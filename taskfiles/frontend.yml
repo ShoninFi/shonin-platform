@@ -1,0 +1,42 @@
+# Frontend: Rust -> wasm via Trunk, deployed as Workers static assets
+# (the shonin-landing Worker, configured in cloudflare/landing/wrangler.jsonc).
+# Commands `cd` explicitly rather than using `dir:`, so absolute templated
+# paths behave the same in included taskfiles.
+version: "3"
+
+includes:
+  config:
+    taskfile: ./config.yml
+    flatten: true
+
+tasks:
+  dev:
+    desc: "Trunk dev server with live reload"
+    cmds:
+      - >-
+        cd "{{.PATH_PACKAGE_FRONTEND}}" && NO_COLOR=true trunk serve
+        --port {{.PORT_FRONTEND_DEV}}
+        --dist "{{.PATH_DIST_FRONTEND_DEV}}"
+        --watch "{{.PATH_ROOT_CARGO_TOML}}"
+        --watch "{{.PATH_PACKAGE_SHARED}}"
+        --watch .
+
+  build:
+    desc: "Release build into .trunk-dist/frontend"
+    cmds:
+      - cd "{{.PATH_PACKAGE_FRONTEND}}" && NO_COLOR=true trunk clean --dist "{{.PATH_DIST_FRONTEND}}"
+      - cd "{{.PATH_PACKAGE_FRONTEND}}" && NO_COLOR=true trunk build --release --dist "{{.PATH_DIST_FRONTEND}}"
+      # Per-route HTML (with 404.html), sitemap.xml and robots.txt, from src/route.rs.
+      - cargo run -q -p shonin-frontend --bin seo -- --dist "{{.PATH_DIST_FRONTEND}}" --base-url "{{.URL_FRONTEND_PROD}}"
+
+  deploy:
+    desc: "Build and deploy to Cloudflare (the Worker is created on first deploy)"
+    requires:
+      vars: [CLOUDFLARE_DEPLOY_WORKERS_TOKEN, CLOUDFLARE_ACCOUNT_ID]
+    env:
+      # Account API token from .env, never a global `wrangler login`.
+      # Wrangler reads CLOUDFLARE_ACCOUNT_ID from the environment directly.
+      CLOUDFLARE_API_TOKEN: "{{.CLOUDFLARE_DEPLOY_WORKERS_TOKEN}}"
+    cmds:
+      - task: build
+      - npx wrangler deploy -c "{{.PATH_WRANGLER_LANDING}}"

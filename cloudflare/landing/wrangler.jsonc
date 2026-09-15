@@ -1,0 +1,22 @@
+{
+  // landing — the frontend's static Trunk dist, served as Workers static
+  // assets. There is no Worker script (`main`); Cloudflare serves the files.
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  // `name` is the SINGLE SOURCE OF TRUTH for this Worker's name. Each deploy
+  // target gets its own: shonin-landing, later shonin-api, shonin-admin, ...
+  "name": "shonin-landing",
+  "compatibility_date": "2026-09-15",
+  // The custom domain is declared here, so config stays the source of truth
+  // and a deploy never drops it. www.shonin.fi 301s here via a zone rule.
+  "routes": [{ "pattern": "shonin.fi", "custom_domain": true }],
+  // One canonical origin: no workers.dev address, no per-version preview URLs.
+  "workers_dev": false,
+  "preview_urls": false,
+  "assets": {
+    // Must match PATH_DIST_FRONTEND in taskfiles/config.yml.
+    "directory": "../../.trunk-dist/frontend",
+    // Every route has its own pre-rendered file (src/bin/seo.rs), so unknown
+    // paths get a real 404 status with 404.html, not a soft-404 index.html.
+    "not_found_handling": "404-page"
+  }
+}

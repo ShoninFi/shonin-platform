@@ -1,0 +1,89 @@
+[workspace]
+resolver = "3"
+members = [
+    "packages/shared",
+    "packages/frontend",
+    "packages/backend",
+    "packages/executor",
+    "packages/coordinator",
+    "packages/simulator",
+    "packages/strategy-sdk",
+    "packages/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+# Business Source License 1.1; see LICENSE. packages/strategy-sdk overrides
+# this with Apache-2.0 because its code is compiled into authors' strategies.
+license = "BUSL-1.1"
+publish = false
+
+[workspace.dependencies]
+# Local crates
+shared = { path = "packages/shared", package = "shonin-shared" }
+simulator = { path = "packages/simulator", package = "shonin-simulator" }
+strategy-sdk = { path = "packages/strategy-sdk", package = "shonin-strategy-sdk" }
+
+# Common
+anyhow = "1.0.104"
+thiserror = "2.0.20"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+ciborium = "0.2.2"
+sha2 = "0.11.0"
+hex = "0.4.3"
+url = "2.5.8"
+time = "0.3.55"
+futures = "0.3.34"
+tracing = "0.1.44"
+
+# Native services (executor, coordinator, cli)
+tokio = { version = "1.53.1", features = ["full"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+reqwest = "0.13.5"
+tokio-tungstenite = "0.30.0"
+
+# Strategy runtime (WASM component model)
+wasmtime = "48.0.2"
+wasmtime-wasi = "48.0.2"
+wit-bindgen = "0.62.0"
+
+# Chains and keys
+alloy = "2.4.2"
+k256 = "0.14.0"
+ed25519-dalek = "3.0.0"
+
+# Frontend (wasm32-unknown-unknown via Trunk).
+# The wasm-bindgen family is pinned EXACTLY: Trunk downloads the wasm-bindgen CLI
+# matching the version in Cargo.lock, and these crates must move together.
+dominator = "0.5.38"
+futures-signals = "0.3.34"
+wasm-bindgen = "=0.2.128"
+wasm-bindgen-futures = "=0.4.78"
+js-sys = "=0.3.105"
+web-sys = "=0.3.105"
+gloo-net = "0.7.0"
+gloo-timers = { version = "0.4.0", features = ["futures"] }
+console_error_panic_hook = "0.1.7"
+
+# Backend (Cloudflare Workers via worker-build)
+worker = "0.8.5"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

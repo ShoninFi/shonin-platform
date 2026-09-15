@@ -1,0 +1,9 @@
+{
+  "name": "shonin-platform",
+  "private": true,
+  "license": "BUSL-1.1",
+  "description": "npm holds only build tooling (wrangler). All application code is Rust.",
+  "devDependencies": {
+    "wrangler": "^4.131.2"
+  }
+}

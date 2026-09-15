@@ -1,0 +1,16 @@
+[package]
+name = "shonin-strategy-sdk"
+description = "Rust SDK for writing Shonin strategies as WASM components"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+publish.workspace = true
+
+[lib]
+name = "strategy_sdk"
+
+[dependencies]
+
+[lints]
+workspace = true

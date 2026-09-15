@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Per-route title, description, canonical and Open Graph tags replace
+         everything between these markers at build time (src/bin/seo.rs). -->
+    <!-- seo:head -->
+    <title>Shonin</title>
+    <!-- /seo:head -->
+    <meta name="theme-color" content="#1e1b4b" />
+    <link rel="icon" type="image/svg+xml" href="/public/logo.svg" />
+
+    <link data-trunk rel="rust" data-bin="frontend" data-wasm-opt="z" />
+    <link data-trunk rel="copy-dir" href="public" />
+    <!-- Workers static assets read _headers from the output root. -->
+    <link data-trunk rel="copy-file" href="_headers" />
+
+    <style>
+      :root {
+        --ink: #1e1b4b;
+        --ink-deep: #13112e;
+        --teal: #2dd4bf;
+        --text: #eef2ff;
+        --muted: #a5b4fc;
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        display: grid;
+        place-items: center;
+        padding: 1.5rem;
+        background: radial-gradient(ellipse at top, var(--ink) 0%, var(--ink-deep) 70%);
+        color: var(--text);
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      main { text-align: center; max-width: 32rem; }
+      .logo { width: 4.5rem; height: 4.5rem; }
+      h1 {
+        margin: 1.25rem 0 0.5rem;
+        font-size: clamp(2.25rem, 7vw, 3.25rem);
+        font-weight: 700;
+        letter-spacing: -0.02em;
+      }
+      p { margin: 0; color: var(--muted); font-size: 1.1rem; line-height: 1.5; }
+      p + p { margin-top: 0.75rem; }
+      .soon {
+        display: inline-block;
+        margin-top: 2rem;
+        padding: 0.4rem 1rem;
+        border: 1px solid color-mix(in srgb, var(--teal) 50%, transparent);
+        border-radius: 999px;
+        color: var(--teal);
+        font-size: 0.8rem;
+        font-weight: 600;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+      nav {
+        display: flex;
+        justify-content: center;
+        gap: 1.5rem;
+        margin-top: 3rem;
+        font-size: 0.9rem;
+      }
+      nav a { color: var(--muted); text-decoration: none; }
+      nav a:hover, nav a[aria-current="page"] { color: var(--text); }
+    </style>
+  </head>
+  <body>
+    <!-- The route's copy is written here at build time (src/bin/seo.rs), so
+         crawlers and link previews see real content. The app replaces this
+         element with the same content when it boots (src/main.rs). -->
+    <main id="prerender"><!-- seo:body --></main>
+  </body>
+</html>

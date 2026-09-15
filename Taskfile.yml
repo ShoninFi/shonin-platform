@@ -1,0 +1,84 @@
+# Root Taskfile: orchestration only.
+# Non-secret config: taskfiles/config.yml (single source of truth).
+# Secrets: .env (gitignored; template in .env.example), loaded here so tasks can
+# forward exactly the variables they need.
+version: "3"
+silent: true
+dotenv: [".env"]
+
+includes:
+  config:
+    taskfile: taskfiles/config.yml
+    flatten: true
+  frontend: taskfiles/frontend.yml
+
+tasks:
+  default:
+    cmds:
+      - task --list
+
+  setup:
+    desc: "Install tooling (pinned Rust toolchain, wrangler) and enable the commit guard"
+    cmds:
+      - rustup show active-toolchain || rustup toolchain install
+      - npm install
+      # Commit guard: every commit runs .githooks/commit-msg (see CLAUDE.md).
+      - git config core.hooksPath .githooks
+      - |
+        for bin in trunk gitleaks claude jq; do
+          command -v "$bin" >/dev/null || echo "missing: $bin (see README.md)"
+        done
+        for f in .private/terms.txt .private/review.md; do
+          [ -f "$f" ] || echo "missing: $f (commit guard input; commits are blocked until it exists)"
+        done
+
+  dev:
+    desc: "Local dev with live reload"
+    deps: [frontend:dev]
+
+  build:
+    desc: "Release build of everything that deploys"
+    cmds:
+      - task: frontend:build
+
+  deploy:
+    desc: "Build and deploy to Cloudflare"
+    cmds:
+      - task: frontend:deploy
+
+  check:
+    desc: "cargo check: native crates, then wasm crates for wasm32-unknown-unknown"
+    cmds:
+      - cargo check --workspace --all-targets {{.CARGO_EXCLUDE_WASM}}
+      - cargo check {{.CARGO_WASM_PACKAGES}} --target wasm32-unknown-unknown
+
+  lint:
+    desc: "rustfmt --check and clippy -D warnings (native and wasm)"
+    cmds:
+      - cargo fmt --all --check
+      - cargo clippy --workspace --all-targets {{.CARGO_EXCLUDE_WASM}} -- -D warnings
+      - cargo clippy {{.CARGO_WASM_PACKAGES}} --target wasm32-unknown-unknown -- -D warnings
+
+  fmt:
+    desc: "Format all crates"
+    cmds:
+      - cargo fmt --all
+
+  test:
+    desc: "Native tests"
+    cmds:
+      - cargo test --workspace {{.CARGO_EXCLUDE_WASM}}
+
+  clean:
+    desc: "Remove build output"
+    cmds:
+      - cargo clean
+      - rm -rf "{{.PATH_TRUNK_DIST}}"
+
+  down:
+    desc: "Kill stray local dev servers"
+    cmds:
+      - |
+        for p in {{.PORT_FRONTEND_DEV}}; do
+          lsof -ti tcp:$p | xargs kill -9 2>/dev/null || true
+        done

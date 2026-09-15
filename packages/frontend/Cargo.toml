@@ -1,0 +1,33 @@
+[package]
+name = "shonin-frontend"
+description = "The Shonin web app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "frontend"
+
+# The app (wasm, built by Trunk).
+[[bin]]
+name = "frontend"
+path = "src/main.rs"
+
+# Build-time SEO: per-route HTML, sitemap.xml, robots.txt (native).
+[[bin]]
+name = "seo"
+path = "src/bin/seo.rs"
+
+[dependencies]
+shared.workspace = true
+dominator.workspace = true
+futures-signals.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+console_error_panic_hook.workspace = true
+web-sys = { workspace = true, features = ["Window", "Document", "Element", "Url"] }
+
+[lints]
+workspace = true

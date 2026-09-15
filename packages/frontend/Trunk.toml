@@ -1,0 +1,3 @@
+# Dev and build output flags (port, dist dir) live in taskfiles/frontend.yml so
+# the same app runs under `task dev` and builds into .trunk-dist/ for deploy.
+[build]

@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Claude Code PreToolUse guard, wired up in the local (gitignored)
+# .claude/settings.json. It keeps an AI assistant from getting around the
+# commit guard in .githooks/commit-msg:
+#
+# - deny: commands that skip git hooks (--no-verify, `commit -n`), repoint
+#   core.hooksPath, or set SHONIN_SKIP_REVIEW;
+# - ask:  any command or file edit that touches .githooks/, .private/ or
+#   .claude/settings*, so changes to the guard itself need a human's approval.
+#
+# Reads the hook payload (JSON) on stdin; prints a permission decision as JSON,
+# or nothing to let the tool call proceed normally.
+set -euo pipefail
+
+input="$(cat)"
+tool="$(jq -r '.tool_name // ""' <<<"$input")"
+
+decide() {
+  jq -n --arg decision "$1" --arg reason "$2" '{
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: $decision,
+      permissionDecisionReason: $reason
+    }
+  }'
+  exit 0
+}
+
+# Matches in file paths and inside shell commands alike: the name must start
+# the string or follow a character that can't be part of a name (/, space, quote).
+guarded_path='(^|[^[:alnum:]_.-])\.(githooks/|private(/|[[:space:]"'"'"']|$)|claude/settings)'
+
+case "$tool" in
+  Bash)
+    cmd="$(jq -r '.tool_input.command // ""' <<<"$input")"
+    if grep -qE '(^|[[:space:]])--no-verify([[:space:]=]|$)' <<<"$cmd"; then
+      decide deny "Commit guard: --no-verify skips the repository's commit checks. Fix what the check reports instead."
+    fi
+    if grep -qE '(^|[^[:alnum:]_-])commit([[:space:]]|$)' <<<"$cmd" &&
+       grep -qE '(^|[[:space:]])-[[:alpha:]]*n[[:alpha:]]*([[:space:]]|$)' <<<"$cmd"; then
+      decide deny "Commit guard: \`git commit -n\` skips the repository's commit checks. Fix what the check reports instead."
+    fi
+    if grep -qi 'core\.hookspath' <<<"$cmd" &&
+       ! grep -qE '^[[:space:]]*git config core\.hooksPath \.githooks[[:space:]]*$' <<<"$cmd"; then
+      decide deny "Commit guard: changing core.hooksPath would disable the repository's commit checks."
+    fi
+    if grep -q 'SHONIN_SKIP_REVIEW' <<<"$cmd"; then
+      decide deny "Commit guard: SHONIN_SKIP_REVIEW skips the commit review. Only a human may set it, outside Claude."
+    fi
+    if grep -qE "$guarded_path" <<<"$cmd"; then
+      decide ask "Commit guard: this command touches the guard's own files (.githooks/, .private/ or .claude/settings)."
+    fi
+    ;;
+  Edit | Write | MultiEdit | NotebookEdit)
+    path="$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<<"$input")"
+    if grep -qE "$guarded_path" <<<"$path"; then
+      decide ask "Commit guard: this edits the guard's own files (.githooks/, .private/ or .claude/settings)."
+    fi
+    ;;
+esac

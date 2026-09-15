@@ -1,0 +1,41 @@
+# SINGLE SOURCE OF TRUTH for non-secret configuration. No tasks, only vars.
+# Every taskfile includes this with `flatten: true`.
+#
+# Rules:
+# - Composite paths are computed HERE, never re-joined in a leaf taskfile.
+# - Secrets never live here; they come from .env.
+# - Cloudflare Worker names are defined once, as `name` in each
+#   cloudflare/<target>/wrangler.jsonc; deploys pass that file with -c.
+version: "3"
+
+vars:
+  # Paths
+  PATH_ROOT: "{{.ROOT_DIR}}"
+  PATH_ROOT_CARGO_TOML: '{{joinPath .PATH_ROOT "Cargo.toml"}}'
+  PATH_PACKAGES: '{{joinPath .PATH_ROOT "packages"}}'
+  PATH_PACKAGE_SHARED: '{{joinPath .PATH_PACKAGES "shared"}}'
+  PATH_PACKAGE_FRONTEND: '{{joinPath .PATH_PACKAGES "frontend"}}'
+  PATH_CLOUDFLARE: '{{joinPath .PATH_ROOT "cloudflare"}}'
+  PATH_WRANGLER_LANDING: '{{joinPath .PATH_CLOUDFLARE "landing" "wrangler.jsonc"}}'
+  PATH_TRUNK_DIST: '{{joinPath .PATH_ROOT ".trunk-dist"}}'
+  # Must match assets.directory in cloudflare/landing/wrangler.jsonc.
+  PATH_DIST_FRONTEND: '{{joinPath .PATH_TRUNK_DIST "frontend"}}'
+  PATH_DIST_FRONTEND_DEV: '{{joinPath .PATH_TRUNK_DIST "frontend-dev"}}'
+
+  # Cargo: crates that run as wasm are also checked for wasm32-unknown-unknown.
+  # The frontend builds natively too (its seo tool runs at build time); the
+  # backend only builds for wasm.
+  CARGO_WASM_PACKAGES: "-p shonin-frontend -p shonin-backend -p shonin-shared"
+  CARGO_EXCLUDE_WASM: "--exclude shonin-backend"
+
+  # Ports: a base (override with SHONIN_START_PORT_DEV in .env) plus fixed offsets.
+  # Offsets are stable; reserved ones stay reserved.
+  SHONIN_START_PORT_DEV:
+    sh: echo "${SHONIN_START_PORT_DEV:-19080}"
+  PORT_FRONTEND_DEV: "{{add (atoi .SHONIN_START_PORT_DEV) 0}}"
+  # +1 reserved: backend API
+  # +2 reserved: backend API inspector
+
+  # URLs
+  URL_FRONTEND_DEV: "http://localhost:{{.PORT_FRONTEND_DEV}}"
+  URL_FRONTEND_PROD: "https://shonin.fi"
