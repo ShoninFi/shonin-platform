@@ -16,6 +16,8 @@ This repository is the platform: the web app, its backend, the executor and the 
 
 `task setup` points git at `.githooks/`, so every commit is checked for secrets, for private terms and paths, and by a reviewer model against a publication policy. The term list and policy are local and never committed (`.private/`, gitignored); commits are blocked until both exist. See `CLAUDE.md` for the rules.
 
+In CI, `.github/workflows/secret-scan.yml` runs gitleaks over the full history on every push to `main` and every pull request.
+
 ## Quickstart
 
 ```bash
