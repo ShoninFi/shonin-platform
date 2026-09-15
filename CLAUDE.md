@@ -18,6 +18,8 @@ Every commit runs `.githooks/commit-msg` (enabled by `task setup`). It rejects a
 - any term from the local, gitignored `.private/terms.txt`, or an absolute home path;
 - content that a reviewer model (`claude -p`) judges to break the local, gitignored policy in `.private/review.md`.
 
+CI (`.github/workflows/secret-scan.yml`) re-runs the secret scan over the full history on every push to `main` and every pull request. The term and review checks run only locally, because their inputs never leave the machine.
+
 Never bypass it: no `--no-verify` or `-n`, no changes to `core.hooksPath`, no `SHONIN_SKIP_REVIEW`. When it blocks a commit, fix the commit. If a check itself looks wrong, tell the user rather than working around it. Never commit anything under `.private/`.
 
 ## Done means
