@@ -22,6 +22,8 @@ CI (`.github/workflows/secret-scan.yml`) re-runs the secret scan over the full h
 
 Never bypass it: no `--no-verify` or `-n`, no changes to `core.hooksPath`, no `SHONIN_SKIP_REVIEW`. When it blocks a commit, fix the commit. If a check itself looks wrong, tell the user rather than working around it. Never commit anything under `.private/`.
 
+For assistants, a Claude Code hook (`.githooks/claude-bash-guard`, wired up in the local `.claude/settings.json`) enforces this. It denies those bypasses, and any write to `.githooks/`, `.private/` or `.claude/settings*`. It never prompts, so unattended runs don't stall. To change the guard files with an assistant's help, the user starts the session with `SHONIN_GUARD_UNLOCK=1`.
+
 ## Done means
 
 `task check`, `task lint` and `task test` all pass.
