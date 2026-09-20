@@ -423,11 +423,20 @@ fn connect_flow(agent: &'static Strategy, connected: &'static Connected) -> Dom 
     html!("div", {
         .future(watcher)
         .child(modal(&open, "Connect your account", true, move || {
-            let current = step().get().unwrap_or(0);
-            vec![
-                steps_list(current),
-                step_body(agent, connected, current),
-            ]
+            // The modal's body is built when it opens, so the steps inside it
+            // have to follow the step signal themselves — otherwise the
+            // wizard never advances past the step it opened on.
+            vec![html!("div", {
+                .class("stack")
+                .child_signal(step().signal().map(move |current| {
+                    let current = current.unwrap_or(0);
+                    Some(html!("div", {
+                        .class("stack")
+                        .child(steps_list(current))
+                        .child(step_body(agent, connected, current))
+                    }))
+                }))
+            })]
         }))
     })
 }
