@@ -1,0 +1,123 @@
+//! An author's page: everything they have ever published.
+
+use dominator::{Dom, html};
+use shared::Standing;
+
+use crate::data;
+use crate::format as fmt;
+use crate::pages::parts;
+use crate::ui::primitives as ui;
+use crate::ui::primitives::Tone;
+use crate::ui::table::{Column, Row, table};
+
+pub fn render(handle: &str) -> Dom {
+    let Some(author) = data::author(handle) else {
+        return crate::pages::not_found::render();
+    };
+    let published = data::by_author(handle);
+
+    let live = published
+        .iter()
+        .filter(|strategy| strategy.standing.is_live())
+        .count();
+    let capital: f64 = published
+        .iter()
+        .filter(|strategy| strategy.standing.is_live())
+        .map(|strategy| strategy.capital())
+        .sum();
+    let lowest = published
+        .iter()
+        .filter_map(|strategy| strategy.review.as_ref().map(|review| review.score))
+        .min();
+
+    let rows: Vec<Row> = published
+        .iter()
+        .map(|strategy| {
+            let performance = data::performance(strategy);
+            Row::linked(
+                parts::path_of(strategy),
+                vec![
+                    html!("div", {
+                        .child(html!("div", { .class("table__primary").text(&strategy.name()) }))
+                        .child(html!("div", {
+                            .class(["faint", "small"])
+                            .text(&strategy.title)
+                        }))
+                    }),
+                    parts::standing_badge(strategy.standing),
+                    ui::muted(&fmt::date(strategy.registered)),
+                    ui::number(&fmt::days(strategy.days_live)),
+                    if strategy.standing == Standing::BuildFailed {
+                        ui::muted("—")
+                    } else {
+                        ui::signed(
+                            performance.normalised_annualised,
+                            &fmt::percent_signed(performance.normalised_annualised, 1),
+                        )
+                    },
+                    parts::review_badge(strategy),
+                    ui::number(&fmt::money_compact(strategy.capital())),
+                    parts::spark(strategy),
+                ],
+            )
+        })
+        .collect();
+
+    html!("div", {
+        .class("stack-lg")
+        .child(html!("div", {
+            .class("stack")
+            .child(html!("h1", { .class("title").text(handle) }))
+            .child(html!("p", { .class("lede").text(&author.blurb) }))
+            .child(html!("p", {
+                .class(["faint", "small"])
+                .text(&format!("Publishing since {}.", fmt::date(author.joined)))
+            }))
+        }))
+        .child(ui::stats(vec![
+            ui::stat("Published", &published.len().to_string(), Some("all of it below")),
+            ui::stat("Live", &live.to_string(), Some("taking deposits")),
+            ui::stat(
+                "Capital behind them",
+                &fmt::money_compact(capital),
+                Some("across live strategies"),
+            ),
+            ui::stat(
+                "Lowest review score",
+                &lowest.map_or_else(|| "—".to_string(), |score| score.to_string()),
+                Some("of everything they've published"),
+            ),
+        ]))
+        .child(ui::section(
+            "Everything they have published",
+            vec![
+                table(
+                    vec![
+                        Column::new("Strategy").wide(),
+                        Column::new("Standing"),
+                        Column::new("Registered"),
+                        Column::num("Live"),
+                        Column::num("Normalised"),
+                        Column::num("Review"),
+                        Column::num("Capital"),
+                        Column::new("Shape"),
+                    ],
+                    rows,
+                ),
+                ui::notice(
+                    Tone::Info,
+                    "This is the whole list",
+                    "Live, new, superseded, retired, and the builds that failed. Publishing \
+                     means funding a vault's tank and leaves a permanent record, so an author \
+                     who tried a hundred variants would have a hundred visible entries here. \
+                     Nothing on this page can be hidden by its author.",
+                ),
+                ui::note(
+                    "The honest limit: an author can publish under a fresh identity, and their \
+                     earlier failures don't follow them. What makes that costly isn't the money, \
+                     it's the clock — ninety live days before anything they publish is ranked.",
+                ),
+            ],
+        ))
+    })
+}

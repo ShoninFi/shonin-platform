@@ -176,12 +176,6 @@ fn colophon() -> String {
 
 // -------------------------------------------------------------- the pages
 
-/// One route's page content, without the shell around it. The app renders
-/// this directly for any route whose interactive page hasn't landed yet.
-pub fn page_html(route: &Route) -> String {
-    page(route)
-}
-
 fn page(route: &Route) -> String {
     match route {
         Route::Home => home(),
