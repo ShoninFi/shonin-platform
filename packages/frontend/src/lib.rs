@@ -14,3 +14,4 @@ pub mod prerender;
 pub mod route;
 pub mod state;
 pub mod ui;
+pub mod wallet;

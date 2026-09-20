@@ -32,14 +32,23 @@ pub fn number(value: f64, decimals: usize) -> String {
     }
 }
 
-/// Money, to the dollar: $1,204,331.
+/// Money, to the dollar: $1,204,331. A negative amount carries its sign
+/// before the currency, never inside it.
 pub fn money(value: f64) -> String {
-    format!("${}", number(value, 0))
+    signed_money(value, 0)
 }
 
 /// Money, to the cent, for amounts a person is about to move.
 pub fn money_exact(value: f64) -> String {
-    format!("${}", number(value, 2))
+    signed_money(value, 2)
+}
+
+fn signed_money(value: f64, decimals: usize) -> String {
+    if value < 0.0 {
+        format!("−${}", number(-value, decimals))
+    } else {
+        format!("${}", number(value, decimals))
+    }
 }
 
 /// Money at a glance: $3.24M, $412k, $86.40.
@@ -256,7 +265,8 @@ mod tests {
         assert_eq!(money(1_204_331.42), "$1,204,331");
         assert_eq!(money_exact(86.4), "$86.40");
         assert_eq!(money(0.0), "$0");
-        assert_eq!(money(-2_400.0), "$-2,400");
+        assert_eq!(money(-2_400.0), "−$2,400");
+        assert_eq!(money_exact(-20.0), "−$20.00");
     }
 
     #[test]

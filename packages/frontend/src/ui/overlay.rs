@@ -33,8 +33,14 @@ pub fn modal(
                 .attr("role", "dialog")
                 .attr("aria-modal", "true")
                 .attr("aria-label", title)
-                // A click on the backdrop closes; a click inside must not.
-                .event(clone!(open => move |_: events::Click| open.set_neq(false)))
+                // A click on the backdrop closes. The listener is in the
+                // capture phase, so every click inside the modal arrives here
+                // first: only one on the backdrop itself counts.
+                .event(clone!(open => move |event: events::Click| {
+                    if crate::ui::clicked_self(&event, "overlay") {
+                        open.set_neq(false);
+                    }
+                }))
                 .global_event(clone!(open => move |event: events::KeyDown| {
                     if event.key() == "Escape" {
                         open.set_neq(false);
@@ -43,7 +49,6 @@ pub fn modal(
                 .child(html!("div", {
                     .class("modal")
                     .apply_if(wide, |dom| dom.class("modal--wide"))
-                    .event(|event: events::Click| event.stop_propagation())
                     .child(html!("div", {
                         .class("modal__head")
                         .child(html!("h2", { .class("modal__title").text(title) }))

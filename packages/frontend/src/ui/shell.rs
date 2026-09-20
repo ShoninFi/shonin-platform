@@ -41,6 +41,7 @@ pub fn masthead(route: &Route) -> Dom {
             }))
             .child(html!("div", {
                 .class("masthead__tools")
+                .child(crate::pages::invest::wallet_button())
                 .child(theme_button())
             }))
         }))

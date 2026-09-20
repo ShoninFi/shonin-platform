@@ -43,6 +43,14 @@ pub struct State {
     pub theme: Mutable<Theme>,
     /// What the app has to say about something that just happened.
     pub toasts: Toasts,
+    /// What the viewer holds, restored from their browser.
+    holdings: Mutable<crate::wallet::Holdings>,
+}
+
+impl State {
+    pub fn holdings(&self) -> &Mutable<crate::wallet::Holdings> {
+        &self.holdings
+    }
 }
 
 static STATE: OnceLock<State> = OnceLock::new();
@@ -56,6 +64,7 @@ pub fn get() -> &'static State {
                 .unwrap_or(Theme::Dark),
         ),
         toasts: Toasts::new(),
+        holdings: Mutable::new(crate::wallet::restore()),
     })
 }
 

@@ -1,8 +1,10 @@
 //! One module per page. `render` picks the one a route belongs to.
 
 pub mod home;
+pub mod invest;
 pub mod not_found;
 pub mod parts;
+pub mod portfolio;
 pub mod strategies;
 pub mod strategy;
 
@@ -17,6 +19,7 @@ pub fn render(route: &Route) -> Dom {
         Route::Home => home::render(),
         Route::Strategies => strategies::render(),
         Route::Strategy { slug, tab } => strategy::render(slug, *tab),
+        Route::Portfolio => portfolio::render(),
         Route::NotFound => not_found::render(),
         // Pages land here one at a time as they're built. Until a route has
         // its interactive page, the app renders the same markup the build

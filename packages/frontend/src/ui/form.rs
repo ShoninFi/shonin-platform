@@ -84,7 +84,9 @@ pub fn amount(value: &Mutable<String>, unit: &str, max: f64) -> Dom {
             .attr("type", "button")
             .text("Max")
             .event(clone!(value => move |_: events::Click| {
-                value.set_neq(format!("{max:.2}"));
+                // Round down, never to the nearest: rounding up would fill in
+                // more than there is and the action would be refused.
+                value.set_neq(format!("{:.2}", (max * 100.0).floor() / 100.0));
             }))
         }))
     })

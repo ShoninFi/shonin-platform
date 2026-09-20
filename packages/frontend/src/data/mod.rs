@@ -180,6 +180,43 @@ pub fn past() -> Vec<&'static Strategy> {
         .collect()
 }
 
+/// Simple things to compare a record against, so a depositor can see whether
+/// a strategy is adding anything to what they already hold.
+pub fn benchmarks() -> &'static [(&'static str, Vec<shared::Point>)] {
+    static BENCHMARKS: OnceLock<Vec<(&'static str, Vec<shared::Point>)>> = OnceLock::new();
+    BENCHMARKS.get_or_init(|| {
+        vec![
+            (
+                "BTC",
+                series::record(
+                    "benchmark-btc",
+                    as_of(),
+                    series::Shape::new(400, 0.34, 0.52, 1.0, 1.0),
+                )
+                .value_per_share,
+            ),
+            (
+                "ETH",
+                series::record(
+                    "benchmark-eth",
+                    as_of(),
+                    series::Shape::new(400, 0.21, 0.66, 1.0, 1.0),
+                )
+                .value_per_share,
+            ),
+            (
+                "A basket of funding rates",
+                series::record(
+                    "benchmark-funding",
+                    as_of(),
+                    series::Shape::new(400, 0.11, 0.06, 1.0, 1.0),
+                )
+                .value_per_share,
+            ),
+        ]
+    })
+}
+
 /// Capital across every live vault.
 pub fn total_vault_capital() -> f64 {
     vaults()

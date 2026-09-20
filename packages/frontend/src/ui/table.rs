@@ -12,7 +12,7 @@ use crate::ui::icon;
 /// One column: what it is called, whether it holds figures, and the key the
 /// table sorts by when its header is used.
 pub struct Column {
-    pub label: &'static str,
+    pub label: String,
     pub numeric: bool,
     pub sort_key: Option<&'static str>,
     /// On a narrow screen, whether this cell takes the full width.
@@ -20,18 +20,18 @@ pub struct Column {
 }
 
 impl Column {
-    pub fn new(label: &'static str) -> Self {
+    pub fn new(label: impl Into<String>) -> Self {
         Self {
-            label,
+            label: label.into(),
             numeric: false,
             sort_key: None,
             wide: false,
         }
     }
 
-    pub fn num(label: &'static str) -> Self {
+    pub fn num(label: impl Into<String>) -> Self {
         Self {
-            label,
+            label: label.into(),
             numeric: true,
             sort_key: None,
             wide: false,
@@ -116,7 +116,7 @@ pub fn sortable_table(columns: Vec<Column>, rows: Vec<Row>, sort: &'static Sort)
 }
 
 fn render(columns: Vec<Column>, rows: Vec<Row>, sort: Option<&'static Sort>) -> Dom {
-    let labels: Vec<&'static str> = columns.iter().map(|column| column.label).collect();
+    let labels: Vec<String> = columns.iter().map(|column| column.label.clone()).collect();
     let numeric: Vec<bool> = columns.iter().map(|column| column.numeric).collect();
     let wide: Vec<bool> = columns.iter().map(|column| column.wide).collect();
 
@@ -137,8 +137,13 @@ fn render(columns: Vec<Column>, rows: Vec<Row>, sort: Option<&'static Sort>) -> 
                     let href = row.href.clone();
                     html!("tr", {
                         .apply(|dom| match href {
-                            Some(href) => dom.event(move |_: events::Click| {
-                                routing::go_to_url(&href);
+                            // Also a capture-phase listener, so a click on a
+                            // control inside the row would otherwise navigate
+                            // instead of doing what the control does.
+                            Some(href) => dom.event(move |event: events::Click| {
+                                if !crate::ui::clicked_control(&event) {
+                                    routing::go_to_url(&href);
+                                }
                             }),
                             None => dom,
                         })
@@ -150,7 +155,7 @@ fn render(columns: Vec<Column>, rows: Vec<Row>, sort: Option<&'static Sort>) -> 
                                 .apply_if(wide.get(index).copied().unwrap_or(false), |dom| {
                                     dom.attr("data-span", "full")
                                 })
-                                .attr("data-label", labels.get(index).copied().unwrap_or(""))
+                                .attr("data-label", labels.get(index).map_or("", String::as_str))
                                 .child(cell)
                             })
                         }))
@@ -166,7 +171,7 @@ fn header(column: Column, sort: Option<&'static Sort>) -> Dom {
         return html!("th", {
             .attr("scope", "col")
             .apply_if(column.numeric, |dom| dom.class("num"))
-            .text(column.label)
+            .text(&column.label)
         });
     };
 
@@ -185,7 +190,7 @@ fn header(column: Column, sort: Option<&'static Sort>) -> Dom {
             .apply_if(active, |dom| {
                 dom.attr("aria-sort", if descending { "descending" } else { "ascending" })
             })
-            .text(column.label)
+            .text(&column.label)
             .apply_if(active, |dom| {
                 dom.child(if descending {
                     icon::chevron_down()

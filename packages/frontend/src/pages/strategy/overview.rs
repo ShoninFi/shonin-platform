@@ -7,6 +7,7 @@ use shared::{ExitClass, Strategy, Valuation};
 
 use crate::copy;
 use crate::format as fmt;
+use crate::pages::invest;
 use crate::pages::parts;
 use crate::pages::strategy::fee_table;
 use crate::ui::primitives as ui;
@@ -336,39 +337,42 @@ fn aside(strategy: &'static Strategy) -> Vec<Dom> {
         return Vec::new();
     };
 
-    let mut cards = vec![ui::card_titled(
-        "The vault",
-        None,
-        vec![ui::kv_rows(vec![
-            ("Value".to_string(), ui::number(&fmt::money(vault.value))),
-            (
-                "Value per share".to_string(),
-                ui::number(&fmt::share_price(vault.share_price)),
-            ),
-            (
-                "High-water mark".to_string(),
-                ui::number(&fmt::share_price(vault.high_water_mark)),
-            ),
-            (
-                "Shares".to_string(),
-                ui::number(&fmt::number(vault.shares, 0)),
-            ),
-            (
-                "Idle balance".to_string(),
-                html!("div", {
-                    .child(ui::number(&fmt::money(vault.idle)))
-                    .child(html!("div", {
-                        .class(["faint", "small"])
-                        .text("withdrawals up to this are paid in one transaction")
-                    }))
-                }),
-            ),
-            ("Asset".to_string(), ui::value(&vault.asset)),
-            ("Chain".to_string(), ui::value(vault.chain.label())),
-            ("Contract".to_string(), ui::address(&vault.address)),
-            ("Opened".to_string(), ui::value(&fmt::date(vault.created))),
-        ])],
-    )];
+    let mut cards = vec![
+        invest::panel(strategy),
+        ui::card_titled(
+            "The vault",
+            None,
+            vec![ui::kv_rows(vec![
+                ("Value".to_string(), ui::number(&fmt::money(vault.value))),
+                (
+                    "Value per share".to_string(),
+                    ui::number(&fmt::share_price(vault.share_price)),
+                ),
+                (
+                    "High-water mark".to_string(),
+                    ui::number(&fmt::share_price(vault.high_water_mark)),
+                ),
+                (
+                    "Shares".to_string(),
+                    ui::number(&fmt::number(vault.shares, 0)),
+                ),
+                (
+                    "Idle balance".to_string(),
+                    html!("div", {
+                        .child(ui::number(&fmt::money(vault.idle)))
+                        .child(html!("div", {
+                            .class(["faint", "small"])
+                            .text("withdrawals up to this are paid in one transaction")
+                        }))
+                    }),
+                ),
+                ("Asset".to_string(), ui::value(&vault.asset)),
+                ("Chain".to_string(), ui::value(vault.chain.label())),
+                ("Contract".to_string(), ui::address(&vault.address)),
+                ("Opened".to_string(), ui::value(&fmt::date(vault.created))),
+            ])],
+        ),
+    ];
 
     if let Some(transit) = &vault.in_transit {
         cards.push(ui::notice(
