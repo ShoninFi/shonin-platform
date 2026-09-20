@@ -109,20 +109,20 @@
   --accent-bright: #075a51;
   --accent-deep: #075a51;
   --on-accent: #fff;
-  --accent-wash: rgb(13 139 127 / 9%);
-  --accent-edge: rgb(13 139 127 / 30%);
+  --accent-wash: rgb(10 111 100 / 9%);
+  --accent-edge: rgb(10 111 100 / 30%);
 
   --up: #0f7350;
   --down: #b3291f;
   --warn: #7a5100;
   --info: #1f5fbf;
 
-  --up-wash: rgb(17 131 90 / 10%);
-  --down-wash: rgb(194 55 47 / 10%);
-  --warn-wash: rgb(154 101 0 / 10%);
+  --up-wash: rgb(15 115 80 / 10%);
+  --down-wash: rgb(179 41 31 / 10%);
+  --warn-wash: rgb(122 81 0 / 10%);
   --info-wash: rgb(31 95 191 / 10%);
 
-  --selection: rgb(13 139 127 / 20%);
+  --selection: rgb(10 111 100 / 20%);
   --shadow-overlay: 0 24px 60px rgb(16 21 28 / 18%);
 }
 
@@ -706,8 +706,11 @@ th.num {
 .select:focus,
 .textarea:focus {
   border-color: var(--accent);
-  outline: none;
   box-shadow: 0 0 0 3px var(--accent-wash);
+  /* The ring is the visible indicator, but a transparent outline keeps one in
+     forced-colours mode, where box-shadows are dropped. */
+  outline: 2px solid transparent;
+  outline-offset: 1px;
 }
 
 .input::placeholder,
@@ -1085,6 +1088,18 @@ th.num {
 
 .table--rows-link tbody tr {
   cursor: pointer;
+}
+
+/* The link that makes a clickable row reachable without a mouse. It reads as
+   part of the row rather than as a link, but it is one. */
+.table__link {
+  color: inherit;
+  display: block;
+}
+
+.table__link:hover {
+  color: inherit;
+  text-decoration: none;
 }
 
 /* Below this the leaderboard reads as stacked records rather than a grid. */

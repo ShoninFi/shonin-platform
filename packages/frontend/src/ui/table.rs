@@ -4,7 +4,7 @@
 //! On a narrow screen a table can collapse into one record per row, with each
 //! cell labelled by its column — the same data, read down instead of across.
 
-use dominator::{Dom, events, html, routing};
+use dominator::{Dom, events, html, link, routing};
 use futures_signals::signal::Mutable;
 
 use crate::ui::icon;
@@ -137,6 +137,7 @@ fn render(columns: Vec<Column>, rows: Vec<Row>, sort: Option<&'static Sort>) -> 
             .child(html!("tbody", {
                 .children(rows.into_iter().map(|row| {
                     let href = row.href.clone();
+                    let target = row.href.clone();
                     html!("tr", {
                         .apply(|dom| match href {
                             // Also a capture-phase listener, so a click on a
@@ -150,6 +151,17 @@ fn render(columns: Vec<Column>, rows: Vec<Row>, sort: Option<&'static Sort>) -> 
                             None => dom,
                         })
                         .children(row.cells.into_iter().enumerate().map(|(index, cell)| {
+                            // The whole row is clickable, but a click is not
+                            // the only way people move: the first cell carries
+                            // the real link, so the row is reachable by
+                            // keyboard and can be opened in a new window.
+                            let cell = match (index, target.clone()) {
+                                (0, Some(href)) => link!(href, {
+                                    .class("table__link")
+                                    .child(cell)
+                                }),
+                                _ => cell,
+                            };
                             html!("td", {
                                 .apply_if(numeric.get(index).copied().unwrap_or(false), |dom| {
                                     dom.class("num")
