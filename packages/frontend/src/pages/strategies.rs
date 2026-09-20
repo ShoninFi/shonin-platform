@@ -59,7 +59,7 @@ pub fn render() -> Dom {
             .child(html!("div", {
                 .child_signal(map_ref! {
                     let view = controls.view.signal(),
-                    let key = controls.sort.key.signal(),
+                    let key = controls.sort.key.signal_cloned(),
                     let descending = controls.sort.descending.signal(),
                     let chain = controls.chain.signal_cloned(),
                     let source = controls.source.signal_cloned(),
@@ -154,8 +154,33 @@ fn filters() -> Dom {
                 &controls.exit,
             ),
         ))
+        // The table's own headers sort it, but they are hidden when the table
+        // collapses on a narrow screen, so sorting needs a control of its own
+        // — bound to the same state, not a copy of it.
+        .child(form::field(
+            "Sort by",
+            None,
+            form::select(
+                SORT_KEYS
+                    .iter()
+                    .map(|(key, label)| ((*key).to_string(), (*label).to_string()))
+                    .collect(),
+                &controls.sort.key,
+            ),
+        ))
     })
 }
+
+/// Every key the leaderboard can sort by, and what it is called.
+const SORT_KEYS: [(&str, &str); 7] = [
+    ("normalised", "Normalised return"),
+    ("raw", "Raw return"),
+    ("drawdown", "Max drawdown"),
+    ("score", "Review score"),
+    ("aum", "Size now"),
+    ("average", "Average size"),
+    ("age", "Days live"),
+];
 
 fn listing(
     view: View,

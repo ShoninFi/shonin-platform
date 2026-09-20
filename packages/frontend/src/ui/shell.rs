@@ -8,6 +8,16 @@ use crate::route::Route;
 use crate::state::{self, Theme};
 use crate::ui::icon;
 
+/// A link straight to the page, so a keyboard doesn't have to tab through the
+/// navigation on every route.
+pub fn skip_link() -> Dom {
+    html!("a", {
+        .class("skip-link")
+        .attr("href", "#main")
+        .text("Skip to the page")
+    })
+}
+
 /// The header: the mark, the primary navigation, and the theme control.
 pub fn masthead(route: &Route) -> Dom {
     let section = route.section();

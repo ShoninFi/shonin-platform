@@ -70,25 +70,27 @@ impl Row {
 
 /// Which column a table is sorted by, and which way.
 pub struct Sort {
-    pub key: Mutable<&'static str>,
+    /// Owned rather than borrowed, so a `select` elsewhere on the page can
+    /// drive exactly this state instead of mirroring it.
+    pub key: Mutable<String>,
     pub descending: Mutable<bool>,
 }
 
 impl Sort {
-    pub fn new(key: &'static str) -> Self {
+    pub fn new(key: &str) -> Self {
         Self {
-            key: Mutable::new(key),
+            key: Mutable::new(key.to_string()),
             descending: Mutable::new(true),
         }
     }
 
     /// Use a column: the same one flips direction, a new one starts
     /// descending, because the interesting end of a figure is usually the top.
-    pub fn use_column(&self, key: &'static str) {
-        if self.key.get() == key {
+    pub fn use_column(&self, key: &str) {
+        if self.key.get_cloned() == key {
             self.descending.set(!self.descending.get());
         } else {
-            self.key.set(key);
+            self.key.set(key.to_string());
             self.descending.set(true);
         }
     }
@@ -175,7 +177,7 @@ fn header(column: Column, sort: Option<&'static Sort>) -> Dom {
         });
     };
 
-    let active = sort.key.get() == key;
+    let active = sort.key.get_cloned() == key;
     let descending = sort.descending.get();
 
     html!("th", {

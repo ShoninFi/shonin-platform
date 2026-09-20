@@ -31,12 +31,13 @@
 
   --text: #e8edf4;
   --text-muted: #96a2b4;
-  --text-faint: #66738a;
+  --text-faint: #7b899e;
 
   /* Teal carries every affordance: links, focus, the active row. */
   --accent: #2dd4bf;
   --accent-bright: #5eead4;
   --accent-deep: #0d7f74;
+  --on-accent: #05221f;
   --accent-wash: rgb(45 212 191 / 10%);
   --accent-edge: rgb(45 212 191 / 35%);
 
@@ -102,17 +103,18 @@
 
   --text: #10151c;
   --text-muted: #55616f;
-  --text-faint: #7a8595;
+  --text-faint: #67707e;
 
-  --accent: #0d8b7f;
-  --accent-bright: #0b6f66;
-  --accent-deep: #0b6f66;
+  --accent: #0a6f64;
+  --accent-bright: #075a51;
+  --accent-deep: #075a51;
+  --on-accent: #fff;
   --accent-wash: rgb(13 139 127 / 9%);
   --accent-edge: rgb(13 139 127 / 30%);
 
-  --up: #11835a;
-  --down: #c2372f;
-  --warn: #9a6500;
+  --up: #0f7350;
+  --down: #b3291f;
+  --warn: #7a5100;
   --info: #1f5fbf;
 
   --up-wash: rgb(17 131 90 / 10%);
@@ -324,6 +326,7 @@ th.num {
     --gutter: 1rem;
   }
 
+
   .grid--2,
   .grid--3,
   .grid--4 {
@@ -413,6 +416,35 @@ th.num {
   align-items: center;
   gap: var(--space-2);
   flex: none;
+}
+
+/* Two rows on a narrow screen: the mark and the controls, then the navigation
+   under them. Squeezing all three onto one line leaves the nav a few
+   characters wide and pushes the rest off the edge. */
+@media (width <= 720px) {
+  .masthead__inner {
+    flex-wrap: wrap;
+    height: auto;
+    gap: var(--space-2) var(--space-3);
+    padding: var(--space-2) 0;
+  }
+
+  .mainnav {
+    order: 3;
+    flex: 0 0 100%;
+  }
+
+  .masthead__tools {
+    margin-left: auto;
+  }
+}
+
+/* The wallet's balance is a convenience, not a control: it is the first thing
+   to go when there is no room. */
+@media (width <= 480px) {
+  .masthead__tools .num.small {
+    display: none;
+  }
 }
 
 .colophon {
@@ -566,13 +598,13 @@ th.num {
 .btn--primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #05221f;
+  color: var(--on-accent);
 }
 
 .btn--primary:hover {
   background: var(--accent-bright);
   border-color: var(--accent-bright);
-  color: #05221f;
+  color: var(--on-accent);
 }
 
 .btn--ghost {
@@ -1067,6 +1099,12 @@ th.num {
     gap: 0.15rem var(--space-3);
     padding: var(--space-3) 0;
     border-bottom: 1px solid var(--line);
+  }
+
+  @media (width <= 560px) {
+    .table--responsive tbody tr {
+      grid-template-columns: minmax(0, 1fr);
+    }
   }
 
   .table--responsive tbody td {
@@ -1749,7 +1787,7 @@ th.num {
 .steps__item.is-current::before {
   border-color: var(--accent);
   background: var(--accent);
-  color: #05221f;
+  color: var(--on-accent);
 }
 
 .steps__title {
@@ -1841,7 +1879,7 @@ th.num {
   padding: var(--space-2) var(--space-3);
   border-radius: var(--radius);
   background: var(--accent);
-  color: #05221f;
+  color: var(--on-accent);
   transition: top 120ms ease;
 }
 

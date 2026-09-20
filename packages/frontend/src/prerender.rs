@@ -102,7 +102,7 @@ fn code_block(body: &str) -> String {
 /// The whole page body for a route: the header, the page, and the footer.
 pub fn body(route: &Route) -> String {
     format!(
-        "{}{}{}",
+        "<a class=\"skip-link\" href=\"#main\">Skip to the page</a>{}{}{}",
         masthead(route),
         el(
             "main",
@@ -227,6 +227,42 @@ fn home() -> String {
         })
         .collect();
 
+    let totals = facts(&[
+        (
+            "In vaults".to_string(),
+            esc(&format!(
+                "{} across {} live strategies",
+                fmt::money_compact(data::total_vault_capital()),
+                data::vaults()
+                    .iter()
+                    .filter(|strategy| strategy.standing.is_live())
+                    .count()
+            )),
+        ),
+        (
+            "In connected accounts".to_string(),
+            esc(&format!(
+                "{} across {} agents",
+                fmt::money_compact(data::total_connected_capital()),
+                data::agents().len()
+            )),
+        ),
+        (
+            "Trades on the record".to_string(),
+            esc(&format!(
+                "{}, every one of them public",
+                fmt::count(data::total_trades())
+            )),
+        ),
+        (
+            "Authors".to_string(),
+            esc(&format!(
+                "{}, and anyone can publish",
+                data::get().authors.len()
+            )),
+        ),
+    ]);
+
     [
         el(
             "div",
@@ -238,6 +274,7 @@ fn home() -> String {
                 para(copy::HALT_NEVER_STEAL)
             ),
         ),
+        totals,
         section("What a depositor is promised", &guarantees),
         section("How it works", &steps),
         section(
@@ -508,7 +545,11 @@ fn strategy_overview(strategy: &shared::Strategy) -> String {
                     ],
                     &venue_rows
                 ),
-                para(&vault.exit_class.summary())
+                para(&format!(
+                    "Exit class: {}. {}",
+                    vault.exit_class.label(),
+                    vault.exit_class.summary()
+                ))
             ),
         ));
 
@@ -1732,6 +1773,93 @@ mod tests {
                 "{:?} has no header",
                 route.path()
             );
+        }
+    }
+
+    /// The pre-rendered view is a plainer view of the same data, so the facts
+    /// a strategy's page turns on have to appear in it. If a page grows a
+    /// figure the pre-render doesn't carry, a reader without JavaScript — and
+    /// every link-preview bot — sees a different page from everyone else.
+    #[test]
+    fn a_strategys_pre_render_carries_the_same_facts() {
+        for strategy in data::vaults() {
+            let html = body(&Route::Strategy {
+                slug: strategy.slug.clone(),
+                tab: Tab::Overview,
+            });
+
+            assert!(
+                html.contains(&esc(&strategy.name())),
+                "{}: no name",
+                strategy.slug
+            );
+            assert!(
+                html.contains(&esc(&strategy.author)),
+                "{}: no author",
+                strategy.slug
+            );
+            assert!(
+                html.contains(&esc(&strategy.description)),
+                "{}: no description",
+                strategy.slug
+            );
+
+            if let Some(review) = &strategy.review {
+                assert!(
+                    html.contains(&format!("Score {} out of 100", review.score)),
+                    "{}: no review score",
+                    strategy.slug
+                );
+            }
+            if let Some(vault) = strategy.vault() {
+                assert!(
+                    html.contains(&esc(&fmt::money(vault.value))),
+                    "{}: no value",
+                    strategy.slug
+                );
+                assert!(
+                    html.contains(&esc(vault.exit_class.label())),
+                    "{}: no exit class",
+                    strategy.slug
+                );
+                for leg in &strategy.legs {
+                    assert!(
+                        html.contains(&esc(&leg.venue)),
+                        "{}: no {} leg",
+                        strategy.slug,
+                        leg.venue
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whatever the route, the pre-render and the app read the same data, so a
+    /// figure shown on one is the figure shown on the other.
+    #[test]
+    fn the_home_page_carries_the_platform_totals() {
+        let html = body(&Route::Home);
+        assert!(html.contains(&esc(copy::PITCH)));
+        assert!(html.contains(&esc(&fmt::money_compact(data::total_vault_capital()))));
+        assert!(html.contains(&esc(&fmt::count(data::total_trades()))));
+        for strategy in data::ranked().into_iter().take(5) {
+            assert!(
+                html.contains(&esc(&strategy.name())),
+                "the home page doesn't list {}",
+                strategy.slug
+            );
+        }
+    }
+
+    /// A page a reader can't leave is a dead end, so every pre-rendered page
+    /// carries the navigation and the footer.
+    #[test]
+    fn every_page_can_be_left_again() {
+        for route in Route::indexable() {
+            let html = body(&route);
+            assert!(html.contains("class=\"mainnav\""), "{:?}", route.path());
+            assert!(html.contains("colophon"), "{:?}", route.path());
+            assert!(html.contains("skip-link"), "{:?}", route.path());
         }
     }
 

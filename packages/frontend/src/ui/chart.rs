@@ -196,8 +196,19 @@ fn chart(series: Vec<Series>, format: Format, filled: bool) -> Dom {
         })
         .collect();
 
+    let label = format!(
+        "Chart: {}. The figures beside it are the values on the day under the pointer.",
+        series
+            .iter()
+            .map(|one| one.label)
+            .collect::<Vec<_>>()
+            .join(" against ")
+    );
+
     html!("div", {
         .class(["chart", "stack-sm"])
+        .attr("role", "img")
+        .attr("aria-label", &label)
         .child(readout(&series, &hover, &format))
         .child(html!("div", {
             .class("chart__plot")
@@ -412,6 +423,8 @@ pub fn bar_chart(points: Vec<Point>) -> Dom {
 
     html!("div", {
         .class(["chart", "stack-sm"])
+        .attr("role", "img")
+        .attr("aria-label", "Chart: return in each month covered by the record.")
         .child(html!("div", {
             .class(["chart__plot", "chart__plot--short"])
             .child(svg!("svg", {
@@ -466,6 +479,8 @@ pub fn sparkline(points: &[Point]) -> Dom {
         .class("sparkline")
         .attr("viewBox", &format!("0 0 {WIDTH} {HEIGHT}"))
         .attr("preserveAspectRatio", "none")
+        // The figures it summarises are in the same row, so a reader gains
+        // nothing from it being announced.
         .attr("aria-hidden", "true")
         .child(svg!("path", {
             .class("sparkline__line")

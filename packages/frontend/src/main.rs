@@ -34,6 +34,7 @@ fn app() -> Dom {
                 document().set_title(&page.title);
                 scroll_to_top();
                 vec![
+                    shell::skip_link(),
                     shell::masthead(&route),
                     html!("main", {
                         .class("app__main")
