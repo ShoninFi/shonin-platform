@@ -306,18 +306,18 @@ pub fn vault_notices(strategy: &'static Strategy) -> Vec<Dom> {
         }
     }
 
-    if let Some(health) = &strategy.health {
-        if health.level() == HealthLevel::Error {
-            notices.push(ui::notice_with(
-                Tone::Error,
-                "This strategy's health report shows an error",
-                &health.summary(),
-                Some(ui::action_link(
-                    &format!("/strategies/{}/health", strategy.slug),
-                    "The health report",
-                )),
-            ));
-        }
+    if let Some(health) = &strategy.health
+        && health.level() == HealthLevel::Error
+    {
+        notices.push(ui::notice_with(
+            Tone::Error,
+            "This strategy's health report shows an error",
+            &health.summary(),
+            Some(ui::action_link(
+                &format!("/strategies/{}/health", strategy.slug),
+                "The health report",
+            )),
+        ));
     }
 
     notices

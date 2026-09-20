@@ -1,8 +1,10 @@
 //! One module per page. `render` picks the one a route belongs to.
 
 pub mod home;
+pub mod not_found;
 pub mod parts;
 pub mod strategies;
+pub mod strategy;
 
 use dominator::{Dom, html};
 
@@ -14,6 +16,8 @@ pub fn render(route: &Route) -> Dom {
     match route {
         Route::Home => home::render(),
         Route::Strategies => strategies::render(),
+        Route::Strategy { slug, tab } => strategy::render(slug, *tab),
+        Route::NotFound => not_found::render(),
         // Pages land here one at a time as they're built. Until a route has
         // its interactive page, the app renders the same markup the build
         // pre-renders for it — the same data, from the same modules, without

@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 use dominator::{Dom, html};
 use futures_signals::map_ref;
-use futures_signals::signal::{Mutable, SignalExt};
+use futures_signals::signal::Mutable;
 use shared::{ExitClass, Source, Standing, Strategy};
 
 use crate::copy;
