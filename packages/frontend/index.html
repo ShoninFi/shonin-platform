@@ -8,70 +8,39 @@
     <!-- seo:head -->
     <title>Shonin</title>
     <!-- /seo:head -->
-    <meta name="theme-color" content="#1e1b4b" />
+    <meta name="theme-color" content="#07090c" />
     <link rel="icon" type="image/svg+xml" href="/public/logo.svg" />
 
+    <!-- The design system. Trunk hashes it and injects the <link> here, so
+         every pre-rendered page gets it too. -->
+    <link data-trunk rel="css" href="styles/app.css" />
     <link data-trunk rel="rust" data-bin="frontend" data-wasm-opt="z" />
     <link data-trunk rel="copy-dir" href="public" />
     <!-- Workers static assets read _headers from the output root. -->
     <link data-trunk rel="copy-file" href="_headers" />
 
+    <!-- Enough to paint the right background before app.css lands, so the
+         page never flashes white, and to apply a remembered light theme
+         before the first paint rather than after the app boots. -->
     <style>
-      :root {
-        --ink: #1e1b4b;
-        --ink-deep: #13112e;
-        --teal: #2dd4bf;
-        --text: #eef2ff;
-        --muted: #a5b4fc;
-      }
-      * { box-sizing: border-box; }
-      html, body { height: 100%; margin: 0; }
-      body {
-        display: grid;
-        place-items: center;
-        padding: 1.5rem;
-        background: radial-gradient(ellipse at top, var(--ink) 0%, var(--ink-deep) 70%);
-        color: var(--text);
-        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-        -webkit-font-smoothing: antialiased;
-      }
-      main { text-align: center; max-width: 32rem; }
-      .logo { width: 4.5rem; height: 4.5rem; }
-      h1 {
-        margin: 1.25rem 0 0.5rem;
-        font-size: clamp(2.25rem, 7vw, 3.25rem);
-        font-weight: 700;
-        letter-spacing: -0.02em;
-      }
-      p { margin: 0; color: var(--muted); font-size: 1.1rem; line-height: 1.5; }
-      p + p { margin-top: 0.75rem; }
-      .soon {
-        display: inline-block;
-        margin-top: 2rem;
-        padding: 0.4rem 1rem;
-        border: 1px solid color-mix(in srgb, var(--teal) 50%, transparent);
-        border-radius: 999px;
-        color: var(--teal);
-        font-size: 0.8rem;
-        font-weight: 600;
-        letter-spacing: 0.14em;
-        text-transform: uppercase;
-      }
-      nav {
-        display: flex;
-        justify-content: center;
-        gap: 1.5rem;
-        margin-top: 3rem;
-        font-size: 0.9rem;
-      }
-      nav a { color: var(--muted); text-decoration: none; }
-      nav a:hover, nav a[aria-current="page"] { color: var(--text); }
+      html { background: #07090c; }
+      html[data-theme="light"] { background: #f6f7f8; }
     </style>
+    <script>
+      try {
+        var t = localStorage.getItem("shonin.theme");
+        if (t === "light" || t === "dark")
+          document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {
+        /* private mode, blocked storage: the default theme is fine */
+      }
+    </script>
   </head>
   <body>
-    <!-- The route's copy is written here at build time (src/bin/seo.rs), so
-         crawlers and link previews see real content. The app replaces this
-         element with the same content when it boots (src/main.rs). -->
-    <main id="prerender"><!-- seo:body --></main>
+    <!-- Each route's content is written here at build time (src/bin/seo.rs),
+         so crawlers, link previews and readers without JavaScript see the real
+         page. The app removes this and renders the interactive version of the
+         same data when it boots (src/main.rs). -->
+    <div id="prerender"><!-- seo:body --></div>
   </body>
 </html>

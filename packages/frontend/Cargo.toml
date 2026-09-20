@@ -26,8 +26,28 @@ dominator.workspace = true
 futures-signals.workspace = true
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
 console_error_panic_hook.workspace = true
-web-sys = { workspace = true, features = ["Window", "Document", "Element", "Url"] }
+gloo-timers.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+web-sys = { workspace = true, features = [
+    "Window",
+    "Document",
+    "DomRect",
+    "Element",
+    "EventTarget",
+    "HtmlElement",
+    "HtmlInputElement",
+    "HtmlSelectElement",
+    "HtmlTextAreaElement",
+    "Navigator",
+    "Clipboard",
+    "KeyboardEvent",
+    "MouseEvent",
+    "Storage",
+    "Url",
+] }
 
 [lints]
 workspace = true
