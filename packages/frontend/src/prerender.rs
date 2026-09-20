@@ -273,33 +273,7 @@ fn para_link(href: &str, text: &str) -> String {
     el("p", "", &link(href, text))
 }
 
-fn ranked() -> Vec<&'static shared::Strategy> {
-    let mut live: Vec<&'static shared::Strategy> = data::vaults()
-        .into_iter()
-        .filter(|strategy| strategy.standing == Standing::Ranked)
-        .collect();
-    live.sort_by(|a, b| {
-        performance(b)
-            .normalised_annualised
-            .partial_cmp(&performance(a).normalised_annualised)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    live
-}
-
-fn performance(strategy: &shared::Strategy) -> shared::Performance {
-    strategy.record.as_ref().map_or(
-        shared::Performance {
-            raw_annualised: 0.0,
-            normalised_annualised: 0.0,
-            volatility: 0.0,
-            max_drawdown: 0.0,
-            total_return: 0.0,
-            days: 0,
-        },
-        |record| data::series::performance(&record.value_per_share, &record.normalised),
-    )
-}
+use data::{performance, ranked};
 
 fn strategies() -> String {
     let row = |strategy: &shared::Strategy| {

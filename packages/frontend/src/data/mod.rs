@@ -131,6 +131,55 @@ pub fn job(id: &str) -> Option<&'static Job> {
     get().jobs.iter().find(|job| job.id == id)
 }
 
+/// A strategy's record, summarised. Both the app and the pre-render read it
+/// from here, so a figure is computed once however it is shown.
+pub fn performance(strategy: &Strategy) -> shared::Performance {
+    strategy.record.as_ref().map_or(
+        shared::Performance {
+            raw_annualised: 0.0,
+            normalised_annualised: 0.0,
+            volatility: 0.0,
+            max_drawdown: 0.0,
+            total_return: 0.0,
+            days: 0,
+        },
+        |record| series::performance(&record.value_per_share, &record.normalised),
+    )
+}
+
+/// Every live vault strategy, best normalised return first.
+pub fn ranked() -> Vec<&'static Strategy> {
+    let mut live: Vec<&'static Strategy> = vaults()
+        .into_iter()
+        .filter(|strategy| strategy.standing == shared::Standing::Ranked)
+        .collect();
+    live.sort_by(|a, b| {
+        performance(b)
+            .normalised_annualised
+            .partial_cmp(&performance(a).normalised_annualised)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    live
+}
+
+/// Live vaults too new to be ranked, newest first.
+pub fn newest() -> Vec<&'static Strategy> {
+    let mut new: Vec<&'static Strategy> = vaults()
+        .into_iter()
+        .filter(|strategy| strategy.standing == shared::Standing::New)
+        .collect();
+    new.sort_by_key(|strategy| strategy.days_live);
+    new
+}
+
+/// Vaults that are no longer taking a record forward.
+pub fn past() -> Vec<&'static Strategy> {
+    vaults()
+        .into_iter()
+        .filter(|strategy| !strategy.standing.is_live())
+        .collect()
+}
+
 /// Capital across every live vault.
 pub fn total_vault_capital() -> f64 {
     vaults()
@@ -346,5 +395,35 @@ mod tests {
                 .any(|job| matches!(job.state, shared::JobState::Failed { .. })),
             "no failed build in the queue"
         );
+    }
+}
+
+#[cfg(test)]
+mod figures {
+    use super::*;
+
+    /// Normalising rescales a record; it should not invent a different sign or
+    /// a wildly different size from the record it rescales.
+    #[test]
+    fn normalising_keeps_a_record_recognisable() {
+        for strategy in &get().strategies {
+            if strategy.record.is_none() || strategy.days_live < 60 {
+                continue;
+            }
+            let performance = performance(strategy);
+            let raw = performance.raw_annualised;
+            let normalised = performance.normalised_annualised;
+            assert_eq!(
+                raw > 0.0,
+                normalised > 0.0,
+                "{}: raw {raw:.3} and normalised {normalised:.3} disagree on sign",
+                strategy.slug
+            );
+            assert!(
+                normalised.abs() <= raw.abs() * 3.5 + 0.02,
+                "{}: normalised {normalised:.3} is far past 3x raw {raw:.3}",
+                strategy.slug
+            );
+        }
     }
 }

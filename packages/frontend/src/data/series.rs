@@ -183,13 +183,20 @@ pub fn record(seed: &str, as_of: Date, shape: Shape) -> shared::Record {
 fn normalise(returns: &[f64], dates: &[Point]) -> Vec<Point> {
     let decay = 0.5f64.powf(1.0 / VOL_HALF_LIFE);
     let mut variance = 0.0;
+    // An exponentially weighted average that starts at zero reads as far too
+    // quiet for its first weeks, which would push the scaling to its cap
+    // exactly where a record is least understood. Correcting for the weight
+    // seen so far removes that.
+    let mut weight = 0.0;
     let mut level = 1.0;
     let mut out = Vec::with_capacity(returns.len());
 
     for (day, r) in returns.iter().enumerate() {
-        // The estimate uses the days before this one only.
-        let realised = (variance * DAYS_PER_YEAR).sqrt();
-        // The first few weeks have too little history to rescale from.
+        // The estimate uses the days before this one only, so the scaling
+        // carries no hindsight.
+        let estimate = if weight > 0.0 { variance / weight } else { 0.0 };
+        let realised = (estimate * DAYS_PER_YEAR).sqrt();
+        // Too little history to rescale from at all.
         let scale = if day < 20 || realised <= 0.0 {
             1.0
         } else {
@@ -202,6 +209,7 @@ fn normalise(returns: &[f64], dates: &[Point]) -> Vec<Point> {
         });
 
         variance = decay * variance + (1.0 - decay) * r * r;
+        weight = decay * weight + (1.0 - decay);
     }
     out
 }

@@ -992,9 +992,6 @@ th.num {
 }
 
 .table thead th {
-  position: sticky;
-  top: var(--header-height);
-  z-index: 1;
   background: var(--ink-0);
   color: var(--text-faint);
   font-size: var(--text-2xs);
@@ -1002,10 +999,6 @@ th.num {
   letter-spacing: 0.08em;
   text-transform: uppercase;
   white-space: nowrap;
-}
-
-.table--static thead th {
-  position: static;
 }
 
 .table tbody tr:hover {
