@@ -263,6 +263,22 @@ pub fn venue_split(legs: &[Leg]) -> Dom {
 pub fn vault_notices(strategy: &'static Strategy) -> Vec<Dom> {
     let mut notices = Vec::new();
 
+    if strategy.standing == Standing::BuildFailed {
+        // Every tab of a failed build would otherwise be an empty state with
+        // no explanation of why it is empty.
+        let build = data::get()
+            .jobs
+            .iter()
+            .find(|job| job.strategy_slug.as_deref() == Some(strategy.slug.as_str()));
+
+        notices.push(ui::notice_with(
+            Tone::Error,
+            "This build failed, so there is no bundle and no vault",
+            "The project didn't produce the same bytes twice, so nothing could be published: a              build nobody can reproduce isn't one anyone should trust. There is no record, no              review and no running code — only the log, which is public like every other. A              fixed resubmission is a new vault.",
+            build.map(|job| ui::action_link(&format!("/queue/{}", job.id), "The build log")),
+        ));
+    }
+
     if let Some(kill) = &strategy.kill {
         notices.push(ui::notice(
             Tone::Error,
