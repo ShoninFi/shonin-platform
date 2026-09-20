@@ -110,6 +110,7 @@ pub enum FeedKind {
     VaultFrozen,
     StrategyRegistered,
     ReviewPublished,
+    ClaimNote,
 }
 
 impl FeedKind {
@@ -123,6 +124,7 @@ impl FeedKind {
             Self::VaultFrozen => "vault frozen",
             Self::StrategyRegistered => "strategy registered",
             Self::ReviewPublished => "review published",
+            Self::ClaimNote => "claim waiting",
         }
     }
 
@@ -130,7 +132,11 @@ impl FeedKind {
     pub fn is_alarming(self) -> bool {
         matches!(
             self,
-            Self::Kill | Self::ImageRevoked | Self::VenueSuspended | Self::VaultFrozen
+            Self::Kill
+                | Self::ImageRevoked
+                | Self::VenueSuspended
+                | Self::VaultFrozen
+                | Self::ClaimNote
         )
     }
 }

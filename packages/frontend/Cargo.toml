@@ -31,6 +31,7 @@ console_error_panic_hook.workspace = true
 gloo-timers.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+time.workspace = true
 web-sys = { workspace = true, features = [
     "Window",
     "Document",

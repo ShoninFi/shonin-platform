@@ -5,4 +5,5 @@
 //! (`src/bin/seo.rs`, native). Adding a route here gives it a client-side page,
 //! a pre-rendered HTML file and a sitemap entry.
 
+pub mod data;
 pub mod route;
