@@ -238,7 +238,16 @@ impl Route {
         !matches!(self, Self::NotFound | Self::Portfolio)
     }
 
-    /// Every route the build pre-renders and the sitemap lists, in order.
+    /// Every route the build writes a file for: the indexable ones, plus the
+    /// pages that are real but shouldn't be listed. Without a file, opening
+    /// one of those directly would answer 404 before the app could render it.
+    pub fn all_pages() -> Vec<Route> {
+        let mut routes = Self::indexable();
+        routes.push(Route::Portfolio);
+        routes
+    }
+
+    /// Every route the sitemap lists, in order.
     pub fn indexable() -> Vec<Route> {
         let mut routes = vec![Route::Home, Route::Strategies];
 
@@ -535,11 +544,28 @@ mod tests {
         );
     }
 
+    /// The portfolio is built in the browser from one viewer's own wallet, so
+    /// it is never listed — but it still needs a file of its own, or opening
+    /// it directly would answer "not found".
     #[test]
-    fn the_portfolio_is_never_indexed() {
+    fn the_portfolio_has_a_page_but_is_never_indexed() {
         assert!(!Route::Portfolio.is_indexable());
         assert!(!Route::NotFound.is_indexable());
         assert!(!Route::indexable().contains(&Route::Portfolio));
+        assert!(Route::all_pages().contains(&Route::Portfolio));
+    }
+
+    /// Everything the sitemap lists is also written as a file.
+    #[test]
+    fn every_listed_route_is_written() {
+        let pages = Route::all_pages();
+        for route in Route::indexable() {
+            assert!(
+                pages.contains(&route),
+                "{:?} is listed but not written",
+                route.path()
+            );
+        }
     }
 
     #[test]

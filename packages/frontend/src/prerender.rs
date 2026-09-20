@@ -1759,7 +1759,7 @@ mod tests {
     /// be a page crawlers and readers without JavaScript see as blank.
     #[test]
     fn every_route_renders_a_real_page() {
-        for route in Route::indexable() {
+        for route in Route::all_pages() {
             let html = body(&route);
             assert!(
                 html.len() > 1200,

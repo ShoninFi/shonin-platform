@@ -10,11 +10,13 @@
 //! would see the same empty page on every URL. From the routes in `route.rs`,
 //! this writes:
 //!
-//! - one HTML file per route (`index.html`, `strategies.html`,
+//! - one HTML file per page (`index.html`, `strategies.html`,
 //!   `strategies/funding-basis-v3/record.html`, …, and `404.html`) with that
 //!   route's title, description, canonical URL and Open Graph tags, and a
 //!   no-JavaScript view of the same data already in the page. The app replaces
-//!   that view with the interactive one when it boots.
+//!   that view with the interactive one when it boots. Pages that shouldn't be
+//!   listed still get a file, marked `noindex`: without one, opening such a
+//!   page directly would answer 404 before the app could render it.
 //! - `sitemap.xml`, listing every indexable route.
 //! - `robots.txt`, pointing at the sitemap.
 //!
@@ -51,8 +53,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let routes = Route::indexable();
-    for route in routes.iter().chain([&Route::NotFound]) {
+    let pages = Route::all_pages();
+    for route in pages.iter().chain([&Route::NotFound]) {
         let html = render(&shell, base, route);
         let file = match route.path().as_deref() {
             Some("/") => "index.html".to_string(),
@@ -66,7 +68,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         fs::write(&target, html)?;
     }
 
-    let urls: String = routes
+    let urls: String = Route::indexable()
         .iter()
         .filter_map(Route::path)
         .map(|path| {
@@ -90,8 +92,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
 
     println!(
-        "pre-rendered {} routes, 404.html, sitemap.xml, robots.txt",
-        routes.len()
+        "pre-rendered {} pages ({} of them listed), 404.html, sitemap.xml, robots.txt",
+        pages.len(),
+        Route::indexable().len()
     );
     Ok(())
 }
