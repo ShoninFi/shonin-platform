@@ -1,26 +1,32 @@
-//! Build-time SEO for the static site. Runs natively, after `trunk build`:
+//! Build-time pre-render for the static site. Runs natively, after
+//! `trunk build`:
 //!
 //! ```text
 //! seo --dist .trunk-dist/frontend --base-url https://shonin.fi
 //! ```
 //!
-//! The app is a wasm SPA, so the HTML Trunk writes has no content of its own:
-//! crawlers that don't run JavaScript, and every link-preview bot, would see the
-//! same empty page on every URL. From the routes in `route.rs`, this writes:
+//! The app is a wasm single-page app, so the HTML Trunk writes has no content
+//! of its own: crawlers that don't run JavaScript, and every link-preview bot,
+//! would see the same empty page on every URL. From the routes in `route.rs`,
+//! this writes:
 //!
-//! - one HTML file per route (`index.html`, `about.html`, ..., and `404.html`)
-//!   with that route's title, description, canonical URL and Open Graph tags,
-//!   and its copy already in the page. The app replaces that copy when it
-//!   boots, with the same content, so nothing is hidden from anyone.
+//! - one HTML file per page (`index.html`, `strategies.html`,
+//!   `strategies/funding-basis-v3/record.html`, …, and `404.html`) with that
+//!   route's title, description, canonical URL and Open Graph tags, and a
+//!   no-JavaScript view of the same data already in the page. The app replaces
+//!   that view with the interactive one when it boots. Pages that shouldn't be
+//!   listed still get a file, marked `noindex`: without one, opening such a
+//!   page directly would answer 404 before the app could render it.
 //! - `sitemap.xml`, listing every indexable route.
 //! - `robots.txt`, pointing at the sitemap.
 //!
-//! Files are flat (`about.html`, not `about/index.html`): Workers static assets
-//! serve them at `/about` with no trailing-slash redirect.
+//! Files are flat (`about.html`, not `about/index.html`): Workers static
+//! assets serve them at `/about` with no trailing-slash redirect, which is
+//! also why a nested route becomes `strategies/<slug>/record.html`.
 
 use std::{error::Error, fs, path::PathBuf};
 
-use frontend::route::{Page, Route};
+use frontend::{prerender, route::Route};
 
 const SITE_NAME: &str = "Shonin";
 const LOGO: &str = "/public/logo.svg";
@@ -47,9 +53,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    for &route in Route::INDEXABLE.iter().chain([&Route::NotFound]) {
+    let pages = Route::all_pages();
+    for route in pages.iter().chain([&Route::NotFound]) {
         let html = render(&shell, base, route);
-        let file = match route.path() {
+        let file = match route.path().as_deref() {
             Some("/") => "index.html".to_string(),
             Some(path) => format!("{}.html", path.trim_start_matches('/')),
             None => "404.html".to_string(),
@@ -59,16 +66,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             fs::create_dir_all(parent)?;
         }
         fs::write(&target, html)?;
-        println!("  {:<14} {}", file, route.page().title);
     }
 
-    let urls: String = Route::INDEXABLE
+    let urls: String = Route::indexable()
         .iter()
-        .filter_map(|route| route.path())
+        .filter_map(Route::path)
         .map(|path| {
             format!(
                 "  <url><loc>{}</loc></url>\n",
-                escape(&absolute(base, path))
+                escape(&absolute(base, &path))
             )
         })
         .collect();
@@ -86,8 +92,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
 
     println!(
-        "SEO: {} indexable routes, 404.html, sitemap.xml, robots.txt",
-        Route::INDEXABLE.len()
+        "pre-rendered {} pages ({} of them listed), 404.html, sitemap.xml, robots.txt",
+        pages.len(),
+        Route::indexable().len()
     );
     Ok(())
 }
@@ -109,17 +116,15 @@ fn parse_args() -> Result<(PathBuf, String), Box<dyn Error>> {
     }
 }
 
-fn render(shell: &str, base: &str, route: Route) -> String {
+fn render(shell: &str, base: &str, route: &Route) -> String {
     let (before, rest) = shell.split_once(HEAD_START).expect("checked in main");
     let (_, after) = rest.split_once(HEAD_END).expect("checked in main");
-    format!("{before}{}{after}", head(base, route)).replacen(BODY, &body(route), 1)
+    format!("{before}{}{after}", head(base, route)).replacen(BODY, &prerender::body(route), 1)
 }
 
-fn head(base: &str, route: Route) -> String {
-    let Page {
-        title, description, ..
-    } = route.page();
-    let (title, description) = (escape(title), escape(description));
+fn head(base: &str, route: &Route) -> String {
+    let page = route.page();
+    let (title, description) = (escape(&page.title), escape(&page.description));
     let mut out = format!(
         "<title>{title}</title>\n\
          <meta name=\"description\" content=\"{description}\" />\n\
@@ -130,16 +135,16 @@ fn head(base: &str, route: Route) -> String {
          <meta name=\"twitter:card\" content=\"summary\" />\n"
     );
     match route.path() {
-        Some(path) => {
-            let url = escape(&absolute(base, path));
+        Some(path) if route.is_indexable() => {
+            let url = escape(&absolute(base, &path));
             out += &format!(
                 "<link rel=\"canonical\" href=\"{url}\" />\n\
                  <meta property=\"og:url\" content=\"{url}\" />\n"
             );
         }
-        None => out += "<meta name=\"robots\" content=\"noindex\" />\n",
+        _ => out += "<meta name=\"robots\" content=\"noindex\" />\n",
     }
-    if route == Route::Home {
+    if *route == Route::Home {
         // Structured data: tells search engines the site's name and logo.
         out += &format!(
             "<script type=\"application/ld+json\">{{\"@context\":\"https://schema.org\",\"@graph\":[\
@@ -148,35 +153,6 @@ fn head(base: &str, route: Route) -> String {
              ]}}</script>\n"
         );
     }
-    out
-}
-
-/// The route's copy, in the same markup the app renders, so the page looks the
-/// same before and after the app boots.
-fn body(route: Route) -> String {
-    let page = route.page();
-    let mut out = format!(
-        "<a href=\"/\" aria-label=\"{SITE_NAME} home\"><img class=\"logo\" src=\"{LOGO}\" alt=\"\" /></a>\n\
-         <h1>{}</h1>\n",
-        escape(page.heading)
-    );
-    for paragraph in page.body {
-        out += &format!("<p>{}</p>\n", escape(paragraph));
-    }
-    if let Some(note) = page.note {
-        out += &format!("<span class=\"soon\">{}</span>\n", escape(note));
-    }
-    out += "<nav>";
-    for &link in Route::INDEXABLE {
-        let path = link.path().expect("indexable routes have a path");
-        let current = if link == route {
-            " aria-current=\"page\""
-        } else {
-            ""
-        };
-        out += &format!("<a href=\"{path}\"{current}>{}</a>", escape(link.label()));
-    }
-    out += "</nav>\n";
     out
 }
 

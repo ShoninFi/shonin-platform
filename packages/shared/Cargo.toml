@@ -12,6 +12,7 @@ name = "shared"
 
 [dependencies]
 serde.workspace = true
+time.workspace = true
 
 [lints]
 workspace = true
