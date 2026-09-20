@@ -4,6 +4,9 @@ use std::sync::OnceLock;
 
 use futures_signals::signal::Mutable;
 
+use crate::ui::overlay::Toasts;
+use crate::ui::primitives::Tone;
+
 /// Which theme the viewer has chosen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Theme {
@@ -38,6 +41,8 @@ impl Theme {
 /// The app's state. One instance, built on first use.
 pub struct State {
     pub theme: Mutable<Theme>,
+    /// What the app has to say about something that just happened.
+    pub toasts: Toasts,
 }
 
 static STATE: OnceLock<State> = OnceLock::new();
@@ -50,7 +55,13 @@ pub fn get() -> &'static State {
                 .and_then(Theme::from_key)
                 .unwrap_or(Theme::Dark),
         ),
+        toasts: Toasts::new(),
     })
+}
+
+/// Say something happened, in the corner of the screen.
+pub fn notify(message: impl Into<String>, tone: Tone) {
+    get().toasts.push(message, tone);
 }
 
 /// Switch themes, remember it, and apply it to the document.

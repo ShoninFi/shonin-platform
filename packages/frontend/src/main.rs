@@ -2,7 +2,12 @@
 //! the build-time pre-render (`src/bin/seo.rs`).
 
 use dominator::{Dom, html, routing};
-use frontend::{pages, route::Route, state, ui::shell};
+use frontend::{
+    pages,
+    route::Route,
+    state,
+    ui::{overlay, shell},
+};
 use futures_signals::signal::SignalExt;
 
 fn main() {
@@ -39,6 +44,7 @@ fn app() -> Dom {
                         }))
                     }),
                     shell::colophon(),
+                    overlay::toast_host(&state::get().toasts),
                 ]
             })
             .to_signal_vec())
