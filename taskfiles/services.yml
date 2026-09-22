@@ -1,0 +1,101 @@
+# The local development stack: a chain, the contracts on it, and each service
+# that reads or writes them. Every service retries until the chain answers and
+# the deployment file exists, so they can all start at once.
+#
+# Commands `cd` explicitly rather than using `dir:`, so absolute templated
+# paths behave the same in included taskfiles.
+version: "3"
+
+includes:
+  config:
+    taskfile: ./config.yml
+    flatten: true
+
+vars:
+  # Every service takes the same three arguments, so one variable carries them.
+  SERVICE_ARGS: >-
+    --rpc-url "{{.URL_CHAIN_DEV}}"
+    --deployments "{{.PATH_DEPLOYMENTS}}"
+    --store "{{.PATH_STORE}}"
+
+tasks:
+  chain:
+    desc: "Anvil: the local development chain"
+    cmds:
+      - >-
+        anvil
+        --port {{.PORT_CHAIN}}
+        --chain-id {{.CHAIN_ID_LOCAL}}
+        --block-time 1
+        --accounts 10
+        --balance 10000
+        --host 127.0.0.1
+
+  devnet:
+    desc: "Deploy the contracts, then drive the chain's clock and its market"
+    cmds:
+      - >-
+        cargo run -q -p shonin-devnet --
+        {{.SERVICE_ARGS}}
+        --port {{.PORT_DEVNET}}
+        --seconds-per-block {{.CHAIN_SECONDS_PER_BLOCK}}
+
+  deploy:
+    desc: "Deploy the contracts to the local chain and write the deployment file"
+    cmds:
+      - >-
+        cargo run -q -p shonin-devnet --
+        {{.SERVICE_ARGS}}
+        deploy
+
+  seed:
+    desc: "Publish the reference work to the local chain, through the real flows"
+    cmds:
+      - >-
+        cargo run -q -p shonin-devnet --
+        {{.SERVICE_ARGS}}
+        seed --api "{{.URL_API_DEV}}"
+
+  indexer:
+    desc: "The indexer and the public API"
+    cmds:
+      - >-
+        cargo run -q -p shonin-indexer --
+        {{.SERVICE_ARGS}}
+        --port {{.PORT_API}}
+        --builder-url "{{.URL_BUILDER_DEV}}"
+
+  builder:
+    desc: "The build service"
+    cmds:
+      - >-
+        cargo run -q -p shonin-builder --
+        {{.SERVICE_ARGS}}
+        --port {{.PORT_BUILDER}}
+        --builds "{{.PATH_BUILDS}}"
+
+  reviewer:
+    desc: "The reviewer"
+    cmds:
+      - >-
+        cargo run -q -p shonin-reviewer --
+        {{.SERVICE_ARGS}}
+        --port {{.PORT_REVIEWER}}
+
+  executor:
+    desc: "The executor"
+    cmds:
+      - >-
+        cargo run -q -p shonin-executor --
+        {{.SERVICE_ARGS}}
+        --port {{.PORT_EXECUTOR}}
+        --api-url "{{.URL_API_DEV}}"
+
+  coordinator:
+    desc: "The coordinator"
+    cmds:
+      - >-
+        cargo run -q -p shonin-coordinator --
+        {{.SERVICE_ARGS}}
+        --port {{.PORT_COORDINATOR}}
+        --api-url "{{.URL_API_DEV}}"

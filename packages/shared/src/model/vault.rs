@@ -82,26 +82,21 @@ pub struct Claim {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ClaimState {
-    /// Booked; the close has not started.
+    /// Booked, and the close has not been attempted yet.
     Pending,
-    /// Reduce-only closes and sales are working inside the exit band.
-    Closing,
-    /// The cash is home and the shares can be burned.
-    CashHome,
-    /// Burned at the marks and paid.
-    Paid,
-    /// The close did not fill inside the band; settlement is retried.
+    /// A settlement was tried and the market was outside the exit band, so
+    /// nothing was sold badly. It is retried.
     Waiting,
+    /// Closed, valued again, burned at the marks, and paid.
+    Paid,
 }
 
 impl ClaimState {
     pub fn label(self) -> &'static str {
         match self {
             Self::Pending => "pending",
-            Self::Closing => "closing",
-            Self::CashHome => "cash home",
-            Self::Paid => "paid",
             Self::Waiting => "waiting for the market",
+            Self::Paid => "paid",
         }
     }
 }

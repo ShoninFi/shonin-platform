@@ -2,11 +2,15 @@
 resolver = "3"
 members = [
     "packages/shared",
+    "packages/chain",
     "packages/frontend",
     "packages/backend",
+    "packages/indexer",
     "packages/executor",
+    "packages/builder",
+    "packages/reviewer",
     "packages/coordinator",
-    "packages/simulator",
+    "packages/devnet",
     "packages/strategy-sdk",
     "packages/cli",
 ]
@@ -23,7 +27,7 @@ publish = false
 [workspace.dependencies]
 # Local crates
 shared = { path = "packages/shared", package = "shonin-shared" }
-simulator = { path = "packages/simulator", package = "shonin-simulator" }
+chain = { path = "packages/chain", package = "shonin-chain" }
 strategy-sdk = { path = "packages/strategy-sdk", package = "shonin-strategy-sdk" }
 
 # Common
@@ -32,6 +36,7 @@ thiserror = "2.0.20"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 ciborium = "0.2.2"
+toml = "1.1.6"
 sha2 = "0.11.0"
 hex = "0.4.3"
 url = "2.5.8"
@@ -39,20 +44,35 @@ time = { version = "0.3.55", features = ["serde"] }
 futures = "0.3.34"
 tracing = "0.1.44"
 
-# Native services (executor, coordinator, cli)
+# Native services (indexer, executor, builder, reviewer, coordinator, devnet, cli)
 tokio = { version = "1.53.1", features = ["full"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
-reqwest = "0.13.5"
+reqwest = { version = "0.13.5", features = ["json"] }
 tokio-tungstenite = "0.30.0"
+axum = "0.8.9"
+tower-http = { version = "0.7.1", features = ["cors", "trace"] }
+tar = "0.4.46"
+rand = "0.10.3"
 
-# Strategy runtime (WASM component model)
-wasmtime = "48.0.2"
+# Strategy runtime (WASM component model). The executor hosts components with
+# wasmtime's async component model; strategies are built for wasm32-wasip2 and
+# bind the shonin:strategy world with wit-bindgen.
+wasmtime = { version = "48.0.2", features = ["component-model-async"] }
 wasmtime-wasi = "48.0.2"
-wit-bindgen = "0.62.0"
+wit-bindgen = { version = "0.62.0", features = ["async"] }
 
-# Chains and keys
-alloy = "2.4.2"
+# The decimal a strategy and an adapter agree on, on both sides of the
+# component boundary.
+fastnum = { version = "0.7.5", default-features = false, features = ["std", "serde"] }
+
+# Chains and keys. The alloy-core crates (1.x) encode calls and decode events
+# and build for every target, including wasm32-unknown-unknown, so `chain` is
+# dual-target. The `alloy` meta-crate (2.x) adds providers and signers and is
+# used only by native services.
+alloy = { version = "2.4.2", features = ["full"] }
+alloy-primitives = "1.7.3"
+alloy-sol-types = "1.7.3"
 k256 = "0.14.0"
 ed25519-dalek = "3.0.0"
 

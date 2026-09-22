@@ -11,6 +11,11 @@ publish.workspace = true
 name = "strategy_sdk"
 
 [dependencies]
+ciborium.workspace = true
+fastnum.workspace = true
+futures.workspace = true
+serde.workspace = true
+wit-bindgen.workspace = true
 
 [lints]
 workspace = true

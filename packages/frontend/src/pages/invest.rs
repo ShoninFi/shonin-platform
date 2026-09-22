@@ -233,11 +233,13 @@ fn claim_card(claim: &wallet::Claim) -> Dom {
     let steps = [
         (ClaimState::Pending, "Claim booked, shares pending"),
         (
-            ClaimState::Closing,
-            "Closing your fraction of every position",
+            ClaimState::Waiting,
+            "Waiting for a market inside the exit band",
         ),
-        (ClaimState::CashHome, "Cash home; the vault is valued again"),
-        (ClaimState::Paid, "Shares burned at the marks, and paid"),
+        (
+            ClaimState::Paid,
+            "Closed, valued again, burned at the marks, and paid",
+        ),
     ];
     let reached = steps
         .iter()

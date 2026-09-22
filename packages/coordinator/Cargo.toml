@@ -1,6 +1,6 @@
 [package]
 name = "shonin-coordinator"
-description = "The untrusted Shonin coordinator that deploys and monitors executors"
+description = "The untrusted coordinator: places strategies, keeps the vaults' clockwork turning"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,15 @@ path = "src/main.rs"
 
 [dependencies]
 shared.workspace = true
+chain.workspace = true
+alloy.workspace = true
 anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

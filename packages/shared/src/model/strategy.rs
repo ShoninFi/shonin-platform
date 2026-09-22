@@ -120,6 +120,8 @@ impl Strategy {
     /// Days a strategy has to run live before it is ranked.
     pub const DAYS_TO_RANK: u32 = 90;
 
-    /// The volatility every record is rescaled to for comparison.
-    pub const VOLATILITY_TARGET: f64 = 0.15;
+    /// The volatility every record is rescaled to for comparison. It belongs
+    /// to the maths that does the rescaling, and is named here so a page can
+    /// say it without reaching past the model.
+    pub const VOLATILITY_TARGET: f64 = crate::record::VOLATILITY_TARGET;
 }

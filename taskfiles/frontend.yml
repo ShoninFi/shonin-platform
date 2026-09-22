@@ -11,14 +11,16 @@ includes:
 
 tasks:
   dev:
-    desc: "Trunk dev server with live reload"
+    desc: "Trunk dev server with live reload, proxying /api to the local API"
     cmds:
       - >-
         cd "{{.PATH_PACKAGE_FRONTEND}}" && NO_COLOR=true trunk serve
         --port {{.PORT_FRONTEND_DEV}}
         --dist "{{.PATH_DIST_FRONTEND_DEV}}"
+        --proxy-backend "{{.URL_API_DEV}}/api/"
         --watch "{{.PATH_ROOT_CARGO_TOML}}"
         --watch "{{.PATH_PACKAGE_SHARED}}"
+        --watch "{{.PATH_PACKAGE_CHAIN}}"
         --watch .
 
   build:
@@ -27,7 +29,10 @@ tasks:
       - cd "{{.PATH_PACKAGE_FRONTEND}}" && NO_COLOR=true trunk clean --dist "{{.PATH_DIST_FRONTEND}}"
       - cd "{{.PATH_PACKAGE_FRONTEND}}" && NO_COLOR=true trunk build --release --dist "{{.PATH_DIST_FRONTEND}}"
       # Per-route HTML (with 404.html), sitemap.xml and robots.txt, from src/route.rs.
-      - cargo run -q -p shonin-frontend --bin seo -- --dist "{{.PATH_DIST_FRONTEND}}" --base-url "{{.URL_FRONTEND_PROD}}"
+      # Pass --api to pre-render the pages that need data from a running API.
+      - cargo run -q -p shonin-frontend --bin seo -- --dist "{{.PATH_DIST_FRONTEND}}" --base-url "{{.URL_FRONTEND_PROD}}" {{.SEO_API_ARG}}
+    vars:
+      SEO_API_ARG: '{{if .API}}--api "{{.API}}"{{end}}'
 
   deploy:
     desc: "Build and deploy to Cloudflare (the Worker is created on first deploy)"

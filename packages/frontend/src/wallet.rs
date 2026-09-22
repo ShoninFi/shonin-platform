@@ -287,21 +287,16 @@ pub fn withdraw(slug: &str, shares: f64) -> Result<WithdrawQuote, String> {
     Ok(quote)
 }
 
-/// Drive a claim's settlement one step. Anyone can send these transactions:
-/// the contract closes the leaver's fraction of every position, brings the
-/// cash home, values the vault again and pays.
+/// Send a claim's settlement. Anyone can: the contract closes the leaver's
+/// fraction of every position, brings the cash home, values the vault again,
+/// burns the pending shares and pays, all in one transaction.
 pub fn settle(id: u32) -> Option<ClaimState> {
     let mut reached = None;
     let mut paid_to_balance = 0.0;
 
     holdings().replace_with(|holdings| {
         if let Some(claim) = holdings.claims.iter_mut().find(|claim| claim.id == id) {
-            let next = match claim.state {
-                ClaimState::Pending => ClaimState::Closing,
-                ClaimState::Closing => ClaimState::CashHome,
-                ClaimState::CashHome | ClaimState::Waiting => ClaimState::Paid,
-                ClaimState::Paid => ClaimState::Paid,
-            };
+            let next = ClaimState::Paid;
             claim.state = next;
             reached = Some(next);
 
