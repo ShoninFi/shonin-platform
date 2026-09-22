@@ -7,7 +7,8 @@
 //! cache it had is gone, and it was promised to nobody.
 
 use std::path::Path;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use alloy::primitives::Address;
 use anyhow::{Context, Result, anyhow};
@@ -46,8 +47,8 @@ impl Runner {
         component: &Path,
         account_events: UnboundedReceiver<Vec<u8>>,
         vault_events: UnboundedReceiver<VaultEvent>,
-        restarts: u64,
-    ) -> Result<Counters> {
+        counters: Arc<Mutex<Counters>>,
+    ) -> Result<()> {
         let bytes =
             std::fs::read(component).with_context(|| format!("reading {}", component.display()))?;
         let component = Component::new(engine, &bytes)
@@ -77,13 +78,14 @@ impl Runner {
                 cache: Default::default(),
                 account_events: Some(account_events),
                 vault_events: Some(vault_events),
-                counters: Counters {
-                    restarts,
-                    ..Default::default()
-                },
+                counters: counters.clone(),
+                fuel_per_second: FUEL_PER_SECOND,
+                last_refuel: Instant::now(),
             },
         );
 
+        // A second's worth to begin with; the host tops it back up for the
+        // time that passes, so the allowance is a rate rather than a budget.
         store.set_fuel(FUEL_PER_SECOND)?;
         store.fuel_async_yield_interval(Some(FUEL_PER_SECOND / 100))?;
         store.set_epoch_deadline(1);
@@ -98,21 +100,20 @@ impl Runner {
             .run_concurrent(async |accessor| instance.call_run(accessor, config).await)
             .await;
 
-        let mut counters = store.data().counters;
+        let fault = |why: String| {
+            if let Ok(mut counters) = counters.lock() {
+                counters.faults += 1;
+            }
+            tracing::warn!(vault = %self.vault, why, "the strategy stopped");
+        };
         match outcome {
-            Ok(Ok(Ok(()))) => {
-                tracing::info!(vault = %self.vault, "the strategy finished");
-            }
-            Ok(Ok(Err(reason))) => {
-                counters.faults += 1;
-                tracing::warn!(vault = %self.vault, reason, "the strategy stopped itself");
-            }
-            Ok(Err(error)) | Err(error) => {
-                counters.faults += 1;
-                tracing::warn!(vault = %self.vault, %error, "the strategy faulted");
-            }
+            Ok(Ok(Ok(()))) => tracing::info!(vault = %self.vault, "the strategy finished"),
+            Ok(Ok(Err(reason))) => fault(reason),
+            // The whole chain, because the line that matters is usually the
+            // last one rather than the backtrace above it.
+            Ok(Err(error)) | Err(error) => fault(format!("{error:#}")),
         }
-        Ok(counters)
+        Ok(())
     }
 }
 

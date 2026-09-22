@@ -29,6 +29,7 @@ publish = false
 shared = { path = "packages/shared", package = "shonin-shared" }
 chain = { path = "packages/chain", package = "shonin-chain" }
 strategy-sdk = { path = "packages/strategy-sdk", package = "shonin-strategy-sdk" }
+shonin-cli = { path = "packages/cli" }
 
 # Common
 anyhow = "1.0.104"

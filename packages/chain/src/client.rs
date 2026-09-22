@@ -144,6 +144,38 @@ impl Client {
             .with_context(|| format!("decoding what {} returned", C::SIGNATURE))
     }
 
+    /// Read a contract as it was at a past block. A chain that keeps its
+    /// history is a record nobody has to be trusted to have kept.
+    pub async fn read_at<C: SolCall>(
+        &self,
+        to: Address,
+        call: C,
+        block: alloy::eips::BlockId,
+    ) -> Result<C::Return> {
+        let request = TransactionRequest::default()
+            .with_to(to)
+            .with_input(call.abi_encode());
+        let returned = self
+            .provider
+            .call(request)
+            .block(block)
+            .await
+            .with_context(|| format!("reading {} at block {block:?}", C::SIGNATURE))?;
+        C::abi_decode_returns(&returned)
+            .with_context(|| format!("decoding what {} returned", C::SIGNATURE))
+    }
+
+    /// When a past block was mined, in the chain's own time.
+    pub async fn block_timestamp_at(&self, block: u64) -> Result<u64> {
+        let block = self
+            .provider
+            .get_block(alloy::eips::BlockId::number(block))
+            .await
+            .context("a past block")?
+            .ok_or_else(|| anyhow!("no such block"))?;
+        Ok(block.header.timestamp)
+    }
+
     /// Send a call as `from`, and wait for it to land.
     pub async fn send<C: SolCall>(
         &self,

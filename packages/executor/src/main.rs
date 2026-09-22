@@ -7,7 +7,6 @@
 //! accounts. Whatever a strategy decides, that is the whole of what can
 //! happen.
 
-mod attest;
 mod feed;
 mod health;
 mod host;
@@ -18,6 +17,7 @@ mod watch;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256, keccak256};
@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let chain = Client::connect(&args.rpc_url).await?;
     let deployments = chain.wait_for_deployments(&args.deployments).await?;
-    tracing::info!(image = %attest::image_digest(), "the executor is up");
+    tracing::info!(image = %chain::attest::image_digest("executor"), "the executor is up");
 
     if args.port != 0 {
         tokio::spawn(serve_status(SocketAddr::from(([127, 0, 0, 1], args.port))));
@@ -141,7 +141,15 @@ async fn serve(
     let signer = key_for(vault);
     let key = chain.with_key(signer)?;
 
-    let info = attest::bless(&chain, &deployments, key.address, vault, bundle).await?;
+    let info = chain::attest::bless_for_vault(
+        &chain,
+        &deployments,
+        "executor",
+        key.address,
+        vault,
+        bundle,
+    )
+    .await?;
     tracing::info!(vault = %vault, key = %key.address, until = info.blessedUntil, "blessed");
 
     // Anyone may send this; the contract obeys only what the registry says.
@@ -159,6 +167,36 @@ async fn serve(
 
     // A fresh key has no gas of its own.
     health::fund_gas(&chain, &deployments, key.address).await?;
+
+    // Keep it blessed, and keep the venue's approval following the blessing:
+    // a key that stopped attesting stops being able to trade.
+    let renewing = chain.clone();
+    let renewed_for = deployments.clone();
+    chain::attest::keep_blessed(
+        chain.clone(),
+        deployments.clone(),
+        "executor",
+        key.address,
+        vault,
+        bundle,
+        move || {
+            let chain = renewing.clone();
+            let deployments = renewed_for.clone();
+            let signer = key.address;
+            tokio::spawn(async move {
+                let _ = chain
+                    .send(
+                        deployments.roles.executor,
+                        vault,
+                        IVault::approveKeyCall {
+                            venue: chain::accounts::VENUE_ID,
+                            key: signer,
+                        },
+                    )
+                    .await;
+            });
+        },
+    );
 
     let (account_tx, account_rx) = tokio::sync::mpsc::unbounded_channel();
     let (vault_tx, vault_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -178,21 +216,49 @@ async fn serve(
         vault,
         venue: deployments.venue,
         venue_id: "local".to_string(),
-        config: Vec::new(),
+        config: config_for(&chain, &store, bundle),
     };
 
+    // A strategy's `run` is meant never to return, so the report cannot wait
+    // for it: the counters are shared and sent while it is still running.
+    let counters = Arc::new(Mutex::new(host::Counters::default()));
     let reporter = health::Reporter::new(chain.clone(), key.clone(), vault, api);
-    let counters = runner
+    let reporting = counters.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            let now = reporting
+                .lock()
+                .map(|counters| *counters)
+                .unwrap_or_default();
+            reporter.post(now).await;
+        }
+    });
+
+    runner
         .run(
             &engine,
             &bundle_path(&store, bundle),
             account_rx,
             vault_rx,
-            0,
+            counters,
         )
         .await?;
-    reporter.post(counters).await;
     Ok(())
+}
+
+/// The config the manifest declared, as the strategy's `run` receives it.
+fn config_for(_chain: &Client, store: &std::path::Path, bundle: B256) -> Vec<u8> {
+    let path = store
+        .join(format!("sha256-{}", alloy::hex::encode(bundle)))
+        .join("manifest.json");
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let Ok(manifest) = serde_json::from_slice::<shared::Manifest>(&bytes) else {
+        return Vec::new();
+    };
+    strategy_sdk::to_payload(&manifest.config)
 }
 
 /// Where a bundle's component lives once the build service has written it.
@@ -204,7 +270,7 @@ fn bundle_path(store: &std::path::Path, bundle: B256) -> PathBuf {
 
 /// A key for one vault, made where the strategy runs.
 fn key_for(vault: Address) -> PrivateKeySigner {
-    let seed = keccak256((attest::image_digest(), vault).abi_encode_seed());
+    let seed = keccak256((chain::attest::image_digest("executor"), vault).abi_encode_seed());
     PrivateKeySigner::from_bytes(&seed).expect("a key from a seed")
 }
 

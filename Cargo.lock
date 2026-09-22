@@ -5076,6 +5076,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5093,6 +5094,8 @@ dependencies = [
  "tar",
  "time",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -5126,6 +5129,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shonin-chain",
+ "shonin-cli",
  "shonin-shared",
  "time",
  "tokio",
@@ -5191,6 +5195,7 @@ dependencies = [
  "serde_json",
  "shonin-chain",
  "shonin-shared",
+ "tar",
  "time",
  "tokio",
  "tower-http 0.7.1",
@@ -5210,6 +5215,7 @@ dependencies = [
  "serde_json",
  "shonin-chain",
  "shonin-shared",
+ "tar",
  "time",
  "tokio",
  "tracing",
@@ -5225,6 +5231,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tar",
  "time",
  "toml 1.1.6+spec-1.1.0",
 ]

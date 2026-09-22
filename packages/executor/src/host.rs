@@ -7,6 +7,8 @@
 //! reaches a key.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use alloy::primitives::Address;
 use anyhow::Result;
@@ -15,6 +17,7 @@ use chain::bindings::venue::{ILocalVenue, OrderRequest};
 use chain::{Client, KeyClient};
 use strategy_sdk::{Account, Action, MarketState, PositionState, Receipt, Side};
 use tokio::sync::mpsc::UnboundedReceiver;
+use wasmtime::AsContextMut;
 use wasmtime::Result as HostResult;
 use wasmtime::component::{Access, Accessor, HasSelf, Resource, ResourceTable, StreamReader};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
@@ -55,8 +58,50 @@ pub struct Ctx {
     /// first asks for the stream.
     pub account_events: Option<UnboundedReceiver<Vec<u8>>>,
     pub vault_events: Option<UnboundedReceiver<VaultEvent>>,
-    /// What the health report is made of.
-    pub counters: Counters,
+    /// What the health report is made of. Shared, so a report can be sent
+    /// while the strategy is still running: a strategy's `run` is meant never
+    /// to return.
+    pub counters: Arc<Mutex<Counters>>,
+    /// How much fuel a second of running is worth, and when it was last
+    /// topped up.
+    pub fuel_per_second: u64,
+    pub last_refuel: Instant,
+}
+
+impl Ctx {
+    fn count(&self, change: impl FnOnce(&mut Counters)) {
+        if let Ok(mut counters) = self.counters.lock() {
+            change(&mut counters);
+        }
+    }
+}
+
+/// Top the strategy back up for the time that has passed.
+///
+/// Fuel is a rate, not a budget: a strategy is entitled to so much work a
+/// second, for as long as it runs. It is topped up whenever it calls the host,
+/// which is every time it does anything, and it can bank a few seconds of it
+/// so a burst of work is not punished.
+fn refuel<S>(access: &mut Access<'_, Ctx, S>)
+where
+    S: wasmtime::component::HasData,
+    for<'a> S::Data<'a>: std::ops::DerefMut<Target = Ctx>,
+{
+    let (rate, elapsed) = {
+        let ctx = access.get();
+        (ctx.fuel_per_second, ctx.last_refuel.elapsed())
+    };
+    if elapsed.as_millis() < 200 {
+        return;
+    }
+    access.get().last_refuel = Instant::now();
+
+    let earned = (rate as f64 * elapsed.as_secs_f64()) as u64;
+    let mut store = access.as_context_mut();
+    let held = store.get_fuel().unwrap_or(0);
+    // A few seconds' worth is as much as anyone may bank.
+    let ceiling = rate.saturating_mul(5);
+    let _ = store.set_fuel(held.saturating_add(earned).min(ceiling));
 }
 
 /// What the executor counts while a strategy runs, and signs into its health
@@ -102,6 +147,7 @@ impl shonin::strategy::venues::HostWithStore<Ctx> for HasSelf<Ctx> {
         actions: Vec<Vec<u8>>,
     ) -> HostResult<Vec<Verdict>> {
         let (key, vault, venue_address, expected) = accessor.with(|mut access| {
+            refuel(&mut access);
             let ctx = access.get();
             (ctx.key.clone(), ctx.vault, ctx.venue, ctx.venue_id.clone())
         });
@@ -123,13 +169,16 @@ impl shonin::strategy::venues::HostWithStore<Ctx> for HasSelf<Ctx> {
             verdicts.push(verdict);
         }
 
+        let refused = verdicts
+            .iter()
+            .filter(|verdict| matches!(verdict, Verdict::Rejected(_)))
+            .count() as u64;
         accessor.with(|mut access| {
-            let ctx = access.get();
-            ctx.counters.submissions += actions.len() as u64;
-            ctx.counters.rejections += verdicts
-                .iter()
-                .filter(|verdict| matches!(verdict, Verdict::Rejected(_)))
-                .count() as u64;
+            refuel(&mut access);
+            access.get().count(|counters| {
+                counters.submissions += actions.len() as u64;
+                counters.rejections += refused;
+            });
         });
         Ok(verdicts)
     }
@@ -163,6 +212,7 @@ impl shonin::strategy::venues::HostWithStore<Ctx> for HasSelf<Ctx> {
         mut access: Access<'_, Ctx, Self>,
         _venue: String,
     ) -> HostResult<StreamReader<Vec<u8>>> {
+        refuel(&mut access);
         let events = access.get().account_events.take();
         stream_of(&mut access, events)
     }
@@ -172,6 +222,7 @@ impl shonin::strategy::venues::HostWithStore<Ctx> for HasSelf<Ctx> {
 
 impl shonin::strategy::vault::HostWithStore<Ctx> for HasSelf<Ctx> {
     async fn events(mut access: Access<'_, Ctx, Self>) -> HostResult<StreamReader<VaultEvent>> {
+        refuel(&mut access);
         let events = access.get().vault_events.take();
         stream_of(&mut access, events)
     }
@@ -209,8 +260,10 @@ impl shonin::strategy::data::HostWithStore<Ctx> for HasSelf<Ctx> {
                 "this executor knows no source called {source}"
             )));
         }
-        let (chain, venue) =
-            accessor.with(|mut access| (access.get().chain.clone(), access.get().venue));
+        let (chain, venue) = accessor.with(|mut access| {
+            refuel(&mut access);
+            (access.get().chain.clone(), access.get().venue)
+        });
         match read_markets(&chain, venue).await {
             Ok(markets) => Ok(Ok(strategy_sdk::to_payload(&markets))),
             Err(error) => Ok(Err(error.to_string())),
@@ -286,6 +339,7 @@ impl shonin::strategy::secrets::HostWithStore<Ctx> for HasSelf<Ctx> {
 
 impl shonin::strategy::state::HostWithStore<Ctx> for HasSelf<Ctx> {
     async fn get(mut access: Access<'_, Ctx, Self>, key: String) -> HostResult<Option<Vec<u8>>> {
+        refuel(&mut access);
         Ok(access.get().cache.get(&key).cloned())
     }
 

@@ -11,6 +11,8 @@
 //! through exactly the bindings the services use.
 
 #[cfg(feature = "rpc")]
+pub mod attest;
+#[cfg(feature = "rpc")]
 pub mod client;
 pub mod deployments;
 
@@ -27,6 +29,27 @@ pub use deployments::{Deployments, Roles};
 /// of a call is the contract's decision rather than this crate's.
 #[allow(clippy::too_many_arguments)]
 pub mod bindings {
+    /// The token standard, which is nobody's invention and so is written
+    /// here rather than read from a contract of ours. A vault's shares and the
+    /// asset it settles in are both read through it.
+    pub mod erc20 {
+        alloy_sol_types::sol! {
+            interface IERC20 {
+                event Transfer(address indexed from, address indexed to, uint256 value);
+                event Approval(address indexed owner, address indexed spender, uint256 value);
+
+                function name() external view returns (string memory);
+                function symbol() external view returns (string memory);
+                function decimals() external view returns (uint8);
+                function totalSupply() external view returns (uint256);
+                function balanceOf(address account) external view returns (uint256);
+                function allowance(address owner, address spender) external view returns (uint256);
+                function transfer(address to, uint256 value) external returns (bool);
+                function approve(address spender, uint256 value) external returns (bool);
+                function transferFrom(address from, address to, uint256 value) external returns (bool);
+            }
+        }
+    }
     pub mod usd {
         alloy_sol_types::sol!("../../contracts/src/interfaces/ILocalUsd.sol");
     }

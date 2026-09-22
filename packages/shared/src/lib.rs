@@ -7,6 +7,7 @@
 //! compute the same figures from the same inputs.
 
 pub mod api;
+pub mod archive;
 pub mod manifest;
 pub mod model;
 pub mod record;

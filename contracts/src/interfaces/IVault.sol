@@ -75,6 +75,10 @@ struct Tank {
 
 /// Pooled capital behind one strategy version.
 ///
+/// Its shares are an ordinary ERC-20, so nothing about them is described
+/// here: a wallet, an aggregator or another contract holds and moves them
+/// knowing only the standard.
+///
 /// The contract computes its own value from the chain, in the same
 /// transaction, and lets anyone leave at any time: at once from the idle
 /// balance, or as a claim it settles itself by closing the leaver's fraction.

@@ -16,7 +16,10 @@ vars:
   PATH_PACKAGE_SHARED: '{{joinPath .PATH_PACKAGES "shared"}}'
   PATH_PACKAGE_CHAIN: '{{joinPath .PATH_PACKAGES "chain"}}'
   PATH_PACKAGE_FRONTEND: '{{joinPath .PATH_PACKAGES "frontend"}}'
+  PATH_PACKAGE_SDK: '{{joinPath .PATH_PACKAGES "strategy-sdk"}}'
   PATH_CONTRACTS: '{{joinPath .PATH_ROOT "contracts"}}'
+  # What the deploy reads the contracts' bytecode from.
+  PATH_ARTIFACTS: '{{joinPath .PATH_ROOT "contracts" "out"}}'
   PATH_CLOUDFLARE: '{{joinPath .PATH_ROOT "cloudflare"}}'
   PATH_WRANGLER_LANDING: '{{joinPath .PATH_CLOUDFLARE "landing" "wrangler.jsonc"}}'
   PATH_TRUNK_DIST: '{{joinPath .PATH_ROOT ".trunk-dist"}}'

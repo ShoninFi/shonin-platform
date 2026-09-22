@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lib]
+name = "shonin_cli"
+
 [[bin]]
 name = "shonin"
 path = "src/main.rs"
@@ -23,6 +26,8 @@ serde_json.workspace = true
 tar.workspace = true
 time.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

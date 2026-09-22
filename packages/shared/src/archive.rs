@@ -4,15 +4,23 @@
 //! the same bytes. So the archive is canonical: entries in name order,
 //! timestamps zeroed, permissions fixed, no compression, and nothing that
 //! isn't source in it at all.
+//!
+//! Both sides read this: whoever packs a submission and whoever unpacks it to
+//! build it. They have to agree byte for byte, so there is one copy of it.
 
-use std::io::Cursor;
+use std::io::{Cursor, Error, Result};
 use std::path::{Path, PathBuf};
-
-use anyhow::{Context, Result, bail};
 
 /// What never goes into an archive: build output, local settings, anything a
 /// machine made rather than a person wrote.
-const SKIP: &[&str] = &["target", ".git", ".cargo", "node_modules", ".shonin", ".DS_Store"];
+const SKIP: &[&str] = &[
+    "target",
+    ".git",
+    ".cargo",
+    "node_modules",
+    ".shonin",
+    ".DS_Store",
+];
 
 /// Pack a directory into a canonical archive.
 pub fn pack(root: &Path) -> Result<Vec<u8>> {
@@ -23,7 +31,7 @@ pub fn pack(root: &Path) -> Result<Vec<u8>> {
     let mut archive = tar::Builder::new(Vec::new());
     for relative in &files {
         let full = root.join(relative);
-        let body = std::fs::read(&full).with_context(|| format!("reading {}", full.display()))?;
+        let body = std::fs::read(&full)?;
         let mut header = tar::Header::new_gnu();
         header.set_size(body.len() as u64);
         // Fixed, so the archive says nothing about the machine it was made on.
@@ -32,38 +40,37 @@ pub fn pack(root: &Path) -> Result<Vec<u8>> {
         header.set_uid(0);
         header.set_gid(0);
         header.set_cksum();
-        archive
-            .append_data(&mut header, relative, Cursor::new(body))
-            .with_context(|| format!("adding {}", relative.display()))?;
+        archive.append_data(&mut header, relative, Cursor::new(body))?;
     }
-    archive.into_inner().context("finishing the archive")
+    archive.into_inner()
 }
 
 /// Unpack one back out, refusing anything that tries to write outside.
 pub fn unpack(bytes: &[u8], into: &Path) -> Result<()> {
-    std::fs::create_dir_all(into).with_context(|| format!("making {}", into.display()))?;
+    std::fs::create_dir_all(into)?;
     let mut archive = tar::Archive::new(Cursor::new(bytes));
-    for entry in archive.entries().context("reading the archive")? {
-        let mut entry = entry.context("reading an entry")?;
-        let path = entry.path().context("an entry's name")?.into_owned();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        // An archive that names a path outside the directory it is unpacked
+        // into is not a mistake, so it is refused rather than corrected.
         if path.is_absolute() || path.components().any(|part| part.as_os_str() == "..") {
-            bail!("the archive tries to write outside itself: {}", path.display());
+            return Err(Error::other(format!(
+                "the archive tries to write outside itself: {}",
+                path.display()
+            )));
         }
         let target = into.join(&path);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        entry
-            .unpack(&target)
-            .with_context(|| format!("writing {}", target.display()))?;
+        entry.unpack(&target)?;
     }
     Ok(())
 }
 
 fn collect(root: &Path, directory: &Path, into: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(directory)
-        .with_context(|| format!("reading {}", directory.display()))?
-    {
+    for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -74,7 +81,7 @@ fn collect(root: &Path, directory: &Path, into: &mut Vec<PathBuf>) -> Result<()>
         if path.is_dir() {
             collect(root, &path, into)?;
         } else {
-            into.push(path.strip_prefix(root)?.to_path_buf());
+            into.push(path.strip_prefix(root).map_err(Error::other)?.to_path_buf());
         }
     }
     Ok(())
@@ -89,7 +96,7 @@ pub fn bundle(component: &[u8], models: &[(String, Vec<u8>)]) -> Result<Vec<u8>>
     for (name, body) in sorted {
         add(&mut archive, &format!("models/{name}.onnx"), body)?;
     }
-    archive.into_inner().context("finishing the bundle")
+    archive.into_inner()
 }
 
 fn add(archive: &mut tar::Builder<Vec<u8>>, name: &str, body: &[u8]) -> Result<()> {
@@ -100,9 +107,7 @@ fn add(archive: &mut tar::Builder<Vec<u8>>, name: &str, body: &[u8]) -> Result<(
     header.set_uid(0);
     header.set_gid(0);
     header.set_cksum();
-    archive
-        .append_data(header, name, Cursor::new(body))
-        .with_context(|| format!("adding {name}"))?;
+    archive.append_data(&mut header, name, Cursor::new(body))?;
     Ok(())
 }
 
@@ -152,8 +157,16 @@ mod tests {
 
     #[test]
     fn a_bundle_orders_its_models() {
-        let one = bundle(b"wasm", &[("b".into(), b"two".to_vec()), ("a".into(), b"one".to_vec())]).unwrap();
-        let two = bundle(b"wasm", &[("a".into(), b"one".to_vec()), ("b".into(), b"two".to_vec())]).unwrap();
+        let one = bundle(
+            b"wasm",
+            &[("b".into(), b"two".to_vec()), ("a".into(), b"one".to_vec())],
+        )
+        .unwrap();
+        let two = bundle(
+            b"wasm",
+            &[("a".into(), b"one".to_vec()), ("b".into(), b"two".to_vec())],
+        )
+        .unwrap();
         assert_eq!(one, two);
     }
 
