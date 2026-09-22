@@ -1,10 +1,10 @@
 //! Every route in the app: its path, its title and description, and whether
 //! search engines should index it.
 //!
-//! Routes are resolved against the data, so a path naming a strategy that
-//! doesn't exist is `NotFound` rather than an empty page — and the build-time
-//! pre-render writes one file per route, so a deep link is a real page with a
-//! real status code rather than a soft 404.
+//! A route is read from the path alone. Whether the thing it names exists is
+//! the page's business, not the router's: the app is looking at a live chain,
+//! and a strategy that is not in the snapshot the app happens to hold may
+//! simply not have arrived yet.
 
 use crate::data;
 
@@ -132,19 +132,13 @@ impl Route {
                 Some(tab) => Self::strategy(slug, tab),
                 None => Self::NotFound,
             },
-            ["authors", handle] => match data::author(handle) {
-                Some(_) => Self::Author {
-                    handle: (*handle).to_string(),
-                },
-                None => Self::NotFound,
+            ["authors", handle] => Self::Author {
+                handle: (*handle).to_string(),
             },
             ["portfolio"] => Self::Portfolio,
             ["queue"] => Self::Queue,
-            ["queue", id] => match data::job(id) {
-                Some(_) => Self::Job {
-                    id: (*id).to_string(),
-                },
-                None => Self::NotFound,
+            ["queue", id] => Self::Job {
+                id: (*id).to_string(),
             },
             ["publish"] => Self::Publish,
             ["status"] => Self::Status,
@@ -154,14 +148,10 @@ impl Route {
         }
     }
 
-    /// A strategy's page, if the strategy exists.
     fn strategy(slug: &str, tab: Tab) -> Self {
-        match data::strategy(slug) {
-            Some(_) => Self::Strategy {
-                slug: slug.to_string(),
-                tab,
-            },
-            None => Self::NotFound,
+        Self::Strategy {
+            slug: slug.to_string(),
+            tab,
         }
     }
 
@@ -200,7 +190,7 @@ impl Route {
     }
 
     /// Whether a search engine should index it. The portfolio is one viewer's
-    /// own holdings, built in the browser, so it never is.
+    /// own holdings, read from the chain for one address, so it never is.
     pub fn is_indexable(&self) -> bool {
         !matches!(self, Self::NotFound | Self::Portfolio)
     }
@@ -228,11 +218,11 @@ impl Route {
         }
 
         routes.push(Route::Queue);
-        for job in &data::get().jobs {
+        for job in data::jobs() {
             routes.push(Route::Job { id: job.id.clone() });
         }
 
-        for author in &data::get().authors {
+        for author in data::authors() {
             routes.push(Route::Author {
                 handle: author.handle.clone(),
             });
@@ -317,7 +307,8 @@ impl Route {
             ),
             Self::Portfolio => page(
                 "Your positions · Shonin",
-                "What you hold across vaults, kept in your browser and nowhere else.",
+                "What you hold across vaults, read from the chain for the address you \
+                 connected.",
             ),
             Self::Queue => page(
                 "Build queue · Shonin",
@@ -379,10 +370,15 @@ fn summarise(description: &str) -> String {
 mod tests {
     use super::*;
 
+    fn platform() {
+        crate::fixture::install();
+    }
+
     /// Every route the sitemap lists must lead back to itself, or it would be
     /// advertising URLs that render as "not found".
     #[test]
     fn indexable_routes_round_trip_their_path() {
+        platform();
         for route in Route::indexable() {
             let path = route.path().expect("an indexable route has a path");
             assert_eq!(
@@ -395,6 +391,7 @@ mod tests {
 
     #[test]
     fn every_indexable_route_says_something_about_itself() {
+        platform();
         for route in Route::indexable() {
             let page = route.page();
             assert!(page.title.contains("Shonin"), "{page:?} has no site name");
@@ -408,6 +405,7 @@ mod tests {
 
     #[test]
     fn paths_resolve() {
+        platform();
         assert_eq!(Route::from_path("/"), Route::Home);
         assert_eq!(Route::from_path(""), Route::Home);
         assert_eq!(Route::from_path("/strategies"), Route::Strategies);
@@ -429,28 +427,37 @@ mod tests {
         assert_eq!(Route::from_path("/nope"), Route::NotFound);
     }
 
-    /// A URL naming something that isn't there is a 404, not an empty page.
+    /// A path the app cannot read at all is a 404. A path naming a strategy
+    /// is not: the app is looking at a live chain, and a strategy that is not
+    /// in the snapshot it happens to hold may simply not have arrived yet, so
+    /// the page says so rather than the router pretending the URL is wrong.
     #[test]
-    fn unknown_names_are_not_found() {
-        assert_eq!(
+    fn unknown_names_are_a_page_rather_than_a_dead_route() {
+        assert!(matches!(
             Route::from_path("/strategies/no-such-thing"),
-            Route::NotFound
-        );
+            Route::Strategy { .. }
+        ));
         assert_eq!(
             Route::from_path("/strategies/funding-basis-v3/nonsense"),
             Route::NotFound
         );
-        assert_eq!(Route::from_path("/authors/nobody"), Route::NotFound);
+        assert!(matches!(
+            Route::from_path("/authors/nobody"),
+            Route::Author { .. }
+        ));
+        assert!(matches!(Route::from_path("/queue/0"), Route::Job { .. }));
+
+        // A path the app has no page for at all is still a real 404.
         assert_eq!(Route::from_path("/accounts"), Route::NotFound);
         assert_eq!(Route::from_path("/components"), Route::NotFound);
-        assert_eq!(Route::from_path("/queue/0"), Route::NotFound);
     }
 
-    /// The portfolio is built in the browser from one viewer's own wallet, so
+    /// The portfolio is one address's own holdings, so
     /// it is never listed — but it still needs a file of its own, or opening
     /// it directly would answer "not found".
     #[test]
     fn the_portfolio_has_a_page_but_is_never_indexed() {
+        platform();
         assert!(!Route::Portfolio.is_indexable());
         assert!(!Route::NotFound.is_indexable());
         assert!(!Route::indexable().contains(&Route::Portfolio));
@@ -460,6 +467,7 @@ mod tests {
     /// Everything the sitemap lists is also written as a file.
     #[test]
     fn every_listed_route_is_written() {
+        platform();
         let pages = Route::all_pages();
         for route in Route::indexable() {
             assert!(
@@ -472,6 +480,7 @@ mod tests {
 
     #[test]
     fn navigation_points_at_real_pages() {
+        platform();
         for item in Route::nav() {
             let path = item.route.path().expect("a nav item has a path");
             assert_eq!(Route::from_path(&path), item.route);
@@ -481,6 +490,7 @@ mod tests {
     /// Every strategy tab is reachable, and the overview is the page itself.
     #[test]
     fn strategy_tabs_are_their_own_urls() {
+        crate::fixture::install();
         let slug = data::vaults()[0].slug.clone();
         for tab in Tab::ALL {
             let route = Route::Strategy {

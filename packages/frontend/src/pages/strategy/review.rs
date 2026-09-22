@@ -1,6 +1,8 @@
 //! The review tab: the score, every finding behind it, what produced it, and
 //! what it cannot tell you.
 
+use std::rc::Rc;
+
 use std::sync::OnceLock;
 
 use dominator::{Dom, html, text};
@@ -20,7 +22,7 @@ fn buying() -> &'static Mutable<bool> {
     BUYING.get_or_init(|| Mutable::new(false))
 }
 
-pub fn render(strategy: &'static Strategy) -> Dom {
+pub fn render(strategy: &Rc<Strategy>) -> Dom {
     let Some(review) = &strategy.review else {
         return ui::section(
             "Review pending",
@@ -42,7 +44,7 @@ pub fn render(strategy: &'static Strategy) -> Dom {
     })
 }
 
-fn score(review: &'static Review) -> Dom {
+fn score(review: &Review) -> Dom {
     let serious = review
         .findings
         .iter()
@@ -90,7 +92,7 @@ fn score(review: &'static Review) -> Dom {
     )
 }
 
-fn findings(review: &'static Review) -> Dom {
+fn findings(review: &Review) -> Dom {
     if review.findings.is_empty() {
         return ui::section(
             "Findings",
@@ -139,7 +141,7 @@ fn findings(review: &'static Review) -> Dom {
     )
 }
 
-fn categories(review: &'static Review) -> Dom {
+fn categories(review: &Review) -> Dom {
     let rows: Vec<Dom> = FindingCategory::all()
         .into_iter()
         .map(|category| {
@@ -174,7 +176,7 @@ fn categories(review: &'static Review) -> Dom {
     )
 }
 
-fn provenance(review: &'static Review) -> Dom {
+fn provenance(review: &Review) -> Dom {
     ui::section(
         "What produced this score",
         vec![
@@ -204,14 +206,19 @@ fn provenance(review: &'static Review) -> Dom {
     )
 }
 
-fn limits(review: &'static Review) -> Dom {
+fn limits(review: &Review) -> Dom {
     ui::section(
         "What a review can't tell you",
         vec![ui::bullets(review.limits.iter().cloned())],
     )
 }
 
-fn buy_modal(strategy: &'static Strategy) -> Dom {
+fn buy_modal(strategy: &Rc<Strategy>) -> Dom {
+    let name = strategy.name();
+    let image = strategy
+        .review
+        .as_ref()
+        .map_or_else(String::new, |review| review.reviewer_image.clone());
     modal(buying(), "Buy a fresh review", false, move || {
         vec![
             ui::para(
@@ -219,16 +226,8 @@ fn buy_modal(strategy: &'static Strategy) -> Dom {
                  fee. The newest is shown first and the older ones are kept.",
             ),
             ui::kv(vec![
-                ("Strategy".to_string(), ui::value(&strategy.name())),
-                (
-                    "Reviewer image".to_string(),
-                    ui::hash(
-                        &strategy
-                            .review
-                            .as_ref()
-                            .map_or_else(String::new, |review| review.reviewer_image.clone()),
-                    ),
-                ),
+                ("Strategy".to_string(), ui::value(&name)),
+                ("Reviewer image".to_string(), ui::hash(&image)),
                 ("Fee".to_string(), ui::number("$1.00")),
             ]),
             ui::note("Nothing is re-reviewed automatically when the reviewer image changes."),

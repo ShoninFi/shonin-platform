@@ -23,19 +23,19 @@ pub fn render(slug: &str, tab: Tab) -> Dom {
 
     html!("div", {
         .class("stack-lg")
-        .child(header(strategy, tab))
+        .child(header(&strategy, tab))
         .child(match tab {
-            Tab::Overview => overview::render(strategy),
-            Tab::Record => record::render(strategy),
-            Tab::Code => code::render(strategy),
-            Tab::Review => review::render(strategy),
-            Tab::Verify => verify::render(strategy),
-            Tab::Health => health::render(strategy),
+            Tab::Overview => overview::render(&strategy),
+            Tab::Record => record::render(&strategy),
+            Tab::Code => code::render(&strategy),
+            Tab::Review => review::render(&strategy),
+            Tab::Verify => verify::render(&strategy),
+            Tab::Health => health::render(&strategy),
         })
     })
 }
 
-fn header(strategy: &'static Strategy, current: Tab) -> Dom {
+fn header(strategy: &Strategy, current: Tab) -> Dom {
     let items = Tab::ALL
         .into_iter()
         .map(|tab| TabItem {

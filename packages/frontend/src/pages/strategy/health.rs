@@ -1,6 +1,8 @@
 //! The health report: how a strategy is running, each signal against the
 //! threshold that turns it into a warning or an error.
 
+use std::rc::Rc;
+
 use dominator::{Dom, html};
 use shared::{HealthLevel, Strategy};
 
@@ -9,7 +11,7 @@ use crate::format as fmt;
 use crate::ui::primitives as ui;
 use crate::ui::primitives::Tone;
 
-pub fn render(strategy: &'static Strategy) -> Dom {
+pub fn render(strategy: &Rc<Strategy>) -> Dom {
     let Some(health) = &strategy.health else {
         return ui::section(
             "Nothing is running",
@@ -55,7 +57,7 @@ pub fn render(strategy: &'static Strategy) -> Dom {
     })
 }
 
-fn signals(health: &'static shared::Health) -> Dom {
+fn signals(health: &shared::Health) -> Dom {
     let cards: Vec<Dom> = health
         .signals
         .iter()
@@ -117,7 +119,7 @@ fn signals(health: &'static shared::Health) -> Dom {
     )
 }
 
-fn entries(health: &'static shared::Health) -> Dom {
+fn entries(health: &shared::Health) -> Dom {
     let items: Vec<Dom> = health
         .entries
         .iter()
@@ -143,7 +145,7 @@ fn entries(health: &'static shared::Health) -> Dom {
     )
 }
 
-fn consequences(strategy: &'static Strategy, level: HealthLevel) -> Dom {
+fn consequences(strategy: &Rc<Strategy>, level: HealthLevel) -> Dom {
     let mut children = vec![ui::para(
         "A health report informs; it never gates. Deposits and withdrawals carry on whatever \
          it says.",

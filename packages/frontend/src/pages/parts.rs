@@ -112,7 +112,7 @@ pub fn spark(strategy: &Strategy) -> Dom {
 }
 
 /// A strategy as a card, for the home page and any other list of a few.
-pub fn strategy_card(strategy: &'static Strategy) -> Dom {
+pub fn strategy_card(strategy: &Strategy) -> Dom {
     let performance = data::performance(strategy);
 
     link!(path_of(strategy), {
@@ -257,14 +257,14 @@ pub fn venue_split(legs: &[Leg]) -> Dom {
 }
 
 /// A banner for anything that has gone wrong with a vault, or nothing.
-pub fn vault_notices(strategy: &'static Strategy) -> Vec<Dom> {
+pub fn vault_notices(strategy: &Strategy) -> Vec<Dom> {
     let mut notices = Vec::new();
 
     if strategy.standing == Standing::BuildFailed {
         // Every tab of a failed build would otherwise be an empty state with
         // no explanation of why it is empty.
-        let build = data::get()
-            .jobs
+        let jobs = data::jobs();
+        let build = jobs
             .iter()
             .find(|job| job.strategy_slug.as_deref() == Some(strategy.slug.as_str()));
 

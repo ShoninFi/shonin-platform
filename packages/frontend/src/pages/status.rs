@@ -25,7 +25,7 @@ pub fn render() -> Dom {
         }))
         .child(html!("div", {
             .class("stack")
-            .children(data::get().feed.iter().map(entry))
+            .children(data::feed().iter().map(|event| entry(event)))
         }))
         .child(ui::section(
             "What can be done to a running vault",
@@ -57,7 +57,7 @@ pub fn render() -> Dom {
     })
 }
 
-fn entry(event: &'static FeedEvent) -> Dom {
+fn entry(event: &FeedEvent) -> Dom {
     let tone = if event.kind.is_alarming() {
         Tone::Warn
     } else {

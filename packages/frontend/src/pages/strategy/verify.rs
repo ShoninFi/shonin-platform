@@ -1,6 +1,8 @@
 //! "Which code is trading this vault?" — the panel a depositor should read,
 //! and the checks anyone can run against it themselves.
 
+use std::rc::Rc;
+
 use dominator::{Dom, html};
 use shared::{KeyRole, Strategy};
 
@@ -12,7 +14,7 @@ use crate::ui::primitives as ui;
 use crate::ui::primitives::Tone;
 use crate::ui::table::{Column, Row, table};
 
-pub fn render(strategy: &'static Strategy) -> Dom {
+pub fn render(strategy: &Rc<Strategy>) -> Dom {
     let Some(attestation) = &strategy.attestation else {
         return ui::section(
             "Nothing is running",
@@ -33,7 +35,7 @@ pub fn render(strategy: &'static Strategy) -> Dom {
     })
 }
 
-fn panel(strategy: &'static Strategy, attestation: &'static shared::Attestation) -> Dom {
+fn panel(strategy: &Rc<Strategy>, attestation: &shared::Attestation) -> Dom {
     let value = format!(
         "{} {}",
         fmt::money(strategy.vault.value),
@@ -115,7 +117,7 @@ fn panel(strategy: &'static Strategy, attestation: &'static shared::Attestation)
     )
 }
 
-fn keys(attestation: &'static shared::Attestation) -> Dom {
+fn keys(attestation: &shared::Attestation) -> Dom {
     let now = data::now();
     let rows: Vec<Row> = attestation
         .keys
@@ -170,7 +172,7 @@ fn keys(attestation: &'static shared::Attestation) -> Dom {
     )
 }
 
-fn approvals(attestation: &'static shared::Attestation) -> Dom {
+fn approvals(attestation: &shared::Attestation) -> Dom {
     let rows: Vec<Row> = attestation
         .approvals
         .iter()
@@ -230,7 +232,7 @@ fn checks() -> Dom {
     )
 }
 
-fn audits(strategy: &'static Strategy) -> Dom {
+fn audits(strategy: &Rc<Strategy>) -> Dom {
     let rows: Vec<Row> = strategy
         .vault
         .audits

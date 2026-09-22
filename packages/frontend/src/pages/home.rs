@@ -84,7 +84,7 @@ fn featured() -> Dom {
     let cards: Vec<Dom> = data::ranked()
         .into_iter()
         .take(4)
-        .map(parts::strategy_card)
+        .map(|strategy| parts::strategy_card(&strategy))
         .collect();
 
     ui::section_with_aside(

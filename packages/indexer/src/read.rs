@@ -168,8 +168,17 @@ async fn one(
     let days_live = (now.saturating_sub(created as u64)) / 86_400;
 
     let vault = read_vault(chain, deployments, address, &state, now).await?;
-    let record = sample(chain, address, history, head, created as u64, &vault).await?;
-    let trades = read_trades(chain, deployments, address).await?;
+    let (trades, trade_count) = read_trades(chain, deployments, address).await?;
+    let record = sample(
+        chain,
+        address,
+        history,
+        head,
+        created as u64,
+        &vault,
+        trade_count,
+    )
+    .await?;
     let events = read_events(chain, address).await?;
     let legs = read_legs(chain, deployments, address, &vault).await?;
     let review = read_review(chain, deployments, store, strategy_id, version).await?;
@@ -202,7 +211,7 @@ async fn one(
             .unwrap_or_else(|| {
                 "This strategy's source has been submitted and is waiting to be built.".to_string()
             }),
-        author: address_of(author),
+        author: handle_of(chain, deployments, author).await,
         standing,
         registered: day(if registered.registeredAt == 0 {
             created as u64
@@ -363,6 +372,7 @@ async fn read_vault(
 }
 
 /// The record, sampled from the vault itself at each past block.
+#[allow(clippy::too_many_arguments)]
 async fn sample(
     chain: &Client,
     address: Address,
@@ -370,11 +380,12 @@ async fn sample(
     head: u64,
     created: u64,
     vault: &Vault,
+    trades: u32,
 ) -> Result<Option<Record>> {
     let from = history.sampled_to.get(&address).copied();
     let start = from.map(|block| block + 1).unwrap_or(0);
     if start > head {
-        return Ok(build_record(history, address));
+        return Ok(build_record(history, address, trades));
     }
 
     // Sampling every block would be a lot of calls on a chain that mines every
@@ -411,16 +422,16 @@ async fn sample(
             value: 1.0,
         });
     }
-    Ok(build_record(history, address))
+    Ok(build_record(history, address, trades))
 }
 
-fn build_record(history: &History, address: Address) -> Option<Record> {
+fn build_record(history: &History, address: Address, trades: u32) -> Option<Record> {
     let series = history.value_per_share.get(&address)?;
     if series.len() < 2 {
         return None;
     }
     let aum = history.aum.get(&address).cloned().unwrap_or_default();
-    Some(Record::from_series(daily(series), daily(&aum), 0))
+    Some(Record::from_series(daily(series), daily(&aum), trades))
 }
 
 /// One reading a day: the record is daily, and a day with several readings
@@ -450,11 +461,13 @@ async fn block_time(chain: &Client, block: u64) -> Result<u64> {
     chain.block_timestamp_at(block).await
 }
 
+/// Every fill this vault has had: the last few in full, for the page, and how
+/// many there were altogether, for the record.
 async fn read_trades(
     chain: &Client,
     deployments: &Deployments,
     address: Address,
-) -> Result<Vec<Trade>> {
+) -> Result<(Vec<Trade>, u32)> {
     let logs = chain
         .logs(
             &Filter::new()
@@ -465,6 +478,7 @@ async fn read_trades(
         )
         .await?;
 
+    let count = logs.len() as u32;
     let mut trades = Vec::new();
     for log in logs.iter().rev().take(60) {
         let Ok(filled) = log.log_decode::<ILocalVenue::Filled>() else {
@@ -490,7 +504,7 @@ async fn read_trades(
                 .unwrap_or_default(),
         });
     }
-    Ok(trades)
+    Ok((trades, count))
 }
 
 async fn read_events(chain: &Client, address: Address) -> Result<Vec<VaultEvent>> {
@@ -843,26 +857,47 @@ fn read_bundle(
     }
 }
 
+/// What to call an author: the handle they chose, or their address if they
+/// chose none. Nothing depends on it either way.
+async fn handle_of(chain: &Client, deployments: &Deployments, author: Address) -> String {
+    match chain
+        .read(
+            deployments.profiles,
+            IAuthorProfiles::profileOfCall { author },
+        )
+        .await
+    {
+        Ok(profile) if !profile.handle.is_empty() => profile.handle,
+        _ => address_of(author),
+    }
+}
+
 /// Everyone who has published, plus anyone who said who they are.
-pub async fn authors(
-    chain: &Client,
-    deployments: &Deployments,
-    strategies: &[Strategy],
-) -> Result<Vec<Author>> {
+pub async fn authors(chain: &Client, deployments: &Deployments) -> Result<Vec<Author>> {
     let mut out: Vec<Author> = Vec::new();
-    for strategy in strategies {
-        if out.iter().any(|author| author.handle == strategy.author) {
+    let owners = chain
+        .read(deployments.factory, IVaultFactory::vaultsCall {})
+        .await?;
+    let mut seen: Vec<Address> = Vec::new();
+    for vault in owners {
+        let address = chain.read(vault, IVault::authorCall {}).await?;
+        if seen.contains(&address) {
             continue;
         }
-        let address: Address = strategy.author.parse().unwrap_or(Address::ZERO);
+        seen.push(address);
         let profile = chain
             .read(
                 deployments.profiles,
                 IAuthorProfiles::profileOfCall { author: address },
             )
             .await?;
+        let handle = if profile.handle.is_empty() {
+            address_of(address)
+        } else {
+            profile.handle.clone()
+        };
         out.push(Author {
-            handle: strategy.author.clone(),
+            handle,
             joined: day(profile.joinedAt as u64),
             blurb: if profile.blurb.is_empty() {
                 "This author has not said anything about themselves.".to_string()

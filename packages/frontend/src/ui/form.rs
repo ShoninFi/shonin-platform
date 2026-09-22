@@ -3,6 +3,7 @@
 use dominator::{Dom, EventOptions, clone, events, html, with_node};
 use futures_signals::signal::{Mutable, SignalExt};
 use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::Closure;
 
 /// A labelled field wrapper: the label, the control, and a hint under it.
 pub fn field(label: &str, hint: Option<&str>, control: Dom) -> Dom {
@@ -153,7 +154,110 @@ pub fn checkbox(label: &str, checked: &Mutable<bool>) -> Dom {
 
 /// A place to drop a file. It reports the file's name and size; nothing is
 /// uploaded anywhere.
-pub fn dropzone(prompt: &str, chosen: &Mutable<Option<String>>) -> Dom {
+/// A file the viewer picked: what it is called, and what is in it.
+#[derive(Clone, Debug)]
+pub struct Picked {
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
+impl Picked {
+    pub fn label(&self) -> String {
+        format!(
+            "{} · {:.0} KiB",
+            self.name,
+            self.bytes.len() as f64 / 1024.0
+        )
+    }
+}
+
+/// Read a file the viewer dropped or chose, and hand over its bytes.
+///
+/// The bytes matter, not the name: a submission is hashed here, and the hash
+/// is what the vault is created with, so the browser has to have actually read
+/// what it is about to send.
+fn read_into(file: web_sys::File, chosen: Mutable<Option<Picked>>) {
+    let reader = match web_sys::FileReader::new() {
+        Ok(reader) => reader,
+        Err(_) => return,
+    };
+    let name = file.name();
+    let on_load = Closure::<dyn FnMut()>::new({
+        let reader = reader.clone();
+        move || {
+            let Ok(buffer) = reader.result() else { return };
+            let Some(buffer) = buffer.dyn_ref::<js_sys::ArrayBuffer>() else {
+                return;
+            };
+            let bytes = js_sys::Uint8Array::new(buffer).to_vec();
+            chosen.set(Some(Picked {
+                name: name.clone(),
+                bytes,
+            }));
+        }
+    });
+    reader.set_onload(Some(on_load.as_ref().unchecked_ref()));
+    let _ = reader.read_as_array_buffer(&file);
+    // The reader outlives this call; letting the closure go would cancel it.
+    on_load.forget();
+}
+
+pub fn file_drop(prompt: &str, chosen: &Mutable<Option<Picked>>) -> Dom {
+    let chosen = chosen.clone();
+    let over = Mutable::new(false);
+    let prompt = prompt.to_string();
+
+    html!("label", {
+        .class("dropzone")
+        .class_signal("is-over", over.signal())
+        .child(html!("input" => web_sys::HtmlInputElement, {
+            .class("visually-hidden")
+            .attr("type", "file")
+            .with_node!(element => {
+                .event(clone!(chosen => move |_: events::Change| {
+                    if let Some(file) = element.files().and_then(|files| files.get(0)) {
+                        read_into(file, chosen.clone());
+                    }
+                }))
+            })
+        }))
+        .child_signal(chosen.signal_cloned().map(clone!(prompt => move |chosen| {
+            Some(match chosen {
+                Some(picked) => html!("span", { .class("num").text(&picked.label()) }),
+                None => html!("span", { .text(&prompt) }),
+            })
+        })))
+        .apply(clone!(over => move |dom| {
+            dom.event_with_options(
+                &EventOptions::preventable(),
+                clone!(over => move |event: events::DragOver| {
+                    event.prevent_default();
+                    over.set_neq(true);
+                }),
+            )
+        }))
+        .event(clone!(over => move |_: events::DragLeave| over.set_neq(false)))
+        .apply(clone!(over, chosen => move |dom| {
+            dom.event_with_options(
+                &EventOptions::preventable(),
+                move |event: events::Drop| {
+                    event.prevent_default();
+                    over.set_neq(false);
+                    if let Some(file) = event
+                        .data_transfer()
+                        .and_then(|transfer| transfer.files())
+                        .and_then(|files| files.get(0))
+                    {
+                        read_into(file, chosen.clone());
+                    }
+                },
+            )
+        }))
+    })
+}
+
+#[allow(dead_code)]
+fn dropzone(prompt: &str, chosen: &Mutable<Option<String>>) -> Dom {
     let chosen = chosen.clone();
     let over = Mutable::new(false);
     let prompt = prompt.to_string();

@@ -156,7 +156,7 @@ async fn refresh(service: &Arc<Service>) -> Result<()> {
         )
         .await?
     };
-    let authors = read::authors(&service.chain, &service.deployments, &strategies).await?;
+    let authors = read::authors(&service.chain, &service.deployments).await?;
     let feed = read::feed(&service.chain, &service.deployments, &strategies).await?;
     let benchmarks = {
         let mut history = service.history.write().await;
@@ -165,9 +165,17 @@ async fn refresh(service: &Arc<Service>) -> Result<()> {
     let jobs = fetch_jobs(service).await.unwrap_or_default();
 
     let totals = Totals {
+        // Every vault still holding depositors' money, which includes one
+        // whose author has published a successor: it carries on as it was.
         vault_capital: strategies
             .iter()
-            .filter(|strategy| strategy.standing.is_live())
+            .filter(|strategy| {
+                matches!(
+                    strategy.vault.state,
+                    shared::model::vault::VaultState::Open
+                        | shared::model::vault::VaultState::Frozen
+                )
+            })
             .map(|strategy| strategy.vault.value)
             .sum(),
         trades: strategies
@@ -274,6 +282,7 @@ async fn portfolio(
                 exit_value: held
                     * strategy.vault.share_price
                     * (1.0 - strategy.vault.fees.transaction_bps as f64 / 10_000.0),
+                cost: cost_basis(&service.chain, vault, who).await.unwrap_or(0.0),
             });
         }
         for claim in &strategy.vault.claims {
@@ -299,6 +308,52 @@ async fn portfolio(
         positions,
         claims,
     }))
+}
+
+/// What an address paid for what it still holds: everything it put in, less
+/// everything it took out. The vault's own log is the whole of it.
+async fn cost_basis(chain: &Client, vault: Address, who: Address) -> Option<f64> {
+    use alloy::rpc::types::Filter;
+    use alloy::sol_types::SolEvent;
+    use chain::bindings::vault::IVault;
+
+    let mut paid = 0.0;
+    let deposits = chain
+        .logs(
+            &Filter::new()
+                .address(vault)
+                .event_signature(IVault::Deposited::SIGNATURE_HASH)
+                .topic1(who.into_word())
+                .from_block(0u64),
+        )
+        .await
+        .ok()?;
+    for log in deposits {
+        if let Ok(event) = log.log_decode::<IVault::Deposited>() {
+            paid += dollars(event.inner.data.assets);
+        }
+    }
+
+    let withdrawals = chain
+        .logs(
+            &Filter::new()
+                .address(vault)
+                .event_signature(IVault::Withdrawn::SIGNATURE_HASH)
+                .topic1(who.into_word())
+                .from_block(0u64),
+        )
+        .await
+        .ok()?;
+    for log in withdrawals {
+        if let Ok(event) = log.log_decode::<IVault::Withdrawn>() {
+            paid -= dollars(event.inner.data.assets);
+        }
+    }
+    Some(paid.max(0.0))
+}
+
+fn dollars(value: alloy::primitives::U256) -> f64 {
+    value.to_string().parse::<f64>().unwrap_or(0.0) / 1e6
 }
 
 async fn jobs(State(service): State<Arc<Service>>) -> Json<Vec<Job>> {

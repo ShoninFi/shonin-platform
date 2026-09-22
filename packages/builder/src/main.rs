@@ -58,14 +58,25 @@ struct Service {
     sdk: PathBuf,
     /// The queue, oldest first.
     jobs: Mutex<Vec<Entry>>,
+    /// Where the queue is kept, so restarting the service does not lose a
+    /// build someone paid for.
+    queue_file: PathBuf,
 }
 
 /// A job, and what it was asked to build.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Entry {
     job: Job,
     submission: Submission,
-    archive: Vec<u8>,
+    /// The submitted source, base64 as it arrived, so a restart can still
+    /// build it.
+    archive: String,
+}
+
+impl Entry {
+    fn bytes(&self) -> Result<Vec<u8>> {
+        decode(&self.archive)
+    }
 }
 
 #[tokio::main]
@@ -82,13 +93,25 @@ async fn main() -> Result<()> {
     let deployments = chain.wait_for_deployments(&args.deployments).await?;
     bless(&chain, &deployments).await?;
 
+    // A build someone funded should survive this service restarting, so the
+    // queue is on disk rather than only in memory.
+    let queue_file = args.store.join("queue.json");
+    let waiting: Vec<Entry> = std::fs::read(&queue_file)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    if !waiting.is_empty() {
+        tracing::info!(count = waiting.len(), "picked the queue back up");
+    }
+
     let service = Arc::new(Service {
         chain,
         deployments,
         store: args.store,
         builds: args.builds,
         sdk: args.sdk,
-        jobs: Mutex::new(Vec::new()),
+        jobs: Mutex::new(waiting),
+        queue_file,
     });
 
     let worker = service.clone();
@@ -123,6 +146,7 @@ async fn bless(chain: &Client, deployments: &Deployments) -> Result<()> {
         chain.clone(),
         deployments.clone(),
         "builder",
+        key,
         key,
         Address::ZERO,
         B256::ZERO,
@@ -178,8 +202,9 @@ async fn submit(
     jobs.push(Entry {
         job: job.clone(),
         submission,
-        archive,
+        archive: encode(&archive),
     });
+    write_queue(&service, &jobs);
 
     tracing::info!(id, "a submission joined the queue");
     Ok(Json(SubmissionAccepted {
@@ -245,7 +270,7 @@ async fn take_one(service: &Arc<Service>) -> Result<()> {
 
     let source = service.builds.join(&entry.job.id).join("source");
     let _ = std::fs::remove_dir_all(source.parent().unwrap_or(&source));
-    shared::archive::unpack(&entry.archive, &source)?;
+    shared::archive::unpack(&entry.bytes()?, &source)?;
 
     let sdk = service.sdk.clone();
     let built =
@@ -390,7 +415,7 @@ async fn finish(
             &service.store,
             &entry.job.source_hash,
             "source.tar",
-            &entry.archive,
+            &entry.bytes()?,
         )?;
     }
 
@@ -472,6 +497,23 @@ async fn set_state_full(
         if seconds != 0 {
             entry.job.duration_seconds = seconds;
         }
+    }
+    write_queue(service, &jobs);
+}
+
+/// Keep the queue on disk. A build that cannot be written down is still built;
+/// the note about it is what would be lost.
+fn write_queue(service: &Arc<Service>, jobs: &[Entry]) {
+    if let Some(parent) = service.queue_file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match serde_json::to_vec(jobs) {
+        Ok(bytes) => {
+            if let Err(error) = std::fs::write(&service.queue_file, bytes) {
+                tracing::warn!(%error, "the queue could not be written down");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "the queue could not be written down"),
     }
 }
 

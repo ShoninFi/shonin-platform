@@ -16,13 +16,13 @@ use crate::ui::primitives as ui;
 use crate::ui::primitives::Tone;
 use crate::ui::shell;
 use crate::ui::table::{Column, Row, table};
+use crate::wallet;
 
 struct Draft {
-    repo: Mutable<String>,
-    commit: Mutable<String>,
     sealed: Mutable<bool>,
-    upload: Mutable<Option<String>>,
+    archive: Mutable<Option<form::Picked>>,
     strategy_id: Mutable<String>,
+    version: Mutable<String>,
     tank: Mutable<String>,
     allowance: Mutable<String>,
     reviewed: Mutable<bool>,
@@ -33,11 +33,10 @@ struct Draft {
 fn state_of() -> &'static Draft {
     static DRAFT: OnceLock<Draft> = OnceLock::new();
     DRAFT.get_or_init(|| Draft {
-        repo: Mutable::new(String::new()),
-        commit: Mutable::new(String::new()),
         sealed: Mutable::new(false),
-        upload: Mutable::new(None),
+        archive: Mutable::new(None),
         strategy_id: Mutable::new(String::new()),
+        version: Mutable::new("1".to_string()),
         tank: Mutable::new(String::new()),
         allowance: Mutable::new("light".to_string()),
         reviewed: Mutable::new(false),
@@ -106,42 +105,26 @@ fn submit() -> Dom {
         vec![
             html!("div", {
                 .class("stack")
+                .child(ui::note(
+                    "A submission is the whole workspace your strategy belongs to, packed the \
+                     same way every time so its hash means something. Pack it with the command \
+                     below, then drop the archive here.",
+                ))
+                .child(ui::code_block("shonin pack packages/bots/your-strategy > strategy.tar"))
+                .child(form::file_drop(
+                    "Drop the packed project, or choose it",
+                    &draft.archive,
+                ))
                 .child(form::toggle("Seal the source", &draft.sealed))
-                .child(html!("div", {
-                    .child_signal(draft.sealed.signal().map(|sealed| {
-                        Some(if sealed {
-                            html!("div", {
-                                .class("stack")
-                                .child(ui::note(
-                                    "Upload the project encrypted instead of pointing us at a repository. Only who can \
-                                     read it changes."
-                                ))
-                                .child(form::dropzone(
-                                    "Drop an encrypted project archive, or choose one",
-                                    &state_of().upload,
-                                ))
-                            })
-                        } else {
-                            html!("div", {
-                                .class("stack")
-                                .child(form::field(
-                                    "Public repository",
-                                    Some("We clone it and hash the tree"),
-                                    form::input(&state_of().repo, "github.com/you/your-strategy"),
-                                ))
-                                .child(form::field(
-                                    "Commit",
-                                    Some("The exact commit to build"),
-                                    form::input(&state_of().commit, "9f2ac1…"),
-                                ))
-                            })
-                        })
-                    }))
-                }))
                 .child(form::field(
                     "Strategy id",
                     Some("Stable across versions; each version gets its own vault"),
                     form::input(&draft.strategy_id, "funding-basis"),
+                ))
+                .child(form::field(
+                    "Version",
+                    Some("A new version is a new vault, and never an edit of a running one"),
+                    form::input(&draft.version, "1"),
                 ))
                 .child(form::field(
                     "Allowances",
@@ -170,25 +153,61 @@ fn submit() -> Dom {
                     }
                 })
             }),
-            shell::button("Create the vault and queue the build", true, || {
-                let tank = form::parse_amount(&state_of().tank.get_cloned());
-                if tank < minimum(&state_of().allowance.get_cloned()) {
-                    state::notify(
-                        "The tank needs to cover the build, the review and a week at the \
-                         declared allowances.",
-                        Tone::Warn,
-                    );
-                    return;
-                }
-                state::notify(
-                    "Queued. The build is first come, first served, and its log is public \
-                     whether it succeeds or fails.",
-                    Tone::Ok,
-                );
-            }),
+            shell::button("Create the vault and queue the build", true, publish),
             ui::action_link("/queue", "Watch the build queue"),
         ],
     )
+}
+
+/// Create the vault, then hand the source to the build service.
+///
+/// The order matters and is the platform's, not this page's: the build service
+/// will not admit a job until its vault exists with a funded tank, so nothing
+/// is ever compiled for free.
+fn publish() {
+    let draft = state_of();
+    let Some(archive) = draft.archive.get_cloned() else {
+        state::notify(
+            "Pack the project and drop the archive here first.",
+            Tone::Warn,
+        );
+        return;
+    };
+    let id = draft.strategy_id.get_cloned().trim().to_string();
+    if id.is_empty() {
+        state::notify("Give the strategy an id.", Tone::Warn);
+        return;
+    }
+    let Ok(version) = draft.version.get_cloned().trim().parse::<u32>() else {
+        state::notify("The version is a whole number.", Tone::Warn);
+        return;
+    };
+    let tank = form::parse_amount(&draft.tank.get_cloned());
+    if tank < minimum(&draft.allowance.get_cloned()) {
+        state::notify(
+            "The tank needs to cover the build, the review and a week at the declared \
+             allowances.",
+            Tone::Warn,
+        );
+        return;
+    }
+    let sealed = draft.sealed.get();
+
+    wasm_bindgen_futures::spawn_local(async move {
+        match wallet::publish(&id, version, tank, &archive.bytes, sealed).await {
+            Ok(job) => {
+                state::notify(
+                    format!(
+                        "Queued as build {job}. It is first come, first served, and its log is \
+                         public whether it succeeds or fails."
+                    ),
+                    Tone::Ok,
+                );
+                dominator::routing::go_to_url(&format!("/queue/{job}"));
+            }
+            Err(problem) => state::notify(problem, Tone::Warn),
+        }
+    });
 }
 
 fn minimum(allowance: &str) -> f64 {
@@ -331,7 +350,9 @@ fn secrets() -> Dom {
             ),
             form::field(
                 "Value",
-                Some("Encrypted in your browser before anything is sent"),
+                Some(
+                    "Sealed to the bundle's hash, so the executor can use it and nobody else can read it",
+                ),
                 form::input(&draft.secret_value, "…"),
             ),
             shell::button("Seal it", false, || {
@@ -366,7 +387,7 @@ fn costs() -> Dom {
             ui::note(copy::TANK_NOTE),
             ui::kv_rows(vec![(
                 "Builds in the queue".to_string(),
-                ui::number(&data::get().jobs.len().to_string()),
+                ui::number(&data::jobs().len().to_string()),
             )]),
         ],
     )

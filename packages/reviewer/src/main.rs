@@ -75,6 +75,7 @@ async fn main() -> Result<()> {
         deployments.clone(),
         "reviewer",
         key,
+        key,
         alloy::primitives::Address::ZERO,
         B256::ZERO,
         || {},

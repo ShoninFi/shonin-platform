@@ -3,6 +3,8 @@
 //! The panel on a vault's page, the two modals behind it, and the wallet
 //! button in the header.
 
+use std::rc::Rc;
+
 use std::sync::OnceLock;
 
 use dominator::{Dom, clone, events, html, text};
@@ -10,6 +12,7 @@ use futures_signals::map_ref;
 use futures_signals::signal::{Mutable, SignalExt};
 use shared::{ClaimState, Strategy};
 
+use crate::data;
 use crate::format as fmt;
 use crate::state;
 use crate::ui::form;
@@ -75,27 +78,33 @@ fn connect_modal() -> Dom {
     modal(connecting(), "Connect a wallet", false, || {
         vec![
             ui::para(
-                "Nothing is signed and nothing leaves your browser. Connecting gives you a balance \
-                 to walk the deposit, withdrawal and claim flows through.",
+                "Connecting only says which address you are. Depositing, leaving and settling are \
+                 transactions your own wallet signs, against the vault's own contract.",
             ),
             html!("div", {
                 .class("stack-sm")
-                .children(["Browser wallet", "Hardware wallet", "Watch an address"]
+                .children(ways_to_connect()
                     .into_iter()
-                    .map(|label| {
+                    .map(|(how, label)| {
                         html!("button", {
                             .class(["btn", "btn--block"])
                             .attr("type", "button")
                             .text(label)
-                            .event(move |_: events::Click| {
-                                wallet::connect(label);
+                            .event(clone!(how => move |_: events::Click| {
+                                let how = how.clone();
                                 connecting().set(false);
-                                state::notify(
-                                    "Connected. Your balance and positions are kept in this \
-                                     browser only.",
-                                    Tone::Ok,
-                                );
-                            })
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    let watching = how == wallet::Connection::Watching;
+                                    let address = watching.then(ask_for_an_address).flatten();
+                                    match wallet::connect(how, address).await {
+                                        Ok(()) => state::notify(
+                                            "Connected. What you hold is read from the chain.",
+                                            Tone::Ok,
+                                        ),
+                                        Err(problem) => state::notify(problem, Tone::Warn),
+                                    }
+                                });
+                            }))
                         })
                     }))
             }),
@@ -103,23 +112,62 @@ fn connect_modal() -> Dom {
     })
 }
 
+/// Ask which address to watch. Watching signs nothing, so a prompt is the
+/// whole of what is needed.
+fn ask_for_an_address() -> Option<String> {
+    web_sys::window()?
+        .prompt_with_message("Which address would you like to watch?")
+        .ok()
+        .flatten()
+        .filter(|address| !address.trim().is_empty())
+        .map(|address| address.trim().to_string())
+}
+
+/// The ways a viewer can connect here. The development wallet appears only
+/// when the platform says it has one to offer.
+fn ways_to_connect() -> Vec<(wallet::Connection, &'static str)> {
+    let mut ways = vec![(wallet::Connection::Browser, "Browser wallet")];
+    if data::config().is_some_and(|config| config.dev.is_some()) {
+        ways.push((wallet::Connection::Development, "Development wallet"));
+    }
+    ways.push((wallet::Connection::Watching, "Watch an address"));
+    ways
+}
+
+/// Send something, and say what happened when it lands.
+///
+/// Every action on this page is a transaction: it takes a moment, it can be
+/// turned down, and the page says which.
+fn act<F>(what: F, said: impl FnOnce(&str) -> String + 'static)
+where
+    F: std::future::Future<Output = Result<String, String>> + 'static,
+{
+    wasm_bindgen_futures::spawn_local(async move {
+        match what.await {
+            Ok(hash) => state::notify(said(&hash), Tone::Ok),
+            Err(problem) => state::notify(problem, Tone::Warn),
+        }
+    });
+}
+
 // --------------------------------------------------------- the vault panel
 
 /// The panel on a vault's page: what you hold, and what you can do about it.
-pub fn panel(strategy: &'static Strategy) -> Dom {
+pub fn panel(strategy: &Rc<Strategy>) -> Dom {
     let slug = strategy.slug.clone();
+    let held = strategy.clone();
 
     html!("div", {
         .class("stack")
-        .child_signal(wallet::holdings().signal_cloned().map(clone!(slug => move |holdings| {
-            Some(panel_body(strategy, &holdings, &slug))
+        .child_signal(wallet::holdings().signal_cloned().map(clone!(slug, held => move |holdings| {
+            Some(panel_body(&held, &holdings, &slug))
         })))
         .child(deposit_modal(strategy))
         .child(withdraw_modal(strategy))
     })
 }
 
-fn panel_body(strategy: &'static Strategy, holdings: &Holdings, slug: &str) -> Dom {
+fn panel_body(strategy: &Rc<Strategy>, holdings: &Holdings, slug: &str) -> Dom {
     let slug = slug.to_string();
     let vault = &strategy.vault;
     let position = holdings.position(&slug);
@@ -197,7 +245,7 @@ fn panel_body(strategy: &'static Strategy, holdings: &Holdings, slug: &str) -> D
     }
 
     for claim in claims {
-        children.push(claim_card(claim));
+        children.push(claim_card(claim, &slug));
     }
 
     if let Some(successor) = &strategy.superseded_by
@@ -213,13 +261,15 @@ fn panel_body(strategy: &'static Strategy, holdings: &Holdings, slug: &str) -> D
             Some(shell::button(
                 "Move everything",
                 false,
-                move || match wallet::move_to(&from, &to) {
-                    Ok(assets) => state::notify(
-                        format!("Moved {} into the new vault.", fmt::money_exact(assets)),
-                        Tone::Ok,
-                    ),
-                    Err(problem) => state::notify(problem, Tone::Warn),
-                },
+                clone!(from, to => move || {
+                    act(
+                        {
+                            let (from, to) = (from.clone(), to.clone());
+                            async move { wallet::move_to(&from, &to).await }
+                        },
+                        |_| "Moved into the new vault.".to_string(),
+                    );
+                }),
             )),
         ));
     }
@@ -227,7 +277,8 @@ fn panel_body(strategy: &'static Strategy, holdings: &Holdings, slug: &str) -> D
     ui::card_titled("Your position", None, children)
 }
 
-fn claim_card(claim: &wallet::Claim) -> Dom {
+fn claim_card(claim: &shared::HeldClaim, slug: &str) -> Dom {
+    let slug = slug.to_string();
     let id = claim.id;
     let state = claim.state;
     let steps = [
@@ -271,7 +322,7 @@ fn claim_card(claim: &wallet::Claim) -> Dom {
             ),
             (
                 "Fraction of the vault closed for it".to_string(),
-                ui::number(&fmt::percent(claim.fraction, 2)),
+                ui::number(&fmt::percent(claim.fraction_closed, 2)),
             ),
         ]),
         html!("ol", { .class("steps").children(items) }),
@@ -283,12 +334,9 @@ fn claim_card(claim: &wallet::Claim) -> Dom {
             "Paid",
             &format!(
                 "{} reached your balance, valued at exit-side marks once the cash was home.",
-                fmt::money_exact(claim.paid.unwrap_or_default())
+                fmt::money_exact(claim.settled_for.unwrap_or_default())
             ),
         ));
-        children.push(shell::button("Clear", false, move || {
-            wallet::clear_claim(id);
-        }));
     } else {
         children.push(ui::note(
             "Anyone can send the next transaction. Your shares stay outstanding until the last \
@@ -297,15 +345,15 @@ fn claim_card(claim: &wallet::Claim) -> Dom {
         children.push(shell::button(
             "Send the next settle transaction",
             true,
-            move || match wallet::settle(id) {
-                Some(ClaimState::Paid) => {
-                    state::notify("Claim settled and paid.", Tone::Ok);
-                }
-                Some(state) => {
-                    state::notify(format!("Claim is now {}.", state.label()), Tone::Ok);
-                }
-                None => {}
-            },
+            clone!(slug => move || {
+                act(
+                    {
+                        let slug = slug.clone();
+                        async move { wallet::settle(&slug, id).await }
+                    },
+                    |_| "Settlement sent. The claim pays once the close has filled.".to_string(),
+                );
+            }),
         ));
     }
 
@@ -325,9 +373,10 @@ fn claim_card(claim: &wallet::Claim) -> Dom {
 
 // ------------------------------------------------------------- the modals
 
-fn deposit_modal(strategy: &'static Strategy) -> Dom {
+fn deposit_modal(strategy: &Rc<Strategy>) -> Dom {
     let open = Mutable::new(false);
     let slug = strategy.slug.clone();
+    let held = strategy.clone();
 
     // The one modal follows whichever vault asked for it.
     let watcher = depositing()
@@ -339,8 +388,8 @@ fn deposit_modal(strategy: &'static Strategy) -> Dom {
 
     html!("div", {
         .future(watcher)
-        .child(modal(&open, "Deposit", false, move || {
-            let vault = &strategy.vault;
+        .child(modal(&open, "Deposit", false, clone!(held => move || {
+            let vault = &held.vault;
             let balance = wallet::holdings().lock_ref().balance;
 
             vec![
@@ -350,13 +399,13 @@ fn deposit_modal(strategy: &'static Strategy) -> Dom {
                     form::amount(amount(), &vault.asset, balance),
                 ),
                 html!("div", {
-                    .child_signal(amount().signal_cloned().map(move |value| {
-                        let quote = wallet::quote_deposit(vault, form::parse_amount(&value));
+                    .child_signal(amount().signal_cloned().map(clone!(held => move |value| {
+                        let quote = wallet::quote_deposit(&held.vault, form::parse_amount(&value));
                         Some(ui::kv_rows(vec![
                             (
                                 format!(
                                     "Transaction fee ({}), kept in the pool",
-                                    wallet::transaction_fee_label(vault)
+                                    wallet::transaction_fee_label(&held.vault)
                                 ),
                                 ui::number(&fmt::money_exact(quote.fee)),
                             ),
@@ -372,7 +421,7 @@ fn deposit_modal(strategy: &'static Strategy) -> Dom {
                                 ui::number(&fmt::number(quote.shares, 2)),
                             ),
                         ]))
-                    }))
+                    })))
                 }),
                 ui::note(
                     "The contract computes the vault's value from on-chain state in the same \
@@ -380,33 +429,33 @@ fn deposit_modal(strategy: &'static Strategy) -> Dom {
                 ),
                 modal_actions(vec![
                     shell::button("Cancel", false, || depositing().set(None)),
-                    shell::button("Deposit", true, move || {
+                    shell::button("Deposit", true, clone!(slug => move || {
                         let value = form::parse_amount(&amount().get_cloned());
-                        match wallet::deposit(&strategy.slug, value) {
-                            Ok(quote) => {
-                                depositing().set(None);
-                                state::notify(
-                                    format!(
-                                        "Deposited {}. {} shares minted at {}.",
-                                        fmt::money_exact(quote.assets),
-                                        fmt::number(quote.shares, 2),
-                                        fmt::share_price(quote.share_price)
-                                    ),
-                                    Tone::Ok,
-                                );
-                            }
-                            Err(problem) => state::notify(problem, Tone::Warn),
-                        }
-                    }),
+                        depositing().set(None);
+                        act(
+                            {
+                                let slug = slug.clone();
+                                async move { wallet::deposit(&slug, value).await }
+                            },
+                            move |_| {
+                                format!(
+                                    "Deposited {}. Shares were minted at the value the contract \
+                                     computed in the same transaction.",
+                                    fmt::money_exact(value)
+                                )
+                            },
+                        );
+                    })),
                 ]),
             ]
-        }))
+        })))
     })
 }
 
-fn withdraw_modal(strategy: &'static Strategy) -> Dom {
+fn withdraw_modal(strategy: &Rc<Strategy>) -> Dom {
     let open = Mutable::new(false);
     let slug = strategy.slug.clone();
+    let held = strategy.clone();
 
     let watcher = withdrawing()
         .signal_cloned()
@@ -417,22 +466,21 @@ fn withdraw_modal(strategy: &'static Strategy) -> Dom {
 
     html!("div", {
         .future(watcher)
-        .child(modal(&open, "Withdraw", false, move || {
-            let vault = &strategy.vault;
-            let held = wallet::holdings()
+        .child(modal(&open, "Withdraw", false, clone!(held, slug => move || {
+            let shares = wallet::holdings()
                 .lock_ref()
-                .position(&strategy.slug)
+                .position(&slug)
                 .map_or(0.0, |position| position.shares);
 
             vec![
                 form::field(
                     "Shares",
-                    Some(&format!("You hold {}", fmt::number(held, 2))),
-                    form::amount(amount(), "shares", held),
+                    Some(&format!("You hold {}", fmt::number(shares, 2))),
+                    form::amount(amount(), "shares", shares),
                 ),
                 html!("div", {
-                    .child_signal(amount().signal_cloned().map(move |value| {
-                        let quote = wallet::quote_withdraw(vault, form::parse_amount(&value));
+                    .child_signal(amount().signal_cloned().map(clone!(held => move |value| {
+                        let quote = wallet::quote_withdraw(&held.vault, form::parse_amount(&value));
                         Some(html!("div", {
                             .class("stack-sm")
                             .child(ui::kv_rows(vec![
@@ -446,7 +494,7 @@ fn withdraw_modal(strategy: &'static Strategy) -> Dom {
                                 (
                                     format!(
                                         "Transaction fee ({}), kept in the pool",
-                                        wallet::transaction_fee_label(vault)
+                                        wallet::transaction_fee_label(&held.vault)
                                     ),
                                     ui::number(&fmt::money_exact(quote.fee)),
                                 ),
@@ -463,7 +511,7 @@ fn withdraw_modal(strategy: &'static Strategy) -> Dom {
                                         "It is more than the vault's idle balance of {}, so your shares are pending while \
                                          the contract closes your fraction of every position. Once the \
                                          cash is home you are paid.",
-                                        fmt::money(vault.idle)
+                                        fmt::money(held.vault.idle)
                                     ),
                                 )
                             } else {
@@ -473,41 +521,36 @@ fn withdraw_modal(strategy: &'static Strategy) -> Dom {
                                     &format!(
                                         "The vault's idle balance of {} covers it, so the shares \
                                          are burned and you are paid in the same transaction.",
-                                        fmt::money(vault.idle)
+                                        fmt::money(held.vault.idle)
                                     ),
                                 )
                             })
                         }))
-                    }))
+                    })))
                 }),
                 ui::note(
                     "Valued at exit-side marks, so the leaver pays the spread rather than the pool.",
                 ),
                 modal_actions(vec![
                     shell::button("Cancel", false, || withdrawing().set(None)),
-                    shell::button("Withdraw", true, move || {
+                    shell::button("Withdraw", true, clone!(slug => move || {
                         let value = form::parse_amount(&amount().get_cloned());
-                        match wallet::withdraw(&strategy.slug, value) {
-                            Ok(quote) if quote.books_claim => {
-                                withdrawing().set(None);
-                                state::notify(
-                                    "Claim booked. Your shares are pending until it settles.",
-                                    Tone::Warn,
-                                );
-                            }
-                            Ok(quote) => {
-                                withdrawing().set(None);
-                                state::notify(
-                                    format!("Paid {}.", fmt::money_exact(quote.assets)),
-                                    Tone::Ok,
-                                );
-                            }
-                            Err(problem) => state::notify(problem, Tone::Warn),
-                        }
-                    }),
+                        withdrawing().set(None);
+                        act(
+                            {
+                                let slug = slug.clone();
+                                async move { wallet::withdraw(&slug, value).await }
+                            },
+                            |_| {
+                                "Sent. The contract pays from its idle balance if it covers it, \
+                                 and books a claim if it does not."
+                                    .to_string()
+                            },
+                        );
+                    })),
                 ]),
             ]
-        }))
+        })))
     })
 }
 

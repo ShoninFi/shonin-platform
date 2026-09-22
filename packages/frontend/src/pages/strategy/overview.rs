@@ -2,6 +2,8 @@
 //! review found, where the money sits, who is stopping it leaving, and how
 //! they would get it back.
 
+use std::rc::Rc;
+
 use dominator::{Dom, html, text};
 use shared::{ExitClass, Strategy, Valuation};
 
@@ -14,7 +16,7 @@ use crate::ui::primitives as ui;
 use crate::ui::primitives::Tone;
 use crate::ui::table::{Column, Row, table};
 
-pub fn render(strategy: &'static Strategy) -> Dom {
+pub fn render(strategy: &Rc<Strategy>) -> Dom {
     html!("div", {
         .class(["grid", "grid--aside"])
         .child(html!("div", {
@@ -33,7 +35,7 @@ pub fn render(strategy: &'static Strategy) -> Dom {
     })
 }
 
-fn what_it_does(strategy: &'static Strategy) -> Dom {
+fn what_it_does(strategy: &Rc<Strategy>) -> Dom {
     ui::section(
         "What it does",
         vec![
@@ -48,7 +50,7 @@ fn what_it_does(strategy: &'static Strategy) -> Dom {
     )
 }
 
-fn record(strategy: &'static Strategy) -> Dom {
+fn record(strategy: &Rc<Strategy>) -> Dom {
     let Some(record) = &strategy.record else {
         return ui::section(
             "The record",
@@ -98,7 +100,7 @@ fn record(strategy: &'static Strategy) -> Dom {
     )
 }
 
-fn review(strategy: &'static Strategy) -> Dom {
+fn review(strategy: &Rc<Strategy>) -> Dom {
     let Some(review) = &strategy.review else {
         return ui::section(
             "The review",
@@ -159,7 +161,7 @@ fn review(strategy: &'static Strategy) -> Dom {
     )
 }
 
-fn where_the_money_is(strategy: &'static Strategy) -> Dom {
+fn where_the_money_is(strategy: &Rc<Strategy>) -> Dom {
     if strategy.legs.is_empty() {
         return ui::section(
             "Where the money is",
@@ -258,7 +260,7 @@ fn valuation_detail(valuation: &Valuation) -> String {
     }
 }
 
-fn leaving(strategy: &'static Strategy) -> Dom {
+fn leaving(strategy: &Rc<Strategy>) -> Dom {
     let vault = &strategy.vault;
 
     let mut children = vec![
@@ -303,7 +305,7 @@ fn leaving(strategy: &'static Strategy) -> Dom {
     ui::section("Leaving", children)
 }
 
-fn limits(strategy: &'static Strategy) -> Dom {
+fn limits(strategy: &Rc<Strategy>) -> Dom {
     if strategy.limits.is_empty() && strategy.dependencies.is_empty() {
         return html!("span");
     }
@@ -324,7 +326,7 @@ fn limits(strategy: &'static Strategy) -> Dom {
     ui::section("What it will not do", children)
 }
 
-fn aside(strategy: &'static Strategy) -> Vec<Dom> {
+fn aside(strategy: &Rc<Strategy>) -> Vec<Dom> {
     let vault = &strategy.vault;
 
     let mut cards = vec![
@@ -455,7 +457,10 @@ fn aside(strategy: &'static Strategy) -> Vec<Dom> {
             (
                 "Executors".to_string(),
                 ui::value(&match &strategy.attestation {
-                    Some(attestation) => format!("{} blessed keys", attestation.keys.len()),
+                    Some(attestation) => {
+                        let keys = attestation.keys.len();
+                        format!("{keys} blessed key{}", if keys == 1 { "" } else { "s" })
+                    }
                     None => "none running".to_string(),
                 }),
             ),

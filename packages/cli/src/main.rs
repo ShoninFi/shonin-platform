@@ -39,6 +39,12 @@ enum Command {
         #[arg(long)]
         sealed: bool,
     },
+    /// Pack a project the way the build service unpacks it, and write the
+    /// archive to standard output.
+    Pack {
+        /// The directory holding the strategy and its manifest.
+        project: PathBuf,
+    },
     /// Say who you are. Nothing depends on it.
     Author {
         #[arg(long)]
@@ -70,6 +76,15 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // Packing needs nothing but the files, so it does not wait for a chain.
+    if let Command::Pack { project } = &args.command {
+        use std::io::Write;
+        let archive = shonin_cli::pack(project)?;
+        std::io::stdout().write_all(&archive)?;
+        return Ok(());
+    }
+
     let chain = Client::connect(&args.rpc_url).await?;
     let deployments = chain
         .deployments(&args.deployments)
@@ -101,6 +116,7 @@ async fn main() -> Result<()> {
                 other => println!("the build is {}", other.label()),
             }
         }
+        Command::Pack { .. } => unreachable!("handled before the chain is needed"),
         Command::Author { handle, blurb } => {
             let author = chain.account(Role::Author)?;
             chain

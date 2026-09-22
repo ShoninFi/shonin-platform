@@ -141,10 +141,16 @@ async fn serve(
     let signer = key_for(vault);
     let key = chain.with_key(signer)?;
 
+    // A fresh key has no gas of its own, and it pays for its own blessing
+    // from here on: one account per vault, so two vaults never reach for the
+    // same next nonce.
+    health::fund_gas(&chain, &deployments, key.address).await?;
+
     let info = chain::attest::bless_for_vault(
         &chain,
         &deployments,
         "executor",
+        key.address,
         key.address,
         vault,
         bundle,
@@ -153,47 +159,42 @@ async fn serve(
     tracing::info!(vault = %vault, key = %key.address, until = info.blessedUntil, "blessed");
 
     // Anyone may send this; the contract obeys only what the registry says.
-    chain
-        .send(
-            deployments.roles.executor,
-            vault,
-            IVault::approveKeyCall {
-                venue: chain::accounts::VENUE_ID,
-                key: key.address,
-            },
-        )
-        .await
-        .context("the vault would not approve the key")?;
-
-    // A fresh key has no gas of its own.
-    health::fund_gas(&chain, &deployments, key.address).await?;
+    key.send(
+        vault,
+        IVault::approveKeyCall {
+            venue: chain::accounts::VENUE_ID,
+            key: key.address,
+        },
+    )
+    .await
+    .context("the vault would not approve the key")?;
 
     // Keep it blessed, and keep the venue's approval following the blessing:
     // a key that stopped attesting stops being able to trade.
-    let renewing = chain.clone();
-    let renewed_for = deployments.clone();
+    let approving = key.clone();
     chain::attest::keep_blessed(
         chain.clone(),
         deployments.clone(),
         "executor",
         key.address,
+        key.address,
         vault,
         bundle,
         move || {
-            let chain = renewing.clone();
-            let deployments = renewed_for.clone();
-            let signer = key.address;
+            let key = approving.clone();
             tokio::spawn(async move {
-                let _ = chain
+                if let Err(error) = key
                     .send(
-                        deployments.roles.executor,
                         vault,
                         IVault::approveKeyCall {
                             venue: chain::accounts::VENUE_ID,
-                            key: signer,
+                            key: key.address,
                         },
                     )
-                    .await;
+                    .await
+                {
+                    tracing::warn!(%vault, %error, "the venue's approval did not follow");
+                }
             });
         },
     );

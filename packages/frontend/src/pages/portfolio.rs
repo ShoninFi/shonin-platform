@@ -1,6 +1,8 @@
 //! What the viewer holds: positions across vaults, claims waiting to settle,
 //! and how correlated any of it is.
 
+use std::rc::Rc;
+
 use dominator::{Dom, html, text};
 use futures_signals::signal::SignalExt;
 use shared::Strategy;
@@ -24,7 +26,7 @@ pub fn render() -> Dom {
             .child(html!("p", {
                 .class("lede")
                 .text(
-                    "What you hold across vaults. It is kept in this browser and nowhere else."
+                    "What you hold across vaults, read from each vault's own contract."
                 )
             }))
         }))
@@ -55,16 +57,13 @@ fn disconnected() -> Dom {
 }
 
 fn connected(holdings: &Holdings) -> Dom {
-    let held: Vec<(&'static Strategy, f64, f64)> = holdings
+    let held: Vec<(Rc<Strategy>, f64, f64)> = holdings
         .positions
         .iter()
         .filter_map(|position| {
             let strategy = data::strategy(&position.slug)?;
-            Some((
-                strategy,
-                position.shares * strategy.vault.share_price,
-                position.cost,
-            ))
+            let value = position.shares * strategy.vault.share_price;
+            Some((strategy, value, position.cost))
         })
         .collect();
 
@@ -92,17 +91,16 @@ fn wallet_card(holdings: &Holdings) -> Dom {
             .class(["row", "row--wrap"])
             .child(shell::button("Disconnect", false, || {
                 wallet::disconnect();
-                state::notify("Disconnected. Your positions are still here.", Tone::Ok);
-            }))
-            .child(shell::button("Start again", false, || {
-                wallet::reset();
-                state::notify("Cleared: no wallet, no positions, no claims.", Tone::Ok);
+                state::notify(
+                    "Disconnected. What you hold is on the chain, and still there.",
+                    Tone::Ok,
+                );
             }))
         }))
     })])
 }
 
-fn positions(holdings: &Holdings, held: &[(&'static Strategy, f64, f64)]) -> Dom {
+fn positions(holdings: &Holdings, held: &[(Rc<Strategy>, f64, f64)]) -> Dom {
     if held.is_empty() {
         return ui::section("Positions", vec![ui::empty("You hold nothing yet.")]);
     }
@@ -175,7 +173,7 @@ fn claims(holdings: &Holdings) -> Dom {
                     .class(["row", "row--between", "row--wrap"])
                     .child(html!("a", {
                         .class("table__primary")
-                        .attr("href", &parts::path_of(strategy))
+                        .attr("href", &parts::path_of(&strategy))
                         .text(&strategy.name())
                     }))
                     .child(ui::badge(
@@ -194,17 +192,17 @@ fn claims(holdings: &Holdings) -> Dom {
                     ),
                     (
                         "Fraction of the vault closed".to_string(),
-                        ui::number(&fmt::percent(claim.fraction, 2)),
+                        ui::number(&fmt::percent(claim.fraction_closed, 2)),
                     ),
                     (
                         "Paid".to_string(),
-                        match claim.paid {
+                        match claim.settled_for {
                             Some(paid) => ui::number(&fmt::money_exact(paid)),
                             None => ui::muted("not yet"),
                         },
                     ),
                 ]),
-                ui::action_link(&parts::path_of(strategy), "Drive the settlement"),
+                ui::action_link(&parts::path_of(&strategy), "Drive the settlement"),
             ]))
         })
         .collect();
@@ -221,12 +219,12 @@ fn claims(holdings: &Holdings) -> Dom {
     )
 }
 
-fn correlations(held: &[(&'static Strategy, f64, f64)]) -> Dom {
+fn correlations(held: &[(Rc<Strategy>, f64, f64)]) -> Dom {
     if held.is_empty() {
         return html!("span");
     }
 
-    let series = |strategy: &'static Strategy| {
+    let series = |strategy: &Strategy| {
         strategy
             .record
             .as_ref()
@@ -239,8 +237,8 @@ fn correlations(held: &[(&'static Strategy, f64, f64)]) -> Dom {
     for (strategy, _, _) in held {
         columns.push(Column::num(strategy.name()));
     }
-    for (name, _) in benchmarks {
-        columns.push(Column::num(*name));
+    for benchmark in &benchmarks {
+        columns.push(Column::num(benchmark.label.clone()));
     }
 
     let rows: Vec<Row> = held
@@ -253,12 +251,12 @@ fn correlations(held: &[(&'static Strategy, f64, f64)]) -> Dom {
             })];
 
             for (other, _, _) in held {
-                let value = data::series::correlation(&own, &series(other));
+                let value = data::correlation(&own, &series(other));
                 cells.push(correlation_cell(value, strategy.slug == other.slug));
             }
-            for (_, points) in benchmarks {
+            for benchmark in &benchmarks {
                 cells.push(correlation_cell(
-                    data::series::correlation(&own, points),
+                    data::correlation(&own, &benchmark.series),
                     false,
                 ));
             }
@@ -276,7 +274,7 @@ fn correlations(held: &[(&'static Strategy, f64, f64)]) -> Dom {
                     (
                         a.name(),
                         b.name(),
-                        data::series::correlation(&series(a), &series(b)),
+                        data::correlation(&series(a), &series(b)),
                     )
                 })
         })

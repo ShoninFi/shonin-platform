@@ -1,6 +1,8 @@
 //! The on-chain record: what the vault is worth day by day, what it gave back
 //! along the way, and every trade and contract event behind it.
 
+use std::rc::Rc;
+
 use std::sync::OnceLock;
 
 use dominator::{Dom, html};
@@ -41,7 +43,11 @@ fn listing() -> &'static Mutable<Listing> {
     LISTING.get_or_init(|| Mutable::new(Listing::Trades))
 }
 
-pub fn render(strategy: &'static Strategy) -> Dom {
+pub fn render(strategy: &Rc<Strategy>) -> Dom {
+    // Handles the charts' own signals can keep, rather than borrows of
+    // whatever the page happened to be showing when it was built.
+    let held = strategy.clone();
+    let shown = strategy.clone();
     let Some(record) = &strategy.record else {
         return ui::empty("This strategy never traded, so there is no record.");
     };
@@ -65,7 +71,7 @@ pub fn render(strategy: &'static Strategy) -> Dom {
             vec![html!("div", {
                 .child_signal(map_ref! {
                     let line = line().signal() => {
-                        Some(main_chart(strategy, *line))
+                        Some(main_chart(&held, *line))
                     }
                 })
             })],
@@ -89,8 +95,8 @@ pub fn render(strategy: &'static Strategy) -> Dom {
                 .child_signal(map_ref! {
                     let listing = listing().signal() => {
                         Some(match listing {
-                            Listing::Trades => trades(strategy),
-                            Listing::Events => events(strategy),
+                            Listing::Trades => trades(&shown),
+                            Listing::Events => events(&shown),
                         })
                     }
                 })
@@ -99,7 +105,7 @@ pub fn render(strategy: &'static Strategy) -> Dom {
     })
 }
 
-fn summary(strategy: &'static Strategy) -> Dom {
+fn summary(strategy: &Rc<Strategy>) -> Dom {
     let performance = data::performance(strategy);
     let record = strategy.record.as_ref().expect("checked by the caller");
 
@@ -136,7 +142,7 @@ fn summary(strategy: &'static Strategy) -> Dom {
     ])
 }
 
-fn main_chart(strategy: &'static Strategy, line: Line) -> Dom {
+fn main_chart(strategy: &Rc<Strategy>, line: Line) -> Dom {
     let record = strategy.record.as_ref().expect("checked by the caller");
 
     match line {
@@ -177,7 +183,7 @@ fn main_chart(strategy: &'static Strategy, line: Line) -> Dom {
     }
 }
 
-fn trades(strategy: &'static Strategy) -> Dom {
+fn trades(strategy: &Rc<Strategy>) -> Dom {
     if strategy.trades.is_empty() {
         return ui::empty("No trades yet.");
     }
@@ -229,7 +235,7 @@ fn trades(strategy: &'static Strategy) -> Dom {
     })
 }
 
-fn events(strategy: &'static Strategy) -> Dom {
+fn events(strategy: &Rc<Strategy>) -> Dom {
     if strategy.events.is_empty() {
         return ui::empty("No events yet.");
     }

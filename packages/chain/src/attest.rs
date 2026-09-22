@@ -34,32 +34,48 @@ pub fn project_id() -> B256 {
 
 /// Bless a key that serves every strategy and no particular vault: a build
 /// service, or a reviewer.
+///
+/// The key sends its own blessing. Anyone may send one — the proof is what
+/// the registry checks — but having each key send its own keeps two services
+/// from reaching for the same account's next nonce at the same moment.
 pub async fn bless_service(
     chain: &Client,
     deployments: &Deployments,
     service: &str,
     key: Address,
 ) -> Result<KeyInfo> {
-    bless(chain, deployments, service, key, Address::ZERO, B256::ZERO).await
+    bless(
+        chain,
+        deployments,
+        service,
+        key,
+        key,
+        Address::ZERO,
+        B256::ZERO,
+    )
+    .await
 }
 
-/// Bless a key for one vault running one bundle.
+/// Bless a key for one vault running one bundle, sent by `sender`.
 pub async fn bless_for_vault(
     chain: &Client,
     deployments: &Deployments,
     service: &str,
     key: Address,
+    sender: Address,
     vault: Address,
     bundle: B256,
 ) -> Result<KeyInfo> {
-    bless(chain, deployments, service, key, vault, bundle).await
+    bless(chain, deployments, service, key, sender, vault, bundle).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn bless(
     chain: &Client,
     deployments: &Deployments,
     service: &str,
     key: Address,
+    sender: Address,
     vault: Address,
     bundle: B256,
 ) -> Result<KeyInfo> {
@@ -94,7 +110,7 @@ async fn bless(
         if allowed {
             chain
                 .send(
-                    deployments.roles.executor,
+                    sender,
                     deployments.attestation,
                     IAttestationRegistry::blessCall {
                         seal: seal.clone(),
@@ -134,11 +150,13 @@ async fn bless(
 /// one — which is the point: an instance that stops attesting stops being
 /// able to act. So an instance that is still running attests again well
 /// before its blessing runs out.
+#[allow(clippy::too_many_arguments)]
 pub fn keep_blessed(
     chain: Client,
     deployments: Deployments,
     service: &'static str,
     key: Address,
+    sender: Address,
     vault: Address,
     bundle: B256,
     mut on_renewal: impl FnMut() + Send + 'static,
@@ -168,9 +186,11 @@ pub fn keep_blessed(
                 .unwrap_or(0);
 
             if left * 3 <= ttl {
-                match bless(&chain, &deployments, service, key, vault, bundle).await {
+                match bless(&chain, &deployments, service, key, sender, vault, bundle).await {
                     Ok(_) => on_renewal(),
-                    Err(error) => tracing::debug!(service, %error, "could not renew a blessing"),
+                    // A key that stops being blessed stops being able to act,
+                    // so this is never a quiet failure.
+                    Err(error) => tracing::warn!(service, %error, "could not renew a blessing"),
                 }
             }
 

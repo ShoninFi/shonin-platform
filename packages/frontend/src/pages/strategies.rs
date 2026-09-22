@@ -1,6 +1,7 @@
 //! The leaderboard: every strategy with a vault, and the rules the list is
 //! built by.
 
+use std::rc::Rc;
 use std::sync::OnceLock;
 
 use dominator::{Dom, html};
@@ -191,7 +192,7 @@ fn listing(
     exit: &str,
 ) -> Dom {
     let controls = controls();
-    let mut strategies: Vec<&'static Strategy> = match view {
+    let mut strategies: Vec<Rc<Strategy>> = match view {
         View::Ranked => data::ranked(),
         View::New => data::newest(),
         View::Past => data::past(),
@@ -224,7 +225,7 @@ fn listing(
     let rows: Vec<Row> = strategies
         .into_iter()
         .enumerate()
-        .map(|(index, strategy)| row(index, strategy, ranked))
+        .map(|(index, strategy)| row(index, &strategy, ranked))
         .collect();
 
     let mut columns: Vec<Column> = Vec::new();
@@ -257,7 +258,7 @@ fn listing(
     })
 }
 
-fn row(index: usize, strategy: &'static Strategy, ranked: bool) -> Row {
+fn row(index: usize, strategy: &Strategy, ranked: bool) -> Row {
     let performance = data::performance(strategy);
     let average = strategy
         .record
@@ -293,7 +294,7 @@ fn row(index: usize, strategy: &'static Strategy, ranked: bool) -> Row {
     Row::linked(parts::path_of(strategy), cells)
 }
 
-fn past_table(strategies: Vec<&'static Strategy>) -> Dom {
+fn past_table(strategies: Vec<Rc<Strategy>>) -> Dom {
     if strategies.is_empty() {
         return ui::empty("Nothing has been superseded or stopped yet.");
     }
@@ -301,16 +302,16 @@ fn past_table(strategies: Vec<&'static Strategy>) -> Dom {
     let rows: Vec<Row> = strategies
         .into_iter()
         .map(|strategy| {
-            let performance = data::performance(strategy);
+            let performance = data::performance(&strategy);
             Row::linked(
-                parts::path_of(strategy),
+                parts::path_of(&strategy),
                 vec![
                     html!("span", { .class("table__primary").text(&strategy.name()) }),
                     ui::muted(&strategy.author),
                     parts::standing_badge(strategy.standing),
                     ui::number(&fmt::days(strategy.days_live)),
                     ui::number(&fmt::percent_signed(performance.total_return, 1)),
-                    ui::muted(&reason(strategy)),
+                    ui::muted(&reason(&strategy)),
                 ],
             )
         })

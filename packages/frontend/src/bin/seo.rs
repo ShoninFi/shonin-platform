@@ -2,7 +2,7 @@
 //! `trunk build`:
 //!
 //! ```text
-//! seo --dist .trunk-dist/frontend --base-url https://shonin.fi
+//! seo --dist .trunk-dist/frontend --base-url https://shonin.fi [--api http://localhost:19081]
 //! ```
 //!
 //! The app is a wasm single-page app, so the HTML Trunk writes has no content
@@ -19,6 +19,11 @@
 //!   page directly would answer 404 before the app could render it.
 //! - `sitemap.xml`, listing every indexable route.
 //! - `robots.txt`, pointing at the sitemap.
+//!
+//! With `--api`, it reads one snapshot from a running platform first, so every
+//! strategy, author and build has a page written for it. Without it, only the
+//! pages that need no data are written: a build should not depend on a service
+//! being up, and a page of nothing would be worse than no page at all.
 //!
 //! Files are flat (`about.html`, not `about/index.html`): Workers static
 //! assets serve them at `/about` with no trailing-slash redirect, which is
@@ -38,8 +43,23 @@ const HEAD_END: &str = "<!-- /seo:head -->";
 const BODY: &str = "<!-- seo:body -->";
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let (dist, base_url) = parse_args()?;
+    let (dist, base_url, api) = parse_args()?;
     let base = base_url.trim_end_matches('/');
+
+    // One snapshot, so every page written below is written from the same
+    // moment, exactly as the app renders it.
+    if let Some(api) = &api {
+        let snapshot = frontend::api::fetch_snapshot(api)?;
+        println!(
+            "read {} strategies, {} builds and {} authors from {api}",
+            snapshot.strategies.len(),
+            snapshot.jobs.len(),
+            snapshot.authors.len()
+        );
+        frontend::data::set(snapshot);
+    } else {
+        println!("no --api: writing only the pages that need no data");
+    }
 
     let shell = fs::read_to_string(dist.join("index.html")).map_err(|e| {
         format!(
@@ -99,20 +119,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn parse_args() -> Result<(PathBuf, String), Box<dyn Error>> {
+fn parse_args() -> Result<(PathBuf, String, Option<String>), Box<dyn Error>> {
     let mut dist = None;
     let mut base_url = None;
+    let mut api = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dist" => dist = args.next().map(PathBuf::from),
             "--base-url" => base_url = args.next(),
+            "--api" => api = args.next().filter(|url| !url.is_empty()),
             other => return Err(format!("unknown argument `{other}`").into()),
         }
     }
     match (dist, base_url) {
-        (Some(dist), Some(base_url)) => Ok((dist, base_url)),
-        _ => Err("usage: seo --dist <dir> --base-url <url>".into()),
+        (Some(dist), Some(base_url)) => Ok((dist, base_url, api)),
+        _ => Err("usage: seo --dist <dir> --base-url <url> [--api <url>]".into()),
     }
 }
 

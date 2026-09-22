@@ -114,6 +114,10 @@ pub struct Holding {
     pub value: f64,
     /// What they would fetch on the way out, after the spread and the fee.
     pub exit_value: f64,
+    /// What was paid for them, read from the vault's own deposits and
+    /// withdrawals, so a profit or loss is the chain's arithmetic rather than
+    /// something the browser remembered.
+    pub cost: f64,
 }
 
 /// A claim this address is waiting on.

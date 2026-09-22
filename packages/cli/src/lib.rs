@@ -3,4 +3,4 @@
 
 pub mod publish;
 
-pub use publish::{Published, publish};
+pub use publish::{Published, pack, publish};

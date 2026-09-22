@@ -213,7 +213,7 @@ fn home() -> String {
         .into_iter()
         .take(5)
         .map(|strategy| {
-            let performance = performance(strategy);
+            let performance = performance(&strategy);
             vec![
                 link(&format!("/strategies/{}", strategy.slug), &strategy.name()),
                 esc(&strategy.author),
@@ -316,11 +316,11 @@ fn strategies() -> String {
         "Capital",
     ];
 
-    let ranked_rows: Vec<Vec<String>> = ranked().into_iter().map(row).collect();
+    let ranked_rows: Vec<Vec<String>> = ranked().iter().map(|strategy| row(strategy)).collect();
     let new_rows: Vec<Vec<String>> = data::vaults()
-        .into_iter()
+        .iter()
         .filter(|strategy| strategy.standing == Standing::New)
-        .map(row)
+        .map(|strategy| row(strategy))
         .collect();
     let rest_rows: Vec<Vec<String>> = data::vaults()
         .into_iter()
@@ -405,12 +405,12 @@ fn strategy(slug: &str, tab: Tab) -> String {
     );
 
     let content = match tab {
-        Tab::Overview => strategy_overview(strategy),
-        Tab::Record => strategy_record(strategy),
-        Tab::Code => strategy_code(strategy),
-        Tab::Review => strategy_review(strategy),
-        Tab::Verify => strategy_verify(strategy),
-        Tab::Health => strategy_health(strategy),
+        Tab::Overview => strategy_overview(&strategy),
+        Tab::Record => strategy_record(&strategy),
+        Tab::Code => strategy_code(&strategy),
+        Tab::Review => strategy_review(&strategy),
+        Tab::Verify => strategy_verify(&strategy),
+        Tab::Health => strategy_health(&strategy),
     };
 
     format!("{header}{content}")
@@ -1148,15 +1148,14 @@ fn portfolio() -> String {
             "What you hold across vaults, with your pending claims and how correlated your \
              holdings are with each other.",
         ),
-        para("This page is built in your browser from your own wallet, so there is nothing to show until you connect one."),
+        para("This page shows what one address holds, read from the chain, so there is nothing to show until you connect a wallet."),
         para_link("/strategies", "Browse the strategies"),
     ]
     .concat()
 }
 
 fn queue() -> String {
-    let rows: Vec<Vec<String>> = data::get()
-        .jobs
+    let rows: Vec<Vec<String>> = data::jobs()
         .iter()
         .map(|job| {
             vec![
@@ -1286,8 +1285,7 @@ fn publish() -> String {
 }
 
 fn status() -> String {
-    let items: String = data::get()
-        .feed
+    let items: String = data::feed()
         .iter()
         .map(|event| {
             let link_html = event
@@ -1450,10 +1448,15 @@ fn not_found() -> String {
 mod tests {
     use super::*;
 
+    fn platform() {
+        crate::fixture::install();
+    }
+
     /// Every route must pre-render something substantial: an empty page would
     /// be a page crawlers and readers without JavaScript see as blank.
     #[test]
     fn every_route_renders_a_real_page() {
+        platform();
         for route in Route::all_pages() {
             let html = body(&route);
             assert!(
@@ -1477,6 +1480,7 @@ mod tests {
     /// every link-preview bot — sees a different page from everyone else.
     #[test]
     fn a_strategys_pre_render_carries_the_same_facts() {
+        platform();
         for strategy in data::vaults() {
             let html = body(&Route::Strategy {
                 slug: strategy.slug.clone(),
@@ -1532,6 +1536,7 @@ mod tests {
     /// figure shown on one is the figure shown on the other.
     #[test]
     fn the_home_page_carries_the_platform_totals() {
+        platform();
         let html = body(&Route::Home);
         assert!(html.contains(&esc(copy::PITCH)));
         assert!(html.contains(&esc(&fmt::money_compact(data::total_vault_capital()))));
@@ -1549,6 +1554,7 @@ mod tests {
     /// carries the navigation and the footer.
     #[test]
     fn every_page_can_be_left_again() {
+        platform();
         for route in Route::indexable() {
             let html = body(&route);
             assert!(html.contains("class=\"mainnav\""), "{:?}", route.path());
@@ -1559,6 +1565,7 @@ mod tests {
 
     #[test]
     fn the_not_found_page_renders_too() {
+        platform();
         let html = body(&Route::NotFound);
         assert!(html.contains("Page not found"));
     }
@@ -1566,6 +1573,7 @@ mod tests {
     /// Nothing in the data escapes into the markup as HTML.
     #[test]
     fn text_from_the_data_is_escaped() {
+        platform();
         assert_eq!(
             esc("<script>a & b</script>"),
             "&lt;script&gt;a &amp; b&lt;/script&gt;"
