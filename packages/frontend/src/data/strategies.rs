@@ -7,10 +7,10 @@
 
 use shared::{
     Allowances, Approval, Attestation, Audit, AuditStatus, BlessedKey, Bundle, Chain, Claim,
-    ClaimState, ComponentPin, Connected, Custody, EventKind, ExitClass, ExitPath, Fees, Finding,
-    FindingCategory, Health, HealthEntry, HealthLevel, HealthSignal, Image, InTransit, KeyRole,
-    Kill, Leg, LogLine, ModelFile, Product, Review, Severity, Side, Source, SourceFile, Standing,
-    Strategy, Tank, Trade, Valuation, Vault, VaultEvent, VaultState, VenueStatus,
+    ClaimState, Custody, EventKind, ExitClass, ExitPath, Fees, Finding, FindingCategory, Health,
+    HealthEntry, HealthLevel, HealthSignal, Image, InTransit, KeyRole, Kill, Leg, LogLine,
+    ModelFile, Review, Severity, Side, Source, SourceFile, Standing, Strategy, Tank, Trade,
+    Valuation, Vault, VaultEvent, VaultState, VenueStatus,
 };
 use time::Duration;
 
@@ -65,18 +65,6 @@ fn playing() -> Allowances {
         streams: 6,
         inference_ms_per_min: 0,
         placement: "near solana".to_string(),
-    }
-}
-
-fn agentic() -> Allowances {
-    Allowances {
-        fuel_per_sec: 1_000_000,
-        memory_mib: 256,
-        requests_per_min: 120,
-        bytes_per_day: 20_000_000,
-        streams: 2,
-        inference_ms_per_min: 400,
-        placement: "any".to_string(),
     }
 }
 
@@ -136,8 +124,8 @@ fn stock_tokens(share: f64) -> Leg {
         last_resort: None,
         share_of_value: share,
         valuation: Valuation::OnChain {
-            source: "Chainlink per-token feeds, with the corporate-action multiplier already \
-                    applied; the lower of feed and market price when the feed is stale"
+            source: "Chainlink per-token feeds; the lower of feed and market when the feed is \
+                     stale"
                 .to_string(),
         },
         account: "a Safe owned by the vault contract".to_string(),
@@ -149,23 +137,22 @@ fn stock_tokens(share: f64) -> Leg {
         ],
         status: VenueStatus::Ok,
         note: Some(
-            "The cash market behind these tokens closes. While it is shut the feed holds its \
-             last price, so withdrawals are valued at the lower of the feed and the on-chain \
-             market and deposits at the higher."
+            "The cash market behind these tokens closes. While it is shut, withdrawals are \
+             valued at the lower of the feed and the on-chain market, deposits at the higher."
                 .to_string(),
         ),
     }
 }
 
-fn arcus_perps(share: f64, status: VenueStatus) -> Leg {
+fn arcus_perps(share: f64) -> Leg {
     Leg {
         venue: "Arcus".to_string(),
         chain: Chain::RobinhoodChain,
         custody: Custody::VenueEnforced,
         exit_path: ExitPath::Unwinder,
         last_resort: Some(
-            "The exchange's own emergency settlement. Its behaviour in normal operation isn't \
-             documented, so this vault says so rather than assuming it."
+            "The exchange's own emergency settlement, whose behaviour in normal operation isn't \
+             documented."
                 .to_string(),
         ),
         share_of_value: share,
@@ -182,19 +169,12 @@ fn arcus_perps(share: f64, status: VenueStatus) -> Leg {
             "Withdraw, which needs a separate key".to_string(),
             "Send anywhere but the owner's own address".to_string(),
         ],
-        status,
-        note: match status {
-            VenueStatus::Suspended => Some(
-                "Suspended: order rejections have been above a quarter of submissions for two \
-                 hours, and the venue's own status page reports degraded matching."
-                    .to_string(),
-            ),
-            VenueStatus::Ok => Some(
-                "Positions here can only be closed through the exchange's API, so a claim on \
-                 this leg is served by an unwinder rather than by the contract."
-                    .to_string(),
-            ),
-        },
+        status: VenueStatus::Ok,
+        note: Some(
+            "Positions here close only through the exchange's API, so a claim on this leg is \
+             served by an unwinder rather than by the contract."
+                .to_string(),
+        ),
     }
 }
 
@@ -230,39 +210,6 @@ fn arena_game(share: f64) -> Leg {
     }
 }
 
-fn broker_account(share: f64) -> Leg {
-    Leg {
-        venue: "Robinhood Agentic".to_string(),
-        chain: Chain::Solana,
-        custody: Custody::BrokerEnforced,
-        exit_path: ExitPath::Contract,
-        last_resort: None,
-        share_of_value: share,
-        valuation: Valuation::AttestedRead {
-            image: "an hourly read of the account inside the measured image, posted to the \
-                    account's entry"
-                .to_string(),
-        },
-        account: "the owner's own brokerage account".to_string(),
-        key: "a token the broker only lets trade".to_string(),
-        can: vec![
-            "Place orders in the owner's agentic account".to_string(),
-            "Read positions, balances and transfers".to_string(),
-        ],
-        cannot: vec![
-            "Withdraw funds".to_string(),
-            "Transfer, stake or lend".to_string(),
-            "Touch any other account the owner holds".to_string(),
-        ],
-        status: VenueStatus::Ok,
-        note: Some(
-            "The owner can revoke the token at the broker at any time, without the strategy's \
-             cooperation."
-                .to_string(),
-        ),
-    }
-}
-
 // ------------------------------------------------------------- the builder
 
 /// What makes a strategy itself. Everything else is derived.
@@ -280,7 +227,6 @@ struct Spec {
     exit_class: ExitClass,
     source: Source,
     allowances: Allowances,
-    components: Vec<(&'static str, &'static str, &'static str)>,
     models: Vec<ModelFile>,
     secrets: Vec<&'static str>,
     config: Vec<(&'static str, &'static str)>,
@@ -298,7 +244,6 @@ struct Spec {
     claims: Vec<Claim>,
     in_transit: Option<InTransit>,
     kill: Option<Kill>,
-    connected: Option<Connected>,
     markets: Vec<&'static str>,
 }
 
@@ -308,7 +253,6 @@ enum Project {
     Quoter,
     Catalyst,
     Arena,
-    Agent,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -316,7 +260,6 @@ enum HealthShape {
     Quiet,
     Busy,
     Warning,
-    Failing,
     None,
 }
 
@@ -340,7 +283,6 @@ impl Spec {
             exit_class: ExitClass::Direct,
             source: Source::Sealed,
             allowances: light(),
-            components: Vec::new(),
             models: Vec::new(),
             secrets: Vec::new(),
             config: Vec::new(),
@@ -356,7 +298,6 @@ impl Spec {
             claims: Vec::new(),
             in_transit: None,
             kill: None,
-            connected: None,
             markets: vec!["BTC-PERP"],
         }
     }
@@ -411,7 +352,6 @@ fn build(spec: Spec) -> Strategy {
             Project::Quoter => source::quoter_project(spec.id, &manifest),
             Project::Catalyst => source::catalyst_project(spec.id, &manifest),
             Project::Arena => source::arena_project(spec.id, &manifest),
-            Project::Agent => source::agent_project(spec.id, &manifest),
         },
     };
 
@@ -438,16 +378,6 @@ fn build(spec: Spec) -> Strategy {
         toolchain: "rust 1.98.0 · wasm32-wasip3 · cargo-component 0.24.1".to_string(),
         builder_image: sha256("builder-image"),
         models: spec.models.clone(),
-        components: spec
-            .components
-            .iter()
-            .map(|(slug, name, version)| ComponentPin {
-                slug: (*slug).to_string(),
-                name: (*name).to_string(),
-                version: (*version).to_string(),
-                hash: sha256(&format!("component-{slug}")),
-            })
-            .collect(),
         allowances: spec.allowances.clone(),
         secrets: spec.secrets.iter().map(|s| (*s).to_string()).collect(),
         config: spec
@@ -485,44 +415,40 @@ fn build(spec: Spec) -> Strategy {
         _ => value,
     };
 
-    let product = if let Some(connected) = spec.connected.clone() {
-        Product::Connected(connected)
-    } else {
-        Product::Vault(Box::new(Vault {
-            address: address(&format!("{slug}-vault")),
-            chain: spec.chain,
-            asset: spec.chain.asset().to_string(),
-            state: match spec.standing {
-                Standing::BuildFailed => VaultState::Closed,
-                Standing::Killed => VaultState::Killed,
-                Standing::Retired => VaultState::Closed,
-                _ => VaultState::Open,
-            },
-            created: registered,
-            value,
-            idle: value * spec.idle_share,
-            shares: if share_price > 0.0 {
-                value / share_price
-            } else {
-                0.0
-            },
-            share_price,
-            high_water_mark,
-            last_crystallised: as_of(),
-            fees: Fees::standard(),
-            tank: Tank {
-                balance: spec.daily_charge * 23.0,
-                daily_charge: spec.daily_charge,
-                target: spec.daily_charge * 30.0,
-                autofill_bps: 10_000,
-                debt: 0.0,
-            },
-            exit_class: spec.exit_class,
-            freeze_after_days: 7,
-            claims: spec.claims.clone(),
-            in_transit: spec.in_transit.clone(),
-            audits: audits(spec.chain),
-        }))
+    let vault = Vault {
+        address: address(&format!("{slug}-vault")),
+        chain: spec.chain,
+        asset: spec.chain.asset().to_string(),
+        state: match spec.standing {
+            Standing::BuildFailed => VaultState::Closed,
+            Standing::Killed => VaultState::Killed,
+            Standing::Retired => VaultState::Closed,
+            _ => VaultState::Open,
+        },
+        created: registered,
+        value,
+        idle: value * spec.idle_share,
+        shares: if share_price > 0.0 {
+            value / share_price
+        } else {
+            0.0
+        },
+        share_price,
+        high_water_mark,
+        last_crystallised: as_of(),
+        fees: Fees::standard(),
+        tank: Tank {
+            balance: spec.daily_charge * 23.0,
+            daily_charge: spec.daily_charge,
+            target: spec.daily_charge * 30.0,
+            autofill_bps: 10_000,
+            debt: 0.0,
+        },
+        exit_class: spec.exit_class,
+        freeze_after_days: 7,
+        claims: spec.claims.clone(),
+        in_transit: spec.in_transit.clone(),
+        audits: audits(spec.chain),
     };
 
     let attestation = (spec.standing != Standing::BuildFailed).then(|| attestation(&slug, &spec));
@@ -544,7 +470,7 @@ fn build(spec: Spec) -> Strategy {
         supersedes: spec.supersedes.map(str::to_string),
         superseded_by: spec.superseded_by.map(str::to_string),
         bundle,
-        product,
+        vault,
         legs: spec.legs.clone(),
         review: spec.review.clone(),
         past_reviews: Vec::new(),
@@ -564,8 +490,7 @@ fn venue_key(venue: &str) -> &'static str {
         "Hyperliquid" | "Hyperliquid spot" => "hyperliquid",
         "Arcus" => "robinhood-arcus",
         "Stock tokens" => "robinhood-chain",
-        "Arena" => "arena",
-        _ => "robinhood-agentic",
+        _ => "arena",
     }
 }
 
@@ -576,10 +501,8 @@ fn account_key(account: &str) -> &'static str {
         "rh-safe"
     } else if account.contains("smart account") {
         "sol-main"
-    } else if account.contains("exchange") {
-        "arcus-main"
     } else {
-        "owner"
+        "arcus-main"
     }
 }
 
@@ -593,16 +516,12 @@ fn audits(chain: Chain) -> Vec<Audit> {
         Audit {
             subject: "Executor image".to_string(),
             status: AuditStatus::InProgress,
-            note: "Review underway; the image is reproducible from published source in the \
-                   meantime."
-                .to_string(),
+            note: "Review underway; the image is reproducible from published source.".to_string(),
         },
         Audit {
             subject: "Attestation proof guest".to_string(),
             status: AuditStatus::Unaudited,
-            note: "Not yet reviewed. Vaults open before every audit is finished, and every page \
-                   says where each one stands."
-                .to_string(),
+            note: "Not yet reviewed.".to_string(),
         },
         Audit {
             subject: "Unwinder image".to_string(),
@@ -686,25 +605,20 @@ fn health(slug: &str, shape: HealthShape, spec: &Spec) -> Health {
     let busy = matches!(shape, HealthShape::Busy);
 
     let restarts = match shape {
-        HealthShape::Failing => 4.0,
         HealthShape::Warning => 3.0,
         _ => f64::from(rng.int(0, 1) as i32),
     };
     let rejections = match shape {
-        HealthShape::Failing => 31.4,
         HealthShape::Warning => 7.2,
         HealthShape::Busy => rng.range(1.2, 3.4),
         _ => rng.range(0.1, 0.9),
     };
-    let suspended_share = if shape == HealthShape::Failing {
-        spec.legs
-            .iter()
-            .filter(|leg| leg.status == VenueStatus::Suspended)
-            .map(|leg| leg.share_of_value * 100.0)
-            .sum()
-    } else {
-        0.0
-    };
+    let suspended_share: f64 = spec
+        .legs
+        .iter()
+        .filter(|leg| leg.status == VenueStatus::Suspended)
+        .map(|leg| leg.share_of_value * 100.0)
+        .sum();
     let quota = if busy {
         rng.range(8.0, 14.0)
     } else {
@@ -779,11 +693,8 @@ fn health(slug: &str, shape: HealthShape, spec: &Spec) -> Health {
             error_at: 168.0,
             lower_is_worse: false,
             window: "now".to_string(),
-            note: (claim_age > 0.0).then(|| {
-                "An unserved claim freezes the vault after seven days: no new deposits, and the \
-                 home chain's trading approvals revoked."
-                    .to_string()
-            }),
+            note: (claim_age > 0.0)
+                .then(|| "An unserved claim freezes the vault after seven days.".to_string()),
         },
         HealthSignal {
             name: "Stale value".to_string(),
@@ -831,7 +742,7 @@ fn health(slug: &str, shape: HealthShape, spec: &Spec) -> Health {
             window: "now".to_string(),
             note: Some(
                 "Running costs are the author's, paid from the tank. An empty tank becomes a \
-                 debt against future author fees; it never touches depositors' capital."
+                 debt against future author fees."
                     .to_string(),
             ),
         },
@@ -850,23 +761,13 @@ fn health(slug: &str, shape: HealthShape, spec: &Spec) -> Health {
         },
     ];
     match shape {
-        HealthShape::Failing => entries.insert(
-            0,
-            HealthEntry {
-                at: hours_ago(2),
-                level: HealthLevel::Error,
-                message: "Arcus rejected 31% of submissions this hour and is marked suspended. \
-                          The strategy has been told."
-                    .to_string(),
-            },
-        ),
         HealthShape::Warning => entries.insert(
             0,
             HealthEntry {
                 at: hours_ago(3),
                 level: HealthLevel::Warning,
-                message: "Three restarts in the hour: a wire feed dropped its connection and \
-                          the program was rebuilt each time."
+                message: "Three restarts in the hour: a feed dropped its connection and the \
+                          program was rebuilt each time."
                     .to_string(),
             },
         ),
@@ -936,7 +837,6 @@ fn base_price(market: &str) -> f64 {
         "BTC-PERP" | "BTC/USDC" => 96_400.0,
         "ETH-PERP" | "ETH/USDC" => 4_180.0,
         "SOL-PERP" => 214.0,
-        "HYPE-PERP" => 39.4,
         "NVDA" | "NVDA-PERP" => 187.2,
         "SPY" | "SPY-PERP" => 641.0,
         "QQQ" | "QQQ-PERP" => 572.0,
@@ -1129,19 +1029,12 @@ pub fn all() -> Vec<Strategy> {
     vec![
         funding_basis_v3(),
         mm_quoter_v7(),
-        funding_rotator_v2(),
         weekend_carry_v2(),
-        follow_northstar_v1(),
         catalyst_v1(),
-        basis_arcus_v1(),
         arena_v1(),
         funding_basis_v2(),
-        mm_eth_perp_v6(),
-        basis_rh_v1(),
-        vol_harvest_v1(),
-        steady_dividends_v2(),
-        index_rebalance_v1(),
-        earnings_drift_v1(),
+        mm_quoter_v6(),
+        arena_v2(),
     ]
 }
 
@@ -1150,20 +1043,14 @@ fn funding_basis_v3() -> Strategy {
     spec.title = "Hyperliquid funding basis";
     spec.description = "Holds spot on HyperCore and shorts the perpetual against it to collect funding, and \
          unwinds when the carry stops paying. Enters when annualised funding is above 9% and \
-         exits below 3%. Both legs sit inside one venue-enforced account, so there is no bridge \
-         in the loop and no second custody level to explain. Never holds unhedged delta above \
-         2% of the vault's value.";
+         exits below 3%. Both legs sit in one venue-enforced account, so there is no bridge in \
+         the loop. Never holds unhedged delta above 2% of the vault's value.";
     spec.shape = Shape::new(214, 0.176, 0.082, 420_000.0, 3_240_000.0)
         .with_shock(0.62, -0.021)
         .with_trades(18.0);
     spec.legs = vec![hyperliquid_perps(0.58), hyperliquid_spot(0.37)];
     spec.source = published("github.com/shonin/funding-basis", "funding-basis-v3");
     spec.project = Project::Basis;
-    spec.components = vec![
-        ("hedge", "hedge", "1.2"),
-        ("twap-exec", "twap-exec", "0.9"),
-        ("rebalancer", "rebalancer", "1.0"),
-    ];
     spec.config = vec![
         ("entry_apr", "0.09"),
         ("exit_apr", "0.03"),
@@ -1173,14 +1060,13 @@ fn funding_basis_v3() -> Strategy {
     ];
     spec.markets = vec!["BTC-PERP", "ETH-PERP", "BTC/USDC", "ETH/USDC"];
     spec.daily_charge = 1.15;
-    spec.superseded_by = None;
     spec.supersedes = Some("funding-basis@2");
     spec.limits = vec![
         "Gross leverage never exceeds 2×.",
         "Unhedged delta never exceeds 2% of the vault's value.",
         "No single order above 5% of the vault's value.",
         "Both legs are cut together if the vault falls 10% from its peak.",
-        "No builder-deployed markets: only the venue's own perpetuals.",
+        "Only the venue's own perpetuals, no builder-deployed markets.",
     ];
     spec.dependencies = vec![
         "The venue's own funding feed, through the executor's shared data layer.",
@@ -1191,17 +1077,15 @@ fn funding_basis_v3() -> Strategy {
         "Two legs on one venue, with the size of both derived from the vault's value and capped \
          in code. Entry and exit are a single funding threshold with hysteresis, and the \
          drawdown rule closes both legs together rather than leaving one naked. Rejections back \
-         off. The margin rebalance moves capital only between the vault's own accounts, which \
-         the contract enforces anyway.",
+         off. The margin rebalance moves capital only between the vault's own accounts.",
         vec![finding(
             FindingCategory::ExternalDependence,
             Severity::Note,
             "The hedge leg depends on one venue's funding feed",
             "The entry and exit decision reads a single funding stream. If that feed stalls, the \
              strategy holds its current position rather than unwinding, until the stream \
-             recovers. That is a deliberate choice in the code and it is stated in the \
-             description, but a depositor should know the position is held, not flattened, when \
-             the feed goes quiet.",
+             recovers. That is a deliberate choice, stated in the description, but a depositor \
+             should know the position is held, not flattened, when the feed goes quiet.",
             "src/lib.rs",
             41,
         )],
@@ -1216,13 +1100,12 @@ fn funding_basis_v2() -> Strategy {
     let mut spec = Spec::new("funding-basis", 2, "shonin", 301);
     spec.standing = Standing::Superseded;
     spec.title = "Hyperliquid funding basis";
-    spec.description = "The earlier version of this strategy. It runs exactly as it always has: nothing about a \
-         published strategy can be changed, so the successor is a separate vault that depositors \
-         choose to move to. Enters above 12% annualised funding and exits below 4%.";
+    spec.description = "The earlier version of this strategy. It runs exactly as it always has; the successor \
+         is a separate vault that depositors choose to move to. Enters above 12% annualised \
+         funding and exits below 4%.";
     spec.shape = Shape::new(301, 0.121, 0.094, 260_000.0, 318_000.0).with_trades(14.0);
     spec.legs = vec![hyperliquid_perps(0.55), hyperliquid_spot(0.40)];
     spec.source = published("github.com/shonin/funding-basis", "funding-basis-v2");
-    spec.components = vec![("hedge", "hedge", "1.1"), ("twap-exec", "twap-exec", "0.9")];
     spec.config = vec![
         ("entry_apr", "0.12"),
         ("exit_apr", "0.04"),
@@ -1249,7 +1132,7 @@ fn funding_basis_v2() -> Strategy {
             "When the spot leg is rejected the strategy re-submits the same order on its next \
              pass. There is a back-off on the perp leg but not on the hedge, so a persistently \
              rejected hedge can sit unfilled while the perp leg is already on. The successor \
-             version changes this.",
+             changes this.",
             "src/lib.rs",
             68,
         )],
@@ -1261,12 +1144,11 @@ fn funding_basis_v2() -> Strategy {
 }
 
 fn mm_quoter_v7() -> Strategy {
-    let mut spec = Spec::new("mm-quoter", 7, "tidewater", 161);
+    let mut spec = Spec::new("mm-quoter", 7, "shonin", 161);
     spec.title = "Perpetual market making";
     spec.description = "Quotes two-sided on a small set of perpetuals, leans against inventory, and widens or \
-         pulls entirely when the book goes stale. Inventory is the product: more of it means \
-         more size on more markets. The source is sealed; the attested builder compiled it and \
-         the reviewer read it.";
+         pulls entirely when the book goes stale. The source is sealed; the attested builder \
+         compiled it and the reviewer read it.";
     spec.shape = Shape::new(161, 0.229, 0.148, 300_000.0, 1_150_000.0)
         .with_shock(0.41, -0.038)
         .with_trades(340.0);
@@ -1274,10 +1156,6 @@ fn mm_quoter_v7() -> Strategy {
     spec.source = Source::Sealed;
     spec.project = Project::Quoter;
     spec.allowances = quoting();
-    spec.components = vec![
-        ("mm-quoter", "mm-quoter", "2.1"),
-        ("twap-exec", "twap-exec", "0.9"),
-    ];
     spec.config = vec![
         ("markets", "ETH-PERP, BTC-PERP, SOL-PERP"),
         ("spread_bps", "6"),
@@ -1292,7 +1170,7 @@ fn mm_quoter_v7() -> Strategy {
     spec.limits = vec![
         "Inventory never exceeds 25% of the vault's value in any one market.",
         "Quotes are pulled entirely when the book is older than 400ms.",
-        "No market order is ever sent: the strategy is maker-only except when flattening.",
+        "Maker-only except when flattening: no market order is ever sent.",
         "Quoting stops for the day after a 4% loss.",
     ];
     spec.dependencies = vec![
@@ -1323,8 +1201,8 @@ fn mm_quoter_v7() -> Strategy {
                 "A restart re-subscribes but does not re-check its own open orders first",
                 "After a restart the program subscribes to the book and begins quoting from the \
                  ladder it computes, cancelling what it finds afterwards. For a few hundred \
-                 milliseconds, orders from before the restart and orders after it can both rest \
-                 on the book.",
+                 milliseconds, orders from before and after the restart can both rest on the \
+                 book.",
                 "src/lib.rs",
                 27,
             ),
@@ -1336,77 +1214,89 @@ fn mm_quoter_v7() -> Strategy {
     build(spec)
 }
 
-fn funding_rotator_v2() -> Strategy {
-    let mut spec = Spec::new("funding-rotator", 2, "kestrel.lab", 133);
-    spec.title = "Funding rotation across perpetuals";
-    spec.description = "Watches funding across every perpetual on one venue and holds the carry on whichever \
-         two pay best, rotating as the ranking changes. One venue, one account, both legs \
-         hedged; the rotation is the only moving part.";
-    spec.shape = Shape::new(133, 0.124, 0.071, 210_000.0, 764_000.0).with_trades(26.0);
-    spec.legs = vec![hyperliquid_perps(0.61), hyperliquid_spot(0.33)];
-    spec.source = published(
-        "github.com/kestrel-lab/funding-rotator",
-        "funding-rotator-v2",
-    );
-    spec.components = vec![
-        ("hedge", "hedge", "1.2"),
-        ("twap-exec", "twap-exec", "0.9"),
-        ("funding-rank", "funding-rank", "0.4"),
-    ];
-    spec.config = vec![
-        ("hold_count", "2"),
-        ("rotate_threshold_apr", "0.035"),
-        ("max_gross_leverage", "1.8"),
-    ];
-    spec.markets = vec!["BTC-PERP", "ETH-PERP", "SOL-PERP", "HYPE-PERP"];
-    spec.daily_charge = 2.40;
+fn mm_quoter_v6() -> Strategy {
+    let mut spec = Spec::new("mm-quoter", 6, "shonin", 190);
+    spec.standing = Standing::Killed;
+    spec.title = "Perpetual market making";
+    spec.description = "The earlier version of the quoter, with a single market and a simpler inventory rule. \
+         Stopped by the admin key after it kept submitting into a venue that was rejecting more \
+         than a quarter of its orders, for six hours. A kill unwinds every position and brings \
+         the cash home, so every withdrawal since is paid from the idle balance in one \
+         transaction.";
+    spec.shape = Shape::new(190, 0.041, 0.161, 400_000.0, 90_000.0)
+        .with_shock(0.79, -0.061)
+        .with_trades(280.0);
+    spec.legs = vec![hyperliquid_perps(0.95)];
+    spec.source = Source::Sealed;
+    spec.project = Project::Quoter;
+    spec.allowances = quoting();
+    spec.config = vec![("markets", "ETH-PERP"), ("spread_bps", "8")];
+    spec.markets = vec!["ETH-PERP"];
+    spec.daily_charge = 28.90;
+    spec.health = HealthShape::None;
+    spec.kill = Some(Kill {
+        at: hours_ago(62),
+        reason: "Killed: submissions continued for six hours while the venue rejected more \
+                 than a quarter of them."
+            .to_string(),
+        outcome: "Every position was closed reduce-only inside the exit band and the cash \
+                  brought home. The vault holds only its idle balance, so each withdrawal is \
+                  paid in one transaction."
+            .to_string(),
+        reference: tx("mm-quoter-v6-kill"),
+    });
     spec.limits = vec![
-        "At most two markets held at once.",
-        "Gross leverage never exceeds 1.8×.",
-        "A rotation only happens when the ranking gap is above 3.5% annualised, so the strategy \
-         cannot churn.",
+        "Inventory never exceeded 30% of the vault's value.",
+        "Quoting stopped for the day after a 5% loss.",
     ];
-    spec.dependencies = vec!["The venue's funding feeds, through the shared data layer."];
+    spec.dependencies = vec!["The venue's public book feed."];
     spec.review = Some(review(
-        85,
-        "The most bounded strategy of its kind on the platform: two positions at a time, a \
-         rotation threshold that prevents churn, leverage capped below 2×, and every size \
-         derived from the vault's value. Failure handling is thorough — rejections, feed gaps \
-         and restarts all have explicit paths.",
-        vec![finding(
-            FindingCategory::UnauditedDependencies,
-            Severity::Note,
-            "Composes a component with little use elsewhere",
-            "`funding-rank` is used by this strategy and one other. It is public and pinned by \
-             hash, and it only ranks numbers the strategy already has, so the exposure is \
-             small — but it has had far less use under real capital than the first-party \
-             components beside it.",
-            "Cargo.toml",
-            11,
-        )],
+        61,
+        "A simpler ancestor of the current quoter, whose failure handling was the weak part: \
+         rejected orders were retried on a fixed interval with no ceiling and no venue-health \
+         check, which is exactly the behaviour that ended it.",
+        vec![
+            finding(
+                FindingCategory::MissingFailureHandling,
+                Severity::Serious,
+                "Rejected orders are retried on a fixed interval, indefinitely",
+                "There is no back-off and no check of the venue's health before re-submitting. A \
+                 venue that rejects everything will be asked again every few seconds for as long \
+                 as the strategy runs.",
+                "src/lib.rs",
+                77,
+            ),
+            finding(
+                FindingCategory::UnboundedRisk,
+                Severity::Concern,
+                "Inventory could reach 30% of the vault in one market",
+                "One market, one position, and a limit set at nearly a third of the vault. The \
+                 later version lowers it.",
+                "src/inventory.rs",
+                44,
+            ),
+        ],
         REVIEW_LIMITS.to_vec(),
-        131,
-        "funding-rotator-v2",
+        188,
+        "mm-quoter-v6",
     ));
     build(spec)
 }
 
 fn weekend_carry_v2() -> Strategy {
-    let mut spec = Spec::new("weekend-carry", 2, "kestrel.lab", 133);
+    let mut spec = Spec::new("weekend-carry", 2, "shonin", 133);
     spec.chain = Chain::RobinhoodChain;
     spec.title = "Weekend carry on tokenised equities";
-    spec.description = "Stock tokens trade around the clock; the cash market behind them does not, and neither \
-         does the channel that keeps token and underlying together. From Friday evening to \
-         Monday morning the token's price is set purely by on-chain flow. This strategy holds \
-         the token and shorts the perpetual against it, sized to the funding on offer, and \
-         carries it into Monday's open.";
+    spec.description = "Stock tokens trade around the clock; the cash market behind them does not. From Friday \
+         evening to Monday morning the token's price is set purely by on-chain flow. This \
+         strategy holds the token and shorts the perpetual against it, sized to the funding on \
+         offer, and carries it into Monday's open.";
     spec.shape = Shape::new(133, 0.143, 0.088, 180_000.0, 842_000.0)
         .with_shock(0.55, -0.026)
         .with_trades(9.0);
-    spec.legs = vec![stock_tokens(0.46), arcus_perps(0.49, VenueStatus::Ok)];
+    spec.legs = vec![stock_tokens(0.46), arcus_perps(0.49)];
     spec.exit_class = ExitClass::Served { operators: 2 };
-    spec.source = published("github.com/kestrel-lab/weekend-carry", "weekend-carry-v2");
-    spec.components = vec![("hedge", "hedge", "1.2"), ("twap-exec", "twap-exec", "0.9")];
+    spec.source = published("github.com/shonin/weekend-carry", "weekend-carry-v2");
     spec.config = vec![
         ("underlyings", "SPY, QQQ, NVDA"),
         ("max_gross_leverage", "2.0"),
@@ -1423,6 +1313,15 @@ fn weekend_carry_v2() -> Strategy {
         elapsed_minutes: 4,
         timeout_minutes: 60,
     });
+    spec.claims = vec![Claim {
+        id: 41,
+        owner: address("claimant-41"),
+        shares: 18_402.61,
+        fraction_closed: 0.071,
+        booked: days_ago(5),
+        state: ClaimState::Waiting,
+        settled_for: None,
+    }];
     spec.limits = vec![
         "Gross leverage never exceeds 2×.",
         "Three named underlyings, and nothing else.",
@@ -1438,8 +1337,8 @@ fn weekend_carry_v2() -> Strategy {
         79,
         "A two-leg carry with a fixed universe of three names and both legs cut together. The \
          unwind order is explicit and correct: the hedge comes off before the thing it hedges. \
-         Sizing is a share of the vault throughout. The strategy is honest that weekend \
-         liquidity is thin, and keeps its exposure small because of it.",
+         Sizing is a share of the vault throughout, and the exposure is kept small because \
+         weekend liquidity is thin.",
         vec![
             finding(
                 FindingCategory::ExternalDependence,
@@ -1448,7 +1347,7 @@ fn weekend_carry_v2() -> Strategy {
                 "The perpetual leg lives in an exchange's own books, so the vault learns what it \
                  is worth from an attested read rather than from chain state. The read runs in a \
                  measured image and is signed for this vault, and a stale read closes the door on \
-                 deposits and withdrawals — but a wrong answer from the exchange's API would \
+                 deposits and withdrawals, but a wrong answer from the exchange's API would \
                  misprice the vault until the next read.",
                 "src/lib.rs",
                 58,
@@ -1472,105 +1371,21 @@ fn weekend_carry_v2() -> Strategy {
     build(spec)
 }
 
-fn follow_northstar_v1() -> Strategy {
-    let mut spec = Spec::new("follow-northstar", 1, "northwind", 96);
-    spec.title = "Mirror one public trader";
-    spec.description = "Tracks one public account's perpetual positions and holds the same shape, scaled to \
-         the vault's value. Following a wallet is one strategy among many here: what makes this \
-         one checkable is that you can read exactly how it scales, what it refuses to copy, and \
-         what it does when the account it follows goes quiet.";
-    spec.shape = Shape::new(96, 0.157, 0.132, 120_000.0, 418_000.0)
-        .with_shock(0.73, -0.052)
-        .with_trades(21.0);
-    spec.legs = vec![hyperliquid_perps(0.92)];
-    spec.source = published(
-        "github.com/northwind/follow-northstar",
-        "follow-northstar-v1",
-    );
-    spec.components = vec![
-        ("follow-wallet", "follow-wallet", "1.4"),
-        ("twap-exec", "twap-exec", "0.9"),
-    ];
-    spec.config = vec![
-        ("target", "a public account on the venue"),
-        ("scale_pct", "0.60"),
-        ("max_leverage", "2.5"),
-        ("ignore_markets", "builder-deployed"),
-    ];
-    spec.markets = vec!["BTC-PERP", "ETH-PERP", "SOL-PERP"];
-    spec.daily_charge = 1.90;
-    spec.limits = vec![
-        "Never more than 2.5× gross leverage, whatever the followed account does.",
-        "Builder-deployed markets are ignored entirely.",
-        "Positions are scaled to 60% of what proportional copying would give.",
-        "If the followed account is quiet for 48 hours, positions are closed.",
-    ];
-    spec.dependencies = vec![
-        "The venue's public data for one account's positions, read through the shared data layer.",
-    ];
-    spec.review = Some(review(
-        63,
-        "A mirror with a leverage cap and a market exclusion list, both applied before anything \
-         is submitted. The strategy's risk is not really in its code: it is in the account it \
-         follows, which can change what it does at any time and owes this vault nothing.",
-        vec![
-            finding(
-                FindingCategory::ExternalDependence,
-                Severity::Serious,
-                "The strategy does whatever one outside account does",
-                "Every position this vault takes is a copy of a third party's. That party is not \
-                 the author, is not accountable to depositors, and can change strategy, take on \
-                 leverage or stop trading without notice. The leverage cap bounds the size of the \
-                 mistake, not whether it happens.",
-                "src/lib.rs",
-                34,
-            ),
-            finding(
-                FindingCategory::KnownFailurePattern,
-                Severity::Concern,
-                "Copying arrives after the move it is copying",
-                "Positions are mirrored once they are visible on-chain, so this vault buys after \
-                 the account it follows has bought. In fast markets the fill it gets is \
-                 systematically worse than the one it is copying, and the code does not measure \
-                 or bound that gap.",
-                "src/lib.rs",
-                61,
-            ),
-            finding(
-                FindingCategory::MissingFailureHandling,
-                Severity::Note,
-                "A restart re-derives the target from positions, not from the followed account",
-                "After a restart the program treats its own current positions as the target \
-                 until the next update from the account it follows. If that account moved during \
-                 the outage, the vault stays on the old shape until the next change.",
-                "src/lib.rs",
-                22,
-            ),
-        ],
-        REVIEW_LIMITS.to_vec(),
-        94,
-        "follow-northstar-v1",
-    ));
-    build(spec)
-}
-
 fn catalyst_v1() -> Strategy {
-    let mut spec = Spec::new("catalyst", 1, "halcyon.works", 41);
+    let mut spec = Spec::new("catalyst", 1, "shonin", 41);
     spec.chain = Chain::RobinhoodChain;
     spec.title = "Event-driven equities";
     spec.description = "Reads regulator filings and wire headlines as they arrive, scores them with a model in \
-         the bundle, takes a bounded position in the name, and exits on a timer or a stop. Every \
-         news bot asks you to trust what it reads and who runs it. This one asks you to trust \
-         neither: the code that turns news into trades was read by the reviewer, the keys to its \
-         feeds are sealed to the bundle, and whatever it concludes it can only trade this \
-         vault's own accounts.";
+         the bundle, takes a bounded position in the name, and exits on a timer or a stop. The \
+         code that turns news into trades was read by the reviewer, the keys to its feeds are \
+         sealed to the bundle, and whatever it concludes it can only trade this vault's own \
+         accounts.";
     spec.shape = Shape::new(41, 0.216, 0.194, 220_000.0, 412_000.0).with_trades(31.0);
-    spec.legs = vec![stock_tokens(0.52), arcus_perps(0.43, VenueStatus::Ok)];
+    spec.legs = vec![stock_tokens(0.52), arcus_perps(0.43)];
     spec.exit_class = ExitClass::Served { operators: 2 };
     spec.source = Source::Sealed;
     spec.project = Project::Catalyst;
     spec.allowances = thinking();
-    spec.components = vec![("twap-exec", "twap-exec", "0.9"), ("hedge", "hedge", "1.2")];
     spec.models = vec![ModelFile {
         name: "catalyst-scorer".to_string(),
         opset: 17,
@@ -1606,17 +1421,18 @@ fn catalyst_v1() -> Strategy {
         "The plumbing is careful: inference is budgeted, its failure path is a smaller \
          hand-written position rather than a stall, and the per-name cap is applied to the \
          vault's value before the model's score is used at all. What pulls the score down is how \
-         much of the outcome rests on things the review cannot see — a model's weights, and \
-         feeds that can be withdrawn or rate-limited.",
+         much of the outcome rests on things the review cannot see: a model's weights, and feeds \
+         that can be withdrawn or rate-limited.",
         vec![
             finding(
                 FindingCategory::ModelDependence,
                 Severity::Concern,
                 "Most positions are sized by a model whose behaviour cannot be verified",
                 "The scorer decides both the direction and the scale of nearly every position. \
-                 The code bounds what that can mean — a cap per name, a hold period, a stop — so \
-                 a badly wrong score costs a bounded amount. But the reviewer cannot read the \
-                 weights, and the live record is the only evidence that the model is any good.",
+                 The code bounds what that can mean, with a cap per name, a hold period and a \
+                 stop, so a badly wrong score costs a bounded amount. But the reviewer cannot \
+                 read the weights, and the live record is the only evidence that the model is \
+                 any good.",
                 "src/lib.rs",
                 47,
             ),
@@ -1653,86 +1469,18 @@ fn catalyst_v1() -> Strategy {
     build(spec)
 }
 
-fn basis_arcus_v1() -> Strategy {
-    let mut spec = Spec::new("basis-arcus", 1, "kestrel.lab", 63);
-    spec.chain = Chain::RobinhoodChain;
-    spec.title = "Equity perpetual basis";
-    spec.description = "Holds the spot token and shorts the equity perpetual against it whenever the perpetual \
-         trades rich. A simple carry, on a venue whose positions can only be closed through its \
-         own API — which is why this vault's exit class is served rather than direct, and why \
-         the page says how many operators can serve a claim.";
-    spec.shape = Shape::new(63, 0.061, 0.104, 140_000.0, 268_000.0)
-        .with_shock(0.88, -0.044)
-        .with_trades(11.0);
-    spec.legs = vec![
-        stock_tokens(0.44),
-        arcus_perps(0.51, VenueStatus::Suspended),
-    ];
-    spec.exit_class = ExitClass::Served { operators: 2 };
-    spec.source = published("github.com/kestrel-lab/basis-arcus", "basis-arcus-v1");
-    spec.components = vec![("hedge", "hedge", "1.2")];
-    spec.config = vec![
-        ("underlyings", "NVDA, TSLA"),
-        ("entry_bps", "35"),
-        ("exit_bps", "8"),
-        ("max_gross_leverage", "1.6"),
-    ];
-    spec.markets = vec!["NVDA", "TSLA", "NVDA-PERP"];
-    spec.daily_charge = 3.60;
-    spec.health = HealthShape::Failing;
-    spec.claims = vec![Claim {
-        id: 41,
-        owner: address("claimant-41"),
-        shares: 18_402.61,
-        fraction_closed: 0.071,
-        booked: days_ago(5),
-        state: ClaimState::Waiting,
-        settled_for: None,
-    }];
-    spec.limits = vec![
-        "Two names, and nothing else.",
-        "Gross leverage never exceeds 1.6×.",
-        "Both legs are cut together if the vault falls 8% from its peak.",
-    ];
-    spec.dependencies = vec![
-        "The exchange's API for the perpetual leg, read inside the measured image.",
-        "The per-token price feeds the contract values the spot leg with.",
-    ];
-    spec.review = Some(review(
-        71,
-        "A conventional two-name carry, bounded and readable. The live problem is not in the \
-         code: the venue holding one leg is rejecting submissions, and a claim against this \
-         vault has been waiting five days for that leg to close inside the exit band.",
-        vec![finding(
-            FindingCategory::ExternalDependence,
-            Severity::Concern,
-            "Half the vault sits where only an unwinder can close it",
-            "The perpetual leg closes through the exchange's own API, so serving a withdrawal \
-             claim needs an operator running the unwinder image, not just anyone sending a \
-             transaction. The vault page says so, says how many operators can do it, and says \
-             what the venue's own last resort is.",
-            "shonin.toml",
-            18,
-        )],
-        REVIEW_LIMITS.to_vec(),
-        61,
-        "basis-arcus-v1",
-    ));
-    build(spec)
-}
-
 fn arena_v1() -> Strategy {
-    let mut spec = Spec::new("arena", 1, "moraine", 27);
+    let mut spec = Spec::new("arena", 1, "shonin", 27);
     spec.chain = Chain::Solana;
     spec.title = "On-chain match play";
     spec.description = "Plays one on-chain game for real stakes, continuously, inside limits written in its own \
-         code. It is here to prove something about the platform rather than about games: a match \
-         escrow is margin at a venue, the payout destination is fixed to this vault's own account \
-         when a match is entered, and the most a match can cost is its stake. The riskiest \
-         strategy on the leaderboard still cannot move a dollar to a stranger.";
+         code. A match escrow is margin at a venue: the payout destination is fixed to this \
+         vault's own account when a match is entered, and the most a match can cost is its \
+         stake. The riskiest strategy on the leaderboard still cannot move a dollar to a \
+         stranger.";
     spec.shape = Shape::new(27, -0.088, 0.238, 140_000.0, 178_000.0).with_trades(64.0);
     spec.legs = vec![arena_game(0.91)];
-    spec.source = published("github.com/moraine/arena", "arena-v1");
+    spec.source = published("github.com/shonin/arena", "arena-v1");
     spec.project = Project::Arena;
     spec.allowances = playing();
     spec.config = vec![
@@ -1761,17 +1509,16 @@ fn arena_v1() -> Strategy {
         71,
         "Every limit this strategy has is a share of the vault's value, checked before it enters \
          a match, and the stopping rule is correct for the venue: it stops entering and lets open \
-         matches settle rather than forfeiting them. The valuation rule is the conservative one — \
-         an open match counts at what it cost, never at what it might win.",
+         matches settle rather than forfeiting them. An open match counts at what it cost, never \
+         at what it might win.",
         vec![
             finding(
                 FindingCategory::UnboundedRisk,
                 Severity::Note,
                 "The daily loss cap resets on a clock the strategy reads itself",
-                "The cap uses the host's clock to decide when tomorrow starts. That is fine and \
-                 nothing depends on it being precise, but it means the cap is per calendar day \
-                 rather than rolling, and a bad run spanning midnight can spend two caps within a \
-                 few hours.",
+                "The cap uses the host's clock to decide when tomorrow starts, so it is per \
+                 calendar day rather than rolling, and a bad run spanning midnight can spend two \
+                 caps within a few hours.",
                 "src/limits.rs",
                 38,
             ),
@@ -1794,344 +1541,22 @@ fn arena_v1() -> Strategy {
     build(spec)
 }
 
-fn mm_eth_perp_v6() -> Strategy {
-    let mut spec = Spec::new("mm-eth-perp", 6, "tidewater", 247);
-    spec.standing = Standing::Retired;
-    spec.title = "Single-market quoting";
-    spec.description = "Retired by its author after the successor started. It quoted one perpetual with a \
-         simpler inventory rule. Its record stays here, as every record does: what an author \
-         has published does not disappear when it stops working.";
-    spec.shape = Shape::new(247, 0.041, 0.161, 400_000.0, 90_000.0)
-        .with_shock(0.79, -0.061)
-        .with_trades(280.0);
-    spec.legs = vec![hyperliquid_perps(0.95)];
-    spec.source = Source::Sealed;
-    spec.project = Project::Quoter;
-    spec.allowances = quoting();
-    spec.components = vec![("mm-quoter", "mm-quoter", "1.8")];
-    spec.config = vec![("markets", "ETH-PERP"), ("spread_bps", "8")];
-    spec.markets = vec!["ETH-PERP"];
-    spec.daily_charge = 28.90;
-    spec.health = HealthShape::None;
-    spec.limits = vec![
-        "Inventory never exceeded 30% of the vault's value.",
-        "Quoting stopped for the day after a 5% loss.",
-    ];
-    spec.dependencies = vec!["The venue's public book feed."];
-    spec.review = Some(review(
-        68,
-        "A simpler ancestor of the author's current quoter, with a single market and a looser \
-         inventory bound.",
-        vec![finding(
-            FindingCategory::UnboundedRisk,
-            Severity::Concern,
-            "Inventory could reach 30% of the vault in one market",
-            "One market, one position, and a limit set at nearly a third of the vault. The \
-             author's later version lowers it.",
-            "src/inventory.rs",
-            44,
-        )],
-        REVIEW_LIMITS.to_vec(),
-        245,
-        "mm-eth-perp-v6",
-    ));
-    build(spec)
-}
-
-fn basis_rh_v1() -> Strategy {
-    let mut spec = Spec::new("basis-rh", 1, "northwind", 88);
-    spec.chain = Chain::RobinhoodChain;
-    spec.standing = Standing::Killed;
-    spec.title = "Index token carry";
-    spec.description = "Held index tokens against their perpetuals. Stopped by the admin key after the \
-         strategy kept submitting into a venue that had been suspended for six hours, and its \
-         health report showed rejections above a quarter of submissions for most of a day. A \
-         kill unwinds every position and brings the cash home, so every withdrawal after it is \
-         paid from the idle balance in one transaction.";
-    spec.shape = Shape::new(88, -0.121, 0.142, 300_000.0, 196_000.0)
-        .with_shock(0.91, -0.068)
-        .with_trades(12.0);
-    spec.legs = vec![stock_tokens(0.51), arcus_perps(0.44, VenueStatus::Ok)];
-    spec.exit_class = ExitClass::Served { operators: 2 };
-    spec.source = published("github.com/northwind/basis-rh", "basis-rh-v1");
-    spec.components = vec![("hedge", "hedge", "1.1")];
-    spec.config = vec![("underlyings", "SPY, QQQ"), ("max_gross_leverage", "2.0")];
-    spec.markets = vec!["SPY", "QQQ", "SPY-PERP"];
-    spec.daily_charge = 3.10;
-    spec.health = HealthShape::None;
-    spec.kill = Some(Kill {
-        at: hours_ago(62),
-        reason: "Killed: submissions to a suspended venue continued for six hours, with \
-                 rejections above a quarter of the hour's submissions."
-            .to_string(),
-        outcome: "Every position was closed reduce-only inside the exit band and the cash \
-                  brought home. The vault holds only its idle balance, so each withdrawal is \
-                  paid in one transaction."
-            .to_string(),
-        reference: tx("basis-rh-kill"),
-    });
-    spec.limits = vec![
-        "Two names, and nothing else.",
-        "Gross leverage never exceeded 2×.",
-    ];
-    spec.dependencies = vec!["The exchange's API for the perpetual leg."];
-    spec.review = Some(review(
-        58,
-        "A plain carry whose failure handling was the weak part: rejected submissions were \
-         retried on a fixed interval with no ceiling and no venue-health check, which is exactly \
-         the behaviour that ended it.",
-        vec![
-            finding(
-                FindingCategory::MissingFailureHandling,
-                Severity::Serious,
-                "Rejected orders are retried on a fixed interval, indefinitely",
-                "There is no back-off and no check of the venue's health before re-submitting. A \
-                 venue that rejects everything will be asked again every few seconds for as long \
-                 as the strategy runs.",
-                "src/lib.rs",
-                77,
-            ),
-            finding(
-                FindingCategory::MissingFailureHandling,
-                Severity::Concern,
-                "A suspended venue does not change what the strategy does",
-                "The host tells the strategy when a venue is suspended. This code ignores the \
-                 signal, so it keeps trying to trade a venue that has told it not to.",
-                "src/lib.rs",
-                52,
-            ),
-        ],
-        REVIEW_LIMITS.to_vec(),
-        86,
-        "basis-rh-v1",
-    ));
-    build(spec)
-}
-
-fn vol_harvest_v1() -> Strategy {
-    let mut spec = Spec::new("vol-harvest", 1, "northwind", 3);
+fn arena_v2() -> Strategy {
+    let mut spec = Spec::new("arena", 2, "shonin", 3);
+    spec.chain = Chain::Solana;
     spec.standing = Standing::BuildFailed;
-    spec.title = "Short volatility carry";
-    spec.description = "The build did not produce the same bytes twice, so there is no bundle, no vault and no \
-         record. The log below is public, as every build log is: an author cannot quietly try \
-         twenty times and show you the twentieth. A fixed resubmission is a new vault.";
+    spec.title = "On-chain match play";
+    spec.description = "A resubmission whose build did not produce the same bytes twice, so there is no bundle, \
+         no vault and no record. The log is public, as every build log is. A fixed resubmission \
+         is a new vault.";
     spec.shape = Shape::new(3, 0.0, 0.0, 0.0, 0.0);
     spec.legs = vec![];
-    spec.source = published("github.com/northwind/vol-harvest", "vol-harvest-v1");
+    spec.source = published("github.com/shonin/arena", "arena-v2");
+    spec.project = Project::Arena;
     spec.health = HealthShape::None;
     spec.markets = vec![];
     spec.daily_charge = 0.0;
     spec.limits = vec![];
     spec.dependencies = vec![];
-    build(spec)
-}
-
-// ------------------------------------------------------ connected accounts
-
-fn steady_dividends_v2() -> Strategy {
-    let mut spec = Spec::new("steady-dividends", 2, "pallas.qt", 168);
-    spec.chain = Chain::Solana;
-    spec.title = "Dividend capture";
-    spec.description = "Buys into names ahead of their ex-dividend dates and sells once the drop has been \
-         recovered, in the owner's own brokerage account. It never holds more than a fifth of \
-         the account in one name, and it never sells anything the owner bought themselves.";
-    spec.shape = Shape::new(168, 0.094, 0.061, 4_000_000.0, 18_400_000.0).with_trades(4.0);
-    spec.legs = vec![broker_account(1.0)];
-    spec.source = published(
-        "github.com/pallas-qt/steady-dividends",
-        "steady-dividends-v2",
-    );
-    spec.project = Project::Agent;
-    spec.allowances = agentic();
-    spec.components = vec![("mcp", "mcp", "1.0"), ("oauth", "oauth", "1.1")];
-    spec.secrets = vec!["broker_refresh_token"];
-    spec.config = vec![
-        ("max_name_pct", "0.20"),
-        ("hold_after_ex_days", "9"),
-        ("min_yield_pct", "0.015"),
-    ];
-    spec.markets = vec![];
-    spec.daily_charge = 0.32;
-    spec.connected = Some(Connected {
-        broker: "Robinhood Agentic".to_string(),
-        broker_limits: vec![
-            "It can place orders in the owner's agentic account.".to_string(),
-            "It cannot withdraw funds.".to_string(),
-            "It cannot transfer, stake or lend.".to_string(),
-            "It cannot touch any other account the owner holds.".to_string(),
-        ],
-        accounts: 412,
-        total_value: 18_400_000.0,
-        read_cadence: "hourly".to_string(),
-        registry: "the connected-account registry, with one entry and one tank per account"
-            .to_string(),
-        requirements: vec![
-            "An agentic account at the broker.".to_string(),
-            "A one-time authorisation, completed on the owner's own machine.".to_string(),
-            "A funded tank: running costs are the owner's, and a broker account needs no gas."
-                .to_string(),
-            "No hand-trading in the same account: the fee is on the account's whole gain."
-                .to_string(),
-        ],
-        monthly_cost: 9.60,
-    });
-    spec.limits = vec![
-        "No more than 20% of the account in any one name.",
-        "It only sells what it bought.",
-        "It stops for the day if the account falls 2%.",
-    ];
-    spec.dependencies = vec![
-        "The broker's own interface, over a token the owner can revoke at any time.",
-        "A dividend calendar, read from a public source.",
-    ];
-    spec.review = Some(review(
-        81,
-        "Bounded and narrow: a fifth of the account per name, a fixed holding period, and an \
-         explicit refusal to sell anything the strategy did not buy — which matters more here \
-         than in a vault, because the account is the owner's and may hold things they care \
-         about.",
-        vec![finding(
-            FindingCategory::ExternalDependence,
-            Severity::Note,
-            "The dividend calendar comes from one public source",
-            "A wrong or late calendar entry means a position taken at the wrong time. The \
-             consequence is bounded by the per-name cap, and the source is named in the \
-             description.",
-            "src/plan.rs",
-            31,
-        )],
-        REVIEW_LIMITS.to_vec(),
-        166,
-        "steady-dividends-v2",
-    ));
-    build(spec)
-}
-
-fn index_rebalance_v1() -> Strategy {
-    let mut spec = Spec::new("index-rebalance", 1, "pallas.qt", 121);
-    spec.chain = Chain::Solana;
-    spec.title = "Index rebalancing";
-    spec.description = "Keeps the owner's account at a target weighting they choose, rebalancing when a \
-         holding drifts more than three points from its target. The least exciting agent in the \
-         catalogue, and the one whose code is easiest to read end to end.";
-    spec.shape = Shape::new(121, 0.071, 0.048, 3_000_000.0, 9_700_000.0).with_trades(1.0);
-    spec.legs = vec![broker_account(1.0)];
-    spec.source = published("github.com/pallas-qt/index-rebalance", "index-rebalance-v1");
-    spec.project = Project::Agent;
-    spec.allowances = agentic();
-    spec.components = vec![("mcp", "mcp", "1.0"), ("oauth", "oauth", "1.1")];
-    spec.secrets = vec!["broker_refresh_token"];
-    spec.config = vec![("drift_pct", "0.03"), ("min_trade_usd", "50")];
-    spec.markets = vec![];
-    spec.daily_charge = 0.21;
-    spec.connected = Some(Connected {
-        broker: "Robinhood Agentic".to_string(),
-        broker_limits: vec![
-            "It can place orders in the owner's agentic account.".to_string(),
-            "It cannot withdraw funds.".to_string(),
-            "It cannot transfer, stake or lend.".to_string(),
-            "It cannot touch any other account the owner holds.".to_string(),
-        ],
-        accounts: 233,
-        total_value: 9_700_000.0,
-        read_cadence: "hourly".to_string(),
-        registry: "the connected-account registry, with one entry and one tank per account"
-            .to_string(),
-        requirements: vec![
-            "An agentic account at the broker.".to_string(),
-            "A target weighting, set when the account is connected.".to_string(),
-            "A funded tank for running costs.".to_string(),
-        ],
-        monthly_cost: 6.30,
-    });
-    spec.limits = vec![
-        "It only rebalances towards the weights the owner set.",
-        "No trade below $50, so drift never turns into churn.",
-        "It never takes the account to cash.",
-    ];
-    spec.dependencies = vec!["The broker's own interface, and nothing else."];
-    spec.review = Some(review(
-        88,
-        "The whole strategy is a difference between two weight vectors and a minimum trade size. \
-         There is nothing to steer it, no model, and no outside feed. The highest score in the \
-         catalogue, and the review is careful to say that means it is well-bounded, not that it \
-         will make money.",
-        vec![],
-        REVIEW_LIMITS.to_vec(),
-        119,
-        "index-rebalance-v1",
-    ));
-    build(spec)
-}
-
-fn earnings_drift_v1() -> Strategy {
-    let mut spec = Spec::new("earnings-drift", 1, "halcyon.works", 44);
-    spec.chain = Chain::Solana;
-    spec.title = "Post-earnings drift";
-    spec.description = "Holds names that surprised at earnings for a fixed window afterwards, in the owner's \
-         own account. Labelled new: it has run for a few weeks, and a few weeks of a record is \
-         not something to lean on.";
-    spec.shape = Shape::new(44, 0.132, 0.121, 900_000.0, 2_140_000.0).with_trades(3.0);
-    spec.legs = vec![broker_account(1.0)];
-    spec.source = Source::Sealed;
-    spec.project = Project::Agent;
-    spec.allowances = agentic();
-    spec.components = vec![("mcp", "mcp", "1.0"), ("oauth", "oauth", "1.1")];
-    spec.secrets = vec!["broker_refresh_token", "estimates_api_key"];
-    spec.config = vec![
-        ("max_name_pct", "0.15"),
-        ("hold_days", "21"),
-        ("min_surprise_pct", "0.05"),
-    ];
-    spec.markets = vec![];
-    spec.daily_charge = 0.44;
-    spec.connected = Some(Connected {
-        broker: "Robinhood Agentic".to_string(),
-        broker_limits: vec![
-            "It can place orders in the owner's agentic account.".to_string(),
-            "It cannot withdraw funds.".to_string(),
-            "It cannot transfer, stake or lend.".to_string(),
-            "It cannot touch any other account the owner holds.".to_string(),
-        ],
-        accounts: 96,
-        total_value: 2_140_000.0,
-        read_cadence: "hourly".to_string(),
-        registry: "the connected-account registry, with one entry and one tank per account"
-            .to_string(),
-        requirements: vec![
-            "An agentic account at the broker.".to_string(),
-            "A one-time authorisation, completed on the owner's own machine.".to_string(),
-            "A funded tank for running costs.".to_string(),
-        ],
-        monthly_cost: 13.20,
-    });
-    spec.limits = vec![
-        "No more than 15% of the account in any one name.",
-        "Positions are closed after 21 days whatever happens.",
-        "It only acts on surprises above 5%.",
-    ];
-    spec.dependencies = vec![
-        "An estimates feed, behind a key sealed to this bundle.",
-        "The broker's own interface.",
-    ];
-    spec.review = Some(review(
-        69,
-        "A fixed window and a fixed cap, with the surprise threshold as the only judgement in \
-         the code. The estimates feed is the dependency worth knowing about: the strategy's \
-         whole signal comes from one provider.",
-        vec![finding(
-            FindingCategory::ExternalDependence,
-            Severity::Concern,
-            "The signal comes entirely from one commercial estimates feed",
-            "Every position this strategy takes rests on one provider's numbers for what was \
-             expected. If those numbers are wrong, late or withheld, the strategy either acts on \
-             a bad surprise or stops acting, and the code does not distinguish the two.",
-            "src/plan.rs",
-            44,
-        )],
-        REVIEW_LIMITS.to_vec(),
-        42,
-        "earnings-drift-v1",
-    ));
     build(spec)
 }

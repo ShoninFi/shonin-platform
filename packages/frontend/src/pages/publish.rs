@@ -75,9 +75,8 @@ fn header() -> Dom {
         .child(html!("p", {
             .class("lede")
             .text(
-                "You submit a Rust project; we compile it. The bundle a vault runs is an \
-                 artifact of our build, not a file someone handed us, so every strategy on the \
-                 platform has source behind it that the reviewer read."
+                "You submit a Rust project; we compile it. Every strategy has source behind it that \
+                 the reviewer read."
             )
         }))
     })
@@ -114,9 +113,8 @@ fn submit() -> Dom {
                             html!("div", {
                                 .class("stack")
                                 .child(ui::note(
-                                    "Upload the project encrypted instead of pointing us at a \
-                                     repository. The build, the hashes and the review are \
-                                     identical; what changes is who else can read it."
+                                    "Upload the project encrypted instead of pointing us at a repository. Only who can \
+                                     read it changes."
                                 ))
                                 .child(form::dropzone(
                                     "Drop an encrypted project archive, or choose one",
@@ -244,7 +242,7 @@ fn estimate(tank: &str, allowance: &str, sealed: bool) -> Dom {
                 Tone::Ok,
                 "That covers it",
                 "Creating the vault and funding its tank happen in one transaction. If the build \
-                 fails, the build is still charged, the vault closes, and you reclaim the rest.",
+                 fails, the vault closes and you reclaim the rest.",
             )
         } else {
             ui::notice(
@@ -259,14 +257,12 @@ fn estimate(tank: &str, allowance: &str, sealed: bool) -> Dom {
         },
         if sealed {
             ui::note(
-                "A sealed project is uploaded encrypted. The attested builder and the reviewer \
-                 still read it — the reviewer's model receives it under terms that exclude \
-                 training — and nobody else does.",
+                "A sealed project is uploaded encrypted. The attested builder and the reviewer still \
+                 read it; nobody else does.",
             )
         } else {
             ui::note(
-                "Published source can be rebuilt by anyone with the published builder image, \
-                 and compared against the hash the registry accepted.",
+                "Anyone can rebuild published source with the builder image and compare the hash.",
             )
         },
     ])
@@ -279,10 +275,8 @@ fn pre_review() -> Dom {
         "Run the review before you publish",
         vec![
             ui::para(
-                "The reviewer's prompt and output schema are published and pinned in its image, \
-                 so you can run the same review yourself against any model before anyone sees \
-                 your strategy. It is unsigned and binding on nobody — which is the point of \
-                 running it early.",
+                "The reviewer's prompt and output schema are published, so you can run the same review \
+                 yourself before anyone sees your strategy. It is unsigned and binds nobody.",
             ),
             html!("div", {
                 .child_signal(draft.reviewed.signal().map(|reviewed| {
@@ -300,8 +294,7 @@ fn pre_review() -> Dom {
                                  back-off (src/lib.rs:71).".to_string(),
                             ]),
                             ui::note(
-                                "The same categories the signed review uses, so what you see \
-                                 here is what a depositor would see later.",
+                                "The same categories the signed review uses.",
                             ),
                         ])
                     } else {
@@ -327,10 +320,9 @@ fn secrets() -> Dom {
         "Seal a secret to your bundle",
         vec![
             ui::para(
-                "An API key your strategy needs, sealed so that only an attested executor \
-                 running exactly your bundle can read it. Your browser encrypts it to the key \
-                 the registry publishes, so the plaintext never leaves your machine — and it \
-                 never appears in a record.",
+                "An API key your strategy needs, sealed so that only an attested executor running \
+                 exactly your bundle can read it. Your browser encrypts it, so the plaintext \
+                 never leaves your machine.",
             ),
             form::field(
                 "Name",
@@ -355,8 +347,8 @@ fn secrets() -> Dom {
                 );
             }),
             ui::note(
-                "A secret is sealed to a bundle hash rather than being part of it, so rotating \
-                 one doesn't mean publishing a new strategy.",
+                "Rotating a secret doesn't need a new version: it is sealed to the bundle hash, not \
+                 part of it.",
             ),
         ],
     )
@@ -372,17 +364,10 @@ fn costs() -> Dom {
                  and the review are its first charges.",
             ),
             ui::note(copy::TANK_NOTE),
-            ui::kv_rows(vec![
-                (
-                    "Builds in the queue".to_string(),
-                    ui::number(&data::get().jobs.len().to_string()),
-                ),
-                (
-                    "Components you can compose".to_string(),
-                    ui::number(&data::get().components.len().to_string()),
-                ),
-            ]),
-            ui::action_link("/components", "The components"),
+            ui::kv_rows(vec![(
+                "Builds in the queue".to_string(),
+                ui::number(&data::get().jobs.len().to_string()),
+            )]),
         ],
     )
 }
@@ -391,17 +376,9 @@ fn sealed_note() -> Dom {
     ui::card_titled(
         "Published or sealed",
         None,
-        vec![
-            ui::para(
-                "Source is public by default. An author who needs to protect an edge can seal it \
-                 instead: the build, the on-chain hashes and the review are identical either \
-                 way.",
-            ),
-            ui::note(
-                "The difference is publication, not scrutiny. Every strategy on the platform is \
-                 compiled by us from source a reviewer read; sealing decides who else gets to \
-                 read it.",
-            ),
-        ],
+        vec![ui::para(
+            "Source is public by default. Sealing it changes who can read it, not whether the \
+             builder compiled it or the reviewer read it.",
+        )],
     )
 }

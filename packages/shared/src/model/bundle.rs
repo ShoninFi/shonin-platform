@@ -1,5 +1,5 @@
-//! What an author commits: the source, the bundle built from it, the
-//! components it pins, and the allowances it declares.
+//! What an author commits: the source, the bundle built from it, and the
+//! allowances it declares.
 
 use serde::{Deserialize, Serialize};
 
@@ -37,15 +37,6 @@ pub struct ModelFile {
     pub size_mib: f64,
     /// What the author says it is for.
     pub purpose: String,
-}
-
-/// A component the strategy composes, pinned by hash.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ComponentPin {
-    pub slug: String,
-    pub name: String,
-    pub version: String,
-    pub hash: String,
 }
 
 /// One file of the submitted project, for the source browser.
@@ -96,7 +87,6 @@ pub struct Bundle {
     pub toolchain: String,
     pub builder_image: String,
     pub models: Vec<ModelFile>,
-    pub components: Vec<ComponentPin>,
     pub allowances: Allowances,
     /// Names of the sealed secrets the strategy reads. Values are never shown.
     pub secrets: Vec<String>,

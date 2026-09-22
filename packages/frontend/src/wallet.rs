@@ -9,7 +9,7 @@
 
 use futures_signals::signal::Mutable;
 use serde::{Deserialize, Serialize};
-use shared::{ClaimState, Strategy, Vault};
+use shared::{ClaimState, Vault};
 
 use crate::data;
 use crate::state;
@@ -41,22 +41,6 @@ pub struct Claim {
     pub paid: Option<f64>,
 }
 
-/// A broker account the viewer has connected to a published strategy. There
-/// is no pool and no shares: the account stays theirs, and what the strategy
-/// holds is a token the broker only lets trade.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Account {
-    pub slug: String,
-    /// The account's entry on the registry: an opaque id, not the account.
-    pub entry: String,
-    /// What the last attested read said the account was worth.
-    pub value: f64,
-    /// The owner's balance for running costs.
-    pub tank: f64,
-    pub connected_days: u32,
-    pub revoked: bool,
-}
-
 /// Everything the viewer has done, saved in their browser and nowhere else.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Holdings {
@@ -64,8 +48,6 @@ pub struct Holdings {
     pub balance: f64,
     pub positions: Vec<Position>,
     pub claims: Vec<Claim>,
-    #[serde(default)]
-    pub accounts: Vec<Account>,
     next_claim: u32,
 }
 
@@ -85,18 +67,13 @@ impl Holdings {
         self.address.is_some()
     }
 
-    pub fn account(&self, slug: &str) -> Option<&Account> {
-        self.accounts.iter().find(|account| account.slug == slug)
-    }
-
     /// What every position is worth at today's value per share.
     pub fn value(&self) -> f64 {
         self.positions
             .iter()
             .map(|held| {
                 data::strategy(&held.slug)
-                    .and_then(Strategy::vault)
-                    .map_or(0.0, |vault| held.shares * vault.share_price)
+                    .map_or(0.0, |strategy| held.shares * strategy.vault.share_price)
             })
             .sum()
     }
@@ -211,9 +188,10 @@ fn fee_fraction(vault: &Vault) -> f64 {
 /// Deposit into a vault: the fee stays in the pool, and shares are minted at
 /// the value the contract computes in the same transaction.
 pub fn deposit(slug: &str, assets: f64) -> Result<DepositQuote, String> {
-    let Some(vault) = data::strategy(slug).and_then(Strategy::vault) else {
+    let Some(strategy) = data::strategy(slug) else {
         return Err("That vault doesn't exist.".to_string());
     };
+    let vault = &strategy.vault;
     if !vault.state.takes_deposits() {
         return Err(format!(
             "This vault is {} and isn't taking deposits.",
@@ -254,9 +232,7 @@ pub fn withdraw(slug: &str, shares: f64) -> Result<WithdrawQuote, String> {
     let Some(strategy) = data::strategy(slug) else {
         return Err("That vault doesn't exist.".to_string());
     };
-    let Some(vault) = strategy.vault() else {
-        return Err("That vault doesn't exist.".to_string());
-    };
+    let vault = &strategy.vault;
     if shares <= 0.0 {
         return Err("Enter an amount.".to_string());
     }
@@ -332,11 +308,7 @@ pub fn settle(id: u32) -> Option<ClaimState> {
             if next == ClaimState::Paid && claim.paid.is_none() {
                 // Valued again once the cash is home, at exit-side marks then.
                 let assets = data::strategy(&claim.slug)
-                    .and_then(Strategy::vault)
-                    .map(|vault| {
-                        let quote = quote_withdraw(vault, claim.shares);
-                        quote.assets
-                    })
+                    .map(|strategy| quote_withdraw(&strategy.vault, claim.shares).assets)
                     .unwrap_or_default();
                 claim.paid = Some(assets);
                 paid_to_balance = assets;
@@ -386,94 +358,4 @@ pub fn move_to(from: &str, to: &str) -> Result<f64, String> {
 /// What the transaction fee comes to, as a percentage, for showing in a quote.
 pub fn transaction_fee_label(vault: &Vault) -> String {
     crate::format::from_bps(vault.fees.transaction_bps)
-}
-
-// ------------------------------------------------------- connected accounts
-
-/// Connect a broker account to a strategy: the owner authorises once at the
-/// broker, seals the token to the bundle hash, and the account becomes an
-/// entry with a tank of its own.
-pub fn connect_account(slug: &str, value: f64, tank: f64) -> Result<(), String> {
-    let Some(strategy) = data::strategy(slug) else {
-        return Err("That strategy doesn't exist.".to_string());
-    };
-    if !strategy.is_connected() {
-        return Err("That strategy runs a vault, not a connected account.".to_string());
-    }
-    if holdings().lock_ref().account(slug).is_some() {
-        return Err("This account is already connected.".to_string());
-    }
-    if tank > holdings().lock_ref().balance {
-        return Err("That's more than your balance.".to_string());
-    }
-
-    let entry = data::address(&format!("entry-{slug}"));
-    holdings().replace_with(|holdings| {
-        holdings.balance -= tank;
-        holdings.accounts.push(Account {
-            slug: slug.to_string(),
-            entry: entry.clone(),
-            value,
-            tank,
-            connected_days: 0,
-            revoked: false,
-        });
-        holdings.clone()
-    });
-    save();
-    Ok(())
-}
-
-/// Top up an account's tank. A broker account needs no gas, so the tank pays
-/// only for metered running costs and the fees charged from each statement.
-pub fn fund_tank(slug: &str, amount: f64) -> Result<(), String> {
-    if amount <= 0.0 {
-        return Err("Enter an amount.".to_string());
-    }
-    if amount > holdings().lock_ref().balance {
-        return Err("That's more than your balance.".to_string());
-    }
-    holdings().replace_with(|holdings| {
-        holdings.balance -= amount;
-        if let Some(account) = holdings
-            .accounts
-            .iter_mut()
-            .find(|account| account.slug == slug)
-        {
-            account.tank += amount;
-        }
-        holdings.clone()
-    });
-    save();
-    Ok(())
-}
-
-/// Revoke the strategy's access at the broker and close the entry. Whatever
-/// is left of the tank comes back; open positions stay the owner's.
-pub fn revoke_account(slug: &str) -> Result<f64, String> {
-    let mut returned = 0.0;
-    holdings().replace_with(|holdings| {
-        if let Some(account) = holdings
-            .accounts
-            .iter_mut()
-            .find(|account| account.slug == slug)
-        {
-            returned = account.tank;
-            account.tank = 0.0;
-            account.revoked = true;
-        }
-        holdings.balance += returned;
-        holdings.clone()
-    });
-    save();
-    Ok(returned)
-}
-
-/// Forget a closed entry.
-pub fn close_account(slug: &str) {
-    holdings().replace_with(|holdings| {
-        holdings.accounts.retain(|account| account.slug != slug);
-        holdings.clone()
-    });
-    save();
 }

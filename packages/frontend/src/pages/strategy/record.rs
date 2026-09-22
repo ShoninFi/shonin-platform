@@ -75,9 +75,7 @@ pub fn render(strategy: &'static Strategy) -> Dom {
             vec![
                 chart::bar_chart(record.monthly.clone()),
                 ui::note(
-                    "Each bar is the month's return on the vault's value per share, before \
-                     nothing and after everything: fees are already in it, because they are \
-                     taken as shares.",
+                    "The month's return on value per share, with fees already in it.",
                 ),
             ],
         ))
@@ -152,9 +150,8 @@ fn main_chart(strategy: &'static Strategy, line: Line) -> Dom {
                 fmt::share_price,
             ))
             .child(ui::note(
-                "The solid line is what the vault's contract computed. The dashed line is the \
-                 same record rescaled to 15% annualised volatility, which is what the \
-                 leaderboard ranks on — it is for comparison and changes nothing the vault did.",
+                "The solid line is what the vault's contract computed. The dashed line is the same \
+                 record rescaled to 15% annualised volatility, which the leaderboard ranks on.",
             ))
         }),
         Line::Drawdown => html!("div", {
@@ -174,9 +171,7 @@ fn main_chart(strategy: &'static Strategy, line: Line) -> Dom {
                 fmt::money_compact,
             ))
             .child(ui::note(
-                "The capital behind the strategy, day by day. It is the honest answer to \
-                 \"what size was this record earned at\", and nothing here is extrapolated to a \
-                 size the strategy never traded.",
+                "The capital behind the strategy, day by day: the size this record was earned at.",
             ))
         }),
     }
@@ -229,8 +224,7 @@ fn trades(strategy: &'static Strategy) -> Dom {
             rows,
         ))
         .child(ui::note(
-            "Every order, fill and transfer on a venue that can hold vault capital is already a \
-             public, timestamped record. Nothing here is reported to you by us.",
+            "Every order, fill and transfer on a venue is already a public, timestamped record.",
         ))
     })
 }
@@ -270,9 +264,7 @@ fn events(strategy: &'static Strategy) -> Dom {
             rows,
         ))
         .child(ui::note(
-            "The vault contract's own event log: deposits and withdrawals, claims booked and \
-             settled, the daily crystallisation of fees, capital moved between the vault's own \
-             accounts, and the tank being charged and funded.",
+            "The vault contract's own event log.",
         ))
     })
 }

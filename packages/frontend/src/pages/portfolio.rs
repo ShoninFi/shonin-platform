@@ -1,5 +1,5 @@
 //! What the viewer holds: positions across vaults, claims waiting to settle,
-//! the connected accounts they own, and how correlated any of it is.
+//! and how correlated any of it is.
 
 use dominator::{Dom, html, text};
 use futures_signals::signal::SignalExt;
@@ -24,8 +24,7 @@ pub fn render() -> Dom {
             .child(html!("p", {
                 .class("lede")
                 .text(
-                    "What you hold across vaults and connected accounts. It is kept in this \
-                     browser and nowhere else."
+                    "What you hold across vaults. It is kept in this browser and nowhere else."
                 )
             }))
         }))
@@ -46,12 +45,11 @@ fn disconnected() -> Dom {
         .class("stack")
         .child(ui::empty(
             "Connect a wallet to deposit into a vault, withdraw from one, and watch a claim \
-             settle. Nothing is signed and nothing leaves your browser.",
+             settle. Nothing leaves your browser.",
         ))
         .child(html!("div", {
             .class(["row", "row--wrap"])
             .child(shell::button_link("/strategies", "Browse the strategies", true))
-            .child(shell::button_link("/accounts", "Connected accounts", false))
         }))
     })
 }
@@ -62,8 +60,11 @@ fn connected(holdings: &Holdings) -> Dom {
         .iter()
         .filter_map(|position| {
             let strategy = data::strategy(&position.slug)?;
-            let vault = strategy.vault()?;
-            Some((strategy, position.shares * vault.share_price, position.cost))
+            Some((
+                strategy,
+                position.shares * strategy.vault.share_price,
+                position.cost,
+            ))
         })
         .collect();
 
@@ -103,13 +104,7 @@ fn wallet_card(holdings: &Holdings) -> Dom {
 
 fn positions(holdings: &Holdings, held: &[(&'static Strategy, f64, f64)]) -> Dom {
     if held.is_empty() {
-        return ui::section(
-            "Positions",
-            vec![ui::empty(
-                "You hold nothing yet. A deposit mints shares at the value the vault's contract \
-                 computes in the same transaction.",
-            )],
-        );
+        return ui::section("Positions", vec![ui::empty("You hold nothing yet.")]);
     }
 
     let rows: Vec<Row> = held
@@ -160,10 +155,7 @@ fn positions(holdings: &Holdings, held: &[(&'static Strategy, f64, f64)]) -> Dom
                 ],
                 rows,
             ),
-            ui::note(
-                "What a position is worth is its shares times the value per share the vault's \
-                 own contract computes. Nobody reports it to you.",
-            ),
+            ui::note("Shares times the value per share the vault's own contract computes."),
         ],
     )
 }
@@ -221,9 +213,8 @@ fn claims(holdings: &Holdings) -> Dom {
         "Claims waiting to settle",
         vec![
             ui::note(
-                "A claim is a withdrawal the vault's idle balance couldn't pay. Your shares stay \
-                 outstanding until it settles, so you bear the close pro rata with everyone \
-                 else — and anyone can send the transactions that serve it.",
+                "A withdrawal the idle balance couldn't pay. Your shares stay outstanding until it \
+                 settles, and anyone can send the transactions that serve it.",
             ),
             html!("div", { .class(["grid", "grid--2"]).children(cards) }),
         ],
@@ -293,9 +284,8 @@ fn correlations(held: &[(&'static Strategy, f64, f64)]) -> Dom {
 
     let mut children = vec![
         ui::note(
-            "How each of your positions has moved with the others, and with a few simple things \
-             to compare against. A strategy that moves almost exactly like something you already \
-             hold is adding risk rather than spreading it.",
+            "How each position has moved with the others and with a few benchmarks. Two things \
+             that move together are more of one risk, not less.",
         ),
         table(columns, rows),
     ];
@@ -307,8 +297,7 @@ fn correlations(held: &[(&'static Strategy, f64, f64)]) -> Dom {
             Tone::Warn,
             "Two of your positions move together",
             &format!(
-                "{a} and {b} are {} correlated over the days they share. Holding both is closer \
-                 to holding more of one than to spreading your risk.",
+                "{a} and {b} are {} correlated over the days they share.",
                 fmt::number(value, 2)
             ),
         ));

@@ -51,7 +51,6 @@ pub fn build_log(name: &str, seconds: u32, models: &[&str]) -> Vec<LogLine> {
         line("    Finished `release` profile in 68.9s"),
         line("pass 2 complete"),
         line("comparing outputs: byte-identical ✓"),
-        line("composing pinned components"),
         line("instantiating the component in the executor's runtime ✓"),
     ];
 
@@ -519,66 +518,7 @@ async fn run(config: Config) -> Result<(), String> {
     ]
 }
 
-/// A strategy that trades an owner's own account at a broker.
-pub fn agent_project(id: &str, manifest: &str) -> Vec<SourceFile> {
-    vec![
-        file(
-            "Cargo.toml",
-            &cargo_toml(id, &["shonin-mcp", "shonin-oauth"]),
-        ),
-        file("shonin.toml", manifest),
-        file(
-            "src/lib.rs",
-            r#"//! Trades one owner's own brokerage account. The token this program
-//! holds can place orders and cannot withdraw a cent: the broker enforces
-//! that, not us.
-
-use shonin::{secrets, venues, Verdict};
-use shonin_mcp::Mcp;
-use shonin_oauth::OAuth;
-use shonin_broker as broker;
-
-mod plan;
-mod limits;
-
-#[shonin::main]
-async fn run(config: Config) -> Result<(), String> {
-    // The owner sealed a refresh token to this bundle hash on their own
-    // machine. Only an attested executor running exactly this code can read
-    // it, and it is never written to a log or a record.
-    let refresh = secrets::get("broker_refresh_token").ok_or("no token sealed")?;
-    let mut auth = OAuth::new(refresh);
-    let mut mcp = Mcp::connect(&config.broker_url, auth.access().await?).await?;
-
-    let limits = limits::Limits::from(&config);
-    let mut plan = plan::Plan::new(&config);
-
-    loop {
-        // The hourly read is the account's value series: what fees and the
-        // record are computed from, posted on-chain as an attested read.
-        let account = broker::read(&mut mcp).await?;
-        plan.observe(&account);
-
-        // The owner's own deposits and withdrawals are read from the same
-        // history and netted out: they aren't performance.
-        plan.net_out_transfers(account.transfers());
-
-        let orders = plan.orders(&account, &limits);
-        for verdict in venues::submit("robinhood-agentic", broker::encode(&orders)).await {
-            if let Verdict::Rejected(reason) = verdict {
-                plan.on_rejected(&reason);
-            }
-        }
-
-        shonin::sleep(config.interval).await;
-    }
-}
-"#,
-        ),
-    ]
-}
-
-fn cargo_toml(id: &str, components: &[&str]) -> String {
+fn cargo_toml(id: &str, helpers: &[&str]) -> String {
     let mut out = format!(
         "[package]\n\
          name = \"{id}\"\n\
@@ -591,13 +531,9 @@ fn cargo_toml(id: &str, components: &[&str]) -> String {
          [dependencies]\n\
          shonin = \"0.1\"\n"
     );
-    for (index, component) in components.iter().enumerate() {
-        // Components are pinned by hash, so a new version of one can never
-        // reach a running vault.
-        out += &format!(
-            "{component} = {{ version = \"1.{index}\", component = \"sha256:{}…\" }}\n",
-            super::hex(component, 6)
-        );
+    for (index, helper) in helpers.iter().enumerate() {
+        // Ordinary crates, pinned by Cargo.lock like any dependency.
+        out += &format!("{helper} = \"1.{index}\"\n");
     }
     out
 }

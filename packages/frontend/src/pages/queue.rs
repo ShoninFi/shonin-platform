@@ -31,7 +31,7 @@ pub fn list() -> Dom {
                         .child(html!("div", { .text(&job.subject) }))
                         .child(html!("div", {
                             .class(["faint", "small"])
-                            .text(&format!("{} by {}", job.kind, job.author))
+                            .text(&format!("by {}", job.author))
                         }))
                     }),
                     ui::badge(job.state.label(), tone(&job.state)),
@@ -55,8 +55,8 @@ pub fn list() -> Dom {
             .child(html!("p", {
                 .class("lede")
                 .text(
-                    "First come, first served, one job in flight per author. Every job shows its \
-                     state and its full log, whether it succeeded or failed."
+                    "First come, first served, one job in flight per author, and every log is public \
+                     whether the build succeeded or failed."
                 )
             }))
         }))
@@ -78,34 +78,29 @@ pub fn list() -> Dom {
                 .child(ui::card(vec![
                     ui::subheading("A pinned, offline recipe"),
                     ui::para(
-                        "Builds run in a published image that fixes the compiler, the tooling, \
-                         the target and the flags. Dependencies come from a pinned snapshot with \
-                         a lockfile, and the sandbox has no network, so a build script can't \
-                         fetch anything.",
+                        "Builds run in a published image that pins the compiler, the tooling, the target and \
+                         the flags, from a pinned dependency snapshot, with no network.",
                     ),
                 ]))
                 .child(ui::card(vec![
                     ui::subheading("Built twice, bytes must match"),
                     ui::para(
-                        "Every job compiles the project twice and compares. A project whose \
-                         output isn't stable is rejected with the difference rather than \
-                         published as something nobody can reproduce.",
+                        "Every job compiles the project twice and compares. Unstable output is rejected with \
+                         the difference.",
                     ),
                 ]))
                 .child(ui::card(vec![
                     ui::subheading("An attested builder signs it"),
                     ui::para(
-                        "The build the registry accepts runs in an enclave on an image sitting \
-                         on the same allowlist and timelock as executor images. It signs the \
-                         mapping from source to bundle, and the registry accepts nothing else.",
+                        "The build runs in an enclave on an allowlisted image, which signs the mapping from \
+                         source to bundle. The registry accepts nothing else.",
                     ),
                 ]))
                 .child(ui::card(vec![
                     ui::subheading("Anyone can rebuild"),
                     ui::para(
-                        "The recipe and the builder image are public, so a third party can \
-                         rebuild any published strategy from its source and compare hashes. A \
-                         disagreement is a public, checkable claim rather than an accusation.",
+                        "The recipe and the builder image are public, so anyone can rebuild a published \
+                         strategy from its source and compare hashes.",
                     ),
                 ]))
             })],
@@ -135,7 +130,7 @@ pub fn detail(id: &str) -> Dom {
                 .child(html!("h1", { .class("title").text(&format!("Build {}", job.id)) }))
                 .child(html!("p", {
                     .class("muted")
-                    .text(&format!("{} · {} by {}", job.subject, job.kind, job.author))
+                    .text(&format!("{} by {}", job.subject, job.author))
                 }))
             }))
             .child(ui::badge(job.state.label(), tone(&job.state)))
@@ -183,17 +178,15 @@ fn outcome(job: &'static Job) -> Dom {
             Tone::Error,
             "This build failed",
             &format!(
-                "{reason}. The build is charged, because it ran: the vault closes and the author \
-                 reclaims the rest of its tank. A fixed resubmission is a new vault — an author \
-                 can't quietly try twenty times and show you the twentieth."
+                "{reason}. The build is charged because it ran; the vault closes and the author \
+                 reclaims the rest of its tank. A fixed resubmission is a new vault."
             ),
         ),
         JobState::Succeeded => ui::notice(
             Tone::Ok,
             "Signed and registered",
             "The attested builder signed the mapping from this source to this bundle, and the \
-             registry accepted the signature. A vault's executors are blessed for that bundle \
-             hash, so the chain from published source to running code is unbroken.",
+             registry accepted it.",
         ),
         JobState::Building { step, percent } => ui::notice(
             Tone::Info,
@@ -204,9 +197,8 @@ fn outcome(job: &'static Job) -> Dom {
             Tone::Info,
             "Waiting for a builder",
             &format!(
-                "Position {position} in the queue. Jobs are taken first come, first served, and \
-                 an author can have one in flight at a time, so a busy author can't crowd out \
-                 everyone else."
+                "Position {position} in the queue: first come, first served, one job in flight per \
+                 author."
             ),
         ),
     }

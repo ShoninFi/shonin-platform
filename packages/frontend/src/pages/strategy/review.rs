@@ -33,7 +33,7 @@ pub fn render(strategy: &'static Strategy) -> Dom {
 
     html!("div", {
         .class("stack-lg")
-        .child(score(strategy, review))
+        .child(score(review))
         .child(findings(review))
         .child(categories(review))
         .child(provenance(review))
@@ -42,7 +42,7 @@ pub fn render(strategy: &'static Strategy) -> Dom {
     })
 }
 
-fn score(strategy: &'static Strategy, review: &'static Review) -> Dom {
+fn score(review: &'static Review) -> Dom {
     let serious = review
         .findings
         .iter()
@@ -81,16 +81,11 @@ fn score(strategy: &'static Strategy, review: &'static Review) -> Dom {
                 Tone::Info,
                 "A score, not a gate",
                 &format!(
-                    "It didn't stop this vault opening and it protects nobody. {} It is the \
-                     author's code that decides what this strategy does, and the chain that \
-                     says how that worked out.",
+                    "It didn't stop this vault opening and it protects nobody. {}",
                     copy::REVIEW_NOTE
                 ),
             ),
-            ui::note(&format!(
-                "Read against the code alone, never against {}'s description of it.",
-                strategy.author
-            )),
+            ui::note("Read against the code alone, never against the description."),
         ],
     )
 }
@@ -102,9 +97,8 @@ fn findings(review: &'static Review) -> Dom {
             vec![ui::notice(
                 Tone::Ok,
                 "No findings",
-                "The reviewer found nothing in the fixed categories worth reporting. That means \
-                 it read the code and saw nothing it recognised as a problem — not that the \
-                 strategy will make money.",
+                "The reviewer found nothing in the fixed categories worth reporting. That is not a \
+                 promise it will make money.",
             )],
         );
     }
@@ -172,8 +166,8 @@ fn categories(review: &'static Review) -> Dom {
         "What the reviewer looks for",
         vec![
             ui::note(
-                "The categories are pinned by the reviewer image, so a score means the same \
-                 thing across strategies, and a finding can only be one of these.",
+                "The categories are pinned by the reviewer image, so a score means the same thing \
+                 across strategies.",
             ),
             html!("div", { .class(["grid", "grid--2"]).children(rows) }),
         ],
@@ -202,11 +196,9 @@ fn provenance(review: &'static Review) -> Dom {
                 ("Paid for by".to_string(), ui::muted(&review.bought_by)),
             ]),
             ui::note(
-                "The image pins the model, the prompt, the output schema and the finding \
-                 categories, and changing any of them is an image change behind the allowlist \
-                 timelock. The reviewer signs the result with a blessed key, so the score really \
-                 is the model's answer — and because the prompt and schema are published, an \
-                 author can run the same review themselves before publishing.",
+                "The image pins the model, the prompt, the schema and the categories; changing any \
+                 of them is an image change behind the allowlist timelock. The reviewer signs the \
+                 result with a blessed key.",
             ),
         ],
     )
@@ -223,10 +215,8 @@ fn buy_modal(strategy: &'static Strategy) -> Dom {
     modal(buying(), "Buy a fresh review", false, move || {
         vec![
             ui::para(
-                "Anyone can buy a new review of any strategy under the current reviewer image, \
-                 for the same flat fee the strategy's own tank paid. The newest is shown first \
-                 and the older ones are kept, so a score can be re-checked but never quietly \
-                 replaced.",
+                "Anyone can buy a new review under the current reviewer image, for the same flat \
+                 fee. The newest is shown first and the older ones are kept.",
             ),
             ui::kv(vec![
                 ("Strategy".to_string(), ui::value(&strategy.name())),
@@ -241,11 +231,7 @@ fn buy_modal(strategy: &'static Strategy) -> Dom {
                 ),
                 ("Fee".to_string(), ui::number("$1.00")),
             ]),
-            ui::note(
-                "Nothing is re-reviewed automatically when the reviewer image changes, because \
-                 a score that moved on its own would say more about the reviewer than about the \
-                 strategy.",
-            ),
+            ui::note("Nothing is re-reviewed automatically when the reviewer image changes."),
             modal_actions(vec![
                 shell::button("Cancel", false, || buying().set(false)),
                 shell::button("Buy the review", true, move || {

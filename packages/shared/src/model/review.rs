@@ -59,8 +59,8 @@ impl FindingCategory {
                  trades differently after a date or a signal."
             }
             Self::UnauditedDependencies => {
-                "Components or crates with little use elsewhere, composed into code that holds \
-                 depositors' money."
+                "Crates with little use elsewhere, pulled into code that holds depositors' \
+                 money."
             }
         }
     }

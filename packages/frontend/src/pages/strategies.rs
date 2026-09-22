@@ -250,9 +250,8 @@ fn listing(
         .child(html!("p", {
             .class(["faint", "small"])
             .text(
-                "Normalised to 15% annualised volatility, estimated only from the days before \
-                 each one and scaled up no more than three times. Raw returns are what the vault \
-                 actually did."
+                "Normalised to 15% annualised volatility, estimated only from the days before each \
+                 one. Raw returns are what the vault actually did."
             )
         }))
     })
@@ -333,8 +332,7 @@ fn past_table(strategies: Vec<&'static Strategy>) -> Dom {
         .child(html!("p", {
             .class(["faint", "small"])
             .text(
-                "Records stay here. A strategy that stopped working doesn't disappear, and it \
-                 never adjusts a live strategy's rank."
+                "Records stay here, and never adjust a live strategy's rank."
             )
         }))
     })
@@ -380,15 +378,9 @@ fn key_of(strategy: &Strategy, key: &str) -> f64 {
 
 fn matches(strategy: &Strategy, chain: &str, source: &str, exit: &str) -> bool {
     let chain_matches = match chain {
-        "hyperevm" => strategy
-            .vault()
-            .is_some_and(|vault| matches!(vault.chain, shared::Chain::HyperEvm)),
-        "robinhood" => strategy
-            .vault()
-            .is_some_and(|vault| matches!(vault.chain, shared::Chain::RobinhoodChain)),
-        "solana" => strategy
-            .vault()
-            .is_some_and(|vault| matches!(vault.chain, shared::Chain::Solana)),
+        "hyperevm" => matches!(strategy.vault.chain, shared::Chain::HyperEvm),
+        "robinhood" => matches!(strategy.vault.chain, shared::Chain::RobinhoodChain),
+        "solana" => matches!(strategy.vault.chain, shared::Chain::Solana),
         _ => true,
     };
 
@@ -399,12 +391,8 @@ fn matches(strategy: &Strategy, chain: &str, source: &str, exit: &str) -> bool {
     };
 
     let exit_matches = match exit {
-        "direct" => strategy
-            .vault()
-            .is_some_and(|vault| vault.exit_class == ExitClass::Direct),
-        "served" => strategy
-            .vault()
-            .is_some_and(|vault| matches!(vault.exit_class, ExitClass::Served { .. })),
+        "direct" => strategy.vault.exit_class == ExitClass::Direct,
+        "served" => matches!(strategy.vault.exit_class, ExitClass::Served { .. }),
         _ => true,
     };
 

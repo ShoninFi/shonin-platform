@@ -19,9 +19,8 @@ pub fn render() -> Dom {
             .child(html!("p", {
                 .class("lede")
                 .text(
-                    "Nothing here asks to be taken on trust. Everything the platform claims \
-                     about a vault is something you can check yourself, with a chain RPC and the \
-                     published source."
+                    "Everything the platform claims about a vault is something you can check yourself, \
+                     with a chain RPC and the published source."
                 )
             }))
         }))
@@ -56,10 +55,6 @@ fn checks() -> Dom {
                 rows,
             ),
             ui::notice(Tone::Info, "The limit of it", copy::VERIFY_LIMIT),
-            ui::note(
-                "Every vault page has a panel that answers the same question for that vault, \
-                 with the blessings, the image and the venue approvals filled in.",
-            ),
         ],
     )
 }
@@ -99,10 +94,8 @@ fn images() -> Dom {
                 allowlisted,
             ),
             ui::note(
-                "An image can be proposed at any time and blessed only after the timelock. \
-                 During it, anyone can rebuild the image from its published source and compare \
-                 the digest. Removing one is instant, so a vulnerable image stops being \
-                 honoured the moment it is revoked.",
+                "An image is blessed only after its timelock, during which anyone can rebuild it and \
+                 compare the digest. Revoking one is instant.",
             ),
             ui::action_link("/status", "Every proposal and revocation, as it happened"),
         ],
@@ -110,11 +103,13 @@ fn images() -> Dom {
 }
 
 fn audits() -> Dom {
-    let Some(vault) = data::vaults().first().and_then(|strategy| strategy.vault()) else {
+    let vaults = data::vaults();
+    let Some(strategy) = vaults.first() else {
         return html!("span");
     };
 
-    let rows: Vec<Row> = vault
+    let rows: Vec<Row> = strategy
+        .vault
         .audits
         .iter()
         .map(|audit| {
@@ -140,10 +135,8 @@ fn audits() -> Dom {
             ui::notice(
                 Tone::Warn,
                 "Vaults open before every audit is finished",
-                "Rather than wait, every vault page shows where each audit stands, so a \
-                 depositor can size their own exposure. Bugs in this stack are the realistic way \
-                 to lose money here — which is exactly why exits don't depend on anything we \
-                 run.",
+                "Every vault page shows where each audit stands, so a depositor can size their own \
+                 exposure.",
             ),
         ],
     )
@@ -157,19 +150,15 @@ fn changing() -> Dom {
             .child(ui::card(vec![
                 ui::subheading("The strategy: nothing"),
                 ui::para(
-                    "A published bundle is frozen. There is no in-place upgrade, no timelock \
-                     with an exit window, no migration. A new version is a new bundle with its \
-                     own vault, which a depositor chooses to move to — and moving is a \
-                     withdrawal and a deposit, nothing more.",
+                    "A published bundle is frozen. A new version is a new bundle with its own vault, \
+                     which a depositor chooses to move to.",
                 ),
             ]))
             .child(ui::card(vec![
                 ui::subheading("The executor image: deliberately"),
                 ui::para(
-                    "It is our code, and a runtime fix has to be able to reach a running vault. \
-                     What bounds that power is the two-day timelock, the fact that the image is \
-                     reproducible from published source, and instant revocation. Nobody needs a \
-                     special exit window for it, because depositors can withdraw at any time.",
+                    "It is our code, and a fix has to be able to reach a running vault. What bounds that \
+                     is the two-day timelock, a reproducible image, and instant revocation.",
                 ),
             ]))
         })],

@@ -107,15 +107,12 @@ pub fn render(handle: &str) -> Dom {
                 ui::notice(
                     Tone::Info,
                     "This is the whole list",
-                    "Live, new, superseded, retired, and the builds that failed. Publishing \
-                     means funding a vault's tank and leaves a permanent record, so an author \
-                     who tried a hundred variants would have a hundred visible entries here. \
-                     Nothing on this page can be hidden by its author.",
+                    "Live, new, superseded, retired, and the builds that failed. Nothing here can be \
+                     hidden by its author.",
                 ),
                 ui::note(
-                    "The honest limit: an author can publish under a fresh identity, and their \
-                     earlier failures don't follow them. What makes that costly isn't the money, \
-                     it's the clock — ninety live days before anything they publish is ranked.",
+                    "An author can publish under a fresh identity, but every strategy needs ninety live \
+                     days before it is ranked.",
                 ),
             ],
         ))

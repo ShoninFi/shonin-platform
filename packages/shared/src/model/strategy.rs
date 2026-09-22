@@ -1,5 +1,4 @@
-//! A strategy: one frozen bundle, its vault or its connected accounts, and
-//! everything shown beside it. A new version is a new strategy, never an
+//! A strategy: one frozen bundle, its vault, and everything shown beside it. A new version is a new strategy, never an
 //! edit of this one.
 
 use serde::{Deserialize, Serialize};
@@ -50,40 +49,10 @@ impl Standing {
     }
 }
 
-/// Which product a strategy was published for.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Product {
-    /// Pooled capital in a vault contract.
-    Vault(Box<Vault>),
-    /// Owners' own accounts at a broker, each an entry and a tank on-chain.
-    Connected(Connected),
-}
-
-/// A strategy that runs on owners' own broker accounts. There is no pool and
-/// no share price: value is an attested read of each account.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Connected {
-    pub broker: String,
-    /// What the broker's rules stop the strategy doing.
-    pub broker_limits: Vec<String>,
-    pub accounts: u32,
-    /// The total value of every account running this strategy.
-    pub total_value: f64,
-    /// How often the executor reads each account and posts the read on-chain.
-    pub read_cadence: String,
-    /// The registry the entries and tanks live on.
-    pub registry: String,
-    /// What an owner needs before they can connect.
-    pub requirements: Vec<String>,
-    /// A typical tank: what a month of running costs comes to.
-    pub monthly_cost: f64,
-}
-
 /// The daily series a record is read from, and everything derived from it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
-    /// Value per share, or an account's value, day by day.
+    /// Value per share, day by day.
     pub value_per_share: Vec<Point>,
     /// The same series rescaled to the platform's volatility target.
     pub normalised: Vec<Point>,
@@ -120,7 +89,8 @@ pub struct Strategy {
     /// Set on the earlier version when a successor declares it.
     pub superseded_by: Option<String>,
     pub bundle: Bundle,
-    pub product: Product,
+    /// The vault behind it. A failed build's vault is closed and empty.
+    pub vault: Vault,
     pub legs: Vec<Leg>,
     pub review: Option<Review>,
     /// Earlier reviews, newest first. Nothing is re-reviewed automatically.
@@ -142,30 +112,9 @@ impl Strategy {
         format!("{} v{}", self.id, self.version)
     }
 
-    pub fn vault(&self) -> Option<&Vault> {
-        match &self.product {
-            Product::Vault(vault) => Some(vault),
-            Product::Connected(_) => None,
-        }
-    }
-
-    pub fn connected(&self) -> Option<&Connected> {
-        match &self.product {
-            Product::Connected(connected) => Some(connected),
-            Product::Vault(_) => None,
-        }
-    }
-
-    pub fn is_connected(&self) -> bool {
-        matches!(self.product, Product::Connected(_))
-    }
-
-    /// What the strategy is worth today, whichever product it is.
+    /// What the vault is worth today.
     pub fn capital(&self) -> f64 {
-        match &self.product {
-            Product::Vault(vault) => vault.value,
-            Product::Connected(connected) => connected.total_value,
-        }
+        self.vault.value
     }
 
     /// Days a strategy has to run live before it is ranked.

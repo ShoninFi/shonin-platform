@@ -1,12 +1,11 @@
 //! The data the app renders.
 //!
-//! Every strategy, vault, review, component, build and feed entry in the app
+//! Every strategy, vault, review, build and feed entry in the app
 //! is built here, once, from seeded generators: nothing is fetched, and the
 //! same dataset is built by the app in the browser and by the build-time
 //! pre-render, so a page reads the same before and after it boots.
 
 pub mod authors;
-pub mod components;
 pub mod feed;
 pub mod queue;
 pub mod series;
@@ -15,7 +14,7 @@ pub mod strategies;
 
 use std::sync::OnceLock;
 
-use shared::{Author, Component, FeedEvent, Job, Strategy};
+use shared::{Author, FeedEvent, Job, Strategy};
 use time::{Date, Month, PrimitiveDateTime};
 
 use series::Rng;
@@ -45,7 +44,6 @@ pub fn hours_ago(hours: u32) -> PrimitiveDateTime {
 pub struct Dataset {
     pub strategies: Vec<Strategy>,
     pub authors: Vec<Author>,
-    pub components: Vec<Component>,
     pub jobs: Vec<Job>,
     pub feed: Vec<FeedEvent>,
 }
@@ -57,7 +55,6 @@ pub fn get() -> &'static Dataset {
     DATASET.get_or_init(|| Dataset {
         strategies: strategies::all(),
         authors: authors::all(),
-        components: components::all(),
         jobs: queue::all(),
         feed: feed::all(),
     })
@@ -65,22 +62,9 @@ pub fn get() -> &'static Dataset {
 
 // ------------------------------------------------------------------ lookups
 
-/// Every strategy that has a vault.
+/// Every strategy, in the order the registry saw them.
 pub fn vaults() -> Vec<&'static Strategy> {
-    get()
-        .strategies
-        .iter()
-        .filter(|strategy| !strategy.is_connected())
-        .collect()
-}
-
-/// Every strategy published for owners' own broker accounts.
-pub fn agents() -> Vec<&'static Strategy> {
-    get()
-        .strategies
-        .iter()
-        .filter(|strategy| strategy.is_connected())
-        .collect()
+    get().strategies.iter().collect()
 }
 
 pub fn strategy(slug: &str) -> Option<&'static Strategy> {
@@ -103,28 +87,6 @@ pub fn by_author(handle: &str) -> Vec<&'static Strategy> {
         .collect();
     found.sort_by_key(|strategy| std::cmp::Reverse(strategy.registered));
     found
-}
-
-pub fn component(slug: &str) -> Option<&'static Component> {
-    get()
-        .components
-        .iter()
-        .find(|component| component.slug == slug)
-}
-
-/// The strategies that compose a component.
-pub fn composing(slug: &str) -> Vec<&'static Strategy> {
-    get()
-        .strategies
-        .iter()
-        .filter(|strategy| {
-            strategy
-                .bundle
-                .components
-                .iter()
-                .any(|pin| pin.slug == slug)
-        })
-        .collect()
 }
 
 pub fn job(id: &str) -> Option<&'static Job> {
@@ -226,11 +188,6 @@ pub fn total_vault_capital() -> f64 {
         .sum()
 }
 
-/// Capital across every connected account.
-pub fn total_connected_capital() -> f64 {
-    agents().iter().map(|strategy| strategy.capital()).sum()
-}
-
 /// Trades the platform has made, summed from the records.
 pub fn total_trades() -> u32 {
     get()
@@ -270,7 +227,7 @@ pub fn tx(seed: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared::{Product, Standing};
+    use shared::Standing;
 
     #[test]
     fn slugs_are_unique_and_url_shaped() {
@@ -302,20 +259,6 @@ mod tests {
                 strategy.slug,
                 strategy.author
             );
-        }
-    }
-
-    #[test]
-    fn every_pinned_component_is_in_the_registry() {
-        for strategy in &get().strategies {
-            for pin in &strategy.bundle.components {
-                assert!(
-                    component(&pin.slug).is_some(),
-                    "{} pins {}, which isn't in the registry",
-                    strategy.slug,
-                    pin.slug
-                );
-            }
         }
     }
 
@@ -366,9 +309,7 @@ mod tests {
     #[test]
     fn a_vaults_numbers_agree_with_its_record() {
         for strategy in vaults() {
-            let Product::Vault(vault) = &strategy.product else {
-                continue;
-            };
+            let vault = &strategy.vault;
             if strategy.standing == Standing::BuildFailed {
                 continue;
             }
@@ -399,14 +340,11 @@ mod tests {
             Standing::Ranked,
             Standing::New,
             Standing::Superseded,
-            Standing::Retired,
             Standing::Killed,
             Standing::BuildFailed,
         ] {
             assert!(standings.contains(&wanted), "nothing is {wanted:?}");
         }
-
-        assert!(!agents().is_empty(), "no connected-account agents");
         assert!(
             vaults()
                 .iter()
@@ -420,9 +358,9 @@ mod tests {
             "no strategy with a model"
         );
         assert!(
-            vaults().iter().any(|strategy| strategy
-                .vault()
-                .is_some_and(|vault| !vault.claims.is_empty())),
+            vaults()
+                .iter()
+                .any(|strategy| !strategy.vault.claims.is_empty()),
             "no vault with an outstanding claim"
         );
         assert!(
