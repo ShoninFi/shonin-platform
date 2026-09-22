@@ -15,6 +15,9 @@ struct Market {
     /// Dollars per unit of size that longs have paid shorts since the market
     /// opened. A position's own share of it is settled when it next moves.
     int256 fundingIndex;
+    /// What longs are paying shorts now, in dollars per unit of size per day.
+    /// Positive means the carry favours a short.
+    int256 fundingRate;
     uint64 fundingUpdatedAt;
 }
 
@@ -49,6 +52,23 @@ struct Fill {
     uint256 notional;
 }
 
+/// One market's prices, as the operator posts them.
+struct Quote {
+    bytes32 market;
+    uint256 mark;
+    uint256 oracle;
+    uint256 bid;
+    uint256 ask;
+}
+
+/// What longs are paying shorts in one market, and what has accrued since the
+/// last posting.
+struct Funding {
+    bytes32 market;
+    int256 ratePerDay;
+    int256 paidPerUnit;
+}
+
 /// The venue a vault's capital sits on: it holds the account, it decides what
 /// the account is worth, and it is what stops a trading key withdrawing.
 ///
@@ -74,6 +94,7 @@ interface ILocalVenue {
     event Rejected(address indexed master, bytes32 indexed market, address indexed by, string reason);
     event PricesSet(bytes32 indexed market, uint256 mark, uint256 oracle, uint256 bid, uint256 ask);
     event FundingAccrued(bytes32 indexed market, int256 paidPerUnit, int256 fundingIndex);
+    event FundingSet(bytes32 indexed market, int256 ratePerDay);
 
     /// Approve a key to trade this account until `validUntil`. Master only.
     function approveAgent(address agent, uint64 validUntil) external;
@@ -119,5 +140,10 @@ interface ILocalVenue {
     function setPrices(bytes32 market, uint256 mark, uint256 oracle, uint256 bid, uint256 ask) external;
     /// Longs pay shorts `paidPerUnit` dollars for each unit of size held.
     function accrueFunding(bytes32 market, int256 paidPerUnit) external;
+    /// Publish what longs are paying shorts, per unit of size per day.
+    function setFunding(bytes32 market, int256 ratePerDay) external;
     function listMarket(bytes32 id, bool isPerp, uint256 price) external;
+    /// Everything a market operator has to say in one call, so a chain that
+    /// mines on a timer keeps up with itself.
+    function post(Quote[] calldata quotes, Funding[] calldata funding) external;
 }

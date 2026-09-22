@@ -10,8 +10,12 @@
 //! and logs, which every target can do, so the web app reaches the contracts
 //! through exactly the bindings the services use.
 
+#[cfg(feature = "rpc")]
+pub mod client;
 pub mod deployments;
 
+#[cfg(feature = "rpc")]
+pub use client::{Client, KeyClient, Role};
 pub use deployments::{Deployments, Roles};
 
 /// The generated bindings, one module per interface file.

@@ -5069,10 +5069,13 @@ dependencies = [
 name = "shonin-chain"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "alloy-primitives",
  "alloy-sol-types",
+ "anyhow",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -5142,11 +5145,13 @@ dependencies = [
  "fastnum",
  "futures",
  "hex",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "shonin-chain",
  "shonin-shared",
+ "shonin-strategy-sdk",
  "time",
  "tokio",
  "tracing",
@@ -6919,6 +6924,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "53cb4b5556c3a791e86838ea287782bdafa704d55b0e68b5b81a3a16b9ea5f4b"
 dependencies = [
  "bitflags 2.13.2",
+ "futures",
  "wit-bindgen-rust-macro",
 ]
 

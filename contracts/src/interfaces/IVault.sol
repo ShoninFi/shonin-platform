@@ -173,6 +173,8 @@ interface IVault {
     // What the page shows ---------------------------------------------------
 
     function state() external view returns (VaultState);
+    /// The bundle this vault's strategy is, as the registry holds it.
+    function bundleHash() external view returns (bytes32);
     function strategyId() external view returns (bytes32);
     function version() external view returns (uint32);
     function author() external view returns (address);

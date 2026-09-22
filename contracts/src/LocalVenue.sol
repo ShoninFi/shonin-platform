@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.30;
 
-import {Fill, ILocalVenue, Market, OrderRequest, Position} from "./interfaces/ILocalVenue.sol";
+import {
+    Fill, Funding, ILocalVenue, Market, OrderRequest, Position, Quote
+} from "./interfaces/ILocalVenue.sol";
 import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
 import {SafeERC20} from "openzeppelin/token/ERC20/utils/SafeERC20.sol";
 
@@ -77,6 +79,7 @@ contract LocalVenue is ILocalVenue {
             bid: price,
             ask: price,
             fundingIndex: 0,
+            fundingRate: 0,
             fundingUpdatedAt: uint64(block.timestamp)
         });
         _markets.push(id);
@@ -90,6 +93,22 @@ contract LocalVenue is ILocalVenue {
         uint256 bid,
         uint256 ask
     ) external onlyOperator {
+        _setPrices(market, mark, oracle, bid, ask);
+    }
+
+    /// Everything a market operator has to say, in one call. A chain that
+    /// mines on a timer cannot afford a transaction per market per block.
+    function post(Quote[] calldata quotes, Funding[] calldata funding) external onlyOperator {
+        for (uint256 i = 0; i < quotes.length; i++) {
+            _setPrices(quotes[i].market, quotes[i].mark, quotes[i].oracle, quotes[i].bid, quotes[i].ask);
+        }
+        for (uint256 i = 0; i < funding.length; i++) {
+            _setFunding(funding[i].market, funding[i].ratePerDay);
+            _accrueFunding(funding[i].market, funding[i].paidPerUnit);
+        }
+    }
+
+    function _setPrices(bytes32 market, uint256 mark, uint256 oracle, uint256 bid, uint256 ask) private {
         Market storage m = _market[market];
         if (m.id == bytes32(0)) revert NoSuchMarket();
         m.mark = mark;
@@ -100,11 +119,26 @@ contract LocalVenue is ILocalVenue {
     }
 
     function accrueFunding(bytes32 market, int256 paidPerUnit) external onlyOperator {
+        _accrueFunding(market, paidPerUnit);
+    }
+
+    function setFunding(bytes32 market, int256 ratePerDay) external onlyOperator {
+        _setFunding(market, ratePerDay);
+    }
+
+    function _accrueFunding(bytes32 market, int256 paidPerUnit) private {
         Market storage m = _market[market];
         if (m.id == bytes32(0)) revert NoSuchMarket();
         m.fundingIndex += paidPerUnit;
         m.fundingUpdatedAt = uint64(block.timestamp);
         emit FundingAccrued(market, paidPerUnit, m.fundingIndex);
+    }
+
+    function _setFunding(bytes32 market, int256 ratePerDay) private {
+        Market storage m = _market[market];
+        if (m.id == bytes32(0)) revert NoSuchMarket();
+        m.fundingRate = ratePerDay;
+        emit FundingSet(market, ratePerDay);
     }
 
     function markets() external view returns (bytes32[] memory) {

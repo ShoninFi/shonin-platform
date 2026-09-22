@@ -60,7 +60,7 @@ rand = "0.10.3"
 # bind the shonin:strategy world with wit-bindgen.
 wasmtime = { version = "48.0.2", features = ["component-model-async"] }
 wasmtime-wasi = "48.0.2"
-wit-bindgen = { version = "0.62.0", features = ["async"] }
+wit-bindgen = { version = "0.62.0", features = ["async", "futures-stream"] }
 
 # The decimal a strategy and an adapter agree on, on both sides of the
 # component boundary.
