@@ -1,5 +1,5 @@
-//! The code tab: the bundle, the project it was compiled from, the components
-//! it pins, and the log of the build that made it.
+//! The code tab: the bundle, the project it was compiled from, and the log of
+//! the build that made it.
 
 use std::sync::OnceLock;
 
@@ -24,7 +24,6 @@ pub fn render(strategy: &'static Strategy) -> Dom {
         .class("stack-lg")
         .child(identity(strategy))
         .child(source(strategy))
-        .child(components(strategy))
         .child(models(strategy))
         .child(allowances(strategy))
         .child(build_log(strategy))
@@ -39,9 +38,8 @@ fn identity(strategy: &'static Strategy) -> Dom {
         "The bundle",
         vec![
             ui::note(
-                "The bundle is the strategy: one WASM component, plus any models it calls, \
-                 compiled by the build service from the submitted project. An executor refuses \
-                 to run anything whose hash differs.",
+                "One WASM component plus any models it calls, compiled by the build service from the \
+                 submitted project. An executor refuses anything whose hash differs.",
             ),
             ui::kv(vec![
                 ("Bundle hash".to_string(), ui::hash(&bundle.bundle_hash)),
@@ -72,10 +70,9 @@ fn source(strategy: &'static Strategy) -> Dom {
             vec![ui::notice(
                 Tone::Info,
                 "This strategy's source is sealed",
-                "The project is stored encrypted and released only to attested builders, \
-                 reviewers and executors, so it isn't served here. The build, the hashes and the \
-                 review are identical to a published strategy's: the attested builder compiled \
-                 this source and the reviewer read it. What sealing changes is who else can.",
+                "The project is stored encrypted and released only to attested builders, reviewers \
+                 and executors. The build, the hashes and the review are the same as for \
+                 published source; only who else can read it changes.",
             )],
         ),
         Source::Published { repo, commit } => {
@@ -166,50 +163,6 @@ fn file_body(strategy: &'static Strategy, path: &str) -> Dom {
     })
 }
 
-fn components(strategy: &'static Strategy) -> Dom {
-    let pins = &strategy.bundle.components;
-    if pins.is_empty() {
-        return ui::section(
-            "Components",
-            vec![ui::empty("This strategy composes no components.")],
-        );
-    }
-
-    let rows: Vec<Row> = pins
-        .iter()
-        .map(|pin| {
-            Row::linked(
-                format!("/components/{}", pin.slug),
-                vec![
-                    html!("span", { .class("table__primary").text(&pin.name) }),
-                    ui::value(&pin.version),
-                    ui::hash(&pin.hash),
-                ],
-            )
-        })
-        .collect();
-
-    ui::section(
-        "Components it pins",
-        vec![
-            table(
-                vec![
-                    Column::new("Component"),
-                    Column::new("Version"),
-                    Column::new("Hash").wide(),
-                ],
-                rows,
-            ),
-            ui::note(
-                "A strategy names the exact hash of every component it composes, and a pinned \
-                 hash can't be republished — so a new version of a component never reaches a \
-                 running vault. The composed result is one component, and the bundle hash covers \
-                 all of it.",
-            ),
-        ],
-    )
-}
-
 fn models(strategy: &'static Strategy) -> Dom {
     let models = &strategy.bundle.models;
     if models.is_empty() {
@@ -245,10 +198,8 @@ fn models(strategy: &'static Strategy) -> Dom {
             ui::notice(
                 Tone::Warn,
                 "Weights are data, not source",
-                "Nobody can read a model the way they read code. The review judges it by its \
-                 inputs, outputs and operators and by what the code does with its output, and \
-                 says its behaviour is unverified. New weights mean a new bundle hash, so \
-                 retraining is a new strategy with its own vault.",
+                "Nobody can read a model the way they read code. The review judges what the code \
+                 does with its output, and says the model's behaviour is unverified.",
             ),
         ],
     )
@@ -287,9 +238,8 @@ fn allowances(strategy: &'static Strategy) -> Dom {
             ("Placement".to_string(), ui::value(&allowances.placement)),
         ]),
         ui::note(
-            "The compute this strategy declared. The executor enforces each one as a cap and \
-             meters what is used against it, charged to the vault's tank at published prices — \
-             never more than the allowances times those prices.",
+            "The compute this strategy declared: each one a cap, metered to the vault's tank at \
+             published prices.",
         ),
     ];
 
@@ -297,9 +247,8 @@ fn allowances(strategy: &'static Strategy) -> Dom {
         children.push(ui::subheading("Sealed secrets"));
         children.push(ui::bullets(secrets.iter().cloned()));
         children.push(ui::note(
-            "The names the manifest declares. The values are sealed to this bundle's hash, so \
-             only an attested executor running exactly this bundle can read them, and they never \
-             appear in a record.",
+            "Sealed to this bundle's hash, so only an attested executor running exactly this \
+             bundle can read them.",
         ));
     }
 
@@ -330,11 +279,7 @@ fn build_log(strategy: &'static Strategy) -> Dom {
         "The build log",
         vec![
             html!("div", { .class("log").children(lines) }),
-            ui::note(
-                "Builds run offline on a pinned recipe, twice, and the bytes must match. A \
-                 project whose output isn't stable is rejected with the difference rather than \
-                 published as something nobody can reproduce.",
-            ),
+            ui::note("Builds run offline on a pinned recipe, twice, and the bytes must match."),
         ],
     )
 }
@@ -348,10 +293,8 @@ fn rebuilding(strategy: &'static Strategy) -> Dom {
         "Rebuilding it yourself",
         vec![
             ui::para(
-                "The builder image and the recipe are public, so anyone can rebuild this \
-                 strategy from its source and compare the result with the hash the registry \
-                 accepted. A disagreement is a public, checkable claim rather than an \
-                 accusation. It needs no account, no tank and no permission from us.",
+                "The builder image and the recipe are public, so anyone can rebuild this strategy \
+                 from its source and compare the result with the hash the registry accepted.",
             ),
             html!("pre", {
                 .class("code")

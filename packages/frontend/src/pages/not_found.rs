@@ -2,7 +2,6 @@
 
 use dominator::{Dom, html};
 
-use crate::ui::primitives as ui;
 use crate::ui::shell;
 
 pub fn render() -> Dom {
@@ -17,12 +16,7 @@ pub fn render() -> Dom {
             .class(["row", "row--wrap"])
             .child(shell::button_link("/", "Home", true))
             .child(shell::button_link("/strategies", "Strategies", false))
-            .child(shell::button_link("/accounts", "Connected accounts", false))
             .child(shell::button_link("/verify", "Verify", false))
         }))
-        .child(ui::note(
-            "Every page in the app has a file of its own, so a link that leads here really is a \
-             link to nothing rather than a page that failed to load.",
-        ))
     })
 }

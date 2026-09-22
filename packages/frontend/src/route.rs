@@ -76,11 +76,7 @@ pub enum Route {
     Strategies,
     Strategy { slug: String, tab: Tab },
     Author { handle: String },
-    Accounts,
-    Account { slug: String },
     Portfolio,
-    Components,
-    Component { slug: String },
     Queue,
     Job { id: String },
     Publish,
@@ -110,14 +106,6 @@ impl Route {
             NavItem {
                 route: Route::Strategies,
                 label: "Strategies",
-            },
-            NavItem {
-                route: Route::Accounts,
-                label: "Accounts",
-            },
-            NavItem {
-                route: Route::Components,
-                label: "Components",
             },
             NavItem {
                 route: Route::Queue,
@@ -150,21 +138,7 @@ impl Route {
                 },
                 None => Self::NotFound,
             },
-            ["accounts"] => Self::Accounts,
-            ["accounts", slug] => match data::strategy(slug) {
-                Some(strategy) if strategy.is_connected() => Self::Account {
-                    slug: (*slug).to_string(),
-                },
-                _ => Self::NotFound,
-            },
             ["portfolio"] => Self::Portfolio,
-            ["components"] => Self::Components,
-            ["components", slug] => match data::component(slug) {
-                Some(_) => Self::Component {
-                    slug: (*slug).to_string(),
-                },
-                None => Self::NotFound,
-            },
             ["queue"] => Self::Queue,
             ["queue", id] => match data::job(id) {
                 Some(_) => Self::Job {
@@ -180,15 +154,14 @@ impl Route {
         }
     }
 
-    /// A vault strategy's page. Connected-account strategies live under
-    /// `/accounts`, so they don't answer here.
+    /// A strategy's page, if the strategy exists.
     fn strategy(slug: &str, tab: Tab) -> Self {
         match data::strategy(slug) {
-            Some(strategy) if !strategy.is_connected() => Self::Strategy {
+            Some(_) => Self::Strategy {
                 slug: slug.to_string(),
                 tab,
             },
-            _ => Self::NotFound,
+            None => Self::NotFound,
         }
     }
 
@@ -202,11 +175,7 @@ impl Route {
                 None => format!("/strategies/{slug}"),
             },
             Self::Author { handle } => format!("/authors/{handle}"),
-            Self::Accounts => "/accounts".to_string(),
-            Self::Account { slug } => format!("/accounts/{slug}"),
             Self::Portfolio => "/portfolio".to_string(),
-            Self::Components => "/components".to_string(),
-            Self::Component { slug } => format!("/components/{slug}"),
             Self::Queue => "/queue".to_string(),
             Self::Job { id } => format!("/queue/{id}"),
             Self::Publish => "/publish".to_string(),
@@ -224,8 +193,6 @@ impl Route {
             Self::Strategies | Self::Strategy { .. } | Self::Author { .. } => {
                 Some(Self::Strategies)
             }
-            Self::Accounts | Self::Account { .. } => Some(Self::Accounts),
-            Self::Components | Self::Component { .. } => Some(Self::Components),
             Self::Queue | Self::Job { .. } => Some(Self::Queue),
             Self::Verify => Some(Self::Verify),
             _ => None,
@@ -258,20 +225,6 @@ impl Route {
                     tab,
                 });
             }
-        }
-
-        routes.push(Route::Accounts);
-        for agent in data::agents() {
-            routes.push(Route::Account {
-                slug: agent.slug.clone(),
-            });
-        }
-
-        routes.push(Route::Components);
-        for component in &data::get().components {
-            routes.push(Route::Component {
-                slug: component.slug.clone(),
-            });
         }
 
         routes.push(Route::Queue);
@@ -362,39 +315,10 @@ impl Route {
                      the builds that failed — with their records."
                 ),
             ),
-            Self::Accounts => page(
-                "Connected accounts · Shonin",
-                "Published strategies that trade an account you keep at your own broker. The \
-                 broker stops the strategy withdrawing anything; Shonin supplies the code's \
-                 identity and its record.",
-            ),
-            Self::Account { slug } => {
-                let Some(agent) = data::strategy(slug) else {
-                    return Self::NotFound.page();
-                };
-                page(
-                    &format!("{} · Connected accounts · Shonin", agent.name()),
-                    &summarise(&agent.description),
-                )
-            }
             Self::Portfolio => page(
                 "Your positions · Shonin",
-                "What you hold across vaults and connected accounts.",
+                "What you hold across vaults, kept in your browser and nowhere else.",
             ),
-            Self::Components => page(
-                "Components · Shonin",
-                "Reusable pieces of a strategy: published with their source, pinned by hash, and \
-                 shown with the capital running behind them.",
-            ),
-            Self::Component { slug } => {
-                let Some(component) = data::component(slug) else {
-                    return Self::NotFound.page();
-                };
-                page(
-                    &format!("{} · Components · Shonin", component.name),
-                    &component.summary,
-                )
-            }
             Self::Queue => page(
                 "Build queue · Shonin",
                 "Every build, first come first served, with its full log whether it succeeded or \
@@ -517,31 +441,9 @@ mod tests {
             Route::NotFound
         );
         assert_eq!(Route::from_path("/authors/nobody"), Route::NotFound);
-        assert_eq!(Route::from_path("/components/nothing"), Route::NotFound);
+        assert_eq!(Route::from_path("/accounts"), Route::NotFound);
+        assert_eq!(Route::from_path("/components"), Route::NotFound);
         assert_eq!(Route::from_path("/queue/0"), Route::NotFound);
-    }
-
-    /// The two products have separate interfaces: a connected-account
-    /// strategy is not a vault and doesn't answer at a vault's URL.
-    #[test]
-    fn the_two_products_keep_their_own_urls() {
-        let agent = data::agents()[0].slug.clone();
-        assert_eq!(
-            Route::from_path(&format!("/accounts/{agent}")),
-            Route::Account {
-                slug: agent.clone()
-            }
-        );
-        assert_eq!(
-            Route::from_path(&format!("/strategies/{agent}")),
-            Route::NotFound
-        );
-
-        let vault = data::vaults()[0].slug.clone();
-        assert_eq!(
-            Route::from_path(&format!("/accounts/{vault}")),
-            Route::NotFound
-        );
     }
 
     /// The portfolio is built in the browser from one viewer's own wallet, so

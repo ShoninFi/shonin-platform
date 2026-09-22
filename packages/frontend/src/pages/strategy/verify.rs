@@ -34,17 +34,16 @@ pub fn render(strategy: &'static Strategy) -> Dom {
 }
 
 fn panel(strategy: &'static Strategy, attestation: &'static shared::Attestation) -> Dom {
-    let value = strategy.vault().map_or_else(String::new, |vault| {
-        format!("{} {}", fmt::money(vault.value), vault.asset)
-    });
+    let value = format!(
+        "{} {}",
+        fmt::money(strategy.vault.value),
+        strategy.vault.asset
+    );
 
     ui::section(
         "Which code is trading this vault?",
         vec![
-            ui::note(
-                "Everything in this panel is on-chain, and every line of it can be checked \
-                 without asking us for anything.",
-            ),
+            ui::note("Everything in this panel is on-chain and can be checked without asking us."),
             ui::kv(vec![
                 ("Strategy".to_string(), ui::value(&strategy.name())),
                 (
@@ -85,10 +84,7 @@ fn panel(strategy: &'static Strategy, attestation: &'static shared::Attestation)
                             .text(&format!(
                                 "allowlisted {} · this vault was created {} · audit {}",
                                 fmt::date(attestation.image.allowlisted),
-                                strategy
-                                    .vault()
-                                    .map(|vault| fmt::date(vault.created))
-                                    .unwrap_or_default(),
+                                fmt::date(strategy.vault.created),
                                 attestation.image.audit.label()
                             ))
                         }))
@@ -110,10 +106,8 @@ fn panel(strategy: &'static Strategy, attestation: &'static shared::Attestation)
                 Tone::Accent,
                 "One key, one vault, one strategy version",
                 &format!(
-                    "Each blessing binds a key to this vault and to this bundle hash, and lasts \
-                     {} hours before the executor has to attest again. A key blessed for another \
-                     vault can't act here, and a vault's strategy version never changes — so \
-                     neither does what its keys may run.",
+                    "Each blessing binds a key to this vault and this bundle hash, and lasts {} hours \
+                     before the executor has to attest again.",
                     attestation.blessing_ttl_hours
                 ),
             ),
@@ -168,11 +162,9 @@ fn keys(attestation: &'static shared::Attestation) -> Dom {
                 rows,
             ),
             ui::note(
-                "The keys are generated inside the enclave and never leave it. A standby in \
-                 another zone is blessed and approved in advance, so a failure is a restart \
-                 rather than a wait — and the chain is the handoff: a new executor starts only \
-                 once the old key's approval is revoked or has lapsed, so two copies never trade \
-                 at once.",
+                "The keys are generated inside the enclave and never leave it. A standby in another \
+                 zone is blessed in advance, and the chain is the handoff, so two copies never \
+                 trade at once.",
             ),
         ],
     )
@@ -203,10 +195,8 @@ fn approvals(attestation: &'static shared::Attestation) -> Dom {
                 rows,
             ),
             ui::note(
-                "Anyone can send the transaction that approves a key, and it succeeds only if \
-                 the registry says that key is blessed for this vault and this strategy with an \
-                 allowed image. Anyone can revoke one whose blessing has lapsed or whose image \
-                 was revoked. Neither needs us.",
+                "Anyone can send the transaction that approves or revokes a key; the contract obeys \
+                 only what the registry justifies.",
             ),
         ],
     )
@@ -241,11 +231,8 @@ fn checks() -> Dom {
 }
 
 fn audits(strategy: &'static Strategy) -> Dom {
-    let Some(vault) = strategy.vault() else {
-        return html!("span");
-    };
-
-    let rows: Vec<Row> = vault
+    let rows: Vec<Row> = strategy
+        .vault
         .audits
         .iter()
         .map(|audit| {
@@ -269,10 +256,8 @@ fn audits(strategy: &'static Strategy) -> Dom {
                 rows,
             ),
             ui::note(
-                "A vault opens to deposits before every audit is finished. Rather than wait, \
-                 every page says exactly where each one stands, so a depositor can size their \
-                 own exposure. Bugs in this stack are the realistic way to lose money here, \
-                 which is why exits don't depend on anything we run.",
+                "A vault opens before every audit is finished, so the page says where each one \
+                 stands.",
             ),
         ],
     )
@@ -287,18 +272,14 @@ fn changing() -> Dom {
                 .child(ui::card(vec![
                     ui::subheading("The strategy never changes"),
                     ui::para(
-                        "A published bundle is frozen. There is no upgrade path, no timelock \
-                         with an exit window, nothing. A new version is a new bundle with its \
-                         own vault, which a depositor chooses to move to.",
+                        "A published bundle is frozen. A new version is a new bundle with its own vault.",
                     ),
                 ]))
                 .child(ui::card(vec![
                     ui::subheading("The executor image can"),
                     ui::para(
-                        "It is our code and it has to be patchable: a runtime fix has to be able \
-                         to reach a running vault. A new image is proposed publicly and can only \
-                         be blessed after a two-day timelock, long enough for anyone to rebuild \
-                         it from source and object. Removing one is instant.",
+                        "It is our code, and a fix has to reach running vaults. A new image is proposed \
+                         publicly and blessed only after a two-day timelock; removing one is instant.",
                     ),
                 ]))
             }),

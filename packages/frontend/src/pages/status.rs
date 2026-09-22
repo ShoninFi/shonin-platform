@@ -22,11 +22,6 @@ pub fn render() -> Dom {
                      venue that stopped behaving."
                 )
             }))
-            .child(ui::note(
-                "Nothing here is a promise that a vault will never be halted. It is the record \
-                 of when one was, and why — because a halt is the one thing anyone running this \
-                 platform can always do, and the only honest answer is to say so out loud.",
-            ))
         }))
         .child(html!("div", {
             .class("stack")
@@ -39,27 +34,22 @@ pub fn render() -> Dom {
                 .child(ui::card(vec![
                     ui::subheading("A kill"),
                     ui::para(
-                        "The admin key can stop any vault. The strategy gets a short grace \
-                         period to unwind itself, then every position is closed reduce-only \
-                         inside the exit band and the cash brought home. It moves no funds \
-                         anywhere but back to depositors.",
+                        "The admin key can stop any vault. Every position is closed reduce-only inside the \
+                         exit band and the cash brought home, to depositors and nowhere else.",
                     ),
                 ]))
                 .child(ui::card(vec![
                     ui::subheading("An image change"),
                     ui::para(
-                        "A new executor image is proposed publicly and can only be blessed after \
-                         a two-day timelock — long enough for anyone to rebuild it from source \
-                         and object. Revoking one is instant, and never hands a vault's keys to \
-                         another runtime.",
+                        "A new executor image is proposed publicly and blessed only after a two-day \
+                         timelock. Revoking one is instant.",
                     ),
                 ]))
                 .child(ui::card(vec![
                     ui::subheading("A freeze"),
                     ui::para(
-                        "A claim that goes unserved for seven days freezes its vault: no new \
-                         deposits, and the home chain's trading approvals revoked so that only \
-                         unwinding remains possible there.",
+                        "A claim that goes unserved for seven days freezes its vault: no new deposits, and \
+                         only unwinding remains possible.",
                     ),
                 ]))
             })],

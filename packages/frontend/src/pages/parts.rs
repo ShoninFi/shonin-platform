@@ -10,13 +10,9 @@ use crate::ui::chart;
 use crate::ui::primitives as ui;
 use crate::ui::primitives::Tone;
 
-/// Where a strategy's page is, whichever product it belongs to.
+/// Where a strategy's page is.
 pub fn path_of(strategy: &Strategy) -> String {
-    if strategy.is_connected() {
-        format!("/accounts/{}", strategy.slug)
-    } else {
-        format!("/strategies/{}", strategy.slug)
-    }
+    format!("/strategies/{}", strategy.slug)
 }
 
 /// How a strategy's standing reads.
@@ -55,7 +51,7 @@ pub fn custody_badge(custody: Custody) -> Dom {
     ui::badge(
         custody.label(),
         match custody {
-            Custody::VenueEnforced | Custody::BrokerEnforced => Tone::Ok,
+            Custody::VenueEnforced => Tone::Ok,
             Custody::ChainEnforced => Tone::Info,
         },
     )
@@ -81,12 +77,13 @@ pub fn health_badge(strategy: &Strategy) -> Option<Dom> {
 
 /// Every label a strategy carries, in one row.
 pub fn labels(strategy: &Strategy) -> Dom {
-    let mut items = vec![standing_badge(strategy.standing), source_badge(strategy)];
-    if let Some(vault) = strategy.vault() {
-        items.push(exit_badge(vault.exit_class));
-        if vault.state == VaultState::Frozen {
-            items.push(ui::badge("frozen", Tone::Error));
-        }
+    let mut items = vec![
+        standing_badge(strategy.standing),
+        source_badge(strategy),
+        exit_badge(strategy.vault.exit_class),
+    ];
+    if strategy.vault.state == VaultState::Frozen {
+        items.push(ui::badge("frozen", Tone::Error));
     }
     if let Some(health) = health_badge(strategy) {
         items.push(health);
@@ -141,8 +138,8 @@ pub fn strategy_card(strategy: &'static Strategy) -> Dom {
         }))
         .child(html!("div", {
             .class(["row", "row--between", "small", "muted"])
-            .child(text(&fmt::money_compact(strategy.capital())))
-            .child(text(&fmt::days(strategy.days_live)))
+            .child(html!("span", { .text(&fmt::money_compact(strategy.capital())) }))
+            .child(html!("span", { .text(&fmt::days(strategy.days_live)) }))
         }))
     })
 }
@@ -274,7 +271,8 @@ pub fn vault_notices(strategy: &'static Strategy) -> Vec<Dom> {
         notices.push(ui::notice_with(
             Tone::Error,
             "This build failed, so there is no bundle and no vault",
-            "The project didn't produce the same bytes twice, so nothing could be published: a              build nobody can reproduce isn't one anyone should trust. There is no record, no              review and no running code — only the log, which is public like every other. A              fixed resubmission is a new vault.",
+            "The project didn't produce the same bytes twice, so nothing was published. There is \
+             no record, no review and no running code, only the public log.",
             build.map(|job| ui::action_link(&format!("/queue/{}", job.id), "The build log")),
         ));
     }
@@ -291,9 +289,8 @@ pub fn vault_notices(strategy: &'static Strategy) -> Vec<Dom> {
         notices.push(ui::notice_with(
             Tone::Info,
             "A newer version of this strategy exists",
-            "This vault runs exactly as it always has: nothing about a published strategy can \
-             change. Moving means withdrawing here and depositing there, and the new vault's \
-             high-water mark starts fresh.",
+            "This vault runs exactly as it always has. Moving means withdrawing here and \
+             depositing there.",
             Some(ui::action_link(
                 &format!("/strategies/{successor}"),
                 "See what changed",
@@ -301,7 +298,8 @@ pub fn vault_notices(strategy: &'static Strategy) -> Vec<Dom> {
         ));
     }
 
-    if let Some(vault) = strategy.vault() {
+    {
+        let vault = &strategy.vault;
         for claim in &vault.claims {
             let age = (data::as_of() - claim.booked).whole_days();
             let left = i64::from(vault.freeze_after_days) - age;
@@ -309,10 +307,8 @@ pub fn vault_notices(strategy: &'static Strategy) -> Vec<Dom> {
                 Tone::Warn,
                 "A withdrawal claim is waiting",
                 &format!(
-                    "{} of the vault was closed for it {} ago, and the close hasn't filled \
-                     inside the exit band yet, so settlement is being retried rather than filled \
-                     at any price. If it goes unserved for {} more day{}, the vault freezes: no \
-                     new deposits, and the home chain's trading approvals revoked.",
+                    "{} of the vault was closed for it {} ago, and the close hasn't filled inside the \
+                     exit band yet. If it goes unserved for {} more day{}, the vault freezes.",
                     fmt::percent(claim.fraction_closed, 1),
                     fmt::days(age.max(0) as u32),
                     left.max(0),

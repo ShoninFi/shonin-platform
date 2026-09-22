@@ -182,11 +182,7 @@ fn page(route: &Route) -> String {
         Route::Strategies => strategies(),
         Route::Strategy { slug, tab } => strategy(slug, *tab),
         Route::Author { handle } => author(handle),
-        Route::Accounts => accounts(),
-        Route::Account { slug } => account(slug),
         Route::Portfolio => portfolio(),
-        Route::Components => components(),
-        Route::Component { slug } => component(slug),
         Route::Queue => queue(),
         Route::Job { id } => job(id),
         Route::Publish => publish(),
@@ -240,14 +236,6 @@ fn home() -> String {
             )),
         ),
         (
-            "In connected accounts".to_string(),
-            esc(&format!(
-                "{} across {} agents",
-                fmt::money_compact(data::total_connected_capital()),
-                data::agents().len()
-            )),
-        ),
-        (
             "Trades on the record".to_string(),
             esc(&format!(
                 "{}, every one of them public",
@@ -255,10 +243,11 @@ fn home() -> String {
             )),
         ),
         (
-            "Authors".to_string(),
+            "Ranked".to_string(),
             esc(&format!(
-                "{}, and anyone can publish",
-                data::get().authors.len()
+                "{}, and {} more labelled new",
+                data::ranked().len(),
+                data::newest().len()
             )),
         ),
     ]);
@@ -286,14 +275,6 @@ fn home() -> String {
                     &rows
                 ),
                 para_link("/strategies", "Every strategy, ranked")
-            ),
-        ),
-        section(
-            "The second product",
-            &format!(
-                "{}{}",
-                para(copy::CONNECTED_LEDE),
-                para_link("/accounts", "The connected-accounts catalogue")
             ),
         ),
     ]
@@ -516,7 +497,8 @@ fn strategy_overview(strategy: &shared::Strategy) -> String {
         ));
     }
 
-    if let Some(vault) = strategy.vault() {
+    {
+        let vault = &strategy.vault;
         let venue_rows: Vec<Vec<String>> = strategy
             .legs
             .iter()
@@ -776,31 +758,6 @@ fn strategy_code(strategy: &shared::Strategy) -> String {
             ),
         ]),
     )];
-
-    if !bundle.components.is_empty() {
-        let rows: Vec<Vec<String>> = bundle
-            .components
-            .iter()
-            .map(|pin| {
-                vec![
-                    link(&format!("/components/{}", pin.slug), &pin.name),
-                    esc(&pin.version),
-                    esc(&pin.hash),
-                ]
-            })
-            .collect();
-        out.push(section(
-            "Components it pins",
-            &format!(
-                "{}{}",
-                para(
-                    "A pinned hash can't be republished, so a new version of a component never \
-                     reaches a running vault."
-                ),
-                table(&["Component", "Version", "Hash"], &rows)
-            ),
-        ));
-    }
 
     if !bundle.models.is_empty() {
         let rows: Vec<Vec<String>> = bundle
@@ -1149,13 +1106,8 @@ fn author(handle: &str) -> String {
     let rows: Vec<Vec<String>> = published
         .iter()
         .map(|strategy| {
-            let path = if strategy.is_connected() {
-                format!("/accounts/{}", strategy.slug)
-            } else {
-                format!("/strategies/{}", strategy.slug)
-            };
             vec![
-                link(&path, &strategy.name()),
+                link(&format!("/strategies/{}", strategy.slug), &strategy.name()),
                 esc(strategy.standing.label()),
                 esc(&fmt::days(strategy.days_live)),
                 strategy
@@ -1189,268 +1141,17 @@ fn author(handle: &str) -> String {
     .concat()
 }
 
-fn accounts() -> String {
-    let rows: Vec<Vec<String>> = data::agents()
-        .into_iter()
-        .map(|agent| {
-            let connected = agent.connected().expect("an agent has a connected product");
-            vec![
-                link(&format!("/accounts/{}", agent.slug), &agent.name()),
-                esc(&agent.author),
-                esc(&connected.broker),
-                esc(&fmt::count(connected.accounts)),
-                esc(&fmt::money_compact(connected.total_value)),
-                esc(&fmt::annualised(performance(agent).normalised_annualised)),
-            ]
-        })
-        .collect();
-
-    let comparison: Vec<Vec<String>> = copy::PRODUCTS
-        .iter()
-        .map(|(row, vault, connected)| vec![esc(row), esc(vault), esc(connected)])
-        .collect();
-
-    [
-        heading(1, "Connected accounts"),
-        para(copy::CONNECTED_LEDE),
-        section(
-            "The catalogue",
-            &format!(
-                "{}{}",
-                table(
-                    &[
-                        "Strategy",
-                        "Author",
-                        "Broker",
-                        "Accounts",
-                        "Total value",
-                        "Normalised return",
-                    ],
-                    &rows
-                ),
-                para(copy::CONNECTED_RECORD_NOTE)
-            ),
-        ),
-        section(
-            "How this differs from a vault",
-            &table(&["", "Pooled vault", "Connected account"], &comparison),
-        ),
-    ]
-    .concat()
-}
-
-fn account(slug: &str) -> String {
-    let Some(agent) = data::strategy(slug) else {
-        return not_found();
-    };
-    let Some(connected) = agent.connected() else {
-        return not_found();
-    };
-    let performance = performance(agent);
-
-    [
-        heading(1, &agent.name()),
-        para(&format!(
-            "{} · by {} · {} · {}",
-            agent.title,
-            agent.author,
-            agent.bundle.source.label(),
-            agent.standing.label()
-        )),
-        section("What it does", &para(&agent.description)),
-        section(
-            "The record, from attested reads",
-            &facts(&[
-                (
-                    "Accounts running it".to_string(),
-                    esc(&fmt::count(connected.accounts)),
-                ),
-                (
-                    "Total value".to_string(),
-                    esc(&fmt::money_compact(connected.total_value)),
-                ),
-                (
-                    "Normalised return".to_string(),
-                    esc(&fmt::annualised(performance.normalised_annualised)),
-                ),
-                (
-                    "Max drawdown".to_string(),
-                    esc(&fmt::percent_signed(performance.max_drawdown, 1)),
-                ),
-                ("Live".to_string(), esc(&fmt::days(agent.days_live))),
-                (
-                    "Read".to_string(),
-                    esc(&format!(
-                        "{}, posted to each account's entry on-chain",
-                        connected.read_cadence
-                    )),
-                ),
-            ]),
-        ),
-        section(
-            "What the broker will not let it do",
-            &list(connected.broker_limits.iter().map(|limit| esc(limit))),
-        ),
-        section(
-            "What you need to connect",
-            &list(connected.requirements.iter().map(|item| esc(item))),
-        ),
-        section(
-            "What it costs",
-            &format!(
-                "{}{}",
-                fee_table(),
-                para(&format!(
-                    "Charged to a tank on your account's entry rather than minted as shares. \
-                     Running costs for this strategy come to about {} a month.",
-                    fmt::money_exact(connected.monthly_cost)
-                ))
-            ),
-        ),
-        section(
-            "What it will not do",
-            &list(agent.limits.iter().map(|limit| esc(limit))),
-        ),
-    ]
-    .concat()
-}
-
 fn portfolio() -> String {
     [
         heading(1, "Your positions"),
         para(
-            "What you hold across vaults and connected accounts, with your pending claims and \
-             how correlated your holdings are with each other.",
+            "What you hold across vaults, with your pending claims and how correlated your \
+             holdings are with each other.",
         ),
         para("This page is built in your browser from your own wallet, so there is nothing to show until you connect one."),
         para_link("/strategies", "Browse the strategies"),
     ]
     .concat()
-}
-
-fn components() -> String {
-    let rows: Vec<Vec<String>> = data::get()
-        .components
-        .iter()
-        .map(|component| {
-            let users = data::composing(&component.slug);
-            let capital: f64 = users.iter().map(|strategy| strategy.capital()).sum();
-            vec![
-                link(&format!("/components/{}", component.slug), &component.name),
-                esc(&component.version),
-                esc(if component.first_party {
-                    "first-party"
-                } else {
-                    &component.author
-                }),
-                esc(&users.len().to_string()),
-                esc(&fmt::money_compact(capital)),
-            ]
-        })
-        .collect();
-
-    [
-        heading(1, "Components"),
-        para(
-            "A component is a reusable piece of a strategy: it does one job, it is always \
-             published with its source, and a strategy pins it by hash. Components are free, and \
-             anyone can publish one.",
-        ),
-        section(
-            "The registry",
-            &table(
-                &[
-                    "Component",
-                    "Version",
-                    "Author",
-                    "Strategies",
-                    "Capital behind them",
-                ],
-                &rows,
-            ),
-        ),
-    ]
-    .concat()
-}
-
-fn component(slug: &str) -> String {
-    let Some(component) = data::component(slug) else {
-        return not_found();
-    };
-    let users = data::composing(slug);
-    let capital: f64 = users.iter().map(|strategy| strategy.capital()).sum();
-
-    let api: Vec<Vec<String>> = component
-        .api
-        .iter()
-        .map(|(item, doc)| vec![esc(item), esc(doc)])
-        .collect();
-
-    let used_by: Vec<Vec<String>> = users
-        .iter()
-        .map(|strategy| {
-            vec![
-                link(&format!("/strategies/{}", strategy.slug), &strategy.name()),
-                esc(strategy.standing.label()),
-                esc(&fmt::money_compact(strategy.capital())),
-            ]
-        })
-        .collect();
-
-    let versions: Vec<Vec<String>> = component
-        .versions
-        .iter()
-        .map(|(version, hash, note)| vec![esc(version), esc(hash), esc(note)])
-        .collect();
-
-    let mut out = vec![
-        heading(1, &component.name),
-        para(&component.summary),
-        section("What it is", &para(&component.description)),
-        section(
-            "Identity",
-            &facts(&[
-                ("Version".to_string(), esc(&component.version)),
-                ("Hash".to_string(), esc(&component.hash)),
-                ("Author".to_string(), esc(&component.author)),
-                ("Source".to_string(), esc(&component.repo)),
-                (
-                    "Published".to_string(),
-                    esc(&fmt::date(component.published)),
-                ),
-                ("Audit".to_string(), esc(component.audit.label())),
-                ("Exports".to_string(), esc(&component.exports.join(", "))),
-                ("Imports".to_string(), esc(&component.imports.join(", "))),
-            ]),
-        ),
-        section("Interface", &table(&["Item", "What it does"], &api)),
-        section(
-            "Used under real capital",
-            &format!(
-                "{}{}",
-                para(&format!(
-                    "{} strateg{} compose it, with {} behind them.",
-                    users.len(),
-                    if users.len() == 1 { "y" } else { "ies" },
-                    fmt::money_compact(capital)
-                )),
-                table(&["Strategy", "Standing", "Capital"], &used_by)
-            ),
-        ),
-        section(
-            "Versions",
-            &table(&["Version", "Hash", "What changed"], &versions),
-        ),
-    ];
-
-    if !component.review_warnings.is_empty() {
-        out.push(section(
-            "Raised in strategies' reviews",
-            &list(component.review_warnings.iter().map(|note| esc(note))),
-        ));
-    }
-
-    out.concat()
 }
 
 fn queue() -> String {
@@ -1462,7 +1163,6 @@ fn queue() -> String {
                 link(&format!("/queue/{}", job.id), &job.id),
                 esc(&job.subject),
                 esc(&job.author),
-                esc(&job.kind),
                 esc(job.state.label()),
                 esc(&fmt::ago(job.submitted, data::now())),
             ]
@@ -1476,10 +1176,7 @@ fn queue() -> String {
              and its full log, whether it succeeded or failed — an author can't quietly try \
              twenty times and show you the twentieth.",
         ),
-        table(
-            &["Build", "Subject", "Author", "Kind", "State", "Submitted"],
-            &rows,
-        ),
+        table(&["Build", "Subject", "Author", "State", "Submitted"], &rows),
     ]
     .concat()
 }
@@ -1499,7 +1196,6 @@ fn job(id: &str) -> String {
     let mut facts_rows = vec![
         ("Subject".to_string(), esc(&job.subject)),
         ("Author".to_string(), esc(&job.author)),
-        ("Kind".to_string(), esc(&job.kind)),
         ("State".to_string(), esc(job.state.label())),
         ("Submitted".to_string(), esc(&fmt::timestamp(job.submitted))),
         ("Source hash".to_string(), esc(&job.source_hash)),
@@ -1636,9 +1332,9 @@ fn verify() -> String {
 
     let audits: Vec<Vec<String>> = data::vaults()
         .first()
-        .and_then(|strategy| strategy.vault())
-        .map(|vault| {
-            vault
+        .map(|strategy| {
+            strategy
+                .vault
                 .audits
                 .iter()
                 .map(|audit| {
@@ -1744,7 +1440,6 @@ fn not_found() -> String {
         list(vec![
             link("/", "Home"),
             link("/strategies", "Strategies"),
-            link("/accounts", "Connected accounts"),
             link("/verify", "Verify"),
         ]),
     ]
@@ -1762,7 +1457,7 @@ mod tests {
         for route in Route::all_pages() {
             let html = body(&route);
             assert!(
-                html.len() > 1200,
+                html.len() > 1000,
                 "{:?} pre-renders only {} bytes",
                 route.path(),
                 html.len()
@@ -1811,25 +1506,24 @@ mod tests {
                     strategy.slug
                 );
             }
-            if let Some(vault) = strategy.vault() {
+            let vault = &strategy.vault;
+            assert!(
+                html.contains(&esc(&fmt::money(vault.value))),
+                "{}: no value",
+                strategy.slug
+            );
+            assert!(
+                html.contains(&esc(vault.exit_class.label())),
+                "{}: no exit class",
+                strategy.slug
+            );
+            for leg in &strategy.legs {
                 assert!(
-                    html.contains(&esc(&fmt::money(vault.value))),
-                    "{}: no value",
-                    strategy.slug
+                    html.contains(&esc(&leg.venue)),
+                    "{}: no {} leg",
+                    strategy.slug,
+                    leg.venue
                 );
-                assert!(
-                    html.contains(&esc(vault.exit_class.label())),
-                    "{}: no exit class",
-                    strategy.slug
-                );
-                for leg in &strategy.legs {
-                    assert!(
-                        html.contains(&esc(&leg.venue)),
-                        "{}: no {} leg",
-                        strategy.slug,
-                        leg.venue
-                    );
-                }
             }
         }
     }

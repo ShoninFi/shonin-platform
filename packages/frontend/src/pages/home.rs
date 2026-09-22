@@ -19,7 +19,6 @@ pub fn render() -> Dom {
         .child(guarantees())
         .child(featured())
         .child(how_it_works())
-        .child(second_product())
         .child(verify_note())
     })
 }
@@ -42,7 +41,6 @@ fn totals() -> Dom {
         .iter()
         .filter(|strategy| strategy.standing.is_live())
         .count();
-    let agents = data::agents().len();
 
     ui::stats(vec![
         ui::stat(
@@ -51,19 +49,14 @@ fn totals() -> Dom {
             Some(&format!("{live} live strategies")),
         ),
         ui::stat(
-            "In connected accounts",
-            &fmt::money_compact(data::total_connected_capital()),
-            Some(&format!("{agents} agents")),
-        ),
-        ui::stat(
             "Trades on the record",
             &fmt::count(data::total_trades()),
             Some("every one of them public"),
         ),
         ui::stat(
-            "Authors",
-            &data::get().authors.len().to_string(),
-            Some("anyone can publish"),
+            "Ranked",
+            &data::ranked().len().to_string(),
+            Some(&format!("{} more labelled new", data::newest().len())),
         ),
     ])
 }
@@ -88,8 +81,7 @@ fn guarantees() -> Dom {
 }
 
 fn featured() -> Dom {
-    let ranked = data::ranked();
-    let cards: Vec<Dom> = ranked
+    let cards: Vec<Dom> = data::ranked()
         .into_iter()
         .take(4)
         .map(parts::strategy_card)
@@ -100,8 +92,8 @@ fn featured() -> Dom {
         Some(ui::action_link("/strategies", "The whole leaderboard")),
         vec![
             ui::note(
-                "Ranked on live on-chain records, rescaled to one level of risk so the list \
-                 doesn't simply reward leverage. Every record shows the size it was earned at.",
+                "Ranked on live on-chain records, rescaled to one level of risk, with the size \
+                 each record was earned at.",
             ),
             html!("div", {
                 .class(["grid", "grid--4"])
@@ -127,27 +119,12 @@ fn how_it_works() -> Dom {
     )
 }
 
-fn second_product() -> Dom {
-    ui::section_with_aside(
-        "The second product: connected accounts",
-        Some(ui::action_link("/accounts", "The catalogue")),
-        vec![
-            ui::para(copy::CONNECTED_LEDE),
-            html!("div", {
-                .class(["grid", "grid--2"])
-                .children(data::agents().into_iter().take(2).map(parts::strategy_card))
-            }),
-        ],
-    )
-}
-
 fn verify_note() -> Dom {
     ui::notice_with(
         Tone::Accent,
         "Nothing here asks to be taken on trust",
-        "Which code is trading a vault, that its bundle came from its source, that its trades \
-         are real and what it is worth are all things anyone can check with a chain RPC and the \
-         published source.",
+        "Which code is trading a vault, that it came from its source, that its trades are real \
+         and what it is worth are all things anyone can check with a chain RPC.",
         Some(html!("div", {
             .class(["row", "row--wrap"])
             .child(ui::action_link("/verify", "How to check it"))

@@ -43,11 +43,9 @@ pub fn render(strategy: &'static Strategy) -> Dom {
                     ("Signed by".to_string(), ui::address(&health.signed_by)),
                 ]),
                 ui::note(
-                    "A health report is signed by the executor running the strategy and \
-                     published live. It is evidence of how the strategy is running, not the \
-                     record of what it did — that is the chain. Nothing here decides anything \
-                     on its own: there is no automatic stop, and any limits on how a strategy \
-                     trades live in its own code.",
+                    "Signed by the executor running the strategy. It is evidence of how the strategy is \
+                     running, not the record of what it did; nothing here stops anything on its \
+                     own.",
                 ),
             ],
         ))
@@ -147,35 +145,28 @@ fn entries(health: &'static shared::Health) -> Dom {
 
 fn consequences(strategy: &'static Strategy, level: HealthLevel) -> Dom {
     let mut children = vec![ui::para(
-        "A health report informs; it never gates. Deposits and withdrawals carry on whatever it \
-         says, because what a depositor relies on is elsewhere: only the committed bundle can \
-         use this vault's keys, funds can't leave its own accounts, and leaving doesn't depend \
-         on anything we run.",
+        "A health report informs; it never gates. Deposits and withdrawals carry on whatever \
+         it says.",
     )];
 
     if level != HealthLevel::Ok {
         children.push(ui::notice(
             Tone::Warn,
             "What happens if this doesn't recover",
-            "Administrators can kill a vault by hand, typically after its health report shows it \
-             failing. A kill gives the strategy a short grace period to unwind itself, then \
-             every position is closed reduce-only inside the exit band and the cash brought \
-             home, so every withdrawal afterwards is paid from the idle balance in one \
-             transaction. It moves no funds anywhere but back to depositors.",
+            "The admin key can kill a vault by hand. Every position is closed reduce-only inside \
+             the exit band and the cash brought home, so every withdrawal afterwards is paid in \
+             one transaction.",
         ));
     }
 
-    if let Some(vault) = strategy.vault()
-        && !vault.claims.is_empty()
-    {
+    if !strategy.vault.claims.is_empty() {
         children.push(ui::notice(
             Tone::Info,
             "A claim is outstanding",
             &format!(
-                "An unserved claim freezes this vault after {} days: no new deposits, and the \
-                 home chain's trading approvals revoked so that only unwinding remains possible \
-                 there. Until then settlement is retried rather than filled at any price.",
-                vault.freeze_after_days
+                "An unserved claim freezes this vault after {} days. Until then settlement is retried \
+                 rather than filled at any price.",
+                strategy.vault.freeze_after_days
             ),
         ));
     }

@@ -13,8 +13,6 @@ pub enum Custody {
     VenueEnforced,
     /// Contracts on the chain hold the line: scoped roles and session keys.
     ChainEnforced,
-    /// The broker holds the line, for an account its owner keeps.
-    BrokerEnforced,
 }
 
 impl Custody {
@@ -22,7 +20,6 @@ impl Custody {
         match self {
             Self::VenueEnforced => "venue-enforced",
             Self::ChainEnforced => "chain-enforced",
-            Self::BrokerEnforced => "broker-enforced",
         }
     }
 
@@ -31,7 +28,6 @@ impl Custody {
         match self {
             Self::VenueEnforced => "the venue",
             Self::ChainEnforced => "contracts on the chain",
-            Self::BrokerEnforced => "the broker",
         }
     }
 }

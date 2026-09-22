@@ -41,8 +41,7 @@ fn what_it_does(strategy: &'static Strategy) -> Dom {
             html!("p", {
                 .class(["faint", "small"])
                 .text(
-                    "The author's own words. The review reads the code, not the description, \
-                     and its summary of what the code does is beside it."
+                    "The author's own words. The review reads the code, not the description."
                 )
             }),
         ],
@@ -71,10 +70,8 @@ fn record(strategy: &'static Strategy) -> Dom {
                 Tone::Info,
                 "The size it was earned at",
                 &format!(
-                    "This record was earned at an average of {}, and at most {}. Most strategies \
-                     do worse with size and some can't absorb it at all, so nothing here is \
-                     extrapolated to a size this strategy never traded — returns at a much \
-                     larger size are unknown.",
+                    "This record was earned at an average of {}, and at most {}. Returns at a much larger \
+                     size are unknown.",
                     fmt::money_compact(record.average_aum),
                     fmt::money_compact(record.peak_aum)
                 ),
@@ -84,9 +81,8 @@ fn record(strategy: &'static Strategy) -> Dom {
                     Tone::Warn,
                     "This strategy is labelled new",
                     &format!(
-                        "It has run for {} and made {} trades. It is open for deposits like any \
-                         other, and it won't be ranked until it has {} live days, so a lucky \
-                         fortnight never reaches the top of the list.",
+                        "It has run for {} and made {} trades. It is open for deposits, and won't be ranked \
+                         until it has {} live days.",
                         fmt::days(strategy.days_live),
                         fmt::count(record.trades),
                         Strategy::DAYS_TO_RANK
@@ -243,9 +239,8 @@ fn where_the_money_is(strategy: &'static Strategy) -> Dom {
                 rows,
             ),
             ui::note(
-                "Custody says who refuses a withdrawal to a stranger. Whatever the strategy's \
-                 code does, funds can only move between this vault's own accounts, and the \
-                 venues and contracts enforce that themselves.",
+                "Custody says who refuses a withdrawal to a stranger. Whatever the code does, \
+                 funds can only move between this vault's own accounts.",
             ),
             html!("div", { .class(["grid", "grid--2"]).children(details) }),
         ],
@@ -264,9 +259,7 @@ fn valuation_detail(valuation: &Valuation) -> String {
 }
 
 fn leaving(strategy: &'static Strategy) -> Dom {
-    let Some(vault) = strategy.vault() else {
-        return html!("span");
-    };
+    let vault = &strategy.vault;
 
     let mut children = vec![
         html!("div", {
@@ -295,10 +288,9 @@ fn leaving(strategy: &'static Strategy) -> Dom {
             Tone::Info,
             "This vault is served, not direct",
             &format!(
-                "At least one venue can only be unwound off-chain, so a claim there is served by \
-                 an unwinder that any allowlisted operator can run — {operators} can today. If a \
-                 claim goes unserved for {} days the vault freezes: no new deposits, and the home \
-                 chain's trading approvals revoked.",
+                "At least one venue can only be unwound off-chain, so a claim there is served by an \
+                 unwinder that any allowlisted operator can run; {operators} can today. A claim \
+                 unserved for {} days freezes the vault.",
                 vault.freeze_after_days
             ),
         ));
@@ -319,8 +311,8 @@ fn limits(strategy: &'static Strategy) -> Dom {
     let mut children = Vec::new();
     if !strategy.limits.is_empty() {
         children.push(ui::note(
-            "There is no platform risk policy. These limits live in the strategy's own code, \
-             where the reviewer reads them.",
+            "These limits live in the strategy's own code, where the reviewer reads them. There \
+             is no platform risk policy.",
         ));
         children.push(ui::bullets(strategy.limits.iter().cloned()));
     }
@@ -333,9 +325,7 @@ fn limits(strategy: &'static Strategy) -> Dom {
 }
 
 fn aside(strategy: &'static Strategy) -> Vec<Dom> {
-    let Some(vault) = strategy.vault() else {
-        return Vec::new();
-    };
+    let vault = &strategy.vault;
 
     let mut cards = vec![
         invest::panel(strategy),
@@ -379,9 +369,8 @@ fn aside(strategy: &'static Strategy) -> Vec<Dom> {
             Tone::Info,
             "Capital in transit",
             &format!(
-                "{} is moving from {} to {} over {}. It is counted in the vault's value, with a \
-                 timeout of {} minutes, and shows as an error in the health report if it doesn't \
-                 arrive.",
+                "{} is moving from {} to {} over {}. It counts in the vault's value, and times out \
+                 after {} minutes.",
                 fmt::money(transit.amount),
                 transit.from,
                 transit.to,
@@ -446,10 +435,7 @@ fn aside(strategy: &'static Strategy) -> Vec<Dom> {
         "Audit status",
         None,
         vec![
-            ui::note(
-                "Vaults open to deposits before every audit is finished, so every page says \
-                 where each one stands.",
-            ),
+            ui::note("Vaults open before every audit is finished, so the page says where each one stands."),
             html!("div", { .class("stack").children(audits) }),
         ],
     ));

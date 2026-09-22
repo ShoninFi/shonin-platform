@@ -75,9 +75,8 @@ fn connect_modal() -> Dom {
     modal(connecting(), "Connect a wallet", false, || {
         vec![
             ui::para(
-                "Nothing here is signed and nothing leaves your browser. Connecting gives you a \
-                 balance to spend so the deposit, withdrawal and claim flows can be walked \
-                 through end to end.",
+                "Nothing is signed and nothing leaves your browser. Connecting gives you a balance \
+                 to walk the deposit, withdrawal and claim flows through.",
             ),
             html!("div", {
                 .class("stack-sm")
@@ -122,9 +121,7 @@ pub fn panel(strategy: &'static Strategy) -> Dom {
 
 fn panel_body(strategy: &'static Strategy, holdings: &Holdings, slug: &str) -> Dom {
     let slug = slug.to_string();
-    let Some(vault) = strategy.vault() else {
-        return html!("span");
-    };
+    let vault = &strategy.vault;
     let position = holdings.position(&slug);
     let claims = holdings.claims_for(&slug);
     let open = vault.state.takes_deposits();
@@ -193,8 +190,8 @@ fn panel_body(strategy: &'static Strategy, holdings: &Holdings, slug: &str) -> D
 
     if position.is_none() {
         children.push(ui::note(&format!(
-            "Deposits are instant: shares are minted at the value the contract computes from the \
-             chain in the same transaction, after a {} transaction fee that stays in the pool.",
+            "Shares are minted at the value the contract computes in the same transaction, after \
+             a {} transaction fee that stays in the pool.",
             wallet::transaction_fee_label(vault)
         )));
     }
@@ -211,8 +208,7 @@ fn panel_body(strategy: &'static Strategy, holdings: &Holdings, slug: &str) -> D
         children.push(ui::notice_with(
             Tone::Info,
             "Move to the new version",
-            "Moving is a withdrawal here and a deposit there — the interface can do both at \
-             once. It costs the transaction fee each way, and the new vault's high-water mark \
+            "A withdrawal here and a deposit there, in one step. The new vault's high-water mark \
              starts fresh.",
             Some(shell::button(
                 "Move everything",
@@ -284,8 +280,7 @@ fn claim_card(claim: &wallet::Claim) -> Dom {
             Tone::Ok,
             "Paid",
             &format!(
-                "{} reached your balance. The shares were valued once the cash was home, at \
-                 exit-side marks then, so everyone bore the close pro rata.",
+                "{} reached your balance, valued at exit-side marks once the cash was home.",
                 fmt::money_exact(claim.paid.unwrap_or_default())
             ),
         ));
@@ -294,9 +289,8 @@ fn claim_card(claim: &wallet::Claim) -> Dom {
         }));
     } else {
         children.push(ui::note(
-            "Anyone can send the next transaction — it needs nothing of ours. The leaver's \
-             shares stay outstanding until the last one, so the close is borne pro rata with \
-             everyone else.",
+            "Anyone can send the next transaction. Your shares stay outstanding until the last \
+             one, so the close is borne pro rata.",
         ));
         children.push(shell::button(
             "Send the next settle transaction",
@@ -344,9 +338,7 @@ fn deposit_modal(strategy: &'static Strategy) -> Dom {
     html!("div", {
         .future(watcher)
         .child(modal(&open, "Deposit", false, move || {
-            let Some(vault) = strategy.vault() else {
-                return Vec::new();
-            };
+            let vault = &strategy.vault;
             let balance = wallet::holdings().lock_ref().balance;
 
             vec![
@@ -382,9 +374,7 @@ fn deposit_modal(strategy: &'static Strategy) -> Dom {
                 }),
                 ui::note(
                     "The contract computes the vault's value from on-chain state in the same \
-                     transaction and mints at that. Nobody reports it, and the fee is not paid \
-                     to anyone: it stays in the pool, so a deposit timed around a price update \
-                     can't take value from the depositors who stay.",
+                     transaction and mints at that. The fee stays in the pool.",
                 ),
                 modal_actions(vec![
                     shell::button("Cancel", false, || depositing().set(None)),
@@ -426,9 +416,7 @@ fn withdraw_modal(strategy: &'static Strategy) -> Dom {
     html!("div", {
         .future(watcher)
         .child(modal(&open, "Withdraw", false, move || {
-            let Some(vault) = strategy.vault() else {
-                return Vec::new();
-            };
+            let vault = &strategy.vault;
             let held = wallet::holdings()
                 .lock_ref()
                 .position(&strategy.slug)
@@ -470,12 +458,9 @@ fn withdraw_modal(strategy: &'static Strategy) -> Dom {
                                     Tone::Warn,
                                     "This books a claim",
                                     &format!(
-                                        "It is more than the vault's idle balance of {}, so your \
-                                         shares are marked pending while the contract closes \
-                                         your fraction of every position inside the exit band \
-                                         and sells your fraction of what it holds. Once the cash \
-                                         is home the vault is valued again and you are paid. \
-                                         Anyone can send those transactions.",
+                                        "It is more than the vault's idle balance of {}, so your shares are pending while \
+                                         the contract closes your fraction of every position. Once the \
+                                         cash is home you are paid.",
                                         fmt::money(vault.idle)
                                     ),
                                 )
@@ -494,8 +479,7 @@ fn withdraw_modal(strategy: &'static Strategy) -> Dom {
                     }))
                 }),
                 ui::note(
-                    "A withdrawal is valued at exit-side marks — a long at the best bid, a short \
-                     at the best ask — so the leaver pays the spread rather than the pool.",
+                    "Valued at exit-side marks, so the leaver pays the spread rather than the pool.",
                 ),
                 modal_actions(vec![
                     shell::button("Cancel", false, || withdrawing().set(None)),
