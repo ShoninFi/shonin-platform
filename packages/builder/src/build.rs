@@ -99,7 +99,7 @@ pub fn build(
             claimed.0, claimed.1, manifest.strategy.id, manifest.strategy.version
         )));
         return Err(Failed {
-            reason: "the manifest names a different strategy than the vault".to_string(),
+            reason: "the manifest names a different agent than the vault".to_string(),
             log,
             seconds: started.elapsed().as_secs() as u32,
         });
@@ -139,7 +139,7 @@ pub fn build(
                 log.push(error(line.to_string()));
             }
             return Err(Failed {
-                reason: "the strategy did not compile".to_string(),
+                reason: "the agent did not compile".to_string(),
                 log,
                 seconds: started.elapsed().as_secs() as u32,
             });
@@ -337,7 +337,7 @@ mod tests {
     fn a_manifest_is_found_deep_inside_a_workspace() {
         let root = std::env::temp_dir().join(format!("shonin-deep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let nested = root.join("packages/bots/funding-basis");
+        let nested = root.join("packages/agents/funding-basis");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(root.join("Cargo.toml"), b"[workspace]").unwrap();
         std::fs::write(nested.join("shonin.toml"), b"").unwrap();
@@ -348,7 +348,7 @@ mod tests {
     fn a_manifest_is_found_wherever_the_strategy_is() {
         let root = std::env::temp_dir().join(format!("shonin-find-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let nested = root.join("packages/bots/one");
+        let nested = root.join("packages/agents/one");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("shonin.toml"), b"").unwrap();
         assert_eq!(find_manifest(&root), Some(nested.join("shonin.toml")));

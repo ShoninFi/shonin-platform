@@ -10,8 +10,8 @@
 //! would see the same empty page on every URL. From the routes in `route.rs`,
 //! this writes:
 //!
-//! - one HTML file per page (`index.html`, `strategies.html`,
-//!   `strategies/funding-basis-v3/record.html`, …, and `404.html`) with that
+//! - one HTML file per page (`index.html`, `agents.html`,
+//!   `agents/funding-basis-v3/record.html`, …, and `404.html`) with that
 //!   route's title, description, canonical URL and Open Graph tags, and a
 //!   no-JavaScript view of the same data already in the page. The app replaces
 //!   that view with the interactive one when it boots. Pages that shouldn't be
@@ -27,7 +27,7 @@
 //!
 //! Files are flat (`about.html`, not `about/index.html`): Workers static
 //! assets serve them at `/about` with no trailing-slash redirect, which is
-//! also why a nested route becomes `strategies/<slug>/record.html`.
+//! also why a nested route becomes `agents/<slug>/record.html`.
 
 use std::{error::Error, fs, path::PathBuf};
 
@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(api) = &api {
         let snapshot = frontend::api::fetch_snapshot(api)?;
         println!(
-            "read {} strategies, {} builds and {} authors from {api}",
+            "read {} agents, {} builds and {} authors from {api}",
             snapshot.strategies.len(),
             snapshot.jobs.len(),
             snapshot.authors.len()

@@ -6,7 +6,7 @@ Everything the platform claims is a mechanism, and every mechanism has a way to 
 
 | The claim | How to check it | What you need |
 | --- | --- | --- |
-| **The vault's keys belong to attested executors running the committed agent** | Read the blessing on the attestation registry: each key's image digest, the strategy hash it may run, the vault it may act for, and when it expires | A chain RPC |
+| **The vault's keys belong to attested executors running the committed agent** | Read the blessing on the attestation registry: each key's image digest, the bundle hash it may run, the vault it may act for, and when it expires | A chain RPC |
 | **The agent's bytecode came from its published source** | Rebuild the source with the published builder image and compare the bundle hash | The source and the builder image |
 | **These are all the vault's trades** | Read the vault's accounts on each venue. Every order, fill and transfer is already a public, timestamped record | Chain RPCs and venue APIs |
 | **The returns are real** | Read value per share from the vault contract over time. It computes its own value from on-chain state | A chain RPC |
@@ -14,13 +14,13 @@ Everything the platform claims is a mechanism, and every mechanism has a way to 
 
 ## The panel on every vault page
 
-Every strategy page answers the question a depositor should ask — **which code is trading my money right now?** — and everything in it is on-chain:
+Every agent's page answers the question a depositor should ask — **which code is trading my money right now?** — and everything in it is on-chain:
 
 ```text
 Which code is trading this vault?                     Vault 0x7a3…
 Audit status        vault contracts: … · executor image: … · zk guest: …
 
-Strategy            funding-basis · v3
+Agent               funding-basis · v3
   bundleHash        0x51af…        source: published ✓ rebuilds to 0x51af…
   built by          builder 0xae77…  from source 0x44d0…   immutable for this vault's life
 Executor image      0x3b9e…        allowlisted 2026-09-28 ✓ (this vault created 2026-09-20)

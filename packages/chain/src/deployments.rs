@@ -42,7 +42,7 @@ pub struct Roles {
     pub keeper: Address,
     /// Moves prices and funding on the venue.
     pub operator: Address,
-    /// Publishes the reference strategies.
+    /// Publishes the reference agents.
     pub author: Address,
     /// The account the web app's development wallet uses.
     pub viewer: Address,

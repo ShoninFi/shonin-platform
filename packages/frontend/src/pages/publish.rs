@@ -70,11 +70,11 @@ pub fn render() -> Dom {
 fn header() -> Dom {
     html!("div", {
         .class("stack")
-        .child(html!("h1", { .class("title").text("Publish a strategy") }))
+        .child(html!("h1", { .class("title").text("Publish an agent") }))
         .child(html!("p", {
             .class("lede")
             .text(
-                "You submit a Rust project; we compile it. Every strategy has source behind it that \
+                "You submit a Rust project; we compile it. Every agent has source behind it that \
                  the reviewer read."
             )
         }))
@@ -106,11 +106,11 @@ fn submit() -> Dom {
             html!("div", {
                 .class("stack")
                 .child(ui::note(
-                    "A submission is the whole workspace your strategy belongs to, packed the \
+                    "A submission is the whole workspace your agent belongs to, packed the \
                      same way every time so its hash means something. Pack it with the command \
                      below, then drop the archive here.",
                 ))
-                .child(ui::code_block("shonin pack packages/bots/your-strategy > strategy.tar"))
+                .child(ui::code_block("shonin pack packages/agents/your-agent > agent.tar"))
                 .child(form::file_drop(
                     "Drop the packed project, or choose it",
                     &draft.archive,
@@ -122,7 +122,7 @@ fn submit() -> Dom {
                 }))
                 .child(form::toggle("Seal the source", &draft.sealed))
                 .child(form::field(
-                    "Strategy id",
+                    "Agent id",
                     Some("Read from the project's manifest; stable across versions, and each version gets its own vault"),
                     form::input(&draft.strategy_id, "funding-basis"),
                 ))
@@ -133,7 +133,7 @@ fn submit() -> Dom {
                 ))
                 .child(form::field(
                     "Allowances",
-                    Some("What the strategy may use, metered to its vault's tank"),
+                    Some("What the agent may use, metered to its vault's tank"),
                     form::select(
                         shared::DeclaredAllowances::SHAPES
                             .iter()
@@ -179,7 +179,7 @@ fn publish() {
     };
     let id = draft.strategy_id.get_cloned().trim().to_string();
     if id.is_empty() {
-        state::notify("Give the strategy an id.", Tone::Warn);
+        state::notify("Give the agent an id.", Tone::Warn);
         return;
     }
     let Ok(version) = draft.version.get_cloned().trim().parse::<u32>() else {
@@ -237,7 +237,7 @@ fn declared(picked: Option<&form::Picked>) -> Dom {
             Tone::Warn,
             "No manifest in that archive",
             "A submission is a packed workspace with a `shonin.toml` in it. Pack it with \
-             `shonin pack`, which packs the whole workspace the strategy belongs to.",
+             `shonin pack`, which packs the whole workspace the agent belongs to.",
         );
     };
 
@@ -257,7 +257,7 @@ fn label(shape: &str) -> String {
     let what = match shape {
         "quoting" => "Quoting: fuel, bandwidth, placement",
         "thinking" => "With models: inference and bandwidth",
-        _ => "Modest: a slow carry strategy",
+        _ => "Modest: a slow carry agent",
     };
     format!("{what} ({} a day)", fmt::money_exact(daily(shape)))
 }
@@ -309,7 +309,7 @@ fn estimate(tank: &str, allowance: &str, sealed: bool) -> Dom {
                 ]),
                 Row::new(vec![
                     ui::value("A week at these allowances"),
-                    ui::muted("so the strategy can actually run"),
+                    ui::muted("so the agent can actually run"),
                     ui::number(&fmt::money_exact(week)),
                 ]),
             ],
@@ -362,7 +362,7 @@ fn pre_review() -> Dom {
         vec![
             ui::para(
                 "The reviewer's prompt and output schema are published, so you can run the same review \
-                 yourself before anyone sees your strategy. It is unsigned and binds nobody.",
+                 yourself before anyone sees your agent. It is unsigned and binds nobody.",
             ),
             html!("div", {
                 .child_signal(draft.reviewed.signal().map(|reviewed| {
@@ -406,7 +406,7 @@ fn secrets() -> Dom {
         "Seal a secret to your bundle",
         vec![
             ui::para(
-                "An API key your strategy needs, sealed so that only an attested executor running \
+                "An API key your agent needs, sealed so that only an attested executor running \
                  exactly your bundle can read it. Your browser encrypts it, so the plaintext \
                  never leaves your machine.",
             ),

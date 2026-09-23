@@ -152,7 +152,7 @@ fn colophon() -> String {
         ("/about", "About"),
         ("/verify", "Verify"),
         ("/status", "Status"),
-        ("/publish", "Publish a strategy"),
+        ("/publish", "Publish an agent"),
     ]
     .into_iter()
     .map(|(href, label)| link(href, label))
@@ -215,7 +215,7 @@ fn home() -> String {
         .map(|strategy| {
             let performance = performance(&strategy);
             vec![
-                link(&format!("/strategies/{}", strategy.slug), &strategy.name()),
+                link(&format!("/agents/{}", strategy.slug), &strategy.name()),
                 esc(&strategy.author),
                 esc(&fmt::annualised(performance.normalised_annualised)),
                 esc(&fmt::money_compact(strategy.capital())),
@@ -227,7 +227,7 @@ fn home() -> String {
         (
             "In vaults".to_string(),
             esc(&format!(
-                "{} across {} live strategies",
+                "{} across {} live agents",
                 fmt::money_compact(data::total_vault_capital()),
                 data::vaults()
                     .iter()
@@ -267,14 +267,11 @@ fn home() -> String {
         section("What a depositor is promised", &guarantees),
         section("How it works", &steps),
         section(
-            "The strategies",
+            "The agents",
             &format!(
                 "{}{}",
-                table(
-                    &["Strategy", "Author", "Normalised return", "Capital"],
-                    &rows
-                ),
-                para_link("/strategies", "Every strategy, ranked")
+                table(&["Agent", "Author", "Normalised return", "Capital"], &rows),
+                para_link("/agents", "Every agent, ranked")
             ),
         ),
     ]
@@ -291,7 +288,7 @@ fn strategies() -> String {
     let row = |strategy: &shared::Strategy| {
         let performance = performance(strategy);
         vec![
-            link(&format!("/strategies/{}", strategy.slug), &strategy.name()),
+            link(&format!("/agents/{}", strategy.slug), &strategy.name()),
             link(&format!("/authors/{}", strategy.author), &strategy.author),
             esc(&fmt::days(strategy.days_live)),
             esc(&fmt::annualised(performance.normalised_annualised)),
@@ -306,7 +303,7 @@ fn strategies() -> String {
     };
 
     let headers = [
-        "Strategy",
+        "Agent",
         "Author",
         "Live",
         "Normalised return",
@@ -327,7 +324,7 @@ fn strategies() -> String {
         .filter(|strategy| !strategy.standing.is_live())
         .map(|strategy| {
             vec![
-                link(&format!("/strategies/{}", strategy.slug), &strategy.name()),
+                link(&format!("/agents/{}", strategy.slug), &strategy.name()),
                 link(&format!("/authors/{}", strategy.author), &strategy.author),
                 esc(strategy.standing.label()),
                 esc(&fmt::days(strategy.days_live)),
@@ -342,7 +339,7 @@ fn strategies() -> String {
     );
 
     [
-        heading(1, "Strategies"),
+        heading(1, "Agents"),
         para(
             "Ranked on live on-chain records, rescaled to one level of risk, with the size each \
              record was earned at.",
@@ -361,7 +358,7 @@ fn strategies() -> String {
         ),
         section(
             "Superseded, retired and stopped",
-            &table(&["Strategy", "Author", "Standing", "Live"], &rest_rows),
+            &table(&["Agent", "Author", "Standing", "Live"], &rest_rows),
         ),
         section("How this list is built", &rules),
     ]
@@ -404,7 +401,7 @@ fn strategy(slug: &str, tab: Tab) -> String {
             strategy.bundle.source.label(),
             strategy.standing.label()
         )),
-        el("nav", "class=\"tabs\" aria-label=\"Strategy\"", &tabs)
+        el("nav", "class=\"tabs\" aria-label=\"Agent\"", &tabs)
     );
 
     let content = match tab {
@@ -439,7 +436,7 @@ fn strategy_overview(strategy: &shared::Strategy) -> String {
                     "This vault runs exactly as it always has. A new version is a separate vault, \
                      which depositors choose to move to."
                 ),
-                para_link(&format!("/strategies/{successor}"), "See the new version")
+                para_link(&format!("/agents/{successor}"), "See the new version")
             ),
         ));
     }
@@ -493,7 +490,7 @@ fn strategy_overview(strategy: &shared::Strategy) -> String {
                 )),
                 para(&review.summary),
                 para_link(
-                    &format!("/strategies/{}/review", strategy.slug),
+                    &format!("/agents/{}/review", strategy.slug),
                     "The full review"
                 )
             ),
@@ -608,7 +605,7 @@ fn strategy_overview(strategy: &shared::Strategy) -> String {
             &format!(
                 "{}{}",
                 para(
-                    "There is no platform risk policy. These limits live in the strategy's own \
+                    "There is no platform risk policy. These limits live in the agent's own \
                      code, where the reviewer reads them."
                 ),
                 list(strategy.limits.iter().map(|limit| esc(limit)))
@@ -658,7 +655,7 @@ fn fee_table(fees: &shared::Fees) -> String {
 
 fn strategy_record(strategy: &shared::Strategy) -> String {
     let Some(record) = &strategy.record else {
-        return para("This strategy never traded, so it has no record.");
+        return para("This agent never traded, so it has no record.");
     };
     let performance = performance(strategy);
 
@@ -886,7 +883,7 @@ fn strategy_code(strategy: &shared::Strategy) -> String {
         out.push(section(
             "The source",
             &para(
-                "This strategy's source is sealed, so the project isn't served here. The \
+                "This agent's source is sealed, so the project isn't served here. The \
                  attested builder compiled it and the reviewer read it; what sealing changes is \
                  who else can.",
             ),
@@ -923,7 +920,7 @@ fn strategy_review(strategy: &shared::Strategy) -> String {
         return section(
             "Review pending",
             &para(
-                "The reviewer hasn't scored this strategy yet. The score appears here when it is signed.",
+                "The reviewer hasn't scored this agent yet. The score appears here when it is signed.",
             ),
         );
     };
@@ -988,7 +985,7 @@ fn strategy_review(strategy: &shared::Strategy) -> String {
 
 fn strategy_verify(strategy: &shared::Strategy) -> String {
     let Some(attestation) = &strategy.attestation else {
-        return para("Nothing is running for this strategy, so no keys are blessed for it.");
+        return para("Nothing is running for this agent, so no keys are blessed for it.");
     };
 
     let keys: Vec<Vec<String>> = attestation
@@ -1025,7 +1022,7 @@ fn strategy_verify(strategy: &shared::Strategy) -> String {
     [
         heading(2, "Which code is trading this vault?"),
         facts(&[
-            ("Strategy".to_string(), esc(&strategy.name())),
+            ("Agent".to_string(), esc(&strategy.name())),
             ("Bundle".to_string(), esc(&strategy.bundle.bundle_hash)),
             (
                 "Built from".to_string(),
@@ -1074,7 +1071,7 @@ fn strategy_verify(strategy: &shared::Strategy) -> String {
 
 fn strategy_health(strategy: &shared::Strategy) -> String {
     let Some(health) = &strategy.health else {
-        return para("Nothing is running for this strategy, so there is no health report.");
+        return para("Nothing is running for this agent, so there is no health report.");
     };
 
     let signals: Vec<Vec<String>> = health
@@ -1110,8 +1107,8 @@ fn strategy_health(strategy: &shared::Strategy) -> String {
                 "{}{}",
                 para(&health.summary()),
                 para(
-                    "A health report is signed by the executor and says how a strategy is \
-                     running. It is operational evidence, not the record: what the strategy did \
+                    "A health report is signed by the executor and says how an agent is \
+                     running. It is operational evidence, not the record: what the agent did \
                      is on the chain."
                 )
             ),
@@ -1141,7 +1138,7 @@ fn author(handle: &str) -> String {
         .iter()
         .map(|strategy| {
             vec![
-                link(&format!("/strategies/{}", strategy.slug), &strategy.name()),
+                link(&format!("/agents/{}", strategy.slug), &strategy.name()),
                 esc(strategy.standing.label()),
                 esc(&fmt::days(strategy.days_live)),
                 strategy
@@ -1162,13 +1159,10 @@ fn author(handle: &str) -> String {
             &format!(
                 "{}{}",
                 para(
-                    "Every strategy an author has registered is here: live, new, superseded, \
+                    "Every agent an author has registered is here: live, new, superseded, \
                      retired, and the builds that failed. Publishing leaves a permanent record."
                 ),
-                table(
-                    &["Strategy", "Standing", "Live", "Review", "Capital"],
-                    &rows
-                )
+                table(&["Agent", "Standing", "Live", "Review", "Capital"], &rows)
             ),
         ),
     ]
@@ -1183,7 +1177,7 @@ fn portfolio() -> String {
              holdings are with each other.",
         ),
         para("This page shows what one address holds, read from the chain, so there is nothing to show until you connect a wallet."),
-        para_link("/strategies", "Browse the strategies"),
+        para_link("/agents", "Browse the agents"),
     ]
     .concat()
 }
@@ -1261,8 +1255,8 @@ fn job(id: &str) -> String {
 
     if let Some(slug) = &job.strategy_slug {
         out.push(para_link(
-            &format!("/strategies/{slug}"),
-            "The strategy this build belongs to",
+            &format!("/agents/{slug}"),
+            "The agent this build belongs to",
         ));
     }
 
@@ -1286,10 +1280,10 @@ fn publish() -> String {
     );
 
     [
-        heading(1, "Publish a strategy"),
+        heading(1, "Publish an agent"),
         para(
             "You submit a Rust project; we compile it. The bundle a vault runs is an artifact of \
-             our build, not a file someone handed us, so every strategy on the platform has \
+             our build, not a file someone handed us, so every agent on the platform has \
              source behind it that the reviewer read.",
         ),
         section("How it goes", &steps),
@@ -1300,7 +1294,7 @@ fn publish() -> String {
                 para(
                     "There is no publishing fee. Creating the vault funds its tank, and the \
                      build and the review are its first charges: the metered build, a flat $1 \
-                     review, and enough for a week at the allowances the strategy declares."
+                     review, and enough for a week at the allowances the agent declares."
                 ),
                 para(copy::TANK_NOTE)
             ),
@@ -1405,7 +1399,7 @@ fn verify() -> String {
         section(
             "Changing the code that runs vaults",
             &para(&format!(
-                "A strategy never changes: it is what the depositor chose. The executor is \
+                "An agent never changes: it is what the depositor chose. The executor is \
                      our code and has to be patchable, so a new image is proposed publicly and \
                      can only be blessed after {} — long enough for anyone to rebuild it from \
                      source and object. Removing an image is instant. A running vault adopts a \
@@ -1487,7 +1481,7 @@ fn not_found() -> String {
         para("There's no page at this address."),
         list(vec![
             link("/", "Home"),
-            link("/strategies", "Strategies"),
+            link("/agents", "Agents"),
             link("/verify", "Verify"),
         ]),
     ]

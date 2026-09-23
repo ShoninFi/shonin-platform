@@ -111,7 +111,7 @@ Neither is a trick. It falls out of charging fees on the pool rather than per de
 
 ## Getting out
 
-Withdrawing has two shapes, and which one you get depends on how much cash the strategy is holding idle.
+Withdrawing has two shapes, and which one you get depends on how much cash the agent is holding idle.
 
 **Paid immediately.** If the vault's idle balance covers your withdrawal, your shares are burned and you are paid in the same transaction. Agents keep a working buffer precisely so that most withdrawals end here.
 

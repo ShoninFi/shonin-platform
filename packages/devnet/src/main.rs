@@ -44,14 +44,14 @@ struct Args {
 enum Command {
     /// Deploy the contracts and write the addresses, then stop.
     Deploy,
-    /// Publish the reference strategies through the platform's own flows.
+    /// Publish the reference agents through the platform's own flows.
     Seed {
         /// Where the API is answering.
         #[arg(long)]
         api: String,
         /// Where the strategies to publish live.
-        #[arg(long, env = "SHONIN_BOTS_DIR")]
-        bots: Option<PathBuf>,
+        #[arg(long, env = "SHONIN_AGENTS_DIR")]
+        agents: Option<PathBuf>,
     },
 }
 
@@ -73,9 +73,9 @@ async fn main() -> Result<()> {
             deploy::ensure(&client, &args.artifacts, &args.deployments).await?;
             Ok(())
         }
-        Some(Command::Seed { api, bots }) => {
+        Some(Command::Seed { api, agents }) => {
             let deployments = client.wait_for_deployments(&args.deployments).await?;
-            seed::run(&client, &deployments, &api, bots.as_deref(), &args.store).await
+            seed::run(&client, &deployments, &api, agents.as_deref(), &args.store).await
         }
         None => {
             let deployments = deploy::ensure(&client, &args.artifacts, &args.deployments).await?;

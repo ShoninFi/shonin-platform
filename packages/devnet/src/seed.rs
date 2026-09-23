@@ -1,6 +1,6 @@
 //! Putting something on the platform, by publishing it.
 //!
-//! Nothing here is a fixture. Each strategy is packed, submitted, built,
+//! Nothing here is a fixture. Each agent is packed, submitted, built,
 //! registered and reviewed exactly as an author's would be, so what the site
 //! shows afterwards is what the platform did. That includes the unhappy ones:
 //! a build that fails, a source nobody published, a vault the admin stops.
@@ -76,16 +76,16 @@ pub async fn run(
     client: &Client,
     deployments: &Deployments,
     api: &str,
-    bots: Option<&Path>,
+    agents: Option<&Path>,
     store: &Path,
 ) -> Result<()> {
-    let bots = bots
+    let agents = agents
         .map(Path::to_path_buf)
-        .or_else(guess_bots)
-        .context("where the strategies live: pass --bots or set SHONIN_BOTS_DIR")?;
-    let strategy = bots.join("packages/bots/funding-basis");
-    if !strategy.join("shonin.toml").exists() {
-        bail!("no strategy at {}", strategy.display());
+        .or_else(guess_agents)
+        .context("where the agents live: pass --agents or set SHONIN_AGENTS_DIR")?;
+    let agent = agents.join("packages/agents/funding-basis");
+    if !agent.join("shonin.toml").exists() {
+        bail!("no agent at {}", agent.display());
     }
 
     let author = client.account(Role::Author)?;
@@ -95,7 +95,7 @@ pub async fn run(
     let _ = std::fs::remove_dir_all(&work);
 
     for plan in PLAN {
-        let prepared = prepare(&bots, &strategy, &work, plan)?;
+        let prepared = prepare(&agents, &agent, &work, plan)?;
         tracing::info!(id = plan.id, version = plan.version, "publishing");
 
         let published =
@@ -134,14 +134,14 @@ pub async fn run(
     Ok(())
 }
 
-/// Copy the strategy into a scratch tree, with the manifest a plan asks for.
-fn prepare(bots: &Path, strategy: &Path, work: &Path, plan: &Plan) -> Result<PathBuf> {
+/// Copy the agent into a scratch tree, with the manifest a plan asks for.
+fn prepare(agents: &Path, agent: &Path, work: &Path, plan: &Plan) -> Result<PathBuf> {
     let into = work.join(format!("{}-v{}", plan.id, plan.version));
-    copy_tree(bots, &into)?;
+    copy_tree(agents, &into)?;
 
-    let relative = strategy
-        .strip_prefix(bots)
-        .unwrap_or(Path::new("packages/bots/funding-basis"));
+    let relative = agent
+        .strip_prefix(agents)
+        .unwrap_or(Path::new("packages/agents/funding-basis"));
     let project = into.join(relative);
 
     let manifest_path = project.join("shonin.toml");
@@ -208,7 +208,7 @@ async fn say_who_the_author_is(
             deployments.profiles,
             IAuthorProfiles::setProfileCall {
                 handle: "shonin".to_string(),
-                blurb: "The platform's own reference strategies. They are published like \
+                blurb: "The platform's own reference agents. They are published like \
                         anyone else's, and their records are as public as anyone else's."
                     .to_string(),
                 linkLabels: Vec::new(),
@@ -220,10 +220,10 @@ async fn say_who_the_author_is(
 }
 
 /// A sibling checkout, which is where they usually are.
-fn guess_bots() -> Option<PathBuf> {
+fn guess_agents() -> Option<PathBuf> {
     let here = std::env::current_dir().ok()?;
     let parent = here.parent()?;
-    for name in ["SHONIN-BOTS", "shonin-bots", "bots"] {
+    for name in ["SHONIN-AGENTS", "shonin-agents", "agents"] {
         let candidate = parent.join(name);
         if candidate.join("Cargo.toml").exists() {
             return Some(candidate);

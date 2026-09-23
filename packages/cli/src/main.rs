@@ -102,11 +102,7 @@ async fn main() -> Result<()> {
                 JobState::Succeeded => {
                     println!("built and registered");
                     println!("  vault    {:?}", published.vault);
-                    println!(
-                        "  strategy {}/strategies/{}",
-                        site(&args.api),
-                        published.slug
-                    );
+                    println!("  agent    {}/agents/{}", site(&args.api), published.slug);
                     println!("  queue    {}/queue/{}", site(&args.api), published.job_id);
                 }
                 JobState::Failed { reason } => {

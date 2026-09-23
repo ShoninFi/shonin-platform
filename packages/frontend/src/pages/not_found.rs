@@ -15,7 +15,7 @@ pub fn render() -> Dom {
         .child(html!("div", {
             .class(["row", "row--wrap"])
             .child(shell::button_link("/", "Home", true))
-            .child(shell::button_link("/strategies", "Strategies", false))
+            .child(shell::button_link("/agents", "Agents", false))
             .child(shell::button_link("/verify", "Verify", false))
         }))
     })

@@ -92,7 +92,7 @@ impl FeedKind {
             Self::VenueSuspended => "venue suspended",
             Self::VenueRestored => "venue restored",
             Self::VaultFrozen => "vault frozen",
-            Self::StrategyRegistered => "strategy registered",
+            Self::StrategyRegistered => "agent registered",
             Self::ReviewPublished => "review published",
             Self::ClaimNote => "claim waiting",
         }

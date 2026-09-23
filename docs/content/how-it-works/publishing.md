@@ -25,7 +25,7 @@ flowchart LR
 A submission is the whole **workspace** your strategy belongs to, packed the same way every time so that its hash means something:
 
 ```bash
-shonin pack packages/bots/your-strategy > strategy.tar
+shonin pack packages/agents/your-agent > agent.tar
 ```
 
 The archive is canonical — sorted entries, fixed metadata — so the same tree always produces the same bytes and the same hash. That hash is what the vault is created with, so the chain and the build service are talking about one thing.

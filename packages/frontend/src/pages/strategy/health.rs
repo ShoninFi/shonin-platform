@@ -16,7 +16,7 @@ pub fn render(strategy: &Rc<Strategy>) -> Dom {
         return ui::section(
             "Nothing is running",
             vec![ui::empty(
-                "This strategy isn't running, so there is no health report for it.",
+                "This agent isn't running, so there is no health report for it.",
             )],
         );
     };
@@ -45,7 +45,7 @@ pub fn render(strategy: &Rc<Strategy>) -> Dom {
                     ("Signed by".to_string(), ui::address(&health.signed_by)),
                 ]),
                 ui::note(
-                    "Signed by the executor running the strategy. It is evidence of how the strategy is \
+                    "Signed by the executor running the agent. It is evidence of how the agent is \
                      running, not the record of what it did; nothing here stops anything on its \
                      own.",
                 ),

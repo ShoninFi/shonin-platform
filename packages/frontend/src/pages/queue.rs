@@ -99,7 +99,7 @@ pub fn list() -> Dom {
                     ui::subheading("Anyone can rebuild"),
                     ui::para(
                         "The recipe and the builder image are public, so anyone can rebuild a published \
-                         strategy from its source and compare hashes.",
+                         agent from its source and compare hashes.",
                     ),
                 ]))
             })],
@@ -163,8 +163,8 @@ fn facts(job: &Job) -> Dom {
     }
     if let Some(slug) = &job.strategy_slug {
         rows.push((
-            "Strategy".to_string(),
-            ui::inline_link(&format!("/strategies/{slug}"), slug),
+            "Agent".to_string(),
+            ui::inline_link(&format!("/agents/{slug}"), slug),
         ));
     }
 

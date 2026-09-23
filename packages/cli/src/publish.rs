@@ -276,7 +276,7 @@ mod tests {
     fn a_strategy_packs_the_workspace_it_belongs_to() {
         let root = std::env::temp_dir().join(format!("shonin-root-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let project = root.join("packages/bots/one");
+        let project = root.join("packages/agents/one");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(root.join("Cargo.toml"), b"[workspace]\nmembers = []\n").unwrap();
         std::fs::write(project.join("Cargo.toml"), b"[package]\n").unwrap();

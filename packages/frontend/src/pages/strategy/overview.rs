@@ -58,7 +58,7 @@ fn record(strategy: &Rc<Strategy>) -> Dom {
         return ui::section(
             "The record",
             vec![ui::empty(
-                "This strategy never traded, so there is no record to read.",
+                "This agent never traded, so there is no record to read.",
             )],
         );
     };
@@ -66,7 +66,7 @@ fn record(strategy: &Rc<Strategy>) -> Dom {
     ui::section_with_aside(
         "The record",
         Some(ui::action_link(
-            &format!("/strategies/{}/record", strategy.slug),
+            &format!("/agents/{}/record", strategy.slug),
             "The whole record",
         )),
         vec![
@@ -84,7 +84,7 @@ fn record(strategy: &Rc<Strategy>) -> Dom {
             if strategy.days_live < Strategy::DAYS_TO_RANK {
                 ui::notice(
                     Tone::Warn,
-                    "This strategy is labelled new",
+                    "This agent is labelled new",
                     &format!(
                         "It has run for {} and made {} trades. It is open for deposits, and won't be ranked \
                          until it has {} live days.",
@@ -134,7 +134,7 @@ fn review(strategy: &Rc<Strategy>) -> Dom {
     ui::section_with_aside(
         "The review",
         Some(ui::action_link(
-            &format!("/strategies/{}/review", strategy.slug),
+            &format!("/agents/{}/review", strategy.slug),
             "The full report",
         )),
         vec![
@@ -168,7 +168,7 @@ fn where_the_money_is(strategy: &Rc<Strategy>) -> Dom {
     if strategy.legs.is_empty() {
         return ui::section(
             "Where the money is",
-            vec![ui::empty("This strategy has no venue accounts.")],
+            vec![ui::empty("This agent has no venue accounts.")],
         );
     }
 
@@ -316,7 +316,7 @@ fn limits(strategy: &Rc<Strategy>) -> Dom {
     let mut children = Vec::new();
     if !strategy.limits.is_empty() {
         children.push(ui::note(
-            "These limits live in the strategy's own code, where the reviewer reads them. There \
+            "These limits live in the agent's own code, where the reviewer reads them. There \
              is no platform risk policy.",
         ));
         children.push(ui::bullets(strategy.limits.iter().cloned()));
@@ -448,7 +448,7 @@ fn aside(strategy: &Rc<Strategy>) -> Vec<Dom> {
     cards.push(ui::card_titled(
         "Which code is trading this",
         Some(ui::action_link(
-            &format!("/strategies/{}/verify", strategy.slug),
+            &format!("/agents/{}/verify", strategy.slug),
             "Check it",
         )),
         vec![ui::kv_rows(vec![

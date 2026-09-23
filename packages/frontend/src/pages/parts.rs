@@ -15,7 +15,7 @@ use crate::ui::primitives::Tone;
 
 /// Where a strategy's page is.
 pub fn path_of(strategy: &Strategy) -> String {
-    format!("/strategies/{}", strategy.slug)
+    format!("/agents/{}", strategy.slug)
 }
 
 /// How a strategy's standing reads.
@@ -300,11 +300,11 @@ pub fn vault_notices(strategy: &Strategy) -> Vec<Dom> {
     if let Some(successor) = &strategy.superseded_by {
         notices.push(ui::notice_with(
             Tone::Info,
-            "A newer version of this strategy exists",
+            "A newer version of this agent exists",
             "This vault runs exactly as it always has. Moving means withdrawing here and \
              depositing there.",
             Some(ui::action_link(
-                &format!("/strategies/{successor}"),
+                &format!("/agents/{successor}"),
                 "See what changed",
             )),
         ));
@@ -335,10 +335,10 @@ pub fn vault_notices(strategy: &Strategy) -> Vec<Dom> {
     {
         notices.push(ui::notice_with(
             Tone::Error,
-            "This strategy's health report shows an error",
+            "This agent's health report shows an error",
             &health.summary(),
             Some(ui::action_link(
-                &format!("/strategies/{}/health", strategy.slug),
+                &format!("/agents/{}/health", strategy.slug),
                 "The health report",
             )),
         ));

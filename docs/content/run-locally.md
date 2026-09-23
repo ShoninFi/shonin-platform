@@ -9,7 +9,7 @@ Nothing needs a key, an account or a cloud project.
 
 ## Prerequisites
 
-- [Rust](https://rustup.rs) — the toolchain is pinned and installs itself on first use, with `wasm32-unknown-unknown` for the web app and `wasm32-wasip2` for strategies
+- [Rust](https://rustup.rs) — the toolchain is pinned and installs itself on first use, with `wasm32-unknown-unknown` for the web app and `wasm32-wasip2` for agents
 - [Foundry](https://getfoundry.sh) for the contracts and the chain (`forge`, `anvil`, `cast`)
 - [Task](https://taskfile.dev)
 - [Trunk](https://trunkrs.dev) for the frontend
@@ -25,7 +25,7 @@ task dev      # chain, contracts, every service, and the web app
 Then open **http://localhost:19080**.
 
 ```bash
-task services:seed   # publish the reference strategies through the real flows
+task services:seed   # publish the reference agents through the real flows
 task down            # stop everything task dev started
 ```
 
@@ -68,13 +68,13 @@ The web app offers one of them as a **development wallet**. It signs nothing in 
 | The executor running a real WebAssembly component under fuel, allowances and signed health reports | |
 | The record, read from each vault's value per share | |
 
-Deliberately absent: a bridge, a second chain, remote legs, an enclave, model inference, and any network for a strategy to reach. Those are on the [checklist](checklist.md), and a local chain has no way to exercise them honestly.
+Deliberately absent: a bridge, a second chain, remote legs, an enclave, model inference, and any network for an agent to reach. Those are on the [checklist](checklist.md), and a local chain has no way to exercise them honestly.
 
-## Publishing a strategy to it
+## Publishing an agent to it
 
 ```bash
-# from a checkout of the bots repository, with SHONIN_PLATFORM_DIR set
-task dev     # packs, creates the vault, submits, and prints the queue and strategy URLs
+# from a checkout of the agents repository, with SHONIN_PLATFORM_DIR set
+task dev     # packs, creates the vault, submits, and prints the queue and agent URLs
 ```
 
 or from the web app's **Publish** page: drop the packed archive, fund the tank, and watch the queue.

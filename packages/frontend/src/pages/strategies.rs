@@ -89,7 +89,7 @@ pub fn render() -> Dom {
 fn header() -> Dom {
     html!("div", {
         .class("stack")
-        .child(html!("h1", { .class("title").text("Strategies") }))
+        .child(html!("h1", { .class("title").text("Agents") }))
         .child(html!("p", {
             .class("lede")
             .text(
@@ -230,7 +230,7 @@ fn listing(
     });
 
     if strategies.is_empty() {
-        return ui::empty("No strategy matches those filters.");
+        return ui::empty("No agent matches those filters.");
     }
 
     let ranked = view == View::Ranked;
@@ -245,7 +245,7 @@ fn listing(
         columns.push(Column::num("#"));
     }
     columns.extend([
-        Column::new("Strategy").wide(),
+        Column::new("Agent").wide(),
         Column::new("Author"),
         Column::num("Live").sortable("age"),
         Column::num("Normalised").sortable("normalised"),
@@ -334,7 +334,7 @@ fn past_table(strategies: Vec<Rc<Strategy>>) -> Dom {
         .class("stack-sm")
         .child(crate::ui::table::table(
             vec![
-                Column::new("Strategy").wide(),
+                Column::new("Agent").wide(),
                 Column::new("Author"),
                 Column::new("Standing"),
                 Column::num("Live"),
@@ -346,7 +346,7 @@ fn past_table(strategies: Vec<Rc<Strategy>>) -> Dom {
         .child(html!("p", {
             .class(["faint", "small"])
             .text(
-                "Records stay here, and never adjust a live strategy's rank."
+                "Records stay here, and never adjust a live agent's rank."
             )
         }))
     })

@@ -51,7 +51,7 @@ fn disconnected() -> Dom {
         ))
         .child(html!("div", {
             .class(["row", "row--wrap"])
-            .child(shell::button_link("/strategies", "Browse the strategies", true))
+            .child(shell::button_link("/agents", "Browse the agents", true))
         }))
     })
 }
