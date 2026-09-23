@@ -1,0 +1,74 @@
+/* Shonin docs theme
+ *
+ * Deep indigo header, teal accent. Light and dark (slate) schemes.
+ */
+
+:root,
+[data-md-color-scheme="default"] {
+    --md-primary-fg-color: #1e1b4b;
+    --md-primary-fg-color--light: #3730a3;
+    --md-primary-fg-color--dark: #13112e;
+    --md-primary-bg-color: #ffffff;
+    --md-primary-bg-color--light: #ffffffb3;
+
+    --md-accent-fg-color: #0d9488;
+    --md-accent-fg-color--transparent: rgba(13, 148, 136, 0.1);
+    --md-accent-bg-color: #ffffff;
+    --md-accent-bg-color--light: #ffffffb3;
+
+    --md-typeset-a-color: #4338ca;
+    --md-code-hl-color: rgba(45, 212, 191, 0.2);
+}
+
+[data-md-color-scheme="slate"] {
+    --md-hue: 245;
+    --md-primary-fg-color: #1e1b4b;
+    --md-primary-fg-color--light: #3730a3;
+    --md-primary-fg-color--dark: #13112e;
+    --md-primary-bg-color: #ffffff;
+    --md-primary-bg-color--light: #ffffffb3;
+
+    --md-accent-fg-color: #2dd4bf;
+    --md-accent-fg-color--transparent: rgba(45, 212, 191, 0.12);
+
+    --md-typeset-a-color: #a5b4fc;
+    --md-code-hl-color: rgba(45, 212, 191, 0.18);
+}
+
+.md-header__button.md-logo img {
+    height: 1.7rem;
+    width: auto;
+}
+
+.md-header__topic {
+    font-weight: 700;
+}
+
+/* Keep inline code in tables on one line */
+.md-typeset table code {
+    white-space: nowrap;
+}
+
+/* Diagrams, drawn by javascripts/diagrams.js.
+ *
+ * Until one is drawn it is the source in a code block, which is what a reader
+ * gets if the drawing never happens. Once drawn it is an SVG that scrolls
+ * rather than overflowing the page.
+ */
+.md-typeset .shonin-diagram--drawn {
+    background: none;
+    border: none;
+    box-shadow: none;
+    overflow-x: auto;
+    padding: 0;
+    text-align: center;
+}
+
+.md-typeset .shonin-diagram--drawn svg {
+    height: auto;
+    max-width: 100%;
+}
+
+.md-nav__link--active {
+    font-weight: 600;
+}

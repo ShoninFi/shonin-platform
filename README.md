@@ -33,6 +33,18 @@ task deploy   # release build + deploy to Cloudflare
 
 Run `task` on its own to list every task.
 
+## Documentation
+
+The public documentation lives in `docs/` and is built with [Zensical](https://zensical.org). It describes how the platform works, how to check it, and what is left to build.
+
+```bash
+task docs:dev      # serve it with live reload on http://localhost:19089
+task docs:build    # build it into docs/site
+task docs:deploy   # build and deploy it to Cloudflare
+```
+
+The [build checklist](docs/content/checklist.md) is the working guideline for what is still to do.
+
 ## Running the platform locally
 
 `task dev` starts a development chain, deploys the contracts to it, and runs every service against them, so the web app shows real data: real vaults, real deposits, a real build queue, a real record read from the chain.
@@ -81,13 +93,18 @@ packages/
   devnet/         deploys and drives the local development chain
   strategy-sdk/   Rust bindings for the shonin:strategy WIT world
   cli/            the `shonin` CLI for strategy authors
+docs/
+  zensical.toml   the public documentation site (docs.shonin.fi)
+  content/        its pages: how it works, how to verify it, and the build checklist
 cloudflare/
   landing/        wrangler.jsonc for the shonin-landing Worker (the frontend)
+  docs/           wrangler.jsonc for the shonin-docs Worker (the documentation)
 taskfiles/
   config.yml      non-secret configuration: paths, ports, URLs, project names
   contracts.yml   building and testing the contracts
   services.yml    the local chain and every service that reads it
   frontend.yml    frontend dev, build and deploy
+  docs.yml        documentation dev, build and deploy
 ```
 
 ## Where configuration lives
@@ -95,7 +112,7 @@ taskfiles/
 | What | Where |
 | --- | --- |
 | Paths, ports, URLs | `taskfiles/config.yml` |
-| Cloudflare Worker names (`shonin-landing`, ...) | `name` in `cloudflare/<target>/wrangler.jsonc` |
+| Cloudflare Worker names (`shonin-landing`, `shonin-docs`, ...) | `name` in `cloudflare/<target>/wrangler.jsonc` |
 | Secrets and per-developer settings | `.env` (gitignored); the template is `.env.example` |
 | Contract addresses, after a local deploy | `.shonin/local/deployments.json` (gitignored) |
 | Rust toolchain | `rust-toolchain.toml` |

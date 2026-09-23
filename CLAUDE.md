@@ -1,6 +1,6 @@
 # Shonin Platform
 
-The Shonin platform: Solidity contracts (`contracts/`) and one Cargo workspace (`packages/*`), driven by Task. See `README.md` for the layout, the quickstart and how to run the whole platform locally.
+The Shonin platform: Solidity contracts (`contracts/`), one Cargo workspace (`packages/*`) and the public documentation site (`docs/`), driven by Task. See `README.md` for the layout, the quickstart and how to run the whole platform locally.
 
 ## Rules
 
@@ -12,6 +12,7 @@ The Shonin platform: Solidity contracts (`contracts/`) and one Cargo workspace (
 - **The contracts' interfaces are the source of truth for both sides.** `contracts/src/interfaces/*.sol` is what the contracts implement and what `packages/chain` parses with `sol!`. Change the interface once and both follow; never hand-write a second copy of a signature.
 - **No key is written down.** The local chain's accounts come from its own published mnemonic, taken by index. `.env` holds a key only when someone points a role at an account of their own.
 - **Nothing local is committed.** A local run writes only under `.shonin/local`, which is gitignored and safe to delete.
+- **`docs/` is published.** It describes mechanisms a reader can check, and what is left to build. It never carries strategy, reasoning about pricing, comparisons with anyone, or plans beyond the checklist. Where something is designed but not built, the page says so. `docs/content/checklist.md` is the working guideline: keep it current.
 
 ## Commit guard
 
@@ -29,4 +30,4 @@ For assistants, a Claude Code hook (`.githooks/claude-bash-guard`, wired up in t
 
 ## Done means
 
-`task check`, `task lint` and `task test` all pass.
+`task check`, `task lint` and `task test` all pass, and `task docs:build` reports no issues when the documentation changed.
