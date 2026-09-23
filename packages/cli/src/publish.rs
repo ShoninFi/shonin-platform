@@ -98,6 +98,28 @@ async fn create_vault(
 
     let strategy_id = name_to_bytes(&manifest.strategy.id);
     let hash = hash_to_bytes(source_hash).context("the source hash")?;
+
+    // A version is published once. Saying so here is kinder than a reverted
+    // transaction, and the answer is always the same: bump the version in the
+    // manifest, because a new version is a new vault.
+    let existing = chain
+        .read(
+            deployments.factory,
+            IVaultFactory::vaultOfCall {
+                strategyId: strategy_id.into(),
+                version: manifest.strategy.version,
+            },
+        )
+        .await
+        .context("asking whether this version already has a vault")?;
+    if existing != alloy::primitives::Address::ZERO {
+        anyhow::bail!(
+            "{} v{} already has a vault at {existing:?}. A version is published once: raise \
+             `version` in the manifest and publish that.",
+            manifest.strategy.id,
+            manifest.strategy.version
+        );
+    }
     chain
         .send(
             author,
