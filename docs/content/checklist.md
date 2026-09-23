@@ -125,6 +125,7 @@ Working defaults are in the [parameters](reference/parameters.md); these need me
 
 ## The site
 
+- [ ] **Publish the repository.** Most of what this site claims — rebuild it yourself, run your own indexer, read the review prompt, run the whole platform locally — is worth nothing while the source is private. Near the top of the list for that reason
 - [ ] `local` **Pre-rendered pages, a sitemap and robots.txt**, so every route has real content without JavaScript
 - [ ] **A link preview image**
 

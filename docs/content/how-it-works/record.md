@@ -34,11 +34,13 @@ An author's page shows **everything they have published**: live, new, superseded
 
 An author can publish under a fresh identity, of course. What they cannot do is carry a record with them: every strategy needs its own ninety live days before it is ranked, whoever wrote it.
 
-## The indexer is open source
+## Run your own indexer
 
-The service that reads the chain into a record, computes the maths and serves the public API is part of this repository. You can run your own against the same chain and compare, and the maths — normalisation, drawdown, volatility, correlation — is a library with its own tests rather than something hidden in a server.
+The service that reads the chain into a record, computes the maths and serves the public API is one program, and the maths — normalisation, drawdown, volatility, correlation — is a library with its own tests rather than something buried in a server.
 
-If our indexer and yours disagree, one of them has a bug, and the chain says which.
+The point of that is for you to run your own against the same chain and compare. If ours and yours disagree, one of them has a bug, and the chain says which.
+
+It is written to be published and it is not published yet, which is [on the checklist](../checklist.md#the-site). Until then this is a description of an intention, and you should read it as one.
 
 ## Benchmarks and correlation
 

@@ -18,8 +18,8 @@ docs_dir = "content"
 site_dir = "site"
 extra_css = ["stylesheets/theme.css"]
 extra_javascript = ["javascripts/diagrams.js"]
-repo_url = "https://github.com/ShoninFi/shonin-platform"
-repo_name = "ShoninFi/shonin-platform"
+# No repo_url yet: the repository is not public, so a header link would be a
+# 404 for every reader, and the theme would fetch its stats on every page.
 nav = [
     {"Start here" = "index.md"},
     {"Putting money in" = "depositors.md"},

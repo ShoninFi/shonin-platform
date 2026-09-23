@@ -4,6 +4,9 @@ The whole platform runs on your own machine: a development chain, the contracts 
 
 Nothing needs a key, an account or a cloud project.
 
+!!! warning "The repository is not public yet"
+    Everything below works, and it is what we run. You cannot clone it today, because the source has not been published. That is [on the checklist](checklist.md#the-site), and until it is done this page describes something you have to take our word for — which is the one thing this project is supposed to avoid asking of anyone.
+
 ## Prerequisites
 
 - [Rust](https://rustup.rs) — the toolchain is pinned and installs itself on first use, with `wasm32-unknown-unknown` for the web app and `wasm32-wasip2` for strategies
