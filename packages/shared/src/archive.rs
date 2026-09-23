@@ -88,6 +88,29 @@ fn collect(root: &Path, directory: &Path, into: &mut Vec<PathBuf>) -> Result<()>
 }
 
 /// The bundle: the component, and the models it calls, in one archive.
+/// The manifest inside a packed project, without unpacking it. What an author
+/// declared is what the build is about, so a page can read it back rather than
+/// asking them to type it again.
+pub fn manifest_in(bytes: &[u8]) -> Option<crate::Manifest> {
+    let mut archive = tar::Archive::new(Cursor::new(bytes));
+    for entry in archive.entries().ok()? {
+        let mut entry = entry.ok()?;
+        let named = entry
+            .path()
+            .ok()
+            .map(|path| path.ends_with("shonin.toml"))
+            .unwrap_or(false);
+        if !named {
+            continue;
+        }
+        let mut text = String::new();
+        use std::io::Read;
+        entry.read_to_string(&mut text).ok()?;
+        return crate::Manifest::from_toml(&text).ok();
+    }
+    None
+}
+
 pub fn bundle(component: &[u8], models: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
     let mut archive = tar::Builder::new(Vec::new());
     add(&mut archive, "component.wasm", component)?;

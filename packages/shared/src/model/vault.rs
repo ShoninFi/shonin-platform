@@ -43,7 +43,8 @@ impl VaultState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Tank {
     pub balance: f64,
-    /// What usage and gas cost the strategy in a day.
+    /// What the last day's usage statement charged, or, before there is one,
+    /// the most a day may charge at the allowances the author declared.
     pub daily_charge: f64,
     /// What auto-fill tops it back up to.
     pub target: f64,

@@ -9,6 +9,8 @@ use futures_signals::map_ref;
 use futures_signals::signal::Mutable;
 use shared::{ExitClass, Source, Standing, Strategy};
 
+use shared::model::registry::JobState;
+
 use crate::copy;
 use crate::data;
 use crate::format as fmt;
@@ -49,6 +51,16 @@ fn controls() -> &'static Controls {
 
 pub fn render() -> Dom {
     let controls = controls();
+
+    // A platform with nothing ranked yet would otherwise open on an empty
+    // table and say so, which reads as a broken page rather than a young one.
+    // Once anything is ranked, the ranked view is the one worth landing on.
+    if controls.view.get() == View::Ranked
+        && data::ranked().is_empty()
+        && !data::newest().is_empty()
+    {
+        controls.view.set(View::New);
+    }
 
     html!("div", {
         .class("stack-lg")
@@ -351,10 +363,12 @@ fn reason(strategy: &Strategy) -> String {
             .kill
             .as_ref()
             .map_or_else(|| "Stopped.".to_string(), |kill| kill.reason.clone()),
-        Standing::BuildFailed => {
-            "The build didn't produce the same bytes twice, so there is no bundle and no vault."
-                .to_string()
-        }
+        Standing::BuildFailed => data::build_of(&strategy.slug)
+            .and_then(|job| match &job.state {
+                JobState::Failed { reason } => Some(format!("{reason}. No bundle, and no vault.")),
+                _ => None,
+            })
+            .unwrap_or_else(|| "The build failed, so there is no bundle and no vault.".to_string()),
         _ => String::new(),
     }
 }

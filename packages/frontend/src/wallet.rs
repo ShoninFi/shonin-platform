@@ -595,8 +595,9 @@ mod send {
         let config = data::config().ok_or("the app has not reached the platform yet")?;
         let reviews = address_of(&config.addresses.reviews)?;
         let usd = asset_address()?;
-        // The fee is a dollar; approving it exactly is what the registry pulls.
-        let fee = units(1.0);
+        // Approving exactly what the registry will pull, as the registry
+        // itself reports it.
+        let fee = units(config.terms.review_fee);
 
         working("Approving");
         send(

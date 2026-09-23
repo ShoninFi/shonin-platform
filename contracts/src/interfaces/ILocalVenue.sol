@@ -92,6 +92,11 @@ interface ILocalVenue {
         uint256 notional
     );
     event Rejected(address indexed master, bytes32 indexed market, address indexed by, string reason);
+    /// An immediate-or-cancel order that found nobody at its price. Not a
+    /// refusal: the venue would have taken it, and the market moved. It is a
+    /// separate event because a strategy whose orders are not crossing is
+    /// trading, and one whose orders are being refused is not.
+    event Unfilled(address indexed master, bytes32 indexed market, address indexed by);
     event PricesSet(bytes32 indexed market, uint256 mark, uint256 oracle, uint256 bid, uint256 ask);
     event FundingAccrued(bytes32 indexed market, int256 paidPerUnit, int256 fundingIndex);
     event FundingSet(bytes32 indexed market, int256 ratePerDay);

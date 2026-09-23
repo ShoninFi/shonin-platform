@@ -347,7 +347,13 @@ async fn read_vault(
         exit_band_bps: exit_band as u32,
         tank: Tank {
             balance: dollars(tank.balance),
-            daily_charge: dollars(tank.lastCharge.max(tank.dailyCap)),
+            // What it is actually charging, once it has charged anything.
+            // Before that the cap is the only honest answer.
+            daily_charge: if tank.lastCharge.is_zero() {
+                dollars(tank.dailyCap)
+            } else {
+                dollars(tank.lastCharge)
+            },
             target: dollars(tank.target),
             autofill_bps: tank.autofillBps as u32,
             debt: dollars(tank.debt),

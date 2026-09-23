@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.30;
 
-import {Fill, OrderRequest} from "../src/interfaces/ILocalVenue.sol";
+import {Fill, ILocalVenue, OrderRequest} from "../src/interfaces/ILocalVenue.sol";
 import {Fixture} from "./Fixture.sol";
 
 /// The venue's job is to make one sentence true: a trading key can lose money
@@ -106,10 +106,14 @@ contract LocalVenueTest is Fixture {
 
     function test_an_order_outside_its_limit_does_not_fill() public {
         setPrice(SPOT, PRICE, 20);
+        // Nobody at that price is the market's answer, not the venue's, so it
+        // is an unfilled order rather than a refusal.
+        vm.expectEmit(true, true, true, false);
+        emit ILocalVenue.Unfilled(master, SPOT, agent);
         vm.prank(agent);
         Fill[] memory fills = venue.place(master, buy(SPOT, 1e18, PRICE, false));
         assertFalse(fills[0].accepted);
-        assertEq(fills[0].reason, "price outside the limit");
+        assertEq(fills[0].reason, "no fill at that price");
         assertEq(venue.positionOf(master, SPOT).size, 0);
     }
 

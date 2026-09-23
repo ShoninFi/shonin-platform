@@ -115,15 +115,20 @@ fn submit() -> Dom {
                     "Drop the packed project, or choose it",
                     &draft.archive,
                 ))
+                .child(html!("div", {
+                    .child_signal(draft.archive.signal_cloned().map(|picked| {
+                        Some(declared(picked.as_ref()))
+                    }))
+                }))
                 .child(form::toggle("Seal the source", &draft.sealed))
                 .child(form::field(
                     "Strategy id",
-                    Some("Stable across versions; each version gets its own vault"),
+                    Some("Read from the project's manifest; stable across versions, and each version gets its own vault"),
                     form::input(&draft.strategy_id, "funding-basis"),
                 ))
                 .child(form::field(
                     "Version",
-                    Some("A new version is a new vault, and never an edit of a running one"),
+                    Some("Read from the project's manifest; a new version is a new vault, and never an edit of a running one"),
                     form::input(&draft.version, "1"),
                 ))
                 .child(form::field(
@@ -215,6 +220,34 @@ fn publish() {
             Err(problem) => state::notify(problem, Tone::Warn),
         }
     });
+}
+
+/// What the dropped project declares about itself. The manifest inside it is
+/// what the build is about and what its hash covers, so the page reads it back
+/// rather than asking the author to type the same thing twice: a vault created
+/// for one version and a manifest naming another is a failed build and a
+/// closed vault.
+fn declared(picked: Option<&form::Picked>) -> Dom {
+    let draft = state_of();
+    let Some(picked) = picked else {
+        return html!("div");
+    };
+    let Some(manifest) = shared::archive::manifest_in(&picked.bytes) else {
+        return ui::notice(
+            Tone::Warn,
+            "No manifest in that archive",
+            "A submission is a packed workspace with a `shonin.toml` in it. Pack it with \
+             `shonin pack`, which packs the whole workspace the strategy belongs to.",
+        );
+    };
+
+    // The form follows the manifest, so the two can never disagree.
+    draft.strategy_id.set(manifest.strategy.id.clone());
+    draft.version.set(manifest.strategy.version.to_string());
+    ui::note(&format!(
+        "This project declares {} v{}, which is what the vault will be created for.",
+        manifest.strategy.id, manifest.strategy.version
+    ))
 }
 
 /// What each shape the SDK names is called on the page, and what a day of it

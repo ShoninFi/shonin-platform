@@ -219,7 +219,10 @@ contract LocalVenue is ILocalVenue {
 
         uint256 price = order.isBuy ? m.ask : m.bid;
         if (order.isBuy ? price > order.limitPrice : price < order.limitPrice) {
-            return _reject(master, order.market, "price outside the limit");
+            // Nobody was there at that price. The venue would have taken the
+            // order, so this is the market's answer rather than the venue's.
+            emit Unfilled(master, order.market, msg.sender);
+            return _empty(order.market);
         }
 
         // What the account would look like afterwards. Nothing is written
@@ -260,6 +263,12 @@ contract LocalVenue is ILocalVenue {
     function _reject(address master, bytes32 market, string memory reason) private returns (Fill memory) {
         emit Rejected(master, market, msg.sender, reason);
         return Fill({accepted: false, reason: reason, size: 0, price: 0, notional: 0});
+    }
+
+    /// An order that found no fill. It was not refused, so it carries no
+    /// reason of the venue's.
+    function _empty(bytes32) private pure returns (Fill memory) {
+        return Fill({accepted: false, reason: "no fill at that price", size: 0, price: 0, notional: 0});
     }
 
     // Value -----------------------------------------------------------------

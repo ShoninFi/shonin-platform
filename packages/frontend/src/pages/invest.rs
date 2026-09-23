@@ -138,7 +138,7 @@ fn ways_to_connect() -> Vec<(wallet::Connection, &'static str)> {
 ///
 /// Every action on this page is a transaction: it takes a moment, it can be
 /// turned down, and the page says which.
-fn act<F>(what: F, said: impl FnOnce(&str) -> String + 'static)
+pub fn act<F>(what: F, said: impl FnOnce(&str) -> String + 'static)
 where
     F: std::future::Future<Output = Result<String, String>> + 'static,
 {

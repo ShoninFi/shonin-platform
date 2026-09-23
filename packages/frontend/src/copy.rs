@@ -169,8 +169,8 @@ pub fn publish_steps() -> [(&'static str, String); 5] {
         ),
         (
             "Submit, and fund the vault's tank",
-            "Point us at a public repository and commit, or upload the project encrypted to \
-             seal it. The build and the review are the tank's first charges."
+            "Pack the project and upload it, sealed if you would rather nobody else read it. \
+             The build and the review are the tank's first charges."
                 .to_string(),
         ),
         (

@@ -175,18 +175,20 @@ impl shonin::strategy::venues::HostWithStore<Ctx> for HasSelf<Ctx> {
         }
 
         let mut verdicts = Vec::with_capacity(actions.len());
+        let mut refused = 0;
         for bytes in &actions {
-            let verdict = match strategy_sdk::from_payload::<Action>(bytes) {
+            let (verdict, counts) = match strategy_sdk::from_payload::<Action>(bytes) {
                 Ok(action) => act(&key, vault, venue_address, action).await,
-                Err(error) => Verdict::Rejected(format!("that is not an action: {error}")),
+                Err(error) => (
+                    Verdict::Rejected(format!("that is not an action: {error}")),
+                    true,
+                ),
             };
+            if counts {
+                refused += 1;
+            }
             verdicts.push(verdict);
         }
-
-        let refused = verdicts
-            .iter()
-            .filter(|verdict| matches!(verdict, Verdict::Rejected(_)))
-            .count() as u64;
         accessor.with(|mut access| {
             refuel(&mut access);
             access.get().count(|counters| {
@@ -391,7 +393,11 @@ impl shonin::strategy::inference::HostWithStore<Ctx> for HasSelf<Ctx> {
 
 // Doing what a strategy asked ------------------------------------------------
 
-async fn act(key: &KeyClient, vault: Address, venue: Address, action: Action) -> Verdict {
+/// Do one action, and say whether the answer counts against the strategy's
+/// health. An order that found nobody at its price is the market's answer, not
+/// the venue's: a strategy whose orders are not crossing is trading, and one
+/// whose orders are being refused is not.
+async fn act(key: &KeyClient, vault: Address, venue: Address, action: Action) -> (Verdict, bool) {
     let done = match action {
         Action::Place(order) => place(key, vault, venue, &order).await,
         Action::MoveCapital { from, to, amount } => {
@@ -399,10 +405,28 @@ async fn act(key: &KeyClient, vault: Address, venue: Address, action: Action) ->
         }
     };
     match done {
-        Ok(receipt) => Verdict::Accepted(strategy_sdk::to_payload(&receipt)),
+        Ok(receipt) => (Verdict::Accepted(strategy_sdk::to_payload(&receipt)), false),
+        Err(Refusal::NoFill) => (Verdict::Rejected(NO_FILL.to_string()), false),
         // A refusal is the venue's answer, not a fault: the strategy is told
         // why and decides what to do about it.
-        Err(error) => Verdict::Rejected(error.to_string()),
+        Err(Refusal::Refused(why)) => (Verdict::Rejected(why), true),
+    }
+}
+
+/// What the venue says when an order found no fill.
+const NO_FILL: &str = "no fill at that price";
+
+/// Why an action produced no receipt.
+enum Refusal {
+    /// The venue would have taken the order; nobody was there at that price.
+    NoFill,
+    /// The venue would not take it, and said why.
+    Refused(String),
+}
+
+impl From<anyhow::Error> for Refusal {
+    fn from(error: anyhow::Error) -> Self {
+        Refusal::Refused(format!("{error}"))
     }
 }
 
@@ -411,7 +435,7 @@ async fn place(
     vault: Address,
     venue: Address,
     order: &strategy_sdk::Order,
-) -> Result<Receipt> {
+) -> std::result::Result<Receipt, Refusal> {
     let request = OrderRequest {
         market: market_id(&order.market),
         isBuy: matches!(order.side, Side::Buy),
@@ -442,11 +466,16 @@ async fn place(
                 notional: to_decimal(filled.notional, ASSET_DECIMALS)?,
             });
         }
+        if log.log_decode::<ILocalVenue::Unfilled>().is_ok() {
+            return Err(Refusal::NoFill);
+        }
         if let Ok(rejected) = log.log_decode::<ILocalVenue::Rejected>() {
-            anyhow::bail!("{}", rejected.inner.data.reason);
+            return Err(Refusal::Refused(rejected.inner.data.reason));
         }
     }
-    anyhow::bail!("the venue said nothing about that order")
+    Err(Refusal::Refused(
+        "the venue said nothing about that order".to_string(),
+    ))
 }
 
 async fn move_capital(
@@ -455,7 +484,7 @@ async fn move_capital(
     from: Account,
     to: Account,
     amount: strategy_sdk::Decimal,
-) -> Result<Receipt> {
+) -> std::result::Result<Receipt, Refusal> {
     key.send(
         vault,
         IVault::moveCapitalCall {

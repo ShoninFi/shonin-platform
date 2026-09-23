@@ -63,8 +63,15 @@ fn error(text: impl Into<String>) -> LogLine {
     }
 }
 
-/// Build a project that has already been unpacked.
-pub fn build(source: &Path, sdk: &Path, image: &str) -> Result<Built, Failed> {
+/// Build a project that has already been unpacked. `claimed` is the strategy
+/// and version the vault was created for: the manifest inside has to say the
+/// same, or the bundle and the vault would be about different things.
+pub fn build(
+    source: &Path,
+    sdk: &Path,
+    image: &str,
+    claimed: (&str, u32),
+) -> Result<Built, Failed> {
     let started = std::time::Instant::now();
     let mut log = vec![
         plain(format!("builder {image} (allowlisted, timelock cleared)")),
@@ -82,6 +89,18 @@ pub fn build(source: &Path, sdk: &Path, image: &str) -> Result<Built, Failed> {
             });
         }
     };
+    if manifest.strategy.id != claimed.0 || manifest.strategy.version != claimed.1 {
+        log.push(error(format!(
+            "the vault was created for {} v{}, and the manifest says {} v{}",
+            claimed.0, claimed.1, manifest.strategy.id, manifest.strategy.version
+        )));
+        return Err(Failed {
+            reason: "the manifest names a different strategy than the vault".to_string(),
+            log,
+            seconds: started.elapsed().as_secs() as u32,
+        });
+    }
+
     let package = package_name(source, &manifest);
     log.push(plain(format!(
         "{} v{}, package {package}",

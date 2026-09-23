@@ -5,18 +5,19 @@ use std::rc::Rc;
 
 use std::sync::OnceLock;
 
-use dominator::{Dom, html, text};
+use dominator::{Dom, clone, html, text};
 use futures_signals::signal::Mutable;
 use shared::{FindingCategory, Review, Severity, Strategy};
 
 use crate::copy;
 use crate::data;
 use crate::format as fmt;
-use crate::state;
+use crate::pages::invest;
 use crate::ui::overlay::{modal, modal_actions};
 use crate::ui::primitives as ui;
 use crate::ui::primitives::Tone;
 use crate::ui::shell;
+use crate::wallet;
 
 fn buying() -> &'static Mutable<bool> {
     static BUYING: OnceLock<Mutable<bool>> = OnceLock::new();
@@ -216,6 +217,7 @@ fn limits(review: &Review) -> Dom {
 
 fn buy_modal(strategy: &Rc<Strategy>) -> Dom {
     let name = strategy.name();
+    let slug = strategy.slug.clone();
     let image = strategy
         .review
         .as_ref()
@@ -241,13 +243,24 @@ fn buy_modal(strategy: &Rc<Strategy>) -> Dom {
             ui::note("Nothing is re-reviewed automatically when the reviewer image changes."),
             modal_actions(vec![
                 shell::button("Cancel", false, || buying().set(false)),
-                shell::button("Buy the review", true, move || {
-                    buying().set(false);
-                    state::notify(
-                        "Queued. A fresh review appears here when the reviewer has signed it.",
-                        Tone::Ok,
-                    );
-                }),
+                shell::button(
+                    "Buy the review",
+                    true,
+                    clone!(slug => move || {
+                        buying().set(false);
+                        invest::act(
+                            {
+                                let slug = slug.clone();
+                                async move { wallet::buy_review(&slug).await }
+                            },
+                            |_| {
+                                "Bought. A fresh review appears here when the reviewer has \
+                                 signed it."
+                                    .to_string()
+                            },
+                        );
+                    }),
+                ),
             ]),
         ]
     })

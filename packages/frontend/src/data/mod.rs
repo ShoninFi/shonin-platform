@@ -109,6 +109,15 @@ pub fn config() -> Option<Rc<Config>> {
 /// carries, the exit band, the timelocks and what publishing costs. Every page
 /// that states one of these as a fact reads it here rather than spelling it
 /// out, so nothing in the app can drift from the chain it is talking to.
+/// The build that made this strategy, if the queue still holds it, and why it
+/// failed if it did. A failure has one reason and the page says that one
+/// rather than the commonest one.
+pub fn build_of(slug: &str) -> Option<Rc<Job>> {
+    jobs()
+        .into_iter()
+        .find(|job| job.strategy_slug.as_deref() == Some(slug))
+}
+
 pub fn terms() -> Option<shared::Terms> {
     config().map(|config| config.terms)
 }

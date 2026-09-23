@@ -6,7 +6,10 @@
 //! than blocking. The prompt and the output schema are in this repository, so
 //! an author can run the same review over their own code before submitting it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+/// How many times a review is attempted before it is left alone.
+const ATTEMPTS: u32 = 5;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -92,7 +95,7 @@ async fn main() -> Result<()> {
         tokio::spawn(serve_status(SocketAddr::from(([127, 0, 0, 1], args.port))));
     }
 
-    let mut refused: HashSet<(B256, u32, u32)> = HashSet::new();
+    let mut refused: HashMap<(B256, u32, u32), u32> = HashMap::new();
     loop {
         if let Err(error) = sweep(&chain, &deployments, &args.store, &model, &mut refused).await {
             tracing::warn!(%error, "could not look for work");
@@ -108,7 +111,7 @@ async fn sweep(
     deployments: &Deployments,
     store: &std::path::Path,
     model: &str,
-    refused: &mut HashSet<(B256, u32, u32)>,
+    refused: &mut HashMap<(B256, u32, u32), u32>,
 ) -> Result<()> {
     let logs = chain
         .logs(
@@ -135,9 +138,16 @@ async fn sweep(
             *counted += 1;
             *counted
         };
-        // A review this reviewer could not produce is not retried forever: it
-        // is a line in the log and the next request's problem.
-        if refused.contains(&(strategy_id, version, nth)) {
+        // A review this reviewer cannot produce is tried a few times and then
+        // left alone: the first failures are usually a build that has not
+        // finished writing its source, and the last one is a real problem
+        // that belongs in the log rather than in a loop.
+        if refused
+            .get(&(strategy_id, version, nth))
+            .copied()
+            .unwrap_or(0)
+            >= ATTEMPTS
+        {
             continue;
         }
 
@@ -182,8 +192,13 @@ async fn sweep(
         {
             Ok(score) => tracing::info!(version, score, nth, "reviewed"),
             Err(error) => {
-                tracing::warn!(%error, "could not review this one");
-                refused.insert((strategy_id, version, nth));
+                let tried = refused.entry((strategy_id, version, nth)).or_default();
+                *tried += 1;
+                if *tried >= ATTEMPTS {
+                    tracing::warn!(%error, version, "giving up on this review");
+                } else {
+                    tracing::debug!(%error, version, "could not review this one yet");
+                }
             }
         }
     }

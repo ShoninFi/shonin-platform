@@ -312,9 +312,14 @@ async fn take_one(service: &Arc<Service>) -> Result<()> {
     shared::archive::unpack(&entry.bytes()?, &source)?;
 
     let sdk = service.sdk.clone();
-    let built =
-        tokio::task::spawn_blocking(move || build::build(&source, &sdk, "sha256:dev-builder"))
-            .await?;
+    let claimed = (
+        entry.submission.strategy_id.clone(),
+        entry.submission.version,
+    );
+    let built = tokio::task::spawn_blocking(move || {
+        build::build(&source, &sdk, "sha256:dev-builder", (&claimed.0, claimed.1))
+    })
+    .await?;
 
     // A build that ran is charged, whichever way it ended. The vault's
     // contract believes the figure only up to a day at the allowances its
@@ -390,40 +395,11 @@ async fn finish(
         .sign(service.deployments.roles.builder, digest)
         .await?;
 
-    let (supersedes_id, supersedes_version) = supersedes(&built.manifest);
-    service
-        .chain
-        .send(
-            service.deployments.roles.builder,
-            service.deployments.strategies,
-            IStrategyRegistry::registerCall {
-                strategyId: strategy_id.into(),
-                version: submission.version,
-                author,
-                sourceHash: source_hash.into(),
-                bundleHash: bundle_hash.into(),
-                manifestHash: manifest_hash.into(),
-                supersedesId: supersedes_id.into(),
-                supersedesVersion: supersedes_version,
-                builderSignature: signature,
-            },
-        )
-        .await
-        .context("the registry would not take the registration")?;
-
-    // Anyone may open a vault once the registry holds its bundle.
-    service
-        .chain
-        .send(
-            service.deployments.roles.builder,
-            vault,
-            IVault::openCall {},
-        )
-        .await
-        .context("the vault would not open")?;
-
     // Everything the site shows about a build lives in the store, addressed
-    // by the hashes the chain holds.
+    // by the hashes the chain holds. It is written before the registration,
+    // because a registry pointing at bytes nobody has is worse than bytes
+    // nobody has looked up yet: the reviewer reads the source the moment the
+    // version appears.
     store::put(
         &service.store,
         &built.bundle_hash,
@@ -472,6 +448,38 @@ async fn finish(
         },
         &entry.bytes()?,
     )?;
+
+    let (supersedes_id, supersedes_version) = supersedes(&built.manifest);
+    service
+        .chain
+        .send(
+            service.deployments.roles.builder,
+            service.deployments.strategies,
+            IStrategyRegistry::registerCall {
+                strategyId: strategy_id.into(),
+                version: submission.version,
+                author,
+                sourceHash: source_hash.into(),
+                bundleHash: bundle_hash.into(),
+                manifestHash: manifest_hash.into(),
+                supersedesId: supersedes_id.into(),
+                supersedesVersion: supersedes_version,
+                builderSignature: signature,
+            },
+        )
+        .await
+        .context("the registry would not take the registration")?;
+
+    // Anyone may open a vault once the registry holds its bundle.
+    service
+        .chain
+        .send(
+            service.deployments.roles.builder,
+            vault,
+            IVault::openCall {},
+        )
+        .await
+        .context("the vault would not open")?;
 
     let slug = built.manifest.slug();
     tracing::info!(id = entry.job.id, slug, "built, signed and registered");
