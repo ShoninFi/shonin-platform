@@ -156,10 +156,15 @@ fn changing() -> Dom {
             ]))
             .child(ui::card(vec![
                 ui::subheading("The executor image: deliberately"),
-                ui::para(
-                    "It is our code, and a fix has to be able to reach a running vault. What bounds that \
-                     is the two-day timelock, a reproducible image, and instant revocation.",
-                ),
+                ui::para(&format!(
+                    "It is our code, and a fix has to be able to reach a running vault. What \
+                     bounds that is {}, a reproducible image, and instant revocation.",
+                    match data::terms() {
+                        Some(terms) =>
+                            format!("a timelock of {}", fmt::day_count(terms.image_timelock_days)),
+                        None => "the timelock".to_string(),
+                    }
+                )),
             ]))
         })],
     )

@@ -279,10 +279,17 @@ fn changing() -> Dom {
                 ]))
                 .child(ui::card(vec![
                     ui::subheading("The executor image can"),
-                    ui::para(
-                        "It is our code, and a fix has to reach running vaults. A new image is proposed \
-                         publicly and blessed only after a two-day timelock; removing one is instant.",
-                    ),
+                    ui::para(&format!(
+                        "It is our code, and a fix has to reach running vaults. A new image is \
+                         proposed publicly and blessed only after {}; removing one is instant.",
+                        match data::terms() {
+                            Some(terms) => format!(
+                                "a timelock of {}",
+                                fmt::day_count(terms.image_timelock_days)
+                            ),
+                            None => "a public timelock".to_string(),
+                        }
+                    )),
                 ]))
             }),
             ui::action_link("/status", "Every allowlist change, as it happened"),

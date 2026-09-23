@@ -21,14 +21,17 @@ use axum::extract::{Path as UrlPath, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
+use chain::bindings::attestation::IAttestationRegistry;
 use chain::bindings::erc20::IERC20;
+use chain::bindings::factory::IVaultFactory;
+use chain::bindings::reviews::IReviewRegistry;
 use chain::{Client, Deployments, Role};
 use clap::Parser;
 use shared::model::health::Health;
 use shared::model::registry::Job;
 use shared::{
     Addresses, ChainInfo, Config, DevMode, HealthPost, HeldClaim, Holding, Portfolio, Snapshot,
-    Submission, SubmissionAccepted, Totals,
+    Submission, SubmissionAccepted, Terms, Totals,
 };
 use tokio::sync::RwLock;
 
@@ -213,10 +216,24 @@ async fn snapshot(State(service): State<Arc<Service>>) -> Json<Snapshot> {
     Json(service.snapshot.read().await.clone())
 }
 
-async fn config(State(service): State<Arc<Service>>) -> Json<Config> {
+async fn config(
+    State(service): State<Arc<Service>>,
+) -> Result<Json<Config>, (StatusCode, Json<shared::ApiError>)> {
+    let terms = terms(&service).await.map_err(|error| {
+        tracing::warn!(%error, "could not read the platform's terms");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(shared::ApiError {
+                // An app told the wrong terms would state them as facts, so it
+                // is told nothing until the chain answers.
+                message: "the chain did not answer for the platform's terms".to_string(),
+            }),
+        )
+    })?;
     let snapshot = service.snapshot.read().await;
     let viewer = service.chain.account(Role::Viewer).ok();
-    Json(Config {
+    Ok(Json(Config {
+        terms,
         chain: snapshot.chain.clone(),
         rpc_url: service.chain.rpc_url.clone(),
         addresses: Addresses {
@@ -236,7 +253,7 @@ async fn config(State(service): State<Arc<Service>>) -> Json<Config> {
             address: format!("{address:?}"),
             label: "Development wallet".to_string(),
         }),
-    })
+    }))
 }
 
 async fn portfolio(
@@ -350,6 +367,47 @@ async fn cost_basis(chain: &Client, vault: Address, who: Address) -> Option<f64>
         }
     }
     Some(paid.max(0.0))
+}
+
+/// The terms the platform is running under, asked of the contracts that
+/// enforce them. They are governed rather than fixed, so the app is told them
+/// instead of being built with them.
+async fn terms(service: &Arc<Service>) -> Result<Terms> {
+    const DAY: f64 = 86_400.0;
+
+    let vaults = service
+        .chain
+        .read(service.deployments.factory, IVaultFactory::configCall {})
+        .await?;
+    let timelock = service
+        .chain
+        .read(
+            service.deployments.attestation,
+            IAttestationRegistry::timelockCall {},
+        )
+        .await?;
+    let review_fee = service
+        .chain
+        .read(
+            service.deployments.reviews,
+            IReviewRegistry::reviewFeeCall {},
+        )
+        .await?;
+
+    Ok(Terms {
+        minimum_tank: dollars(vaults.minimumTank),
+        review_fee: dollars(review_fee),
+        fees: shared::Fees {
+            streaming_bps: vaults.streamingBps as u32,
+            author_bps: vaults.authorBps as u32,
+            platform_bps: vaults.platformBps as u32,
+            transaction_bps: vaults.transactionBps as u32,
+        },
+        exit_band_bps: vaults.exitBandBps as u32,
+        freeze_after_days: vaults.freezeAfter as f64 / DAY,
+        image_timelock_days: timelock as f64 / DAY,
+        tank_target_days: vaults.tankTargetDays,
+    })
 }
 
 fn dollars(value: alloy::primitives::U256) -> f64 {

@@ -57,6 +57,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             snapshot.authors.len()
         );
         frontend::data::set(snapshot);
+        // The terms the chain is running under, so a written page quotes the
+        // platform rather than whatever this build was compiled with.
+        frontend::data::set_config(frontend::api::fetch_config(api)?);
     } else {
         println!("no --api: writing only the pages that need no data");
     }

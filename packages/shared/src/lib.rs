@@ -14,7 +14,7 @@ pub mod record;
 
 pub use api::{
     Addresses, ApiError, Benchmark, ChainInfo, Config, DevMode, HealthPost, HeldClaim, Holding,
-    Portfolio, Snapshot, Submission, SubmissionAccepted, SubmissionSource, Totals,
+    Portfolio, Snapshot, Submission, SubmissionAccepted, SubmissionSource, Terms, Totals,
 };
 pub use manifest::{Allowances as DeclaredAllowances, Manifest, Prices};
 

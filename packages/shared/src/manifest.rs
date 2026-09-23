@@ -102,6 +102,46 @@ impl Allowances {
             inference_ms_per_min: 0,
         }
     }
+
+    /// A strategy that carries a model: the same shape as a modest one, with
+    /// room to think and the bandwidth to fetch what it thinks about.
+    pub fn thinking() -> Self {
+        Self {
+            fuel_per_sec: 4_000_000,
+            memory_mib: 512,
+            bytes_per_day: 500_000_000,
+            inference_ms_per_min: 2_000,
+            ..Self::modest()
+        }
+    }
+
+    /// A strategy that quotes: it answers every tick, so it needs the fuel to
+    /// price one and the request rate to place what it priced.
+    pub fn quoting() -> Self {
+        Self {
+            fuel_per_sec: 16_000_000,
+            memory_mib: 1_024,
+            requests_per_min: 6_000,
+            bytes_per_day: 5_000_000_000,
+            streams: 64,
+            inference_ms_per_min: 0,
+        }
+    }
+
+    /// The shapes an author picks between, named. They are starting points
+    /// rather than a menu: a manifest may declare any allowances it likes, and
+    /// what it declares is what its vault is capped at.
+    pub const SHAPES: [&'static str; 3] = ["modest", "thinking", "quoting"];
+
+    /// One of [`Allowances::SHAPES`] by name. An unknown name is the modest
+    /// shape, which is the one that asks for least.
+    pub fn shape(name: &str) -> Self {
+        match name {
+            "quoting" => Self::quoting(),
+            "thinking" => Self::thinking(),
+            _ => Self::modest(),
+        }
+    }
 }
 
 /// The published price of each unit of an allowance, which is how a day's

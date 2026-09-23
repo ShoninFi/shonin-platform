@@ -204,9 +204,9 @@ fn home() -> String {
     }));
 
     let steps = list(
-        copy::HOW_IT_WORKS
-            .iter()
-            .map(|(title, body)| format!("{} {}", el("strong", "", &esc(title)), esc(body))),
+        copy::how_it_works()
+            .into_iter()
+            .map(|(title, body)| format!("{} {}", el("strong", "", &esc(title)), esc(&body))),
     );
 
     let rows: Vec<Vec<String>> = ranked()
@@ -336,9 +336,9 @@ fn strategies() -> String {
         .collect();
 
     let rules = list(
-        copy::RANKING
-            .iter()
-            .map(|(title, body)| format!("{} {}", el("strong", "", &esc(title)), esc(body))),
+        copy::ranking()
+            .into_iter()
+            .map(|(title, body)| format!("{} {}", el("strong", "", &esc(&title)), esc(&body))),
     );
 
     [
@@ -352,7 +352,10 @@ fn strategies() -> String {
             "New",
             &format!(
                 "{}{}",
-                para("Open for deposits, and not ranked until they have ninety live days."),
+                para(&format!(
+                    "Open for deposits, and not ranked until they have {} live days.",
+                    copy::days_to_rank()
+                )),
                 table(&headers, &new_rows)
             ),
         ),
@@ -585,9 +588,18 @@ fn strategy_overview(strategy: &shared::Strategy) -> String {
 
         out.push(section(
             "Fees",
-            &format!("{}{}", fee_table(), para(copy::FEE_NOTE)),
+            &format!(
+                "{}{}",
+                fee_table(&strategy.vault.fees),
+                para(copy::FEE_NOTE)
+            ),
         ));
-        out.push(section("Leaving", &para(copy::EXIT_NOTE)));
+        out.push(section(
+            "Leaving",
+            &para(&copy::exit_note(&fmt::from_bps(
+                strategy.vault.exit_band_bps,
+            ))),
+        ));
     }
 
     if !strategy.limits.is_empty() {
@@ -614,11 +626,33 @@ fn strategy_overview(strategy: &shared::Strategy) -> String {
     out.concat()
 }
 
-fn fee_table() -> String {
-    let rows: Vec<Vec<String>> = copy::FEES
-        .iter()
-        .map(|(fee, on, to, level)| vec![esc(fee), esc(on), esc(to), esc(level)])
-        .collect();
+fn fee_table(fees: &shared::Fees) -> String {
+    let rows = vec![
+        vec![
+            esc("Streaming fee"),
+            esc("The vault's value"),
+            esc("Shonin"),
+            esc(&format!("{} a year", fmt::from_bps(fees.streaming_bps))),
+        ],
+        vec![
+            esc("Author fee"),
+            esc("Gains above the high-water mark, daily"),
+            esc("The author, filling the vault's tank first"),
+            esc(&format!("{} of profit", fmt::from_bps(fees.author_bps))),
+        ],
+        vec![
+            esc("Shonin fee"),
+            esc("The same gains"),
+            esc("Shonin"),
+            esc(&format!("{} of profit", fmt::from_bps(fees.platform_bps))),
+        ],
+        vec![
+            esc("Transaction fee"),
+            esc("Every deposit and withdrawal"),
+            esc("Nobody: it stays in the pool"),
+            esc(&fmt::from_bps(fees.transaction_bps)),
+        ],
+    ];
     table(&["Fee", "Charged on", "Paid to", "Level"], &rows)
 }
 
@@ -1246,9 +1280,9 @@ fn job(id: &str) -> String {
 
 fn publish() -> String {
     let steps = list(
-        copy::PUBLISH_STEPS
-            .iter()
-            .map(|(title, body)| format!("{} {}", el("strong", "", &esc(title)), esc(body))),
+        copy::publish_steps()
+            .into_iter()
+            .map(|(title, body)| format!("{} {}", el("strong", "", &esc(title)), esc(&body))),
     );
 
     [
@@ -1370,13 +1404,20 @@ fn verify() -> String {
         ),
         section(
             "Changing the code that runs vaults",
-            &para(
-                "A strategy never changes: it is what the depositor chose. The executor is our \
-                 code and has to be patchable, so a new image is proposed publicly and can only \
-                 be blessed after a two-day timelock — long enough for anyone to rebuild it from \
-                 source and object. Removing an image is instant. A running vault adopts a new \
-                 image by failover, with its own on-chain approval as the handoff.",
-            ),
+            &para(&format!(
+                "A strategy never changes: it is what the depositor chose. The executor is \
+                     our code and has to be patchable, so a new image is proposed publicly and \
+                     can only be blessed after {} — long enough for anyone to rebuild it from \
+                     source and object. Removing an image is instant. A running vault adopts a \
+                     new image by failover, with its own on-chain approval as the handoff.",
+                match data::terms() {
+                    Some(terms) => format!(
+                        "a timelock of {}",
+                        fmt::day_count(terms.image_timelock_days)
+                    ),
+                    None => "a public timelock".to_string(),
+                }
+            )),
         ),
     ]
     .concat()
@@ -1415,12 +1456,21 @@ fn about() -> String {
             "Fees",
             &format!(
                 "{}{}{}",
-                fee_table(),
+                match data::terms() {
+                    Some(terms) => fee_table(&terms.fees),
+                    None => para(copy::REACHING),
+                },
                 para(copy::FEE_NOTE),
                 para(copy::TANK_NOTE)
             ),
         ),
-        section("Leaving a vault", &para(copy::EXIT_NOTE)),
+        section(
+            "Leaving a vault",
+            &para(&copy::exit_note(&match data::terms() {
+                Some(terms) => fmt::from_bps(terms.exit_band_bps),
+                None => "narrow".to_string(),
+            })),
+        ),
         section("The review", &para(copy::REVIEW_NOTE)),
         section("What Shonin is not", &not_this),
         section(

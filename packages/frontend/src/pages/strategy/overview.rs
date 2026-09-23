@@ -12,6 +12,9 @@ use crate::format as fmt;
 use crate::pages::invest;
 use crate::pages::parts;
 use crate::pages::strategy::fee_table;
+
+/// The band a claim's closes are bounded by, as every vault here is created
+/// with. It is the factory's, so it is the same for every vault on the page.
 use crate::ui::primitives as ui;
 use crate::ui::primitives::Tone;
 use crate::ui::table::{Column, Row, table};
@@ -269,7 +272,7 @@ fn leaving(strategy: &Rc<Strategy>) -> Dom {
             .child(parts::exit_badge(vault.exit_class))
             .child(ui::muted(&vault.exit_class.summary()))
         }),
-        ui::para(copy::EXIT_NOTE),
+        ui::para(&copy::exit_note(&fmt::from_bps(vault.exit_band_bps))),
     ];
 
     if let ExitClass::Served { operators } = vault.exit_class {
@@ -414,7 +417,7 @@ fn aside(strategy: &Rc<Strategy>) -> Vec<Dom> {
     cards.push(ui::card_titled(
         "Fees",
         None,
-        vec![fee_table(), ui::note(copy::FEE_NOTE)],
+        vec![fee_table(&strategy.vault.fees), ui::note(copy::FEE_NOTE)],
     ));
 
     let audits: Vec<Dom> = vault

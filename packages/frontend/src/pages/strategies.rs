@@ -250,10 +250,11 @@ fn listing(
         .child(sortable_table(columns, rows, &controls.sort))
         .child(html!("p", {
             .class(["faint", "small"])
-            .text(
-                "Normalised to 15% annualised volatility, estimated only from the days before each \
-                 one. Raw returns are what the vault actually did."
-            )
+            .text(&format!(
+                "Normalised to {} annualised volatility, estimated only from the days before \
+                 each one. Raw returns are what the vault actually did.",
+                copy::volatility_target()
+            ))
         }))
     })
 }
@@ -405,10 +406,10 @@ fn rules() -> Dom {
         "How this list is built",
         vec![html!("div", {
             .class(["grid", "grid--2"])
-            .children(copy::RANKING.iter().map(|(title, body)| {
+            .children(copy::ranking().into_iter().map(|(title, body)| {
                 ui::card(vec![
-                    html!("h3", { .class("subtitle").text(title) }),
-                    ui::para(body),
+                    html!("h3", { .class("subtitle").text(&title) }),
+                    ui::para(&body),
                 ])
             }))
         })],

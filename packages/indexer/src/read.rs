@@ -281,6 +281,7 @@ async fn read_vault(
     let crystallised = chain.read(address, IVault::lastCrystallisedCall {}).await?;
     let created = chain.read(address, IVault::createdAtCall {}).await?;
     let freeze_after = chain.read(address, IVault::freezeAfterCall {}).await?;
+    let exit_band = chain.read(address, IVault::exitBandBpsCall {}).await?;
     let claim_count = chain.read(address, IVault::claimCountCall {}).await?;
     let supply = chain
         .read(address, IVault::pendingSharesCall {})
@@ -343,6 +344,7 @@ async fn read_vault(
             platform_bps: fees.platformBps as u32,
             transaction_bps: fees.transactionBps as u32,
         },
+        exit_band_bps: exit_band as u32,
         tank: Tank {
             balance: dollars(tank.balance),
             daily_charge: dollars(tank.lastCharge.max(tank.dailyCap)),

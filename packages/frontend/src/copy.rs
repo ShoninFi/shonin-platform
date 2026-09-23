@@ -2,6 +2,31 @@
 //!
 //! Kept in one place so the pre-rendered page and the app say exactly the
 //! same thing, and so the product's copy can be read and edited on its own.
+//!
+//! Where a sentence states a number as a fact, it takes it from whatever
+//! enforces it rather than spelling it out: the platform's own terms for the
+//! fees and the timelocks, and the constants below for the two the record
+//! maths is defined by. A block of copy with a figure in it is a function for
+//! that reason.
+
+use shared::Strategy;
+
+/// Live days before the leaderboard will rank a strategy.
+const DAYS_TO_RANK: u32 = Strategy::DAYS_TO_RANK;
+
+/// The annualised volatility every record is rescaled to, as a percentage.
+const VOLATILITY_TARGET_PCT: f64 = Strategy::VOLATILITY_TARGET * 100.0;
+
+/// The volatility every record is normalised to, as a sentence says it.
+pub fn volatility_target() -> String {
+    format!("{VOLATILITY_TARGET_PCT:.0}%")
+}
+
+/// The live days a strategy needs before the leaderboard will rank it, as a
+/// sentence says it.
+pub fn days_to_rank() -> String {
+    DAYS_TO_RANK.to_string()
+}
 
 /// The line the whole product hangs on.
 pub const PITCH: &str = "Smart contracts are public and auditable. Trading bots should be too.";
@@ -53,52 +78,35 @@ pub const HALT_NEVER_STEAL: &str = "Every lever anyone has ends in a halt, never
      nobody, including us, can take money out of a vault.";
 
 /// How the platform works, end to end.
-pub const HOW_IT_WORKS: [(&str, &str); 4] = [
-    (
-        "An author publishes source",
-        "An attested builder compiles the Rust project twice, checks the bytes match, and signs \
-         the mapping from source to bundle.",
-    ),
-    (
-        "An attested reviewer reads it",
-        "A pinned model scores whether the code is reasonable and lists what a careful reader \
-         would worry about. A score, not a gate.",
-    ),
-    (
-        "A vault opens, and depositors choose",
-        "Shares are minted at the value the contract computes from the chain. The strategy is \
-         labelled new until it has ninety live days.",
-    ),
-    (
-        "Executors trade, and the chain records it",
-        "Attested executors hold the vault's keys and can only move funds between its own \
-         accounts. Every trade is public.",
-    ),
-];
-
-/// The fee schedule, as a table: what it is, what it is charged on, who gets
-/// it, and the default level.
-pub const FEES: [(&str, &str, &str, &str); 4] = [
-    (
-        "Streaming fee",
-        "The vault's value",
-        "Shonin",
-        "0.5% a year",
-    ),
-    (
-        "Author fee",
-        "Gains above the high-water mark, daily",
-        "The author, filling the vault's tank first",
-        "10% of profit",
-    ),
-    ("Shonin fee", "The same gains", "Shonin", "5% of profit"),
-    (
-        "Transaction fee",
-        "Every deposit and withdrawal",
-        "Nobody: it stays in the pool",
-        "0.1%",
-    ),
-];
+pub fn how_it_works() -> [(&'static str, String); 4] {
+    [
+        (
+            "An author publishes source",
+            "An attested builder compiles the Rust project twice, checks the bytes match, and \
+             signs the mapping from source to bundle."
+                .to_string(),
+        ),
+        (
+            "An attested reviewer reads it",
+            "A pinned model scores whether the code is reasonable and lists what a careful \
+             reader would worry about. A score, not a gate."
+                .to_string(),
+        ),
+        (
+            "A vault opens, and depositors choose",
+            format!(
+                "Shares are minted at the value the contract computes from the chain. The \
+                 strategy is labelled new until it has {DAYS_TO_RANK} live days."
+            ),
+        ),
+        (
+            "Executors trade, and the chain records it",
+            "Attested executors hold the vault's keys and can only move funds between its own \
+             accounts. Every trade is public."
+                .to_string(),
+        ),
+    ]
+}
 
 pub const FEE_NOTE: &str = "Fees crystallise daily as new shares, so paying them never forces a sale. Profit fees are \
      only taken on a new high-water mark. The transaction fee stays in the pool, so timing a \
@@ -134,8 +142,8 @@ pub const VERIFY_CHECKS: [(&str, &str, &str); 5] = [
     ),
     (
         "The image running today is one the allowlist permits",
-        "Check the image digest against the registry's allowlist and the two-day timelock on \
-         the proposal that added it.",
+        "Check the image digest against the registry's allowlist and the timelock on the \
+         proposal that added it.",
         "A chain RPC and the executor's source",
     ),
 ];
@@ -144,64 +152,92 @@ pub const VERIFY_LIMIT: &str = "What the chain can't prove is that nothing happe
      vault's keys can only move funds between the vault's own accounts.";
 
 /// What an author does, from a template to an open vault.
-pub const PUBLISH_STEPS: [(&str, &str); 5] = [
-    (
-        "Start from a template",
-        "An ordinary Cargo project: your code, your dependencies, a pinned toolchain, and a \
-         manifest that describes the strategy, its venues, its config and the compute it needs.",
-    ),
-    (
-        "Write your limits in code",
-        "There is no platform risk policy. A leverage cap or a drawdown stop is code you write, \
-         and code the reviewer reads.",
-    ),
-    (
-        "Submit, and fund the vault's tank",
-        "Point us at a public repository and commit, or upload the project encrypted to seal \
-         it. The build and the review are the tank's first charges.",
-    ),
-    (
-        "The queue builds it, and the reviewer reads it",
-        "The build runs offline on a pinned recipe, twice, and the bytes must match. The log is \
-         public either way.",
-    ),
-    (
-        "The vault opens",
-        "Deposits from the moment it is registered, labelled new until it has ninety live days.",
-    ),
-];
+pub fn publish_steps() -> [(&'static str, String); 5] {
+    [
+        (
+            "Start from a template",
+            "An ordinary Cargo project: your code, your dependencies, a pinned toolchain, and a \
+             manifest that describes the strategy, its venues, its config and the compute it \
+             needs."
+                .to_string(),
+        ),
+        (
+            "Write your limits in code",
+            "There is no platform risk policy. A leverage cap or a drawdown stop is code you \
+             write, and code the reviewer reads."
+                .to_string(),
+        ),
+        (
+            "Submit, and fund the vault's tank",
+            "Point us at a public repository and commit, or upload the project encrypted to \
+             seal it. The build and the review are the tank's first charges."
+                .to_string(),
+        ),
+        (
+            "The queue builds it, and the reviewer reads it",
+            "The build runs offline on a pinned recipe, twice, and the bytes must match. The \
+             log is public either way."
+                .to_string(),
+        ),
+        (
+            "The vault opens",
+            format!(
+                "Deposits from the moment it is registered, labelled new until it has \
+                 {DAYS_TO_RANK} live days."
+            ),
+        ),
+    ]
+}
 
 /// How the leaderboard decides what to show.
-pub const RANKING: [(&str, &str); 4] = [
-    (
-        "Live records only",
-        "A record is a vault's own on-chain history. No backtests, no paper trading.",
-    ),
-    (
-        "Normalised for risk",
-        "Returns are rescaled to a common 15% annualised volatility, estimated only from the \
-         days before each one, so the list doesn't simply reward leverage.",
-    ),
-    (
-        "Ninety days before ranking",
-        "A strategy is open for deposits from its first day, labelled new. It isn't ranked \
-         until it has ninety live days.",
-    ),
-    (
-        "The size it was earned at",
-        "Every record shows the capital behind it. Nothing is extrapolated to a size the \
-         strategy never traded.",
-    ),
-];
+pub fn ranking() -> [(String, String); 4] {
+    [
+        (
+            "Live records only".to_string(),
+            "A record is a vault's own on-chain history. No backtests, no paper trading."
+                .to_string(),
+        ),
+        (
+            "Normalised for risk".to_string(),
+            format!(
+                "Returns are rescaled to a common {VOLATILITY_TARGET_PCT:.0}% annualised \
+                 volatility, estimated only from the days before each one, so the list doesn't \
+                 simply reward leverage."
+            ),
+        ),
+        (
+            format!("{DAYS_TO_RANK} days before ranking"),
+            format!(
+                "A strategy is open for deposits from its first day, labelled new. It isn't \
+                 ranked until it has {DAYS_TO_RANK} live days."
+            ),
+        ),
+        (
+            "The size it was earned at".to_string(),
+            "Every record shows the capital behind it. Nothing is extrapolated to a size the \
+             strategy never traded."
+                .to_string(),
+        ),
+    ]
+}
 
 pub const REVIEW_NOTE: &str = "The reviewer reads the source, sealed or not, and scores whether the code is reasonable. It \
      never rates expected profit, and it is never a gate.";
 
-pub const EXIT_NOTE: &str = "A withdrawal is valued at exit-side marks, so the leaver pays the spread rather than the \
-     pool. If the idle balance covers it, the shares are burned and paid in the same \
-     transaction. If not, a claim is booked: the leaver's fraction of every position is closed \
-     inside a 1% band around the venue's oracle price, and once the cash is home the claim is \
-     paid. Anyone can send the settle transaction.";
+/// Shown in place of a figure the platform has not answered for yet. A page
+/// says nothing rather than a number it made up.
+pub const REACHING: &str = "Reaching the platform for the terms it is running under today.";
+
+/// The exit band is the vault's own, so the sentence takes it.
+pub fn exit_note(band: &str) -> String {
+    format!(
+        "A withdrawal is valued at exit-side marks, so the leaver pays the spread rather than \
+         the pool. If the idle balance covers it, the shares are burned and paid in the same \
+         transaction. If not, a claim is booked: the leaver's fraction of every position is \
+         closed inside a {band} band around the venue's oracle price, and once the cash is home \
+         the claim is paid. Anyone can send the settle transaction."
+    )
+}
 
 /// Terms worth defining wherever they first appear.
 pub const TERMS: [(&str, &str); 12] = [

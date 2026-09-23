@@ -4,6 +4,7 @@
 use dominator::{Dom, html, link, text};
 use shared::{Custody, ExitClass, HealthLevel, Leg, Standing, Strategy, VaultState};
 
+use crate::copy;
 use crate::data;
 use crate::format as fmt;
 use crate::ui::chart;
@@ -153,7 +154,10 @@ pub fn record_stats(strategy: &Strategy) -> Dom {
         ui::stat_toned(
             "Normalised return",
             &fmt::annualised(performance.normalised_annualised),
-            Some("rescaled to 15% volatility"),
+            Some(&format!(
+                "rescaled to {} volatility",
+                copy::volatility_target()
+            )),
             tone_of(performance.normalised_annualised),
         ),
         ui::stat_toned(

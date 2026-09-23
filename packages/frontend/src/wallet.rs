@@ -284,6 +284,7 @@ mod send {
         _id: &str,
         _version: u32,
         _tank: f64,
+        _allowance: &str,
         _archive: &[u8],
         _sealed: bool,
     ) -> Result<String, String> {
@@ -491,6 +492,7 @@ mod send {
         id: &str,
         version: u32,
         tank: f64,
+        allowance: &str,
         archive: &[u8],
         sealed: bool,
     ) -> Result<String, String> {
@@ -534,9 +536,10 @@ mod send {
                 version,
                 sourceHash: alloy_primitives::FixedBytes(hash_bytes),
                 tankFunding: funding,
-                // A day at the allowances this build service publishes prices
-                // for; the contract will not let a usage statement charge more.
-                dailyUsageCap: units(daily_cap()),
+                // A day at the allowances the author declared, priced as the
+                // platform publishes; the contract will not let a usage
+                // statement charge a tank more than this in a day.
+                dailyUsageCap: units(daily_cap(allowance)),
             }
             .abi_encode(),
         )
@@ -558,11 +561,12 @@ mod send {
         Ok(accepted.job_id)
     }
 
-    /// What a day at a modest strategy's allowances costs at the published
-    /// prices.
-    fn daily_cap() -> f64 {
+    /// What a day at a shape of allowances costs at the published prices. The
+    /// floor is there because a vault with no cap at all could not charge for
+    /// the build that made it.
+    fn daily_cap(allowance: &str) -> f64 {
         shared::Prices::published()
-            .daily_cap(&shared::manifest::Allowances::modest())
+            .daily_cap(&shared::DeclaredAllowances::shape(allowance))
             .max(1.0)
     }
 

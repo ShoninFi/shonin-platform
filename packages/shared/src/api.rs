@@ -68,9 +68,34 @@ pub struct Config {
     /// The asset deposits and withdrawals are paid in.
     pub asset_symbol: String,
     pub asset_decimals: u8,
+    /// The terms the platform is running under, read from the chain.
+    pub terms: Terms,
     /// Set on a development chain, where accounts are unlocked and the app can
     /// offer one as a wallet. Never set anywhere else.
     pub dev: Option<DevMode>,
+}
+
+/// The terms a new vault is created with and the charges an author meets,
+/// every one of them read from the contract that enforces it. A page that
+/// states one of these as a fact quotes this rather than a number written into
+/// the app, so the app cannot go stale against the chain it is talking to.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Terms {
+    /// The least a vault may be created with: the build, the review and a
+    /// minimum run. The factory refuses anything under it.
+    pub minimum_tank: f64,
+    /// A flat fee for one review, charged whoever asks for it.
+    pub review_fee: f64,
+    /// The fee schedule a vault created today carries for its whole life.
+    pub fees: crate::Fees,
+    /// How far either side of the venue's price a claim may close.
+    pub exit_band_bps: u32,
+    /// How long a claim may go unserved before anyone may freeze the vault.
+    pub freeze_after_days: f64,
+    /// How long a proposed runtime image waits before it may be blessed.
+    pub image_timelock_days: f64,
+    /// Days of charges auto-fill aims to keep in a tank.
+    pub tank_target_days: u32,
 }
 
 /// Where each contract lives, as hex strings, because that is what a

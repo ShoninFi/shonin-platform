@@ -10,6 +10,7 @@ use futures_signals::signal::Mutable;
 use shared::{FindingCategory, Review, Severity, Strategy};
 
 use crate::copy;
+use crate::data;
 use crate::format as fmt;
 use crate::state;
 use crate::ui::overlay::{modal, modal_actions};
@@ -228,7 +229,14 @@ fn buy_modal(strategy: &Rc<Strategy>) -> Dom {
             ui::kv(vec![
                 ("Strategy".to_string(), ui::value(&name)),
                 ("Reviewer image".to_string(), ui::hash(&image)),
-                ("Fee".to_string(), ui::number("$1.00")),
+                (
+                    "Fee".to_string(),
+                    // The registry charges it, so the registry is asked.
+                    ui::number(&match data::terms() {
+                        Some(terms) => fmt::money_exact(terms.review_fee),
+                        None => "\u{2014}".to_string(),
+                    }),
+                ),
             ]),
             ui::note("Nothing is re-reviewed automatically when the reviewer image changes."),
             modal_actions(vec![

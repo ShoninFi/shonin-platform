@@ -105,6 +105,14 @@ pub fn config() -> Option<Rc<Config>> {
     CONFIG.with(|config| config.borrow().clone())
 }
 
+/// The terms the platform is running under: the fee schedule a new vault
+/// carries, the exit band, the timelocks and what publishing costs. Every page
+/// that states one of these as a fact reads it here rather than spelling it
+/// out, so nothing in the app can drift from the chain it is talking to.
+pub fn terms() -> Option<shared::Terms> {
+    config().map(|config| config.terms)
+}
+
 pub fn set_config(config: Config) {
     CONFIG.with(|held| *held.borrow_mut() = Some(Rc::new(config)));
 }

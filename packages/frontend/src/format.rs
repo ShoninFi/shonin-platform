@@ -230,6 +230,35 @@ pub fn days(days: u32) -> String {
     }
 }
 
+/// A span in prose: "two days", "one day", "18 hours". Used where a sentence
+/// states a period the chain enforces, so the sentence takes the chain's
+/// figure rather than repeating one.
+pub fn day_count(days: f64) -> String {
+    if days < 1.0 {
+        let hours = (days * 24.0).round() as u32;
+        return if hours == 1 {
+            "one hour".to_string()
+        } else {
+            format!("{hours} hours")
+        };
+    }
+    let whole = days.round() as u32;
+    let spelled = match whole {
+        1 => return "one day".to_string(),
+        2 => "two",
+        3 => "three",
+        4 => "four",
+        5 => "five",
+        6 => "six",
+        7 => "seven",
+        8 => "eight",
+        9 => "nine",
+        10 => "ten",
+        _ => return format!("{whole} days"),
+    };
+    format!("{spelled} days")
+}
+
 /// A build's duration: 2m 22s.
 pub fn duration(seconds: u32) -> String {
     if seconds < 60 {

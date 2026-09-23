@@ -10,6 +10,7 @@ use futures_signals::map_ref;
 use futures_signals::signal::Mutable;
 use shared::Strategy;
 
+use crate::copy;
 use crate::data;
 use crate::format as fmt;
 use crate::pages::parts;
@@ -155,10 +156,12 @@ fn main_chart(strategy: &Rc<Strategy>, line: Line) -> Dom {
                 ],
                 fmt::share_price,
             ))
-            .child(ui::note(
-                "The solid line is what the vault's contract computed. The dashed line is the same \
-                 record rescaled to 15% annualised volatility, which the leaderboard ranks on.",
-            ))
+            .child(ui::note(&format!(
+                "The solid line is what the vault's contract computed. The dashed line is the \
+                 same record rescaled to {} annualised volatility, which the leaderboard ranks \
+                 on.",
+                copy::volatility_target()
+            )))
         }),
         Line::Drawdown => html!("div", {
             .class("stack-sm")

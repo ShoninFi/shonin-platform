@@ -126,18 +126,6 @@ pub struct Fees {
     pub transaction_bps: u32,
 }
 
-impl Fees {
-    /// The schedule every vault is created with today.
-    pub fn standard() -> Self {
-        Self {
-            streaming_bps: 50,
-            author_bps: 1000,
-            platform_bps: 500,
-            transaction_bps: 10,
-        }
-    }
-}
-
 /// Pooled capital behind one strategy version.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Vault {
@@ -158,6 +146,9 @@ pub struct Vault {
     pub high_water_mark: f64,
     pub last_crystallised: Date,
     pub fees: Fees,
+    /// How far either side of the venue's price a claim may close. Fixed when
+    /// the vault was created, like its fees.
+    pub exit_band_bps: u32,
     pub tank: Tank,
     pub exit_class: ExitClass,
     /// Days an unserved claim freezes the vault after.

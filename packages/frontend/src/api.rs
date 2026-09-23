@@ -87,16 +87,34 @@ pub async fn submit(submission: &shared::Submission) -> Result<shared::Submissio
 pub fn follow() {}
 
 /// The pre-render is a native tool, and the browser has its own way to fetch,
-/// so this is only ever called from the one that has it.
+/// so these are only ever called from the one that has it.
 #[cfg(target_arch = "wasm32")]
 pub fn fetch_snapshot(_api: &str) -> Result<shared::Snapshot, String> {
+    Err("the pre-render runs natively".to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn fetch_config(_api: &str) -> Result<shared::Config, String> {
     Err("the pre-render runs natively".to_string())
 }
 
 /// Read a snapshot without a browser, for the build-time pre-render.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn fetch_snapshot(api: &str) -> Result<shared::Snapshot, String> {
-    let url = format!("{}/snapshot", api.trim_end_matches('/'));
+    blocking(api, "snapshot")
+}
+
+/// The platform's own terms, for the same pre-render: a written page states
+/// the fees and the bands the chain is running under, not the ones this app
+/// was built with.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fetch_config(api: &str) -> Result<shared::Config, String> {
+    blocking(api, "config")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn blocking<T: serde::de::DeserializeOwned>(api: &str, path: &str) -> Result<T, String> {
+    let url = format!("{}/{path}", api.trim_end_matches('/'));
     let reply =
         reqwest::blocking::get(&url).map_err(|error| format!("{url} did not answer: {error}"))?;
     if !reply.status().is_success() {

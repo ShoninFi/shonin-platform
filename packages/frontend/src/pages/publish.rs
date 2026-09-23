@@ -38,7 +38,7 @@ fn state_of() -> &'static Draft {
         strategy_id: Mutable::new(String::new()),
         version: Mutable::new("1".to_string()),
         tank: Mutable::new(String::new()),
-        allowance: Mutable::new("light".to_string()),
+        allowance: Mutable::new("modest".to_string()),
         reviewed: Mutable::new(false),
         secret_name: Mutable::new(String::new()),
         secret_value: Mutable::new(String::new()),
@@ -86,11 +86,11 @@ fn how_it_goes() -> Dom {
         "How it goes",
         vec![html!("ol", {
             .class("steps")
-            .children(copy::PUBLISH_STEPS.iter().map(|(title, body)| {
+            .children(copy::publish_steps().into_iter().map(|(title, body)| {
                 html!("li", {
                     .class(["steps__item", "is-done"])
                     .child(html!("div", { .class("steps__title").text(title) }))
-                    .child(html!("p", { .class("muted").text(body) }))
+                    .child(html!("p", { .class("muted").text(&body) }))
                 })
             }))
         })],
@@ -130,11 +130,10 @@ fn submit() -> Dom {
                     "Allowances",
                     Some("What the strategy may use, metered to its vault's tank"),
                     form::select(
-                        vec![
-                            ("light".to_string(), "Light: a slow carry strategy".to_string()),
-                            ("thinking".to_string(), "With models: inference and bandwidth".to_string()),
-                            ("quoting".to_string(), "Quoting: fuel, bandwidth, placement".to_string()),
-                        ],
+                        shared::DeclaredAllowances::SHAPES
+                            .iter()
+                            .map(|shape| ((*shape).to_string(), label(shape)))
+                            .collect(),
                         &draft.allowance,
                     ),
                 ))
@@ -183,7 +182,15 @@ fn publish() {
         return;
     };
     let tank = form::parse_amount(&draft.tank.get_cloned());
-    if tank < minimum(&draft.allowance.get_cloned()) {
+    let allowance = draft.allowance.get_cloned();
+    let Some(needed) = minimum(&allowance) else {
+        state::notify(
+            "The app has not reached the platform yet, so it cannot say what publishing costs.",
+            Tone::Warn,
+        );
+        return;
+    };
+    if tank < needed {
         state::notify(
             "The tank needs to cover the build, the review and a week at the declared \
              allowances.",
@@ -194,7 +201,7 @@ fn publish() {
     let sealed = draft.sealed.get();
 
     wasm_bindgen_futures::spawn_local(async move {
-        match wallet::publish(&id, version, tank, &archive.bytes, sealed).await {
+        match wallet::publish(&id, version, tank, &allowance, &archive.bytes, sealed).await {
             Ok(job) => {
                 state::notify(
                     format!(
@@ -210,20 +217,43 @@ fn publish() {
     });
 }
 
-fn minimum(allowance: &str) -> f64 {
-    let week = match allowance {
-        "quoting" => 34.60 * 7.0,
-        "thinking" => 12.40 * 7.0,
-        _ => 1.15 * 7.0,
+/// What each shape the SDK names is called on the page, and what a day of it
+/// costs. The list itself comes from the SDK, so the form cannot offer a shape
+/// a strategy could not declare.
+fn label(shape: &str) -> String {
+    let what = match shape {
+        "quoting" => "Quoting: fuel, bandwidth, placement",
+        "thinking" => "With models: inference and bandwidth",
+        _ => "Modest: a slow carry strategy",
     };
-    // The metered build, the flat review fee, and a week of running costs.
-    38.0 + 1.0 + week
+    format!("{what} ({} a day)", fmt::money_exact(daily(shape)))
+}
+
+/// What a day at a shape of allowance costs, at the platform's published
+/// prices. Nothing here is a guess: it is the arithmetic the vault's contract
+/// caps a usage statement with, over the same shapes the SDK names.
+fn daily(allowance: &str) -> f64 {
+    shared::Prices::published().daily_cap(&shared::DeclaredAllowances::shape(allowance))
+}
+
+/// The least the tank may be funded with: the factory's own minimum, or a week
+/// of running plus the review if that comes to more.
+fn minimum(allowance: &str) -> Option<f64> {
+    let costs = data::terms()?;
+    let week = daily(allowance) * 7.0;
+    Some(costs.minimum_tank.max(costs.review_fee + week))
 }
 
 fn estimate(tank: &str, allowance: &str, sealed: bool) -> Dom {
     let entered = form::parse_amount(tank);
-    let needed = minimum(allowance);
-    let week = needed - 39.0;
+    let Some(costs) = data::terms() else {
+        return ui::card(vec![
+            ui::subheading("What the tank has to cover"),
+            ui::note(copy::REACHING),
+        ]);
+    };
+    let week = daily(allowance) * 7.0;
+    let needed = costs.minimum_tank.max(costs.review_fee + week);
 
     ui::card(vec![
         ui::subheading("What the tank has to cover"),
@@ -235,21 +265,25 @@ fn estimate(tank: &str, allowance: &str, sealed: bool) -> Dom {
             ],
             vec![
                 Row::new(vec![
-                    ui::value("The build"),
-                    ui::muted("metered compute, charged because it ran"),
-                    ui::number(&fmt::money_exact(38.0)),
+                    ui::value("The vault's minimum"),
+                    ui::muted("what the factory will not create a vault below"),
+                    ui::number(&fmt::money_exact(costs.minimum_tank)),
                 ]),
                 Row::new(vec![
                     ui::value("The review"),
                     ui::muted("a flat fee, one model call over the source"),
-                    ui::number(&fmt::money_exact(1.0)),
+                    ui::number(&fmt::money_exact(costs.review_fee)),
                 ]),
                 Row::new(vec![
-                    ui::value("A week at full allowances"),
+                    ui::value("A week at these allowances"),
                     ui::muted("so the strategy can actually run"),
                     ui::number(&fmt::money_exact(week)),
                 ]),
             ],
+        ),
+        ui::muted(
+            "The build itself is metered compute and is charged once it has run, so what it comes \
+             to is known only afterwards.",
         ),
         html!("div", {
             .class(["row", "row--between", "row--wrap"])
