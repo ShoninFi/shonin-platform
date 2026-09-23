@@ -41,6 +41,8 @@ nav = [
         {"The API" = "reference/api.md"},
         {"Glossary" = "reference/glossary.md"},
     ]},
+    # The app itself, which is a site of its own rather than a page here.
+    {"The app" = "https://shonin.fi/"},
 ]
 
 [project.extra]

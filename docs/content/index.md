@@ -141,6 +141,8 @@ Everything above runs, end to end, on a local development chain: the contracts, 
 
 Nothing is deployed to a public chain yet. There is no live vault and no money in anything. The [build checklist](checklist.md) is the honest list of what stands between here and there, and it is long.
 
+The web app is at [shonin.fi](https://shonin.fi/). It sits behind a login while the project is pre-release, so a link to it will ask you to sign in rather than let you in; what it shows is a development chain either way.
+
 The source is not public yet either. That is on the checklist and it is near the top of it, because a page that tells you to check things for yourself is worth very little until you can.
 
 These docs describe what is built. Where something is designed but not finished, the page says so rather than using the present tense and hoping.
