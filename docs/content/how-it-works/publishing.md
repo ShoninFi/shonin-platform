@@ -3,14 +3,21 @@
 From a Cargo project to an open vault, with a public log at every step.
 
 ```mermaid
-flowchart TB
-    A["pack the project"] --> B["create the vault,<br/>fund its tank"]
-    B --> C["submit the source"]
-    C --> D["the queue admits it"]
-    D --> E["build it,<br/>load the component"]
-    E -->|built| F["sign source → bundle,<br/>register, open the vault"]
+flowchart LR
+    A["pack the<br/>project"] ==> B["create the vault,<br/>fund its tank"]
+    B ==> C["submit the<br/>source"]
+    C ==> D["the queue<br/>admits it"]
+    D ==> E{"build it, load<br/>the component"}
+    E ==>|built| F["sign source → bundle,<br/>register, open"]
     E -->|failed| G["the log is public,<br/>the vault closes,<br/>the tank comes back"]
-    F --> H["the reviewer reads it"]
+    F ==> H["the reviewer<br/>reads it"]
+
+    classDef you fill:#4338ca18,stroke:#4338ca,color:inherit
+    classDef us fill:#0d948818,stroke:#0d9488,color:inherit
+    classDef bad fill:#dc262612,stroke:#dc2626,color:inherit,stroke-dasharray:5 4
+    class A,B,C you
+    class D,E,F,H us
+    class G bad
 ```
 
 ## What you submit

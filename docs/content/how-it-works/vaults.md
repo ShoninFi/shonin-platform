@@ -24,26 +24,36 @@ So the mover pays the spread, and the pool never does.
 
 ```mermaid
 flowchart TB
-    R["redeem(shares)"] --> C["crystallise fees due"]
-    C --> V["value the shares at<br/>exit-side marks, take the<br/>transaction fee"]
-    V --> Q{"does idle balance<br/>cover it?"}
-    Q -->|yes| P["burn the shares,<br/>pay in this transaction"]
+    R(["redeem(shares)"]) --> C["crystallise any fees due"]
+    C --> V["value at exit-side marks,<br/>take the transaction fee"]
+    V --> Q{"does the idle balance<br/>cover it?"}
+    Q ==>|yes| P(["burn the shares,<br/>pay in this transaction"])
     Q -->|no| B["mark the shares pending,<br/>book a claim"]
-    B --> S["settle: close your fraction<br/>of every position inside<br/>the exit band"]
-    S --> H["cash home, value again,<br/>burn at the marks then, pay"]
+    B --> S["<b>settle</b> — anyone may call it<br/>close your fraction of every position,<br/>inside the exit band"]
+    S --> H["cash home: value again, burn<br/>at the marks then, pay"]
+    H --> P2(["paid"])
+
+    classDef fast fill:#0d948818,stroke:#0d9488,color:inherit
+    classDef slow fill:#f59e0b18,stroke:#f59e0b,color:inherit
+    classDef ends fill:#4338ca18,stroke:#4338ca,color:inherit,font-weight:bold
+    class C,V fast
+    class B,S,H slow
+    class R,P,P2 ends
 ```
 
-**Paid at once.** Strategies keep a working buffer of idle capital, so most withdrawals end here: the shares are burned and you are paid in the same transaction.
+Strategies keep a working buffer of idle capital, so most withdrawals end in the first branch: the shares are burned and the depositor is paid in the same transaction.
 
-**Booked as a claim.** When idle capital cannot cover it, your shares are marked pending and the contract books a claim. A claim has three states: *pending*, *waiting* (a settlement was tried and the market was outside the band), and *paid*.
+When idle capital cannot cover it, the shares are marked pending and the contract books a **claim**, which has three states — *pending*, *waiting* when a settlement was tried and the market was outside the band, and *paid*.
 
-**Anyone can settle it.** `settle` is a public function. You do not need us, or the author, or the executor, to get your money. If every one of our services stopped this minute, a depositor could still send the settle transaction themselves and be paid.
+`settle` is a public function, and that is the part worth dwelling on. A depositor does not need us, or the author, or the executor, to get their money. If every service we run stopped this minute, they could send the settle transaction themselves and be paid by the contract.
 
-**The exit band.** A claim's positions are closed with reduce-only immediate-or-cancel orders limited to the venue's oracle price plus or minus the exit band, 1% by default. The pool's cost beyond the spread is bounded by that band times the notional closed. If the market is outside the band the close does not fill, the claim waits, and settlement is retried.
+### The exit band
 
-**Who bears what.** The leaver pays the spread through exit-side marks, pays the transaction fee, and bears the close's impact pro rata with everyone else, because their shares are still outstanding when it lands. The depositors who stay keep the transaction fee.
+A claim's positions are closed with reduce-only immediate-or-cancel orders, limited to the venue's oracle price plus or minus the **exit band**, 1% by default. The pool's cost beyond the spread is therefore bounded by that band times the notional closed. If the market is outside the band the close does not fill, the claim waits, and settlement is retried.
 
-**A frozen vault.** A claim that goes unserved for the freeze period — seven days by default — lets anyone freeze the vault: no new deposits, and only unwinding remains possible.
+The leaver pays the spread through exit-side marks, pays the transaction fee, and bears the close's impact pro rata with everyone else, because their shares are still outstanding when it lands. The depositors who stay keep the transaction fee.
+
+A claim that goes unserved for seven days lets anyone freeze the vault: no new deposits, and only unwinding left.
 
 ## Fees
 

@@ -16,6 +16,7 @@ Attestation is what tells you which code holds a key. It is not what stops the k
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant E as Executor
     participant P as Prover (anyone)
     participant R as AttestationRegistry
