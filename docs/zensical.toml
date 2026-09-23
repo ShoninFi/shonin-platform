@@ -10,7 +10,7 @@
 
 [project]
 site_name = "Shonin Docs"
-site_description = "How Shonin works: verifiable trading strategies, pooled vaults, and attested execution"
+site_description = "How Shonin works: trading agents you can read, pooled vaults, and attested execution"
 site_author = "Shonin"
 site_url = "https://docs.shonin.fi/"
 copyright = "Copyright &copy; 2026 Shonin"
@@ -23,12 +23,12 @@ extra_javascript = ["javascripts/diagrams.js"]
 nav = [
     {"Start here" = "index.md"},
     {"Putting money in" = "depositors.md"},
-    {"Publishing a strategy" = "authors.md"},
+    {"Publishing an agent" = "authors.md"},
     {"Verify it yourself" = "verify.md"},
     {"Technical deep-dive" = [
         {"The whole system" = "how-it-works/index.md"},
         {"Vaults" = "how-it-works/vaults.md"},
-        {"Strategies" = "how-it-works/strategies.md"},
+        {"Agents" = "how-it-works/strategies.md"},
         {"Publishing" = "how-it-works/publishing.md"},
         {"The review" = "how-it-works/review.md"},
         {"Attested execution" = "how-it-works/execution.md"},

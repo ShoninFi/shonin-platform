@@ -2,6 +2,9 @@
 
 One word for one thing, throughout the platform and these docs.
 
+**Agent**
+: The program an author publishes: a long-lived Rust program, compiled to a WebAssembly component, that watches the market, computes, and decides. It reaches the world through seven interfaces and nothing else. *Strategy* is the same thing named for what it is trying to do, and it is the word the contracts use.
+
 **Allowances**
 : The compute a strategy declares in its manifest: fuel a second, memory, requests, bandwidth, open streams and inference. The host holds it to them, and its vault's tank is charged for them at the published prices.
 
@@ -84,7 +87,7 @@ One word for one thing, throughout the platform and these docs.
 : ERC-4626 shares in a vault. A pro-rata claim on the pool, minted at value per share on deposit and burned on withdrawal.
 
 **Strategy**
-: The code an author publishes. One long-lived program, compiled to a component, that sources its own data and hands the host its decisions.
+: What an agent is trying to do, and the word the contracts use for the published, versioned artefact: `strategyId`, `StrategyRegistry`, one vault per strategy version. The running program is an **agent**.
 
 **Supersede**
 : An author's declaration that a new version replaces an older one. A claim about lineage, not a mechanism: the old vault runs exactly as it always has.

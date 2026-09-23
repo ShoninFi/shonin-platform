@@ -1,6 +1,8 @@
-# Strategies
+# Agents
 
-A strategy is an ordinary Rust project that compiles to one **WebAssembly component**. It runs as a single long-lived program, sources its own data, and hands the host its decisions. It never holds a key, never signs anything, and can only ever trade its vault's own accounts.
+An agent is an ordinary Rust project that compiles to one **WebAssembly component**. It runs as a single long-lived program: it watches the market, computes, decides, and hands the host its submissions. It never holds a key, never signs anything, and can only ever trade its vault's own accounts.
+
+Throughout the contracts and the registries this is a *strategy* — `strategyId`, `StrategyRegistry`, one vault per strategy version. The two words name the same artefact from different sides: the agent is the program, the strategy is what it is for.
 
 ## One long-lived program
 

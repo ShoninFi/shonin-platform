@@ -1,4 +1,4 @@
-# Publishing a strategy
+# Publishing an agent
 
 You write an ordinary Rust project. We compile it, a model reads it, a vault opens, and if people deposit you earn a share of what it makes.
 
@@ -6,7 +6,7 @@ This page is the shape of that, end to end. The mechanism is in the [technical d
 
 ## What you actually write
 
-One long-lived async function. The host starts it once and never schedules it again; everything the strategy does, it does inside that call.
+One long-lived async function. The host starts it once and never schedules it again; everything your agent does, it does inside that call. No tick handler, no callback, no scheduler taking it away between events.
 
 ```rust
 impl Strategy for FundingBasis {
@@ -33,13 +33,34 @@ impl Strategy for FundingBasis {
 }
 ```
 
-No keys, no signing, no network of your own. You submit decisions and the host tells you what happened to them. Whatever your code decides, it can only ever trade your vault's own accounts, which is what lets a stranger deposit into it.
+You submit decisions and the host tells you what happened to each one. You never hold a key and never sign anything, and whatever your code decides, it can only ever trade your vault's own accounts — which is exactly what makes a stranger willing to deposit into it.
+
+## What it can reach
+
+Seven interfaces, frozen as `shonin:strategy@0.1.0`. Everything your agent touches, it touches through one of them.
+
+| Interface | What you get |
+| --- | --- |
+| `venues` | Submit orders, cancels and capital moves; a live stream of your own fills and funding; a read of your account state |
+| `vault` | A stream of two events: a depositor is leaving, and the vault is stopping |
+| `data` | Market data the executor fetches once and shares across every agent that wants it |
+| `websocket` | An open socket to a host, terminated by the executor so you never hold a certificate |
+| `inference` | Run an ONNX model you packed into your own bundle, under a time budget |
+| `state` | A cache that usually survives a restart, and is promised to nobody |
+| `secrets` | Values you sealed to your bundle's hash, which the platform cannot read |
+
+What you do not get is a filesystem, an environment, or a socket of your own. That is not a restriction on what you can build; it is what lets the host say precisely what your agent did.
+
+!!! info "Not all of it runs yet"
+    `websocket` and `inference` are in the frozen interface and the executor does not implement them yet — a call to either returns an error. Everything else works today. Both are on the [checklist](checklist.md#execution).
+
+Helper crates in the SDK carry the plumbing you should not have to rewrite: hedging two legs, working an order over time, quoting from fair value. They are ordinary dependencies with no privileges of their own, pinned by your `Cargo.lock` like anything else.
 
 ## Your limits are your code
 
 There is no platform risk policy. We do not impose a leverage cap, a drawdown stop or a position limit.
 
-That is not laziness. A limit we imposed would be a promise about your code that we could not keep, and it would let a depositor believe a number that nothing enforces. So a limit is something you write:
+That is not laziness. A limit we imposed would be a promise about your code that we could not keep, and it would let a depositor believe a number that nothing enforces. Your agent is a program; the only thing that can bound a program is its own code. So a limit is something you write:
 
 ```toml
 [config]
@@ -49,13 +70,13 @@ idle_buffer        = "0.05"
 drawdown_stop      = "0.10"
 ```
 
-...and something your code enforces, and something the reviewer reads and a depositor can read too. A strategy that claims a cap in its manifest and does not enforce it in its sizing is a finding, and the score says so.
+...and something your code enforces, and something the reviewer reads and a depositor can read too. An agent that claims a cap in its manifest and does not enforce it in its sizing is a finding, and the score says so.
 
 ## What it costs to publish
 
 Creating the vault and funding its tank happen in one transaction, and the build service will not admit a job until that vault exists. Nothing is compiled for free.
 
-For a strategy declaring modest allowances — two million fuel a second, 256 MiB, a little bandwidth — the numbers come out like this:
+For an agent declaring modest allowances — two million fuel a second, 256 MiB, a little bandwidth — the numbers come out like this:
 
 | | |
 | --- | ---: |
@@ -64,19 +85,19 @@ For a strategy declaring modest allowances — two million fuel a second, 256 Mi
 | A week at those allowances | $50.87 |
 | **Least you can fund the tank with** | **$51.87** |
 
-The build itself is metered compute, charged once it has run, so what it comes to is known only afterwards. On the development chain a build of the reference strategy takes about twenty seconds, which at the published prices is under a cent.
+The build itself is metered compute, charged once it has run, so what it comes to is known only afterwards. On the development chain a build of the reference agent takes about twenty seconds, which at the published prices is under a cent.
 
-Those figures are read from the chain and shown on the publish page before you commit to anything. A heavier strategy costs more a day, and the page prices each shape as you pick it.
+Those figures are read from the chain and shown on the publish page before you commit to anything. A heavier agent costs more a day, and the page prices each shape as you pick it.
 
 **A failed build is charged, because it ran.** The vault closes and you reclaim the rest of the tank. A fixed resubmission is a new vault.
 
 ## The tank, and why it exists
 
-Running a strategy costs money: compute, and gas where a chain charges it. That is your cost, not your depositors'.
+Running an agent costs money: compute, and gas where a chain charges it. That is your cost, not your depositors'.
 
 Each vault has a tank you fund and your own fees refill. It is excluded from what shares are worth, so a depositor's value never pays for your electricity. The executor states each day's usage, signed by the vault's own key, and the contract believes it only up to the allowances you declared at the published prices — so a wrong statement cannot charge you more than you agreed to.
 
-**Auto-fill** redeems a share of each author fee back into the tank, all of it by default, until the tank holds about thirty days of charges. For a modest strategy that target is around $218. Above it, your fee shares are simply yours.
+**Auto-fill** redeems a share of each author fee back into the tank, all of it by default, until the tank holds about thirty days of charges. For a modest agent that target is around $218. Above it, your fee shares are simply yours.
 
 A tank that empties accrues a debt, repaid from future fees before anything reaches you.
 
@@ -86,7 +107,7 @@ Ten per cent of gains above the vault's high-water mark, crystallised daily as n
 
 Concretely: a vault holding a million dollars that returns 20% over a year pays its author about **$19,400** for that year. The first $218 or so refills the tank; the rest is shares you can hold or redeem like any depositor's.
 
-You earn nothing on a recovery back to a previous high, because the high-water mark is the vault's and it does not reset. A strategy that loses 20% and then makes it back has, as far as the fee is concerned, done nothing.
+You earn nothing on a recovery back to a previous high, because the high-water mark is the vault's and it does not reset. An agent that loses 20% and then makes it back has, as far as the fee is concerned, done nothing.
 
 ## Publishing, step by step
 
@@ -121,15 +142,15 @@ Opening is a public function. Once the registry holds your bundle, anyone can op
 
 ## Sealing your source
 
-Source is public by default, and most authors leave it that way, because a published strategy is one anybody can rebuild and check.
+Source is public by default, and most authors leave it that way, because a published agent is one anybody can rebuild and check.
 
 If you would rather not show it, upload it sealed. It is encrypted to the platform's key; the attested builder and the attested reviewer still read it, and nobody else does. Sealing changes who can read your code, never whether it was compiled or reviewed.
 
-What a depositor then relies on is the attested build plus the attested review, and the strategy's page says exactly that rather than implying more.
+What a depositor then relies on is the attested build plus the attested review, and the agent's page says exactly that rather than implying more.
 
 ## Versions
 
-A strategy version never changes. Publishing v2 creates a new bundle, a new vault and a declared lineage.
+A version never changes. Publishing v2 creates a new bundle, a new vault and a declared lineage.
 
 Depositors in v1 are not moved, not asked and not affected — their vault runs exactly the code they chose. Its page shows that a newer version exists and links to it, and moving is a withdrawal there and a deposit here, done when they want to.
 
