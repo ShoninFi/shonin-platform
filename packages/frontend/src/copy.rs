@@ -29,11 +29,11 @@ pub fn days_to_rank() -> String {
 }
 
 /// The line the whole product hangs on.
-pub const PITCH: &str = "Smart contracts are public and auditable. Trading bots should be too.";
+pub const PITCH: &str = "Smart contracts are public and auditable. Trading agents should be too.";
 
-pub const HOME_LEDE: &str = "Authors publish trading strategies as source. Depositors pool capital behind the ones they \
-     trust. Attested executors run them, and can only move funds between a vault's own \
-     accounts.";
+pub const HOME_LEDE: &str = "Authors publish trading agents as source: real programs that watch the market, compute, \
+     and decide. Depositors pool capital behind the ones they trust. Attested executors run \
+     them, and can only move funds between a vault's own accounts.";
 
 /// What a depositor is promised, what it rules out, and where it is enforced.
 pub const GUARANTEES: [(&str, &str, &str); 6] = [

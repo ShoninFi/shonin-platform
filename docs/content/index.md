@@ -1,8 +1,8 @@
 # Shonin
 
-**Smart contracts are public and auditable. Trading bots should be too.**
+**Smart contracts are public and auditable. Trading agents should be too.**
 
-Somebody is running a trading bot with your money. You would like to know what it does, whether it can lose more than you agreed to, and whether you can get out. Almost everywhere, the answer to all three is a screenshot and a promise.
+Somebody is running a trading agent with your money. You would like to know what it does, whether it can lose more than you agreed to, and whether you can get out. Almost everywhere, the answer to all three is a screenshot and a promise.
 
 Shonin is built so that none of it rests on a promise.
 
@@ -10,7 +10,7 @@ An author publishes a trading **agent** as source code. We compile it, a model r
 
 ## What an agent actually is
 
-"Trading bot" is the phrase everybody knows, and it undersells this badly. Not a configuration. Not a formula sitting in a contract. Not a grid bot with three parameters and a stop.
+Not a configuration. Not a formula sitting in a contract. Not a trading bot with three parameters and a stop.
 
 An agent is a **real program**, written in Rust, compiled to a WebAssembly component, running continuously on a machine we attest. It has its own memory, its own control flow, and a long-lived async function that the host starts once and never schedules again. Everything it does, it does inside that call.
 
