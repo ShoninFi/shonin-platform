@@ -444,8 +444,9 @@ mod send {
         let moved = holdings().lock_ref().balance - balance_before;
         if moved <= 0.0 {
             return Err(
-                "The idle balance could not cover it, so a claim was booked. The move finishes \
-                 when the claim settles."
+                "More than the idle balance, so a claim was booked instead. Once it settles \
+                 the cash is in your wallet, and depositing it into the new vault is a second \
+                 step you take when you are ready."
                     .to_string(),
             );
         }

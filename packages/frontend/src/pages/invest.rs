@@ -256,8 +256,9 @@ fn panel_body(strategy: &Rc<Strategy>, holdings: &Holdings, slug: &str) -> Dom {
         children.push(ui::notice_with(
             Tone::Info,
             "Move to the new version",
-            "A withdrawal here and a deposit there, in one step. The new vault's high-water mark \
-             starts fresh.",
+            "A withdrawal here and a deposit there. It is one step when the idle balance covers \
+             the withdrawal; otherwise a claim is booked and the deposit is yours to make once \
+             it has settled. The new vault's high-water mark starts fresh.",
             Some(shell::button(
                 "Move everything",
                 false,
