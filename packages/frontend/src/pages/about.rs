@@ -6,8 +6,10 @@ use crate::copy;
 use crate::data;
 use crate::format as fmt;
 use crate::pages::strategy::fee_table;
+use crate::route::HANDBOOK;
 use crate::ui::primitives as ui;
 use crate::ui::primitives::Tone;
+use crate::ui::shell;
 use crate::ui::table::{Column, Row, table};
 
 pub fn render() -> Dom {
@@ -28,6 +30,7 @@ pub fn render() -> Dom {
         .child(leaving())
         .child(review())
         .child(not_this())
+        .child(handbook())
         .child(glossary())
     })
 }
@@ -94,6 +97,18 @@ fn not_this() -> Dom {
                 ui::card(vec![ui::subheading(title), ui::para(body)])
             }))
         })],
+    )
+}
+
+fn handbook() -> Dom {
+    ui::section(
+        "The handbook",
+        vec![
+            ui::para(copy::HANDBOOK_NOTE),
+            html!("p", {
+                .child(shell::offsite(HANDBOOK, "Read the handbook", None))
+            }),
+        ],
     )
 }
 

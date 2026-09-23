@@ -35,6 +35,11 @@ pub const HOME_LEDE: &str = "Authors publish trading agents as source: real prog
      and decide. Depositors pool capital behind the ones they trust. Attested executors run \
      them, and can only move funds between a vault's own accounts.";
 
+/// Where the long version of all of this lives.
+pub const HANDBOOK_NOTE: &str = "This page is the short version. The handbook covers the same system at length: what an \
+     agent is and what it can reach, what a deposit costs across a good year and a bad one, and \
+     how to check every claim on this site against the chain yourself.";
+
 /// What a depositor is promised, what it rules out, and where it is enforced.
 pub const GUARANTEES: [(&str, &str, &str); 6] = [
     (

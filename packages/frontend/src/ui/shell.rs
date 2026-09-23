@@ -4,7 +4,7 @@ use dominator::{Dom, events, html, link};
 use futures_signals::signal::SignalExt;
 
 use crate::copy;
-use crate::route::Route;
+use crate::route::{HANDBOOK, NavItem, Route};
 use crate::state::{self, Theme};
 use crate::ui::icon;
 
@@ -40,13 +40,20 @@ pub fn masthead(route: &Route) -> Dom {
                 .class("mainnav")
                 .attr("aria-label", "Primary")
                 .children(Route::nav().into_iter().map(|item| {
-                    let path = item.route.path().unwrap_or_else(|| "/".to_string());
-                    let current = Some(&item.route) == section.as_ref();
-                    link!(path, {
-                        .class("mainnav__link")
-                        .apply_if(current, |dom| dom.attr("aria-current", "page"))
-                        .text(item.label)
-                    })
+                    let current = item.is_current(section.as_ref());
+                    match item {
+                        NavItem::Page { route, label } => {
+                            let path = route.path().unwrap_or_else(|| "/".to_string());
+                            link!(path, {
+                                .class("mainnav__link")
+                                .apply_if(current, |dom| dom.attr("aria-current", "page"))
+                                .text(label)
+                            })
+                        }
+                        NavItem::Site { href, label } => {
+                            offsite(href, label, Some("mainnav__link"))
+                        }
+                    }
                 }))
             }))
             .child(html!("div", {
@@ -92,9 +99,23 @@ pub fn colophon() -> Dom {
                     ("/status", "Status"),
                     ("/publish", "Publish an agent"),
                 ].into_iter().map(|(path, label)| link!(path, { .text(label) })))
+                .child(offsite(HANDBOOK, "Docs", None))
             }))
             .child(html!("div", { .class("faint").text(copy::PITCH) }))
         }))
+    })
+}
+
+/// A link off this site. The router only knows this app's own paths, so an
+/// outward link has to be a plain anchor rather than one it would intercept.
+pub fn offsite(href: &str, label: &str, class: Option<&str>) -> Dom {
+    html!("a", {
+        .apply(|dom| match class {
+            Some(name) => dom.class(name),
+            None => dom,
+        })
+        .attr("href", href)
+        .text(label)
     })
 }
 

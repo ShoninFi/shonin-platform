@@ -93,27 +93,66 @@ pub struct Page {
     pub description: String,
 }
 
-/// An entry in the header's navigation.
-pub struct NavItem {
-    pub route: Route,
-    pub label: &'static str,
+/// The handbook: the same system explained at length, on a site of its own.
+pub const HANDBOOK: &str = "https://docs.shonin.fi/";
+
+/// An entry in the header's navigation. Most name a page of this app; the
+/// handbook is a separate site, so that one names a URL instead.
+pub enum NavItem {
+    Page {
+        route: Route,
+        label: &'static str,
+    },
+    Site {
+        href: &'static str,
+        label: &'static str,
+    },
+}
+
+impl NavItem {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Page { label, .. } | Self::Site { label, .. } => label,
+        }
+    }
+
+    /// Where the link goes.
+    pub fn href(&self) -> String {
+        match self {
+            Self::Page { route, .. } => route.path().unwrap_or_else(|| "/".to_string()),
+            Self::Site { href, .. } => (*href).to_string(),
+        }
+    }
+
+    /// Whether this is the section the reader is in. A link off the site is
+    /// never the current one, whatever page they are on.
+    pub fn is_current(&self, section: Option<&Route>) -> bool {
+        match self {
+            Self::Page { route, .. } => Some(route) == section,
+            Self::Site { .. } => false,
+        }
+    }
 }
 
 impl Route {
     /// The primary navigation, in order.
     pub fn nav() -> Vec<NavItem> {
         vec![
-            NavItem {
+            NavItem::Page {
                 route: Route::Strategies,
                 label: "Agents",
             },
-            NavItem {
+            NavItem::Page {
                 route: Route::Queue,
                 label: "Queue",
             },
-            NavItem {
+            NavItem::Page {
                 route: Route::Verify,
                 label: "Verify",
+            },
+            NavItem::Site {
+                href: HANDBOOK,
+                label: "Docs",
             },
         ]
     }
@@ -482,8 +521,18 @@ mod tests {
     fn navigation_points_at_real_pages() {
         platform();
         for item in Route::nav() {
-            let path = item.route.path().expect("a nav item has a path");
-            assert_eq!(Route::from_path(&path), item.route);
+            match item {
+                NavItem::Page { route, .. } => {
+                    let path = route.path().expect("a nav item has a path");
+                    assert_eq!(Route::from_path(&path), route);
+                }
+                // An outward link is not this app's to resolve; all the router
+                // can say is that it leaves the site rather than looking like
+                // a path it would try to route.
+                NavItem::Site { href, .. } => {
+                    assert!(href.starts_with("https://"), "{href} is not a URL");
+                }
+            }
         }
     }
 
