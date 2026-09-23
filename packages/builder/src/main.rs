@@ -197,7 +197,13 @@ async fn submit(
             "queued  {} v{}",
             submission.strategy_id, submission.version
         ))],
-        strategy_slug: None,
+        // What this build is for, from the moment it is queued: a build that
+        // fails never registers a strategy, and its page still has to be able
+        // to find the log that says why.
+        strategy_slug: Some(format!(
+            "{}-v{}",
+            submission.strategy_id, submission.version
+        )),
     };
     jobs.push(Entry {
         job: job.clone(),
