@@ -282,7 +282,9 @@ fn build_log(strategy: &Rc<Strategy>) -> Dom {
         "The build log",
         vec![
             html!("div", { .class("log").children(lines) }),
-            ui::note("Builds run offline on a pinned recipe, twice, and the bytes must match."),
+            ui::note(
+                "Every build runs the same pinned recipe, and an attested builder signs what came out of it.",
+            ),
         ],
     )
 }

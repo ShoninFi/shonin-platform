@@ -43,7 +43,9 @@ curl -s https://api.shonin.fi/api/store/<sourceHash>/source.tar -o source.tar
 #   bundleHash on the registry  ==  sha256 of what you just built
 ```
 
-The build is deliberately reproducible — pinned toolchain, pinned dependencies, offline, paths remapped, timestamps fixed — and the build service itself checks it by building twice and comparing the bytes before it will sign anything.
+The recipe is pinned and published: the toolchain, the SDK the build service carries, and the dependency graph the author locked.
+
+A rebuild that matches is the strongest form of this check, and it needs the recipe to be **hermetic** — a pinned image, fixed paths, a fixed timestamp, no network. That is not finished yet, so a rebuild today may differ in ways that have nothing to do with the source. It is [on the checklist](checklist.md#build-and-review), and until it is done the attested signature is what the mapping from source to bundle rests on.
 
 ## What the chain cannot prove
 

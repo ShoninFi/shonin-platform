@@ -1,12 +1,16 @@
-//! Compiling a submission into a bundle, twice.
+//! Compiling a submission into a bundle.
 //!
 //! The recipe is pinned and the same for everyone: the toolchain the
 //! repository names, the SDK the build service carries, `--locked` so the
-//! dependency graph is the author's own, and the component target. Then the
-//! whole thing is built a second time and the bytes are compared. A project
-//! that does not produce the same component twice is refused with the
-//! difference shown, because a bundle nobody else can reproduce is a bundle
-//! nobody else can check.
+//! dependency graph is the author's own, and the component target.
+//!
+//! It is built once. What a depositor relies on is that an attested image ran
+//! this recipe over that source and signed what came out, and the image
+//! cannot misreport what it did. Building a second time on the same machine,
+//! seconds later, would test almost nothing that the first build did not:
+//! reproducing a bundle elsewhere is a property of a hermetic recipe, not of
+//! running the same one twice, and a project that reaches for a clock or a
+//! random number while it compiles is something the reviewer reads.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -15,8 +19,8 @@ use anyhow::{Context, Result};
 use shared::manifest::{Manifest, hash_bytes};
 use shared::model::bundle::{LogLevel, LogLine};
 
-/// The recipe. Every submission is built with exactly this, whatever it
-/// asked for, so two builds of the same source are comparable.
+/// The recipe. Every submission is built with exactly this, whatever it asked
+/// for, so the same source builds the same way for everyone.
 pub const TOOLCHAIN: &str = "rust 1.98.1 · wasm32-wasip2";
 
 /// What a finished build produced.
@@ -119,47 +123,29 @@ pub fn build(
     }
     log.push(plain("the SDK is the build service's own copy"));
 
-    let mut passes = Vec::new();
-    for pass in 1..=2 {
-        log.push(plain(format!(
-            "cargo build --release --locked --target wasm32-wasip2 -p {package}   (pass {pass})"
-        )));
-        match compile(source, &package, pass) {
-            Ok((bytes, output)) => {
-                for line in output.lines().take(40) {
-                    log.push(plain(line.to_string()));
-                }
-                log.push(plain(format!("pass {pass} complete")));
-                passes.push(bytes);
+    log.push(plain(format!(
+        "cargo build --release --locked --target wasm32-wasip2 -p {package}"
+    )));
+    let component = match compile(source, &package) {
+        Ok((bytes, output)) => {
+            for line in output.lines().take(40) {
+                log.push(plain(line.to_string()));
             }
-            Err(output) => {
-                for line in output.lines() {
-                    log.push(error(line.to_string()));
-                }
-                return Err(Failed {
-                    reason: "the strategy did not compile".to_string(),
-                    log,
-                    seconds: started.elapsed().as_secs() as u32,
-                });
-            }
+            log.push(plain(format!("built {} bytes", bytes.len())));
+            bytes
         }
-    }
+        Err(output) => {
+            for line in output.lines() {
+                log.push(error(line.to_string()));
+            }
+            return Err(Failed {
+                reason: "the strategy did not compile".to_string(),
+                log,
+                seconds: started.elapsed().as_secs() as u32,
+            });
+        }
+    };
 
-    if passes[0] != passes[1] {
-        log.push(error(format!(
-            "comparing outputs: the two passes differ ({} bytes against {})",
-            passes[0].len(),
-            passes[1].len()
-        )));
-        return Err(Failed {
-            reason: "the two passes produced different bytes".to_string(),
-            log,
-            seconds: started.elapsed().as_secs() as u32,
-        });
-    }
-    log.push(plain("comparing outputs: byte-identical"));
-
-    let component = passes.remove(0);
     if let Err(problem) = instantiate(&component) {
         log.push(error(problem.to_string()));
         return Err(Failed {
@@ -290,8 +276,8 @@ fn pin_sdk(source: &Path, sdk: &Path) -> Result<()> {
 
 /// One pass. Each writes to its own directory, so neither can see what the
 /// other left behind.
-fn compile(source: &Path, package: &str, pass: u32) -> Result<(Vec<u8>, String), String> {
-    let target = source.join(format!("../build-pass-{pass}"));
+fn compile(source: &Path, package: &str) -> Result<(Vec<u8>, String), String> {
+    let target = source.join("../build");
     let output = Command::new("cargo")
         .current_dir(source)
         .env("CARGO_TARGET_DIR", &target)

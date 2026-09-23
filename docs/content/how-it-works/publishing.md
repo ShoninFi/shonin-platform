@@ -7,9 +7,9 @@ flowchart TB
     A["pack the project"] --> B["create the vault,<br/>fund its tank"]
     B --> C["submit the source"]
     C --> D["the queue admits it"]
-    D --> E["build twice,<br/>compare the bytes"]
-    E -->|match| F["sign source → bundle,<br/>register, open the vault"]
-    E -->|differ| G["the build fails;<br/>the log is public,<br/>the vault closes,<br/>the tank comes back"]
+    D --> E["build it,<br/>load the component"]
+    E -->|built| F["sign source → bundle,<br/>register, open the vault"]
+    E -->|failed| G["the log is public,<br/>the vault closes,<br/>the tank comes back"]
     F --> H["the reviewer reads it"]
 ```
 
@@ -51,12 +51,20 @@ Each job shows its position while it waits, what it is doing while it builds, an
 
 The recipe is fixed and published, so anyone can repeat it:
 
-- a pinned toolchain and a pinned dependency snapshot, `--locked`, offline;
-- the target is `wasm32-wasip2`, and `rustc` emits the component itself;
-- paths remapped and timestamps fixed, so nothing about the machine leaks into the bytes;
-- **build twice and compare**. A project whose output is not stable is refused, because a build that cannot be repeated cannot be checked by anyone else.
+- a pinned toolchain and the build service's own copy of the SDK;
+- `--locked`, so the dependency graph is the one the author committed;
+- the target is `wasm32-wasip2`, and `rustc` emits the component itself.
 
-Then the bundle is assembled — the component, plus any models the project ships — and hashed.
+The project is built **once**. What a depositor relies on is that an attested image ran this recipe over that source and signed what came out of it, and an attested image cannot misreport what it did.
+
+The component is then loaded in the executor's own runtime, to check it satisfies the world before anything is registered, and the bundle — the component plus any models the project ships — is assembled and hashed.
+
+!!! note "Why not build it twice and compare?"
+    Because it would prove less than it looks. Two builds on the same machine, seconds apart, differ in almost nothing, so they test the easy cases and not the ones that actually break someone else's rebuild.
+
+    Reproducing a bundle elsewhere is a property of a hermetic recipe, and making the recipe hermetic is the work — a pinned image, fixed paths, a fixed timestamp, no network. That is [on the checklist](../checklist.md#build-and-review).
+
+    A project that reaches for a clock, the network or a random number while it compiles is a finding the reviewer reports as hidden behaviour, and it scores the strategy down.
 
 ## The signature
 

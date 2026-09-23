@@ -82,8 +82,8 @@ pub fn how_it_works() -> [(&'static str, String); 4] {
     [
         (
             "An author publishes source",
-            "An attested builder compiles the Rust project twice, checks the bytes match, and \
-             signs the mapping from source to bundle."
+            "An attested builder compiles the Rust project with a pinned recipe and signs the \
+             mapping from the source it read to the bundle it made."
                 .to_string(),
         ),
         (
@@ -175,8 +175,8 @@ pub fn publish_steps() -> [(&'static str, String); 5] {
         ),
         (
             "The queue builds it, and the reviewer reads it",
-            "The build runs offline on a pinned recipe, twice, and the bytes must match. The \
-             log is public either way."
+            "The build runs offline on a pinned recipe, and the reviewer reads the same \
+             source. The log is public either way."
                 .to_string(),
         ),
         (

@@ -4,7 +4,7 @@ Five things happen, in order, and each one leaves evidence on a chain.
 
 ```mermaid
 flowchart LR
-    A["An author<br/>publishes source"] --> B["An attested builder<br/>compiles it, twice"]
+    A["An author<br/>publishes source"] --> B["An attested builder<br/>compiles it"]
     B --> C["An attested reviewer<br/>reads it and scores it"]
     C --> D["A vault opens<br/>and takes deposits"]
     D --> E["Attested executors<br/>trade its own accounts"]
@@ -21,7 +21,7 @@ Creating the vault and funding its tank happen in the same transaction. Nothing 
 
 ## 2. An attested builder compiles it
 
-The build service takes jobs first come, first served, with one in flight per author, and a public log either way. It compiles the project **twice** and compares the bytes; a project whose output is not stable is refused. It then signs the mapping from the source it read to the bundle it produced, and the strategy registry accepts a bundle only with that signature.
+The build service takes jobs first come, first served, with one in flight per author, and a public log either way. It compiles the project with a pinned recipe, then signs the mapping from the source it read to the bundle it produced. The strategy registry accepts a bundle only with that signature.
 
 The builder runs on an image that sits on the same public, timelocked allowlist as every other image, so anyone can rebuild it and check what it does.
 

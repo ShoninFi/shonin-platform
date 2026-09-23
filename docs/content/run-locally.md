@@ -60,7 +60,7 @@ The web app offers one of them as a **development wallet**. It signs nothing in 
 | The contracts, their accounting and their access control | The venue is a contract with markets, marks, a funding index and trade-only agents |
 | Share maths, fees, the high-water mark, the tank | The asset is a local dollar token anyone may mint |
 | Claims, the exit band, freezes, kills | Attestation is a development verifier that accepts a signed journal |
-| The build service, its queue and its build-twice check | The image digest stands for the service rather than measuring an enclave |
+| The build service, its queue and its pinned recipe | The image digest stands for the service rather than measuring an enclave |
 | The review, run against a real model with the pinned prompt and schema | |
 | The executor running a real WebAssembly component under fuel, allowances and signed health reports | |
 | The record, read from each vault's value per share | |

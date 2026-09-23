@@ -1,8 +1,8 @@
 //! The build service.
 //!
 //! An author submits a project; the service compiles it with a pinned recipe,
-//! twice, compares the bytes, loads the component, and signs what it made with
-//! a key the registry blessed for the image it is. The queue is public and
+//! loads the component, and signs what it made with a key the registry blessed
+//! for the image it is. The queue is public and
 //! first come, first served, one job in flight per author, and a failed build
 //! is as public as one that worked.
 

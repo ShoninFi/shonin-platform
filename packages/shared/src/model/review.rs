@@ -56,7 +56,8 @@ impl FindingCategory {
             }
             Self::HiddenBehaviour => {
                 "Code paths that behave very differently from the rest, such as logic that \
-                 trades differently after a date or a signal."
+                 trades differently after a date or a signal, or a build that compiles to \
+                 something different each time it runs."
             }
             Self::UnauditedDependencies => {
                 "Crates with little use elsewhere, pulled into code that holds depositors' \

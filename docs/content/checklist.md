@@ -53,15 +53,16 @@ The guarantees are the product. Everything else is how they are shown.
 
 - [ ] `local` **The queue**: first come first served, one job per author, the full log whether it succeeded or failed, and a position that is counted when it is asked for
 - [ ] `local` **Admission and charges**: a job admitted once its vault exists and its tank covers the minimum; a build charged because it ran; a failed build closing the vault and returning the rest
-- [ ] `local` **Build twice and compare the bytes**, and refuse anything that is not stable
 - [ ] `local` **The signature** binding source, manifest and bundle to the chain, the registry, the strategy and its author
 - [ ] `local` **The review**: a pinned model, prompt, schema, categories and severities, signed and recorded, with anyone able to buy a fresh one
-- [ ] **A published, pinned builder image** with an offline dependency snapshot, remapped paths and fixed timestamps, so an outsider's rebuild matches ours byte for byte
+- [ ] **A hermetic build**: a published, pinned builder image with an offline dependency snapshot, remapped paths and a fixed timestamp, so an outsider's rebuild matches ours byte for byte. Until this is done, a rebuild can differ for reasons that have nothing to do with the source
+- [ ] **Reproducibility shown rather than asserted**: rebuild published bundles off the critical path, deliberately varying the machine, the path and the date, and show the result on the strategy page
+- [ ] **Rebuild attestations from outsiders**, so corroboration accrues publicly instead of resting on our word
 - [ ] **Submission from a public repository and commit**, cloned and hashed by the build service
 - [ ] **Models in a bundle**: shipped, hashed, loaded at build time and reviewed alongside the code
 - [ ] **A version diff** for a strategy that declares what it supersedes
 - [ ] **A pre-review** an author can run before publishing, through the same prompt and schema
-- [ ] **Build reproducibility in practice**: do real projects, with their proc macros and build scripts, pass the build-twice check?
+- [ ] **Build reproducibility in practice**: once the recipe is hermetic, do real projects, with their proc macros and build scripts, rebuild to the same bytes on a different machine?
 
 ## Venues and custody
 
