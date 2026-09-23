@@ -105,7 +105,7 @@ impl Route {
         vec![
             NavItem {
                 route: Route::Strategies,
-                label: "Strategies",
+                label: "Agents",
             },
             NavItem {
                 route: Route::Queue,
@@ -126,9 +126,9 @@ impl Route {
 
         match segments.as_slice() {
             [] => Self::Home,
-            ["strategies"] => Self::Strategies,
-            ["strategies", slug] => Self::strategy(slug, Tab::Overview),
-            ["strategies", slug, tab] => match Tab::from_segment(tab) {
+            ["agents"] => Self::Strategies,
+            ["agents", slug] => Self::strategy(slug, Tab::Overview),
+            ["agents", slug, tab] => match Tab::from_segment(tab) {
                 Some(tab) => Self::strategy(slug, tab),
                 None => Self::NotFound,
             },
@@ -159,10 +159,10 @@ impl Route {
     pub fn path(&self) -> Option<String> {
         Some(match self {
             Self::Home => "/".to_string(),
-            Self::Strategies => "/strategies".to_string(),
+            Self::Strategies => "/agents".to_string(),
             Self::Strategy { slug, tab } => match tab.segment() {
-                Some(segment) => format!("/strategies/{slug}/{segment}"),
-                None => format!("/strategies/{slug}"),
+                Some(segment) => format!("/agents/{slug}/{segment}"),
+                None => format!("/agents/{slug}"),
             },
             Self::Author { handle } => format!("/authors/{handle}"),
             Self::Portfolio => "/portfolio".to_string(),
@@ -241,14 +241,14 @@ impl Route {
 
         match self {
             Self::Home => page(
-                "Shonin · Verifiable trading strategies with pooled capital",
-                "Pooled capital behind trading strategies whose code, custody and records are \
-                 provable. Authors publish strategies as source; attested executors run them and \
+                "Shonin · Verifiable trading agents with pooled capital",
+                "Pooled capital behind trading agents whose code, custody and records are \
+                 provable. Authors publish agents as source; attested executors run them and \
                  can only move funds between a vault's own accounts.",
             ),
             Self::Strategies => page(
-                "Strategies · Shonin",
-                "Every strategy on the platform, ranked on live on-chain records normalised to \
+                "Agents · Shonin",
+                "Every agent on the platform, ranked on live on-chain records normalised to \
                  one level of risk, with the size each record was earned at.",
             ),
             Self::Strategy { slug, tab } => {
@@ -301,7 +301,7 @@ impl Route {
             Self::Author { handle } => page(
                 &format!("{handle} · Shonin"),
                 &format!(
-                    "Every strategy {handle} has published — live, new, superseded, retired and \
+                    "Every agent {handle} has published — live, new, superseded, retired and \
                      the builds that failed — with their records."
                 ),
             ),
@@ -328,7 +328,7 @@ impl Route {
                 )
             }
             Self::Publish => page(
-                "Publish a strategy · Shonin",
+                "Publish an agent · Shonin",
                 "Submit a Rust project; an attested builder compiles it, an attested reviewer \
                  reads it, and its vault opens for deposits.",
             ),
@@ -408,17 +408,17 @@ mod tests {
         platform();
         assert_eq!(Route::from_path("/"), Route::Home);
         assert_eq!(Route::from_path(""), Route::Home);
-        assert_eq!(Route::from_path("/strategies"), Route::Strategies);
-        assert_eq!(Route::from_path("/strategies/"), Route::Strategies);
+        assert_eq!(Route::from_path("/agents"), Route::Strategies);
+        assert_eq!(Route::from_path("/agents/"), Route::Strategies);
         assert_eq!(
-            Route::from_path("/strategies/funding-basis-v3"),
+            Route::from_path("/agents/funding-basis-v3"),
             Route::Strategy {
                 slug: "funding-basis-v3".to_string(),
                 tab: Tab::Overview
             }
         );
         assert_eq!(
-            Route::from_path("/strategies/funding-basis-v3/review"),
+            Route::from_path("/agents/funding-basis-v3/review"),
             Route::Strategy {
                 slug: "funding-basis-v3".to_string(),
                 tab: Tab::Review
@@ -434,11 +434,11 @@ mod tests {
     #[test]
     fn unknown_names_are_a_page_rather_than_a_dead_route() {
         assert!(matches!(
-            Route::from_path("/strategies/no-such-thing"),
+            Route::from_path("/agents/no-such-thing"),
             Route::Strategy { .. }
         ));
         assert_eq!(
-            Route::from_path("/strategies/funding-basis-v3/nonsense"),
+            Route::from_path("/agents/funding-basis-v3/nonsense"),
             Route::NotFound
         );
         assert!(matches!(

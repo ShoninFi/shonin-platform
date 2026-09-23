@@ -148,7 +148,7 @@ fn changing() -> Dom {
         vec![html!("div", {
             .class(["grid", "grid--2"])
             .child(ui::card(vec![
-                ui::subheading("The strategy: nothing"),
+                ui::subheading("The agent: nothing"),
                 ui::para(
                     "A published bundle is frozen. A new version is a new bundle with its own vault, \
                      which a depositor chooses to move to.",

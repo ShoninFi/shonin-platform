@@ -29,19 +29,19 @@ pub fn days_to_rank() -> String {
 }
 
 /// The line the whole product hangs on.
-pub const PITCH: &str = "Smart contracts are public and auditable. Trading bots should be too.";
+pub const PITCH: &str = "Smart contracts are public and auditable. Trading agents should be too.";
 
-pub const HOME_LEDE: &str = "Authors publish trading strategies as source. Depositors pool capital behind the ones they \
-     trust. Attested executors run them, and can only move funds between a vault's own \
-     accounts.";
+pub const HOME_LEDE: &str = "Authors publish trading agents as source: real programs that watch the market, compute, \
+     and decide. Depositors pool capital behind the ones they trust. Attested executors run \
+     them, and can only move funds between a vault's own accounts.";
 
 /// What a depositor is promised, what it rules out, and where it is enforced.
 pub const GUARANTEES: [(&str, &str, &str); 6] = [
     (
-        "Strategy identity",
+        "Agent identity",
         "Only the committed bundle can use a vault's keys, and the keys exist only inside \
          attested enclaves.",
-        "Rules out swapping strategies, or trading by hand.",
+        "Rules out swapping agents, or trading by hand.",
     ),
     (
         "Funds stay home",
@@ -62,8 +62,8 @@ pub const GUARANTEES: [(&str, &str, &str); 6] = [
     ),
     (
         "Nothing changes under you",
-        "A published strategy is frozen. A new version is a separate vault you choose to join.",
-        "Rules out being switched onto a strategy you didn't pick.",
+        "A published agent is frozen. A new version is a separate vault you choose to join.",
+        "Rules out being switched onto an agent you didn't pick.",
     ),
     (
         "Auditable source",
@@ -74,7 +74,7 @@ pub const GUARANTEES: [(&str, &str, &str); 6] = [
 ];
 
 /// The trust bar, in one line.
-pub const HALT_NEVER_STEAL: &str = "Every lever anyone has ends in a halt, never a theft. Anyone can switch a strategy off; \
+pub const HALT_NEVER_STEAL: &str = "Every lever anyone has ends in a halt, never a theft. Anyone can switch an agent off; \
      nobody, including us, can take money out of a vault.";
 
 /// How the platform works, end to end.
@@ -82,8 +82,8 @@ pub fn how_it_works() -> [(&'static str, String); 4] {
     [
         (
             "An author publishes source",
-            "An attested builder compiles the Rust project twice, checks the bytes match, and \
-             signs the mapping from source to bundle."
+            "An attested builder compiles the Rust project with a pinned recipe and signs the \
+             mapping from the source it read to the bundle it made."
                 .to_string(),
         ),
         (
@@ -96,7 +96,7 @@ pub fn how_it_works() -> [(&'static str, String); 4] {
             "A vault opens, and depositors choose",
             format!(
                 "Shares are minted at the value the contract computes from the chain. The \
-                 strategy is labelled new until it has {DAYS_TO_RANK} live days."
+                 agent is labelled new until it has {DAYS_TO_RANK} live days."
             ),
         ),
         (
@@ -118,13 +118,13 @@ pub const TANK_NOTE: &str = "Running costs are the author's, not the depositors'
 /// What anyone can check for themselves, how, and what they need to do it.
 pub const VERIFY_CHECKS: [(&str, &str, &str); 5] = [
     (
-        "The vault's keys belong to attested executors running the committed strategy",
-        "Read the blessing on the attestation registry: each key's image digest, the strategy \
+        "The vault's keys belong to attested executors running the committed agent",
+        "Read the blessing on the attestation registry: each key's image digest, the agent \
          hash it may run, the vault it may act for, and when it expires.",
         "A chain RPC",
     ),
     (
-        "The strategy's bytecode came from its published source",
+        "The agent's bytecode came from its published source",
         "Rebuild the source with the published builder image and compare the bundle hash.",
         "The source and the builder image",
     ),
@@ -157,7 +157,7 @@ pub fn publish_steps() -> [(&'static str, String); 5] {
         (
             "Start from a template",
             "An ordinary Cargo project: your code, your dependencies, a pinned toolchain, and a \
-             manifest that describes the strategy, its venues, its config and the compute it \
+             manifest that describes the agent, its venues, its config and the compute it \
              needs."
                 .to_string(),
         ),
@@ -175,8 +175,8 @@ pub fn publish_steps() -> [(&'static str, String); 5] {
         ),
         (
             "The queue builds it, and the reviewer reads it",
-            "The build runs offline on a pinned recipe, twice, and the bytes must match. The \
-             log is public either way."
+            "The build runs offline on a pinned recipe, and the reviewer reads the same \
+             source. The log is public either way."
                 .to_string(),
         ),
         (
@@ -208,14 +208,14 @@ pub fn ranking() -> [(String, String); 4] {
         (
             format!("{DAYS_TO_RANK} days before ranking"),
             format!(
-                "A strategy is open for deposits from its first day, labelled new. It isn't \
+                "An agent is open for deposits from its first day, labelled new. It isn't \
                  ranked until it has {DAYS_TO_RANK} live days."
             ),
         ),
         (
             "The size it was earned at".to_string(),
             "Every record shows the capital behind it. Nothing is extrapolated to a size the \
-             strategy never traded."
+             agent never traded."
                 .to_string(),
         ),
     ]
@@ -243,12 +243,12 @@ pub fn exit_note(band: &str) -> String {
 pub const TERMS: [(&str, &str); 12] = [
     (
         "vault",
-        "Pooled capital behind one strategy version, with its own accounts on every venue that \
-         strategy uses.",
+        "Pooled capital behind one agent version, with its own accounts on every venue that \
+         agent uses.",
     ),
     (
         "bundle",
-        "A strategy's code: one WASM component plus any models it calls, compiled by us from \
+        "An agent's code: one WASM component plus any models it calls, compiled by us from \
          submitted source and identified by one hash.",
     ),
     (
@@ -263,7 +263,7 @@ pub const TERMS: [(&str, &str); 12] = [
     ),
     (
         "tank",
-        "The author's balance for the strategy's running costs. It is excluded from what shares \
+        "The author's balance for the agent's running costs. It is excluded from what shares \
          are worth.",
     ),
     (
@@ -292,7 +292,7 @@ pub const TERMS: [(&str, &str); 12] = [
     ),
     (
         "normalised return",
-        "A strategy's return after rescaling to a common volatility target.",
+        "An agent's return after rescaling to a common volatility target.",
     ),
     (
         "sealed source",
@@ -319,11 +319,11 @@ pub const NOT_THIS: [(&str, &str); 5] = [
     ),
     (
         "Not a single-venue product",
-        "Strategies span venues and chains, and every vault page shows each venue's custody \
+        "Agents span venues and chains, and every vault page shows each venue's custody \
          level.",
     ),
     (
         "Not a promise about returns",
-        "A strategy can lose everything in its vault. Only its own code limits that.",
+        "An agent can lose everything in its vault. Only its own code limits that.",
     ),
 ];

@@ -6,6 +6,8 @@
 //! than blocking. The prompt and the output schema are in this repository, so
 //! an author can run the same review over their own code before submitting it.
 
+use shonin_reviewer::{battery, jev, source};
+
 use std::collections::HashMap;
 
 /// How many times a review is attempted before it is left alone.
@@ -46,17 +48,36 @@ struct Args {
     /// shows "review pending", which is a state the site has to handle anyway.
     #[arg(long, env = "SHONIN_REVIEW_MODEL")]
     model: Option<String>,
+    /// The key for the model that answers the battery. Without it the score
+    /// is the prose model's own, and the report says so.
+    #[arg(long, env = "SHONIN_CALIBRATOR_KEY")]
+    calibrator_key: Option<String>,
+    /// Where to ask it. Defaults to the published endpoint.
+    #[arg(long, env = "SHONIN_CALIBRATOR_URL")]
+    calibrator_url: Option<String>,
+    /// Which version to ask. Defaults to the version this image pins.
+    #[arg(long, env = "SHONIN_CALIBRATOR_MODEL")]
+    calibrator_model: Option<String>,
     #[arg(long, default_value_t = 0)]
     port: u16,
 }
 
 /// What the model is asked to return, and what the store keeps.
+///
+/// The prose comes from one model and, where this image is configured for it,
+/// the score comes from another: a fixed battery of narrow questions, weighted
+/// in this repository. Both go into the report, so a reader can see which
+/// question moved the number.
 #[derive(Clone, Serialize, Deserialize)]
 struct Report {
     score: u8,
     summary: String,
     findings: Vec<Finding>,
     limits: Vec<String>,
+    /// Absent when this image had no battery to ask, in which case the score
+    /// above is the prose model's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    calibrated: Option<battery::Calibrated>,
 }
 
 #[tokio::main]
@@ -89,7 +110,24 @@ async fn main() -> Result<()> {
         forever(args.port).await;
         return Ok(());
     };
-    tracing::info!(%key, model, "the reviewer is up");
+    // The battery is asked only when this image was given somewhere to ask
+    // it. Without that a review still goes out, scored by the prose model, and
+    // says as much in its report.
+    let calibrator = jev::Client::configured(
+        args.calibrator_key.clone(),
+        args.calibrator_url.clone(),
+        args.calibrator_model.clone(),
+    );
+    match &calibrator {
+        Some(client) => {
+            tracing::info!(%key, model, calibrator = client.model(), "the reviewer is up")
+        }
+        None => tracing::info!(
+            %key,
+            model,
+            "the reviewer is up; no battery is configured, so the prose model scores too"
+        ),
+    }
 
     if args.port != 0 {
         tokio::spawn(serve_status(SocketAddr::from(([127, 0, 0, 1], args.port))));
@@ -97,7 +135,16 @@ async fn main() -> Result<()> {
 
     let mut refused: HashMap<(B256, u32, u32), u32> = HashMap::new();
     loop {
-        if let Err(error) = sweep(&chain, &deployments, &args.store, &model, &mut refused).await {
+        if let Err(error) = sweep(
+            &chain,
+            &deployments,
+            &args.store,
+            &model,
+            calibrator.as_ref(),
+            &mut refused,
+        )
+        .await
+        {
             tracing::warn!(%error, "could not look for work");
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -111,6 +158,7 @@ async fn sweep(
     deployments: &Deployments,
     store: &std::path::Path,
     model: &str,
+    calibrator: Option<&jev::Client>,
     refused: &mut HashMap<(B256, u32, u32), u32>,
 ) -> Result<()> {
     let logs = chain
@@ -183,6 +231,7 @@ async fn sweep(
             deployments,
             store,
             model,
+            calibrator,
             strategy_id,
             version,
             &registered,
@@ -211,16 +260,41 @@ async fn review_one(
     deployments: &Deployments,
     store: &std::path::Path,
     model: &str,
+    calibrator: Option<&jev::Client>,
     strategy_id: B256,
     version: u32,
     registered: &chain::bindings::strategies::StrategyVersion,
     bought_by: alloy::primitives::Address,
 ) -> Result<u8> {
     let source_hash = format!("sha256:{}", alloy::hex::encode(registered.sourceHash));
-    let source = read_source(store, &source_hash)
+    let source = source::from_store(store, &source_hash)
         .context("the source is not in the store; a sealed strategy is still reviewed, and this one has no bytes here")?;
 
-    let report = ask(model, &source).await?;
+    let mut report = ask(model, &source).await?;
+
+    // The calibrated half, when this image has somewhere to ask it. The score
+    // then comes from a fixed battery of narrow questions weighted by this
+    // repository, rather than from one model's opinion of a number, and the
+    // working goes out with the report so a reader can argue with a question
+    // instead of with the total.
+    let battery = battery::Battery::pinned();
+    let calibrated = match calibrator {
+        Some(client) => match client.ask(&battery, &source).await {
+            Ok(calibrated) => Some(calibrated),
+            Err(error) => {
+                // A review still goes out. Losing the calibrated score costs
+                // precision; losing the review costs the author their fee.
+                tracing::warn!(%error, version, "the battery went unanswered");
+                None
+            }
+        },
+        None => None,
+    };
+    if let Some(calibrated) = &calibrated {
+        report.score = calibrated.score;
+    }
+    report.calibrated = calibrated;
+
     let body = serde_json::to_vec_pretty(&report)?;
     let report_hash = hash_bytes(&body);
     write(store, &report_hash, "report.json", &body)?;
@@ -229,11 +303,19 @@ async fn review_one(
         bundleHash: registered.bundleHash,
         sourceHash: registered.sourceHash,
         reviewerImage: chain::attest::image_digest("reviewer"),
-        modelIdHash: keccak256(model.as_bytes()),
+        // Both models, when two answered: a review says what read the code.
+        modelIdHash: keccak256(models(model, report.calibrated.as_ref()).as_bytes()),
         // The prompt and the output schema together: a review is what the
         // model was asked and the shape it had to answer in, so changing
         // either changes the review this one can be compared with.
-        promptHash: keccak256([PROMPT.as_bytes(), SCHEMA.as_bytes()].concat()),
+        promptHash: keccak256(
+            [
+                PROMPT.as_bytes(),
+                SCHEMA.as_bytes(),
+                battery::BATTERY.as_bytes(),
+            ]
+            .concat(),
+        ),
         reportHash: hash_to_bytes(&report_hash)?,
         score: report.score,
         findingCount: report.findings.len() as u16,
@@ -307,41 +389,13 @@ fn sanitise(mut report: Report) -> Report {
     report
 }
 
-/// Every file of the submitted project, in full, with line numbers so a
-/// finding can point at one.
-fn read_source(store: &std::path::Path, source_hash: &str) -> Result<String> {
-    // Sealed or not, the reviewer reads the code: sealing decides who else may
-    // read it, never whether it was read.
-    let held = store.join(source_hash.replace(':', "-"));
-    let published = held.join("source.tar");
-    let sealed = held.join("source.sealed.tar");
-    let archive = if published.exists() {
-        std::fs::read(published)?
-    } else {
-        std::fs::read(sealed)?
-    };
-    let mut reader = tar::Archive::new(std::io::Cursor::new(archive));
-    let mut out = String::new();
-    for entry in reader.entries()?.flatten() {
-        let path = entry.path()?.display().to_string();
-        if !(path.ends_with(".rs") || path.ends_with(".toml")) {
-            continue;
-        }
-        let mut entry = entry;
-        let mut body = String::new();
-        use std::io::Read;
-        if entry.read_to_string(&mut body).is_err() {
-            continue;
-        }
-        out.push_str(&format!("\n----- {path} -----\n"));
-        for (number, line) in body.lines().enumerate() {
-            out.push_str(&format!("{:>4} {line}\n", number + 1));
-        }
+/// What answered, as a review records it. One name when the prose model scored
+/// it too, both when a battery did.
+fn models(prose: &str, calibrated: Option<&battery::Calibrated>) -> String {
+    match calibrated {
+        Some(calibrated) => format!("{prose}+{}", calibrated.model),
+        None => prose.to_string(),
     }
-    if out.is_empty() {
-        bail!("there is no source to read");
-    }
-    Ok(out)
 }
 
 fn write(store: &std::path::Path, hash: &str, name: &str, bytes: &[u8]) -> Result<()> {
@@ -410,6 +464,7 @@ mod tests {
             summary: String::new(),
             findings: Vec::new(),
             limits: Vec::new(),
+            calibrated: None,
         });
         assert_eq!(report.score, 100);
         assert!(!report.limits.is_empty());

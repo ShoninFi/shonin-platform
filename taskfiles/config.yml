@@ -22,6 +22,14 @@ vars:
   PATH_ARTIFACTS: '{{joinPath .PATH_ROOT "contracts" "out"}}'
   PATH_CLOUDFLARE: '{{joinPath .PATH_ROOT "cloudflare"}}'
   PATH_WRANGLER_LANDING: '{{joinPath .PATH_CLOUDFLARE "landing" "wrangler.jsonc"}}'
+  PATH_WRANGLER_DOCS: '{{joinPath .PATH_CLOUDFLARE "docs" "wrangler.jsonc"}}'
+  # The public documentation site. Zensical insists its output sits inside its
+  # own project, so this one does not live under .trunk-dist with the rest.
+  PATH_DOCS: '{{joinPath .PATH_ROOT "docs"}}'
+  PATH_DOCS_VENV: '{{joinPath .PATH_DOCS ".venv"}}'
+  # Must match assets.directory in cloudflare/docs/wrangler.jsonc and site_dir
+  # in docs/zensical.toml.
+  PATH_DIST_DOCS: '{{joinPath .PATH_DOCS "site"}}'
   PATH_TRUNK_DIST: '{{joinPath .PATH_ROOT ".trunk-dist"}}'
   # Must match assets.directory in cloudflare/landing/wrangler.jsonc.
   PATH_DIST_FRONTEND: '{{joinPath .PATH_TRUNK_DIST "frontend"}}'
@@ -58,12 +66,14 @@ vars:
   PORT_REVIEWER: "{{add (atoi .SHONIN_START_PORT_DEV) 6}}"
   PORT_COORDINATOR: "{{add (atoi .SHONIN_START_PORT_DEV) 7}}"
   PORT_DEVNET: "{{add (atoi .SHONIN_START_PORT_DEV) 8}}"
+  PORT_DOCS_DEV: "{{add (atoi .SHONIN_START_PORT_DEV) 9}}"
   # Every port a local run listens on, for `task down`.
   PORTS_DEV: "{{.PORT_FRONTEND_DEV}} {{.PORT_API}} {{.PORT_CHAIN}} {{.PORT_BUILDER}} {{.PORT_EXECUTOR}} {{.PORT_REVIEWER}} {{.PORT_COORDINATOR}} {{.PORT_DEVNET}}"
 
   # URLs
   URL_FRONTEND_DEV: "http://localhost:{{.PORT_FRONTEND_DEV}}"
   URL_FRONTEND_PROD: "https://shonin.fi"
+  URL_DOCS_PROD: "https://docs.shonin.fi"
   URL_API_DEV: "http://localhost:{{.PORT_API}}"
   URL_CHAIN_DEV: "http://localhost:{{.PORT_CHAIN}}"
   URL_BUILDER_DEV: "http://localhost:{{.PORT_BUILDER}}"

@@ -72,7 +72,7 @@ fn source(strategy: &Rc<Strategy>) -> Dom {
             "The source",
             vec![ui::notice(
                 Tone::Info,
-                "This strategy's source is sealed",
+                "This agent's source is sealed",
                 "The project is stored encrypted and released only to attested builders, reviewers \
                  and executors. The build, the hashes and the review are the same as for \
                  published source; only who else can read it changes.",
@@ -241,7 +241,7 @@ fn allowances(strategy: &Rc<Strategy>) -> Dom {
             ("Placement".to_string(), ui::value(&allowances.placement)),
         ]),
         ui::note(
-            "The compute this strategy declared: each one a cap, metered to the vault's tank at \
+            "The compute this agent declared: each one a cap, metered to the vault's tank at \
              published prices.",
         ),
     ];
@@ -282,7 +282,9 @@ fn build_log(strategy: &Rc<Strategy>) -> Dom {
         "The build log",
         vec![
             html!("div", { .class("log").children(lines) }),
-            ui::note("Builds run offline on a pinned recipe, twice, and the bytes must match."),
+            ui::note(
+                "Every build runs the same pinned recipe, and an attested builder signs what came out of it.",
+            ),
         ],
     )
 }
@@ -296,7 +298,7 @@ fn rebuilding(strategy: &Rc<Strategy>) -> Dom {
         "Rebuilding it yourself",
         vec![
             ui::para(
-                "The builder image and the recipe are public, so anyone can rebuild this strategy \
+                "The builder image and the recipe are public, so anyone can rebuild this agent \
                  from its source and compare the result with the hash the registry accepted.",
             ),
             html!("pre", {

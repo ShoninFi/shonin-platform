@@ -11,6 +11,7 @@ includes:
     taskfile: taskfiles/config.yml
     flatten: true
   frontend: taskfiles/frontend.yml
+  docs: taskfiles/docs.yml
   contracts: taskfiles/contracts.yml
   services: taskfiles/services.yml
 

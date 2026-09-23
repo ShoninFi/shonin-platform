@@ -75,17 +75,17 @@ pub fn list() -> Dom {
             vec![html!("div", {
                 .class(["grid", "grid--2"])
                 .child(ui::card(vec![
-                    ui::subheading("A pinned, offline recipe"),
+                    ui::subheading("One pinned recipe"),
                     ui::para(
-                        "Builds run in a published image that pins the compiler, the tooling, the target and \
-                         the flags, from a pinned dependency snapshot, with no network.",
+                        "Every job is built the same way: the same compiler, the same tooling, the same \
+                         SDK, and the dependency graph the author locked.",
                     ),
                 ]))
                 .child(ui::card(vec![
-                    ui::subheading("Built twice, bytes must match"),
+                    ui::subheading("The component has to load"),
                     ui::para(
-                        "Every job compiles the project twice and compares. Unstable output is rejected with \
-                         the difference.",
+                        "What the build produced is instantiated in the executor's own runtime before \
+                         anything is registered. A bundle that will not load never opens a vault.",
                     ),
                 ]))
                 .child(ui::card(vec![
@@ -99,7 +99,7 @@ pub fn list() -> Dom {
                     ui::subheading("Anyone can rebuild"),
                     ui::para(
                         "The recipe and the builder image are public, so anyone can rebuild a published \
-                         strategy from its source and compare hashes.",
+                         agent from its source and compare hashes.",
                     ),
                 ]))
             })],
@@ -163,8 +163,8 @@ fn facts(job: &Job) -> Dom {
     }
     if let Some(slug) = &job.strategy_slug {
         rows.push((
-            "Strategy".to_string(),
-            ui::inline_link(&format!("/strategies/{slug}"), slug),
+            "Agent".to_string(),
+            ui::inline_link(&format!("/agents/{slug}"), slug),
         ));
     }
 

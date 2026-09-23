@@ -50,7 +50,7 @@ pub fn render(strategy: &Rc<Strategy>) -> Dom {
     let held = strategy.clone();
     let shown = strategy.clone();
     let Some(record) = &strategy.record else {
-        return ui::empty("This strategy never traded, so there is no record.");
+        return ui::empty("This agent never traded, so there is no record.");
     };
 
     html!("div", {
@@ -180,7 +180,7 @@ fn main_chart(strategy: &Rc<Strategy>, line: Line) -> Dom {
                 fmt::money_compact,
             ))
             .child(ui::note(
-                "The capital behind the strategy, day by day: the size this record was earned at.",
+                "The capital behind the agent, day by day: the size this record was earned at.",
             ))
         }),
     }

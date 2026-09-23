@@ -30,7 +30,7 @@ fn hero() -> Dom {
         .child(html!("p", { .class("lede").text(copy::HOME_LEDE) }))
         .child(html!("div", {
             .class(["row", "row--wrap"])
-            .child(shell::button_link("/strategies", "Browse the strategies", true))
+            .child(shell::button_link("/agents", "Browse the agents", true))
             .child(shell::button_link("/about", "How it works", false))
         }))
     })
@@ -46,7 +46,7 @@ fn totals() -> Dom {
         ui::stat(
             "In vaults",
             &fmt::money_compact(data::total_vault_capital()),
-            Some(&format!("{live} live strategies")),
+            Some(&format!("{live} live agents")),
         ),
         ui::stat(
             "Trades on the record",
@@ -88,8 +88,8 @@ fn featured() -> Dom {
         .collect();
 
     ui::section_with_aside(
-        "Strategies with a record",
-        Some(ui::action_link("/strategies", "The whole leaderboard")),
+        "Agents with a record",
+        Some(ui::action_link("/agents", "The whole leaderboard")),
         vec![
             ui::note(
                 "Ranked on live on-chain records, rescaled to one level of risk, with the size \
@@ -130,7 +130,7 @@ fn verify_note() -> Dom {
             .child(ui::action_link("/verify", "How to check it"))
             .child(html!("span", {
                 .class(["small", "muted"])
-                .child(text("Publishing a strategy? "))
+                .child(text("Publishing an agent? "))
                 .child(link!("/publish", { .text("Start here") }))
                 .child(text("."))
             }))

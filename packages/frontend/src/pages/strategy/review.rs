@@ -29,7 +29,7 @@ pub fn render(strategy: &Rc<Strategy>) -> Dom {
         return ui::section(
             "Review pending",
             vec![ui::empty(
-                "The reviewer hasn't scored this strategy yet. A vault opens for deposits \
+                "The reviewer hasn't scored this agent yet. A vault opens for deposits \
                  without waiting for it, and the score appears here when it is signed.",
             )],
         );
@@ -171,7 +171,7 @@ fn categories(review: &Review) -> Dom {
         vec![
             ui::note(
                 "The categories are pinned by the reviewer image, so a score means the same thing \
-                 across strategies.",
+                 across agents.",
             ),
             html!("div", { .class(["grid", "grid--2"]).children(rows) }),
         ],
@@ -229,7 +229,7 @@ fn buy_modal(strategy: &Rc<Strategy>) -> Dom {
                  fee. The newest is shown first and the older ones are kept.",
             ),
             ui::kv(vec![
-                ("Strategy".to_string(), ui::value(&name)),
+                ("Agent".to_string(), ui::value(&name)),
                 ("Reviewer image".to_string(), ui::hash(&image)),
                 (
                     "Fee".to_string(),

@@ -25,7 +25,13 @@ Each finding falls into exactly one of these categories.
   short-volatility sizing, a hedge resting on one price source, a strategy
   that only works with unbounded capital.
 - **hidden-behaviour** — code that behaves very differently from the rest, such
-  as logic that trades differently after a date or a signal.
+  as logic that trades differently after a date or a signal. It also covers
+  anything that makes the **build** itself behave differently from one run to
+  the next: a build script or a procedural macro that reads the clock, the
+  environment, the network or a random number, or that emits different code
+  depending on any of them. The bundle a reader rebuilds should be the bundle
+  that runs, and a project that decides at compile time what it will be takes
+  that away.
 - **unaudited-dependencies** — crates with little use elsewhere, pulled into
   code that holds depositors' money.
 

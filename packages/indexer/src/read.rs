@@ -209,7 +209,7 @@ async fn one(
             .as_ref()
             .map(|manifest| manifest.description.text.clone())
             .unwrap_or_else(|| {
-                "This strategy's source has been submitted and is waiting to be built.".to_string()
+                "This agent's source has been submitted and is waiting to be built.".to_string()
             }),
         author: handle_of(chain, deployments, author).await,
         standing,
@@ -952,7 +952,7 @@ pub async fn feed(
             kind: FeedKind::StrategyRegistered,
             title: format!("{slug} was registered"),
             detail: "An allowlisted build service compiled it and signed what it made.".to_string(),
-            link: Some(format!("/strategies/{slug}")),
+            link: Some(format!("/agents/{slug}")),
             reference: hash_of(event.inner.data.bundleHash),
         });
     }
@@ -986,7 +986,7 @@ pub async fn feed(
                 kind: FeedKind::Kill,
                 title: format!("{} was stopped", strategy.slug),
                 detail: kill.outcome.clone(),
-                link: Some(format!("/strategies/{}", strategy.slug)),
+                link: Some(format!("/agents/{}", strategy.slug)),
                 reference: kill.reference.clone(),
             });
         }
@@ -997,7 +997,7 @@ pub async fn feed(
                 title: format!("{} froze", strategy.slug),
                 detail: "A claim went unserved, so no new deposits and only unwinding is left."
                     .to_string(),
-                link: Some(format!("/strategies/{}", strategy.slug)),
+                link: Some(format!("/agents/{}", strategy.slug)),
                 reference: strategy.vault.address.clone(),
             });
         }
@@ -1007,7 +1007,7 @@ pub async fn feed(
                 kind: FeedKind::ReviewPublished,
                 title: format!("{} was reviewed", strategy.slug),
                 detail: format!("It scored {} out of 100.", review.score),
-                link: Some(format!("/strategies/{}/review", strategy.slug)),
+                link: Some(format!("/agents/{}/review", strategy.slug)),
                 reference: review.report_hash.clone(),
             });
         }

@@ -11,16 +11,22 @@
 use std::io::{Cursor, Error, Result};
 use std::path::{Path, PathBuf};
 
-/// What never goes into an archive: build output, local settings, anything a
-/// machine made rather than a person wrote.
-const SKIP: &[&str] = &[
-    "target",
-    ".git",
-    ".cargo",
-    "node_modules",
-    ".shonin",
-    ".DS_Store",
-];
+/// What never goes into an archive: build output, and anything a machine made
+/// rather than a person wrote.
+const SKIP: &[&str] = &["target", "node_modules"];
+
+/// Whether a name is a person's project file rather than their machine's.
+///
+/// Nothing beginning with a dot is packed. A published archive is served to
+/// anyone who asks for it, and a workspace's dotfiles are where the things
+/// that must never be served live: `.env`, credentials, editor state, the
+/// local git directory. A Rust project needs none of them to build —
+/// `Cargo.toml`, `Cargo.lock`, `src/` and the manifest are not hidden files —
+/// so the safe rule is also the simple one, and an author can predict it
+/// without reading this list.
+fn packable(name: &str) -> bool {
+    !name.starts_with('.') && !SKIP.contains(&name)
+}
 
 /// Pack a directory into a canonical archive.
 pub fn pack(root: &Path) -> Result<Vec<u8>> {
@@ -74,7 +80,7 @@ fn collect(root: &Path, directory: &Path, into: &mut Vec<PathBuf>) -> Result<()>
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if SKIP.contains(&name.as_ref()) {
+        if !packable(&name) {
             continue;
         }
         let path = entry.path();
@@ -136,6 +142,41 @@ fn add(archive: &mut tar::Builder<Vec<u8>>, name: &str, body: &[u8]) -> Result<(
 
 #[cfg(test)]
 mod tests {
+    /// A published archive is served to anybody who asks. Whatever else packing
+    /// gets wrong, it must never carry a secret out of an author's workspace.
+    #[test]
+    fn packing_leaves_every_hidden_file_behind() {
+        let root = std::env::temp_dir().join(format!("shonin-pack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).expect("a scratch project");
+        std::fs::create_dir_all(root.join(".private")).expect("a hidden directory");
+        std::fs::create_dir_all(root.join("target")).expect("build output");
+        std::fs::write(root.join("Cargo.toml"), "[package]").expect("a manifest");
+        std::fs::write(root.join("src/lib.rs"), "// code").expect("some code");
+        std::fs::write(root.join(".env"), "SECRET=hunter2").expect("a secret");
+        std::fs::write(root.join(".private/terms.txt"), "private").expect("a private file");
+        std::fs::write(root.join("target/out.bin"), "built").expect("build output");
+
+        let packed = super::pack(&root).expect("it packs");
+        let mut archive = tar::Archive::new(std::io::Cursor::new(packed));
+        let names: Vec<String> = archive
+            .entries()
+            .expect("entries")
+            .flatten()
+            .map(|entry| entry.path().expect("a path").display().to_string())
+            .collect();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(names.contains(&"Cargo.toml".to_string()));
+        assert!(names.contains(&"src/lib.rs".to_string()));
+        for name in &names {
+            assert!(
+                !name.starts_with('.') && !name.starts_with("target"),
+                "packed {name}, which should never leave the author's machine"
+            );
+        }
+    }
+
     use super::*;
 
     fn tree(root: &Path) {

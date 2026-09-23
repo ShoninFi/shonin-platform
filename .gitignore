@@ -9,6 +9,11 @@ target/
 .trunk/
 dist/
 
+# Documentation site: Zensical's output and its Python virtualenv
+docs/site/
+docs/.cache/
+.venv/
+
 # Task
 .task/
 

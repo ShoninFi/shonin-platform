@@ -81,7 +81,7 @@ pub fn render(handle: &str) -> Dom {
             ui::stat(
                 "Capital behind them",
                 &fmt::money_compact(capital),
-                Some("across live strategies"),
+                Some("across live agents"),
             ),
             ui::stat(
                 "Lowest review score",
@@ -94,7 +94,7 @@ pub fn render(handle: &str) -> Dom {
             vec![
                 table(
                     vec![
-                        Column::new("Strategy").wide(),
+                        Column::new("Agent").wide(),
                         Column::new("Standing"),
                         Column::new("Registered"),
                         Column::num("Live"),
@@ -112,7 +112,7 @@ pub fn render(handle: &str) -> Dom {
                      hidden by its author.",
                 ),
                 ui::note(&format!(
-                    "An author can publish under a fresh identity, but every strategy needs {} \
+                    "An author can publish under a fresh identity, but every agent needs {} \
                      live days before it is ranked.",
                     copy::days_to_rank()
                 )),

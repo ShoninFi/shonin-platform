@@ -1,0 +1,52 @@
+# The public documentation site: Markdown in docs/content, built by Zensical,
+# deployed as Workers static assets (the shonin-docs Worker, configured in
+# cloudflare/docs/wrangler.jsonc).
+#
+# Zensical is a Python tool, so it lives in its own virtualenv under docs/.
+# Commands `cd` explicitly rather than using `dir:`, so absolute templated
+# paths behave the same in included taskfiles.
+version: "3"
+
+includes:
+  config:
+    taskfile: ./config.yml
+    flatten: true
+
+tasks:
+  setup:
+    desc: "Create the docs virtualenv and install Zensical"
+    status:
+      - test -x "{{.PATH_DOCS_VENV}}/bin/zensical"
+    cmds:
+      - cd "{{.PATH_DOCS}}" && python3 -m venv .venv
+      - cd "{{.PATH_DOCS}}" && .venv/bin/pip install --quiet --upgrade pip
+      - cd "{{.PATH_DOCS}}" && .venv/bin/pip install --quiet -r requirements.txt
+
+  dev:
+    desc: "Serve the docs with live reload"
+    deps: [setup]
+    cmds:
+      - cd "{{.PATH_DOCS}}" && .venv/bin/zensical serve --dev-addr localhost:{{.PORT_DOCS_DEV}}
+
+  build:
+    desc: "Build the docs into docs/site"
+    deps: [setup]
+    cmds:
+      - cd "{{.PATH_DOCS}}" && .venv/bin/zensical build
+
+  deploy:
+    desc: "Build and deploy the docs to Cloudflare"
+    requires:
+      vars: [CLOUDFLARE_DEPLOY_WORKERS_TOKEN, CLOUDFLARE_ACCOUNT_ID]
+    env:
+      # Account API token from .env, never a global `wrangler login`.
+      # Wrangler reads CLOUDFLARE_ACCOUNT_ID from the environment directly.
+      CLOUDFLARE_API_TOKEN: "{{.CLOUDFLARE_DEPLOY_WORKERS_TOKEN}}"
+    cmds:
+      - task: build
+      - npx wrangler deploy -c "{{.PATH_WRANGLER_DOCS}}"
+
+  clean:
+    desc: "Remove the built docs and the Zensical cache"
+    cmds:
+      - rm -rf "{{.PATH_DIST_DOCS}}" "{{.PATH_DOCS}}/.cache"

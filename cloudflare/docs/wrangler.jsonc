@@ -1,0 +1,22 @@
+{
+  // docs — the public documentation site, built by Zensical from docs/content
+  // and served as Workers static assets. There is no Worker script (`main`);
+  // Cloudflare serves the files.
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  // `name` is the SINGLE SOURCE OF TRUTH for this Worker's name.
+  "name": "shonin-docs",
+  "compatibility_date": "2026-09-15",
+  // No custom domain yet. When docs.shonin.fi is ready, add
+  //   "routes": [{ "pattern": "docs.shonin.fi", "custom_domain": true }],
+  // and set workers_dev to false, so there is one canonical origin.
+  "workers_dev": true,
+  "preview_urls": false,
+  "assets": {
+    // Must match PATH_DIST_DOCS in taskfiles/config.yml and site_dir in
+    // docs/zensical.toml.
+    "directory": "../../docs/site",
+    // Zensical writes a real 404.html, so an unknown path gets a 404 status
+    // rather than a soft-404 of the index page.
+    "not_found_handling": "404-page"
+  }
+}

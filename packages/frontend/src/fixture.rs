@@ -55,7 +55,7 @@ mod tests {
                 .strategies
                 .iter()
                 .any(|strategy| !strategy.bundle.source.is_published()),
-            "no sealed-source strategy"
+            "no sealed-source agent"
         );
         assert!(
             snapshot
@@ -71,7 +71,7 @@ mod tests {
                 .strategies
                 .iter()
                 .any(|strategy| strategy.record.is_some()),
-            "no strategy has a record"
+            "no agent has a record"
         );
     }
 }

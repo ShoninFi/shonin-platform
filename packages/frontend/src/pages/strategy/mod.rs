@@ -61,7 +61,7 @@ fn header(strategy: &Strategy, current: Tab) -> Dom {
             .child(parts::labels(strategy))
         }))
         .children(parts::vault_notices(strategy))
-        .child(tabs(items, "Strategy"))
+        .child(tabs(items, "Agent"))
     })
 }
 

@@ -90,7 +90,7 @@ pub fn colophon() -> Dom {
                     ("/about", "About"),
                     ("/verify", "Verify"),
                     ("/status", "Status"),
-                    ("/publish", "Publish a strategy"),
+                    ("/publish", "Publish an agent"),
                 ].into_iter().map(|(path, label)| link!(path, { .text(label) })))
             }))
             .child(html!("div", { .class("faint").text(copy::PITCH) }))

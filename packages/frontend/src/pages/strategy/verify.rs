@@ -19,7 +19,7 @@ pub fn render(strategy: &Rc<Strategy>) -> Dom {
         return ui::section(
             "Nothing is running",
             vec![ui::empty(
-                "No keys are blessed for this strategy, so nothing can trade for it.",
+                "No keys are blessed for this agent, so nothing can trade for it.",
             )],
         );
     };
@@ -47,7 +47,7 @@ fn panel(strategy: &Rc<Strategy>, attestation: &shared::Attestation) -> Dom {
         vec![
             ui::note("Everything in this panel is on-chain and can be checked without asking us."),
             ui::kv(vec![
-                ("Strategy".to_string(), ui::value(&strategy.name())),
+                ("Agent".to_string(), ui::value(&strategy.name())),
                 (
                     "Bundle".to_string(),
                     html!("div", {
@@ -106,7 +106,7 @@ fn panel(strategy: &Rc<Strategy>, attestation: &shared::Attestation) -> Dom {
             ]),
             ui::notice(
                 Tone::Accent,
-                "One key, one vault, one strategy version",
+                "One key, one vault, one agent version",
                 &format!(
                     "Each blessing binds a key to this vault and this bundle hash, and lasts {} hours \
                      before the executor has to attest again.",
@@ -272,7 +272,7 @@ fn changing() -> Dom {
             html!("div", {
                 .class(["grid", "grid--2"])
                 .child(ui::card(vec![
-                    ui::subheading("The strategy never changes"),
+                    ui::subheading("The agent never changes"),
                     ui::para(
                         "A published bundle is frozen. A new version is a new bundle with its own vault.",
                     ),
