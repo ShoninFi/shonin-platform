@@ -6,7 +6,7 @@
 //! than blocking. The prompt and the output schema are in this repository, so
 //! an author can run the same review over their own code before submitting it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -75,7 +75,7 @@ async fn main() -> Result<()> {
         deployments.clone(),
         "reviewer",
         key,
-        key,
+        chain::attest::Sender::Unlocked(key),
         alloy::primitives::Address::ZERO,
         B256::ZERO,
         || {},
@@ -92,9 +92,9 @@ async fn main() -> Result<()> {
         tokio::spawn(serve_status(SocketAddr::from(([127, 0, 0, 1], args.port))));
     }
 
-    let mut done: HashSet<(B256, u32)> = HashSet::new();
+    let mut refused: HashSet<(B256, u32, u32)> = HashSet::new();
     loop {
-        if let Err(error) = sweep(&chain, &deployments, &args.store, &model, &mut done).await {
+        if let Err(error) = sweep(&chain, &deployments, &args.store, &model, &mut refused).await {
             tracing::warn!(%error, "could not look for work");
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -108,7 +108,7 @@ async fn sweep(
     deployments: &Deployments,
     store: &std::path::Path,
     model: &str,
-    done: &mut HashSet<(B256, u32)>,
+    refused: &mut HashSet<(B256, u32, u32)>,
 ) -> Result<()> {
     let logs = chain
         .logs(
@@ -119,12 +119,25 @@ async fn sweep(
         )
         .await?;
 
+    // Every request is one paid review. Counting the requests for a version
+    // against the reviews the registry already holds is what decides whether
+    // this one has been served, so a restart never re-reviews and a second
+    // purchase is never dropped.
+    let mut asked: HashMap<(B256, u32), u32> = HashMap::new();
+
     for log in logs {
         let Ok(request) = log.log_decode::<IReviewRegistry::ReviewRequested>() else {
             continue;
         };
         let (strategy_id, version) = (request.inner.strategyId, request.inner.version);
-        if done.contains(&(strategy_id, version)) {
+        let nth = {
+            let counted = asked.entry((strategy_id, version)).or_default();
+            *counted += 1;
+            *counted
+        };
+        // A review this reviewer could not produce is not retried forever: it
+        // is a line in the log and the next request's problem.
+        if refused.contains(&(strategy_id, version, nth)) {
             continue;
         }
 
@@ -151,8 +164,7 @@ async fn sweep(
                 },
             )
             .await?;
-        if already > alloy::primitives::U256::ZERO {
-            done.insert((strategy_id, version));
+        if already >= alloy::primitives::U256::from(nth) {
             continue;
         }
 
@@ -164,14 +176,15 @@ async fn sweep(
             strategy_id,
             version,
             &registered,
+            request.inner.by,
         )
         .await
         {
-            Ok(score) => {
-                tracing::info!(version, score, "reviewed");
-                done.insert((strategy_id, version));
+            Ok(score) => tracing::info!(version, score, nth, "reviewed"),
+            Err(error) => {
+                tracing::warn!(%error, "could not review this one");
+                refused.insert((strategy_id, version, nth));
             }
-            Err(error) => tracing::warn!(%error, "could not review this one"),
         }
     }
     Ok(())
@@ -186,6 +199,7 @@ async fn review_one(
     strategy_id: B256,
     version: u32,
     registered: &chain::bindings::strategies::StrategyVersion,
+    bought_by: alloy::primitives::Address,
 ) -> Result<u8> {
     let source_hash = format!("sha256:{}", alloy::hex::encode(registered.sourceHash));
     let source = read_source(store, &source_hash)
@@ -201,12 +215,15 @@ async fn review_one(
         sourceHash: registered.sourceHash,
         reviewerImage: chain::attest::image_digest("reviewer"),
         modelIdHash: keccak256(model.as_bytes()),
-        promptHash: keccak256(PROMPT.as_bytes()),
+        // The prompt and the output schema together: a review is what the
+        // model was asked and the shape it had to answer in, so changing
+        // either changes the review this one can be compared with.
+        promptHash: keccak256([PROMPT.as_bytes(), SCHEMA.as_bytes()].concat()),
         reportHash: hash_to_bytes(&report_hash)?,
         score: report.score,
         findingCount: report.findings.len() as u16,
         reviewedAt: chain.block_timestamp().await? as u64,
-        boughtBy: alloy::primitives::Address::ZERO,
+        boughtBy: bought_by,
     };
     chain
         .send(
@@ -278,7 +295,16 @@ fn sanitise(mut report: Report) -> Report {
 /// Every file of the submitted project, in full, with line numbers so a
 /// finding can point at one.
 fn read_source(store: &std::path::Path, source_hash: &str) -> Result<String> {
-    let archive = std::fs::read(store.join(source_hash.replace(':', "-")).join("source.tar"))?;
+    // Sealed or not, the reviewer reads the code: sealing decides who else may
+    // read it, never whether it was read.
+    let held = store.join(source_hash.replace(':', "-"));
+    let published = held.join("source.tar");
+    let sealed = held.join("source.sealed.tar");
+    let archive = if published.exists() {
+        std::fs::read(published)?
+    } else {
+        std::fs::read(sealed)?
+    };
     let mut reader = tar::Archive::new(std::io::Cursor::new(archive));
     let mut out = String::new();
     for entry in reader.entries()?.flatten() {

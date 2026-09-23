@@ -37,6 +37,9 @@ pub struct Built {
 pub struct Failed {
     pub reason: String,
     pub log: Vec<LogLine>,
+    /// How long it ran before it failed. A build that ran is charged, so a
+    /// failure has to say how much of the machine it used.
+    pub seconds: u32,
 }
 
 pub fn plain(text: impl Into<String>) -> LogLine {
@@ -75,6 +78,7 @@ pub fn build(source: &Path, sdk: &Path, image: &str) -> Result<Built, Failed> {
             return Err(Failed {
                 reason: "the manifest could not be read".to_string(),
                 log,
+                seconds: started.elapsed().as_secs() as u32,
             });
         }
     };
@@ -91,6 +95,7 @@ pub fn build(source: &Path, sdk: &Path, image: &str) -> Result<Built, Failed> {
         return Err(Failed {
             reason: "the SDK could not be pinned".to_string(),
             log,
+            seconds: started.elapsed().as_secs() as u32,
         });
     }
     log.push(plain("the SDK is the build service's own copy"));
@@ -115,6 +120,7 @@ pub fn build(source: &Path, sdk: &Path, image: &str) -> Result<Built, Failed> {
                 return Err(Failed {
                     reason: "the strategy did not compile".to_string(),
                     log,
+                    seconds: started.elapsed().as_secs() as u32,
                 });
             }
         }
@@ -129,6 +135,7 @@ pub fn build(source: &Path, sdk: &Path, image: &str) -> Result<Built, Failed> {
         return Err(Failed {
             reason: "the two passes produced different bytes".to_string(),
             log,
+            seconds: started.elapsed().as_secs() as u32,
         });
     }
     log.push(plain("comparing outputs: byte-identical"));
@@ -139,6 +146,7 @@ pub fn build(source: &Path, sdk: &Path, image: &str) -> Result<Built, Failed> {
         return Err(Failed {
             reason: "the component would not load".to_string(),
             log,
+            seconds: started.elapsed().as_secs() as u32,
         });
     }
     log.push(plain(
@@ -156,6 +164,7 @@ pub fn build(source: &Path, sdk: &Path, image: &str) -> Result<Built, Failed> {
             return Err(Failed {
                 reason: "the bundle could not be made".to_string(),
                 log,
+                seconds: started.elapsed().as_secs() as u32,
             });
         }
     };

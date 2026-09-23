@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::Address;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::Json;
 use axum::extract::{Path as UrlPath, State};
 use axum::http::{StatusCode, header};
@@ -25,6 +25,7 @@ use chain::bindings::attestation::IAttestationRegistry;
 use chain::bindings::erc20::IERC20;
 use chain::bindings::factory::IVaultFactory;
 use chain::bindings::reviews::IReviewRegistry;
+use chain::bindings::vault::IVault;
 use chain::{Client, Deployments, Role};
 use clap::Parser;
 use shared::model::health::Health;
@@ -465,6 +466,9 @@ async fn submissions(
 }
 
 /// An executor's report on how a strategy is running.
+/// Take a health report, but only from a key the registry blessed for that
+/// vault. Anyone may read a report; only the instance running the strategy may
+/// write one, or the page would be repeating whatever it was told.
 async fn post_health(
     State(service): State<Arc<Service>>,
     Json(post): Json<HealthPost>,
@@ -472,8 +476,48 @@ async fn post_health(
     let Ok(vault) = post.vault.parse::<Address>() else {
         return StatusCode::BAD_REQUEST;
     };
+    let Ok(signer) = recover(&post) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let bundle = match service.chain.read(vault, IVault::bundleHashCall {}).await {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            tracing::warn!(%vault, %error, "could not read the vault for a health report");
+            return StatusCode::SERVICE_UNAVAILABLE;
+        }
+    };
+    let blessed = service
+        .chain
+        .read(
+            service.deployments.attestation,
+            IAttestationRegistry::isBlessedForCall {
+                signer,
+                vault,
+                strategyHash: bundle,
+            },
+        )
+        .await
+        .unwrap_or(false);
+    if !blessed {
+        tracing::warn!(%vault, %signer, "a health report from a key this vault has not blessed");
+        return StatusCode::FORBIDDEN;
+    }
+
     service.health.write().await.insert(vault, post.report);
     StatusCode::ACCEPTED
+}
+
+/// Who signed a report, from the signature it carries.
+fn recover(post: &HealthPost) -> Result<Address> {
+    use alloy::primitives::{B256, Signature};
+
+    let bytes = alloy::hex::decode(&post.signature).context("the signature is not hex")?;
+    let signature = Signature::try_from(bytes.as_slice())
+        .map_err(|error| anyhow::anyhow!("the signature is malformed: {error}"))?;
+    let digest = B256::from(HealthPost::digest(&post.vault, &post.report));
+    signature
+        .recover_address_from_msg(digest.as_slice())
+        .context("recovering the signer")
 }
 
 /// Anything the store holds, to whoever has its hash.
@@ -483,6 +527,11 @@ async fn store_file(
 ) -> impl IntoResponse {
     if name.contains("..") || name.contains('/') {
         return (StatusCode::BAD_REQUEST, "no").into_response();
+    }
+    // Sealed source is kept so the reviewer can read it and the build can be
+    // repeated, and it is never served.
+    if name.ends_with(".sealed.tar") {
+        return (StatusCode::FORBIDDEN, "this source is sealed").into_response();
     }
     match service.store.read_path(&hash, &name) {
         Some((bytes, kind)) => ([(header::CONTENT_TYPE, kind)], bytes).into_response(),

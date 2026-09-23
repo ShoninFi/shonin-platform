@@ -412,7 +412,7 @@ contract VaultTest is Fixture {
         vm.stopPrank();
     }
 
-    function test_a_failed_build_closes_the_vault_and_returns_the_tank() public {
+    function test_a_failed_build_is_charged_and_the_rest_is_returned() public {
         give(author, MINIMUM_TANK);
         vm.startPrank(author);
         usd.approve(address(factory), MINIMUM_TANK);
@@ -423,11 +423,46 @@ contract VaultTest is Fixture {
         vm.expectRevert();
         failing.failBuild(keccak256("the two passes disagreed"));
 
+        // The build ran, so the build is charged, and then the vault closes.
+        vm.prank(builder);
+        failing.chargeBuild(0.5e6);
         vm.prank(builder);
         failing.failBuild(keccak256("the two passes disagreed"));
         assertTrue(failing.state() == VaultState.Closed);
-        // The build was charged; the rest is the author's again.
-        assertEq(usd.balanceOf(author), MINIMUM_TANK - REVIEW_FEE);
+        assertEq(usd.balanceOf(author), MINIMUM_TANK - REVIEW_FEE - 0.5e6);
+    }
+
+    function test_only_a_builder_charges_a_build_and_only_once() public {
+        give(author, MINIMUM_TANK);
+        vm.startPrank(author);
+        usd.approve(address(factory), MINIMUM_TANK);
+        Vault building = Vault(factory.create("slow", 1, keccak256("source"), MINIMUM_TANK, 2e6));
+        vm.stopPrank();
+
+        vm.prank(alice);
+        vm.expectRevert();
+        building.chargeBuild(1e6);
+
+        vm.prank(builder);
+        building.chargeBuild(1e6);
+        assertEq(building.tank().balance, MINIMUM_TANK - REVIEW_FEE - 1e6);
+
+        vm.prank(builder);
+        vm.expectRevert();
+        building.chargeBuild(1e6);
+    }
+
+    function test_a_build_cannot_charge_more_than_a_day_of_the_declared_allowances() public {
+        give(author, MINIMUM_TANK);
+        vm.startPrank(author);
+        usd.approve(address(factory), MINIMUM_TANK);
+        Vault building = Vault(factory.create("greedy", 1, keccak256("source"), MINIMUM_TANK, 2e6));
+        vm.stopPrank();
+
+        // The daily cap is 2 USDC, so a builder claiming 30 is believed for 2.
+        vm.prank(builder);
+        building.chargeBuild(30e6);
+        assertEq(building.tank().balance, MINIMUM_TANK - REVIEW_FEE - 2e6);
     }
 
     function test_a_vault_cannot_be_created_without_enough_in_its_tank() public {

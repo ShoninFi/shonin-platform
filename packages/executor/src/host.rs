@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use alloy::primitives::Address;
 use anyhow::Result;
@@ -64,8 +63,8 @@ pub struct Ctx {
     pub counters: Arc<Mutex<Counters>>,
     /// How much fuel a second of running is worth, and when it was last
     /// topped up.
-    pub fuel_per_second: u64,
-    pub last_refuel: Instant,
+    /// The most memory the strategy's instance may hold, from its manifest.
+    pub memory_bytes: usize,
 }
 
 impl Ctx {
@@ -78,30 +77,22 @@ impl Ctx {
 
 /// Top the strategy back up for the time that has passed.
 ///
-/// Fuel is a rate, not a budget: a strategy is entitled to so much work a
-/// second, for as long as it runs. It is topped up whenever it calls the host,
-/// which is every time it does anything, and it can bank a few seconds of it
-/// so a burst of work is not punished.
+/// Fuel is kept topped up, because it is not what bounds a strategy here: the
+/// engine's epoch is, and it takes the machine back every few milliseconds
+/// whatever the strategy is doing. What the declared fuel rate decides is how
+/// often the strategy yields, and what its vault's tank is charged for. Until
+/// the mapping from fuel to processor time is measured, a rate that stopped a
+/// strategy mid-thought would be an arbitrary number deciding whether a
+/// strategy works at all.
 fn refuel<S>(access: &mut Access<'_, Ctx, S>)
 where
     S: wasmtime::component::HasData,
     for<'a> S::Data<'a>: std::ops::DerefMut<Target = Ctx>,
 {
-    let (rate, elapsed) = {
-        let ctx = access.get();
-        (ctx.fuel_per_second, ctx.last_refuel.elapsed())
-    };
-    if elapsed.as_millis() < 200 {
-        return;
-    }
-    access.get().last_refuel = Instant::now();
-
-    let earned = (rate as f64 * elapsed.as_secs_f64()) as u64;
     let mut store = access.as_context_mut();
-    let held = store.get_fuel().unwrap_or(0);
-    // A few seconds' worth is as much as anyone may bank.
-    let ceiling = rate.saturating_mul(5);
-    let _ = store.set_fuel(held.saturating_add(earned).min(ceiling));
+    if store.get_fuel().unwrap_or(0) < crate::runner::BANK / 2 {
+        let _ = store.set_fuel(crate::runner::BANK);
+    }
 }
 
 /// What the executor counts while a strategy runs, and signs into its health
@@ -114,6 +105,29 @@ pub struct Counters {
     pub venue_errors: u64,
     pub faults: u64,
     pub restarts: u64,
+}
+
+/// The memory allowance, enforced. A strategy that asks for more than it
+/// declared is refused the growth, which it sees as an allocation failure and
+/// the host counts as a fault if it cannot carry on.
+impl wasmtime::ResourceLimiter for Ctx {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(desired <= self.memory_bytes)
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        _desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(true)
+    }
 }
 
 impl WasiView for Ctx {

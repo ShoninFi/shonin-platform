@@ -15,8 +15,33 @@ use alloy::sol_types::SolValue;
 use anyhow::{Context, Result, bail};
 
 use crate::bindings::attestation::{IAttestationRegistry, ImageKind, KeyInfo};
-use crate::client::Client;
+use crate::client::{Client, KeyClient};
 use crate::deployments::Deployments;
+
+/// Who puts a blessing on the chain. Anyone may — the proof is what the
+/// registry checks — but a key that holds its own account sends with it, so
+/// two services never reach for the same account's next nonce at once.
+#[derive(Clone)]
+pub enum Sender {
+    /// An account the development chain itself holds the key for.
+    Unlocked(Address),
+    /// A key made inside the service, which signs its own transactions.
+    Own(KeyClient),
+}
+
+impl Sender {
+    async fn send<C: alloy::sol_types::SolCall>(
+        &self,
+        chain: &Client,
+        to: Address,
+        call: C,
+    ) -> Result<()> {
+        match self {
+            Sender::Unlocked(from) => chain.send(*from, to, call).await.map(|_| ()),
+            Sender::Own(key) => key.send(to, call).await.map(|_| ()),
+        }
+    }
+}
 
 /// What an instance attests to. It matches `AttestationRegistry.Journal`.
 type Journal = (B256, B256, Address, B256);
@@ -49,7 +74,7 @@ pub async fn bless_service(
         deployments,
         service,
         key,
-        key,
+        Sender::Unlocked(key),
         Address::ZERO,
         B256::ZERO,
     )
@@ -62,7 +87,7 @@ pub async fn bless_for_vault(
     deployments: &Deployments,
     service: &str,
     key: Address,
-    sender: Address,
+    sender: Sender,
     vault: Address,
     bundle: B256,
 ) -> Result<KeyInfo> {
@@ -75,7 +100,7 @@ async fn bless(
     deployments: &Deployments,
     service: &str,
     key: Address,
-    sender: Address,
+    sender: Sender,
     vault: Address,
     bundle: B256,
 ) -> Result<KeyInfo> {
@@ -108,9 +133,9 @@ async fn bless(
             .unwrap_or(false);
 
         if allowed {
-            chain
+            sender
                 .send(
-                    sender,
+                    chain,
                     deployments.attestation,
                     IAttestationRegistry::blessCall {
                         seal: seal.clone(),
@@ -156,7 +181,7 @@ pub fn keep_blessed(
     deployments: Deployments,
     service: &'static str,
     key: Address,
-    sender: Address,
+    sender: Sender,
     vault: Address,
     bundle: B256,
     mut on_renewal: impl FnMut() + Send + 'static,
@@ -186,7 +211,17 @@ pub fn keep_blessed(
                 .unwrap_or(0);
 
             if left * 3 <= ttl {
-                match bless(&chain, &deployments, service, key, sender, vault, bundle).await {
+                match bless(
+                    &chain,
+                    &deployments,
+                    service,
+                    key,
+                    sender.clone(),
+                    vault,
+                    bundle,
+                )
+                .await
+                {
                     Ok(_) => on_renewal(),
                     // A key that stops being blessed stops being able to act,
                     // so this is never a quiet failure.

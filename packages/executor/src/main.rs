@@ -12,6 +12,7 @@ mod health;
 mod host;
 mod runner;
 mod scale;
+mod usage;
 mod watch;
 
 use std::collections::HashMap;
@@ -116,7 +117,7 @@ async fn sweep(
         let api = args.api_url.clone();
         let task = tokio::spawn(async move {
             if let Err(error) = serve(chain, deployments, engine, vault, bundle, store, api).await {
-                tracing::warn!(vault = %vault, %error, "stopped serving this vault");
+                tracing::warn!(vault = %vault, error = format!("{error:#}"), "stopped serving this vault");
             }
         });
         running.insert(vault, task);
@@ -151,7 +152,7 @@ async fn serve(
         &deployments,
         "executor",
         key.address,
-        key.address,
+        chain::attest::Sender::Own(key.clone()),
         vault,
         bundle,
     )
@@ -177,7 +178,7 @@ async fn serve(
         deployments.clone(),
         "executor",
         key.address,
-        key.address,
+        chain::attest::Sender::Own(key.clone()),
         vault,
         bundle,
         move || {
@@ -199,29 +200,9 @@ async fn serve(
         },
     );
 
-    let (account_tx, account_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (vault_tx, vault_rx) = tokio::sync::mpsc::unbounded_channel();
-    let from_block = chain.block_number().await?;
-    tokio::spawn(watch::run(
-        chain.clone(),
-        vault,
-        deployments.venue,
-        from_block,
-        account_tx,
-        vault_tx,
-    ));
-
-    let runner = runner::Runner {
-        chain: chain.clone(),
-        key: key.clone(),
-        vault,
-        venue: deployments.venue,
-        venue_id: "local".to_string(),
-        config: config_for(&chain, &store, bundle),
-    };
-
     // A strategy's `run` is meant never to return, so the report cannot wait
-    // for it: the counters are shared and sent while it is still running.
+    // for it: the counters are shared and sent while it is still running, and
+    // they outlive a restart so that restarts can be counted at all.
     let counters = Arc::new(Mutex::new(host::Counters::default()));
     let reporter = health::Reporter::new(chain.clone(), key.clone(), vault, api);
     let reporting = counters.clone();
@@ -236,30 +217,82 @@ async fn serve(
         }
     });
 
-    runner
-        .run(
-            &engine,
-            &bundle_path(&store, bundle),
-            account_rx,
-            vault_rx,
-            counters,
-        )
-        .await?;
-    Ok(())
+    let (config, allowances) = manifest_for(&store, bundle);
+
+    // What the day cost, said once a day and charged to the author's tank.
+    tokio::spawn(usage::run(chain.clone(), key.clone(), vault, allowances));
+
+    // A strategy that stops is started again. It rebuilds its own picture from
+    // the venue, so a restart costs it nothing but the time.
+    loop {
+        let (account_tx, account_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (vault_tx, vault_rx) = tokio::sync::mpsc::unbounded_channel();
+        let from_block = chain.block_number().await?;
+        let watching = tokio::spawn(watch::run(
+            chain.clone(),
+            vault,
+            deployments.venue,
+            from_block,
+            account_tx,
+            vault_tx,
+        ));
+
+        let runner = runner::Runner {
+            chain: chain.clone(),
+            key: key.clone(),
+            vault,
+            venue: deployments.venue,
+            venue_id: "local".to_string(),
+            config: config.clone(),
+            allowances,
+        };
+        let outcome = runner
+            .run(
+                &engine,
+                &bundle_path(&store, bundle),
+                account_rx,
+                vault_rx,
+                counters.clone(),
+            )
+            .await;
+        watching.abort();
+        if let Err(error) = outcome {
+            tracing::warn!(%vault, %error, "the strategy could not be run");
+        }
+
+        // The vault may have been killed or frozen while it ran, in which case
+        // there is nothing left to restart.
+        let state = chain.read(vault, IVault::stateCall {}).await?;
+        if !matches!(state, VaultState::Open) {
+            tracing::info!(%vault, "the vault is no longer open; letting it go");
+            return Ok(());
+        }
+        if let Ok(mut counters) = counters.lock() {
+            counters.restarts += 1;
+        }
+        tracing::warn!(%vault, "restarting the strategy");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
 }
 
-/// The config the manifest declared, as the strategy's `run` receives it.
-fn config_for(_chain: &Client, store: &std::path::Path, bundle: B256) -> Vec<u8> {
+/// What the manifest asked for: the config the strategy's `run` receives, and
+/// the compute it declared, which is what its vault's tank is charged for and
+/// so what the host holds it to.
+fn manifest_for(store: &std::path::Path, bundle: B256) -> (Vec<u8>, shared::DeclaredAllowances) {
+    let modest = shared::DeclaredAllowances::modest();
     let path = store
         .join(format!("sha256-{}", alloy::hex::encode(bundle)))
         .join("manifest.json");
     let Ok(bytes) = std::fs::read(path) else {
-        return Vec::new();
+        return (Vec::new(), modest);
     };
     let Ok(manifest) = serde_json::from_slice::<shared::Manifest>(&bytes) else {
-        return Vec::new();
+        return (Vec::new(), modest);
     };
-    strategy_sdk::to_payload(&manifest.config)
+    (
+        strategy_sdk::to_payload(&manifest.config),
+        manifest.runtime.allowances,
+    )
 }
 
 /// Where a bundle's component lives once the build service has written it.

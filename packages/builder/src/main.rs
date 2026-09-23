@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::primitives::{Address, B256, keccak256};
+use alloy::primitives::{Address, B256, U256, keccak256};
 use anyhow::{Context, Result};
 use axum::Json;
 use axum::extract::{Path as UrlPath, State};
@@ -147,7 +147,7 @@ async fn bless(chain: &Client, deployments: &Deployments) -> Result<()> {
         deployments.clone(),
         "builder",
         key,
-        key,
+        chain::attest::Sender::Unlocked(key),
         Address::ZERO,
         B256::ZERO,
         || {},
@@ -215,7 +215,7 @@ async fn submit(
 
 async fn list_jobs(State(service): State<Arc<Service>>) -> Json<Vec<Job>> {
     let jobs = service.jobs.lock().await;
-    Json(jobs.iter().map(|entry| entry.job.clone()).collect())
+    Json(placed(&jobs))
 }
 
 async fn one_job(
@@ -223,10 +223,49 @@ async fn one_job(
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<Job>, StatusCode> {
     let jobs = service.jobs.lock().await;
-    jobs.iter()
-        .find(|entry| entry.job.id == id)
-        .map(|entry| Json(entry.job.clone()))
+    placed(&jobs)
+        .into_iter()
+        .find(|job| job.id == id)
+        .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// The queue as it stands now. A waiting job's position is counted when it is
+/// asked for, not when it was submitted, so a queue that drains is a queue
+/// that visibly drains.
+fn placed(jobs: &[Entry]) -> Vec<Job> {
+    let mut waiting = 0;
+    jobs.iter()
+        .map(|entry| {
+            let mut job = entry.job.clone();
+            if matches!(job.state, JobState::Queued { .. }) {
+                waiting += 1;
+                job.state = JobState::Queued { position: waiting };
+            }
+            job
+        })
+        .collect()
+}
+
+/// What the build cost, at the platform's published prices, charged to the
+/// vault's tank. A build is processor time and nothing else, so that is what
+/// it is billed as.
+async fn charge_build(service: &Arc<Service>, vault: Address, seconds: u32) {
+    let dollars = seconds as f64 / 3_600.0 * shared::Prices::published().vcpu_hour;
+    let amount = U256::from((dollars * 1_000_000.0).round().max(0.0) as u128);
+    if let Err(error) = service
+        .chain
+        .send(
+            service.deployments.roles.builder,
+            vault,
+            IVault::chargeBuildCall { amount },
+        )
+        .await
+    {
+        // The build still happened and the vault still opens: an uncharged
+        // build costs the platform, never the author or the depositors.
+        tracing::warn!(%vault, %error, "the build could not be charged");
+    }
 }
 
 /// Take the oldest job whose vault is ready, and build it.
@@ -276,6 +315,15 @@ async fn take_one(service: &Arc<Service>) -> Result<()> {
     let built =
         tokio::task::spawn_blocking(move || build::build(&source, &sdk, "sha256:dev-builder"))
             .await?;
+
+    // A build that ran is charged, whichever way it ended. The vault's
+    // contract believes the figure only up to a day at the allowances its
+    // author declared.
+    let ran = match &built {
+        Ok(built) => built.seconds,
+        Err(failed) => failed.seconds,
+    };
+    charge_build(service, vault, ran).await;
 
     match built {
         Ok(built) => finish(service, &entry, vault, built).await,
@@ -410,14 +458,20 @@ async fn finish(
             "seconds": built.seconds,
         }),
     )?;
-    if !submission.sealed {
-        store::put(
-            &service.store,
-            &entry.job.source_hash,
-            "source.tar",
-            &entry.bytes()?,
-        )?;
-    }
+    // The source is kept either way, because the reviewer reads it either way
+    // and a rebuild has to be possible for as long as the vault lives. A
+    // sealed one is kept under a name the public store refuses to serve, so
+    // sealing changes who can read the source and nothing else.
+    store::put(
+        &service.store,
+        &entry.job.source_hash,
+        if submission.sealed {
+            "source.sealed.tar"
+        } else {
+            "source.tar"
+        },
+        &entry.bytes()?,
+    )?;
 
     let slug = built.manifest.slug();
     tracing::info!(id = entry.job.id, slug, "built, signed and registered");

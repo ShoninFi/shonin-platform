@@ -145,10 +145,20 @@ impl Reporter {
             signed_by: format!("{:?}", self.key.address),
         };
 
+        // Signed with the key the registry blessed for this vault, so a
+        // reader can tell a report from this instance apart from anybody
+        // else's claim about it.
+        let vault = format!("{:?}", self.vault);
+        let digest = HealthPost::digest(&vault, &report);
+        let signature = self
+            .key
+            .sign(alloy::primitives::B256::from(digest))
+            .context("signing the report")?;
+
         Ok(HealthPost {
-            vault: format!("{:?}", self.vault),
+            vault,
             report,
-            signature: format!("{:?}", self.key.address),
+            signature: alloy::hex::encode_prefixed(signature),
         })
     }
 }

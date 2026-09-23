@@ -194,8 +194,28 @@ pub struct HealthPost {
     /// The vault it is about.
     pub vault: String,
     pub report: Health,
-    /// Signed by a key blessed for that vault.
+    /// A signature over [`HealthPost::digest`] by a key blessed for that
+    /// vault, so a report can only come from whoever holds the vault's keys.
     pub signature: String,
+}
+
+impl HealthPost {
+    /// What a reporter signs and a reader checks: the vault and the report,
+    /// canonically encoded, so two encodings of one report cannot differ.
+    pub fn digest(vault: &str, report: &Health) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+
+        let mut body = Vec::new();
+        // Canonical CBOR, the same encoding the manifest and bundle hashes
+        // use, so there is one way to write a report down.
+        ciborium::into_writer(report, &mut body).expect("a report encodes");
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"shonin-health/1");
+        hasher.update(vault.to_ascii_lowercase().as_bytes());
+        hasher.update(&body);
+        hasher.finalize().into()
+    }
 }
 
 /// What an error looks like, whichever endpoint returned it.

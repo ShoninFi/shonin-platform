@@ -8,7 +8,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use alloy::primitives::Address;
 use anyhow::{Context, Result, anyhow};
@@ -21,10 +21,14 @@ use wasmtime_wasi::WasiCtxBuilder;
 use crate::host::{Counters, Ctx, Strategy};
 use crate::watch::VaultEvent;
 
-/// How much fuel a strategy may burn in a second, until the mapping from fuel
-/// to processor time is measured. It is a rate, not a budget: the strategy is
-/// topped back up as it runs.
-const FUEL_PER_SECOND: u64 = 2_000_000;
+/// The least fuel a second any strategy gets, whatever its manifest says. A
+/// strategy with no fuel would never yield.
+const FUEL_FLOOR: u64 = 100_000;
+
+/// What a strategy's fuel is kept at. It is deliberately far more than any
+/// strategy could burn between host calls: fairness between strategies is the
+/// epoch's job, and the declared fuel rate is what the tank is charged for.
+pub const BANK: u64 = u64::MAX / 4;
 
 /// How long between the host taking control back, so no strategy can hold a
 /// machine to itself.
@@ -37,6 +41,9 @@ pub struct Runner {
     pub venue: Address,
     pub venue_id: String,
     pub config: Vec<u8>,
+    /// What the manifest declared and the vault's tank is charged for. The
+    /// host holds the strategy to it rather than to one figure for everyone.
+    pub allowances: shared::DeclaredAllowances,
 }
 
 impl Runner {
@@ -60,6 +67,7 @@ impl Runner {
         Strategy::add_to_linker::<_, HasSelf<Ctx>>(&mut linker, |ctx| ctx)
             .map_err(|error| anyhow!("the platform's imports: {error}"))?;
 
+        let fuel = self.allowances.fuel_per_sec.max(FUEL_FLOOR);
         let mut store = Store::new(
             engine,
             Ctx {
@@ -79,15 +87,17 @@ impl Runner {
                 account_events: Some(account_events),
                 vault_events: Some(vault_events),
                 counters: counters.clone(),
-                fuel_per_second: FUEL_PER_SECOND,
-                last_refuel: Instant::now(),
+                memory_bytes: self.allowances.memory_mib as usize * 1024 * 1024,
             },
         );
 
-        // A second's worth to begin with; the host tops it back up for the
-        // time that passes, so the allowance is a rate rather than a budget.
-        store.set_fuel(FUEL_PER_SECOND)?;
-        store.fuel_async_yield_interval(Some(FUEL_PER_SECOND / 100))?;
+        // The strategy may grow to the memory it declared and no further.
+        store.limiter(|ctx| ctx);
+
+        // Kept full; the declared rate decides how often the strategy yields
+        // to the host rather than whether it may carry on.
+        store.set_fuel(BANK)?;
+        store.fuel_async_yield_interval(Some((fuel / 100).max(1)))?;
         store.set_epoch_deadline(1);
         store.epoch_deadline_async_yield_and_update(1);
 

@@ -58,6 +58,8 @@ contract Vault is IVault, ERC20 {
     uint32 public immutable freezeAfter;
 
     VaultState private _state;
+    /// The build is charged once, whether it succeeded or failed.
+    bool private _buildCharged;
     Fees private _fees;
     Tank private _tank;
     uint256 public highWaterMark;
@@ -454,6 +456,26 @@ contract Vault is IVault, ERC20 {
         _state = VaultState.Open;
         lastCrystallised = uint64(block.timestamp);
         emit Opened(bundle);
+    }
+
+    function chargeBuild(uint256 amount) external {
+        if (_state != VaultState.Building) revert WrongState();
+        if (!attestation.isBlessedAs(msg.sender, ImageKind.Builder)) {
+            revert NotTheBuilder();
+        }
+        if (_buildCharged) revert DayAlreadyCharged();
+        _buildCharged = true;
+
+        // The builder says what the build cost; the contract believes it only
+        // up to a day at the allowances the author declared, which is the same
+        // bound a day of running is held to.
+        uint256 charge = amount > _tank.dailyCap ? _tank.dailyCap : amount;
+        _tank.lastCharge = charge;
+        uint256 paid = charge > _tank.balance ? _tank.balance : charge;
+        _tank.balance -= paid;
+        _tank.debt += charge - paid;
+        if (paid != 0) asset.safeTransfer(platform, paid);
+        emit TankCharged("build", charge, _tank.debt);
     }
 
     function failBuild(bytes32 reasonHash) external {

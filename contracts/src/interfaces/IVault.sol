@@ -161,8 +161,13 @@ interface IVault {
 
     /// Anyone, once the registry holds this version: the vault opens.
     function open() external;
+    /// A blessed builder key charges the build's metered compute. A build runs
+    /// before the vault has a bundle, so the key is checked as a builder
+    /// rather than as this vault's own key. It may be charged once, and never
+    /// more than a day at the allowances the author declared.
+    function chargeBuild(uint256 amount) external;
     /// A blessed builder key reports that the build failed. The vault closes
-    /// and the author reclaims the tank.
+    /// and the author reclaims what is left of the tank.
     function failBuild(bytes32 reasonHash) external;
     /// The admin key stops the vault: every position closed, all cash home,
     /// every withdrawal paid from the idle balance afterwards.
