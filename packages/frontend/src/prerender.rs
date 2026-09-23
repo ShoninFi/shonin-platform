@@ -11,7 +11,7 @@ use shared::Standing;
 use crate::copy;
 use crate::data;
 use crate::format as fmt;
-use crate::route::{Route, Tab};
+use crate::route::{HANDBOOK, Route, Tab};
 
 // ------------------------------------------------------------- html helpers
 
@@ -118,16 +118,15 @@ fn masthead(route: &Route) -> String {
     let nav: String = Route::nav()
         .into_iter()
         .map(|item| {
-            let current = if Some(&item.route) == section.as_ref() {
+            let current = if item.is_current(section.as_ref()) {
                 " aria-current=\"page\""
             } else {
                 ""
             };
-            let path = item.route.path().unwrap_or_else(|| "/".to_string());
             format!(
                 "<a class=\"mainnav__link\" href=\"{}\"{current}>{}</a>",
-                esc(&path),
-                esc(item.label)
+                esc(&item.href()),
+                esc(item.label())
             )
         })
         .collect();
@@ -153,6 +152,7 @@ fn colophon() -> String {
         ("/verify", "Verify"),
         ("/status", "Status"),
         ("/publish", "Publish an agent"),
+        (HANDBOOK, "Docs"),
     ]
     .into_iter()
     .map(|(href, label)| link(href, label))
@@ -1467,6 +1467,14 @@ fn about() -> String {
         ),
         section("The review", &para(copy::REVIEW_NOTE)),
         section("What Shonin is not", &not_this),
+        section(
+            "The handbook",
+            &format!(
+                "{}{}",
+                para(copy::HANDBOOK_NOTE),
+                el("p", "", &link(HANDBOOK, "Read the handbook"))
+            ),
+        ),
         section(
             "Words used here",
             &table(&["Term", "What it means"], &terms),
