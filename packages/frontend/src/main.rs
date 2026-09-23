@@ -3,11 +3,12 @@
 
 use dominator::{Dom, html, routing};
 use frontend::{
-    pages,
+    api, data, pages,
     route::Route,
     state,
     ui::{overlay, shell},
 };
+use futures_signals::map_ref;
 use futures_signals::signal::SignalExt;
 
 fn main() {
@@ -21,35 +22,75 @@ fn main() {
     }
 
     state::apply_theme(state::get().theme.get());
+    // Everything on the screen comes from here, and keeps coming: the app
+    // asks the platform for a newer snapshot every couple of seconds and
+    // re-renders when it gets one.
+    api::follow();
     dominator::append_dom(&dominator::body(), app());
 }
 
 fn app() -> Dom {
+    let address = routing::url().signal_cloned();
+    let snapshots = data::changes();
+    let reaching_it = data::loading();
+
+    // The page is rendered again when the viewer navigates, when a newer
+    // snapshot arrives, or when the app's view of the platform changes.
+    let pages = map_ref! {
+        let url = address,
+        let version = snapshots,
+        let loading = reaching_it => (url.clone(), loading.clone(), *version)
+    }
+    .map(|(url, loading, _version)| {
+        let route = Route::from_path(&path_of(&url));
+        let page = route.page();
+        document().set_title(&page.title);
+        scroll_to_top();
+        vec![
+            shell::skip_link(),
+            shell::masthead(&route),
+            html!("main", {
+                .class("app__main")
+                .attr("id", "main")
+                .child(html!("div", {
+                    .class(["page", "stack-lg"])
+                    .child(match (&loading, data::current().is_some()) {
+                        // Nothing has arrived yet, so there is nothing honest
+                        // to render.
+                        (data::Loading::Waiting, false) => reaching(),
+                        (data::Loading::Failed(why), false) => unreachable(why),
+                        _ => pages::render(&route),
+                    })
+                }))
+            }),
+            shell::colophon(),
+            overlay::toast_host(&state::get().toasts),
+        ]
+    })
+    .to_signal_vec();
+
     html!("div", {
         .class("app")
-        .children_signal_vec(routing::url()
-            .signal_ref(|url| {
-                let route = Route::from_path(&path_of(url));
-                let page = route.page();
-                document().set_title(&page.title);
-                scroll_to_top();
-                vec![
-                    shell::skip_link(),
-                    shell::masthead(&route),
-                    html!("main", {
-                        .class("app__main")
-                        .attr("id", "main")
-                        .child(html!("div", {
-                            .class(["page", "stack-lg"])
-                            .child(pages::render(&route))
-                        }))
-                    }),
-                    shell::colophon(),
-                    overlay::toast_host(&state::get().toasts),
-                ]
-            })
-            .to_signal_vec())
+        .children_signal_vec(pages)
     })
+}
+
+/// Before the first snapshot lands.
+fn reaching() -> Dom {
+    frontend::ui::primitives::empty("Reading the chain…")
+}
+
+/// When the platform cannot be reached at all. The app says what it tried,
+/// because a page that is simply blank tells a reader nothing.
+fn unreachable(why: &str) -> Dom {
+    frontend::ui::primitives::notice(
+        frontend::ui::primitives::Tone::Warn,
+        "The platform is not answering",
+        &format!(
+            "{why}. Nothing on this page would be true, so none of it is shown. It appears as \
+             soon as the platform answers."
+        ),
+    )
 }
 
 /// Following a link should start at the top of the new page, the way loading

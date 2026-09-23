@@ -1,0 +1,29 @@
+[profile.default]
+src = "src"
+test = "test"
+out = "out"
+libs = ["lib"]
+solc = "0.8.30"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+# The vault and the venue both read a lot of state in one place; the IR
+# pipeline compiles that without hand-shuffling locals to dodge the stack.
+via_ir = true
+# Every value the contracts move is checked, so an unchecked overflow would be
+# a bug, not a saving.
+bytecode_hash = "none"
+remappings = [
+    "forge-std/=lib/forge-std/src/",
+    "openzeppelin/=lib/openzeppelin-contracts/contracts/",
+]
+
+[fmt]
+line_length = 110
+tab_width = 4
+bracket_spacing = false
+int_types = "long"
+multiline_func_header = "params_first_multi"
+quote_style = "double"
+number_underscore = "thousands"
+sort_imports = true

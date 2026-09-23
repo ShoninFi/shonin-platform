@@ -1,6 +1,8 @@
 //! The code tab: the bundle, the project it was compiled from, and the log of
 //! the build that made it.
 
+use std::rc::Rc;
+
 use std::sync::OnceLock;
 
 use dominator::{Dom, clone, events, html};
@@ -19,7 +21,7 @@ fn open_file() -> &'static Mutable<String> {
     OPEN.get_or_init(|| Mutable::new(String::new()))
 }
 
-pub fn render(strategy: &'static Strategy) -> Dom {
+pub fn render(strategy: &Rc<Strategy>) -> Dom {
     html!("div", {
         .class("stack-lg")
         .child(identity(strategy))
@@ -31,7 +33,7 @@ pub fn render(strategy: &'static Strategy) -> Dom {
     })
 }
 
-fn identity(strategy: &'static Strategy) -> Dom {
+fn identity(strategy: &Rc<Strategy>) -> Dom {
     let bundle = &strategy.bundle;
 
     ui::section(
@@ -61,7 +63,8 @@ fn identity(strategy: &'static Strategy) -> Dom {
     )
 }
 
-fn source(strategy: &'static Strategy) -> Dom {
+fn source(strategy: &Rc<Strategy>) -> Dom {
+    let held = strategy.clone();
     let bundle = &strategy.bundle;
 
     match &bundle.source {
@@ -108,7 +111,7 @@ fn source(strategy: &'static Strategy) -> Dom {
                         .child(html!("div", {
                             .child_signal(map_ref! {
                                 let path = open_file().signal_cloned() => {
-                                    Some(file_body(strategy, path))
+                                    Some(file_body(&held, path))
                                 }
                             })
                         }))
@@ -142,7 +145,7 @@ fn source(strategy: &'static Strategy) -> Dom {
     }
 }
 
-fn file_body(strategy: &'static Strategy, path: &str) -> Dom {
+fn file_body(strategy: &Rc<Strategy>, path: &str) -> Dom {
     let Some(file) = strategy
         .bundle
         .source_files
@@ -163,7 +166,7 @@ fn file_body(strategy: &'static Strategy, path: &str) -> Dom {
     })
 }
 
-fn models(strategy: &'static Strategy) -> Dom {
+fn models(strategy: &Rc<Strategy>) -> Dom {
     let models = &strategy.bundle.models;
     if models.is_empty() {
         return html!("span");
@@ -205,7 +208,7 @@ fn models(strategy: &'static Strategy) -> Dom {
     )
 }
 
-fn allowances(strategy: &'static Strategy) -> Dom {
+fn allowances(strategy: &Rc<Strategy>) -> Dom {
     let allowances = &strategy.bundle.allowances;
     let secrets = &strategy.bundle.secrets;
 
@@ -255,7 +258,7 @@ fn allowances(strategy: &'static Strategy) -> Dom {
     ui::section("What it may use", children)
 }
 
-fn build_log(strategy: &'static Strategy) -> Dom {
+fn build_log(strategy: &Rc<Strategy>) -> Dom {
     let lines: Vec<Dom> = strategy
         .bundle
         .build_log
@@ -284,7 +287,7 @@ fn build_log(strategy: &'static Strategy) -> Dom {
     )
 }
 
-fn rebuilding(strategy: &'static Strategy) -> Dom {
+fn rebuilding(strategy: &Rc<Strategy>) -> Dom {
     if !strategy.bundle.source.is_published() {
         return html!("span");
     }

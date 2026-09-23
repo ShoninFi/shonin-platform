@@ -1,0 +1,123 @@
+package shonin:strategy@0.1.0;
+
+/// The small vocabulary every other interface is written in.
+interface types {
+    /// Which venue an action or a query is for, as the manifest names it.
+    type venue-id = string;
+    /// Bytes a venue's own adapter understands. The host decodes them inside
+    /// the measured image; a strategy builds them with a typed crate.
+    type payload = list<u8>;
+
+    /// What the adapter did with one action.
+    variant verdict {
+        /// Its receipt: a fill, an order id, whatever the venue returns.
+        accepted(payload),
+        rejected(string),
+    }
+}
+
+/// The only way out to a venue. A strategy submits actions and is told what
+/// happened to them; it never holds a key and never signs anything.
+interface venues {
+    use types.{venue-id, payload, verdict};
+
+    submit: async func(venue: venue-id, actions: list<payload>) -> list<verdict>;
+    /// Fills, order updates and liquidations on the vault's own account.
+    account-events: func(venue: venue-id) -> stream<payload>;
+    account-state: async func(venue: venue-id, query: payload) -> result<payload, string>;
+}
+
+/// What the vault tells the strategy about itself.
+interface vault {
+    variant vault-event {
+        /// A depositor is leaving and their fraction is being closed. The
+        /// payload carries which fraction.
+        claim-pending(list<u8>),
+        /// The vault is stopping. The strategy has a grace period to unwind
+        /// itself before the contract does it.
+        halting(string),
+    }
+
+    events: func() -> stream<vault-event>;
+}
+
+/// Shared, cached reads: prices, order books, anything the executor can fetch
+/// once and hand to every strategy that wants it.
+interface data {
+    use types.{venue-id, payload};
+
+    query: async func(source: string, request: payload) -> result<payload, string>;
+    subscribe: func(venue: venue-id, feed: payload) -> result<stream<payload>, string>;
+}
+
+/// A socket to any host, terminated by the executor so the strategy never
+/// holds a certificate or a key.
+interface websocket {
+    resource connection {
+        send: async func(message: list<u8>) -> result<_, string>;
+        messages: func() -> stream<list<u8>>;
+    }
+
+    connect: async func(url: string, headers: list<tuple<string, string>>) -> result<connection, string>;
+}
+
+/// Values sealed to the bundle's own hash. The strategy can use them and
+/// nobody, including the platform, can read them.
+interface secrets {
+    get: func(name: string) -> option<string>;
+}
+
+/// A per-strategy cache. It usually survives a restart and is promised to
+/// nobody: a strategy rebuilds what it needs from the venue's own state.
+interface state {
+    get: func(key: string) -> option<list<u8>>;
+    set: func(key: string, value: list<u8>);
+    delete: func(key: string);
+}
+
+/// Running a model the bundle carries. Inference is budgeted, and going over
+/// budget is an error the strategy handles rather than a stall.
+interface inference {
+    variant tensor-data {
+        float32(list<f32>),
+        float64(list<f64>),
+        int32(list<s32>),
+        int64(list<s64>),
+        uint8(list<u8>),
+    }
+
+    /// Row-major.
+    record tensor {
+        shape: list<u32>,
+        data: tensor-data,
+    }
+
+    record named-tensor {
+        name: string,
+        tensor: tensor,
+    }
+
+    variant inference-error {
+        unknown-model(string),
+        invalid-input(string),
+        quota-exceeded(string),
+        backend-error(string),
+    }
+
+    infer: async func(model: string, inputs: list<named-tensor>) -> result<list<named-tensor>, inference-error>;
+}
+
+/// One long-lived program. The host starts `run` once and never schedules it
+/// again: everything the strategy does, it does inside that call.
+world strategy {
+    import types;
+    import venues;
+    import vault;
+    import data;
+    import websocket;
+    import state;
+    import inference;
+    import secrets;
+
+    export run: async func(config: list<u8>) -> result<_, string>;
+}

@@ -43,7 +43,8 @@ impl VaultState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Tank {
     pub balance: f64,
-    /// What usage and gas cost the strategy in a day.
+    /// What the last day's usage statement charged, or, before there is one,
+    /// the most a day may charge at the allowances the author declared.
     pub daily_charge: f64,
     /// What auto-fill tops it back up to.
     pub target: f64,
@@ -82,26 +83,21 @@ pub struct Claim {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ClaimState {
-    /// Booked; the close has not started.
+    /// Booked, and the close has not been attempted yet.
     Pending,
-    /// Reduce-only closes and sales are working inside the exit band.
-    Closing,
-    /// The cash is home and the shares can be burned.
-    CashHome,
-    /// Burned at the marks and paid.
-    Paid,
-    /// The close did not fill inside the band; settlement is retried.
+    /// A settlement was tried and the market was outside the exit band, so
+    /// nothing was sold badly. It is retried.
     Waiting,
+    /// Closed, valued again, burned at the marks, and paid.
+    Paid,
 }
 
 impl ClaimState {
     pub fn label(self) -> &'static str {
         match self {
             Self::Pending => "pending",
-            Self::Closing => "closing",
-            Self::CashHome => "cash home",
-            Self::Paid => "paid",
             Self::Waiting => "waiting for the market",
+            Self::Paid => "paid",
         }
     }
 }
@@ -131,18 +127,6 @@ pub struct Fees {
     pub transaction_bps: u32,
 }
 
-impl Fees {
-    /// The schedule every vault is created with today.
-    pub fn standard() -> Self {
-        Self {
-            streaming_bps: 50,
-            author_bps: 1000,
-            platform_bps: 500,
-            transaction_bps: 10,
-        }
-    }
-}
-
 /// Pooled capital behind one strategy version.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Vault {
@@ -163,6 +147,9 @@ pub struct Vault {
     pub high_water_mark: f64,
     pub last_crystallised: Date,
     pub fees: Fees,
+    /// How far either side of the venue's price a claim may close. Fixed when
+    /// the vault was created, like its fees.
+    pub exit_band_bps: u32,
     pub tank: Tank,
     pub exit_class: ExitClass,
     /// Days an unserved claim freezes the vault after.

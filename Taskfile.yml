@@ -11,6 +11,8 @@ includes:
     taskfile: taskfiles/config.yml
     flatten: true
   frontend: taskfiles/frontend.yml
+  contracts: taskfiles/contracts.yml
+  services: taskfiles/services.yml
 
 tasks:
   default:
@@ -22,10 +24,12 @@ tasks:
     cmds:
       - rustup show active-toolchain || rustup toolchain install
       - npm install
+      # The contracts' libraries are pinned submodules.
+      - git submodule update --init --recursive
       # Commit guard: every commit runs .githooks/commit-msg (see CLAUDE.md).
       - git config core.hooksPath .githooks
       - |
-        for bin in trunk gitleaks claude jq; do
+        for bin in trunk anvil forge gitleaks claude jq; do
           command -v "$bin" >/dev/null || echo "missing: $bin (see README.md)"
         done
         for f in .private/terms.txt .private/review.md; do
@@ -33,8 +37,27 @@ tasks:
         done
 
   dev:
-    desc: "Local dev with live reload"
-    deps: [frontend:dev]
+    desc: "The whole platform, locally: chain, contracts, services and the web app"
+    deps:
+      - services:chain
+      - services:devnet
+      - services:builder
+      - services:reviewer
+      - services:indexer
+      - services:executor
+      - services:coordinator
+      - frontend:dev
+
+  dev:services:
+    desc: "Everything but the web app"
+    deps:
+      - services:chain
+      - services:devnet
+      - services:builder
+      - services:reviewer
+      - services:indexer
+      - services:executor
+      - services:coordinator
 
   build:
     desc: "Release build of everything that deploys"
@@ -47,38 +70,46 @@ tasks:
       - task: frontend:deploy
 
   check:
-    desc: "cargo check: native crates, then wasm crates for wasm32-unknown-unknown"
+    desc: "Compile everything: the contracts, then the crates for each target they run on"
     cmds:
+      - task: contracts:build
       - cargo check --workspace --all-targets {{.CARGO_EXCLUDE_WASM}}
       - cargo check {{.CARGO_WASM_PACKAGES}} --target wasm32-unknown-unknown
+      - cargo check {{.CARGO_WASIP2_PACKAGES}} --target wasm32-wasip2
 
   lint:
-    desc: "rustfmt --check and clippy -D warnings (native and wasm)"
+    desc: "rustfmt --check and clippy -D warnings (native and wasm), forge fmt --check"
     cmds:
+      - task: contracts:lint
       - cargo fmt --all --check
       - cargo clippy --workspace --all-targets {{.CARGO_EXCLUDE_WASM}} -- -D warnings
       - cargo clippy {{.CARGO_WASM_PACKAGES}} --target wasm32-unknown-unknown -- -D warnings
+      - cargo clippy {{.CARGO_WASIP2_PACKAGES}} --target wasm32-wasip2 -- -D warnings
 
   fmt:
-    desc: "Format all crates"
+    desc: "Format every crate and every contract"
     cmds:
       - cargo fmt --all
+      - task: contracts:fmt
 
   test:
-    desc: "Native tests"
+    desc: "Native tests and the contracts' tests"
     cmds:
+      - task: contracts:test
       - cargo test --workspace {{.CARGO_EXCLUDE_WASM}}
 
   clean:
-    desc: "Remove build output"
+    desc: "Remove build output and local chain state"
     cmds:
       - cargo clean
+      - task: contracts:clean
       - rm -rf "{{.PATH_TRUNK_DIST}}"
+      - rm -rf "{{.PATH_LOCAL_STATE}}"
 
   down:
     desc: "Kill stray local dev servers"
     cmds:
       - |
-        for p in {{.PORT_FRONTEND_DEV}}; do
+        for p in {{.PORTS_DEV}}; do
           lsof -ti tcp:$p | xargs kill -9 2>/dev/null || true
         done

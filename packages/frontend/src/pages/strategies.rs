@@ -1,12 +1,15 @@
 //! The leaderboard: every strategy with a vault, and the rules the list is
 //! built by.
 
+use std::rc::Rc;
 use std::sync::OnceLock;
 
 use dominator::{Dom, html};
 use futures_signals::map_ref;
 use futures_signals::signal::Mutable;
 use shared::{ExitClass, Source, Standing, Strategy};
+
+use shared::model::registry::JobState;
 
 use crate::copy;
 use crate::data;
@@ -48,6 +51,16 @@ fn controls() -> &'static Controls {
 
 pub fn render() -> Dom {
     let controls = controls();
+
+    // A platform with nothing ranked yet would otherwise open on an empty
+    // table and say so, which reads as a broken page rather than a young one.
+    // Once anything is ranked, the ranked view is the one worth landing on.
+    if controls.view.get() == View::Ranked
+        && data::ranked().is_empty()
+        && !data::newest().is_empty()
+    {
+        controls.view.set(View::New);
+    }
 
     html!("div", {
         .class("stack-lg")
@@ -191,7 +204,7 @@ fn listing(
     exit: &str,
 ) -> Dom {
     let controls = controls();
-    let mut strategies: Vec<&'static Strategy> = match view {
+    let mut strategies: Vec<Rc<Strategy>> = match view {
         View::Ranked => data::ranked(),
         View::New => data::newest(),
         View::Past => data::past(),
@@ -224,7 +237,7 @@ fn listing(
     let rows: Vec<Row> = strategies
         .into_iter()
         .enumerate()
-        .map(|(index, strategy)| row(index, strategy, ranked))
+        .map(|(index, strategy)| row(index, &strategy, ranked))
         .collect();
 
     let mut columns: Vec<Column> = Vec::new();
@@ -249,15 +262,16 @@ fn listing(
         .child(sortable_table(columns, rows, &controls.sort))
         .child(html!("p", {
             .class(["faint", "small"])
-            .text(
-                "Normalised to 15% annualised volatility, estimated only from the days before each \
-                 one. Raw returns are what the vault actually did."
-            )
+            .text(&format!(
+                "Normalised to {} annualised volatility, estimated only from the days before \
+                 each one. Raw returns are what the vault actually did.",
+                copy::volatility_target()
+            ))
         }))
     })
 }
 
-fn row(index: usize, strategy: &'static Strategy, ranked: bool) -> Row {
+fn row(index: usize, strategy: &Strategy, ranked: bool) -> Row {
     let performance = data::performance(strategy);
     let average = strategy
         .record
@@ -293,7 +307,7 @@ fn row(index: usize, strategy: &'static Strategy, ranked: bool) -> Row {
     Row::linked(parts::path_of(strategy), cells)
 }
 
-fn past_table(strategies: Vec<&'static Strategy>) -> Dom {
+fn past_table(strategies: Vec<Rc<Strategy>>) -> Dom {
     if strategies.is_empty() {
         return ui::empty("Nothing has been superseded or stopped yet.");
     }
@@ -301,16 +315,16 @@ fn past_table(strategies: Vec<&'static Strategy>) -> Dom {
     let rows: Vec<Row> = strategies
         .into_iter()
         .map(|strategy| {
-            let performance = data::performance(strategy);
+            let performance = data::performance(&strategy);
             Row::linked(
-                parts::path_of(strategy),
+                parts::path_of(&strategy),
                 vec![
                     html!("span", { .class("table__primary").text(&strategy.name()) }),
                     ui::muted(&strategy.author),
                     parts::standing_badge(strategy.standing),
                     ui::number(&fmt::days(strategy.days_live)),
                     ui::number(&fmt::percent_signed(performance.total_return, 1)),
-                    ui::muted(&reason(strategy)),
+                    ui::muted(&reason(&strategy)),
                 ],
             )
         })
@@ -349,10 +363,12 @@ fn reason(strategy: &Strategy) -> String {
             .kill
             .as_ref()
             .map_or_else(|| "Stopped.".to_string(), |kill| kill.reason.clone()),
-        Standing::BuildFailed => {
-            "The build didn't produce the same bytes twice, so there is no bundle and no vault."
-                .to_string()
-        }
+        Standing::BuildFailed => data::build_of(&strategy.slug)
+            .and_then(|job| match &job.state {
+                JobState::Failed { reason } => Some(format!("{reason}. No bundle, and no vault.")),
+                _ => None,
+            })
+            .unwrap_or_else(|| "The build failed, so there is no bundle and no vault.".to_string()),
         _ => String::new(),
     }
 }
@@ -404,10 +420,10 @@ fn rules() -> Dom {
         "How this list is built",
         vec![html!("div", {
             .class(["grid", "grid--2"])
-            .children(copy::RANKING.iter().map(|(title, body)| {
+            .children(copy::ranking().into_iter().map(|(title, body)| {
                 ui::card(vec![
-                    html!("h3", { .class("subtitle").text(title) }),
-                    ui::para(body),
+                    html!("h3", { .class("subtitle").text(&title) }),
+                    ui::para(&body),
                 ])
             }))
         })],

@@ -1,0 +1,35 @@
+# The contracts: Solidity built and tested with Foundry.
+# Commands `cd` explicitly rather than using `dir:`, so absolute templated
+# paths behave the same in included taskfiles.
+version: "3"
+
+includes:
+  config:
+    taskfile: ./config.yml
+    flatten: true
+
+tasks:
+  build:
+    desc: "Compile the contracts"
+    cmds:
+      - cd "{{.PATH_CONTRACTS}}" && forge build
+
+  test:
+    desc: "Run the contracts' tests"
+    cmds:
+      - cd "{{.PATH_CONTRACTS}}" && forge test
+
+  fmt:
+    desc: "Format the contracts"
+    cmds:
+      - cd "{{.PATH_CONTRACTS}}" && forge fmt
+
+  lint:
+    desc: "Check the contracts' formatting"
+    cmds:
+      - cd "{{.PATH_CONTRACTS}}" && forge fmt --check
+
+  clean:
+    desc: "Remove the contracts' build output"
+    cmds:
+      - cd "{{.PATH_CONTRACTS}}" && forge clean

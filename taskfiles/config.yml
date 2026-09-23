@@ -14,7 +14,12 @@ vars:
   PATH_ROOT_CARGO_TOML: '{{joinPath .PATH_ROOT "Cargo.toml"}}'
   PATH_PACKAGES: '{{joinPath .PATH_ROOT "packages"}}'
   PATH_PACKAGE_SHARED: '{{joinPath .PATH_PACKAGES "shared"}}'
+  PATH_PACKAGE_CHAIN: '{{joinPath .PATH_PACKAGES "chain"}}'
   PATH_PACKAGE_FRONTEND: '{{joinPath .PATH_PACKAGES "frontend"}}'
+  PATH_PACKAGE_SDK: '{{joinPath .PATH_PACKAGES "strategy-sdk"}}'
+  PATH_CONTRACTS: '{{joinPath .PATH_ROOT "contracts"}}'
+  # What the deploy reads the contracts' bytecode from.
+  PATH_ARTIFACTS: '{{joinPath .PATH_ROOT "contracts" "out"}}'
   PATH_CLOUDFLARE: '{{joinPath .PATH_ROOT "cloudflare"}}'
   PATH_WRANGLER_LANDING: '{{joinPath .PATH_CLOUDFLARE "landing" "wrangler.jsonc"}}'
   PATH_TRUNK_DIST: '{{joinPath .PATH_ROOT ".trunk-dist"}}'
@@ -22,20 +27,52 @@ vars:
   PATH_DIST_FRONTEND: '{{joinPath .PATH_TRUNK_DIST "frontend"}}'
   PATH_DIST_FRONTEND_DEV: '{{joinPath .PATH_TRUNK_DIST "frontend-dev"}}'
 
+  # Everything the local development chain and services write. Gitignored, and
+  # safe to delete: `task dev` rebuilds all of it.
+  PATH_LOCAL_STATE: '{{joinPath .PATH_ROOT ".shonin" "local"}}'
+  # Where the deploy records the contracts' addresses. Every service reads it.
+  PATH_DEPLOYMENTS: '{{joinPath .PATH_LOCAL_STATE "deployments.json"}}'
+  # Content-addressed storage: source archives, bundles, build logs, reviews.
+  PATH_STORE: '{{joinPath .PATH_LOCAL_STATE "store"}}'
+  # Where the build service compiles submissions.
+  PATH_BUILDS: '{{joinPath .PATH_LOCAL_STATE "builds"}}'
+
   # Cargo: crates that run as wasm are also checked for wasm32-unknown-unknown.
   # The frontend builds natively too (its seo tool runs at build time); the
-  # backend only builds for wasm.
-  CARGO_WASM_PACKAGES: "-p shonin-frontend -p shonin-backend -p shonin-shared"
+  # backend only builds for wasm. The SDK's real target is wasm32-wasip2, where
+  # a strategy is compiled into a component.
+  CARGO_WASM_PACKAGES: "-p shonin-frontend -p shonin-backend -p shonin-shared -p shonin-chain"
   CARGO_EXCLUDE_WASM: "--exclude shonin-backend"
+  CARGO_WASIP2_PACKAGES: "-p shonin-strategy-sdk"
 
   # Ports: a base (override with SHONIN_START_PORT_DEV in .env) plus fixed offsets.
   # Offsets are stable; reserved ones stay reserved.
   SHONIN_START_PORT_DEV:
     sh: echo "${SHONIN_START_PORT_DEV:-19080}"
   PORT_FRONTEND_DEV: "{{add (atoi .SHONIN_START_PORT_DEV) 0}}"
-  # +1 reserved: backend API
+  PORT_API: "{{add (atoi .SHONIN_START_PORT_DEV) 1}}"
   # +2 reserved: backend API inspector
+  PORT_CHAIN: "{{add (atoi .SHONIN_START_PORT_DEV) 3}}"
+  PORT_BUILDER: "{{add (atoi .SHONIN_START_PORT_DEV) 4}}"
+  PORT_EXECUTOR: "{{add (atoi .SHONIN_START_PORT_DEV) 5}}"
+  PORT_REVIEWER: "{{add (atoi .SHONIN_START_PORT_DEV) 6}}"
+  PORT_COORDINATOR: "{{add (atoi .SHONIN_START_PORT_DEV) 7}}"
+  PORT_DEVNET: "{{add (atoi .SHONIN_START_PORT_DEV) 8}}"
+  # Every port a local run listens on, for `task down`.
+  PORTS_DEV: "{{.PORT_FRONTEND_DEV}} {{.PORT_API}} {{.PORT_CHAIN}} {{.PORT_BUILDER}} {{.PORT_EXECUTOR}} {{.PORT_REVIEWER}} {{.PORT_COORDINATOR}} {{.PORT_DEVNET}}"
 
   # URLs
   URL_FRONTEND_DEV: "http://localhost:{{.PORT_FRONTEND_DEV}}"
   URL_FRONTEND_PROD: "https://shonin.fi"
+  URL_API_DEV: "http://localhost:{{.PORT_API}}"
+  URL_CHAIN_DEV: "http://localhost:{{.PORT_CHAIN}}"
+  URL_BUILDER_DEV: "http://localhost:{{.PORT_BUILDER}}"
+
+  # The local development chain. Anvil's default mnemonic is public and its
+  # accounts are unlocked, which is exactly what a development chain wants and
+  # exactly why nothing of value ever goes near one.
+  CHAIN_ID_LOCAL: "31337"
+  CHAIN_LABEL_LOCAL: "Local devnet"
+  # Seconds of chain time each block advances: one block a second, an hour of
+  # chain time a second, so a vault reaches its ninety live days in 36 minutes.
+  CHAIN_SECONDS_PER_BLOCK: "3600"

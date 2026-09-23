@@ -3,6 +3,8 @@
 use dominator::{Dom, html};
 
 use crate::copy;
+use crate::data;
+use crate::format as fmt;
 use crate::pages::strategy::fee_table;
 use crate::ui::primitives as ui;
 use crate::ui::primitives::Tone;
@@ -56,10 +58,15 @@ fn guarantees() -> Dom {
 }
 
 fn fees() -> Dom {
+    // The schedule a vault created today carries, as the factory has it.
+    let schedule = match data::terms() {
+        Some(terms) => fee_table(&terms.fees),
+        None => ui::note(copy::REACHING),
+    };
     ui::section(
         "Fees",
         vec![
-            fee_table(),
+            schedule,
             ui::note(copy::FEE_NOTE),
             ui::note(copy::TANK_NOTE),
         ],
@@ -67,7 +74,11 @@ fn fees() -> Dom {
 }
 
 fn leaving() -> Dom {
-    ui::section("Leaving a vault", vec![ui::para(copy::EXIT_NOTE)])
+    let band = match data::terms() {
+        Some(terms) => fmt::from_bps(terms.exit_band_bps),
+        None => "narrow".to_string(),
+    };
+    ui::section("Leaving a vault", vec![ui::para(&copy::exit_note(&band))])
 }
 
 fn review() -> Dom {

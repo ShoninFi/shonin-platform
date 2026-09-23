@@ -1,6 +1,8 @@
 //! "Which code is trading this vault?" — the panel a depositor should read,
 //! and the checks anyone can run against it themselves.
 
+use std::rc::Rc;
+
 use dominator::{Dom, html};
 use shared::{KeyRole, Strategy};
 
@@ -12,7 +14,7 @@ use crate::ui::primitives as ui;
 use crate::ui::primitives::Tone;
 use crate::ui::table::{Column, Row, table};
 
-pub fn render(strategy: &'static Strategy) -> Dom {
+pub fn render(strategy: &Rc<Strategy>) -> Dom {
     let Some(attestation) = &strategy.attestation else {
         return ui::section(
             "Nothing is running",
@@ -33,7 +35,7 @@ pub fn render(strategy: &'static Strategy) -> Dom {
     })
 }
 
-fn panel(strategy: &'static Strategy, attestation: &'static shared::Attestation) -> Dom {
+fn panel(strategy: &Rc<Strategy>, attestation: &shared::Attestation) -> Dom {
     let value = format!(
         "{} {}",
         fmt::money(strategy.vault.value),
@@ -115,7 +117,7 @@ fn panel(strategy: &'static Strategy, attestation: &'static shared::Attestation)
     )
 }
 
-fn keys(attestation: &'static shared::Attestation) -> Dom {
+fn keys(attestation: &shared::Attestation) -> Dom {
     let now = data::now();
     let rows: Vec<Row> = attestation
         .keys
@@ -170,7 +172,7 @@ fn keys(attestation: &'static shared::Attestation) -> Dom {
     )
 }
 
-fn approvals(attestation: &'static shared::Attestation) -> Dom {
+fn approvals(attestation: &shared::Attestation) -> Dom {
     let rows: Vec<Row> = attestation
         .approvals
         .iter()
@@ -230,7 +232,7 @@ fn checks() -> Dom {
     )
 }
 
-fn audits(strategy: &'static Strategy) -> Dom {
+fn audits(strategy: &Rc<Strategy>) -> Dom {
     let rows: Vec<Row> = strategy
         .vault
         .audits
@@ -277,10 +279,17 @@ fn changing() -> Dom {
                 ]))
                 .child(ui::card(vec![
                     ui::subheading("The executor image can"),
-                    ui::para(
-                        "It is our code, and a fix has to reach running vaults. A new image is proposed \
-                         publicly and blessed only after a two-day timelock; removing one is instant.",
-                    ),
+                    ui::para(&format!(
+                        "It is our code, and a fix has to reach running vaults. A new image is \
+                         proposed publicly and blessed only after {}; removing one is instant.",
+                        match data::terms() {
+                            Some(terms) => format!(
+                                "a timelock of {}",
+                                fmt::day_count(terms.image_timelock_days)
+                            ),
+                            None => "a public timelock".to_string(),
+                        }
+                    )),
                 ]))
             }),
             ui::action_link("/status", "Every allowlist change, as it happened"),

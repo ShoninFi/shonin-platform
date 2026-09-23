@@ -1,6 +1,6 @@
 # Shonin Platform
 
-The Shonin platform: one Cargo workspace (`packages/*`) driven by Task. See `README.md` for the layout and the quickstart.
+The Shonin platform: Solidity contracts (`contracts/`) and one Cargo workspace (`packages/*`), driven by Task. See `README.md` for the layout, the quickstart and how to run the whole platform locally.
 
 ## Rules
 
@@ -8,7 +8,10 @@ The Shonin platform: one Cargo workspace (`packages/*`) driven by Task. See `REA
 - **Config has one home.** Non-secret config lives only in `taskfiles/config.yml`. Cloudflare project names live only as `name` in `cloudflare/<target>/wrangler.jsonc`. Secrets live only in `.env`.
 - **Secrets travel by name.** Tasks forward exactly the `.env` variables they need through `requires:` and `env:`. Never pass a secret with `--var`, and never set `CLOUDFLARE_INCLUDE_PROCESS_ENV`. The frontend never receives secrets.
 - **Dependencies live in the workspace.** Declare every version in `[workspace.dependencies]` in the root `Cargo.toml`; crates use `{ workspace = true }`. Keep the wasm-bindgen family (`wasm-bindgen`, `wasm-bindgen-futures`, `js-sys`, `web-sys`) exactly pinned and bumped together.
-- **`shared` is dual-target.** It compiles for native and `wasm32-unknown-unknown` with no `#[cfg(target_arch)]` and no web-sys types.
+- **`shared` and `chain` are dual-target.** They compile for native and `wasm32-unknown-unknown` with no `#[cfg(target_arch)]` and no web-sys types, so the web app and the services read the same types and the same contract bindings.
+- **The contracts' interfaces are the source of truth for both sides.** `contracts/src/interfaces/*.sol` is what the contracts implement and what `packages/chain` parses with `sol!`. Change the interface once and both follow; never hand-write a second copy of a signature.
+- **No key is written down.** The local chain's accounts come from its own published mnemonic, taken by index. `.env` holds a key only when someone points a role at an account of their own.
+- **Nothing local is committed.** A local run writes only under `.shonin/local`, which is gitignored and safe to delete.
 
 ## Commit guard
 

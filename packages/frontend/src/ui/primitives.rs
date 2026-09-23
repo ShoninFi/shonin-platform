@@ -328,6 +328,14 @@ pub fn split_bar(parts: Vec<(f64, &'static str, String)>) -> Dom {
 }
 
 /// A hash or an address, elided, with a button that copies the whole thing.
+/// A command to run, shown as one, and copyable because it is meant to be.
+pub fn code_block(command: &str) -> Dom {
+    html!("div", {
+        .class(["code-block", "num"])
+        .child(copyable(command, command))
+    })
+}
+
 pub fn hash(full: &str) -> Dom {
     copyable(&fmt::short_hash(full), full)
 }

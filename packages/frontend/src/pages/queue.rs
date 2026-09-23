@@ -19,8 +19,7 @@ fn tone(state: &JobState) -> Tone {
 }
 
 pub fn list() -> Dom {
-    let rows: Vec<Row> = data::get()
-        .jobs
+    let rows: Vec<Row> = data::jobs()
         .iter()
         .map(|job| {
             Row::linked(
@@ -135,13 +134,13 @@ pub fn detail(id: &str) -> Dom {
             }))
             .child(ui::badge(job.state.label(), tone(&job.state)))
         }))
-        .child(facts(job))
-        .child(outcome(job))
-        .child(log(job))
+        .child(facts(&job))
+        .child(outcome(&job))
+        .child(log(&job))
     })
 }
 
-fn facts(job: &'static Job) -> Dom {
+fn facts(job: &Job) -> Dom {
     let mut rows = vec![
         (
             "Submitted".to_string(),
@@ -172,7 +171,7 @@ fn facts(job: &'static Job) -> Dom {
     ui::section("The job", vec![ui::kv(rows)])
 }
 
-fn outcome(job: &'static Job) -> Dom {
+fn outcome(job: &Job) -> Dom {
     match &job.state {
         JobState::Failed { reason } => ui::notice(
             Tone::Error,
@@ -204,7 +203,7 @@ fn outcome(job: &'static Job) -> Dom {
     }
 }
 
-fn log(job: &'static Job) -> Dom {
+fn log(job: &Job) -> Dom {
     if job.log.is_empty() {
         return ui::section(
             "The log",

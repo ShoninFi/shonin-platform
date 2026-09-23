@@ -11,6 +11,8 @@ pub enum Chain {
     HyperEvm,
     RobinhoodChain,
     Solana,
+    /// The development chain the platform runs against locally.
+    Local,
 }
 
 impl Chain {
@@ -19,6 +21,7 @@ impl Chain {
             Self::HyperEvm => "HyperEVM",
             Self::RobinhoodChain => "Robinhood Chain",
             Self::Solana => "Solana",
+            Self::Local => "Local devnet",
         }
     }
 
@@ -28,11 +31,17 @@ impl Chain {
             Self::HyperEvm => "USDC",
             Self::RobinhoodChain => "USDG",
             Self::Solana => "USDC",
+            Self::Local => "USDC",
         }
     }
 
-    pub fn all() -> [Chain; 3] {
-        [Self::HyperEvm, Self::RobinhoodChain, Self::Solana]
+    pub fn all() -> [Chain; 4] {
+        [
+            Self::HyperEvm,
+            Self::RobinhoodChain,
+            Self::Solana,
+            Self::Local,
+        ]
     }
 }
 

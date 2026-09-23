@@ -6,8 +6,10 @@
 //! `route.rs` gives it a page in the app, a pre-rendered HTML file and a
 //! sitemap entry.
 
+pub mod api;
 pub mod copy;
 pub mod data;
+pub mod fixture;
 pub mod format;
 pub mod pages;
 pub mod prerender;

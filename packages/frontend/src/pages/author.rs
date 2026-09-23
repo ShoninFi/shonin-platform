@@ -3,6 +3,7 @@
 use dominator::{Dom, html};
 use shared::Standing;
 
+use crate::copy;
 use crate::data;
 use crate::format as fmt;
 use crate::pages::parts;
@@ -110,10 +111,11 @@ pub fn render(handle: &str) -> Dom {
                     "Live, new, superseded, retired, and the builds that failed. Nothing here can be \
                      hidden by its author.",
                 ),
-                ui::note(
-                    "An author can publish under a fresh identity, but every strategy needs ninety live \
-                     days before it is ranked.",
-                ),
+                ui::note(&format!(
+                    "An author can publish under a fresh identity, but every strategy needs {} \
+                     live days before it is ranked.",
+                    copy::days_to_rank()
+                )),
             ],
         ))
     })

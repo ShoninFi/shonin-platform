@@ -84,7 +84,7 @@ fn featured() -> Dom {
     let cards: Vec<Dom> = data::ranked()
         .into_iter()
         .take(4)
-        .map(parts::strategy_card)
+        .map(|strategy| parts::strategy_card(&strategy))
         .collect();
 
     ui::section_with_aside(
@@ -108,11 +108,11 @@ fn how_it_works() -> Dom {
         "How it works",
         vec![html!("ol", {
             .class("steps")
-            .children(copy::HOW_IT_WORKS.iter().map(|(title, body)| {
+            .children(copy::how_it_works().into_iter().map(|(title, body)| {
                 html!("li", {
                     .class(["steps__item", "is-done"])
                     .child(html!("div", { .class("steps__title").text(title) }))
-                    .child(html!("p", { .class("muted").text(body) }))
+                    .child(html!("p", { .class("muted").text(&body) }))
                 })
             }))
         })],

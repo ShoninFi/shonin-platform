@@ -204,16 +204,16 @@ fn home() -> String {
     }));
 
     let steps = list(
-        copy::HOW_IT_WORKS
-            .iter()
-            .map(|(title, body)| format!("{} {}", el("strong", "", &esc(title)), esc(body))),
+        copy::how_it_works()
+            .into_iter()
+            .map(|(title, body)| format!("{} {}", el("strong", "", &esc(title)), esc(&body))),
     );
 
     let rows: Vec<Vec<String>> = ranked()
         .into_iter()
         .take(5)
         .map(|strategy| {
-            let performance = performance(strategy);
+            let performance = performance(&strategy);
             vec![
                 link(&format!("/strategies/{}", strategy.slug), &strategy.name()),
                 esc(&strategy.author),
@@ -316,11 +316,11 @@ fn strategies() -> String {
         "Capital",
     ];
 
-    let ranked_rows: Vec<Vec<String>> = ranked().into_iter().map(row).collect();
+    let ranked_rows: Vec<Vec<String>> = ranked().iter().map(|strategy| row(strategy)).collect();
     let new_rows: Vec<Vec<String>> = data::vaults()
-        .into_iter()
+        .iter()
         .filter(|strategy| strategy.standing == Standing::New)
-        .map(row)
+        .map(|strategy| row(strategy))
         .collect();
     let rest_rows: Vec<Vec<String>> = data::vaults()
         .into_iter()
@@ -336,9 +336,9 @@ fn strategies() -> String {
         .collect();
 
     let rules = list(
-        copy::RANKING
-            .iter()
-            .map(|(title, body)| format!("{} {}", el("strong", "", &esc(title)), esc(body))),
+        copy::ranking()
+            .into_iter()
+            .map(|(title, body)| format!("{} {}", el("strong", "", &esc(&title)), esc(&body))),
     );
 
     [
@@ -352,7 +352,10 @@ fn strategies() -> String {
             "New",
             &format!(
                 "{}{}",
-                para("Open for deposits, and not ranked until they have ninety live days."),
+                para(&format!(
+                    "Open for deposits, and not ranked until they have {} live days.",
+                    copy::days_to_rank()
+                )),
                 table(&headers, &new_rows)
             ),
         ),
@@ -405,12 +408,12 @@ fn strategy(slug: &str, tab: Tab) -> String {
     );
 
     let content = match tab {
-        Tab::Overview => strategy_overview(strategy),
-        Tab::Record => strategy_record(strategy),
-        Tab::Code => strategy_code(strategy),
-        Tab::Review => strategy_review(strategy),
-        Tab::Verify => strategy_verify(strategy),
-        Tab::Health => strategy_health(strategy),
+        Tab::Overview => strategy_overview(&strategy),
+        Tab::Record => strategy_record(&strategy),
+        Tab::Code => strategy_code(&strategy),
+        Tab::Review => strategy_review(&strategy),
+        Tab::Verify => strategy_verify(&strategy),
+        Tab::Health => strategy_health(&strategy),
     };
 
     format!("{header}{content}")
@@ -585,9 +588,18 @@ fn strategy_overview(strategy: &shared::Strategy) -> String {
 
         out.push(section(
             "Fees",
-            &format!("{}{}", fee_table(), para(copy::FEE_NOTE)),
+            &format!(
+                "{}{}",
+                fee_table(&strategy.vault.fees),
+                para(copy::FEE_NOTE)
+            ),
         ));
-        out.push(section("Leaving", &para(copy::EXIT_NOTE)));
+        out.push(section(
+            "Leaving",
+            &para(&copy::exit_note(&fmt::from_bps(
+                strategy.vault.exit_band_bps,
+            ))),
+        ));
     }
 
     if !strategy.limits.is_empty() {
@@ -614,11 +626,33 @@ fn strategy_overview(strategy: &shared::Strategy) -> String {
     out.concat()
 }
 
-fn fee_table() -> String {
-    let rows: Vec<Vec<String>> = copy::FEES
-        .iter()
-        .map(|(fee, on, to, level)| vec![esc(fee), esc(on), esc(to), esc(level)])
-        .collect();
+fn fee_table(fees: &shared::Fees) -> String {
+    let rows = vec![
+        vec![
+            esc("Streaming fee"),
+            esc("The vault's value"),
+            esc("Shonin"),
+            esc(&format!("{} a year", fmt::from_bps(fees.streaming_bps))),
+        ],
+        vec![
+            esc("Author fee"),
+            esc("Gains above the high-water mark, daily"),
+            esc("The author, filling the vault's tank first"),
+            esc(&format!("{} of profit", fmt::from_bps(fees.author_bps))),
+        ],
+        vec![
+            esc("Shonin fee"),
+            esc("The same gains"),
+            esc("Shonin"),
+            esc(&format!("{} of profit", fmt::from_bps(fees.platform_bps))),
+        ],
+        vec![
+            esc("Transaction fee"),
+            esc("Every deposit and withdrawal"),
+            esc("Nobody: it stays in the pool"),
+            esc(&fmt::from_bps(fees.transaction_bps)),
+        ],
+    ];
     table(&["Fee", "Charged on", "Paid to", "Level"], &rows)
 }
 
@@ -1148,15 +1182,14 @@ fn portfolio() -> String {
             "What you hold across vaults, with your pending claims and how correlated your \
              holdings are with each other.",
         ),
-        para("This page is built in your browser from your own wallet, so there is nothing to show until you connect one."),
+        para("This page shows what one address holds, read from the chain, so there is nothing to show until you connect a wallet."),
         para_link("/strategies", "Browse the strategies"),
     ]
     .concat()
 }
 
 fn queue() -> String {
-    let rows: Vec<Vec<String>> = data::get()
-        .jobs
+    let rows: Vec<Vec<String>> = data::jobs()
         .iter()
         .map(|job| {
             vec![
@@ -1247,9 +1280,9 @@ fn job(id: &str) -> String {
 
 fn publish() -> String {
     let steps = list(
-        copy::PUBLISH_STEPS
-            .iter()
-            .map(|(title, body)| format!("{} {}", el("strong", "", &esc(title)), esc(body))),
+        copy::publish_steps()
+            .into_iter()
+            .map(|(title, body)| format!("{} {}", el("strong", "", &esc(title)), esc(&body))),
     );
 
     [
@@ -1286,8 +1319,7 @@ fn publish() -> String {
 }
 
 fn status() -> String {
-    let items: String = data::get()
-        .feed
+    let items: String = data::feed()
         .iter()
         .map(|event| {
             let link_html = event
@@ -1372,13 +1404,20 @@ fn verify() -> String {
         ),
         section(
             "Changing the code that runs vaults",
-            &para(
-                "A strategy never changes: it is what the depositor chose. The executor is our \
-                 code and has to be patchable, so a new image is proposed publicly and can only \
-                 be blessed after a two-day timelock — long enough for anyone to rebuild it from \
-                 source and object. Removing an image is instant. A running vault adopts a new \
-                 image by failover, with its own on-chain approval as the handoff.",
-            ),
+            &para(&format!(
+                "A strategy never changes: it is what the depositor chose. The executor is \
+                     our code and has to be patchable, so a new image is proposed publicly and \
+                     can only be blessed after {} — long enough for anyone to rebuild it from \
+                     source and object. Removing an image is instant. A running vault adopts a \
+                     new image by failover, with its own on-chain approval as the handoff.",
+                match data::terms() {
+                    Some(terms) => format!(
+                        "a timelock of {}",
+                        fmt::day_count(terms.image_timelock_days)
+                    ),
+                    None => "a public timelock".to_string(),
+                }
+            )),
         ),
     ]
     .concat()
@@ -1417,12 +1456,21 @@ fn about() -> String {
             "Fees",
             &format!(
                 "{}{}{}",
-                fee_table(),
+                match data::terms() {
+                    Some(terms) => fee_table(&terms.fees),
+                    None => para(copy::REACHING),
+                },
                 para(copy::FEE_NOTE),
                 para(copy::TANK_NOTE)
             ),
         ),
-        section("Leaving a vault", &para(copy::EXIT_NOTE)),
+        section(
+            "Leaving a vault",
+            &para(&copy::exit_note(&match data::terms() {
+                Some(terms) => fmt::from_bps(terms.exit_band_bps),
+                None => "narrow".to_string(),
+            })),
+        ),
         section("The review", &para(copy::REVIEW_NOTE)),
         section("What Shonin is not", &not_this),
         section(
@@ -1450,10 +1498,15 @@ fn not_found() -> String {
 mod tests {
     use super::*;
 
+    fn platform() {
+        crate::fixture::install();
+    }
+
     /// Every route must pre-render something substantial: an empty page would
     /// be a page crawlers and readers without JavaScript see as blank.
     #[test]
     fn every_route_renders_a_real_page() {
+        platform();
         for route in Route::all_pages() {
             let html = body(&route);
             assert!(
@@ -1477,6 +1530,7 @@ mod tests {
     /// every link-preview bot — sees a different page from everyone else.
     #[test]
     fn a_strategys_pre_render_carries_the_same_facts() {
+        platform();
         for strategy in data::vaults() {
             let html = body(&Route::Strategy {
                 slug: strategy.slug.clone(),
@@ -1532,6 +1586,7 @@ mod tests {
     /// figure shown on one is the figure shown on the other.
     #[test]
     fn the_home_page_carries_the_platform_totals() {
+        platform();
         let html = body(&Route::Home);
         assert!(html.contains(&esc(copy::PITCH)));
         assert!(html.contains(&esc(&fmt::money_compact(data::total_vault_capital()))));
@@ -1549,6 +1604,7 @@ mod tests {
     /// carries the navigation and the footer.
     #[test]
     fn every_page_can_be_left_again() {
+        platform();
         for route in Route::indexable() {
             let html = body(&route);
             assert!(html.contains("class=\"mainnav\""), "{:?}", route.path());
@@ -1559,6 +1615,7 @@ mod tests {
 
     #[test]
     fn the_not_found_page_renders_too() {
+        platform();
         let html = body(&Route::NotFound);
         assert!(html.contains("Page not found"));
     }
@@ -1566,6 +1623,7 @@ mod tests {
     /// Nothing in the data escapes into the markup as HTML.
     #[test]
     fn text_from_the_data_is_escaped() {
+        platform();
         assert_eq!(
             esc("<script>a & b</script>"),
             "&lt;script&gt;a &amp; b&lt;/script&gt;"

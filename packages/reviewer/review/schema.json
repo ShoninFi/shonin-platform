@@ -1,0 +1,44 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["score", "summary", "findings", "limits"],
+  "properties": {
+    "score": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "summary": {
+      "type": "string",
+      "description": "What the code does, in the reviewer's own words, beside the author's."
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["category", "severity", "summary", "detail", "file", "line"],
+        "properties": {
+          "category": {
+            "type": "string",
+            "enum": [
+              "unbounded-risk",
+              "missing-failure-handling",
+              "model-dependence",
+              "external-dependence",
+              "known-failure-pattern",
+              "hidden-behaviour",
+              "unaudited-dependencies"
+            ]
+          },
+          "severity": { "type": "string", "enum": ["note", "concern", "serious"] },
+          "summary": { "type": "string" },
+          "detail": { "type": "string" },
+          "file": { "type": "string" },
+          "line": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "limits": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "What this review could not see."
+    }
+  }
+}

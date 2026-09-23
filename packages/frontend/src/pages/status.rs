@@ -25,7 +25,7 @@ pub fn render() -> Dom {
         }))
         .child(html!("div", {
             .class("stack")
-            .children(data::get().feed.iter().map(entry))
+            .children(data::feed().iter().map(|event| entry(event)))
         }))
         .child(ui::section(
             "What can be done to a running vault",
@@ -40,24 +40,36 @@ pub fn render() -> Dom {
                 ]))
                 .child(ui::card(vec![
                     ui::subheading("An image change"),
-                    ui::para(
-                        "A new executor image is proposed publicly and blessed only after a two-day \
-                         timelock. Revoking one is instant.",
-                    ),
+                    ui::para(&match data::terms() {
+                        Some(terms) => format!(
+                            "A new executor image is proposed publicly and blessed only after a \
+                             timelock of {}. Revoking one is instant.",
+                            fmt::day_count(terms.image_timelock_days)
+                        ),
+                        None => "A new executor image is proposed publicly and blessed only after \
+                                 a timelock. Revoking one is instant."
+                            .to_string(),
+                    }),
                 ]))
                 .child(ui::card(vec![
                     ui::subheading("A freeze"),
-                    ui::para(
-                        "A claim that goes unserved for seven days freezes its vault: no new deposits, and \
-                         only unwinding remains possible.",
-                    ),
+                    ui::para(&match data::terms() {
+                        Some(terms) => format!(
+                            "A claim that goes unserved for {} freezes its vault: no new \
+                             deposits, and only unwinding remains possible.",
+                            fmt::day_count(terms.freeze_after_days)
+                        ),
+                        None => "A claim that goes unserved past the freeze period freezes its \
+                                 vault: no new deposits, and only unwinding remains possible."
+                            .to_string(),
+                    }),
                 ]))
             })],
         ))
     })
 }
 
-fn entry(event: &'static FeedEvent) -> Dom {
+fn entry(event: &FeedEvent) -> Dom {
     let tone = if event.kind.is_alarming() {
         Tone::Warn
     } else {
