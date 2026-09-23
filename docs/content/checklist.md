@@ -55,6 +55,8 @@ The guarantees are the product. Everything else is how they are shown.
 - [ ] `local` **Admission and charges**: a job admitted once its vault exists and its tank covers the minimum; a build charged because it ran; a failed build closing the vault and returning the rest
 - [ ] `local` **The signature** binding source, manifest and bundle to the chain, the registry, the strategy and its author
 - [ ] `local` **The review**: a pinned model, prompt, schema, categories and severities, signed and recorded, with anyone able to buy a fresh one
+- [ ] **A calibrated score**: a second model answers a fixed battery of narrow questions and the score is computed from the answers with published weights, so a reader can see which question moved it. The battery, the client and the comparison harness are built; measuring it needs an account
+- [ ] **A calibration set**: a fixed set of strategies with agreed scores, re-run before any reviewer image is proposed, so a change to the model or the prompt has to show what it did to them
 - [ ] **A hermetic build**: a published, pinned builder image with an offline dependency snapshot, remapped paths and a fixed timestamp, so an outsider's rebuild matches ours byte for byte. Until this is done, a rebuild can differ for reasons that have nothing to do with the source
 - [ ] **Reproducibility shown rather than asserted**: rebuild published bundles off the critical path, deliberately varying the machine, the path and the date, and show the result on the strategy page
 - [ ] **Rebuild attestations from outsiders**, so corroboration accrues publicly instead of resting on our word

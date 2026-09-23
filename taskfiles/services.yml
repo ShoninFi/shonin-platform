@@ -86,6 +86,22 @@ tasks:
         {{.SERVICE_ARGS}}
         --port {{.PORT_REVIEWER}}
 
+  calibrate:
+    desc: "Compare the prose reviewer with the battery (PROJECTS=dir... [INJECTION=1])"
+    vars:
+      INJECTION: '{{if .INJECTION}}--injection{{end}}'
+    cmds:
+      # Development tooling, not a service. Neither model is required: without
+      # them it prints the battery it would ask and stops. Point PROJECTS at
+      # the strategies to review, or set SHONIN_BOTS_DIR and it reads the
+      # strategies in that checkout.
+      - |
+        projects="{{.PROJECTS}}"
+        if [ -z "$projects" ] && [ -n "${SHONIN_BOTS_DIR:-}" ]; then
+          projects=$(find "${SHONIN_BOTS_DIR}/packages/bots" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | tr '\n' ' ')
+        fi
+        cargo run -q -p shonin-reviewer --bin calibrate -- {{.INJECTION}} $projects
+
   executor:
     desc: "The executor"
     cmds:
