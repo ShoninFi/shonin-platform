@@ -30,6 +30,7 @@ nav = [
     ]},
     {"Verify it yourself" = "verify.md"},
     {"Putting money in" = "depositors.md"},
+    {"Fees" = "fees.md"},
     {"Publishing an agent" = "authors.md"},
     {"Technical deep-dive" = [
         {"The whole system" = "how-it-works/index.md"},
@@ -42,8 +43,8 @@ nav = [
     ]},
     {"Run it locally" = "run-locally.md"},
     {"Reference" = [
-        {"Parameters" = "reference/parameters.md"},
         {"The API" = "reference/api.md"},
+        {"Verification helpers" = "reference/verification.md"},
         {"Glossary" = "reference/glossary.md"},
     ]},
     {"Build checklist" = "checklist.md"},

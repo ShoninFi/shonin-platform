@@ -98,6 +98,8 @@
     --h-disc: rgba(67, 56, 202, 0.06);
     --h-glass-disc: rgba(13, 148, 136, 0.08);
     --h-red-soft: rgba(220, 38, 38, 0.07);
+    --h-blob-solid: #f4f4fb;
+    --h-amber-dark: #d97706;
     --h-badge-ink: #ffffff;
     --h-shine-strong: rgba(255, 255, 255, 0.9);
     --h-coin-ink: #1e1b4b;
@@ -130,6 +132,8 @@
     --h-disc: rgba(165, 180, 252, 0.06);
     --h-glass-disc: rgba(45, 212, 191, 0.07);
     --h-red-soft: rgba(248, 113, 113, 0.08);
+    --h-blob-solid: #16161f;
+    --h-amber-dark: #d99a0b;
     --h-badge-ink: #0b0b10;
     --h-shine-strong: rgba(255, 255, 255, 0.35);
     --h-blob: rgba(165, 180, 252, 0.05);
@@ -157,6 +161,7 @@
 .shonin-hero .h-plaque { fill: #ffffff; font-size: 19px; font-weight: 700; }
 .shonin-hero .h-tag { fill: var(--h-ink); font-size: 16px; font-weight: 700; }
 .shonin-hero .h-bag { fill: var(--h-coin-ink); font-size: 24px; font-weight: 800; }
+.shonin-hero .h-ticket { fill: var(--h-teal); font-size: 15px; font-weight: 800; }
 .shonin-hero .h-coin { fill: var(--h-coin-ink); font-size: 12px; font-weight: 700; }
 
 /* The indigo primary button disappears into the dark background. */

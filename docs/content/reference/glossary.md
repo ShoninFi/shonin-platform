@@ -78,7 +78,7 @@ One word for one thing, throughout the platform and these docs.
 : The venue's own reference price, used to value a deposit. A withdrawal uses **exit-side marks** instead: a long at the bid, a short at the ask.
 
 **New**
-: An agent open for deposits but not yet ranked, because it has fewer than ninety live days.
+: An agent open for deposits but not yet ranked, because its record is still too short to mean much.
 
 **Normalised return**
 : A record rescaled to a common 15% annualised volatility, so agents can be compared at one level of risk. Shown beside the raw return, never instead of it.
@@ -87,7 +87,7 @@ One word for one thing, throughout the platform and these docs.
 : A vault's own on-chain history: value per share over time, read from the contract that computes it.
 
 **Review**
-: An attested model's reading of the source before it is built: a score out of 100 with findings, each in a fixed category with a severity, a file and a line. A score, not a gate, except that code found malicious is refused and never built.
+: An attested model's reading of the source before it is built: a score out of 100, a written assessment, and findings, each in a fixed category with a severity. Only for public source do findings point to a file and a line. A score, not a gate, except that code found malicious is refused and never built.
 
 **Sealed**
 : Source, or a secret, encrypted so that only the attested services can read it. Sealing changes who can read something, never whether it was compiled or reviewed.

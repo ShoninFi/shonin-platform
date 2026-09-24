@@ -45,7 +45,7 @@ Everything a run writes lives under `.shonin/local`, which is safe to delete; th
 
 ## The clock runs fast
 
-A block is mined every second and advances an hour of chain time, so a week of fees passes in under three minutes and a vault reaches the ninety live days it needs to be ranked in about thirty-six minutes. Crystallisation, claims, freezes and blessing renewals all become things you can watch rather than read about.
+A block is mined every second and advances an hour of chain time, so a week of fees passes in under three minutes and a vault builds up the record it needs to be ranked in well under an hour. Crystallisation, claims, freezes and blessing renewals all become things you can watch rather than read about.
 
 ## The development wallet
 

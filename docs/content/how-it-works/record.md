@@ -16,7 +16,7 @@ Every trade behind that number is a public event on the venue: every order, ever
 
 **Normalised for risk.** Returns are rescaled to a common 15% annualised volatility, so a list of agents is not simply a list of who used the most leverage. The volatility used for the rescaling is an exponentially weighted moving average of daily returns with a sixty-day half-life, estimated only from the days *before* each one, never from the whole series, so no part of a record is normalised by information from its own future. A very quiet record is scaled up by at most three times, because multiplying a tiny sample by a large number invents confidence that is not there.
 
-**Ninety days before ranking.** An agent is open for deposits from its first day, labelled **new**, and is not ranked until it has ninety live days. A short run of good days is noise, and ranking it would be selling noise.
+**A minimum record before ranking.** An agent is open for deposits from its first day, labelled **new**, and is not ranked until it has been live long enough for its record to mean something. A short run of good days is noise, and ranking it would be selling noise.
 
 **The size it was earned at.** Every record shows the capital behind it, now, on average and at most. Nothing is extrapolated to a size the agent never traded. An edge that worked on a small vault very often does not survive a large one, and the record should let you see that rather than hide it.
 
@@ -32,7 +32,7 @@ The platform's job is to make the history impossible to fake. Reading it is stil
 
 An Author's page shows **everything they have published**: live, new, superseded, retired, the builds that failed, and the projects the review refused. Nothing there can be hidden by its Author.
 
-An Author can publish under a fresh identity, of course. What they cannot do is carry a record with them: every agent needs its own ninety live days before it is ranked, whoever wrote it.
+An Author can publish under a fresh identity, of course. What they cannot do is carry a record with them: every agent has to build its own record before it is ranked, whoever wrote it.
 
 ## Run your own indexer
 

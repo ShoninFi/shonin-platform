@@ -60,7 +60,7 @@ The content-addressed store, addressed by the hashes the chain holds:
 | `manifest.json` | What the Author declared |
 | `log.json` | The build log |
 | `hashes.json` | Every hash this build produced, beside the bytes they name |
-| `report.json` | A review's full report |
+| `report.json` | A review's report, as published: for sealed source, without anything that points into the code |
 
 Sealed source is kept so the Reviewer can read it and a build can be repeated, and the store refuses to serve it.
 

@@ -25,7 +25,9 @@ Every finding falls into exactly one of eight categories. The first refuses the 
 | `hidden-behaviour` | Code paths that behave very differently from the rest, such as logic that trades differently after a date or a signal |
 | `unaudited-dependencies` | Crates with little use elsewhere, pulled into code that holds Depositors' money |
 
-Each finding carries a severity (**note**, **concern** or **serious**) and points at a file and a line. The report also carries a summary in the Reviewer's own words, beside the Author's, and a plain list of **what the review could not tell**.
+Each finding carries a severity (**note**, **concern** or **serious**). The report also carries an overall assessment in the Reviewer's own words, beside the Author's summary, and a plain list of **what the review could not tell**.
+
+When the source is public, each finding also points to a file and a line. When it is sealed, the published report leaves out anything that would reveal the code: no file names, no line numbers and no quotes. The Reviewer still reads all of it; the report just doesn't repeat it.
 
 ## The score
 
@@ -57,7 +59,7 @@ submitReview(strategyId, version, Review(
     bytes32 reviewerImage,     // the image it ran in
     bytes32 modelIdHash,       // the pinned model
     bytes32 promptHash,        // the prompt and the output schema together
-    bytes32 reportHash,        // the full JSON report
+    bytes32 reportHash,        // the report as published
     uint8   score,             // 0-100
     uint16  findingCount,
     uint64  reviewedAt,
@@ -80,12 +82,12 @@ Nothing is re-reviewed automatically when the reviewer image changes. A review s
 An agent's comments, identifiers and strings are text the Author controls and a model reads. Three things bound that:
 
 - **The prompt comes first and is pinned in the image**, and the Author's code follows it as clearly delimited data, named as data and given no authority over the review.
-- **The output is schema-constrained.** The model can only return a score and findings from the fixed categories, each with a severity, a file and a line.
-- **Addressing the Reviewer is itself a finding.** Text that tries to instruct the Reviewer is reported as hidden behaviour, quoted where it appears, and scores the agent down.
+- **The output is schema-constrained.** The model can only return a score, an assessment, and findings from the fixed categories, each with a severity and, for public source, a file and a line.
+- **Addressing the Reviewer is itself a finding.** Text that tries to instruct the Reviewer is reported as hidden behaviour, and scores the agent down. For public source the report quotes it where it appears.
 
 ## Sealed source
 
-Sealed source is reviewed exactly like published source. The Reviewer reads it on its attested machine; the store refuses to serve it to anyone else. What a Depositor relies on is the attested build plus the attested review. Published source is extra, and it is what makes an independent rebuild possible.
+Sealed source is reviewed exactly like published source. The Reviewer reads it on its attested machine; the store refuses to serve it to anyone else, and the published report gives a score, an assessment and findings by category, but never points into the code. What a Depositor relies on is the attested build plus the attested review. Published source is extra, and it is what makes an independent rebuild possible.
 
 ## A new version
 

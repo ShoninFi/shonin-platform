@@ -101,7 +101,7 @@ A vault's executors are then blessed for that exact `bundleHash`, so the chain f
 
 ## Opening
 
-Once the registry holds the bundle, **anyone** can open the vault. It is a public function, not a favour. From that moment it takes deposits, labelled **new** until it has ninety live days.
+Once the registry holds the bundle, **anyone** can open the vault. It is a public function, not a favour. From that moment it takes deposits, labelled **new** until it has the record it needs to be ranked.
 
 A vault opens before any audit, with the audit status of every contract and image it runs on shown on its page. Waiting for an audit to open would mean no record, and the record is what a Depositor is actually choosing between.
 

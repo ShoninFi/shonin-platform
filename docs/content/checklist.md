@@ -13,15 +13,6 @@ Nothing is deployed to a public chain yet. There is no live vault and no money i
 
 ---
 
-## Changes to the design
-
-Decisions already made, where the docs describe the new design and what is built still does the old thing.
-
-- [ ] **Review before build.** The Reviewer reads the source before anything is compiled, so a project's build scripts and proc macros never run until it has been read. A finding in a narrow `malicious` category refuses the build: the review fee is charged, the vault closes and the rest of the tank comes back, and the refusal is recorded against the source hash in that transaction, with the report public. Everything else stays a score, not a gate, and is recorded as today once the bundle is registered. The Author's page lists refusals beside failed builds. Built today: build first, then review, and nothing can refuse a build
-- [ ] **A malicious finding on a live vault pauses its deposits.** The agent keeps running and Depositors can leave as usual; the guardian key then kills the vault or lifts the pause, publishing its reason, and a later clean review cannot lift it. Built today: no pause state, and a review never changes a vault
-- [ ] **Fees are paid weekly.** What is owed is worked out daily and taken out of value per share, shrinks again if gains are given back, and is paid as new shares at a weekly payment anyone can call; a withdrawal pays what its own shares owe so far. The high-water mark moves only at a weekly payment. Built today: fees crystallise daily, and the high-water mark moves daily
-- [ ] **Two keys, split by power.** The allowlist key proposes and revokes images; the guardian key kills vaults and lifts paused deposits. Neither can move funds except back to Depositors. Built today: the contracts already keep the two powers apart, and one development account holds both
-
 ## Guarantees first
 
 The guarantees are the product. Everything else is how they are shown.
@@ -36,6 +27,9 @@ The guarantees are the product. Everything else is how they are shown.
 
 ## Contracts
 
+- [ ] **A malicious finding on a live vault pauses its deposits.** The agent keeps running and Depositors can leave as usual; the guardian key then kills the vault or lifts the pause, publishing its reason, and a later clean review cannot lift it
+- [ ] **Fees are paid weekly.** What is owed is worked out daily and taken out of value per share, shrinks again if gains are given back, and is paid as new shares at a weekly payment anyone can call; a withdrawal pays what its own shares owe so far. The high-water mark moves only at a weekly payment
+- [ ] **Two keys, split by power.** The allowlist key proposes and revokes images; the guardian key kills vaults and lifts paused deposits. Neither can move funds except back to Depositors
 - [ ] `local` **Vault and factory**: ERC-4626 shares, deposit at mark, redeem at exit-side marks, claims with pending shares, capital moved only between registered accounts
 - [ ] `local` **Fees and the tank**: daily crystallisation as shares, the high-water mark, the transaction fee, tank funding, auto-fill, usage charges
 - [ ] `local` **Claims and kills**: settle inside the exit band, freeze after an unserved claim, a kill that returns everything to Depositors
@@ -63,6 +57,8 @@ The guarantees are the product. Everything else is how they are shown.
 
 ## Build and review
 
+- [ ] **Review before build.** The Reviewer reads the source before anything is compiled, so a project's build scripts and proc macros never run until it has been read. A finding in a narrow `malicious` category refuses the build: the review fee is charged, the vault closes and the rest of the tank comes back, and the refusal is recorded against the source hash in that transaction, with the report public. Everything else stays a score, not a gate, and is recorded once the bundle is registered. The Author's page lists refusals beside failed builds
+- [ ] **Sealed source stays sealed in the report.** For sealed source, the published report gives the score, the assessment and findings by category and severity, with no file names, line numbers or quotes, and the hash recorded on-chain is of the report as published
 - [ ] `local` **The queue**: first come first served, one job per Author, the full log whether it succeeded or failed, and a position that is counted when it is asked for
 - [ ] `local` **Admission and charges**: a job admitted once its vault exists and its tank covers the minimum; a build charged because it ran; a failed build closing the vault and returning the rest
 - [ ] `local` **The signature** binding source, manifest and bundle to the chain, the registry, the agent and its Author
@@ -116,16 +112,6 @@ The guarantees are the product. Everything else is how they are shown.
 - [ ] **Helper crates** for the plumbing an agent should not rewrite: hedging two legs, working an order over time, quoting from fair value, rebalancing margin
 - [ ] **Generated API documentation** for the SDK, published
 - [ ] **An authoring guide** that takes someone from `cargo new` to an open vault
-
-## Numbers to measure
-
-Working defaults are in the [parameters](reference/parameters.md); these need measuring before they can be trusted.
-
-- [ ] **Fuel to processor time** on real machines, and what the yield interval costs
-- [ ] **Model limits**: load time and per-call latency for representative models
-- [ ] **Bandwidth**: what real agents actually consume against their declared ranges
-- [ ] **Unit prices**: what compute actually costs, and how many agents fit on one machine, to set the published prices
-- [ ] **Executor latency** to each venue, to set placement defaults
 
 ## Operations
 

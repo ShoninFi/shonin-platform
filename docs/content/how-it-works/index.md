@@ -58,7 +58,7 @@ Creating the vault and funding its tank happen in the same transaction, because 
 
 ## 2. An attested Reviewer reads it
 
-A pinned model, with a pinned prompt and a pinned output schema, answers one question: is this code reasonable? It returns a score out of 100 and findings, each in a fixed category, each with a severity, each pointing at a file and a line.
+A pinned model, with a pinned prompt and a pinned output schema, answers one question: is this code reasonable? It returns a score out of 100, a written assessment, and findings, each in a fixed category with a severity. When the source is public, each finding also points to a file and a line.
 
 It reads the source before anything is compiled, because compiling Rust runs the Author's build scripts and macros. Code it finds **malicious** is refused there and never built. Anything else is a score, not a gate, and it never rates expected profit.
 
