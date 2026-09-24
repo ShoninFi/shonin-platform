@@ -6,71 +6,19 @@ This page is the shape of that, end to end. The mechanism is in the [technical d
 
 ## What you actually write
 
-One long-lived async function. The host starts it once and never schedules it again; everything your agent does, it does inside that call. No tick handler, no callback, no scheduler taking it away between events.
+One long-lived async function. The host starts it once and never schedules it again; everything your agent does, it does inside that call. It waits on streams of what the venue and the vault tell it, and decides.
 
-```rust
-impl Strategy for FundingBasis {
-    async fn run(config: Vec<u8>) -> Result<(), String> {
-        let mut mind = Mind::new(&Config::from_bytes(&config)?);
+You submit decisions and the host tells you what happened to each one. You never hold a key and never sign anything, and whatever your code decides, it can only ever trade your vault's own accounts.
 
-        // Whatever a previous instance left behind is still on the venue.
-        step(&mut mind).await?;
+It reaches the world through seven interfaces, frozen as `shonin:strategy@0.1.0`: your own fills and account state, the vault's events, shared market data, websockets the executor terminates, models you ship in the bundle, a cache, and secrets sealed to your bundle. No filesystem, no environment, no socket of your own.
 
-        let mut waking = select(
-            venues::account_events(VENUE).into_stream().map(|_| Woke::Venue),
-            vault::events().into_stream().map(Woke::Vault),
-        );
-
-        while let Some(woke) = waking.next().await {
-            match woke {
-                Woke::Venue => step(&mut mind).await?,
-                Woke::Vault(VaultEvent::ClaimPending(_)) => step(&mut mind).await?,
-                Woke::Vault(VaultEvent::Halting(_)) => return flatten(&mind).await,
-            }
-        }
-        Ok(())
-    }
-}
-```
-
-You submit decisions and the host tells you what happened to each one. You never hold a key and never sign anything, and whatever your code decides, it can only ever trade your vault's own accounts — which is exactly what makes a stranger willing to deposit into it.
-
-## What it can reach
-
-Seven interfaces, frozen as `shonin:strategy@0.1.0`. Everything your agent touches, it touches through one of them.
-
-| Interface | What you get |
-| --- | --- |
-| `venues` | Submit orders, cancels and capital moves; a live stream of your own fills and funding; a read of your account state |
-| `vault` | A stream of two events: a depositor is leaving, and the vault is stopping |
-| `data` | Market data the executor fetches once and shares across every agent that wants it |
-| `websocket` | An open socket to a host, terminated by the executor so you never hold a certificate |
-| `inference` | Run an ONNX model you packed into your own bundle, under a time budget |
-| `state` | A cache that usually survives a restart, and is promised to nobody |
-| `secrets` | Values you sealed to your bundle's hash, which the platform cannot read |
-
-What you do not get is a filesystem, an environment, or a socket of your own. That is not a restriction on what you can build; it is what lets the host say precisely what your agent did.
-
-!!! info "Not all of it runs yet"
-    `websocket` and `inference` are in the frozen interface and the executor does not implement them yet — a call to either returns an error. Everything else works today. Both are on the [checklist](checklist.md#execution).
-
-Helper crates in the SDK carry the plumbing you should not have to rewrite: hedging two legs, working an order over time, quoting from fair value. They are ordinary dependencies with no privileges of their own, pinned by your `Cargo.lock` like anything else.
+[Agents](how-it-works/agents.md) has the full interface, a complete example, and what is not implemented yet.
 
 ## Your limits are your code
 
-There is no platform risk policy. We do not impose a leverage cap, a drawdown stop or a position limit.
+There is no platform risk policy. We do not impose a leverage cap, a drawdown stop or a position limit. A limit is something you declare in your manifest's config, enforce in your own code, and the reviewer reads, and a depositor can read too. An agent that claims a cap and does not enforce it in its sizing is a finding, and the score says so.
 
-That is not laziness. A limit we imposed would be a promise about your code that we could not keep, and it would let a depositor believe a number that nothing enforces. Your agent is a program; the only thing that can bound a program is its own code. So a limit is something you write:
-
-```toml
-[config]
-max_gross_leverage = "2"
-max_order_fraction = "0.10"
-idle_buffer        = "0.05"
-drawdown_stop      = "0.10"
-```
-
-...and something your code enforces, and something the reviewer reads and a depositor can read too. An agent that claims a cap in its manifest and does not enforce it in its sizing is a finding, and the score says so.
+[Limits are code](how-it-works/agents.md#limits-are-code) shows what that looks like.
 
 ## What it costs to publish
 
@@ -80,10 +28,11 @@ For an agent declaring modest allowances — two million fuel a second, 256 MiB,
 
 | | |
 | --- | ---: |
-| The vault's minimum, set by the factory | $40.00 |
 | The review, a flat fee | $1.00 |
 | A week at those allowances | $50.87 |
-| **Least you can fund the tank with** | **$51.87** |
+| Together | $51.87 |
+| The vault's minimum, set by the factory | $40.00 |
+| **Least you can fund the tank with: the larger of the two** | **$51.87** |
 
 The build itself is metered compute, charged once it has run, so what it comes to is known only afterwards. On the development chain a build of the reference agent takes about twenty seconds, which at the published prices is under a cent.
 
@@ -142,7 +91,7 @@ Opening is a public function. Once the registry holds your bundle, anyone can op
 
 ## Sealing your source
 
-Source is public by default, and most authors leave it that way, because a published agent is one anybody can rebuild and check.
+Source is public by default. A published agent is one anybody can rebuild and check.
 
 If you would rather not show it, upload it sealed. It is encrypted to the platform's key; the attested builder and the attested reviewer still read it, and nobody else does. Sealing changes who can read your code, never whether it was compiled or reviewed.
 

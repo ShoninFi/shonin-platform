@@ -14,11 +14,11 @@ Every trade behind that number is a public event on the venue: every order, ever
 
 **Live records only.** A vault that never ran has nothing to show.
 
-**Normalised for risk.** Returns are rescaled to a common 15% annualised volatility, so a list of strategies is not simply a list of who used the most leverage. The volatility used for the rescaling is an exponentially weighted moving average of daily returns with a sixty-day half-life, estimated only from the days *before* each one — never from the whole series, so no part of a record is normalised by information from its own future. A very quiet record is scaled up by at most three times, because multiplying a tiny sample by a large number invents confidence that is not there.
+**Normalised for risk.** Returns are rescaled to a common 15% annualised volatility, so a list of agents is not simply a list of who used the most leverage. The volatility used for the rescaling is an exponentially weighted moving average of daily returns with a sixty-day half-life, estimated only from the days *before* each one — never from the whole series, so no part of a record is normalised by information from its own future. A very quiet record is scaled up by at most three times, because multiplying a tiny sample by a large number invents confidence that is not there.
 
-**Ninety days before ranking.** A strategy is open for deposits from its first day, labelled **new**, and is not ranked until it has ninety live days. A short run of good days is noise, and ranking it would be selling noise.
+**Ninety days before ranking.** An agent is open for deposits from its first day, labelled **new**, and is not ranked until it has ninety live days. A short run of good days is noise, and ranking it would be selling noise.
 
-**The size it was earned at.** Every record shows the capital behind it, now, on average and at most. Nothing is extrapolated to a size the strategy never traded. An edge that worked on a small vault very often does not survive a large one, and the record should let you see that rather than hide it.
+**The size it was earned at.** Every record shows the capital behind it, now, on average and at most. Nothing is extrapolated to a size the agent never traded. An edge that worked on a small vault very often does not survive a large one, and the record should let you see that rather than hide it.
 
 **Raw beside normalised.** The raw return is what the vault actually did. Both are shown, always.
 
@@ -32,7 +32,7 @@ The platform's job is to make the history impossible to fake. Reading it is stil
 
 An author's page shows **everything they have published**: live, new, superseded, retired, and the builds that failed. Nothing there can be hidden by its author.
 
-An author can publish under a fresh identity, of course. What they cannot do is carry a record with them: every strategy needs its own ninety live days before it is ranked, whoever wrote it.
+An author can publish under a fresh identity, of course. What they cannot do is carry a record with them: every agent needs its own ninety live days before it is ranked, whoever wrote it.
 
 ## Run your own indexer
 

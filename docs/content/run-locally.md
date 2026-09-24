@@ -73,9 +73,12 @@ Deliberately absent: a bridge, a second chain, remote legs, an enclave, model in
 ## Publishing an agent to it
 
 ```bash
-# from a checkout of the agents repository, with SHONIN_PLATFORM_DIR set
-task dev     # packs, creates the vault, submits, and prints the queue and agent URLs
+# from the root of this repository, with task dev running
+cargo run -q -p shonin-cli -- publish path/to/your-agent            # packs, creates the vault, funds the tank, submits
+cargo run -q -p shonin-cli -- publish path/to/your-agent --sealed   # the same, with the source kept out of the store
 ```
+
+It publishes as the chain's author account, so it needs no key of yours.
 
 or from the web app's **Publish** page: drop the packed archive, fund the tank, and watch the queue.
 

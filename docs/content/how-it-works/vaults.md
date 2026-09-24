@@ -1,6 +1,6 @@
 # Vaults
 
-A vault is one contract holding one pool of capital behind one strategy version. It computes its own value, mints and burns its own shares, pays its own withdrawals, and charges its own fees. Nobody reports anything to it.
+A vault is one contract holding one pool of capital behind one agent version. It computes its own value, mints and burns its own shares, pays its own withdrawals, and charges its own fees. Nobody reports anything to it.
 
 ## Shares
 
@@ -41,7 +41,7 @@ flowchart TB
     class R,P,P2 ends
 ```
 
-Strategies keep a working buffer of idle capital, so most withdrawals end in the first branch: the shares are burned and the depositor is paid in the same transaction.
+Agents keep a working buffer of idle capital, so most withdrawals end in the first branch: the shares are burned and the depositor is paid in the same transaction.
 
 When idle capital cannot cover it, the shares are marked pending and the contract books a **claim**, which has three states — *pending*, *waiting* when a settlement was tried and the market was outside the band, and *paid*.
 
@@ -81,9 +81,9 @@ The schedule is fixed when a vault is created and never changes under it. A vaul
 
 ## The tank
 
-Running a strategy costs money: compute, and gas where a chain charges it. That is the **author's** cost, not the depositors'.
+Running an agent costs money: compute, and gas where a chain charges it. That is the **author's** cost, not the depositors'.
 
-Each vault has a **tank**, which the author funds when they create it and their own fees refill. It is excluded from what shares are worth, so a depositor's value never pays for the strategy's electricity.
+Each vault has a **tank**, which the author funds when they create it and their own fees refill. It is excluded from what shares are worth, so a depositor's value never pays for the agent's electricity.
 
 - The build and the review are the tank's first charges.
 - The executor states each day's usage, signed by the vault's own blessed key, and the contract believes it only up to the allowances the author declared at the platform's published prices. A wrong statement cannot charge more than the author agreed to.

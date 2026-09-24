@@ -2,7 +2,7 @@
 
 An attested model reads the source and answers one question: **is this code reasonable?**
 
-It is a score, not a gate. It has never stopped a vault opening, it protects nobody on its own, and it never rates expected profit. A strategy can be careful and lose money, and reckless and make it.
+It is a score, not a gate. It never stops a vault opening, it protects nobody on its own, and it never rates expected profit. An agent can be careful and lose money, and reckless and make it.
 
 ## What it looks at
 
@@ -24,9 +24,9 @@ Each finding carries a severity — **note**, **concern** or **serious** — and
 
 ## The score
 
-An integer from 0 to 100, higher being more reasonable. Ordinary, plainly-written code with stated limits scores well, and the score comes down for what was actually found, weighted by severity. A strategy with no findings at all should score in the nineties rather than at 100: no reader sees everything.
+An integer from 0 to 100, higher being more reasonable. Ordinary, plainly-written code with stated limits scores well, and the score comes down for what was actually found, weighted by severity. An agent with no findings at all should score in the nineties rather than at 100: no reader sees everything.
 
-Every strategy page shows the score beside what it cannot tell you, because a number on its own would be read as a promise.
+Every agent page shows the score beside what it cannot tell you, because a number on its own would be read as a promise.
 
 ## What is pinned
 
@@ -62,21 +62,21 @@ Every review is kept, newest first. A review is of one bundle built from one sou
 
 ## Buying another one
 
-**Anyone can buy a fresh review** of any strategy, at any time, for the same flat fee — the author, a depositor, a competitor, a sceptic. The newest is shown first and the older ones are kept, so a strategy cannot quietly shop for a better score.
+**Anyone can buy a fresh review** of any agent, at any time, for the same flat fee — the author, a depositor, a competitor, a sceptic. The newest is shown first and the older ones are kept, so an agent cannot quietly shop for a better score.
 
 Nothing is re-reviewed automatically when the reviewer image changes. A review says which image produced it, and you can buy one under the current image whenever you want.
 
 ## Prompt injection
 
-A strategy's comments, identifiers and strings are text the author controls and a model reads. Three things bound that:
+An agent's comments, identifiers and strings are text the author controls and a model reads. Three things bound that:
 
 - **The prompt comes first and is pinned in the image**, and the author's code follows it as clearly delimited data, named as data and given no authority over the review.
 - **The output is schema-constrained.** The model can only return a score and findings from the fixed categories, each with a severity, a file and a line.
-- **Addressing the reviewer is itself a finding.** Text that tries to instruct the reviewer is reported as hidden behaviour, quoted where it appears, and scores the strategy down.
+- **Addressing the reviewer is itself a finding.** Text that tries to instruct the reviewer is reported as hidden behaviour, quoted where it appears, and scores the agent down.
 
 ## Sealed source
 
-Sealed source is reviewed exactly like published source. The attested reviewer reads it inside its measured image; the store refuses to serve it to anyone else. What a depositor relies on is the attested build plus the attested review. Published source is extra — and it is what makes an independent rebuild possible, which is why most authors publish.
+Sealed source is reviewed exactly like published source. The attested reviewer reads it inside its measured image; the store refuses to serve it to anyone else. What a depositor relies on is the attested build plus the attested review. Published source is extra, and it is what makes an independent rebuild possible.
 
 ## A new version
 

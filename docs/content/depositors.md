@@ -2,7 +2,7 @@
 
 You pick an agent, put money into its vault, and hold shares in a pool. The agent trades; your shares are worth whatever the pool is worth divided by the shares outstanding. You leave when you want to.
 
-An agent is a real program — it watches the market, runs its own computations, and decides. [What an agent actually is](index.md#what-an-agent-actually-is) covers what it can reach, and why a program that capable still cannot take your money.
+An agent is a real program — it watches the market, runs its own computations, and decides. [What an agent actually is](index.md#what-an-agent-actually-is) covers what it can reach, and [what it cannot do](index.md#what-it-cannot-do) covers why a program that capable still cannot withdraw your money.
 
 This page is what that costs and what it feels like. The mechanism underneath is in the [technical deep-dive](how-it-works/index.md).
 
@@ -14,7 +14,7 @@ Every agent's page shows the same four things, and they are worth reading in thi
 
 **The size it was earned at.** An edge that worked on a small vault often does not survive a large one. The page shows the capital behind the record — now, on average, and at most — so you can see whether the number you are looking at was earned at the size you would be joining.
 
-**The review.** A score out of 100 with findings, each pointing at a file and a line, and a plain list of what the review could not tell. It is not a gate and it never stopped a vault opening. Read the findings rather than the number.
+**The review.** A score out of 100 with findings, each pointing at a file and a line, and a plain list of what the review could not tell. It is not a gate and it never stops a vault opening. Read the findings rather than the number.
 
 **Which code is trading it.** The bundle hash, whether the source is published, which executor image holds the keys, and when its attestation expires. All of it on-chain.
 
@@ -95,9 +95,9 @@ The same $10,000, in an agent that loses 10%.
 
 You take out **$8,937**, down 10.6% on an agent that lost 10%.
 
-No profit fee is charged, because there is no gain above the high-water mark — the author earns nothing this year. The streaming fee is charged anyway, at 0.5% of value, because it pays for a platform that ran whether or not the agent worked. The mark stays at $1.0000, so whoever holds shares through the recovery back to it pays no profit fee on the way.
+No profit fee is charged, because there is no gain above the high-water mark, so the author earns nothing this year. The streaming fee is charged on value whether the agent gained or lost. The mark stays at $1.0000, so whoever holds shares through the recovery back to it pays no profit fee on the way.
 
-The asymmetry is deliberate and it is worth being clear about: the author has upside and no downside beyond earning nothing, and the platform takes a small fee in a bad year. What neither of them can do is take more than that.
+In a losing year, then, the author earns nothing and the platform takes the streaming fee. Neither can take more than the schedule the vault was created with.
 
 ## The high-water mark is the vault's, not yours
 
@@ -117,7 +117,9 @@ Withdrawing has two shapes, and which one you get depends on how much cash the a
 
 **Booked as a claim.** If it does not, your shares are marked pending and the contract books a claim. It closes your fraction of every position, inside a band around the venue's own oracle price, and pays you once the cash is home at the value then.
 
-The settle function is public. Anyone can call it — you, another depositor, a passer-by, or the keeper we run. That is the part that matters: your exit does not depend on us being alive, solvent, or willing.
+The settle function is public. Anyone can call it — you, another depositor, a passer-by, or the keeper we run. That is the part that matters: in a vault whose exit class is **direct**, your exit does not depend on us being alive, solvent, or willing.
+
+A vault that trades on a venue the contract cannot reach is **served** instead: a claim there needs an operator to close that part of the positions. The vault's page shows its exit class, and for a served vault how many operators can serve a claim.
 
 A claim that goes unserved for seven days lets anyone freeze the vault, which stops new deposits and leaves only unwinding.
 
@@ -127,10 +129,12 @@ Being honest about this is the point of the whole project, so here it is plainly
 
 **The agent can lose money.** Nothing here prevents that. A review is not a prediction and a record is not a promise. The platform makes the losses visible and honest; it does not stop them.
 
+**The agent can lose it on purpose.** A key that can trade can trade badly by design, for instance buying from an account its author controls above the market and selling to it below. No key can withdraw your deposit, but a run of deliberate bad trades moves value out all the same. Today nothing on the chain bounds the price of an agent's orders outside a claim; what stands against it is the source, the review, the record and your ability to leave. A bound is [on the checklist](checklist.md#guarantees-first).
+
 **The market can be bad when you leave.** A claim closes your positions at the market, inside a band. In a fast market the close may not fill, and the claim waits.
 
 **Our code can be wrong.** The contracts and the images are ours. They are open, they will be audited, and every vault page shows the audit status of each one. Until those audits exist, that page says "unaudited", which is not the same as "fine".
 
 **A venue can fail.** Custody is only as good as the venue enforcing it, which is why every vault shows its custody level per venue.
 
-What you are *not* exposed to is somebody transferring your deposit somewhere else. There is no path for it.
+What you are *not* exposed to is somebody withdrawing your deposit or transferring it somewhere else. There is no path for it.

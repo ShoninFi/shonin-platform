@@ -22,10 +22,10 @@ flowchart LR
 
 ## What you submit
 
-A submission is the whole **workspace** your strategy belongs to, packed the same way every time so that its hash means something:
+A submission is the whole **workspace** your agent belongs to, packed the same way every time so that its hash means something:
 
 ```bash
-shonin pack packages/agents/your-agent > agent.tar
+shonin pack path/to/your-agent > agent.tar
 ```
 
 The archive is canonical — sorted entries, fixed metadata — so the same tree always produces the same bytes and the same hash. That hash is what the vault is created with, so the chain and the build service are talking about one thing.
@@ -36,13 +36,12 @@ You can upload it **sealed**. A sealed project is encrypted to the platform's ke
 
 Creating the vault and funding its tank happen in one transaction, and the build service will not admit a job until that vault exists. Nothing is ever compiled for free.
 
-The tank has to cover:
+The tank has to hold the larger of two amounts:
 
-| Charge | Why |
+| Amount | What it is |
 | --- | --- |
-| The vault's minimum | What the factory will not create a vault below |
-| The review | A flat fee, one model call over the source |
-| A week at the declared allowances | So the strategy can actually run |
+| The factory's minimum | The least any vault can be created with, whatever it declares |
+| The review and a week | The review's flat fee, one model call over the source, plus a week at the declared allowances, so the agent can actually run |
 
 The build itself is metered compute and is charged once it has run, so what it comes to is known only afterwards. The publish page shows every one of these figures read from the chain, not from a number written into the app.
 
@@ -71,7 +70,7 @@ The component is then loaded in the executor's own runtime, to check it satisfie
 
     Reproducing a bundle elsewhere is a property of a hermetic recipe, and making the recipe hermetic is the work — a pinned image, fixed paths, a fixed timestamp, no network. That is [on the checklist](../checklist.md#build-and-review).
 
-    A project that reaches for a clock, the network or a random number while it compiles is a finding the reviewer reports as hidden behaviour, and it scores the strategy down.
+    A project that reaches for a clock, the network or a random number while it compiles is a finding the reviewer reports as hidden behaviour, and it scores the agent down.
 
 ## The signature
 
@@ -81,7 +80,7 @@ The build service signs a digest that binds:
 (sourceHash, manifestHash) → bundleHash
 ```
 
-together with the chain, the registry's own address, the strategy's id and version, and its author — so a signature for one registration can never be replayed as another. The strategy registry accepts a bundle **only** with that signature, from a key blessed for an allowlisted builder image.
+together with the chain, the registry's own address, the agent's id and version, and its author — so a signature for one registration can never be replayed as another. The strategy registry accepts a bundle **only** with that signature, from a key blessed for an allowlisted builder image.
 
 A vault's executors are then blessed for that exact `bundleHash`, so the chain from published source to running code is unbroken.
 
@@ -90,7 +89,7 @@ A vault's executors are then blessed for that exact `bundleHash`, so the chain f
 - A build is admitted once its vault exists and its tank covers the minimum.
 - **A failed build is charged, because it ran.** The vault closes and the author reclaims the rest of the tank. A fixed resubmission is a new vault.
 - A build service that crashes requeues the job at no charge.
-- A project whose manifest names a different strategy or version than the vault it is building for is refused before it compiles, rather than after it has cost anything.
+- A project whose manifest names a different agent or version than the vault it is building for is refused before it compiles, rather than after it has cost anything.
 
 ## Opening
 
@@ -100,7 +99,7 @@ A vault opens before any audit, with the audit status of every contract and imag
 
 ## What you get
 
-A strategy page with:
+An agent page with:
 
 - the record, read from the vault's own contract;
 - the review, with its score and findings;

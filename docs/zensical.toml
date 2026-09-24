@@ -28,19 +28,19 @@ nav = [
     {"Technical deep-dive" = [
         {"The whole system" = "how-it-works/index.md"},
         {"Vaults" = "how-it-works/vaults.md"},
-        {"Agents" = "how-it-works/strategies.md"},
+        {"Agents" = "how-it-works/agents.md"},
         {"Publishing" = "how-it-works/publishing.md"},
         {"The review" = "how-it-works/review.md"},
         {"Attested execution" = "how-it-works/execution.md"},
         {"The record" = "how-it-works/record.md"},
     ]},
     {"Run it locally" = "run-locally.md"},
-    {"Build checklist" = "checklist.md"},
     {"Reference" = [
         {"Parameters" = "reference/parameters.md"},
         {"The API" = "reference/api.md"},
         {"Glossary" = "reference/glossary.md"},
     ]},
+    {"Build checklist" = "checklist.md"},
     # The app itself, which is a site of its own rather than a page here.
     {"The app" = "https://shonin.fi/"},
 ]

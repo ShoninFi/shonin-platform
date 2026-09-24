@@ -11,7 +11,7 @@ The service behind it is the **indexer**, which is part of this repository and o
 
 ### `GET /api/snapshot`
 
-The entire state of the platform in one document — every strategy with its vault, record, review, health and attestation; every author; the build queue; the activity feed; benchmarks and totals. It carries a version, so a client can poll cheaply and re-render only when it changes.
+The entire state of the platform in one document — every agent with its vault, record, review, health and attestation; every author; the build queue; the activity feed; benchmarks and totals. It carries a version, so a client can poll cheaply and re-render only when it changes.
 
 ```bash
 curl -s http://localhost:19081/api/snapshot | jq '.strategies[0] | {id, version, standing, vault: .vault.value}'
@@ -57,7 +57,7 @@ The content-addressed store, addressed by the hashes the chain holds:
 
 | Name | What |
 | --- | --- |
-| `source.tar` | The packed project, for a published strategy |
+| `source.tar` | The packed project, for a published agent |
 | `bundle.tar` | The bundle: the component and any models |
 | `component.wasm` | The compiled component |
 | `manifest.json` | What the author declared |
@@ -92,7 +92,7 @@ Replies with the job id and the source hash:
 
 ### `POST /api/health`
 
-Where an executor posts a vault's health report. It is signed by the key the registry blessed for that vault, over a canonical encoding of the report, and a report signed by any other key is refused. Anyone may read a health report; only the instance running the strategy may write one.
+Where an executor posts a vault's health report. It is signed by the key the registry blessed for that vault, over a canonical encoding of the report, and a report signed by any other key is refused. Anyone may read a health report; only the instance running the agent may write one.
 
 ## Also listening
 

@@ -3,16 +3,16 @@
 One word for one thing, throughout the platform and these docs.
 
 **Agent**
-: The program an author publishes: a long-lived Rust program, compiled to a WebAssembly component, that watches the market, computes, and decides. It reaches the world through seven interfaces and nothing else. *Strategy* is the same thing named for what it is trying to do, and it is the word the contracts use.
+: The program an author publishes: a long-lived Rust program, compiled to a WebAssembly component, that watches the market, computes, and decides. It reaches the world through seven interfaces and nothing else. The contracts call it a *strategy*.
 
 **Allowances**
-: The compute a strategy declares in its manifest: fuel a second, memory, requests, bandwidth, open streams and inference. The host holds it to them, and its vault's tank is charged for them at the published prices.
+: The compute an agent declares in its manifest: fuel a second, memory, requests, bandwidth, open streams and inference. The host holds it to them, and its vault's tank is charged for them at the published prices.
 
 **Attestation**
-: A proof of which code is running inside an enclave. It says which image holds a key; it is not what stops the key stealing.
+: A proof of which code is running inside an enclave. It says which image holds a key; it is not what stops the key withdrawing.
 
 **Author**
-: Whoever publishes a strategy. They fund its tank, earn the author fee, and cannot touch a vault's capital.
+: Whoever publishes an agent. They fund its tank, earn the author fee, and cannot touch a vault's capital.
 
 **Blessing**
 : The registry's record that one key, made in one image, may act for one vault running one bundle, until it expires. Renewed by attesting again.
@@ -39,13 +39,13 @@ One word for one thing, throughout the platform and these docs.
 : Whether a vault can be exited by its contract alone (**direct**) or needs an operator to unwind a venue the contract cannot reach (**served**). Shown on every vault page.
 
 **Executor**
-: The attested service that runs a strategy and holds the vault's trading keys. It can only trade the vault's own accounts.
+: The attested service that runs an agent and holds the vault's trading keys. It can only trade the vault's own accounts.
 
 **Freeze**
 : What anyone may do to a vault whose claim has gone unserved for the freeze period: no new deposits, and only unwinding remains possible.
 
 **Fuel**
-: The runtime's unit of work. A strategy declares a rate, the rate is what its tank is billed at, and it decides how often the strategy yields.
+: The runtime's unit of work. An agent declares a rate, the rate is what its tank is billed at, and it decides how often the agent yields.
 
 **High-water mark**
 : The highest value per share a vault has crystallised at. Profit fees are only ever taken above it.
@@ -60,16 +60,16 @@ One word for one thing, throughout the platform and these docs.
 : The admin key stopping a vault: every position closed, all cash home, every depositor paid from idle balance. A halt, never a theft.
 
 **Manifest**
-: The `shonin.toml` in a project. What the strategy is, what it will not do, the venues it trades, the config it takes and the allowances it asks for. Hashed with the bundle.
+: The `shonin.toml` in a project. What the agent is, what it will not do, the venues it trades, the config it takes and the allowances it asks for. Hashed with the bundle.
 
 **Mark**
 : The venue's own reference price, used to value a deposit. A withdrawal uses **exit-side marks** instead: a long at the bid, a short at the ask.
 
 **New**
-: A strategy open for deposits but not yet ranked, because it has fewer than ninety live days.
+: An agent open for deposits but not yet ranked, because it has fewer than ninety live days.
 
 **Normalised return**
-: A record rescaled to a common 15% annualised volatility, so strategies can be compared at one level of risk. Shown beside the raw return, never instead of it.
+: A record rescaled to a common 15% annualised volatility, so agents can be compared at one level of risk. Shown beside the raw return, never instead of it.
 
 **Record**
 : A vault's own on-chain history: value per share over time, read from the contract that computes it.
@@ -87,7 +87,7 @@ One word for one thing, throughout the platform and these docs.
 : ERC-4626 shares in a vault. A pro-rata claim on the pool, minted at value per share on deposit and burned on withdrawal.
 
 **Strategy**
-: What an agent is trying to do, and the word the contracts use for the published, versioned artefact: `strategyId`, `StrategyRegistry`, one vault per strategy version. The running program is an **agent**.
+: The contracts' word for an agent: `strategyId`, `StrategyRegistry`, the `shonin:strategy` interface. These docs use it only where they name something in the contracts.
 
 **Supersede**
 : An author's declaration that a new version replaces an older one. A claim about lineage, not a mechanism: the old vault runs exactly as it always has.
@@ -105,10 +105,10 @@ One word for one thing, throughout the platform and these docs.
 : A vault's value divided by its shares outstanding. The whole of the record is the change in this number over time.
 
 **Vault**
-: One contract holding one pool of capital behind one strategy version. It computes its own value, mints its own shares, and pays its own withdrawals.
+: One contract holding one pool of capital behind one agent version. It computes its own value, mints its own shares, and pays its own withdrawals.
 
 **Venue**
-: Where a strategy actually trades. Each one enforces, in its own way, that a vault's key can trade but cannot withdraw.
+: Where an agent actually trades. Each one enforces, in its own way, that a vault's key can trade but cannot withdraw.
 
 **Version**
-: A strategy version never changes. A new version is a new bundle, a new vault and a declared lineage — never an edit of something a depositor already chose.
+: An agent version never changes. A new version is a new bundle, a new vault and a declared lineage — never an edit of something a depositor already chose.

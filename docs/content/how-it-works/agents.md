@@ -2,11 +2,11 @@
 
 An agent is an ordinary Rust project that compiles to one **WebAssembly component**. It runs as a single long-lived program: it watches the market, computes, decides, and hands the host its submissions. It never holds a key, never signs anything, and can only ever trade its vault's own accounts.
 
-Throughout the contracts and the registries this is a *strategy* — `strategyId`, `StrategyRegistry`, one vault per strategy version. The two words name the same artefact from different sides: the agent is the program, the strategy is what it is for.
+The contracts call it a *strategy* — `strategyId`, `StrategyRegistry`, the `shonin:strategy` interface. It is the same thing, and these pages use that word only where they name something in the contracts.
 
 ## One long-lived program
 
-There is no callback, no tick handler and no scheduler. The host starts `run` once and never schedules it again: everything the strategy does, it does inside that call.
+There is no callback, no tick handler and no scheduler. The host starts `run` once and never schedules it again: everything the agent does, it does inside that call.
 
 ```rust
 impl Strategy for FundingBasis {
@@ -39,23 +39,26 @@ impl Strategy for FundingBasis {
 }
 ```
 
-If it faults, the host tears it down and starts it again. A strategy is written to rebuild its picture from venue state, because that is where the truth is.
+If it faults, the host tears it down and starts it again. An agent is written to rebuild its picture from venue state, because that is where the truth is.
 
 ## What it may reach
 
-The interface is frozen as `shonin:strategy@0.1.0`. A strategy sees these and nothing else — no filesystem, no environment, no sockets of its own.
+The interface is frozen as `shonin:strategy@0.1.0`. An agent sees these and nothing else — no filesystem, no environment, no sockets of its own.
 
 | Interface | What it gives | What it does not |
 | --- | --- | --- |
 | `venues` | `submit` actions and be told what happened to each, a stream of the vault's own account events, and a read of the vault's account state | Reach any account but the vault's |
 | `vault` | A stream of two events: `claim-pending` when a depositor is leaving, and `halting` when the vault is stopping | Move capital anywhere outside the vault |
-| `data` | Cached, shared reads the executor fetches once and hands to every strategy that wants them | Be a private feed |
-| `websocket` | A socket the executor terminates, so the strategy never holds a certificate or a key | Hold credentials |
-| `state` | A per-strategy cache that may survive a restart | Be relied on; it is promised to nobody |
+| `data` | Cached, shared reads the executor fetches once and hands to every agent that wants them | Be a private feed |
+| `websocket` | A socket the executor terminates, so the agent never holds a certificate or a key | Hold credentials |
+| `state` | A per-agent cache that may survive a restart | Be relied on; it is promised to nobody |
 | `secrets` | Values the author sealed to the bundle, opened only inside the measured image | Be read by us, or by another bundle |
-| `inference` | Models the author shipped in the bundle, run on the host under a time budget | Reach a model the bundle does not contain |
+| `inference` | ONNX models the author shipped in the bundle, run on the host under a time budget | Reach a model the bundle does not contain |
 
-A **submission** is opaque bytes that the venue's own adapter understands, decoded inside the measured image. A strategy builds them with a typed crate, so the decision is the strategy's and the signing is the host's.
+!!! info "Not all of it runs yet"
+    `websocket` and `inference` are in the frozen interface, and the executor does not implement them yet: a call to either returns an error rather than pretending. Everything else works on the development chain. Both are on the [checklist](../checklist.md#execution).
+
+A **submission** is opaque bytes that the venue's own adapter understands, decoded inside the measured image. An agent builds them with a typed crate, so the decision is the agent's and the signing is the host's.
 
 ## Limits are code
 
@@ -72,11 +75,11 @@ drawdown_stop      = "0.10"
 minimum_notional   = "100"
 ```
 
-...and something the author's code enforces, and something the reviewer reads and the depositor can read too. A strategy that says it caps its leverage and does not is a finding, and the score says so.
+...and something the author's code enforces, and something the reviewer reads and the depositor can read too. An agent that says it caps its leverage and does not is a finding, and the score says so.
 
 ## The manifest
 
-Every project carries a `shonin.toml`: what the strategy is, what it will not do, the venues and accounts it trades, the config it takes, and the compute it asks for.
+Every project carries a `shonin.toml`: what the agent is, what it will not do, the venues and accounts it trades, the config it takes, and the compute it asks for.
 
 ```toml
 [strategy]
@@ -98,11 +101,11 @@ streams = 4
 inference_ms_per_min = 0
 ```
 
-The manifest is hashed with the bundle, so what it declared is fixed for the vault's life and shown on the vault's page. The **allowances** are what the host holds the strategy to and what the vault's tank is charged for, at the platform's published prices.
+The manifest is hashed with the bundle, so what it declared is fixed for the vault's life and shown on the vault's page. The **allowances** are what the host holds the agent to and what the vault's tank is charged for, at the platform's published prices.
 
 ## Versions
 
-A strategy version never changes. A new version is a new bundle, a new vault and a declared lineage:
+An agent version never changes. A new version is a new bundle, a new vault and a declared lineage:
 
 - Depositors in the old vault are not moved, not asked and not affected. It runs exactly as it always has.
 - The old vault's page shows that a newer version exists, and links to it.
@@ -111,6 +114,6 @@ A strategy version never changes. A new version is a new bundle, a new vault and
 
 ## The SDK
 
-Authors depend on `shonin-strategy-sdk`, which carries the generated bindings, typed helpers for each interface, decimal arithmetic that two machines cannot round differently, and the payload types each venue's adapter understands. Helper code that a strategy should not have to rewrite — hedging two legs, working an order over time, quoting from fair value — ships as ordinary crates, pinned by `Cargo.lock` like any dependency, with no privileges of their own.
+Authors depend on `shonin-strategy-sdk`, which carries the generated bindings, typed helpers for each interface, decimal arithmetic that two machines cannot round differently, and the payload types each venue's adapter understands. Helper code that an agent should not have to rewrite — hedging two legs, working an order over time, quoting from fair value — ships as ordinary crates, pinned by `Cargo.lock` like any dependency, with no privileges of their own.
 
 The SDK is Apache-2.0.

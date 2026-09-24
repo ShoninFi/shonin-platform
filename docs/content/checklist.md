@@ -16,10 +16,11 @@ Everything between here and a platform running on a public chain, grouped by are
 The guarantees are the product. Everything else is how they are shown.
 
 - [ ] `local` **Funds can only move between a vault's own accounts**, enforced by the venue and by the vault contract, with no route out for any key
-- [ ] `local` **Anyone can exit without us**: `redeem` pays from idle balance, or books a claim that `settle` — a public function — completes
+- [ ] `local` **Anyone can exit without us** from a vault whose exit class is direct: `redeem` pays from idle balance, or books a claim that `settle` — a public function — completes
 - [ ] `local` **Only the committed bundle can use a vault's keys**, checked against the registry on every approval
 - [ ] `local` **The record is computed by the vault contract** from on-chain state, never reported
 - [ ] `local` **Every image that may hold a key is on a public, timelocked allowlist**, reproducible from published source
+- [ ] **A trade-only key cannot trade value away on purpose**: a bound on the price of every order a vault's key places, not only a claim's, so buying from a friendly account above the market or selling to it below is refused. Where a venue gives a contract no way to see or limit orders, the vault's page says the exposure is unbounded
 - [ ] Each guarantee demonstrated publicly, end to end, on a real chain
 
 ## Contracts
@@ -36,16 +37,16 @@ The guarantees are the product. Everything else is how they are shown.
 
 ## Execution
 
-- [ ] `local` **The runtime**: one long-lived instance per vault, fuel and epoch yields, a memory cap, restart after a fault, an ephemeral per-strategy cache
+- [ ] `local` **The runtime**: one long-lived instance per vault, fuel and epoch yields, a memory cap, restart after a fault, an ephemeral per-agent cache
 - [ ] `local` **Signed health reports**: restarts, faults, refused submissions, venue errors and tank runway, refused from any key not blessed for that vault
 - [ ] `local` **Signed daily usage statements**, capped by the allowances the author declared at the published prices
 - [ ] `local` **Blessing and renewal**, with the venue's approval following the blessing
 - [ ] **A real enclave**: keys generated inside it, a genuine attestation token, and the on-chain proof of that token
 - [ ] **The root key**: generated in the enclave, released only by attested key exchange to an allowlisted image, with derived per-bundle and per-vault keys
 - [ ] **Image rotation by failover**: a standby on the new image blessed and taking over, the previous known-good image kept allowlisted, propose before revoke
-- [ ] **Network for strategies**: host-terminated TLS and websockets under per-strategy quotas, with the declared bandwidth allowances actually metered
+- [ ] **Network for agents**: host-terminated TLS and websockets under per-agent quotas, with the declared bandwidth allowances actually metered
 - [ ] **Model inference**: the runtime, a time budget and a watchdog, and models loaded from the bundle
-- [ ] **Many vaults per machine**: placement by allowance, standbys, and failover that restarts a strategy which rebuilds from venue state
+- [ ] **Many vaults per machine**: placement by allowance, standbys, and failover that restarts an agent which rebuilds from venue state
 - [ ] **A published unwinder image** with the venue adapters' unwind paths only, runnable by another operator
 - [ ] **Audits** of every image
 
@@ -53,22 +54,22 @@ The guarantees are the product. Everything else is how they are shown.
 
 - [ ] `local` **The queue**: first come first served, one job per author, the full log whether it succeeded or failed, and a position that is counted when it is asked for
 - [ ] `local` **Admission and charges**: a job admitted once its vault exists and its tank covers the minimum; a build charged because it ran; a failed build closing the vault and returning the rest
-- [ ] `local` **The signature** binding source, manifest and bundle to the chain, the registry, the strategy and its author
+- [ ] `local` **The signature** binding source, manifest and bundle to the chain, the registry, the agent and its author
 - [ ] `local` **The review**: a pinned model, prompt, schema, categories and severities, signed and recorded, with anyone able to buy a fresh one
 - [ ] **A calibrated score**: a second model answers a fixed battery of narrow questions and the score is computed from the answers with published weights, so a reader can see which question moved it. The battery, the client and the comparison harness are built; measuring it needs an account
-- [ ] **A calibration set**: a fixed set of strategies with agreed scores, re-run before any reviewer image is proposed, so a change to the model or the prompt has to show what it did to them
+- [ ] **A calibration set**: a fixed set of agents with agreed scores, re-run before any reviewer image is proposed, so a change to the model or the prompt has to show what it did to them
 - [ ] **A hermetic build**: a published, pinned builder image with an offline dependency snapshot, remapped paths and a fixed timestamp, so an outsider's rebuild matches ours byte for byte. Until this is done, a rebuild can differ for reasons that have nothing to do with the source, and a public build log can carry the builder's own filesystem paths
-- [ ] **Reproducibility shown rather than asserted**: rebuild published bundles off the critical path, deliberately varying the machine, the path and the date, and show the result on the strategy page
+- [ ] **Reproducibility shown rather than asserted**: rebuild published bundles off the critical path, deliberately varying the machine, the path and the date, and show the result on the agent page
 - [ ] **Rebuild attestations from outsiders**, so corroboration accrues publicly instead of resting on our word
 - [ ] **Submission from a public repository and commit**, cloned and hashed by the build service
 - [ ] **Models in a bundle**: shipped, hashed, loaded at build time and reviewed alongside the code
-- [ ] **A version diff** for a strategy that declares what it supersedes
+- [ ] **A version diff** for an agent that declares what it supersedes
 - [ ] **A pre-review** an author can run before publishing, through the same prompt and schema
 - [ ] **Build reproducibility in practice**: once the recipe is hermetic, do real projects, with their proc macros and build scripts, rebuild to the same bytes on a different machine?
 
 ## Venues and custody
 
-- [ ] `local` **A venue adapter**, with the shared payload types and decimal arithmetic every strategy uses
+- [ ] `local` **A venue adapter**, with the shared payload types and decimal arithmetic every agent uses
 - [ ] **A perpetuals venue where a vault contract can be the master of its own account**, add a trade-only agent, read account value on-chain, and close reduce-only for a claim
 - [ ] **An equities venue**, with holdings valued from a price feed under a stale-feed rule
 - [ ] **A second chain**, with a remote-leg contract that owns the vault's accounts there, values them from chain state, and posts home on demand
@@ -85,8 +86,8 @@ The guarantees are the product. Everything else is how they are shown.
 
 ## The web app
 
-- [ ] `local` **Leaderboard and strategy pages**: on-chain records, review scores, normalised returns, the size each record was earned at, the author's whole history
-- [ ] `local` **Source, build log and toolchain** for every strategy
+- [ ] `local` **Leaderboard and agent pages**: on-chain records, review scores, normalised returns, the size each record was earned at, the author's whole history
+- [ ] `local` **Source, build log and toolchain** for every agent
 - [ ] `local` **The build queue**, with a public log for every job
 - [ ] `local` **Deposits, withdrawals and claims**, with a pending claim's state shown
 - [ ] `local` **Health reports** on every vault page, with warnings and errors surfaced
@@ -99,9 +100,9 @@ The guarantees are the product. Everything else is how they are shown.
 ## Authoring
 
 - [ ] `local` **The SDK**: the frozen world, typed helpers for each interface, decimals, and a venue's payload types
-- [ ] `local` **A working reference strategy**, with its limits in its own code
-- [ ] **Template repositories** for a few recognisable strategy shapes
-- [ ] **Helper crates** for the plumbing a strategy should not rewrite: hedging two legs, working an order over time, quoting from fair value, rebalancing margin
+- [ ] `local` **A working reference agent**, with its limits in its own code
+- [ ] **Template repositories** for a few recognisable agent shapes
+- [ ] **Helper crates** for the plumbing an agent should not rewrite: hedging two legs, working an order over time, quoting from fair value, rebalancing margin
 - [ ] **Generated API documentation** for the SDK, published
 - [ ] **An authoring guide** that takes someone from `cargo new` to an open vault
 
@@ -111,8 +112,8 @@ Working defaults are in the [parameters](reference/parameters.md); these need me
 
 - [ ] **Fuel to processor time** on real machines, and what the yield interval costs
 - [ ] **Model limits**: load time and per-call latency for representative models
-- [ ] **Bandwidth**: what real strategies actually consume against their declared ranges
-- [ ] **Unit prices**: what compute actually costs, and how many strategies fit on one machine, to set the published prices
+- [ ] **Bandwidth**: what real agents actually consume against their declared ranges
+- [ ] **Unit prices**: what compute actually costs, and how many agents fit on one machine, to set the published prices
 - [ ] **Executor latency** to each venue, to set placement defaults
 
 ## Operations
@@ -133,7 +134,7 @@ Working defaults are in the [parameters](reference/parameters.md); these need me
         - A 1200×630 PNG, with text and logo inside the central safe area, since some platforms crop to a square.
         - In the pre-render, emit `og:image` (absolute URL), `og:image:width`, `og:image:height` and `og:image:alt`, plus `twitter:image`.
         - Switch `twitter:card` from `summary` to `summary_large_image`.
-        - Consider per-route images later, such as a generated card per strategy page.
+        - Consider per-route images later, such as a generated card per agent page.
 
 - [ ] **Social profiles**, once they exist: `twitter:site`, and the profile URLs as `sameAs` on the home page's structured data
 - [x] **These docs**, deployed
@@ -143,5 +144,5 @@ Working defaults are in the [parameters](reference/parameters.md); these need me
 
 - [ ] **Reference vaults on a public chain**, open for deposits
 - [ ] **Demonstration: exit without us.** Stop every executor, then a depositor withdraws more than the idle balance, sends the settle transaction themselves, and is paid
-- [ ] **Demonstration: the blocked exit.** A strategy tries to send most of a vault to an outside address and fails, because no such route exists
+- [ ] **Demonstration: the blocked exit.** An agent tries to send most of a vault to an outside address and fails, because no such route exists
 - [ ] **Demonstration: a record nobody can backfill**, with every trade on-chain and returns read straight from the vault contract

@@ -49,7 +49,7 @@ A rebuild that matches is the strongest form of this check, and it needs the rec
 
 ## What the chain cannot prove
 
-**That nothing happened outside it.** And it does not need to: a vault's keys can only move funds between the vault's own accounts, so there is no outside for value to go to.
+**That nothing happened outside it.** For withdrawals it does not need to: a vault's keys can only move funds between the vault's own accounts, so no key can send value anywhere else. Trades are different. A trade at a bad price moves value to whoever took the other side, and the chain shows the trade without saying who that was or why. Today the only on-chain bound on an order's price is the exit band on a claim; a bound on every order is [on the checklist](checklist.md#guarantees-first).
 
 **That the source is honest.** Reproducible builds prove the bytecode matches the source. Whether the code does something sensible is what the review reads, what an audit examines, and what you can read yourself.
 
@@ -57,7 +57,7 @@ A rebuild that matches is the strongest form of this check, and it needs the rec
 
 ## Exit without us
 
-The check that matters most is the one you can run on the worst day:
+The check that matters most is the one you can run on the worst day. It holds for a vault whose exit class is **direct**, which the vault's page shows:
 
 1. Stop trusting every service we run.
 2. Call `redeem` on the vault contract directly.
@@ -65,3 +65,5 @@ The check that matters most is the one you can run on the worst day:
 4. If not, a claim is booked — and `settle` is a public function that **you** can send.
 
 No service of ours is in that path. That is the point of it.
+
+A vault whose exit class is **served** trades on at least one venue the contract cannot unwind by itself, so a claim there needs an operator to close that part. The vault's page says how many operators can serve it.
