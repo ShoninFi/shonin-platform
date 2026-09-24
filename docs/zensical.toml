@@ -13,7 +13,7 @@ site_name = "Shonin Docs"
 site_description = "How Shonin works: trading agents you can read, pooled vaults, and attested execution"
 site_author = "Shonin"
 site_url = "https://docs.shonin.fi/"
-copyright = "Copyright &copy; 2026 Shonin"
+copyright = "These docs describe the platform as designed; the <a href=\"/checklist/\">build checklist</a> records what is built. &middot; Copyright &copy; 2026 Shonin"
 docs_dir = "content"
 site_dir = "site"
 extra_css = ["stylesheets/theme.css"]
@@ -22,6 +22,12 @@ extra_javascript = ["javascripts/diagrams.js"]
 # 404 for every reader, and the theme would fetch its stats on every page.
 nav = [
     {"Start here" = "index.md"},
+    {"The basics" = [
+        {"Roles" = "basics/roles.md"},
+        {"Trading agents" = "basics/trading-agents.md"},
+        {"Attested machines" = "basics/attested-machines.md"},
+        {"Trade-only keys" = "basics/trade-only-keys.md"},
+    ]},
     {"Putting money in" = "depositors.md"},
     {"Publishing an agent" = "authors.md"},
     {"Verify it yourself" = "verify.md"},

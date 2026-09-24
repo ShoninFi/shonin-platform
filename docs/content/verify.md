@@ -6,7 +6,7 @@ Everything the platform claims is a mechanism, and every mechanism has a way to 
 
 | The claim | How to check it | What you need |
 | --- | --- | --- |
-| **The vault's keys belong to attested executors running the committed agent** | Read the blessing on the attestation registry: each key's image digest, the bundle hash it may run, the vault it may act for, and when it expires | A chain RPC |
+| **The vault's keys belong to attested machines running the committed agent** | Read the blessing on the attestation registry: each key's image digest, the bundle hash it may run, the vault it may act for, and when it expires | A chain RPC |
 | **The agent's bytecode came from its published source** | Rebuild the source with the published builder image and compare the bundle hash | The source and the builder image |
 | **These are all the vault's trades** | Read the vault's accounts on each venue. Every order, fill and transfer is already a public, timestamped record | Chain RPCs and venue APIs |
 | **The returns are real** | Read value per share from the vault contract over time. It computes its own value from on-chain state | A chain RPC |
@@ -14,7 +14,7 @@ Everything the platform claims is a mechanism, and every mechanism has a way to 
 
 ## The panel on every vault page
 
-Every agent's page answers the question a depositor should ask — **which code is trading my money right now?** — and everything in it is on-chain:
+Every agent's page answers the question a depositor should ask, **which code is trading my money right now?**, and everything in it is on-chain:
 
 ```text
 Which code is trading this vault?                     Vault 0x7a3…
@@ -45,11 +45,11 @@ curl -s https://api.shonin.fi/api/store/<sourceHash>/source.tar -o source.tar
 
 The recipe is pinned and published: the toolchain, the SDK the build service carries, and the dependency graph the author locked.
 
-A rebuild that matches is the strongest form of this check, and it needs the recipe to be **hermetic** — a pinned image, fixed paths, a fixed timestamp, no network. That is not finished yet, so a rebuild today may differ in ways that have nothing to do with the source. It is [on the checklist](checklist.md#build-and-review), and until it is done the attested signature is what the mapping from source to bundle rests on.
+A rebuild that matches is the strongest form of this check, and it needs the recipe to be **hermetic** (a pinned image, fixed paths, a fixed timestamp, no network), so that an outsider's rebuild differs from ours only if the source does. Where a rebuild cannot be made, the attested signature is what the mapping from source to bundle rests on.
 
 ## What the chain cannot prove
 
-**That nothing happened outside it.** For withdrawals it does not need to: a vault's keys can only move funds between the vault's own accounts, so no key can send value anywhere else. Trades are different. A trade at a bad price moves value to whoever took the other side, and the chain shows the trade without saying who that was or why. Today the only on-chain bound on an order's price is the exit band on a claim; a bound on every order is [on the checklist](checklist.md#guarantees-first).
+**That nothing happened outside it.** For withdrawals it does not need to: a vault's keys can only move funds between the vault's own accounts, so no key can send value anywhere else. Trades are different. A trade at a bad price moves value to whoever took the other side, and the chain shows the trade without saying who that was or why. The only on-chain bound on an order's price is the exit band on a claim.
 
 **That the source is honest.** Reproducible builds prove the bytecode matches the source. Whether the code does something sensible is what the review reads, what an audit examines, and what you can read yourself.
 
@@ -62,7 +62,7 @@ The check that matters most is the one you can run on the worst day. It holds fo
 1. Stop trusting every service we run.
 2. Call `redeem` on the vault contract directly.
 3. If the idle balance covers it, you are paid in that transaction.
-4. If not, a claim is booked — and `settle` is a public function that **you** can send.
+4. If not, a claim is booked, and `settle` is a public function that **you** can send.
 
 No service of ours is in that path. That is the point of it.
 

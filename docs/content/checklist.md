@@ -2,21 +2,31 @@
 
 Everything between here and a platform running on a public chain, grouped by area, with no dates. This is the working guideline: tick a box when it is done, add items as work appears, and keep it honest.
 
-!!! info "What a tick means"
-    **`local`** — built and working on the local development chain, against its stand-in venue and development attestation verifier. It is not a tick: the mechanism is proved, the environment is not.
+Nothing is deployed to a public chain yet. There is no live vault and no money in anything. The web app is at [shonin.fi](https://shonin.fi/), behind a login while the project is pre-release, and what it shows is a local development chain.
 
-    **`[x]`** — done for real, on the chain and the venue it names.
+!!! info "What a tick means"
+    **`local`**: built and working on the local development chain, against its stand-in venue and development attestation verifier. It is not a tick: the mechanism is proved, the environment is not.
+
+    **`[x]`**: done for real, on the chain and the venue it names.
 
     A card with neither is not started.
 
 ---
+
+## Changes to the design
+
+Decisions already made, where the docs describe the new design and what is built still does the old thing.
+
+- [ ] **Review before build.** The reviewer reads the source before anything is compiled, so a project's build scripts and proc macros never run until it has been read. A finding in a narrow `malicious` category refuses the build: the review fee is charged, the vault closes and the rest of the tank comes back, and the refusal is recorded against the source hash in that transaction, with the report public. Everything else stays a score, not a gate, and is recorded as today once the bundle is registered. The author's page lists refusals beside failed builds. Built today: build first, then review, and nothing can refuse a build
+- [ ] **A malicious finding on a live vault pauses its deposits.** The agent keeps running and depositors can leave as usual; the guardian key then kills the vault or lifts the pause, publishing its reason, and a later clean review cannot lift it. Built today: no pause state, and a review never changes a vault
+- [ ] **Two keys, split by power.** The allowlist key proposes and revokes images; the guardian key kills vaults and lifts paused deposits. Neither can move funds except back to depositors. Built today: the contracts already keep the two powers apart, and one development account holds both
 
 ## Guarantees first
 
 The guarantees are the product. Everything else is how they are shown.
 
 - [ ] `local` **Funds can only move between a vault's own accounts**, enforced by the venue and by the vault contract, with no route out for any key
-- [ ] `local` **Anyone can exit without us** from a vault whose exit class is direct: `redeem` pays from idle balance, or books a claim that `settle` — a public function — completes
+- [ ] `local` **Anyone can exit without us** from a vault whose exit class is direct: `redeem` pays from idle balance, or books a claim that `settle`, a public function, completes
 - [ ] `local` **Only the committed bundle can use a vault's keys**, checked against the registry on every approval
 - [ ] `local` **The record is computed by the vault contract** from on-chain state, never reported
 - [ ] `local` **Every image that may hold a key is on a public, timelocked allowlist**, reproducible from published source
@@ -27,7 +37,7 @@ The guarantees are the product. Everything else is how they are shown.
 
 - [ ] `local` **Vault and factory**: ERC-4626 shares, deposit at mark, redeem at exit-side marks, claims with pending shares, capital moved only between registered accounts
 - [ ] `local` **Fees and the tank**: daily crystallisation as shares, the high-water mark, the transaction fee, tank funding, auto-fill, usage charges
-- [ ] `local` **Claims and kills**: settle inside the exit band, freeze after an unserved claim, an admin kill that returns everything to depositors
+- [ ] `local` **Claims and kills**: settle inside the exit band, freeze after an unserved claim, a kill that returns everything to depositors
 - [ ] `local` **Attestation registry**: the timelocked allowlist by image kind, key blessing from a proof, a Merkle proof per vault
 - [ ] `local` **Strategy registry**: registration only with a valid builder signature, supersession, retirement
 - [ ] `local` **Review registry**: signed reviews from blessed reviewers, and anyone buying a fresh one
@@ -122,11 +132,11 @@ Working defaults are in the [parameters](reference/parameters.md); these need me
 - [ ] `local` **A public status feed**: every kill, every allowlist change, every venue that stopped behaving
 - [ ] **Monitoring and alerting** for the services, separate from the on-chain guarantees
 - [ ] **A runbook** for a revoked image, a failing venue and a stuck claim
-- [ ] **Key management** for the admin key, and a path to a multisig
+- [ ] **Key management** for the allowlist key and the guardian key, and a path to a multisig for each
 
 ## The site
 
-- [ ] **Publish the repository.** Most of what this site claims — rebuild it yourself, run your own indexer, read the review prompt, run the whole platform locally — is worth nothing while the source is private. Near the top of the list for that reason
+- [ ] **Publish the repository.** Most of what this site claims (rebuild it yourself, run your own indexer, read the review prompt, run the whole platform locally) is worth nothing while the source is private. Near the top of the list for that reason
 - [ ] `local` **Pre-rendered pages, a sitemap and robots.txt**, so every route has real content without JavaScript
 - [ ] **A link preview image**
 

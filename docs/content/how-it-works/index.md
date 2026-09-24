@@ -8,10 +8,10 @@ Six things happen, in order, and each one leaves evidence on a chain.
 flowchart LR
     A1["Rust source"]
 
-    subgraph PLATFORM["attested images, on a public allowlist"]
+    subgraph PLATFORM["attested machines, running allowlisted images"]
         direction TB
-        B1["builder<br/>compiles and signs"]
         B2["reviewer<br/>reads and scores"]
+        B1["builder<br/>compiles and signs"]
         B3["executor<br/>holds the keys"]
     end
 
@@ -25,10 +25,10 @@ flowchart LR
 
     D1["the vault's own<br/>accounts at the venue"]
 
-    A1 ==> B1
-    B1 ==> C1
-    B1 -.-> B2
+    A1 ==> B2
     B2 ==> C2
+    B2 ==>|"unless malicious"| B1
+    B1 ==> C1
     B3 ==> C3
     C3 -.->|"which keys may act"| C4
     C4 <==>|"value, capital"| D1
@@ -56,21 +56,21 @@ Creating the vault and funding its tank happen in the same transaction, because 
 
 → [Agents](agents.md) · [Publishing](publishing.md)
 
-## 2. An attested builder compiles it
+## 2. An attested reviewer reads it
+
+A pinned model, with a pinned prompt and a pinned output schema, answers one question: is this code reasonable? It returns a score out of 100 and findings, each in a fixed category, each with a severity, each pointing at a file and a line.
+
+It reads the source before anything is compiled, because compiling Rust runs the author's build scripts and macros. Code it finds **malicious** is refused there and never built. Anything else is a score, not a gate, and it never rates expected profit.
+
+→ [The review](review.md)
+
+## 3. An attested builder compiles it
 
 The queue is public, first come first served, one job in flight per author, with the full log either way. A failed build's log is as public as a successful one's, which matters more than it sounds: an author cannot quietly try twenty times and show you the twentieth.
 
 The builder then signs a digest binding the source it read to the bundle it made, together with the chain, the registry's address, the agent's id and version, and its author. The registry accepts a bundle only with that signature, from a key blessed for an allowlisted builder image.
 
 → [Publishing](publishing.md)
-
-## 3. An attested reviewer reads it
-
-A pinned model, with a pinned prompt and a pinned output schema, answers one question: is this code reasonable? It returns a score out of 100 and findings, each in a fixed category, each with a severity, each pointing at a file and a line.
-
-It is a score, not a gate. It never rates expected profit, and it never stops a vault opening.
-
-→ [The review](review.md)
 
 ## 4. A vault opens
 
@@ -84,7 +84,7 @@ An agent version never changes. A new version is a new bundle, a new vault and a
 
 ## 5. Attested executors trade
 
-The vault's trading keys are generated inside an attested image and never leave it. A registry records what each key may do: which image made it, which bundle it may run, which one vault it may act for, and when the blessing expires.
+The vault's trading keys are generated inside an attested machine and never leave it. Our contracts are the gatekeepers: the attestation registry verifies the attestation and records what each key may do (which image made it, which bundle it may run, which one vault it may act for, and when the blessing expires), the vault approves a key at the venue only if the registry says so, and the venue takes orders only from approved keys.
 
 Attestation is what tells you *which* code holds a key. What stops that key withdrawing is simpler, and it is worth separating the two: the venue and the vault contract will only let it move funds between the vault's own accounts. It can still trade at a loss, including on purpose, which is covered in [Attested execution](execution.md#the-keys-can-only-trade).
 

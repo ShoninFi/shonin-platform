@@ -1,17 +1,22 @@
 # The review
 
-An attested model reads the source and answers one question: **is this code reasonable?**
+An attested model reads the source, before anything is compiled, and answers one question: **is this code reasonable?**
 
-It is a score, not a gate. It never stops a vault opening, it protects nobody on its own, and it never rates expected profit. An agent can be careful and lose money, and reckless and make it.
+It is a score, with one exception: code it finds **malicious** is refused and never built. Anything else goes ahead whatever it scores. The review protects nobody on its own, and it never rates expected profit. An agent can be careful and lose money, and reckless and make it.
+
+## Why it comes before the build
+
+Compiling Rust runs the author's own code: build scripts and procedural macros execute on the machine doing the build. Reading the source first means code written to attack the builder is refused before any of it runs.
 
 ## What it looks at
 
 Whether the risks are bounded by something in the code itself. Whether the code handles the ways the world goes wrong. Whether it does what it appears to do.
 
-Every finding falls into exactly one of seven categories:
+Every finding falls into exactly one of eight categories. The first refuses the build; the other seven only lower the score.
 
 | Category | What it means |
 | --- | --- |
+| `malicious` | Code written to do harm: to attack the machine that builds or runs it, to reach for keys or secrets it was not given, or to move depositors' money out by trading it away on purpose. **Refuses the build** |
 | `unbounded-risk` | Position sizing that can grow without a ceiling, leverage the code never bounds, or nothing said about what happens after a losing streak |
 | `missing-failure-handling` | Rejected orders, venue errors, a host that is down, or a restart that begins with an empty cache |
 | `model-dependence` | A model's output sizing a position directly, with no bound around it |
@@ -20,7 +25,7 @@ Every finding falls into exactly one of seven categories:
 | `hidden-behaviour` | Code paths that behave very differently from the rest, such as logic that trades differently after a date or a signal |
 | `unaudited-dependencies` | Crates with little use elsewhere, pulled into code that holds depositors' money |
 
-Each finding carries a severity — **note**, **concern** or **serious** — and points at a file and a line. The report also carries a summary in the reviewer's own words, beside the author's, and a plain list of **what the review could not tell**.
+Each finding carries a severity (**note**, **concern** or **serious**) and points at a file and a line. The report also carries a summary in the reviewer's own words, beside the author's, and a plain list of **what the review could not tell**.
 
 ## The score
 
@@ -30,18 +35,20 @@ Every agent page shows the score beside what it cannot tell you, because a numbe
 
 ## What is pinned
 
-The reviewer runs inside a measured image, and the image pins:
+The reviewer runs on an attested machine, and its image pins:
 
 - the model,
 - the prompt,
 - the output schema,
-- the seven categories and the three severities.
+- the eight categories and the three severities.
 
 Changing any of them is an image change, which goes through the same public, timelocked allowlist as an executor image. The prompt and the schema are published, so an author can run the same review themselves against any model they like before publishing. It just is not signed, and it is not binding.
 
 ## What is recorded
 
-The reviewer submits the result to the review registry with its blessed key. The registry checks that the sender is blessed as a reviewer on an allowed image, and that the bundle and source hashes match the version registered:
+A **refusal** is recorded in the transaction that closes the vault: the source hash, the reviewer's image and the hash of its report, which is public. There is no bundle, because nothing was built.
+
+A review that goes on to the build is submitted to the review registry with the reviewer's blessed key once the bundle is registered. The registry checks that the sender is blessed as a reviewer on an allowed image, and that the bundle and source hashes match the version registered:
 
 ```solidity
 submitReview(strategyId, version, Review(
@@ -51,18 +58,20 @@ submitReview(strategyId, version, Review(
     bytes32 modelIdHash,       // the pinned model
     bytes32 promptHash,        // the prompt and the output schema together
     bytes32 reportHash,        // the full JSON report
-    uint8   score,             // 0–100
+    uint8   score,             // 0-100
     uint16  findingCount,
     uint64  reviewedAt,
     address boughtBy           // who paid for this one
 ))
 ```
 
-Every review is kept, newest first. A review is of one bundle built from one source: a good score can never follow code nobody scored.
+Every review is kept, newest first. A review is of one source and the one bundle built from it: a good score can never follow code nobody scored.
 
 ## Buying another one
 
-**Anyone can buy a fresh review** of any agent, at any time, for the same flat fee — the author, a depositor, a competitor, a sceptic. The newest is shown first and the older ones are kept, so an agent cannot quietly shop for a better score.
+**Anyone can buy a fresh review** of any agent, at any time, for the same flat fee: the author, a depositor, a competitor, a sceptic. The newest is shown first and the older ones are kept, so an agent cannot quietly shop for a better score.
+
+A fresh review that finds a live agent **malicious** cannot refuse a build that already happened. Instead it [pauses deposits](vaults.md#deposits-paused) into the vault until the guardian key either kills it or lifts the pause, with its reason published.
 
 Nothing is re-reviewed automatically when the reviewer image changes. A review says which image produced it, and you can buy one under the current image whenever you want.
 
@@ -76,7 +85,7 @@ An agent's comments, identifiers and strings are text the author controls and a 
 
 ## Sealed source
 
-Sealed source is reviewed exactly like published source. The attested reviewer reads it inside its measured image; the store refuses to serve it to anyone else. What a depositor relies on is the attested build plus the attested review. Published source is extra, and it is what makes an independent rebuild possible.
+Sealed source is reviewed exactly like published source. The reviewer reads it on its attested machine; the store refuses to serve it to anyone else. What a depositor relies on is the attested build plus the attested review. Published source is extra, and it is what makes an independent rebuild possible.
 
 ## A new version
 

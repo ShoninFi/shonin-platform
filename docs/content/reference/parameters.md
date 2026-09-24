@@ -88,8 +88,9 @@ A manifest may declare any allowances it likes; these are a starting point. A he
 
 | What | Value |
 | --- | --- |
-| Score | An integer, 0–100, higher is more reasonable |
-| Finding categories | 7, fixed by the reviewer image |
+| Score | An integer, 0-100, higher is more reasonable |
+| Finding categories | 8, fixed by the reviewer image |
 | Severities | Note, concern, serious |
 | Who may buy one | Anyone, at any time, for the same flat fee |
-| Is it a gate? | No |
+| When it runs | Before the build |
+| Is it a gate? | Only for code found `malicious`, which is refused and never built |

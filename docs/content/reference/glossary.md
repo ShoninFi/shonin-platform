@@ -5,11 +5,17 @@ One word for one thing, throughout the platform and these docs.
 **Agent**
 : The program an author publishes: a long-lived Rust program, compiled to a WebAssembly component, that watches the market, computes, and decides. It reaches the world through seven interfaces and nothing else. The contracts call it a *strategy*.
 
+**Allowlist key**
+: One of Shonin's two keys. It proposes machine images for the allowlist, which become usable after a public timelock, and revokes them instantly. It cannot move funds or stop a vault.
+
 **Allowances**
 : The compute an agent declares in its manifest: fuel a second, memory, requests, bandwidth, open streams and inference. The host holds it to them, and its vault's tank is charged for them at the published prices.
 
+**Attested machine**
+: A secure enclave running one of the platform's allowlisted images: it reviews, builds, or runs an agent and holds its keys. It signs an attestation of the exact code it runs, and our contracts accept a key only with one.
+
 **Attestation**
-: A proof of which code is running inside an enclave. It says which image holds a key; it is not what stops the key withdrawing.
+: A proof, signed by the hardware, of which code an attested machine is running. Our contracts check it before they accept a key. It says which code holds a key; it is not what stops the key withdrawing.
 
 **Author**
 : Whoever publishes an agent. They fund its tank, earn the author fee, and cannot touch a vault's capital.
@@ -29,6 +35,9 @@ One word for one thing, throughout the platform and these docs.
 **Custody level**
 : How a venue enforces that a key cannot take funds out: venue-enforced, chain-enforced, or something weaker, shown per venue on every vault page.
 
+**Deposits paused**
+: A vault that has stopped taking deposits because a review of its live code found it malicious. The agent keeps running and depositors can leave as usual, until the guardian key kills the vault or lifts the pause.
+
 **Depositor**
 : Whoever puts capital into a vault. They hold shares, can leave at any time, and never need permission to do either.
 
@@ -47,6 +56,9 @@ One word for one thing, throughout the platform and these docs.
 **Fuel**
 : The runtime's unit of work. An agent declares a rate, the rate is what its tank is billed at, and it decides how often the agent yields.
 
+**Guardian key**
+: One of Shonin's two keys. It kills a vault or lifts a pause on its deposits, and publishes its reason. It cannot move funds anywhere but back to depositors, or touch the allowlist.
+
 **High-water mark**
 : The highest value per share a vault has crystallised at. Profit fees are only ever taken above it.
 
@@ -54,10 +66,10 @@ One word for one thing, throughout the platform and these docs.
 : The part of a vault's value sitting in the contract rather than at a venue. Withdrawals up to it are paid in one transaction.
 
 **Image**
-: A measured build of one of the platform's services — an executor, an unwinder, the build service or the reviewer. Every image that may hold a key is on a public, timelocked allowlist.
+: A measured build of one of the platform's services (an executor, an unwinder, the build service or the reviewer), which runs on an attested machine. Every image that may hold a key is on a public, timelocked allowlist.
 
 **Kill**
-: The admin key stopping a vault: every position closed, all cash home, every depositor paid from idle balance. A halt, never a theft.
+: The guardian key stopping a vault: every position closed, all cash home, every depositor paid from idle balance. A halt, never a theft.
 
 **Manifest**
 : The `shonin.toml` in a project. What the agent is, what it will not do, the venues it trades, the config it takes and the allowances it asks for. Hashed with the bundle.
@@ -75,7 +87,7 @@ One word for one thing, throughout the platform and these docs.
 : A vault's own on-chain history: value per share over time, read from the contract that computes it.
 
 **Review**
-: An attested model's score out of 100 with findings, each in a fixed category with a severity, a file and a line. A score, not a gate.
+: An attested model's reading of the source before it is built: a score out of 100 with findings, each in a fixed category with a severity, a file and a line. A score, not a gate, except that code found malicious is refused and never built.
 
 **Sealed**
 : Source, or a secret, encrypted so that only the attested services can read it. Sealing changes who can read something, never whether it was compiled or reviewed.
@@ -111,4 +123,4 @@ One word for one thing, throughout the platform and these docs.
 : Where an agent actually trades. Each one enforces, in its own way, that a vault's key can trade but cannot withdraw.
 
 **Version**
-: An agent version never changes. A new version is a new bundle, a new vault and a declared lineage — never an edit of something a depositor already chose.
+: An agent version never changes. A new version is a new bundle, a new vault and a declared lineage, never an edit of something a depositor already chose.

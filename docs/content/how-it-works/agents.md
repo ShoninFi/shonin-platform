@@ -2,7 +2,7 @@
 
 An agent is an ordinary Rust project that compiles to one **WebAssembly component**. It runs as a single long-lived program: it watches the market, computes, decides, and hands the host its submissions. It never holds a key, never signs anything, and can only ever trade its vault's own accounts.
 
-The contracts call it a *strategy* — `strategyId`, `StrategyRegistry`, the `shonin:strategy` interface. It is the same thing, and these pages use that word only where they name something in the contracts.
+The contracts call it a *strategy*: `strategyId`, `StrategyRegistry`, the `shonin:strategy` interface. It is the same thing, and these pages use that word only where they name something in the contracts.
 
 ## One long-lived program
 
@@ -43,7 +43,7 @@ If it faults, the host tears it down and starts it again. An agent is written to
 
 ## What it may reach
 
-The interface is frozen as `shonin:strategy@0.1.0`. An agent sees these and nothing else — no filesystem, no environment, no sockets of its own.
+The interface is frozen as `shonin:strategy@0.1.0`. An agent sees these and nothing else: no filesystem, no environment, no sockets of its own.
 
 | Interface | What it gives | What it does not |
 | --- | --- | --- |
@@ -52,13 +52,10 @@ The interface is frozen as `shonin:strategy@0.1.0`. An agent sees these and noth
 | `data` | Cached, shared reads the executor fetches once and hands to every agent that wants them | Be a private feed |
 | `websocket` | A socket the executor terminates, so the agent never holds a certificate or a key | Hold credentials |
 | `state` | A per-agent cache that may survive a restart | Be relied on; it is promised to nobody |
-| `secrets` | Values the author sealed to the bundle, opened only inside the measured image | Be read by us, or by another bundle |
+| `secrets` | Values the author sealed to the bundle, opened only inside the attested machine | Be read by us, or by another bundle |
 | `inference` | ONNX models the author shipped in the bundle, run on the host under a time budget | Reach a model the bundle does not contain |
 
-!!! info "Not all of it runs yet"
-    `websocket` and `inference` are in the frozen interface, and the executor does not implement them yet: a call to either returns an error rather than pretending. Everything else works on the development chain. Both are on the [checklist](../checklist.md#execution).
-
-A **submission** is opaque bytes that the venue's own adapter understands, decoded inside the measured image. An agent builds them with a typed crate, so the decision is the agent's and the signing is the host's.
+A **submission** is opaque bytes that the venue's own adapter understands, decoded inside the attested machine. An agent builds them with a typed crate, so the decision is the agent's and the signing is the host's.
 
 ## Limits are code
 
@@ -114,6 +111,6 @@ An agent version never changes. A new version is a new bundle, a new vault and a
 
 ## The SDK
 
-Authors depend on `shonin-strategy-sdk`, which carries the generated bindings, typed helpers for each interface, decimal arithmetic that two machines cannot round differently, and the payload types each venue's adapter understands. Helper code that an agent should not have to rewrite — hedging two legs, working an order over time, quoting from fair value — ships as ordinary crates, pinned by `Cargo.lock` like any dependency, with no privileges of their own.
+Authors depend on `shonin-strategy-sdk`, which carries the generated bindings, typed helpers for each interface, decimal arithmetic that two machines cannot round differently, and the payload types each venue's adapter understands. Helper code that an agent should not have to rewrite (hedging two legs, working an order over time, quoting from fair value) ships as ordinary crates, pinned by `Cargo.lock` like any dependency, with no privileges of their own.
 
 The SDK is Apache-2.0.

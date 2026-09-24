@@ -12,7 +12,7 @@ You submit decisions and the host tells you what happened to each one. You never
 
 It reaches the world through seven interfaces, frozen as `shonin:strategy@0.1.0`: your own fills and account state, the vault's events, shared market data, websockets the executor terminates, models you ship in the bundle, a cache, and secrets sealed to your bundle. No filesystem, no environment, no socket of your own.
 
-[Agents](how-it-works/agents.md) has the full interface, a complete example, and what is not implemented yet.
+[Agents](how-it-works/agents.md) has the full interface and a complete example.
 
 ## Your limits are your code
 
@@ -24,7 +24,7 @@ There is no platform risk policy. We do not impose a leverage cap, a drawdown st
 
 Creating the vault and funding its tank happen in one transaction, and the build service will not admit a job until that vault exists. Nothing is compiled for free.
 
-For an agent declaring modest allowances — two million fuel a second, 256 MiB, a little bandwidth — the numbers come out like this:
+For an agent declaring modest allowances (two million fuel a second, 256 MiB, a little bandwidth), the numbers come out like this:
 
 | | |
 | --- | ---: |
@@ -40,11 +40,13 @@ Those figures are read from the chain and shown on the publish page before you c
 
 **A failed build is charged, because it ran.** The vault closes and you reclaim the rest of the tank. A fixed resubmission is a new vault.
 
+The review runs before the build. Code it finds malicious is refused and never built, and the review fee is the only charge.
+
 ## The tank, and why it exists
 
 Running an agent costs money: compute, and gas where a chain charges it. That is your cost, not your depositors'.
 
-Each vault has a tank you fund and your own fees refill. It is excluded from what shares are worth, so a depositor's value never pays for your electricity. The executor states each day's usage, signed by the vault's own key, and the contract believes it only up to the allowances you declared at the published prices — so a wrong statement cannot charge you more than you agreed to.
+Each vault has a tank you fund and your own fees refill. It is excluded from what shares are worth, so a depositor's value never pays for your electricity. The executor states each day's usage, signed by the vault's own key, and the contract believes it only up to the allowances you declared at the published prices, so a wrong statement cannot charge you more than you agreed to.
 
 **Auto-fill** redeems a share of each author fee back into the tank, all of it by default, until the tank holds about thirty days of charges. For a modest agent that target is around $218. Above it, your fee shares are simply yours.
 
@@ -69,9 +71,9 @@ flowchart TB
     end
     subgraph US["The platform"]
         direction TB
-        Q["the queue admits it"] --> B["an attested builder<br/>compiles it"]
+        Q["the queue admits it"] --> R["the reviewer reads<br/>and scores it"]
+        R --> B["an attested builder<br/>compiles it"]
         B --> S["signs source → bundle,<br/>the registry accepts it"]
-        S --> R["the reviewer reads<br/>and scores it"]
     end
     subgraph OPEN["Anyone"]
         direction TB
@@ -87,7 +89,7 @@ flowchart TB
     class OPEN open
 ```
 
-Opening is a public function. Once the registry holds your bundle, anyone can open the vault — it is not a favour we grant.
+Opening is a public function. Once the registry holds your bundle, anyone can open the vault. It is not a favour we grant.
 
 ## Sealing your source
 
@@ -101,7 +103,7 @@ What a depositor then relies on is the attested build plus the attested review, 
 
 A version never changes. Publishing v2 creates a new bundle, a new vault and a declared lineage.
 
-Depositors in v1 are not moved, not asked and not affected — their vault runs exactly the code they chose. Its page shows that a newer version exists and links to it, and moving is a withdrawal there and a deposit here, done when they want to.
+Depositors in v1 are not moved, not asked and not affected: their vault runs exactly the code they chose. Its page shows that a newer version exists and links to it, and moving is a withdrawal there and a deposit here, done when they want to.
 
 The new vault's high-water mark starts fresh, which means you earn on its gains from the beginning.
 

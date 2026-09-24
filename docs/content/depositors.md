@@ -2,7 +2,7 @@
 
 You pick an agent, put money into its vault, and hold shares in a pool. The agent trades; your shares are worth whatever the pool is worth divided by the shares outstanding. You leave when you want to.
 
-An agent is a real program — it watches the market, runs its own computations, and decides. [What an agent actually is](index.md#what-an-agent-actually-is) covers what it can reach, and [what it cannot do](index.md#what-it-cannot-do) covers why a program that capable still cannot withdraw your money.
+An agent is a real program: it watches the market, runs its own computations, and decides. [Trading agents](basics/trading-agents.md) covers what it can reach, and [trade-only keys](basics/trade-only-keys.md) covers why a program that capable still cannot withdraw your money.
 
 This page is what that costs and what it feels like. The mechanism underneath is in the [technical deep-dive](how-it-works/index.md).
 
@@ -12,9 +12,9 @@ Every agent's page shows the same four things, and they are worth reading in thi
 
 **The record.** Value per share over time, read from the vault's own contract. Beside it, the same record rescaled to a common level of risk, because an unadjusted leaderboard mostly measures who used the most leverage.
 
-**The size it was earned at.** An edge that worked on a small vault often does not survive a large one. The page shows the capital behind the record — now, on average, and at most — so you can see whether the number you are looking at was earned at the size you would be joining.
+**The size it was earned at.** An edge that worked on a small vault often does not survive a large one. The page shows the capital behind the record now, on average, and at most, so you can see whether the number you are looking at was earned at the size you would be joining.
 
-**The review.** A score out of 100 with findings, each pointing at a file and a line, and a plain list of what the review could not tell. It is not a gate and it never stops a vault opening. Read the findings rather than the number.
+**The review.** A score out of 100 with findings, each pointing at a file and a line, and a plain list of what the review could not tell. Code it finds malicious is never built, so it never reaches a vault; anything else opens whatever it scores. Read the findings rather than the number.
 
 **Which code is trading it.** The bundle hash, whether the source is published, which executor image holds the keys, and when its attestation expires. All of it on-chain.
 
@@ -90,7 +90,7 @@ The same $10,000, in an agent that loses 10%.
 | You buy in at | $1.0000 | $9,990.00 |
 | The agent loses 10% | $0.9000 | $8,991.00 |
 | Less the streaming fee, 0.5% | $0.8955 | $8,946.05 |
-| Profit fee | — | — |
+| Profit fee | - | - |
 | Less the transaction fee on the way out | | $8,937.10 |
 
 You take out **$8,937**, down 10.6% on an agent that lost 10%.
@@ -117,7 +117,7 @@ Withdrawing has two shapes, and which one you get depends on how much cash the a
 
 **Booked as a claim.** If it does not, your shares are marked pending and the contract books a claim. It closes your fraction of every position, inside a band around the venue's own oracle price, and pays you once the cash is home at the value then.
 
-The settle function is public. Anyone can call it — you, another depositor, a passer-by, or the keeper we run. That is the part that matters: in a vault whose exit class is **direct**, your exit does not depend on us being alive, solvent, or willing.
+The settle function is public. Anyone can call it: you, another depositor, a passer-by, or the keeper we run. That is the part that matters: in a vault whose exit class is **direct**, your exit does not depend on us being alive, solvent, or willing.
 
 A vault that trades on a venue the contract cannot reach is **served** instead: a claim there needs an operator to close that part of the positions. The vault's page shows its exit class, and for a served vault how many operators can serve a claim.
 
@@ -129,7 +129,7 @@ Being honest about this is the point of the whole project, so here it is plainly
 
 **The agent can lose money.** Nothing here prevents that. A review is not a prediction and a record is not a promise. The platform makes the losses visible and honest; it does not stop them.
 
-**The agent can lose it on purpose.** A key that can trade can trade badly by design, for instance buying from an account its author controls above the market and selling to it below. No key can withdraw your deposit, but a run of deliberate bad trades moves value out all the same. Today nothing on the chain bounds the price of an agent's orders outside a claim; what stands against it is the source, the review, the record and your ability to leave. A bound is [on the checklist](checklist.md#guarantees-first).
+**The agent can lose it on purpose.** A key that can trade can trade badly by design, for instance buying from an account its author controls above the market and selling to it below. No key can withdraw your deposit, but a run of deliberate bad trades moves value out all the same. Outside a claim, nothing on the chain bounds the price of an agent's orders; what stands against it is the source, the review, the record and your ability to leave.
 
 **The market can be bad when you leave.** A claim closes your positions at the market, inside a band. In a fast market the close may not fill, and the claim waits.
 

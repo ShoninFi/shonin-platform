@@ -12,7 +12,7 @@ The Shonin platform: Solidity contracts (`contracts/`), one Cargo workspace (`pa
 - **The contracts' interfaces are the source of truth for both sides.** `contracts/src/interfaces/*.sol` is what the contracts implement and what `packages/chain` parses with `sol!`. Change the interface once and both follow; never hand-write a second copy of a signature.
 - **No key is written down.** The local chain's accounts come from its own published mnemonic, taken by index. `.env` holds a key only when someone points a role at an account of their own.
 - **Nothing local is committed.** A local run writes only under `.shonin/local`, which is gitignored and safe to delete.
-- **`docs/` is published.** It describes mechanisms a reader can check, and what is left to build. It never carries strategy, reasoning about pricing, comparisons with anyone, or plans beyond the checklist. Where something is designed but not built, the page says so. `docs/content/checklist.md` is the working guideline: keep it current.
+- **`docs/` is published.** It describes the platform as designed: mechanisms a reader can check. It never carries strategy, reasoning about pricing, comparisons with anyone, or plans beyond the checklist. `docs/content/checklist.md` is the only record of what is built; pages do not carry "not built yet" notes, and the site's footer says so once. Keep the checklist current.
 
 ## Commit guard
 

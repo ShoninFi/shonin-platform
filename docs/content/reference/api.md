@@ -4,14 +4,11 @@ Everything the web app shows, it reads from this API. There is nothing it can se
 
 The service behind it is the **indexer**, which is part of this repository and open source, so you can run your own against the same chain and compare. Running locally it listens on `http://localhost:19081`.
 
-!!! warning "Not yet versioned"
-    The shapes below are what the app reads today. A documented, versioned API with stability guarantees is on the [checklist](../checklist.md#the-record-and-the-api). Until then, treat it as something that can change.
-
 ## Reading
 
 ### `GET /api/snapshot`
 
-The entire state of the platform in one document — every agent with its vault, record, review, health and attestation; every author; the build queue; the activity feed; benchmarks and totals. It carries a version, so a client can poll cheaply and re-render only when it changes.
+The entire state of the platform in one document: every agent with its vault, record, review, health and attestation; every author; the build queue; the activity feed; benchmarks and totals. It carries a version, so a client can poll cheaply and re-render only when it changes.
 
 ```bash
 curl -s http://localhost:19081/api/snapshot | jq '.strategies[0] | {id, version, standing, vault: .vault.value}'
