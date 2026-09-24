@@ -61,7 +61,7 @@ struct KeyInfo {
 
 ## The allowlist
 
-The registry keeps the list of images that may hold a key at all (executors, unwinders, the build service and the reviewer), and the operator projects that may run them.
+The registry keeps the list of images that may hold a key at all (executors, unwinders, the build service and the Reviewer), and the operator projects that may run them.
 
 - **Adding is slow and public.** A new image digest can be proposed at any time, and becomes blessable only after a timelock, two days by default. During that window anyone can rebuild the image from its published source and check the digest, and object.
 - **Removing is instant.** A revoked image stops being blessable immediately.
@@ -69,7 +69,7 @@ The registry keeps the list of images that may hold a key at all (executors, unw
 
 ## The one asymmetry
 
-The **agent** never changes: it is what the depositor chose.
+The **agent** never changes: it is what the Depositor chose.
 
 The **executor** is our code, and it has to be patchable: a runtime fix has to be able to reach a running vault. What bounds that power is the timelock, a reproducible image, and instant revocation. A running vault adopts a new image by failover: a standby on the new image is blessed and takes over, with the vault's own on-chain approval as the handoff.
 
@@ -95,12 +95,12 @@ If an image is revoked for cause:
 2. each affected vault's venue approvals are revoked;
 3. a standby on another allowed image takes over, and if there is none, the vault stops trading, which shows as an error on its page.
 
-The guardian key can kill a vault, which flattens positions and pays every depositor out. Depositors can exit on their own without waiting for anyone.
+The guardian key can kill a vault, which flattens positions and pays every Depositor out. Depositors can exit on their own without waiting for anyone.
 
-A vault **never** resumes on a runtime its depositors did not accept. Revocation can halt an agent. It cannot hand the keys to someone else.
+A vault **never** resumes on a runtime its Depositors did not accept. Revocation can halt an agent. It cannot hand the keys to someone else.
 
 ## Health reports
 
 The executor publishes a signed health report per vault: restarts, faults, refused submissions, venue errors, and what the tank has left. It is signed by the key the registry blessed for that vault, over a canonical encoding of the report, and the API refuses one from any other key, so the page repeats the instance, not whoever spoke last.
 
-It is operational evidence, never the record of what the agent did. That is on the chain, where nobody can backfill it. Nothing a depositor needs in order to leave depends on a health report.
+It is operational evidence, never the record of what the agent did. That is on the chain, where nobody can backfill it. Nothing a Depositor needs in order to leave depends on a health report.

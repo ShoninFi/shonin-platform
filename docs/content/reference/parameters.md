@@ -9,11 +9,16 @@ Anything marked **working default** has not been measured yet and is on the [che
 | What | Level | Charged on | Paid to |
 | --- | --- | --- | --- |
 | Streaming fee | 0.5% a year | The vault's value | The platform |
-| Author fee | 10% | Gains above the high-water mark | The author |
+| Author fee | 10% | Gains above the high-water mark | The Author |
 | Platform fee | 5% | The same gains | The platform |
 | Transaction fee | 0.1% | Every deposit and withdrawal | Nobody: it stays in the pool |
 
-Fees crystallise daily, as new shares. The profit fee is only ever taken on a new high-water mark.
+Fees are worked out daily and paid weekly, as new shares. What is owed so far is already taken out of value per share, and shrinks again if the gains are given back before the week is out. The profit fee is only ever taken on a new high-water mark.
+
+| What | Value |
+| --- | --- |
+| Fees worked out | Daily |
+| Fees paid, and the high-water mark moved | Weekly |
 
 ## Leaving
 
@@ -29,7 +34,7 @@ Fees crystallise daily, as new shares. The profit fee is only ever taken on a ne
 
 | What | Value |
 | --- | --- |
-| Auto-fill | 100% of each author fee, until the tank reaches its target |
+| Auto-fill | 100% of each Author fee, until the tank reaches its target |
 | Tank target | 30 days of charges at the declared allowances |
 | Review fee | A flat fee per review |
 | Factory minimum | The least any vault's tank can be created with, read from the factory |
@@ -46,7 +51,7 @@ What a day of declared allowances costs, and what the vault's contract will let 
 | Egress | $0.15 a GB | working default |
 | Inference | At the processor rate | working default |
 
-The mapping from the runtime's fuel to processor time is not measured yet, so the fuel rate an author declares is what the tank is billed at and how often the agent yields, and the runtime's **epoch** is what actually bounds an agent.
+The mapping from the runtime's fuel to processor time is not measured yet, so the fuel rate an Author declares is what the tank is billed at and how often the agent yields, and the runtime's **epoch** is what actually bounds an agent.
 
 ## Allowances
 

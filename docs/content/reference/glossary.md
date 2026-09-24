@@ -3,7 +3,7 @@
 One word for one thing, throughout the platform and these docs.
 
 **Agent**
-: The program an author publishes: a long-lived Rust program, compiled to a WebAssembly component, that watches the market, computes, and decides. It reaches the world through seven interfaces and nothing else. The contracts call it a *strategy*.
+: The program an Author publishes: a long-lived Rust program, compiled to a WebAssembly component, that watches the market, computes, and decides. It reaches the world through seven interfaces and nothing else. The contracts call it a *strategy*.
 
 **Allowlist key**
 : One of Shonin's two keys. It proposes machine images for the allowlist, which become usable after a public timelock, and revokes them instantly. It cannot move funds or stop a vault.
@@ -18,7 +18,7 @@ One word for one thing, throughout the platform and these docs.
 : A proof, signed by the hardware, of which code an attested machine is running. Our contracts check it before they accept a key. It says which code holds a key; it is not what stops the key withdrawing.
 
 **Author**
-: Whoever publishes an agent. They fund its tank, earn the author fee, and cannot touch a vault's capital.
+: Whoever publishes an agent. They fund its tank, earn the Author fee, and cannot touch a vault's capital.
 
 **Blessing**
 : The registry's record that one key, made in one image, may act for one vault running one bundle, until it expires. Renewed by attesting again.
@@ -30,13 +30,13 @@ One word for one thing, throughout the platform and these docs.
 : A withdrawal the idle balance could not pay. The shares go pending, the contract closes the leaver's fraction of every position inside the exit band, and once the cash is home they are burned at the marks then and paid. Three states: pending, waiting, paid.
 
 **Crystallise**
-: Turning the fees a vault has accrued into new shares. Daily, and anyone may call it.
+: Paying the fees a vault owes as new shares. Weekly, and anyone may call it. Between payments, what is owed so far is already taken out of value per share.
 
 **Custody level**
 : How a venue enforces that a key cannot take funds out: venue-enforced, chain-enforced, or something weaker, shown per venue on every vault page.
 
 **Deposits paused**
-: A vault that has stopped taking deposits because a review of its live code found it malicious. The agent keeps running and depositors can leave as usual, until the guardian key kills the vault or lifts the pause.
+: A vault that has stopped taking deposits because a review of its live code found it malicious. The agent keeps running and Depositors can leave as usual, until the guardian key kills the vault or lifts the pause.
 
 **Depositor**
 : Whoever puts capital into a vault. They hold shares, can leave at any time, and never need permission to do either.
@@ -57,19 +57,19 @@ One word for one thing, throughout the platform and these docs.
 : The runtime's unit of work. An agent declares a rate, the rate is what its tank is billed at, and it decides how often the agent yields.
 
 **Guardian key**
-: One of Shonin's two keys. It kills a vault or lifts a pause on its deposits, and publishes its reason. It cannot move funds anywhere but back to depositors, or touch the allowlist.
+: One of Shonin's two keys. It kills a vault or lifts a pause on its deposits, and publishes its reason. It cannot move funds anywhere but back to Depositors, or touch the allowlist.
 
 **High-water mark**
-: The highest value per share a vault has crystallised at. Profit fees are only ever taken above it.
+: The highest value per share a vault has reached at a weekly fee payment. Profit fees are only ever charged on gains above it, so no gain is charged for twice.
 
 **Idle balance**
 : The part of a vault's value sitting in the contract rather than at a venue. Withdrawals up to it are paid in one transaction.
 
 **Image**
-: A measured build of one of the platform's services (an executor, an unwinder, the build service or the reviewer), which runs on an attested machine. Every image that may hold a key is on a public, timelocked allowlist.
+: A measured build of one of the platform's services (an executor, an unwinder, the build service or the Reviewer), which runs on an attested machine. Every image that may hold a key is on a public, timelocked allowlist.
 
 **Kill**
-: The guardian key stopping a vault: every position closed, all cash home, every depositor paid from idle balance. A halt, never a theft.
+: The guardian key stopping a vault: every position closed, all cash home, every Depositor paid from idle balance. A halt, never a theft.
 
 **Manifest**
 : The `shonin.toml` in a project. What the agent is, what it will not do, the venues it trades, the config it takes and the allowances it asks for. Hashed with the bundle.
@@ -102,16 +102,16 @@ One word for one thing, throughout the platform and these docs.
 : The contracts' word for an agent: `strategyId`, `StrategyRegistry`, the `shonin:strategy` interface. These docs use it only where they name something in the contracts.
 
 **Supersede**
-: An author's declaration that a new version replaces an older one. A claim about lineage, not a mechanism: the old vault runs exactly as it always has.
+: An Author's declaration that a new version replaces an older one. A claim about lineage, not a mechanism: the old vault runs exactly as it always has.
 
 **Tank**
-: The author's balance for a vault's running costs, funded by them and refilled from their own fees. Excluded from what shares are worth.
+: The Author's balance for a vault's running costs, funded by them and refilled from their own fees. Excluded from what shares are worth.
 
 **Transaction fee**
 : 0.1% on every deposit and withdrawal, which stays in the pool. Nobody receives it.
 
 **Usage statement**
-: What a day of running cost, signed by the vault's blessed key and charged to its tank, capped by the allowances the author declared.
+: What a day of running cost, signed by the vault's blessed key and charged to its tank, capped by the allowances the Author declared.
 
 **Value per share**
 : A vault's value divided by its shares outstanding. The whole of the record is the change in this number over time.
@@ -123,4 +123,4 @@ One word for one thing, throughout the platform and these docs.
 : Where an agent actually trades. Each one enforces, in its own way, that a vault's key can trade but cannot withdraw.
 
 **Version**
-: An agent version never changes. A new version is a new bundle, a new vault and a declared lineage, never an edit of something a depositor already chose.
+: An agent version never changes. A new version is a new bundle, a new vault and a declared lineage, never an edit of something a Depositor already chose.

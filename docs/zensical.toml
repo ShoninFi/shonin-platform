@@ -28,9 +28,9 @@ nav = [
         {"Attested machines" = "basics/attested-machines.md"},
         {"Trade-only keys" = "basics/trade-only-keys.md"},
     ]},
+    {"Verify it yourself" = "verify.md"},
     {"Putting money in" = "depositors.md"},
     {"Publishing an agent" = "authors.md"},
-    {"Verify it yourself" = "verify.md"},
     {"Technical deep-dive" = [
         {"The whole system" = "how-it-works/index.md"},
         {"Vaults" = "how-it-works/vaults.md"},

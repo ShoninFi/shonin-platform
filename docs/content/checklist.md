@@ -17,9 +17,10 @@ Nothing is deployed to a public chain yet. There is no live vault and no money i
 
 Decisions already made, where the docs describe the new design and what is built still does the old thing.
 
-- [ ] **Review before build.** The reviewer reads the source before anything is compiled, so a project's build scripts and proc macros never run until it has been read. A finding in a narrow `malicious` category refuses the build: the review fee is charged, the vault closes and the rest of the tank comes back, and the refusal is recorded against the source hash in that transaction, with the report public. Everything else stays a score, not a gate, and is recorded as today once the bundle is registered. The author's page lists refusals beside failed builds. Built today: build first, then review, and nothing can refuse a build
-- [ ] **A malicious finding on a live vault pauses its deposits.** The agent keeps running and depositors can leave as usual; the guardian key then kills the vault or lifts the pause, publishing its reason, and a later clean review cannot lift it. Built today: no pause state, and a review never changes a vault
-- [ ] **Two keys, split by power.** The allowlist key proposes and revokes images; the guardian key kills vaults and lifts paused deposits. Neither can move funds except back to depositors. Built today: the contracts already keep the two powers apart, and one development account holds both
+- [ ] **Review before build.** The Reviewer reads the source before anything is compiled, so a project's build scripts and proc macros never run until it has been read. A finding in a narrow `malicious` category refuses the build: the review fee is charged, the vault closes and the rest of the tank comes back, and the refusal is recorded against the source hash in that transaction, with the report public. Everything else stays a score, not a gate, and is recorded as today once the bundle is registered. The Author's page lists refusals beside failed builds. Built today: build first, then review, and nothing can refuse a build
+- [ ] **A malicious finding on a live vault pauses its deposits.** The agent keeps running and Depositors can leave as usual; the guardian key then kills the vault or lifts the pause, publishing its reason, and a later clean review cannot lift it. Built today: no pause state, and a review never changes a vault
+- [ ] **Fees are paid weekly.** What is owed is worked out daily and taken out of value per share, shrinks again if gains are given back, and is paid as new shares at a weekly payment anyone can call; a withdrawal pays what its own shares owe so far. The high-water mark moves only at a weekly payment. Built today: fees crystallise daily, and the high-water mark moves daily
+- [ ] **Two keys, split by power.** The allowlist key proposes and revokes images; the guardian key kills vaults and lifts paused deposits. Neither can move funds except back to Depositors. Built today: the contracts already keep the two powers apart, and one development account holds both
 
 ## Guarantees first
 
@@ -37,10 +38,10 @@ The guarantees are the product. Everything else is how they are shown.
 
 - [ ] `local` **Vault and factory**: ERC-4626 shares, deposit at mark, redeem at exit-side marks, claims with pending shares, capital moved only between registered accounts
 - [ ] `local` **Fees and the tank**: daily crystallisation as shares, the high-water mark, the transaction fee, tank funding, auto-fill, usage charges
-- [ ] `local` **Claims and kills**: settle inside the exit band, freeze after an unserved claim, a kill that returns everything to depositors
+- [ ] `local` **Claims and kills**: settle inside the exit band, freeze after an unserved claim, a kill that returns everything to Depositors
 - [ ] `local` **Attestation registry**: the timelocked allowlist by image kind, key blessing from a proof, a Merkle proof per vault
 - [ ] `local` **Strategy registry**: registration only with a valid builder signature, supersession, retirement
-- [ ] `local` **Review registry**: signed reviews from blessed reviewers, and anyone buying a fresh one
+- [ ] `local` **Review registry**: signed reviews from blessed Reviewers, and anyone buying a fresh one
 - [ ] `local` **Permissionless venue approvals** that obey only the registry
 - [ ] **Gas stocking**: funding an executor key's gas on chains that charge it, and repaying whoever funded it
 - [ ] **Audits** of every contract, with the status of each shown on every vault page from day one
@@ -49,7 +50,7 @@ The guarantees are the product. Everything else is how they are shown.
 
 - [ ] `local` **The runtime**: one long-lived instance per vault, fuel and epoch yields, a memory cap, restart after a fault, an ephemeral per-agent cache
 - [ ] `local` **Signed health reports**: restarts, faults, refused submissions, venue errors and tank runway, refused from any key not blessed for that vault
-- [ ] `local` **Signed daily usage statements**, capped by the allowances the author declared at the published prices
+- [ ] `local` **Signed daily usage statements**, capped by the allowances the Author declared at the published prices
 - [ ] `local` **Blessing and renewal**, with the venue's approval following the blessing
 - [ ] **A real enclave**: keys generated inside it, a genuine attestation token, and the on-chain proof of that token
 - [ ] **The root key**: generated in the enclave, released only by attested key exchange to an allowlisted image, with derived per-bundle and per-vault keys
@@ -62,9 +63,9 @@ The guarantees are the product. Everything else is how they are shown.
 
 ## Build and review
 
-- [ ] `local` **The queue**: first come first served, one job per author, the full log whether it succeeded or failed, and a position that is counted when it is asked for
+- [ ] `local` **The queue**: first come first served, one job per Author, the full log whether it succeeded or failed, and a position that is counted when it is asked for
 - [ ] `local` **Admission and charges**: a job admitted once its vault exists and its tank covers the minimum; a build charged because it ran; a failed build closing the vault and returning the rest
-- [ ] `local` **The signature** binding source, manifest and bundle to the chain, the registry, the agent and its author
+- [ ] `local` **The signature** binding source, manifest and bundle to the chain, the registry, the agent and its Author
 - [ ] `local` **The review**: a pinned model, prompt, schema, categories and severities, signed and recorded, with anyone able to buy a fresh one
 - [ ] **A calibrated score**: a second model answers a fixed battery of narrow questions and the score is computed from the answers with published weights, so a reader can see which question moved it. The battery, the client and the comparison harness are built; measuring it needs an account
 - [ ] **A calibration set**: a fixed set of agents with agreed scores, re-run before any reviewer image is proposed, so a change to the model or the prompt has to show what it did to them
@@ -74,7 +75,7 @@ The guarantees are the product. Everything else is how they are shown.
 - [ ] **Submission from a public repository and commit**, cloned and hashed by the build service
 - [ ] **Models in a bundle**: shipped, hashed, loaded at build time and reviewed alongside the code
 - [ ] **A version diff** for an agent that declares what it supersedes
-- [ ] **A pre-review** an author can run before publishing, through the same prompt and schema
+- [ ] **A pre-review** an Author can run before publishing, through the same prompt and schema
 - [ ] **Build reproducibility in practice**: once the recipe is hermetic, do real projects, with their proc macros and build scripts, rebuild to the same bytes on a different machine?
 
 ## Venues and custody
@@ -96,7 +97,7 @@ The guarantees are the product. Everything else is how they are shown.
 
 ## The web app
 
-- [ ] `local` **Leaderboard and agent pages**: on-chain records, review scores, normalised returns, the size each record was earned at, the author's whole history
+- [ ] `local` **Leaderboard and agent pages**: on-chain records, review scores, normalised returns, the size each record was earned at, the Author's whole history
 - [ ] `local` **Source, build log and toolchain** for every agent
 - [ ] `local` **The build queue**, with a public log for every job
 - [ ] `local` **Deposits, withdrawals and claims**, with a pending claim's state shown
@@ -153,6 +154,6 @@ Working defaults are in the [parameters](reference/parameters.md); these need me
 ## Launch
 
 - [ ] **Reference vaults on a public chain**, open for deposits
-- [ ] **Demonstration: exit without us.** Stop every executor, then a depositor withdraws more than the idle balance, sends the settle transaction themselves, and is paid
+- [ ] **Demonstration: exit without us.** Stop every executor, then a Depositor withdraws more than the idle balance, sends the settle transaction themselves, and is paid
 - [ ] **Demonstration: the blocked exit.** An agent tries to send most of a vault to an outside address and fails, because no such route exists
 - [ ] **Demonstration: a record nobody can backfill**, with every trade on-chain and returns read straight from the vault contract

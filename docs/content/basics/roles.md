@@ -1,17 +1,17 @@
 # Roles
 
-There are four roles on Shonin. Each can do some things and not others.
+Here's who does what on Shonin. You'll meet this cast of characters throughout the docs.
 
 **Author**
-: Writes a trading agent and publishes it. Funds the vault's tank, which pays for running it, and earns 10% of the vault's gains above its high-water mark. Cannot touch the vault's capital.
+: Writes a trading agent and publishes it. Funds the vault's tank, which pays for running it, and earns 10% of the vault's new profit, paid weekly. New profit means gains above the best the vault has done, so no gain is charged for twice. Cannot touch the vault's capital.
+
+**Reviewer**
+: An AI model, running on an attested machine, that reads an agent's source before it is built and writes a report on it, with a score out of 100. It reads the source whether the Author publishes it or seals it, and its report is public either way. Code it finds malicious is never built.
 
 **Depositor**
-: Puts money into an agent's vault and holds shares in it. Can leave at any time, without asking anyone.
+: Puts money into an agent's vault and earns what the agent makes with it: the vault's profit, after fees, in proportion to their shares. Losses are shared the same way. Can leave at any time, without asking anyone.
 
 **Shonin**
-: Runs the attested machines that review, build and execute agents, and the keeper that does the daily upkeep. Takes a 0.5% yearly fee on value and 5% of gains above the high-water mark. It holds two keys, and neither can move anyone's money: the **allowlist key** adds machine images to the allowlist, after a public delay, and removes them; the **guardian key** stops a vault and returns everything to its depositors.
-
-**Anyone**
-: Can do everything the platform needs done in public: open a vault once its bundle is registered, settle a depositor's claim, crystallise fees, buy a fresh review, and check every claim on this site against the chain. Nothing a depositor needs in order to leave depends on Shonin doing it.
+: Runs the platform and the attested machines, and takes a small share of fees. Can stop a vault, which returns everything to its Depositors, but cannot move anyone's money anywhere else.
 
 [Next: trading agents →](trading-agents.md){ .md-button .md-button--primary }

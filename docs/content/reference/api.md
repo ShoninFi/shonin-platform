@@ -8,7 +8,7 @@ The service behind it is the **indexer**, which is part of this repository and o
 
 ### `GET /api/snapshot`
 
-The entire state of the platform in one document: every agent with its vault, record, review, health and attestation; every author; the build queue; the activity feed; benchmarks and totals. It carries a version, so a client can poll cheaply and re-render only when it changes.
+The entire state of the platform in one document: every agent with its vault, record, review, health and attestation; every Author; the build queue; the activity feed; benchmarks and totals. It carries a version, so a client can poll cheaply and re-render only when it changes.
 
 ```bash
 curl -s http://localhost:19081/api/snapshot | jq '.strategies[0] | {id, version, standing, vault: .vault.value}'
@@ -57,12 +57,12 @@ The content-addressed store, addressed by the hashes the chain holds:
 | `source.tar` | The packed project, for a published agent |
 | `bundle.tar` | The bundle: the component and any models |
 | `component.wasm` | The compiled component |
-| `manifest.json` | What the author declared |
+| `manifest.json` | What the Author declared |
 | `log.json` | The build log |
 | `hashes.json` | Every hash this build produced, beside the bytes they name |
 | `report.json` | A review's full report |
 
-Sealed source is kept so the reviewer can read it and a build can be repeated, and the store refuses to serve it.
+Sealed source is kept so the Reviewer can read it and a build can be repeated, and the store refuses to serve it.
 
 ## Writing
 

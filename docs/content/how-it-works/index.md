@@ -10,7 +10,7 @@ flowchart LR
 
     subgraph PLATFORM["attested machines, running allowlisted images"]
         direction TB
-        B2["reviewer<br/>reads and scores"]
+        B2["Reviewer<br/>reads and scores"]
         B1["builder<br/>compiles and signs"]
         B3["executor<br/>holds the keys"]
     end
@@ -46,7 +46,7 @@ flowchart LR
     style CHAIN fill:none,stroke:#4338ca,stroke-width:1px
 ```
 
-## 1. An author publishes source
+## 1. An Author publishes source
 
 An ordinary Rust project: their code, their dependencies, a pinned toolchain, and a manifest declaring what the agent is, which venues it trades, the config it takes and the compute it needs.
 
@@ -56,19 +56,19 @@ Creating the vault and funding its tank happen in the same transaction, because 
 
 → [Agents](agents.md) · [Publishing](publishing.md)
 
-## 2. An attested reviewer reads it
+## 2. An attested Reviewer reads it
 
 A pinned model, with a pinned prompt and a pinned output schema, answers one question: is this code reasonable? It returns a score out of 100 and findings, each in a fixed category, each with a severity, each pointing at a file and a line.
 
-It reads the source before anything is compiled, because compiling Rust runs the author's build scripts and macros. Code it finds **malicious** is refused there and never built. Anything else is a score, not a gate, and it never rates expected profit.
+It reads the source before anything is compiled, because compiling Rust runs the Author's build scripts and macros. Code it finds **malicious** is refused there and never built. Anything else is a score, not a gate, and it never rates expected profit.
 
 → [The review](review.md)
 
 ## 3. An attested builder compiles it
 
-The queue is public, first come first served, one job in flight per author, with the full log either way. A failed build's log is as public as a successful one's, which matters more than it sounds: an author cannot quietly try twenty times and show you the twentieth.
+The queue is public, first come first served, one job in flight per Author, with the full log either way. A failed build's log is as public as a successful one's, which matters more than it sounds: an Author cannot quietly try twenty times and show you the twentieth.
 
-The builder then signs a digest binding the source it read to the bundle it made, together with the chain, the registry's address, the agent's id and version, and its author. The registry accepts a bundle only with that signature, from a key blessed for an allowlisted builder image.
+The builder then signs a digest binding the source it read to the bundle it made, together with the chain, the registry's address, the agent's id and version, and its Author. The registry accepts a bundle only with that signature, from a key blessed for an allowlisted builder image.
 
 → [Publishing](publishing.md)
 
@@ -76,9 +76,9 @@ The builder then signs a digest binding the source it read to the bundle it made
 
 One vault per agent version, with ERC-4626 accounting. A deposit is valued at mark in the same transaction; a withdrawal at exit-side marks, so the person leaving pays the spread rather than the pool.
 
-If the vault's idle balance covers a withdrawal, the shares burn and the depositor is paid then and there. If not, a claim is booked, and the function that settles it is one anybody can call.
+If the vault's idle balance covers a withdrawal, the shares burn and the Depositor is paid then and there. If not, a claim is booked, and the function that settles it is one anybody can call.
 
-An agent version never changes. A new version is a new bundle, a new vault and a declared lineage, never an edit of something a depositor already chose.
+An agent version never changes. A new version is a new bundle, a new vault and a declared lineage, never an edit of something a Depositor already chose.
 
 → [Vaults](vaults.md)
 
@@ -100,9 +100,9 @@ The indexer that turns this into a leaderboard is open source, so you can run yo
 
 ## What the platform never does
 
-It never takes custody. A vault's contract holds the money and pays the depositor.
+It never takes custody. A vault's contract holds the money and pays the Depositor.
 
-It never sets an agent's risk. Limits live in the agent's own code, where the reviewer reads them and a depositor can too.
+It never sets an agent's risk. Limits live in the agent's own code, where the Reviewer reads them and a Depositor can too.
 
 It never re-runs an agent to check it. Agents are not deterministic, so attestation is the witness rather than replay.
 

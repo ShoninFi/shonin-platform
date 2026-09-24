@@ -14,7 +14,7 @@ Everything the platform claims is a mechanism, and every mechanism has a way to 
 
 ## The panel on every vault page
 
-Every agent's page answers the question a depositor should ask, **which code is trading my money right now?**, and everything in it is on-chain:
+Every agent's page answers the question a Depositor should ask, **which code is trading my money right now?**, and everything in it is on-chain:
 
 ```text
 Which code is trading this vault?                     Vault 0x7a3…
@@ -43,7 +43,7 @@ curl -s https://api.shonin.fi/api/store/<sourceHash>/source.tar -o source.tar
 #   bundleHash on the registry  ==  sha256 of what you just built
 ```
 
-The recipe is pinned and published: the toolchain, the SDK the build service carries, and the dependency graph the author locked.
+The recipe is pinned and published: the toolchain, the SDK the build service carries, and the dependency graph the Author locked.
 
 A rebuild that matches is the strongest form of this check, and it needs the recipe to be **hermetic** (a pinned image, fixed paths, a fixed timestamp, no network), so that an outsider's rebuild differs from ours only if the source does. Where a rebuild cannot be made, the attested signature is what the mapping from source to bundle rests on.
 

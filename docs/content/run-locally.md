@@ -1,6 +1,6 @@
 # Run it locally
 
-The whole platform runs on your own machine: a development chain, the contracts on it, a stand-in venue, the build service, the reviewer, an executor, the keeper, the indexer and the web app. The site shows only what that chain produced.
+The whole platform runs on your own machine: a development chain, the contracts on it, a stand-in venue, the build service, the Reviewer, an executor, the keeper, the indexer and the web app. The site shows only what that chain produced.
 
 Nothing needs a key, an account or a cloud project.
 
@@ -26,7 +26,7 @@ task services:seed   # publish the reference agents through the real flows
 task down            # stop everything task dev started
 ```
 
-`task services:seed` publishes several versions the way an author would: one superseded by a newer one, one sealed, one that deliberately fails to build, and one that is then killed, so every state the site has to handle actually exists on your chain.
+`task services:seed` publishes several versions the way an Author would: one superseded by a newer one, one sealed, one that deliberately fails to build, and one that is then killed, so every state the site has to handle actually exists on your chain.
 
 ## What is listening
 
@@ -37,7 +37,7 @@ task down            # stop everything task dev started
 | 19083 | The chain |
 | 19084 | The build service |
 | 19085 | The executor |
-| 19086 | The reviewer |
+| 19086 | The Reviewer |
 | 19087 | The coordinator (the keeper) |
 | 19088 | The devnet: the chain's clock and its market |
 
@@ -45,7 +45,7 @@ Everything a run writes lives under `.shonin/local`, which is safe to delete; th
 
 ## The clock runs fast
 
-A block is mined every second and advances an hour of chain time, so a day of fees passes in twenty-four seconds and a vault reaches the ninety live days it needs to be ranked in about thirty-six minutes. Crystallisation, claims, freezes and blessing renewals all become things you can watch rather than read about.
+A block is mined every second and advances an hour of chain time, so a week of fees passes in under three minutes and a vault reaches the ninety live days it needs to be ranked in about thirty-six minutes. Crystallisation, claims, freezes and blessing renewals all become things you can watch rather than read about.
 
 ## The development wallet
 
@@ -75,7 +75,7 @@ cargo run -q -p shonin-cli -- publish path/to/your-agent            # packs, cre
 cargo run -q -p shonin-cli -- publish path/to/your-agent --sealed   # the same, with the source kept out of the store
 ```
 
-It publishes as the chain's author account, so it needs no key of yours.
+It publishes as the chain's Author account, so it needs no key of yours.
 
 or from the web app's **Publish** page: drop the packed archive, fund the tank, and watch the queue.
 

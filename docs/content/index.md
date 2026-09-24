@@ -4,14 +4,16 @@
 
 Anyone who uses an automated trading strategy wants to know three things: what it does, what it can do with their money, and whether they can get out. On Shonin, each answer is something they can check rather than something they are told.
 
-An author publishes a trading agent as source code. We use attested machines to evaluate it, compile it, and run it with keys that can trade but cannot withdraw.
+Here's how it works, in a nutshell. *Don't worry if it's a lot at once*, the next few pages take it one piece at a time:
 
-Depositors put money behind the agent they choose, and can check it's *really* that agent trading it. The source code is public too, unless the author opts out. Trades only go through when our on-chain contracts have verified the attestation, but depositors can withdraw at any time.
+An Author publishes a trading agent as source code. We use attested machines to evaluate it, compile it, and run it with keys that can trade but cannot withdraw.
+
+Depositors put money behind the agent they choose, and can check it's *really* that agent trading it. The source code is public too, unless the Author opts out. Trades only go through when our on-chain contracts have verified the attestation, but Depositors can withdraw at any time.
 
 <div class="shonin-hero" markdown="0">
 <svg viewBox="0 0 1000 700" role="img" aria-labelledby="hero-title hero-desc" xmlns="http://www.w3.org/2000/svg">
 <title id="hero-title">How Shonin fits together</title>
-<desc id="hero-desc">An author feeds source code into a sealed glass booth with an attestation seal on its roof. Inside, a small robot, the agent, trades at a screen. The booth has no door, and its only connection is a locked cable to a vault standing on a chain of blocks, where one depositor drops in a coin while another walks away with their money. Beneath the attested machine hang the two things it does: a model reads the source and scores it before anything is built, and then it is built once and signed. Beneath the vault runs the chain it is part of, and from it hang the two things the chain does: it checks the attested machine's seal, and it holds the record the returns are read from.</desc>
+<desc id="hero-desc">An Author feeds source code into a sealed glass booth with an attestation seal on its roof. Inside, a small robot, the agent, trades at a screen. The booth has no door, and its only connection is a locked cable to a vault standing on a chain of blocks, where one Depositor drops in a coin while another walks away with their money. Beneath the attested machine hang the two things it does: a model reads the source and scores it before anything is built, and then it is built once and signed. Beneath the vault runs the chain it is part of, and from it hang the two things the chain does: it checks the attested machine's seal, and it holds the record the returns are read from.</desc>
 <ellipse cx="500" cy="236" rx="480" ry="164" style="fill:var(--h-blob)"/>
 <ellipse cx="110" cy="362" rx="52" ry="8" style="fill:var(--h-shadow)"/>
 <ellipse cx="390" cy="364" rx="160" ry="10" style="fill:var(--h-shadow)"/>
@@ -230,10 +232,10 @@ Depositors put money behind the agent they choose, and can check it's *really* t
 <path d="M-28 12 v-8 M16 12 v-18" style="stroke:var(--h-muted);stroke-width:2;stroke-linecap:round;stroke-dasharray:1 5"/>
 </g>
 <!-- captions -->
-<text x="110" y="400" class="h-caption">author</text>
+<text x="110" y="400" class="h-caption">Author</text>
 <text x="390" y="400" class="h-caption">agent, in an attested machine</text>
 <text x="703" y="400" class="h-caption">vault, on-chain</text>
-<text x="900" y="400" class="h-caption">depositors</text>
+<text x="900" y="400" class="h-caption">Depositors</text>
 <text x="300" y="686" class="h-caption">reviewed by AI</text>
 <text x="480" y="686" class="h-caption">built and signed</text>
 <text x="710" y="686" class="h-caption">seal checked</text>

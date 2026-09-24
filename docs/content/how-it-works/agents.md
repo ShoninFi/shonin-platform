@@ -48,12 +48,12 @@ The interface is frozen as `shonin:strategy@0.1.0`. An agent sees these and noth
 | Interface | What it gives | What it does not |
 | --- | --- | --- |
 | `venues` | `submit` actions and be told what happened to each, a stream of the vault's own account events, and a read of the vault's account state | Reach any account but the vault's |
-| `vault` | A stream of two events: `claim-pending` when a depositor is leaving, and `halting` when the vault is stopping | Move capital anywhere outside the vault |
+| `vault` | A stream of two events: `claim-pending` when a Depositor is leaving, and `halting` when the vault is stopping | Move capital anywhere outside the vault |
 | `data` | Cached, shared reads the executor fetches once and hands to every agent that wants them | Be a private feed |
 | `websocket` | A socket the executor terminates, so the agent never holds a certificate or a key | Hold credentials |
 | `state` | A per-agent cache that may survive a restart | Be relied on; it is promised to nobody |
-| `secrets` | Values the author sealed to the bundle, opened only inside the attested machine | Be read by us, or by another bundle |
-| `inference` | ONNX models the author shipped in the bundle, run on the host under a time budget | Reach a model the bundle does not contain |
+| `secrets` | Values the Author sealed to the bundle, opened only inside the attested machine | Be read by us, or by another bundle |
+| `inference` | ONNX models the Author shipped in the bundle, run on the host under a time budget | Reach a model the bundle does not contain |
 
 A **submission** is opaque bytes that the venue's own adapter understands, decoded inside the attested machine. An agent builds them with a typed crate, so the decision is the agent's and the signing is the host's.
 
@@ -61,7 +61,7 @@ A **submission** is opaque bytes that the venue's own adapter understands, decod
 
 **There is no platform risk policy.** We do not impose a leverage cap, a drawdown stop or a position limit, because a limit we imposed would be a promise about someone else's code that we could not keep.
 
-A limit is something the author writes:
+A limit is something the Author writes:
 
 ```toml
 [config]
@@ -72,7 +72,7 @@ drawdown_stop      = "0.10"
 minimum_notional   = "100"
 ```
 
-...and something the author's code enforces, and something the reviewer reads and the depositor can read too. An agent that says it caps its leverage and does not is a finding, and the score says so.
+...and something the Author's code enforces, and something the Reviewer reads and the Depositor can read too. An agent that says it caps its leverage and does not is a finding, and the score says so.
 
 ## The manifest
 

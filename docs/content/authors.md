@@ -16,7 +16,7 @@ It reaches the world through seven interfaces, frozen as `shonin:strategy@0.1.0`
 
 ## Your limits are your code
 
-There is no platform risk policy. We do not impose a leverage cap, a drawdown stop or a position limit. A limit is something you declare in your manifest's config, enforce in your own code, and the reviewer reads, and a depositor can read too. An agent that claims a cap and does not enforce it in its sizing is a finding, and the score says so.
+There is no platform risk policy. We do not impose a leverage cap, a drawdown stop or a position limit. A limit is something you declare in your manifest's config, enforce in your own code, and the Reviewer reads, and a Depositor can read too. An agent that claims a cap and does not enforce it in its sizing is a finding, and the score says so.
 
 [Limits are code](how-it-works/agents.md#limits-are-code) shows what that looks like.
 
@@ -44,19 +44,19 @@ The review runs before the build. Code it finds malicious is refused and never b
 
 ## The tank, and why it exists
 
-Running an agent costs money: compute, and gas where a chain charges it. That is your cost, not your depositors'.
+Running an agent costs money: compute, and gas where a chain charges it. That is your cost, not your Depositors'.
 
-Each vault has a tank you fund and your own fees refill. It is excluded from what shares are worth, so a depositor's value never pays for your electricity. The executor states each day's usage, signed by the vault's own key, and the contract believes it only up to the allowances you declared at the published prices, so a wrong statement cannot charge you more than you agreed to.
+Each vault has a tank you fund and your own fees refill. It is excluded from what shares are worth, so a Depositor's value never pays for your electricity. The executor states each day's usage, signed by the vault's own key, and the contract believes it only up to the allowances you declared at the published prices, so a wrong statement cannot charge you more than you agreed to.
 
-**Auto-fill** redeems a share of each author fee back into the tank, all of it by default, until the tank holds about thirty days of charges. For a modest agent that target is around $218. Above it, your fee shares are simply yours.
+**Auto-fill** redeems a share of each Author fee back into the tank, all of it by default, until the tank holds about thirty days of charges. For a modest agent that target is around $218. Above it, your fee shares are simply yours.
 
 A tank that empties accrues a debt, repaid from future fees before anything reaches you.
 
 ## What you earn
 
-Ten per cent of gains above the vault's high-water mark, crystallised daily as new shares.
+Ten per cent of the vault's new profit: gains above the best value per share it has reached at a weekly fee payment, its **high-water mark**. It is worked out every day, shown on your page as it builds up, and paid weekly as new shares. If the vault gives a gain back before the week is out, the fee on it goes too.
 
-Concretely: a vault holding a million dollars that returns 20% over a year pays its author about **$19,400** for that year. The first $218 or so refills the tank; the rest is shares you can hold or redeem like any depositor's.
+Concretely: a vault holding a million dollars that returns 20% over a year pays its Author about **$19,400** for that year. The first $218 or so refills the tank; the rest is shares you can hold or redeem like any Depositor's.
 
 You earn nothing on a recovery back to a previous high, because the high-water mark is the vault's and it does not reset. An agent that loses 20% and then makes it back has, as far as the fee is concerned, done nothing.
 
@@ -71,13 +71,13 @@ flowchart TB
     end
     subgraph US["The platform"]
         direction TB
-        Q["the queue admits it"] --> R["the reviewer reads<br/>and scores it"]
+        Q["the queue admits it"] --> R["the Reviewer reads<br/>and scores it"]
         R --> B["an attested builder<br/>compiles it"]
         B --> S["signs source → bundle,<br/>the registry accepts it"]
     end
     subgraph OPEN["Anyone"]
         direction TB
-        O["opens the vault"] --> D["depositors arrive"]
+        O["opens the vault"] --> D["Depositors arrive"]
     end
     YOU --> US --> OPEN
 
@@ -95,9 +95,9 @@ Opening is a public function. Once the registry holds your bundle, anyone can op
 
 Source is public by default. A published agent is one anybody can rebuild and check.
 
-If you would rather not show it, upload it sealed. It is encrypted to the platform's key; the attested builder and the attested reviewer still read it, and nobody else does. Sealing changes who can read your code, never whether it was compiled or reviewed.
+If you would rather not show it, upload it sealed. It is encrypted to the platform's key; the attested builder and the attested Reviewer still read it, and nobody else does. Sealing changes who can read your code, never whether it was compiled or reviewed.
 
-What a depositor then relies on is the attested build plus the attested review, and the agent's page says exactly that rather than implying more.
+What a Depositor then relies on is the attested build plus the attested review, and the agent's page says exactly that rather than implying more.
 
 ## Versions
 
@@ -109,6 +109,6 @@ The new vault's high-water mark starts fresh, which means you earn on its gains 
 
 ## Before you publish
 
-The reviewer's prompt and output schema are in the repository. Run the same review over your own code first, against any model you like. It is not signed and it is not binding, but it is the same questions.
+The Reviewer's prompt and output schema are in the repository. Run the same review over your own code first, against any model you like. It is not signed and it is not binding, but it is the same questions.
 
 Then check the obvious things a review will otherwise find for you: that your sizing is bounded by something in the code, that a rejected order does not leave you thinking you hold a position you do not, and that a restart with an empty cache does the right thing.

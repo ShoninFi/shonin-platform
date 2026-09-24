@@ -88,11 +88,16 @@
     --h-hair: #2b2540;
     --h-screen: #0f172a;
     --h-slot: #1e1b4b;
+    --h-sand: #f3e0b0;
+    --h-sand-dot: #dcc184;
+    --h-wood-dark: #8f5a2b;
+    --h-amber-soft: #fdf0cf;
     --h-block: #eef0ff;
     --h-block-top: #ffffff;
     --h-block-side: #d9dcfb;
     --h-disc: rgba(67, 56, 202, 0.06);
     --h-glass-disc: rgba(13, 148, 136, 0.08);
+    --h-red-soft: rgba(220, 38, 38, 0.07);
     --h-badge-ink: #ffffff;
     --h-shine-strong: rgba(255, 255, 255, 0.9);
     --h-coin-ink: #1e1b4b;
@@ -115,11 +120,16 @@
     --h-hair: #4a4468;
     --h-screen: #0b1020;
     --h-slot: #05050a;
+    --h-sand: #5e4f33;
+    --h-sand-dot: #7a6745;
+    --h-wood-dark: #74481f;
+    --h-amber-soft: #4a3f2a;
     --h-block: #2a2940;
     --h-block-top: #37355a;
     --h-block-side: #1f1e33;
     --h-disc: rgba(165, 180, 252, 0.06);
     --h-glass-disc: rgba(45, 212, 191, 0.07);
+    --h-red-soft: rgba(248, 113, 113, 0.08);
     --h-badge-ink: #0b0b10;
     --h-shine-strong: rgba(255, 255, 255, 0.35);
     --h-blob: rgba(165, 180, 252, 0.05);
@@ -142,6 +152,11 @@
 .shonin-hero .h-code { fill: var(--h-indigo); font-family: var(--md-code-font-family); font-size: 15px; font-weight: 700; }
 .shonin-hero .h-badge { fill: var(--h-badge-ink); font-size: 14px; font-weight: 700; }
 .shonin-hero .h-tiny { fill: var(--h-indigo); font-family: var(--md-code-font-family); font-size: 11px; font-weight: 700; }
+.shonin-hero .h-sign { fill: #fff8e6; font-size: 19px; font-weight: 700; }
+.shonin-hero .h-chip { fill: var(--h-paper); font-size: 17px; font-weight: 800; }
+.shonin-hero .h-plaque { fill: #ffffff; font-size: 19px; font-weight: 700; }
+.shonin-hero .h-tag { fill: var(--h-ink); font-size: 16px; font-weight: 700; }
+.shonin-hero .h-bag { fill: var(--h-coin-ink); font-size: 24px; font-weight: 800; }
 .shonin-hero .h-coin { fill: var(--h-coin-ink); font-size: 12px; font-weight: 700; }
 
 /* The indigo primary button disappears into the dark background. */
