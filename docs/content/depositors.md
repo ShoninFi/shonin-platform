@@ -1,136 +1,89 @@
 # Putting money in
 
-You pick an agent, put money into its vault, and hold shares in a pool. The agent trades; your shares are worth whatever the pool is worth divided by the shares outstanding. You leave when you want to.
+As a Depositor, you put money into an agent's vault and get shares back. Your shares rise and fall with the vault, and you can cash them in whenever you like.
 
-An agent is a real program — it watches the market, runs its own computations, and decides. [What an agent actually is](index.md#what-an-agent-actually-is) covers what it can reach, and why a program that capable still cannot take your money.
+<div class="shonin-hero" markdown="0">
+<svg viewBox="0 0 1000 360" role="img" aria-labelledby="deposit-title deposit-desc" xmlns="http://www.w3.org/2000/svg">
+<title id="deposit-title">Money in, shares back</title>
+<desc id="deposit-desc">A Depositor tosses a coin up into the slot on top of a vault, and a ticket marked share slides back out of the vault towards their other hand, which holds a little stack of coins: the money they can take back out.</desc>
+<ellipse cx="500" cy="196" rx="480" ry="150" style="fill:var(--h-blob)"/>
+<ellipse cx="300" cy="322" rx="48" ry="8" style="fill:var(--h-shadow)"/>
+<ellipse cx="715" cy="322" rx="110" ry="9" style="fill:var(--h-shadow)"/>
+<!-- the vault -->
+<rect x="620" y="130" width="190" height="186" rx="18" style="fill:var(--h-indigo-soft);stroke:var(--h-indigo);stroke-width:3"/>
+<rect x="636" y="146" width="158" height="154" rx="12" style="fill:var(--h-paper);stroke:var(--h-indigo);stroke-width:2"/>
+<rect x="626" y="172" width="8" height="24" rx="3" style="fill:var(--h-indigo)"/>
+<circle cx="715" cy="223" r="36" style="fill:var(--h-indigo-soft);stroke:var(--h-indigo);stroke-width:3"/>
+<path d="M715 197 v-9 M715 249 v9 M689 223 h-9 M741 223 h9" style="stroke:var(--h-indigo);stroke-width:4;stroke-linecap:round"/>
+<circle cx="715" cy="223" r="11" style="fill:var(--h-indigo)"/>
+<rect x="695" y="122" width="40" height="9" rx="3" style="fill:var(--h-slot)"/>
+<rect x="614" y="270" width="10" height="34" rx="3" style="fill:var(--h-slot)"/>
+<!-- money in -->
+<path d="M366 170 Q520 50 704 116" style="fill:none;stroke:var(--h-muted);stroke-width:2.5;stroke-linecap:round;stroke-dasharray:1 8"/>
+<circle cx="530" cy="104" r="12" style="fill:var(--h-amber);stroke:var(--h-coin-ink);stroke-width:1.5"/>
+<text x="530" y="109" class="h-coin">$</text>
+<!-- shares back -->
+<path d="M610 286 Q480 304 392 282" style="fill:none;stroke:var(--h-teal);stroke-width:2.5;stroke-linecap:round;stroke-dasharray:1 8"/>
+<g transform="rotate(-5 500 292)">
+<rect x="458" y="269" width="88" height="46" rx="7" style="fill:var(--h-paper);stroke:var(--h-teal);stroke-width:2.5"/>
+<circle cx="458" cy="292" r="7" style="fill:var(--h-blob-solid)"/>
+<circle cx="546" cy="292" r="7" style="fill:var(--h-blob-solid)"/>
+<text x="502" y="289" class="h-ticket">share</text>
+<polyline points="478,304 490,298 500,301 522,292" style="fill:none;stroke:var(--h-teal);stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round"/>
+</g>
+<!-- the Depositor -->
+<rect x="289" y="312" width="11" height="10" rx="4" style="fill:var(--h-hair)"/>
+<rect x="289" y="276" width="11" height="44" rx="5" style="fill:var(--h-hair)"/>
+<rect x="305" y="276" width="11" height="44" rx="5" style="fill:var(--h-hair)"/>
+<path d="M268 282 Q268 208 302 204 Q336 208 336 282 Z" style="fill:var(--h-teal)"/>
+<path d="M326 226 Q340 212 346 196" style="fill:none;stroke:var(--h-teal);stroke-width:9;stroke-linecap:round"/>
+<circle cx="347" cy="192" r="6" style="fill:var(--h-skin)"/>
+<circle cx="356" cy="178" r="12" style="fill:var(--h-amber);stroke:var(--h-coin-ink);stroke-width:1.5"/>
+<text x="356" y="183" class="h-coin">$</text>
+<path d="M330 250 Q344 262 352 274" style="fill:none;stroke:var(--h-teal);stroke-width:9;stroke-linecap:round"/>
+<circle cx="354" cy="278" r="6" style="fill:var(--h-skin)"/>
+<!-- money back: a little stack of coins in the other hand -->
+<path d="M356 285 v9 a15 5 0 0 0 30 0 v-9" style="fill:var(--h-amber-dark);stroke:var(--h-coin-ink);stroke-width:1.5;stroke-linejoin:round"/>
+<ellipse cx="371" cy="285" rx="15" ry="5" style="fill:var(--h-amber);stroke:var(--h-coin-ink);stroke-width:1.5"/>
+<path d="M359 275 v9 a15 5 0 0 0 30 0 v-9" style="fill:var(--h-amber-dark);stroke:var(--h-coin-ink);stroke-width:1.5;stroke-linejoin:round"/>
+<ellipse cx="374" cy="275" rx="15" ry="5" style="fill:var(--h-amber);stroke:var(--h-coin-ink);stroke-width:1.5"/>
+<circle cx="302" cy="178" r="24" style="fill:var(--h-skin)"/>
+<path d="M278 176 Q279 152 302 152 Q327 152 326 174 Q316 165 302 166 Q288 167 278 176 Z" style="fill:var(--h-hair)"/>
+<text x="530" y="72" class="h-caption">money in</text>
+<text x="302" y="352" class="h-caption">Depositor</text>
+<text x="500" y="352" class="h-caption">shares back</text>
+<text x="715" y="352" class="h-caption">vault</text>
+</svg>
+</div>
 
-This page is what that costs and what it feels like. The mechanism underneath is in the [technical deep-dive](how-it-works/index.md).
+## Choosing an agent
 
-## Choosing one
+Which agent to back is up to you, and nobody can predict the future. But every agent's page shows you the things that make it an informed choice:
 
-Every agent's page shows the same four things, and they are worth reading in this order.
+**The review.** The Reviewer's report: an overall score out of 100, a written assessment of the code, and what the review couldn't tell. Read the assessment, not just the score.
 
-**The record.** Value per share over time, read from the vault's own contract. Beside it, the same record rescaled to a common level of risk, because an unadjusted leaderboard mostly measures who used the most leverage.
+**Historical performance.** How the vault's value has moved, read from its own contract. It's shown two ways: as it happened, and adjusted to a common level of risk, so an agent that simply took bigger risks doesn't look better than it is. The page also shows how much money was behind the record, now, on average and at its largest, because a strategy that works with a small pot often doesn't with a big one.
 
-**The size it was earned at.** An edge that worked on a small vault often does not survive a large one. The page shows the capital behind the record — now, on average, and at most — so you can see whether the number you are looking at was earned at the size you would be joining.
+**How old it is.** A young agent is marked **new** and kept out of the rankings until its record is long enough to mean something. It's open for deposits like any other, but there's less history to go on.
 
-**The review.** A score out of 100 with findings, each pointing at a file and a line, and a plain list of what the review could not tell. It is not a gate and it never stopped a vault opening. Read the findings rather than the number.
-
-**Which code is trading it.** The bundle hash, whether the source is published, which executor image holds the keys, and when its attestation expires. All of it on-chain.
-
-An agent with fewer than ninety live days is labelled **new** and is not ranked. It can still take your money. That is deliberate: a record has to start somewhere, and hiding young agents would just mean nobody could ever have one.
-
-## What a deposit costs
-
-One fee on the way in, one on the way out, and two while you are there.
-
-| | | |
-| --- | --- | --- |
-| Entering | 0.1% | Stays in the pool |
-| Leaving | 0.1% | Stays in the pool |
-| While you hold | 0.5% a year | To the platform |
-| On profit above the vault's high-water mark | 15% | 10% to the author, 5% to the platform |
-
-The transaction fee is the odd one. Nobody receives it. It stays in the pool, which lifts the value of every share that did not move, so somebody timing a deposit around a price update cannot take anything from the people who stayed.
-
-Fees crystallise daily as **new shares** rather than as a sale, so paying them never forces the agent out of a position at a bad moment. Your share count does not change. The value behind each share does.
-
-## Two worked years
-
-The fees are easier to judge against real numbers than percentages, so here are both directions.
-
-### A good year
-
-Say a vault is at $1.00 a share, sitting exactly on its high-water mark, and the agent makes 20% over the following year before fees.
-
-You put in **$10,000**.
-
-```mermaid
-flowchart LR
-    IN(["$10,000"]) ==> SH["9,990 shares<br/>$1.0000"]
-    SH ==> UP["after +20%<br/>$1.2000"]
-    UP ==> ST["$1.1940"]
-    ST ==> PF["$1.1649"]
-    PF ==> OUT(["$11,626"])
-
-    UP -.-> F1["streaming<br/>$60"]
-    ST -.-> F2["profit fee<br/>$291"]
-    SH -.-> F0["entering<br/>$10"]
-    PF -.-> F3["leaving<br/>$12"]
-
-    classDef ends fill:#4338ca20,stroke:#4338ca,color:inherit,font-weight:bold
-    classDef share fill:#0d948818,stroke:#0d9488,color:inherit
-    classDef fee fill:#f59e0b18,stroke:#f59e0b,color:inherit,stroke-dasharray:4 3
-    class IN,OUT ends
-    class SH,UP,ST,PF share
-    class F0,F1,F2,F3 fee
-```
-
-In numbers:
-
-| | Per share | Your 9,990 shares |
-| --- | ---: | ---: |
-| You buy in at | $1.0000 | $9,990.00 |
-| The agent returns 20% | $1.2000 | $11,988.00 |
-| Less the streaming fee, 0.5% | $1.1940 | $11,928.06 |
-| Less the profit fee, 15% of $0.194 | $1.1649 | $11,637.35 |
-| Less the transaction fee on the way out | | $11,625.71 |
-
-**You put in $10,000 and take out $11,626**, a return of 16.3% on an agent that made 20%. Of the difference, $194 went to the author, $157 to the platform, and $22 stayed in the pool as the two transaction fees.
-
-!!! note "Where this simplifies"
-    Crystallisation is daily, not annual. Compressing a year into one call changes the streaming fee by a few pence. The example also assumes the exit-side marks equal the mid price, so it leaves out the spread you pay on the way out, which depends on the market rather than on the platform.
-
-### A losing year
-
-The same $10,000, in an agent that loses 10%.
-
-| | Per share | Your 9,990 shares |
-| --- | ---: | ---: |
-| You buy in at | $1.0000 | $9,990.00 |
-| The agent loses 10% | $0.9000 | $8,991.00 |
-| Less the streaming fee, 0.5% | $0.8955 | $8,946.05 |
-| Profit fee | — | — |
-| Less the transaction fee on the way out | | $8,937.10 |
-
-You take out **$8,937**, down 10.6% on an agent that lost 10%.
-
-No profit fee is charged, because there is no gain above the high-water mark — the author earns nothing this year. The streaming fee is charged anyway, at 0.5% of value, because it pays for a platform that ran whether or not the agent worked. The mark stays at $1.0000, so whoever holds shares through the recovery back to it pays no profit fee on the way.
-
-The asymmetry is deliberate and it is worth being clear about: the author has upside and no downside beyond earning nothing, and the platform takes a small fee in a bad year. What neither of them can do is take more than that.
-
-## The high-water mark is the vault's, not yours
-
-This one surprises people, and it can work for or against you.
-
-The profit fee is charged on value per share above the highest the vault has ever crystallised at. That mark belongs to the vault. It does not reset when you arrive.
-
-Deposit into a vault that is 10% below its own high-water mark, and the recovery back up to that mark costs you no profit fee at all. Deposit into one that has just made a new high, and you pay from the first dollar.
-
-Neither is a trick. It falls out of charging fees on the pool rather than per depositor, and the vault's page shows its high-water mark beside its value per share so you can see where you are standing.
+**Its source, if it's public.** You can read exactly what the agent does, and check that it's the code actually trading. [Verify it yourself](verify.md) shows how.
 
 ## Getting out
 
-Withdrawing has two shapes, and which one you get depends on how much cash the agent is holding idle.
+Most of the time you're paid straight away, from cash the vault keeps on hand for exactly that.
 
-**Paid immediately.** If the vault's idle balance covers your withdrawal, your shares are burned and you are paid in the same transaction. Agents keep a working buffer precisely so that most withdrawals end here.
+If there isn't enough, your withdrawal is booked instead. The contract closes your share of the vault's positions, at close to the market price, and pays you once the cash is back. Anyone can push that through, including you, so it doesn't depend on us. If a booked withdrawal sits unpaid for seven days, anyone can freeze the vault: no new deposits, and it can only wind down.
 
-**Booked as a claim.** If it does not, your shares are marked pending and the contract books a claim. It closes your fraction of every position, inside a band around the venue's own oracle price, and pays you once the cash is home at the value then.
+A few vaults trade somewhere the contract can't reach by itself. Those need an operator to finish a booked withdrawal, and their page says so.
 
-The settle function is public. Anyone can call it — you, another depositor, a passer-by, or the keeper we run. That is the part that matters: your exit does not depend on us being alive, solvent, or willing.
+## What can still go wrong
 
-A claim that goes unserved for seven days lets anyone freeze the vault, which stops new deposits and leaves only unwinding.
+**The agent can lose money.** Nothing here stops that, and it could even lose it on purpose, as [Trade-only keys](basics/trade-only-keys.md) explains. A review isn't a prediction and a track record isn't a promise.
 
-## What you are still exposed to
+**The market can be rough when you leave.** A booked withdrawal closes positions within a set distance of the market price. In a fast market that may not fill straight away, and your withdrawal waits.
 
-Being honest about this is the point of the whole project, so here it is plainly.
+**Our code can have bugs.** The contracts and the machine images are ours. Every vault's page shows whether each one has been audited, and "unaudited" doesn't mean "fine".
 
-**The agent can lose money.** Nothing here prevents that. A review is not a prediction and a record is not a promise. The platform makes the losses visible and honest; it does not stop them.
+**A venue can fail.** Your money is only as safe as the venue holding it, so every vault's page shows how each of its venues keeps it safe.
 
-**The market can be bad when you leave.** A claim closes your positions at the market, inside a band. In a fast market the close may not fill, and the claim waits.
-
-**Our code can be wrong.** The contracts and the images are ours. They are open, they will be audited, and every vault page shows the audit status of each one. Until those audits exist, that page says "unaudited", which is not the same as "fine".
-
-**A venue can fail.** Custody is only as good as the venue enforcing it, which is why every vault shows its custody level per venue.
-
-What you are *not* exposed to is somebody transferring your deposit somewhere else. There is no path for it.
+What can't happen is someone withdrawing your money or sending it somewhere else. There's no way to do it.

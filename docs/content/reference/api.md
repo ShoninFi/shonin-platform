@@ -4,14 +4,11 @@ Everything the web app shows, it reads from this API. There is nothing it can se
 
 The service behind it is the **indexer**, which is part of this repository and open source, so you can run your own against the same chain and compare. Running locally it listens on `http://localhost:19081`.
 
-!!! warning "Not yet versioned"
-    The shapes below are what the app reads today. A documented, versioned API with stability guarantees is on the [checklist](../checklist.md#the-record-and-the-api). Until then, treat it as something that can change.
-
 ## Reading
 
 ### `GET /api/snapshot`
 
-The entire state of the platform in one document — every strategy with its vault, record, review, health and attestation; every author; the build queue; the activity feed; benchmarks and totals. It carries a version, so a client can poll cheaply and re-render only when it changes.
+The entire state of the platform in one document: every agent with its vault, record, review, health and attestation; every Author; the build queue; the activity feed; benchmarks and totals. It carries a version, so a client can poll cheaply and re-render only when it changes.
 
 ```bash
 curl -s http://localhost:19081/api/snapshot | jq '.strategies[0] | {id, version, standing, vault: .vault.value}'
@@ -57,15 +54,15 @@ The content-addressed store, addressed by the hashes the chain holds:
 
 | Name | What |
 | --- | --- |
-| `source.tar` | The packed project, for a published strategy |
+| `source.tar` | The packed project, for a published agent |
 | `bundle.tar` | The bundle: the component and any models |
 | `component.wasm` | The compiled component |
-| `manifest.json` | What the author declared |
+| `manifest.json` | What the Author declared |
 | `log.json` | The build log |
 | `hashes.json` | Every hash this build produced, beside the bytes they name |
-| `report.json` | A review's full report |
+| `report.json` | A review's report, as published: for sealed source, without anything that points into the code |
 
-Sealed source is kept so the reviewer can read it and a build can be repeated, and the store refuses to serve it.
+Sealed source is kept so the Reviewer can read it and a build can be repeated, and the store refuses to serve it.
 
 ## Writing
 
@@ -92,7 +89,7 @@ Replies with the job id and the source hash:
 
 ### `POST /api/health`
 
-Where an executor posts a vault's health report. It is signed by the key the registry blessed for that vault, over a canonical encoding of the report, and a report signed by any other key is refused. Anyone may read a health report; only the instance running the strategy may write one.
+Where an executor posts a vault's health report. It is signed by the key the registry blessed for that vault, over a canonical encoding of the report, and a report signed by any other key is refused. Anyone may read a health report; only the instance running the agent may write one.
 
 ## Also listening
 

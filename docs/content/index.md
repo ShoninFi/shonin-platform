@@ -2,147 +2,245 @@
 
 **Smart contracts are public and auditable. Trading agents should be too.**
 
-Somebody is running a trading agent with your money. You would like to know what it does, whether it can lose more than you agreed to, and whether you can get out. Almost everywhere, the answer to all three is a screenshot and a promise.
+Anyone who uses an automated trading strategy wants to know three things: what it does, what it can do with their money, and whether they can get out. On Shonin, each answer is something they can check rather than something they are told.
 
-Shonin is built so that none of it rests on a promise.
+Here's how it works, in a nutshell. *Don't worry if it's a lot at once*, the next few pages take it one piece at a time:
 
-An author publishes a trading **agent** as source code. We compile it, a model reads it and scores it, and attested machines run it with keys that can trade and cannot withdraw. You put money into a vault behind the agents you like. Every trade, every fee and every unit of value lands on a chain, where it stays.
+An Author publishes a trading agent as source code. We use attested machines to evaluate it, compile it, and run it with keys that can trade but cannot withdraw.
 
-## What an agent actually is
+Depositors put money behind the agent they choose, and can check it's *really* that agent trading it. The source code is public too, unless the Author opts out. Trades only go through when our on-chain contracts have verified the attestation, but Depositors can withdraw at any time.
 
-Not a configuration. Not a formula sitting in a contract. Not a trading bot with three parameters and a stop.
-
-An agent is a **real program**, written in Rust, compiled to a WebAssembly component, running continuously on a machine we attest. It has its own memory, its own control flow, and a long-lived async function that the host starts once and never schedules again. Everything it does, it does inside that call.
-
-```rust
-// It wakes on what the market and the vault tell it, and decides.
-while let Some(woke) = waking.next().await {
-    match woke {
-        Woke::Venue => step(&mut mind).await?,          // a fill, a funding payment, a price
-        Woke::Vault(ClaimPending(_)) => step(&mut mind).await?,  // a depositor is leaving
-        Woke::Vault(Halting(_)) => return flatten(&mind).await,  // unwind, don't be unwound
-    }
-}
-```
-
-It can reach out. It can compute. It can call a model it shipped.
-
-| It can | Through |
-| --- | --- |
-| Watch its own fills, funding and account state, as a live stream | `venues` |
-| Read market data the executor fetches once and shares | `data` |
-| Hold an open websocket to a host, terminated by the executor | `websocket` |
-| Run an ONNX model it packed in its own bundle | `inference` |
-| Keep a cache across events, and across a restart | `state` |
-| Use a secret sealed to its own bundle hash, which we cannot read | `secrets` |
-| Submit orders, cancels and capital moves, and be told what happened to each | `venues` |
-
-That is the whole interface, frozen as `shonin:strategy@0.1.0`. An author writes against it with an SDK; the host implements it inside the measured image. No filesystem, no environment, no sockets of its own — everything it reaches, it reaches through one of those seven doors.
-
-!!! abstract "Agent, or strategy?"
-    Same thing. **Agent** is the program: the code that runs, reacts and decides. **Strategy** is what it is trying to do, and it is the word the contracts use — `StrategyRegistry`, `strategyId`, one vault per strategy version. These pages say *agent* when the point is the running program and *strategy* when the point is the published, versioned thing a vault sits behind.
-
-So an agent can fetch a funding curve, run a model over it, size a position from the output, place both legs of a hedge, and unwind itself when a depositor leaves — because it is software, with the tools software has.
-
-!!! info "What runs today"
-    The venue stream, the vault stream, market data, the state cache, sealed secrets and the full order path all work on the development chain. Outward websockets and model inference are in the frozen interface but not yet implemented by the executor: a call to either returns an error rather than pretending. Both are on the [checklist](checklist.md#execution).
-
-## Why that is safe anyway
-
-You have just been told that a program with a network connection and a model of its own is going to trade your money. The obvious question is what stops it walking off with the lot.
-
-The agent never holds a key and never signs anything. It submits a decision; the host signs it. And the key the host signs with is registered at the venue as a **trade-only agent key**: it can place orders, and it cannot move money out. Moving money at all goes through the vault's contract, which will only move it between accounts the vault itself owns.
-
-So the worst thing anyone can do to your deposit — the agent, its author, an executor, us, or somebody who has stolen all our keys — is **trade it badly**. There is no route out for them to take.
-
-That is what makes it safe to let a program this capable near other people's money. Not a sandbox we promise to maintain, and not a review that caught everything. The money simply has nowhere else to go.
-
-That is the trust bar: *halt, never steal*. Anyone can switch an agent off. Nobody can take the money.
-
-```mermaid
-flowchart LR
-    K(["the key the host<br/>signs the agent's<br/>decisions with"])
-
-    subgraph CAN["can"]
-        direction TB
-        T["place an order"]
-        C["cancel an order"]
-    end
-
-    subgraph CANNOT["cannot — refused by the venue and by the contract"]
-        direction TB
-        W["withdraw"]
-        X["send to an outside address"]
-        A["approve somebody else"]
-    end
-
-    K ==> CAN
-    K -.-> CANNOT
-
-    classDef key fill:#4338ca20,stroke:#4338ca,color:inherit,font-weight:bold
-    classDef yes fill:#0d948825,stroke:#0d9488,color:inherit
-    classDef no fill:#dc262612,stroke:#dc2626,color:inherit,stroke-dasharray:5 4
-    class K key
-    class T,C yes
-    class W,X,A no
-    style CAN fill:none,stroke:#0d9488,stroke-width:1px
-    style CANNOT fill:none,stroke:#dc2626,stroke-width:1px,stroke-dasharray:5 4
-```
-
-## What that buys you
-
-You can leave whenever you want, and you do not need us to do it. A withdrawal is paid out of the vault's idle balance in the same transaction. If there is not enough sitting idle, the contract books a claim, closes your share of every position, and pays you when the cash is home. The function that drives that is public: if every service we run stopped tonight, you could send it yourself.
-
-You can check the returns rather than believe them. The vault contract computes its own value from on-chain state, so a record is value per share over time, read from the chain. There is nothing to backfill and nothing to restate.
-
-You can read the code. Most agents publish their source, and the build is designed so that anyone can compile it and compare hashes. An author can seal their source if they would rather not show it, and then what you are relying on is the attested build and the attested review, which the page says plainly.
-
-## Where to go next
-
-<div class="grid cards" markdown>
-
-- **:material-cash-multiple: I want to put money in**
-
-    ---
-
-    How to read an agent's record, what the fees actually take out of a year, and how leaving works.
-
-    [Putting money in](depositors.md)
-
-- **:material-code-braces: I want to publish an agent**
-
-    ---
-
-    What you write, what it can reach, what it costs to publish, and what you earn if it works.
-
-    [Publishing an agent](authors.md)
-
-- **:material-magnify: I do not believe you**
-
-    ---
-
-    Every claim on this site, and how to check it with a chain node and the published source.
-
-    [Verify it yourself](verify.md)
-
-- **:material-console: I want to read the code**
-
-    ---
-
-    The whole platform runs on your own machine with one command.
-
-    [Run it locally](run-locally.md)
-
+<div class="shonin-hero" markdown="0">
+<svg viewBox="0 0 1000 700" role="img" aria-labelledby="hero-title hero-desc" xmlns="http://www.w3.org/2000/svg">
+<title id="hero-title">How Shonin fits together</title>
+<desc id="hero-desc">An Author feeds source code into a sealed glass booth with an attestation seal on its roof. Inside, a small robot, the agent, trades at a screen. The booth has no door, and its only connection is a locked cable to a vault standing on a chain of blocks, where one Depositor drops in a coin while another walks away with their money. Beneath the attested machine hang the two things it does: a model reads the source and scores it before anything is built, and then it is built once and signed. Beneath the vault runs the chain it is part of, and from it hang the two things the chain does: it checks the attested machine's seal, and it holds the record the returns are read from.</desc>
+<ellipse cx="500" cy="236" rx="480" ry="164" style="fill:var(--h-blob)"/>
+<ellipse cx="110" cy="362" rx="52" ry="8" style="fill:var(--h-shadow)"/>
+<ellipse cx="390" cy="364" rx="160" ry="10" style="fill:var(--h-shadow)"/>
+<ellipse cx="703" cy="364" rx="112" ry="9" style="fill:var(--h-shadow)"/>
+<ellipse cx="860" cy="362" rx="40" ry="7" style="fill:var(--h-shadow)"/>
+<ellipse cx="946" cy="362" rx="36" ry="7" style="fill:var(--h-shadow)"/>
+<!-- the author, handing in source -->
+<rect x="95" y="318" width="12" height="44" rx="5" style="fill:var(--h-hair)"/>
+<rect x="113" y="318" width="12" height="44" rx="5" style="fill:var(--h-hair)"/>
+<path d="M78 326 Q78 252 110 248 Q142 252 142 326 Z" style="fill:var(--h-indigo)"/>
+<path d="M134 266 Q156 270 172 262" style="fill:none;stroke:var(--h-indigo);stroke-width:12;stroke-linecap:round"/>
+<circle cx="176" cy="261" r="7" style="fill:var(--h-skin)"/>
+<circle cx="110" cy="222" r="22" style="fill:var(--h-skin)"/>
+<path d="M88 220 Q88 196 110 196 Q134 196 132 218 Q124 208 110 210 Q98 211 88 220 Z" style="fill:var(--h-hair)"/>
+<g transform="rotate(-6 212 262)">
+<rect x="186" y="236" width="50" height="58" rx="4" style="fill:var(--h-paper);stroke:var(--h-ink);stroke-width:1.5"/>
+<text x="211" y="262" class="h-code">&lt;/&gt;</text>
+<path d="M195 274 h32 M195 282 h22" style="stroke:var(--h-muted);stroke-width:2;stroke-linecap:round"/>
+</g>
+<!-- the attested machine: a sealed glass booth with no door -->
+<rect x="250" y="120" width="280" height="240" rx="18" style="fill:var(--h-glass);stroke:var(--h-teal);stroke-width:3"/>
+<path d="M266 152 L298 128 L308 128 L266 160 Z M266 176 L330 128 L344 128 L266 188 Z" style="fill:var(--h-shine)"/>
+<rect x="238" y="102" width="304" height="24" rx="10" style="fill:var(--h-teal)"/>
+<rect x="244" y="238" width="12" height="50" rx="3" style="fill:var(--h-slot)"/>
+<!-- desk and screen -->
+<rect x="340" y="302" width="8" height="58" style="fill:var(--h-wood)"/>
+<rect x="494" y="302" width="8" height="58" style="fill:var(--h-wood)"/>
+<rect x="330" y="290" width="182" height="12" rx="4" style="fill:var(--h-wood)"/>
+<rect x="441" y="268" width="10" height="20" style="fill:var(--h-ink)"/>
+<rect x="426" y="285" width="40" height="5" rx="2" style="fill:var(--h-ink)"/>
+<rect x="395" y="190" width="102" height="80" rx="8" style="fill:var(--h-ink)"/>
+<rect x="403" y="198" width="86" height="64" rx="4" style="fill:var(--h-screen)"/>
+<path d="M415 212 v38 M431 218 v36 M447 206 v38 M463 202 v34 M479 210 v30" style="stroke:var(--h-muted);stroke-width:1.5"/>
+<rect x="411" y="222" width="8" height="18" rx="1.5" style="fill:#2dd4bf"/>
+<rect x="427" y="228" width="8" height="18" rx="1.5" style="fill:#f87171"/>
+<rect x="443" y="214" width="8" height="20" rx="1.5" style="fill:#2dd4bf"/>
+<rect x="459" y="208" width="8" height="18" rx="1.5" style="fill:#2dd4bf"/>
+<rect x="475" y="216" width="8" height="16" rx="1.5" style="fill:#f87171"/>
+<rect x="396" y="283" width="58" height="7" rx="2" style="fill:var(--h-muted)"/>
+<!-- the agent, at work -->
+<rect x="338" y="310" width="8" height="50" style="fill:var(--h-muted)"/>
+<rect x="316" y="300" width="52" height="10" rx="4" style="fill:var(--h-muted)"/>
+<rect x="320" y="246" width="52" height="56" rx="14" style="fill:var(--h-paper);stroke:var(--h-ink);stroke-width:2.5"/>
+<rect x="331" y="260" width="30" height="22" rx="5" style="fill:var(--h-amber)"/>
+<circle cx="340" cy="271" r="4" style="fill:none;stroke:var(--h-coin-ink);stroke-width:2"/>
+<path d="M344 271 h11 M351 271 v4 M355 271 v3" style="stroke:var(--h-coin-ink);stroke-width:2;stroke-linecap:round"/>
+<path d="M368 262 Q392 262 404 282" style="fill:none;stroke:var(--h-ink);stroke-width:7;stroke-linecap:round"/>
+<rect x="340" y="234" width="12" height="14" style="fill:var(--h-ink)"/>
+<line x1="346" y1="180" x2="346" y2="166" style="stroke:var(--h-ink);stroke-width:2.5"/>
+<circle cx="346" cy="161" r="6" style="fill:var(--h-amber)"/>
+<rect x="312" y="180" width="68" height="56" rx="16" style="fill:var(--h-paper);stroke:var(--h-ink);stroke-width:2.5"/>
+<circle cx="352" cy="205" r="6" style="fill:var(--h-ink)"/>
+<circle cx="369" cy="205" r="6" style="fill:var(--h-ink)"/>
+<circle cx="354" cy="203" r="2" style="fill:var(--h-paper)"/>
+<circle cx="371" cy="203" r="2" style="fill:var(--h-paper)"/>
+<path d="M355 219 Q363 226 371 219" style="fill:none;stroke:var(--h-ink);stroke-width:2.5;stroke-linecap:round"/>
+<circle cx="377" cy="216" r="4" style="fill:var(--h-amber);opacity:.55"/>
+<!-- the seal on the roof -->
+<path d="M510 124 L502 156 L512 150 L518 160 L524 128 Z M534 124 L542 156 L532 150 L526 160 L520 128 Z" style="fill:var(--h-teal)"/>
+<circle cx="522" cy="112" r="24" style="fill:var(--h-amber);stroke:var(--h-amber);stroke-width:5;stroke-dasharray:3 3"/>
+<path d="M511 112 l7 7 l14 -15" style="fill:none;stroke:var(--h-coin-ink);stroke-width:3.5;stroke-linecap:round;stroke-linejoin:round"/>
+<!-- the only line out: a locked cable to the vault -->
+<path d="M530 322 C566 322 568 264 600 264" style="fill:none;stroke:var(--h-ink);stroke-width:5;stroke-linecap:round"/>
+<path d="M559 293 v-6 a7 7 0 0 1 14 0 v6" style="fill:none;stroke:var(--h-ink);stroke-width:3"/>
+<rect x="554" y="292" width="24" height="18" rx="4" style="fill:var(--h-amber);stroke:var(--h-ink);stroke-width:2"/>
+<circle cx="566" cy="301" r="2.5" style="fill:var(--h-coin-ink)"/>
+<!-- the chain the vault stands on: blocks, linked -->
+<path d="M606 330 l8 -8 h34 l-8 8 Z" style="fill:var(--h-block-top);stroke:var(--h-indigo);stroke-width:1.5;stroke-linejoin:round"/>
+<path d="M640 330 l8 -8 v28 l-8 8 Z" style="fill:var(--h-block-side);stroke:var(--h-indigo);stroke-width:1.5;stroke-linejoin:round"/>
+<rect x="606" y="330" width="34" height="28" rx="2" style="fill:var(--h-block);stroke:var(--h-indigo);stroke-width:1.5"/>
+<path d="M615 340 h16 M615 347 h10" style="stroke:var(--h-indigo);stroke-width:2;stroke-linecap:round;opacity:.6"/>
+<ellipse cx="650" cy="344" rx="7" ry="4.5" style="fill:none;stroke:var(--h-ink);stroke-width:2.5"/>
+<path d="M654 330 l8 -8 h34 l-8 8 Z" style="fill:var(--h-block-top);stroke:var(--h-indigo);stroke-width:1.5;stroke-linejoin:round"/>
+<path d="M688 330 l8 -8 v28 l-8 8 Z" style="fill:var(--h-block-side);stroke:var(--h-indigo);stroke-width:1.5;stroke-linejoin:round"/>
+<rect x="654" y="330" width="34" height="28" rx="2" style="fill:var(--h-block);stroke:var(--h-indigo);stroke-width:1.5"/>
+<path d="M663 340 h16 M663 347 h10" style="stroke:var(--h-indigo);stroke-width:2;stroke-linecap:round;opacity:.6"/>
+<ellipse cx="698" cy="344" rx="7" ry="4.5" style="fill:none;stroke:var(--h-ink);stroke-width:2.5"/>
+<path d="M702 330 l8 -8 h34 l-8 8 Z" style="fill:var(--h-block-top);stroke:var(--h-indigo);stroke-width:1.5;stroke-linejoin:round"/>
+<path d="M736 330 l8 -8 v28 l-8 8 Z" style="fill:var(--h-block-side);stroke:var(--h-indigo);stroke-width:1.5;stroke-linejoin:round"/>
+<rect x="702" y="330" width="34" height="28" rx="2" style="fill:var(--h-block);stroke:var(--h-indigo);stroke-width:1.5"/>
+<path d="M711 340 h16 M711 347 h10" style="stroke:var(--h-indigo);stroke-width:2;stroke-linecap:round;opacity:.6"/>
+<ellipse cx="746" cy="344" rx="7" ry="4.5" style="fill:none;stroke:var(--h-ink);stroke-width:2.5"/>
+<path d="M750 330 l8 -8 h34 l-8 8 Z" style="fill:var(--h-block-top);stroke:var(--h-indigo);stroke-width:1.5;stroke-linejoin:round"/>
+<path d="M784 330 l8 -8 v28 l-8 8 Z" style="fill:var(--h-block-side);stroke:var(--h-indigo);stroke-width:1.5;stroke-linejoin:round"/>
+<rect x="750" y="330" width="34" height="28" rx="2" style="fill:var(--h-block);stroke:var(--h-indigo);stroke-width:1.5"/>
+<path d="M759 340 h16 M759 347 h10" style="stroke:var(--h-indigo);stroke-width:2;stroke-linecap:round;opacity:.6"/>
+<ellipse cx="598" cy="344" rx="7" ry="4.5" style="fill:none;stroke:var(--h-ink);stroke-width:2.5;opacity:.5"/>
+<!-- the vault -->
+<g transform="translate(0 -36)">
+<rect x="600" y="168" width="190" height="190" rx="18" style="fill:var(--h-indigo-soft);stroke:var(--h-indigo);stroke-width:3"/>
+<rect x="616" y="184" width="158" height="158" rx="12" style="fill:var(--h-paper);stroke:var(--h-indigo);stroke-width:2"/>
+<rect x="606" y="210" width="8" height="24" rx="3" style="fill:var(--h-indigo)"/>
+<rect x="606" y="292" width="8" height="24" rx="3" style="fill:var(--h-indigo)"/>
+<circle cx="695" cy="263" r="38" style="fill:var(--h-indigo-soft);stroke:var(--h-indigo);stroke-width:3"/>
+<path d="M695 237 v-10 M695 289 v10 M669 263 h-10 M721 263 h10" style="stroke:var(--h-indigo);stroke-width:4;stroke-linecap:round"/>
+<circle cx="695" cy="263" r="11" style="fill:var(--h-indigo)"/>
+<rect x="675" y="160" width="40" height="9" rx="3" style="fill:var(--h-slot)"/>
+</g>
+<!-- a depositor, putting a coin in -->
+<path d="M806 222 Q824 36 712 114" style="fill:none;stroke:var(--h-muted);stroke-width:2.5;stroke-linecap:round;stroke-dasharray:1 8"/>
+<circle cx="792" cy="103" r="10" style="fill:var(--h-amber);stroke:var(--h-coin-ink);stroke-width:1.5"/>
+<text x="792" y="107.5" class="h-coin">$</text>
+<rect x="846" y="322" width="11" height="40" rx="5" style="fill:var(--h-hair)"/>
+<rect x="863" y="322" width="11" height="40" rx="5" style="fill:var(--h-hair)"/>
+<path d="M832 328 Q832 262 860 258 Q888 262 888 328 Z" style="fill:var(--h-teal)"/>
+<path d="M840 274 Q828 254 818 238" style="fill:none;stroke:var(--h-teal);stroke-width:11;stroke-linecap:round"/>
+<circle cx="815" cy="232" r="7" style="fill:var(--h-skin)"/>
+<circle cx="860" cy="234" r="20" style="fill:var(--h-skin)"/>
+<path d="M840 232 Q841 212 860 212 Q881 212 880 230 Q872 222 860 223 Q848 224 840 232 Z" style="fill:var(--h-hair)"/>
+<!-- another, walking off with their money -->
+<path d="M904 290 h-14 M906 304 h-20 M904 318 h-12" style="stroke:var(--h-muted);stroke-width:2.5;stroke-linecap:round"/>
+<rect x="934" y="324" width="11" height="38" rx="5" transform="rotate(10 939 324)" style="fill:var(--h-hair)"/>
+<rect x="950" y="324" width="11" height="38" rx="5" transform="rotate(-12 955 324)" style="fill:var(--h-hair)"/>
+<path d="M922 330 Q922 268 946 264 Q970 268 970 330 Z" style="fill:var(--h-amber)"/>
+<circle cx="946" cy="242" r="18" style="fill:var(--h-skin)"/>
+<path d="M928 240 Q929 222 946 222 Q965 222 964 238 Q957 231 946 232 Q935 233 928 240 Z" style="fill:var(--h-hair)"/>
+<path d="M966 282 Q976 296 976 304" style="fill:none;stroke:var(--h-amber);stroke-width:10;stroke-linecap:round"/>
+<path d="M968 306 q10 -6 20 0 q6 18 -10 22 q-16 -4 -10 -22 Z" style="fill:var(--h-wood);stroke:var(--h-coin-ink);stroke-width:1.5"/>
+<text x="978" y="324" class="h-coin" style="fill:var(--h-paper)">$</text>
+<!-- what the attested machines do: read, then build -->
+<path d="M252 412 q0 10 10 10 H518 q10 0 10 -10" style="fill:none;stroke:var(--h-teal);stroke-width:3;stroke-linecap:round"/>
+<path d="M300 424 V490" style="stroke:var(--h-teal);stroke-width:2.2;stroke-dasharray:6 5"/>
+<path d="M480 424 V490" style="stroke:var(--h-teal);stroke-width:2.2;stroke-dasharray:6 5"/>
+<!-- what the chain does: check the seal, and hold the record -->
+<path d="M600 446 l6 -6 h24 l-6 6 Z" style="fill:var(--h-block-top);stroke:var(--h-indigo);stroke-width:1.2;stroke-linejoin:round"/>
+<path d="M624 446 l6 -6 v18 l-6 6 Z" style="fill:var(--h-block-side);stroke:var(--h-indigo);stroke-width:1.2;stroke-linejoin:round"/>
+<rect x="600" y="446" width="24" height="18" rx="1.5" style="fill:var(--h-block);stroke:var(--h-indigo);stroke-width:1.2"/>
+<ellipse cx="637" cy="455" rx="5" ry="3.2" style="fill:none;stroke:var(--h-ink);stroke-width:2;opacity:.7"/>
+<path d="M644 446 l6 -6 h24 l-6 6 Z" style="fill:var(--h-block-top);stroke:var(--h-indigo);stroke-width:1.2;stroke-linejoin:round"/>
+<path d="M668 446 l6 -6 v18 l-6 6 Z" style="fill:var(--h-block-side);stroke:var(--h-indigo);stroke-width:1.2;stroke-linejoin:round"/>
+<rect x="644" y="446" width="24" height="18" rx="1.5" style="fill:var(--h-block);stroke:var(--h-indigo);stroke-width:1.2"/>
+<ellipse cx="681" cy="455" rx="5" ry="3.2" style="fill:none;stroke:var(--h-ink);stroke-width:2;opacity:.7"/>
+<path d="M688 446 l6 -6 h24 l-6 6 Z" style="fill:var(--h-block-top);stroke:var(--h-indigo);stroke-width:1.2;stroke-linejoin:round"/>
+<path d="M712 446 l6 -6 v18 l-6 6 Z" style="fill:var(--h-block-side);stroke:var(--h-indigo);stroke-width:1.2;stroke-linejoin:round"/>
+<rect x="688" y="446" width="24" height="18" rx="1.5" style="fill:var(--h-block);stroke:var(--h-indigo);stroke-width:1.2"/>
+<ellipse cx="725" cy="455" rx="5" ry="3.2" style="fill:none;stroke:var(--h-ink);stroke-width:2;opacity:.7"/>
+<path d="M732 446 l6 -6 h24 l-6 6 Z" style="fill:var(--h-block-top);stroke:var(--h-indigo);stroke-width:1.2;stroke-linejoin:round"/>
+<path d="M756 446 l6 -6 v18 l-6 6 Z" style="fill:var(--h-block-side);stroke:var(--h-indigo);stroke-width:1.2;stroke-linejoin:round"/>
+<rect x="732" y="446" width="24" height="18" rx="1.5" style="fill:var(--h-block);stroke:var(--h-indigo);stroke-width:1.2"/>
+<ellipse cx="769" cy="455" rx="5" ry="3.2" style="fill:none;stroke:var(--h-ink);stroke-width:2;opacity:.7"/>
+<path d="M776 446 l6 -6 h24 l-6 6 Z" style="fill:var(--h-block-top);stroke:var(--h-indigo);stroke-width:1.2;stroke-linejoin:round"/>
+<path d="M800 446 l6 -6 v18 l-6 6 Z" style="fill:var(--h-block-side);stroke:var(--h-indigo);stroke-width:1.2;stroke-linejoin:round"/>
+<rect x="776" y="446" width="24" height="18" rx="1.5" style="fill:var(--h-block);stroke:var(--h-indigo);stroke-width:1.2"/>
+<ellipse cx="813" cy="455" rx="5" ry="3.2" style="fill:none;stroke:var(--h-ink);stroke-width:2;opacity:.7"/>
+<path d="M820 446 l6 -6 h24 l-6 6 Z" style="fill:var(--h-block-top);stroke:var(--h-indigo);stroke-width:1.2;stroke-linejoin:round"/>
+<path d="M844 446 l6 -6 v18 l-6 6 Z" style="fill:var(--h-block-side);stroke:var(--h-indigo);stroke-width:1.2;stroke-linejoin:round"/>
+<rect x="820" y="446" width="24" height="18" rx="1.5" style="fill:var(--h-block);stroke:var(--h-indigo);stroke-width:1.2"/>
+<ellipse cx="857" cy="455" rx="5" ry="3.2" style="fill:none;stroke:var(--h-ink);stroke-width:2;opacity:.7"/>
+<path d="M864 446 l6 -6 h24 l-6 6 Z" style="fill:var(--h-block-top);stroke:var(--h-indigo);stroke-width:1.2;stroke-linejoin:round"/>
+<path d="M888 446 l6 -6 v18 l-6 6 Z" style="fill:var(--h-block-side);stroke:var(--h-indigo);stroke-width:1.2;stroke-linejoin:round"/>
+<rect x="864" y="446" width="24" height="18" rx="1.5" style="fill:var(--h-block);stroke:var(--h-indigo);stroke-width:1.2"/>
+<ellipse cx="901" cy="455" rx="5" ry="3.2" style="fill:none;stroke:var(--h-ink);stroke-width:2;opacity:.7"/>
+<path d="M908 446 l6 -6 h24 l-6 6 Z" style="fill:var(--h-block-top);stroke:var(--h-indigo);stroke-width:1.2;stroke-linejoin:round"/>
+<path d="M932 446 l6 -6 v18 l-6 6 Z" style="fill:var(--h-block-side);stroke:var(--h-indigo);stroke-width:1.2;stroke-linejoin:round"/>
+<rect x="908" y="446" width="24" height="18" rx="1.5" style="fill:var(--h-block);stroke:var(--h-indigo);stroke-width:1.2"/>
+<ellipse cx="800" cy="360" rx="3.4" ry="6" style="fill:none;stroke:var(--h-ink);stroke-width:2.2;opacity:.7"/>
+<ellipse cx="800" cy="373" rx="3.4" ry="6" style="fill:none;stroke:var(--h-ink);stroke-width:2.2;opacity:.7"/>
+<ellipse cx="800" cy="386" rx="3.4" ry="6" style="fill:none;stroke:var(--h-ink);stroke-width:2.2;opacity:.7"/>
+<ellipse cx="800" cy="399" rx="3.4" ry="6" style="fill:none;stroke:var(--h-ink);stroke-width:2.2;opacity:.7"/>
+<ellipse cx="800" cy="412" rx="3.4" ry="6" style="fill:none;stroke:var(--h-ink);stroke-width:2.2;opacity:.7"/>
+<ellipse cx="800" cy="425" rx="3.4" ry="6" style="fill:none;stroke:var(--h-ink);stroke-width:2.2;opacity:.7"/>
+<ellipse cx="800" cy="438" rx="3.4" ry="6" style="fill:none;stroke:var(--h-ink);stroke-width:2.2;opacity:.7"/>
+<path d="M710 466 V490" style="stroke:var(--h-indigo);stroke-width:2.2;stroke-dasharray:6 5"/>
+<path d="M890 466 V490" style="stroke:var(--h-indigo);stroke-width:2.2;stroke-dasharray:6 5"/>
+<g transform="translate(300 572)">
+<circle r="80" style="fill:var(--h-glass-disc)"/>
+<rect x="-42" y="-48" width="58" height="72" rx="5" style="fill:var(--h-paper);stroke:var(--h-ink);stroke-width:1.5"/>
+<text x="-13" y="-20" class="h-code">&lt;/&gt;</text>
+<path d="M-33 -4 h38 M-33 6 h30 M-33 16 h22" style="stroke:var(--h-muted);stroke-width:2;stroke-linecap:round"/>
+<line x1="30" y1="26" x2="46" y2="42" style="stroke:var(--h-ink);stroke-width:8;stroke-linecap:round"/>
+<circle cx="15" cy="11" r="21" style="fill:var(--h-glass);stroke:var(--h-ink);stroke-width:4"/>
+<path d="M4 2 q6 -8 14 -6" style="fill:none;stroke:var(--h-shine-strong);stroke-width:3;stroke-linecap:round"/>
+<path d="M38 -46 l3 7 l7 3 l-7 3 l-3 7 l-3 -7 l-7 -3 l7 -3 Z M54 -24 l2 5 l5 2 l-5 2 l-2 5 l-2 -5 l-5 -2 l5 -2 Z" style="fill:var(--h-amber)"/>
+<rect x="-58" y="30" width="42" height="24" rx="12" style="fill:var(--h-teal)"/>
+<text x="-37" y="47" class="h-badge">94</text>
+</g>
+<g transform="translate(480 572)">
+<circle r="80" style="fill:var(--h-glass-disc)"/>
+<circle cx="-20" cy="-18" r="21" style="fill:none;stroke:var(--h-muted);stroke-width:9;stroke-dasharray:6 5"/>
+<circle cx="-20" cy="-18" r="17" style="fill:var(--h-muted)"/>
+<circle cx="-20" cy="-18" r="6" style="fill:var(--h-paper)"/>
+<circle cx="18" cy="-40" r="11" style="fill:none;stroke:var(--h-muted);stroke-width:7;stroke-dasharray:4 4"/>
+<circle cx="18" cy="-40" r="8" style="fill:var(--h-muted)"/>
+<circle cx="18" cy="-40" r="3" style="fill:var(--h-paper)"/>
+<path d="M-12 6 l12 -12 h40 l-12 12 Z" style="fill:var(--h-block-top);stroke:var(--h-indigo);stroke-width:2;stroke-linejoin:round"/>
+<path d="M28 6 l12 -12 v38 l-12 12 Z" style="fill:var(--h-block-side);stroke:var(--h-indigo);stroke-width:2;stroke-linejoin:round"/>
+<rect x="-12" y="6" width="40" height="38" rx="2" style="fill:var(--h-block);stroke:var(--h-indigo);stroke-width:2"/>
+<text x="8" y="30" class="h-tiny">wasm</text>
+<circle cx="44" cy="44" r="13" style="fill:var(--h-teal)"/>
+<path d="M38 44 l4 4 l8 -9" style="fill:none;stroke:var(--h-badge-ink);stroke-width:3;stroke-linecap:round;stroke-linejoin:round"/>
+</g>
+<g transform="translate(710 572)">
+<circle r="80" style="fill:var(--h-disc)"/>
+<path d="M-42 4 L-48 30 L-40 25 L-35 33 L-32 8 Z M-22 4 L-16 30 L-24 25 L-29 33 L-32 8 Z" style="fill:var(--h-teal)"/>
+<circle cx="-32" cy="-6" r="20" style="fill:var(--h-amber);stroke:var(--h-amber);stroke-width:5;stroke-dasharray:3 3"/>
+<path d="M-41 -6 l6 6 l12 -13" style="fill:none;stroke:var(--h-coin-ink);stroke-width:3;stroke-linecap:round;stroke-linejoin:round"/>
+<path d="M14 6 l10 -10 h32 l-10 10 Z" style="fill:var(--h-block-top);stroke:var(--h-indigo);stroke-width:2;stroke-linejoin:round"/>
+<path d="M46 6 l10 -10 v32 l-10 10 Z" style="fill:var(--h-block-side);stroke:var(--h-indigo);stroke-width:2;stroke-linejoin:round"/>
+<rect x="14" y="6" width="32" height="32" rx="2" style="fill:var(--h-block);stroke:var(--h-indigo);stroke-width:2"/>
+<path d="M22 17 h16 M22 25 h10" style="stroke:var(--h-indigo);stroke-width:2;stroke-linecap:round;opacity:.6"/>
+<ellipse cx="0" cy="36" rx="7" ry="4.5" style="fill:none;stroke:var(--h-ink);stroke-width:2.5;opacity:.5"/>
+<path d="M-18 -28 Q-4 -46 4 -48 M26 -12 Q20 -40 12 -48" style="fill:none;stroke:var(--h-muted);stroke-width:2.5;stroke-linecap:round;stroke-dasharray:1 7"/>
+<circle cx="8" cy="-52" r="14" style="fill:var(--h-teal)"/>
+<path d="M1 -52 l5 5 l9 -10" style="fill:none;stroke:var(--h-badge-ink);stroke-width:3;stroke-linecap:round;stroke-linejoin:round"/>
+</g>
+<g transform="translate(890 572)">
+<circle r="80" style="fill:var(--h-disc)"/>
+<path d="M-46 -2 H48" style="stroke:var(--h-muted);stroke-width:1.5;stroke-dasharray:3 4"/>
+<polyline points="-46,-2 -28,-14 -12,-6 6,-30 24,-22 44,-48" style="fill:none;stroke:var(--h-teal);stroke-width:4;stroke-linecap:round;stroke-linejoin:round"/>
+<circle cx="44" cy="-48" r="5" style="fill:var(--h-teal)"/>
+<path d="M-42 20 l8 -8 h28 l-8 8 Z M2 20 l8 -8 h28 l-8 8 Z" style="fill:var(--h-block-top);stroke:var(--h-indigo);stroke-width:1.5;stroke-linejoin:round"/>
+<path d="M-14 20 l8 -8 v26 l-8 8 Z M30 20 l8 -8 v26 l-8 8 Z" style="fill:var(--h-block-side);stroke:var(--h-indigo);stroke-width:1.5;stroke-linejoin:round"/>
+<rect x="-42" y="20" width="28" height="26" rx="2" style="fill:var(--h-block);stroke:var(--h-indigo);stroke-width:1.5"/>
+<rect x="2" y="20" width="28" height="26" rx="2" style="fill:var(--h-block);stroke:var(--h-indigo);stroke-width:1.5"/>
+<ellipse cx="-6" cy="33" rx="6" ry="4" style="fill:none;stroke:var(--h-ink);stroke-width:2.5"/>
+<path d="M-28 12 v-8 M16 12 v-18" style="stroke:var(--h-muted);stroke-width:2;stroke-linecap:round;stroke-dasharray:1 5"/>
+</g>
+<!-- captions -->
+<text x="110" y="400" class="h-caption">Author</text>
+<text x="390" y="400" class="h-caption">agent, in an attested machine</text>
+<text x="703" y="400" class="h-caption">vault, on-chain</text>
+<text x="900" y="400" class="h-caption">Depositors</text>
+<text x="300" y="686" class="h-caption">reviewed by AI</text>
+<text x="480" y="686" class="h-caption">built and signed</text>
+<text x="710" y="686" class="h-caption">seal checked</text>
+<text x="890" y="686" class="h-caption">exit anytime</text>
+</svg>
 </div>
 
-## Where the project is today
-
-Everything above runs, end to end, on a local development chain: the contracts, the build service, the reviewer, an executor, the keeper, the indexer and the web app.
-
-Nothing is deployed to a public chain yet. There is no live vault and no money in anything. The [build checklist](checklist.md) is the honest list of what stands between here and there, and it is long.
-
-The web app is at [shonin.fi](https://shonin.fi/). It sits behind a login while the project is pre-release, so a link to it will ask you to sign in rather than let you in; what it shows is a development chain either way.
-
-The source is not public yet either. That is on the checklist and it is near the top of it, because a page that tells you to check things for yourself is worth very little until you can.
-
-These docs describe what is built. Where something is designed but not finished, the page says so rather than using the present tense and hoping.
+[Learn about roles →](basics/roles.md){ .md-button .md-button--primary }

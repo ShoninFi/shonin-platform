@@ -1,15 +1,12 @@
 # Run it locally
 
-The whole platform runs on your own machine: a development chain, the contracts on it, a stand-in venue, the build service, the reviewer, an executor, the keeper, the indexer and the web app. The site shows only what that chain produced.
+The whole platform runs on your own machine: a development chain, the contracts on it, a stand-in venue, the build service, the Reviewer, an executor, the keeper, the indexer and the web app. The site shows only what that chain produced.
 
 Nothing needs a key, an account or a cloud project.
 
-!!! warning "The repository is not public yet"
-    Everything below works, and it is what we run. You cannot clone it today, because the source has not been published. That is [on the checklist](checklist.md#the-site), and until it is done this page describes something you have to take our word for — which is the one thing this project is supposed to avoid asking of anyone.
-
 ## Prerequisites
 
-- [Rust](https://rustup.rs) — the toolchain is pinned and installs itself on first use, with `wasm32-unknown-unknown` for the web app and `wasm32-wasip2` for agents
+- [Rust](https://rustup.rs): the toolchain is pinned and installs itself on first use, with `wasm32-unknown-unknown` for the web app and `wasm32-wasip2` for agents
 - [Foundry](https://getfoundry.sh) for the contracts and the chain (`forge`, `anvil`, `cast`)
 - [Task](https://taskfile.dev)
 - [Trunk](https://trunkrs.dev) for the frontend
@@ -29,7 +26,7 @@ task services:seed   # publish the reference agents through the real flows
 task down            # stop everything task dev started
 ```
 
-`task services:seed` publishes several versions the way an author would: one superseded by a newer one, one sealed, one that deliberately fails to build, and one that is then killed — so every state the site has to handle actually exists on your chain.
+`task services:seed` publishes several versions the way an Author would: one superseded by a newer one, one sealed, one that deliberately fails to build, and one that is then killed, so every state the site has to handle actually exists on your chain.
 
 ## What is listening
 
@@ -40,7 +37,7 @@ task down            # stop everything task dev started
 | 19083 | The chain |
 | 19084 | The build service |
 | 19085 | The executor |
-| 19086 | The reviewer |
+| 19086 | The Reviewer |
 | 19087 | The coordinator (the keeper) |
 | 19088 | The devnet: the chain's clock and its market |
 
@@ -48,7 +45,7 @@ Everything a run writes lives under `.shonin/local`, which is safe to delete; th
 
 ## The clock runs fast
 
-A block is mined every second and advances an hour of chain time, so a day of fees passes in twenty-four seconds and a vault reaches the ninety live days it needs to be ranked in about thirty-six minutes. Crystallisation, claims, freezes and blessing renewals all become things you can watch rather than read about.
+A block is mined every second and advances an hour of chain time, so a week of fees passes in under three minutes and a vault builds up the record it needs to be ranked in well under an hour. Crystallisation, claims, freezes and blessing renewals all become things you can watch rather than read about.
 
 ## The development wallet
 
@@ -73,9 +70,12 @@ Deliberately absent: a bridge, a second chain, remote legs, an enclave, model in
 ## Publishing an agent to it
 
 ```bash
-# from a checkout of the agents repository, with SHONIN_PLATFORM_DIR set
-task dev     # packs, creates the vault, submits, and prints the queue and agent URLs
+# from the root of this repository, with task dev running
+cargo run -q -p shonin-cli -- publish path/to/your-agent            # packs, creates the vault, funds the tank, submits
+cargo run -q -p shonin-cli -- publish path/to/your-agent --sealed   # the same, with the source kept out of the store
 ```
+
+It publishes as the chain's Author account, so it needs no key of yours.
 
 or from the web app's **Publish** page: drop the packed archive, fund the tank, and watch the queue.
 
