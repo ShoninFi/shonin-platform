@@ -73,6 +73,22 @@
     font-weight: 600;
 }
 
+/*
+ * A page at the top level of the sidebar reads as a heading of its own, like
+ * a section does, so it isn't taken for the last page of the section above.
+ * Sections only render this way on wide screens, so this follows suit.
+ */
+@media screen and (min-width: 76.25em) {
+    .md-nav--primary > .md-nav__list > .md-nav__item:not(.md-nav__item--section) > .md-nav__link {
+        font-weight: 700;
+        margin-top: 1.25em;
+    }
+
+    .md-nav--primary > .md-nav__list > .md-nav__item:first-child > .md-nav__link {
+        margin-top: 0;
+    }
+}
+
 /* The illustration on the start page. Its colours follow the theme. */
 .shonin-hero {
     --h-ink: #1e1b4b;
@@ -160,6 +176,7 @@
 .shonin-hero .h-chip { fill: var(--h-paper); font-size: 17px; font-weight: 800; }
 .shonin-hero .h-plaque { fill: #ffffff; font-size: 19px; font-weight: 700; }
 .shonin-hero .h-tag { fill: var(--h-ink); font-size: 16px; font-weight: 700; }
+.shonin-hero .h-note { fill: var(--md-default-fg-color--light); font-size: 14px; }
 .shonin-hero .h-bag { fill: var(--h-coin-ink); font-size: 24px; font-weight: 800; }
 .shonin-hero .h-ticket { fill: var(--h-teal); font-size: 15px; font-weight: 800; }
 .shonin-hero .h-coin { fill: var(--h-coin-ink); font-size: 12px; font-weight: 700; }
@@ -169,4 +186,179 @@
     background-color: var(--md-accent-fg-color);
     border-color: var(--md-accent-fg-color);
     color: #0b0b10;
+}
+
+/* The money flow simulator. */
+.shonin-sim {
+    border: 1px solid var(--md-default-fg-color--lightest);
+    border-radius: 0.6rem;
+    margin: 1.5em 0;
+    padding: 1rem;
+}
+
+.shonin-sim__inputs {
+    display: grid;
+    gap: 0.6rem 1rem;
+    grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
+    margin-top: 0.6rem;
+}
+
+.shonin-sim__inputs label {
+    display: flex;
+    flex-direction: column;
+    font-size: 0.65rem;
+    gap: 0.2rem;
+}
+
+.shonin-sim input {
+    background: var(--md-default-bg-color);
+    border: 1px solid var(--md-default-fg-color--lighter);
+    border-radius: 0.3rem;
+    color: var(--md-default-fg-color);
+    font: inherit;
+    font-size: 0.75rem;
+    padding: 0.3rem 0.5rem;
+}
+
+.shonin-sim__controls {
+    align-items: flex-end;
+    border-bottom: 1px solid var(--md-default-fg-color--lightest);
+    border-top: 1px solid var(--md-default-fg-color--lightest);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem 2rem;
+    margin: 1rem 0;
+    padding: 0.8rem 0;
+}
+
+.shonin-sim__group {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+}
+
+.shonin-sim__caption {
+    color: var(--md-default-fg-color--light);
+    flex-basis: 100%;
+    font-size: 0.6rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+}
+
+.shonin-sim__btn {
+    background: transparent;
+    border: 2px solid var(--md-typeset-a-color);
+    border-radius: 2rem;
+    color: var(--md-typeset-a-color);
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.7rem;
+    font-weight: 700;
+    padding: 0.35rem 0.9rem;
+}
+
+.shonin-sim__btn--solid {
+    background: var(--md-typeset-a-color);
+    color: var(--md-default-bg-color);
+}
+
+.shonin-sim__btn:hover {
+    opacity: 0.85;
+}
+
+.shonin-sim__amount {
+    align-items: center;
+    display: inline-flex;
+    gap: 0.2rem;
+}
+
+.shonin-sim__amount input {
+    width: 6.5rem;
+}
+
+.shonin-sim__reset {
+    background: none;
+    border: none;
+    color: var(--md-default-fg-color--light);
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.65rem;
+    margin-left: auto;
+    text-decoration: underline;
+}
+
+.shonin-sim__state section {
+    margin-bottom: 0.8rem;
+}
+
+.md-typeset .shonin-sim__state h5 {
+    color: var(--md-default-fg-color--light);
+    font-size: 0.6rem;
+    letter-spacing: 0.05em;
+    margin: 0 0 0.4rem;
+    text-transform: uppercase;
+}
+
+.shonin-sim__cards {
+    display: grid;
+    gap: 0.5rem;
+    grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr));
+}
+
+.shonin-sim__card {
+    background: var(--md-code-bg-color);
+    border-radius: 0.4rem;
+    display: flex;
+    flex-direction: column;
+    padding: 0.5rem 0.7rem;
+}
+
+.shonin-sim__card span {
+    color: var(--md-default-fg-color--light);
+    font-size: 0.6rem;
+}
+
+.shonin-sim__card strong {
+    font-size: 0.85rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.shonin-sim__card small {
+    color: var(--md-default-fg-color--light);
+    font-size: 0.55rem;
+}
+
+.shonin-sim__card.is-up strong {
+    color: #0d9488;
+}
+
+.shonin-sim__card.is-down strong {
+    color: #dc2626;
+}
+
+.md-typeset .shonin-sim__logtitle {
+    font-size: 0.7rem;
+    margin: 1rem 0 0.4rem;
+}
+
+.shonin-sim__log {
+    font-size: 0.68rem;
+    max-height: 22rem;
+    overflow-y: auto;
+}
+
+.shonin-sim__entry {
+    border-left: 3px solid var(--md-default-fg-color--lightest);
+    margin-bottom: 0.6rem;
+    padding-left: 0.6rem;
+}
+
+.md-typeset .shonin-sim__entry ul {
+    margin: 0.2rem 0 0;
+}
+
+.md-typeset .shonin-sim__entry li {
+    margin-bottom: 0.1rem;
 }

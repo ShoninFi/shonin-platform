@@ -1,4 +1,4 @@
-# Verify it yourself
+# Verification
 
 You shouldn't have to take our word for any of this. Every question below has an answer on the chain, where anyone can look it up.
 
@@ -57,15 +57,17 @@ You shouldn't have to take our word for any of this. Every question below has an
 
 ## Is it really the agent I chose?
 
-Only keys made inside an enclave, for this exact agent, can trade for its vault. Our contracts check every key before it can act, and every order has to come from one of them.
+Yes, by definition. Only keys made inside an enclave, for this exact agent, can trade for its vault. Our contracts check every key before it can act, and every order has to come from one of them.
 
 For convenience, every vault's page shows the public address of each of its keys, so you can look them up on the chain yourself.
 
 ## Is the code what it claims?
 
-If the source is public, you can build it yourself and get the same fingerprint the chain has on record. That proves the code running is the code you just read.
+There are two ways to check, and one is stronger than the other. Which one you get depends on whether the Author made the source public.
 
-If the Author sealed it, you can't read it, but the Reviewer can. It reads the source on an attested machine before anything is built, and its report is public. The chain records exactly which source it read, so you can check that the report is about the code that's running.
+**Public source: check it yourself.** You can build it yourself and get the same fingerprint the chain has on record. That proves the code running is the code you just read.
+
+**Sealed source: rely on the Reviewer.** You can't read it, but the Reviewer can. It reads the source on an attested machine before anything is built, and its report is public. The chain records exactly which source it read, so you can check that the report is about the code that's running. You know the Reviewer saw the real code, but you are trusting its reading rather than your own.
 
 ## Could you slip in keys of your own?
 
@@ -100,5 +102,4 @@ The one exception: a few vaults trade somewhere the contract can't reach on its 
 !!! tip "Running the checks"
     The commands and contract calls for each check are in [Verification helpers](reference/verification.md).
 
-[I want to put money in →](depositors.md){ .md-button .md-button--primary }
-[I want to publish an agent →](authors.md){ .md-button .md-button--primary }
+[Next: the technical deep-dive →](how-it-works/index.md){ .md-button .md-button--primary }

@@ -1,6 +1,6 @@
 # The whole system
 
-This is the part of the site for people who want the mechanism. If you are deciding whether to deposit or to publish, [Putting money in](../depositors.md) and [Publishing an agent](../authors.md) cover the same ground with fewer moving parts.
+This is the part of the site for people who want the mechanism. If you are deciding whether to deposit or to publish, [Depositors](../depositors.md) and [Authors](../authors.md) cover the same ground with fewer moving parts.
 
 Six things happen, in order, and each one leaves evidence on a chain.
 

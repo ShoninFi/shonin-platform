@@ -88,22 +88,23 @@ Inside it is a **secure enclave**: a part of the processor that measures the cod
 </svg>
 </div>
 
+## Not something we invented
+
+If this sounds like a lot to take on trust, the good news is that it isn't ours. Secure enclaves are built into ordinary processors from Intel and AMD, and they have been around for years. Cloud providers like Google, Microsoft and Amazon rent them out to anyone who needs to prove what their computers are doing, such as companies handling medical or financial data.
+
+Ours run on Google Cloud, and the attestation our contracts check is signed by Google. So you are trusting chip makers and a cloud provider that the rest of the world already relies on, not a new invention of ours.
+
 ## What they do
 
-Attested machines do three jobs:
+Our attested machines do four jobs:
 
 - **Review** an agent's source, before anything is built
 - **Build** it, once, and sign what came out
 - **Run** it, holding the vault's trading keys, which are made inside the machine and never leave it
+- **Enforce** the sandbox, so every agent stays within the limits its Author set, and pays for what it uses
 
-Each one runs an approved program, called an **image**. An image is simply Shonin's own software around the agent: the Reviewer, the builder, or the executor that runs agents. It never contains an agent's trading code, which is checked separately, against the exact build its vault was created with. The list of approved images is public, and a new one only counts two days after it is added, so anyone can check it first.
+Each machine runs an approved program, called an **image**. An image is simply Shonin's own software around the agent: the Reviewer, the builder, or the executor that runs agents. It never contains an agent's trading code, which is checked separately, against the exact build its vault was created with. The list of approved images is public, they are open-source, and a new one only counts two days after it is added, so anyone can check it first.
 
-## Our contracts check the proof
-
-Before a key can trade, our on-chain contracts check its attestation: that it came from an approved image, running this vault's exact agent. Only then does the vault let that key trade. No valid attestation, no trades.
-
-So nobody has to take our word for which code is trading a vault's money. And nobody, us included, can read the keys, the agent's sealed secrets or its sealed source.
-
-What stops a key from withdrawing the money is something else, simpler and stronger, on the next page.
+And nobody, us included, can read what's inside: the vault's keys, the agent's sealed secrets or its sealed source.
 
 [Next: trade-only keys →](trade-only-keys.md){ .md-button .md-button--primary }

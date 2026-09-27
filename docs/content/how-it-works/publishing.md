@@ -37,12 +37,7 @@ You can upload it **sealed**. A sealed project is encrypted to the platform's ke
 
 Creating the vault and funding its tank happen in one transaction, and the build service will not admit a job until that vault exists. Nothing is ever compiled for free.
 
-The tank has to hold the larger of two amounts:
-
-| Amount | What it is |
-| --- | --- |
-| The factory's minimum | The least any vault can be created with, whatever it declares |
-| The review and a week | The review's flat fee, one model call over the source, plus a week at the declared allowances, so the agent can actually run |
+The tank has to hold at least the factory's minimum, the least any vault can be created with, which covers the review's flat fee and the build. Past that it's up to the Author. A week at the declared allowances is a sensible start, since an agent whose tank runs dry stops.
 
 The build itself is metered compute and is charged once it has run, so what it comes to is known only afterwards. The publish page shows every one of these figures read from the chain, not from a number written into the app.
 
@@ -94,6 +89,7 @@ A vault's executors are then blessed for that exact `bundleHash`, so the chain f
 ## Admission and charges
 
 - A job is admitted once its vault exists and its tank covers the minimum.
+- **Every submission has limits, generous but not unlimited:** a maximum size for the source, and a maximum time to build it. They're published with the other parameters. A project over the size limit is refused before the review runs, so it costs nothing; a build that runs past the time limit fails, and is charged like any failed build.
 - **A refused project is charged the review fee, because the review ran.** The vault closes and the Author reclaims the rest of the tank.
 - **A failed build is charged, because it ran.** The vault closes and the Author reclaims the rest of the tank. A fixed resubmission is a new vault.
 - A build service that crashes requeues the job at no charge.

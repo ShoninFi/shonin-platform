@@ -8,7 +8,7 @@ Here's how it works, in a nutshell. *Don't worry if it's a lot at once*, the nex
 
 An Author publishes a trading agent as source code. We use attested machines to evaluate it, compile it, and run it with keys that can trade but cannot withdraw.
 
-Depositors put money behind the agent they choose, and can check it's *really* that agent trading it. The source code is public too, unless the Author opts out. Trades only go through when our on-chain contracts have verified the attestation, but Depositors can withdraw at any time.
+Depositors put money behind the agent they choose, and can verify, definitively, that it's *really* that agent trading it. Trades only go through when our on-chain contracts have verified the attestation, and that mechanism is secured by hardware and cryptography - while still allowing the agent to do powerful off-chain computation, internet queries, and more - within its sandbox. Depositors can withdraw at any time.
 
 <div class="shonin-hero" markdown="0">
 <svg viewBox="0 0 1000 700" role="img" aria-labelledby="hero-title hero-desc" xmlns="http://www.w3.org/2000/svg">

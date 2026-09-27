@@ -1,6 +1,6 @@
 # Verification helpers
 
-How to run each check on [Verify it yourself](../verify.md). Everything here reads public state: a chain RPC, the venue's own records, and the content-addressed store, which is keyed by the hashes the chain holds.
+How to run each check on [Verification](../verify.md). Everything here reads public state: a chain RPC, the venue's own records, and the content-addressed store, which is keyed by the hashes the chain holds.
 
 The examples use `cast` from [Foundry](https://getfoundry.sh). Any client that can call a contract works the same way.
 

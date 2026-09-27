@@ -72,7 +72,7 @@ One word for one thing, throughout the platform and these docs.
 : The guardian key stopping a vault: every position closed, all cash home, every Depositor paid from idle balance. A halt, never a theft.
 
 **Manifest**
-: The `shonin.toml` in a project. What the agent is, what it will not do, the venues it trades, the config it takes and the allowances it asks for. Hashed with the bundle.
+: The `shonin.toml` in a project. What the agent is, what it will not do, the venues it trades, the config it takes and the allowances it starts with. Hashed with the bundle; only the allowances can change afterwards.
 
 **Mark**
 : The venue's own reference price, used to value a deposit. A withdrawal uses **exit-side marks** instead: a long at the bid, a short at the ask.
@@ -110,8 +110,8 @@ One word for one thing, throughout the platform and these docs.
 **Transaction fee**
 : 0.1% on every deposit and withdrawal, which stays in the pool. Nobody receives it.
 
-**Usage statement**
-: What a day of running cost, signed by the vault's blessed key and charged to its tank, capped by the allowances the Author declared.
+**Usage total**
+: A running total of what the agent has used, kept by the executor and signed by the vault's blessed key. It stops the agent when the unpaid part reaches the tank, and Shonin collects from it, capped by the allowances the Author declared.
 
 **Value per share**
 : A vault's value divided by its shares outstanding. The whole of the record is the change in this number over time.
