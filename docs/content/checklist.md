@@ -23,6 +23,8 @@ The guarantees are the product. Everything else is how they are shown.
 - [ ] `local` **The record is computed by the vault contract** from on-chain state, never reported
 - [ ] `local` **Every image that may hold a key is on a public, timelocked allowlist**, reproducible from published source
 - [ ] **A trade-only key cannot trade value away on purpose**: a bound on the price of every order a vault's key places, not only a claim's, so buying from a friendly account above the market or selling to it below is refused. Where a venue gives a contract no way to see or limit orders, the vault's page says the exposure is unbounded
+- [ ] **Extensive property tests that the vault can never go insolvent or into bad debt**: long random sequences of deposits, withdrawals, claims, price moves, fee payments, bills, auto-fill and tank withdrawals, checked after every step. The vault always holds enough to pay every share at its value, the tank never pays out more than it holds or ends up owing anything, fees are never more than what's owed, money only moves between the vault's own accounts, the agent can never send money out below the floor, and every rounding favours the vault
+- [ ] **Property tests of a run on the vault**: everyone cashes out at once, Depositors, the Author and Shonin with their fee shares, in random orders, at random prices, with the cash at home running out partway. Every holder is paid their fraction and no more, the Author and Shonin get no priority, a claim is served by closing only the leaver's own fraction, whoever leaves last is treated the same way as whoever leaves first, the tank is never touched, and the vault ends with nothing owed to anyone
 - [ ] Each guarantee demonstrated publicly, end to end, on a real chain
 
 ## Contracts
@@ -31,20 +33,21 @@ The guarantees are the product. Everything else is how they are shown.
 - [ ] **Fees are paid weekly.** What is owed is worked out daily and taken out of value per share, shrinks again if gains are given back, and is paid as new shares at a weekly payment anyone can call; a withdrawal pays what its own shares owe so far. The high-water mark moves only at a weekly payment
 - [ ] **Two keys, split by power.** The allowlist key proposes and revokes images; the guardian key kills vaults and lifts paused deposits. Neither can move funds except back to Depositors
 - [ ] `local` **Vault and factory**: ERC-4626 shares, deposit at mark, redeem at exit-side marks, claims with pending shares, capital moved only between registered accounts
-- [ ] `local` **Fees and the tank**: daily crystallisation as shares, the high-water mark, the transaction fee, tank funding, auto-fill, usage charges
+- [ ] `local` **Fees and the tank**: daily crystallisation as shares, the high-water mark, the transaction fee, tank funding, usage charges
+- [ ] **The tank as plain dollars**: top-ups from the Author's fee shares, auto-fill as one "keep my tank at $X" setting, and a tank withdrawal that settles usage first
 - [ ] `local` **Claims and kills**: settle inside the exit band, freeze after an unserved claim, a kill that returns everything to Depositors
 - [ ] `local` **Attestation registry**: the timelocked allowlist by image kind, key blessing from a proof, a Merkle proof per vault
 - [ ] `local` **Strategy registry**: registration only with a valid builder signature, supersession, retirement
 - [ ] `local` **Review registry**: signed reviews from blessed Reviewers, and anyone buying a fresh one
 - [ ] `local` **Permissionless venue approvals** that obey only the registry
-- [ ] **Gas stocking**: funding an executor key's gas on chains that charge it, and repaying whoever funded it
+- [ ] **Gas on the bill**: Shonin keeps executor keys stocked, and each transaction's actual gas goes on the same running tab as resources, which the attested machine never lets pass what's in the tank
 - [ ] **Audits** of every contract, with the status of each shown on every vault page from day one
 
 ## Execution
 
 - [ ] `local` **The runtime**: one long-lived instance per vault, fuel and epoch yields, a memory cap, restart after a fault, an ephemeral per-agent cache
 - [ ] `local` **Signed health reports**: restarts, faults, refused submissions, venue errors and tank runway, refused from any key not blessed for that vault
-- [ ] `local` **Signed daily usage statements**, capped by the allowances the Author declared at the published prices
+- [ ] **Signed running usage total**: metered at every yield point, stopping the agent when the unpaid part reaches the tank, collected by Shonin and capped by the allowances the Author declared at the published prices
 - [ ] `local` **Blessing and renewal**, with the venue's approval following the blessing
 - [ ] **A real enclave**: keys generated inside it, a genuine attestation token, and the on-chain proof of that token
 - [ ] **The root key**: generated in the enclave, released only by attested key exchange to an allowlisted image, with derived per-bundle and per-vault keys

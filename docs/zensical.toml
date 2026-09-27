@@ -17,21 +17,26 @@ copyright = "These docs describe the platform as designed; the <a href=\"/checkl
 docs_dir = "content"
 site_dir = "site"
 extra_css = ["stylesheets/theme.css"]
-extra_javascript = ["javascripts/diagrams.js"]
+extra_javascript = ["javascripts/diagrams.js", "javascripts/flow-sim.js"]
 # No repo_url yet: the repository is not public, so a header link would be a
 # 404 for every reader, and the theme would fetch its stats on every page.
 nav = [
     {"Start here" = "index.md"},
-    {"The basics" = [
+    {"Overview" = [
         {"Roles" = "basics/roles.md"},
         {"Trading agents" = "basics/trading-agents.md"},
         {"Attested machines" = "basics/attested-machines.md"},
         {"Trade-only keys" = "basics/trade-only-keys.md"},
+        {"Smart contracts" = "basics/smart-contracts.md"},
+        {"The tank" = "tank.md"},
+        {"Fees" = "fees.md"},
+        {"Money flow" = "flow.md"},
     ]},
-    {"Verify it yourself" = "verify.md"},
-    {"Putting money in" = "depositors.md"},
-    {"Fees" = "fees.md"},
-    {"Publishing an agent" = "authors.md"},
+    {"Using Shonin" = [
+        {"Depositors" = "depositors.md"},
+        {"Authors" = "authors.md"},
+        {"Verification" = "verify.md"},
+    ]},
     {"Technical deep-dive" = [
         {"The whole system" = "how-it-works/index.md"},
         {"Vaults" = "how-it-works/vaults.md"},

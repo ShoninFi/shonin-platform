@@ -41,7 +41,7 @@ flowchart TB
     class R,P,P2 ends
 ```
 
-Agents keep a working buffer of idle capital, so most withdrawals end in the first branch: the shares are burned and the Depositor is paid in the same transaction.
+Each vault keeps some of its money home, in the vault contract itself, rather than out at the venue. How much is the Author's choice, 5% of the vault by default, and the contract enforces it: it won't let the agent move money out if that would leave less than the Author's floor. Lowering the floor takes a day to apply, so Depositors can see it coming. So most withdrawals end in the first branch: the shares are burned and the Depositor is paid in the same transaction.
 
 When idle capital cannot cover it, the shares are marked pending and the contract books a **claim**, which has three states: *pending*, *waiting* when a settlement was tried and the market was outside the band, and *paid*.
 
@@ -62,8 +62,8 @@ Fees are worked out every day and paid once a week, as **new shares**, so paying
 ```text
 every day, what is owed so far is worked out and taken out of value per share:
 
-  streaming fee  = value × 0.5% × (days since the last payment) / 365
-  if value per share (after streaming) > high-water mark:
+  holding fee  = value × 0.5% × (days since the last payment) / 365
+  if value per share (after the holding fee) > high-water mark:
       gains      = (value per share − high-water mark) × shares
       author fee = gains × 10%
       platform   = gains × 5%
@@ -89,14 +89,15 @@ The schedule is fixed when a vault is created and never changes under it. A vaul
 
 Running an agent costs money: compute, and gas where a chain charges it. That is the **Author's** cost, not the Depositors'.
 
-Each vault has a **tank**, which the Author funds when they create it and their own fees refill. It is excluded from what shares are worth, so a Depositor's value never pays for the agent's electricity.
+Each vault has a **tank**, a plain dollar balance for running it. The Author funds it when they create the vault, and it's excluded from what shares are worth, so a Depositor's value never pays for the agent's electricity.
 
 - The review and the build are the tank's first charges.
-- The executor states each day's usage, signed by the vault's own blessed key, and the contract believes it only up to the allowances the Author declared at the platform's published prices. A wrong statement cannot charge more than the Author agreed to.
-- **Auto-fill** redeems a share of each Author fee back into the tank (all of it, by default) until the tank holds its target, around thirty days of charges. It is paid from idle balance and waits for the next week when there is not enough, never booking a claim.
-- A tank that runs dry accrues a debt, repaid from future Author fees before anything reaches the Author.
+- The executor keeps a running total of usage, signed by the vault's own blessed key, and stops the agent the moment the unpaid part reaches the tank. Once a day, one keeper call collects it from the tank, pays fees on the weekly day, then runs auto-fill; Shonin sends it and pays its gas, and and the contract believes the total only up to the allowances the Author declared at the platform's published prices over the time elapsed. A wrong total cannot charge more than the Author agreed to.
+- The Author's fee shares are theirs. They can redeem some into the tank in one transaction, or set **auto-fill** to "keep my tank at $X": each day, just enough of their shares are redeemed to bring the tank back to $X, from the vault's idle balance, waiting until the next day when there isn't enough.
+- The Author can withdraw from the tank at any time. The withdrawal settles a recent signed usage total first, then transfers the rest at once.
+- A tank that runs dry stops the agent until anyone tops it up. Its open positions stay as they are, unmanaged, and the vault page says so; Depositors can leave at any time, and exits never draw on the tank. A last bill the tank can't cover takes what's there, and the rest is written off; the tank never carries a debt.
 
-Every vault page shows the tank's balance, what it is charging and how long that lasts.
+Every vault page shows the tank's balance and its recent charges.
 
 ## Deposits paused
 

@@ -1,4 +1,4 @@
-# Putting money in
+# Depositors
 
 As a Depositor, you put money into an agent's vault and get shares back. Your shares rise and fall with the vault, and you can cash them in whenever you like.
 
@@ -66,7 +66,7 @@ Which agent to back is up to you, and nobody can predict the future. But every a
 
 **How old it is.** A young agent is marked **new** and kept out of the rankings until its record is long enough to mean something. It's open for deposits like any other, but there's less history to go on.
 
-**Its source, if it's public.** You can read exactly what the agent does, and check that it's the code actually trading. [Verify it yourself](verify.md) shows how.
+**Its source, if it's public.** You can read exactly what the agent does, and check that it's the code actually trading. [Verification](verify.md) shows how.
 
 ## Getting out
 

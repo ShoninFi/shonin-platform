@@ -98,7 +98,7 @@ streams = 4
 inference_ms_per_min = 0
 ```
 
-The manifest is hashed with the bundle, so what it declared is fixed for the vault's life and shown on the vault's page. The **allowances** are what the host holds the agent to and what the vault's tank is charged for, at the platform's published prices.
+The manifest is hashed with the bundle, so what it declared is fixed for the vault's life and shown on the vault's page. The one exception is the **allowances**: what the host holds the agent to and what the vault's tank is charged for, at the platform's published prices. The manifest sets where they start, and the Author can change them on the live vault at any time, since they cap only the Author's own tank. The vault's page shows every change.
 
 ## Versions
 

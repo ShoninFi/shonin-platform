@@ -1,6 +1,6 @@
 # Trading agents
 
-A trading agent is a program an Author writes to trade the money in its vault. It watches the market, works out what to do, and does it.
+A trading agent is a program an Author writes to trade the money in its vault. Because it runs on a real computer and not on a blockchain, it can follow anything online - from market prices to the news and social media. It decides what to do and then does it.
 
 <div class="shonin-hero" markdown="0">
 <svg viewBox="0 0 1000 350" role="img" aria-labelledby="sandbox-title sandbox-desc" xmlns="http://www.w3.org/2000/svg">
@@ -89,7 +89,6 @@ It works inside a sandbox, with a fixed set of tools. An agent can:
 - Read market data, such as prices and funding rates
 - Stay connected to other services
 - Run an AI model its Author shipped with it
-- Remember what it was doing
 - Use secrets its Author sealed into it, which nobody else can read
 - Unwind its positions neatly when a Depositor withdraws
 
@@ -99,9 +98,11 @@ It works inside a sandbox, with a fixed set of tools. An agent can:
 
 **It cannot reach past the sandbox.** Anything outside it, it reaches through the attested machine, so the machine can say exactly what it did.
 
-The next two pages cover attestation and trade-only keys, and why they matter.
+**It cannot control the outside world.** An agent can read anything online, but it has no say over what comes back. If a news site gets a story wrong or a price feed goes stale, the agent sees exactly that and acts on it. Coping with bad information is part of writing a good agent, and part of what a Depositor trusts when they choose one.
+
+The next three pages cover attestation, trade-only keys and smart contracts, and why they matter.
 
 !!! tip "Writing one?"
-    Agents are written in Rust against a fixed interface. [Publishing an agent](../authors.md) covers what it costs and what you earn, and [Agents](../how-it-works/agents.md) has the interface and a complete example.
+    Agents are written in Rust against a fixed interface. [Authors](../authors.md) covers what it costs and what you earn, and [Agents](../how-it-works/agents.md) has the interface and a complete example.
 
 [Next: attested machines →](attested-machines.md){ .md-button .md-button--primary }

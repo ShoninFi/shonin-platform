@@ -1,4 +1,4 @@
-# Publishing an agent
+# Authors
 
 You write an ordinary Rust project. We compile it, a model reads it, a vault opens, and if people deposit you earn a share of what it makes.
 
@@ -30,9 +30,8 @@ For an agent declaring modest allowances (two million fuel a second, 256 MiB, a 
 | --- | ---: |
 | The review, a flat fee | $1.00 |
 | A week at those allowances | $50.87 |
-| Together | $51.87 |
-| The vault's minimum, set by the factory | $40.00 |
-| **Least you can fund the tank with: the larger of the two** | **$51.87** |
+| **Suggested: the review and a week** | **$51.87** |
+| The least you can fund the tank with, the factory's minimum | $40.00 |
 
 The build itself is metered compute, charged once it has run, so what it comes to is known only afterwards. On the development chain a build of the reference agent takes about twenty seconds, which at the published prices is under a cent.
 
@@ -46,17 +45,17 @@ The review runs before the build. Code it finds malicious is refused and never b
 
 Running an agent costs money: compute, and gas where a chain charges it. That is your cost, not your Depositors'.
 
-Each vault has a tank you fund and your own fees refill. It is excluded from what shares are worth, so a Depositor's value never pays for your electricity. The executor states each day's usage, signed by the vault's own key, and the contract believes it only up to the allowances you declared at the published prices, so a wrong statement cannot charge you more than you agreed to.
+Each vault has a tank: a plain dollar balance for running it, which you fund. It is excluded from what shares are worth, so a Depositor's value never pays for your electricity. The executor keeps a running total of your agent's usage, signed by the vault's own key, stops the agent if the tank can't cover it, and we collect from the tank now and then at our own gas cost. The contract believes the total only up to the allowances you declared at the published prices, so a wrong total cannot charge you more than you agreed to.
 
-**Auto-fill** redeems a share of each Author fee back into the tank, all of it by default, until the tank holds about thirty days of charges. For a modest agent that target is around $218. Above it, your fee shares are simply yours.
+Your earnings are shares in the vault, yours to hold or redeem like any Depositor's, and you can turn some into tank money with one click. Or switch on **auto-fill** and pick a number, "keep my tank at $X": every day, if the tank is below $X, just enough of your earnings tops it back up. You can take money out of the tank whenever you like; it settles what your agent owes first.
 
-A tank that empties accrues a debt, repaid from future fees before anything reaches you.
+A tank that empties stops your agent until it's topped up. The minimum covers the review and the build, but it's wise to fund a week of running on top, or your agent may stop before it has earned anything.
 
 ## What you earn
 
 Ten per cent of the vault's new profit: gains above the best value per share it has reached at a weekly fee payment, its **high-water mark**. It is worked out every day, shown on your page as it builds up, and paid weekly as new shares. If the vault gives a gain back before the week is out, the fee on it goes too.
 
-Concretely: a vault holding a million dollars that returns 20% over a year pays its Author about **$19,400** for that year. The first $218 or so refills the tank; the rest is shares you can hold or redeem like any Depositor's.
+Concretely: a vault holding a million dollars that returns 20% over a year pays its Author about **$19,400** for that year. It's paid to you as shares; auto-fill keeps what you've chosen in the tank, and the rest you hold or redeem like any Depositor.
 
 You earn nothing on a recovery back to a previous high, because the high-water mark is the vault's and it does not reset. An agent that loses 20% and then makes it back has, as far as the fee is concerned, done nothing.
 
