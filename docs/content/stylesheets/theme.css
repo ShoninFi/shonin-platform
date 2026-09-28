@@ -1,6 +1,6 @@
 /* Shonin docs theme
  *
- * Deep indigo header, teal accent. Light and dark (slate) schemes.
+ * Deep indigo header, teal accent. Light only: there is no dark scheme.
  */
 
 :root,
@@ -18,21 +18,6 @@
 
     --md-typeset-a-color: #4338ca;
     --md-code-hl-color: rgba(45, 212, 191, 0.2);
-}
-
-[data-md-color-scheme="slate"] {
-    --md-hue: 245;
-    --md-primary-fg-color: #1e1b4b;
-    --md-primary-fg-color--light: #3730a3;
-    --md-primary-fg-color--dark: #13112e;
-    --md-primary-bg-color: #ffffff;
-    --md-primary-bg-color--light: #ffffffb3;
-
-    --md-accent-fg-color: #2dd4bf;
-    --md-accent-fg-color--transparent: rgba(45, 212, 191, 0.12);
-
-    --md-typeset-a-color: #a5b4fc;
-    --md-code-hl-color: rgba(45, 212, 191, 0.18);
 }
 
 .md-header__button.md-logo img {
@@ -131,38 +116,6 @@
     margin: 2rem 0;
 }
 
-[data-md-color-scheme="slate"] .shonin-hero {
-    --h-ink: #e2e8f0;
-    --h-paper: #2a2940;
-    --h-muted: #64748b;
-    --h-indigo: #a5b4fc;
-    --h-indigo-soft: rgba(165, 180, 252, 0.14);
-    --h-teal: #2dd4bf;
-    --h-glass: rgba(45, 212, 191, 0.07);
-    --h-amber: #fbbf24;
-    --h-wood: #a86b35;
-    --h-hair: #4a4468;
-    --h-screen: #0b1020;
-    --h-slot: #05050a;
-    --h-sand: #5e4f33;
-    --h-sand-dot: #7a6745;
-    --h-wood-dark: #74481f;
-    --h-amber-soft: #4a3f2a;
-    --h-block: #2a2940;
-    --h-block-top: #37355a;
-    --h-block-side: #1f1e33;
-    --h-disc: rgba(165, 180, 252, 0.06);
-    --h-glass-disc: rgba(45, 212, 191, 0.07);
-    --h-red-soft: rgba(248, 113, 113, 0.08);
-    --h-blob-solid: #16161f;
-    --h-amber-dark: #d99a0b;
-    --h-badge-ink: #0b0b10;
-    --h-shine-strong: rgba(255, 255, 255, 0.35);
-    --h-blob: rgba(165, 180, 252, 0.05);
-    --h-shine: rgba(255, 255, 255, 0.12);
-    --h-shadow: rgba(0, 0, 0, 0.35);
-}
-
 .shonin-hero svg {
     display: block;
     height: auto;
@@ -186,13 +139,6 @@
 .shonin-hero .h-bag { fill: var(--h-coin-ink); font-size: 24px; font-weight: 800; }
 .shonin-hero .h-ticket { fill: var(--h-teal); font-size: 15px; font-weight: 800; }
 .shonin-hero .h-coin { fill: var(--h-coin-ink); font-size: 12px; font-weight: 700; }
-
-/* The indigo primary button disappears into the dark background. */
-[data-md-color-scheme="slate"] .md-typeset .md-button--primary {
-    background-color: var(--md-accent-fg-color);
-    border-color: var(--md-accent-fg-color);
-    color: #0b0b10;
-}
 
 /* The money flow simulator. */
 .shonin-sim {

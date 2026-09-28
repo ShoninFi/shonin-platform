@@ -18,8 +18,11 @@ docs_dir = "content"
 site_dir = "site"
 extra_css = ["stylesheets/theme.css"]
 extra_javascript = ["javascripts/diagrams.js", "javascripts/flow-sim.js"]
-# No repo_url yet: the repository is not public, so a header link would be a
-# 404 for every reader, and the theme would fetch its stats on every page.
+# The theme's source-repository slot is used for a permanent header link to
+# the main site (overrides/partials/source.html retitles it). It is not a
+# GitHub URL, so the theme fetches no repository stats for it.
+repo_url = "https://shonin.fi/"
+repo_name = "shonin.fi"
 nav = [
     {"Welcome" = "index.md"},
     {"Using Shonin" = [
@@ -27,7 +30,6 @@ nav = [
         {"Authors" = "authors.md"},
     ]},
     {"System Overview" = [
-        {"Glossary" = "basics/glossary.md"},
         {"Trading agents" = "basics/trading-agents.md"},
         {"AI Review" = "basics/ai-review.md"},
         {"Attested machines" = "basics/attested-machines.md"},
@@ -46,24 +48,24 @@ nav = [
         {"Publishing" = "writing/publishing.md"},
     ]},
     {"Under the hood" = [
-        {"Attested machines" = "under-the-hood/machines.md"},
+        {"How the machines work" = "under-the-hood/machines.md"},
         {"The vault contract" = "under-the-hood/vaults.md"},
     ]},
     {"Reference" = [
         {"Supported venues" = "reference/venues.md"},
         {"The API" = "reference/api.md"},
-        {"Technical glossary" = "reference/glossary.md"},
+        {"Glossary" = "reference/glossary.md"},
     ]},
     {"Build checklist" = "checklist.md"},
-    # The app itself, which is a site of its own rather than a page here.
-    {"The app" = "https://shonin.fi/"},
 ]
 
 [project.extra]
 generator = false
 
 [project.theme]
+custom_dir = "overrides"
 language = "en"
+icon.repo = "lucide/globe"
 logo = "assets/logo.svg"
 favicon = "assets/logo.svg"
 features = [
@@ -81,21 +83,11 @@ features = [
     "toc.follow",
 ]
 
-[[project.theme.palette]]
-media = "(prefers-color-scheme: light)"
+# Light only: a single palette, so the theme shows no switcher.
+[project.theme.palette]
 scheme = "default"
 primary = "custom"
 accent = "custom"
-toggle.icon = "lucide/moon"
-toggle.name = "Switch to dark mode"
-
-[[project.theme.palette]]
-media = "(prefers-color-scheme: dark)"
-scheme = "slate"
-primary = "custom"
-accent = "custom"
-toggle.icon = "lucide/sun"
-toggle.name = "Switch to light mode"
 
 [project.markdown_extensions]
 abbr = {}

@@ -10,9 +10,9 @@ Before you trust an automated trading strategy with your money, you want to know
 - Could anyone walk off with my money?
 - Can I get out whenever I want?
 
-**On Shonin, nobody can swap the agent you chose for different code, or make an unverified claim about what it's doing.** Every answer is verifiable, backed by a powerful combination of secure enclaves and blockchain technology.
+**On Shonin, the answer to every one of these questions is clear and verifiable,** backed by a powerful combination of secure enclaves and blockchain technology.
 
-That opens trading agents up to everyone. Depositors can put money behind strategies they can actually check, and take it back whenever they like. Authors can turn a good strategy into income, earning a share of the profit it makes on other people's capital, without ever holding their money.
+That opens trading agents up to everyone. Depositors can put money behind strategies they can actually check. Authors can turn a good strategy into income, earning a share of the profit it makes on other people's capital, without ever holding their money.
 
 <div class="shonin-hero" markdown="0">
 <svg viewBox="0 0 1000 700" role="img" aria-labelledby="hero-title hero-desc" xmlns="http://www.w3.org/2000/svg">

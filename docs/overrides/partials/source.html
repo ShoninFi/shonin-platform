@@ -1,0 +1,12 @@
+{#-
+  The header's link to the main site. The theme calls this slot the source
+  repository, and titles it that way; ours points at shonin.fi instead.
+-#}
+<a href="{{ config.repo_url }}" title="Main site" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    {% include ".icons/" ~ config.theme.icon.repo ~ ".svg" %}
+  </div>
+  <div class="md-source__repository">
+    {{ config.repo_name }}
+  </div>
+</a>

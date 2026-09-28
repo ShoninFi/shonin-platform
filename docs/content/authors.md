@@ -3,7 +3,7 @@
 As an Author, you write a trading agent and publish it. If Depositors back it and it makes money, you earn a share of the profit. You don't need anyone's permission to publish.
 
 !!! tip "New here?"
-    The [System Overview](basics/glossary.md) explains the terms used here, and how it all fits together.
+    The [System Overview](basics/trading-agents.md) explains how it all fits together, and the [Glossary](reference/glossary.md) explains the terms used here.
 
 <div class="shonin-hero" markdown="0">
 <svg viewBox="0 0 1000 380" role="img" aria-labelledby="authors-title authors-desc" xmlns="http://www.w3.org/2000/svg">
@@ -146,7 +146,7 @@ If you'd rather keep it private, you can seal it. Then only our attested machine
 
 ## Retiring your agent
 
-You can retire your agent whenever you like, but not all at once, so nobody is caught out. Retiring starts a **seven-day wind-down**: the vault stops taking deposits, the agent keeps trading, and Depositors can leave as usual. When the week is up, the agent is stopped for good, and whatever it still holds is closed and brought home, so anyone still in can be paid straight away.
+You can retire your agent whenever you like, but not all at once, so nobody is caught out. Retiring starts a **seven-day wind-down**: the vault stops taking deposits, the agent keeps trading, and Depositors can leave as usual. When the week is up, the agent is stopped for good, and whatever it still holds is closed and brought home to the vault, which stays on-chain for anyone still in to withdraw from.
 
 ## Changing your agent
 
@@ -154,4 +154,4 @@ A published agent never changes. To change it, you publish a new agent, with its
 
 The two aren't linked. Depositors in the old vault keep exactly the agent they chose, and anyone who wants to move withdraws from one and deposits in the other.
 
-[Next: the system overview →](basics/glossary.md){ .md-button .md-button--primary }
+[Next: the system overview →](basics/trading-agents.md){ .md-button .md-button--primary }

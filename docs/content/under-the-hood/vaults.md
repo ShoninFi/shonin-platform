@@ -100,7 +100,7 @@ Every vault page shows the tank's balance and its recent charges.
 
 ## Retiring
 
-An Author can **retire** their agent at any time, and it takes effect slowly on purpose. Retiring starts a **wind-down** of seven days: the vault refuses new deposits, the agent keeps running, and every withdrawal works exactly as before. When the wind-down ends, the agent is evicted from the attested machine, and its positions are closed through the same reduce-only path a claim uses and the cash brought home, so every remaining Depositor is paid from idle balance in one transaction.
+An Author can **retire** their agent at any time, and it takes effect slowly on purpose. Retiring starts a **wind-down** of seven days: the vault refuses new deposits, the agent keeps running, and every withdrawal works exactly as before. When the wind-down ends, the agent is evicted from the attested machine, and its positions are closed through the same reduce-only path a claim uses and the cash brought home, so every remaining Depositor is paid from idle balance in one transaction. The vault contract itself stays on-chain, holding only cash, and anyone still in, the Author included, withdraws from it whenever they like.
 
 The tank works as always during the wind-down. If the Author empties it, the agent stops early, and the positions are still closed when the week is up.
 

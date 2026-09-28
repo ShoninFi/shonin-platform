@@ -3,9 +3,7 @@
  * The theme ships its own Mermaid integration, and in this version it empties
  * the block without drawing anything into it. So the fences are given our own
  * class (see `custom_fences` in zensical.toml), which the theme leaves alone,
- * and this renders them: once on load, again on each instant navigation, and
- * again when the colour scheme changes, because a diagram drawn for the light
- * palette is unreadable on the dark one.
+ * and this renders them: once on load, and again on each instant navigation.
  */
 (() => {
   "use strict";
@@ -16,32 +14,23 @@
   let mermaid = null;
   let counter = 0;
 
-  /** The palette a diagram should be drawn in, from the theme's own scheme. */
-  const theme = () =>
-    document.body.getAttribute("data-md-color-scheme") === "slate"
-      ? "dark"
-      : "default";
-
-  /** Load Mermaid once, and configure it for the scheme in use right now. */
+  /** Load and configure Mermaid, once. */
   const ready = async () => {
     if (!mermaid) {
       const module = await import(SOURCE);
       mermaid = module.default;
+      mermaid.initialize({
+        startOnLoad: false,
+        theme: "default",
+        securityLevel: "strict",
+        flowchart: { curve: "basis", useMaxWidth: true },
+        sequence: { useMaxWidth: true },
+      });
     }
-    mermaid.initialize({
-      startOnLoad: false,
-      theme: theme(),
-      securityLevel: "strict",
-      flowchart: { curve: "basis", useMaxWidth: true },
-      sequence: { useMaxWidth: true },
-    });
     return mermaid;
   };
 
-  /**
-   * Draw every diagram on the page. The source is kept on the element so a
-   * re-draw, after the reader switches the palette, still has it.
-   */
+  /** Draw every diagram on the page. */
   const draw = async () => {
     const blocks = [...document.querySelectorAll(SELECTOR)];
     if (blocks.length === 0) return;
@@ -84,16 +73,4 @@
   } else {
     draw();
   }
-
-  // Redraw when the reader switches between light and dark.
-  new MutationObserver((records) => {
-    for (const record of records) {
-      if (record.attributeName === "data-md-color-scheme") {
-        for (const block of document.querySelectorAll(SELECTOR)) {
-          block.classList.remove("shonin-diagram--drawn");
-        }
-        draw();
-      }
-    }
-  }).observe(document.body, { attributes: true });
 })();
