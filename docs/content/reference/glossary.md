@@ -9,7 +9,7 @@ One word for one thing, throughout the platform and these docs. The plain-words 
 : The program an Author publishes: a long-lived Rust program, compiled to a WebAssembly component, that watches the market, computes, and decides. It reaches the world through seven interfaces and nothing else. The contracts call it a *strategy*.
 
 **Allowances**
-: The compute an agent declares in its manifest: fuel a second, memory, requests, bandwidth, open streams and inference. The host holds it to them, and its vault's tank is charged for them at the published prices.
+: How much computing and gas an agent may use: fuel a second, memory, requests, bandwidth, open streams, inference and gas. Set by its Author when publishing and changeable on the live vault; the attested machine holds the agent to them, and its tank is charged for them at the published prices.
 
 **Attested machine**
 : A secure enclave running one of the platform's allowlisted images: it reviews, builds, or runs an agent and holds its keys. It signs an attestation of the exact code it runs, and our contracts accept a key only with one.
@@ -66,7 +66,7 @@ One word for one thing, throughout the platform and these docs. The plain-words 
 : Shonin's admin key stopping a vault: every position closed, all cash home, every Depositor paid from idle balance. A halt, never a theft.
 
 **Manifest**
-: The `shonin.toml` in a project. What the agent is, what it will not do, the venues it trades, the config it takes and the allowances it starts with. Hashed with the bundle; only the allowances can change afterwards.
+: The `shonin.toml` in a project: what the agent is, the limits it promises, the venues it trades and the bridges it uses. Read by the platform, never by the agent, and fixed once published.
 
 **Mark**
 : The venue's own reference price, used to value a deposit. A withdrawal uses **exit-side marks** instead: a long at the bid, a short at the ask.
@@ -93,7 +93,7 @@ One word for one thing, throughout the platform and these docs. The plain-words 
 : ERC-4626 shares in a vault. A pro-rata claim on the pool, minted at value per share on deposit and burned on withdrawal.
 
 **Strategy**
-: The contracts' word for an agent: `strategyId`, `StrategyRegistry`, the `shonin:strategy` interface. These docs use it only where they name something in the contracts.
+: The contracts' word for an agent: `strategyId`, `StrategyRegistry`. These docs use it only where they name something in the contracts.
 
 **Tank**
 : The Author's balance for a vault's running costs, funded by them and refilled from their own fees. Excluded from what shares are worth.

@@ -110,7 +110,8 @@ As an Author, you write a trading agent and publish it. If Depositors back it an
 
 An ordinary Rust project. Your agent is one program that runs for as long as its vault does: it watches the markets, decides what to do, and hands its orders to the [attested machine](basics/attested-machines.md) it runs on, a computer that can prove exactly what code it's running, which signs and sends them. You never hold a key, and your code can only ever trade your vault's own accounts.
 
-[Agents](how-it-works/agents.md) has the interface and a complete example.
+!!! example "Ready to write an agent?"
+    Start from our template: a complete, small agent you can build, test and publish as it is, then make your own. [Getting started](writing/getting-started.md) walks you through it.
 
 ## What it costs
 
@@ -130,7 +131,7 @@ Your shares are yours, like any Depositor's. Hold them, cash them in, or turn so
 
 ## Publishing, step by step
 
-1. **Pay the deposit and upload your code.** The deposit is the $1, plus whatever you'd like in your agent's tank to start with. Your wallet signs the upload, so nobody else can spend your deposit.
+1. **Pay the deposit and upload your code.** The deposit is the $1, plus whatever you'd like in your agent's tank to start with, and it's where you choose how much computing your agent may use. Your wallet signs the upload, so nobody else can spend your deposit.
 2. **The [Reviewer](basics/ai-review.md) reads your code** and writes its report. Malicious code stops here.
 3. **An attested builder compiles it**, once, and signs what came out.
 4. **Your vault opens**, on every chain your agent trades. Anyone can deposit from then on, and it's marked **new** until it has some history.

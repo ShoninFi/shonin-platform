@@ -1,6 +1,6 @@
 # Publishing
 
-From a Cargo project to an open vault, with a public log at every step.
+From a Cargo project to an open vault, with a public log at every step. [Authors](../authors.md) tells the same story in plain words; this page has the detail.
 
 ```mermaid
 flowchart LR
@@ -35,6 +35,8 @@ Nothing is compiled for free, so a job is only admitted once its **deposit** is 
 
 **Publishing costs a flat $1**, which covers the review and the build. The source size and build time limits below keep what either can cost us bounded, so one flat price holds. The rest of the deposit is whatever the Author wants in the tank to start with, and nothing past the $1 is required. A week at the declared allowances is a sensible start, since an agent whose tank runs dry stops.
 
+The same transaction sets the vault's starting **allowances**, how much computing and gas the agent may use, and its **idle floor**, how much stays at home as cash. Both can be changed on the live vault later ([Configuration](configuration.md#vault-configuration)).
+
 The deposit is held by a publishing contract, not by us. If a job is never finished, the Author can take the whole deposit back after a waiting period.
 
 ## The queue
@@ -47,7 +49,42 @@ Each job shows its position while it waits, what it is doing while it builds, an
 
 Before anything is compiled, the attested Reviewer reads the source. Compiling Rust runs the Author's own code, in build scripts and procedural macros, so reading it first means none of that runs on the builder until it has been read.
 
-If the Reviewer finds the code **malicious**, the project is refused and never built. The $1 is spent, because the review ran; the rest of the deposit goes back to the Author; and the refusal is recorded on-chain against the source hash, with the full report public. No vault is ever created for it. Anything short of malicious is advice, and goes on to the build. [The review](review.md) has what it looks for.
+If the Reviewer finds the code **malicious**, the project is refused and never built. The $1 is spent, because the review ran; the rest of the deposit goes back to the Author; and the refusal is recorded on-chain against the source hash, with the full report public. No vault is ever created for it. Anything short of malicious is advice, and goes on to the build. [AI Review](../basics/ai-review.md) has what it looks for.
+
+## What the review pins
+
+The Reviewer runs on an attested machine, and its image pins:
+
+- the model,
+- the prompt and the output schema,
+- the questions and their thresholds,
+- the six areas, the four ratings and the three severities.
+
+Changing any of them is an image change, which goes through the same public, timelocked allowlist as an executor image. The prompt, the schema and the questions are published, so an Author can run the same review themselves against any model they like before publishing. It just is not signed, and it is not binding.
+
+## What the review records
+
+Each agent is reviewed **once**, before it is built, and that review stays with it for the life of its vault. A later Reviewer image does not re-review agents that are already running.
+
+A **refusal** is recorded in the transaction that returns the deposit: the source hash, the Reviewer's image and the hash of its report, which is public. There is no bundle, because nothing was built.
+
+A review that goes on to the build is submitted to the review registry with the Reviewer's blessed key once the bundle is registered. The registry checks that the sender is blessed as a Reviewer on an allowed image, and that the bundle and source hashes match the agent registered:
+
+```solidity
+submitReview(strategyId, Review(
+    bytes32  bundleHash,       // the bundle reviewed
+    bytes32  sourceHash,       // the source the reviewer read
+    bytes32  reviewerImage,    // the image it ran in
+    bytes32  modelIdHash,      // the pinned model
+    bytes32  promptHash,       // the prompt, the schema and the questions together
+    bytes32  reportHash,       // the report as published
+    uint8[6] ratings,          // one per area: fine, some concerns, serious, couldn't tell
+    uint16   findingCount,
+    uint64   reviewedAt
+))
+```
+
+A review is of one source and the one bundle built from it, so a good rating can never follow code nobody read.
 
 ## The build
 
@@ -76,7 +113,7 @@ The build service signs a digest that binds:
 (sourceHash, manifestHash) → bundleHash
 ```
 
-together with the chain, the registry's own address, the agent's id, and its Author, so a signature for one registration can never be replayed as another. The strategy registry accepts a bundle **only** with that signature, from a key blessed for an allowlisted builder image.
+together with the chain, the registry's own address, the agent's id (assigned when its deposit was paid), and its Author, so a signature for one registration can never be replayed as another. The strategy registry accepts a bundle **only** with that signature, from a key blessed for an allowlisted builder image.
 
 The same attested key then **creates the vault**, in the same step as registering the bundle. The attested machines have read the manifest themselves, so they know which venues the agent trades and so which chains it needs: the vault lives on the chain of its main venue, with its shares and its tank, and it gets its own accounts on every other chain it trades. The deposit, less the $1, becomes its tank.
 
@@ -105,3 +142,5 @@ An agent page with:
 - the bundle, component, source and manifest hashes;
 - which keys are blessed for the vault and what they may run;
 - the vault: its value, its fees, its tank, its claims.
+
+[Next: under the hood →](../under-the-hood/machines.md){ .md-button .md-button--primary }

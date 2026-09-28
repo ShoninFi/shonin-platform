@@ -107,6 +107,6 @@ The agent stops the moment the tab reaches what's in the tank, whether the tank 
 
 We don't step in beyond that. An agent its Author stops paying for is simply an unsuccessful one: its open positions stay where they are, with nothing managing them, and the vault's page says so loudly. An empty tank adds no risk beyond the agent's own trades, and Depositors can still leave whenever they like.
 
-The [Vaults](how-it-works/vaults.md#the-tank) page in Hands-On has the details.
+[The vault contract](under-the-hood/vaults.md#the-tank) has the details.
 
 [Next: fees →](fees.md){ .md-button .md-button--primary }

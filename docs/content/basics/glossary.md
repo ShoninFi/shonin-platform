@@ -42,7 +42,7 @@ The words you'll meet throughout these docs: first who does what, then the handf
 **[Trade-only key](trade-only-keys.md)**
 : The key that trades for a vault. A venue lets it place and cancel orders, and nothing else.
 
-**[Vault](../how-it-works/vaults.md)**
+**[Vault](../under-the-hood/vaults.md)**
 : The smart contract holding the money behind one agent. It keeps its own accounts, pays its own withdrawals, and works out its own share price.
 
 **Venue**

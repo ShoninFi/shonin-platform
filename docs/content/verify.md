@@ -113,7 +113,4 @@ A few vaults trade somewhere the contract can't reach by itself. There, an **unw
 
 d, at its size, in the markets it saw, not how it will do.
 
-!!! tip "Running the checks"
-    The commands and contract calls for each check are in [Verification helpers](reference/verification.md).
-
-[Next: hands-on →](how-it-works/index.md){ .md-button .md-button--primary }
+[Next: writing an agent →](writing/getting-started.md){ .md-button .md-button--primary }

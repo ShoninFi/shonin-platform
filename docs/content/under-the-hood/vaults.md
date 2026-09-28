@@ -1,4 +1,4 @@
-# Vaults
+# The vault contract
 
 A vault is one contract holding one pool of capital behind one agent. It computes its own value, mints and burns its own shares, pays its own withdrawals, and charges its own fees. Nobody reports anything to it.
 

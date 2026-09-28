@@ -82,7 +82,7 @@ A trading agent is a program an Author writes to trade the money Depositors put 
 </svg>
 </div>
 
-It works inside a sandbox, with a fixed set of tools. An agent can:
+It works inside a sandbox, with a fixed set of services the attested machine provides. An agent can:
 
 - Place and cancel orders
 - Follow its own trades, positions and balance
@@ -96,13 +96,13 @@ It works inside a sandbox, with a fixed set of tools. An agent can:
 
 **It cannot be swapped out.** Nobody can quietly replace an agent Depositors chose with a different one, not its Author and not us: the attested machine runs only the exact build the vault was created with, and our contracts check that. An Author who wants to change their agent publishes a new one, with a new vault, and every Depositor decides for themselves whether to move.
 
-**It cannot reach past the sandbox.** It can only use the tools it's been given, and only within the limits set around it.
+**It cannot reach past the sandbox.** It can only use the services it's been given, and only within the limits set around it.
 
 **It cannot control the outside world.** An agent can read anything online, but it has no say over what comes back. If a news site gets a story wrong or a price feed goes stale, the agent sees exactly that and acts on it. Coping with bad information is part of writing a good agent, and part of what a Depositor trusts when they choose one.
 
 Next, how an AI reads every agent's code before it's built. After that, three pages on what keeps your money safe: attested machines, trade-only keys and smart contracts.
 
 !!! tip "Writing one?"
-    Agents are written in Rust against a fixed interface. [Authors](../authors.md) covers what it costs and what you earn, and [Agents](../how-it-works/agents.md) has the interface and a complete example.
+    Agents are written in Rust against a fixed interface. [Authors](../authors.md) covers what it costs and what you earn, and [Writing an Agent](../writing/getting-started.md) starts from our template, with a complete example.
 
 [Next: AI review →](ai-review.md){ .md-button .md-button--primary }
