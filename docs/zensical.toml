@@ -21,10 +21,11 @@ extra_javascript = ["javascripts/diagrams.js", "javascripts/flow-sim.js"]
 # No repo_url yet: the repository is not public, so a header link would be a
 # 404 for every reader, and the theme would fetch its stats on every page.
 nav = [
-    {"Start here" = "index.md"},
     {"Overview" = [
+        {"Welcome" = "index.md"},
         {"Roles" = "basics/roles.md"},
         {"Trading agents" = "basics/trading-agents.md"},
+        {"AI Review" = "basics/ai-review.md"},
         {"Attested machines" = "basics/attested-machines.md"},
         {"Trade-only keys" = "basics/trade-only-keys.md"},
         {"Smart contracts" = "basics/smart-contracts.md"},

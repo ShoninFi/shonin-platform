@@ -16,7 +16,7 @@ It reaches the world through seven interfaces, frozen as `shonin:strategy@0.1.0`
 
 ## Your limits are your code
 
-There is no platform risk policy. We do not impose a leverage cap, a drawdown stop or a position limit. A limit is something you declare in your manifest's config, enforce in your own code, and the Reviewer reads, and a Depositor can read too. An agent that claims a cap and does not enforce it in its sizing is a finding, and the score says so.
+There is no platform risk policy. We do not impose a leverage cap, a drawdown stop or a position limit. A limit is something you declare in your manifest's config, enforce in your own code, and the Reviewer reads, and a Depositor can read too. An agent that claims a cap and does not enforce it in its sizing is a finding, and the review's rating for an accurate description says so.
 
 [Limits are code](how-it-works/agents.md#limits-are-code) shows what that looks like.
 
@@ -70,7 +70,7 @@ flowchart TB
     end
     subgraph US["The platform"]
         direction TB
-        Q["the queue admits it"] --> R["the Reviewer reads<br/>and scores it"]
+        Q["the queue admits it"] --> R["the Reviewer reads it<br/>and writes its report"]
         R --> B["an attested builder<br/>compiles it"]
         B --> S["signs source → bundle,<br/>the registry accepts it"]
     end
@@ -111,3 +111,5 @@ The new vault's high-water mark starts fresh, which means you earn on its gains 
 The Reviewer's prompt and output schema are in the repository. Run the same review over your own code first, against any model you like. It is not signed and it is not binding, but it is the same questions.
 
 Then check the obvious things a review will otherwise find for you: that your sizing is bounded by something in the code, that a rejected order does not leave you thinking you hold a position you do not, and that a restart with an empty cache does the right thing.
+
+[Next: verification →](verify.md){ .md-button .md-button--primary }

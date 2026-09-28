@@ -30,13 +30,10 @@ One word for one thing, throughout the platform and these docs.
 : A withdrawal the idle balance could not pay. The shares go pending, the contract closes the leaver's fraction of every position inside the exit band, and once the cash is home they are burned at the marks then and paid. Three states: pending, waiting, paid.
 
 **Crystallise**
-: Paying the fees a vault owes as new shares. Weekly, and anyone may call it. Between payments, what is owed so far is already taken out of value per share.
+: Paying the fees a vault owes as new shares. Weekly, as part of the vault's daily `keep` call, which anyone may send. Between payments, what is owed so far is already taken out of value per share.
 
 **Custody level**
 : How a venue enforces that a key cannot take funds out: venue-enforced, chain-enforced, or something weaker, shown per venue on every vault page.
-
-**Deposits paused**
-: A vault that has stopped taking deposits because a review of its live code found it malicious. The agent keeps running and Depositors can leave as usual, until the guardian key kills the vault or lifts the pause.
 
 **Depositor**
 : Whoever puts capital into a vault. They hold shares, can leave at any time, and never need permission to do either.
@@ -57,7 +54,7 @@ One word for one thing, throughout the platform and these docs.
 : The runtime's unit of work. An agent declares a rate, the rate is what its tank is billed at, and it decides how often the agent yields.
 
 **Guardian key**
-: One of Shonin's two keys. It kills a vault or lifts a pause on its deposits, and publishes its reason. It cannot move funds anywhere but back to Depositors, or touch the allowlist.
+: One of Shonin's two keys. It kills a vault, and publishes its reason. It cannot move funds anywhere but back to Depositors, or touch the allowlist.
 
 **High-water mark**
 : The highest value per share a vault has reached at a weekly fee payment. Profit fees are only ever charged on gains above it, so no gain is charged for twice.
@@ -87,7 +84,7 @@ One word for one thing, throughout the platform and these docs.
 : A vault's own on-chain history: value per share over time, read from the contract that computes it.
 
 **Review**
-: An attested model's reading of the source before it is built: a score out of 100, a written assessment, and findings, each in a fixed category with a severity. Only for public source do findings point to a file and a line. A score, not a gate, except that code found malicious is refused and never built.
+: An attested model's reading of the source before it is built: a rating in each of six areas, the findings behind them, and a summary in its own words. Only for public source do findings point to a file and a line. Advice, not a gate, except that code found malicious is refused and never built.
 
 **Sealed**
 : Source, or a secret, encrypted so that only the attested services can read it. Sealing changes who can read something, never whether it was compiled or reviewed.

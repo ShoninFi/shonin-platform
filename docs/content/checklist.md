@@ -29,9 +29,8 @@ The guarantees are the product. Everything else is how they are shown.
 
 ## Contracts
 
-- [ ] **A malicious finding on a live vault pauses its deposits.** The agent keeps running and Depositors can leave as usual; the guardian key then kills the vault or lifts the pause, publishing its reason, and a later clean review cannot lift it
 - [ ] **Fees are paid weekly.** What is owed is worked out daily and taken out of value per share, shrinks again if gains are given back, and is paid as new shares at a weekly payment anyone can call; a withdrawal pays what its own shares owe so far. The high-water mark moves only at a weekly payment
-- [ ] **Two keys, split by power.** The allowlist key proposes and revokes images; the guardian key kills vaults and lifts paused deposits. Neither can move funds except back to Depositors
+- [ ] **Two keys, split by power.** The allowlist key proposes and revokes images; the guardian key kills vaults. Neither can move funds except back to Depositors
 - [ ] `local` **Vault and factory**: ERC-4626 shares, deposit at mark, redeem at exit-side marks, claims with pending shares, capital moved only between registered accounts
 - [ ] `local` **Fees and the tank**: daily crystallisation as shares, the high-water mark, the transaction fee, tank funding, usage charges
 - [ ] **The tank as plain dollars**: top-ups from the Author's fee shares, auto-fill as one "keep my tank at $X" setting, and a tank withdrawal that settles usage first
@@ -60,14 +59,15 @@ The guarantees are the product. Everything else is how they are shown.
 
 ## Build and review
 
-- [ ] **Review before build.** The Reviewer reads the source before anything is compiled, so a project's build scripts and proc macros never run until it has been read. A finding in a narrow `malicious` category refuses the build: the review fee is charged, the vault closes and the rest of the tank comes back, and the refusal is recorded against the source hash in that transaction, with the report public. Everything else stays a score, not a gate, and is recorded once the bundle is registered. The Author's page lists refusals beside failed builds
-- [ ] **Sealed source stays sealed in the report.** For sealed source, the published report gives the score, the assessment and findings by category and severity, with no file names, line numbers or quotes, and the hash recorded on-chain is of the report as published
+- [ ] **Review before build.** The Reviewer reads the source before anything is compiled, so a project's build scripts and proc macros never run until it has been read. A finding that the code is malicious refuses the build: the review fee is charged, the vault closes and the rest of the tank comes back, and the refusal is recorded against the source hash in that transaction, with the report public. Everything else stays advice, not a gate, and is recorded once the bundle is registered. The Author's page lists refusals beside failed builds
+- [ ] **Sealed source stays sealed in the report.** For sealed source, the published report gives the ratings, the summary and findings by area and severity, with no file names, line numbers or quotes, and the hash recorded on-chain is of the report as published
 - [ ] `local` **The queue**: first come first served, one job per Author, the full log whether it succeeded or failed, and a position that is counted when it is asked for
 - [ ] `local` **Admission and charges**: a job admitted once its vault exists and its tank covers the minimum; a build charged because it ran; a failed build closing the vault and returning the rest
 - [ ] `local` **The signature** binding source, manifest and bundle to the chain, the registry, the agent and its Author
-- [ ] `local` **The review**: a pinned model, prompt, schema, categories and severities, signed and recorded, with anyone able to buy a fresh one
-- [ ] **A calibrated score**: a second model answers a fixed battery of narrow questions and the score is computed from the answers with published weights, so a reader can see which question moved it. The battery, the client and the comparison harness are built; measuring it needs an account
-- [ ] **A calibration set**: a fixed set of agents with agreed scores, re-run before any reviewer image is proposed, so a change to the model or the prompt has to show what it did to them
+- [ ] `local` **The review**: a pinned model, prompt and schema, signed and recorded once per agent version, before the build
+- [ ] **Ratings by area**: six areas (security, financial risk, reliability, reproducibility, outside influence, accurate description), each rated looks fine, some concerns, serious concerns or couldn't tell, in place of a single score. The Author's summary and claimed limits go to the Reviewer so it can check them against the code
+- [ ] **Calibrated ratings**: a second model answers a fixed battery of narrow questions, and each area's rating is computed from the answers with published thresholds, so a reader can see which question moved it. The battery, the client and the comparison harness are built; measuring it needs an account
+- [ ] **A calibration set**: a fixed set of agents with agreed ratings, re-run before any reviewer image is proposed, so a change to the model or the prompt has to show what it did to them
 - [ ] **A hermetic build**: a published, pinned builder image with an offline dependency snapshot, remapped paths and a fixed timestamp, so an outsider's rebuild matches ours byte for byte. Until this is done, a rebuild can differ for reasons that have nothing to do with the source, and a public build log can carry the builder's own filesystem paths
 - [ ] **Reproducibility shown rather than asserted**: rebuild published bundles off the critical path, deliberately varying the machine, the path and the date, and show the result on the agent page
 - [ ] **Rebuild attestations from outsiders**, so corroboration accrues publicly instead of resting on our word
@@ -96,7 +96,7 @@ The guarantees are the product. Everything else is how they are shown.
 
 ## The web app
 
-- [ ] `local` **Leaderboard and agent pages**: on-chain records, review scores, normalised returns, the size each record was earned at, the Author's whole history
+- [ ] `local` **Leaderboard and agent pages**: on-chain records, reviews, normalised returns, the size each record was earned at, the Author's whole history
 - [ ] `local` **Source, build log and toolchain** for every agent
 - [ ] `local` **The build queue**, with a public log for every job
 - [ ] `local` **Deposits, withdrawals and claims**, with a pending claim's state shown

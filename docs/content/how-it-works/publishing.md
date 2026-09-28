@@ -8,7 +8,7 @@ flowchart LR
     B ==> C["submit the<br/>source"]
     C ==> D["the queue<br/>admits it"]
     D ==> H{"the Reviewer<br/>reads it"}
-    H ==>|scored| E{"build it, load<br/>the component"}
+    H ==>|reported| E{"build it, load<br/>the component"}
     H -->|malicious| R["refused: the report is public,<br/>the vault closes,<br/>the tank comes back"]
     E ==>|built| F["sign source → bundle,<br/>register, open"]
     E -->|failed| G["the log is public,<br/>the vault closes,<br/>the tank comes back"]
@@ -53,7 +53,7 @@ Each job shows its position while it waits, what it is doing while it builds, an
 
 Before anything is compiled, the attested Reviewer reads the source. Compiling Rust runs the Author's own code, in build scripts and procedural macros, so reading it first means none of that runs on the builder until it has been read.
 
-If the Reviewer finds the code **malicious**, the project is refused and never built. The review fee is charged, because the review ran; the vault closes and the Author reclaims the rest of the tank; and the refusal is recorded on-chain against the source hash, with the full report public. Anything short of malicious is a score and goes on to the build. [The review](review.md) has what it looks for.
+If the Reviewer finds the code **malicious**, the project is refused and never built. The review fee is charged, because the review ran; the vault closes and the Author reclaims the rest of the tank; and the refusal is recorded on-chain against the source hash, with the full report public. Anything short of malicious is advice, and goes on to the build. [The review](review.md) has what it looks for.
 
 ## The build
 
@@ -72,7 +72,7 @@ The component is then loaded in the executor's own runtime, to check it satisfie
 
     Reproducing a bundle elsewhere is a property of a hermetic recipe, and making the recipe hermetic is the work: a pinned image, fixed paths, a fixed timestamp, no network.
 
-    A project that reaches for a clock, the network or a random number while it compiles is a finding the Reviewer reports as hidden behaviour, and it scores the agent down.
+    A project that reaches for a clock, the network or a random number while it compiles is a finding under reproducibility.
 
 ## The signature
 
@@ -106,7 +106,7 @@ A vault opens before any audit, with the audit status of every contract and imag
 An agent page with:
 
 - the record, read from the vault's own contract;
-- the review, with its score and findings;
+- the review, with its ratings and findings;
 - the source, the `Cargo.toml` and the `Cargo.lock`, the build log and the toolchain;
 - the bundle, component, source and manifest hashes;
 - which keys are blessed for the vault and what they may run;

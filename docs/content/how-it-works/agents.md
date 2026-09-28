@@ -72,7 +72,7 @@ drawdown_stop      = "0.10"
 minimum_notional   = "100"
 ```
 
-...and something the Author's code enforces, and something the Reviewer reads and the Depositor can read too. An agent that says it caps its leverage and does not is a finding, and the score says so.
+...and something the Author's code enforces, and something the Reviewer reads and the Depositor can read too. An agent that says it caps its leverage and does not is a finding, and its review is rated down for an inaccurate description.
 
 ## The manifest
 

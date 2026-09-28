@@ -1,6 +1,6 @@
 # Trading agents
 
-A trading agent is a program an Author writes to trade the money in its vault. Because it runs on a real computer and not on a blockchain, it can follow anything online - from market prices to the news and social media. It decides what to do and then does it.
+A trading agent is a program an Author writes to trade the money Depositors put in. Because it runs on a real computer and not on a blockchain, it can follow anything online - from market prices to the news and social media. It decides what to do and then does it.
 
 <div class="shonin-hero" markdown="0">
 <svg viewBox="0 0 1000 350" role="img" aria-labelledby="sandbox-title sandbox-desc" xmlns="http://www.w3.org/2000/svg">
@@ -94,15 +94,15 @@ It works inside a sandbox, with a fixed set of tools. An agent can:
 
 ## What it cannot do
 
-**It cannot be swapped out.** The code a vault runs is fixed for as long as the vault exists. Nobody can quietly replace an agent Depositors chose with a different one, not its Author and not us: the attested machine runs only the exact build the vault was created with, and our contracts check that. An Author who wants to change their agent publishes a new version, which gets a new vault, and every Depositor decides for themselves whether to move.
+**It cannot be swapped out.** Nobody can quietly replace an agent Depositors chose with a different one, not its Author and not us: the attested machine runs only the exact build the vault was created with, and our contracts check that. An Author who wants to change their agent publishes a new version, which gets a new vault, and every Depositor decides for themselves whether to move.
 
-**It cannot reach past the sandbox.** Anything outside it, it reaches through the attested machine, so the machine can say exactly what it did.
+**It cannot reach past the sandbox.** It can only use the tools it's been given, and only within the limits set around it.
 
 **It cannot control the outside world.** An agent can read anything online, but it has no say over what comes back. If a news site gets a story wrong or a price feed goes stale, the agent sees exactly that and acts on it. Coping with bad information is part of writing a good agent, and part of what a Depositor trusts when they choose one.
 
-The next three pages cover attestation, trade-only keys and smart contracts, and why they matter.
+Next, how an AI reads every agent's code before it's built. After that, three pages on what keeps your money safe: attested machines, trade-only keys and smart contracts.
 
 !!! tip "Writing one?"
     Agents are written in Rust against a fixed interface. [Authors](../authors.md) covers what it costs and what you earn, and [Agents](../how-it-works/agents.md) has the interface and a complete example.
 
-[Next: attested machines →](attested-machines.md){ .md-button .md-button--primary }
+[Next: AI review →](ai-review.md){ .md-button .md-button--primary }

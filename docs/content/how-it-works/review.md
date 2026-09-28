@@ -1,52 +1,50 @@
 # The review
 
-An attested model reads the source, before anything is compiled, and answers one question: **is this code reasonable?**
+An attested model reads the source, before anything is compiled, and rates it in six areas. The plain-words version is [AI Review](../basics/ai-review.md); this page has the mechanism.
 
-It is a score, with one exception: code it finds **malicious** is refused and never built. Anything else goes ahead whatever it scores. The review protects nobody on its own, and it never rates expected profit. An agent can be careful and lose money, and reckless and make it.
+The review is advice, with one exception: code it finds **malicious** is refused and never built. Anything else goes ahead however it is rated. The review protects nobody on its own, and it never rates expected profit. An agent can be careful and lose money, and reckless and make it.
 
 ## Why it comes before the build
 
 Compiling Rust runs the Author's own code: build scripts and procedural macros execute on the machine doing the build. Reading the source first means code written to attack the builder is refused before any of it runs.
 
-## What it looks at
+## The six areas
 
-Whether the risks are bounded by something in the code itself. Whether the code handles the ways the world goes wrong. Whether it does what it appears to do.
+The Reviewer judges what the code actually does, then checks that against what its Author says it does. Every finding belongs to exactly one area.
 
-Every finding falls into exactly one of eight categories. The first refuses the build; the other seven only lower the score.
-
-| Category | What it means |
+| Area | What it looks for |
 | --- | --- |
-| `malicious` | Code written to do harm: to attack the machine that builds or runs it, to reach for keys or secrets it was not given, or to move Depositors' money out by trading it away on purpose. **Refuses the build** |
-| `unbounded-risk` | Position sizing that can grow without a ceiling, leverage the code never bounds, or nothing said about what happens after a losing streak |
-| `missing-failure-handling` | Rejected orders, venue errors, a host that is down, or a restart that begins with an empty cache |
-| `model-dependence` | A model's output sizing a position directly, with no bound around it |
-| `external-dependence` | Behaviour that hangs on something outside the bundle |
-| `known-failure-pattern` | A shape that has gone wrong before, in code that holds other people's money |
-| `hidden-behaviour` | Code paths that behave very differently from the rest, such as logic that trades differently after a date or a signal |
-| `unaudited-dependencies` | Crates with little use elsewhere, pulled into code that holds Depositors' money |
+| Security | Code written to do harm: attacking the machine that builds or runs it, reaching for keys or secrets it was not given, trading Depositors' money away on purpose, or logic that behaves differently after a date, an address or a signal. Text addressed to the Reviewer, and crates with little use elsewhere, are findings here too. A finding that the code is **malicious refuses the build** |
+| Financial risk | Position size or leverage with no ceiling the code enforces, no response to a losing streak, sizing shapes that have failed before (adding to losers, martingale doubling, selling volatility with no cap on the loss), and a model's output sizing a position with no bound around it |
+| Reliability | Rejected orders, venue errors and failed reads that leave the agent believing it holds what it does not, and a restart that begins with an empty cache |
+| Reproducibility | A build script or procedural macro that reads the clock, the network, the environment or a random number, so that building twice could produce different code |
+| Outside influence | Behaviour that hangs on something outside the bundle: hosts, feeds and signals the agent follows, especially any its Author controls |
+| Accurate description | The Author's summary and the limits their manifest claims, compared with what the code does. A limit that is claimed and never enforced is a finding here |
 
-Each finding carries a severity (**note**, **concern** or **serious**). The report also carries an overall assessment in the Reviewer's own words, beside the Author's summary, and a plain list of **what the review could not tell**.
+## Ratings
 
-When the source is public, each finding also points to a file and a line. When it is sealed, the published report leaves out anything that would reveal the code: no file names, no line numbers and no quotes. The Reviewer still reads all of it; the report just doesn't repeat it.
+Each area is rated one of four ways: **looks fine**, **some concerns**, **serious concerns**, or **couldn't tell**, for an area the source alone cannot settle, such as how a shipped model's weights will behave. There is no overall score.
 
-## The score
+A rating is not the model's opinion of a number. It is worked out from a fixed set of narrow questions about the code, each answered by the model, with the thresholds published, so a reader can see which answer moved it.
 
-An integer from 0 to 100, higher being more reasonable. Ordinary, plainly-written code with stated limits scores well, and the score comes down for what was actually found, weighted by severity. An agent with no findings at all should score in the nineties rather than at 100: no reader sees everything.
+Behind the ratings are the **findings**, each with a severity (**note**, **concern** or **serious**). The report also carries a summary of the code in the Reviewer's own words, beside the Author's, and a plain list of **what the review could not tell**.
 
-Every agent page shows the score beside what it cannot tell you, because a number on its own would be read as a promise.
+When the source is public, each finding also points to a file and a line. When it is sealed, the published report leaves out anything that would reveal the code: no file names, no line numbers and no quotes.
 
 ## What is pinned
 
 The Reviewer runs on an attested machine, and its image pins:
 
 - the model,
-- the prompt,
-- the output schema,
-- the eight categories and the three severities.
+- the prompt and the output schema,
+- the questions and their thresholds,
+- the six areas, the four ratings and the three severities.
 
-Changing any of them is an image change, which goes through the same public, timelocked allowlist as an executor image. The prompt and the schema are published, so an Author can run the same review themselves against any model they like before publishing. It just is not signed, and it is not binding.
+Changing any of them is an image change, which goes through the same public, timelocked allowlist as an executor image. The prompt, the schema and the questions are published, so an Author can run the same review themselves against any model they like before publishing. It just is not signed, and it is not binding.
 
 ## What is recorded
+
+Each agent version is reviewed **once**, before it is built, and that review stays with it for the life of its vault. A later Reviewer image does not re-review agents that are already running.
 
 A **refusal** is recorded in the transaction that closes the vault: the source hash, the Reviewer's image and the hash of its report, which is public. There is no bundle, because nothing was built.
 
@@ -54,41 +52,32 @@ A review that goes on to the build is submitted to the review registry with the 
 
 ```solidity
 submitReview(strategyId, version, Review(
-    bytes32 bundleHash,        // the bundle reviewed
-    bytes32 sourceHash,        // the source the reviewer read
-    bytes32 reviewerImage,     // the image it ran in
-    bytes32 modelIdHash,       // the pinned model
-    bytes32 promptHash,        // the prompt and the output schema together
-    bytes32 reportHash,        // the report as published
-    uint8   score,             // 0-100
-    uint16  findingCount,
-    uint64  reviewedAt,
-    address boughtBy           // who paid for this one
+    bytes32  bundleHash,       // the bundle reviewed
+    bytes32  sourceHash,       // the source the reviewer read
+    bytes32  reviewerImage,    // the image it ran in
+    bytes32  modelIdHash,      // the pinned model
+    bytes32  promptHash,       // the prompt, the schema and the questions together
+    bytes32  reportHash,       // the report as published
+    uint8[6] ratings,          // one per area: fine, some concerns, serious, couldn't tell
+    uint16   findingCount,
+    uint64   reviewedAt
 ))
 ```
 
-Every review is kept, newest first. A review is of one source and the one bundle built from it: a good score can never follow code nobody scored.
-
-## Buying another one
-
-**Anyone can buy a fresh review** of any agent, at any time, for the same flat fee: the Author, a Depositor, a competitor, a sceptic. The newest is shown first and the older ones are kept, so an agent cannot quietly shop for a better score.
-
-A fresh review that finds a live agent **malicious** cannot refuse a build that already happened. Instead it [pauses deposits](vaults.md#deposits-paused) into the vault until the guardian key either kills it or lifts the pause, with its reason published.
-
-Nothing is re-reviewed automatically when the reviewer image changes. A review says which image produced it, and you can buy one under the current image whenever you want.
+A review is of one source and the one bundle built from it, so a good rating can never follow code nobody read.
 
 ## Prompt injection
 
 An agent's comments, identifiers and strings are text the Author controls and a model reads. Three things bound that:
 
 - **The prompt comes first and is pinned in the image**, and the Author's code follows it as clearly delimited data, named as data and given no authority over the review.
-- **The output is schema-constrained.** The model can only return a score, an assessment, and findings from the fixed categories, each with a severity and, for public source, a file and a line.
-- **Addressing the Reviewer is itself a finding.** Text that tries to instruct the Reviewer is reported as hidden behaviour, and scores the agent down. For public source the report quotes it where it appears.
+- **The output is schema-constrained.** The model can only return ratings, a summary, and findings in the fixed areas, each with a severity and, for public source, a file and a line.
+- **Addressing the Reviewer is itself a finding.** Text that tries to instruct the Reviewer is reported under security. For public source the report quotes it where it appears.
 
 ## Sealed source
 
-Sealed source is reviewed exactly like published source. The Reviewer reads it on its attested machine; the store refuses to serve it to anyone else, and the published report gives a score, an assessment and findings by category, but never points into the code. What a Depositor relies on is the attested build plus the attested review. Published source is extra, and it is what makes an independent rebuild possible.
+Sealed source is reviewed exactly like published source. The Reviewer reads it on its attested machine; the store refuses to serve it to anyone else, and the published report gives the ratings, a summary and findings by area, but never points into the code. What a Depositor relies on is the attested build plus the attested review. Published source is extra, and it is what makes an independent rebuild possible.
 
 ## A new version
 
-Where an Author declares that a version supersedes another, the review of the new version stands on its own: a new bundle from new source gets a new reading, and the old review stays attached to the old vault, which is still running the code it was scored on.
+Where an Author declares that a version supersedes another, the review of the new version stands on its own: a new bundle from new source gets a new reading, and the old review stays attached to the old vault, which is still running the code it was read against.

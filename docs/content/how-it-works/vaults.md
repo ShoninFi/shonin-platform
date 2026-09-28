@@ -68,7 +68,7 @@ every day, what is owed so far is worked out and taken out of value per share:
       author fee = gains × 10%
       platform   = gains × 5%
 
-every week, anyone can call crystallise():
+once a day, keep() collects the tank's bill, and on the weekly day:
   what is owed then is paid as new shares          → the Author, the platform
   high-water mark = value per share, if that is a new high
 
@@ -92,24 +92,16 @@ Running an agent costs money: compute, and gas where a chain charges it. That is
 Each vault has a **tank**, a plain dollar balance for running it. The Author funds it when they create the vault, and it's excluded from what shares are worth, so a Depositor's value never pays for the agent's electricity.
 
 - The review and the build are the tank's first charges.
-- The executor keeps a running total of usage, signed by the vault's own blessed key, and stops the agent the moment the unpaid part reaches the tank. Once a day, one keeper call collects it from the tank, pays fees on the weekly day, then runs auto-fill; Shonin sends it and pays its gas, and and the contract believes the total only up to the allowances the Author declared at the platform's published prices over the time elapsed. A wrong total cannot charge more than the Author agreed to.
+- The executor keeps a running total of usage, signed by the vault's own blessed key, and stops the agent the moment the unpaid part reaches the tank. Once a day, one call to the vault's `keep` collects it from the tank, pays fees on the weekly day, then runs auto-fill. Anyone may send it; Shonin's keeper normally does, and pays its gas. The contract believes the total only up to the allowances the Author declared at the platform's published prices over the time elapsed. A wrong total cannot charge more than the Author agreed to.
 - The Author's fee shares are theirs. They can redeem some into the tank in one transaction, or set **auto-fill** to "keep my tank at $X": each day, just enough of their shares are redeemed to bring the tank back to $X, from the vault's idle balance, waiting until the next day when there isn't enough.
 - The Author can withdraw from the tank at any time. The withdrawal settles a recent signed usage total first, then transfers the rest at once.
 - A tank that runs dry stops the agent until anyone tops it up. Its open positions stay as they are, unmanaged, and the vault page says so; Depositors can leave at any time, and exits never draw on the tank. A last bill the tank can't cover takes what's there, and the rest is written off; the tank never carries a debt.
 
 Every vault page shows the tank's balance and its recent charges.
 
-## Deposits paused
-
-A vault stops taking deposits, and changes nothing else, when a review of its live code finds it **malicious**. Anyone can buy a fresh review at any time, so this can happen long after the vault opened. The agent keeps running, and every Depositor can leave exactly as before. The vault's page shows the finding and links to the report.
-
-The pause does not kill the vault, because a kill makes every Depositor unwind at market, and one reading by a model is not enough to impose that cost. A later clean review does not lift it either, or an Author could buy reviews until one came back clean.
-
-The guardian key ends it, one way or the other: it kills the vault, or lifts the pause. Either way the reason is published. Until it acts, deposits stay paused.
-
 ## A kill
 
-Shonin's **guardian key** can **kill** any vault, typically after its health report shows it failing or a review of its live code finds it malicious. It is a separate key from the allowlist key, and it can do only two things: kill a vault, and lift a pause on deposits. A kill closes every position through the same reduce-only path a claim uses and brings all the cash home. After that the vault holds only idle balance, so every Depositor's withdrawal is paid in one transaction.
+Shonin's **guardian key** can **kill** any vault, typically after its health report shows it failing. It is a separate key from the allowlist key, and killing a vault is the only thing it can do. A kill closes every position through the same reduce-only path a claim uses and brings all the cash home. After that the vault holds only idle balance, so every Depositor's withdrawal is paid in one transaction.
 
 It moves no funds anywhere but back to Depositors. It is a halt, never a theft. Every kill is announced on the vault's page and on a public feed, with its reason.
 

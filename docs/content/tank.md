@@ -76,10 +76,10 @@ The tank pays for two things:
 
 **Gas.** The fee a blockchain charges for each transaction the agent sends. It's set by the chain, not by us, so it depends on where the agent trades: Hyperliquid charges no gas for orders, while on other chains, like Ethereum, gas can be costly and rises when the network is busy.
 
-We cover both as they happen, and set the money aside in the tank: each cost goes on a running tab, and once a day we're paid the tab out of the tank. The tab can never pass what's in the tank, even for an agent written to waste money on purpose:
+We cover both as they happen, and set the money aside in the tank: each cost goes on a running tab, and once a day we're paid the tab out of the tank. The tab can't get more than a few seconds ahead of what's in the tank, even for an agent written to waste money on purpose:
 
 - **Gas is checked before it's spent.** Like any wallet, the attested machine sets a transaction's maximum gas fee before sending it, and adds that to the tab. If the tank can't cover it, the transaction isn't sent and the agent stops.
-- **Resources are counted as they're used,** a few seconds' worth at a time, since there's no knowing in advance how much work the agent will do. The moment the tab reaches what's in the tank, the agent stops, so at most a few seconds' worth can slip past, which we absorb.
+- **Resources are counted as they're used,** a few seconds' worth at a time, since there's no knowing in advance how much work the agent will do. The moment the tab reaches what's in the tank, the agent stops, so at most a few seconds' worth can slip past, and we absorb that.
 
 Every vault's page shows how full its tank is and its recent charges. The Author sets limits on both resources and gas, and the vault's contract never pays out more than those limits allow.
 
@@ -89,17 +89,17 @@ Every vault's page shows how full its tank is and its recent charges. The Author
 
 **Trading fees.** The fees a venue charges on each trade, like Hyperliquid's trading fee, come out of the trade itself, from the vault's trading account. They're part of what the agent makes or loses, as at any fund.
 
-**Leaving the vault.** A withdrawal pays its own way: a Depositor pays its network fee, like any other transaction. On the few vaults that need an operator to finish an exit, the operator's costs come out of that withdrawal, and the vault's page says so up front.
+**Leaving the vault.** A withdrawal pays its own way: a Depositor pays its network fee, like any other transaction. On the few vaults that need an operator to finish an exit, the operator's costs come out of that withdrawal.
 
 ## Filling it
 
-The Author fills the tank when they publish. The first bills are the review and the build, and it's wise to add about a week of running on top.
+The Author fills the tank when they publish. The first bills are the review and the build for $1, and it's wise to add about a week of running on top.
 
 After that, a successful agent can pay its own way. The Author can top the tank up from their earnings with one click, or switch on **auto-fill** and pick a number, "keep my tank at $X", and it tops itself up every day. The [Money flow](flow.md) page shows how that plays out.
 
 ## Taking money out
 
-The Author can take money out whenever they like: the tab is paid first, the rest goes to their wallet, and whatever they leave in keeps the agent running.
+The Author can take money out whenever they like, say if they've put in more than they need: the tab is paid first, the rest goes to their wallet, and whatever they leave in keeps the agent running.
 
 ## If it runs dry
 

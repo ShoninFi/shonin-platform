@@ -10,7 +10,7 @@ flowchart LR
 
     subgraph PLATFORM["attested machines, running allowlisted images"]
         direction TB
-        B2["Reviewer<br/>reads and scores"]
+        B2["Reviewer<br/>reads and reports"]
         B1["builder<br/>compiles and signs"]
         B3["executor<br/>holds the keys"]
     end
@@ -58,9 +58,9 @@ Creating the vault and funding its tank happen in the same transaction, because 
 
 ## 2. An attested Reviewer reads it
 
-A pinned model, with a pinned prompt and a pinned output schema, answers one question: is this code reasonable? It returns a score out of 100, a written assessment, and findings, each in a fixed category with a severity. When the source is public, each finding also points to a file and a line.
+A pinned model, with a pinned prompt and a pinned output schema, reads the code and rates it in six areas: security, financial risk, reliability, reproducibility, outside influence, and whether it does what its Author says. Each area is rated looks fine, some concerns, serious concerns, or couldn't tell, with the findings behind it and a summary in the Reviewer's own words. When the source is public, each finding also points to a file and a line.
 
-It reads the source before anything is compiled, because compiling Rust runs the Author's build scripts and macros. Code it finds **malicious** is refused there and never built. Anything else is a score, not a gate, and it never rates expected profit.
+It reads the source before anything is compiled, because compiling Rust runs the Author's build scripts and macros. Code it finds **malicious** is refused there and never built. Anything else is advice, not a gate, and it never rates expected profit.
 
 → [The review](review.md)
 

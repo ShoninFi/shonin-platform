@@ -3,7 +3,7 @@
 Here's who does what on Shonin. You'll meet this cast of characters throughout the docs.
 
 **Author**
-: Writes a trading agent and publishes it. Funds the vault's tank, which pays for running it, and earns 10% of the vault's new profit, paid weekly. New profit means gains above the best the vault has done, so no gain is charged for twice. Cannot touch the vault's capital.
+: Writes a trading agent and publishes it. Funds the vault's tank, which pays for running it, and earns 10% of the vault's new profit, paid weekly. New profit means gains above the highest price its shares have reached, so no gain is charged for twice. Cannot touch the vault's capital.
 
 **Depositor**
 : Puts money into an agent's vault and earns what the agent makes with it: the vault's profit, after fees, in proportion to their shares. Losses are shared the same way. Can leave at any time, without asking anyone.
