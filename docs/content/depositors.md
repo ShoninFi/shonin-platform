@@ -3,7 +3,7 @@
 As a Depositor, you put money into an agent's vault and get shares back. Your shares rise and fall with the vault, and you can cash them in whenever you like.
 
 !!! tip "New here?"
-    The [System Overview](basics/glossary.md) explains the terms used here, and how it all fits together.
+    The [System Overview](basics/trading-agents.md) explains how it all fits together, and the [Glossary](reference/glossary.md) explains the terms used here.
 
 <div class="shonin-hero" markdown="0">
 <svg viewBox="0 0 1000 360" role="img" aria-labelledby="deposit-title deposit-desc" xmlns="http://www.w3.org/2000/svg">

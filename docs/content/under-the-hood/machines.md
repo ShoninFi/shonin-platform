@@ -1,4 +1,4 @@
-# Attested machines
+# How the machines work
 
 Four kinds of attested machine run Shonin: the **Reviewer**, the **builder**, the **executor** and the **unwinder**. Each runs its own image, proves which image it is, and can only do its own job. This page follows each one through: what it receives, what it holds, what it signs, and what the chain checks.
 
@@ -60,7 +60,27 @@ Everything sealed (an Author's source, a sealed bundle, an agent's secrets) is e
 2. Reads it with the pinned AI model, using the pinned instructions, and answers the fixed questions that set each area's rating.
 3. Writes the report.
 
-**Signs** the review with its blessed key. The review registry accepts it only from a key blessed as a Reviewer on an allowed image, and only if its source hash matches the one the builder signs later. A refusal is recorded instead, in the transaction that returns the deposit, and nothing is built.
+**Pins**, in its image, the model, the prompt and the output schema, the questions and their thresholds, and the six areas, four ratings and three severities. Changing any of them is an image change, which goes through the same public, timelocked [allowlist](#the-allowlist) as any other. The prompt, the schema and the questions are published, so an Author can run the same review against any model before publishing; it just isn't signed, so it isn't binding.
+
+**Signs** the review with its blessed key, once the bundle is registered. The review registry accepts it only from a key blessed as a Reviewer on an allowed image, and only if its source and bundle hashes match the agent registered:
+
+```solidity
+submitReview(strategyId, Review(
+    bytes32  bundleHash,       // the bundle reviewed
+    bytes32  sourceHash,       // the source the reviewer read
+    bytes32  reviewerImage,    // the image it ran in
+    bytes32  modelIdHash,      // the pinned model
+    bytes32  promptHash,       // the prompt, the schema and the questions together
+    bytes32  reportHash,       // the report as published
+    uint8[6] ratings,          // one per area: fine, some concerns, serious, couldn't tell
+    uint16   findingCount,
+    uint64   reviewedAt
+))
+```
+
+A review covers one source and the one bundle built from it, so a good rating can never follow code nobody read. Each agent is reviewed once, and a later Reviewer image doesn't review running agents again.
+
+A refusal is recorded instead, in the transaction that returns the deposit: the source hash, the Reviewer's image and the hash of its public report. Nothing is built.
 
 **Holds** a credential for the hosted AI model, which only the Reviewer image can obtain.
 
@@ -76,6 +96,11 @@ Everything sealed (an Author's source, a sealed bundle, an agent's secrets) is e
 2. Compiles it once, offline, with the published recipe.
 3. Loads the result to check it works, and assembles the bundle.
 4. Reads the manifest to learn which venues, and so which chains, the agent needs.
+
+The recipe is fixed and published, so anyone can repeat it: a pinned toolchain and the builder's own copy of the SDK, `--locked` so the dependency graph is the one the Author committed, and the `wasm32-wasip2` target, for which `rustc` emits the component itself. The component is then loaded in the executor's own runtime, to check it satisfies the interface before anything is registered, and the bundle, the component plus any models the project ships, is assembled and hashed.
+
+!!! note "Why not build it twice and compare?"
+    Because it would prove less than it looks. Two builds on the same machine, seconds apart, differ in almost nothing, so they test the easy cases and not the ones that break someone else's rebuild. Reproducing a bundle elsewhere comes from a hermetic recipe: a pinned image, fixed paths, a fixed timestamp, no network. A project that reaches for a clock, the network or a random number while it compiles is a finding under reproducibility.
 
 **Signs** "this source and manifest → this bundle", together with the chain, the registry, the agent's id and its Author, so the signature can't be reused for anything else. The strategy registry accepts a bundle only with a signature from a key blessed as a builder.
 

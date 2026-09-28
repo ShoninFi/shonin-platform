@@ -1,114 +1,117 @@
-# Technical glossary
+# Glossary
 
-One word for one thing, throughout the platform and these docs. The plain-words version is the [Glossary](../basics/glossary.md) in the System Overview.
+The words you'll meet throughout these docs: first who does what, then the handful of terms everything else is built from, and last the terms you'll only meet once you look under the hood.
 
-**Admin key**
-: Shonin's one key with special powers. It proposes machine images for the allowlist, which only count after a public two-day wait, revokes them instantly, and can kill a vault. It cannot move funds anywhere but back to Depositors.
+## Roles
 
-**Agent**
-: The program an Author publishes: a long-lived Rust program, compiled to a WebAssembly component, that watches the market, computes, and decides. It reaches the world through seven interfaces and nothing else. The contracts call it a *strategy*.
+**[Author](../authors.md)**
+: Writes a trading agent and publishes it. Funds the vault's tank, which pays for running it, and earns 10% of the vault's new profit, paid weekly. New profit means gains above the highest price its shares have reached, so no gain is charged for twice. Cannot touch the vault's capital.
 
-**Allowances**
-: How much computing and gas an agent may use: fuel a second, memory, requests, bandwidth, open streams, inference and gas. Set by its Author when publishing and changeable on the live vault; the attested machine holds the agent to them, and its tank is charged for them at the published prices.
+**[Depositor](../depositors.md)**
+: Puts money into an agent's vault and earns what the agent makes with it: the vault's profit, after fees, in proportion to their shares. Losses are shared the same way. Can leave at any time, without asking anyone.
 
-**Attested machine**
-: A secure enclave running one of the platform's allowlisted images: it reviews, builds, or runs an agent and holds its keys. It signs an attestation of the exact code it runs, and our contracts accept a key only with one.
+**[Reviewer](../basics/ai-review.md)**
+: An AI model, running on an attested machine, that reads an agent's source before it is built and writes a report on it. Code it finds malicious is never built. The report is there to help you choose an agent, not to keep your money safe: that is the job of the attested machine and the trade-only keys.
 
-**Attestation**
-: A proof, signed by the hardware, of which code an attested machine is running. Our contracts check it before they accept a key. It says which code holds a key; it is not what stops the key withdrawing.
+**Shonin**
+: Runs the platform and the attested machines, and takes a small share of fees. Can stop a vault, which returns everything to its Depositors, but cannot move anyone's money anywhere else.
 
-**Author**
-: Whoever publishes an agent. They fund its tank, earn the Author fee, and cannot touch a vault's capital.
+## Key terms
 
-**Blessing**
-: The registry's record that one key, made in one image, may act for one vault running one bundle, until it expires. Renewed by attesting again.
+**[Agent](../basics/trading-agents.md)**
+: A program an Author writes to trade the money in its vault. It runs on an attested machine, inside a sandbox.
 
-**Bundle**
-: What a build produces: one WebAssembly component plus any models the project ships. Identified by its `bundleHash`, which is what a vault's keys are blessed for.
+**[AI Review](../basics/ai-review.md)**
+: The report card the Reviewer writes on an agent's code before it's built, rating it in six areas.
 
-**Claim**
-: A withdrawal the idle balance could not pay. The shares go pending, the contract closes the leaver's fraction of every position inside the exit band, and once the cash is home they are burned at the marks then and paid. Three states: pending, waiting, paid.
+**[Allowances](../writing/configuration.md#vault-configuration)**
+: How much computing and gas an agent may use, set by its Author and changeable on the live vault. They're also the most its tank can be charged.
 
-**Crystallise**
-: Paying the fees a vault owes as new shares. Weekly, as part of the vault's daily `keep` call, which anyone may send. Between payments, what is owed so far is already taken out of value per share.
+**[Attested machine](../basics/attested-machines.md)**
+: A computer that can prove exactly what code it's running, so nobody can quietly change it or read what's inside.
 
-**Custody level**
-: How a venue enforces that a key cannot take funds out: venue-enforced, chain-enforced, or something weaker, shown per venue on every vault page.
+**Booked withdrawal**
+: A withdrawal bigger than the cash the vault has at home. The contract closes your share of its positions and pays you once that cash is back.
 
-**Depositor**
-: Whoever puts capital into a vault. They hold shares, can leave at any time, and never need permission to do either.
+**[High-water mark](../fees.md#the-profit-fee)**
+: The highest a vault's share price has been on a payday. The profit fee is only charged on gains above it.
 
-**Exit band**
-: How far either side of the venue's oracle price a claim may close, 1% by default. It bounds what the pool pays for someone else's exit.
-
-**Exit class**
-: Whether a vault can be exited by its contract alone (**direct**) or needs an operator to unwind a venue the contract cannot reach (**served**). Shown on every vault page.
-
-**Executor**
-: The attested service that runs an agent and holds the vault's trading keys. It can only trade the vault's own accounts.
-
-**Freeze**
-: What anyone may do to a vault whose claim has gone unserved for the freeze period: no new deposits, and only unwinding remains possible.
-
-**Fuel**
-: The runtime's unit of work. An agent declares a rate, the rate is what its tank is billed at, and it decides how often the agent yields.
-
-**High-water mark**
-: The highest value per share a vault has reached at a weekly fee payment. Profit fees are only ever charged on gains above it, so no gain is charged for twice.
-
-**Idle balance**
-: The part of a vault's value sitting in the contract rather than at a venue. Withdrawals up to it are paid in one transaction.
-
-**Image**
-: A measured build of one of the platform's services (an executor, an unwinder, the build service or the Reviewer), which runs on an attested machine. Every image that may hold a key is on a public, timelocked allowlist.
-
-**Kill**
-: Shonin's admin key stopping a vault: every position closed, all cash home, every Depositor paid from idle balance. A halt, never a theft.
-
-**Manifest**
-: The `shonin.toml` in a project: what the agent is, the limits it promises, the venues it trades and the bridges it uses. Read by the platform, never by the agent, and fixed once published.
-
-**Mark**
-: The venue's own reference price, used to value a deposit. A withdrawal uses **exit-side marks** instead: a long at the bid, a short at the ask.
+**[Idle floor](../writing/configuration.md#vault-configuration)**
+: How much of a vault its Author keeps at home as cash, ready for withdrawals.
 
 **New**
-: An agent open for deposits but not yet on the leaderboard, because it has fewer than 30 live days.
+: An agent open for deposits, but with fewer than 30 days of history, so it isn't on the leaderboard yet.
 
 **Record**
-: A vault's own on-chain history: value per share over time, read from the contract that computes it.
+: A vault's history of its share price, read straight from its own contract.
 
-**Retire**
-: An Author ending their agent. The vault stops taking deposits for a seven-day wind-down while Depositors leave as usual; then the agent is stopped for good, and its positions are closed and the cash brought home.
+**[Retire](../writing/publishing.md#retiring-it)**
+: An Author ending their agent. The vault stops taking deposits and the agent keeps running for seven days; then it's stopped for good, and its positions are closed and the cash brought home to the vault, where anyone still in can withdraw it.
 
-**Review**
-: An attested model's reading of the source before it is built: a rating in each of six areas, the findings behind them, and a summary in its own words. Only for public source do findings point to a file and a line. Advice, not a gate, except that code found malicious is refused and never built.
+**[Sealed](../authors.md#keeping-your-code-private)**
+: Source code, or a secret, encrypted so only the attested machines can read it. Sealing changes who can read something, never whether it was reviewed and built.
 
-**Sealed**
-: Source, or a secret, encrypted so that only the attested services can read it. Sealing changes who can read something, never whether it was compiled or reviewed.
+**Share**
+: Your slice of a vault. You get shares when you put money in, and their price rises and falls with the vault.
+
+**[`shonin.toml`](../writing/configuration.md#shonintoml)**
+: An agent's configuration file: its description, the claims it makes about itself, the venues it trades and the bridges it uses. Fixed once published.
+
+**[Tank](../tank.md)**
+: The Author's account for running their agent. It pays for computing and gas, never from Depositors' money.
+
+**[Trade-only key](../basics/trade-only-keys.md)**
+: The key that trades for a vault. A venue lets it place and cancel orders, and nothing else.
+
+**[Vault](../under-the-hood/vaults.md)**
+: The smart contract holding the money behind one agent. It keeps its own accounts, pays its own withdrawals, and works out its own share price.
+
+**[Venue](venues.md)**
+: Where an agent actually trades, like an exchange.
+
+## Under the hood
+
+**[Admin key](../under-the-hood/vaults.md#a-kill)**
+: Shonin's one key with special powers. It proposes machine images, which only count after a public wait, revokes them at once, and can kill a vault. It can't move money anywhere but back to Depositors.
+
+**[Attestation](../under-the-hood/machines.md#what-attestation-proves-and-what-it-doesnt)**
+: A statement, signed by the processor, of exactly which code an attested machine is running. Our contracts check one before they accept any key it made.
+
+**[Blessing](../under-the-hood/machines.md#blessing-a-key)**
+: The on-chain record that one key, made on one image, may act for one vault running one bundle, until it expires. Renewed by attesting again.
+
+**Bundle**
+: What a build produces: the agent's compiled code, plus any AI models it ships. Its hash is what a vault's keys are blessed to run.
+
+**Claim**
+: The contract's name for a booked withdrawal. It's *pending*, then *waiting* if the market was too far from its price to close, then *paid*.
+
+**[Exit band](../under-the-hood/vaults.md#the-exit-band)**
+: How far from the venue's own price a booked withdrawal may close positions, 1% by default. It limits what one person leaving can cost everyone else.
+
+**Freeze**
+: What anyone can do to a vault whose booked withdrawal has gone unpaid for seven days: no new deposits, and only winding down left.
+
+**Idle balance**
+: The part of a vault's money sitting in its contract rather than at a venue. Withdrawals up to it are paid at once.
+
+**[Image](../under-the-hood/machines.md#the-allowlist)**
+: One of the approved programs an attested machine may run: the Reviewer, the builder, the executor or the unwinder. The list is public, and a new image only counts after a public wait.
+
+**[Kill](../under-the-hood/vaults.md#a-kill)**
+: Shonin stopping a vault: every position closed, all the cash brought home, and every Depositor able to withdraw at once. A halt, never a theft.
+
+**Mark**
+: A venue's own reference price, used to value a deposit. A withdrawal is valued at **exit-side marks** instead: what a position would actually sell for.
 
 **Settle**
-: The public function that closes a claim's positions, brings the cash home and pays the leaver. Anyone can send it.
-
-**Shares**
-: ERC-4626 shares in a vault. A pro-rata claim on the pool, minted at value per share on deposit and burned on withdrawal.
+: The public function that closes a booked withdrawal's positions, brings the cash home and pays the leaver. Anyone can send it.
 
 **Strategy**
-: The contracts' word for an agent: `strategyId`, `StrategyRegistry`. These docs use it only where they name something in the contracts.
-
-**Tank**
-: The Author's balance for a vault's running costs, funded by them and refilled from their own fees. Excluded from what shares are worth.
-
-**Transaction fee**
-: 0.1% on every deposit and withdrawal, which stays in the pool. Nobody receives it.
+: The contracts' word for an agent, as in `strategyId` and `StrategyRegistry`. These docs only use it when naming something in the contracts.
 
 **Usage total**
-: A running total of what the agent has used, kept by the executor and signed by the vault's blessed key. It stops the agent when the unpaid part reaches the tank, and Shonin collects from it, capped by the allowances the Author declared.
+: The running total of what an agent has used, kept and signed by its attested machine. The agent stops when the unpaid part reaches the tank, and Shonin collects from it, never past the allowances.
 
 **Value per share**
-: A vault's value divided by its shares outstanding. The whole of the record is the change in this number over time.
-
-**Vault**
-: One contract holding one pool of capital behind one agent. It computes its own value, mints its own shares, and pays its own withdrawals.
-
-**Venue**
-: Where an agent actually trades. Each one enforces, in its own way, that a vault's key can trade but cannot withdraw.
+: A vault's value divided by its shares. It's the share price, and the whole of a vault's record is how it changes.
