@@ -83,6 +83,7 @@ The guarantees are the product. Everything else is how they are shown.
 - [ ] **An equities venue**, with holdings valued from a price feed under a stale-feed rule
 - [ ] **A second chain**, with a remote-leg contract that owns the vault's accounts there, values them from chain state, and posts home on demand
 - [ ] **A transfer route between chains**, with per-route caps and timeouts
+- [ ] **A share price that counts every chain**: the home vault contract values its accounts on other chains from what their remote legs post, never from a reported number, with a limit on how old a posted value may be before deposits, withdrawals and fees wait for a fresh one
 - [ ] **Attested reads** for venues whose state is not on a chain
 - [ ] For each venue: its custody level, shown on every vault page that uses it
 

@@ -130,7 +130,7 @@
           352
         ],
         "fees": {
-          "streaming_bps": 50,
+          "streaming_bps": 100,
           "author_bps": 1000,
           "platform_bps": 500,
           "transaction_bps": 10
@@ -1552,7 +1552,7 @@
           352
         ],
         "fees": {
-          "streaming_bps": 50,
+          "streaming_bps": 100,
           "author_bps": 1000,
           "platform_bps": 500,
           "transaction_bps": 10
@@ -2863,7 +2863,7 @@
           352
         ],
         "fees": {
-          "streaming_bps": 50,
+          "streaming_bps": 100,
           "author_bps": 1000,
           "platform_bps": 500,
           "transaction_bps": 10
@@ -4133,7 +4133,7 @@
           273
         ],
         "fees": {
-          "streaming_bps": 50,
+          "streaming_bps": 100,
           "author_bps": 1000,
           "platform_bps": 500,
           "transaction_bps": 10
@@ -5158,7 +5158,7 @@
           273
         ],
         "fees": {
-          "streaming_bps": 50,
+          "streaming_bps": 100,
           "author_bps": 1000,
           "platform_bps": 500,
           "transaction_bps": 10

@@ -62,7 +62,7 @@ Fees are worked out every day and paid once a week, as **new shares**, so paying
 ```text
 every day, what is owed so far is worked out and taken out of value per share:
 
-  holding fee  = value × 0.5% × (days since the last payment) / 365
+  holding fee  = value × 1% × (days since the last payment) / 365
   if value per share (after the holding fee) > high-water mark:
       gains      = (value per share − high-water mark) × shares
       author fee = gains × 10%

@@ -14,7 +14,7 @@
 
   const SELECTOR = ".shonin-sim[data-sim='flow']";
 
-  const HOLDING_FEE = 0.005; // a year
+  const HOLDING_FEE = 0.01; // a year
   const AUTHOR_CUT = 0.1;
   const SHONIN_CUT = 0.05;
   const MOVE_FEE = 0.001; // deposits and withdrawals, kept in the vault

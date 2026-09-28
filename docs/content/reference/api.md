@@ -28,7 +28,7 @@ What a client needs to reach the chain itself, and the terms the platform is run
   "terms": {
     "minimum_tank":        40.0,
     "review_fee":          1.0,
-    "fees":                { "streaming_bps": 50, "author_bps": 1000,
+    "fees":                { "streaming_bps": 100, "author_bps": 1000,
                              "platform_bps": 500, "transaction_bps": 10 },
     "exit_band_bps":       100,
     "freeze_after_days":   7.0,
