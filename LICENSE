@@ -11,10 +11,13 @@ Licensed Work:        Shonin Platform, the source code in this repository,
 Additional Use Grant: You may make production use of the Licensed Work to:
                       (a) develop, build, test, simulate and publish
                           strategies for the Shonin platform operated by the
-                          Licensor or its affiliated entities; and
+                          Licensor or its affiliated entities;
                       (b) independently verify the Shonin platform, including
-                          rebuilding executor images, checking attestations,
-                          and replaying decision logs.
+                          rebuilding its images, checking attestations,
+                          reading the vault contracts, and checking reviews
+                          and builds; and
+                      (c) operate images on the Shonin platform's allowlist,
+                          such as the unwinder, for the Shonin platform.
 Change Date:          For each version of the Licensed Work, the fourth
                       anniversary of the first publicly available
                       distribution of that version under this License.

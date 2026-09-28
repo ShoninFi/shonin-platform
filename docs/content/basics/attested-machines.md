@@ -103,8 +103,8 @@ Our attested machines do four jobs:
 - **Run** it, holding the vault's trading keys, which are made inside the machine and never leave it
 - **Enforce** the sandbox, so every agent stays within the limits its Author set, and pays for what it uses
 
-Each machine runs an approved program, called an **image**. An image is simply Shonin's own software around the agent: the Reviewer, the builder, or the executor that runs agents. It never contains an agent's trading code, which is checked separately, against the exact build its vault was created with. The list of approved images is public, they are open-source, and a new one only counts two days after it is added, so anyone can check it first.
+Each machine runs an approved program, called an **image**. An image is simply Shonin's own software around the agent: the Reviewer, the builder, and the executor that runs agents (not the agents themselves). The list of approved images is public, they are open-source, and a new one only counts two days after it is added, so anyone can check it first.
 
-And nobody, us included, can read what's inside: the vault's keys, the agent's sealed secrets or its sealed source.
+Nobody, us included, can read the secret data inside: the vault's keys, the Author's private API keys, or the agent's sealed source. The one exception is the AI model the Reviewer consults, which sees sealed source under terms that rule out training on it or keeping it.
 
 [Next: trade-only keys →](trade-only-keys.md){ .md-button .md-button--primary }

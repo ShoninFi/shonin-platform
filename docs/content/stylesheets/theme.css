@@ -84,8 +84,14 @@
         margin-top: 1.25em;
     }
 
+    /* Welcome opens the sidebar as a plain page, not a heading. */
     .md-nav--primary > .md-nav__list > .md-nav__item:first-child > .md-nav__link {
+        font-weight: 400;
         margin-top: 0;
+    }
+
+    .md-nav--primary > .md-nav__list > .md-nav__item:first-child > .md-nav__link--active {
+        font-weight: 600;
     }
 }
 

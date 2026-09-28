@@ -2,18 +2,22 @@
 
 **Smart contracts are public and auditable. Trading agents should be too.**
 
-Anyone who uses an automated trading strategy wants to know three things: what it does, what it can do with their money, and whether they can get out. On Shonin, each answer is something they can check rather than something they are told.
+Before you trust an automated trading strategy with your money, you want to know:
 
-Here's how it works, in a nutshell. *Don't worry if it's a lot at once*, the next few pages take it one piece at a time:
+- What does it do?
+- What risks does its strategy take?
+- Can somebody swap the code out from under my feet?
+- Could anyone walk off with my money?
+- Can I get out whenever I want?
 
-An Author publishes a trading agent as source code. We use attested machines to evaluate it, compile it, and run it with keys that can trade but cannot withdraw.
+**On Shonin, nobody can swap the agent you chose for different code, or make an unverified claim about what it's doing.** Every answer is verifiable, backed by a powerful combination of secure enclaves and blockchain technology.
 
-Depositors put money behind the agent they choose, and can verify, definitively, that it's *really* that agent trading it. Trades only go through when our on-chain contracts have verified the attestation, and that mechanism is secured by hardware and cryptography - while still allowing the agent to do powerful off-chain computation, internet queries, and more - within its sandbox. Depositors can withdraw at any time.
+That opens trading agents up to everyone. Depositors can put money behind strategies they can actually check, and take it back whenever they like. Authors can turn a good strategy into income, earning a share of the profit it makes on other people's capital, without ever holding their money.
 
 <div class="shonin-hero" markdown="0">
 <svg viewBox="0 0 1000 700" role="img" aria-labelledby="hero-title hero-desc" xmlns="http://www.w3.org/2000/svg">
 <title id="hero-title">How Shonin fits together</title>
-<desc id="hero-desc">An Author feeds source code into a sealed glass booth with an attestation seal on its roof. Inside, a small robot, the agent, trades at a screen. The booth has no door, and its only connection is a locked cable to a vault standing on a chain of blocks, where one Depositor drops in a coin while another walks away with their money. Beneath the attested machine hang the two things it does: a model reads the source and scores it before anything is built, and then it is built once and signed. Beneath the vault runs the chain it is part of, and from it hang the two things the chain does: it checks the attested machine's seal, and it holds the record the returns are read from.</desc>
+<desc id="hero-desc">An Author feeds source code into a sealed glass booth with an attestation seal on its roof. Inside, a small robot, the agent, trades at a screen. The booth has no door, and its only connection is a locked cable to a vault standing on a chain of blocks, where one Depositor drops in a coin while another walks away with their money. Beneath the attested machine hang the two things it does: a model reads the source and writes a report on it before anything is built, and then it is built once and signed. Beneath the vault runs the chain it is part of, and from it hang the two things the chain does: it checks the attested machine's seal, and it holds the record the returns are read from.</desc>
 <ellipse cx="500" cy="236" rx="480" ry="164" style="fill:var(--h-blob)"/>
 <ellipse cx="110" cy="362" rx="52" ry="8" style="fill:var(--h-shadow)"/>
 <ellipse cx="390" cy="364" rx="160" ry="10" style="fill:var(--h-shadow)"/>
@@ -187,8 +191,10 @@ Depositors put money behind the agent they choose, and can verify, definitively,
 <circle cx="15" cy="11" r="21" style="fill:var(--h-glass);stroke:var(--h-ink);stroke-width:4"/>
 <path d="M4 2 q6 -8 14 -6" style="fill:none;stroke:var(--h-shine-strong);stroke-width:3;stroke-linecap:round"/>
 <path d="M38 -46 l3 7 l7 3 l-7 3 l-3 7 l-3 -7 l-7 -3 l7 -3 Z M54 -24 l2 5 l5 2 l-5 2 l-2 5 l-2 -5 l-5 -2 l5 -2 Z" style="fill:var(--h-amber)"/>
-<rect x="-58" y="30" width="42" height="24" rx="12" style="fill:var(--h-teal)"/>
-<text x="-37" y="47" class="h-badge">94</text>
+<rect x="-62" y="30" width="50" height="24" rx="12" style="fill:var(--h-paper);stroke:var(--h-ink);stroke-width:2"/>
+<circle cx="-49" cy="42" r="5" style="fill:var(--h-teal)"/>
+<circle cx="-37" cy="42" r="5" style="fill:var(--h-amber)"/>
+<circle cx="-25" cy="42" r="5" style="fill:var(--h-teal)"/>
 </g>
 <g transform="translate(480 572)">
 <circle r="80" style="fill:var(--h-glass-disc)"/>
@@ -243,4 +249,4 @@ Depositors put money behind the agent they choose, and can verify, definitively,
 </svg>
 </div>
 
-[Learn about roles →](basics/roles.md){ .md-button .md-button--primary }
+[Get started: depositors →](depositors.md){ .md-button .md-button--primary }

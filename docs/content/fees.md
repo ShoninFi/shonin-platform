@@ -24,4 +24,18 @@ A small yearly fee on what the vault holds, whether it's up or down.
 
 A tenth of a percent, going in and coming out. Neither the Author nor Shonin gets it: it stays in the vault and nudges up the value of every share in it. That way, people coming and going cover the cost of their own moves, and everyone in the vault benefits.
 
+## An example
+
+Depositors put $100 into a vault whose shares start at $1.00. To keep it simple, the share prices shown are before fees.
+
+| Payday | That week | Share price | High-water mark | Profit fee |
+| --- | --- | --- | --- | --- |
+| 1 | Depositors put in $100, and the agent makes 7% | $1.07 | $1.07 | $1.05 = 15% of the $7.00 profit |
+| 2 | Depositors take out $90, and the agent makes 7% on the $17 left | $1.14 | $1.14 | $0.18 = 15% of the $1.19 profit |
+| 3 | The agent loses 10% | $1.03 | $1.14 | nothing |
+| 4 | The agent makes 10% | $1.13 | $1.14 | nothing: it's still climbing back to $1.14 |
+| 5 | The agent makes 5% | $1.19 | $1.19 | $0.11 = 15% of the $0.72 profit above $1.14 |
+
+When most of the money came out in week 2, the agent kept working and the fee kept coming, just on fewer dollars. And after the loss in week 3, there was no fee until the vault had made it all back.
+
 [Next: money flow →](flow.md){ .md-button .md-button--primary }

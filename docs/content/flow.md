@@ -79,5 +79,4 @@ A few things to try:
 
 The simulator rounds things the real contract doesn't, such as the price a leaver sells at, and the trading account moves the same amount every day. None of it changes how the money moves.
 
-[I want to put money in →](depositors.md){ .md-button .md-button--primary }
-[I want to publish an agent →](authors.md){ .md-button .md-button--primary }
+[Next: verification →](verify.md){ .md-button .md-button--primary }

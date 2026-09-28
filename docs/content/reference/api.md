@@ -8,10 +8,10 @@ The service behind it is the **indexer**, which is part of this repository and o
 
 ### `GET /api/snapshot`
 
-The entire state of the platform in one document: every agent with its vault, record, review, health and attestation; every Author; the build queue; the activity feed; benchmarks and totals. It carries a version, so a client can poll cheaply and re-render only when it changes.
+The entire state of the platform in one document: every agent with its vault, record, review, health and attestation; every Author; the build queue; the activity feed; and totals. It carries a version, so a client can poll cheaply and re-render only when it changes.
 
 ```bash
-curl -s http://localhost:19081/api/snapshot | jq '.strategies[0] | {id, version, standing, vault: .vault.value}'
+curl -s http://localhost:19081/api/snapshot | jq '.strategies[0] | {id, standing, vault: .vault.value}'
 ```
 
 ### `GET /api/config`
@@ -54,7 +54,7 @@ The content-addressed store, addressed by the hashes the chain holds:
 
 | Name | What |
 | --- | --- |
-| `source.tar` | The packed project, for a published agent |
+| `source.tar` | The source as the builder received it, for a published agent |
 | `bundle.tar` | The bundle: the component and any models |
 | `component.wasm` | The compiled component |
 | `manifest.json` | What the Author declared |
@@ -68,23 +68,21 @@ Sealed source is kept so the Reviewer can read it and a build can be repeated, a
 
 ### `POST /api/submissions`
 
-Hand a packed project to the build service. The vault must already exist, because nothing is compiled for free.
+Hand your agent's source to the build service: an archive of its folder. Its publishing deposit must already be paid, because nothing is compiled for free, and the request carries a signature from the wallet that paid it, so nobody else can spend it.
 
 ```json
 {
-  "strategy_id": "funding-basis",
-  "version": 1,
-  "author": "0x…",
-  "package": "funding-basis",
+  "deposit": "0x…",
+  "source": { "archive": { "base64": "…" } },
   "sealed": false,
-  "source": { "archive": { "base64": "…" } }
+  "signature": "0x…"
 }
 ```
 
-Replies with the job id and the source hash:
+For sealed source the archive is encrypted in the browser to the platform's published key. The reply is the job id. The source hash is not in it: the attested builder computes it from the files it received, and the job shows it, and the vault it creates, once it has.
 
 ```json
-{ "job_id": "8814", "source_hash": "sha256:…" }
+{ "job_id": "8814" }
 ```
 
 ### `POST /api/health`

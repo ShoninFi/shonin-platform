@@ -21,36 +21,38 @@ extra_javascript = ["javascripts/diagrams.js", "javascripts/flow-sim.js"]
 # No repo_url yet: the repository is not public, so a header link would be a
 # 404 for every reader, and the theme would fetch its stats on every page.
 nav = [
-    {"Start here" = "index.md"},
-    {"Overview" = [
-        {"Roles" = "basics/roles.md"},
+    {"Welcome" = "index.md"},
+    {"Using Shonin" = [
+        {"Depositors" = "depositors.md"},
+        {"Authors" = "authors.md"},
+    ]},
+    {"System Overview" = [
+        {"Glossary" = "basics/glossary.md"},
         {"Trading agents" = "basics/trading-agents.md"},
+        {"AI Review" = "basics/ai-review.md"},
         {"Attested machines" = "basics/attested-machines.md"},
         {"Trade-only keys" = "basics/trade-only-keys.md"},
         {"Smart contracts" = "basics/smart-contracts.md"},
         {"The tank" = "tank.md"},
         {"Fees" = "fees.md"},
         {"Money flow" = "flow.md"},
-    ]},
-    {"Using Shonin" = [
-        {"Depositors" = "depositors.md"},
-        {"Authors" = "authors.md"},
         {"Verification" = "verify.md"},
     ]},
-    {"Technical deep-dive" = [
-        {"The whole system" = "how-it-works/index.md"},
-        {"Vaults" = "how-it-works/vaults.md"},
-        {"Agents" = "how-it-works/agents.md"},
-        {"Publishing" = "how-it-works/publishing.md"},
-        {"The review" = "how-it-works/review.md"},
-        {"Attested execution" = "how-it-works/execution.md"},
-        {"The record" = "how-it-works/record.md"},
+    {"Writing an Agent" = [
+        {"Getting started" = "writing/getting-started.md"},
+        {"Configuration" = "writing/configuration.md"},
+        {"Services" = "writing/services.md"},
+        {"Example: a rebalancer" = "writing/rebalancer.md"},
+        {"Publishing" = "writing/publishing.md"},
     ]},
-    {"Run it locally" = "run-locally.md"},
+    {"Under the hood" = [
+        {"Attested machines" = "under-the-hood/machines.md"},
+        {"The vault contract" = "under-the-hood/vaults.md"},
+    ]},
     {"Reference" = [
+        {"Supported venues" = "reference/venues.md"},
         {"The API" = "reference/api.md"},
-        {"Verification helpers" = "reference/verification.md"},
-        {"Glossary" = "reference/glossary.md"},
+        {"Technical glossary" = "reference/glossary.md"},
     ]},
     {"Build checklist" = "checklist.md"},
     # The app itself, which is a site of its own rather than a page here.

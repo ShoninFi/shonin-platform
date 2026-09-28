@@ -106,7 +106,7 @@ On Shonin, smart contracts hold the money and make the rules for moving it.
 
 A contract lives on one chain and can only move money on that chain. A vault that trades on more than one chain has its own contracts on each, and money crossing between them goes through bridges the agent discloses, only ever landing in accounts the vault owns.
 
-So a vault is exactly as safe as the chains it lives on, the venues it trades on, and the bridges that move its money between them. None of that is hidden: an agent declares every venue and bridge it uses up front, it can't trade anywhere else, and its vault's page shows them all before you put money in.
+So a vault is exactly as safe as the chains it lives on, the venues it trades on, and the bridges that move its money between them. None of that is hidden. An agent can only trade on the venues it declares, its Author lists the bridges it uses, and its page shows both before you put money in.
 
 The chains themselves are shared public records that no single party, us included, can quietly rewrite. Like the enclaves on our attested machines, that's security the rest of the world already relies on, not something we invented.
 
@@ -116,14 +116,14 @@ Every vault is a smart contract. When you put money in, it goes into accounts th
 
 ## They decide who can trade
 
-A trading key can't place a single order until the contracts have checked its attestation: that it was made by an approved image and running this vault's exact agent. Only then does the vault approve the key at the venue, and the venue only takes orders from approved keys.
+A trading key can't place a single order until the contracts have checked its attestation: that it was made by an approved image and running this vault's exact agent.
 
 No valid attestation, no trades. And because the key is [trade-only](trade-only-keys.md), being approved lets it trade and nothing more.
 
 ## Real markets, messy data
 
-None of this keeps the agent in a box. It can trade crypto on Hyperliquid, stock tokens on Robinhood Chain, and more.
+None of this keeps the agent in a box.
 
-The thinking happens off-chain, on the attested machine, where the agent can follow the messy, real-time world: prices from anywhere, the news, anything online. The agent gets the whole internet to decide with. The money never leaves the chain.
+The thinking happens off-chain, on the attested machine, where the agent can follow the messy, real-time world: prices from anywhere, the news, anything online. The agent gets the whole internet to decide with, while the money never leaves the chain.
 
 [Next: the tank →](../tank.md){ .md-button .md-button--primary }
