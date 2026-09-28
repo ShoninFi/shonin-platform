@@ -10,21 +10,28 @@ Nothing is posted, nothing is attested, nothing is reported. There is no epoch t
 
 Every trade behind that number is a public event on the venue: every order, every fill, every transfer, timestamped, against accounts the vault owns.
 
-## What the leaderboard shows
+## The leaderboard
 
-**Live records only.** A vault that never ran has nothing to show.
+A sortable table, built only from what each vault's contract records, with no maths beyond subtraction:
 
-**Normalised for risk.** Returns are rescaled to a common 15% annualised volatility, so a list of agents is not simply a list of who used the most leverage. The volatility used for the rescaling is an exponentially weighted moving average of daily returns with a sixty-day half-life, estimated only from the days *before* each one, never from the whole series, so no part of a record is normalised by information from its own future. A very quiet record is scaled up by at most three times, because multiplying a tiny sample by a large number invents confidence that is not there.
+| Column | From |
+| --- | --- |
+| Return, last 30 days | Value per share now against 30 days ago |
+| Return since opening | Value per share now against 1.00, where every vault starts |
+| Deepest drop | The largest fall in value per share from an earlier high |
+| Money in the vault | Its total value now |
 
-**A minimum record before ranking.** An agent is open for deposits from its first day, labelled **new**, and is not ranked until it has been live long enough for its record to mean something. A short run of good days is noise, and ranking it would be selling noise.
+**No single ranking.** You choose the column to sort by, for the same reason the review has no overall score: one number would hide what matters.
 
-**The size it was earned at.** Every record shows the capital behind it, now, on average and at most. Nothing is extrapolated to a size the agent never traded. An edge that worked on a small vault very often does not survive a large one, and the record should let you see that rather than hide it.
+**Deepest drop keeps it honest.** It sits beside every return, so an agent that took big risks and happened to win can't top the list without showing how it got there.
 
-**Raw beside normalised.** The raw return is what the vault actually did. Both are shown, always.
+**Live records only, and 30 days first.** An agent is open for deposits from its first day, labelled **new**, and listed separately until it has 30 live days. A short run of good days is noise.
+
+**The size it was earned at.** An agent's page charts its share price and the money in its vault over time. Nothing is extrapolated to a size the agent never traded: an edge that worked on a small vault very often doesn't survive a large one, and the record lets you see that rather than hiding it.
 
 ## What a record does not tell you
 
-It is one vault's history at the size it traded, in the conditions it met. It is not a prediction, it is not risk-adjusted advice, and a longer record is not a promise.
+It is one vault's history at the size it traded, in the conditions it met. It is not a prediction, it is not advice, and a longer record is not a promise.
 
 The platform's job is to make the history impossible to fake. Reading it is still yours.
 
@@ -32,14 +39,10 @@ The platform's job is to make the history impossible to fake. Reading it is stil
 
 An Author's page shows **everything they have published**: live, new, retired, the builds that failed, and the projects the review refused. Nothing there can be hidden by its Author.
 
-An Author can publish under a fresh identity, of course. What they cannot do is carry a record with them: every agent has to build its own record before it is ranked, whoever wrote it.
+An Author can publish under a fresh identity, of course. What they cannot do is carry a record with them: every agent has to build its own record before it is on the leaderboard, whoever wrote it.
 
 ## Run your own indexer
 
-The service that reads the chain into a record, computes the maths and serves the public API is one program, and the maths (normalisation, drawdown, volatility, correlation) is a library with its own tests rather than something buried in a server.
+The service that reads the chain into a record, computes the maths and serves the public API is one program, and the maths (returns and the deepest drop) is a small library with its own tests rather than something buried in a server.
 
 The point of that is for you to run your own against the same chain and compare. If ours and yours disagree, one of them has a bug, and the chain says which.
-
-## Benchmarks and correlation
-
-A portfolio page shows how your positions have moved with each other and with a few benchmarks, because two things that move together are more of one risk, not less. Benchmarks are named for what they are: a venue's own series, not an invented index.

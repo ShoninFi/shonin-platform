@@ -31,7 +31,7 @@ The guarantees are the product. Everything else is how they are shown.
 
 - [ ] **Fees are paid weekly.** What is owed is worked out daily and taken out of value per share, shrinks again if gains are given back, and is paid as new shares at a weekly payment anyone can call; a withdrawal pays what its own shares owe so far. The high-water mark moves only at a weekly payment
 - [ ] **Retiring winds down.** An Author's retirement stops deposits at once, keeps the agent running and exits open for seven days, then evicts the agent and closes its positions through the reduce-only path, bringing the cash home
-- [ ] **Two keys, split by power.** The allowlist key proposes and revokes images; the guardian key kills vaults. Neither can move funds except back to Depositors
+- [ ] **One admin key, with narrow powers.** It proposes and revokes images, and kills vaults. It can't move funds except back to Depositors
 - [ ] `local` **Vault and factory**: ERC-4626 shares, deposit at mark, redeem at exit-side marks, claims with pending shares, capital moved only between registered accounts
 - [ ] `local` **Fees and the tank**: daily crystallisation as shares, the high-water mark, the transaction fee, tank funding, usage charges
 - [ ] **The tank as plain dollars**: top-ups from the Author's fee shares, auto-fill as one "keep my tank at $X" setting, and a tank withdrawal that settles usage first
@@ -88,14 +88,15 @@ The guarantees are the product. Everything else is how they are shown.
 
 ## The record and the API
 
-- [ ] `local` **The indexer**: returns, drawdowns and volatility from each vault's value per share, open source so anyone can run their own
+- [ ] `local` **The indexer**: returns and the deepest drop from each vault's value per share, and the money in each vault over time, open source so anyone can run their own
 - [ ] `local` **The public HTTP API** behind every page
 - [ ] **Oracle monitors** that flag a stale or anomalous price behind a vault's valuation in its health report
 - [ ] **A documented, versioned API** with stability guarantees
 
 ## The web app
 
-- [ ] `local` **Leaderboard and agent pages**: on-chain records, reviews, normalised returns, the size each record was earned at, the Author's whole history
+- [ ] `local` **Leaderboard and agent pages**: on-chain records, reviews, the Author's whole history
+- [ ] **A plain leaderboard**: a sortable table of 30-day return, return since opening, deepest drop and money in the vault, with agents under 30 live days listed separately as new; agent pages chart share price and money in the vault over time
 - [ ] `local` **Source, build log and toolchain** for every agent
 - [ ] `local` **The build queue**, with a public log for every job
 - [ ] `local` **Deposits, withdrawals and claims**, with a pending claim's state shown
@@ -121,7 +122,7 @@ The guarantees are the product. Everything else is how they are shown.
 - [ ] `local` **A public status feed**: every kill, every allowlist change, every venue that stopped behaving
 - [ ] **Monitoring and alerting** for the services, separate from the on-chain guarantees
 - [ ] **A runbook** for a revoked image, a failing venue and a stuck claim
-- [ ] **Key management** for the allowlist key and the guardian key, and a path to a multisig for each
+- [ ] **Key management** for the admin key, and a path to a multisig
 
 ## The site
 

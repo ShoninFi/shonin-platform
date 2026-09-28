@@ -2,6 +2,9 @@
 
 As a Depositor, you put money into an agent's vault and get shares back. Your shares rise and fall with the vault, and you can cash them in whenever you like.
 
+!!! tip "New here?"
+    The [System Overview](basics/glossary.md) explains the terms used here, and how it all fits together.
+
 <div class="shonin-hero" markdown="0">
 <svg viewBox="0 0 1000 360" role="img" aria-labelledby="deposit-title deposit-desc" xmlns="http://www.w3.org/2000/svg">
 <title id="deposit-title">Money in, shares back</title>
@@ -67,18 +70,18 @@ Which agent to back is up to you. Every agent's page gives you what you need to 
 
 ### Its history
 
-- **Share price over time.** How the price of one share has moved since the vault opened, with its high-water mark, read straight from the vault's contract. Look at it by the day, the week or the month. A young agent is marked **new**, because there's less history to go on.
+- **Share price over time.** How the price of one share has moved since the vault opened, with its [high-water mark](fees.md#the-profit-fee) (the highest it's been on a payday, which the profit fee is measured from), read straight from the vault's contract. Look at it by the day, the week or the month. A young agent is marked **new**, because there's less history to go on.
 - **The money in its vault over time.** How much was in the vault along the way. It's a different thing from the share price: money coming and going changes it, but only the agent's trading moves the price. A strategy that works with a small pot often doesn't with a big one.
 
 ### Its vault
 
-- **Where it trades.** The venues and bridges it uses, and how each venue keeps your money safe.
-- **Its tank.** How full it is. An agent whose tank runs dry stops trading.
-- **How you'd get out.** Whether the contract can always finish a withdrawal by itself, or if it relies on additional operations.
+- **Where it trades.** The venues (exchanges) and bridges it uses, and how each venue keeps your money safe. [Smart contracts](basics/smart-contracts.md) explains why that matters.
+- **Its tank.** The Author's account that pays for running the agent, kept apart from your money. How full it is matters, because an agent whose [tank](tank.md) runs dry stops trading.
+- **How you'd get out.** Whether the contract can always finish a withdrawal by itself, or if it relies on additional operations. [Getting out](#getting-out), below, has the details.
 
 ## Getting out
 
-You can ask for your money back at any time, and nobody can say no. It goes one of two ways:
+You can ask for your money back at any time. It goes one of two ways:
 
 **Paid straight away.** The vault keeps some cash at home, in the contract itself. If there's enough to cover your withdrawal, you're paid in the same transaction.
 

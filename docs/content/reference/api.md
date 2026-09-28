@@ -8,7 +8,7 @@ The service behind it is the **indexer**, which is part of this repository and o
 
 ### `GET /api/snapshot`
 
-The entire state of the platform in one document: every agent with its vault, record, review, health and attestation; every Author; the build queue; the activity feed; benchmarks and totals. It carries a version, so a client can poll cheaply and re-render only when it changes.
+The entire state of the platform in one document: every agent with its vault, record, review, health and attestation; every Author; the build queue; the activity feed; and totals. It carries a version, so a client can poll cheaply and re-render only when it changes.
 
 ```bash
 curl -s http://localhost:19081/api/snapshot | jq '.strategies[0] | {id, standing, vault: .vault.value}'

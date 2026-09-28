@@ -27,7 +27,7 @@ The whole **workspace** your agent belongs to, as it is: upload the folder or an
 
 **You never compute a hash, and nobody trusts one from outside.** The attested Reviewer and the attested builder each take the files they received and hash them themselves.
 
-You can upload it **sealed**. The browser encrypts the project to the platform's key, which is published on-chain, before it leaves your machine; the attested builder and the attested Reviewer still read it, and nobody else does. Sealing changes who can read the source, never whether it was compiled or reviewed.
+You can upload it **sealed**. The browser encrypts the project to the platform's key, which is published on-chain, before it leaves your machine; the attested builder and the attested Reviewer still read it. The one thing outside an attested machine that sees it is the AI model the Reviewer consults, a hosted service whose terms rule out training on it or keeping it. Sealing changes who can read the source, never whether it was compiled or reviewed.
 
 ## Paying first
 

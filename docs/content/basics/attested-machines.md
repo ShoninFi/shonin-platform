@@ -105,6 +105,6 @@ Our attested machines do four jobs:
 
 Each machine runs an approved program, called an **image**. An image is simply Shonin's own software around the agent: the Reviewer, the builder, and the executor that runs agents (not the agents themselves). The list of approved images is public, they are open-source, and a new one only counts two days after it is added, so anyone can check it first.
 
-Nobody, us included, can read the secret data inside: the vault's keys, the Author's private API keys, or the agent's sealed source.
+Nobody, us included, can read the secret data inside: the vault's keys, the Author's private API keys, or the agent's sealed source. The one exception is the AI model the Reviewer consults, which sees sealed source under terms that rule out training on it or keeping it.
 
 [Next: trade-only keys →](trade-only-keys.md){ .md-button .md-button--primary }

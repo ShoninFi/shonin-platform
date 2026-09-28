@@ -106,7 +106,7 @@ The tank works as always during the wind-down. If the Author empties it, the age
 
 ## A kill
 
-Shonin's **guardian key** can **kill** any vault, typically after its health report shows it failing. It is a separate key from the allowlist key, and killing a vault is the only thing it can do. A kill closes every position through the same reduce-only path a claim uses and brings all the cash home. After that the vault holds only idle balance, so every Depositor's withdrawal is paid in one transaction.
+Shonin's **admin key** can **kill** any vault, typically after its health report shows it failing. Besides proposing and revoking machine images, it's the only other thing that key can do. A kill closes every position through the same reduce-only path a claim uses and brings all the cash home. After that the vault holds only idle balance, so every Depositor's withdrawal is paid in one transaction.
 
 It moves no funds anywhere but back to Depositors. It is a halt, never a theft. Every kill is announced on the vault's page and on a public feed, with its reason.
 

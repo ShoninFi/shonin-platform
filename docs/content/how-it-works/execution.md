@@ -65,7 +65,7 @@ The registry keeps the list of images that may hold a key at all (executors, unw
 
 - **Adding is slow and public.** A new image digest can be proposed at any time, and becomes blessable only after a timelock, two days by default. During that window anyone can rebuild the image from its published source and check the digest, and object.
 - **Removing is instant.** A revoked image stops being blessable immediately.
-- **The allowlist key can only do those two things.** It cannot bless keys, move funds, change a vault's agent, or stop a vault. Stopping a vault is the guardian key's, a separate key, described in [Vaults](vaults.md#a-kill).
+- **Shonin's admin key governs the list**, and beyond that it can only kill a vault, described in [Vaults](vaults.md#a-kill). It cannot bless keys, move funds anywhere but back to Depositors, or change a vault's agent.
 
 ## The one asymmetry
 
@@ -95,7 +95,7 @@ If an image is revoked for cause:
 2. each affected vault's venue approvals are revoked;
 3. a standby on another allowed image takes over, and if there is none, the vault stops trading, which shows as an error on its page.
 
-The guardian key can kill a vault, which flattens positions and pays every Depositor out. Depositors can exit on their own without waiting for anyone.
+The admin key can kill a vault, which flattens positions and pays every Depositor out. Depositors can exit on their own without waiting for anyone.
 
 A vault **never** resumes on a runtime its Depositors did not accept. Revocation can halt an agent. It cannot hand the keys to someone else.
 

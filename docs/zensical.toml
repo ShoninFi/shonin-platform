@@ -21,9 +21,13 @@ extra_javascript = ["javascripts/diagrams.js", "javascripts/flow-sim.js"]
 # No repo_url yet: the repository is not public, so a header link would be a
 # 404 for every reader, and the theme would fetch its stats on every page.
 nav = [
-    {"Overview" = [
-        {"Welcome" = "index.md"},
-        {"Roles" = "basics/roles.md"},
+    {"Welcome" = "index.md"},
+    {"Using Shonin" = [
+        {"Depositors" = "depositors.md"},
+        {"Authors" = "authors.md"},
+    ]},
+    {"System Overview" = [
+        {"Glossary" = "basics/glossary.md"},
         {"Trading agents" = "basics/trading-agents.md"},
         {"AI Review" = "basics/ai-review.md"},
         {"Attested machines" = "basics/attested-machines.md"},
@@ -32,26 +36,23 @@ nav = [
         {"The tank" = "tank.md"},
         {"Fees" = "fees.md"},
         {"Money flow" = "flow.md"},
-    ]},
-    {"Using Shonin" = [
-        {"Depositors" = "depositors.md"},
-        {"Authors" = "authors.md"},
         {"Verification" = "verify.md"},
     ]},
-    {"Technical deep-dive" = [
+    {"Hands-On" = [
         {"The whole system" = "how-it-works/index.md"},
         {"Vaults" = "how-it-works/vaults.md"},
         {"Agents" = "how-it-works/agents.md"},
         {"Publishing" = "how-it-works/publishing.md"},
         {"The review" = "how-it-works/review.md"},
         {"Attested execution" = "how-it-works/execution.md"},
+        {"The machines, one by one" = "how-it-works/machines.md"},
         {"The record" = "how-it-works/record.md"},
     ]},
     {"Run it locally" = "run-locally.md"},
     {"Reference" = [
         {"The API" = "reference/api.md"},
         {"Verification helpers" = "reference/verification.md"},
-        {"Glossary" = "reference/glossary.md"},
+        {"Technical glossary" = "reference/glossary.md"},
     ]},
     {"Build checklist" = "checklist.md"},
     # The app itself, which is a site of its own rather than a page here.

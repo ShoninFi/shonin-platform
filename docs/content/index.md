@@ -5,14 +5,14 @@
 Before you trust an automated trading strategy with your money, you want to know:
 
 - What does it do?
-- What are the risks?
+- What risks does its strategy take?
 - Can somebody swap the code out from under my feet?
 - Could anyone walk off with my money?
 - Can I get out whenever I want?
 
-On Shonin, you don't have to take anyone's word for the answers, including ours. You can definitively verify every one of them.
+**On Shonin, nobody can swap the agent you chose for different code, or make an unverified claim about what it's doing.** Every answer is verifiable, backed by a powerful combination of secure enclaves and blockchain technology.
 
-These docs walk through how it all works, one piece at a time.
+That opens trading agents up to everyone. Depositors can put money behind strategies they can actually check, and take it back whenever they like. Authors can turn a good strategy into income, earning a share of the profit it makes on other people's capital, without ever holding their money.
 
 <div class="shonin-hero" markdown="0">
 <svg viewBox="0 0 1000 700" role="img" aria-labelledby="hero-title hero-desc" xmlns="http://www.w3.org/2000/svg">
@@ -249,4 +249,4 @@ These docs walk through how it all works, one piece at a time.
 </svg>
 </div>
 
-[Learn about roles →](basics/roles.md){ .md-button .md-button--primary }
+[Get started: depositors →](depositors.md){ .md-button .md-button--primary }

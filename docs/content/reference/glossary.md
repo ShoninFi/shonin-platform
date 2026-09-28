@@ -1,12 +1,12 @@
-# Glossary
+# Technical glossary
 
-One word for one thing, throughout the platform and these docs.
+One word for one thing, throughout the platform and these docs. The plain-words version is the [Glossary](../basics/glossary.md) in the System Overview.
+
+**Admin key**
+: Shonin's one key with special powers. It proposes machine images for the allowlist, which only count after a public two-day wait, revokes them instantly, and can kill a vault. It cannot move funds anywhere but back to Depositors.
 
 **Agent**
 : The program an Author publishes: a long-lived Rust program, compiled to a WebAssembly component, that watches the market, computes, and decides. It reaches the world through seven interfaces and nothing else. The contracts call it a *strategy*.
-
-**Allowlist key**
-: One of Shonin's two keys. It proposes machine images for the allowlist, which become usable after a public timelock, and revokes them instantly. It cannot move funds or stop a vault.
 
 **Allowances**
 : The compute an agent declares in its manifest: fuel a second, memory, requests, bandwidth, open streams and inference. The host holds it to them, and its vault's tank is charged for them at the published prices.
@@ -53,9 +53,6 @@ One word for one thing, throughout the platform and these docs.
 **Fuel**
 : The runtime's unit of work. An agent declares a rate, the rate is what its tank is billed at, and it decides how often the agent yields.
 
-**Guardian key**
-: One of Shonin's two keys. It kills a vault, and publishes its reason. It cannot move funds anywhere but back to Depositors, or touch the allowlist.
-
 **High-water mark**
 : The highest value per share a vault has reached at a weekly fee payment. Profit fees are only ever charged on gains above it, so no gain is charged for twice.
 
@@ -66,7 +63,7 @@ One word for one thing, throughout the platform and these docs.
 : A measured build of one of the platform's services (an executor, an unwinder, the build service or the Reviewer), which runs on an attested machine. Every image that may hold a key is on a public, timelocked allowlist.
 
 **Kill**
-: The guardian key stopping a vault: every position closed, all cash home, every Depositor paid from idle balance. A halt, never a theft.
+: Shonin's admin key stopping a vault: every position closed, all cash home, every Depositor paid from idle balance. A halt, never a theft.
 
 **Manifest**
 : The `shonin.toml` in a project. What the agent is, what it will not do, the venues it trades, the config it takes and the allowances it starts with. Hashed with the bundle; only the allowances can change afterwards.
@@ -75,10 +72,7 @@ One word for one thing, throughout the platform and these docs.
 : The venue's own reference price, used to value a deposit. A withdrawal uses **exit-side marks** instead: a long at the bid, a short at the ask.
 
 **New**
-: An agent open for deposits but not yet ranked, because its record is still too short to mean much.
-
-**Normalised return**
-: A record rescaled to a common 15% annualised volatility, so agents can be compared at one level of risk. Shown beside the raw return, never instead of it.
+: An agent open for deposits but not yet on the leaderboard, because it has fewer than 30 live days.
 
 **Record**
 : A vault's own on-chain history: value per share over time, read from the contract that computes it.

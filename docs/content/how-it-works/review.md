@@ -76,4 +76,4 @@ An agent's comments, identifiers and strings are text the Author controls and a 
 
 ## Sealed source
 
-Sealed source is reviewed exactly like published source. The Reviewer reads it on its attested machine; the store refuses to serve it to anyone else, and the published report gives the ratings, a summary and findings by area, but never points into the code. What a Depositor relies on is the attested build plus the attested review. Published source is extra, and it is what makes an independent rebuild possible.
+Sealed source is reviewed exactly like published source. The Reviewer reads it on its attested machine and sends it to the pinned AI model, a hosted service, from inside the enclave, under terms that rule out training on it or keeping it; the store refuses to serve it to anyone else, and the published report gives the ratings, a summary and findings by area, but never points into the code. What a Depositor relies on is the attested build plus the attested review. Published source is extra, and it is what makes an independent rebuild possible.

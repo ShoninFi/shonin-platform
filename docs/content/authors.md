@@ -2,6 +2,9 @@
 
 As an Author, you write a trading agent and publish it. If Depositors back it and it makes money, you earn a share of the profit. You don't need anyone's permission to publish.
 
+!!! tip "New here?"
+    The [System Overview](basics/glossary.md) explains the terms used here, and how it all fits together.
+
 <div class="shonin-hero" markdown="0">
 <svg viewBox="0 0 1000 380" role="img" aria-labelledby="authors-title authors-desc" xmlns="http://www.w3.org/2000/svg">
 <title id="authors-title">From your code to your share</title>
@@ -105,13 +108,15 @@ As an Author, you write a trading agent and publish it. If Depositors back it an
 
 ## What you write
 
-An ordinary Rust project. Your agent is one program that runs for as long as its vault does: it watches the markets, decides what to do, and hands its orders to the attested machine, which signs and sends them. You never hold a key, and your code can only ever trade your vault's own accounts.
+An ordinary Rust project. Your agent is one program that runs for as long as its vault does: it watches the markets, decides what to do, and hands its orders to the [attested machine](basics/attested-machines.md) it runs on, a computer that can prove exactly what code it's running, which signs and sends them. You never hold a key, and your code can only ever trade your vault's own accounts.
 
 [Agents](how-it-works/agents.md) has the interface and a complete example.
 
 ## What it costs
 
-Publishing costs a flat **$1**, which covers both the review and the build. After that, you pay for running your agent, from its [tank](tank.md): the resources it uses and the gas its transactions cost, at published prices and never past the limits you set. That includes the first few transactions, which set up your vault on every chain it trades.
+Publishing costs a flat **$1**, which covers both the [AI Review](basics/ai-review.md) of your code and the build.
+
+After that, you pay for running your agent from its [tank](tank.md): its own running account, kept apart from Depositors' money. The tank pays for the computing your agent uses and the gas, the fee a blockchain charges, for each transaction it sends, at published prices and never past the limits you set. That includes the first few transactions, which set up your vault on every chain it trades.
 
 If the review finds your code malicious, or the build fails, the $1 is spent, the rest of what you paid comes back to you, and no vault is created. To try again, you submit a new agent. There are no version upgrades either.
 
@@ -125,8 +130,8 @@ Your shares are yours, like any Depositor's. Hold them, cash them in, or turn so
 
 ## Publishing, step by step
 
-1. **Pay the deposit and upload your code.** Your wallet signs the upload, so nobody else can spend your deposit.
-2. **The Reviewer reads your code** and writes its report. Malicious code stops here.
+1. **Pay the deposit and upload your code.** The deposit is the $1, plus whatever you'd like in your agent's tank to start with. Your wallet signs the upload, so nobody else can spend your deposit.
+2. **The [Reviewer](basics/ai-review.md) reads your code** and writes its report. Malicious code stops here.
 3. **An attested builder compiles it**, once, and signs what came out.
 4. **Your vault opens**, on every chain your agent trades. Anyone can deposit from then on, and it's marked **new** until it has some history.
 
@@ -136,7 +141,7 @@ Every step leaves a public record, including builds that fail.
 
 Your source is public by default, so anyone can read it and rebuild it to check.
 
-If you'd rather keep it private, you can seal it. Then only our attested machines can read it, and the review's report describes what it found without quoting your code. Depositors rely on the review instead of reading the code themselves, and your agent's page says so.
+If you'd rather keep it private, you can seal it. Then only our attested machines can read it, along with the AI model the Reviewer consults, whose provider's terms rule out training on your code or keeping it. The review's report describes what it found without quoting your code. Depositors rely on the review instead of reading the code themselves, and your agent's page says so.
 
 ## Retiring your agent
 
@@ -148,4 +153,4 @@ A published agent never changes. To change it, you publish a new agent, with its
 
 The two aren't linked. Depositors in the old vault keep exactly the agent they chose, and anyone who wants to move withdraws from one and deposits in the other.
 
-[Next: verification →](verify.md){ .md-button .md-button--primary }
+[Next: the system overview →](basics/glossary.md){ .md-button .md-button--primary }
