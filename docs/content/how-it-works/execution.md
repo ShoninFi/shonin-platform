@@ -30,7 +30,7 @@ sequenceDiagram
     E->>P: the token and the key it made
     P->>R: bless(seal, journal, vault, strategyHash, merkleProof)
     R->>R: verify the proof, check the claims,<br/>image allowlisted at the vault's creation or since
-    R->>S: bundleHashOf(strategyId, version)
+    R->>S: bundleHashOf(strategyId)
     S-->>R: bundleHash
     R->>R: strategyHash == bundleHash?
     R->>R: record KeyInfo, blessedUntil = now + TTL
@@ -54,7 +54,7 @@ struct KeyInfo {
 }
 ```
 
-- **One key, one vault, one agent version.** A key blessed for vault A cannot trade or move capital for vault B. A vault's agent version never changes, so neither does what its keys may run.
+- **One key, one vault, one agent.** A key blessed for vault A cannot trade or move capital for vault B. A vault's agent never changes, so neither does what its keys may run.
 - **Time-limited.** A blessing lasts a fixed period, 72 hours by default, and the executor renews by attesting again.
 - **Kinds are separate.** An image is allowlisted as one kind, and a key blessed from it can only do that kind's job. A key from a builder image cannot post a review.
 - **Approval follows blessing, permissionlessly.** Anyone may send the vault's `approveKey`, and it succeeds only if the registry says that key belongs to this vault and this bundle on an allowed image. Anyone may send `revokeKey`, and it succeeds only for a key whose blessing has lapsed or whose image was revoked.

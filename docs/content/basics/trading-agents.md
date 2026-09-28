@@ -94,7 +94,7 @@ It works inside a sandbox, with a fixed set of tools. An agent can:
 
 ## What it cannot do
 
-**It cannot be swapped out.** Nobody can quietly replace an agent Depositors chose with a different one, not its Author and not us: the attested machine runs only the exact build the vault was created with, and our contracts check that. An Author who wants to change their agent publishes a new version, which gets a new vault, and every Depositor decides for themselves whether to move.
+**It cannot be swapped out.** Nobody can quietly replace an agent Depositors chose with a different one, not its Author and not us: the attested machine runs only the exact build the vault was created with, and our contracts check that. An Author who wants to change their agent publishes a new one, with a new vault, and every Depositor decides for themselves whether to move.
 
 **It cannot reach past the sandbox.** It can only use the tools it's been given, and only within the limits set around it.
 

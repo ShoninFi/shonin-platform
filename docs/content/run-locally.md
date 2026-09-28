@@ -26,7 +26,7 @@ task services:seed   # publish the reference agents through the real flows
 task down            # stop everything task dev started
 ```
 
-`task services:seed` publishes several versions the way an Author would: one superseded by a newer one, one sealed, one that deliberately fails to build, and one that is then killed, so every state the site has to handle actually exists on your chain.
+`task services:seed` publishes several agents the way an Author would: one sealed, one that deliberately fails to build, and one that is then killed, so every state the site has to handle actually exists on your chain.
 
 ## What is listening
 
@@ -69,15 +69,9 @@ Deliberately absent: a bridge, a second chain, remote legs, an enclave, model in
 
 ## Publishing an agent to it
 
-```bash
-# from the root of this repository, with task dev running
-cargo run -q -p shonin-cli -- publish path/to/your-agent            # packs, creates the vault, funds the tank, submits
-cargo run -q -p shonin-cli -- publish path/to/your-agent --sealed   # the same, with the source kept out of the store
-```
+From the web app's **Publish** page, with `task dev` running: pay the deposit, choose your agent's folder, and watch the queue until its vault opens. The development wallet signs as the chain's Author account, so it needs no key of yours.
 
-It publishes as the chain's Author account, so it needs no key of yours.
-
-or from the web app's **Publish** page: drop the packed archive, fund the tank, and watch the queue.
+The same two steps work from a script: one transaction to pay the deposit, then one signed request to [`POST /api/submissions`](reference/api.md#post-apisubmissions).
 
 ## The API
 

@@ -4,44 +4,38 @@ From a Cargo project to an open vault, with a public log at every step.
 
 ```mermaid
 flowchart LR
-    A["pack the<br/>project"] ==> B["create the vault,<br/>fund its tank"]
-    B ==> C["submit the<br/>source"]
-    C ==> D["the queue<br/>admits it"]
+    B["pay the deposit,<br/>upload the source"] ==> D["the queue<br/>admits it"]
     D ==> H{"the Reviewer<br/>reads it"}
     H ==>|reported| E{"build it, load<br/>the component"}
-    H -->|malicious| R["refused: the report is public,<br/>the vault closes,<br/>the tank comes back"]
-    E ==>|built| F["sign source → bundle,<br/>register, open"]
-    E -->|failed| G["the log is public,<br/>the vault closes,<br/>the tank comes back"]
+    H -->|malicious| R["refused: the report is public,<br/>the deposit comes back,<br/>less the $1"]
+    E ==>|built| F["sign source → bundle,<br/>register, create the vault<br/>on every chain it needs"]
+    E -->|failed| G["the log is public,<br/>the deposit comes back,<br/>less the $1"]
 
     classDef you fill:#4338ca18,stroke:#4338ca,color:inherit
     classDef us fill:#0d948818,stroke:#0d9488,color:inherit
     classDef bad fill:#dc262612,stroke:#dc2626,color:inherit,stroke-dasharray:5 4
-    class A,B,C you
+    class B you
     class D,E,F,H us
     class G,R bad
 ```
 
 ## What you submit
 
-A submission is the whole **workspace** your agent belongs to, packed the same way every time so that its hash means something:
+The whole **workspace** your agent belongs to, as it is: upload the folder or an archive of it. There is no packing step and no tool to install. The web app does it, and so does a single signed request to the [API](../reference/api.md#post-apisubmissions).
 
-```bash
-shonin pack path/to/your-agent > agent.tar
-```
+**Your wallet signs the submission**, naming the deposit that pays for it. That signature is the only link between an upload and a deposit, so nobody but you can spend your deposit on a build.
 
-The archive is canonical, with sorted entries and fixed metadata, so the same tree always produces the same bytes and the same hash. That hash is what the vault is created with, so the chain and the build service are talking about one thing.
+**You never compute a hash, and nobody trusts one from outside.** The attested Reviewer and the attested builder each take the files they received and hash them themselves.
 
-You can upload it **sealed**. A sealed project is encrypted to the platform's key; the attested builder and the attested Reviewer still read it, and nobody else does. Sealing changes who can read the source, never whether it was compiled or reviewed.
+You can upload it **sealed**. The browser encrypts the project to the platform's key, which is published on-chain, before it leaves your machine; the attested builder and the attested Reviewer still read it, and nobody else does. Sealing changes who can read the source, never whether it was compiled or reviewed.
 
-## The vault comes first
+## Paying first
 
-Creating the vault and funding its tank happen in one transaction, and the build service will not admit a job until that vault exists. Nothing is ever compiled for free.
+Nothing is compiled for free, so a job is only admitted once its **deposit** is paid: one transaction from the Author's wallet, on the chain of the agent's main venue, which is where its vault will live.
 
-The tank has to hold at least the factory's minimum, the least any vault can be created with, which covers the review's flat fee and the build. Past that it's up to the Author. A week at the declared allowances is a sensible start, since an agent whose tank runs dry stops.
+**Publishing costs a flat $1**, which covers the review and the build. The source size and build time limits below keep what either can cost us bounded, so one flat price holds. The rest of the deposit is whatever the Author wants in the tank to start with, and nothing past the $1 is required. A week at the declared allowances is a sensible start, since an agent whose tank runs dry stops.
 
-The build itself is metered compute and is charged once it has run, so what it comes to is known only afterwards. The publish page shows every one of these figures read from the chain, not from a number written into the app.
-
-**There is no publishing fee.** Creating the vault funds its tank, and the review and the build are its first charges.
+The deposit is held by a publishing contract, not by us. If a job is never finished, the Author can take the whole deposit back after a waiting period.
 
 ## The queue
 
@@ -53,7 +47,7 @@ Each job shows its position while it waits, what it is doing while it builds, an
 
 Before anything is compiled, the attested Reviewer reads the source. Compiling Rust runs the Author's own code, in build scripts and procedural macros, so reading it first means none of that runs on the builder until it has been read.
 
-If the Reviewer finds the code **malicious**, the project is refused and never built. The review fee is charged, because the review ran; the vault closes and the Author reclaims the rest of the tank; and the refusal is recorded on-chain against the source hash, with the full report public. Anything short of malicious is advice, and goes on to the build. [The review](review.md) has what it looks for.
+If the Reviewer finds the code **malicious**, the project is refused and never built. The $1 is spent, because the review ran; the rest of the deposit goes back to the Author; and the refusal is recorded on-chain against the source hash, with the full report public. No vault is ever created for it. Anything short of malicious is advice, and goes on to the build. [The review](review.md) has what it looks for.
 
 ## The build
 
@@ -82,24 +76,24 @@ The build service signs a digest that binds:
 (sourceHash, manifestHash) → bundleHash
 ```
 
-together with the chain, the registry's own address, the agent's id and version, and its Author, so a signature for one registration can never be replayed as another. The strategy registry accepts a bundle **only** with that signature, from a key blessed for an allowlisted builder image.
+together with the chain, the registry's own address, the agent's id, and its Author, so a signature for one registration can never be replayed as another. The strategy registry accepts a bundle **only** with that signature, from a key blessed for an allowlisted builder image.
+
+The same attested key then **creates the vault**, in the same step as registering the bundle. The attested machines have read the manifest themselves, so they know which venues the agent trades and so which chains it needs: the vault lives on the chain of its main venue, with its shares and its tank, and it gets its own accounts on every other chain it trades. The deposit, less the $1, becomes its tank.
+
+Every one of those steps is a transaction the attested machine sends, and transactions cost gas: registering the bundle, creating the vault, and setting up its accounts on each other chain. That gas comes out of the deposit, like any gas the agent's own transactions cost later, so an agent that trades on several chains starts with a slightly smaller tank.
 
 A vault's executors are then blessed for that exact `bundleHash`, so the chain from published source to running code is unbroken.
 
 ## Admission and charges
 
-- A job is admitted once its vault exists and its tank covers the minimum.
-- **Every submission has limits, generous but not unlimited:** a maximum size for the source, and a maximum time to build it. They're published with the other parameters. A project over the size limit is refused before the review runs, so it costs nothing; a build that runs past the time limit fails, and is charged like any failed build.
-- **A refused project is charged the review fee, because the review ran.** The vault closes and the Author reclaims the rest of the tank.
-- **A failed build is charged, because it ran.** The vault closes and the Author reclaims the rest of the tank. A fixed resubmission is a new vault.
+- A job is admitted once its deposit is paid and the submission carries its Author's signature.
+- **Every submission has limits, generous but not unlimited:** a maximum size for the source, and a maximum time to build it. They're published with the other parameters. A project over the size limit is refused before the review runs, so it costs nothing; a build that runs past the time limit fails like any failed build.
+- **A refused project or a failed build spends the $1, because it ran.** The rest of the deposit goes back, less the gas to send it, and no vault is created. To try again, you submit a new agent.
 - A build service that crashes requeues the job at no charge.
-- A project whose manifest names a different agent or version than the vault it is building for is refused before it compiles, rather than after it has cost anything.
 
 ## Opening
 
-Once the registry holds the bundle, **anyone** can open the vault. It is a public function, not a favour. From that moment it takes deposits, labelled **new** until it has the record it needs to be ranked.
-
-A vault opens before any audit, with the audit status of every contract and image it runs on shown on its page. Waiting for an audit to open would mean no record, and the record is what a Depositor is actually choosing between.
+The vault opens as soon as it's created. From that moment it takes deposits, labelled **new** until it has some history.
 
 ## What you get
 

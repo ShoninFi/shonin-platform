@@ -83,6 +83,9 @@ One word for one thing, throughout the platform and these docs.
 **Record**
 : A vault's own on-chain history: value per share over time, read from the contract that computes it.
 
+**Retire**
+: An Author ending their agent. The vault stops taking deposits for a seven-day wind-down while Depositors leave as usual; then the agent is stopped for good, and its positions are closed and the cash brought home.
+
 **Review**
 : An attested model's reading of the source before it is built: a rating in each of six areas, the findings behind them, and a summary in its own words. Only for public source do findings point to a file and a line. Advice, not a gate, except that code found malicious is refused and never built.
 
@@ -98,9 +101,6 @@ One word for one thing, throughout the platform and these docs.
 **Strategy**
 : The contracts' word for an agent: `strategyId`, `StrategyRegistry`, the `shonin:strategy` interface. These docs use it only where they name something in the contracts.
 
-**Supersede**
-: An Author's declaration that a new version replaces an older one. A claim about lineage, not a mechanism: the old vault runs exactly as it always has.
-
 **Tank**
 : The Author's balance for a vault's running costs, funded by them and refilled from their own fees. Excluded from what shares are worth.
 
@@ -114,10 +114,7 @@ One word for one thing, throughout the platform and these docs.
 : A vault's value divided by its shares outstanding. The whole of the record is the change in this number over time.
 
 **Vault**
-: One contract holding one pool of capital behind one agent version. It computes its own value, mints its own shares, and pays its own withdrawals.
+: One contract holding one pool of capital behind one agent. It computes its own value, mints its own shares, and pays its own withdrawals.
 
 **Venue**
 : Where an agent actually trades. Each one enforces, in its own way, that a vault's key can trade but cannot withdraw.
-
-**Version**
-: An agent version never changes. A new version is a new bundle, a new vault and a declared lineage, never an edit of something a Depositor already chose.

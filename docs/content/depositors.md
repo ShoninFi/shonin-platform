@@ -58,47 +58,49 @@ As a Depositor, you put money into an agent's vault and get shares back. Your sh
 
 ## Choosing an agent
 
-Which agent to back is up to you, and nobody can predict the future. But every agent's page shows you the things that make it an informed choice:
+Which agent to back is up to you. Every agent's page gives you what you need to make an informed choice.
 
-**The review.** The [AI Review](basics/ai-review.md)'s report card: how the agent rates in six areas, from security to financial risk, and a summary of what its code does.
+### The agent
 
-**Historical performance.** How the vault's value has moved, read from its own contract. It's shown two ways: as it happened, and adjusted to a common level of risk, so an agent that simply took bigger risks doesn't look better than it is. The page also shows how much money was behind the record, now, on average and at its largest, because a strategy that works with a small pot often doesn't with a big one.
+- **The review.** The [AI Review](basics/ai-review.md) report card: six areas rated, and a summary of what the code does.
+- **Source code (if shared).** You can read it, and check it's the code actually trading.
 
-**How old it is.** A young agent is marked **new** and kept out of the rankings until its record is long enough to mean something. It's open for deposits like any other, but there's less history to go on.
+### Its history
 
-**Its source, if it's public.** You can read exactly what the agent does, and check that it's the code actually trading. [Verification](verify.md) shows how.
+- **Share price over time.** How the price of one share has moved since the vault opened, with its high-water mark, read straight from the vault's contract. Look at it by the day, the week or the month. A young agent is marked **new**, because there's less history to go on.
+- **The money in its vault over time.** How much was in the vault along the way. It's a different thing from the share price: money coming and going changes it, but only the agent's trading moves the price. A strategy that works with a small pot often doesn't with a big one.
 
-**Where it trades.** The venues it trades on, the bridges it uses to move money between chains, and how each venue keeps your money safe.
+### Its vault
 
-**Its fees and high-water mark.** The fees are fixed when the vault is created, and [Fees](fees.md) explains them. The page shows the vault's high-water mark next to today's share value: if you join while it's below the mark, its recovery up to the mark is fee-free for you.
-
-**Its tank.** How full it is, and what it's been charged lately. An agent whose tank runs dry stops trading, so a healthy tank is a good sign that its Author is looking after it.
-
-**How you'd get out.** Whether the contract can always finish a withdrawal by itself, or, on a few vaults, sometimes needs an operator. More on that below.
-
-**Audits.** Whether each contract and machine image the vault runs on has been audited.
+- **Where it trades.** The venues and bridges it uses, and how each venue keeps your money safe.
+- **Its tank.** How full it is. An agent whose tank runs dry stops trading.
+- **How you'd get out.** Whether the contract can always finish a withdrawal by itself, or if it relies on additional operations.
 
 ## Getting out
 
-Most of the time you're paid straight away, from cash the vault keeps on hand for exactly that. Your shares are valued at the prices the vault could actually sell at, not the middle of the market, and a 0.1% fee stays behind in the vault. That way, you cover the cost of your own exit, and the people who stay don't pay for it.
+You can ask for your money back at any time, and nobody can say no. It goes one of two ways:
 
-If there isn't enough, your withdrawal is booked instead. The contract closes your share of the vault's positions, at close to the market price, and pays you once the cash is back. Anyone can push that through, including you, so it doesn't depend on us. If a booked withdrawal sits unpaid for seven days, anyone can freeze the vault: no new deposits, and it can only wind down.
+**Paid straight away.** The vault keeps some cash at home, in the contract itself. If there's enough to cover your withdrawal, you're paid in the same transaction.
 
-A few vaults trade somewhere the contract can't reach by itself. Those need an operator to finish a booked withdrawal, and their page says so.
+**Booked.** If there isn't enough cash at home, your withdrawal is booked. The contract closes your share of each of the vault's positions, and pays you once that cash is back. Anyone can push this through, including you, so it doesn't depend on us.
+
+A few vaults trade somewhere the contract can't reach by itself, and rely on an operator to finish a booked withdrawal. Their page says so.
+
+**What it costs.** Your shares are valued at the prices the vault could actually sell at, not the middle of the market, and there's the 0.1% [withdrawal fee](fees.md#the-deposit-and-withdrawal-fee), which stays in the vault for the people still in it.
 
 ## What can still go wrong
 
-**The agent can lose money.** Nothing here stops that, and it could even lose it on purpose, as [Trade-only keys](basics/trade-only-keys.md) explains. A review isn't a prediction and a track record isn't a promise.
+**The agent can lose money.** Nothing here stops that, and it could even lose it on purpose, as [Trade-only keys](basics/trade-only-keys.md) explains. A review isn't a prediction, and a track record isn't a promise.
 
-**The agent can stop.** If its tank runs dry, the agent stops until someone tops it up. Its open positions stay where they are, with nothing managing them, and the vault's page says so. You can still leave whenever you like.
+**The agent can stop.** If its tank runs dry, it stops until someone tops it up, and its open positions sit there with nothing managing them. You can still leave whenever you like.
 
-**The market can be rough when you leave.** A booked withdrawal closes positions within a set distance of the market price. In a fast market that may not fill straight away, and your withdrawal waits.
+**A withdrawal can be delayed.** If a booked withdrawal still isn't paid after seven days, anyone can freeze the vault. It stops taking deposits, so nobody new joins a vault that can't pay out, and from then on it can only wind down.
 
-**The vault can be stopped.** We can stop a vault, for example if it keeps failing. That closes every position and brings the cash home, so everyone can withdraw straight away, and the vault's page says why.
+**The agent can be retired.** Its Author can retire it at any time. The vault then stops taking deposits and gives everyone a week to leave as usual, after which the agent stops for good and its positions are closed at market, which can lock in a loss.
 
-**Our code can have bugs.** The contracts and the machine images are ours. Every vault's page shows whether each one has been audited, and "unaudited" doesn't mean "fine".
+**The vault can be stopped.** We can stop a vault that keeps failing. That closes every position at market, which can lock in a loss, and brings the cash home so everyone can withdraw.
 
-**A venue can fail.** Your money is only as safe as the venue holding it, so every vault's page shows how each of its venues keeps it safe.
+**A venue can fail.** Your money is only as safe as the venues holding it.
 
 What can't happen is someone withdrawing your money or sending it somewhere else. There's no way to do it.
 

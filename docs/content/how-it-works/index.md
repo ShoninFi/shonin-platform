@@ -52,7 +52,7 @@ An ordinary Rust project: their code, their dependencies, a pinned toolchain, an
 
 They submit the project, not a binary. Compiling it ourselves is the only way a reader can tie running code to source they can read.
 
-Creating the vault and funding its tank happen in the same transaction, because the build service will not admit a job until its vault exists. Nothing is compiled for free.
+They pay a deposit first, because nothing is compiled for free: the $1 for the review and the build, plus whatever they want in the tank. The vault itself is only created once the agent is built.
 
 → [Agents](agents.md) · [Publishing](publishing.md)
 
@@ -68,17 +68,17 @@ It reads the source before anything is compiled, because compiling Rust runs the
 
 The queue is public, first come first served, one job in flight per Author, with the full log either way. A failed build's log is as public as a successful one's, which matters more than it sounds: an Author cannot quietly try twenty times and show you the twentieth.
 
-The builder then signs a digest binding the source it read to the bundle it made, together with the chain, the registry's address, the agent's id and version, and its Author. The registry accepts a bundle only with that signature, from a key blessed for an allowlisted builder image.
+The builder then signs a digest binding the source it read to the bundle it made, together with the chain, the registry's address, the agent's id, and its Author. The registry accepts a bundle only with that signature, from a key blessed for an allowlisted builder image.
 
 → [Publishing](publishing.md)
 
 ## 4. A vault opens
 
-One vault per agent version, with ERC-4626 accounting. A deposit is valued at mark in the same transaction; a withdrawal at exit-side marks, so the person leaving pays the spread rather than the pool.
+One vault per agent, with ERC-4626 accounting. A deposit is valued at mark in the same transaction; a withdrawal at exit-side marks, so the person leaving pays the spread rather than the pool.
 
 If the vault's idle balance covers a withdrawal, the shares burn and the Depositor is paid then and there. If not, a claim is booked, and the function that settles it is one anybody can call.
 
-An agent version never changes. A new version is a new bundle, a new vault and a declared lineage, never an edit of something a Depositor already chose.
+An agent never changes. A change is a new agent, with a new bundle and a new vault, never an edit of something a Depositor already chose.
 
 → [Vaults](vaults.md)
 

@@ -21,8 +21,8 @@ The examples use `cast` from [Foundry](https://getfoundry.sh). Any client that c
 # the one vault it may act for, and when its blessing expires
 cast call $REGISTRY "keyInfo(address)" $KEY --rpc-url $RPC
 
-# the bundle a vault's agent version must be
-cast call $STRATEGIES "bundleHashOf(bytes32,uint32)(bytes32)" $STRATEGY_ID $VERSION --rpc-url $RPC
+# the bundle a vault's agent must be
+cast call $STRATEGIES "bundleHashOf(bytes32)(bytes32)" $STRATEGY_ID --rpc-url $RPC
 
 # an image on the allowlist, and when it became usable
 cast call $REGISTRY "imageOf(bytes32)" $IMAGE_DIGEST --rpc-url $RPC
@@ -36,7 +36,6 @@ Every vault page carries a panel like this one, and every line of it is on-chain
 
 ```text
 Which code is trading this vault?                     Vault 0x7a3…
-Audit status        vault contracts: … · executor image: … · zk guest: …
 
 Agent               funding-basis · v3
   bundleHash        0x51af…        source: published ✓ rebuilds to 0x51af…
@@ -51,7 +50,7 @@ To check it: read the blessing transactions it links; confirm each key's record 
 
 ## Rebuilding a bundle
 
-The builder image and the recipe are published. Take the source archive from the store, run the same image against it, and compare the bundle hash with what the registry holds:
+The builder image and the recipe are published. Take a published agent's source from the store, run the same image against it, and compare the bundle hash with what the registry holds:
 
 ```bash
 # the source the registry says this bundle came from

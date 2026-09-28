@@ -81,7 +81,6 @@ Every project carries a `shonin.toml`: what the agent is, what it will not do, t
 ```toml
 [strategy]
 id = "funding-basis"
-version = 1
 name = "Funding basis"
 summary = "Holds the spot asset, shorts the perpetual against it, and collects the funding between them."
 limits = ["Gross leverage never exceeds 2×", "..."]
@@ -100,12 +99,11 @@ inference_ms_per_min = 0
 
 The manifest is hashed with the bundle, so what it declared is fixed for the vault's life and shown on the vault's page. The one exception is the **allowances**: what the host holds the agent to and what the vault's tank is charged for, at the platform's published prices. The manifest sets where they start, and the Author can change them on the live vault at any time, since they cap only the Author's own tank. The vault's page shows every change.
 
-## Versions
+## Changing an agent
 
-An agent version never changes. A new version is a new bundle, a new vault and a declared lineage:
+An agent never changes. A change is a new agent, with a new id, a new bundle and a new vault, and nothing links the two:
 
 - Depositors in the old vault are not moved, not asked and not affected. It runs exactly as it always has.
-- The old vault's page shows that a newer version exists, and links to it.
 - Moving is a withdrawal there and a deposit here, which you do when you want to.
 - The new vault's high-water mark starts fresh.
 

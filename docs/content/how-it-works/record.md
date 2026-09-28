@@ -30,7 +30,7 @@ The platform's job is to make the history impossible to fake. Reading it is stil
 
 ## Author history
 
-An Author's page shows **everything they have published**: live, new, superseded, retired, the builds that failed, and the projects the review refused. Nothing there can be hidden by its Author.
+An Author's page shows **everything they have published**: live, new, retired, the builds that failed, and the projects the review refused. Nothing there can be hidden by its Author.
 
 An Author can publish under a fresh identity, of course. What they cannot do is carry a record with them: every agent has to build its own record before it is ranked, whoever wrote it.
 

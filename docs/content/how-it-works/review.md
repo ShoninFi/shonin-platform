@@ -44,14 +44,14 @@ Changing any of them is an image change, which goes through the same public, tim
 
 ## What is recorded
 
-Each agent version is reviewed **once**, before it is built, and that review stays with it for the life of its vault. A later Reviewer image does not re-review agents that are already running.
+Each agent is reviewed **once**, before it is built, and that review stays with it for the life of its vault. A later Reviewer image does not re-review agents that are already running.
 
-A **refusal** is recorded in the transaction that closes the vault: the source hash, the Reviewer's image and the hash of its report, which is public. There is no bundle, because nothing was built.
+A **refusal** is recorded in the transaction that returns the deposit: the source hash, the Reviewer's image and the hash of its report, which is public. There is no bundle, because nothing was built.
 
-A review that goes on to the build is submitted to the review registry with the Reviewer's blessed key once the bundle is registered. The registry checks that the sender is blessed as a Reviewer on an allowed image, and that the bundle and source hashes match the version registered:
+A review that goes on to the build is submitted to the review registry with the Reviewer's blessed key once the bundle is registered. The registry checks that the sender is blessed as a Reviewer on an allowed image, and that the bundle and source hashes match the agent registered:
 
 ```solidity
-submitReview(strategyId, version, Review(
+submitReview(strategyId, Review(
     bytes32  bundleHash,       // the bundle reviewed
     bytes32  sourceHash,       // the source the reviewer read
     bytes32  reviewerImage,    // the image it ran in
@@ -77,7 +77,3 @@ An agent's comments, identifiers and strings are text the Author controls and a 
 ## Sealed source
 
 Sealed source is reviewed exactly like published source. The Reviewer reads it on its attested machine; the store refuses to serve it to anyone else, and the published report gives the ratings, a summary and findings by area, but never points into the code. What a Depositor relies on is the attested build plus the attested review. Published source is extra, and it is what makes an independent rebuild possible.
-
-## A new version
-
-Where an Author declares that a version supersedes another, the review of the new version stands on its own: a new bundle from new source gets a new reading, and the old review stays attached to the old vault, which is still running the code it was read against.
