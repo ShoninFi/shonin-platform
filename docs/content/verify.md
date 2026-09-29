@@ -70,7 +70,7 @@ The [Welcome](index.md) page asked five questions anyone should ask before trust
 Three places to look, all on the agent's page:
 
 - **The review.** Especially its ratings for financial risk, and for whether the code keeps the limits its Author describes. The report is tied on the chain to the exact code that's running.
-- **Where it trades.** The venues it trades on and the bridges it uses, and how each venue keeps money safe.
+- **Where it trades.** The exchanges it trades on and the bridges it uses, and how each exchange keeps money safe.
 - **Its history.** Its share price over time, its deepest drop, and how much money was in the vault along the way, all read straight from its contract.
 
 The facts are on the chain. The review is one careful reading of the code, and a careful reading can still miss things.
@@ -87,7 +87,7 @@ Every vault's page lists its keys, and each key's record on the chain shows whic
 
 ## Could anyone walk off with my money?
 
-No. The keys that trade for a vault are [trade-only](basics/trade-only-keys.md): the venue lets them place and cancel orders and nothing else. Money only moves through the vault's [smart contracts](basics/smart-contracts.md), and only between accounts the vault owns. That's enforced by the venue and the contracts, not by our code, so it holds even if our code were wrong.
+No. The keys that trade for a vault are [trade-only](basics/trade-only-keys.md): the exchange lets them place and cancel orders and nothing else. Money only moves through the vault's [smart contracts](basics/smart-contracts.md), and only between accounts the vault owns. That's enforced by the exchange and the contracts, not by our code, so it holds even if our code were wrong.
 
 The admin key can kill a vault, but a kill only closes positions and brings the cash home, where every Depositor can withdraw it.
 
@@ -110,7 +110,5 @@ A few vaults trade somewhere the contract can't reach by itself. There, an **unw
 **That the hardware is honest.** Attestations are signed by Google, and rest on security built into Intel and AMD chips. If either were broken, attestations could be faked, and nothing on the chain would show it.
 
 **What happens next.** A history is history. It shows how an agent did, at its size, in the markets it saw, not how it will do.
-
-d, at its size, in the markets it saw, not how it will do.
 
 [Next: writing an agent →](writing/getting-started.md){ .md-button .md-button--primary }

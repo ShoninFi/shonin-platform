@@ -3,11 +3,11 @@
 An agent is configured in two places:
 
 - **On its vault:** the things you can change while it runs.
-- **In `shonin.toml`:** the agent's description, claims, venues and bridges, which are decisions locked in forever.
+- **In `shonin.toml`:** the chain its vault lives on, and the agent's description, claims, drivers and bridges, which are decisions locked in forever.
 
 ## Vault Configuration
 
-Two settings live on the vault itself. You choose them when you pay the publishing deposit, and you can change them on the live vault whenever you like. The vault's page shows every change.
+Two settings live on the vault itself. You choose them when you [activate](publishing.md#activate-it) your agent, and you can change them on the live vault whenever you like. The vault's page shows every change.
 
 - **Allowances:** how much computing and gas your agent may use, which is also the most your [tank](../tank.md) can be charged for it. They cover computing, memory, requests to other services, data, live connections, time spent running AI models, and gas in dollars a day.
 - **The idle floor:** how much of the vault stays at home as cash, ready for withdrawals. Raising it is instant; lowering it takes a day, so Depositors see it coming.
@@ -16,11 +16,14 @@ Two settings live on the vault itself. You choose them when you pay the publishi
 
 Every agent carries one configuration file, `shonin.toml`, at the root of its project.
 
-- **It's read by the attested machines, not taken on trust.** The Reviewer reads it beside your code, and the builder reads it to learn which venues, and so which chains, your vault needs.
+- **It's read by the attested machines, not taken on trust.** The Reviewer reads it beside your code, and the builder reads it to learn which chain your vault lives on, and which other chains its drivers need.
 - **It never changes.** It's part of what gets built and recorded, so nobody can change what an agent promised after Depositors chose it. Changing it means publishing a new agent.
-- **It's always shown on the agent's page**, even when the source is sealed. Depositors see the same description, claims, venues and bridges the Reviewer read, whether or not they can read the code.
+- **It's always shown on the agent's page**, even when the source is sealed. Depositors see the same vault chain, description, claims, drivers and bridges the Reviewer read, whether or not they can read the code.
 
 ```toml
+[vault]
+chain = "hyperliquid"
+
 [description]
 title = "My agent"
 text = "What it does, in your own words."
@@ -28,17 +31,21 @@ claims = [
     "Something it promises about itself",
 ]
 
-# one table for each venue it trades on
-[venues.hyperliquid]
-[venues.robinhood-stocks]
+# one table for each driver it trades through
+[drivers.hyperliquid]
+[drivers.robinhood-stocks]
 
 # and one for each bridge it uses
 [bridges.across]
 ```
 
-This agent trades on two venues, on two different chains, and uses one bridge to move money between them.
+This agent's vault lives on Hyperliquid, where it trades. It also trades stock tokens on Robinhood Chain, and uses one bridge to move money between the two.
 
-You don't give your agent an id: it gets one automatically when you pay the publishing deposit. Its `title` is the name people see.
+You don't give your agent an id: it gets one automatically when you submit it. Its `title` is the name people see.
+
+### `[vault]`
+
+**`chain`**: the chain your vault lives on, from the list of [vault chains](vault-and-drivers.md#vault-chains). It's where Depositors put money in and take it out, and where you pay the $1 to publish. It needn't be where your agent trades: its drivers can trade on other chains, reached through its bridges.
 
 ### `[description]`
 
@@ -47,13 +54,13 @@ You don't give your agent an id: it gets one automatically when you pay the publ
 
 The [AI Review](../basics/ai-review.md) reads your description and your claims, and checks them against what the code actually does. A claim your code doesn't keep counts against your agent's rating for an accurate description.
 
-### `[venues.<name>]`
+### `[drivers.<name>]`
 
-One table for each venue the agent trades on, named from the list of [supported venues](../reference/venues.md), holding whatever settings that venue needs. An agent can only ever trade the venues it lists here.
+One table for each [driver](vault-and-drivers.md#drivers) the agent trades through, holding whatever settings that driver needs. An agent can only ever trade through the drivers it lists here.
 
 ### `[bridges.<name>]`
 
-One table for each bridge the agent uses to move money between chains. They're shown on the vault's page before anyone deposits. An agent that only trades on one chain has none.
+One table for each bridge the agent uses to move money between chains. They're shown on the vault's page before anyone deposits. An agent that only trades on its vault's chain has none.
 
 ## Your agent's own settings
 

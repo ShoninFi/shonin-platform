@@ -5,9 +5,9 @@ Everything between here and a platform running on a public chain, grouped by are
 Nothing is deployed to a public chain yet. There is no live vault and no money in anything. The web app is at [shonin.fi](https://shonin.fi/), behind a login while the project is pre-release, and what it shows is a local development chain.
 
 !!! info "What a tick means"
-    **`local`**: built and working on the local development chain, against its stand-in venue and development attestation verifier. It is not a tick: the mechanism is proved, the environment is not.
+    **`local`**: built and working on the local development chain, against its stand-in exchange and development attestation verifier. It is not a tick: the mechanism is proved, the environment is not.
 
-    **`[x]`**: done for real, on the chain and the venue it names.
+    **`[x]`**: done for real, on the chain and the exchange it names.
 
     A card with neither is not started.
 
@@ -17,12 +17,12 @@ Nothing is deployed to a public chain yet. There is no live vault and no money i
 
 The guarantees are the product. Everything else is how they are shown.
 
-- [ ] `local` **Funds can only move between a vault's own accounts**, enforced by the venue and by the vault contract, with no route out for any key
+- [ ] `local` **Funds can only move between a vault's own accounts**, enforced by the exchange and by the vault contract, with no route out for any key
 - [ ] `local` **Anyone can exit without us** from a vault whose exit class is direct: `redeem` pays from idle balance, or books a claim that `settle`, a public function, completes
 - [ ] `local` **Only the committed bundle can use a vault's keys**, checked against the registry on every approval
 - [ ] `local` **The record is computed by the vault contract** from on-chain state, never reported
 - [ ] `local` **Every image that may hold a key is on a public, timelocked allowlist**, reproducible from published source
-- [ ] **A trade-only key cannot trade value away on purpose**: a bound on the price of every order a vault's key places, not only a claim's, so buying from a friendly account above the market or selling to it below is refused. Where a venue gives a contract no way to see or limit orders, the vault's page says the exposure is unbounded
+- [ ] **A trade-only key cannot trade value away on purpose**: a bound on the price of every order a vault's key places, not only a claim's, so buying from a friendly account above the market or selling to it below is refused. Where an exchange gives a contract no way to see or limit orders, the vault's page says the exposure is unbounded
 - [ ] **Extensive property tests that the vault can never go insolvent or into bad debt**: long random sequences of deposits, withdrawals, claims, price moves, fee payments, bills, auto-fill and tank withdrawals, checked after every step. The vault always holds enough to pay every share at its value, the tank never pays out more than it holds or ends up owing anything, fees are never more than what's owed, money only moves between the vault's own accounts, the agent can never send money out below the floor, and every rounding favours the vault
 - [ ] **Property tests of a run on the vault**: everyone cashes out at once, Depositors, the Author and Shonin with their fee shares, in random orders, at random prices, with the cash at home running out partway. Every holder is paid their fraction and no more, the Author and Shonin get no priority, a claim is served by closing only the leaver's own fraction, whoever leaves last is treated the same way as whoever leaves first, the tank is never touched, and the vault ends with nothing owed to anyone
 - [ ] Each guarantee demonstrated publicly, end to end, on a real chain
@@ -39,29 +39,29 @@ The guarantees are the product. Everything else is how they are shown.
 - [ ] `local` **Attestation registry**: the timelocked allowlist by image kind, key blessing from a proof, a Merkle proof per vault
 - [ ] `local` **Strategy registry**: registration only with a valid builder signature, retirement
 - [ ] `local` **Review registry**: signed reviews from blessed Reviewers
-- [ ] `local` **Permissionless venue approvals** that obey only the registry
+- [ ] `local` **Permissionless exchange approvals** that obey only the registry
 - [ ] **Gas on the bill**: Shonin keeps executor keys stocked, and each transaction's actual gas goes on the same running tab as resources, which the attested machine never lets pass what's in the tank
 
 ## Execution
 
 - [ ] `local` **The runtime**: one long-lived instance per vault, fuel and epoch yields, a memory cap, restart after a fault, an ephemeral per-agent cache
-- [ ] `local` **Signed health reports**: restarts, faults, refused submissions, venue errors and tank runway, refused from any key not blessed for that vault
+- [ ] `local` **Signed health reports**: restarts, faults, refused submissions, exchange errors and tank runway, refused from any key not blessed for that vault
 - [ ] **Signed running usage total**: metered at every yield point, stopping the agent when the unpaid part reaches the tank, collected by Shonin and capped by the allowances the Author declared at the published prices
-- [ ] `local` **Blessing and renewal**, with the venue's approval following the blessing
+- [ ] `local` **Blessing and renewal**, with the exchange's approval following the blessing
 - [ ] **A real enclave**: keys generated inside it, a genuine attestation token, and the on-chain proof of that token
 - [ ] **The root key**: generated in the enclave, released only by attested key exchange to an allowlisted image, with derived per-bundle and per-vault keys
 - [ ] **Image rotation by failover**: a standby on the new image blessed and taking over, the previous known-good image kept allowlisted, propose before revoke
 - [ ] **Network for agents**: host-terminated TLS and websockets under per-agent quotas, with the declared bandwidth allowances actually metered
 - [ ] **Model inference**: the runtime, a time budget and a watchdog, and models loaded from the bundle
-- [ ] **Many vaults per machine**: placement by allowance, standbys, and failover that restarts an agent which rebuilds from venue state
-- [ ] **A published unwinder image** with the venue adapters' unwind paths only, runnable by another operator
+- [ ] **Many vaults per machine**: placement by allowance, standbys, and failover that restarts an agent which rebuilds from exchange state
+- [ ] **A published unwinder image** with the drivers' unwind paths only, runnable by another operator
 
 ## Build and review
 
-- [ ] **Review before build.** The Reviewer reads the source before anything is compiled, so a project's build scripts and proc macros never run until it has been read. A finding that the code is malicious refuses the build: the $1 publishing fee is spent, the rest of the deposit comes back and no vault is created, and the refusal is recorded against the source hash in that transaction, with the report public. Everything else stays advice, not a gate, and is recorded once the bundle is registered. The Author's page lists refusals beside failed builds
+- [ ] **Review before build.** The Reviewer reads the source before anything is compiled, so a project's build scripts and proc macros never run until it has been read. A finding that the code is malicious refuses the build: the $1 publishing fee is spent, nothing is built, and the refusal is recorded against the source hash, with the report public. Everything else stays advice, not a gate, and is recorded once the bundle is registered. The Author's page lists refusals beside failed builds
 - [ ] **Sealed source stays sealed in the report.** For sealed source, the published report gives the ratings, the summary and findings by area and severity, with no file names, line numbers or quotes, and the hash recorded on-chain is of the report as published
-- [ ] `local` **The queue**: first come first served, one job per Author, the full log whether it succeeded or failed, and a position that is counted when it is asked for
-- [ ] **Paying first, the vault last**: a publishing deposit held by a contract admits a job; the attested builder registers the bundle and creates the vault, on its home chain with its own accounts on every other chain it trades, and the deposit less the $1 becomes its tank; a refusal or a failed build returns the deposit less the $1 and creates nothing; an unfinished job's deposit can be taken back after a waiting period
+- [ ] `local` **The queue**: first come first served, one job per Author, showing only how each job ended, never its log, and a position that is counted when it is asked for
+- [ ] **Submit, then activate**: one $1 transaction on the vault's chain, from the wallet that uploaded the archive, admits a job and assigns the agent's id; the attested builder registers the bundle with the chains `shonin.toml` needs; the Author activates a ready agent whenever they like, in one transaction that opens the vault from that record, sets its allowances and idle floor, and adds a starting tank, at least the factory's minimum, with Shonin setting up the accounts on other chains and paying their gas from the tank; a refusal or a failed build creates nothing
 - [ ] **A flat $1 to publish**, covering the review and the build, in place of a metered build and a separate review fee
 - [ ] `local` **The signature** binding source, manifest and bundle to the chain, the registry, the agent and its Author
 - [ ] `local` **The review**: a pinned model, prompt and schema, signed and recorded once per agent, before the build
@@ -71,46 +71,45 @@ The guarantees are the product. Everything else is how they are shown.
 - [ ] **A hermetic build**: a published, pinned builder image with an offline dependency snapshot, remapped paths and a fixed timestamp, so an outsider's rebuild matches ours byte for byte. Until this is done, a rebuild can differ for reasons that have nothing to do with the source, and a public build log can carry the builder's own filesystem paths
 - [ ] **Reproducibility shown rather than asserted**: rebuild published bundles off the critical path, deliberately varying the machine, the path and the date, and show the result on the agent page
 - [ ] **Rebuild attestations from outsiders**, so corroboration accrues publicly instead of resting on our word
-- [ ] **Submission as an upload of a folder or an archive**, signed by the wallet that paid its deposit, with every hash computed inside the attested machines
+- [ ] **Submission as an upload of one zip made with `git archive`**, unpacked defensively (zip bombs, path traversal, links, the size limit), started only by a payment from the wallet that uploaded it, with every hash computed inside the attested machines
 - [ ] **Models in a bundle**: shipped, hashed, loaded at build time and reviewed alongside the code
 - [ ] **A pre-review** an Author can run before publishing, through the same prompt and schema
 - [ ] **Build reproducibility in practice**: once the recipe is hermetic, do real projects, with their proc macros and build scripts, rebuild to the same bytes on a different machine?
 
-## Venues and custody
+## Drivers and custody
 
-- [ ] `local` **A venue adapter**, with the shared payload types and decimal arithmetic every agent uses
-- [ ] **A perpetuals venue where a vault contract can be the master of its own account**, add a trade-only agent, read account value on-chain, and close reduce-only for a claim
-- [ ] **An equities venue**, with holdings valued from a price feed under a stale-feed rule
-- [ ] **A second chain**, with a remote-leg contract that owns the vault's accounts there, values them from chain state, and posts home on demand
+- [ ] `local` **A driver**, with the shared payload types and decimal arithmetic every agent uses
+- [ ] **A perpetuals driver, on an exchange where a vault contract can be the master of its own account**, add a trade-only agent, read account value on-chain, and close reduce-only for a claim
+- [ ] **An equities driver**, with holdings valued from a price feed under a stale-feed rule
+- [ ] **Stations**: the vault's contract on each chain the agent trades on, the vault's own included, which owns the vault's accounts on that chain and values them from chain state; the vault reads a station beside it directly, and one on another chain posts home on demand
 - [ ] **A transfer route between chains**, with per-route caps and timeouts
-- [ ] **A share price that counts every chain**: the home vault contract values its accounts on other chains from what their remote legs post, never from a reported number, with a limit on how old a posted value may be before deposits, withdrawals and fees wait for a fresh one
-- [ ] **Attested reads** for venues whose state is not on a chain
-- [ ] For each venue: its custody level, shown on every vault page that uses it
+- [ ] **A share price that counts every chain**: the home vault contract values its accounts on other chains from what their stations post, never from a reported number, with a limit on how old a posted value may be before deposits, withdrawals and fees wait for a fresh one
+- [ ] **Attested reads** for exchanges whose state is not on a chain
+- [ ] For each exchange: its custody level, shown on every vault page that uses it
 
-## The record and the API
+## The record
 
 - [ ] `local` **The indexer**: returns and the deepest drop from each vault's value per share, and the money in each vault over time, open source so anyone can run their own
-- [ ] `local` **The public HTTP API** behind every page
+- [ ] `local` **The server behind the web app**, private to it and free to change
 - [ ] **Oracle monitors** that flag a stale or anomalous price behind a vault's valuation in its health report
-- [ ] **A documented, versioned API** with stability guarantees
 
 ## The web app
 
 - [ ] `local` **Leaderboard and agent pages**: on-chain records, reviews, the Author's whole history
 - [ ] **A plain leaderboard**: a sortable table of 30-day return, return since opening, deepest drop and money in the vault, with agents under 30 live days listed separately as new; agent pages chart share price and money in the vault over time
-- [ ] `local` **Source, build log and toolchain** for every agent
+- [ ] `local` **Source and toolchain** for every agent
 - [ ] `local` **The build queue**, with a public log for every job
 - [ ] `local` **Deposits, withdrawals and claims**, with a pending claim's state shown
 - [ ] `local` **Health reports** on every vault page, with warnings and errors surfaced
 - [ ] `local` **"Which code is trading this vault?"**
-- [ ] `local` **Publishing from the browser**: pay the deposit, submit, follow the queue
+- [ ] `local` **Publishing from the browser**: submit and pay the $1, follow the queue, activate
 - [ ] **Sealing a secret in the browser** to the key the registry publishes
 - [ ] **A real wallet flow** against a public chain, with network switching and clear failure states
 - [ ] **Accessibility and mobile** passes on every page
 
 ## Authoring
 
-- [ ] `local` **The SDK**: the frozen world, typed helpers for each interface, decimals, and a venue's payload types
+- [ ] `local` **The SDK**: the frozen world, typed helpers for each interface, decimals, and each driver's payload types
 - [ ] `local` **A working reference agent**, with its limits in its own code
 - [ ] **Template repositories** for a few recognisable agent shapes
 - [ ] **Helper crates** for the plumbing an agent should not rewrite: hedging two legs, working an order over time, quoting from fair value, rebalancing margin
@@ -120,9 +119,9 @@ The guarantees are the product. Everything else is how they are shown.
 ## Operations
 
 - [ ] `local` **The keeper**: daily crystallisation, settling claims, freezing when due
-- [ ] `local` **A public status feed**: every kill, every allowlist change, every venue that stopped behaving
+- [ ] `local` **A public status feed**: every kill, every allowlist change, every exchange that stopped behaving
 - [ ] **Monitoring and alerting** for the services, separate from the on-chain guarantees
-- [ ] **A runbook** for a revoked image, a failing venue and a stuck claim
+- [ ] **A runbook** for a revoked image, a failing exchange and a stuck claim
 - [ ] **Key management** for the admin key, and a path to a multisig
 
 ## The site
