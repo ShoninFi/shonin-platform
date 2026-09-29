@@ -117,9 +117,9 @@ An ordinary Rust project. Your agent is one program that runs for as long as its
 
 Publishing costs a flat **$1**, which covers both the [AI Review](basics/ai-review.md) of your code and the build.
 
-After that, you pay for running your agent from its [tank](tank.md): its own running account, kept apart from Depositors' money. The tank pays for the computing your agent uses and the gas, the fee a blockchain charges, for each transaction it sends, at published prices and never past the limits you set. That includes the first few transactions, which set up your vault on every chain it trades.
+After that, you pay for running your agent from its [tank](tank.md): its own running account, kept apart from Depositors' money. The tank pays for the computing your agent uses and the gas, the fee a blockchain charges, for each transaction it sends, at published prices and never past the limits you set. That includes setting your vault up on any other chains it trades on.
 
-If the review finds your code malicious, or the build fails, the $1 is spent, the rest of what you paid comes back to you, and no vault is created. To try again, you submit a new agent. There are no version upgrades either.
+If the review finds your code malicious, or the build fails, the $1 is spent and no vault is created. To try again, you submit a new agent. There are no version upgrades either.
 
 ## What you earn
 
@@ -131,10 +131,10 @@ Your shares are yours, like any Depositor's. Hold them, cash them in, or turn so
 
 ## Publishing, step by step
 
-1. **Pay the deposit and upload your code.** The deposit is the $1, plus whatever you'd like in your agent's tank to start with, and it's where you choose how much computing your agent may use. Your wallet signs the upload, so nobody else can spend your deposit.
+1. **Submit your code and pay $1.** Only a payment from the wallet that uploaded the code starts the job, so nobody else can claim it.
 2. **The [Reviewer](basics/ai-review.md) reads your code** and writes its report. Malicious code stops here.
 3. **An attested builder compiles it**, once, and signs what came out.
-4. **Your vault opens**, on every chain your agent trades. Anyone can deposit from then on, and it's marked **new** until it has some history.
+4. **You activate it**, once you've read the report: choose how much computing it may use, and put some money in its tank. Your vault opens, on every chain your agent trades. Anyone can deposit from then on, and it's marked **new** until it has some history.
 
 Every step leaves a public record, including builds that fail.
 
@@ -146,7 +146,7 @@ If you'd rather keep it private, you can seal it. Then only our attested machine
 
 ## Retiring your agent
 
-You can retire your agent whenever you like, but not all at once, so nobody is caught out. Retiring starts a **seven-day wind-down**: the vault stops taking deposits, the agent keeps trading, and Depositors can leave as usual. When the week is up, the agent is stopped for good, and whatever it still holds is closed and brought home to the vault, which stays on-chain for anyone still in to withdraw from.
+You can retire your agent whenever you like, but not all at once, so nobody is caught out. Retiring starts a **seven-day wind-down**: the vault stops taking deposits, the agent keeps trading, and Depositors can leave as usual. When the week is up, the agent is stopped for good, and whatever it still holds is closed and brought home to the vault, which stays on-chain for anyone still in to withdraw from. [Retiring](writing/retiring.md) has the details.
 
 ## Changing your agent
 

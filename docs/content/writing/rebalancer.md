@@ -5,6 +5,9 @@ The template's agent holds a target exposure to one market, say half the vault's
 ## Its configuration file
 
 ```toml
+[vault]
+chain = "hyperliquid"
+
 [description]
 title = "Rebalancer"
 text = """
@@ -17,7 +20,7 @@ claims = [
     "Trades one market, and nothing else",
 ]
 
-[venues.hyperliquid]
+[drivers.hyperliquid]
 ```
 
 [Configuration](configuration.md) explains each part.
@@ -43,23 +46,23 @@ The numbers are written as text and read as exact decimals, so two machines can 
 
 ## How it runs
 
-Its one long-lived `run`, from `src/lib.rs`. It uses two of the [services](services.md): `venues`, to read the vault's account and send orders, and `vault`, to hear when a Depositor is leaving or the vault is stopping:
+Its one long-lived `run`, from `src/lib.rs`. It uses two of the [services](services.md): `drivers`, to read the vault's account and send orders, and `vault`, to hear when a Depositor is leaving or the vault is stopping:
 
 ```rust
 impl Strategy for Rebalancer {
     async fn run() -> Result<(), String> {
-        // Whatever a previous run left behind is still on the venue,
+        // Whatever a previous run left behind is still on the exchange,
         // so look before doing anything.
         step().await?;
 
-        let account = venues::account_events(VENUE).into_stream().map(|_| Woke::Venue);
+        let account = drivers::account_events(DRIVER).into_stream().map(|_| Woke::Account);
         let vault_events = vault::events().into_stream().map(Woke::Vault);
         let mut waking = futures::stream::select(account, vault_events);
 
         while let Some(woke) = waking.next().await {
             match woke {
                 // A fill or a price move: look again.
-                Woke::Venue => step().await?,
+                Woke::Account => step().await?,
                 // A Depositor is leaving, or cash at home is running low:
                 // look again, and keep more at home.
                 Woke::Vault(VaultEvent::ClaimPending(_) | VaultEvent::BufferLow(_)) => {
@@ -77,7 +80,7 @@ impl Strategy for Rebalancer {
 }
 ```
 
-There's no callback, no tick handler and no scheduler. The attested machine starts `run` once, and everything the agent does, it does inside that call. If it ever crashes, it's started again, so an agent always rebuilds its picture from what the venue says it holds, because that's where the truth is.
+There's no callback, no tick handler and no scheduler. The attested machine starts `run` once, and everything the agent does, it does inside that call. If it ever crashes, it's started again, so an agent always rebuilds its picture from what the exchange says it holds, because that's where the truth is.
 
 ## Its claims, kept in code
 
@@ -85,8 +88,8 @@ Each of the rebalancer's three claims is a promise in `claims` and something its
 
 - **"Exposure never above the vault's value"**: `MAX_EXPOSURE` is `1.0`, the target is held below it whatever `TARGET_EXPOSURE` says, and a buy never goes past the target.
 - **"No single order above 5% of the vault"**: every order is capped at `MAX_ORDER_FRACTION` of the vault's value, so a big gap closes over several steps.
-- **"Trades one market, and nothing else"**: it only ever reads and orders `MARKET`, and does nothing if the venue doesn't list it.
+- **"Trades one market, and nothing else"**: it only ever reads and orders `MARKET`, and does nothing if the exchange doesn't list it.
 
 That's the whole pattern. There's no platform risk policy, so a limit only exists if your code enforces it, and the [AI Review](../basics/ai-review.md) checks each promise against the code.
 
-[Next: publishing →](publishing.md){ .md-button .md-button--primary }
+[Next: how the machines work →](../under-the-hood/machines.md){ .md-button .md-button--primary }

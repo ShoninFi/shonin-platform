@@ -41,7 +41,7 @@ flowchart TB
     class R,P,P2 ends
 ```
 
-Each vault keeps some of its money home, in the vault contract itself, rather than out at the venue. How much is the Author's choice, 5% of the vault by default, and the contract enforces it: it won't let the agent move money out if that would leave less than the Author's floor. Lowering the floor takes a day to apply, so Depositors can see it coming. So most withdrawals end in the first branch: the shares are burned and the Depositor is paid in the same transaction.
+Each vault keeps some of its money home, in the vault contract itself, rather than out at an exchange. How much is the Author's choice, 5% of the vault by default, and the contract enforces it: it won't let the agent move money out if that would leave less than the Author's floor. Lowering the floor takes a day to apply, so Depositors can see it coming. So most withdrawals end in the first branch: the shares are burned and the Depositor is paid in the same transaction.
 
 When idle capital cannot cover it, the shares are marked pending and the contract books a **claim**, which has three states: *pending*, *waiting* when a settlement was tried and the market was outside the band, and *paid*.
 
@@ -49,7 +49,7 @@ When idle capital cannot cover it, the shares are marked pending and the contrac
 
 ### The exit band
 
-A claim's positions are closed with reduce-only immediate-or-cancel orders, limited to the venue's oracle price plus or minus the **exit band**, 1% by default. The pool's cost beyond the spread is therefore bounded by that band times the notional closed. If the market is outside the band the close does not fill, the claim waits, and settlement is retried.
+A claim's positions are closed with reduce-only immediate-or-cancel orders, limited to the exchange's oracle price plus or minus the **exit band**, 1% by default. The pool's cost beyond the spread is therefore bounded by that band times the notional closed. If the market is outside the band the close does not fill, the claim waits, and settlement is retried.
 
 The leaver pays the spread through exit-side marks, pays the transaction fee, and bears the close's impact pro rata with everyone else, because their shares are still outstanding when it lands. The Depositors who stay keep the transaction fee.
 
@@ -89,7 +89,7 @@ The schedule is fixed when a vault is created and never changes under it. A vaul
 
 Running an agent costs money: compute, and gas where a chain charges it. That is the **Author's** cost, not the Depositors'.
 
-Each vault has a **tank**, a plain dollar balance for running it. The Author funds it from their publishing deposit, and it's excluded from what shares are worth, so a Depositor's value never pays for the agent's electricity.
+Each vault has a **tank**, a plain dollar balance for running it. The Author funds it when activating the agent, and whenever they like after that, and it's excluded from what shares are worth, so a Depositor's value never pays for the agent's electricity.
 
 - The executor keeps a running total of usage, signed by the vault's own blessed key, and stops the agent the moment the unpaid part reaches the tank. Once a day, one call to the vault's `keep` collects it from the tank, pays fees on the weekly day, then runs auto-fill. Anyone may send it; Shonin's keeper normally does, and pays its gas. The contract believes the total only up to the allowances the Author declared at the platform's published prices over the time elapsed. A wrong total cannot charge more than the Author agreed to.
 - The Author's fee shares are theirs. They can redeem some into the tank in one transaction, or set **auto-fill** to "keep my tank at $X": each day, just enough of their shares are redeemed to bring the tank back to $X, from the vault's idle balance, waiting until the next day when there isn't enough.
@@ -100,7 +100,7 @@ Every vault page shows the tank's balance and its recent charges.
 
 ## Retiring
 
-An Author can **retire** their agent at any time, and it takes effect slowly on purpose. Retiring starts a **wind-down** of seven days: the vault refuses new deposits, the agent keeps running, and every withdrawal works exactly as before. When the wind-down ends, the agent is evicted from the attested machine, and its positions are closed through the same reduce-only path a claim uses and the cash brought home, so every remaining Depositor is paid from idle balance in one transaction. The vault contract itself stays on-chain, holding only cash, and anyone still in, the Author included, withdraws from it whenever they like.
+An Author can **retire** their agent at any time, and it takes effect slowly on purpose. Retiring starts a **wind-down** of seven days: the vault refuses new deposits, the agent keeps running, and every withdrawal works exactly as before. When the wind-down ends, the agent is evicted from the attested machine, and its positions are closed through the same reduce-only path a claim uses and the cash brought home, its costs paid from what comes home, never by the tank or by us. After that, every remaining Depositor is paid from idle balance in one transaction. The vault contract itself stays on-chain, holding only cash, and anyone still in, the Author included, withdraws from it whenever they like.
 
 The tank works as always during the wind-down. If the Author empties it, the agent stops early, and the positions are still closed when the week is up.
 
@@ -116,6 +116,6 @@ It moves no funds anywhere but back to Depositors. It is a halt, never a theft. 
 | --- | --- |
 | Share supply, deposits, withdrawals, pending shares, claims and their settlement | ✓ |
 | Fees, the high-water mark, the tank and what it was charged | ✓ |
-| The vault's value, computed by the contract from venue state | ✓ |
+| The vault's value, computed by the contract from exchange state | ✓ |
 | Which keys may act for the vault, and what they may run | ✓ |
-| Every order and fill on the venue | ✓ |
+| Every order and fill on the exchange | ✓ |

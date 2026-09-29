@@ -4,7 +4,7 @@ An agent's sandbox gives it a fixed set of services, provided by the attested ma
 
 | Service | What it gives |
 | --- | --- |
-| `venues` | Submit orders and hear what happened to each; a stream of the vault's own account events; a read of the vault's account state |
+| `drivers` | Submit orders and hear what happened to each; a stream of the vault's own account events; a read of the vault's account state |
 | `vault` | A stream of three events: `claim-pending` when a Depositor is leaving, `buffer-low` when cash at home is running low, and `halting` when the vault is stopping |
 | `data` | Shared market data the attested machine fetches once and hands to every agent that wants it |
 | `websocket` | Live connections to other services, which the attested machine holds for it |
@@ -12,6 +12,6 @@ An agent's sandbox gives it a fixed set of services, provided by the attested ma
 | `secrets` | Values you sealed to your agent, such as an API key, readable only inside the attested machine |
 | `inference` | AI models you shipped with your agent, run by the attested machine under a time budget |
 
-An order is opaque bytes that the venue's own adapter understands, decoded inside the attested machine. You build them with a typed crate from the SDK, so the decision is yours and the signing is ours.
+An order is opaque bytes that its driver understands, decoded inside the attested machine. You build them with a typed crate from the SDK, so the decision is yours and the signing is ours.
 
-[Next: example: a rebalancer →](rebalancer.md){ .md-button .md-button--primary }
+[Next: vault and driver list →](vault-and-drivers.md){ .md-button .md-button--primary }

@@ -75,7 +75,7 @@ Which agent to back is up to you. Every agent's page gives you what you need to 
 
 ### Its vault
 
-- **Where it trades.** The venues (exchanges) and bridges it uses, and how each venue keeps your money safe. [Smart contracts](basics/smart-contracts.md) explains why that matters.
+- **Where it trades.** The exchanges and bridges it uses, and how each exchange keeps your money safe. [Smart contracts](basics/smart-contracts.md) explains why that matters.
 - **Its tank.** The Author's account that pays for running the agent, kept apart from your money. How full it is matters, because an agent whose [tank](tank.md) runs dry stops trading.
 - **How you'd get out.** Whether the contract can always finish a withdrawal by itself, or if it relies on additional operations. [Getting out](#getting-out), below, has the details.
 
@@ -103,7 +103,7 @@ A few vaults trade somewhere the contract can't reach by itself, and rely on an 
 
 **The vault can be stopped.** We can stop a vault that keeps failing. That closes every position at market, which can lock in a loss, and brings the cash home so everyone can withdraw.
 
-**A venue can fail.** Your money is only as safe as the venues holding it.
+**An exchange can fail.** Your money is only as safe as the exchanges holding it.
 
 What can't happen is someone withdrawing your money or sending it somewhere else. There's no way to do it.
 

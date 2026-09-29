@@ -1,6 +1,6 @@
 # Smart contracts
 
-On Shonin, smart contracts hold the money and make the rules for moving it.
+On Shonin, smart contracts hold the money and make the rules for moving it, including who may trade it. A trading key can't place a single order until the contracts have checked its attestation: that it was made by an approved image, running this vault's exact agent. And because the key is [trade-only](trade-only-keys.md), being approved lets it trade and nothing more.
 
 <div class="shonin-hero" markdown="0">
 <svg viewBox="0 0 1000 380" role="img" aria-labelledby="contract-title contract-desc" xmlns="http://www.w3.org/2000/svg">
@@ -104,26 +104,88 @@ On Shonin, smart contracts hold the money and make the rules for moving it.
 </svg>
 </div>
 
-A contract lives on one chain and can only move money on that chain. A vault that trades on more than one chain has its own contracts on each, and money crossing between them goes through bridges the agent discloses, only ever landing in accounts the vault owns.
+## They're the same for every agent
 
-So a vault is exactly as safe as the chains it lives on, the venues it trades on, and the bridges that move its money between them. None of that is hidden. An agent can only trade on the venues it declares, its Author lists the bridges it uses, and its page shows both before you put money in.
-
-The chains themselves are shared public records that no single party, us included, can quietly rewrite. Like the enclaves on our attested machines, that's security the rest of the world already relies on, not something we invented.
+**No agent brings a contract of its own.** Every vault, and everything else on this page, runs the same open-source contract code, written by us and shared by every agent on Shonin. An agent is only the program on the attested machine: it decides what to trade, and the contracts decide what that's allowed to do. So once you know how these contracts behave, you know how they behave for every agent, whoever wrote it.
 
 ## They hold the money
 
-Every vault is a smart contract. When you put money in, it goes into accounts the vault owns on the chain, and it only ever moves between them. Deposits, fees and withdrawals are all paid by the contract, and every trade is on the public record. The agent's running costs come from a separate balance, [the tank](../tank.md), which the Author pays for.
+Every vault is a smart contract. When you put money in, it goes into accounts the vault owns, and it only ever moves between them. Deposits, fees and withdrawals are all paid by the contract, and every trade is on the public record. The agent's running costs come from a separate balance, [the tank](../tank.md), which the Author pays for.
 
-## They decide who can trade
+## Where they live
 
-A trading key can't place a single order until the contracts have checked its attestation: that it was made by an approved image and running this vault's exact agent.
+A contract lives on one chain and can only move money on that chain, so an agent that trades on several chains needs contracts on each. Let's look at a complicated multi-chain setup first, and then simplify to single-chain.
 
-No valid attestation, no trades. And because the key is [trade-only](trade-only-keys.md), being approved lets it trade and nothing more.
+### Across three chains
+
+Take an agent that buys tokenised shares on Robinhood Chain and hedges them with perpetuals on Arcus (also on Robinhood Chain), then also places orders on Hyperliquid (e.g. wherever the hedge is cheaper). Its Author chose Solana for its vault, because that's where their Depositors already keep their dollars.
+
+```mermaid
+flowchart LR
+    D(["Depositors"])
+    subgraph SOL["Solana"]
+        V["<b>Vault</b><br/>shares, fees, tank"]
+    end
+    subgraph RH["Robinhood Chain"]
+        S1["<b>Station</b>"] --- R1["<b>Driver</b><br/>stock tokens"]
+        S1 --- R2["<b>Driver</b><br/>Arcus"]
+    end
+    subgraph HL["Hyperliquid"]
+        S2["<b>Station</b>"] --- H1["<b>Driver</b><br/>Hyperliquid"]
+    end
+    D <-->|"deposit, withdraw"| V
+    V <-->|"bridge"| S1
+    V <-->|"bridge"| S2
+
+    classDef vault fill:#4338ca18,stroke:#4338ca,color:inherit
+    classDef station fill:#0d948818,stroke:#0d9488,color:inherit
+    classDef driver fill:#d9770618,stroke:#d97706,color:inherit
+    class V vault
+    class S1,S2 station
+    class R1,R2,H1 driver
+```
+
+- **The vault**, on Solana. It's the only contract Depositors ever deal with: it takes their deposits, pays their withdrawals, issues their shares, pays the fees and holds the [tank](../tank.md). Every agent has exactly one.
+- **A station** on each chain the agent trades on. It holds the money the agent trades with on that chain, takes no deposits and issues no shares, and reports what it holds to the vault, so the vault's share price counts every chain.
+- **A driver** for each exchange, plugged into the station on its chain: two on Robinhood Chain, one on Hyperliquid. A driver is what knows how to work with one exchange. It lets the vault's trade-only keys trade there, works out what the station holds there, and closes positions when someone withdraws. The vault and the stations know nothing about any exchange, so a new exchange is just a new driver.
+- **Bridges** carry money between the vault and its stations: only the ones the agent declares, and only ever to the vault's own addresses on the other side.
+
+Money comes in and goes out only at the vault. A deposit lands on Solana, and the agent moves what it needs out to its stations. A withdrawal is paid on Solana, and if the vault's cash there isn't enough, money is brought home from the stations first.
+
+### On one chain
+
+Now let's look at the setup for a single chain, like the [example rebalancer](../writing/rebalancer.md), which lives on Hyperliquid and trades only there. It's the same shape, only smaller: the vault, one station beside it and one driver. There's no bridge: the vault moves money to its station directly and reads what it's worth straight from the chain, and Depositors' money never leaves Hyperliquid.
+
+```mermaid
+flowchart LR
+    D(["Depositors"])
+    subgraph HL["Hyperliquid"]
+        V["<b>Vault</b><br/>shares, fees, tank"] <--> S["<b>Station</b>"] --- H["<b>Driver</b><br/>Hyperliquid"]
+    end
+    D <-->|"deposit, withdraw"| V
+
+    classDef vault fill:#4338ca18,stroke:#4338ca,color:inherit
+    classDef station fill:#0d948818,stroke:#0d9488,color:inherit
+    classDef driver fill:#d9770618,stroke:#d97706,color:inherit
+    class V vault
+    class S station
+    class H driver
+```
+
+### The contracts, in short
+
+| Contract | Where | What it does |
+| --- | --- | --- |
+| Vault | One per agent, on the chain its Author chose | Deposits, withdrawals, shares, fees and the tank |
+| Station | One per chain the agent trades on, the vault's own included | Owns the agent's accounts on that chain, and reports what they're worth to the vault |
+| Driver | One for each exchange, plugged into the station on its chain | Knows how to work with that exchange: lets the vault's trade-only keys trade there, works out what the station holds there, and closes positions when someone withdraws |
+| Registries | Every chain we support | The approved machine images and the keys they've blessed, the published agents and their builds, and their reviews; shared by every vault |
+| Publishing | Every chain a vault can live on | Takes the $1 to publish, gives each agent its id, and opens its vault and stations when the Author activates it |
 
 ## Real markets, messy data
 
 None of this keeps the agent in a box.
 
-The thinking happens off-chain, on the attested machine, where the agent can follow the messy, real-time world: prices from anywhere, the news, anything online. The agent gets the whole internet to decide with, while the money never leaves the chain.
+The thinking happens off-chain, on the attested machine, where the agent can follow the messy, real-time world: prices from anywhere, the news, anything online. The agent gets the whole internet to decide with, while the money never leaves the contracts.
 
 [Next: the tank →](../tank.md){ .md-button .md-button--primary }

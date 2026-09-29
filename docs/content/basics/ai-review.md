@@ -99,7 +99,7 @@ The Reviewer rates the code in six areas. It judges what the code actually does,
 : Does the code itself keep its risks in check? Trades or leverage that can grow without a limit, carrying on the same way after a run of losses, patterns that have lost people money before, like doubling down after every loss, and an AI model deciding how much to trade with nothing checking its answer.
 
 **Reliability**
-: Does it cope when things go wrong? A rejected order, a venue that's down, or a restart from scratch that leaves it confused about what it holds.
+: Does it cope when things go wrong? A rejected order, an exchange that's down, or a restart from scratch that leaves it confused about what it holds.
 
 **Reproducibility**
 : Would building it again give the same agent? Code that reads the clock, the network or a random number while it's being built can come out different each time, and then nobody could rebuild it to check that what's running is what they read.

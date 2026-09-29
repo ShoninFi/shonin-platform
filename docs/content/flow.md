@@ -5,7 +5,7 @@ This page puts the last few pages together: where a vault's money sits, who pays
 <div class="shonin-hero" markdown="0">
 <svg viewBox="0 0 1000 370" role="img" aria-labelledby="flow-title flow-desc" xmlns="http://www.w3.org/2000/svg">
 <title id="flow-title">Where a vault's money goes</title>
-<desc id="flow-desc">At the top, the vault, split in two: cash at home in the vault contract, and money trading at the venue, with arrows both ways between them. Depositors put money in and take it out on the left. From the vault, weekly fees go as shares to the Author and to Shonin. The Author fills the tank, by hand and by auto-fill, and can take money out of it. Shonin pays the running costs, gas and compute, up front, and the tank pays Shonin back with a daily bill. The venue takes its trading fees from the trading account.</desc>
+<desc id="flow-desc">At the top, the vault, split in two: cash at home in the vault contract, and money trading at the exchange, with arrows both ways between them. Depositors put money in and take it out on the left. From the vault, weekly fees go as shares to the Author and to Shonin. The Author fills the tank, by hand and by auto-fill, and can take money out of it. Shonin pays the running costs, gas and compute, up front, and the tank pays Shonin back with a daily bill. The exchange takes its trading fees from the trading account.</desc>
 <ellipse cx="500" cy="190" rx="490" ry="178" style="fill:var(--h-blob)"/>
 <rect x="270" y="40" width="440" height="150" rx="18" style="fill:var(--h-paper);stroke:var(--h-indigo);stroke-width:3"/>
 <text x="490" y="68" class="h-tag">the vault</text>
@@ -14,7 +14,7 @@ This page puts the last few pages together: where a vault's money sits, who pays
 <text x="380.0" y="141.0" class="h-note">in the vault contract</text>
 <rect x="510" y="84" width="180" height="86" rx="14" style="fill:var(--h-glass-disc);stroke:var(--h-teal);stroke-width:2.5"/>
 <text x="600.0" y="113.0" class="h-tag">trading</text>
-<text x="600.0" y="135.0" class="h-note">at the venue,</text>
+<text x="600.0" y="135.0" class="h-note">at the exchange,</text>
 <text x="600.0" y="152.0" class="h-note">which takes its fees</text>
 <path d="M474 116 H504" style="fill:none;stroke:var(--h-ink);stroke-width:3;stroke-linecap:round"/>
 <path d="M496 109 l8 7 l-8 7" style="fill:none;stroke:var(--h-ink);stroke-width:3;stroke-linecap:round;stroke-linejoin:round"/>
@@ -60,7 +60,7 @@ This page puts the last few pages together: where a vault's money sits, who pays
 </svg>
 </div>
 
-A vault's money is always in one of two places: **at home**, in the vault contract, or **trading**, at the venue. Shares are a claim on both. Fees are paid by creating new shares, so they never move cash. Cash only leaves the vault when someone turns shares back into dollars, and it's paid from home first.
+A vault's money is always in one of two places: **at home**, in the vault contract, or **trading**, at an exchange. Shares are a claim on both. Fees are paid by creating new shares, so they never move cash. Cash only leaves the vault when someone turns shares back into dollars, and it's paid from home first.
 
 ## Try it
 

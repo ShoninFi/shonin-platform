@@ -18,6 +18,9 @@ The words you'll meet throughout these docs: first who does what, then the handf
 
 ## Key terms
 
+**[Activate](../writing/publishing.md#activate-it)**
+: An Author opening their agent's vault once it has been reviewed and built, choosing its allowances and idle floor, and putting money in its tank. Until then, nothing runs and nothing is listed.
+
 **[Agent](../basics/trading-agents.md)**
 : A program an Author writes to trade the money in its vault. It runs on an attested machine, inside a sandbox.
 
@@ -33,6 +36,9 @@ The words you'll meet throughout these docs: first who does what, then the handf
 **Booked withdrawal**
 : A withdrawal bigger than the cash the vault has at home. The contract closes your share of its positions and pays you once that cash is back.
 
+**[Driver](../writing/vault-and-drivers.md#drivers)**
+: What lets agents trade on one exchange: it approves the vault's trade-only keys there, works out what the vault holds, and closes positions when someone withdraws. Authors choose drivers in `shonin.toml`; Depositors only ever see the exchanges.
+
 **[High-water mark](../fees.md#the-profit-fee)**
 : The highest a vault's share price has been on a payday. The profit fee is only charged on gains above it.
 
@@ -45,7 +51,7 @@ The words you'll meet throughout these docs: first who does what, then the handf
 **Record**
 : A vault's history of its share price, read straight from its own contract.
 
-**[Retire](../writing/publishing.md#retiring-it)**
+**[Retire](../writing/retiring.md)**
 : An Author ending their agent. The vault stops taking deposits and the agent keeps running for seven days; then it's stopped for good, and its positions are closed and the cash brought home to the vault, where anyone still in can withdraw it.
 
 **[Sealed](../authors.md#keeping-your-code-private)**
@@ -55,19 +61,19 @@ The words you'll meet throughout these docs: first who does what, then the handf
 : Your slice of a vault. You get shares when you put money in, and their price rises and falls with the vault.
 
 **[`shonin.toml`](../writing/configuration.md#shonintoml)**
-: An agent's configuration file: its description, the claims it makes about itself, the venues it trades and the bridges it uses. Fixed once published.
+: An agent's configuration file: its description, the claims it makes about itself, the drivers it trades through and the bridges it uses. Fixed once published.
+
+**[Station](../basics/smart-contracts.md#where-they-live)**
+: A vault's contract on a chain its agent trades on, the vault's own chain included. It holds the money the agent trades with there and reports its value to the vault, but takes no deposits and issues no shares.
 
 **[Tank](../tank.md)**
 : The Author's account for running their agent. It pays for computing and gas, never from Depositors' money.
 
 **[Trade-only key](../basics/trade-only-keys.md)**
-: The key that trades for a vault. A venue lets it place and cancel orders, and nothing else.
+: The key that trades for a vault. The exchange lets it place and cancel orders, and nothing else.
 
 **[Vault](../under-the-hood/vaults.md)**
-: The smart contract holding the money behind one agent. It keeps its own accounts, pays its own withdrawals, and works out its own share price.
-
-**[Venue](venues.md)**
-: Where an agent actually trades, like an exchange.
+: The smart contract holding the money behind one agent. It lives on one chain, named in the agent's `shonin.toml`, takes deposits and pays withdrawals there, and works out its share price from its stations.
 
 ## Under the hood
 
@@ -87,13 +93,13 @@ The words you'll meet throughout these docs: first who does what, then the handf
 : The contract's name for a booked withdrawal. It's *pending*, then *waiting* if the market was too far from its price to close, then *paid*.
 
 **[Exit band](../under-the-hood/vaults.md#the-exit-band)**
-: How far from the venue's own price a booked withdrawal may close positions, 1% by default. It limits what one person leaving can cost everyone else.
+: How far from the exchange's own price a booked withdrawal may close positions, 1% by default. It limits what one person leaving can cost everyone else.
 
 **Freeze**
 : What anyone can do to a vault whose booked withdrawal has gone unpaid for seven days: no new deposits, and only winding down left.
 
 **Idle balance**
-: The part of a vault's money sitting in its contract rather than at a venue. Withdrawals up to it are paid at once.
+: The part of a vault's money sitting in its contract rather than at an exchange. Withdrawals up to it are paid at once.
 
 **[Image](../under-the-hood/machines.md#the-allowlist)**
 : One of the approved programs an attested machine may run: the Reviewer, the builder, the executor or the unwinder. The list is public, and a new image only counts after a public wait.
@@ -102,7 +108,7 @@ The words you'll meet throughout these docs: first who does what, then the handf
 : Shonin stopping a vault: every position closed, all the cash brought home, and every Depositor able to withdraw at once. A halt, never a theft.
 
 **Mark**
-: A venue's own reference price, used to value a deposit. A withdrawal is valued at **exit-side marks** instead: what a position would actually sell for.
+: An exchange's own reference price, used to value a deposit. A withdrawal is valued at **exit-side marks** instead: what a position would actually sell for.
 
 **Settle**
 : The public function that closes a booked withdrawal's positions, brings the cash home and pays the leaver. Anyone can send it.

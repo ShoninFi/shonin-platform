@@ -30,10 +30,10 @@ The quickest way to write one is to start from our template: a complete, small a
 
 | File | What it is |
 | --- | --- |
-| `shonin.toml` | The agent's [configuration](configuration.md): its description, its claims, where it trades and the bridges it uses |
+| `shonin.toml` | The agent's [configuration](configuration.md): its vault's chain, its description, its claims, where it trades and the bridges it uses |
 | `src/config.rs` | Its settings, as constants: the market, the target, and the numbers behind its limits |
 | `src/lib.rs` | The agent itself: its one long-lived `run` |
-| `src/decide.rs` | Its decisions, as plain functions of what it sees, so they can be tested without a venue |
+| `src/decide.rs` | Its decisions, as plain functions of what it sees, so they can be tested without an exchange |
 | `tests/` | Tests for those decisions |
 | `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml` | The dependencies and toolchain, pinned, so our builder compiles exactly what you did |
 
@@ -41,6 +41,6 @@ Keeping the decisions apart from the waiting and the ordering is the one habit w
 
 ## The SDK
 
-The template depends on `shonin-strategy-sdk`, which has everything an agent needs to talk to its venues and its vault, plus helpers for common jobs.
+The template depends on `shonin-strategy-sdk`, which has everything an agent needs to talk to its drivers and its vault, plus helpers for common jobs.
 
 [Next: configuration →](configuration.md){ .md-button .md-button--primary }
