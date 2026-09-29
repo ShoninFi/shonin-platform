@@ -96,10 +96,10 @@ The Reviewer rates the code in six areas. It judges what the code actually does,
 : Is the code trying to do harm? Attacking the machine it runs on, reaching for keys or secrets it wasn't given, trading money away on purpose, or quietly behaving differently after a certain date or signal. Text that tries to talk the Reviewer into a better report counts too, and so does leaning on little-used code libraries that few people have checked.
 
 **Financial risk**
-: Does the code itself keep its risks in check? Trades or leverage that can grow without a limit, carrying on the same way after a run of losses, patterns that have lost people money before, like doubling down after every loss, and an AI model deciding how much to trade with nothing checking its answer.
+: Does the code itself keep its risks in check? Trades or leverage that can grow without a limit, carrying on the same way after a run of losses, patterns that have lost people money before, like doubling down after every loss, an AI model deciding how much to trade with nothing checking its answer, and trading markets whose price can be moved cheaply, or whose price feed someone else controls.
 
 **Reliability**
-: Does it cope when things go wrong? A rejected order, an exchange that's down, or a restart from scratch that leaves it confused about what it holds.
+: Does it cope when things go wrong? A rejected order, a venue that's down, or a restart from scratch that leaves it confused about what it holds.
 
 **Reproducibility**
 : Would building it again give the same agent? Code that reads the clock, the network or a random number while it's being built can come out different each time, and then nobody could rebuild it to check that what's running is what they read.

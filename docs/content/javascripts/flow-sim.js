@@ -1,7 +1,7 @@
 /* The money flow simulator.
  *
  * A toy model of one vault, stepped a day at a time, so a reader can watch
- * where the money sits and what the daily keeper does. It follows the rules
+ * where the money sits and what the daily keep call does. It follows the rules
  * the docs describe, in round numbers: fees are worked out every day and paid
  * weekly as new shares above the high-water mark, the tab is paid from the
  * tank, auto-fill tops the tank up from the Author's shares using cash at
@@ -217,7 +217,7 @@
         lines.push("The agent is stopped: its positions sit where they are, unmanaged.");
       }
 
-      // 1. The keeper collects the tab.
+      // 1. The daily keep call collects the tab.
       if (s.running) {
         const cost = read("cost");
         if (s.tank >= cost) {

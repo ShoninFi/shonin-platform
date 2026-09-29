@@ -110,7 +110,7 @@ On Shonin, smart contracts hold the money and make the rules for moving it, incl
 
 ## They hold the money
 
-Every vault is a smart contract. When you put money in, it goes into accounts the vault owns, and it only ever moves between them. Deposits, fees and withdrawals are all paid by the contract, and every trade is on the public record. The agent's running costs come from a separate balance, [the tank](../tank.md), which the Author pays for.
+Every vault is a smart contract. When you put money in, it goes into the vault, and it only ever moves between the vault and its own stations. Deposits, fees and withdrawals are all paid by the contract, and every trade is on the public record. The agent's running costs come from a separate balance, [the tank](../tank.md), which the Author pays for.
 
 ## Where they live
 
@@ -147,8 +147,8 @@ flowchart LR
 
 - **The vault**, on Solana. It's the only contract Depositors ever deal with: it takes their deposits, pays their withdrawals, issues their shares, pays the fees and holds the [tank](../tank.md). Every agent has exactly one.
 - **A station** on each chain the agent trades on. It holds the money the agent trades with on that chain, takes no deposits and issues no shares, and reports what it holds to the vault, so the vault's share price counts every chain.
-- **A driver** for each exchange, plugged into the station on its chain: two on Robinhood Chain, one on Hyperliquid. A driver is what knows how to work with one exchange. It lets the vault's trade-only keys trade there, works out what the station holds there, and closes positions when someone withdraws. The vault and the stations know nothing about any exchange, so a new exchange is just a new driver.
-- **Bridges** carry money between the vault and its stations: only the ones the agent declares, and only ever to the vault's own addresses on the other side.
+- **A driver** for each venue, plugged into the station on its chain: two on Robinhood Chain, one on Hyperliquid. A driver is what knows how to work with one venue. It lets the vault's trade-only keys trade there, works out what the station holds there, and closes positions when someone withdraws. The vault and the stations know nothing about any venue, so a new venue is just a new driver.
+- **Bridges** carry money between the vault and its stations: only the ones the agent names, and the station checks on the chain that the money will arrive at the vault's own address on the other side.
 
 Money comes in and goes out only at the vault. A deposit lands on Solana, and the agent moves what it needs out to its stations. A withdrawal is paid on Solana, and if the vault's cash there isn't enough, money is brought home from the stations first.
 
@@ -178,9 +178,10 @@ flowchart LR
 | --- | --- | --- |
 | Vault | One per agent, on the chain its Author chose | Deposits, withdrawals, shares, fees and the tank |
 | Station | One per chain the agent trades on, the vault's own included | Owns the agent's accounts on that chain, and reports what they're worth to the vault |
-| Driver | One for each exchange, plugged into the station on its chain | Knows how to work with that exchange: lets the vault's trade-only keys trade there, works out what the station holds there, and closes positions when someone withdraws |
+| Driver | One for each venue, plugged into the station on its chain | Knows how to work with that venue: lets the vault's trade-only keys trade there, works out what the station holds there, and closes positions when someone withdraws |
 | Registries | Every chain we support | The approved machine images and the keys they've blessed, the published agents and their builds, and their reviews; shared by every vault |
-| Publishing | Every chain a vault can live on | Takes the $1 to publish, gives each agent its id, and opens its vault and stations when the Author activates it |
+| Publishing | Every chain a vault can live on | Takes the $1 to publish, and gives each agent its id |
+| Factories | Every chain we support | Create a vault, and its station on the same chain, when the Author activates it; stations on other chains are created by its executor |
 
 ## Real markets, messy data
 

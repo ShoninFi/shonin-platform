@@ -52,7 +52,11 @@ Whichever way it ends, the $1 is spent. After a refusal or a failed build, you t
 When you're ready, activate your agent from its page, in one transaction on the same chain. There's no deadline. You choose:
 
 - **Its allowances and idle floor:** the two [vault settings](configuration.md#vault-configuration). You can change both later.
-- **A starting tank:** money for your agent's [tank](../tank.md). It has to be more than nothing, since an agent with an empty tank doesn't run, and about a week of running is a sensible start.
+- **A starting tank:** money for your agent's [tank](../tank.md). It has to be at least $10, plus the cost of creating its stations on any other chains, which the web app shows, and about a week of running is a sensible start.
+
+Before you activate, seal any [secrets](services.md#secrets) your agent needs, such as an API key for a paid data service.
+
+If your agent trades on more than one chain, its vault opens once its [stations](../basics/smart-contracts.md#where-they-live) on the other chains are ready, usually within minutes. The web app shows how far along it is.
 
 ## Once it's live
 

@@ -105,4 +105,4 @@ Next, how an AI reads every agent's code before it's built. After that, three pa
 !!! tip "Writing one?"
     Agents are written in Rust against a fixed interface. [Authors](../authors.md) covers what it costs and what you earn, and [Writing an Agent](../writing/getting-started.md) starts from our template, with a complete example.
 
-[Next: AI review →](ai-review.md){ .md-button .md-button--primary }
+[Next: AI Review →](ai-review.md){ .md-button .md-button--primary }

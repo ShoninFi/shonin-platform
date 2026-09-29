@@ -68,11 +68,11 @@ An agent has a network connection and a model of its own, and it trades other pe
 </svg>
 </div>
 
-The agent never holds a key. It decides what to trade, and the attested machine signs the order with the vault's key. That key is **trade-only**: the exchange lets it place and cancel orders, and nothing else. It can't withdraw, can't send money to another address, and can't hand its powers to anyone else.
+The agent never holds a key. It decides what to trade, and the attested machine signs the order with the vault's key. That key is **trade-only**: the venue lets it place and cancel orders, and nothing else. It can't withdraw, can't send money to another address, and can't hand its powers to anyone else.
 
-Moving money at all goes through our [smart contracts](smart-contracts.md), which only move it between accounts the vault owns.
+Moving money at all goes through our [smart contracts](smart-contracts.md), which only move it between the vault and its own stations.
 
-So nobody can withdraw a Depositor's money: not the agent, not its Author, not Shonin, and not somebody who has stolen all our keys. The exchange and our contracts refuse it, whatever the code says.
+So nobody can withdraw a Depositor's money: not the agent, not its Author, not Shonin, and not somebody who has stolen all our keys. The venue and our contracts refuse it, whatever the code says.
 
 That's the trust bar: *halt, never withdraw*. An agent can be switched off. The money can't be taken out.
 

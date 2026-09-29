@@ -5,12 +5,12 @@ An agent is configured in two places:
 - **On its vault:** the things you can change while it runs.
 - **In `shonin.toml`:** the chain its vault lives on, and the agent's description, claims, drivers and bridges, which are decisions locked in forever.
 
-## Vault Configuration
+## Vault configuration
 
 Two settings live on the vault itself. You choose them when you [activate](publishing.md#activate-it) your agent, and you can change them on the live vault whenever you like. The vault's page shows every change.
 
 - **Allowances:** how much computing and gas your agent may use, which is also the most your [tank](../tank.md) can be charged for it. They cover computing, memory, requests to other services, data, live connections, time spent running AI models, and gas in dollars a day.
-- **The idle floor:** how much of the vault stays at home as cash, ready for withdrawals. Raising it is instant; lowering it takes a day, so Depositors see it coming.
+- **The idle floor:** how much of the vault stays at home as cash, ready for withdrawals: 5% by default, and 0% is allowed for an agent that needs every dollar out trading. Raising it is instant; lowering it takes a day, so Depositors see it coming.
 
 ## `shonin.toml`
 
@@ -45,7 +45,16 @@ You don't give your agent an id: it gets one automatically when you submit it. I
 
 ### `[vault]`
 
-**`chain`**: the chain your vault lives on, from the list of [vault chains](vault-and-drivers.md#vault-chains). It's where Depositors put money in and take it out, and where you pay the $1 to publish. It needn't be where your agent trades: its drivers can trade on other chains, reached through its bridges.
+**`chain`**: the chain your vault lives on. It's where Depositors put money in and take it out, in that chain's dollar, and where you pay the $1 to publish.
+
+| Chain | Name | Its dollar |
+| --- | --- | --- |
+| Base | `base` | USDC |
+| Hyperliquid | `hyperliquid` | USDC |
+| Robinhood Chain | `robinhood` | USDG |
+| Solana | `solana` | USDC |
+
+It needn't be where your agent trades: its drivers can trade on other chains, reached through its bridges. But if your agent uses one driver, choose that driver's chain, so the vault and its station sit side by side with no bridge in between.
 
 ### `[description]`
 
@@ -56,11 +65,11 @@ The [AI Review](../basics/ai-review.md) reads your description and your claims, 
 
 ### `[drivers.<name>]`
 
-One table for each [driver](vault-and-drivers.md#drivers) the agent trades through, holding whatever settings that driver needs. An agent can only ever trade through the drivers it lists here.
+One table for each [driver](drivers.md) the agent trades through, holding whatever settings that driver needs. An agent can only ever trade through the drivers it lists here.
 
 ### `[bridges.<name>]`
 
-One table for each bridge the agent uses to move money between chains. They're shown on the vault's page before anyone deposits. An agent that only trades on its vault's chain has none.
+One table for each [bridge](bridges.md) the agent uses to move money between chains. They're shown on the vault's page before anyone deposits. An agent that only trades on its vault's chain has none.
 
 ## Your agent's own settings
 
