@@ -141,7 +141,7 @@ async fn deploy(client: &Client, artifacts: &Path) -> Result<Deployments> {
             // The terms every vault is created with, in the order
             // `VaultConfig` declares them.
             (
-                50u16,               // streaming, a year
+                100u16,              // streaming, a year
                 1_000u16,            // of gains, to the author
                 500u16,              // of the same gains, to the platform
                 10u16,               // on a deposit or a withdrawal, kept in the pool

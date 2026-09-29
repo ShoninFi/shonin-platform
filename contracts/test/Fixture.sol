@@ -80,7 +80,7 @@ contract Fixture is Test {
             admin,
             platform,
             VaultConfig({
-                streamingBps: 50,
+                streamingBps: 100,
                 authorBps: 1000,
                 platformBps: 500,
                 transactionBps: 10,

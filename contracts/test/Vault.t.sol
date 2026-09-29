@@ -213,9 +213,9 @@ contract VaultTest is Fixture {
         skip(365 days);
         vault.crystallise();
 
-        // Half a per cent of the value, a year of it, paid in new shares.
+        // One per cent of the value, a year of it, paid in new shares.
         uint256 platformValue = vault.balanceOf(platform) * vault.sharePrice() / 1e18;
-        assertApproxEqRel(platformValue, total * 50 / 10_000, 0.01e18);
+        assertApproxEqRel(platformValue, total * 100 / 10_000, 0.01e18);
         // The pool is not any poorer: the fee is dilution, not a withdrawal.
         assertEq(vault.totalValue(), total);
     }
@@ -242,7 +242,7 @@ contract VaultTest is Fixture {
         // And the platform takes half as much again from the same gain, on
         // top of the day of streaming fee it was owed anyway.
         uint256 platformTook = (vault.balanceOf(platform) - platformBefore) * vault.sharePrice() / 1e18;
-        uint256 streamingForADay = uint256(100_000e6) * 50 / 10_000 / 365;
+        uint256 streamingForADay = uint256(100_000e6) * 100 / 10_000 / 365;
         assertApproxEqRel(platformTook, gain / 20 + streamingForADay, 0.05e18);
 
         uint256 high = vault.highWaterMark();

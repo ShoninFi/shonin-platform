@@ -1,11 +1,11 @@
 # Fees
 
-Depositors pay for results, and so the main fee is a share of the profit an agent actually makes. There's no charge for running it: that's the Author's cost, paid from [the tank](tank.md).
+Two fees pay the Author and Shonin. The profit fee is a share of the profit an agent actually makes, and nothing when it makes none. The holding fee is a yearly fee on what the vault holds, for the platform every vault runs on. Running the agent itself is the Author's cost, paid from [the tank](tank.md).
 
 | Fee | How much | Who gets it |
 | --- | --- | --- |
 | Profit fee | 15% of new profit | 10% to the Author, 5% to Shonin |
-| Holding fee | 0.5% a year | Shonin |
+| Holding fee | 1% a year | Shonin |
 | Deposit and withdrawal fee | 0.1% each way | The vault: it raises every share's value |
 
 The profit and holding fees are paid once a week, by creating new shares for the Author and Shonin rather than taking cash out of the vault.
@@ -18,7 +18,7 @@ Every vault's page shows its mark next to today's share value. If you join while
 
 ## The holding fee
 
-A small yearly fee on what the vault holds, whether it's up or down.
+A yearly fee on what the vault holds, whether it's up or down. It pays for the platform: the vault contracts, the reviews and the checks behind every vault, on every chain it trades.
 
 ## The deposit and withdrawal fee
 
