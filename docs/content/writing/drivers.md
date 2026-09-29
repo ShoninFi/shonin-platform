@@ -49,10 +49,14 @@ flowchart TB
 
 | Half | What it does |
 | --- | --- |
-| **On the chain** | Approves the vault's trade-only keys at the venue once they're [blessed](../under-the-hood/attestation.md#blessing-a-key) for the vault, and withdraws the approval when they're not. Where the station carries out trades itself, checks that each one is only a trade. Works out what the station holds at the venue. Closes positions when someone withdraws, a vault is killed or an agent is retired |
+| **On the chain** | Prepares and checks the calls the station makes at the venue: approving the vault's trade-only keys once they're [blessed](../under-the-hood/attestation.md#blessing-a-key) for the vault, and withdrawing them when they're not; checking that each trade the station carries out is only a trade; working out what the station holds there; and closing positions when someone withdraws, a vault is killed or an agent is retired |
 | **In the executor** | Turns the agent's orders into the venue's own, and signs them with the vault's trade-only key, only ever for the vault's own accounts. Streams the account's fills and balances back to the agent, and the venue's public market data to every agent that wants it |
 
 An agent never talks to a venue directly. It builds its orders with the driver's typed library from the SDK, hands them over, and the driver checks and signs them inside the attested machine.
+
+**A driver never holds money.** The station owns the vault's account at the venue, and makes every call there itself: the driver only prepares each call and checks it. Whatever a driver says, the station still keeps its own rules, so money only ever goes to the vault's own addresses. A driver with a bug could prepare a bad call, but it can't move money by itself.
+
+**One driver serves everyone.** Each venue has one driver on its chain, shared by every station there. A fixed version reaches running vaults the same way a fix to a machine image does, after the same public wait, so nothing needs redeploying.
 
 ## The promises every driver keeps
 
@@ -80,6 +84,7 @@ A new driver never touches a running vault. Existing agents keep the drivers the
 
 - **Anyone can ask for one,** on our Discord.
 - **Anyone can build one.** The driver interface and a test harness are published, so a venue, or a developer who needs one, can write it.
-- **Every driver is approved the slow, public way,** like a machine image: its executor half ships in an approved executor image, and its on-chain half is added to the [registries](../under-the-hood/registries.md#the-attestation-registry). Both wait out the same public wait before they count, and can be revoked at once.
+- **Every driver is approved the slow, public way,** like a machine image. Its executor half is added to our executor and unwinder images, whoever wrote it, and its on-chain half is added to the [registries](../under-the-hood/registries.md#the-attestation-registry). Both wait out the same public wait before they count.
+- **Revoking a driver stops trading through it at once,** but closing positions through it keeps working, so Depositors can always get out.
 
 [Next: bridges →](bridges.md){ .md-button .md-button--primary }
