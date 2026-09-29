@@ -8,7 +8,7 @@ The attestation registry decides which machines may hold a key at all. It record
 
 - **Approved images,** each as one kind: Reviewer, builder, executor or unwinder. A new image only counts after a public wait, and a revoked one stops at once ([the allowlist](attestation.md#the-allowlist)).
 - **Approved operators,** whose accounts may run those images, added the same slow, public way.
-- **Approved drivers,** the on-chain half of each, added the same slow, public way and revoked at once ([drivers](../writing/drivers.md#adding-a-driver)).
+- **Approved drivers,** the on-chain half of each, shared by every station on its chain, added the same slow, public way; revoking one stops trading through it at once, while closing positions still works ([drivers](../writing/drivers.md#adding-a-driver)).
 - **Blessed keys:** for each, the image it came from, its kind, and for a vault's key the one vault and exact build it may act for, and when its blessing expires ([blessing a key](attestation.md#blessing-a-key)).
 - **The attestation checker:** the fingerprint of the one proof program it accepts, and the Google root certificate that program trusts ([proving an attestation](attestation.md#proving-an-attestation)). These change only through the same public wait as an image.
 
