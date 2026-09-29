@@ -59,7 +59,7 @@ The [Welcome](index.md) page asked five questions anyone should ask before trust
 
 ## What does it do?
 
-**If its source is public, read it.** Then rebuild it with the published recipe, and you get the same fingerprint the chain holds for the build that's running. That proves the code trading is the code you just read.
+**If its source is public, read it.** Then rebuild it with the published recipe, and you get the same fingerprint the chain holds for the build that's running. The same goes for our own machine images: Google's attestation proves which fingerprint is running, and rebuilding the published source is what shows what that fingerprint contains. Every build is made to be exactly repeatable, so a rebuild always matches. That proves the code trading is the code you just read.
 
 **If its source is sealed, the Reviewer read it for you.** You can't see the code, but you can check that the [AI Review](basics/ai-review.md) read the real thing: the chain records exactly which source the Reviewer read, and it's the same source the running build came from. What you're trusting is the Reviewer's reading, not your own.
 
@@ -70,7 +70,7 @@ The [Welcome](index.md) page asked five questions anyone should ask before trust
 Three places to look, all on the agent's page:
 
 - **The review.** Especially its ratings for financial risk, and for whether the code keeps the limits its Author describes. The report is tied on the chain to the exact code that's running.
-- **Where it trades.** The exchanges it trades on and the bridges it uses, and how each exchange keeps money safe.
+- **Where it trades.** The venues it trades on and the bridges it uses, and how each venue keeps money safe.
 - **Its history.** Its share price over time, its deepest drop, and how much money was in the vault along the way, all read straight from its contract.
 
 The facts are on the chain. The review is one careful reading of the code, and a careful reading can still miss things.
@@ -79,7 +79,7 @@ The facts are on the chain. The review is one careful reading of the code, and a
 
 No. Only keys made inside an attested machine running this agent's exact build can trade for its vault, and our contracts check every key before it can act. An agent never changes: a changed agent is a new one, with a new vault, and nobody is moved into it.
 
-Nobody can add a key by hand, us included. The contracts accept a key only with an attestation, and the part that checks attestations is fixed when the contracts are deployed, so it can't be swapped for a more forgiving one later.
+Nobody can add a key by hand, us included. The contracts accept a key only with an attestation, and the part that checks attestations can only be changed the same slow, public way as a machine image, so it can never be swapped for a more forgiving one quietly.
 
 Shonin's one admin key can't get around it either. It can add a machine image to the approved list, which only counts after a public two-day wait, take one off, or kill a vault. So the list is the thing to watch: every image on it can be rebuilt from published source, and the wait gives anyone time to check a new one first.
 
@@ -87,7 +87,7 @@ Every vault's page lists its keys, and each key's record on the chain shows whic
 
 ## Could anyone walk off with my money?
 
-No. The keys that trade for a vault are [trade-only](basics/trade-only-keys.md): the exchange lets them place and cancel orders and nothing else. Money only moves through the vault's [smart contracts](basics/smart-contracts.md), and only between accounts the vault owns. That's enforced by the exchange and the contracts, not by our code, so it holds even if our code were wrong.
+No. The keys that trade for a vault are [trade-only](basics/trade-only-keys.md): the venue lets them place and cancel orders and nothing else. Money only moves through the vault's [smart contracts](basics/smart-contracts.md), and only between the vault and its own stations. That's enforced by the venue and by our open-source contracts, not by the agent or the machine running it, so it holds even if the agent is written to steal. What it does rely on is those contracts being right, and on the machine images that pass the public wait being honest: see [What checking can't tell you](#what-checking-cant-tell-you).
 
 The admin key can kill a vault, but a kill only closes positions and brings the cash home, where every Depositor can withdraw it.
 
@@ -95,11 +95,11 @@ What trading does allow is losing money, even on purpose, through bad trades. Th
 
 ## Can I get out whenever I want?
 
-Yes. Even if everything we run went dark tonight, you could withdraw by going to the vault's contract directly.
+Yes, and on most vaults without anyone's help. On a vault whose stations are all on its own chain, even if everything we run went dark tonight, you could withdraw by going to the vault's contract directly.
 
-If there's enough cash at home, you're paid in the same transaction. If not, the contract books your withdrawal and closes your share of its positions, and anyone, including you, can push it through.
+If there's enough cash at home, you're paid within seconds, priced just after you asked. If not, the contract books your withdrawal and closes your share of its positions, and anyone, including you, can push it through.
 
-A few vaults trade somewhere the contract can't reach by itself. There, an **unwinder** finishes the job: an attested machine that only closes positions and sends the cash home, and that any approved operator can run, not only us. Those vaults' pages say so up front.
+Vaults that trade on other chains, or at venues that keep their accounts off-chain, can't finish every withdrawal through the contracts alone. There, an **unwinder** finishes the job: an attested machine that only closes positions and sends the cash home. Any approved operator can run one, but at launch that's only us, so on these vaults a withdrawal that needs one waits until one runs. Those vaults' pages say so up front.
 
 ## What checking can't tell you
 
@@ -107,7 +107,9 @@ A few vaults trade somewhere the contract can't reach by itself. There, an **unw
 
 **Why a trade happened.** The chain shows every trade, but not who was on the other side or why. A trade at a bad price still moves money, which is the risk explained on [Trade-only keys](basics/trade-only-keys.md).
 
-**That the hardware is honest.** Attestations are signed by Google, and rest on security built into Intel and AMD chips. If either were broken, attestations could be faked, and nothing on the chain would show it.
+**That our own code is right.** The contracts, the machine images and the proof program are open source, so anyone can read them, but a bug in them could still lose money. And if our admin key were stolen, a dishonest image could reach running vaults after the public wait. It couldn't withdraw anyone's money, but it could trade it away or misprice it, so the approved list is worth watching.
+
+**That the hardware is honest.** Attestations are signed by Google, and rest on security built into the chip, Intel's at launch. If either were broken, attestations could be faked, and nothing on the chain would show it.
 
 **What happens next.** A history is history. It shows how an agent did, at its size, in the markets it saw, not how it will do.
 

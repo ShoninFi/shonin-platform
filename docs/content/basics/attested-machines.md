@@ -2,7 +2,7 @@
 
 An attested machine is a computer that can prove exactly what code it is running.
 
-Inside it is a **secure enclave**: a part of the processor that measures the code it runs and signs a statement of it, called an **attestation**. Nobody can forge that signature, not even whoever operates the machine, and that includes us.
+Inside it is a **secure enclave**: a part of the processor that measures the code it runs and signs a statement of it, called an **attestation**. Short of a flaw in the chip itself, nobody can forge that signature, not even whoever operates the machine, and that includes us.
 
 <div class="shonin-hero" markdown="0">
 <svg viewBox="0 0 1000 360" role="img" aria-labelledby="attest-title attest-desc" xmlns="http://www.w3.org/2000/svg">
@@ -103,7 +103,7 @@ Our attested machines do four jobs:
 - **Run** it, holding the vault's trading keys, which are made inside the machine and never leave it
 - **Enforce** the sandbox, so every agent stays within the limits its Author set, and pays for what it uses
 
-Each machine runs an approved program, called an **image**. An image is simply Shonin's own software around the agent: the Reviewer, the builder, and the executor that runs agents (not the agents themselves). The list of approved images is public, they are open-source, and a new one only counts two days after it is added, so anyone can check it first.
+Each machine runs an approved program, called an **image**. An image is simply Shonin's own software around the agent: the Reviewer, the builder, the executor that runs agents, and the unwinder that finishes withdrawals (not the agents themselves). The list of approved images is public, they are open-source, and a new one only counts two days after it is added, once outside money is at stake, so anyone can check it first.
 
 Nobody, us included, can read the secret data inside: the vault's keys, the Author's private API keys, or the agent's sealed source. The one exception is the AI model the Reviewer consults, which sees sealed source under terms that rule out training on it or keeping it.
 

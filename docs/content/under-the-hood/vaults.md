@@ -1,63 +1,114 @@
-# The vault contract
+# Vaults
 
-A vault is one contract holding one pool of capital behind one agent. It computes its own value, mints and burns its own shares, pays its own withdrawals, and charges its own fees. Nobody reports anything to it.
+A vault is the one contract behind each agent that Depositors deal with. It lives on the chain its Author chose, takes deposits, pays withdrawals, issues shares, charges fees and holds the [tank](../tank.md). It never trades: its [stations](stations.md) do. It works out its own share price, from its own cash and what its stations hold. For a station on another chain, that figure is carried to it by our attested machines.
+
+## Its life
+
+```mermaid
+stateDiagram-v2
+    [*] --> Activating: the Author activates
+    Activating --> Live: every station exists
+    Activating --> Cancelled: not whole after 3 days
+    Live --> WindingDown: the Author retires it
+    WindingDown --> Closed: 7 days later, positions closed
+    Live --> Frozen: a claim unserved for 7 days
+    Live --> Killed: the admin key kills it
+    Frozen --> Killed
+    Killed --> Closed: positions closed
+```
+
+| State | Deposits | Withdrawals | The agent |
+| --- | --- | --- | --- |
+| **Activating** | No | Nothing to withdraw | Not started, while its stations are created |
+| **Live** | Yes | Yes | Running |
+| **Winding down** | No | Yes | Running, for 7 days |
+| **Frozen** | No | Yes | Only unwinding is left |
+| **Killed** | No | Yes, once the positions are closed | Stopped |
+| **Closed** | No | Yes, from cash, whenever anyone likes | Stopped for good |
+| **Cancelled** | Never took any | Nothing to withdraw; the tank goes back to the Author | Never started |
+
+A vault never changes its agent. A changed agent is a new agent, with a vault of its own.
 
 ## Shares
 
-Shares follow **ERC-4626**, the standard interface for tokenised vaults: the vault is an ERC-20 whose shares are a pro-rata claim on a pool of one asset, with a share price of assets divided by shares that wallets and other contracts already understand.
+A deposit mints shares at the vault's value per share, and a withdrawal burns them. Your profit or loss is your shares times today's value per share, less what you paid.
 
-A deposit mints shares at the vault's current value per share. Your profit and loss is your shares times today's value per share, less what you paid.
+On Ethereum-style chains, a vault's shares use **ERC-4626**'s maths and its deposit and withdraw calls. On Solana, the vault is a Solana program with the same rules. On every chain, **shares can't be transferred**: you get money out by withdrawing.
 
-The standard's one fairness rule, round against whoever is moving, is applied to prices as well as to shares:
+Whoever is moving pays for the move, never the pool:
 
 | Moving | Valued at |
 | --- | --- |
 | Depositing | Mark |
 | Withdrawing | Exit-side marks: a long at the best bid, a short at the best ask |
 
-So the mover pays the spread, and the pool never does.
+**An empty vault can't be gamed.** A classic trick against a new vault is to deposit a tiny amount, then send the vault a large sum directly, so the next depositor's shares round down to nothing. It doesn't work here: the share maths always counts a small number of phantom shares, a vault only counts money that came in through its own deposits and its stations, and a sliver of shares that nobody can withdraw is created when the vault is activated.
 
-!!! note "Not fully ERC-4626 compliant"
-    `redeem` may book a claim rather than transfer assets, in the manner of ERC-7540. An integrator should expect that.
+## Priced after you ask
+
+**Every deposit and withdrawal is a request, priced a few seconds after you make it.** When you ask, the vault records your request and a **valuation time**: the first ten-second mark at least five seconds away. You're then valued at the prices at that moment, never at a price that was already known when you asked. Nobody, you included, can see that price when committing to it, so nobody can race the vault's own figure with news from elsewhere.
+
+- **A request can't be cancelled.** Otherwise it would be a free bet: ask, then cancel if the price moved the wrong way.
+- **Which prices count is fixed by a rule, not by whoever settles.** Prices on the vault's own chain must be recorded within three seconds after the valuation time. A station on another chain is valued at that chain's first block at or after it, and an attested machine carries that figure to the vault within the next minute, signed with a key blessed for this vault. If nothing is recorded in time, the request moves to the next valuation time.
+- **Requests for the same moment are settled together,** at one price.
+- **If two carried figures for the same moment disagree,** deposits use the higher and withdrawals the lower, so a wrong figure can't help anyone take money from the pool.
+
+The web app does both steps for you, and a deposit or withdrawal paid from cash is still done within seconds. The smallest deposit is $10.
+
+!!! note "Not quite ERC-4626"
+    Deposits and withdrawals settle after a request, in the manner of ERC-7540. Anything integrating with a vault should expect that.
+
+## Its value
+
+```text
+vault value = cash in the vault
+            + what each station holds
+            − the tank (the Author's money for running the agent, not Depositors')
+```
+
+The vault reads a station on its own chain directly. A station on another chain works out what it holds from its own chain, and an attested machine carries the figure to the vault. [Stations](stations.md#what-its-worth) explains how each is valued. Money crossing a bridge counts for up to an hour, then as zero until it arrives.
 
 ## Leaving
 
 ```mermaid
 flowchart TB
-    R(["redeem(shares)"]) --> C["pay the fees these<br/>shares owe so far"]
+    R(["ask to withdraw"]) --> T["wait for the<br/>valuation time"]
+    T --> C["pay the fees these<br/>shares owe so far"]
     C --> V["value at exit-side marks,<br/>take the transaction fee"]
-    V --> Q{"does the idle balance<br/>cover it?"}
-    Q ==>|yes| P(["burn the shares,<br/>pay in this transaction"])
+    V --> Q{"enough cash<br/>in the vault?"}
+    Q ==>|yes| P(["burn the shares, pay"])
     Q -->|no| B["mark the shares pending,<br/>book a claim"]
-    B --> S["<b>settle</b>: anyone may call it<br/>close your fraction of every position,<br/>inside the exit band"]
-    S --> H["cash home: value again, burn<br/>at the marks then, pay"]
+    B --> S["<b>settle</b>: anyone may call it<br/>close your share of every position,<br/>inside the exit band"]
+    S --> H["cash home: value again,<br/>burn the shares, pay"]
     H --> P2(["paid"])
 
     classDef fast fill:#0d948818,stroke:#0d9488,color:inherit
     classDef slow fill:#f59e0b18,stroke:#f59e0b,color:inherit
     classDef ends fill:#4338ca18,stroke:#4338ca,color:inherit,font-weight:bold
-    class C,V fast
+    class T,C,V fast
     class B,S,H slow
     class R,P,P2 ends
 ```
 
-Each vault keeps some of its money home, in the vault contract itself, rather than out at an exchange. How much is the Author's choice, 5% of the vault by default, and the contract enforces it: it won't let the agent move money out if that would leave less than the Author's floor. Lowering the floor takes a day to apply, so Depositors can see it coming. So most withdrawals end in the first branch: the shares are burned and the Depositor is paid in the same transaction.
+**Most withdrawals are paid from cash.** Each vault keeps some of its money at home as cash, its **idle floor**: 5% by default, set by the Author, and enforced by the vault, which won't let money out to its stations if that would leave less. Lowering the floor takes a day, so Depositors see it coming.
 
-When idle capital cannot cover it, the shares are marked pending and the contract books a **claim**, which has three states: *pending*, *waiting* when a settlement was tried and the market was outside the band, and *paid*.
+**When there isn't enough cash,** the shares are marked pending and the vault books a **claim**. It's settled by closing the leaver's share of every position and bringing the cash home, and then they're paid. A claim is *pending*, *waiting* if the market was outside the exit band when settling was tried, or *paid*.
 
-`settle` is a public function, and that is the part worth dwelling on. A Depositor does not need us, or the Author, or the executor, to get their money. If every service we run stopped this minute, they could send the settle transaction themselves and be paid by the contract.
+**Settling needs nobody's permission.** `settle` is public: if everything we run stopped this minute, a Depositor could send it themselves. On the vault's own chain the contracts finish it alone. Where a station is on another chain, or a venue keeps its accounts off-chain, an [unwinder](machines.md#the-unwinder) finishes it. Any approved operator can run one, though at launch that's only us. Each vault's page says which kind of vault it is, **direct** or **served**, and [Stations](stations.md#getting-money-out) explains the difference.
+
+**If no price can be had at all,** say a station's figure can't be carried because no operator is running, a withdrawal isn't stuck. After 24 hours without a valuation, you can take your exact share of the vault's cash straight away, and the rest of your shares become a claim on the same share of each station's holdings, paid when that money comes home. Nothing needs pricing, so nothing can be gamed, and nobody else in the pool pays for it.
 
 ### The exit band
 
-A claim's positions are closed with reduce-only immediate-or-cancel orders, limited to the exchange's oracle price plus or minus the **exit band**, 1% by default. The pool's cost beyond the spread is therefore bounded by that band times the notional closed. If the market is outside the band the close does not fill, the claim waits, and settlement is retried.
+A claim's positions are closed with reduce-only orders that fill at once or not at all, at the venue's oracle price plus or minus the **exit band**, 1% by default. What one leaver can cost the pool beyond the spread is bounded by that band. If the market is outside it, nothing fills, the claim waits, and settling is tried again.
 
-The leaver pays the spread through exit-side marks, pays the transaction fee, and bears the close's impact pro rata with everyone else, because their shares are still outstanding when it lands. The Depositors who stay keep the transaction fee.
+The leaver pays the spread, the transaction fee, and the costs of their own exit, such as an unwinder's gas and bridge fees. The unwinder reports those, signed with its blessed key, and they can never be more than the chain's gas price times published limits for each step, plus the bridge's quoted fee. The leaver also shares the close's impact with everyone else, since their shares are still outstanding when it lands.
 
-A claim that goes unserved for seven days lets anyone freeze the vault: no new deposits, and only unwinding left.
+**A claim nobody has tried to settle for seven days lets anyone freeze the vault:** no new deposits, the agent's trading keys lose their approval at every station, and only unwinding is left. A claim that's only waiting because the market is outside the exit band doesn't count.
 
 ## Fees
 
-Fees are worked out every day and paid once a week, as **new shares**, so paying them never forces a sale.
+Fees are worked out every day and paid every Monday, as **new shares**, so paying them never forces a sale.
 
 ```text
 every day, what is owed so far is worked out and taken out of value per share:
@@ -68,7 +119,7 @@ every day, what is owed so far is worked out and taken out of value per share:
       author fee = gains × 10%
       platform   = gains × 5%
 
-once a day, keep() collects the tank's bill, and on the weekly day:
+once a day, keep() collects the tank's bill, and every Monday at 00:00 UTC:
   what is owed then is paid as new shares          → the Author, the platform
   high-water mark = value per share, if that is a new high
 
@@ -77,45 +128,40 @@ on every deposit and withdrawal:
   a withdrawal pays what its own shares owe so far
 ```
 
-- **Value per share is always after fees.** What is owed so far is already taken out of the number a Depositor sees, so there is no drop on the day fees are paid.
-- **Fees owed can shrink.** If the vault gives back its gains before the week is out, what it owes shrinks with them. Only what is still owed at the weekly payment is paid, so a gain that vanishes within the week is never charged for.
-- **The high-water mark is the vault's own.** It is the highest value per share the vault has reached at a weekly payment, so profit fees are only taken on new highs. A loss followed by a recovery pays nothing on the recovery.
-- **The transaction fee is nobody's.** It stays in the pool and raises value per share for the Depositors who stay, so timing a deposit or a withdrawal around a price update cannot take value from them.
-- **Moving to another agent** costs the transaction fee out and in.
+- **Value per share is always after fees.** What's owed so far is already taken out of the number a Depositor sees, so there's no drop on payday.
+- **Fees owed can shrink.** If the vault gives back its gains before the week is out, what it owes shrinks with them. A gain that vanishes within the week is never charged for.
+- **The high-water mark is the vault's own:** its highest value per share at a weekly payment. Profit fees are only ever taken on new highs.
+- **The transaction fee is nobody's.** It stays in the pool and raises value per share for the Depositors who stay, so timing a deposit or withdrawal around a price update costs the one timing it.
 
-The schedule is fixed when a vault is created and never changes under it. A vault's page shows its own schedule, not today's default.
+The schedule is fixed when the vault is created and never changes under it. A vault's page shows its own schedule, not today's default.
 
 ## The tank
 
-Running an agent costs money: compute, and gas where a chain charges it. That is the **Author's** cost, not the Depositors'.
+Each vault has a **tank**: a plain dollar balance, held by the vault but not counted in what shares are worth, that pays for running the agent. The Author fills it when activating, and whenever they like after that.
 
-Each vault has a **tank**, a plain dollar balance for running it. The Author funds it when activating the agent, and whenever they like after that, and it's excluded from what shares are worth, so a Depositor's value never pays for the agent's electricity.
-
-- The executor keeps a running total of usage, signed by the vault's own blessed key, and stops the agent the moment the unpaid part reaches the tank. Once a day, one call to the vault's `keep` collects it from the tank, pays fees on the weekly day, then runs auto-fill. Anyone may send it; Shonin's keeper normally does, and pays its gas. The contract believes the total only up to the allowances the Author declared at the platform's published prices over the time elapsed. A wrong total cannot charge more than the Author agreed to.
-- The Author's fee shares are theirs. They can redeem some into the tank in one transaction, or set **auto-fill** to "keep my tank at $X": each day, just enough of their shares are redeemed to bring the tank back to $X, from the vault's idle balance, waiting until the next day when there isn't enough.
-- The Author can withdraw from the tank at any time. The withdrawal settles a recent signed usage total first, then transfers the rest at once.
-- A tank that runs dry stops the agent until anyone tops it up. Its open positions stay as they are, unmanaged, and the vault page says so; Depositors can leave at any time, and exits never draw on the tank. A last bill the tank can't cover takes what's there, and the rest is written off; the tank never carries a debt.
-
-Every vault page shows the tank's balance and its recent charges.
+- **What's charged is capped.** The executor keeps a running total of what the agent uses, signed with the vault's own blessed key, and stops the agent the moment the unpaid part reaches the tank. Once a day, `keep` collects it, pays fees on the weekly day, and runs auto-fill. Anyone may send it; Shonin normally does, and pays its gas. The vault only believes the total up to the Author's allowances at our published prices, so a wrong total can never charge more than the Author agreed to.
+- **Earnings can pay for it.** The Author's fee shares are theirs. They can turn some into tank money in one transaction, or set **auto-fill**, "keep my tank at $X", and each day just enough of their shares are turned into cash to top it up.
+- **The Author can take it out** at any time. The latest bill is paid first, and the rest comes back at once.
+- **A dry tank stops the agent,** until anyone tops it up. Its positions stay as they are, and the vault's page says so. Withdrawals never draw on the tank, so an empty one can't hold anyone up. A final bill bigger than the tank takes what's there, and the rest is written off.
 
 ## Retiring
 
-An Author can **retire** their agent at any time, and it takes effect slowly on purpose. Retiring starts a **wind-down** of seven days: the vault refuses new deposits, the agent keeps running, and every withdrawal works exactly as before. When the wind-down ends, the agent is evicted from the attested machine, and its positions are closed through the same reduce-only path a claim uses and the cash brought home, its costs paid from what comes home, never by the tank or by us. After that, every remaining Depositor is paid from idle balance in one transaction. The vault contract itself stays on-chain, holding only cash, and anyone still in, the Author included, withdraws from it whenever they like.
-
-The tank works as always during the wind-down. If the Author empties it, the agent stops early, and the positions are still closed when the week is up.
+An Author can **retire** their agent at any time, but it takes a week on purpose. The vault stops taking deposits at once, the agent keeps running, and withdrawals work as usual. After seven days anyone can end it: the agent is sent `halting` and gets ten minutes to wind down, then it's stopped for good, every position is closed the same way a claim closes them, and the cash comes home, its costs paid from the money itself. The vault stays on the chain for good, holding only cash, for anyone still in to withdraw.
 
 ## A kill
 
-Shonin's **admin key** can **kill** any vault, typically after its health report shows it failing. Besides proposing and revoking machine images, it's the only other thing that key can do. A kill closes every position through the same reduce-only path a claim uses and brings all the cash home. After that the vault holds only idle balance, so every Depositor's withdrawal is paid in one transaction.
+Shonin's **admin key** can **kill** a vault, typically one whose health report shows it failing. It's the only thing that key can do to a vault. The agent is sent `halting` and gets ten minutes to wind down itself, then every position is closed the same way a claim closes them, and the cash comes home, so every Depositor can then be paid in one transaction.
 
-It moves no funds anywhere but back to Depositors. It is a halt, never a theft. Every kill is announced on the vault's page and on a public feed, with its reason.
+A kill moves no money anywhere but back to Depositors. It's a halt, never a theft, and every kill is announced on the vault's page and a public feed, with its reason.
 
 ## What the chain verifies
 
-| Fact | On the chain |
-| --- | --- |
-| Share supply, deposits, withdrawals, pending shares, claims and their settlement | ✓ |
-| Fees, the high-water mark, the tank and what it was charged | ✓ |
-| The vault's value, computed by the contract from exchange state | ✓ |
-| Which keys may act for the vault, and what they may run | ✓ |
-| Every order and fill on the exchange | ✓ |
+| Fact | Checked by the chain | Rests on |
+| --- | --- | --- |
+| Shares, deposits, withdrawals, claims and how they settled | ✓ | |
+| Fees, the high-water mark, the tank and what it was charged | ✓ | Charges are capped at the Author's allowances; within that, the executor's signed total |
+| Cash in the vault, and what a station on its own chain holds | ✓ | The prices the station uses |
+| What a station on another chain holds | Signed by a key blessed for this vault, and fresh | The attested machine that carried it |
+| Which keys may trade for the vault, and what they may run | ✓ | Attestation, through each key's [blessing](attestation.md#blessing-a-key) |
+
+[Next: stations →](stations.md){ .md-button .md-button--primary }

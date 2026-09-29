@@ -1,6 +1,6 @@
 # Retiring
 
-When you're done with your agent, retire it from its page in the web app. It can't be done in a hurry: retiring takes a week, so Depositors are never caught out by an agent vanishing from under them.
+When you're done with your agent, retire it from its page in the web app. It can't be done in a hurry: retiring takes a week, so Depositors get a week's warning before an agent stops for good.
 
 ## The week, step by step
 

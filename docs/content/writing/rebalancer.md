@@ -51,7 +51,7 @@ Its one long-lived `run`, from `src/lib.rs`. It uses two of the [services](servi
 ```rust
 impl Strategy for Rebalancer {
     async fn run() -> Result<(), String> {
-        // Whatever a previous run left behind is still on the exchange,
+        // Whatever a previous run left behind is still on the venue,
         // so look before doing anything.
         step().await?;
 
@@ -61,7 +61,7 @@ impl Strategy for Rebalancer {
 
         while let Some(woke) = waking.next().await {
             match woke {
-                // A fill or a price move: look again.
+                // A fill or an order update: look again.
                 Woke::Account => step().await?,
                 // A Depositor is leaving, or cash at home is running low:
                 // look again, and keep more at home.
@@ -80,7 +80,7 @@ impl Strategy for Rebalancer {
 }
 ```
 
-There's no callback, no tick handler and no scheduler. The attested machine starts `run` once, and everything the agent does, it does inside that call. If it ever crashes, it's started again, so an agent always rebuilds its picture from what the exchange says it holds, because that's where the truth is.
+There's no callback, no tick handler and no scheduler. The attested machine starts `run` once, and everything the agent does, it does inside that call. If it ever crashes, it's started again, so an agent always rebuilds its picture from what the venue says it holds, because that's where the truth is.
 
 ## Its claims, kept in code
 
@@ -88,8 +88,8 @@ Each of the rebalancer's three claims is a promise in `claims` and something its
 
 - **"Exposure never above the vault's value"**: `MAX_EXPOSURE` is `1.0`, the target is held below it whatever `TARGET_EXPOSURE` says, and a buy never goes past the target.
 - **"No single order above 5% of the vault"**: every order is capped at `MAX_ORDER_FRACTION` of the vault's value, so a big gap closes over several steps.
-- **"Trades one market, and nothing else"**: it only ever reads and orders `MARKET`, and does nothing if the exchange doesn't list it.
+- **"Trades one market, and nothing else"**: it only ever reads and orders `MARKET`, and does nothing if the venue doesn't list it.
 
 That's the whole pattern. There's no platform risk policy, so a limit only exists if your code enforces it, and the [AI Review](../basics/ai-review.md) checks each promise against the code.
 
-[Next: how the machines work →](../under-the-hood/machines.md){ .md-button .md-button--primary }
+[Next: attestation and keys →](../under-the-hood/attestation.md){ .md-button .md-button--primary }

@@ -72,9 +72,9 @@ Running an agent costs money. Each vault has a **tank**, the Author's account fo
 
 The tank pays for two things:
 
-**Resources.** What the agent consumes as it runs: processor time, memory, network traffic, local inference, etc. Our prices for each are published in US dollars.
+**Resources.** What the agent consumes as it runs: processor time, memory, network traffic, local inference, etc. Our prices for each are published in US dollars, and any change is announced 30 days ahead.
 
-**Gas.** The fee a blockchain charges for each transaction sent for the agent, including the ones that set its vault up on other chains. It's set by the chain, not by us, so it depends on where the agent trades: Hyperliquid charges no gas for orders, while on other chains, like Ethereum, gas can be costly and rises when the network is busy.
+**Gas.** The fee a blockchain charges for each transaction sent for the agent, including the ones that create its stations on other chains. It's set by the chain, not by us, so it depends on where the agent trades: Hyperliquid charges no gas for orders, while on other chains, like Ethereum, gas can be costly and rises when the network is busy.
 
 We cover both as they happen, and set the money aside in the tank: each cost goes on a running tab, and once a day we're paid the tab out of the tank. The tab can't get more than a few seconds ahead of what's in the tank, even for an agent written to waste money on purpose:
 
@@ -87,7 +87,7 @@ Every vault's page shows how full its tank is and its recent charges. The Author
 
 **Private services.** If the agent uses a paid third-party service, like a data feed or an AI model hosted somewhere else, the Author brings their own account. They seal its API key into the agent, where nobody can read it, and the service bills the Author directly.
 
-**Trading fees.** The fees an exchange charges on each trade, like Hyperliquid's trading fee, come out of the trade itself, from the vault's trading account. They're part of what the agent makes or loses, as at any fund.
+**Trading fees.** The fees a venue charges on each trade, like Hyperliquid's trading fee, come out of the trade itself, from the vault's trading account. They're part of what the agent makes or loses, as at any fund.
 
 **Leaving the vault.** A withdrawal pays its own way: a Depositor pays its network fee, like any other transaction. On the few vaults that need an operator to finish an exit, the operator's costs come out of that withdrawal.
 
@@ -107,6 +107,6 @@ The agent stops the moment the tab reaches what's in the tank, whether the tank 
 
 We don't step in beyond that. An agent its Author stops paying for is simply an unsuccessful one: its open positions stay where they are, with nothing managing them, and the vault's page says so loudly. An empty tank adds no risk beyond the agent's own trades, and Depositors can still leave whenever they like.
 
-[The vault contract](under-the-hood/vaults.md#the-tank) has the details.
+[Vaults](under-the-hood/vaults.md#the-tank) has the details.
 
 [Next: fees →](fees.md){ .md-button .md-button--primary }

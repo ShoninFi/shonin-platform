@@ -11,7 +11,7 @@ The words you'll meet throughout these docs: first who does what, then the handf
 : Puts money into an agent's vault and earns what the agent makes with it: the vault's profit, after fees, in proportion to their shares. Losses are shared the same way. Can leave at any time, without asking anyone.
 
 **[Reviewer](../basics/ai-review.md)**
-: An AI model, running on an attested machine, that reads an agent's source before it is built and writes a report on it. Code it finds malicious is never built. The report is there to help you choose an agent, not to keep your money safe: that is the job of the attested machine and the trade-only keys.
+: An AI model, running on an attested machine, that reads an agent's source before it is built and writes a report on it. Code it finds malicious is never built. The report is there to help you choose an agent, not to keep your money safe: that is the job of the attested machine, the trade-only keys and the smart contracts.
 
 **Shonin**
 : Runs the platform and the attested machines, and takes a small share of fees. Can stop a vault, which returns everything to its Depositors, but cannot move anyone's money anywhere else.
@@ -36,8 +36,11 @@ The words you'll meet throughout these docs: first who does what, then the handf
 **Booked withdrawal**
 : A withdrawal bigger than the cash the vault has at home. The contract closes your share of its positions and pays you once that cash is back.
 
-**[Driver](../writing/vault-and-drivers.md#drivers)**
-: What lets agents trade on one exchange: it approves the vault's trade-only keys there, works out what the vault holds, and closes positions when someone withdraws. Authors choose drivers in `shonin.toml`; Depositors only ever see the exchanges.
+**[Bridge](../writing/bridges.md)**
+: Another company's service for moving money between chains. An agent only uses the ones it names, and its station checks the money will arrive at the vault's own address.
+
+**[Driver](../writing/drivers.md)**
+: What lets agents trade on one venue: it approves the vault's trade-only keys there, works out what the vault's station holds there, and closes positions when someone withdraws. Authors choose drivers in `shonin.toml`; Depositors only ever see the venues.
 
 **[High-water mark](../fees.md#the-profit-fee)**
 : The highest a vault's share price has been on a payday. The profit fee is only charged on gains above it.
@@ -61,7 +64,7 @@ The words you'll meet throughout these docs: first who does what, then the handf
 : Your slice of a vault. You get shares when you put money in, and their price rises and falls with the vault.
 
 **[`shonin.toml`](../writing/configuration.md#shonintoml)**
-: An agent's configuration file: its description, the claims it makes about itself, the drivers it trades through and the bridges it uses. Fixed once published.
+: An agent's configuration file: its vault's chain, its description, the claims it makes about itself, the drivers it trades through and the bridges it uses. Fixed once published.
 
 **[Station](../basics/smart-contracts.md#where-they-live)**
 : A vault's contract on a chain its agent trades on, the vault's own chain included. It holds the money the agent trades with there and reports its value to the vault, but takes no deposits and issues no shares.
@@ -70,51 +73,45 @@ The words you'll meet throughout these docs: first who does what, then the handf
 : The Author's account for running their agent. It pays for computing and gas, never from Depositors' money.
 
 **[Trade-only key](../basics/trade-only-keys.md)**
-: The key that trades for a vault. The exchange lets it place and cancel orders, and nothing else.
+: The key that trades for a vault. The venue lets it place and cancel orders, and nothing else.
 
 **[Vault](../under-the-hood/vaults.md)**
 : The smart contract holding the money behind one agent. It lives on one chain, named in the agent's `shonin.toml`, takes deposits and pays withdrawals there, and works out its share price from its stations.
 
 ## Under the hood
 
-**[Admin key](../under-the-hood/vaults.md#a-kill)**
-: Shonin's one key with special powers. It proposes machine images, which only count after a public wait, revokes them at once, and can kill a vault. It can't move money anywhere but back to Depositors.
+**[Admin key](../under-the-hood/registries.md#governance)**
+: Shonin's one key with special powers. It proposes new machine images, operators, drivers and attestation checkers, which only count after a public wait, revokes them at once, and can kill a vault. It can't move money anywhere but back to Depositors.
 
-**[Attestation](../under-the-hood/machines.md#what-attestation-proves-and-what-it-doesnt)**
+**[Attestation](../under-the-hood/attestation.md#what-attestation-proves-and-what-it-doesnt)**
 : A statement, signed by the processor, of exactly which code an attested machine is running. Our contracts check one before they accept any key it made.
 
-**[Blessing](../under-the-hood/machines.md#blessing-a-key)**
-: The on-chain record that one key, made on one image, may act for one vault running one bundle, until it expires. Renewed by attesting again.
-
-**Bundle**
-: What a build produces: the agent's compiled code, plus any AI models it ships. Its hash is what a vault's keys are blessed to run.
+**[Blessing](../under-the-hood/attestation.md#blessing-a-key)**
+: The on-chain record that one key, made on one image, may act for one vault running one build, until it expires. Renewed by attesting again.
 
 **Claim**
 : The contract's name for a booked withdrawal. It's *pending*, then *waiting* if the market was too far from its price to close, then *paid*.
 
 **[Exit band](../under-the-hood/vaults.md#the-exit-band)**
-: How far from the exchange's own price a booked withdrawal may close positions, 1% by default. It limits what one person leaving can cost everyone else.
+: How far from the venue's own price a booked withdrawal may close positions, 1% by default. It limits what one person leaving can cost everyone else.
 
 **Freeze**
 : What anyone can do to a vault whose booked withdrawal has gone unpaid for seven days: no new deposits, and only winding down left.
 
-**Idle balance**
-: The part of a vault's money sitting in its contract rather than at an exchange. Withdrawals up to it are paid at once.
-
-**[Image](../under-the-hood/machines.md#the-allowlist)**
+**[Image](../under-the-hood/attestation.md#the-allowlist)**
 : One of the approved programs an attested machine may run: the Reviewer, the builder, the executor or the unwinder. The list is public, and a new image only counts after a public wait.
 
 **[Kill](../under-the-hood/vaults.md#a-kill)**
 : Shonin stopping a vault: every position closed, all the cash brought home, and every Depositor able to withdraw at once. A halt, never a theft.
 
 **Mark**
-: An exchange's own reference price, used to value a deposit. A withdrawal is valued at **exit-side marks** instead: what a position would actually sell for.
+: A venue's own reference price, used to value a deposit. A withdrawal is valued at **exit-side marks** instead: what a position would actually sell for.
 
 **Settle**
 : The public function that closes a booked withdrawal's positions, brings the cash home and pays the leaver. Anyone can send it.
 
 **Strategy**
-: The contracts' word for an agent, as in `strategyId` and `StrategyRegistry`. These docs only use it when naming something in the contracts.
+: The contracts' word for an agent, as in `strategyId` and `StrategyRegistry`. These docs only use it when naming something in the contracts or the SDK.
 
 **Usage total**
 : The running total of what an agent has used, kept and signed by its attested machine. The agent stops when the unpaid part reaches the tank, and Shonin collects from it, never past the allowances.

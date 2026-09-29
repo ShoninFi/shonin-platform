@@ -8,7 +8,7 @@ Two fees pay the Author and Shonin. The profit fee is a share of the profit an a
 | Holding fee | 1% a year | Shonin |
 | Deposit and withdrawal fee | 0.1% each way | The vault: it raises every share's value |
 
-The profit and holding fees are paid once a week, by creating new shares for the Author and Shonin rather than taking cash out of the vault.
+The profit and holding fees are paid every Monday, by creating new shares for the Author and Shonin rather than taking cash out of the vault.
 
 ## The profit fee
 

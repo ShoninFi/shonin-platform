@@ -33,7 +33,7 @@ The quickest way to write one is to start from our template: a complete, small a
 | `shonin.toml` | The agent's [configuration](configuration.md): its vault's chain, its description, its claims, where it trades and the bridges it uses |
 | `src/config.rs` | Its settings, as constants: the market, the target, and the numbers behind its limits |
 | `src/lib.rs` | The agent itself: its one long-lived `run` |
-| `src/decide.rs` | Its decisions, as plain functions of what it sees, so they can be tested without an exchange |
+| `src/decide.rs` | Its decisions, as plain functions of what it sees, so they can be tested without a venue |
 | `tests/` | Tests for those decisions |
 | `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml` | The dependencies and toolchain, pinned, so our builder compiles exactly what you did |
 
