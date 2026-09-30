@@ -3,7 +3,7 @@
 An agent is configured in two places:
 
 - **On its vault:** the things you can change while it runs.
-- **In `shonin.toml`:** the chain its vault lives on, and the agent's description, claims, drivers and bridges, which are decisions locked in forever.
+- **In `shonin.toml`:** the chain its vault lives on, and the agent's description, claims, drivers, bridges and any extra limits on who can deposit, which are decisions locked in forever.
 
 ## Vault configuration
 
@@ -70,6 +70,17 @@ One table for each [driver](drivers.md) the agent trades through, holding whatev
 ### `[bridges.<name>]`
 
 One table for each [bridge](bridges.md) the agent uses to move money between chains. They're shown on the vault's page before anyone deposits. An agent that only trades on its vault's chain has none.
+
+### `[depositors]`
+
+Optional. Your vault already refuses deposits from US persons, sanctioned persons and anyone its [drivers' venues exclude](drivers.md#who-a-venue-excludes). Here you can add more places, by country code:
+
+```toml
+[depositors]
+exclude = ["GB", "CA"]
+```
+
+You can only add to the list, never shorten it. Like the rest of the file, it's fixed once the agent is published, and it's shown on the vault's page.
 
 ## Your agent's own settings
 

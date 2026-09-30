@@ -54,6 +54,9 @@ The words you'll meet throughout these docs: first who does what, then the handf
 **Record**
 : A vault's history of its share price, read straight from its own contract.
 
+**[Restricted person](../depositors.md#who-can-deposit)**
+: Someone a vault can't take a deposit from: a US person, a sanctioned person, anyone one of its venues excludes, or anyone acting for one of them. Depositing means signing a statement that you aren't one.
+
 **[Retire](../writing/retiring.md)**
 : An Author ending their agent. The vault stops taking deposits and the agent keeps running for seven days; then it's stopped for good, and its positions are closed and the cash brought home to the vault, where anyone still in can withdraw it.
 

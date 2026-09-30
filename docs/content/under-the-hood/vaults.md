@@ -55,6 +55,8 @@ Whoever is moving pays for the move, never the pool:
 
 The web app does both steps for you, and a deposit or withdrawal paid from cash is still done within seconds. The smallest deposit is $10.
 
+**A deposit carries a signed statement.** The depositor's wallet signs that they aren't one of the people this vault excludes and aren't acting for one. The vault works out its list from its drivers, plus US persons and sanctioned persons, plus anything its Author added; it checks the signature against that list, records it, and refuses a deposit without one, however the deposit arrives. A withdrawal never needs one. [Depositors](../depositors.md#who-can-deposit) and [Drivers](../writing/drivers.md#who-a-venue-excludes) have the rest.
+
 !!! note "Not quite ERC-4626"
     Deposits and withdrawals settle after a request, in the manner of ERC-7540. Anything integrating with a vault should expect that.
 
@@ -159,6 +161,7 @@ A kill moves no money anywhere but back to Depositors. It's a halt, never a thef
 | Fact | Checked by the chain | Rests on |
 | --- | --- | --- |
 | Shares, deposits, withdrawals, claims and how they settled | ✓ | |
+| That every depositor signed the vault's statement | ✓ | The depositor's own word: nobody's identity is checked |
 | Fees, the high-water mark, the tank and what it was charged | ✓ | Charges are capped at the Author's allowances; within that, the executor's signed total |
 | Cash in the vault, and what a station on its own chain holds | ✓ | The prices the station uses |
 | What a station on another chain holds | Signed by a key blessed for this vault, and fresh | The attested machine that carried it |

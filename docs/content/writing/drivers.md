@@ -66,6 +66,7 @@ Venues work very differently, but a driver only counts if it keeps the same prom
 - **Money only goes to the vault's own accounts,** whatever the key asks for.
 - **Holdings are worked out, not reported:** from the venue's on-chain state, or, for a venue that keeps its accounts off-chain, an attested read that the vault's page labels as such.
 - **Positions can always be closed** for a withdrawal, by the contracts alone or by an unwinder, and the vault's page says which.
+- **The venue's exclusions are carried through.** Each driver carries the list of people its venue doesn't accept, and every vault using it refuses their deposits.
 
 ### How money stays in
 
@@ -77,6 +78,14 @@ Something has to stop the vault's keys from sending money anywhere but the vault
 | **The station enforces it** | The station's own account, whose rules only allow calls to that venue's contracts, with the station itself as the only receiver | Stock tokens on Robinhood Chain, bought and sold only through approved exchanges; decision markets on Solana |
 
 A venue where only the key's own honesty would stop a withdrawal can't hold a vault's money at all, so it can't have a driver.
+
+### Who a venue excludes
+
+Venues don't accept everyone: most exclude US persons, and some exclude residents of other places too. A vault trading at a venue has to respect that, so each driver carries its venue's list, taken from the venue's own terms.
+
+A vault's list is every one of its drivers' lists put together, plus US persons and sanctioned persons, which every vault excludes. So an agent that uses several drivers takes on the strictest of them. You can add places to your own vault's list in [`shonin.toml`](configuration.md#depositors), but you can't remove any.
+
+The vault enforces it when someone deposits: their wallet signs a statement that they aren't on the list and aren't acting for someone who is, and the contract won't take the deposit without it. [Depositors](../depositors.md#who-can-deposit) explains what they see.
 
 ## Adding a driver
 
