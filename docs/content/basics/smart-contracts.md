@@ -118,7 +118,7 @@ A contract lives on one chain and can only move money on that chain, so an agent
 
 ### Across three chains
 
-Take an agent that buys tokenised shares on Robinhood Chain and hedges them with perpetuals on Arcus (also on Robinhood Chain), then also places orders on Hyperliquid (e.g. wherever the hedge is cheaper). Its Author chose Solana for its vault, because that's where their Depositors already keep their dollars.
+Take an agent that buys tokenised shares on Robinhood Chain and hedges them with perpetuals on Lighter (also on Robinhood Chain), then also places orders on Hyperliquid (e.g. wherever the hedge is cheaper). Its Author chose Solana for its vault, because that's where their Depositors already keep their dollars.
 
 ```mermaid
 flowchart LR
@@ -128,7 +128,7 @@ flowchart LR
     end
     subgraph RH["Robinhood Chain"]
         S1["<b>Station</b>"] --- R1["<b>Driver</b><br/>stock tokens"]
-        S1 --- R2["<b>Driver</b><br/>Arcus"]
+        S1 --- R2["<b>Driver</b><br/>Lighter"]
     end
     subgraph HL["Hyperliquid"]
         S2["<b>Station</b>"] --- H1["<b>Driver</b><br/>Hyperliquid"]

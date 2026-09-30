@@ -68,7 +68,7 @@ An agent has a network connection and a model of its own, and it trades other pe
 </svg>
 </div>
 
-The agent never holds a key. It decides what to trade, and the attested machine signs the order with the vault's key. That key is **trade-only**: the venue lets it place and cancel orders, and nothing else. It can't withdraw, can't send money to another address, and can't hand its powers to anyone else.
+The agent never holds a key. It decides what to trade, and the attested machine signs the order with the vault's key. That key is **trade-only**: the venue lets it trade, and won't let it take money out. It can't withdraw, can't send money to another address, and can't hand its powers to anyone else.
 
 Moving money at all goes through our [smart contracts](smart-contracts.md), which only move it between the vault and its own stations.
 
@@ -78,6 +78,8 @@ That's the trust bar: *halt, never withdraw*. An agent can be switched off. The 
 
 !!! warning "Trade-only doesn't mean risk-free"
     A key that can trade can also lose money, and it could lose it on purpose. An agent could keep buying from an account its Author controls at too high a price, moving value out one bad trade at a time, without ever withdrawing anything.
+
+    Some venues also let a trading key place the account's money in a pool that someone else at that venue runs, where it's locked for a few days. That isn't a withdrawal, so the venue allows it. The attested machine never signs such a move, and if one ever happened, anyone can point the station at it: the station counts that money, pulls it back as soon as the lock ends, and takes the key's powers away.
 
     What helps Depositors judge that risk is the Reviewer's report, the agent's public source and its track record, and what protects them is that they can leave at any time. The price of a trade is only limited on-chain when a withdrawal has to close positions.
 
