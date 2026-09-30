@@ -7,6 +7,7 @@
 
 mod deploy;
 mod market;
+mod publish;
 mod seed;
 
 use std::net::SocketAddr;
@@ -52,6 +53,10 @@ enum Command {
         /// Where the strategies to publish live.
         #[arg(long, env = "SHONIN_AGENTS_DIR")]
         agents: Option<PathBuf>,
+        /// Publish only this agent, once, at the version its manifest names,
+        /// instead of the full set of examples the site needs.
+        #[arg(long)]
+        agent: Option<String>,
     },
 }
 
@@ -73,9 +78,16 @@ async fn main() -> Result<()> {
             deploy::ensure(&client, &args.artifacts, &args.deployments).await?;
             Ok(())
         }
-        Some(Command::Seed { api, agents }) => {
+        Some(Command::Seed { api, agents, agent }) => {
             let deployments = client.wait_for_deployments(&args.deployments).await?;
-            seed::run(&client, &deployments, &api, agents.as_deref(), &args.store).await
+            match agent {
+                Some(name) => {
+                    seed::one(&client, &deployments, &api, agents.as_deref(), &name).await
+                }
+                None => {
+                    seed::run(&client, &deployments, &api, agents.as_deref(), &args.store).await
+                }
+            }
         }
         None => {
             let deployments = deploy::ensure(&client, &args.artifacts, &args.deployments).await?;

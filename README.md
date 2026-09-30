@@ -57,7 +57,7 @@ The [build checklist](docs/content/checklist.md) is the working guideline for wh
 | 19084 | The build service |
 | 19085 | The executor |
 | 19086 | The reviewer |
-| 19087 | The coordinator |
+| 19087 | The keeper |
 | 19088 | The devnet: the chain's clock and its market |
 
 Everything the run writes lives under `.shonin/local` (gitignored): the contracts' addresses, the content-addressed store and the build directories. It is safe to delete; the next run rebuilds it.
@@ -84,15 +84,13 @@ packages/
   shared/         types shared by every crate (native and wasm), and the record's maths
   chain/          contract bindings and deployment addresses (native and wasm)
   frontend/       the web app: Rust -> wasm via Trunk, served as Workers static assets
-  backend/        the API: a Cloudflare Worker (workers-rs)
   indexer/        reads the chain into the record, and serves the public API
   executor/       the attested executor: feeds, runner and signer
   builder/        the build service: compiles submitted source into a signed bundle
   reviewer/       the attested reviewer: scores whether a strategy's code is reasonable
-  coordinator/    the untrusted service that places strategies and keeps the clockwork turning
+  keeper/         the untrusted service that keeps the vaults' clockwork turning
   devnet/         deploys and drives the local development chain
   strategy-sdk/   Rust bindings for the shonin:strategy WIT world
-  cli/            the `shonin` CLI for strategy authors
 docs/
   zensical.toml   the public documentation site (docs.shonin.fi)
   content/        its pages: how it works, how to verify it, and the build checklist

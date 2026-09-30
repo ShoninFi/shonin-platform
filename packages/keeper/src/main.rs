@@ -1,9 +1,9 @@
-//! The coordinator: the clockwork nobody has to trust.
+//! The keeper: the clockwork nobody has to trust.
 //!
 //! It crystallises each vault's fees once a chain-day, settles the claims
 //! depositors have booked, and freezes a vault whose claim has gone unserved
 //! for too long. Every one of those calls is public: anyone may send them, and
-//! a depositor who does not want to wait can send their own. The coordinator
+//! a depositor who does not want to wait can send their own. The keeper
 //! exists so that nobody has to.
 
 use std::net::SocketAddr;
@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
     let chain = Client::connect(&args.rpc_url).await?;
     let deployments = chain.wait_for_deployments(&args.deployments).await?;
     let keeper = chain.account(Role::Keeper)?;
-    tracing::info!(%keeper, "the coordinator is up");
+    tracing::info!(%keeper, "the keeper is up");
 
     if args.port != 0 {
         tokio::spawn(serve_status(SocketAddr::from(([127, 0, 0, 1], args.port))));
@@ -130,7 +130,7 @@ async fn settle_claims(chain: &Client, keeper: Address, vault: Address, now: u64
 }
 
 async fn serve_status(address: SocketAddr) {
-    let app = axum::Router::new().route("/health", axum::routing::get(|| async { "coordinator" }));
+    let app = axum::Router::new().route("/health", axum::routing::get(|| async { "keeper" }));
     if let Ok(listener) = tokio::net::TcpListener::bind(address).await {
         let _ = axum::serve(listener, app).await;
     }

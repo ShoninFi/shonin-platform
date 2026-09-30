@@ -175,7 +175,7 @@ pub struct Submission {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "kind")]
 pub enum SubmissionSource {
-    /// A canonical archive of the project, as the CLI packs it.
+    /// A canonical archive of the project, as the publisher packs it.
     Archive { base64: String },
     /// A public repository and a commit, which the build service reads itself.
     Repository { url: String, commit: String },

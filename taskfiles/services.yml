@@ -51,13 +51,15 @@ tasks:
         deploy
 
   seed:
-    desc: "Publish the reference work to the local chain, through the real flows"
+    desc: "Publish the reference work to the local chain, through the real flows (AGENT=name for just one)"
+    vars:
+      AGENT_ARG: '{{if .AGENT}}--agent "{{.AGENT}}"{{end}}'
     cmds:
       - >-
         cargo run -q -p shonin-devnet --
         {{.SERVICE_ARGS}}
         --artifacts "{{.PATH_ARTIFACTS}}"
-        seed --api "{{.URL_API_DEV}}"
+        seed --api "{{.URL_API_DEV}}" {{.AGENT_ARG}}
 
   indexer:
     desc: "The indexer and the public API"
@@ -111,11 +113,11 @@ tasks:
         --port {{.PORT_EXECUTOR}}
         --api-url "{{.URL_API_DEV}}"
 
-  coordinator:
-    desc: "The coordinator"
+  keeper:
+    desc: "The keeper: crystallises fees, settles claims, freezes"
     cmds:
       - >-
-        cargo run -q -p shonin-coordinator --
+        cargo run -q -p shonin-keeper --
         {{.SERVICE_ARGS}}
-        --port {{.PORT_COORDINATOR}}
+        --port {{.PORT_KEEPER}}
         --api-url "{{.URL_API_DEV}}"

@@ -1,5 +1,5 @@
 //! The domain model: the things the platform talks about, in the shape the
-//! frontend, the backend and the executor all read them in.
+//! frontend, the API and the executor all read them in.
 //!
 //! Plain data with `serde` derives, and no dependency on a browser, a chain
 //! client or a runtime, so it compiles for native targets and for wasm alike.

@@ -46,7 +46,7 @@ tasks:
       - services:reviewer
       - services:indexer
       - services:executor
-      - services:coordinator
+      - services:keeper
       - frontend:dev
 
   dev:services:
@@ -58,7 +58,7 @@ tasks:
       - services:reviewer
       - services:indexer
       - services:executor
-      - services:coordinator
+      - services:keeper
 
   build:
     desc: "Release build of everything that deploys"
@@ -74,7 +74,7 @@ tasks:
     desc: "Compile everything: the contracts, then the crates for each target they run on"
     cmds:
       - task: contracts:build
-      - cargo check --workspace --all-targets {{.CARGO_EXCLUDE_WASM}}
+      - cargo check --workspace --all-targets
       - cargo check {{.CARGO_WASM_PACKAGES}} --target wasm32-unknown-unknown
       - cargo check {{.CARGO_WASIP2_PACKAGES}} --target wasm32-wasip2
 
@@ -83,7 +83,7 @@ tasks:
     cmds:
       - task: contracts:lint
       - cargo fmt --all --check
-      - cargo clippy --workspace --all-targets {{.CARGO_EXCLUDE_WASM}} -- -D warnings
+      - cargo clippy --workspace --all-targets -- -D warnings
       - cargo clippy {{.CARGO_WASM_PACKAGES}} --target wasm32-unknown-unknown -- -D warnings
       - cargo clippy {{.CARGO_WASIP2_PACKAGES}} --target wasm32-wasip2 -- -D warnings
 
@@ -97,7 +97,7 @@ tasks:
     desc: "Native tests and the contracts' tests"
     cmds:
       - task: contracts:test
-      - cargo test --workspace {{.CARGO_EXCLUDE_WASM}}
+      - cargo test --workspace
 
   clean:
     desc: "Remove build output and local chain state"

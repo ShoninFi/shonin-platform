@@ -1,4 +1,5 @@
-//! Publishing a strategy.
+//! Publishing a strategy, the way the web app does it: create the vault from
+//! the author's account, then hand the source to the API.
 //!
 //! Creating the vault is publishing: the author funds its tank in the same
 //! transaction, and the build and the review are the first things that tank
@@ -22,7 +23,6 @@ pub struct Published {
     pub slug: String,
     pub vault: Address,
     pub job_id: String,
-    pub source_hash: String,
     pub outcome: JobState,
 }
 
@@ -60,7 +60,6 @@ pub async fn publish(
         slug,
         vault,
         job_id: accepted.job_id,
-        source_hash,
         outcome,
     })
 }
@@ -203,7 +202,7 @@ async fn follow(api: &str, job_id: &str) -> Result<JobState> {
     bail!("the build is still running after ten minutes")
 }
 
-pub fn read_manifest(project: &Path) -> Result<Manifest> {
+fn read_manifest(project: &Path) -> Result<Manifest> {
     let path = project.join("shonin.toml");
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;

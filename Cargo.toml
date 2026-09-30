@@ -4,15 +4,13 @@ members = [
     "packages/shared",
     "packages/chain",
     "packages/frontend",
-    "packages/backend",
     "packages/indexer",
     "packages/executor",
     "packages/builder",
     "packages/reviewer",
-    "packages/coordinator",
+    "packages/keeper",
     "packages/devnet",
     "packages/strategy-sdk",
-    "packages/cli",
 ]
 
 [workspace.package]
@@ -29,7 +27,6 @@ publish = false
 shared = { path = "packages/shared", package = "shonin-shared" }
 chain = { path = "packages/chain", package = "shonin-chain" }
 strategy-sdk = { path = "packages/strategy-sdk", package = "shonin-strategy-sdk" }
-shonin-cli = { path = "packages/cli" }
 
 # Common
 anyhow = "1.0.104"
@@ -45,7 +42,7 @@ time = { version = "0.3.55", features = ["serde"] }
 futures = "0.3.34"
 tracing = "0.1.44"
 
-# Native services (indexer, executor, builder, reviewer, coordinator, devnet, cli)
+# Native services (indexer, executor, builder, reviewer, keeper, devnet)
 tokio = { version = "1.53.1", features = ["full"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
@@ -89,9 +86,6 @@ web-sys = "=0.3.105"
 gloo-net = "0.7.0"
 gloo-timers = { version = "0.4.0", features = ["futures"] }
 console_error_panic_hook = "0.1.7"
-
-# Backend (Cloudflare Workers via worker-build)
-worker = "0.8.5"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

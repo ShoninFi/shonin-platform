@@ -46,11 +46,10 @@ vars:
   PATH_BUILDS: '{{joinPath .PATH_LOCAL_STATE "builds"}}'
 
   # Cargo: crates that run as wasm are also checked for wasm32-unknown-unknown.
-  # The frontend builds natively too (its seo tool runs at build time); the
-  # backend only builds for wasm. The SDK's real target is wasm32-wasip2, where
-  # a strategy is compiled into a component.
-  CARGO_WASM_PACKAGES: "-p shonin-frontend -p shonin-backend -p shonin-shared -p shonin-chain"
-  CARGO_EXCLUDE_WASM: "--exclude shonin-backend"
+  # The frontend builds natively too (its seo tool runs at build time). The
+  # SDK's real target is wasm32-wasip2, where a strategy is compiled into a
+  # component.
+  CARGO_WASM_PACKAGES: "-p shonin-frontend -p shonin-shared -p shonin-chain"
   CARGO_WASIP2_PACKAGES: "-p shonin-strategy-sdk"
 
   # Ports: a base (override with SHONIN_START_PORT_DEV in .env) plus fixed offsets.
@@ -59,16 +58,16 @@ vars:
     sh: echo "${SHONIN_START_PORT_DEV:-19080}"
   PORT_FRONTEND_DEV: "{{add (atoi .SHONIN_START_PORT_DEV) 0}}"
   PORT_API: "{{add (atoi .SHONIN_START_PORT_DEV) 1}}"
-  # +2 reserved: backend API inspector
+  # +2 reserved
   PORT_CHAIN: "{{add (atoi .SHONIN_START_PORT_DEV) 3}}"
   PORT_BUILDER: "{{add (atoi .SHONIN_START_PORT_DEV) 4}}"
   PORT_EXECUTOR: "{{add (atoi .SHONIN_START_PORT_DEV) 5}}"
   PORT_REVIEWER: "{{add (atoi .SHONIN_START_PORT_DEV) 6}}"
-  PORT_COORDINATOR: "{{add (atoi .SHONIN_START_PORT_DEV) 7}}"
+  PORT_KEEPER: "{{add (atoi .SHONIN_START_PORT_DEV) 7}}"
   PORT_DEVNET: "{{add (atoi .SHONIN_START_PORT_DEV) 8}}"
   PORT_DOCS_DEV: "{{add (atoi .SHONIN_START_PORT_DEV) 9}}"
   # Every port a local run listens on, for `task down`.
-  PORTS_DEV: "{{.PORT_FRONTEND_DEV}} {{.PORT_API}} {{.PORT_CHAIN}} {{.PORT_BUILDER}} {{.PORT_EXECUTOR}} {{.PORT_REVIEWER}} {{.PORT_COORDINATOR}} {{.PORT_DEVNET}}"
+  PORTS_DEV: "{{.PORT_FRONTEND_DEV}} {{.PORT_API}} {{.PORT_CHAIN}} {{.PORT_BUILDER}} {{.PORT_EXECUTOR}} {{.PORT_REVIEWER}} {{.PORT_KEEPER}} {{.PORT_DEVNET}}"
 
   # URLs
   URL_FRONTEND_DEV: "http://localhost:{{.PORT_FRONTEND_DEV}}"
