@@ -32,7 +32,7 @@ tasks:
       # Commit guard: every commit runs .githooks/commit-msg (see CLAUDE.md).
       - git config core.hooksPath .githooks
       - |
-        for bin in trunk anvil forge gitleaks claude jq; do
+        for bin in trunk anvil forge solana-test-validator anchor gitleaks claude jq; do
           command -v "$bin" >/dev/null || echo "missing: $bin (see README.md)"
         done
         for f in .private/terms.txt .private/review.md; do
