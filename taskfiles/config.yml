@@ -69,8 +69,9 @@ vars:
   PORT_DEVNET: "{{add (atoi .SHONIN_START_PORT_DEV) 8}}"
   PORT_DOCS_DEV: "{{add (atoi .SHONIN_START_PORT_DEV) 9}}"
   PORT_UNWINDER: "{{add (atoi .SHONIN_START_PORT_DEV) 10}}"
+  PORT_INDEXER: "{{add (atoi .SHONIN_START_PORT_DEV) 11}}"
   # Every port a local run listens on, for `task down`.
-  PORTS_DEV: "{{.PORT_FRONTEND_DEV}} {{.PORT_API}} {{.PORT_CHAIN}} {{.PORT_BUILDER}} {{.PORT_EXECUTOR}} {{.PORT_REVIEWER}} {{.PORT_KEEPER}} {{.PORT_DEVNET}} {{.PORT_UNWINDER}}"
+  PORTS_DEV: "{{.PORT_FRONTEND_DEV}} {{.PORT_API}} {{.PORT_CHAIN}} {{.PORT_BUILDER}} {{.PORT_EXECUTOR}} {{.PORT_REVIEWER}} {{.PORT_KEEPER}} {{.PORT_DEVNET}} {{.PORT_UNWINDER}} {{.PORT_INDEXER}}"
 
   # URLs
   URL_FRONTEND_DEV: "http://localhost:{{.PORT_FRONTEND_DEV}}"

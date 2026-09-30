@@ -52,7 +52,7 @@ The [build checklist](docs/content/checklist.md) is the working guideline for wh
 | Port | What |
 | --- | --- |
 | 19080 | The web app, with live reload; `/api` is proxied to the API |
-| 19081 | The indexer and the public HTTP API |
+| 19081 | The API the web app reads, running the indexer in-process |
 | 19083 | The chain (anvil) |
 | 19084 | The build service |
 | 19085 | The executor |
@@ -60,6 +60,7 @@ The [build checklist](docs/content/checklist.md) is the working guideline for wh
 | 19087 | The keeper |
 | 19088 | The devnet: the chain's clock and its market |
 | 19090 | The unwinder |
+| 19091 | The reference indexer on its own |
 
 Everything the run writes lives under `.shonin/local` (gitignored): the contracts' addresses, the content-addressed store and the build directories. It is safe to delete; the next run rebuilds it.
 
@@ -85,7 +86,8 @@ packages/
   shared/         types shared by every crate (native and wasm), and the record's maths
   chain/          contract bindings and deployment addresses (native and wasm)
   frontend/       the web app: Rust -> wasm via Trunk, served as Workers static assets
-  indexer/        reads the chain into the record, and serves the public API
+  indexer/        the reference indexer: reads the chain into the record (library and binary)
+  api/            the web app's server: runs the indexer in-process and serves /api
   machines/       the attested machines, each its own image
     reviewer/     scores whether a strategy's code is reasonable
     builder/      compiles submitted source into a signed bundle

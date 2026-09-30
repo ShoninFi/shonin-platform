@@ -61,13 +61,22 @@ tasks:
         --artifacts "{{.PATH_ARTIFACTS}}"
         seed --api "{{.URL_API_DEV}}" {{.AGENT_ARG}}
 
+  api:
+    desc: "The web app's API, running the indexer in-process"
+    cmds:
+      - >-
+        cargo run -q -p shonin-api --
+        {{.SERVICE_ARGS}}
+        --port {{.PORT_API}}
+        --builder-url "{{.URL_BUILDER_DEV}}"
+
   indexer:
-    desc: "The indexer and the public API"
+    desc: "The reference indexer on its own: reads the chain into the record"
     cmds:
       - >-
         cargo run -q -p shonin-indexer --
         {{.SERVICE_ARGS}}
-        --port {{.PORT_API}}
+        --port {{.PORT_INDEXER}}
         --builder-url "{{.URL_BUILDER_DEV}}"
 
   builder:

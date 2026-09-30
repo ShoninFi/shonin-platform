@@ -5,6 +5,7 @@ members = [
     "packages/chain",
     "packages/frontend",
     "packages/indexer",
+    "packages/api",
     "packages/machines/executor",
     "packages/machines/builder",
     "packages/machines/reviewer",
@@ -28,6 +29,7 @@ publish = false
 shared = { path = "packages/shared", package = "shonin-shared" }
 chain = { path = "packages/chain", package = "shonin-chain" }
 strategy-sdk = { path = "packages/strategy-sdk", package = "shonin-strategy-sdk" }
+indexer = { path = "packages/indexer", package = "shonin-indexer" }
 
 # Common
 anyhow = "1.0.104"
@@ -43,7 +45,7 @@ time = { version = "0.3.55", features = ["serde"] }
 futures = "0.3.34"
 tracing = "0.1.44"
 
-# Native services (the machines, indexer, keeper, devnet)
+# Native services (the machines, api, indexer, keeper, devnet)
 tokio = { version = "1.53.1", features = ["full"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }

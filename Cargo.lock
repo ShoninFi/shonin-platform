@@ -5053,6 +5053,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "shonin-api"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "axum",
+ "clap",
+ "reqwest",
+ "shonin-chain",
+ "shonin-indexer",
+ "shonin-shared",
+ "tokio",
+ "tower-http 0.7.1",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "shonin-builder"
 version = "0.1.0"
 dependencies = [
@@ -5173,7 +5191,6 @@ dependencies = [
  "tar",
  "time",
  "tokio",
- "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
 ]

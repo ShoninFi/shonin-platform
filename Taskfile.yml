@@ -44,6 +44,7 @@ tasks:
       - services:devnet
       - services:builder
       - services:reviewer
+      - services:api
       - services:indexer
       - services:executor
       - services:unwinder
@@ -57,6 +58,7 @@ tasks:
       - services:devnet
       - services:builder
       - services:reviewer
+      - services:api
       - services:indexer
       - services:executor
       - services:unwinder
