@@ -66,9 +66,10 @@ vars:
   # safe to delete: `task dev` rebuilds all of it.
   PATH_LOCAL_STATE: '{{joinPath .PATH_ROOT ".shonin" "local"}}'
   # Where the contracts' addresses are, one file per chain (evm-31337.json,
-  # ...). Every service reads the one for its chain. A local deploy writes
-  # them under .shonin/local; public chains' are committed under config/.
-  PATH_DEPLOYMENTS_DIR: '{{if eq .NETWORK "local"}}{{joinPath .PATH_LOCAL_STATE "deployments"}}{{else}}{{joinPath .PATH_ROOT "config" "deployments" .NETWORK}}{{end}}'
+  # ...). Every service reads the one for its chain. Mainnet addresses are
+  # committed under config/deployments/mainnet; local and testnet ones never
+  # are, and stay under .shonin/<network> (gitignored).
+  PATH_DEPLOYMENTS_DIR: '{{if eq .NETWORK "mainnet"}}{{joinPath .PATH_ROOT "config" "deployments" "mainnet"}}{{else}}{{joinPath .PATH_ROOT ".shonin" .NETWORK "deployments"}}{{end}}'
   # The local Solana validator's ledger, wiped on every start.
   PATH_SOLANA_LEDGER: '{{joinPath .PATH_LOCAL_STATE "solana"}}'
   # Content-addressed storage: source archives, bundles, build logs, reviews.
