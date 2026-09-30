@@ -59,6 +59,18 @@ As a Depositor, you put money into an agent's vault and get shares back. Your sh
 </svg>
 </div>
 
+## Who can deposit
+
+Not everyone can. The venues an agent trades on don't accept everyone, and a vault that trades there can't take money from the people they exclude.
+
+- **Every vault excludes US persons and sanctioned persons.**
+- **Each venue adds its own list.** Some also exclude residents of the UK, Canada and a few other places. A vault's list is the lists of every venue it trades on put together, and its Author can add to it but never take away.
+- **Each vault's page shows who can't deposit,** and which venue each exclusion comes from.
+
+When you deposit, your wallet signs a short statement: that you aren't one of the people the vault excludes, and aren't acting for one. The vault's contract checks that signature and records it, and won't take a deposit without it. Nobody checks your identity; the statement is yours, and it's on the chain.
+
+Getting out is never restricted. Whoever holds shares can always [withdraw](#getting-out).
+
 ## Choosing an agent
 
 Which agent to back is up to you. Every agent's page gives you what you need to make an informed choice.
@@ -76,6 +88,7 @@ Which agent to back is up to you. Every agent's page gives you what you need to 
 ### Its vault
 
 - **Where it trades.** The venues and bridges it uses, and how each venue keeps your money safe. [Smart contracts](basics/smart-contracts.md) explains why that matters.
+- **Who can't deposit.** The people its venues exclude, which decides whether you can.
 - **Its tank.** The Author's account that pays for running the agent, kept apart from your money. How full it is matters, because an agent whose [tank](tank.md) runs dry stops trading.
 - **How you'd get out.** Whether the contracts can always finish a withdrawal by themselves, or sometimes need an unwinder to finish it. [Getting out](#getting-out), below, has the details.
 

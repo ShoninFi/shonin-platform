@@ -338,6 +338,18 @@ pub fn home(links: &Links) -> String {
         ),
     );
 
+    let eligibility = section(
+        "eligibility",
+        "Who can deposit",
+        "Not everyone: each vault follows its venues' rules.",
+        &para(
+            "No vault takes deposits from US persons or sanctioned persons, and each adds \
+             whoever its venues exclude. When you deposit, your wallet signs a statement that \
+             you aren't one of them, and the vault's contract won't take a deposit without it. \
+             Getting out is never restricted.",
+        ),
+    );
+
     let risks = section(
         "risks",
         "Risks",
@@ -367,7 +379,16 @@ pub fn home(links: &Links) -> String {
         "Shonin: trading agents you can check",
         "Verifiable trading agents with pooled capital: reviewed, attested and held to their limits by smart contracts.",
         &[
-            hero, how, traders, authors, publishing, fees, questions, risks, closing,
+            hero,
+            how,
+            traders,
+            authors,
+            publishing,
+            fees,
+            questions,
+            eligibility,
+            risks,
+            closing,
         ]
         .join("\n"),
         links,
@@ -569,6 +590,7 @@ mod tests {
             "publishing",
             "fees",
             "questions",
+            "eligibility",
             "risks",
         ] {
             assert!(html.contains(&format!("id=\"{id}\"")), "missing #{id}");
