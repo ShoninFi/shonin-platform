@@ -12,10 +12,12 @@ use anyhow::{Context, Result, anyhow};
 use chain::bindings::attestation::{IAttestationRegistry, ImageKind};
 use chain::bindings::usd::ILocalUsd;
 use chain::bindings::venue::ILocalVenue;
-use chain::{ChainKey, Client, Deployments, Role, Roles};
+use chain::{ChainKey, Client, Deployments, NetworkName, Role, Roles};
 
-/// How long an image waits between being proposed and becoming blessable.
-const TIMELOCK: u64 = 2 * 24 * 60 * 60;
+/// How long an image waits between being proposed and becoming blessable, on
+/// a local chain. Its clock runs an hour a second, so the full two days pass
+/// in under a minute and the timelock's path is exercised every run.
+const LOCAL_TIMELOCK: u64 = 2 * 24 * 60 * 60;
 /// How long a blessing lasts before an executor has to attest again.
 const BLESSING_TTL: u64 = 72 * 60 * 60;
 /// What a review costs, in the asset's own units.
@@ -36,6 +38,7 @@ pub const STARTING_PRICE: u64 = 60_000_000_000;
 /// Deploy if nothing is there, and return what is.
 pub async fn ensure(
     client: &Client,
+    network: NetworkName,
     key: &ChainKey,
     artifacts: &Path,
     file: &Path,
@@ -48,7 +51,7 @@ pub async fn ensure(
         return Ok(existing);
     }
 
-    let deployments = deploy(client, key, artifacts).await?;
+    let deployments = deploy(client, network, key, artifacts).await?;
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("making {}", parent.display()))?;
     }
@@ -58,7 +61,18 @@ pub async fn ensure(
     Ok(deployments)
 }
 
-async fn deploy(client: &Client, key: &ChainKey, artifacts: &Path) -> Result<Deployments> {
+async fn deploy(
+    client: &Client,
+    network: NetworkName,
+    key: &ChainKey,
+    artifacts: &Path,
+) -> Result<Deployments> {
+    // None on testnets: nobody else's money is at stake there, and their
+    // clocks run in real time, so two days would be two real days.
+    let timelock = match network {
+        NetworkName::Local => LOCAL_TIMELOCK,
+        _ => 0,
+    };
     let roles = Roles {
         admin: client.account(Role::Admin)?,
         platform: client.account(Role::Platform)?,
@@ -96,7 +110,7 @@ async fn deploy(client: &Client, key: &ChainKey, artifacts: &Path) -> Result<Dep
         artifacts,
         admin,
         "AttestationRegistry",
-        (admin, verifier, TIMELOCK, BLESSING_TTL).abi_encode_params(),
+        (admin, verifier, timelock, BLESSING_TTL).abi_encode_params(),
     )
     .await?;
     let strategies = put(

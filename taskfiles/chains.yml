@@ -55,13 +55,12 @@ tasks:
           --reset --quiet
 
   deploy:
-    desc: "Deploy the EVM contracts to every local EVM chain and write each deployment file"
+    desc: "Deploy the EVM contracts to every EVM chain of the network (local, or NETWORK=testnet; mainnet refuses)"
     cmds:
-      - >-
-        cargo run -q -p shonin-devnet --
-        --network local
-        --chains "{{.PATH_CHAINS}}"
-        --deployments-dir "{{.PATH_DEPLOYMENTS_DIR}}"
-        --store "{{.PATH_STORE}}"
-        --artifacts "{{.PATH_ARTIFACTS}}"
-        deploy
+      - task: :contracts:build
+      - "{{.DEVNET}} deploy"
+
+  accounts:
+    desc: "Each role's account and gas on every EVM chain, and the Solana deployer: what to fund on a testnet"
+    cmds:
+      - "{{.DEVNET}} accounts"

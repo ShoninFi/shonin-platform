@@ -18,18 +18,24 @@ use crate::host::Counters;
 use crate::scale::{ASSET_DECIMALS, to_decimal};
 
 /// Enough for a strategy to send its transactions for a good while; the tank
-/// repays whoever funded the key.
-const GAS_STAKE: u128 = 1_000_000_000_000_000_000;
+/// repays whoever funded the key. A development chain's coin is free; a
+/// testnet's comes from a faucet, so a key gets a hundredth of it there.
+const GAS_STAKE_DEVELOPMENT: u128 = 1_000_000_000_000_000_000;
+const GAS_STAKE_PUBLIC: u128 = 10_000_000_000_000_000;
 
 /// Give a freshly made key something to pay for its own transactions with.
 pub async fn fund_gas(chain: &Client, deployments: &Deployments, key: Address) -> Result<()> {
-    let params = serde_json::json!([{
-        "from": format!("{:?}", deployments.roles.executor),
-        "to": format!("{key:?}"),
-        "value": format!("0x{:x}", GAS_STAKE),
-    }]);
+    let stake = if chain.is_development() {
+        GAS_STAKE_DEVELOPMENT
+    } else {
+        GAS_STAKE_PUBLIC
+    };
     chain
-        .raw_request("eth_sendTransaction", params)
+        .transfer(
+            deployments.roles.executor,
+            key,
+            alloy::primitives::U256::from(stake),
+        )
         .await
         .context("staking the key with gas")?;
     Ok(())

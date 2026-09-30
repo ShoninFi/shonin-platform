@@ -16,6 +16,9 @@ shared.workspace = true
 chain = { workspace = true, features = ["args"] }
 alloy.workspace = true
 anyhow.workspace = true
+bs58.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
 axum.workspace = true
 clap.workspace = true
 futures.workspace = true

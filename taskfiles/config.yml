@@ -72,10 +72,23 @@ vars:
   PATH_DEPLOYMENTS_DIR: '{{if eq .NETWORK "mainnet"}}{{joinPath .PATH_ROOT "config" "deployments" "mainnet"}}{{else}}{{joinPath .PATH_ROOT ".shonin" .NETWORK "deployments"}}{{end}}'
   # The local Solana validator's ledger, wiped on every start.
   PATH_SOLANA_LEDGER: '{{joinPath .PATH_LOCAL_STATE "solana"}}'
+  # What a run on the chosen network writes, beside its deployments:
+  # .shonin/local, .shonin/testnet (gitignored either way).
+  PATH_NETWORK_STATE: '{{joinPath .PATH_ROOT ".shonin" .NETWORK}}'
   # Content-addressed storage: source archives, bundles, build logs, reviews.
-  PATH_STORE: '{{joinPath .PATH_LOCAL_STATE "store"}}'
+  PATH_STORE: '{{joinPath .PATH_NETWORK_STATE "store"}}'
   # Where the build service compiles submissions.
-  PATH_BUILDS: '{{joinPath .PATH_LOCAL_STATE "builds"}}'
+  PATH_BUILDS: '{{joinPath .PATH_NETWORK_STATE "builds"}}'
+
+  # The devnet binary, with the chain arguments every one of its commands
+  # takes. The chain tasks, the Solana deploy and the cloud tasks call it.
+  DEVNET: >-
+    cargo run -q -p shonin-devnet --
+    --network "{{.NETWORK}}"
+    --chains "{{.PATH_CHAINS}}"
+    --deployments-dir "{{.PATH_DEPLOYMENTS_DIR}}"
+    --store "{{.PATH_STORE}}"
+    --artifacts "{{.PATH_ARTIFACTS}}"
 
   # Cargo: crates that run as wasm are also checked for wasm32-unknown-unknown.
   # The app builds natively too (its seo tool runs at build time). The
@@ -155,3 +168,6 @@ vars:
   GCP_MACHINE_TYPE: "c3-standard-4"
   # The service account the machines and services run as, in the project.
   GCP_WORKLOAD_SERVICE_ACCOUNT: "shonin-workload"
+  # The Secret Manager secret the testnet services read their role accounts'
+  # mnemonic from (uploaded from .env by `task cloud:secrets NETWORK=testnet`).
+  GCP_SECRET_TESTNET_EVM_MNEMONIC: "shonin-testnet-evm-mnemonic"

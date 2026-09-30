@@ -6,10 +6,10 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use shared::Chain;
 
-use crate::client::Client;
+use crate::client::{Client, ROLE_COUNT, Signing, keys_from_mnemonic};
 use crate::config::{ChainConfig, ChainConfigs, ChainKey, ChainKind, NetworkName};
 use crate::deployments::Deployments;
 
@@ -67,26 +67,85 @@ impl Target {
         Deployments::file_in(&self.deployments_dir, &self.key)
     }
 
-    /// Connect to the chain, waiting for it to answer.
+    /// Connect to this target's chain, waiting for it to answer.
     pub async fn connect(&self) -> Result<Client> {
-        if self.key.kind != ChainKind::Evm {
-            bail!(
-                "{} is a {} chain, and the services only speak to EVM chains so far",
-                self.key,
-                self.key.kind.name()
-            );
-        }
-        let client = Client::connect(&self.config).await?;
-        if let Some(expected) = self.key.evm_chain_id()
-            && expected != client.chain_id
-        {
-            bail!(
-                "{} answers as chain {}, not {expected}: check its rpc in the chain config",
-                self.config.rpc,
-                client.chain_id
-            );
-        }
-        tracing::info!(network = %self.network, chain = %self.key, label = self.config.label, "connected");
-        Ok(client)
+        connect_to(self.network, &self.key, &self.config).await
     }
+
+    /// This chain's deployment: from `SHONIN_DEPLOYMENT_JSON` when it is set
+    /// (how a machine in the cloud is handed a testnet deployment, which is
+    /// never committed), otherwise from the deployment file once it appears.
+    pub async fn wait_for_deployments(&self, client: &Client) -> Result<Deployments> {
+        match std::env::var(DEPLOYMENT_JSON)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+        {
+            Some(json) => {
+                let deployments = Deployments::from_json(&json)
+                    .map_err(|error| anyhow!("{DEPLOYMENT_JSON} is not a deployment: {error}"))?;
+                if deployments.chain_id != client.chain_id {
+                    bail!(
+                        "{DEPLOYMENT_JSON} is for chain {}, and this is chain {}",
+                        deployments.chain_id,
+                        client.chain_id
+                    );
+                }
+                Ok(deployments)
+            }
+            None => client.wait_for_deployments(&self.deployments_file()).await,
+        }
+    }
+}
+
+/// A chain's deployment, handed over whole in the environment.
+pub const DEPLOYMENT_JSON: &str = "SHONIN_DEPLOYMENT_JSON";
+
+/// The mnemonic the testnet role accounts are derived from.
+pub const TESTNET_EVM_MNEMONIC: &str = "SHONIN_TESTNET_EVM_MNEMONIC";
+
+/// Who signs on a network: the node on local chains, the developer's
+/// mnemonic on testnets, and nobody on mainnet, where clients only read.
+pub fn signing_for(network: NetworkName) -> Result<Signing> {
+    match network {
+        NetworkName::Local => Ok(Signing::Unlocked),
+        NetworkName::Testnet => {
+            let phrase = std::env::var(TESTNET_EVM_MNEMONIC)
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "the testnet role accounts come from {TESTNET_EVM_MNEMONIC}; set it in .env"
+                    )
+                })?;
+            Ok(Signing::Keys(keys_from_mnemonic(&phrase, ROLE_COUNT)?))
+        }
+        NetworkName::Mainnet => Ok(Signing::ReadOnly),
+    }
+}
+
+/// Connect to any EVM chain of a network, and check it is the chain its key
+/// says.
+pub async fn connect_to(
+    network: NetworkName,
+    key: &ChainKey,
+    config: &ChainConfig,
+) -> Result<Client> {
+    if key.kind != ChainKind::Evm {
+        bail!(
+            "{key} is a {} chain, and the services only speak to EVM chains so far",
+            key.kind.name()
+        );
+    }
+    let client = Client::connect(config, signing_for(network)?).await?;
+    if let Some(expected) = key.evm_chain_id()
+        && expected != client.chain_id
+    {
+        bail!(
+            "{} answers as chain {}, not {expected}: check its rpc in the chain config",
+            config.rpc,
+            client.chain_id
+        );
+    }
+    tracing::info!(%network, chain = %key, label = config.label, "connected");
+    Ok(client)
 }

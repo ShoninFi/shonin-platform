@@ -5,7 +5,9 @@
 
 use anchor_lang::prelude::*;
 
-declare_id!("Bn5t8rYJnsd86vE1DRA7xwfG6Qiz7sw3AoGaM4WrpAs6");
+// The address comes from build.rs: the committed mainnet id, or the keypair
+// this machine deploys with. No other address is ever written down.
+include!(concat!(env!("OUT_DIR"), "/program_id.rs"));
 
 #[program]
 pub mod shonin_registry {

@@ -24,6 +24,10 @@ vars:
   GIT_SHA:
     sh: git rev-parse --short=12 HEAD
   MACHINES: "reviewer builder executor unwinder"
+  # Mainnet addresses are baked into the images; testnet ones are never
+  # committed, so a testnet launch is handed the vault chain's deployment
+  # whole, as SHONIN_DEPLOYMENT_JSON (see `devnet deployment-env`).
+  DEPLOYMENT_ENV: '{{.DEVNET}} --vault-chain "{{.VAULT_CHAIN}}" deployment-env'
   SERVICES: "api indexer keeper"
 
 tasks:
@@ -74,6 +78,7 @@ tasks:
     cmds:
       # The digest, not the tag: it is what the attestation measures.
       - |
+        extra=$({{.DEPLOYMENT_ENV}} --prefix tee-env-) || exit 1
         digest=$(gcloud artifacts docker images describe "{{.GCP_REGISTRY}}/{{.NAME}}:{{.GIT_SHA}}" \
           --project="{{.GCP_PROJECT}}" --format='value(image_summary.digest)')
         [ -n "$digest" ] || { echo "no pushed image {{.NAME}}:{{.GIT_SHA}}: run task cloud:push first"; exit 1; }
@@ -82,7 +87,7 @@ tasks:
           --confidential-compute-type=TDX --machine-type="{{.GCP_MACHINE_TYPE}}" \
           --maintenance-policy=TERMINATE --shielded-secure-boot \
           --image-project=confidential-space-images --image-family=confidential-space \
-          --metadata="^~^tee-image-reference={{.GCP_REGISTRY}}/{{.NAME}}@${digest}~tee-container-log-redirect=true~tee-restart-policy=Always~tee-env-SHONIN_NETWORK={{.NETWORK}}~tee-env-SHONIN_DEPLOYMENTS_DIR=/etc/shonin/deployments/{{.NETWORK}}" \
+          --metadata="^~^tee-image-reference={{.GCP_REGISTRY}}/{{.NAME}}@${digest}~tee-container-log-redirect=true~tee-restart-policy=Always~tee-env-SHONIN_NETWORK={{.NETWORK}}~tee-env-SHONIN_DEPLOYMENTS_DIR=/etc/shonin/deployments/{{.NETWORK}}${extra}" \
           --service-account="{{.GCP_WORKLOAD_SERVICE_ACCOUNT}}@{{.GCP_PROJECT}}.iam.gserviceaccount.com" \
           --scopes=cloud-platform
 
@@ -99,13 +104,41 @@ tasks:
       - sh: 'for n in {{.SERVICES}}; do [ "$n" = "{{.NAME}}" ] && exit 0; done; exit 1'
         msg: "{{.NAME}} is not a service: {{.SERVICES}}"
     cmds:
-      - >-
-        gcloud run deploy "shonin-{{.NAME}}-{{.NETWORK}}"
-        --project="{{.GCP_PROJECT}}" --region="{{.GCP_REGION}}"
-        --image="{{.GCP_REGISTRY}}/{{.NAME}}:{{.GIT_SHA}}"
-        --set-env-vars="SHONIN_NETWORK={{.NETWORK}},SHONIN_DEPLOYMENTS_DIR=/etc/shonin/deployments/{{.NETWORK}}"
-        --service-account="{{.GCP_WORKLOAD_SERVICE_ACCOUNT}}@{{.GCP_PROJECT}}.iam.gserviceaccount.com"
-        --no-allow-unauthenticated
+      - |
+        extra=$({{.DEPLOYMENT_ENV}}) || exit 1
+        secrets=""
+        if [ "{{.NETWORK}}" = "testnet" ]; then
+          secrets="--set-secrets=SHONIN_TESTNET_EVM_MNEMONIC={{.GCP_SECRET_TESTNET_EVM_MNEMONIC}}:latest"
+        fi
+        gcloud run deploy "shonin-{{.NAME}}-{{.NETWORK}}" \
+          --project="{{.GCP_PROJECT}}" --region="{{.GCP_REGION}}" \
+          --image="{{.GCP_REGISTRY}}/{{.NAME}}:{{.GIT_SHA}}" \
+          --set-env-vars="^~^SHONIN_NETWORK={{.NETWORK}}~SHONIN_DEPLOYMENTS_DIR=/etc/shonin/deployments/{{.NETWORK}}${extra}" \
+          $secrets \
+          --service-account="{{.GCP_WORKLOAD_SERVICE_ACCOUNT}}@{{.GCP_PROJECT}}.iam.gserviceaccount.com" \
+          --no-allow-unauthenticated
+
+  secrets:
+    desc: "Upload the testnet role accounts' mnemonic from .env to Secret Manager (NETWORK=testnet)"
+    requires:
+      vars: [NETWORK, GCP_PROJECT, SHONIN_TESTNET_EVM_MNEMONIC]
+    preconditions:
+      - sh: '[ "{{.NETWORK}}" = "testnet" ]'
+        msg: "Only the testnets have role keys to upload; mainnet's roles are never keys in .env."
+      - sh: '[ -n "{{.GCP_PROJECT}}" ]'
+        msg: "No Google Cloud project for {{.NETWORK}}: set GCP_PROJECT_{{upper .NETWORK}} in taskfiles/config.yml. The gcloud default project is never used."
+      - sh: '[ -n "$SHONIN_TESTNET_EVM_MNEMONIC" ]'
+        msg: "SHONIN_TESTNET_EVM_MNEMONIC is empty in .env."
+    env:
+      MNEMONIC: "{{.SHONIN_TESTNET_EVM_MNEMONIC}}"
+    cmds:
+      # The value goes through stdin, never on a command line.
+      - |
+        name="{{.GCP_SECRET_TESTNET_EVM_MNEMONIC}}"
+        if ! gcloud secrets describe "$name" --project="{{.GCP_PROJECT}}" >/dev/null 2>&1; then
+          gcloud secrets create "$name" --project="{{.GCP_PROJECT}}" --replication-policy=automatic
+        fi
+        printf '%s' "$MNEMONIC" | gcloud secrets versions add "$name" --project="{{.GCP_PROJECT}}" --data-file=-
 
   status:
     desc: "What is running in the network's project (NETWORK=testnet|mainnet)"

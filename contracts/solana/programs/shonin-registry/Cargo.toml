@@ -20,9 +20,14 @@ idl-build = ["anchor-lang/idl-build"]
 anchor-debug = []
 custom-heap = []
 custom-panic = []
+# Build with the committed mainnet id (mainnet-id) instead of the local keypair's.
+mainnet = []
 
 [dependencies]
 anchor-lang = "0.32.1"
+
+[build-dependencies]
+bs58 = "0.5"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

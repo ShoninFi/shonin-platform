@@ -60,7 +60,7 @@ The base port is `SHONIN_START_PORT_DEV` (19080); every other port is a fixed of
 
 **The ops dashboard** at `http://localhost:19088/` shows every chain of the network (key, RPC, the chain id or genesis it reports, its head and its clock), every machine and service and whether its `/health` answers, each chain's contract addresses and roles, and, once a Google Cloud project is set, what is running there. It refreshes itself, and it is local only.
 
-**Everything a run writes** lives under `.shonin/local` (gitignored): one deployment file per chain in `deployments/`, the content-addressed store, the build directories and the Solana ledger. It is safe to delete; the next run rebuilds it.
+**Everything a run writes** lives under `.shonin/<network>` (gitignored; `.shonin/local` for `task dev`): one deployment file per chain in `deployments/`, the content-addressed store, the build directories and the Solana ledger. It is safe to delete; the next run rebuilds it.
 
 **The local chains' accounts** come from anvil's published mnemonic. Each role (admin, builder, reviewer, executor, keeper, author, ...) is one of them by index, listed in `.env.example`, so no key is written down anywhere. The app's **development wallet** is one of them: it signs nothing in the browser, because the chain already holds the key. A block is mined every second and advances an hour of chain time, so a vault reaches the ninety live days it needs to be ranked in about thirty-six minutes.
 
@@ -71,7 +71,21 @@ task chains:deploy                   # deploy the contracts to every local EVM c
 task services:seed                   # publish the reference agents through the real flows
 task services:seed AGENT=funding-basis   # publish one agent, as it stands
 task contracts:solana:build          # anchor build
+task contracts:solana:deploy         # deploy the programs to the local validator
 ```
+
+### The testnets
+
+The same stand-in stack deploys to the public testnets (Base Sepolia, Hyperliquid testnet, Robinhood Chain testnet, Solana devnet). There the roles are accounts derived from mnemonics you hold in `.env`, `SHONIN_TESTNET_EVM_MNEMONIC` and `SHONIN_TESTNET_SOLANA_MNEMONIC`, in the same order as the local ones, and the image timelock is zero.
+
+```bash
+task chains:accounts NETWORK=testnet          # every role's address and gas: fund these from the faucets
+task chains:deploy NETWORK=testnet            # deploy to every EVM testnet
+task contracts:solana:deploy NETWORK=testnet  # deploy the programs to Solana devnet
+NETWORK=testnet task dev:services             # run everything here, against them
+```
+
+The testnets keep their own time, so nothing drives their clocks or their stand-in venues' prices. **Mainnet refuses**: these tasks deploy the stand-in stack (a mintable dollar, a stand-in venue, the development attestation verifier), which is for local chains and testnets only.
 
 ### Chains and networks
 
@@ -79,7 +93,7 @@ task contracts:solana:build          # anchor build
 
 - **To point a chain at another RPC**, set `SHONIN_RPC_<KIND>_<ID>` (or `SHONIN_WS_...`) in `.env`, for example `SHONIN_RPC_EVM_8453`. Paid RPC URLs carry keys, so they go there and never in the file.
 - **To add a chain**, add a `[chains."kind:id"]` entry and name it in a network. A new local chain also needs its process in `taskfiles/chains.yml` and its port in `taskfiles/config.yml`.
-- **Deployments:** mainnet addresses, Solana program ids included, are committed under `config/deployments/mainnet/`. Testnet addresses never are: they stay under `.shonin/testnet/deployments/`, as a local run's stay under `.shonin/local/deployments/`.
+- **Deployments:** mainnet addresses are committed under `config/deployments/mainnet/`, and a Solana program's mainnet id in `mainnet-id` beside its `Cargo.toml`. Testnet addresses never are: they stay under `.shonin/testnet/deployments/`, as a local run's stay under `.shonin/local/deployments/`. A program's local or devnet address is its keypair's, set when it builds.
 
 ### Where configuration lives
 
@@ -88,7 +102,7 @@ task contracts:solana:build          # anchor build
 | Paths, ports, URLs, the network, Google Cloud projects and region | `taskfiles/config.yml` |
 | Every chain, its endpoints, and what each network means | `config/chains.toml` |
 | Cloudflare Worker names (`shonin-app`, `shonin-landing`, ...) | `name` in `cloudflare/<target>/wrangler.jsonc` |
-| Secrets, RPC overrides and per-developer settings | `.env` (gitignored); the template is `.env.example` |
+| Secrets (testnet mnemonics included), RPC overrides and per-developer settings | `.env` (gitignored); the template is `.env.example` |
 | Contract addresses | `config/deployments/mainnet/` (committed); `.shonin/<local or testnet>/deployments/` (never committed) |
 | Rust toolchain; dependency versions | `rust-toolchain.toml`; `[workspace.dependencies]` in `Cargo.toml` |
 
