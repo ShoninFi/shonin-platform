@@ -42,9 +42,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let target = args.chain_args.resolve()?;
     let chain = target.connect().await?;
-    let _deployments = chain
-        .wait_for_deployments(&target.deployments_file())
-        .await?;
+    let _deployments = target.wait_for_deployments(&chain).await?;
     tracing::info!(image = %chain::attest::image_digest("unwinder"), "the unwinder is up");
     tracing::info!(
         "no venue on this chain needs unwinding outside the contracts; nothing to serve yet"

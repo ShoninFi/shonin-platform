@@ -4,11 +4,13 @@
 //! read the same addresses out of the same deployment file and encode calls
 //! with the same bindings.
 //!
-//! Nothing here holds a key. The development chain unlocks the accounts it
-//! publishes, so a service says which account it is and the node signs for
-//! it: transactions through `eth_sendTransaction`, messages through
-//! `eth_sign`. That is what makes it a development chain, and it means no key
-//! is written down anywhere in this repository or anyone's environment.
+//! How a client signs depends on the chain ([`Signing`]). A local chain
+//! unlocks the accounts it publishes, so a service says which account it is
+//! and the node signs for it: transactions through `eth_sendTransaction`,
+//! messages through `eth_sign`. That is what makes it a development chain,
+//! and it means no key is written down anywhere. On a testnet the same roles
+//! are accounts derived from a mnemonic the developer holds in `.env`, signed
+//! for here. Mainnet has no role keys at all: a client there only reads.
 
 use std::time::Duration;
 
@@ -20,6 +22,9 @@ use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use alloy_sol_types::SolCall;
 use anyhow::{Context, Result, anyhow, bail};
+
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::config::ChainConfig;
 use crate::deployments::Deployments;
@@ -72,6 +77,35 @@ impl Role {
     }
 }
 
+/// Who signs a client's transactions and messages.
+pub enum Signing {
+    /// The node, for the accounts it unlocked: a development chain.
+    Unlocked,
+    /// These keys, in role order, signed for here.
+    Keys(Vec<PrivateKeySigner>),
+    /// Nobody: the client only reads.
+    ReadOnly,
+}
+
+/// The first accounts a mnemonic derives (`m/44'/60'/0'/0/i`), one per role
+/// index, the same way a development chain derives its own.
+pub fn keys_from_mnemonic(phrase: &str, count: usize) -> Result<Vec<PrivateKeySigner>> {
+    use alloy::signers::local::MnemonicBuilder;
+    use alloy::signers::local::coins_bip39::English;
+    (0..count as u32)
+        .map(|index| {
+            MnemonicBuilder::<English>::default()
+                .phrase(phrase.trim())
+                .index(index)?
+                .build()
+                .context("deriving an account from the mnemonic")
+        })
+        .collect()
+}
+
+/// How many role accounts there are ([`Role::account_index`]).
+pub const ROLE_COUNT: usize = 10;
+
 /// A connection to the chain, and the addresses of everything on it.
 #[derive(Clone)]
 pub struct Client {
@@ -79,15 +113,29 @@ pub struct Client {
     pub rpc_url: String,
     pub chain_id: u64,
     pub accounts: Vec<Address>,
+    /// The keys this client signs with itself, when the node doesn't.
+    keys: Option<Arc<HashMap<Address, PrivateKeySigner>>>,
 }
 
 impl Client {
     /// Connect, waiting for the chain to answer: `task dev` starts everything
     /// at once, so a service usually arrives before the chain does.
-    pub async fn connect(config: &ChainConfig) -> Result<Self> {
+    pub async fn connect(config: &ChainConfig, signing: Signing) -> Result<Self> {
         let rpc_url = config.rpc.as_str();
         let url = rpc_url.parse().context("the chain's address")?;
-        let provider = ProviderBuilder::new().connect_http(url).erased();
+        let provider = match &signing {
+            Signing::Keys(keys) if !keys.is_empty() => {
+                let mut wallet = EthereumWallet::from(keys[0].clone());
+                for key in &keys[1..] {
+                    wallet.register_signer(key.clone());
+                }
+                ProviderBuilder::new()
+                    .wallet(wallet)
+                    .connect_http(url)
+                    .erased()
+            }
+            _ => ProviderBuilder::new().connect_http(url).erased(),
+        };
 
         let mut waited = Duration::ZERO;
         let chain_id = loop {
@@ -103,16 +151,68 @@ impl Client {
             }
         };
 
-        let accounts = provider
-            .get_accounts()
-            .await
-            .context("the chain's accounts")?;
+        let (accounts, keys) = match signing {
+            Signing::Unlocked => (
+                provider
+                    .get_accounts()
+                    .await
+                    .context("the chain's accounts")?,
+                None,
+            ),
+            Signing::Keys(keys) => (
+                keys.iter().map(|key| key.address()).collect(),
+                Some(Arc::new(
+                    keys.into_iter().map(|key| (key.address(), key)).collect(),
+                )),
+            ),
+            Signing::ReadOnly => (Vec::new(), None),
+        };
         Ok(Self {
             provider,
             rpc_url: rpc_url.to_string(),
             chain_id,
             accounts,
+            keys,
         })
+    }
+
+    /// Whether the node itself holds the accounts' keys, which is what makes
+    /// it a development chain.
+    pub fn is_development(&self) -> bool {
+        self.keys.is_none() && !self.accounts.is_empty()
+    }
+
+    /// Send the chain's own coin, for gas.
+    pub async fn transfer(
+        &self,
+        from: Address,
+        to: Address,
+        value: alloy::primitives::U256,
+    ) -> Result<TransactionReceipt> {
+        let request = TransactionRequest::default()
+            .with_from(from)
+            .with_to(to)
+            .with_value(value);
+        let receipt = self
+            .provider
+            .send_transaction(request)
+            .await
+            .context("sending gas money")?
+            .get_receipt()
+            .await
+            .context("waiting for a transfer")?;
+        if !receipt.status() {
+            bail!("the transfer to {to} was reverted by the chain");
+        }
+        Ok(receipt)
+    }
+
+    /// The chain's own coin an address holds.
+    pub async fn balance(&self, of: Address) -> Result<alloy::primitives::U256> {
+        self.provider
+            .get_balance(of)
+            .await
+            .context("reading a balance")
     }
 
     /// The account that plays a part on this chain.
@@ -122,7 +222,7 @@ impl Client {
             .copied()
             .ok_or_else(|| {
                 anyhow!(
-                    "the chain published no account for the {} role",
+                    "no account plays the {} role here: on a testnet, set SHONIN_TESTNET_EVM_MNEMONIC; on mainnet, clients only read",
                     role.label()
                 )
             })
@@ -225,6 +325,12 @@ impl Client {
     /// Have the node sign a digest as `who`, the way a wallet would: the
     /// signature a contract recovers with `toEthSignedMessageHash`.
     pub async fn sign(&self, who: Address, digest: B256) -> Result<Bytes> {
+        if let Some(key) = self.keys.as_ref().and_then(|keys| keys.get(&who)) {
+            let signature = key
+                .sign_message_sync(digest.as_slice())
+                .context("signing")?;
+            return Ok(Bytes::from(signature.as_bytes().to_vec()));
+        }
         let signature: Bytes = self
             .provider
             .raw_request("eth_sign".into(), (who, Bytes::from(digest.to_vec())))
@@ -365,5 +471,28 @@ impl KeyClient {
             .sign_message_sync(digest.as_slice())
             .context("signing")?;
         Ok(Bytes::from(signature.as_bytes().to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mnemonic_derives_the_accounts_a_development_chain_would() {
+        // Anvil's published mnemonic, and the first two accounts it hands out.
+        let keys = keys_from_mnemonic(
+            "test test test test test test test test test test test junk",
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{:?}", keys[0].address()),
+            "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+        );
+        assert_eq!(
+            format!("{:?}", keys[1].address()),
+            "0x70997970c51812dc3a010c7d01b50e0d17dc79c8"
+        );
     }
 }

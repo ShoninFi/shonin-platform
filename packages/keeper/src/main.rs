@@ -42,9 +42,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let target = args.chain_args.resolve()?;
     let chain = target.connect().await?;
-    let deployments = chain
-        .wait_for_deployments(&target.deployments_file())
-        .await?;
+    let deployments = target.wait_for_deployments(&chain).await?;
     let keeper = chain.account(Role::Keeper)?;
     tracing::info!(%keeper, "the keeper is up");
 

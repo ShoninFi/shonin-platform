@@ -5,6 +5,10 @@
 //! real time, and plays the market each venue quotes. Everything else on the
 //! platform reads the files it writes and talks to the chains it prepared.
 //!
+//! On the testnets it deploys and seeds the same stand-in stack, signed by the
+//! accounts the developer's mnemonic derives, and drives nothing: the chains
+//! keep their own time. It never deploys to mainnet ([`MAINNET_MISSING`]).
+//!
 //! On any network it serves the ops dashboard on its port: what is running,
 //! locally and in the cloud.
 
@@ -13,13 +17,14 @@ mod deploy;
 mod market;
 mod publish;
 mod seed;
+mod solana;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use chain::{
-    ChainArgs, ChainConfig, ChainKey, ChainKind, Client, Deployments, NetworkName, Target,
+    ChainArgs, ChainConfig, ChainKey, ChainKind, Deployments, NetworkName, Role, Target, connect_to,
 };
 use clap::{Parser, Subcommand};
 
@@ -58,9 +63,32 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Deploy the contracts to every EVM chain and write the addresses, then
-    /// stop.
+    /// Deploy the contracts to every EVM chain of the network and write the
+    /// addresses, then stop. Local and testnet only.
     Deploy,
+    /// Show each role's account on every EVM chain of the network, with what
+    /// it holds for gas, and the Solana deployer: what to fund before a
+    /// testnet deploy.
+    Accounts,
+    /// Print the vault chain's RPC (overrides applied) and its deployment
+    /// file, one per line, for the tasks that shell out to other tools.
+    Chain,
+    /// Print the vault chain's deployment as `~<prefix>SHONIN_DEPLOYMENT_JSON=`,
+    /// to append to a "^~^"-delimited gcloud list. Testnet addresses are never
+    /// committed, so this is how a cloud launch is handed them; mainnet's are
+    /// in the image, so there it prints nothing.
+    DeploymentEnv {
+        #[arg(long, default_value = "")]
+        prefix: String,
+    },
+    /// Write a Solana keypair derived from the testnet Solana mnemonic.
+    SolanaKeypair {
+        /// Which: the deployer, or the program's own address.
+        #[arg(long, value_parser = ["deployer", "program"])]
+        role: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Publish the reference agents through the platform's own flows, on the
     /// vault chain.
     Seed {
@@ -88,30 +116,66 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let target = args.chain_args.resolve()?;
-    // The devnet signs with the accounts a development chain unlocks, which
-    // no public chain has. On any other network it only shows what is there.
     let local = target.network == NetworkName::Local;
-    if !local && args.command.is_some() {
-        bail!(
-            "the devnet deploys and seeds the local network only, and this is {}",
-            target.network
-        );
+    let changes_chains = matches!(
+        args.command,
+        Some(Command::Deploy | Command::Seed { .. } | Command::Accounts)
+    );
+    if target.network == NetworkName::Mainnet && changes_chains {
+        bail!("{MAINNET_MISSING}");
     }
 
     match args.command {
         Some(Command::Deploy) => {
             for (key, config) in evm_chains(&target) {
-                let client = Client::connect(&config).await?;
+                let client = connect_to(target.network, &key, &config).await?;
                 let file = Deployments::file_in(&target.deployments_dir, &key);
-                deploy::ensure(&client, &key, &args.artifacts, &file).await?;
+                deploy::ensure(&client, target.network, &key, &args.artifacts, &file).await?;
             }
+            Ok(())
+        }
+        Some(Command::Accounts) => accounts(&target).await,
+        Some(Command::DeploymentEnv { prefix }) => {
+            match target.network {
+                NetworkName::Mainnet => {}
+                NetworkName::Local => bail!("the cloud never runs against local chains"),
+                NetworkName::Testnet => {
+                    let file = target.deployments_file();
+                    let text = std::fs::read_to_string(&file).map_err(|error| {
+                        anyhow::anyhow!(
+                            "no testnet deployment at {} ({error}): run task chains:deploy NETWORK=testnet first",
+                            file.display()
+                        )
+                    })?;
+                    let deployment = Deployments::from_json(&text)?;
+                    print!(
+                        "~{prefix}{}={}",
+                        chain::args::DEPLOYMENT_JSON,
+                        serde_json::to_string(&deployment)?
+                    );
+                }
+            }
+            Ok(())
+        }
+        Some(Command::Chain) => {
+            println!("{}", target.config.rpc);
+            println!("{}", target.deployments_file().display());
+            Ok(())
+        }
+        Some(Command::SolanaKeypair { role, out }) => {
+            let index = if role == "program" {
+                solana::PROGRAM
+            } else {
+                solana::DEPLOYER
+            };
+            let pair = solana::keypair_from_mnemonic(&solana::testnet_mnemonic()?, index)?;
+            pair.write(&out)?;
+            println!("{}", pair.address());
             Ok(())
         }
         Some(Command::Seed { api, agents, agent }) => {
             let client = target.connect().await?;
-            let deployments = client
-                .wait_for_deployments(&target.deployments_file())
-                .await?;
+            let deployments = target.wait_for_deployments(&client).await?;
             match agent {
                 Some(name) => {
                     seed::one(&client, &deployments, &api, agents.as_deref(), &name).await
@@ -147,9 +211,11 @@ async fn main() -> Result<()> {
                     let artifacts = args.artifacts.clone();
                     let file = Deployments::file_in(&target.deployments_dir, &key);
                     let seconds_per_block = args.seconds_per_block;
+                    let network = target.network;
                     running.spawn(async move {
-                        let client = Client::connect(&config).await?;
-                        let deployments = deploy::ensure(&client, &key, &artifacts, &file).await?;
+                        let client = connect_to(network, &key, &config).await?;
+                        let deployments =
+                            deploy::ensure(&client, network, &key, &artifacts, &file).await?;
                         tracing::info!(chain = %key, label = config.label, "the chain is up");
                         market::run(&client, &deployments, seconds_per_block)
                             .await
@@ -165,6 +231,52 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Why the devnet never deploys to mainnet: what it deploys is the stand-in
+/// stack, which is for local chains and testnets.
+pub const MAINNET_MISSING: &str = "The devnet does not deploy to mainnet. What it deploys is the \
+stand-in stack: a dollar anyone may mint, a stand-in venue, and an attestation verifier that trusts \
+one development key. It is for local chains and testnets. Mainnet addresses are committed under \
+config/deployments/mainnet.";
+
+/// Each role's account on every EVM chain of the network, with its gas, and
+/// on the testnets the Solana deployer.
+async fn accounts(target: &Target) -> Result<()> {
+    const ROLES: [Role; 10] = [
+        Role::Admin,
+        Role::Builder,
+        Role::Reviewer,
+        Role::Executor,
+        Role::Keeper,
+        Role::Author,
+        Role::Viewer,
+        Role::Operator,
+        Role::Attestor,
+        Role::Platform,
+    ];
+    for (key, config) in evm_chains(target) {
+        let client = connect_to(target.network, &key, &config).await?;
+        println!("{} ({key})", config.label);
+        for role in ROLES {
+            let address = client.account(role)?;
+            let balance = client.balance(address).await?;
+            println!(
+                "  {:<9} {address:?}  {}",
+                role.label(),
+                alloy::primitives::utils::format_ether(balance)
+            );
+        }
+    }
+    if target.network == NetworkName::Testnet {
+        let deployer =
+            solana::keypair_from_mnemonic(&solana::testnet_mnemonic()?, solana::DEPLOYER)?;
+        let program = solana::keypair_from_mnemonic(&solana::testnet_mnemonic()?, solana::PROGRAM)?;
+        println!("Solana devnet");
+        println!("  deployer  {}", deployer.address());
+        println!("  program   {}", program.address());
+    }
+    Ok(())
 }
 
 /// Every EVM chain of the network, which is every chain the contracts go on.

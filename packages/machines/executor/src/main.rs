@@ -57,9 +57,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let target = args.chain_args.resolve()?;
     let chain = target.connect().await?;
-    let deployments = chain
-        .wait_for_deployments(&target.deployments_file())
-        .await?;
+    let deployments = target.wait_for_deployments(&chain).await?;
     tracing::info!(image = %chain::attest::image_digest("executor"), "the executor is up");
 
     if args.port != 0 {

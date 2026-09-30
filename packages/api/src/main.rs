@@ -62,9 +62,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let target = args.chain_args.resolve()?;
     let chain = target.connect().await?;
-    let deployments = chain
-        .wait_for_deployments(&target.deployments_file())
-        .await?;
+    let deployments = target.wait_for_deployments(&chain).await?;
 
     let indexer = Arc::new(Indexer::new(
         chain,
@@ -122,7 +120,14 @@ async fn config(
         )
     })?;
     let snapshot = service.indexer.snapshot.read().await;
-    let viewer = service.indexer.chain.account(Role::Viewer).ok();
+    // Only a development chain holds its accounts' keys, so only there can the
+    // app offer one as a wallet.
+    let viewer = service
+        .indexer
+        .chain
+        .is_development()
+        .then(|| service.indexer.chain.account(Role::Viewer).ok())
+        .flatten();
     Ok(Json(Config {
         terms,
         chain: snapshot.chain.clone(),
