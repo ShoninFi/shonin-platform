@@ -11,6 +11,14 @@ includes:
     taskfile: ./config.yml
     flatten: true
 
+vars:
+  # The local chains exist only on the local network; on a public one there
+  # is nothing to start.
+  ONLY_LOCAL: >-
+    if [ "{{.NETWORK}}" != "local" ]; then
+    echo "NETWORK={{.NETWORK}} uses public chains: no local chain to start";
+    exit 0; fi
+
 tasks:
   default:
     desc: "Every local chain: three anvils and a Solana validator"
@@ -31,27 +39,20 @@ tasks:
     cmds:
       # Quiet, because three of them would drown everything else; the
       # dashboard shows each chain's head and time.
-      - >-
-        anvil
-        --port {{.PORT}}
-        --chain-id {{.CHAIN_ID}}
-        --block-time 1
-        --accounts 10
-        --balance 10000
-        --host 127.0.0.1
-        --silent
+      - |
+        {{.ONLY_LOCAL}}
+        exec anvil --port {{.PORT}} --chain-id {{.CHAIN_ID}} --block-time 1 \
+          --accounts 10 --balance 10000 --host 127.0.0.1 --silent
 
   solana:
     desc: "A Solana validator, with a fresh ledger each time"
     cmds:
-      - mkdir -p "{{.PATH_SOLANA_LEDGER}}"
-      - >-
-        solana-test-validator
-        --rpc-port {{.PORT_SOLANA_RPC}}
-        --faucet-port {{.PORT_SOLANA_FAUCET}}
-        --ledger "{{.PATH_SOLANA_LEDGER}}"
-        --reset
-        --quiet
+      - |
+        {{.ONLY_LOCAL}}
+        mkdir -p "{{.PATH_SOLANA_LEDGER}}"
+        exec solana-test-validator --rpc-port {{.PORT_SOLANA_RPC}} \
+          --faucet-port {{.PORT_SOLANA_FAUCET}} --ledger "{{.PATH_SOLANA_LEDGER}}" \
+          --reset --quiet
 
   deploy:
     desc: "Deploy the EVM contracts to every local EVM chain and write each deployment file"

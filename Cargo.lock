@@ -5116,6 +5116,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "futures",
  "rand 0.10.3",
  "reqwest",
  "serde",

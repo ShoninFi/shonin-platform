@@ -53,14 +53,15 @@ The [build checklist](docs/content/checklist.md) is the working guideline for wh
 | --- | --- |
 | 19080 | The web app, with live reload; `/api` is proxied to the API |
 | 19081 | The API the web app reads, running the indexer in-process |
-| 19083 | The chain (anvil) |
 | 19084 | The build service |
 | 19085 | The executor |
 | 19086 | The reviewer |
 | 19087 | The keeper |
-| 19088 | The devnet: the chain's clock and its market |
+| 19088 | The devnet, and the ops dashboard at `http://localhost:19088/` |
 | 19090 | The unwinder |
 | 19091 | The reference indexer on its own |
+| 19100–19102 | Three anvils standing in for base, hyperliquid and robinhood |
+| 19110–19112 | The Solana validator (RPC, websocket, faucet) |
 
 Everything the run writes lives under `.shonin/local` (gitignored): the contracts' addresses, the content-addressed store and the build directories. It is safe to delete; the next run rebuilds it.
 

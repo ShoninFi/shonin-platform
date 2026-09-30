@@ -9,6 +9,14 @@
 version: "3"
 
 vars:
+  # Which chains: local (what `task dev` starts), testnet or mainnet. Set
+  # SHONIN_NETWORK in .env, or pass NETWORK=testnet to a task. The chains each
+  # one means are in config/chains.toml.
+  NETWORK:
+    sh: echo "${SHONIN_NETWORK:-local}"
+  # The vault chain the services serve, until they serve every one at once.
+  VAULT_CHAIN: "base"
+
   # Paths
   PATH_ROOT: "{{.ROOT_DIR}}"
   PATH_ROOT_CARGO_TOML: '{{joinPath .PATH_ROOT "Cargo.toml"}}'
@@ -45,9 +53,10 @@ vars:
   # Everything the local development chain and services write. Gitignored, and
   # safe to delete: `task dev` rebuilds all of it.
   PATH_LOCAL_STATE: '{{joinPath .PATH_ROOT ".shonin" "local"}}'
-  # Where the deploy records the contracts' addresses, one file per chain
-  # (evm-31337.json, ...). Every service reads the one for its chain.
-  PATH_DEPLOYMENTS_DIR: '{{joinPath .PATH_LOCAL_STATE "deployments"}}'
+  # Where the contracts' addresses are, one file per chain (evm-31337.json,
+  # ...). Every service reads the one for its chain. A local deploy writes
+  # them under .shonin/local; public chains' are committed under config/.
+  PATH_DEPLOYMENTS_DIR: '{{if eq .NETWORK "local"}}{{joinPath .PATH_LOCAL_STATE "deployments"}}{{else}}{{joinPath .PATH_ROOT "config" "deployments" .NETWORK}}{{end}}'
   # The local Solana validator's ledger, wiped on every start.
   PATH_SOLANA_LEDGER: '{{joinPath .PATH_LOCAL_STATE "solana"}}'
   # Content-addressed storage: source archives, bundles, build logs, reviews.
@@ -62,21 +71,14 @@ vars:
   CARGO_WASM_PACKAGES: "-p shonin-frontend -p shonin-shared -p shonin-chain"
   CARGO_WASIP2_PACKAGES: "-p shonin-strategy-sdk"
 
-  # Which chains: local (what `task dev` starts), testnet or mainnet. Set
-  # SHONIN_NETWORK in .env, or pass NETWORK=testnet to a task. The chains each
-  # one means are in config/chains.toml.
-  NETWORK:
-    sh: echo "${SHONIN_NETWORK:-local}"
-  # The vault chain the services serve, until they serve every one at once.
-  VAULT_CHAIN: "base"
-
   # Ports: a base (override with SHONIN_START_PORT_DEV in .env) plus fixed offsets.
   # Offsets are stable; reserved ones stay reserved.
   SHONIN_START_PORT_DEV:
     sh: echo "${SHONIN_START_PORT_DEV:-19080}"
   PORT_FRONTEND_DEV: "{{add (atoi .SHONIN_START_PORT_DEV) 0}}"
   PORT_API: "{{add (atoi .SHONIN_START_PORT_DEV) 1}}"
-  # +2 and +3 reserved
+  PORT_MARKETING_DEV: "{{add (atoi .SHONIN_START_PORT_DEV) 2}}"
+  # +3 reserved
   PORT_BUILDER: "{{add (atoi .SHONIN_START_PORT_DEV) 4}}"
   PORT_EXECUTOR: "{{add (atoi .SHONIN_START_PORT_DEV) 5}}"
   PORT_REVIEWER: "{{add (atoi .SHONIN_START_PORT_DEV) 6}}"
@@ -97,7 +99,7 @@ vars:
   PORT_SOLANA_FAUCET: "{{add (atoi .SHONIN_START_PORT_DEV) 32}}"
   # Every port a local run listens on, for `task down`.
   PORTS_DEV: >-
-    {{.PORT_FRONTEND_DEV}} {{.PORT_API}} {{.PORT_BUILDER}} {{.PORT_EXECUTOR}}
+    {{.PORT_FRONTEND_DEV}} {{.PORT_API}} {{.PORT_MARKETING_DEV}} {{.PORT_BUILDER}} {{.PORT_EXECUTOR}}
     {{.PORT_REVIEWER}} {{.PORT_KEEPER}} {{.PORT_DEVNET}} {{.PORT_UNWINDER}} {{.PORT_INDEXER}}
     {{.PORT_EVM_BASE}} {{.PORT_EVM_HYPERLIQUID}} {{.PORT_EVM_ROBINHOOD}}
     {{.PORT_SOLANA_RPC}} {{.PORT_SOLANA_WS}} {{.PORT_SOLANA_FAUCET}}
@@ -108,6 +110,7 @@ vars:
   URL_DOCS_PROD: "https://docs.shonin.fi"
   URL_API_DEV: "http://localhost:{{.PORT_API}}"
   URL_BUILDER_DEV: "http://localhost:{{.PORT_BUILDER}}"
+  URL_DASHBOARD_DEV: "http://localhost:{{.PORT_DEVNET}}"
 
   # The local EVM chains, standing in for base, hyperliquid and robinhood.
   # Anvil's default mnemonic is public and its accounts are unlocked, which is
@@ -119,3 +122,14 @@ vars:
   # Seconds of chain time each block advances: one block a second, an hour of
   # chain time a second, so a vault reaches its ninety live days in 36 minutes.
   CHAIN_SECONDS_PER_BLOCK: "3600"
+
+  # Google Cloud: where the machines and services run when they are not
+  # running here. One project per network, never the gcloud default: every
+  # gcloud call passes --project, and the cloud tasks refuse to run while the
+  # project for their network is empty. Region and zone are placeholders.
+  GCP_PROJECT_TESTNET: ""
+  GCP_PROJECT_MAINNET: ""
+  GCP_REGION: "us-central1"
+  GCP_ZONE: "us-central1-a"
+  # The Artifact Registry repository the images are pushed to.
+  GCP_ARTIFACT_REPO: "shonin"
