@@ -79,9 +79,11 @@ task services:seed     # publish the reference strategies through the real flows
 
 ```text
 contracts/
-  src/interfaces/ the contracts' interfaces, which the bindings also read
-  src/            the contracts themselves
-  test/           their tests
+  evm/            the EVM contracts (Foundry)
+    src/interfaces/ the contracts' interfaces, which the bindings also read
+    src/          the contracts themselves
+    test/         their tests
+  solana/         the Solana programs (Anchor): a skeleton for now
 packages/
   shared/         types shared by every crate (native and wasm), and the record's maths
   chain/          contract bindings and deployment addresses (native and wasm)

@@ -1,4 +1,5 @@
-# The contracts: Solidity built and tested with Foundry.
+# The contracts: Solidity built and tested with Foundry (contracts/evm), and
+# the Solana programs built with Anchor (contracts/solana).
 # Commands `cd` explicitly rather than using `dir:`, so absolute templated
 # paths behave the same in included taskfiles.
 version: "3"
@@ -10,26 +11,42 @@ includes:
 
 tasks:
   build:
-    desc: "Compile the contracts"
+    desc: "Compile the EVM contracts"
     cmds:
-      - cd "{{.PATH_CONTRACTS}}" && forge build
+      - cd "{{.PATH_CONTRACTS_EVM}}" && forge build
 
   test:
-    desc: "Run the contracts' tests"
+    desc: "Run the EVM contracts' tests"
     cmds:
-      - cd "{{.PATH_CONTRACTS}}" && forge test
+      - cd "{{.PATH_CONTRACTS_EVM}}" && forge test
 
   fmt:
-    desc: "Format the contracts"
+    desc: "Format the EVM contracts and the Solana programs"
     cmds:
-      - cd "{{.PATH_CONTRACTS}}" && forge fmt
+      - cd "{{.PATH_CONTRACTS_EVM}}" && forge fmt
+      - cd "{{.PATH_CONTRACTS_SOLANA}}" && cargo fmt --all
 
   lint:
-    desc: "Check the contracts' formatting"
+    desc: "Check the contracts' and the programs' formatting"
     cmds:
-      - cd "{{.PATH_CONTRACTS}}" && forge fmt --check
+      - cd "{{.PATH_CONTRACTS_EVM}}" && forge fmt --check
+      - cd "{{.PATH_CONTRACTS_SOLANA}}" && cargo fmt --all --check
 
   clean:
-    desc: "Remove the contracts' build output"
+    desc: "Remove the contracts' and the programs' build output"
     cmds:
-      - cd "{{.PATH_CONTRACTS}}" && forge clean
+      - cd "{{.PATH_CONTRACTS_EVM}}" && forge clean
+      - cd "{{.PATH_CONTRACTS_SOLANA}}" && cargo clean
+
+  solana:check:
+    desc: "Type-check the Solana programs (fast; no Solana toolchain needed)"
+    cmds:
+      - cd "{{.PATH_CONTRACTS_SOLANA}}" && cargo check --workspace
+
+  solana:build:
+    desc: "Build the Solana programs and their IDL with Anchor"
+    cmds:
+      # The program's keypair is made on the first build, under target/deploy,
+      # and never committed. `anchor keys sync` writes its address into
+      # declare_id! and Anchor.toml when a program is first deployed.
+      - cd "{{.PATH_CONTRACTS_SOLANA}}" && anchor build

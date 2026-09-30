@@ -1,0 +1,16 @@
+# The Solana programs, built with Anchor. A skeleton for now: the toolchain
+# and the local validator are wired in, and the program does nothing yet.
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+shonin_registry = "Bn5t8rYJnsd86vE1DRA7xwfG6Qiz7sw3AoGaM4WrpAs6"
+
+# The local validator `task dev` starts (see taskfiles/config.yml for ports).
+[provider]
+cluster = "http://127.0.0.1:19110"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "cargo test"

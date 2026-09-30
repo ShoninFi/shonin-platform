@@ -20,8 +20,11 @@ vars:
   # The attested machines: reviewer, builder, executor, unwinder.
   PATH_MACHINES: '{{joinPath .PATH_PACKAGES "machines"}}'
   PATH_CONTRACTS: '{{joinPath .PATH_ROOT "contracts"}}'
-  # What the deploy reads the contracts' bytecode from.
-  PATH_ARTIFACTS: '{{joinPath .PATH_ROOT "contracts" "out"}}'
+  # The EVM contracts (Foundry) and the Solana programs (Anchor).
+  PATH_CONTRACTS_EVM: '{{joinPath .PATH_CONTRACTS "evm"}}'
+  PATH_CONTRACTS_SOLANA: '{{joinPath .PATH_CONTRACTS "solana"}}'
+  # What the deploy reads the EVM contracts' bytecode from.
+  PATH_ARTIFACTS: '{{joinPath .PATH_CONTRACTS_EVM "out"}}'
   PATH_CLOUDFLARE: '{{joinPath .PATH_ROOT "cloudflare"}}'
   PATH_WRANGLER_LANDING: '{{joinPath .PATH_CLOUDFLARE "landing" "wrangler.jsonc"}}'
   PATH_WRANGLER_DOCS: '{{joinPath .PATH_CLOUDFLARE "docs" "wrangler.jsonc"}}'

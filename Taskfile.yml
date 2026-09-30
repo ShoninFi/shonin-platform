@@ -75,9 +75,10 @@ tasks:
       - task: frontend:deploy
 
   check:
-    desc: "Compile everything: the contracts, then the crates for each target they run on"
+    desc: "Compile everything: the contracts and programs, then the crates for each target they run on"
     cmds:
       - task: contracts:build
+      - task: contracts:solana:check
       - cargo check --workspace --all-targets
       - cargo check {{.CARGO_WASM_PACKAGES}} --target wasm32-unknown-unknown
       - cargo check {{.CARGO_WASIP2_PACKAGES}} --target wasm32-wasip2

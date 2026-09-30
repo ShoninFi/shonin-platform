@@ -1,7 +1,7 @@
 //! The chain the platform reads and writes.
 //!
 //! Every binding here is generated from the Solidity under
-//! `contracts/src/interfaces`, which is the same file the contracts
+//! `contracts/evm/src/interfaces`, which is the same file the contracts
 //! implement, so a signature cannot drift between the chain and the code that
 //! talks to it: change the interface and both sides stop compiling until they
 //! agree.
@@ -51,28 +51,28 @@ pub mod bindings {
         }
     }
     pub mod usd {
-        alloy_sol_types::sol!("../../contracts/src/interfaces/ILocalUsd.sol");
+        alloy_sol_types::sol!("../../contracts/evm/src/interfaces/ILocalUsd.sol");
     }
     pub mod venue {
-        alloy_sol_types::sol!("../../contracts/src/interfaces/ILocalVenue.sol");
+        alloy_sol_types::sol!("../../contracts/evm/src/interfaces/ILocalVenue.sol");
     }
     pub mod attestation {
-        alloy_sol_types::sol!("../../contracts/src/interfaces/IAttestationRegistry.sol");
+        alloy_sol_types::sol!("../../contracts/evm/src/interfaces/IAttestationRegistry.sol");
     }
     pub mod strategies {
-        alloy_sol_types::sol!("../../contracts/src/interfaces/IStrategyRegistry.sol");
+        alloy_sol_types::sol!("../../contracts/evm/src/interfaces/IStrategyRegistry.sol");
     }
     pub mod reviews {
-        alloy_sol_types::sol!("../../contracts/src/interfaces/IReviewRegistry.sol");
+        alloy_sol_types::sol!("../../contracts/evm/src/interfaces/IReviewRegistry.sol");
     }
     pub mod profiles {
-        alloy_sol_types::sol!("../../contracts/src/interfaces/IAuthorProfiles.sol");
+        alloy_sol_types::sol!("../../contracts/evm/src/interfaces/IAuthorProfiles.sol");
     }
     pub mod factory {
-        alloy_sol_types::sol!("../../contracts/src/interfaces/IVaultFactory.sol");
+        alloy_sol_types::sol!("../../contracts/evm/src/interfaces/IVaultFactory.sol");
     }
     pub mod vault {
-        alloy_sol_types::sol!("../../contracts/src/interfaces/IVault.sol");
+        alloy_sol_types::sol!("../../contracts/evm/src/interfaces/IVault.sol");
     }
 }
 

@@ -42,10 +42,15 @@ pnpm-debug.log*
 .pnpm-store/
 
 # Solidity / Foundry (contracts)
-contracts/out/
-contracts/cache/
-contracts/broadcast/*/31337/
-contracts/broadcast/**/dry-run/
+contracts/evm/out/
+contracts/evm/cache/
+contracts/evm/broadcast/*/31337/
+contracts/evm/broadcast/**/dry-run/
+
+# Solana / Anchor (contracts/solana; its target/ is covered above). The program
+# keypairs Anchor writes under target/deploy never leave the machine.
+.anchor/
+test-ledger/
 
 # Commit-guard inputs (private term list and review policy). Never commit these:
 # the repository is public and they name what must not appear in it.

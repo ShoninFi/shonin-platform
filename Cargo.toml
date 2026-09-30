@@ -14,6 +14,8 @@ members = [
     "packages/devnet",
     "packages/strategy-sdk",
 ]
+# The Solana programs are their own workspace, built with Anchor.
+exclude = ["contracts/solana"]
 
 [workspace.package]
 version = "0.1.0"
