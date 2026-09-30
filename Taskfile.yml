@@ -46,6 +46,7 @@ tasks:
       - services:reviewer
       - services:indexer
       - services:executor
+      - services:unwinder
       - services:keeper
       - frontend:dev
 
@@ -58,6 +59,7 @@ tasks:
       - services:reviewer
       - services:indexer
       - services:executor
+      - services:unwinder
       - services:keeper
 
   build:

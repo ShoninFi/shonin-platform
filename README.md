@@ -59,6 +59,7 @@ The [build checklist](docs/content/checklist.md) is the working guideline for wh
 | 19086 | The reviewer |
 | 19087 | The keeper |
 | 19088 | The devnet: the chain's clock and its market |
+| 19090 | The unwinder |
 
 Everything the run writes lives under `.shonin/local` (gitignored): the contracts' addresses, the content-addressed store and the build directories. It is safe to delete; the next run rebuilds it.
 
@@ -85,9 +86,11 @@ packages/
   chain/          contract bindings and deployment addresses (native and wasm)
   frontend/       the web app: Rust -> wasm via Trunk, served as Workers static assets
   indexer/        reads the chain into the record, and serves the public API
-  executor/       the attested executor: feeds, runner and signer
-  builder/        the build service: compiles submitted source into a signed bundle
-  reviewer/       the attested reviewer: scores whether a strategy's code is reasonable
+  machines/       the attested machines, each its own image
+    reviewer/     scores whether a strategy's code is reasonable
+    builder/      compiles submitted source into a signed bundle
+    executor/     runs strategies and trades for their vaults: feeds, runner and signer
+    unwinder/     finishes the withdrawals the contracts can't finish alone
   keeper/         the untrusted service that keeps the vaults' clockwork turning
   devnet/         deploys and drives the local development chain
   strategy-sdk/   Rust bindings for the shonin:strategy WIT world

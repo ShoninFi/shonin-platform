@@ -25,7 +25,7 @@ use crate::feed::ChannelProducer;
 use crate::scale::{ASSET_DECIMALS, SIZE_DECIMALS, signed_to_decimal, to_decimal, to_units};
 
 wasmtime::component::bindgen!({
-    path: "../strategy-sdk/wit",
+    path: "../../strategy-sdk/wit",
     world: "strategy",
     imports: { default: async | store | trappable },
     exports: { default: async },

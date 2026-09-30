@@ -113,6 +113,15 @@ tasks:
         --port {{.PORT_EXECUTOR}}
         --api-url "{{.URL_API_DEV}}"
 
+  unwinder:
+    desc: "The unwinder"
+    cmds:
+      - >-
+        cargo run -q -p shonin-unwinder --
+        {{.SERVICE_ARGS}}
+        --port {{.PORT_UNWINDER}}
+        --api-url "{{.URL_API_DEV}}"
+
   keeper:
     desc: "The keeper: crystallises fees, settles claims, freezes"
     cmds:

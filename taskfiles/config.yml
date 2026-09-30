@@ -17,6 +17,8 @@ vars:
   PATH_PACKAGE_CHAIN: '{{joinPath .PATH_PACKAGES "chain"}}'
   PATH_PACKAGE_FRONTEND: '{{joinPath .PATH_PACKAGES "frontend"}}'
   PATH_PACKAGE_SDK: '{{joinPath .PATH_PACKAGES "strategy-sdk"}}'
+  # The attested machines: reviewer, builder, executor, unwinder.
+  PATH_MACHINES: '{{joinPath .PATH_PACKAGES "machines"}}'
   PATH_CONTRACTS: '{{joinPath .PATH_ROOT "contracts"}}'
   # What the deploy reads the contracts' bytecode from.
   PATH_ARTIFACTS: '{{joinPath .PATH_ROOT "contracts" "out"}}'
@@ -66,8 +68,9 @@ vars:
   PORT_KEEPER: "{{add (atoi .SHONIN_START_PORT_DEV) 7}}"
   PORT_DEVNET: "{{add (atoi .SHONIN_START_PORT_DEV) 8}}"
   PORT_DOCS_DEV: "{{add (atoi .SHONIN_START_PORT_DEV) 9}}"
+  PORT_UNWINDER: "{{add (atoi .SHONIN_START_PORT_DEV) 10}}"
   # Every port a local run listens on, for `task down`.
-  PORTS_DEV: "{{.PORT_FRONTEND_DEV}} {{.PORT_API}} {{.PORT_CHAIN}} {{.PORT_BUILDER}} {{.PORT_EXECUTOR}} {{.PORT_REVIEWER}} {{.PORT_KEEPER}} {{.PORT_DEVNET}}"
+  PORTS_DEV: "{{.PORT_FRONTEND_DEV}} {{.PORT_API}} {{.PORT_CHAIN}} {{.PORT_BUILDER}} {{.PORT_EXECUTOR}} {{.PORT_REVIEWER}} {{.PORT_KEEPER}} {{.PORT_DEVNET}} {{.PORT_UNWINDER}}"
 
   # URLs
   URL_FRONTEND_DEV: "http://localhost:{{.PORT_FRONTEND_DEV}}"

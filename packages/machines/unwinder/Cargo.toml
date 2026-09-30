@@ -1,0 +1,24 @@
+[package]
+name = "shonin-unwinder"
+description = "The attested unwinder: finishes the withdrawals the contracts can't finish alone"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "unwinder"
+path = "src/main.rs"
+
+[dependencies]
+chain = { workspace = true, features = ["rpc"] }
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
