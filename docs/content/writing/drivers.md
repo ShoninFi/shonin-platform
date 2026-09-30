@@ -11,7 +11,7 @@ You choose drivers by name in `shonin.toml`, one `[drivers.<name>]` table each. 
 | Hyperliquid | `hyperliquid` | Perpetuals and spot | Hyperliquid |
 | Robinhood Chain stock tokens | `robinhood-stocks` | Tokenised stocks, through approved exchanges on the chain | Robinhood Chain |
 | Lighter | `lighter` | Stock and crypto perpetuals | Robinhood Chain |
-| A decision market | To be announced | Markets that price a governance proposal passing or failing | Solana |
+| Orca | `orca` | Liquidity in concentrated-liquidity pools, and swaps | Solana |
 
 Each driver has its own table, named after it, for whatever that driver needs to know. None of the drivers above needs any settings yet, so an empty table is enough:
 
@@ -75,7 +75,7 @@ Something has to stop the vault's keys from sending money anywhere but the vault
 | | Who stops a withdrawal | For example |
 | --- | --- | --- |
 | **The venue enforces it** | The venue itself: the key it's given can trade, but only the station, as the account's owner, can move money out | Hyperliquid, where the station owns the trading account and the executor's key is a trade-only agent of it; Lighter, where a withdrawal can only ever pay the station that owns the account |
-| **The station enforces it** | The station's own account, whose rules only allow calls to that venue's contracts, with the station itself as the only receiver | Stock tokens on Robinhood Chain, bought and sold only through approved exchanges; decision markets on Solana |
+| **The station enforces it** | The station's own account, whose rules only allow calls to that venue's contracts, with the station itself as the only receiver | Stock tokens on Robinhood Chain, bought and sold only through approved exchanges; liquidity positions on Orca |
 
 A venue where only the key's own honesty would stop a withdrawal can't hold a vault's money at all, so it can't have a driver.
 
