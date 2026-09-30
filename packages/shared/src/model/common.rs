@@ -4,44 +4,68 @@
 use serde::{Deserialize, Serialize};
 use time::Date;
 
-/// A chain a vault, an entry or a registry lives on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// A chain a vault lives on, by the name a strategy's `shonin.toml` gives it.
+///
+/// Which actual chain a name means (a local devnet, a testnet or a mainnet)
+/// is the network's decision, made in `config/chains.toml`; the name stays
+/// the same across all three.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Chain {
-    HyperEvm,
-    RobinhoodChain,
+    Base,
+    Hyperliquid,
+    Robinhood,
     Solana,
-    /// The development chain the platform runs against locally.
-    Local,
 }
 
 impl Chain {
+    pub const ALL: [Chain; 4] = [Self::Base, Self::Hyperliquid, Self::Robinhood, Self::Solana];
+
+    /// The name `shonin.toml` uses: `[vault] chain = "base"`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Base => "base",
+            Self::Hyperliquid => "hyperliquid",
+            Self::Robinhood => "robinhood",
+            Self::Solana => "solana",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
-            Self::HyperEvm => "HyperEVM",
-            Self::RobinhoodChain => "Robinhood Chain",
+            Self::Base => "Base",
+            Self::Hyperliquid => "Hyperliquid",
+            Self::Robinhood => "Robinhood Chain",
             Self::Solana => "Solana",
-            Self::Local => "Local devnet",
         }
     }
 
-    /// The dollar the chain settles in.
-    pub fn asset(self) -> &'static str {
+    /// The dollar a vault on this chain settles in.
+    pub fn dollar(self) -> &'static str {
         match self {
-            Self::HyperEvm => "USDC",
-            Self::RobinhoodChain => "USDG",
-            Self::Solana => "USDC",
-            Self::Local => "USDC",
+            Self::Base | Self::Hyperliquid | Self::Solana => "USDC",
+            Self::Robinhood => "USDG",
         }
     }
 
-    pub fn all() -> [Chain; 4] {
-        [
-            Self::HyperEvm,
-            Self::RobinhoodChain,
-            Self::Solana,
-            Self::Local,
-        ]
+    pub fn from_name(name: &str) -> Option<Chain> {
+        Self::ALL.into_iter().find(|chain| chain.name() == name)
+    }
+}
+
+impl std::fmt::Display for Chain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for Chain {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::from_name(name).ok_or_else(|| {
+            format!("no vault chain is called {name:?}: base, hyperliquid, robinhood or solana")
+        })
     }
 }
 

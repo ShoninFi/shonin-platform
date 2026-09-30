@@ -1,0 +1,23 @@
+# syntax=docker/dockerfile:1
+# The reviewer: reads a strategy's source and scores it before anything is built.
+# Runs on a Confidential Space VM, which attests to this image by its digest.
+# Built from the repository root: task cloud:build NAME=reviewer
+#   (docker build -f deploy/gcp/Dockerfile.reviewer .)
+
+FROM rust:1.98.1-slim-bookworm AS build
+WORKDIR /src
+COPY . .
+# rust-toolchain.toml pins the same compiler; --locked builds exactly Cargo.lock.
+RUN cargo build --release --locked -p shonin-reviewer --bin reviewer
+
+# The reviewer reaches its model through a CLI that is not in this image yet;
+# without it the reviewer runs and every strategy shows "review pending".
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=build /src/target/release/reviewer /usr/local/bin/reviewer
+COPY config/chains.toml /etc/shonin/chains.toml
+COPY config/deployments /etc/shonin/deployments
+# The network (SHONIN_NETWORK) and its deployments directory
+# (SHONIN_DEPLOYMENTS_DIR=/etc/shonin/deployments/<network>) are set where the
+# image is launched.
+ENV SHONIN_CHAINS=/etc/shonin/chains.toml
+ENTRYPOINT ["/usr/local/bin/reviewer"]

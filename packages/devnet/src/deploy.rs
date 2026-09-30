@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow};
 use chain::bindings::attestation::{IAttestationRegistry, ImageKind};
 use chain::bindings::usd::ILocalUsd;
 use chain::bindings::venue::ILocalVenue;
-use chain::{Client, Deployments, Role, Roles};
+use chain::{ChainKey, Client, Deployments, Role, Roles};
 
 /// How long an image waits between being proposed and becoming blessable.
 const TIMELOCK: u64 = 2 * 24 * 60 * 60;
@@ -34,7 +34,12 @@ pub const PERP: &str = "BTC-PERP";
 pub const STARTING_PRICE: u64 = 60_000_000_000;
 
 /// Deploy if nothing is there, and return what is.
-pub async fn ensure(client: &Client, artifacts: &Path, file: &Path) -> Result<Deployments> {
+pub async fn ensure(
+    client: &Client,
+    key: &ChainKey,
+    artifacts: &Path,
+    file: &Path,
+) -> Result<Deployments> {
     if file.exists()
         && let Ok(existing) = client.deployments(file).await
         && client.has_code(existing.factory).await.unwrap_or(false)
@@ -43,7 +48,7 @@ pub async fn ensure(client: &Client, artifacts: &Path, file: &Path) -> Result<De
         return Ok(existing);
     }
 
-    let deployments = deploy(client, artifacts).await?;
+    let deployments = deploy(client, key, artifacts).await?;
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("making {}", parent.display()))?;
     }
@@ -53,7 +58,7 @@ pub async fn ensure(client: &Client, artifacts: &Path, file: &Path) -> Result<De
     Ok(deployments)
 }
 
-async fn deploy(client: &Client, artifacts: &Path) -> Result<Deployments> {
+async fn deploy(client: &Client, key: &ChainKey, artifacts: &Path) -> Result<Deployments> {
     let roles = Roles {
         admin: client.account(Role::Admin)?,
         platform: client.account(Role::Platform)?,
@@ -157,6 +162,7 @@ async fn deploy(client: &Client, artifacts: &Path) -> Result<Deployments> {
     .await?;
 
     let deployments = Deployments {
+        chain_key: key.to_string(),
         chain_id: client.chain_id,
         rpc_url: client.rpc_url.clone(),
         deployed_block: from_block,

@@ -9,19 +9,43 @@
 version: "3"
 
 vars:
+  # Which chains: local (what `task dev` starts), testnet or mainnet. Set
+  # SHONIN_NETWORK in .env, or pass NETWORK=testnet to a task. The chains each
+  # one means are in config/chains.toml.
+  NETWORK:
+    sh: echo "${SHONIN_NETWORK:-local}"
+  # The vault chain the services serve, until they serve every one at once.
+  VAULT_CHAIN: "base"
+
   # Paths
   PATH_ROOT: "{{.ROOT_DIR}}"
   PATH_ROOT_CARGO_TOML: '{{joinPath .PATH_ROOT "Cargo.toml"}}'
   PATH_PACKAGES: '{{joinPath .PATH_ROOT "packages"}}'
   PATH_PACKAGE_SHARED: '{{joinPath .PATH_PACKAGES "shared"}}'
   PATH_PACKAGE_CHAIN: '{{joinPath .PATH_PACKAGES "chain"}}'
-  PATH_PACKAGE_FRONTEND: '{{joinPath .PATH_PACKAGES "frontend"}}'
+  # The frontends: the app (Trunk), the marketing site (static, generated)
+  # and the design system they share.
+  PATH_FRONTEND: '{{joinPath .PATH_PACKAGES "frontend"}}'
+  PATH_PACKAGE_APP: '{{joinPath .PATH_FRONTEND "app"}}'
+  PATH_PACKAGE_UI: '{{joinPath .PATH_FRONTEND "ui"}}'
+  # Written by `task frontend:tokens` from packages/frontend/ui/tokens.json;
+  # gitignored. The app's index.html links it by this relative path.
+  PATH_TOKENS_CSS: '{{joinPath .PATH_PACKAGE_UI "dist" "tokens.css"}}'
   PATH_PACKAGE_SDK: '{{joinPath .PATH_PACKAGES "strategy-sdk"}}'
+  # The attested machines: reviewer, builder, executor, unwinder.
+  PATH_MACHINES: '{{joinPath .PATH_PACKAGES "machines"}}'
   PATH_CONTRACTS: '{{joinPath .PATH_ROOT "contracts"}}'
-  # What the deploy reads the contracts' bytecode from.
-  PATH_ARTIFACTS: '{{joinPath .PATH_ROOT "contracts" "out"}}'
+  # The EVM contracts (Foundry) and the Solana programs (Anchor).
+  PATH_CONTRACTS_EVM: '{{joinPath .PATH_CONTRACTS "evm"}}'
+  PATH_CONTRACTS_SOLANA: '{{joinPath .PATH_CONTRACTS "solana"}}'
+  # What the deploy reads the EVM contracts' bytecode from.
+  PATH_ARTIFACTS: '{{joinPath .PATH_CONTRACTS_EVM "out"}}'
+  # Every chain the platform knows, and which chain each network means.
+  PATH_CHAINS: '{{joinPath .PATH_ROOT "config" "chains.toml"}}'
   PATH_CLOUDFLARE: '{{joinPath .PATH_ROOT "cloudflare"}}'
+  PATH_WRANGLER_APP: '{{joinPath .PATH_CLOUDFLARE "app" "wrangler.jsonc"}}'
   PATH_WRANGLER_LANDING: '{{joinPath .PATH_CLOUDFLARE "landing" "wrangler.jsonc"}}'
+  PATH_WRANGLER_MARKETING: '{{joinPath .PATH_CLOUDFLARE "marketing" "wrangler.jsonc"}}'
   PATH_WRANGLER_DOCS: '{{joinPath .PATH_CLOUDFLARE "docs" "wrangler.jsonc"}}'
   # The public documentation site. Zensical insists its output sits inside its
   # own project, so this one does not live under .trunk-dist with the rest.
@@ -31,58 +55,102 @@ vars:
   # in docs/zensical.toml.
   PATH_DIST_DOCS: '{{joinPath .PATH_DOCS "site"}}'
   PATH_TRUNK_DIST: '{{joinPath .PATH_ROOT ".trunk-dist"}}'
-  # Must match assets.directory in cloudflare/landing/wrangler.jsonc.
-  PATH_DIST_FRONTEND: '{{joinPath .PATH_TRUNK_DIST "frontend"}}'
-  PATH_DIST_FRONTEND_DEV: '{{joinPath .PATH_TRUNK_DIST "frontend-dev"}}'
+  # Must match assets.directory in cloudflare/app and cloudflare/landing.
+  PATH_DIST_APP: '{{joinPath .PATH_TRUNK_DIST "app"}}'
+  PATH_DIST_APP_DEV: '{{joinPath .PATH_TRUNK_DIST "app-dev"}}'
+  # Must match assets.directory in cloudflare/marketing/wrangler.jsonc.
+  PATH_DIST_MARKETING: '{{joinPath .PATH_TRUNK_DIST "marketing"}}'
+  PATH_DIST_MARKETING_DEV: '{{joinPath .PATH_TRUNK_DIST "marketing-dev"}}'
 
   # Everything the local development chain and services write. Gitignored, and
   # safe to delete: `task dev` rebuilds all of it.
   PATH_LOCAL_STATE: '{{joinPath .PATH_ROOT ".shonin" "local"}}'
-  # Where the deploy records the contracts' addresses. Every service reads it.
-  PATH_DEPLOYMENTS: '{{joinPath .PATH_LOCAL_STATE "deployments.json"}}'
+  # Where the contracts' addresses are, one file per chain (evm-31337.json,
+  # ...). Every service reads the one for its chain. A local deploy writes
+  # them under .shonin/local; public chains' are committed under config/.
+  PATH_DEPLOYMENTS_DIR: '{{if eq .NETWORK "local"}}{{joinPath .PATH_LOCAL_STATE "deployments"}}{{else}}{{joinPath .PATH_ROOT "config" "deployments" .NETWORK}}{{end}}'
+  # The local Solana validator's ledger, wiped on every start.
+  PATH_SOLANA_LEDGER: '{{joinPath .PATH_LOCAL_STATE "solana"}}'
   # Content-addressed storage: source archives, bundles, build logs, reviews.
   PATH_STORE: '{{joinPath .PATH_LOCAL_STATE "store"}}'
   # Where the build service compiles submissions.
   PATH_BUILDS: '{{joinPath .PATH_LOCAL_STATE "builds"}}'
 
   # Cargo: crates that run as wasm are also checked for wasm32-unknown-unknown.
-  # The frontend builds natively too (its seo tool runs at build time); the
-  # backend only builds for wasm. The SDK's real target is wasm32-wasip2, where
-  # a strategy is compiled into a component.
-  CARGO_WASM_PACKAGES: "-p shonin-frontend -p shonin-backend -p shonin-shared -p shonin-chain"
-  CARGO_EXCLUDE_WASM: "--exclude shonin-backend"
+  # The app builds natively too (its seo tool runs at build time). The
+  # SDK's real target is wasm32-wasip2, where a strategy is compiled into a
+  # component.
+  CARGO_WASM_PACKAGES: "-p shonin-app -p shonin-shared -p shonin-chain"
   CARGO_WASIP2_PACKAGES: "-p shonin-strategy-sdk"
 
   # Ports: a base (override with SHONIN_START_PORT_DEV in .env) plus fixed offsets.
   # Offsets are stable; reserved ones stay reserved.
   SHONIN_START_PORT_DEV:
     sh: echo "${SHONIN_START_PORT_DEV:-19080}"
-  PORT_FRONTEND_DEV: "{{add (atoi .SHONIN_START_PORT_DEV) 0}}"
+  PORT_APP_DEV: "{{add (atoi .SHONIN_START_PORT_DEV) 0}}"
   PORT_API: "{{add (atoi .SHONIN_START_PORT_DEV) 1}}"
-  # +2 reserved: backend API inspector
-  PORT_CHAIN: "{{add (atoi .SHONIN_START_PORT_DEV) 3}}"
+  PORT_MARKETING_DEV: "{{add (atoi .SHONIN_START_PORT_DEV) 2}}"
+  # +3 reserved
   PORT_BUILDER: "{{add (atoi .SHONIN_START_PORT_DEV) 4}}"
   PORT_EXECUTOR: "{{add (atoi .SHONIN_START_PORT_DEV) 5}}"
   PORT_REVIEWER: "{{add (atoi .SHONIN_START_PORT_DEV) 6}}"
-  PORT_COORDINATOR: "{{add (atoi .SHONIN_START_PORT_DEV) 7}}"
+  PORT_KEEPER: "{{add (atoi .SHONIN_START_PORT_DEV) 7}}"
   PORT_DEVNET: "{{add (atoi .SHONIN_START_PORT_DEV) 8}}"
   PORT_DOCS_DEV: "{{add (atoi .SHONIN_START_PORT_DEV) 9}}"
+  PORT_UNWINDER: "{{add (atoi .SHONIN_START_PORT_DEV) 10}}"
+  PORT_INDEXER: "{{add (atoi .SHONIN_START_PORT_DEV) 11}}"
+  # The local chains, in a block of their own. These must match the local
+  # entries in config/chains.toml (or be overridden there from .env with
+  # SHONIN_RPC_EVM_31337 and friends when the base port moves).
+  PORT_EVM_BASE: "{{add (atoi .SHONIN_START_PORT_DEV) 20}}"
+  PORT_EVM_HYPERLIQUID: "{{add (atoi .SHONIN_START_PORT_DEV) 21}}"
+  PORT_EVM_ROBINHOOD: "{{add (atoi .SHONIN_START_PORT_DEV) 22}}"
+  # The validator's websocket is always its RPC port + 1.
+  PORT_SOLANA_RPC: "{{add (atoi .SHONIN_START_PORT_DEV) 30}}"
+  PORT_SOLANA_WS: "{{add (atoi .SHONIN_START_PORT_DEV) 31}}"
+  PORT_SOLANA_FAUCET: "{{add (atoi .SHONIN_START_PORT_DEV) 32}}"
   # Every port a local run listens on, for `task down`.
-  PORTS_DEV: "{{.PORT_FRONTEND_DEV}} {{.PORT_API}} {{.PORT_CHAIN}} {{.PORT_BUILDER}} {{.PORT_EXECUTOR}} {{.PORT_REVIEWER}} {{.PORT_COORDINATOR}} {{.PORT_DEVNET}}"
+  PORTS_DEV: >-
+    {{.PORT_APP_DEV}} {{.PORT_API}} {{.PORT_MARKETING_DEV}} {{.PORT_BUILDER}} {{.PORT_EXECUTOR}}
+    {{.PORT_REVIEWER}} {{.PORT_KEEPER}} {{.PORT_DEVNET}} {{.PORT_UNWINDER}} {{.PORT_INDEXER}}
+    {{.PORT_EVM_BASE}} {{.PORT_EVM_HYPERLIQUID}} {{.PORT_EVM_ROBINHOOD}}
+    {{.PORT_SOLANA_RPC}} {{.PORT_SOLANA_WS}} {{.PORT_SOLANA_FAUCET}}
 
   # URLs
-  URL_FRONTEND_DEV: "http://localhost:{{.PORT_FRONTEND_DEV}}"
-  URL_FRONTEND_PROD: "https://shonin.fi"
+  URL_APP_DEV: "http://localhost:{{.PORT_APP_DEV}}"
+  URL_MARKETING_DEV: "http://localhost:{{.PORT_MARKETING_DEV}}"
+  URL_APP_PROD: "https://app.shonin.fi"
+  # shonin.fi serves the app (shonin-landing) until the marketing site takes
+  # it; the app's pre-rendered pages name it as their canonical address until
+  # then.
+  URL_SITE_PROD: "https://shonin.fi"
   URL_DOCS_PROD: "https://docs.shonin.fi"
   URL_API_DEV: "http://localhost:{{.PORT_API}}"
-  URL_CHAIN_DEV: "http://localhost:{{.PORT_CHAIN}}"
   URL_BUILDER_DEV: "http://localhost:{{.PORT_BUILDER}}"
+  URL_DASHBOARD_DEV: "http://localhost:{{.PORT_DEVNET}}"
 
-  # The local development chain. Anvil's default mnemonic is public and its
-  # accounts are unlocked, which is exactly what a development chain wants and
-  # exactly why nothing of value ever goes near one.
-  CHAIN_ID_LOCAL: "31337"
-  CHAIN_LABEL_LOCAL: "Local devnet"
+  # The local EVM chains, standing in for base, hyperliquid and robinhood.
+  # Anvil's default mnemonic is public and its accounts are unlocked, which is
+  # exactly what a development chain wants and exactly why nothing of value
+  # ever goes near one. The ids match config/chains.toml.
+  CHAIN_ID_EVM_BASE: "31337"
+  CHAIN_ID_EVM_HYPERLIQUID: "31338"
+  CHAIN_ID_EVM_ROBINHOOD: "31339"
   # Seconds of chain time each block advances: one block a second, an hour of
   # chain time a second, so a vault reaches its ninety live days in 36 minutes.
   CHAIN_SECONDS_PER_BLOCK: "3600"
+
+  # Google Cloud: where the machines and services run when they are not
+  # running here. One project per network, never the gcloud default: every
+  # gcloud call passes --project, and the cloud tasks refuse to run while the
+  # project for their network is empty. Region and zone are placeholders.
+  GCP_PROJECT_TESTNET: ""
+  GCP_PROJECT_MAINNET: ""
+  GCP_REGION: "us-central1"
+  GCP_ZONE: "us-central1-a"
+  # The Artifact Registry repository the images are pushed to.
+  GCP_ARTIFACT_REPO: "shonin"
+  # Confidential Space VMs: Intel TDX needs a C3 machine.
+  GCP_MACHINE_TYPE: "c3-standard-4"
+  # The service account the machines and services run as, in the project.
+  GCP_WORKLOAD_SERVICE_ACCOUNT: "shonin-workload"

@@ -13,7 +13,9 @@ includes:
   frontend: taskfiles/frontend.yml
   docs: taskfiles/docs.yml
   contracts: taskfiles/contracts.yml
+  chains: taskfiles/chains.yml
   services: taskfiles/services.yml
+  cloud: taskfiles/cloud.yml
 
 tasks:
   default:
@@ -30,7 +32,7 @@ tasks:
       # Commit guard: every commit runs .githooks/commit-msg (see CLAUDE.md).
       - git config core.hooksPath .githooks
       - |
-        for bin in trunk anvil forge gitleaks claude jq; do
+        for bin in trunk anvil forge solana-test-validator anchor gitleaks claude jq; do
           command -v "$bin" >/dev/null || echo "missing: $bin (see README.md)"
         done
         for f in .private/terms.txt .private/review.md; do
@@ -38,43 +40,51 @@ tasks:
         done
 
   dev:
-    desc: "The whole platform, locally: chain, contracts, services and the web app"
+    desc: "The whole platform, locally: chains, contracts, machines, services, the app and the marketing site"
     deps:
-      - services:chain
+      - chains:evm
+      - chains:solana
       - services:devnet
       - services:builder
       - services:reviewer
+      - services:api
       - services:indexer
       - services:executor
-      - services:coordinator
-      - frontend:dev
+      - services:unwinder
+      - services:keeper
+      - frontend:app:dev
+      - frontend:marketing:dev
 
   dev:services:
-    desc: "Everything but the web app"
+    desc: "Everything but the frontends: chains, contracts, machines and services"
     deps:
-      - services:chain
+      - chains:evm
+      - chains:solana
       - services:devnet
       - services:builder
       - services:reviewer
+      - services:api
       - services:indexer
       - services:executor
-      - services:coordinator
+      - services:unwinder
+      - services:keeper
 
   build:
-    desc: "Release build of everything that deploys"
+    desc: "Release builds of the frontends: tokens, the app, the marketing site"
     cmds:
       - task: frontend:build
 
   deploy:
-    desc: "Build and deploy to Cloudflare"
+    desc: "Build and deploy the app to Cloudflare: app.shonin.fi and shonin.fi"
     cmds:
       - task: frontend:deploy
 
   check:
-    desc: "Compile everything: the contracts, then the crates for each target they run on"
+    desc: "Compile everything: the contracts and programs, then the crates for each target they run on"
     cmds:
       - task: contracts:build
-      - cargo check --workspace --all-targets {{.CARGO_EXCLUDE_WASM}}
+      - task: contracts:solana:check
+      - cargo check --workspace --all-targets
       - cargo check {{.CARGO_WASM_PACKAGES}} --target wasm32-unknown-unknown
       - cargo check {{.CARGO_WASIP2_PACKAGES}} --target wasm32-wasip2
 
@@ -83,7 +93,7 @@ tasks:
     cmds:
       - task: contracts:lint
       - cargo fmt --all --check
-      - cargo clippy --workspace --all-targets {{.CARGO_EXCLUDE_WASM}} -- -D warnings
+      - cargo clippy --workspace --all-targets -- -D warnings
       - cargo clippy {{.CARGO_WASM_PACKAGES}} --target wasm32-unknown-unknown -- -D warnings
       - cargo clippy {{.CARGO_WASIP2_PACKAGES}} --target wasm32-wasip2 -- -D warnings
 
@@ -97,7 +107,7 @@ tasks:
     desc: "Native tests and the contracts' tests"
     cmds:
       - task: contracts:test
-      - cargo test --workspace {{.CARGO_EXCLUDE_WASM}}
+      - cargo test --workspace
 
   clean:
     desc: "Remove build output and local chain state"

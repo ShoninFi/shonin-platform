@@ -1,0 +1,25 @@
+[package]
+name = "shonin-marketing"
+description = "The marketing site: static pages generated from Rust, no wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "marketing"
+path = "src/main.rs"
+
+[dependencies]
+ui.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tower-http = { workspace = true, features = ["fs"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

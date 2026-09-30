@@ -1,6 +1,9 @@
-# The local development stack: a chain, the contracts on it, and each service
-# that reads or writes them. Every service retries until the chain answers and
-# the deployment file exists, so they can all start at once.
+# The machines and services, and the devnet that drives the local chains
+# (taskfiles/chains.yml starts those). Every service retries until its chain
+# answers and its deployment file exists, so they can all start at once.
+#
+# Each takes the network (NETWORK, from SHONIN_NETWORK; `local` by default)
+# and serves one vault chain (VAULT_CHAIN, `base`).
 #
 # Commands `cd` explicitly rather than using `dir:`, so absolute templated
 # paths behave the same in included taskfiles.
@@ -12,27 +15,17 @@ includes:
     flatten: true
 
 vars:
-  # Every service takes the same three arguments, so one variable carries them.
+  # Every service takes the same arguments, so one variable carries them.
   SERVICE_ARGS: >-
-    --rpc-url "{{.URL_CHAIN_DEV}}"
-    --deployments "{{.PATH_DEPLOYMENTS}}"
+    --network "{{.NETWORK}}"
+    --chains "{{.PATH_CHAINS}}"
+    --deployments-dir "{{.PATH_DEPLOYMENTS_DIR}}"
+    --vault-chain "{{.VAULT_CHAIN}}"
     --store "{{.PATH_STORE}}"
 
 tasks:
-  chain:
-    desc: "Anvil: the local development chain"
-    cmds:
-      - >-
-        anvil
-        --port {{.PORT_CHAIN}}
-        --chain-id {{.CHAIN_ID_LOCAL}}
-        --block-time 1
-        --accounts 10
-        --balance 10000
-        --host 127.0.0.1
-
   devnet:
-    desc: "Deploy the contracts, then drive the chain's clock and its market"
+    desc: "The ops dashboard; on the local network it also deploys the contracts and drives every EVM chain"
     cmds:
       - >-
         cargo run -q -p shonin-devnet --
@@ -40,32 +33,46 @@ tasks:
         --artifacts "{{.PATH_ARTIFACTS}}"
         --port {{.PORT_DEVNET}}
         --seconds-per-block {{.CHAIN_SECONDS_PER_BLOCK}}
-
-  deploy:
-    desc: "Deploy the contracts to the local chain and write the deployment file"
-    cmds:
-      - >-
-        cargo run -q -p shonin-devnet --
-        {{.SERVICE_ARGS}}
-        --artifacts "{{.PATH_ARTIFACTS}}"
-        deploy
+        --service "app=http://127.0.0.1:{{.PORT_APP_DEV}}/"
+        --service "marketing=http://127.0.0.1:{{.PORT_MARKETING_DEV}}/"
+        --service "api=http://127.0.0.1:{{.PORT_API}}/health"
+        --service "indexer=http://127.0.0.1:{{.PORT_INDEXER}}/health"
+        --service "reviewer=http://127.0.0.1:{{.PORT_REVIEWER}}/health"
+        --service "builder=http://127.0.0.1:{{.PORT_BUILDER}}/health"
+        --service "executor=http://127.0.0.1:{{.PORT_EXECUTOR}}/health"
+        --service "unwinder=http://127.0.0.1:{{.PORT_UNWINDER}}/health"
+        --service "keeper=http://127.0.0.1:{{.PORT_KEEPER}}/health"
+        --gcp-project "testnet={{.GCP_PROJECT_TESTNET}}"
+        --gcp-project "mainnet={{.GCP_PROJECT_MAINNET}}"
+        --gcp-region "{{.GCP_REGION}}"
 
   seed:
-    desc: "Publish the reference work to the local chain, through the real flows"
+    desc: "Publish the reference work to the local chain, through the real flows (AGENT=name for just one)"
+    vars:
+      AGENT_ARG: '{{if .AGENT}}--agent "{{.AGENT}}"{{end}}'
     cmds:
       - >-
         cargo run -q -p shonin-devnet --
         {{.SERVICE_ARGS}}
         --artifacts "{{.PATH_ARTIFACTS}}"
-        seed --api "{{.URL_API_DEV}}"
+        seed --api "{{.URL_API_DEV}}" {{.AGENT_ARG}}
+
+  api:
+    desc: "The web app's API, running the indexer in-process"
+    cmds:
+      - >-
+        cargo run -q -p shonin-api --
+        {{.SERVICE_ARGS}}
+        --port {{.PORT_API}}
+        --builder-url "{{.URL_BUILDER_DEV}}"
 
   indexer:
-    desc: "The indexer and the public API"
+    desc: "The reference indexer on its own: reads the chain into the record"
     cmds:
       - >-
         cargo run -q -p shonin-indexer --
         {{.SERVICE_ARGS}}
-        --port {{.PORT_API}}
+        --port {{.PORT_INDEXER}}
         --builder-url "{{.URL_BUILDER_DEV}}"
 
   builder:
@@ -82,7 +89,7 @@ tasks:
     desc: "The reviewer"
     cmds:
       - >-
-        cargo run -q -p shonin-reviewer --
+        cargo run -q -p shonin-reviewer --bin reviewer --
         {{.SERVICE_ARGS}}
         --port {{.PORT_REVIEWER}}
 
@@ -111,11 +118,20 @@ tasks:
         --port {{.PORT_EXECUTOR}}
         --api-url "{{.URL_API_DEV}}"
 
-  coordinator:
-    desc: "The coordinator"
+  unwinder:
+    desc: "The unwinder"
     cmds:
       - >-
-        cargo run -q -p shonin-coordinator --
+        cargo run -q -p shonin-unwinder --
         {{.SERVICE_ARGS}}
-        --port {{.PORT_COORDINATOR}}
+        --port {{.PORT_UNWINDER}}
+        --api-url "{{.URL_API_DEV}}"
+
+  keeper:
+    desc: "The keeper: crystallises fees, settles claims, freezes"
+    cmds:
+      - >-
+        cargo run -q -p shonin-keeper --
+        {{.SERVICE_ARGS}}
+        --port {{.PORT_KEEPER}}
         --api-url "{{.URL_API_DEV}}"

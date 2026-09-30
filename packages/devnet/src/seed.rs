@@ -72,6 +72,39 @@ const PLAN: &[Plan] = &[
     },
 ];
 
+/// Publish one project as it stands, at the version its manifest names: what
+/// an author does from the web app, run from a checkout of their work.
+pub async fn one(
+    client: &Client,
+    deployments: &Deployments,
+    api: &str,
+    agents: Option<&Path>,
+    name: &str,
+) -> Result<()> {
+    let agents = agents
+        .map(Path::to_path_buf)
+        .or_else(guess_agents)
+        .context("where the agents live: pass --agents or set SHONIN_AGENTS_DIR")?;
+    let project = agents.join("packages/agents").join(name);
+    let project = project.as_path();
+    if !project.join("shonin.toml").exists() {
+        bail!("no agent at {}", project.display());
+    }
+    let author = client.account(Role::Author)?;
+    say_who_the_author_is(client, deployments, author).await?;
+    tracing::info!(project = %project.display(), "publishing");
+    let published =
+        crate::publish::publish(client, deployments, api, project, author, false).await?;
+    match published.outcome {
+        JobState::Succeeded => {
+            tracing::info!(slug = published.slug, vault = %published.vault, job = published.job_id, "built and registered");
+            Ok(())
+        }
+        JobState::Failed { reason } => bail!("the build failed ({}): {reason}", published.job_id),
+        other => bail!("the build is {}", other.label()),
+    }
+}
+
 pub async fn run(
     client: &Client,
     deployments: &Deployments,
@@ -99,7 +132,8 @@ pub async fn run(
         tracing::info!(id = plan.id, version = plan.version, "publishing");
 
         let published =
-            shonin_cli::publish(client, deployments, api, &prepared, author, plan.sealed).await?;
+            crate::publish::publish(client, deployments, api, &prepared, author, plan.sealed)
+                .await?;
 
         match &published.outcome {
             JobState::Succeeded => tracing::info!(slug = published.slug, "published"),

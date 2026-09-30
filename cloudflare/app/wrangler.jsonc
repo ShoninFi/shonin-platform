@@ -1,0 +1,23 @@
+{
+  // app — the web app's static Trunk dist, served as Workers static assets at
+  // app.shonin.fi. There is no Worker script (`main`); Cloudflare serves the
+  // files. Who may open it is decided by a Cloudflare Access policy on the
+  // hostname, set in the dashboard.
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  // `name` is the SINGLE SOURCE OF TRUTH for this Worker's name.
+  "name": "shonin-app",
+  "compatibility_date": "2026-09-15",
+  // The custom domain is declared here, so config stays the source of truth
+  // and a deploy never drops it. The first deploy creates it.
+  "routes": [{ "pattern": "app.shonin.fi", "custom_domain": true }],
+  // One canonical origin: no workers.dev address, no per-version preview URLs.
+  "workers_dev": false,
+  "preview_urls": false,
+  "assets": {
+    // Must match PATH_DIST_APP in taskfiles/config.yml.
+    "directory": "../../.trunk-dist/app",
+    // Every route has its own pre-rendered file (src/bin/seo.rs), so unknown
+    // paths get a real 404 status with 404.html, not a soft-404 index.html.
+    "not_found_handling": "404-page"
+  }
+}

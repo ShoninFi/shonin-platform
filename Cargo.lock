@@ -1272,7 +1272,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "itoa",
- "matchit 0.8.4",
+ "matchit",
  "memchr",
  "mime",
  "percent-encoding",
@@ -1576,10 +1576,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
  "serde",
- "wasm-bindgen",
  "windows-link",
 ]
 
@@ -2996,6 +2994,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-range-header"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9171a2ea8a68358193d15dd5d70c1c10a2afc3e7e4c5bc92bc9f025cebd7359c"
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3656,12 +3660,6 @@ dependencies = [
 
 [[package]]
 name = "matchit"
-version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
-
-[[package]]
-name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
@@ -3692,6 +3690,16 @@ name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
+name = "mime_guess"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
+dependencies = [
+ "mime",
+ "unicase",
+]
 
 [[package]]
 name = "mio"
@@ -4885,17 +4893,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde-wasm-bindgen"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
-dependencies = [
- "js-sys",
- "serde",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "serde_core"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5072,12 +5069,44 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
-name = "shonin-backend"
+name = "shonin-api"
 version = "0.1.0"
 dependencies = [
- "serde",
+ "alloy",
+ "anyhow",
+ "axum",
+ "clap",
+ "reqwest",
+ "shonin-chain",
+ "shonin-indexer",
  "shonin-shared",
- "worker",
+ "tokio",
+ "tower-http 0.7.1",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "shonin-app"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
+ "console_error_panic_hook",
+ "dominator",
+ "futures-signals",
+ "gloo-net",
+ "gloo-timers",
+ "js-sys",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "shonin-chain",
+ "shonin-shared",
+ "time",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
@@ -5109,48 +5138,13 @@ dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
  "anyhow",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "shonin-cli"
-version = "0.1.0"
-dependencies = [
- "alloy",
- "anyhow",
  "clap",
- "reqwest",
  "serde",
  "serde_json",
- "shonin-chain",
  "shonin-shared",
- "tar",
- "time",
  "tokio",
+ "toml 1.1.6+spec-1.1.0",
  "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "shonin-coordinator"
-version = "0.1.0"
-dependencies = [
- "alloy",
- "anyhow",
- "axum",
- "clap",
- "reqwest",
- "serde",
- "serde_json",
- "shonin-chain",
- "shonin-shared",
- "time",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -5161,11 +5155,12 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "futures",
  "rand 0.10.3",
+ "reqwest",
  "serde",
  "serde_json",
  "shonin-chain",
- "shonin-cli",
  "shonin-shared",
  "time",
  "tokio",
@@ -5201,29 +5196,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "shonin-frontend"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "alloy-sol-types",
- "console_error_panic_hook",
- "dominator",
- "futures-signals",
- "gloo-net",
- "gloo-timers",
- "js-sys",
- "reqwest",
- "serde",
- "serde_json",
- "shonin-chain",
- "shonin-shared",
- "time",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
 name = "shonin-indexer"
 version = "0.1.0"
 dependencies = [
@@ -5238,6 +5210,38 @@ dependencies = [
  "shonin-shared",
  "tar",
  "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "shonin-keeper"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "axum",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "shonin-chain",
+ "shonin-shared",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "shonin-marketing"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "shonin-ui",
  "tokio",
  "tower-http 0.7.1",
  "tracing",
@@ -5287,6 +5291,29 @@ dependencies = [
  "futures",
  "serde",
  "wit-bindgen 0.62.0",
+]
+
+[[package]]
+name = "shonin-ui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "shonin-unwinder"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "shonin-chain",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -5843,10 +5870,19 @@ checksum = "08a05a66a4fdd61cbbe0a1d755ffe0ca6aba159dd4820936a0ff8a8278245b9c"
 dependencies = [
  "bitflags 2.13.2",
  "bytes",
+ "futures-core",
+ "futures-util",
  "http",
  "http-body",
+ "http-body-util",
+ "http-range-header",
+ "httpdate",
+ "mime",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -5979,6 +6015,12 @@ name = "unarray"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
+
+[[package]]
+name = "unicase"
+version = "2.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
 
 [[package]]
 name = "unicode-ident"
@@ -6206,19 +6248,6 @@ dependencies = [
  "indexmap 2.14.2",
  "wasm-encoder 0.259.0",
  "wasmparser 0.259.0",
-]
-
-[[package]]
-name = "wasm-streams"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7d3be8814f5ba5f074491a469eed3d73c273ffad955f25ed1635efac4b0d269"
-dependencies = [
- "futures-util",
- "js-sys",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
 ]
 
 [[package]]
@@ -7106,65 +7135,6 @@ dependencies = [
  "log",
  "thiserror 1.0.69",
  "wast 35.0.2",
-]
-
-[[package]]
-name = "worker"
-version = "0.8.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f8adbf6c9ae45b665dee995c5e3a342c2bd7d58a2e8ca5c75b50ce8b1b8bfd9"
-dependencies = [
- "async-trait",
- "bytes",
- "chrono",
- "futures-channel",
- "futures-util",
- "http",
- "http-body",
- "js-sys",
- "matchit 0.7.3",
- "pin-project",
- "serde",
- "serde-wasm-bindgen",
- "serde_json",
- "serde_urlencoded",
- "strum",
- "tokio",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-streams",
- "web-sys",
- "worker-macros",
- "worker-sys",
-]
-
-[[package]]
-name = "worker-macros"
-version = "0.8.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d908735d273dd7f9c325a842623f4e5a745e0686187ce465b34dc162ad348df"
-dependencies = [
- "async-trait",
- "proc-macro2",
- "quote",
- "strum",
- "syn 2.0.119",
- "wasm-bindgen",
- "wasm-bindgen-macro-support",
- "worker-sys",
-]
-
-[[package]]
-name = "worker-sys"
-version = "0.8.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33faa1a8fa6c7eec67b196e008859c44d468a5ad4f991855cdc856f119e0e98f"
-dependencies = [
- "cfg-if",
- "js-sys",
- "wasm-bindgen",
- "web-sys",
 ]
 
 [[package]]

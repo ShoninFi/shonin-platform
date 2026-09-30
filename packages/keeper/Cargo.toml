@@ -1,0 +1,30 @@
+[package]
+name = "shonin-keeper"
+description = "The keeper: keeps the vaults' clockwork turning, and nobody has to trust it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "keeper"
+path = "src/main.rs"
+
+[dependencies]
+shared.workspace = true
+chain = { workspace = true, features = ["args"] }
+alloy.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
