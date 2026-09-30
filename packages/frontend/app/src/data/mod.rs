@@ -23,10 +23,11 @@ use time::{Date, PrimitiveDateTime};
 /// Everything the app knows, as of one moment on the chain.
 pub struct Dataset {
     pub version: u64,
-    /// The chain's own clock. Everything dated is relative to it, so a page
-    /// reads correctly however fast the chain is running.
+    /// The chains' own clock, the latest of them. Everything dated is relative
+    /// to its own chain, so a page reads correctly however fast it runs.
     pub as_of: PrimitiveDateTime,
-    pub chain: ChainInfo,
+    /// Every vault chain the snapshot was read from.
+    pub chains: Vec<ChainInfo>,
     pub strategies: Vec<Rc<Strategy>>,
     pub authors: Vec<Rc<Author>>,
     pub jobs: Vec<Rc<Job>>,
@@ -40,7 +41,7 @@ impl From<Snapshot> for Dataset {
         Self {
             version: snapshot.version,
             as_of: snapshot.as_of,
-            chain: snapshot.chain,
+            chains: snapshot.chains,
             strategies: snapshot.strategies.into_iter().map(Rc::new).collect(),
             authors: snapshot.authors.into_iter().map(Rc::new).collect(),
             jobs: snapshot.jobs.into_iter().map(Rc::new).collect(),
@@ -118,8 +119,15 @@ pub fn build_of(slug: &str) -> Option<Rc<Job>> {
         .find(|job| job.strategy_slug.as_deref() == Some(slug))
 }
 
+/// The terms a page quotes: base's, the vault chain a publish goes to. The
+/// devnet deploys every chain with the same terms.
 pub fn terms() -> Option<shared::Terms> {
-    config().map(|config| config.terms)
+    config().and_then(|config| setup(&config, shared::Chain::Base).map(|setup| setup.terms))
+}
+
+/// How to reach a vault chain, from the config.
+pub fn setup(config: &Config, chain: shared::Chain) -> Option<shared::ChainSetup> {
+    config.on(chain).cloned()
 }
 
 pub fn set_config(config: Config) {

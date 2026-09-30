@@ -73,10 +73,11 @@ enum Command {
     /// Print the vault chain's RPC (overrides applied) and its deployment
     /// file, one per line, for the tasks that shell out to other tools.
     Chain,
-    /// Print the vault chain's deployment as `~<prefix>SHONIN_DEPLOYMENT_JSON=`,
-    /// to append to a "^~^"-delimited gcloud list. Testnet addresses are never
-    /// committed, so this is how a cloud launch is handed them; mainnet's are
-    /// in the image, so there it prints nothing.
+    /// Print every served chain's deployment as
+    /// `~<prefix>SHONIN_DEPLOYMENTS_JSON=[...]`, to append to a "^~^"-delimited
+    /// gcloud list. Testnet addresses are never committed, so this is how a
+    /// cloud launch is handed them; mainnet's are in the image, so there it
+    /// prints nothing.
     DeploymentEnv {
         #[arg(long, default_value = "")]
         prefix: String,
@@ -140,18 +141,21 @@ async fn main() -> Result<()> {
                 NetworkName::Mainnet => {}
                 NetworkName::Local => bail!("the cloud never runs against local chains"),
                 NetworkName::Testnet => {
-                    let file = target.deployments_file();
-                    let text = std::fs::read_to_string(&file).map_err(|error| {
-                        anyhow::anyhow!(
-                            "no testnet deployment at {} ({error}): run task chains:deploy NETWORK=testnet first",
-                            file.display()
-                        )
-                    })?;
-                    let deployment = Deployments::from_json(&text)?;
+                    let mut all = Vec::new();
+                    for (key, _) in evm_chains(&target) {
+                        let file = Deployments::file_in(&target.deployments_dir, &key);
+                        let text = std::fs::read_to_string(&file).map_err(|error| {
+                            anyhow::anyhow!(
+                                "no testnet deployment at {} ({error}): run task chains:deploy NETWORK=testnet first",
+                                file.display()
+                            )
+                        })?;
+                        all.push(Deployments::from_json(&text)?);
+                    }
                     print!(
                         "~{prefix}{}={}",
-                        chain::args::DEPLOYMENT_JSON,
-                        serde_json::to_string(&deployment)?
+                        chain::args::DEPLOYMENTS_JSON,
+                        serde_json::to_string(&all)?
                     );
                 }
             }
@@ -178,10 +182,26 @@ async fn main() -> Result<()> {
             let deployments = target.wait_for_deployments(&client).await?;
             match agent {
                 Some(name) => {
-                    seed::one(&client, &deployments, &api, agents.as_deref(), &name).await
+                    seed::one(
+                        &client,
+                        target.vault_chain,
+                        &deployments,
+                        &api,
+                        agents.as_deref(),
+                        &name,
+                    )
+                    .await
                 }
                 None => {
-                    seed::run(&client, &deployments, &api, agents.as_deref(), &args.store).await
+                    seed::run(
+                        &client,
+                        target.vault_chain,
+                        &deployments,
+                        &api,
+                        agents.as_deref(),
+                        &args.store,
+                    )
+                    .await
                 }
             }
         }

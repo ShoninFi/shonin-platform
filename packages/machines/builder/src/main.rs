@@ -23,11 +23,11 @@ use axum::routing::{get, post};
 use chain::bindings::factory::IVaultFactory;
 use chain::bindings::strategies::IStrategyRegistry;
 use chain::bindings::vault::{IVault, VaultState};
-use chain::{Client, Deployments};
+use chain::{Client, Deployments, Served};
 use clap::Parser;
 use shared::manifest::{Manifest, hash_bytes, hash_to_bytes};
 use shared::model::registry::{Job, JobState};
-use shared::{Submission, SubmissionAccepted, SubmissionSource};
+use shared::{Chain, Submission, SubmissionAccepted, SubmissionSource};
 use tokio::sync::Mutex;
 
 #[derive(Parser)]
@@ -49,8 +49,9 @@ struct Args {
 }
 
 struct Service {
-    chain: Client,
-    deployments: Deployments,
+    /// Every vault chain it builds for: a build is registered on the chain its
+    /// vault is on.
+    chains: Vec<Served>,
     store: PathBuf,
     builds: PathBuf,
     sdk: PathBuf,
@@ -59,6 +60,16 @@ struct Service {
     /// Where the queue is kept, so restarting the service does not lose a
     /// build someone paid for.
     queue_file: PathBuf,
+}
+
+impl Service {
+    /// The chain a build for this vault chain is registered on.
+    fn on(&self, chain: Chain) -> Result<&Served> {
+        self.chains
+            .iter()
+            .find(|served| served.vault_chain == chain)
+            .ok_or_else(|| anyhow::anyhow!("this build service does not serve {chain}"))
+    }
 }
 
 /// A job, and what it was asked to build.
@@ -87,10 +98,10 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let target = args.chain_args.resolve()?;
-    let chain = target.connect().await?;
-    let deployments = target.wait_for_deployments(&chain).await?;
-    bless(&chain, &deployments).await?;
+    let chains = args.chain_args.connect_all().await?;
+    for served in &chains {
+        bless(&served.client, &served.deployments).await?;
+    }
 
     // A build someone funded should survive this service restarting, so the
     // queue is on disk rather than only in memory.
@@ -104,8 +115,7 @@ async fn main() -> Result<()> {
     }
 
     let service = Arc::new(Service {
-        chain,
-        deployments,
+        chains,
         store: args.store,
         builds: args.builds,
         sdk: args.sdk,
@@ -173,6 +183,9 @@ async fn submit(
         }
     };
     let source_hash = hash_bytes(&archive);
+    if let Err(error) = service.on(submission.chain) {
+        return Err((StatusCode::BAD_REQUEST, error.to_string()));
+    }
 
     let mut jobs = service.jobs.lock().await;
     let id = format!("{}", 8_800 + jobs.len());
@@ -185,6 +198,7 @@ async fn submit(
 
     let job = Job {
         id: id.clone(),
+        chain: submission.chain,
         subject: format!("{} v{}", submission.strategy_id, submission.version),
         author: submission.author.clone(),
         state: JobState::Queued { position },
@@ -255,13 +269,16 @@ fn placed(jobs: &[Entry]) -> Vec<Job> {
 /// What the build cost, at the platform's published prices, charged to the
 /// vault's tank. A build is processor time and nothing else, so that is what
 /// it is billed as.
-async fn charge_build(service: &Arc<Service>, vault: Address, seconds: u32) {
+async fn charge_build(service: &Arc<Service>, chain: Chain, vault: Address, seconds: u32) {
+    let Ok(on) = service.on(chain) else {
+        return;
+    };
     let dollars = seconds as f64 / 3_600.0 * shared::Prices::published().vcpu_hour;
     let amount = U256::from((dollars * 1_000_000.0).round().max(0.0) as u128);
-    if let Err(error) = service
-        .chain
+    if let Err(error) = on
+        .client
         .send(
-            service.deployments.roles.builder,
+            on.deployments.roles.builder,
             vault,
             IVault::chargeBuildCall { amount },
         )
@@ -333,7 +350,7 @@ async fn take_one(service: &Arc<Service>) -> Result<()> {
         Ok(built) => built.seconds,
         Err(failed) => failed.seconds,
     };
-    charge_build(service, vault, ran).await;
+    charge_build(service, entry.submission.chain, vault, ran).await;
 
     match built {
         Ok(built) => finish(service, &entry, vault, built).await,
@@ -350,10 +367,10 @@ async fn take_one(service: &Arc<Service>) -> Result<()> {
             .await;
             // The build ran, so the tank is charged for it, and the vault
             // closes with the rest returned to its author.
-            service
-                .chain
+            let on = service.on(entry.submission.chain)?;
+            on.client
                 .send(
-                    service.deployments.roles.builder,
+                    on.deployments.roles.builder,
                     vault,
                     IVault::failBuildCall {
                         reasonHash: keccak256(failed.reason.as_bytes()),
@@ -374,6 +391,7 @@ async fn finish(
     vault: Address,
     built: build::Built,
 ) -> Result<()> {
+    let on = service.on(entry.submission.chain)?;
     let submission = &entry.submission;
     let author: Address = submission.author.parse().context("the author's address")?;
     let strategy_id = name_to_bytes(&submission.strategy_id);
@@ -381,10 +399,10 @@ async fn finish(
     let bundle_hash = hash_to_bytes(&built.bundle_hash).context("the bundle hash")?;
     let manifest_hash = hash_to_bytes(&built.manifest_hash).context("the manifest hash")?;
 
-    let digest = service
-        .chain
+    let digest = on
+        .client
         .read(
-            service.deployments.strategies,
+            on.deployments.strategies,
             IStrategyRegistry::registrationDigestCall {
                 strategyId: strategy_id.into(),
                 version: submission.version,
@@ -395,10 +413,7 @@ async fn finish(
             },
         )
         .await?;
-    let signature = service
-        .chain
-        .sign(service.deployments.roles.builder, digest)
-        .await?;
+    let signature = on.client.sign(on.deployments.roles.builder, digest).await?;
 
     // Everything the site shows about a build lives in the store, addressed
     // by the hashes the chain holds. It is written before the registration,
@@ -455,11 +470,10 @@ async fn finish(
     )?;
 
     let (supersedes_id, supersedes_version) = supersedes(&built.manifest);
-    service
-        .chain
+    on.client
         .send(
-            service.deployments.roles.builder,
-            service.deployments.strategies,
+            on.deployments.roles.builder,
+            on.deployments.strategies,
             IStrategyRegistry::registerCall {
                 strategyId: strategy_id.into(),
                 version: submission.version,
@@ -476,13 +490,8 @@ async fn finish(
         .context("the registry would not take the registration")?;
 
     // Anyone may open a vault once the registry holds its bundle.
-    service
-        .chain
-        .send(
-            service.deployments.roles.builder,
-            vault,
-            IVault::openCall {},
-        )
+    on.client
+        .send(on.deployments.roles.builder, vault, IVault::openCall {})
         .await
         .context("the vault would not open")?;
 
@@ -504,10 +513,11 @@ async fn finish(
 /// The vault a submission belongs to, once it exists and is still waiting for
 /// its build.
 async fn vault_for(service: &Arc<Service>, submission: &Submission) -> Result<Option<Address>> {
-    let vault = service
-        .chain
+    let on = service.on(submission.chain)?;
+    let vault = on
+        .client
         .read(
-            service.deployments.factory,
+            on.deployments.factory,
             IVaultFactory::vaultOfCall {
                 strategyId: name_to_bytes(&submission.strategy_id).into(),
                 version: submission.version,
@@ -517,7 +527,7 @@ async fn vault_for(service: &Arc<Service>, submission: &Submission) -> Result<Op
     if vault == Address::ZERO {
         return Ok(None);
     }
-    let state = service.chain.read(vault, IVault::stateCall {}).await?;
+    let state = on.client.read(vault, IVault::stateCall {}).await?;
     Ok(matches!(state, VaultState::Building).then_some(vault))
 }
 

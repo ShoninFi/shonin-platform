@@ -5367,6 +5367,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",

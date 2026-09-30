@@ -20,7 +20,7 @@ pub mod config;
 pub mod deployments;
 
 #[cfg(feature = "args")]
-pub use args::{ChainArgs, Target, connect_to, signing_for};
+pub use args::{ChainArgs, Served, Target, connect_to, signing_for};
 #[cfg(feature = "rpc")]
 pub use client::{Client, KeyClient, ROLE_COUNT, Role, Signing, keys_from_mnemonic};
 pub use config::{ChainConfig, ChainConfigs, ChainKey, ChainKind, Network, NetworkName};

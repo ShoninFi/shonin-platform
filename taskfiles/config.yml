@@ -14,8 +14,10 @@ vars:
   # one means are in config/chains.toml.
   NETWORK:
     sh: echo "${SHONIN_NETWORK:-local}"
-  # The vault chain the services serve, until they serve every one at once.
-  VAULT_CHAIN: "base"
+  # The services serve every vault chain of the network. Set VAULT_CHAIN=base
+  # (or hyperliquid, robinhood) on a task to serve, or seed, just one.
+  VAULT_CHAIN: ""
+  VAULT_CHAIN_ARG: '{{if .VAULT_CHAIN}}--vault-chain "{{.VAULT_CHAIN}}"{{end}}'
 
   # Paths
   PATH_ROOT: "{{.ROOT_DIR}}"

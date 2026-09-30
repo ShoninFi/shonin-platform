@@ -3,7 +3,8 @@
 # answers and its deployment file exists, so they can all start at once.
 #
 # Each takes the network (NETWORK, from SHONIN_NETWORK; `local` by default)
-# and serves one vault chain (VAULT_CHAIN, `base`).
+# and serves every EVM vault chain of it, or only VAULT_CHAIN when it is set.
+# The seed publishes to VAULT_CHAIN, or base.
 #
 # Commands `cd` explicitly rather than using `dir:`, so absolute templated
 # paths behave the same in included taskfiles.
@@ -20,7 +21,7 @@ vars:
     --network "{{.NETWORK}}"
     --chains "{{.PATH_CHAINS}}"
     --deployments-dir "{{.PATH_DEPLOYMENTS_DIR}}"
-    --vault-chain "{{.VAULT_CHAIN}}"
+    {{.VAULT_CHAIN_ARG}}
     --store "{{.PATH_STORE}}"
 
 tasks:

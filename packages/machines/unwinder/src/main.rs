@@ -40,13 +40,14 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let target = args.chain_args.resolve()?;
-    let chain = target.connect().await?;
-    let _deployments = target.wait_for_deployments(&chain).await?;
+    let served = args.chain_args.connect_all().await?;
     tracing::info!(image = %chain::attest::image_digest("unwinder"), "the unwinder is up");
-    tracing::info!(
-        "no venue on this chain needs unwinding outside the contracts; nothing to serve yet"
-    );
+    for served in &served {
+        tracing::info!(
+            chain = %served.key,
+            "no venue on this chain needs unwinding outside the contracts; nothing to serve yet"
+        );
+    }
 
     if args.port != 0 {
         serve_status(SocketAddr::from(([127, 0, 0, 1], args.port))).await;

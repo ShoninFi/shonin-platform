@@ -22,13 +22,13 @@ use chain::bindings::erc20::IERC20;
 use chain::bindings::factory::IVaultFactory;
 use chain::bindings::reviews::IReviewRegistry;
 use chain::bindings::vault::IVault;
-use chain::{Client, Role};
+use chain::{Client, Role, Served};
 use clap::Parser;
 use indexer::{Indexer, read};
 use shared::model::registry::Job;
 use shared::{
-    Addresses, Config, DevMode, HealthPost, HeldClaim, Holding, Portfolio, Snapshot, Submission,
-    SubmissionAccepted, Terms,
+    Addresses, ChainBalance, ChainInfo, ChainSetup, Config, DevMode, HealthPost, HeldClaim,
+    Holding, Portfolio, Snapshot, Submission, SubmissionAccepted, Terms,
 };
 
 #[derive(Parser)]
@@ -60,14 +60,9 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let target = args.chain_args.resolve()?;
-    let chain = target.connect().await?;
-    let deployments = target.wait_for_deployments(&chain).await?;
-
+    let served = args.chain_args.connect_all().await?;
     let indexer = Arc::new(Indexer::new(
-        chain,
-        target.vault_chain,
-        deployments,
+        served,
         args.store.clone(),
         Some(args.builder_url.clone()),
     ));
@@ -108,43 +103,60 @@ async fn snapshot(State(service): State<Arc<Service>>) -> Json<Snapshot> {
 async fn config(
     State(service): State<Arc<Service>>,
 ) -> Result<Json<Config>, (StatusCode, Json<shared::ApiError>)> {
-    let terms = terms(&service).await.map_err(|error| {
-        tracing::warn!(%error, "could not read the platform's terms");
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(shared::ApiError {
-                // An app told the wrong terms would state them as facts, so it
-                // is told nothing until the chain answers.
-                message: "the chain did not answer for the platform's terms".to_string(),
-            }),
-        )
-    })?;
     let snapshot = service.indexer.snapshot.read().await;
+    let mut chains = Vec::new();
+    for reader in &service.indexer.readers {
+        let served = &reader.served;
+        let terms = terms(served).await.map_err(|error| {
+            tracing::warn!(chain = %served.key, %error, "could not read the platform's terms");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(shared::ApiError {
+                    // An app told the wrong terms would state them as facts,
+                    // so it is told nothing until every chain answers.
+                    message: format!(
+                        "{} did not answer for the platform's terms",
+                        served.vault_chain.label()
+                    ),
+                }),
+            )
+        })?;
+        let deployments = &served.deployments;
+        chains.push(ChainSetup {
+            chain: snapshot
+                .chain(served.vault_chain)
+                .cloned()
+                .unwrap_or(ChainInfo {
+                    chain: served.vault_chain,
+                    chain_id: served.client.chain_id,
+                    block: 0,
+                }),
+            rpc_url: served.client.rpc_url.clone(),
+            addresses: Addresses {
+                usd: format!("{:?}", deployments.usd),
+                venue: format!("{:?}", deployments.venue),
+                attestation: format!("{:?}", deployments.attestation),
+                strategies: format!("{:?}", deployments.strategies),
+                reviews: format!("{:?}", deployments.reviews),
+                profiles: format!("{:?}", deployments.profiles),
+                factory: format!("{:?}", deployments.factory),
+            },
+            asset_symbol: served.vault_chain.dollar().to_string(),
+            asset_decimals: 6,
+            terms,
+        });
+    }
     // Only a development chain holds its accounts' keys, so only there can the
     // app offer one as a wallet.
     let viewer = service
         .indexer
-        .chain
-        .is_development()
-        .then(|| service.indexer.chain.account(Role::Viewer).ok())
-        .flatten();
+        .readers
+        .first()
+        .map(|reader| &reader.served.client)
+        .filter(|client| client.is_development())
+        .and_then(|client| client.account(Role::Viewer).ok());
     Ok(Json(Config {
-        terms,
-        chain: snapshot.chain.clone(),
-        rpc_url: service.indexer.chain.rpc_url.clone(),
-        addresses: Addresses {
-            usd: format!("{:?}", service.indexer.deployments.usd),
-            venue: format!("{:?}", service.indexer.deployments.venue),
-            attestation: format!("{:?}", service.indexer.deployments.attestation),
-            strategies: format!("{:?}", service.indexer.deployments.strategies),
-            reviews: format!("{:?}", service.indexer.deployments.reviews),
-            profiles: format!("{:?}", service.indexer.deployments.profiles),
-            factory: format!("{:?}", service.indexer.deployments.factory),
-        },
-        asset_symbol: "USDC".to_string(),
-        asset_decimals: 6,
-        // The chain holds this account's key, which is what makes it a
-        // development chain and why the app can offer it as a wallet.
+        chains,
         dev: viewer.map(|address| DevMode {
             address: format!("{address:?}"),
             label: "Development wallet".to_string(),
@@ -163,16 +175,23 @@ async fn portfolio(
         )
     })?;
 
-    let balance = service
-        .indexer
-        .chain
-        .read(
-            service.indexer.deployments.usd,
-            IERC20::balanceOfCall { account: who },
-        )
-        .await
-        .map(|value| value.to_string().parse::<f64>().unwrap_or(0.0) / 1e6)
-        .unwrap_or(0.0);
+    let mut balances = Vec::new();
+    for reader in &service.indexer.readers {
+        let served = &reader.served;
+        let balance = served
+            .client
+            .read(
+                served.deployments.usd,
+                IERC20::balanceOfCall { account: who },
+            )
+            .await
+            .map(|value| value.to_string().parse::<f64>().unwrap_or(0.0) / 1e6)
+            .unwrap_or(0.0);
+        balances.push(ChainBalance {
+            chain: served.vault_chain,
+            balance,
+        });
+    }
 
     let snapshot = service.indexer.snapshot.read().await;
     let mut positions = Vec::new();
@@ -182,9 +201,11 @@ async fn portfolio(
         let Ok(vault) = strategy.vault.address.parse::<Address>() else {
             continue;
         };
-        let held = service
-            .indexer
-            .chain
+        let Some(served) = service.indexer.on(strategy.vault.chain) else {
+            continue;
+        };
+        let held = served
+            .client
             .read(vault, IERC20::balanceOfCall { account: who })
             .await
             .map(|value| value.to_string().parse::<f64>().unwrap_or(0.0) / 1e18)
@@ -197,9 +218,7 @@ async fn portfolio(
                 exit_value: held
                     * strategy.vault.share_price
                     * (1.0 - strategy.vault.fees.transaction_bps as f64 / 10_000.0),
-                cost: cost_basis(&service.indexer.chain, vault, who)
-                    .await
-                    .unwrap_or(0.0),
+                cost: cost_basis(&served.client, vault, who).await.unwrap_or(0.0),
             });
         }
         for claim in &strategy.vault.claims {
@@ -221,7 +240,8 @@ async fn portfolio(
 
     Ok(Json(Portfolio {
         address,
-        balance,
+        balance: balances.iter().map(|held| held.balance).sum(),
+        balances,
         positions,
         claims,
     }))
@@ -272,32 +292,22 @@ async fn cost_basis(chain: &Client, vault: Address, who: Address) -> Option<f64>
 /// The terms the platform is running under, asked of the contracts that
 /// enforce them. They are governed rather than fixed, so the app is told them
 /// instead of being built with them.
-async fn terms(service: &Arc<Service>) -> Result<Terms> {
+async fn terms(served: &Served) -> Result<Terms> {
     const DAY: f64 = 86_400.0;
 
-    let vaults = service
-        .indexer
-        .chain
-        .read(
-            service.indexer.deployments.factory,
-            IVaultFactory::configCall {},
-        )
+    let chain = &served.client;
+    let deployments = &served.deployments;
+    let vaults = chain
+        .read(deployments.factory, IVaultFactory::configCall {})
         .await?;
-    let timelock = service
-        .indexer
-        .chain
+    let timelock = chain
         .read(
-            service.indexer.deployments.attestation,
+            deployments.attestation,
             IAttestationRegistry::timelockCall {},
         )
         .await?;
-    let review_fee = service
-        .indexer
-        .chain
-        .read(
-            service.indexer.deployments.reviews,
-            IReviewRegistry::reviewFeeCall {},
-        )
+    let review_fee = chain
+        .read(deployments.reviews, IReviewRegistry::reviewFeeCall {})
         .await?;
 
     Ok(Terms {
@@ -384,23 +394,20 @@ async fn post_health(
     let Ok(signer) = recover(&post) else {
         return StatusCode::BAD_REQUEST;
     };
-    let bundle = match service
-        .indexer
-        .chain
-        .read(vault, IVault::bundleHashCall {})
-        .await
-    {
+    let Some(served) = service.indexer.on(post.chain) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let bundle = match served.client.read(vault, IVault::bundleHashCall {}).await {
         Ok(bundle) => bundle,
         Err(error) => {
             tracing::warn!(%vault, %error, "could not read the vault for a health report");
             return StatusCode::SERVICE_UNAVAILABLE;
         }
     };
-    let blessed = service
-        .indexer
-        .chain
+    let blessed = served
+        .client
         .read(
-            service.indexer.deployments.attestation,
+            served.deployments.attestation,
             IAttestationRegistry::isBlessedForCall {
                 signer,
                 vault,
@@ -419,7 +426,7 @@ async fn post_health(
         .health
         .write()
         .await
-        .insert(vault, post.report);
+        .insert((post.chain, vault), post.report);
     StatusCode::ACCEPTED
 }
 

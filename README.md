@@ -40,7 +40,7 @@ They are independent: running the services here against the testnets needs only 
 
 ### What `task dev` runs
 
-Three anvils standing in for the EVM vault chains (base, hyperliquid, robinhood) and a Solana validator; the devnet, which deploys the contracts to every EVM chain, then moves their clocks and plays their markets; the four machines; the API, the indexer and the keeper; the app; and the marketing site. Every service retries until its chain answers and its deployment exists, so they all start at once. `task dev:services` is the same without the frontends.
+Three anvils standing in for the EVM vault chains (base, hyperliquid, robinhood) and a Solana validator; the devnet, which deploys the contracts to every EVM chain, then moves their clocks and plays their markets; the four machines; the API, the indexer and the keeper; the app; and the marketing site. Every machine and service serves all three EVM chains at once, and retries until each chain answers and its deployment exists, so they all start at once. `task services:seed` publishes to base, or to `VAULT_CHAIN=hyperliquid` and so on. `task dev:services` is the same without the frontends.
 
 | Port | What |
 | --- | --- |
@@ -89,7 +89,7 @@ The testnets keep their own time, so nothing drives their clocks or their stand-
 
 ### Chains and networks
 
-`config/chains.toml` lists every chain the platform knows, keyed `kind:id` (`evm:8453`, `solana:devnet`), with its label, RPC, websocket and the dollar a vault there settles in, and maps each network to the chain behind each vault chain name. Every service takes `--network`, `--chains`, `--deployments-dir` and `--vault-chain` (`base` until the services serve every chain at once).
+`config/chains.toml` lists every chain the platform knows, keyed `kind:id` (`evm:8453`, `solana:devnet`), with its label, RPC, websocket and the dollar a vault there settles in, and maps each network to the chain behind each vault chain name. Every service takes `--network`, `--chains` and `--deployments-dir`, and serves every EVM vault chain of the network at once, each with its own client and deployment; `--vault-chain` (or `VAULT_CHAIN=` on a task) narrows it to one. The snapshot and the app's config carry every chain, and each strategy says which chain its vault is on. Where one id and version is published on two chains, its slug is qualified with the chain (`funding-basis-v1-hyperliquid`). No service speaks to Solana yet.
 
 - **To point a chain at another RPC**, set `SHONIN_RPC_<KIND>_<ID>` (or `SHONIN_WS_...`) in `.env`, for example `SHONIN_RPC_EVM_8453`. Paid RPC URLs carry keys, so they go there and never in the file.
 - **To add a chain**, add a `[chains."kind:id"]` entry and name it in a network. A new local chain also needs its process in `taskfiles/chains.yml` and its port in `taskfiles/config.yml`.

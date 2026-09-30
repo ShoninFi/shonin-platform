@@ -36,17 +36,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let target = args.chain_args.resolve()?;
-    let chain = target.connect().await?;
-    let deployments = target.wait_for_deployments(&chain).await?;
-    let indexer = Arc::new(Indexer::new(
-        chain,
-        target.vault_chain,
-        deployments,
-        args.store,
-        args.builder_url,
-    ));
-    tracing::info!(chain = indexer.chain.chain_id, "the indexer is reading");
+    let served = args.chain_args.connect_all().await?;
+    let indexer = Arc::new(Indexer::new(served, args.store, args.builder_url));
+    for reader in &indexer.readers {
+        tracing::info!(chain = %reader.served.key, "the indexer is reading");
+    }
 
     if args.port != 0 {
         let app = axum::Router::new()
@@ -63,8 +57,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Up, and how far it has read.
+/// Up, and how far it has read on each chain.
 async fn health(State(indexer): State<Arc<Indexer>>) -> String {
     let snapshot = indexer.snapshot.read().await;
-    format!("indexer: block {}", snapshot.chain.block)
+    let blocks: Vec<String> = snapshot
+        .chains
+        .iter()
+        .map(|info| format!("{} block {}", info.chain, info.block))
+        .collect();
+    format!("indexer: {}", blocks.join(", "))
 }

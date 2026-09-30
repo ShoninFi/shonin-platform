@@ -42,7 +42,7 @@ gcloud compute instances create shonin-<name>-<network> \
 
 `confidential-space-debug` is the debug image family, `SEV` the AMD alternative to `TDX`, and `tee-env-NAME=value` passes an environment variable to the container. The services run on Cloud Run, from the same registry.
 
-Testnet addresses are never committed, so a testnet image carries none. A testnet launch hands the vault chain's deployment over whole, as `SHONIN_DEPLOYMENT_JSON` (a `tee-env-` value on a machine, an environment variable on Cloud Run), read from `.shonin/testnet/deployments/`, so run `task chains:deploy NETWORK=testnet` first.
+Testnet addresses are never committed, so a testnet image carries none. A testnet launch hands every chain's deployment over whole, as a JSON list in `SHONIN_DEPLOYMENTS_JSON` (a `tee-env-` value on a machine, an environment variable on Cloud Run), read from `.shonin/testnet/deployments/`, so run `task chains:deploy NETWORK=testnet` first.
 
 The testnet services sign with the role accounts from `SHONIN_TESTNET_EVM_MNEMONIC`, which they read from Secret Manager: `task cloud:secrets NETWORK=testnet` uploads it from `.env` (secret `GCP_SECRET_TESTNET_EVM_MNEMONIC`). The machines are never handed a mnemonic: each makes its own key inside the enclave and is blessed through attestation.
 

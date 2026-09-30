@@ -8,11 +8,6 @@
     19,
     0
   ],
-  "chain": {
-    "chain": "base",
-    "chain_id": 31337,
-    "block": 2126
-  },
   "strategies": [
     {
       "id": "funding-basis",
@@ -35,7 +30,7 @@
         "source_hash": "sha256:94c10fa1621721435d85bd7335e66c37ba77a25f82089843e5d62efc72d34952",
         "manifest_hash": "sha256:85a8a8863a4d05929759b64db92913b764a9ba252272e5738052c8aa345b5f08",
         "world": "shonin:strategy@0.1.0",
-        "toolchain": "rust 1.98.1 \u00b7 wasm32-wasip2",
+        "toolchain": "rust 1.98.1 · wasm32-wasip2",
         "builder_image": "sha256:93ba670241746e9315ea1cdfe4e2d94f7b41ff0a28b839d24801334b957e599f",
         "models": [],
         "allowances": {
@@ -1457,7 +1452,7 @@
         "source_hash": "sha256:e7f00be4ad3f4c46b97096215073e1928b6d2a37077411a29f62c627f68001cc",
         "manifest_hash": "sha256:f20e4168cdc6dda5341389147710a9ed55ef1ad1bd4f7c1dc1706b25727df79b",
         "world": "shonin:strategy@0.1.0",
-        "toolchain": "rust 1.98.1 \u00b7 wasm32-wasip2",
+        "toolchain": "rust 1.98.1 · wasm32-wasip2",
         "builder_image": "sha256:93ba670241746e9315ea1cdfe4e2d94f7b41ff0a28b839d24801334b957e599f",
         "models": [],
         "allowances": {
@@ -2784,7 +2779,7 @@
         "source_hash": "sha256:28db4c898444c2f07fb1a1c728c9acad817673ec553f49a48e2e947ad829f6f4",
         "manifest_hash": "sha256:b47dbba93bd1e4d81fd4356726661ede5906d1629802bac23338879c937b1051",
         "world": "shonin:strategy@0.1.0",
-        "toolchain": "rust 1.98.1 \u00b7 wasm32-wasip2",
+        "toolchain": "rust 1.98.1 · wasm32-wasip2",
         "builder_image": "sha256:93ba670241746e9315ea1cdfe4e2d94f7b41ff0a28b839d24801334b957e599f",
         "models": [],
         "allowances": {
@@ -4095,7 +4090,7 @@
         "source_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "manifest_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "world": "shonin:strategy@0.1.0",
-        "toolchain": "rust 1.98.1 \u00b7 wasm32-wasip2",
+        "toolchain": "rust 1.98.1 · wasm32-wasip2",
         "builder_image": "sha256:93ba670241746e9315ea1cdfe4e2d94f7b41ff0a28b839d24801334b957e599f",
         "models": [],
         "allowances": {
@@ -5120,7 +5115,7 @@
         "source_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "manifest_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "world": "shonin:strategy@0.1.0",
-        "toolchain": "rust 1.98.1 \u00b7 wasm32-wasip2",
+        "toolchain": "rust 1.98.1 · wasm32-wasip2",
         "builder_image": "sha256:93ba670241746e9315ea1cdfe4e2d94f7b41ff0a28b839d24801334b957e599f",
         "models": [],
         "allowances": {
@@ -6195,7 +6190,8 @@
           "level": "plain"
         }
       ],
-      "strategy_slug": "funding-basis-v1"
+      "strategy_slug": "funding-basis-v1",
+      "chain": "base"
     },
     {
       "id": "8801",
@@ -6255,7 +6251,8 @@
           "level": "plain"
         }
       ],
-      "strategy_slug": "funding-basis-v2"
+      "strategy_slug": "funding-basis-v2",
+      "chain": "base"
     },
     {
       "id": "8802",
@@ -6315,7 +6312,8 @@
           "level": "plain"
         }
       ],
-      "strategy_slug": "funding-basis-v3"
+      "strategy_slug": "funding-basis-v3",
+      "chain": "base"
     },
     {
       "id": "8803",
@@ -6379,7 +6377,8 @@
           "level": "error"
         }
       ],
-      "strategy_slug": null
+      "strategy_slug": null,
+      "chain": "base"
     },
     {
       "id": "8804",
@@ -6408,7 +6407,8 @@
           "level": "plain"
         }
       ],
-      "strategy_slug": null
+      "strategy_slug": null,
+      "chain": "base"
     }
   ],
   "feed": [
@@ -6739,5 +6739,12 @@
   "totals": {
     "vault_capital": 0.0,
     "trades": 60
-  }
+  },
+  "chains": [
+    {
+      "chain": "base",
+      "chain_id": 31337,
+      "block": 2126
+    }
+  ]
 }

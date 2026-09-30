@@ -42,6 +42,8 @@ impl JobState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Job {
     pub id: String,
+    /// The vault chain the build is registered on.
+    pub chain: crate::model::common::Chain,
     /// The strategy being built.
     pub subject: String,
     pub author: String,
