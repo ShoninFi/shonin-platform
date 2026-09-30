@@ -1,0 +1,145 @@
+# Google Cloud: building the images, pushing them, and running them.
+#
+# Two choices, made separately and always explicitly:
+# - where the services run: here (`task dev`) or on Google Cloud (these tasks);
+# - which chains they talk to: NETWORK=testnet or NETWORK=mainnet. The cloud
+#   never runs against `local`.
+# The project comes from NETWORK (GCP_PROJECT_TESTNET or GCP_PROJECT_MAINNET in
+# config.yml), and every gcloud call passes --project and --region/--zone, so
+# nothing ever falls back to the gcloud default.
+#
+# Machines (reviewer, builder, executor, unwinder) run on Confidential Space
+# VMs, launched from their image's digest because the digest is what the
+# attestation measures. Services (api, indexer, keeper) run on Cloud Run.
+version: "3"
+
+includes:
+  config:
+    taskfile: ./config.yml
+    flatten: true
+
+vars:
+  GCP_PROJECT: '{{if eq .NETWORK "testnet"}}{{.GCP_PROJECT_TESTNET}}{{else if eq .NETWORK "mainnet"}}{{.GCP_PROJECT_MAINNET}}{{end}}'
+  GCP_REGISTRY: "{{.GCP_REGION}}-docker.pkg.dev/{{.GCP_PROJECT}}/{{.GCP_ARTIFACT_REPO}}"
+  GIT_SHA:
+    sh: git rev-parse --short=12 HEAD
+  MACHINES: "reviewer builder executor unwinder"
+  SERVICES: "api indexer keeper"
+
+tasks:
+  build:
+    desc: "Build an image locally (NAME=reviewer|builder|executor|unwinder|api|indexer|keeper), tagged NAME:GIT_SHA"
+    requires:
+      vars: [NAME]
+    preconditions:
+      - sh: 'for n in {{.MACHINES}} {{.SERVICES}}; do [ "$n" = "{{.NAME}}" ] && exit 0; done; exit 1'
+        msg: "No image is called {{.NAME}}: {{.MACHINES}} {{.SERVICES}}"
+    cmds:
+      # Confidential Space and Cloud Run both run linux/amd64.
+      - >-
+        docker build --platform linux/amd64
+        -f "{{.PATH_ROOT}}/deploy/gcp/Dockerfile.{{.NAME}}"
+        -t "{{.NAME}}:{{.GIT_SHA}}"
+        "{{.PATH_ROOT}}"
+
+  push:
+    desc: "Push an image to the network's Artifact Registry (NAME=..., NETWORK=testnet|mainnet)"
+    requires:
+      vars: [NAME, NETWORK, GCP_PROJECT]
+    preconditions:
+      # Every task that reaches Google Cloud checks these first.
+      - sh: '[ "{{.NETWORK}}" = "testnet" ] || [ "{{.NETWORK}}" = "mainnet" ]'
+        msg: "Name the chains: NETWORK=testnet or NETWORK=mainnet. The cloud never runs against local chains (NETWORK={{.NETWORK}})."
+      - sh: '[ -n "{{.GCP_PROJECT}}" ]'
+        msg: "No Google Cloud project for {{.NETWORK}}: set GCP_PROJECT_{{upper .NETWORK}} in taskfiles/config.yml. The gcloud default project is never used."
+    cmds:
+      - task: build
+        vars: { NAME: "{{.NAME}}" }
+      - gcloud auth configure-docker "{{.GCP_REGION}}-docker.pkg.dev" --project="{{.GCP_PROJECT}}" --quiet
+      - docker tag "{{.NAME}}:{{.GIT_SHA}}" "{{.GCP_REGISTRY}}/{{.NAME}}:{{.GIT_SHA}}"
+      - docker push "{{.GCP_REGISTRY}}/{{.NAME}}:{{.GIT_SHA}}"
+
+  deploy:machine:
+    desc: "Launch a machine on a Confidential Space VM from its pushed image's digest (NAME=reviewer|builder|executor|unwinder, NETWORK=...)"
+    requires:
+      vars: [NAME, NETWORK, GCP_PROJECT]
+    preconditions:
+      # Every task that reaches Google Cloud checks these first.
+      - sh: '[ "{{.NETWORK}}" = "testnet" ] || [ "{{.NETWORK}}" = "mainnet" ]'
+        msg: "Name the chains: NETWORK=testnet or NETWORK=mainnet. The cloud never runs against local chains (NETWORK={{.NETWORK}})."
+      - sh: '[ -n "{{.GCP_PROJECT}}" ]'
+        msg: "No Google Cloud project for {{.NETWORK}}: set GCP_PROJECT_{{upper .NETWORK}} in taskfiles/config.yml. The gcloud default project is never used."
+      - sh: 'for n in {{.MACHINES}}; do [ "$n" = "{{.NAME}}" ] && exit 0; done; exit 1'
+        msg: "{{.NAME}} is not a machine: {{.MACHINES}}"
+    cmds:
+      # The digest, not the tag: it is what the attestation measures.
+      - |
+        digest=$(gcloud artifacts docker images describe "{{.GCP_REGISTRY}}/{{.NAME}}:{{.GIT_SHA}}" \
+          --project="{{.GCP_PROJECT}}" --format='value(image_summary.digest)')
+        [ -n "$digest" ] || { echo "no pushed image {{.NAME}}:{{.GIT_SHA}}: run task cloud:push first"; exit 1; }
+        gcloud compute instances create "shonin-{{.NAME}}-{{.NETWORK}}" \
+          --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" \
+          --confidential-compute-type=TDX --machine-type="{{.GCP_MACHINE_TYPE}}" \
+          --maintenance-policy=TERMINATE --shielded-secure-boot \
+          --image-project=confidential-space-images --image-family=confidential-space \
+          --metadata="^~^tee-image-reference={{.GCP_REGISTRY}}/{{.NAME}}@${digest}~tee-container-log-redirect=true~tee-restart-policy=Always~tee-env-SHONIN_NETWORK={{.NETWORK}}~tee-env-SHONIN_DEPLOYMENTS_DIR=/etc/shonin/deployments/{{.NETWORK}}" \
+          --service-account="{{.GCP_WORKLOAD_SERVICE_ACCOUNT}}@{{.GCP_PROJECT}}.iam.gserviceaccount.com" \
+          --scopes=cloud-platform
+
+  deploy:service:
+    desc: "Deploy a service to Cloud Run from its pushed image (NAME=api|indexer|keeper, NETWORK=...)"
+    requires:
+      vars: [NAME, NETWORK, GCP_PROJECT]
+    preconditions:
+      # Every task that reaches Google Cloud checks these first.
+      - sh: '[ "{{.NETWORK}}" = "testnet" ] || [ "{{.NETWORK}}" = "mainnet" ]'
+        msg: "Name the chains: NETWORK=testnet or NETWORK=mainnet. The cloud never runs against local chains (NETWORK={{.NETWORK}})."
+      - sh: '[ -n "{{.GCP_PROJECT}}" ]'
+        msg: "No Google Cloud project for {{.NETWORK}}: set GCP_PROJECT_{{upper .NETWORK}} in taskfiles/config.yml. The gcloud default project is never used."
+      - sh: 'for n in {{.SERVICES}}; do [ "$n" = "{{.NAME}}" ] && exit 0; done; exit 1'
+        msg: "{{.NAME}} is not a service: {{.SERVICES}}"
+    cmds:
+      - >-
+        gcloud run deploy "shonin-{{.NAME}}-{{.NETWORK}}"
+        --project="{{.GCP_PROJECT}}" --region="{{.GCP_REGION}}"
+        --image="{{.GCP_REGISTRY}}/{{.NAME}}:{{.GIT_SHA}}"
+        --set-env-vars="SHONIN_NETWORK={{.NETWORK}},SHONIN_DEPLOYMENTS_DIR=/etc/shonin/deployments/{{.NETWORK}}"
+        --service-account="{{.GCP_WORKLOAD_SERVICE_ACCOUNT}}@{{.GCP_PROJECT}}.iam.gserviceaccount.com"
+        --no-allow-unauthenticated
+
+  status:
+    desc: "What is running in the network's project (NETWORK=testnet|mainnet)"
+    requires:
+      vars: [NETWORK, GCP_PROJECT]
+    preconditions:
+      # Every task that reaches Google Cloud checks these first.
+      - sh: '[ "{{.NETWORK}}" = "testnet" ] || [ "{{.NETWORK}}" = "mainnet" ]'
+        msg: "Name the chains: NETWORK=testnet or NETWORK=mainnet. The cloud never runs against local chains (NETWORK={{.NETWORK}})."
+      - sh: '[ -n "{{.GCP_PROJECT}}" ]'
+        msg: "No Google Cloud project for {{.NETWORK}}: set GCP_PROJECT_{{upper .NETWORK}} in taskfiles/config.yml. The gcloud default project is never used."
+    cmds:
+      - echo "Compute Engine instances in {{.GCP_PROJECT}} ({{.NETWORK}})"
+      - gcloud compute instances list --project="{{.GCP_PROJECT}}" --format="table(name,zone.basename(),machineType.basename(),status)"
+      - echo "Cloud Run services in {{.GCP_PROJECT}}, {{.GCP_REGION}}"
+      - gcloud run services list --project="{{.GCP_PROJECT}}" --region="{{.GCP_REGION}}" --format="table(metadata.name,status.url,status.conditions[0].status)"
+
+  logs:
+    desc: "Recent logs of a machine or service (NAME=..., NETWORK=testnet|mainnet)"
+    requires:
+      vars: [NAME, NETWORK, GCP_PROJECT]
+    preconditions:
+      # Every task that reaches Google Cloud checks these first.
+      - sh: '[ "{{.NETWORK}}" = "testnet" ] || [ "{{.NETWORK}}" = "mainnet" ]'
+        msg: "Name the chains: NETWORK=testnet or NETWORK=mainnet. The cloud never runs against local chains (NETWORK={{.NETWORK}})."
+      - sh: '[ -n "{{.GCP_PROJECT}}" ]'
+        msg: "No Google Cloud project for {{.NETWORK}}: set GCP_PROJECT_{{upper .NETWORK}} in taskfiles/config.yml. The gcloud default project is never used."
+    cmds:
+      - |
+        case " {{.MACHINES}} " in
+          *" {{.NAME}} "*)
+            gcloud compute instances get-serial-port-output "shonin-{{.NAME}}-{{.NETWORK}}" \
+              --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" ;;
+          *)
+            gcloud run services logs read "shonin-{{.NAME}}-{{.NETWORK}}" \
+              --project="{{.GCP_PROJECT}}" --region="{{.GCP_REGION}}" --limit=100 ;;
+        esac

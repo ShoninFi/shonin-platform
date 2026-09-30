@@ -1,0 +1,22 @@
+# The images build from the repository root. Nothing secret, local or built
+# goes into the build context: only what `cargo build --locked` needs.
+.env
+.env.*
+.private/
+.claude/
+.git/
+.shonin/
+.task/
+.trunk-dist/
+.wrangler/
+node_modules/
+target/
+**/target/
+docs/
+cloudflare/
+contracts/evm/lib/
+contracts/evm/out/
+contracts/evm/cache/
+contracts/solana/
+packages/frontend/app/tests/
+**/.DS_Store

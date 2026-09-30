@@ -150,3 +150,7 @@ vars:
   GCP_ZONE: "us-central1-a"
   # The Artifact Registry repository the images are pushed to.
   GCP_ARTIFACT_REPO: "shonin"
+  # Confidential Space VMs: Intel TDX needs a C3 machine.
+  GCP_MACHINE_TYPE: "c3-standard-4"
+  # The service account the machines and services run as, in the project.
+  GCP_WORKLOAD_SERVICE_ACCOUNT: "shonin-workload"

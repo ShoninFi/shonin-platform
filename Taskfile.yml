@@ -15,6 +15,7 @@ includes:
   contracts: taskfiles/contracts.yml
   chains: taskfiles/chains.yml
   services: taskfiles/services.yml
+  cloud: taskfiles/cloud.yml
 
 tasks:
   default:

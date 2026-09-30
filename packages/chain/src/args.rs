@@ -19,13 +19,17 @@ pub struct ChainArgs {
     #[arg(long, env = "SHONIN_NETWORK", default_value = "local")]
     pub network: NetworkName,
     /// Every chain the platform knows, and what each network means.
-    #[arg(long, default_value = "config/chains.toml")]
+    #[arg(long, env = "SHONIN_CHAINS", default_value = "config/chains.toml")]
     pub chains: PathBuf,
     /// Where each chain's deployment file is, one per chain.
-    #[arg(long, default_value = ".shonin/local/deployments")]
+    #[arg(
+        long,
+        env = "SHONIN_DEPLOYMENTS_DIR",
+        default_value = ".shonin/local/deployments"
+    )]
     pub deployments_dir: PathBuf,
     /// The vault chain this service serves.
-    #[arg(long, default_value = "base")]
+    #[arg(long, env = "SHONIN_VAULT_CHAIN", default_value = "base")]
     pub vault_chain: Chain,
 }
 
