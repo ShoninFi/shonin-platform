@@ -26,7 +26,7 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use chain::bindings::factory::IVaultFactory;
 use chain::bindings::vault::{IVault, VaultState};
-use chain::{Client, Deployments};
+use chain::{Client, Deployments, Served};
 use clap::Parser;
 use wasmtime::Engine;
 
@@ -55,9 +55,7 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let target = args.chain_args.resolve()?;
-    let chain = target.connect().await?;
-    let deployments = target.wait_for_deployments(&chain).await?;
+    let served = args.chain_args.connect_all().await?;
     tracing::info!(image = %chain::attest::image_digest("executor"), "the executor is up");
 
     if args.port != 0 {
@@ -67,25 +65,38 @@ async fn main() -> Result<()> {
     let engine = runner::engine()?;
     runner::start_epoch_ticker(&engine);
 
-    let mut running: HashMap<Address, tokio::task::JoinHandle<()>> = HashMap::new();
-    loop {
-        if let Err(error) = sweep(&chain, &deployments, &engine, &args, &mut running).await {
-            tracing::warn!(%error, "could not look for work");
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+    // Each vault chain is swept on its own, with its own vaults: the same
+    // address can be a different vault on another chain.
+    let args = Arc::new(args);
+    let mut chains = tokio::task::JoinSet::new();
+    for served in served {
+        let engine = engine.clone();
+        let args = args.clone();
+        chains.spawn(async move {
+            let mut running: HashMap<Address, tokio::task::JoinHandle<()>> = HashMap::new();
+            loop {
+                if let Err(error) = sweep(&served, &engine, &args, &mut running).await {
+                    tracing::warn!(chain = %served.key, %error, "could not look for work");
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
     }
+    while chains.join_next().await.is_some() {}
+    Ok(())
 }
 
 /// Find the vaults that are open and have a bundle, and start anything that
 /// is not already running.
 async fn sweep(
-    chain: &Client,
-    deployments: &Deployments,
+    served: &Served,
     engine: &Engine,
     args: &Args,
     running: &mut HashMap<Address, tokio::task::JoinHandle<()>>,
 ) -> Result<()> {
     running.retain(|_, task| !task.is_finished());
+    let chain = &served.client;
+    let deployments = &served.deployments;
 
     let vaults = chain
         .read(deployments.factory, IVaultFactory::vaultsCall {})
@@ -111,23 +122,37 @@ async fn sweep(
 
         let chain = chain.clone();
         let deployments = deployments.clone();
+        let vault_chain = served.vault_chain;
         let engine = engine.clone();
         let store = args.store.clone();
         let api = args.api_url.clone();
         let task = tokio::spawn(async move {
-            if let Err(error) = serve(chain, deployments, engine, vault, bundle, store, api).await {
-                tracing::warn!(vault = %vault, error = format!("{error:#}"), "stopped serving this vault");
+            if let Err(error) = serve(
+                chain,
+                vault_chain,
+                deployments,
+                engine,
+                vault,
+                bundle,
+                store,
+                api,
+            )
+            .await
+            {
+                tracing::warn!(chain = %vault_chain, vault = %vault, error = format!("{error:#}"), "stopped serving this vault");
             }
         });
         running.insert(vault, task);
-        tracing::info!(vault = %vault, "taking on a vault");
+        tracing::info!(chain = %served.key, vault = %vault, "taking on a vault");
     }
     Ok(())
 }
 
 /// Run one vault's strategy, restarting it if it faults.
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     chain: Client,
+    vault_chain: shared::Chain,
     deployments: Deployments,
     engine: Engine,
     vault: Address,
@@ -203,7 +228,7 @@ async fn serve(
     // for it: the counters are shared and sent while it is still running, and
     // they outlive a restart so that restarts can be counted at all.
     let counters = Arc::new(Mutex::new(host::Counters::default()));
-    let reporter = health::Reporter::new(chain.clone(), key.clone(), vault, api);
+    let reporter = health::Reporter::new(chain.clone(), vault_chain, key.clone(), vault, api);
     let reporting = counters.clone();
     tokio::spawn(async move {
         loop {

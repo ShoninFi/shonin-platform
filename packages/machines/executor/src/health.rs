@@ -43,15 +43,23 @@ pub async fn fund_gas(chain: &Client, deployments: &Deployments, key: Address) -
 
 pub struct Reporter {
     chain: Client,
+    vault_chain: shared::Chain,
     key: KeyClient,
     vault: Address,
     api: String,
 }
 
 impl Reporter {
-    pub fn new(chain: Client, key: KeyClient, vault: Address, api: String) -> Self {
+    pub fn new(
+        chain: Client,
+        vault_chain: shared::Chain,
+        key: KeyClient,
+        vault: Address,
+        api: String,
+    ) -> Self {
         Self {
             chain,
+            vault_chain,
             key,
             vault,
             api,
@@ -162,6 +170,7 @@ impl Reporter {
             .context("signing the report")?;
 
         Ok(HealthPost {
+            chain: self.vault_chain,
             vault,
             report,
             signature: alloy::hex::encode_prefixed(signature),

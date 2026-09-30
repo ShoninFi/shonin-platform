@@ -1,8 +1,9 @@
-//! The arguments every service takes to find its chain, so each one chooses
-//! the network and the vault chain the same way.
+//! The arguments every service takes to find its chains, so each one chooses
+//! the network and the vault chains the same way.
 //!
-//! Serving several chains at once is later work: for now a service serves one
-//! vault chain, `base` unless told otherwise.
+//! A service serves every vault chain of the network that it can speak to
+//! (the EVM ones), each with its own client and deployment, unless it is told
+//! to serve one.
 
 use std::path::PathBuf;
 
@@ -28,9 +29,18 @@ pub struct ChainArgs {
         default_value = ".shonin/local/deployments"
     )]
     pub deployments_dir: PathBuf,
-    /// The vault chain this service serves.
-    #[arg(long, env = "SHONIN_VAULT_CHAIN", default_value = "base")]
+    /// Serve only this vault chain, instead of every one of the network.
+    #[arg(long, env = "SHONIN_VAULT_CHAIN")]
+    pub vault_chain: Option<Chain>,
+}
+
+/// One vault chain a service serves: its client and its deployment.
+#[derive(Clone)]
+pub struct Served {
     pub vault_chain: Chain,
+    pub key: ChainKey,
+    pub client: Client,
+    pub deployments: Deployments,
 }
 
 /// What the arguments came to: the chain to talk to, and where its
@@ -47,12 +57,72 @@ pub struct Target {
 }
 
 impl ChainArgs {
+    /// The one vault chain named, or base: for the tools that act on a single
+    /// chain, such as the seed.
     pub fn resolve(&self) -> Result<Target> {
         let configs = ChainConfigs::load(&self.chains)?;
-        let (key, config) = configs.resolve(self.network, self.vault_chain)?;
+        self.target(&configs, self.vault_chain.unwrap_or(Chain::Base))
+    }
+
+    /// Every vault chain this service serves: the one named, or every one of
+    /// the network whose chain the services speak to. Solana is listed and
+    /// skipped, because no service speaks to it yet.
+    pub fn targets(&self) -> Result<Vec<Target>> {
+        let configs = ChainConfigs::load(&self.chains)?;
+        let wanted: Vec<Chain> = match self.vault_chain {
+            Some(chain) => vec![chain],
+            None => Chain::ALL.to_vec(),
+        };
+        let mut targets = Vec::new();
+        for chain in wanted {
+            let target = self.target(&configs, chain)?;
+            if target.key.kind == ChainKind::Evm {
+                targets.push(target);
+            } else if self.vault_chain.is_some() {
+                bail!(
+                    "{} is a {} chain, and the services only speak to EVM chains",
+                    target.key,
+                    target.key.kind.name()
+                );
+            } else {
+                tracing::info!(chain = %target.key, "not served: the services only speak to EVM chains");
+            }
+        }
+        Ok(targets)
+    }
+
+    /// Connect to every chain this service serves and wait for each one's
+    /// deployment, all at once.
+    pub async fn connect_all(&self) -> Result<Vec<Served>> {
+        let mut pending = tokio::task::JoinSet::new();
+        for (order, target) in self.targets()?.into_iter().enumerate() {
+            pending.spawn(async move {
+                let client = target.connect().await?;
+                let deployments = target.wait_for_deployments(&client).await?;
+                Ok::<_, anyhow::Error>((
+                    order,
+                    Served {
+                        vault_chain: target.vault_chain,
+                        key: target.key,
+                        client,
+                        deployments,
+                    },
+                ))
+            });
+        }
+        let mut served = Vec::new();
+        while let Some(done) = pending.join_next().await {
+            served.push(done??);
+        }
+        served.sort_by_key(|(order, _)| *order);
+        Ok(served.into_iter().map(|(_, served)| served).collect())
+    }
+
+    fn target(&self, configs: &ChainConfigs, vault_chain: Chain) -> Result<Target> {
+        let (key, config) = configs.resolve(self.network, vault_chain)?;
         Ok(Target {
             network: self.network,
-            vault_chain: self.vault_chain,
+            vault_chain,
             key: key.clone(),
             config: config.clone(),
             deployments_dir: self.deployments_dir.clone(),
@@ -72,20 +142,27 @@ impl Target {
         connect_to(self.network, &self.key, &self.config).await
     }
 
-    /// This chain's deployment: from `SHONIN_DEPLOYMENT_JSON` when it is set
-    /// (how a machine in the cloud is handed a testnet deployment, which is
-    /// never committed), otherwise from the deployment file once it appears.
+    /// This chain's deployment: from `SHONIN_DEPLOYMENTS_JSON` when it is set
+    /// (how a machine in the cloud is handed the testnet deployments, which
+    /// are never committed), otherwise from the deployment file once it
+    /// appears.
     pub async fn wait_for_deployments(&self, client: &Client) -> Result<Deployments> {
-        match std::env::var(DEPLOYMENT_JSON)
+        match std::env::var(DEPLOYMENTS_JSON)
             .ok()
             .filter(|v| !v.trim().is_empty())
         {
             Some(json) => {
-                let deployments = Deployments::from_json(&json)
-                    .map_err(|error| anyhow!("{DEPLOYMENT_JSON} is not a deployment: {error}"))?;
+                let all: Vec<Deployments> = serde_json::from_str(&json).map_err(|error| {
+                    anyhow!("{DEPLOYMENTS_JSON} is not a list of deployments: {error}")
+                })?;
+                let key = self.key.to_string();
+                let deployments = all
+                    .into_iter()
+                    .find(|deployments| deployments.chain_key == key)
+                    .ok_or_else(|| anyhow!("{DEPLOYMENTS_JSON} has no deployment for {key}"))?;
                 if deployments.chain_id != client.chain_id {
                     bail!(
-                        "{DEPLOYMENT_JSON} is for chain {}, and this is chain {}",
+                        "{DEPLOYMENTS_JSON} says {key} is chain {}, and it answers as {}",
                         deployments.chain_id,
                         client.chain_id
                     );
@@ -97,8 +174,9 @@ impl Target {
     }
 }
 
-/// A chain's deployment, handed over whole in the environment.
-pub const DEPLOYMENT_JSON: &str = "SHONIN_DEPLOYMENT_JSON";
+/// Every served chain's deployment, handed over whole in the environment as a
+/// JSON list.
+pub const DEPLOYMENTS_JSON: &str = "SHONIN_DEPLOYMENTS_JSON";
 
 /// The mnemonic the testnet role accounts are derived from.
 pub const TESTNET_EVM_MNEMONIC: &str = "SHONIN_TESTNET_EVM_MNEMONIC";

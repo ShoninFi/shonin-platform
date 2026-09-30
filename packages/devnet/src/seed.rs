@@ -76,6 +76,7 @@ const PLAN: &[Plan] = &[
 /// an author does from the web app, run from a checkout of their work.
 pub async fn one(
     client: &Client,
+    vault_chain: shared::Chain,
     deployments: &Deployments,
     api: &str,
     agents: Option<&Path>,
@@ -93,8 +94,16 @@ pub async fn one(
     let author = client.account(Role::Author)?;
     say_who_the_author_is(client, deployments, author).await?;
     tracing::info!(project = %project.display(), "publishing");
-    let published =
-        crate::publish::publish(client, deployments, api, project, author, false).await?;
+    let published = crate::publish::publish(
+        client,
+        vault_chain,
+        deployments,
+        api,
+        project,
+        author,
+        false,
+    )
+    .await?;
     match published.outcome {
         JobState::Succeeded => {
             tracing::info!(slug = published.slug, vault = %published.vault, job = published.job_id, "built and registered");
@@ -107,6 +116,7 @@ pub async fn one(
 
 pub async fn run(
     client: &Client,
+    vault_chain: shared::Chain,
     deployments: &Deployments,
     api: &str,
     agents: Option<&Path>,
@@ -131,9 +141,16 @@ pub async fn run(
         let prepared = prepare(&agents, &agent, &work, plan)?;
         tracing::info!(id = plan.id, version = plan.version, "publishing");
 
-        let published =
-            crate::publish::publish(client, deployments, api, &prepared, author, plan.sealed)
-                .await?;
+        let published = crate::publish::publish(
+            client,
+            vault_chain,
+            deployments,
+            api,
+            &prepared,
+            author,
+            plan.sealed,
+        )
+        .await?;
 
         match &published.outcome {
             JobState::Succeeded => tracing::info!(slug = published.slug, "published"),

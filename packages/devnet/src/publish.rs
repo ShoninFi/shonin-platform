@@ -29,6 +29,7 @@ pub struct Published {
 /// Pack a project, create its vault, and submit it to be built.
 pub async fn publish(
     chain: &Client,
+    vault_chain: shared::Chain,
     deployments: &Deployments,
     api: &str,
     project: &Path,
@@ -44,6 +45,7 @@ pub async fn publish(
     tracing::debug!(%vault, slug, "the vault is open for its build");
 
     let submission = Submission {
+        chain: vault_chain,
         strategy_id: manifest.strategy.id.clone(),
         version: manifest.strategy.version,
         author: format!("{author:?}"),

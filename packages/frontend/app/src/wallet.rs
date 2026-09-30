@@ -355,12 +355,14 @@ mod send {
     /// contract values itself and mints at that in the same transaction.
     pub async fn deposit(slug: &str, assets: f64) -> Result<String, String> {
         let (strategy, from) = about(slug)?;
+        let chain = strategy.vault.chain;
         let vault = address_of(&strategy.vault.address)?;
         let amount = units(assets);
-        let usd = asset_address()?;
+        let usd = asset_address(chain)?;
 
         working("Approving");
         send(
+            chain,
             &from,
             usd,
             IERC20::approveCall {
@@ -373,6 +375,7 @@ mod send {
 
         working("Depositing");
         let hash = send(
+            chain,
             &from,
             vault,
             IVault::depositCall {
@@ -391,10 +394,12 @@ mod send {
     /// books a claim if it cannot.
     pub async fn withdraw(slug: &str, shares: f64) -> Result<String, String> {
         let (strategy, from) = about(slug)?;
+        let chain = strategy.vault.chain;
         let vault = address_of(&strategy.vault.address)?;
 
         working("Withdrawing");
         let hash = send(
+            chain,
             &from,
             vault,
             IVault::redeemCall {
@@ -412,10 +417,12 @@ mod send {
     /// Settle a claim. Anyone may send this, which is the point of it.
     pub async fn settle(slug: &str, claim: u64) -> Result<String, String> {
         let (strategy, from) = about(slug)?;
+        let chain = strategy.vault.chain;
         let vault = address_of(&strategy.vault.address)?;
 
         working("Settling");
         let hash = send(
+            chain,
             &from,
             vault,
             IVault::settleCall {
@@ -439,6 +446,14 @@ mod send {
         if shares <= 0.0 {
             return Err("You hold nothing in this vault.".to_string());
         }
+        let chain_of = |slug: &str| data::strategy(slug).map(|strategy| strategy.vault.chain);
+        if chain_of(from_slug) != chain_of(to_slug) {
+            return Err(
+                "These vaults are on different chains, so moving between them means bringing \
+                 the cash across first."
+                    .to_string(),
+            );
+        }
         let balance_before = holdings().lock_ref().balance;
         withdraw(from_slug, shares).await?;
         let moved = holdings().lock_ref().balance - balance_before;
@@ -456,12 +471,14 @@ mod send {
     /// Top up the tank that pays a strategy's running costs. Anyone may.
     pub async fn fund_tank(slug: &str, assets: f64) -> Result<String, String> {
         let (strategy, from) = about(slug)?;
+        let chain = strategy.vault.chain;
         let vault = address_of(&strategy.vault.address)?;
         let amount = units(assets);
-        let usd = asset_address()?;
+        let usd = asset_address(chain)?;
 
         working("Approving");
         send(
+            chain,
             &from,
             usd,
             IERC20::approveCall {
@@ -474,6 +491,7 @@ mod send {
 
         working("Funding the tank");
         let hash = send(
+            chain,
             &from,
             vault,
             IVault::fundTankCall { assets: amount }.abi_encode(),
@@ -505,9 +523,10 @@ mod send {
             }
             held.address.clone().ok_or("Connect a wallet first.")?
         };
-        let config = data::config().ok_or("the app has not reached the platform yet")?;
-        let factory = address_of(&config.addresses.factory)?;
-        let usd = asset_address()?;
+        // A publish from the app creates its vault on base.
+        let chain = shared::Chain::Base;
+        let factory = address_of(&setup(chain)?.addresses.factory)?;
+        let usd = asset_address(chain)?;
         let funding = units(tank);
 
         // The hash of exactly these bytes is what the vault is created with,
@@ -518,6 +537,7 @@ mod send {
 
         working("Approving the tank");
         send(
+            chain,
             &from,
             usd,
             IERC20::approveCall {
@@ -530,6 +550,7 @@ mod send {
 
         working("Creating the vault");
         send(
+            chain,
             &from,
             factory,
             IVaultFactory::createCall {
@@ -548,6 +569,7 @@ mod send {
 
         working("Submitting the source");
         let accepted = api::submit(&shared::Submission {
+            chain,
             strategy_id: id.to_string(),
             version,
             author: from.clone(),
@@ -593,15 +615,17 @@ mod send {
     /// Buy a fresh review of a strategy. Anyone may, at any time.
     pub async fn buy_review(slug: &str) -> Result<String, String> {
         let (strategy, from) = about(slug)?;
-        let config = data::config().ok_or("the app has not reached the platform yet")?;
-        let reviews = address_of(&config.addresses.reviews)?;
-        let usd = asset_address()?;
+        let chain = strategy.vault.chain;
+        let setup = setup(chain)?;
+        let reviews = address_of(&setup.addresses.reviews)?;
+        let usd = asset_address(chain)?;
         // Approving exactly what the registry will pull, as the registry
         // itself reports it.
-        let fee = units(config.terms.review_fee);
+        let fee = units(setup.terms.review_fee);
 
         working("Approving");
         send(
+            chain,
             &from,
             usd,
             IERC20::approveCall {
@@ -614,6 +638,7 @@ mod send {
 
         working("Buying a review");
         let hash = send(
+            chain,
             &from,
             reviews,
             IReviewRegistry::requestReviewCall {
@@ -652,9 +677,15 @@ mod send {
         Ok((strategy, from))
     }
 
-    fn asset_address() -> Result<Address, String> {
+    /// How to reach a vault chain.
+    fn setup(chain: shared::Chain) -> Result<shared::ChainSetup, String> {
         let config = data::config().ok_or("the app has not reached the platform yet")?;
-        address_of(&config.addresses.usd)
+        data::setup(&config, chain)
+            .ok_or_else(|| format!("the platform does not serve {} here", chain.label()))
+    }
+
+    fn asset_address(chain: shared::Chain) -> Result<Address, String> {
+        address_of(&setup(chain)?.addresses.usd)
     }
 
     fn address_of(text: &str) -> Result<Address, String> {
@@ -685,7 +716,12 @@ mod send {
     /// Both paths ask for the same thing: the wallet holds the key and signs.
     /// A browser wallet is asked through the page; the development chain is
     /// asked directly, because it holds the key itself.
-    async fn send(from: &str, to: Address, data: Vec<u8>) -> Result<String, String> {
+    async fn send(
+        chain: shared::Chain,
+        from: &str,
+        to: Address,
+        data: Vec<u8>,
+    ) -> Result<String, String> {
         let request = serde_json::json!({
             "from": from,
             "to": format!("{to:?}"),
@@ -695,7 +731,7 @@ mod send {
         let how = holdings().lock_ref().how.clone();
         match how {
             Some(Connection::Browser) => through_the_browser(request).await,
-            Some(Connection::Development) => through_the_chain(request).await,
+            Some(Connection::Development) => through_the_chain(chain, request).await,
             _ => Err("This connection signs nothing.".to_string()),
         }
     }
@@ -728,15 +764,18 @@ mod send {
     }
 
     /// Ask the chain, which holds the key itself.
-    async fn through_the_chain(request: serde_json::Value) -> Result<String, String> {
-        let config = data::config().ok_or("the app has not reached the platform yet")?;
+    async fn through_the_chain(
+        chain: shared::Chain,
+        request: serde_json::Value,
+    ) -> Result<String, String> {
+        let setup = setup(chain)?;
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "eth_sendTransaction",
             "params": [request],
         });
-        let reply: serde_json::Value = gloo_net::http::Request::post(&config.rpc_url)
+        let reply: serde_json::Value = gloo_net::http::Request::post(&setup.rpc_url)
             .json(&body)
             .map_err(|error| error.to_string())?
             .send()

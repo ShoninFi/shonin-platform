@@ -88,21 +88,27 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let target = args.chain_args.resolve()?;
-    let chain = target.connect().await?;
-    let deployments = target.wait_for_deployments(&chain).await?;
-    let key = deployments.roles.reviewer;
-    chain::attest::bless_service(&chain, &deployments, "reviewer", key).await?;
-    chain::attest::keep_blessed(
-        chain.clone(),
-        deployments.clone(),
-        "reviewer",
-        key,
-        chain::attest::Sender::Unlocked(key),
-        alloy::primitives::Address::ZERO,
-        B256::ZERO,
-        || {},
-    );
+    let served = args.chain_args.connect_all().await?;
+    // Blessed on every vault chain it serves, since each chain's registry
+    // decides for itself which keys may post a review there.
+    for served in &served {
+        let key = served.deployments.roles.reviewer;
+        chain::attest::bless_service(&served.client, &served.deployments, "reviewer", key).await?;
+        chain::attest::keep_blessed(
+            served.client.clone(),
+            served.deployments.clone(),
+            "reviewer",
+            key,
+            chain::attest::Sender::Unlocked(key),
+            alloy::primitives::Address::ZERO,
+            B256::ZERO,
+            || {},
+        );
+    }
+    let key = served
+        .first()
+        .map(|served| served.deployments.roles.reviewer)
+        .unwrap_or_default();
 
     let Some(model) = args.model.clone() else {
         tracing::info!("no model is pinned, so nothing is reviewed and every strategy says so");
@@ -132,22 +138,33 @@ async fn main() -> Result<()> {
         tokio::spawn(serve_status(SocketAddr::from(([127, 0, 0, 1], args.port))));
     }
 
-    let mut refused: HashMap<(B256, u32, u32), u32> = HashMap::new();
-    loop {
-        if let Err(error) = sweep(
-            &chain,
-            &deployments,
-            &args.store,
-            &model,
-            calibrator.as_ref(),
-            &mut refused,
-        )
-        .await
-        {
-            tracing::warn!(%error, "could not look for work");
-        }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+    // Each vault chain is swept on its own, so a slow chain holds up no other.
+    let mut chains = tokio::task::JoinSet::new();
+    for served in served {
+        let store = args.store.clone();
+        let model = model.clone();
+        let calibrator = calibrator.clone();
+        chains.spawn(async move {
+            let mut refused: HashMap<(B256, u32, u32), u32> = HashMap::new();
+            loop {
+                if let Err(error) = sweep(
+                    &served.client,
+                    &served.deployments,
+                    &store,
+                    &model,
+                    calibrator.as_ref(),
+                    &mut refused,
+                )
+                .await
+                {
+                    tracing::warn!(chain = %served.key, %error, "could not look for work");
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
     }
+    while chains.join_next().await.is_some() {}
+    Ok(())
 }
 
 /// Anyone can buy a review at any time; every request that has not been served

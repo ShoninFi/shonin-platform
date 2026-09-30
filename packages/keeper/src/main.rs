@@ -40,22 +40,28 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let target = args.chain_args.resolve()?;
-    let chain = target.connect().await?;
-    let deployments = target.wait_for_deployments(&chain).await?;
-    let keeper = chain.account(Role::Keeper)?;
-    tracing::info!(%keeper, "the keeper is up");
+    let served = args.chain_args.connect_all().await?;
 
     if args.port != 0 {
         tokio::spawn(serve_status(SocketAddr::from(([127, 0, 0, 1], args.port))));
     }
 
-    loop {
-        if let Err(error) = tick(&chain, &deployments, keeper).await {
-            tracing::warn!(%error, "the round did not finish");
-        }
-        tokio::time::sleep(Duration::from_secs(3)).await;
+    // Every vault chain turns on its own, so a slow chain holds up no other.
+    let mut chains = tokio::task::JoinSet::new();
+    for served in served {
+        let keeper = served.client.account(Role::Keeper)?;
+        tracing::info!(chain = %served.key, %keeper, "the keeper is up");
+        chains.spawn(async move {
+            loop {
+                if let Err(error) = tick(&served.client, &served.deployments, keeper).await {
+                    tracing::warn!(chain = %served.key, %error, "the round did not finish");
+                }
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        });
     }
+    while chains.join_next().await.is_some() {}
+    Ok(())
 }
 
 async fn tick(chain: &Client, deployments: &Deployments, keeper: Address) -> Result<()> {

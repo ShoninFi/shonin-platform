@@ -21,10 +21,13 @@ pub struct Snapshot {
     /// Rises whenever anything below changes, so the app can ask "is there
     /// anything new?" without reading the rest.
     pub version: u64,
-    /// The chain's own clock, not the reader's. Everything dated is relative
-    /// to it, so a page reads correctly however fast the chain is running.
+    /// The chains' own clock, not the reader's: the latest of them. Everything
+    /// dated is relative to its own chain, so a page reads correctly however
+    /// fast a chain is running.
     pub as_of: PrimitiveDateTime,
-    pub chain: ChainInfo,
+    /// Every vault chain the snapshot was read from. Each strategy says which
+    /// one its vault is on.
+    pub chains: Vec<ChainInfo>,
     pub strategies: Vec<Strategy>,
     pub authors: Vec<Author>,
     pub jobs: Vec<Job>,
@@ -43,6 +46,13 @@ pub struct ChainInfo {
     pub block: u64,
 }
 
+impl Snapshot {
+    /// What the snapshot read from one vault chain.
+    pub fn chain(&self, chain: Chain) -> Option<&ChainInfo> {
+        self.chains.iter().find(|info| info.chain == chain)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Benchmark {
     pub label: String,
@@ -58,21 +68,38 @@ pub struct Totals {
     pub trades: u32,
 }
 
-/// What the app needs to reach the chain itself. No secrets: the addresses are
-/// public and the development wallet is an account the chain published.
+/// What the app needs to reach the chains itself. No secrets: the addresses
+/// are public and the development wallet is an account the chains published.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
+    /// One for every vault chain the platform serves on this network.
+    pub chains: Vec<ChainSetup>,
+    /// Set on development chains, where accounts are unlocked and the app can
+    /// offer one as a wallet. Never set anywhere else. The development chains
+    /// derive their accounts from the same mnemonic, so it is one account on
+    /// all of them.
+    pub dev: Option<DevMode>,
+}
+
+impl Config {
+    /// How to reach one vault chain.
+    pub fn on(&self, chain: Chain) -> Option<&ChainSetup> {
+        self.chains.iter().find(|setup| setup.chain.chain == chain)
+    }
+}
+
+/// How to reach one vault chain: where it answers, where the contracts are,
+/// what it settles in and the terms its contracts enforce.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChainSetup {
     pub chain: ChainInfo,
     pub rpc_url: String,
     pub addresses: Addresses,
     /// The asset deposits and withdrawals are paid in.
     pub asset_symbol: String,
     pub asset_decimals: u8,
-    /// The terms the platform is running under, read from the chain.
+    /// The terms the platform is running under on this chain, read from it.
     pub terms: Terms,
-    /// Set on a development chain, where accounts are unlocked and the app can
-    /// offer one as a wallet. Never set anywhere else.
-    pub dev: Option<DevMode>,
 }
 
 /// The terms a new vault is created with and the charges an author meets,
@@ -124,10 +151,19 @@ pub struct DevMode {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Portfolio {
     pub address: String,
-    /// The asset, outside any vault.
+    /// The asset, outside any vault, on every vault chain together.
     pub balance: f64,
+    /// The same, chain by chain.
+    pub balances: Vec<ChainBalance>,
     pub positions: Vec<Holding>,
     pub claims: Vec<HeldClaim>,
+}
+
+/// The asset an address holds on one vault chain, outside any vault.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChainBalance {
+    pub chain: Chain,
+    pub balance: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -160,6 +196,9 @@ pub struct HeldClaim {
 /// A strategy offered to the build service.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Submission {
+    /// The vault chain the vault was created on, where the build is
+    /// registered.
+    pub chain: Chain,
     pub strategy_id: String,
     pub version: u32,
     /// The address that will own it, and whose vault pays for the build.
@@ -191,6 +230,9 @@ pub struct SubmissionAccepted {
 /// A health report, as the executor signs and posts it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HealthPost {
+    /// The vault chain the vault is on: the same address can be a different
+    /// vault on another chain.
+    pub chain: Chain,
     /// The vault it is about.
     pub vault: String,
     pub report: Health,

@@ -25,9 +25,9 @@ vars:
     sh: git rev-parse --short=12 HEAD
   MACHINES: "reviewer builder executor unwinder"
   # Mainnet addresses are baked into the images; testnet ones are never
-  # committed, so a testnet launch is handed the vault chain's deployment
-  # whole, as SHONIN_DEPLOYMENT_JSON (see `devnet deployment-env`).
-  DEPLOYMENT_ENV: '{{.DEVNET}} --vault-chain "{{.VAULT_CHAIN}}" deployment-env'
+  # committed, so a testnet launch is handed every chain's deployment whole,
+  # as SHONIN_DEPLOYMENTS_JSON (see `devnet deployment-env`).
+  DEPLOYMENT_ENV: "{{.DEVNET}} deployment-env"
   SERVICES: "api indexer keeper"
 
 tasks:
