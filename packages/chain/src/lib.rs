@@ -10,14 +10,20 @@
 //! and logs, which every target can do, so the web app reaches the contracts
 //! through exactly the bindings the services use.
 
+#[cfg(feature = "args")]
+pub mod args;
 #[cfg(feature = "rpc")]
 pub mod attest;
 #[cfg(feature = "rpc")]
 pub mod client;
+pub mod config;
 pub mod deployments;
 
+#[cfg(feature = "args")]
+pub use args::{ChainArgs, Target};
 #[cfg(feature = "rpc")]
 pub use client::{Client, KeyClient, Role};
+pub use config::{ChainConfig, ChainConfigs, ChainKey, ChainKind, Network, NetworkName};
 pub use deployments::{Deployments, Roles};
 
 /// The generated bindings, one module per interface file.

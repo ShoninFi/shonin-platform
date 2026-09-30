@@ -13,6 +13,7 @@ includes:
   frontend: taskfiles/frontend.yml
   docs: taskfiles/docs.yml
   contracts: taskfiles/contracts.yml
+  chains: taskfiles/chains.yml
   services: taskfiles/services.yml
 
 tasks:
@@ -38,9 +39,10 @@ tasks:
         done
 
   dev:
-    desc: "The whole platform, locally: chain, contracts, services and the web app"
+    desc: "The whole platform, locally: chains, contracts, machines, services and the web app"
     deps:
-      - services:chain
+      - chains:evm
+      - chains:solana
       - services:devnet
       - services:builder
       - services:reviewer
@@ -54,7 +56,8 @@ tasks:
   dev:services:
     desc: "Everything but the web app"
     deps:
-      - services:chain
+      - chains:evm
+      - chains:solana
       - services:devnet
       - services:builder
       - services:reviewer

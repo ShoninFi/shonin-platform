@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 shared.workspace = true
-chain = { workspace = true, features = ["rpc"] }
+chain = { workspace = true, features = ["args"] }
 alloy.workspace = true
 anyhow.workspace = true
 axum.workspace = true

@@ -21,6 +21,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy_sol_types::SolCall;
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::config::ChainConfig;
 use crate::deployments::Deployments;
 
 /// One of the platform's roles, as an account on the chain.
@@ -83,7 +84,8 @@ pub struct Client {
 impl Client {
     /// Connect, waiting for the chain to answer: `task dev` starts everything
     /// at once, so a service usually arrives before the chain does.
-    pub async fn connect(rpc_url: &str) -> Result<Self> {
+    pub async fn connect(config: &ChainConfig) -> Result<Self> {
+        let rpc_url = config.rpc.as_str();
         let url = rpc_url.parse().context("the chain's address")?;
         let provider = ProviderBuilder::new().connect_http(url).erased();
 

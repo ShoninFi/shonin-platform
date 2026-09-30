@@ -18,6 +18,7 @@ use std::time::Duration;
 use alloy::primitives::Address;
 use anyhow::Result;
 use chain::{Client, Deployments};
+use shared::Chain;
 use shared::model::health::Health;
 use shared::model::registry::Job;
 use shared::{ChainInfo, Snapshot, Totals};
@@ -29,6 +30,8 @@ use crate::store::Store;
 /// The record, as read from one chain, and what it needs to keep reading.
 pub struct Indexer {
     pub chain: Client,
+    /// The vault chain this indexer reads, by the name a manifest gives it.
+    pub vault_chain: Chain,
     pub deployments: Deployments,
     pub store: Store,
     /// Where the build service answers, for the queue. Without one the record
@@ -43,17 +46,19 @@ pub struct Indexer {
 impl Indexer {
     pub fn new(
         chain: Client,
+        vault_chain: Chain,
         deployments: Deployments,
         store: PathBuf,
         builder: Option<String>,
     ) -> Self {
         Self {
-            snapshot: RwLock::new(empty_snapshot(&chain)),
+            snapshot: RwLock::new(empty_snapshot(&chain, vault_chain)),
             history: RwLock::new(History::default()),
             health: RwLock::new(HashMap::new()),
             store: Store::new(store),
             builder,
             chain,
+            vault_chain,
             deployments,
         }
     }
@@ -80,6 +85,7 @@ impl Indexer {
             let mut history = self.history.write().await;
             read::strategies(
                 &self.chain,
+                self.vault_chain,
                 &self.deployments,
                 &self.store,
                 &mut history,
@@ -144,12 +150,12 @@ impl Indexer {
     }
 }
 
-fn empty_snapshot(chain: &Client) -> Snapshot {
+fn empty_snapshot(chain: &Client, vault_chain: Chain) -> Snapshot {
     Snapshot {
         version: 0,
         as_of: read::moment(0),
         chain: ChainInfo {
-            chain: shared::model::common::Chain::Local,
+            chain: vault_chain,
             chain_id: chain.chain_id,
             block: 0,
         },

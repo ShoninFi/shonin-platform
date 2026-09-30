@@ -34,10 +34,8 @@ use shared::{
 #[derive(Parser)]
 #[command(about = "The web app's server: the record, the queue and the terms")]
 struct Args {
-    #[arg(long, env = "SHONIN_RPC_URL")]
-    rpc_url: String,
-    #[arg(long)]
-    deployments: PathBuf,
+    #[command(flatten)]
+    chain_args: chain::ChainArgs,
     #[arg(long)]
     store: PathBuf,
     /// Where the build service answers, for the queue and for submissions.
@@ -62,11 +60,15 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let chain = Client::connect(&args.rpc_url).await?;
-    let deployments = chain.wait_for_deployments(&args.deployments).await?;
+    let target = args.chain_args.resolve()?;
+    let chain = target.connect().await?;
+    let deployments = chain
+        .wait_for_deployments(&target.deployments_file())
+        .await?;
 
     let indexer = Arc::new(Indexer::new(
         chain,
+        target.vault_chain,
         deployments,
         args.store.clone(),
         Some(args.builder_url.clone()),

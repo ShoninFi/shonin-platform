@@ -8,17 +8,14 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::extract::State;
 use axum::routing::get;
-use chain::Client;
 use clap::Parser;
 use indexer::Indexer;
 
 #[derive(Parser)]
 #[command(about = "Reads the chain into the record")]
 struct Args {
-    #[arg(long, env = "SHONIN_RPC_URL")]
-    rpc_url: String,
-    #[arg(long)]
-    deployments: PathBuf,
+    #[command(flatten)]
+    chain_args: chain::ChainArgs,
     #[arg(long)]
     store: PathBuf,
     /// Where the build service answers, for the queue. Optional: without it
@@ -39,10 +36,14 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let chain = Client::connect(&args.rpc_url).await?;
-    let deployments = chain.wait_for_deployments(&args.deployments).await?;
+    let target = args.chain_args.resolve()?;
+    let chain = target.connect().await?;
+    let deployments = chain
+        .wait_for_deployments(&target.deployments_file())
+        .await?;
     let indexer = Arc::new(Indexer::new(
         chain,
+        target.vault_chain,
         deployments,
         args.store,
         args.builder_url,

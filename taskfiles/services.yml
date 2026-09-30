@@ -1,6 +1,9 @@
-# The local development stack: a chain, the contracts on it, and each service
-# that reads or writes them. Every service retries until the chain answers and
-# the deployment file exists, so they can all start at once.
+# The machines and services, and the devnet that drives the local chains
+# (taskfiles/chains.yml starts those). Every service retries until its chain
+# answers and its deployment file exists, so they can all start at once.
+#
+# Each takes the network (NETWORK, from SHONIN_NETWORK; `local` by default)
+# and serves one vault chain (VAULT_CHAIN, `base`).
 #
 # Commands `cd` explicitly rather than using `dir:`, so absolute templated
 # paths behave the same in included taskfiles.
@@ -12,27 +15,17 @@ includes:
     flatten: true
 
 vars:
-  # Every service takes the same three arguments, so one variable carries them.
+  # Every service takes the same arguments, so one variable carries them.
   SERVICE_ARGS: >-
-    --rpc-url "{{.URL_CHAIN_DEV}}"
-    --deployments "{{.PATH_DEPLOYMENTS}}"
+    --network "{{.NETWORK}}"
+    --chains "{{.PATH_CHAINS}}"
+    --deployments-dir "{{.PATH_DEPLOYMENTS_DIR}}"
+    --vault-chain "{{.VAULT_CHAIN}}"
     --store "{{.PATH_STORE}}"
 
 tasks:
-  chain:
-    desc: "Anvil: the local development chain"
-    cmds:
-      - >-
-        anvil
-        --port {{.PORT_CHAIN}}
-        --chain-id {{.CHAIN_ID_LOCAL}}
-        --block-time 1
-        --accounts 10
-        --balance 10000
-        --host 127.0.0.1
-
   devnet:
-    desc: "Deploy the contracts, then drive the chain's clock and its market"
+    desc: "Deploy the contracts to every local EVM chain, then drive their clocks and markets"
     cmds:
       - >-
         cargo run -q -p shonin-devnet --
@@ -40,15 +33,6 @@ tasks:
         --artifacts "{{.PATH_ARTIFACTS}}"
         --port {{.PORT_DEVNET}}
         --seconds-per-block {{.CHAIN_SECONDS_PER_BLOCK}}
-
-  deploy:
-    desc: "Deploy the contracts to the local chain and write the deployment file"
-    cmds:
-      - >-
-        cargo run -q -p shonin-devnet --
-        {{.SERVICE_ARGS}}
-        --artifacts "{{.PATH_ARTIFACTS}}"
-        deploy
 
   seed:
     desc: "Publish the reference work to the local chain, through the real flows (AGENT=name for just one)"

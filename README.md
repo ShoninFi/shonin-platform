@@ -71,7 +71,7 @@ A chain block is mined every second and advances an hour of chain time, so a vau
 Two tasks are worth knowing separately:
 
 ```bash
-task services:deploy   # deploy the contracts and write .shonin/local/deployments.json
+task chains:deploy     # deploy the contracts to every local EVM chain, one file per chain
 task services:seed     # publish the reference strategies through the real flows
 ```
 

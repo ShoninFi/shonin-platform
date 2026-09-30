@@ -12,7 +12,7 @@ name = "unwinder"
 path = "src/main.rs"
 
 [dependencies]
-chain = { workspace = true, features = ["rpc"] }
+chain = { workspace = true, features = ["args"] }
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true

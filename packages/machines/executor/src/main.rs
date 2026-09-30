@@ -33,10 +33,8 @@ use wasmtime::Engine;
 #[derive(Parser)]
 #[command(about = "Runs strategies for the vaults it is blessed for")]
 struct Args {
-    #[arg(long, env = "SHONIN_RPC_URL")]
-    rpc_url: String,
-    #[arg(long)]
-    deployments: PathBuf,
+    #[command(flatten)]
+    chain_args: chain::ChainArgs,
     /// Where bundles are, by hash.
     #[arg(long)]
     store: PathBuf,
@@ -57,8 +55,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let chain = Client::connect(&args.rpc_url).await?;
-    let deployments = chain.wait_for_deployments(&args.deployments).await?;
+    let target = args.chain_args.resolve()?;
+    let chain = target.connect().await?;
+    let deployments = chain
+        .wait_for_deployments(&target.deployments_file())
+        .await?;
     tracing::info!(image = %chain::attest::image_digest("executor"), "the executor is up");
 
     if args.port != 0 {

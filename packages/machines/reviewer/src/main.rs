@@ -38,10 +38,8 @@ const SCHEMA: &str = include_str!("../review/schema.json");
 #[derive(Parser)]
 #[command(about = "Scores whether a strategy's code is reasonable")]
 struct Args {
-    #[arg(long, env = "SHONIN_RPC_URL")]
-    rpc_url: String,
-    #[arg(long)]
-    deployments: PathBuf,
+    #[command(flatten)]
+    chain_args: chain::ChainArgs,
     #[arg(long)]
     store: PathBuf,
     /// The model this image is pinned to. Without it, every strategy simply
@@ -90,8 +88,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let chain = Client::connect(&args.rpc_url).await?;
-    let deployments = chain.wait_for_deployments(&args.deployments).await?;
+    let target = args.chain_args.resolve()?;
+    let chain = target.connect().await?;
+    let deployments = chain
+        .wait_for_deployments(&target.deployments_file())
+        .await?;
     let key = deployments.roles.reviewer;
     chain::attest::bless_service(&chain, &deployments, "reviewer", key).await?;
     chain::attest::keep_blessed(

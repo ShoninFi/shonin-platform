@@ -134,12 +134,12 @@ fn filters() -> Dom {
             "Chain",
             None,
             form::select(
-                vec![
-                    ("all".to_string(), "Every chain".to_string()),
-                    ("hyperevm".to_string(), "HyperEVM".to_string()),
-                    ("robinhood".to_string(), "Robinhood Chain".to_string()),
-                    ("solana".to_string(), "Solana".to_string()),
-                ],
+                std::iter::once(("all".to_string(), "Every chain".to_string()))
+                    .chain(
+                        shared::Chain::ALL
+                            .map(|chain| (chain.name().to_string(), chain.label().to_string())),
+                    )
+                    .collect(),
                 &controls.chain,
             ),
         ))
@@ -393,11 +393,9 @@ fn key_of(strategy: &Strategy, key: &str) -> f64 {
 }
 
 fn matches(strategy: &Strategy, chain: &str, source: &str, exit: &str) -> bool {
-    let chain_matches = match chain {
-        "hyperevm" => matches!(strategy.vault.chain, shared::Chain::HyperEvm),
-        "robinhood" => matches!(strategy.vault.chain, shared::Chain::RobinhoodChain),
-        "solana" => matches!(strategy.vault.chain, shared::Chain::Solana),
-        _ => true,
+    let chain_matches = match shared::Chain::from_name(chain) {
+        Some(wanted) => strategy.vault.chain == wanted,
+        None => true,
     };
 
     let source_matches = match source {

@@ -33,10 +33,8 @@ use tokio::sync::Mutex;
 #[derive(Parser)]
 #[command(about = "Compiles submitted strategies into signed bundles")]
 struct Args {
-    #[arg(long, env = "SHONIN_RPC_URL")]
-    rpc_url: String,
-    #[arg(long)]
-    deployments: PathBuf,
+    #[command(flatten)]
+    chain_args: chain::ChainArgs,
     #[arg(long)]
     store: PathBuf,
     /// Where submissions are unpacked and compiled.
@@ -89,8 +87,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let chain = Client::connect(&args.rpc_url).await?;
-    let deployments = chain.wait_for_deployments(&args.deployments).await?;
+    let target = args.chain_args.resolve()?;
+    let chain = target.connect().await?;
+    let deployments = chain
+        .wait_for_deployments(&target.deployments_file())
+        .await?;
     bless(&chain, &deployments).await?;
 
     // A build someone funded should survive this service restarting, so the

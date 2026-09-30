@@ -13,16 +13,13 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use chain::Client;
 use clap::Parser;
 
 #[derive(Parser)]
 #[command(about = "Finishes the withdrawals the contracts can't finish alone")]
 struct Args {
-    #[arg(long, env = "SHONIN_RPC_URL")]
-    rpc_url: String,
-    #[arg(long)]
-    deployments: PathBuf,
+    #[command(flatten)]
+    chain_args: chain::ChainArgs,
     /// Where bundles are, by hash.
     #[arg(long)]
     store: PathBuf,
@@ -43,8 +40,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let chain = Client::connect(&args.rpc_url).await?;
-    let _deployments = chain.wait_for_deployments(&args.deployments).await?;
+    let target = args.chain_args.resolve()?;
+    let chain = target.connect().await?;
+    let _deployments = chain
+        .wait_for_deployments(&target.deployments_file())
+        .await?;
     tracing::info!(image = %chain::attest::image_digest("unwinder"), "the unwinder is up");
     tracing::info!(
         "no venue on this chain needs unwinding outside the contracts; nothing to serve yet"

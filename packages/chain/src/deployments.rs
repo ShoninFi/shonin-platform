@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 /// The addresses a deploy produced.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Deployments {
+    /// The chain, as the chain config names it: `evm:31337`.
+    pub chain_key: String,
     pub chain_id: u64,
     /// Where the chain answers, for anything that has only this file.
     pub rpc_url: String,
@@ -49,6 +51,12 @@ pub struct Roles {
 }
 
 impl Deployments {
+    /// Where a chain's deployment file is in a directory of them: one file
+    /// per chain, named for its key (`evm-31337.json`).
+    pub fn file_in(dir: &std::path::Path, key: &crate::config::ChainKey) -> std::path::PathBuf {
+        dir.join(format!("{}.json", key.file_stem()))
+    }
+
     /// Read the file a deploy wrote.
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)

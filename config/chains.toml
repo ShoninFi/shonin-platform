@@ -1,0 +1,100 @@
+# Every chain the platform knows, keyed "kind:id": an EVM chain by its chain
+# id, a Solana cluster by its name. Nothing here is secret.
+#
+# Endpoint overrides come from .env as SHONIN_RPC_<KIND>_<ID> and
+# SHONIN_WS_<KIND>_<ID>, the id upper-cased with anything but letters and
+# digits turned into "_" (SHONIN_RPC_EVM_8453, SHONIN_RPC_SOLANA_MAINNET_BETA).
+# Paid RPC URLs carry keys, so they only ever go there.
+#
+# `dollar` is the stablecoin a vault on that chain settles in.
+
+# --- Local: what `task dev` starts (ports match taskfiles/config.yml) --------
+
+[chains."evm:31337"]
+label = "Base (local)"
+rpc = "http://127.0.0.1:19100"
+dollar = "USDC"
+
+[chains."evm:31338"]
+label = "Hyperliquid (local)"
+rpc = "http://127.0.0.1:19101"
+dollar = "USDC"
+
+[chains."evm:31339"]
+label = "Robinhood Chain (local)"
+rpc = "http://127.0.0.1:19102"
+dollar = "USDG"
+
+[chains."solana:localnet"]
+label = "Solana (local)"
+rpc = "http://127.0.0.1:19110"
+ws = "ws://127.0.0.1:19111"
+dollar = "USDC"
+
+# --- Testnets ----------------------------------------------------------------
+
+[chains."evm:84532"]
+label = "Base Sepolia"
+rpc = "https://sepolia.base.org"
+dollar = "USDC"
+
+[chains."evm:998"]
+label = "Hyperliquid testnet"
+rpc = "https://rpc.hyperliquid-testnet.xyz/evm"
+dollar = "USDC"
+
+[chains."evm:46630"]
+label = "Robinhood Chain testnet"
+rpc = "https://rpc.testnet.chain.robinhood.com"
+dollar = "USDG"
+
+[chains."solana:devnet"]
+label = "Solana devnet"
+rpc = "https://api.devnet.solana.com"
+ws = "wss://api.devnet.solana.com"
+dollar = "USDC"
+
+# --- Mainnets ----------------------------------------------------------------
+
+[chains."evm:8453"]
+label = "Base"
+rpc = "https://mainnet.base.org"
+dollar = "USDC"
+
+[chains."evm:999"]
+label = "Hyperliquid"
+rpc = "https://rpc.hyperliquid.xyz/evm"
+dollar = "USDC"
+
+[chains."evm:4663"]
+label = "Robinhood Chain"
+rpc = "https://rpc.mainnet.chain.robinhood.com"
+dollar = "USDG"
+
+[chains."solana:mainnet-beta"]
+label = "Solana"
+rpc = "https://api.mainnet-beta.solana.com"
+ws = "wss://api.mainnet-beta.solana.com"
+dollar = "USDC"
+
+# --- Networks: which chain each vault chain means ----------------------------
+# Choose one with SHONIN_NETWORK (or --network / NETWORK=). The names on the
+# left are the vault chains a strategy's shonin.toml names.
+
+[networks.local]
+base = "evm:31337"
+hyperliquid = "evm:31338"
+robinhood = "evm:31339"
+solana = "solana:localnet"
+
+[networks.testnet]
+base = "evm:84532"
+hyperliquid = "evm:998"
+robinhood = "evm:46630"
+solana = "solana:devnet"
+
+[networks.mainnet]
+base = "evm:8453"
+hyperliquid = "evm:999"
+robinhood = "evm:4663"
+solana = "solana:mainnet-beta"

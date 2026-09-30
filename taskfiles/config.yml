@@ -25,6 +25,8 @@ vars:
   PATH_CONTRACTS_SOLANA: '{{joinPath .PATH_CONTRACTS "solana"}}'
   # What the deploy reads the EVM contracts' bytecode from.
   PATH_ARTIFACTS: '{{joinPath .PATH_CONTRACTS_EVM "out"}}'
+  # Every chain the platform knows, and which chain each network means.
+  PATH_CHAINS: '{{joinPath .PATH_ROOT "config" "chains.toml"}}'
   PATH_CLOUDFLARE: '{{joinPath .PATH_ROOT "cloudflare"}}'
   PATH_WRANGLER_LANDING: '{{joinPath .PATH_CLOUDFLARE "landing" "wrangler.jsonc"}}'
   PATH_WRANGLER_DOCS: '{{joinPath .PATH_CLOUDFLARE "docs" "wrangler.jsonc"}}'
@@ -43,8 +45,11 @@ vars:
   # Everything the local development chain and services write. Gitignored, and
   # safe to delete: `task dev` rebuilds all of it.
   PATH_LOCAL_STATE: '{{joinPath .PATH_ROOT ".shonin" "local"}}'
-  # Where the deploy records the contracts' addresses. Every service reads it.
-  PATH_DEPLOYMENTS: '{{joinPath .PATH_LOCAL_STATE "deployments.json"}}'
+  # Where the deploy records the contracts' addresses, one file per chain
+  # (evm-31337.json, ...). Every service reads the one for its chain.
+  PATH_DEPLOYMENTS_DIR: '{{joinPath .PATH_LOCAL_STATE "deployments"}}'
+  # The local Solana validator's ledger, wiped on every start.
+  PATH_SOLANA_LEDGER: '{{joinPath .PATH_LOCAL_STATE "solana"}}'
   # Content-addressed storage: source archives, bundles, build logs, reviews.
   PATH_STORE: '{{joinPath .PATH_LOCAL_STATE "store"}}'
   # Where the build service compiles submissions.
@@ -57,14 +62,21 @@ vars:
   CARGO_WASM_PACKAGES: "-p shonin-frontend -p shonin-shared -p shonin-chain"
   CARGO_WASIP2_PACKAGES: "-p shonin-strategy-sdk"
 
+  # Which chains: local (what `task dev` starts), testnet or mainnet. Set
+  # SHONIN_NETWORK in .env, or pass NETWORK=testnet to a task. The chains each
+  # one means are in config/chains.toml.
+  NETWORK:
+    sh: echo "${SHONIN_NETWORK:-local}"
+  # The vault chain the services serve, until they serve every one at once.
+  VAULT_CHAIN: "base"
+
   # Ports: a base (override with SHONIN_START_PORT_DEV in .env) plus fixed offsets.
   # Offsets are stable; reserved ones stay reserved.
   SHONIN_START_PORT_DEV:
     sh: echo "${SHONIN_START_PORT_DEV:-19080}"
   PORT_FRONTEND_DEV: "{{add (atoi .SHONIN_START_PORT_DEV) 0}}"
   PORT_API: "{{add (atoi .SHONIN_START_PORT_DEV) 1}}"
-  # +2 reserved
-  PORT_CHAIN: "{{add (atoi .SHONIN_START_PORT_DEV) 3}}"
+  # +2 and +3 reserved
   PORT_BUILDER: "{{add (atoi .SHONIN_START_PORT_DEV) 4}}"
   PORT_EXECUTOR: "{{add (atoi .SHONIN_START_PORT_DEV) 5}}"
   PORT_REVIEWER: "{{add (atoi .SHONIN_START_PORT_DEV) 6}}"
@@ -73,22 +85,37 @@ vars:
   PORT_DOCS_DEV: "{{add (atoi .SHONIN_START_PORT_DEV) 9}}"
   PORT_UNWINDER: "{{add (atoi .SHONIN_START_PORT_DEV) 10}}"
   PORT_INDEXER: "{{add (atoi .SHONIN_START_PORT_DEV) 11}}"
+  # The local chains, in a block of their own. These must match the local
+  # entries in config/chains.toml (or be overridden there from .env with
+  # SHONIN_RPC_EVM_31337 and friends when the base port moves).
+  PORT_EVM_BASE: "{{add (atoi .SHONIN_START_PORT_DEV) 20}}"
+  PORT_EVM_HYPERLIQUID: "{{add (atoi .SHONIN_START_PORT_DEV) 21}}"
+  PORT_EVM_ROBINHOOD: "{{add (atoi .SHONIN_START_PORT_DEV) 22}}"
+  # The validator's websocket is always its RPC port + 1.
+  PORT_SOLANA_RPC: "{{add (atoi .SHONIN_START_PORT_DEV) 30}}"
+  PORT_SOLANA_WS: "{{add (atoi .SHONIN_START_PORT_DEV) 31}}"
+  PORT_SOLANA_FAUCET: "{{add (atoi .SHONIN_START_PORT_DEV) 32}}"
   # Every port a local run listens on, for `task down`.
-  PORTS_DEV: "{{.PORT_FRONTEND_DEV}} {{.PORT_API}} {{.PORT_CHAIN}} {{.PORT_BUILDER}} {{.PORT_EXECUTOR}} {{.PORT_REVIEWER}} {{.PORT_KEEPER}} {{.PORT_DEVNET}} {{.PORT_UNWINDER}} {{.PORT_INDEXER}}"
+  PORTS_DEV: >-
+    {{.PORT_FRONTEND_DEV}} {{.PORT_API}} {{.PORT_BUILDER}} {{.PORT_EXECUTOR}}
+    {{.PORT_REVIEWER}} {{.PORT_KEEPER}} {{.PORT_DEVNET}} {{.PORT_UNWINDER}} {{.PORT_INDEXER}}
+    {{.PORT_EVM_BASE}} {{.PORT_EVM_HYPERLIQUID}} {{.PORT_EVM_ROBINHOOD}}
+    {{.PORT_SOLANA_RPC}} {{.PORT_SOLANA_WS}} {{.PORT_SOLANA_FAUCET}}
 
   # URLs
   URL_FRONTEND_DEV: "http://localhost:{{.PORT_FRONTEND_DEV}}"
   URL_FRONTEND_PROD: "https://shonin.fi"
   URL_DOCS_PROD: "https://docs.shonin.fi"
   URL_API_DEV: "http://localhost:{{.PORT_API}}"
-  URL_CHAIN_DEV: "http://localhost:{{.PORT_CHAIN}}"
   URL_BUILDER_DEV: "http://localhost:{{.PORT_BUILDER}}"
 
-  # The local development chain. Anvil's default mnemonic is public and its
-  # accounts are unlocked, which is exactly what a development chain wants and
-  # exactly why nothing of value ever goes near one.
-  CHAIN_ID_LOCAL: "31337"
-  CHAIN_LABEL_LOCAL: "Local devnet"
+  # The local EVM chains, standing in for base, hyperliquid and robinhood.
+  # Anvil's default mnemonic is public and its accounts are unlocked, which is
+  # exactly what a development chain wants and exactly why nothing of value
+  # ever goes near one. The ids match config/chains.toml.
+  CHAIN_ID_EVM_BASE: "31337"
+  CHAIN_ID_EVM_HYPERLIQUID: "31338"
+  CHAIN_ID_EVM_ROBINHOOD: "31339"
   # Seconds of chain time each block advances: one block a second, an hour of
   # chain time a second, so a vault reaches its ninety live days in 36 minutes.
   CHAIN_SECONDS_PER_BLOCK: "3600"

@@ -20,10 +20,8 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(about = "Keeps each vault's clockwork turning")]
 struct Args {
-    #[arg(long, env = "SHONIN_RPC_URL")]
-    rpc_url: String,
-    #[arg(long)]
-    deployments: PathBuf,
+    #[command(flatten)]
+    chain_args: chain::ChainArgs,
     #[arg(long)]
     store: PathBuf,
     #[arg(long)]
@@ -42,8 +40,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let chain = Client::connect(&args.rpc_url).await?;
-    let deployments = chain.wait_for_deployments(&args.deployments).await?;
+    let target = args.chain_args.resolve()?;
+    let chain = target.connect().await?;
+    let deployments = chain
+        .wait_for_deployments(&target.deployments_file())
+        .await?;
     let keeper = chain.account(Role::Keeper)?;
     tracing::info!(%keeper, "the keeper is up");
 

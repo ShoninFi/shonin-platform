@@ -82,9 +82,12 @@ fn address_of(value: Address) -> String {
     format!("{value:?}")
 }
 
-/// Every vault, as the site shows it.
+/// Every vault, as the site shows it. `vault_chain` is the chain these
+/// vaults live on, by the name a manifest gives it.
+#[allow(clippy::too_many_arguments)]
 pub async fn strategies(
     chain: &Client,
+    vault_chain: Chain,
     deployments: &Deployments,
     store: &Store,
     history: &mut History,
@@ -100,6 +103,7 @@ pub async fn strategies(
     for address in &addresses {
         match one(
             chain,
+            vault_chain,
             deployments,
             store,
             history,
@@ -139,6 +143,7 @@ pub async fn strategies(
 #[allow(clippy::too_many_arguments)]
 async fn one(
     chain: &Client,
+    vault_chain: Chain,
     deployments: &Deployments,
     store: &Store,
     history: &mut History,
@@ -167,7 +172,7 @@ async fn one(
     let slug = format!("{id}-v{version}");
     let days_live = (now.saturating_sub(created as u64)) / 86_400;
 
-    let vault = read_vault(chain, deployments, address, &state, now).await?;
+    let vault = read_vault(chain, vault_chain, deployments, address, &state, now).await?;
     let (trades, trade_count) = read_trades(chain, deployments, address).await?;
     let record = sample(
         chain,
@@ -267,6 +272,7 @@ fn standing(
 
 async fn read_vault(
     chain: &Client,
+    vault_chain: Chain,
     deployments: &Deployments,
     address: Address,
     state: &ChainVaultState,
@@ -317,7 +323,7 @@ async fn read_vault(
     let _ = (deployments, now, supply);
     Ok(Vault {
         address: address_of(address),
-        chain: Chain::Local,
+        chain: vault_chain,
         asset: "USDC".to_string(),
         state: match state {
             ChainVaultState::Building => VaultState::Building,
@@ -635,7 +641,7 @@ async fn read_legs(
 
     Ok(vec![Leg {
         venue: "Local venue".to_string(),
-        chain: Chain::Local,
+        chain: vault.chain,
         custody: Custody::VenueEnforced,
         exit_path: ExitPath::Contract,
         last_resort: None,
