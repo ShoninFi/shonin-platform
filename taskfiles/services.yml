@@ -89,7 +89,7 @@ tasks:
     desc: "The reviewer"
     cmds:
       - >-
-        cargo run -q -p shonin-reviewer --
+        cargo run -q -p shonin-reviewer --bin reviewer --
         {{.SERVICE_ARGS}}
         --port {{.PORT_REVIEWER}}
 
