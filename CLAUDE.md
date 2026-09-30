@@ -15,7 +15,7 @@ The vocabulary follows the docs. The **machines** are the four attested images: 
 - **The contracts' interfaces are the source of truth for both sides.** `contracts/evm/src/interfaces/*.sol` is what the contracts implement and what `packages/chain` parses with `sol!`. Change the interface once and both follow; never hand-write a second copy of a signature.
 - **No key is written down.** The local chains' accounts come from their own published mnemonic, taken by index for each role. On the testnets the same roles come from the developer's mnemonics in `.env` (`SHONIN_TESTNET_EVM_MNEMONIC`, `SHONIN_TESTNET_SOLANA_MNEMONIC`). Mainnet has no role keys in `.env`: clients there only read, and the deploy tasks refuse it.
 - **Nothing local is committed.** A local run writes only under `.shonin/local`, which is gitignored and safe to delete. Mainnet addresses (EVM contracts and Solana program ids) are committed, under `config/deployments/mainnet/`; testnet addresses never are, and stay under `.shonin/testnet` like local ones.
-- **`docs/` is published.** It describes the platform as designed: mechanisms a reader can check. It never carries strategy, reasoning about pricing, comparisons with anyone, or plans beyond the checklist. `docs/content/checklist.md` is the only record of what is built; pages do not carry "not built yet" notes, and the site's footer says so once. Keep the checklist current.
+- **`docs/` is published.** It describes the platform as designed: mechanisms a reader can check. It never carries strategy, reasoning about pricing, comparisons with anyone, plans, or a record of what is built: pages do not carry "not built yet" notes, and the site's footer says once that the docs describe the design ahead of the build.
 
 ## Commit guard
 

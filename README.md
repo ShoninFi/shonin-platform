@@ -138,7 +138,7 @@ taskfiles/        config.yml, and the tasks: chains, services, contracts, fronte
 
 ## Documentation
 
-The public documentation lives in `docs/` and is built with [Zensical](https://zensical.org). It describes how the platform works and how to check it. The [build checklist](docs/content/checklist.md) is the working guideline for what is still to do.
+The public documentation lives in `docs/` and is built with [Zensical](https://zensical.org). It describes how the platform works, as designed, and how to check it.
 
 ```bash
 task docs:dev      # serve it with live reload on http://localhost:19089
