@@ -1,9 +1,12 @@
 # Deployments
 
-The contracts' addresses on public chains, committed once they are deployed:
-one file per chain, `config/deployments/<network>/<kind>-<id>.json` (for
-example `testnet/evm-84532.json`), in the same shape a local deploy writes.
+The contracts' and programs' addresses on **mainnet**, committed once they are
+deployed: one file per chain, `config/deployments/mainnet/<kind>-<id>.json`
+(for example `mainnet/evm-8453.json`), in the same shape a local deploy
+writes. A Solana program's mainnet id is also committed in its `declare_id!`
+and under `[programs.mainnet]` in `contracts/solana/Anchor.toml`.
 
-Nothing is deployed to a public chain yet, so the network directories are
-empty. A local run writes its own files under `.shonin/local/deployments/`,
-which is gitignored.
+Testnet addresses are never committed. Like a local run's, they stay on the
+machine that deployed them, under `.shonin/testnet/deployments/` (gitignored).
+
+Nothing is deployed to mainnet yet, so this directory holds only this file.

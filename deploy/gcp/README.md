@@ -12,7 +12,7 @@ The project is chosen by the network, from `GCP_PROJECT_TESTNET` or `GCP_PROJECT
 
 ## The images
 
-`Dockerfile.<name>` for each of: `reviewer`, `builder`, `executor`, `unwinder` (the machines), and `api`, `indexer`, `keeper` (the services). Each builds with the pinned toolchain and `--locked` from the repository root, and carries `config/chains.toml` and `config/deployments/` under `/etc/shonin`.
+`Dockerfile.<name>` for each of: `reviewer`, `builder`, `executor`, `unwinder` (the machines), and `api`, `indexer`, `keeper` (the services). Each builds with the pinned toolchain and `--locked` from the repository root, and carries `config/chains.toml` and the committed mainnet deployments under `/etc/shonin`.
 
 - The builder's runtime keeps the Rust toolchain and the strategy SDK, because it compiles strategies.
 - The reviewer's image does not carry the CLI its model is reached through yet; without it every strategy shows "review pending".
@@ -41,5 +41,7 @@ gcloud compute instances create shonin-<name>-<network> \
 ```
 
 `confidential-space-debug` is the debug image family, `SEV` the AMD alternative to `TDX`, and `tee-env-NAME=value` passes an environment variable to the container. The services run on Cloud Run, from the same registry.
+
+Testnet addresses are never committed, so a testnet image carries none: a testnet launch has to hand the machine its chain's deployment file, which the cloud tasks do not do yet.
 
 Nothing is deployed yet: the project ids are empty until the projects exist.

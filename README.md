@@ -79,7 +79,7 @@ task contracts:solana:build          # anchor build
 
 - **To point a chain at another RPC**, set `SHONIN_RPC_<KIND>_<ID>` (or `SHONIN_WS_...`) in `.env`, for example `SHONIN_RPC_EVM_8453`. Paid RPC URLs carry keys, so they go there and never in the file.
 - **To add a chain**, add a `[chains."kind:id"]` entry and name it in a network. A new local chain also needs its process in `taskfiles/chains.yml` and its port in `taskfiles/config.yml`.
-- **Public-chain deployments** will be committed under `config/deployments/<network>/`; a local run writes its own under `.shonin/local/deployments/`.
+- **Deployments:** mainnet addresses, Solana program ids included, are committed under `config/deployments/mainnet/`. Testnet addresses never are: they stay under `.shonin/testnet/deployments/`, as a local run's stay under `.shonin/local/deployments/`.
 
 ### Where configuration lives
 
@@ -89,13 +89,13 @@ task contracts:solana:build          # anchor build
 | Every chain, its endpoints, and what each network means | `config/chains.toml` |
 | Cloudflare Worker names (`shonin-app`, `shonin-landing`, ...) | `name` in `cloudflare/<target>/wrangler.jsonc` |
 | Secrets, RPC overrides and per-developer settings | `.env` (gitignored); the template is `.env.example` |
-| Contract addresses | `.shonin/local/deployments/` locally; `config/deployments/<network>/` for public chains |
+| Contract addresses | `config/deployments/mainnet/` (committed); `.shonin/<local or testnet>/deployments/` (never committed) |
 | Rust toolchain; dependency versions | `rust-toolchain.toml`; `[workspace.dependencies]` in `Cargo.toml` |
 
 ## Layout
 
 ```text
-config/           chains.toml, and committed public-chain deployments
+config/           chains.toml, and the committed mainnet deployments
 contracts/
   evm/            the EVM contracts (Foundry); src/interfaces is what the bindings read
   solana/         the Solana programs (Anchor): a skeleton for now

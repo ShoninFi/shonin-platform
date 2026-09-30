@@ -14,7 +14,7 @@ The vocabulary follows the docs. The **machines** are the four attested images: 
 - **`shared` and `chain` are dual-target.** They compile for native and `wasm32-unknown-unknown` with no `#[cfg(target_arch)]` and no web-sys types, so the web app and the services read the same types and the same contract bindings.
 - **The contracts' interfaces are the source of truth for both sides.** `contracts/evm/src/interfaces/*.sol` is what the contracts implement and what `packages/chain` parses with `sol!`. Change the interface once and both follow; never hand-write a second copy of a signature.
 - **No key is written down.** The local chains' accounts come from their own published mnemonic, taken by index for each role.
-- **Nothing local is committed.** A local run writes only under `.shonin/local`, which is gitignored and safe to delete. Only public-chain deployments are committed, under `config/deployments/<network>/`.
+- **Nothing local is committed.** A local run writes only under `.shonin/local`, which is gitignored and safe to delete. Mainnet addresses (EVM contracts and Solana program ids) are committed, under `config/deployments/mainnet/`; testnet addresses never are, and stay under `.shonin/testnet` like local ones.
 - **`docs/` is published.** It describes the platform as designed: mechanisms a reader can check. It never carries strategy, reasoning about pricing, comparisons with anyone, or plans beyond the checklist. `docs/content/checklist.md` is the only record of what is built; pages do not carry "not built yet" notes, and the site's footer says so once. Keep the checklist current.
 
 ## Commit guard

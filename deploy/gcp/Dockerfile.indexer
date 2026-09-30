@@ -13,9 +13,9 @@ RUN cargo build --release --locked -p shonin-indexer --bin indexer
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /src/target/release/indexer /usr/local/bin/indexer
 COPY config/chains.toml /etc/shonin/chains.toml
-COPY config/deployments /etc/shonin/deployments
-# The network (SHONIN_NETWORK) and its deployments directory
-# (SHONIN_DEPLOYMENTS_DIR=/etc/shonin/deployments/<network>) are set where the
-# image is launched.
+# Only mainnet addresses are committed, so only they are baked in; the network
+# (SHONIN_NETWORK) and its deployments directory (SHONIN_DEPLOYMENTS_DIR) are
+# set where the image is launched.
+COPY config/deployments/mainnet /etc/shonin/deployments/mainnet
 ENV SHONIN_CHAINS=/etc/shonin/chains.toml
 ENTRYPOINT ["/usr/local/bin/indexer"]

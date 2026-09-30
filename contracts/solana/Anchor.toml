@@ -4,6 +4,9 @@
 resolution = true
 skip-lint = false
 
+# Only a program's mainnet id is ever committed, here and in its declare_id!
+# (see config/deployments/README.md). Local and devnet ids come from the
+# keypair Anchor writes under target/deploy, which never leaves the machine.
 [programs.localnet]
 shonin_registry = "Bn5t8rYJnsd86vE1DRA7xwfG6Qiz7sw3AoGaM4WrpAs6"
 
