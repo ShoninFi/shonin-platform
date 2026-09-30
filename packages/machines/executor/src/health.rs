@@ -73,7 +73,7 @@ impl Reporter {
         match self.build(counters).await {
             Ok(report) => {
                 let posted = reqwest::Client::new()
-                    .post(format!("{}/api/health", self.api))
+                    .post(format!("{}/api/{}/health", self.api, self.vault_chain))
                     .json(&report)
                     .send()
                     .await;
@@ -170,7 +170,6 @@ impl Reporter {
             .context("signing the report")?;
 
         Ok(HealthPost {
-            chain: self.vault_chain,
             vault,
             report,
             signature: alloy::hex::encode_prefixed(signature),

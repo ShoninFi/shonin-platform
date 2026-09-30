@@ -65,7 +65,7 @@ pub enum Loading {
 thread_local! {
     static DATASET: Mutable<Option<Rc<Dataset>>> = Mutable::new(None);
     static LOADING: Mutable<Loading> = Mutable::new(Loading::Waiting);
-    static CONFIG: RefCell<Option<Rc<Config>>> = const { RefCell::new(None) };
+    static CONFIGS: RefCell<Vec<Rc<Config>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The snapshot the app is rendering, if one has arrived.
@@ -101,15 +101,30 @@ pub fn set_failed(why: impl Into<String>) {
     LOADING.with(|loading| loading.set(Loading::Failed(why.into())));
 }
 
-/// How the app reaches the chain. Fetched once, beside the first snapshot.
-pub fn config() -> Option<Rc<Config>> {
-    CONFIG.with(|config| config.borrow().clone())
+/// How the app reaches one vault chain. Fetched once per chain the snapshot
+/// lists, from `/api/{chain}/config`.
+pub fn config(chain: shared::Chain) -> Option<Rc<Config>> {
+    CONFIGS.with(|configs| {
+        configs
+            .borrow()
+            .iter()
+            .find(|config| config.chain.chain == chain)
+            .cloned()
+    })
 }
 
-/// The terms the platform is running under: the fee schedule a new vault
-/// carries, the exit band, the timelocks and what publishing costs. Every page
-/// that states one of these as a fact reads it here rather than spelling it
-/// out, so nothing in the app can drift from the chain it is talking to.
+/// Every vault chain the app has a config for.
+pub fn configs() -> Vec<Rc<Config>> {
+    CONFIGS.with(|configs| configs.borrow().clone())
+}
+
+/// The development wallet, when the chains offer one. The development chains
+/// derive their accounts from one mnemonic, so it is one account on all of
+/// them.
+pub fn dev() -> Option<shared::DevMode> {
+    configs().into_iter().find_map(|config| config.dev.clone())
+}
+
 /// The build that made this strategy, if the queue still holds it, and why it
 /// failed if it did. A failure has one reason and the page says that one
 /// rather than the commonest one.
@@ -119,19 +134,21 @@ pub fn build_of(slug: &str) -> Option<Rc<Job>> {
         .find(|job| job.strategy_slug.as_deref() == Some(slug))
 }
 
-/// The terms a page quotes: base's, the vault chain a publish goes to. The
-/// devnet deploys every chain with the same terms.
+/// The terms the platform is running under: the fee schedule a new vault
+/// carries, the exit band, the timelocks and what publishing costs. Every page
+/// that states one of these as a fact reads it here rather than spelling it
+/// out, so nothing in the app can drift from the chain it is talking to. A
+/// page quotes base's, the vault chain a publish from the app goes to.
 pub fn terms() -> Option<shared::Terms> {
-    config().and_then(|config| setup(&config, shared::Chain::Base).map(|setup| setup.terms))
-}
-
-/// How to reach a vault chain, from the config.
-pub fn setup(config: &Config, chain: shared::Chain) -> Option<shared::ChainSetup> {
-    config.on(chain).cloned()
+    config(shared::Chain::Base).map(|config| config.terms)
 }
 
 pub fn set_config(config: Config) {
-    CONFIG.with(|held| *held.borrow_mut() = Some(Rc::new(config)));
+    CONFIGS.with(|held| {
+        let mut held = held.borrow_mut();
+        held.retain(|known| known.chain.chain != config.chain.chain);
+        held.push(Rc::new(config));
+    });
 }
 
 // What a page asks for ------------------------------------------------------

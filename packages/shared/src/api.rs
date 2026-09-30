@@ -68,30 +68,11 @@ pub struct Totals {
     pub trades: u32,
 }
 
-/// What the app needs to reach the chains itself. No secrets: the addresses
-/// are public and the development wallet is an account the chains published.
+/// What the app needs to reach one vault chain itself, from
+/// `/api/{chain}/config`. No secrets: the addresses are public and the
+/// development wallet is an account the chain published.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
-    /// One for every vault chain the platform serves on this network.
-    pub chains: Vec<ChainSetup>,
-    /// Set on development chains, where accounts are unlocked and the app can
-    /// offer one as a wallet. Never set anywhere else. The development chains
-    /// derive their accounts from the same mnemonic, so it is one account on
-    /// all of them.
-    pub dev: Option<DevMode>,
-}
-
-impl Config {
-    /// How to reach one vault chain.
-    pub fn on(&self, chain: Chain) -> Option<&ChainSetup> {
-        self.chains.iter().find(|setup| setup.chain.chain == chain)
-    }
-}
-
-/// How to reach one vault chain: where it answers, where the contracts are,
-/// what it settles in and the terms its contracts enforce.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ChainSetup {
     pub chain: ChainInfo,
     pub rpc_url: String,
     pub addresses: Addresses,
@@ -100,6 +81,9 @@ pub struct ChainSetup {
     pub asset_decimals: u8,
     /// The terms the platform is running under on this chain, read from it.
     pub terms: Terms,
+    /// Set on a development chain, where accounts are unlocked and the app can
+    /// offer one as a wallet. Never set anywhere else.
+    pub dev: Option<DevMode>,
 }
 
 /// The terms a new vault is created with and the charges an author meets,
@@ -149,21 +133,15 @@ pub struct DevMode {
 
 /// What one address holds, read from the chain.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// What one address holds on one vault chain, from
+/// `/api/{chain}/portfolio/{address}`.
 pub struct Portfolio {
+    pub chain: Chain,
     pub address: String,
-    /// The asset, outside any vault, on every vault chain together.
+    /// The asset, outside any vault.
     pub balance: f64,
-    /// The same, chain by chain.
-    pub balances: Vec<ChainBalance>,
     pub positions: Vec<Holding>,
     pub claims: Vec<HeldClaim>,
-}
-
-/// The asset an address holds on one vault chain, outside any vault.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ChainBalance {
-    pub chain: Chain,
-    pub balance: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -195,10 +173,9 @@ pub struct HeldClaim {
 
 /// A strategy offered to the build service.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// A strategy offered to be built, posted to `/api/{chain}/submissions`: the
+/// vault chain its vault was created on, where the build is registered.
 pub struct Submission {
-    /// The vault chain the vault was created on, where the build is
-    /// registered.
-    pub chain: Chain,
     pub strategy_id: String,
     pub version: u32,
     /// The address that will own it, and whose vault pays for the build.
@@ -229,10 +206,9 @@ pub struct SubmissionAccepted {
 
 /// A health report, as the executor signs and posts it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// Posted to `/api/{chain}/health`: the same address can be a different vault
+/// on another chain.
 pub struct HealthPost {
-    /// The vault chain the vault is on: the same address can be a different
-    /// vault on another chain.
-    pub chain: Chain,
     /// The vault it is about.
     pub vault: String,
     pub report: Health,

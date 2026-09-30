@@ -89,7 +89,7 @@ The testnets keep their own time, so nothing drives their clocks or their stand-
 
 ### Chains and networks
 
-`config/chains.toml` lists every chain the platform knows, keyed `kind:id` (`evm:8453`, `solana:devnet`), with its label, RPC, websocket and the dollar a vault there settles in, and maps each network to the chain behind each vault chain name. Every service takes `--network`, `--chains` and `--deployments-dir`, and serves every EVM vault chain of the network at once, each with its own client and deployment; `--vault-chain` (or `VAULT_CHAIN=` on a task) narrows it to one. The snapshot and the app's config carry every chain, and each strategy says which chain its vault is on. Where one id and version is published on two chains, its slug is qualified with the chain (`funding-basis-v1-hyperliquid`). No service speaks to Solana yet.
+`config/chains.toml` lists every chain the platform knows, keyed `kind:id` (`evm:8453`, `solana:devnet`), with its label, RPC, websocket and the dollar a vault there settles in, and maps each network to the chain behind each vault chain name. Every service takes `--network`, `--chains` and `--deployments-dir`, and serves every EVM vault chain of the network at once, each with its own client and deployment; `--vault-chain` (or `VAULT_CHAIN=` on a task) narrows it to one. Everything that acts on one chain names it: each per-chain function takes the chain, and so does each API route that acts on one (`/api/{chain}/config`, `/api/{chain}/portfolio/{address}`, `/api/{chain}/submissions`, `/api/{chain}/health`), while `/api/snapshot` and the build queue span every chain and each strategy says which chain its vault is on. Where one id and version is published on two chains, its slug is qualified with the chain (`funding-basis-v1-hyperliquid`). No service speaks to Solana yet.
 
 - **To point a chain at another RPC**, set `SHONIN_RPC_<KIND>_<ID>` (or `SHONIN_WS_...`) in `.env`, for example `SHONIN_RPC_EVM_8453`. Paid RPC URLs carry keys, so they go there and never in the file.
 - **To add a chain**, add a `[chains."kind:id"]` entry and name it in a network. A new local chain also needs its process in `taskfiles/chains.yml` and its port in `taskfiles/config.yml`.
@@ -138,7 +138,7 @@ taskfiles/        config.yml, and the tasks: chains, services, contracts, fronte
 
 ## Documentation
 
-The public documentation lives in `docs/` and is built with [Zensical](https://zensical.org). It describes how the platform works and how to check it. The [build checklist](docs/content/checklist.md) is the working guideline for what is still to do.
+The public documentation lives in `docs/` and is built with [Zensical](https://zensical.org). It describes how the platform works, as designed, and how to check it.
 
 ```bash
 task docs:dev      # serve it with live reload on http://localhost:19089

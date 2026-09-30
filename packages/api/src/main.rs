@@ -27,8 +27,8 @@ use clap::Parser;
 use indexer::{Indexer, read};
 use shared::model::registry::Job;
 use shared::{
-    Addresses, ChainBalance, ChainInfo, ChainSetup, Config, DevMode, HealthPost, HeldClaim,
-    Holding, Portfolio, Snapshot, Submission, SubmissionAccepted, Terms,
+    Addresses, Chain, ChainInfo, Config, DevMode, HealthPost, HeldClaim, Holding, Portfolio,
+    Snapshot, Submission, SubmissionAccepted, Terms,
 };
 
 #[derive(Parser)]
@@ -77,12 +77,14 @@ async fn main() -> Result<()> {
     let app = axum::Router::new()
         .route("/health", get(|| async { "api" }))
         .route("/api/snapshot", get(snapshot))
-        .route("/api/config", get(config))
-        .route("/api/portfolio/{address}", get(portfolio))
+        // Across every vault chain: the record, and the one build queue.
         .route("/api/jobs", get(jobs))
         .route("/api/jobs/{id}", get(job))
-        .route("/api/submissions", post(submissions))
-        .route("/api/health", post(post_health))
+        // One vault chain, named in the path.
+        .route("/api/{chain}/config", get(config))
+        .route("/api/{chain}/portfolio/{address}", get(portfolio))
+        .route("/api/{chain}/submissions", post(submissions))
+        .route("/api/{chain}/health", post(post_health))
         .route("/api/store/{hash}/{name}", get(store_file))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(service);
@@ -100,63 +102,74 @@ async fn snapshot(State(service): State<Arc<Service>>) -> Json<Snapshot> {
     Json(service.indexer.snapshot.read().await.clone())
 }
 
+/// The vault chain a path names, if this API serves it.
+fn served(
+    service: &Service,
+    chain: Chain,
+) -> Result<&Served, (StatusCode, Json<shared::ApiError>)> {
+    service.indexer.on(chain).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(shared::ApiError {
+                message: format!("this platform does not serve {} here", chain.label()),
+            }),
+        )
+    })
+}
+
 async fn config(
     State(service): State<Arc<Service>>,
+    UrlPath(chain): UrlPath<Chain>,
 ) -> Result<Json<Config>, (StatusCode, Json<shared::ApiError>)> {
-    let snapshot = service.indexer.snapshot.read().await;
-    let mut chains = Vec::new();
-    for reader in &service.indexer.readers {
-        let served = &reader.served;
-        let terms = terms(served).await.map_err(|error| {
-            tracing::warn!(chain = %served.key, %error, "could not read the platform's terms");
+    let served = served(&service, chain)?;
+    let terms = terms(chain, &served.client, &served.deployments)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%chain, %error, "could not read the platform's terms");
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(shared::ApiError {
                     // An app told the wrong terms would state them as facts,
-                    // so it is told nothing until every chain answers.
-                    message: format!(
-                        "{} did not answer for the platform's terms",
-                        served.vault_chain.label()
-                    ),
+                    // so it is told nothing until the chain answers.
+                    message: format!("{} did not answer for the platform's terms", chain.label()),
                 }),
             )
         })?;
-        let deployments = &served.deployments;
-        chains.push(ChainSetup {
-            chain: snapshot
-                .chain(served.vault_chain)
-                .cloned()
-                .unwrap_or(ChainInfo {
-                    chain: served.vault_chain,
-                    chain_id: served.client.chain_id,
-                    block: 0,
-                }),
-            rpc_url: served.client.rpc_url.clone(),
-            addresses: Addresses {
-                usd: format!("{:?}", deployments.usd),
-                venue: format!("{:?}", deployments.venue),
-                attestation: format!("{:?}", deployments.attestation),
-                strategies: format!("{:?}", deployments.strategies),
-                reviews: format!("{:?}", deployments.reviews),
-                profiles: format!("{:?}", deployments.profiles),
-                factory: format!("{:?}", deployments.factory),
-            },
-            asset_symbol: served.vault_chain.dollar().to_string(),
-            asset_decimals: 6,
-            terms,
+    let info = service
+        .indexer
+        .snapshot
+        .read()
+        .await
+        .chain(chain)
+        .cloned()
+        .unwrap_or(ChainInfo {
+            chain,
+            chain_id: served.client.chain_id,
+            block: 0,
         });
-    }
+    let deployments = &served.deployments;
     // Only a development chain holds its accounts' keys, so only there can the
     // app offer one as a wallet.
-    let viewer = service
-        .indexer
-        .readers
-        .first()
-        .map(|reader| &reader.served.client)
-        .filter(|client| client.is_development())
-        .and_then(|client| client.account(Role::Viewer).ok());
+    let viewer = served
+        .client
+        .is_development()
+        .then(|| served.client.account(Role::Viewer).ok())
+        .flatten();
     Ok(Json(Config {
-        chains,
+        chain: info,
+        rpc_url: served.client.rpc_url.clone(),
+        addresses: Addresses {
+            usd: format!("{:?}", deployments.usd),
+            venue: format!("{:?}", deployments.venue),
+            attestation: format!("{:?}", deployments.attestation),
+            strategies: format!("{:?}", deployments.strategies),
+            reviews: format!("{:?}", deployments.reviews),
+            profiles: format!("{:?}", deployments.profiles),
+            factory: format!("{:?}", deployments.factory),
+        },
+        asset_symbol: chain.dollar().to_string(),
+        asset_decimals: 6,
+        terms,
         dev: viewer.map(|address| DevMode {
             address: format!("{address:?}"),
             label: "Development wallet".to_string(),
@@ -166,46 +179,41 @@ async fn config(
 
 async fn portfolio(
     State(service): State<Arc<Service>>,
-    UrlPath(address): UrlPath<String>,
-) -> Result<Json<Portfolio>, (StatusCode, String)> {
+    UrlPath((chain, address)): UrlPath<(Chain, String)>,
+) -> Result<Json<Portfolio>, (StatusCode, Json<shared::ApiError>)> {
+    let served = served(&service, chain)?;
     let who: Address = address.parse().map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
-            "that is not an address".to_string(),
+            Json(shared::ApiError {
+                message: "that is not an address".to_string(),
+            }),
         )
     })?;
+    let client = &served.client;
 
-    let mut balances = Vec::new();
-    for reader in &service.indexer.readers {
-        let served = &reader.served;
-        let balance = served
-            .client
-            .read(
-                served.deployments.usd,
-                IERC20::balanceOfCall { account: who },
-            )
-            .await
-            .map(|value| value.to_string().parse::<f64>().unwrap_or(0.0) / 1e6)
-            .unwrap_or(0.0);
-        balances.push(ChainBalance {
-            chain: served.vault_chain,
-            balance,
-        });
-    }
+    let balance = client
+        .read(
+            served.deployments.usd,
+            IERC20::balanceOfCall { account: who },
+        )
+        .await
+        .map(|value| value.to_string().parse::<f64>().unwrap_or(0.0) / 1e6)
+        .unwrap_or(0.0);
 
     let snapshot = service.indexer.snapshot.read().await;
     let mut positions = Vec::new();
     let mut claims = Vec::new();
 
-    for strategy in &snapshot.strategies {
+    for strategy in snapshot
+        .strategies
+        .iter()
+        .filter(|strategy| strategy.vault.chain == chain)
+    {
         let Ok(vault) = strategy.vault.address.parse::<Address>() else {
             continue;
         };
-        let Some(served) = service.indexer.on(strategy.vault.chain) else {
-            continue;
-        };
-        let held = served
-            .client
+        let held = client
             .read(vault, IERC20::balanceOfCall { account: who })
             .await
             .map(|value| value.to_string().parse::<f64>().unwrap_or(0.0) / 1e18)
@@ -218,7 +226,7 @@ async fn portfolio(
                 exit_value: held
                     * strategy.vault.share_price
                     * (1.0 - strategy.vault.fees.transaction_bps as f64 / 10_000.0),
-                cost: cost_basis(&served.client, vault, who).await.unwrap_or(0.0),
+                cost: cost_basis(client, vault, who).await.unwrap_or(0.0),
             });
         }
         for claim in &strategy.vault.claims {
@@ -239,9 +247,9 @@ async fn portfolio(
     }
 
     Ok(Json(Portfolio {
+        chain,
         address,
-        balance: balances.iter().map(|held| held.balance).sum(),
-        balances,
+        balance,
         positions,
         claims,
     }))
@@ -292,23 +300,25 @@ async fn cost_basis(chain: &Client, vault: Address, who: Address) -> Option<f64>
 /// The terms the platform is running under, asked of the contracts that
 /// enforce them. They are governed rather than fixed, so the app is told them
 /// instead of being built with them.
-async fn terms(served: &Served) -> Result<Terms> {
+/// The terms one vault chain's contracts enforce.
+async fn terms(on: Chain, chain: &Client, deployments: &chain::Deployments) -> Result<Terms> {
     const DAY: f64 = 86_400.0;
 
-    let chain = &served.client;
-    let deployments = &served.deployments;
     let vaults = chain
         .read(deployments.factory, IVaultFactory::configCall {})
-        .await?;
+        .await
+        .with_context(|| format!("reading the terms on {on}"))?;
     let timelock = chain
         .read(
             deployments.attestation,
             IAttestationRegistry::timelockCall {},
         )
-        .await?;
+        .await
+        .with_context(|| format!("reading the terms on {on}"))?;
     let review_fee = chain
         .read(deployments.reviews, IReviewRegistry::reviewFeeCall {})
-        .await?;
+        .await
+        .with_context(|| format!("reading the terms on {on}"))?;
 
     Ok(Terms {
         minimum_tank: dollars(vaults.minimumTank),
@@ -354,11 +364,13 @@ async fn job(
 /// Submissions go straight to the build service; the API only carries them.
 async fn submissions(
     State(service): State<Arc<Service>>,
+    UrlPath(chain): UrlPath<Chain>,
     Json(submission): Json<Submission>,
 ) -> Result<Json<SubmissionAccepted>, (StatusCode, Json<shared::ApiError>)> {
+    served(&service, chain)?;
     let fail = |status: StatusCode, message: String| (status, Json(shared::ApiError { message }));
     let reply = reqwest::Client::new()
-        .post(format!("{}/submissions", service.builder))
+        .post(format!("{}/{chain}/submissions", service.builder))
         .json(&submission)
         .send()
         .await
@@ -386,6 +398,7 @@ async fn submissions(
 /// write one, or the page would be repeating whatever it was told.
 async fn post_health(
     State(service): State<Arc<Service>>,
+    UrlPath(chain): UrlPath<Chain>,
     Json(post): Json<HealthPost>,
 ) -> StatusCode {
     let Ok(vault) = post.vault.parse::<Address>() else {
@@ -394,8 +407,8 @@ async fn post_health(
     let Ok(signer) = recover(&post) else {
         return StatusCode::BAD_REQUEST;
     };
-    let Some(served) = service.indexer.on(post.chain) else {
-        return StatusCode::BAD_REQUEST;
+    let Some(served) = service.indexer.on(chain) else {
+        return StatusCode::NOT_FOUND;
     };
     let bundle = match served.client.read(vault, IVault::bundleHashCall {}).await {
         Ok(bundle) => bundle,
@@ -426,7 +439,7 @@ async fn post_health(
         .health
         .write()
         .await
-        .insert((post.chain, vault), post.report);
+        .insert((chain, vault), post.report);
     StatusCode::ACCEPTED
 }
 

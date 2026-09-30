@@ -137,7 +137,7 @@ async fn main() -> Result<()> {
         .route("/health", get(|| async { "builder" }))
         .route("/jobs", get(list_jobs))
         .route("/jobs/{id}", get(one_job))
-        .route("/submissions", post(submit))
+        .route("/{chain}/submissions", post(submit))
         .with_state(service);
 
     let address = SocketAddr::from(([127, 0, 0, 1], args.port));
@@ -169,6 +169,7 @@ async fn bless(chain: &Client, deployments: &Deployments) -> Result<()> {
 
 async fn submit(
     State(service): State<Arc<Service>>,
+    axum::extract::Path(chain): axum::extract::Path<Chain>,
     Json(submission): Json<Submission>,
 ) -> Result<Json<SubmissionAccepted>, (StatusCode, String)> {
     let archive = match &submission.source {
@@ -183,7 +184,7 @@ async fn submit(
         }
     };
     let source_hash = hash_bytes(&archive);
-    if let Err(error) = service.on(submission.chain) {
+    if let Err(error) = service.on(chain) {
         return Err((StatusCode::BAD_REQUEST, error.to_string()));
     }
 
@@ -198,7 +199,7 @@ async fn submit(
 
     let job = Job {
         id: id.clone(),
-        chain: submission.chain,
+        chain,
         subject: format!("{} v{}", submission.strategy_id, submission.version),
         author: submission.author.clone(),
         state: JobState::Queued { position },
@@ -314,7 +315,8 @@ async fn take_one(service: &Arc<Service>) -> Result<()> {
 
     // A build is admitted once its vault exists and its tank covers the
     // minimum. Until then the job waits, and nothing was built for free.
-    let Some(vault) = vault_for(service, &entry.submission).await? else {
+    let chain = entry.job.chain;
+    let Some(vault) = vault_for(service, chain, &entry.submission).await? else {
         return Ok(());
     };
 
@@ -350,10 +352,10 @@ async fn take_one(service: &Arc<Service>) -> Result<()> {
         Ok(built) => built.seconds,
         Err(failed) => failed.seconds,
     };
-    charge_build(service, entry.submission.chain, vault, ran).await;
+    charge_build(service, chain, vault, ran).await;
 
     match built {
-        Ok(built) => finish(service, &entry, vault, built).await,
+        Ok(built) => finish(service, chain, &entry, vault, built).await,
         Err(failed) => {
             tracing::warn!(id = entry.job.id, reason = failed.reason, "a build failed");
             set_state(
@@ -367,7 +369,7 @@ async fn take_one(service: &Arc<Service>) -> Result<()> {
             .await;
             // The build ran, so the tank is charged for it, and the vault
             // closes with the rest returned to its author.
-            let on = service.on(entry.submission.chain)?;
+            let on = service.on(chain)?;
             on.client
                 .send(
                     on.deployments.roles.builder,
@@ -387,11 +389,12 @@ async fn take_one(service: &Arc<Service>) -> Result<()> {
 /// site will show into the store.
 async fn finish(
     service: &Arc<Service>,
+    chain: Chain,
     entry: &Entry,
     vault: Address,
     built: build::Built,
 ) -> Result<()> {
-    let on = service.on(entry.submission.chain)?;
+    let on = service.on(chain)?;
     let submission = &entry.submission;
     let author: Address = submission.author.parse().context("the author's address")?;
     let strategy_id = name_to_bytes(&submission.strategy_id);
@@ -512,8 +515,12 @@ async fn finish(
 
 /// The vault a submission belongs to, once it exists and is still waiting for
 /// its build.
-async fn vault_for(service: &Arc<Service>, submission: &Submission) -> Result<Option<Address>> {
-    let on = service.on(submission.chain)?;
+async fn vault_for(
+    service: &Arc<Service>,
+    chain: Chain,
+    submission: &Submission,
+) -> Result<Option<Address>> {
+    let on = service.on(chain)?;
     let vault = on
         .client
         .read(

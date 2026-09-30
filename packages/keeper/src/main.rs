@@ -16,6 +16,7 @@ use chain::bindings::factory::IVaultFactory;
 use chain::bindings::vault::{ClaimState, IVault, VaultState};
 use chain::{Client, Deployments, Role};
 use clap::Parser;
+use shared::Chain;
 
 #[derive(Parser)]
 #[command(about = "Keeps each vault's clockwork turning")]
@@ -53,7 +54,14 @@ async fn main() -> Result<()> {
         tracing::info!(chain = %served.key, %keeper, "the keeper is up");
         chains.spawn(async move {
             loop {
-                if let Err(error) = tick(&served.client, &served.deployments, keeper).await {
+                if let Err(error) = tick(
+                    served.vault_chain,
+                    &served.client,
+                    &served.deployments,
+                    keeper,
+                )
+                .await
+                {
                     tracing::warn!(chain = %served.key, %error, "the round did not finish");
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;
@@ -64,41 +72,52 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn tick(chain: &Client, deployments: &Deployments, keeper: Address) -> Result<()> {
-    let now = chain.block_timestamp().await?;
-    let vaults = chain
+async fn tick(
+    chain: Chain,
+    client: &Client,
+    deployments: &Deployments,
+    keeper: Address,
+) -> Result<()> {
+    let now = client.block_timestamp().await?;
+    let vaults = client
         .read(deployments.factory, IVaultFactory::vaultsCall {})
         .await?;
 
     for vault in vaults {
-        let state = chain.read(vault, IVault::stateCall {}).await?;
+        let state = client.read(vault, IVault::stateCall {}).await?;
         if matches!(state, VaultState::Building | VaultState::Closed) {
             continue;
         }
 
         // Fees are proportional to elapsed time, so a late call loses nothing
         // and an early one gains nothing. Once a chain-day is plenty.
-        let last = chain.read(vault, IVault::lastCrystallisedCall {}).await? as u64;
+        let last = client.read(vault, IVault::lastCrystallisedCall {}).await? as u64;
         if now.saturating_sub(last) >= 86_400
-            && let Err(error) = chain.send(keeper, vault, IVault::crystalliseCall {}).await
+            && let Err(error) = client.send(keeper, vault, IVault::crystalliseCall {}).await
         {
-            tracing::debug!(%vault, %error, "could not crystallise");
+            tracing::debug!(%chain, %vault, %error, "could not crystallise");
         }
 
-        settle_claims(chain, keeper, vault, now).await?;
+        settle_claims(chain, client, keeper, vault, now).await?;
     }
     Ok(())
 }
 
 /// Serve every claim that is waiting, and freeze a vault whose claim has gone
 /// unserved for its whole freeze period.
-async fn settle_claims(chain: &Client, keeper: Address, vault: Address, now: u64) -> Result<()> {
-    let count = chain.read(vault, IVault::claimCountCall {}).await?;
+async fn settle_claims(
+    chain: Chain,
+    client: &Client,
+    keeper: Address,
+    vault: Address,
+    now: u64,
+) -> Result<()> {
+    let count = client.read(vault, IVault::claimCountCall {}).await?;
     let count: u64 = count.try_into().unwrap_or(0);
-    let freeze_after = chain.read(vault, IVault::freezeAfterCall {}).await? as u64;
+    let freeze_after = client.read(vault, IVault::freezeAfterCall {}).await? as u64;
 
     for id in 1..=count {
-        let claim = chain
+        let claim = client
             .read(
                 vault,
                 IVault::claimAtCall {
@@ -110,7 +129,7 @@ async fn settle_claims(chain: &Client, keeper: Address, vault: Address, now: u64
             continue;
         }
 
-        if let Err(error) = chain
+        if let Err(error) = client
             .send(
                 keeper,
                 vault,
@@ -120,15 +139,15 @@ async fn settle_claims(chain: &Client, keeper: Address, vault: Address, now: u64
             )
             .await
         {
-            tracing::debug!(%vault, id, %error, "could not settle");
+            tracing::debug!(%chain, %vault, id, %error, "could not settle");
         }
 
         // A claim nobody could serve freezes the vault: no new deposits, and
         // the trading approvals go, so only unwinding is left.
         if now.saturating_sub(claim.bookedAt as u64) >= freeze_after
-            && let Err(error) = chain.send(keeper, vault, IVault::freezeCall {}).await
+            && let Err(error) = client.send(keeper, vault, IVault::freezeCall {}).await
         {
-            tracing::debug!(%vault, %error, "could not freeze");
+            tracing::debug!(%chain, %vault, %error, "could not freeze");
         }
     }
     Ok(())

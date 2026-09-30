@@ -324,7 +324,7 @@ async fn read_vault(
     Ok(Vault {
         address: address_of(address),
         chain: vault_chain,
-        asset: "USDC".to_string(),
+        asset: vault_chain.dollar().to_string(),
         state: match state {
             ChainVaultState::Building => VaultState::Building,
             ChainVaultState::Open => VaultState::Open,

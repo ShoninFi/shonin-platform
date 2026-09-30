@@ -56,10 +56,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             snapshot.jobs.len(),
             snapshot.authors.len()
         );
-        app::data::set(snapshot);
-        // The terms the chain is running under, so a written page quotes the
+        // The terms each chain is running under, so a written page quotes the
         // platform rather than whatever this build was compiled with.
-        app::data::set_config(app::api::fetch_config(api)?);
+        for info in &snapshot.chains {
+            app::data::set_config(app::api::fetch_config(api, info.chain)?);
+        }
+        app::data::set(snapshot);
     } else {
         println!("no --api: writing only the pages that need no data");
     }

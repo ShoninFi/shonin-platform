@@ -149,12 +149,19 @@ pub fn disconnect() {
     holdings().set(Holdings::default());
 }
 
-/// Take what the API read from the chain as the viewer's holdings.
-pub fn apply(portfolio: Portfolio) {
+/// Take what the API read from each vault chain as the viewer's holdings: the
+/// balance on every chain together, and every position and claim.
+pub fn apply(portfolios: Vec<Portfolio>) {
     holdings().replace_with(|holdings| {
-        holdings.balance = portfolio.balance;
-        holdings.positions = portfolio.positions;
-        holdings.claims = portfolio.claims;
+        holdings.balance = portfolios.iter().map(|portfolio| portfolio.balance).sum();
+        holdings.positions = portfolios
+            .iter()
+            .flat_map(|portfolio| portfolio.positions.clone())
+            .collect();
+        holdings.claims = portfolios
+            .iter()
+            .flat_map(|portfolio| portfolio.claims.clone())
+            .collect();
         holdings.clone()
     });
 }
@@ -311,8 +318,8 @@ mod send {
     pub async fn connect(how: Connection, watching: Option<String>) -> Result<(), String> {
         let address = match &how {
             Connection::Browser => ask_the_browser().await?,
-            Connection::Development => data::config()
-                .and_then(|config| config.dev.as_ref().map(|dev| dev.address.clone()))
+            Connection::Development => data::dev()
+                .map(|dev| dev.address)
                 .ok_or("this platform offers no development wallet")?,
             Connection::Watching => watching
                 .filter(|address| address.len() == 42 && address.starts_with("0x"))
@@ -346,9 +353,14 @@ mod send {
         let Some(address) = holdings().lock_ref().address.clone() else {
             return;
         };
-        if let Ok(portfolio) = api::portfolio(&address).await {
-            apply(portfolio);
+        // One portfolio per vault chain, read together.
+        let mut portfolios = Vec::new();
+        for config in data::configs() {
+            if let Ok(portfolio) = api::portfolio(config.chain.chain, &address).await {
+                portfolios.push(portfolio);
+            }
         }
+        apply(portfolios);
     }
 
     /// Put money into a vault: the asset is approved, then deposited, and the
@@ -568,17 +580,19 @@ mod send {
         .await?;
 
         working("Submitting the source");
-        let accepted = api::submit(&shared::Submission {
+        let accepted = api::submit(
             chain,
-            strategy_id: id.to_string(),
-            version,
-            author: from.clone(),
-            source: shared::SubmissionSource::Archive {
-                base64: base64(archive),
+            &shared::Submission {
+                strategy_id: id.to_string(),
+                version,
+                author: from.clone(),
+                source: shared::SubmissionSource::Archive {
+                    base64: base64(archive),
+                },
+                package: id.to_string(),
+                sealed,
             },
-            package: id.to_string(),
-            sealed,
-        })
+        )
         .await?;
         done();
         Ok(accepted.job_id)
@@ -678,10 +692,13 @@ mod send {
     }
 
     /// How to reach a vault chain.
-    fn setup(chain: shared::Chain) -> Result<shared::ChainSetup, String> {
-        let config = data::config().ok_or("the app has not reached the platform yet")?;
-        data::setup(&config, chain)
-            .ok_or_else(|| format!("the platform does not serve {} here", chain.label()))
+    fn setup(chain: shared::Chain) -> Result<Rc<shared::Config>, String> {
+        data::config(chain).ok_or_else(|| {
+            format!(
+                "the app has not reached {} on this platform yet",
+                chain.label()
+            )
+        })
     }
 
     fn asset_address(chain: shared::Chain) -> Result<Address, String> {

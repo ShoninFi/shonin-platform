@@ -45,7 +45,6 @@ pub async fn publish(
     tracing::debug!(%vault, slug, "the vault is open for its build");
 
     let submission = Submission {
-        chain: vault_chain,
         strategy_id: manifest.strategy.id.clone(),
         version: manifest.strategy.version,
         author: format!("{author:?}"),
@@ -55,7 +54,7 @@ pub async fn publish(
         package: manifest.strategy.id.clone(),
         sealed,
     };
-    let accepted = offer(api, &submission).await?;
+    let accepted = offer(api, vault_chain, &submission).await?;
 
     let outcome = follow(api, &accepted.job_id).await?;
     Ok(Published {
@@ -152,12 +151,16 @@ async fn create_vault(
 ///
 /// A service that starts with the chain waits out its image's timelock before
 /// it can sign anything, so arriving early is ordinary rather than an error.
-async fn offer(api: &str, submission: &Submission) -> Result<SubmissionAccepted> {
+async fn offer(
+    api: &str,
+    chain: shared::Chain,
+    submission: &Submission,
+) -> Result<SubmissionAccepted> {
     let client = reqwest::Client::new();
     let mut last = String::new();
     for attempt in 0..60 {
         let reply = client
-            .post(format!("{api}/api/submissions"))
+            .post(format!("{api}/api/{chain}/submissions"))
             .json(submission)
             .send()
             .await;
