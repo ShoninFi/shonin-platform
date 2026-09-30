@@ -26,6 +26,7 @@ use chain::bindings::strategies::IStrategyRegistry;
 use chain::{Client, Deployments};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use shared::Chain;
 use shared::manifest::hash_bytes;
 use shared::model::review::Finding;
 use tokio::io::AsyncWriteExt;
@@ -148,6 +149,7 @@ async fn main() -> Result<()> {
             let mut refused: HashMap<(B256, u32, u32), u32> = HashMap::new();
             loop {
                 if let Err(error) = sweep(
+                    served.vault_chain,
                     &served.client,
                     &served.deployments,
                     &store,
@@ -170,14 +172,15 @@ async fn main() -> Result<()> {
 /// Anyone can buy a review at any time; every request that has not been served
 /// is work.
 async fn sweep(
-    chain: &Client,
+    chain: Chain,
+    client: &Client,
     deployments: &Deployments,
     store: &std::path::Path,
     model: &str,
     calibrator: Option<&jev::Client>,
     refused: &mut HashMap<(B256, u32, u32), u32>,
 ) -> Result<()> {
-    let logs = chain
+    let logs = client
         .logs(
             &Filter::new()
                 .address(deployments.reviews)
@@ -215,7 +218,7 @@ async fn sweep(
             continue;
         }
 
-        let registered = chain
+        let registered = client
             .read(
                 deployments.strategies,
                 IStrategyRegistry::versionOfCall {
@@ -229,7 +232,7 @@ async fn sweep(
         if registered.bundleHash == B256::ZERO {
             continue;
         }
-        let already = chain
+        let already = client
             .read(
                 deployments.reviews,
                 IReviewRegistry::reviewCountCall {
@@ -243,7 +246,7 @@ async fn sweep(
         }
 
         match review_one(
-            chain,
+            client,
             deployments,
             store,
             model,
@@ -255,14 +258,14 @@ async fn sweep(
         )
         .await
         {
-            Ok(score) => tracing::info!(version, score, nth, "reviewed"),
+            Ok(score) => tracing::info!(%chain, version, score, nth, "reviewed"),
             Err(error) => {
                 let tried = refused.entry((strategy_id, version, nth)).or_default();
                 *tried += 1;
                 if *tried >= ATTEMPTS {
-                    tracing::warn!(%error, version, "giving up on this review");
+                    tracing::warn!(%chain, %error, version, "giving up on this review");
                 } else {
-                    tracing::debug!(%error, version, "could not review this one yet");
+                    tracing::debug!(%chain, %error, version, "could not review this one yet");
                 }
             }
         }

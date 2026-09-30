@@ -15,24 +15,32 @@ pub const BASE: &str = "/api";
 #[cfg(target_arch = "wasm32")]
 const EVERY_MILLIS: u32 = 2_000;
 
-/// Fetch the configuration once, then keep fetching snapshots.
+/// Keep fetching snapshots, and fetch each vault chain's configuration the
+/// first time the snapshot lists it.
 #[cfg(target_arch = "wasm32")]
 pub fn follow() {
     wasm_bindgen_futures::spawn_local(async {
-        match fetch::<shared::Config>("config").await {
-            Ok(config) => data::set_config(config),
-            Err(why) => data::set_failed(why),
-        }
-        // Following a link should not disconnect anyone.
-        crate::wallet::resume().await;
-
+        let mut resumed = false;
         loop {
             match fetch::<shared::Snapshot>("snapshot").await {
                 Ok(snapshot) => {
+                    for info in &snapshot.chains {
+                        if data::config(info.chain).is_none() {
+                            match fetch::<shared::Config>(&format!("{}/config", info.chain)).await {
+                                Ok(config) => data::set_config(config),
+                                Err(why) => data::set_failed(why),
+                            }
+                        }
+                    }
                     // Only a newer snapshot is worth re-rendering for.
                     let held = data::current().map(|dataset| dataset.version).unwrap_or(0);
                     if snapshot.version != held {
                         data::set(snapshot);
+                    }
+                    // Following a link should not disconnect anyone.
+                    if !resumed {
+                        resumed = true;
+                        crate::wallet::resume().await;
                     }
                 }
                 Err(why) => data::set_failed(why),
@@ -57,16 +65,19 @@ async fn fetch<T: serde::de::DeserializeOwned>(what: &str) -> Result<T, String> 
         .map_err(|error| format!("the API said something unexpected: {error}"))
 }
 
-/// What one address holds, read from the chain when a page needs it.
+/// What one address holds on one vault chain, read when a page needs it.
 #[cfg(target_arch = "wasm32")]
-pub async fn portfolio(address: &str) -> Result<shared::Portfolio, String> {
-    fetch(&format!("portfolio/{address}")).await
+pub async fn portfolio(chain: shared::Chain, address: &str) -> Result<shared::Portfolio, String> {
+    fetch(&format!("{chain}/portfolio/{address}")).await
 }
 
-/// Offer a strategy to the build service.
+/// Offer a strategy to the build service, for a vault on this chain.
 #[cfg(target_arch = "wasm32")]
-pub async fn submit(submission: &shared::Submission) -> Result<shared::SubmissionAccepted, String> {
-    let reply = gloo_net::http::Request::post(&format!("{BASE}/submissions"))
+pub async fn submit(
+    chain: shared::Chain,
+    submission: &shared::Submission,
+) -> Result<shared::SubmissionAccepted, String> {
+    let reply = gloo_net::http::Request::post(&format!("{BASE}/{chain}/submissions"))
         .json(submission)
         .map_err(|error| error.to_string())?
         .send()
@@ -94,7 +105,7 @@ pub fn fetch_snapshot(_api: &str) -> Result<shared::Snapshot, String> {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub fn fetch_config(_api: &str) -> Result<shared::Config, String> {
+pub fn fetch_config(_api: &str, _chain: shared::Chain) -> Result<shared::Config, String> {
     Err("the pre-render runs natively".to_string())
 }
 
@@ -108,8 +119,8 @@ pub fn fetch_snapshot(api: &str) -> Result<shared::Snapshot, String> {
 /// the fees and the bands the chain is running under, not the ones this app
 /// was built with.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn fetch_config(api: &str) -> Result<shared::Config, String> {
-    blocking(api, "config")
+pub fn fetch_config(api: &str, chain: shared::Chain) -> Result<shared::Config, String> {
+    blocking(api, &format!("{chain}/config"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]

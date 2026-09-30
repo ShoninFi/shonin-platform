@@ -127,7 +127,7 @@ fn ask_for_an_address() -> Option<String> {
 /// when the platform says it has one to offer.
 fn ways_to_connect() -> Vec<(wallet::Connection, &'static str)> {
     let mut ways = vec![(wallet::Connection::Browser, "Browser wallet")];
-    if data::config().is_some_and(|config| config.dev.is_some()) {
+    if data::dev().is_some() {
         ways.push((wallet::Connection::Development, "Development wallet"));
     }
     ways.push((wallet::Connection::Watching, "Watch an address"));

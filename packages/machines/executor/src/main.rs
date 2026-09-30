@@ -26,7 +26,7 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use chain::bindings::factory::IVaultFactory;
 use chain::bindings::vault::{IVault, VaultState};
-use chain::{Client, Deployments, Served};
+use chain::{Client, Deployments};
 use clap::Parser;
 use wasmtime::Engine;
 
@@ -75,7 +75,16 @@ async fn main() -> Result<()> {
         chains.spawn(async move {
             let mut running: HashMap<Address, tokio::task::JoinHandle<()>> = HashMap::new();
             loop {
-                if let Err(error) = sweep(&served, &engine, &args, &mut running).await {
+                if let Err(error) = sweep(
+                    served.vault_chain,
+                    &served.client,
+                    &served.deployments,
+                    &engine,
+                    &args,
+                    &mut running,
+                )
+                .await
+                {
                     tracing::warn!(chain = %served.key, %error, "could not look for work");
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -89,16 +98,16 @@ async fn main() -> Result<()> {
 /// Find the vaults that are open and have a bundle, and start anything that
 /// is not already running.
 async fn sweep(
-    served: &Served,
+    chain: shared::Chain,
+    client: &Client,
+    deployments: &Deployments,
     engine: &Engine,
     args: &Args,
     running: &mut HashMap<Address, tokio::task::JoinHandle<()>>,
 ) -> Result<()> {
     running.retain(|_, task| !task.is_finished());
-    let chain = &served.client;
-    let deployments = &served.deployments;
 
-    let vaults = chain
+    let vaults = client
         .read(deployments.factory, IVaultFactory::vaultsCall {})
         .await?;
 
@@ -106,11 +115,11 @@ async fn sweep(
         if running.contains_key(&vault) {
             continue;
         }
-        let state = chain.read(vault, IVault::stateCall {}).await?;
+        let state = client.read(vault, IVault::stateCall {}).await?;
         if !matches!(state, VaultState::Open) {
             continue;
         }
-        let bundle = chain.read(vault, IVault::bundleHashCall {}).await?;
+        let bundle = client.read(vault, IVault::bundleHashCall {}).await?;
         if bundle == B256::ZERO {
             continue;
         }
@@ -120,16 +129,15 @@ async fn sweep(
             continue;
         }
 
-        let chain = chain.clone();
+        let client = client.clone();
         let deployments = deployments.clone();
-        let vault_chain = served.vault_chain;
         let engine = engine.clone();
         let store = args.store.clone();
         let api = args.api_url.clone();
         let task = tokio::spawn(async move {
             if let Err(error) = serve(
+                client,
                 chain,
-                vault_chain,
                 deployments,
                 engine,
                 vault,
@@ -139,11 +147,11 @@ async fn sweep(
             )
             .await
             {
-                tracing::warn!(chain = %vault_chain, vault = %vault, error = format!("{error:#}"), "stopped serving this vault");
+                tracing::warn!(%chain, vault = %vault, error = format!("{error:#}"), "stopped serving this vault");
             }
         });
         running.insert(vault, task);
-        tracing::info!(chain = %served.key, vault = %vault, "taking on a vault");
+        tracing::info!(%chain, vault = %vault, "taking on a vault");
     }
     Ok(())
 }
