@@ -8,7 +8,7 @@
 //! Regenerate it with the platform running:
 //!
 //! ```text
-//! curl -s http://localhost:19081/api/snapshot > packages/frontend/tests/snapshot.json
+//! curl -s http://localhost:19081/api/snapshot > packages/frontend/app/tests/snapshot.json
 //! ```
 
 use shared::Snapshot;

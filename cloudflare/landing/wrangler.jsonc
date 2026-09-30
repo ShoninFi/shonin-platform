@@ -1,9 +1,10 @@
 {
-  // landing — the frontend's static Trunk dist, served as Workers static
-  // assets. There is no Worker script (`main`); Cloudflare serves the files.
+  // landing — shonin.fi. For now it serves the web app, the same dist as
+  // shonin-app, until the marketing site is real and takes this hostname.
+  // There is no Worker script (`main`); Cloudflare serves the files.
   "$schema": "../../node_modules/wrangler/config-schema.json",
   // `name` is the SINGLE SOURCE OF TRUTH for this Worker's name. Each deploy
-  // target gets its own: shonin-landing, later shonin-api, shonin-admin, ...
+  // target gets its own: shonin-landing, shonin-app, shonin-marketing, ...
   "name": "shonin-landing",
   "compatibility_date": "2026-09-15",
   // The custom domain is declared here, so config stays the source of truth
@@ -13,8 +14,8 @@
   "workers_dev": false,
   "preview_urls": false,
   "assets": {
-    // Must match PATH_DIST_FRONTEND in taskfiles/config.yml.
-    "directory": "../../.trunk-dist/frontend",
+    // Must match PATH_DIST_APP in taskfiles/config.yml.
+    "directory": "../../.trunk-dist/app",
     // Every route has its own pre-rendered file (src/bin/seo.rs), so unknown
     // paths get a real 404 status with 404.html, not a soft-404 index.html.
     "not_found_handling": "404-page"

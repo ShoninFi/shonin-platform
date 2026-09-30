@@ -1,13 +1,13 @@
 //! The Shonin web app. Routes, data and copy live in the library, shared with
 //! the build-time pre-render (`src/bin/seo.rs`).
 
-use dominator::{Dom, html, routing};
-use frontend::{
+use app::{
     api, data, pages,
     route::Route,
     state,
     ui::{overlay, shell},
 };
+use dominator::{Dom, html, routing};
 use futures_signals::map_ref;
 use futures_signals::signal::SignalExt;
 
@@ -77,14 +77,14 @@ fn app() -> Dom {
 
 /// Before the first snapshot lands.
 fn reaching() -> Dom {
-    frontend::ui::primitives::empty("Reading the chain…")
+    app::ui::primitives::empty("Reading the chain…")
 }
 
 /// When the platform cannot be reached at all. The app says what it tried,
 /// because a page that is simply blank tells a reader nothing.
 fn unreachable(why: &str) -> Dom {
-    frontend::ui::primitives::notice(
-        frontend::ui::primitives::Tone::Warn,
+    app::ui::primitives::notice(
+        app::ui::primitives::Tone::Warn,
         "The platform is not answering",
         &format!(
             "{why}. Nothing on this page would be true, so none of it is shown. It appears as \

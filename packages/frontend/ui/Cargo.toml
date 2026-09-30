@@ -1,0 +1,25 @@
+[package]
+name = "shonin-ui"
+description = "The design system the frontends share: tokens, rendered as CSS custom properties"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "ui"
+
+# Writes tokens.css from tokens.json, before either frontend builds.
+[[bin]]
+name = "tokens"
+path = "src/bin/tokens.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

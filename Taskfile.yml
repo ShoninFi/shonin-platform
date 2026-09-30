@@ -39,7 +39,7 @@ tasks:
         done
 
   dev:
-    desc: "The whole platform, locally: chains, contracts, machines, services and the web app"
+    desc: "The whole platform, locally: chains, contracts, machines, services, the app and the marketing site"
     deps:
       - chains:evm
       - chains:solana
@@ -51,10 +51,11 @@ tasks:
       - services:executor
       - services:unwinder
       - services:keeper
-      - frontend:dev
+      - frontend:app:dev
+      - frontend:marketing:dev
 
   dev:services:
-    desc: "Everything but the web app"
+    desc: "Everything but the frontends: chains, contracts, machines and services"
     deps:
       - chains:evm
       - chains:solana
@@ -68,12 +69,12 @@ tasks:
       - services:keeper
 
   build:
-    desc: "Release build of everything that deploys"
+    desc: "Release builds of the frontends: tokens, the app, the marketing site"
     cmds:
       - task: frontend:build
 
   deploy:
-    desc: "Build and deploy to Cloudflare"
+    desc: "Build and deploy the app to Cloudflare: app.shonin.fi and shonin.fi"
     cmds:
       - task: frontend:deploy
 

@@ -23,7 +23,14 @@ vars:
   PATH_PACKAGES: '{{joinPath .PATH_ROOT "packages"}}'
   PATH_PACKAGE_SHARED: '{{joinPath .PATH_PACKAGES "shared"}}'
   PATH_PACKAGE_CHAIN: '{{joinPath .PATH_PACKAGES "chain"}}'
-  PATH_PACKAGE_FRONTEND: '{{joinPath .PATH_PACKAGES "frontend"}}'
+  # The frontends: the app (Trunk), the marketing site (static, generated)
+  # and the design system they share.
+  PATH_FRONTEND: '{{joinPath .PATH_PACKAGES "frontend"}}'
+  PATH_PACKAGE_APP: '{{joinPath .PATH_FRONTEND "app"}}'
+  PATH_PACKAGE_UI: '{{joinPath .PATH_FRONTEND "ui"}}'
+  # Written by `task frontend:tokens` from packages/frontend/ui/tokens.json;
+  # gitignored. The app's index.html links it by this relative path.
+  PATH_TOKENS_CSS: '{{joinPath .PATH_PACKAGE_UI "dist" "tokens.css"}}'
   PATH_PACKAGE_SDK: '{{joinPath .PATH_PACKAGES "strategy-sdk"}}'
   # The attested machines: reviewer, builder, executor, unwinder.
   PATH_MACHINES: '{{joinPath .PATH_PACKAGES "machines"}}'
@@ -36,7 +43,9 @@ vars:
   # Every chain the platform knows, and which chain each network means.
   PATH_CHAINS: '{{joinPath .PATH_ROOT "config" "chains.toml"}}'
   PATH_CLOUDFLARE: '{{joinPath .PATH_ROOT "cloudflare"}}'
+  PATH_WRANGLER_APP: '{{joinPath .PATH_CLOUDFLARE "app" "wrangler.jsonc"}}'
   PATH_WRANGLER_LANDING: '{{joinPath .PATH_CLOUDFLARE "landing" "wrangler.jsonc"}}'
+  PATH_WRANGLER_MARKETING: '{{joinPath .PATH_CLOUDFLARE "marketing" "wrangler.jsonc"}}'
   PATH_WRANGLER_DOCS: '{{joinPath .PATH_CLOUDFLARE "docs" "wrangler.jsonc"}}'
   # The public documentation site. Zensical insists its output sits inside its
   # own project, so this one does not live under .trunk-dist with the rest.
@@ -46,9 +55,12 @@ vars:
   # in docs/zensical.toml.
   PATH_DIST_DOCS: '{{joinPath .PATH_DOCS "site"}}'
   PATH_TRUNK_DIST: '{{joinPath .PATH_ROOT ".trunk-dist"}}'
-  # Must match assets.directory in cloudflare/landing/wrangler.jsonc.
-  PATH_DIST_FRONTEND: '{{joinPath .PATH_TRUNK_DIST "frontend"}}'
-  PATH_DIST_FRONTEND_DEV: '{{joinPath .PATH_TRUNK_DIST "frontend-dev"}}'
+  # Must match assets.directory in cloudflare/app and cloudflare/landing.
+  PATH_DIST_APP: '{{joinPath .PATH_TRUNK_DIST "app"}}'
+  PATH_DIST_APP_DEV: '{{joinPath .PATH_TRUNK_DIST "app-dev"}}'
+  # Must match assets.directory in cloudflare/marketing/wrangler.jsonc.
+  PATH_DIST_MARKETING: '{{joinPath .PATH_TRUNK_DIST "marketing"}}'
+  PATH_DIST_MARKETING_DEV: '{{joinPath .PATH_TRUNK_DIST "marketing-dev"}}'
 
   # Everything the local development chain and services write. Gitignored, and
   # safe to delete: `task dev` rebuilds all of it.
@@ -65,17 +77,17 @@ vars:
   PATH_BUILDS: '{{joinPath .PATH_LOCAL_STATE "builds"}}'
 
   # Cargo: crates that run as wasm are also checked for wasm32-unknown-unknown.
-  # The frontend builds natively too (its seo tool runs at build time). The
+  # The app builds natively too (its seo tool runs at build time). The
   # SDK's real target is wasm32-wasip2, where a strategy is compiled into a
   # component.
-  CARGO_WASM_PACKAGES: "-p shonin-frontend -p shonin-shared -p shonin-chain"
+  CARGO_WASM_PACKAGES: "-p shonin-app -p shonin-shared -p shonin-chain"
   CARGO_WASIP2_PACKAGES: "-p shonin-strategy-sdk"
 
   # Ports: a base (override with SHONIN_START_PORT_DEV in .env) plus fixed offsets.
   # Offsets are stable; reserved ones stay reserved.
   SHONIN_START_PORT_DEV:
     sh: echo "${SHONIN_START_PORT_DEV:-19080}"
-  PORT_FRONTEND_DEV: "{{add (atoi .SHONIN_START_PORT_DEV) 0}}"
+  PORT_APP_DEV: "{{add (atoi .SHONIN_START_PORT_DEV) 0}}"
   PORT_API: "{{add (atoi .SHONIN_START_PORT_DEV) 1}}"
   PORT_MARKETING_DEV: "{{add (atoi .SHONIN_START_PORT_DEV) 2}}"
   # +3 reserved
@@ -99,14 +111,19 @@ vars:
   PORT_SOLANA_FAUCET: "{{add (atoi .SHONIN_START_PORT_DEV) 32}}"
   # Every port a local run listens on, for `task down`.
   PORTS_DEV: >-
-    {{.PORT_FRONTEND_DEV}} {{.PORT_API}} {{.PORT_MARKETING_DEV}} {{.PORT_BUILDER}} {{.PORT_EXECUTOR}}
+    {{.PORT_APP_DEV}} {{.PORT_API}} {{.PORT_MARKETING_DEV}} {{.PORT_BUILDER}} {{.PORT_EXECUTOR}}
     {{.PORT_REVIEWER}} {{.PORT_KEEPER}} {{.PORT_DEVNET}} {{.PORT_UNWINDER}} {{.PORT_INDEXER}}
     {{.PORT_EVM_BASE}} {{.PORT_EVM_HYPERLIQUID}} {{.PORT_EVM_ROBINHOOD}}
     {{.PORT_SOLANA_RPC}} {{.PORT_SOLANA_WS}} {{.PORT_SOLANA_FAUCET}}
 
   # URLs
-  URL_FRONTEND_DEV: "http://localhost:{{.PORT_FRONTEND_DEV}}"
-  URL_FRONTEND_PROD: "https://shonin.fi"
+  URL_APP_DEV: "http://localhost:{{.PORT_APP_DEV}}"
+  URL_MARKETING_DEV: "http://localhost:{{.PORT_MARKETING_DEV}}"
+  URL_APP_PROD: "https://app.shonin.fi"
+  # shonin.fi serves the app (shonin-landing) until the marketing site takes
+  # it; the app's pre-rendered pages name it as their canonical address until
+  # then.
+  URL_SITE_PROD: "https://shonin.fi"
   URL_DOCS_PROD: "https://docs.shonin.fi"
   URL_API_DEV: "http://localhost:{{.PORT_API}}"
   URL_BUILDER_DEV: "http://localhost:{{.PORT_BUILDER}}"

@@ -12,9 +12,12 @@
     <link rel="icon" type="image/svg+xml" href="/public/logo.svg" />
 
     <!-- The design system. Trunk hashes it and injects the <link> here, so
-         every pre-rendered page gets it too. -->
+         every pre-rendered page gets it too. tokens.css is the shared design
+         tokens (written by `task frontend:tokens`); app.css comes after it and
+         still decides how the app looks. -->
+    <link data-trunk rel="css" href="../ui/dist/tokens.css" />
     <link data-trunk rel="css" href="styles/app.css" />
-    <link data-trunk rel="rust" data-bin="frontend" data-wasm-opt="z" />
+    <link data-trunk rel="rust" data-bin="app" data-wasm-opt="z" />
     <link data-trunk rel="copy-dir" href="public" />
     <!-- Workers static assets read _headers from the output root. -->
     <link data-trunk rel="copy-file" href="_headers" />

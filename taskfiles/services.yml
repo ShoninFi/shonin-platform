@@ -33,7 +33,7 @@ tasks:
         --artifacts "{{.PATH_ARTIFACTS}}"
         --port {{.PORT_DEVNET}}
         --seconds-per-block {{.CHAIN_SECONDS_PER_BLOCK}}
-        --service "app=http://127.0.0.1:{{.PORT_FRONTEND_DEV}}/"
+        --service "app=http://127.0.0.1:{{.PORT_APP_DEV}}/"
         --service "marketing=http://127.0.0.1:{{.PORT_MARKETING_DEV}}/"
         --service "api=http://127.0.0.1:{{.PORT_API}}/health"
         --service "indexer=http://127.0.0.1:{{.PORT_INDEXER}}/health"

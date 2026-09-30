@@ -2,7 +2,7 @@
 //! `trunk build`:
 //!
 //! ```text
-//! seo --dist .trunk-dist/frontend --base-url https://shonin.fi [--api http://localhost:19081]
+//! seo --dist .trunk-dist/app --base-url https://shonin.fi [--api http://localhost:19081]
 //! ```
 //!
 //! The app is a wasm single-page app, so the HTML Trunk writes has no content
@@ -31,7 +31,7 @@
 
 use std::{error::Error, fs, path::PathBuf};
 
-use frontend::{prerender, route::Route};
+use app::{prerender, route::Route};
 
 const SITE_NAME: &str = "Shonin";
 const LOGO: &str = "/public/logo.svg";
@@ -49,17 +49,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     // One snapshot, so every page written below is written from the same
     // moment, exactly as the app renders it.
     if let Some(api) = &api {
-        let snapshot = frontend::api::fetch_snapshot(api)?;
+        let snapshot = app::api::fetch_snapshot(api)?;
         println!(
             "read {} agents, {} builds and {} authors from {api}",
             snapshot.strategies.len(),
             snapshot.jobs.len(),
             snapshot.authors.len()
         );
-        frontend::data::set(snapshot);
+        app::data::set(snapshot);
         // The terms the chain is running under, so a written page quotes the
         // platform rather than whatever this build was compiled with.
-        frontend::data::set_config(frontend::api::fetch_config(api)?);
+        app::data::set_config(app::api::fetch_config(api)?);
     } else {
         println!("no --api: writing only the pages that need no data");
     }

@@ -3,7 +3,9 @@ resolver = "3"
 members = [
     "packages/shared",
     "packages/chain",
-    "packages/frontend",
+    "packages/frontend/app",
+    "packages/frontend/ui",
+    "packages/frontend/marketing",
     "packages/indexer",
     "packages/api",
     "packages/machines/executor",
@@ -32,6 +34,7 @@ shared = { path = "packages/shared", package = "shonin-shared" }
 chain = { path = "packages/chain", package = "shonin-chain" }
 strategy-sdk = { path = "packages/strategy-sdk", package = "shonin-strategy-sdk" }
 indexer = { path = "packages/indexer", package = "shonin-indexer" }
+ui = { path = "packages/frontend/ui", package = "shonin-ui" }
 
 # Common
 anyhow = "1.0.104"
