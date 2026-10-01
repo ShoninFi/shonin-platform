@@ -105,13 +105,15 @@ pub fn how_it_works() -> [(&'static str, String); 4] {
     ]
 }
 
-pub const FEE_NOTE: &str = "Fees are worked out daily and paid every Monday as new shares, so paying them never forces a \
-     sale, and the share value shown is always after fees. Profit fees are only taken on a new \
-     high-water mark. The transaction fee stays in the pool, so timing a \
-     deposit around a price update can't take value from the depositors who stay.";
+pub const FEE_NOTE: &str = "Fees are measured at every valuation and paid on the first one on or after Monday as new \
+     shares, so paying them never forces a sale, and the share value shown is always after fees. \
+     Profit fees are only taken above the high-water mark, and money joining above it joins at its \
+     own price. A leaver pays the fee their own shares owe. The transaction fee stays in the pool, \
+     so timing a deposit around a price update can't take value from the depositors who stay.";
 
 pub const TANK_NOTE: &str = "Running costs are the author's, not the depositors'. Each vault has a tank the author funds \
-     and their fees refill: metered compute, and gas where a chain charges it.";
+     and can keep topped up from their own shares: metered compute, and gas where a chain charges \
+     it, never more than the allowances the author set.";
 
 /// What anyone can check for themselves, how, and what they need to do it.
 pub const VERIFY_CHECKS: [(&str, &str, &str); 5] = [

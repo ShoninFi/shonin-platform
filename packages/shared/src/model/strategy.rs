@@ -83,6 +83,9 @@ pub struct Strategy {
     pub claims: Vec<String>,
     /// The author's handle.
     pub author: String,
+    /// The author's address, which the vault takes the author's controls
+    /// from.
+    pub author_address: String,
     pub standing: Standing,
     pub registered: Date,
     pub days_live: u32,

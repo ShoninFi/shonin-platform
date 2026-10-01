@@ -231,7 +231,7 @@ pub fn transaction_fee_label(vault: &Vault) -> String {
 
 /// Whether a claim is still waiting on something.
 pub fn is_outstanding(claim: &HeldClaim) -> bool {
-    !matches!(claim.state, ClaimState::Paid)
+    !matches!(claim.state, ClaimState::Paid | ClaimState::Fallback)
 }
 
 // Sending things -------------------------------------------------------------
@@ -251,7 +251,10 @@ pub fn pending() -> Mutable<Pending> {
     PENDING.with(|pending| pending.clone())
 }
 
-pub use send::{activate, connect, deposit, fund_tank, refresh, resume, settle, submit, withdraw};
+pub use send::{
+    activate, connect, deposit, fund_tank, refresh, resume, retire, set_allowances, set_idle_floor,
+    set_tank_keep, settle, submit, withdraw, withdraw_tank,
+};
 
 /// The same surface where there is no browser to ask. The build-time
 /// pre-render compiles the whole app natively to write its pages out; nothing
@@ -279,6 +282,21 @@ mod send {
     pub async fn fund_tank(_slug: &str, _assets: f64) -> Result<String, String> {
         Err(NOWHERE.to_string())
     }
+    pub async fn set_tank_keep(_slug: &str, _assets: f64) -> Result<String, String> {
+        Err(NOWHERE.to_string())
+    }
+    pub async fn withdraw_tank(_slug: &str, _assets: f64) -> Result<String, String> {
+        Err(NOWHERE.to_string())
+    }
+    pub async fn set_allowances(_slug: &str, _shape: &str) -> Result<String, String> {
+        Err(NOWHERE.to_string())
+    }
+    pub async fn set_idle_floor(_slug: &str, _bps: u16) -> Result<String, String> {
+        Err(NOWHERE.to_string())
+    }
+    pub async fn retire(_slug: &str) -> Result<String, String> {
+        Err(NOWHERE.to_string())
+    }
     pub async fn submit(
         _chain: shared::Chain,
         _archive: &[u8],
@@ -291,6 +309,7 @@ mod send {
         _id: u64,
         _allowance: &str,
         _tank: f64,
+        _floor_bps: u16,
     ) -> Result<String, String> {
         Err(NOWHERE.to_string())
     }
@@ -360,14 +379,19 @@ mod send {
         apply(portfolios);
     }
 
-    /// Put money into a vault: the asset is approved, then deposited, and the
-    /// contract values itself and mints at that in the same transaction.
+    /// Ask to put money into a vault: the depositor signs the statement for
+    /// the vault's list, the asset is approved, and the request waits for the
+    /// next valuation to price it.
     pub async fn deposit(slug: &str, assets: f64) -> Result<String, String> {
         let (strategy, from) = about(slug)?;
         let chain = strategy.vault.chain;
         let vault = address_of(&strategy.vault.address)?;
         let amount = units(assets);
         let usd = asset_address(chain)?;
+
+        working("Signing the statement");
+        let statement =
+            sign_statement(chain, &from, vault, &strategy.vault.restricted.join(",")).await?;
 
         working("Approving");
         send(
@@ -382,14 +406,15 @@ mod send {
         )
         .await?;
 
-        working("Depositing");
+        working("Asking to deposit");
         let hash = send(
             chain,
             &from,
             vault,
-            IVault::depositCall {
+            IVault::requestDepositCall {
                 assets: amount,
                 receiver: address_of(&from)?,
+                statement,
             }
             .abi_encode(),
         )
@@ -399,19 +424,19 @@ mod send {
         hash
     }
 
-    /// Leave a vault. The contract pays from its idle balance if it can, and
-    /// books a claim if it cannot.
+    /// Ask to leave a vault. The next valuation prices it: paid from cash if
+    /// the cash covers it, and booked as a claim if it does not.
     pub async fn withdraw(slug: &str, shares: f64) -> Result<String, String> {
         let (strategy, from) = about(slug)?;
         let chain = strategy.vault.chain;
         let vault = address_of(&strategy.vault.address)?;
 
-        working("Withdrawing");
+        working("Asking to withdraw");
         let hash = send(
             chain,
             &from,
             vault,
-            IVault::redeemCall {
+            IVault::requestRedeemCall {
                 shares: share_units(shares),
                 receiver: address_of(&from)?,
             }
@@ -423,23 +448,104 @@ mod send {
         hash
     }
 
-    /// Settle a claim. Anyone may send this, which is the point of it.
+    /// Serve a claim: close the leaver's fraction and bring it home. Anyone
+    /// may send this, which is the point of it.
     pub async fn settle(slug: &str, claim: u64) -> Result<String, String> {
         let (strategy, from) = about(slug)?;
         let chain = strategy.vault.chain;
         let vault = address_of(&strategy.vault.address)?;
 
-        working("Settling");
+        working("Serving the claim");
         let hash = send(
             chain,
             &from,
             vault,
-            IVault::settleCall {
+            IVault::settleClaimCall {
                 claimId: U256::from(claim),
             }
             .abi_encode(),
         )
         .await;
+        done();
+        refresh().await;
+        hash
+    }
+
+    // The author's controls --------------------------------------------------
+
+    /// "Keep my tank at": topped back up from the author's shares. Zero is
+    /// off.
+    pub async fn set_tank_keep(slug: &str, assets: f64) -> Result<String, String> {
+        author_call(slug, "Setting the tank's level", |_| {
+            IVault::setTankKeepCall {
+                assets: units(assets),
+            }
+            .abi_encode()
+        })
+        .await
+    }
+
+    /// Take money out of the tank, after the bill so far is settled with the
+    /// executor's latest signed total.
+    pub async fn withdraw_tank(slug: &str, assets: f64) -> Result<String, String> {
+        let (strategy, _) = about(slug)?;
+        let total = api::usage(strategy.vault.chain, &strategy.vault.address)
+            .await
+            .map_err(|why| format!("the executor's bill could not be read: {why}"))?;
+        let signature: alloy_primitives::Bytes = total
+            .signature
+            .parse()
+            .map_err(|_| "the executor's bill was not signed".to_string())?;
+        let amount = units(assets);
+        let usage = total.total.parse::<U256>().unwrap_or_default();
+        author_call(slug, "Withdrawing from the tank", move |_| {
+            IVault::withdrawTankCall {
+                assets: amount,
+                total: usage,
+                asOf: total.as_of,
+                signature: signature.clone(),
+            }
+            .abi_encode()
+        })
+        .await
+    }
+
+    /// What the agent may use, which is the most its tank can be charged.
+    pub async fn set_allowances(slug: &str, shape: &str) -> Result<String, String> {
+        let allowances = chain::allowances(&shared::Allowances::shape(shape));
+        author_call(slug, "Setting the allowances", move |_| {
+            IVault::setAllowancesCall {
+                allowances: allowances.clone(),
+            }
+            .abi_encode()
+        })
+        .await
+    }
+
+    /// The share of value kept as cash. Raising it applies at once; lowering
+    /// it waits a day.
+    pub async fn set_idle_floor(slug: &str, bps: u16) -> Result<String, String> {
+        author_call(slug, "Setting the idle floor", move |_| {
+            IVault::setIdleFloorCall { bps }.abi_encode()
+        })
+        .await
+    }
+
+    /// Stop taking deposits and wind the vault down.
+    pub async fn retire(slug: &str) -> Result<String, String> {
+        author_call(slug, "Retiring", |_| IVault::retireCall {}.abi_encode()).await
+    }
+
+    async fn author_call(
+        slug: &str,
+        what: &str,
+        call: impl Fn(Address) -> Vec<u8>,
+    ) -> Result<String, String> {
+        // The contract refuses anyone but the author, and says so.
+        let (strategy, from) = about(slug)?;
+        let vault = address_of(&strategy.vault.address)?;
+        working(what);
+        let hash = send(strategy.vault.chain, &from, vault, call(vault)).await;
         done();
         refresh().await;
         hash
@@ -535,18 +641,49 @@ mod send {
     }
 
     /// Activate a reviewed and built agent: create its vault, with the
-    /// allowances its tank is charged against and a starting tank. Returns the
-    /// agent's slug.
+    /// allowances its tank is charged against, its idle floor and a starting
+    /// tank, on the terms the author has read. The author signs the
+    /// depositor's statement first, like every holder. Returns the agent's
+    /// slug.
     pub async fn activate(
         chain: shared::Chain,
         id: u64,
         allowance: &str,
         tank: f64,
+        floor_bps: u16,
     ) -> Result<String, String> {
         let from = signer()?;
-        let factory = address_of(&setup(chain)?.addresses.factory)?;
+        let config = setup(chain)?;
+        let factory = address_of(&config.addresses.factory)?;
         let usd = asset_address(chain)?;
         let funding = units(tank);
+        let strategy_id = U256::from(id);
+
+        let vault = read(
+            chain,
+            factory,
+            IVaultFactory::predictVaultCall {
+                strategyId: strategy_id,
+            },
+        )
+        .await?;
+        let restricted = read(
+            chain,
+            factory,
+            IVaultFactory::restrictedForCall {
+                strategyId: strategy_id,
+            },
+        )
+        .await?
+        .text;
+        let terms: alloy_primitives::B256 = config
+            .terms
+            .terms_hash
+            .parse()
+            .map_err(|_| "the platform's terms could not be read".to_string())?;
+
+        working("Signing the statement");
+        let statement = sign_statement(chain, &from, vault, &restricted).await?;
 
         working("Approving the tank");
         send(
@@ -567,15 +704,85 @@ mod send {
             &from,
             factory,
             IVaultFactory::activateCall {
-                strategyId: U256::from(id),
+                strategyId: strategy_id,
                 allowances: chain::allowances(&shared::Allowances::shape(allowance)),
+                idleFloorBps: floor_bps,
                 tankFunding: funding,
+                tankKeep: U256::ZERO,
+                statement,
+                terms,
             }
             .abi_encode(),
         )
         .await?;
         done();
         Ok(shared::Strategy::slug_for(chain, id))
+    }
+
+    /// The depositor's statement, as the vault checks it: typed data a wallet
+    /// shows the person, with the words and the list they are agreeing to.
+    async fn sign_statement(
+        chain: shared::Chain,
+        from: &str,
+        vault: Address,
+        restricted: &str,
+    ) -> Result<alloy_primitives::Bytes, String> {
+        let config = setup(chain)?;
+        let typed = serde_json::json!({
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"},
+                ],
+                "Statement": [
+                    {"name": "depositor", "type": "address"},
+                    {"name": "statement", "type": "string"},
+                    {"name": "restricted", "type": "string"},
+                ],
+            },
+            "primaryType": "Statement",
+            "domain": {
+                "name": "Shonin Vault",
+                "version": "1",
+                "chainId": config.chain.chain_id,
+                "verifyingContract": format!("{vault:?}"),
+            },
+            "message": {
+                "depositor": from,
+                "statement": chain::statement::TEXT,
+                "restricted": restricted,
+            },
+        });
+        let params = serde_json::json!([from, typed.to_string()]);
+        let how = holdings().lock_ref().how.clone();
+        let signature = match how {
+            Some(Connection::Browser) => ask_wallet("eth_signTypedData_v4", params).await?,
+            Some(Connection::Development) => {
+                ask_chain(chain, "eth_signTypedData_v4", params).await?
+            }
+            _ => return Err("This connection signs nothing.".to_string()),
+        };
+        signature
+            .parse()
+            .map_err(|_| "the wallet's signature could not be read".to_string())
+    }
+
+    /// Ask a contract something, through the chain's own endpoint.
+    async fn read<C: SolCall>(
+        chain: shared::Chain,
+        to: Address,
+        call: C,
+    ) -> Result<C::Return, String> {
+        let request = serde_json::json!([{
+            "to": format!("{to:?}"),
+            "data": format!("0x{}", alloy_primitives::hex::encode(call.abi_encode())),
+        }, "latest"]);
+        let answer = ask_chain(chain, "eth_call", request).await?;
+        let bytes = alloy_primitives::hex::decode(answer.trim_start_matches("0x"))
+            .map_err(|_| "the chain answered in something other than hex".to_string())?;
+        C::abi_decode_returns(&bytes).map_err(|error| error.to_string())
     }
 
     /// The connected address, if it can sign.
@@ -662,25 +869,20 @@ mod send {
         });
 
         let how = holdings().lock_ref().how.clone();
+        let params = serde_json::json!([request]);
         match how {
-            Some(Connection::Browser) => through_the_browser(request).await,
-            Some(Connection::Development) => through_the_chain(chain, request).await,
+            Some(Connection::Browser) => ask_wallet("eth_sendTransaction", params).await,
+            Some(Connection::Development) => ask_chain(chain, "eth_sendTransaction", params).await,
             _ => Err("This connection signs nothing.".to_string()),
         }
     }
 
     /// Ask the wallet the viewer has installed.
-    async fn through_the_browser(request: serde_json::Value) -> Result<String, String> {
+    async fn ask_wallet(method: &str, params: serde_json::Value) -> Result<String, String> {
         let provider = injected().ok_or("no browser wallet is installed")?;
         let arguments = js_sys::Object::new();
-        set(
-            &arguments,
-            "method",
-            &JsValue::from_str("eth_sendTransaction"),
-        );
-        let params = js_sys::Array::new();
-        params.push(&to_js(&request)?);
-        set(&arguments, "params", &params);
+        set(&arguments, "method", &JsValue::from_str(method));
+        set(&arguments, "params", &to_js(&params)?);
 
         let call = js_sys::Reflect::get(&provider, &JsValue::from_str("request"))
             .map_err(|_| "that wallet does not take requests".to_string())?;
@@ -690,23 +892,25 @@ mod send {
         let answer = call
             .call1(&provider, &arguments)
             .map_err(|error| said(&error))?;
-        let hash = JsFuture::from(js_sys::Promise::from(answer))
+        let answer = JsFuture::from(js_sys::Promise::from(answer))
             .await
             .map_err(|error| said(&error))?;
-        Ok(hash.as_string().unwrap_or_default())
+        Ok(answer.as_string().unwrap_or_default())
     }
 
-    /// Ask the chain, which holds the key itself.
-    async fn through_the_chain(
+    /// Ask the chain directly: on a development chain it holds the key
+    /// itself, and anyone may read from it.
+    async fn ask_chain(
         chain: shared::Chain,
-        request: serde_json::Value,
+        method: &str,
+        params: serde_json::Value,
     ) -> Result<String, String> {
         let setup = setup(chain)?;
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "eth_sendTransaction",
-            "params": [request],
+            "method": method,
+            "params": params,
         });
         let reply: serde_json::Value = gloo_net::http::Request::post(&setup.rpc_url)
             .json(&body)
@@ -789,6 +993,16 @@ mod send {
     fn readable(message: &str) -> String {
         if message.contains("WrongState") {
             "This vault is not taking deposits.".to_string()
+        } else if message.contains("NoStatement") || message.contains("BadSignature") {
+            "The vault needs your signed statement for its list first.".to_string()
+        } else if message.contains("NotAllowed") {
+            "Only the agent's author can do that.".to_string()
+        } else if message.contains("TooSmall") {
+            "That is under the vault's minimum.".to_string()
+        } else if message.contains("BelowFloor") {
+            "That would take the vault's cash below its idle floor.".to_string()
+        } else if message.contains("Stale") {
+            "The executor's bill is out of date; try again in a moment.".to_string()
         } else if message.contains("NothingToDo") {
             "There is nothing to do here.".to_string()
         } else if message.contains("insufficient") || message.contains("Insufficient") {

@@ -200,6 +200,7 @@ async fn one(
             .map(|manifest| manifest.description.claims.clone())
             .unwrap_or_default(),
         author: handle_of(chain, deployments, author).await,
+        author_address: address_of(author),
         standing,
         registered: day(registered.registeredAt),
         days_live: days_live as u32,
