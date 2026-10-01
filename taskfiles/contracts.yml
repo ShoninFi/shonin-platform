@@ -15,6 +15,11 @@ tasks:
     cmds:
       - cd "{{.PATH_CONTRACTS_EVM}}" && forge build
 
+  sizes:
+    desc: "Fail if any EVM contract is over the chain's contract-size limit"
+    cmds:
+      - cd "{{.PATH_CONTRACTS_EVM}}" && forge build --sizes --skip test --skip script
+
   test:
     desc: "Run the EVM contracts' tests"
     cmds:
