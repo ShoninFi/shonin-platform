@@ -35,6 +35,7 @@ contract StationFactory is IStationFactory {
     error NotVaultFactory();
     error NotBlessed();
     error WrongChain();
+    error UnknownDriver();
     error OutOfRange();
 
     constructor(address initializer_) {
@@ -60,6 +61,7 @@ contract StationFactory is IStationFactory {
         bytes32 bundleHash,
         bytes32[] calldata drivers,
         bytes32[] calldata bridges,
+        uint256[] calldata chains,
         uint16 exitBandBps
     ) external returns (address) {
         if (msg.sender != vaultFactory) revert NotVaultFactory();
@@ -70,6 +72,7 @@ contract StationFactory is IStationFactory {
                 bundleHash: bundleHash,
                 drivers: drivers,
                 bridges: bridges,
+                chains: chains,
                 exitBandBps: exitBandBps
             })
         );
@@ -86,11 +89,18 @@ contract StationFactory is IStationFactory {
         // ...and the builder that built the bundle said what this chain's
         // station holds.
         bytes32 digest = MessageHashUtils.toEthSignedMessageHash(
-            stationDigest(spec.vaultChain, spec.bundleHash, spec.drivers, spec.bridges, spec.exitBandBps)
+            stationDigest(
+                spec.vaultChain, spec.bundleHash, spec.drivers, spec.bridges, spec.chains, spec.exitBandBps
+            )
         );
         (address builder, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, builderSignature);
         if (err != ECDSA.RecoverError.NoError || !registry.isBlessedAs(builder, ImageKind.Builder)) {
             revert NotBlessed();
+        }
+        // A driver this chain's registry doesn't know could never value,
+        // stop or unwind the station.
+        for (uint256 i = 0; i < spec.drivers.length; i++) {
+            if (registry.unwindDriver(spec.drivers[i]) == address(0)) revert UnknownDriver();
         }
         return _create(spec);
     }
@@ -108,6 +118,7 @@ contract StationFactory is IStationFactory {
         bytes32 bundleHash,
         bytes32[] calldata drivers,
         bytes32[] calldata bridges,
+        uint256[] calldata chains,
         uint16 exitBandBps
     ) public view returns (bytes32) {
         return keccak256(
@@ -119,6 +130,7 @@ contract StationFactory is IStationFactory {
                 bundleHash,
                 keccak256(abi.encode(drivers)),
                 keccak256(abi.encode(bridges)),
+                keccak256(abi.encode(chains)),
                 exitBandBps
             )
         );

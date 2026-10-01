@@ -148,7 +148,7 @@ contract StationTest is Fixture {
         ownStations.initialize(address(attestation), address(usd), address(this), address(new Station()));
 
         vault = new FakeVault(IERC20(address(usd)));
-        station = Station(ownStations.createHome(address(vault), BUNDLE, locals(), bridges(), 100));
+        station = Station(ownStations.createHome(address(vault), BUNDLE, locals(), bridges(), others(), 100));
         vault.setStation(address(station));
         give(address(vault), 100_000e6);
         vault.fund(100_000e6);
@@ -159,6 +159,12 @@ contract StationTest is Fixture {
     function locals() internal pure returns (bytes32[] memory list) {
         list = new bytes32[](1);
         list[0] = "local";
+    }
+
+    /// The chain the tests' vault also trades on.
+    function others() internal pure returns (uint256[] memory list) {
+        list = new uint256[](1);
+        list[0] = 8453;
     }
 
     function bridges() internal pure returns (bytes32[] memory list) {
@@ -201,13 +207,16 @@ contract StationTest is Fixture {
     }
 
     function test_creating_again_returns_the_same_station() public {
-        assertEq(ownStations.createHome(address(vault), BUNDLE, locals(), bridges(), 100), address(station));
+        assertEq(
+            ownStations.createHome(address(vault), BUNDLE, locals(), bridges(), others(), 100),
+            address(station)
+        );
     }
 
     function test_only_the_vault_factory_creates_a_home_station() public {
         vm.prank(alice);
         vm.expectRevert(StationFactory.NotVaultFactory.selector);
-        ownStations.createHome(address(1), BUNDLE, locals(), bridges(), 100);
+        ownStations.createHome(address(1), BUNDLE, locals(), bridges(), others(), 100);
     }
 
     function test_only_the_named_key_initialises_the_factory_and_only_once() public {
@@ -345,7 +354,7 @@ contract StationTest is Fixture {
             spec.drivers[how] = bytes32(uint256(keccak256(abi.encode("greedy", how))));
         }
         Station greedyStation =
-            Station(ownStations.createHome(spec.vault, BUNDLE, spec.drivers, bridges(), 100));
+            Station(ownStations.createHome(spec.vault, BUNDLE, spec.drivers, bridges(), others(), 100));
         give(address(greedyStation), 1000e6);
         blessExecutorKey(executor, spec.vault, BUNDLE);
 
@@ -428,6 +437,7 @@ contract StationTest is Fixture {
             bundleHash: BUNDLE,
             drivers: locals(),
             bridges: bridges(),
+            chains: new uint256[](0),
             exitBandBps: 100
         });
     }
@@ -436,7 +446,7 @@ contract StationTest is Fixture {
         return signed(
             BUILDER_KEY,
             ownStations.stationDigest(
-                spec.vaultChain, spec.bundleHash, spec.drivers, spec.bridges, spec.exitBandBps
+                spec.vaultChain, spec.bundleHash, spec.drivers, spec.bridges, spec.chains, spec.exitBandBps
             )
         );
     }

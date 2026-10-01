@@ -317,19 +317,18 @@ contract CrossChainTest is Fixture {
         assertEq(v.gross, v.cash + 8000e6 + 1, "a send was counted twice or not at all");
     }
 
-    function test_a_post_names_only_earlier_sends_to_its_own_chain_and_each_once() public {
+    function test_a_post_names_only_earlier_sends_and_each_once() public {
         depositTwo(alice, 100_000e6);
         vm.startPrank(executor);
-        station.pull(3000e6);
+        station.pull(2000e6);
         station.bridge("local-bridge", OTHER, 1000e6, "");
-        station.bridge("local-bridge", 1234, 1000e6, "");
         vm.stopPrank();
         uint64 time = open();
         vm.prank(executor);
         station.bridge("local-bridge", OTHER, 1000e6, "");
 
         uint64[] memory twice = new uint64[](2);
-        uint64[][3] memory refused = [inFlight(1), inFlight(2), twice];
+        uint64[][3] memory refused = [inFlight(1), inFlight(5), twice];
         for (uint256 i = 0; i < refused.length; i++) {
             StationPost memory p = postOf(0, 0);
             p.inFlightFromHome = refused[i];
@@ -337,6 +336,15 @@ contract CrossChainTest is Fixture {
             vm.expectRevert(IVault.NotAllowed.selector);
             vault.postStation(time, OTHER, p, sig);
         }
+    }
+
+    function test_a_station_bridges_only_to_a_chain_the_vault_trades_on() public {
+        depositTwo(alice, 100_000e6);
+        vm.startPrank(executor);
+        station.pull(1000e6);
+        vm.expectRevert(Station.NoRoute.selector);
+        station.bridge("local-bridge", 1234, 1000e6, "");
+        vm.stopPrank();
     }
 
     // Exit costs ------------------------------------------------------------

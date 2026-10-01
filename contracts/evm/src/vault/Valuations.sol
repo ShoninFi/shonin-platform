@@ -90,6 +90,7 @@ library Valuations {
             if (previous.time >= time) revert IVault.AlreadyValued();
             if (previous.status == ValuationStatus.Open) revert IVault.Unsettled();
         }
+        s.passDone();
         if (owed(s)) revert IVault.Unsettled();
 
         syncHolding(s);
@@ -316,10 +317,11 @@ library Valuations {
     function owed(Layout storage s) internal view returns (bool) {
         if (s.lastPriced == 0) return false;
         uint256 i = s.requestCursor;
-        uint256 count = s.requests.length;
-        while (i < count && s.requests[i].done) i++;
-        if (i == count) return false;
-        return s.requests[i].earliest <= s.latest().time;
+        if (i == s.requests.length) return false;
+        Request storage r = s.requests[i];
+        // One taken through the fallback is passed by `settle`, a bounded
+        // number at a time, before the next valuation.
+        return r.done || r.earliest <= s.latest().time;
     }
 
     // Settlement ------------------------------------------------------------
@@ -329,7 +331,11 @@ library Valuations {
         uint256 i = s.requestCursor;
         uint256 vi = s.valuationCursor;
         uint256 count = s.requests.length;
-        while (settled < max && i < count) {
+        // Every request passed counts toward `max`, done or not, so no number
+        // of requests taken through the fallback can make one call too long.
+        uint256 steps;
+        while (steps < max && i < count) {
+            steps++;
             Request storage r = s.requests[i];
             if (r.done) {
                 i++;
@@ -561,6 +567,7 @@ library Valuations {
         // nothing can, not a way round the fee.
         if (s.lastPriced != 0 && s.latest().time >= r.earliest) revert IVault.NotAllowed();
         r.done = true;
+        s.passDone();
         if (deposit) {
             s.escrow -= r.amount;
             s.pay(r.owner, r.amount);
@@ -592,6 +599,7 @@ library Valuations {
         if (s.lastPriced != 0 && s.latest().time >= r.earliest) revert IVault.NotAllowed();
         s.queuedClaims -= 1;
         r.done = true;
+        s.passDone();
         s.reservedCash -= s.claimReserved[claimId];
         s.claimReserved[claimId] = 0;
         uint256 home = s.claimHome[claimId];

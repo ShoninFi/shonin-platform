@@ -32,7 +32,7 @@ contract StationLimitsTest is Fixture {
 
         vm.startPrank(executor);
         station.pull(50_000e6);
-        vm.expectRevert(Station.NotDeclared.selector);
+        vm.expectRevert(Station.NoRoute.selector);
         station.bridge("local-bridge", 999, 50_000e6, "");
         vm.stopPrank();
         value(vault);
@@ -80,8 +80,9 @@ contract StationLimitsTest is Fixture {
         drivers[0] = "local";
         bytes32[] memory bridges = new bytes32[](1);
         bridges[0] = "local-bridge";
-        bytes memory word =
-            signed(BUILDER_KEY, ownStations.stationDigest(8453, BUNDLE, drivers, bridges, 100));
+        bytes memory word = signed(
+            BUILDER_KEY, ownStations.stationDigest(8453, BUNDLE, drivers, bridges, new uint256[](0), 100)
+        );
 
         StationSpec memory spec = StationSpec({
             vaultChain: 8453,
@@ -89,6 +90,7 @@ contract StationLimitsTest is Fixture {
             bundleHash: BUNDLE,
             drivers: drivers,
             bridges: bridges,
+            chains: new uint256[](0),
             exitBandBps: 1000
         });
         vm.prank(executor);

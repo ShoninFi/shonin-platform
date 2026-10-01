@@ -120,6 +120,7 @@ contract VaultFactory is IVaultFactory {
             record.bundleHash,
             drivers,
             others.length == 0 ? new bytes32[](0) : record.bridges,
+            others,
             cfg.exitBandBps
         );
 

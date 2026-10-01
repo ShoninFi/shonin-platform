@@ -274,6 +274,18 @@ library VaultStorage {
         return v.time > s.haltedAt && v.gross == v.cash + 1 && !s.moving[s.lastPriced - 1];
     }
 
+    /// Move the queue's cursor past requests already done (taken through the
+    /// fallback), a bounded number at a time, so nothing has to walk them
+    /// all at once.
+    function passDone(Layout storage s) internal {
+        uint256 i = s.requestCursor;
+        uint256 end = i + 64;
+        uint256 count = s.requests.length;
+        if (end > count) end = count;
+        while (i < end && s.requests[i].done) i++;
+        s.requestCursor = i;
+    }
+
     function queue(
         Layout storage s,
         address owner,

@@ -488,9 +488,8 @@ library Upkeep {
             revert IVault.NotYet();
         }
         if (s.valuations[s.valuations.length - 1].status == ValuationStatus.Open) revert IVault.Unsettled();
-        for (uint256 i = s.requestCursor; i < s.requests.length; i++) {
-            if (!s.requests[i].done) revert IVault.Unsettled();
-        }
+        s.passDone();
+        if (s.requestCursor != s.requests.length) revert IVault.Unsettled();
         Valuations.syncHolding(s);
         Valuations.payday(s, s.cash + 1, s.totalSupply + OFFSET, uint64(block.timestamp));
         _setState(s, VaultState.Closed);

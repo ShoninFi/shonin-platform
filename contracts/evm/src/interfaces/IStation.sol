@@ -20,6 +20,9 @@ struct StationSpec {
     bytes32[] drivers;
     /// The bridges it declared.
     bytes32[] bridges;
+    /// The other chains the vault trades on: with the vault's own, the only
+    /// ones a bridge send may go to.
+    uint256[] chains;
     /// How far from the venue's own price a closing order may fill.
     uint16 exitBandBps;
 }
@@ -105,6 +108,7 @@ interface IStationFactory {
         bytes32 bundleHash,
         bytes32[] calldata drivers,
         bytes32[] calldata bridges,
+        uint256[] calldata chains,
         uint16 exitBandBps
     ) external returns (address);
     /// Another chain, called by a key blessed there as the vault's executor,
@@ -119,6 +123,7 @@ interface IStationFactory {
         bytes32 bundleHash,
         bytes32[] calldata drivers,
         bytes32[] calldata bridges,
+        uint256[] calldata chains,
         uint16 exitBandBps
     ) external view returns (bytes32);
 
