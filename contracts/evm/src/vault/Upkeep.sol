@@ -320,7 +320,11 @@ library Upkeep {
         if (claim.state != ClaimState.Pending && claim.state != ClaimState.Waiting) {
             revert IVault.NotAllowed();
         }
-        if (s.state == VaultState.Closed || s.state == VaultState.Cancelled) revert IVault.WrongState();
+        // A vault ready to close pays its claims from the closed vault, so a
+        // try now could only hold the close off.
+        if (s.state == VaultState.Closed || s.state == VaultState.Cancelled || s.readyToClose()) {
+            revert IVault.WrongState();
+        }
         // Cash at home that already covers it: priced as it stands, with
         // nothing to close.
         if (s.lastPriced != 0) {
@@ -338,7 +342,7 @@ library Upkeep {
         if (fraction > WAD) fraction = WAD;
         if (fraction == 0) fraction = 1;
         // And its part of the cash, as it stands before the close.
-        uint256 cashShare = s.free().mulDiv(claim.shares, s.totalSupply - s.closedShares);
+        uint256 cashShare = s.sharedCash().mulDiv(claim.shares, s.totalSupply - s.closedShares);
         uint256 home;
         bool blocked;
         s.closing = true;
@@ -392,6 +396,7 @@ library Upkeep {
         s.claimReserved[claimId] = reserve;
         s.claimHome[claimId] = home;
         s.reservedCash += reserve;
+        if (home == 0) s.coveredReserved += reserve;
         claim.state = ClaimState.Queued;
         claim.lastAttemptAt = uint64(block.timestamp);
         s.queuedClaims += 1;

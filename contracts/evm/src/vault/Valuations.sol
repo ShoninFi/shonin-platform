@@ -467,8 +467,7 @@ library Valuations {
         s.queuedClaims -= 1;
         // Its own cash, set aside when its fraction came home, is released
         // to it first.
-        s.reservedCash -= s.claimReserved[r.ref];
-        s.claimReserved[r.ref] = 0;
+        s.release(r.ref);
         uint256 shares = claim.shares;
         uint256 home = s.claimHome[r.ref];
         (uint256 slice, uint256 burned, uint256 payout) = exitOf(s, v, shares);
@@ -600,8 +599,7 @@ library Valuations {
         s.queuedClaims -= 1;
         r.done = true;
         s.passDone();
-        s.reservedCash -= s.claimReserved[claimId];
-        s.claimReserved[claimId] = 0;
+        s.release(claimId);
         uint256 home = s.claimHome[claimId];
         if (home == 0) {
             // Queued on the cash alone: nothing was closed for it.
@@ -663,9 +661,11 @@ library Valuations {
     /// No fee: nothing can be priced. The leaver's units are a claim on
     /// their fraction of whatever the stations hold.
     function _proRata(Layout storage s, address owner, uint256 shares) private {
-        // Queued claims' shares own their set-aside cash and none of the
-        // rest, so the free cash is shared over the other shares.
-        uint256 assets = s.free().mulDiv(shares, s.totalSupply - s.closedShares);
+        // Claims whose fraction was closed own their set-aside cash and none
+        // of the rest, so the cash is shared over the other shares, with what
+        // is set aside for claims queued on the cash alone among it.
+        uint256 assets = s.sharedCash().mulDiv(shares, s.totalSupply - s.closedShares);
+        if (assets > s.free()) assets = s.free();
         // The shares own what the units don't; these shares' part of that
         // is the leaver's for good, whatever fees are minted later.
         uint256 fraction = shares.mulDiv(WAD - s.liveUnits(), s.totalSupply - s.closedShares);

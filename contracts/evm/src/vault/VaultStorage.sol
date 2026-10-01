@@ -85,6 +85,10 @@ struct Layout {
     uint256 queuedClaims;
     /// Cash set aside for those claims, which nothing else may pay from.
     uint256 reservedCash;
+    /// The part of it set aside for claims queued on the cash alone, with
+    /// nothing closed: their shares still own their fraction of everything,
+    /// so this cash is still shared with them until they are priced.
+    uint256 coveredReserved;
     mapping(uint256 => uint256) claimReserved;
     /// The request a queued claim is priced by.
     mapping(uint256 => uint256) claimRequest;
@@ -251,6 +255,21 @@ library VaultStorage {
     /// may draw on.
     function free(Layout storage s) internal view returns (uint256) {
         return s.cash - s.reservedCash;
+    }
+
+    /// The free cash the shares that still own the stations share between
+    /// them: the free cash and what is set aside for claims queued on the
+    /// cash alone, whose shares are among them.
+    function sharedCash(Layout storage s) internal view returns (uint256) {
+        return free(s) + s.coveredReserved;
+    }
+
+    /// Release a queued claim's set-aside cash.
+    function release(Layout storage s, uint256 claimId) internal {
+        uint256 reserve = s.claimReserved[claimId];
+        s.reservedCash -= reserve;
+        if (s.claimHome[claimId] == 0) s.coveredReserved -= reserve;
+        s.claimReserved[claimId] = 0;
     }
 
     function latest(Layout storage s) internal view returns (Valuation storage) {
