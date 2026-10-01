@@ -6,7 +6,7 @@
 //! nobody can backfill it. Nothing a depositor needs in order to leave
 //! depends on it.
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::Address;
 use anyhow::{Context, Result};
 use chain::bindings::vault::IVault;
 use chain::{Client, Deployments, KeyClient};
@@ -88,8 +88,18 @@ impl Reporter {
     async fn build(&self, counters: Counters) -> Result<HealthPost> {
         let tank = self.chain.read(self.vault, IVault::tankCall {}).await?;
         let balance = to_decimal(tank.balance, ASSET_DECIMALS)?;
-        let daily = to_decimal(tank.dailyCap.max(U256::from(1u64)), ASSET_DECIMALS)?;
-        let runway: f64 = format!("{}", balance / daily).parse().unwrap_or(0.0);
+        // How many days the tank lasts at what the allowances cost a day.
+        let allowances = crate::usage::shared_allowances(
+            &self
+                .chain
+                .read(self.vault, IVault::allowancesCall {})
+                .await?,
+        );
+        let daily = shared::Prices::published()
+            .daily_cap(&allowances)
+            .max(0.000_001);
+        let held: f64 = format!("{balance}").parse().unwrap_or(0.0);
+        let runway = held / daily;
 
         let rejection_rate = if counters.submissions == 0 {
             0.0

@@ -1,11 +1,14 @@
 //! The attested executor.
 //!
-//! It finds the vaults that are open, gets a key blessed for each one, gets
-//! that key approved on the venue, and runs each vault's strategy. The key it
-//! holds can trade and nothing else: the venue refuses a withdrawal signed by
-//! it, and the vault's contract will only move money between its own two
-//! accounts. Whatever a strategy decides, that is the whole of what can
-//! happen.
+//! It finds the vaults that are open, gets a key blessed for each one, has the
+//! vault's station approve that key at the venue, and runs each vault's agent.
+//! The key can trade and nothing else: the venue refuses a withdrawal signed by
+//! it, and the station only moves money between the vault's own accounts.
+//! Whatever an agent decides, that is the whole of what can happen.
+//!
+//! It also keeps each vault priced, valuing it every slot and settling what
+//! the valuation prices, and keeps a signed running total of what running the
+//! agent costs, for the keeper to collect from the tank.
 
 mod feed;
 mod health;
@@ -18,13 +21,17 @@ mod watch;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use alloy::primitives::U256;
 use alloy::primitives::{Address, B256, keccak256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
+use axum::response::IntoResponse;
 use chain::bindings::factory::IVaultFactory;
+use chain::bindings::station::IStation;
 use chain::bindings::strategies::IStrategyRegistry;
 use chain::bindings::vault::{IVault, VaultState};
 use chain::{Client, Deployments};
@@ -59,8 +66,12 @@ async fn main() -> Result<()> {
     let served = args.chain_args.connect_all().await?;
     tracing::info!(image = %chain::attest::image_digest("executor"), "the executor is up");
 
+    let totals: usage::Totals = Default::default();
     if args.port != 0 {
-        tokio::spawn(serve_status(SocketAddr::from(([127, 0, 0, 1], args.port))));
+        tokio::spawn(serve_status(
+            SocketAddr::from(([127, 0, 0, 1], args.port)),
+            totals.clone(),
+        ));
     }
 
     let engine = runner::engine()?;
@@ -73,6 +84,7 @@ async fn main() -> Result<()> {
     for served in served {
         let engine = engine.clone();
         let args = args.clone();
+        let totals = totals.clone();
         chains.spawn(async move {
             let mut running: HashMap<Address, tokio::task::JoinHandle<()>> = HashMap::new();
             loop {
@@ -82,6 +94,7 @@ async fn main() -> Result<()> {
                     &served.deployments,
                     &engine,
                     &args,
+                    &totals,
                     &mut running,
                 )
                 .await
@@ -104,6 +117,7 @@ async fn sweep(
     deployments: &Deployments,
     engine: &Engine,
     args: &Args,
+    totals: &usage::Totals,
     running: &mut HashMap<Address, tokio::task::JoinHandle<()>>,
 ) -> Result<()> {
     running.retain(|_, task| !task.is_finished());
@@ -117,7 +131,10 @@ async fn sweep(
             continue;
         }
         let state = client.read(vault, IVault::stateCall {}).await?;
-        if !matches!(state, VaultState::Open) {
+        // A retired vault still runs until it is evicted.
+        if !matches!(state, VaultState::Open | VaultState::WindingDown)
+            || finished(client, vault).await?
+        {
             continue;
         }
         let bundle = client.read(vault, IVault::bundleHashCall {}).await?;
@@ -136,6 +153,7 @@ async fn sweep(
         let store = args.store.clone();
         let api = args.api_url.clone();
         let network = args.chain_args.network.to_string();
+        let totals = totals.clone();
         let task = tokio::spawn(async move {
             if let Err(error) = serve(
                 client,
@@ -147,6 +165,7 @@ async fn sweep(
                 store,
                 api,
                 network,
+                totals,
             )
             .await
             {
@@ -171,6 +190,7 @@ async fn serve(
     store: PathBuf,
     api: String,
     network: String,
+    totals: usage::Totals,
 ) -> Result<()> {
     // The key is made here and never written down. Deriving it from the image
     // and the vault means a restart picks the same one back up, so the
@@ -195,16 +215,18 @@ async fn serve(
     .await?;
     tracing::info!(vault = %vault, key = %key.address, until = info.blessedUntil, "blessed");
 
-    // Anyone may send this; the contract obeys only what the registry says.
+    // The station is the venue account's master and approves the key there.
+    // Anyone may ask; it obeys only what the registry says.
+    let station = chain.read(vault, IVault::homeStationCall {}).await?;
     key.send(
-        vault,
-        IVault::approveKeyCall {
-            venue: chain::accounts::VENUE_ID,
+        station,
+        IStation::approveKeyCall {
+            driver: chain::names::LOCAL_DRIVER,
             key: key.address,
         },
     )
     .await
-    .context("the vault would not approve the key")?;
+    .context("the station would not approve the key")?;
 
     // Keep it blessed, and keep the venue's approval following the blessing:
     // a key that stopped attesting stops being able to trade.
@@ -222,9 +244,9 @@ async fn serve(
             tokio::spawn(async move {
                 if let Err(error) = key
                     .send(
-                        vault,
-                        IVault::approveKeyCall {
-                            venue: chain::accounts::VENUE_ID,
+                        station,
+                        IStation::approveKeyCall {
+                            driver: chain::names::LOCAL_DRIVER,
                             key: key.address,
                         },
                     )
@@ -265,23 +287,41 @@ async fn serve(
         )
         .await?;
     let driver = driver_for(&store, registered.manifestHash, &network)?;
-    // The vault holds its author's allowances as a daily cap; until it records
-    // the allowances themselves, the host holds every agent to the modest
-    // shape.
-    let allowances = shared::Allowances::modest();
 
-    // What the day cost, said once a day and charged to the author's tank.
-    tokio::spawn(usage::run(chain.clone(), key.clone(), vault, allowances));
+    // What running it costs, kept as one signed total, and whether the tank
+    // can still pay for it.
+    let dry = Arc::new(AtomicBool::new(false));
+    tokio::spawn(usage::run(
+        chain.clone(),
+        key.clone(),
+        vault,
+        totals,
+        dry.clone(),
+    ));
+    // Value the vault every slot and settle what each valuation prices.
+    tokio::spawn(price(chain.clone(), key.clone(), vault));
 
-    // A strategy that stops is started again. It rebuilds its own picture from
+    // An agent that stops is started again. It rebuilds its own picture from
     // the venue, so a restart costs it nothing but the time.
     loop {
+        if dry.load(Ordering::SeqCst) {
+            if finished(&chain, vault).await? {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+        // The author's allowances as they stand: a change applies from the
+        // agent's next start.
+        let allowances =
+            usage::shared_allowances(&chain.read(vault, IVault::allowancesCall {}).await?);
         let (account_tx, account_rx) = tokio::sync::mpsc::unbounded_channel();
         let (vault_tx, vault_rx) = tokio::sync::mpsc::unbounded_channel();
         let from_block = chain.block_number().await?;
         let watching = tokio::spawn(watch::run(
             chain.clone(),
             vault,
+            station,
             deployments.venue,
             from_block,
             account_tx,
@@ -292,30 +332,42 @@ async fn serve(
             chain: chain.clone(),
             key: key.clone(),
             vault,
+            station,
             venue: deployments.venue,
+            usd: deployments.usd,
+            factory: deployments.factory,
+            home_chain: vault_chain.name().to_string(),
             driver: driver.clone(),
             allowances,
         };
-        let outcome = runner
-            .run(
+        let component = bundle_path(&store, bundle);
+        let stopped_dry = tokio::select! {
+            outcome = runner.run(
                 &engine,
-                &bundle_path(&store, bundle),
+                &component,
                 account_rx,
                 vault_rx,
                 counters.clone(),
-            )
-            .await;
+            ) => {
+                if let Err(error) = outcome {
+                    tracing::warn!(%vault, %error, "the agent could not be run");
+                }
+                false
+            }
+            // A dry tank stops the agent where it is, positions left as they
+            // are, until the author tops it up.
+            _ = until(dry.clone()) => true,
+        };
         watching.abort();
-        if let Err(error) = outcome {
-            tracing::warn!(%vault, %error, "the strategy could not be run");
-        }
 
-        // The vault may have been killed or frozen while it ran, in which case
-        // there is nothing left to restart.
-        let state = chain.read(vault, IVault::stateCall {}).await?;
-        if !matches!(state, VaultState::Open) {
-            tracing::info!(%vault, "the vault is no longer open; letting it go");
+        // Once the vault has halted and its grace is over, the station is
+        // stopped and nothing is left to run.
+        if finished(&chain, vault).await? {
+            tracing::info!(%vault, "the vault has stopped; letting it go");
             return Ok(());
+        }
+        if stopped_dry {
+            continue;
         }
         if let Ok(mut counters) = counters.lock() {
             counters.restarts += 1;
@@ -323,6 +375,102 @@ async fn serve(
         tracing::warn!(%vault, "restarting the strategy");
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
+}
+
+/// Resolve when the flag is set.
+async fn until(flag: Arc<AtomicBool>) {
+    while !flag.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Whether there is nothing left to run: the vault never opened or has
+/// closed, or it halted and the agent's grace is over.
+async fn finished(chain: &Client, vault: Address) -> Result<bool> {
+    let state = chain.read(vault, IVault::stateCall {}).await?;
+    if matches!(
+        state,
+        VaultState::None | VaultState::Closed | VaultState::Cancelled
+    ) {
+        return Ok(true);
+    }
+    let halted = chain
+        .read(
+            vault,
+            chain::bindings::station::IStationVault::haltedAtCall {},
+        )
+        .await?;
+    if halted == 0 {
+        return Ok(false);
+    }
+    let grace = chain
+        .read(
+            vault,
+            chain::bindings::station::IStationVault::haltGraceCall {},
+        )
+        .await?;
+    Ok(chain.block_timestamp().await? >= halted + grace)
+}
+
+/// Value the vault at every slot, and settle what each valuation prices.
+/// Anyone may; doing it here means a vault is never waiting on somebody else
+/// to be priced.
+async fn price(chain: Client, key: chain::KeyClient, vault: Address) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Err(error) = price_once(&chain, &key, vault).await {
+            tracing::debug!(%vault, error = format!("{error:#}"), "could not price the vault");
+        }
+        if matches!(finished(&chain, vault).await, Ok(true)) {
+            let state = chain.read(vault, IVault::stateCall {}).await;
+            if matches!(state, Ok(VaultState::Closed | VaultState::Cancelled)) {
+                return;
+            }
+        }
+    }
+}
+
+async fn price_once(chain: &Client, key: &chain::KeyClient, vault: Address) -> Result<()> {
+    let timers = chain.read(vault, IVault::timersCall {}).await?;
+    let now = chain.block_timestamp().await?;
+    let slot = now - now % timers.slotInterval;
+    let count = chain.read(vault, IVault::valuationCountCall {}).await?;
+    let last = if count.is_zero() {
+        0
+    } else {
+        chain
+            .read(
+                vault,
+                IVault::valuationAtCall {
+                    index: count - U256::from(1u64),
+                },
+            )
+            .await?
+            .time
+    };
+    if now - slot <= timers.slotWindow && last < slot {
+        // Settle what the last valuation priced first: a new one waits for it.
+        let _ = key
+            .send(
+                vault,
+                IVault::settleCall {
+                    max: U256::from(100u64),
+                },
+            )
+            .await;
+        key.send(vault, IVault::recordValuationCall {})
+            .await
+            .context("recording a valuation")?;
+    }
+    key.send(
+        vault,
+        IVault::settleCall {
+            max: U256::from(100u64),
+        },
+    )
+    .await
+    .context("settling")?;
+    Ok(())
 }
 
 /// The driver an agent trades through, from the manifest the builder
@@ -380,8 +528,29 @@ impl Seed for (B256, Address) {
     }
 }
 
-async fn serve_status(address: SocketAddr) {
-    let app = axum::Router::new().route("/health", axum::routing::get(|| async { "executor" }));
+/// The machine's own health, and each vault's signed running total for the
+/// keeper to collect.
+async fn serve_status(address: SocketAddr, totals: usage::Totals) {
+    let app = axum::Router::new()
+        .route("/health", axum::routing::get(|| async { "executor" }))
+        .route(
+            "/usage/{chain}/{vault}",
+            axum::routing::get(
+                move |axum::extract::Path((chain, vault)): axum::extract::Path<(u64, Address)>| {
+                    let totals = totals.clone();
+                    async move {
+                        let found = totals
+                            .lock()
+                            .ok()
+                            .and_then(|totals| totals.get(&(chain, vault)).cloned());
+                        match found {
+                            Some(signed) => axum::Json(signed).into_response(),
+                            None => axum::http::StatusCode::NOT_FOUND.into_response(),
+                        }
+                    }
+                },
+            ),
+        );
     if let Ok(listener) = tokio::net::TcpListener::bind(address).await {
         let _ = axum::serve(listener, app).await;
     }

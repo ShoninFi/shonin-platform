@@ -38,7 +38,11 @@ pub struct Runner {
     pub chain: Client,
     pub key: KeyClient,
     pub vault: Address,
+    pub station: Address,
     pub venue: Address,
+    pub usd: Address,
+    pub factory: Address,
+    pub home_chain: String,
     /// The driver this agent's manifest named.
     pub driver: String,
     /// What the manifest declared and the vault's tank is charged for. The
@@ -81,7 +85,11 @@ impl Runner {
                 chain: self.chain.clone(),
                 key: self.key.clone(),
                 vault: self.vault,
+                station: self.station,
                 venue: self.venue,
+                usd: self.usd,
+                factory: self.factory,
+                home_chain: self.home_chain.clone(),
                 driver: self.driver.clone(),
                 cache: Default::default(),
                 account_events: Some(account_events),

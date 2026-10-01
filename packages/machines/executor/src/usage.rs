@@ -1,106 +1,135 @@
-//! What a day of running cost, said once a day, charged to the vault's tank.
+//! What running a vault's agent has cost: one running total, signed with the
+//! vault's key and handed to whoever collects it.
 //!
-//! The statement is the author's bill and nobody else's: a tank is the
-//! author's balance, never depositors' money. It says what the day cost at the
-//! platform's published prices, and the vault's contract believes it only up
-//! to the allowances the author declared, so a wrong statement can never
-//! charge more than the author agreed to.
+//! The total is the author's bill and nobody else's: a tank is the author's
+//! balance, never depositors' money. The vault believes it only up to the
+//! allowances the author set, at the published prices, for the time that has
+//! passed, so a wrong total can never charge more than the author agreed to.
 //!
-//! What a day costs is the capacity the strategy held, for the time it held
-//! it. A strategy reserves its declared allowances for as long as it runs —
-//! the fuel rate it is topped up to, the memory it may grow into — whether or
-//! not it spends them, so that is what it pays for.
+//! What it costs is the capacity the agent held, for the time it held it: the
+//! allowances in force, whether or not it spent them. The time is measured on
+//! the wall clock, not the chain's, because a development chain's clock runs
+//! fast and a machine costs what it costs however quickly the chain believes
+//! the days are passing.
 //!
-//! The time is measured on the wall clock, not the chain's. A development
-//! chain's clock runs fast, and a machine costs what it costs however quickly
-//! the chain believes the days are passing. The chain's clock decides only
-//! which day a statement is filed for.
+//! When the unpaid part of the total reaches what the tank holds, the agent is
+//! stopped, and it starts again on a top-up: the contract has no "dry" state,
+//! and stopping is this executor's job.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, Bytes, U256};
 use anyhow::{Context, Result};
 use chain::bindings::vault::IVault;
 use chain::{Client, KeyClient};
+use serde::Serialize;
 use shared::{Allowances, Prices};
 
 use crate::scale::ASSET_DECIMALS;
 
-/// A chain day, which on a development chain passes rather faster than a real
-/// one.
-const DAY: u64 = 86_400;
+/// A signed running total, as the keeper collects it.
+#[derive(Clone, Debug, Serialize)]
+pub struct Signed {
+    /// In the asset's smallest unit.
+    pub total: String,
+    pub as_of: u64,
+    pub signature: Bytes,
+}
 
-/// Meter one vault and say what it cost, once a day.
-pub async fn run(chain: Client, key: KeyClient, vault: Address, allowances: Allowances) {
-    // Nothing is charged for the time before this instance took the vault on.
+/// The latest total for each vault this executor serves, by chain id and
+/// vault.
+pub type Totals = Arc<Mutex<HashMap<(u64, Address), Signed>>>;
+
+/// Meter one vault, keep its signed total current, and say when its tank is
+/// dry.
+pub async fn run(
+    chain: Client,
+    key: KeyClient,
+    vault: Address,
+    totals: Totals,
+    dry: Arc<AtomicBool>,
+) {
+    // The total carries on from what the vault has already collected, so it
+    // never goes backwards across a restart; nothing is counted for the time
+    // before this instance took the vault on.
+    let mut base = None;
     let mut since = Instant::now();
+    let mut accrued = 0.0f64;
     loop {
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        match state(&chain, &key, vault, allowances, since).await {
-            Ok(Some(until)) => since = until,
-            Ok(None) => {}
-            Err(error) => tracing::debug!(%vault, %error, "could not state the day's usage"),
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let now = Instant::now();
+        let seconds = now.duration_since(since).as_secs_f64();
+        since = now;
+        match tick(&chain, &key, vault, &mut base, &mut accrued, seconds).await {
+            Ok((signed, is_dry)) => {
+                if let Ok(mut totals) = totals.lock() {
+                    totals.insert((chain.chain_id, vault), signed);
+                }
+                if dry.swap(is_dry, Ordering::SeqCst) != is_dry {
+                    if is_dry {
+                        tracing::warn!(%vault, "the tank is dry: the agent stops until it is topped up");
+                    } else {
+                        tracing::info!(%vault, "the tank has money again");
+                    }
+                }
+            }
+            Err(error) => tracing::debug!(%vault, %error, "could not meter the vault"),
         }
     }
 }
 
-/// Charge the day just gone, if it has not been charged. Returns the moment
-/// the statement covered up to, so the next one measures from there.
-async fn state(
+async fn tick(
     chain: &Client,
     key: &KeyClient,
     vault: Address,
-    allowances: Allowances,
-    since: Instant,
-) -> Result<Option<Instant>> {
-    let now = chain.block_timestamp().await?;
-    let today = now / DAY;
-    if today == 0 {
-        return Ok(None);
-    }
-    let stating = today - 1;
-
+    base: &mut Option<U256>,
+    accrued: &mut f64,
+    seconds: f64,
+) -> Result<(Signed, bool)> {
     let tank = chain.read(vault, IVault::tankCall {}).await?;
-    if stating <= tank.lastChargedDay {
-        return Ok(None);
-    }
-
-    // How long the machine actually ran for what is being stated.
-    let ends = Instant::now();
-    let ran = ends.duration_since(since).as_secs();
-    let amount = cost(ran, allowances);
+    let base = *base.get_or_insert(tank.usageSettled);
+    // The allowances in force now, so a change the author makes is charged
+    // from the moment it applies.
+    let allowances = shared_allowances(&chain.read(vault, IVault::allowancesCall {}).await?);
+    *accrued += cost(seconds, &allowances);
+    let total = base + U256::from(accrued.round().max(0.0) as u128);
+    let as_of = chain.block_timestamp().await?;
 
     let digest = chain
-        .read(
-            vault,
-            IVault::usageDigestCall {
-                day: stating,
-                amount,
-            },
-        )
+        .read(vault, IVault::usageDigestCall { total, asOf: as_of })
         .await?;
-    let signature = key.sign(digest).context("signing the statement")?;
+    let signature = key.sign(digest).context("signing the total")?;
 
-    key.send(
-        vault,
-        IVault::submitUsageCall {
-            day: stating,
-            amount,
+    let unpaid = total.saturating_sub(tank.usageSettled);
+    Ok((
+        Signed {
+            total: total.to_string(),
+            as_of,
             signature,
         },
-    )
-    .await
-    .context("submitting the statement")?;
-    tracing::info!(%vault, day = stating, seconds = ran, "the day's usage is stated");
-    Ok(Some(ends))
+        unpaid >= tank.balance,
+    ))
 }
 
-/// What holding those allowances for that long costs, at the published prices.
-fn cost(seconds: u64, allowances: Allowances) -> U256 {
-    let day = Prices::published().daily_cap(&allowances);
-    let dollars = day * (seconds.min(DAY) as f64 / DAY as f64);
-    let units = (dollars * 10f64.powi(ASSET_DECIMALS as i32))
-        .round()
-        .max(0.0);
-    U256::from(units as u128)
+/// What holding these allowances for this long costs at the published prices,
+/// in the asset's smallest unit.
+fn cost(seconds: f64, allowances: &Allowances) -> f64 {
+    let day = Prices::published().daily_cap(allowances);
+    day * (seconds / 86_400.0) * 10f64.powi(ASSET_DECIMALS as i32)
+}
+
+/// The vault's allowances as the platform's own type.
+pub fn shared_allowances(on_chain: &chain::bindings::prices::Allowances) -> Allowances {
+    Allowances {
+        fuel_per_sec: on_chain.fuelPerSec,
+        memory_mib: on_chain.memoryMib,
+        requests_per_min: on_chain.requestsPerMin,
+        bytes_per_day: on_chain.bytesPerDay,
+        streams: on_chain.streams,
+        inference_ms_per_min: on_chain.inferenceMsPerMin,
+        gas_per_day: on_chain.gasPerDay as f64 / 1_000_000.0,
+    }
 }
