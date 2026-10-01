@@ -365,16 +365,28 @@ impl Client {
         Ok(signature)
     }
 
-    /// Sign a digest as it is, with no message prefix: what an EIP-712
-    /// signature is. Only for accounts whose keys this client holds.
-    pub fn sign_typed(&self, who: Address, digest: B256) -> Result<Bytes> {
-        let key = self
-            .keys
-            .as_ref()
-            .and_then(|keys| keys.get(&who))
-            .ok_or_else(|| anyhow!("no key for {who} to sign typed data with"))?;
-        let signature = key.sign_hash_sync(&digest).context("signing")?;
-        Ok(Bytes::from(signature.as_bytes().to_vec()))
+    /// Sign a depositor's statement for a vault: EIP-712, so a wallet would
+    /// show the words. With the account's key here it signs the digest
+    /// itself; otherwise the node signs, as a development chain does for its
+    /// own accounts.
+    pub async fn sign_statement(
+        &self,
+        who: Address,
+        vault: Address,
+        restricted: &str,
+    ) -> Result<Bytes> {
+        if let Some(key) = self.keys.as_ref().and_then(|keys| keys.get(&who)) {
+            let digest = crate::statement::digest(self.chain_id, vault, who, restricted);
+            let signature = key.sign_hash_sync(&digest).context("signing")?;
+            return Ok(Bytes::from(signature.as_bytes().to_vec()));
+        }
+        let typed = crate::statement::typed_data(self.chain_id, vault, who, restricted);
+        let signature: Bytes = self
+            .provider
+            .raw_request("eth_signTypedData_v4".into(), (who, typed.to_string()))
+            .await
+            .with_context(|| format!("asking the chain to sign a statement as {who}"))?;
+        Ok(signature)
     }
 
     /// Ask the node something the contracts do not cover, such as how fast a

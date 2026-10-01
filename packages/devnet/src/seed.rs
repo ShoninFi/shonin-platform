@@ -252,10 +252,7 @@ async fn deposit(
         )
         .await?;
     let restricted = client.read(vault, IVault::restrictedTextCall {}).await?;
-    let statement = client.sign_typed(
-        who,
-        chain::statement::digest(client.chain_id, vault, who, &restricted),
-    )?;
+    let statement = client.sign_statement(who, vault, &restricted).await?;
     client
         .send(
             who,

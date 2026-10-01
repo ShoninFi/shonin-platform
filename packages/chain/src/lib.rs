@@ -123,6 +123,42 @@ pub mod statement {
     pub const TEXT: &str =
         "I am not a restricted person for this vault, and I am not acting for one.";
 
+    /// The same statement as a wallet is asked to sign it.
+    pub fn typed_data(
+        chain_id: u64,
+        vault: Address,
+        depositor: Address,
+        restricted: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"},
+                ],
+                "Statement": [
+                    {"name": "depositor", "type": "address"},
+                    {"name": "statement", "type": "string"},
+                    {"name": "restricted", "type": "string"},
+                ],
+            },
+            "primaryType": "Statement",
+            "domain": {
+                "name": "Shonin Vault",
+                "version": "1",
+                "chainId": chain_id,
+                "verifyingContract": format!("{vault:?}"),
+            },
+            "message": {
+                "depositor": format!("{depositor:?}"),
+                "statement": TEXT,
+                "restricted": restricted,
+            },
+        })
+    }
+
     /// The digest the vault checks for `depositor`, against the list as the
     /// vault writes it (`SANCTIONED,US`).
     pub fn digest(chain_id: u64, vault: Address, depositor: Address, restricted: &str) -> B256 {

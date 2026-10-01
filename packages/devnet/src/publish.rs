@@ -170,10 +170,7 @@ async fn activate_it(
         )
         .await?
         .text;
-    let statement = chain.sign_typed(
-        author,
-        chain::statement::digest(chain.chain_id, vault, author, &restricted),
-    )?;
+    let statement = chain.sign_statement(author, vault, &restricted).await?;
     let terms = chain
         .read(deployments.factory, IVaultFactory::termsCall {})
         .await?;
