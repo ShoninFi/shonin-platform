@@ -222,16 +222,23 @@ contract CrossChainTest is Fixture {
         assertEq(v.grossExit, v.gross);
     }
 
-    function test_a_home_send_counts_until_the_post_says_it_landed() public {
+    function inFlight(uint64 a) internal pure returns (uint64[] memory list) {
+        list = new uint64[](1);
+        list[0] = a;
+    }
+
+    function test_a_home_send_counts_while_the_post_names_it_in_flight() public {
         depositTwo(alice, 100_000e6);
         vm.startPrank(executor);
         station.pull(5000e6);
         station.bridge("local-bridge", OTHER, 5000e6, "");
         vm.stopPrank();
 
-        // Not landed: the money is counted on its way.
+        // On its way: the post names it, and it is counted.
         uint64 time = open();
-        post(time, postOf(0, 0), EXECUTOR_KEY);
+        StationPost memory p = postOf(0, 0);
+        p.inFlightFromHome = inFlight(0);
+        post(time, p, EXECUTOR_KEY);
         closeAfterDeadline(time);
         Valuation memory v = latest();
         assertEq(v.gross, v.cash + 5000e6 + 1, "a home send on its way was not counted");
@@ -239,12 +246,51 @@ contract CrossChainTest is Fixture {
         // Landed: the other station's own value holds it, and it is counted
         // once.
         time = open();
-        StationPost memory p = postOf(5000e6, 5000e6);
-        p.landedFromHome = 1;
-        post(time, p, EXECUTOR_KEY);
+        post(time, postOf(5000e6, 5000e6), EXECUTOR_KEY);
         closeAfterDeadline(time);
         v = latest();
         assertEq(v.gross, v.cash + 5000e6 + 1, "a landed send was counted twice");
+    }
+
+    function test_sends_that_land_out_of_order_are_each_counted_once() public {
+        depositTwo(alice, 100_000e6);
+        vm.startPrank(executor);
+        station.pull(8000e6);
+        station.bridge("local-bridge", OTHER, 5000e6, "");
+        station.bridge("local-bridge", OTHER, 3000e6, "");
+        vm.stopPrank();
+
+        // The second landed first: the other station holds its 3000, and the
+        // first is still on its way.
+        uint64 time = open();
+        StationPost memory p = postOf(3000e6, 3000e6);
+        p.inFlightFromHome = inFlight(0);
+        post(time, p, EXECUTOR_KEY);
+        closeAfterDeadline(time);
+        Valuation memory v = latest();
+        assertEq(v.gross, v.cash + 8000e6 + 1, "a send was counted twice or not at all");
+    }
+
+    function test_a_post_names_only_earlier_sends_to_its_own_chain_and_each_once() public {
+        depositTwo(alice, 100_000e6);
+        vm.startPrank(executor);
+        station.pull(3000e6);
+        station.bridge("local-bridge", OTHER, 1000e6, "");
+        station.bridge("local-bridge", 1234, 1000e6, "");
+        vm.stopPrank();
+        uint64 time = open();
+        vm.prank(executor);
+        station.bridge("local-bridge", OTHER, 1000e6, "");
+
+        uint64[] memory twice = new uint64[](2);
+        uint64[][3] memory refused = [inFlight(1), inFlight(2), twice];
+        for (uint256 i = 0; i < refused.length; i++) {
+            StationPost memory p = postOf(0, 0);
+            p.inFlightFromHome = refused[i];
+            bytes memory sig = signed(EXECUTOR_KEY, vault.postDigest(time, OTHER, p));
+            vm.expectRevert(IVault.NotAllowed.selector);
+            vault.postStation(time, OTHER, p, sig);
+        }
     }
 
     // Exit costs ------------------------------------------------------------

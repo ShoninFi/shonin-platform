@@ -81,6 +81,8 @@ interface IStation {
     function stopped() external view returns (bool);
     function approvedKey(bytes32 driver) external view returns (address);
     function sends() external view returns (Send[] memory);
+    function sendCount() external view returns (uint256);
+    function sendAt(uint256 index) external view returns (Send memory);
     function stopDigest(bytes32 reason, uint64 haltedAt) external view returns (bytes32);
 }
 

@@ -248,6 +248,14 @@ contract Station is IStation, ReentrancyGuardTransient {
         return _sends;
     }
 
+    function sendCount() external view returns (uint256) {
+        return _sends.length;
+    }
+
+    function sendAt(uint256 index) external view returns (Send memory) {
+        return _sends[index];
+    }
+
     function stopDigest(bytes32 reason, uint64 haltedAt) public view returns (bytes32) {
         return keccak256(abi.encode(block.chainid, address(this), "shonin-stop", reason, haltedAt));
     }

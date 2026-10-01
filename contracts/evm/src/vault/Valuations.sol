@@ -118,7 +118,7 @@ library Valuations {
             price(s, count);
         } else {
             s.openUnits = units;
-            s.sendsAtOpen = IStation(s.homeStation).sends().length;
+            s.sendsAtOpen = IStation(s.homeStation).sendCount();
             emit IVault.ValuationOpened(count, time, missing);
         }
     }
@@ -210,16 +210,17 @@ library Valuations {
         for (uint256 i = 0; i < post.transit.length; i++) {
             if (post.transit[i].sentAt + timeout >= time) moving += post.transit[i].amount;
         }
-        Send[] memory sends = IStation(s.homeStation).sends();
-        uint256 seen;
-        // Sends made after the home station was valued are still in its
-        // value, so only the ones before count as on their way.
-        for (uint256 i = 0; i < s.sendsAtOpen; i++) {
-            if (sends[i].toChain != stationChain) continue;
-            if (seen >= post.landedFromHome && sends[i].sentAt + timeout >= time) {
-                moving += sends[i].amount;
-            }
-            seen++;
+        // Each home send the post names as still on its way, once: only one
+        // made before the home station was valued (a later one is still in
+        // its value), and only one to this chain.
+        IStation home = IStation(s.homeStation);
+        uint64[] calldata inFlight = post.inFlightFromHome;
+        for (uint256 i = 0; i < inFlight.length; i++) {
+            uint256 index = inFlight[i];
+            if (index >= s.sendsAtOpen || (i != 0 && index <= inFlight[i - 1])) revert IVault.NotAllowed();
+            Send memory sent = home.sendAt(index);
+            if (sent.toChain != stationChain) revert IVault.NotAllowed();
+            if (sent.sentAt + timeout >= time) moving += sent.amount;
         }
         markValue = post.mark + moving;
         exitValue = post.exit + moving;

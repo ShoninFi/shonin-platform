@@ -108,8 +108,10 @@ struct StationPost {
     uint64 blockNumber;
     /// Sends from this station that have not landed.
     Transit[] transit;
-    /// How many of the home station's sends to this chain have landed.
-    uint64 landedFromHome;
+    /// The home station's sends to this chain that have not landed, by their
+    /// place in its list, in increasing order. Bridges may land out of
+    /// order, so each one still on its way is named.
+    uint64[] inFlightFromHome;
 }
 
 /// A withdrawal the cash could not pay.
