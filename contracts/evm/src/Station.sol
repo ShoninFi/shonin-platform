@@ -90,7 +90,9 @@ contract Station is IStation, ReentrancyGuardTransient {
             revert NotAllowed();
         }
         if (current != address(0) && current != key) {
-            _run(IDriver(implementation).revokeKey(address(this), current), IDriver(implementation).targets());
+            // A key still blessed must be withdrawn; one whose blessing has
+            // lapsed is withdrawn if the driver can, and replaced either way.
+            _revokeVia(IDriver(implementation), current, _isKey(current, ImageKind.Executor));
             emit KeyRevoked(driver, current);
         }
         uint64 until = _registry().blessedUntil(key, _spec.vaultChain, _spec.vault, _spec.bundleHash);
@@ -248,6 +250,15 @@ contract Station is IStation, ReentrancyGuardTransient {
         }
     }
 
+    function outsideBand() external view returns (bool) {
+        for (uint256 i = 0; i < _spec.drivers.length; i++) {
+            (, bool blocked) =
+                IDriver(_unwindDriver(_spec.drivers[i])).close(address(this), WAD, _spec.exitBandBps);
+            if (blocked) return true;
+        }
+        return false;
+    }
+
     function spec() external view returns (StationSpec memory) {
         return _spec;
     }
@@ -292,19 +303,24 @@ contract Station is IStation, ReentrancyGuardTransient {
 
     function _revoke(bytes32 driver, address key, bool strict) private {
         _declaredDriver(driver);
-        IDriver implementation = IDriver(_unwindDriver(driver));
-        if (strict) {
-            _call(implementation.revokeKey(address(this), key), implementation.targets(), true);
-        } else {
-            // A stop goes through whatever the driver or the venue does.
-            try implementation.revokeKey(address(this), key) returns (Call[] memory calls) {
-                try implementation.targets() returns (address[] memory targets) {
-                    _call(calls, targets, false);
-                } catch {}
-            } catch {}
-        }
+        _revokeVia(IDriver(_unwindDriver(driver)), key, strict);
         if (_approvedKey[driver] == key) delete _approvedKey[driver];
         emit KeyRevoked(driver, key);
+    }
+
+    /// Withdraw `key` through `implementation`. Unless `strict`, whatever the
+    /// driver or the venue does, the station carries on: a stop, or a
+    /// lapsed key's replacement, goes through.
+    function _revokeVia(IDriver implementation, address key, bool strict) private {
+        if (strict) {
+            _call(implementation.revokeKey(address(this), key), implementation.targets(), true);
+            return;
+        }
+        try implementation.revokeKey(address(this), key) returns (Call[] memory calls) {
+            try implementation.targets() returns (address[] memory targets) {
+                _call(calls, targets, false);
+            } catch {}
+        } catch {}
     }
 
     function _send(bytes32 name, uint256 toChain, uint256 amount, bytes memory extra) private {
@@ -341,12 +357,20 @@ contract Station is IStation, ReentrancyGuardTransient {
         address dollar = address(_asset());
         for (uint256 i = 0; i < calls.length; i++) {
             Call memory c = calls[i];
+            // A call the station would refuse is never made; outside a
+            // strict run it is skipped rather than stopping everything.
+            bool allowed;
             if (c.target == dollar) {
-                if (c.data.length != 68 || bytes4(c.data) != APPROVE) revert BadCall();
-                (address spender,) = abi.decode(_args(c.data), (address, uint256));
-                if (!_includes(targets, spender)) revert BadCall();
-            } else if (!_includes(targets, c.target)) {
-                revert BadCall();
+                if (c.data.length == 68 && bytes4(c.data) == APPROVE) {
+                    (address spender,) = abi.decode(_args(c.data), (address, uint256));
+                    allowed = _includes(targets, spender);
+                }
+            } else {
+                allowed = _includes(targets, c.target);
+            }
+            if (!allowed) {
+                if (strict) revert BadCall();
+                continue;
             }
             (bool ok, bytes memory reason) = c.target.call{value: c.value}(c.data);
             if (!ok && strict) {

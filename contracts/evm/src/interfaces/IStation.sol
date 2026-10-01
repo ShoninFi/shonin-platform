@@ -78,6 +78,9 @@ interface IStation {
     function unwind(uint256 fraction) external returns (uint256 sentHome, bool blocked);
     /// What the station holds, at mark and at exit-side prices.
     function value() external view returns (uint256 mark, uint256 exit);
+    /// Whether any market a driver holds is further from the venue's own
+    /// price than the exit band: a close of it would be refused.
+    function outsideBand() external view returns (bool);
 
     function spec() external view returns (StationSpec memory);
     function isHome() external view returns (bool);

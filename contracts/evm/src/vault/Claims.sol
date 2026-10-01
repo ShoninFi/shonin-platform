@@ -138,9 +138,11 @@ library Claims {
         if (state != ClaimState.Pending && state != ClaimState.Waiting && state != ClaimState.Queued) {
             revert IVault.NotAllowed();
         }
-        uint256 since = s.lastPriced == 0 ? s.createdAt : s.latest().time;
-        if (claim.bookedAt > since) since = claim.bookedAt;
-        if (block.timestamp < since + s.timers.fallbackAfter || s.valuing()) revert IVault.NotYet();
+        // A day from its booking: a claim nobody could serve for that long
+        // (a market outside the band, a close that can't come home) takes
+        // its share of the cash and units for the rest, whether or not
+        // valuations kept being priced meanwhile.
+        if (block.timestamp < claim.bookedAt + s.timers.fallbackAfter || s.valuing()) revert IVault.NotYet();
         if (state == ClaimState.Queued) {
             // Not while a priced valuation could settle it.
             Request storage r = s.requests[s.claimRequest[claimId] - 1];

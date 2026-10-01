@@ -52,7 +52,11 @@ contract DepositAtALaggingMarkTest is ClaimBase {
     /// What `shares` own now, less their part of the profit fee owed at the
     /// latest valuation.
     function net(uint256 shares) internal view returns (uint256) {
-        Valuation memory v = latest();
-        return worth(shares) - v.fee * shares / v.supply;
+        (, uint256 exit) = station.value();
+        uint256 total = vault.cash() + exit;
+        uint256 supply = vault.totalSupply() + 1e12;
+        uint256 basis = vault.mark() * supply / 1e30;
+        uint256 fee = total > basis ? (total - basis) * 1500 / 10_000 : 0;
+        return (total - fee) * shares / supply;
     }
 }

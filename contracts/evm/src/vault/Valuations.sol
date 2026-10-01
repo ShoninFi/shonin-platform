@@ -95,10 +95,12 @@ library Valuations {
 
         syncHolding(s);
         (uint256 markValue, uint256 exitValue) = IStation(s.homeStation).value();
-        if (_outsideBand(s, markValue, exitValue)) s.wide[count] = true;
-        // A bid above the mark is what the holdings could be sold for: a
-        // deposit pays that, so it can't buy below the pool's worth.
-        if (exitValue > markValue) markValue = exitValue;
+        if (IStation(s.homeStation).outsideBand()) s.wide[count] = true;
+        // An exit side above the mark is what the holdings could be sold
+        // for: a deposit pays it on top, so it can't buy below the pool's
+        // worth; but nobody is paid it, and no fee is charged on it.
+        uint256 extra;
+        if (exitValue > markValue) (extra, exitValue) = (exitValue - markValue, markValue);
         s.sentAtValuation[count] = s.sentTotal;
         uint256 units = s.liveUnits();
         if (units != 0) {
@@ -106,7 +108,9 @@ library Valuations {
             // holders, who hold it outside the shares.
             markValue = markValue.mulDiv(WAD - units, WAD);
             exitValue = exitValue.mulDiv(WAD - units, WAD);
+            extra = extra.mulDiv(WAD - units, WAD);
         }
+        s.depositExtra[count] = extra;
         uint32 missing = uint32(s.otherChains.length);
         s.valuations.push(
             Valuation({
@@ -157,18 +161,19 @@ library Valuations {
         // dollar amount that could exist would leave the valuation open for
         // good, with every way out waiting behind it.
         if (markValue > MAX_POST || exitValue > MAX_POST) revert IVault.NotAllowed();
-        // Each post on its own: two posts that disagree don't make a spread
-        // neither of them saw.
-        if (_outsideBand(s, markValue, exitValue)) s.wide[index] = true;
-        if (exitValue > markValue) markValue = exitValue;
+        if (post.outsideBand) s.wide[index] = true;
+        uint256 extra;
+        if (exitValue > markValue) (extra, exitValue) = (exitValue - markValue, markValue);
         Post storage p = s.posts[index][stationChain];
         if (post.transit.length != 0 || post.inFlightFromHome.length != 0) s.moving[index] = true;
         if (!p.posted) {
             p.posted = true;
             p.mark = markValue;
             p.exit = exitValue;
+            p.extra = extra;
             v.postsMissing -= 1;
         } else {
+            if (extra > p.extra) p.extra = extra;
             if (markValue > p.mark) p.mark = markValue;
             if (exitValue < p.exit) p.exit = exitValue;
         }
@@ -195,6 +200,7 @@ library Valuations {
         for (uint256 i = 0; i < chains.length; i++) {
             Post storage p = s.posts[index][chains[i]];
             v.gross += p.mark.mulDiv(keep, WAD);
+            s.depositExtra[index] += p.extra.mulDiv(keep, WAD);
             v.grossExit += p.exit.mulDiv(keep, WAD);
         }
         price(s, index);
@@ -240,16 +246,6 @@ library Valuations {
         }
         markValue = post.mark + moving;
         exitValue = post.exit + moving;
-    }
-
-    /// A station's exit-side value further below its mark than the exit
-    /// band: a close couldn't fill there, so nobody is paid as if it could.
-    function _outsideBand(
-        Layout storage s,
-        uint256 markValue,
-        uint256 exitValue
-    ) private view returns (bool) {
-        return exitValue < markValue.mulDiv(BPS - s.exitBandBps, BPS, Math.Rounding.Ceil);
     }
 
     function _isOtherChain(Layout storage s, uint256 chainId) private view returns (bool) {
@@ -374,7 +370,7 @@ library Valuations {
             }
             if (!found) break;
             r.done = true;
-            _settleOne(s, r, i + 1, s.valuations[vi], s.wide[vi]);
+            _settleOne(s, r, i + 1, vi);
             i++;
             settled++;
         }
@@ -382,16 +378,12 @@ library Valuations {
         s.valuationCursor = vi;
     }
 
-    function _settleOne(
-        Layout storage s,
-        Request storage r,
-        uint256 id,
-        Valuation storage v,
-        bool wide
-    ) private {
+    function _settleOne(Layout storage s, Request storage r, uint256 id, uint256 index) private {
+        Valuation storage v = s.valuations[index];
+        bool wide = s.wide[index];
         RequestKind kind = r.kind;
         if (kind == RequestKind.Deposit) {
-            _deposit(s, r, id, v);
+            _deposit(s, r, id, v, s.depositExtra[index]);
         } else if (kind == RequestKind.Redeem) {
             _redeem(s, r, id, v, wide);
         } else if (kind == RequestKind.Claim) {
@@ -401,7 +393,13 @@ library Valuations {
         }
     }
 
-    function _deposit(Layout storage s, Request storage r, uint256 id, Valuation storage v) private {
+    function _deposit(
+        Layout storage s,
+        Request storage r,
+        uint256 id,
+        Valuation storage v,
+        uint256 extra
+    ) private {
         uint256 assets = r.amount;
         s.escrow -= assets;
         // A vault that stopped taking deposits, or a list the depositor
@@ -411,7 +409,8 @@ library Valuations {
             emit IVault.Refunded(id, r.owner, assets);
             return;
         }
-        uint256 net = v.gross - v.fee;
+        uint256 gross = v.gross + extra;
+        uint256 net = gross - (extra == 0 ? v.fee : s.feeOf(gross, v.supply));
         uint256 shares =
             (assets - assets.mulDiv(s.fees.transactionBps, BPS, Math.Rounding.Ceil)).mulDiv(v.supply, net);
         if (shares == 0) {

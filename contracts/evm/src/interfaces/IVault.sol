@@ -113,6 +113,9 @@ struct StationPost {
     /// place in its list, in increasing order. Bridges may land out of
     /// order, so each one still on its way is named.
     uint64[] inFlightFromHome;
+    /// Whether any market the station holds was further from the venue's
+    /// own price than the exit band.
+    bool outsideBand;
 }
 
 /// A withdrawal the cash could not pay.

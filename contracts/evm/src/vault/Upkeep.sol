@@ -394,7 +394,7 @@ library Upkeep {
         Valuation storage v = s.latest();
         // Strictly after the halt: nothing can be sent out once it has
         // halted, so a station found empty then stays empty.
-        if (v.time <= s.haltedAt || v.gross != v.cash + 1 || s.moving[s.lastPriced - 1]) {
+        if (v.time <= s.haltedAt || !s.empty(v) || s.moving[s.lastPriced - 1]) {
             revert IVault.NotYet();
         }
         if (s.valuations[s.valuations.length - 1].status == ValuationStatus.Open) revert IVault.Unsettled();

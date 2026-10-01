@@ -22,6 +22,8 @@ struct Post {
     bool posted;
     uint256 mark;
     uint256 exit;
+    /// How far the exit side sat above the mark: what a deposit pays on top.
+    uint256 extra;
 }
 
 /// Everything a vault holds, in one place, so the vault and the libraries it
@@ -92,6 +94,10 @@ struct Layout {
     /// its mark than the exit band: nobody is paid from cash at a price the
     /// vault would refuse to sell at, so withdrawals wait.
     mapping(uint256 => bool) wide;
+    /// What the stations' exit side was worth above their mark at each
+    /// valuation: a deposit pays it, so it can't buy below what the holdings
+    /// could be sold for. Fees and withdrawals never count it.
+    mapping(uint256 => uint256) depositExtra;
     mapping(uint256 => mapping(uint256 => Post)) posts;
     /// The open valuation's unit fraction and when it was recorded, so the
     /// posts that complete it are counted as of the same moment.
@@ -265,7 +271,14 @@ library VaultStorage {
     function readyToClose(Layout storage s) internal view returns (bool) {
         if (!halted(s) || s.lastPriced == 0) return false;
         Valuation storage v = latest(s);
-        return v.time > s.haltedAt && v.gross == v.cash + 1 && !s.moving[s.lastPriced - 1];
+        return v.time > s.haltedAt && empty(s, v) && !s.moving[s.lastPriced - 1];
+    }
+
+    /// The stations held nothing at `v` beyond dust nobody can be made to
+    /// own (a tenth of the minimum deposit), so a stranger's micro-dollar
+    /// can't hold a halted vault's close off.
+    function empty(Layout storage s, Valuation storage v) internal view returns (bool) {
+        return v.gross <= v.cash + 1 + s.minimumDeposit / 10;
     }
 
     /// Move the queue's cursor past requests already done (taken through the
