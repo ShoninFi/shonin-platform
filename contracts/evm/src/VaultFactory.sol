@@ -59,6 +59,7 @@ contract VaultFactory is IVaultFactory {
     error UnknownChain(bytes32 name);
     error UnknownDriver();
     error ChainTwice();
+    error OtherChainsNotYet();
 
     struct Deps {
         IERC20 asset;
@@ -110,6 +111,7 @@ contract VaultFactory is IVaultFactory {
         if (idleFloorBps > BPS) revert OutOfRange();
 
         (bytes32[] memory drivers, uint256[] memory others) = _chainsOf(record);
+        if (others.length != 0 && !_tradesOnOtherChains()) revert OtherChainsNotYet();
         vault = Clones.cloneDeterministic(vaultImplementation, bytes32(strategyId));
         _vaultOf[strategyId] = vault;
         _vaults.push(vault);
@@ -195,6 +197,14 @@ contract VaultFactory is IVaultFactory {
     }
 
     /// This chain's drivers, and the other chains it trades on, by id.
+    /// Whether a vault may trade on chains besides its own. Not from this
+    /// factory: a leaver's share on another chain can only be brought home
+    /// by an unwinder working there, so a strategy that needs one waits for
+    /// the factory that comes with it.
+    function _tradesOnOtherChains() internal pure virtual returns (bool) {
+        return false;
+    }
+
     function _chainsOf(Strategy memory record)
         private
         view

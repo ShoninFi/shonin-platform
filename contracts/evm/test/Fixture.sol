@@ -106,7 +106,7 @@ contract Fixture is Test {
         driver = new LocalDriver(venue, IERC20(address(usd)));
         bridge = new LocalBridge(IERC20(address(usd)), operator);
         stations = new StationFactory(address(this));
-        factory = new VaultFactory(
+        factory = newFactory(
             VaultFactory.Deps({
                 asset: IERC20(address(usd)),
                 attestation: attestation,
@@ -143,6 +143,16 @@ contract Fixture is Test {
     }
 
     // Configuration ---------------------------------------------------------
+
+    /// The factory under test: the one that ships, unless a test needs one
+    /// whose vaults trade on other chains.
+    function newFactory(
+        VaultFactory.Deps memory deps,
+        VaultConfig memory config,
+        ChainName[] memory chains
+    ) internal virtual returns (VaultFactory) {
+        return new VaultFactory(deps, config, chains);
+    }
 
     function timers() internal pure returns (Timers memory) {
         return Timers({

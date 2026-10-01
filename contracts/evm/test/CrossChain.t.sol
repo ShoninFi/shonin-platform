@@ -3,6 +3,8 @@ pragma solidity ^0.8.30;
 
 import {Station} from "../src/Station.sol";
 import {Vault} from "../src/Vault.sol";
+
+import {VaultFactory} from "../src/VaultFactory.sol";
 import {ImageKind} from "../src/interfaces/IAttestationRegistry.sol";
 import {ChainNeed} from "../src/interfaces/IStrategyRegistry.sol";
 import {
@@ -14,7 +16,9 @@ import {
     ValuationStatus,
     VaultState
 } from "../src/interfaces/IVault.sol";
+import {ChainName, VaultConfig} from "../src/interfaces/IVaultFactory.sol";
 import {Fixture} from "./Fixture.sol";
+import {MultiChainFactory} from "./MultiChainFactory.sol";
 
 /// A vault whose strategy also trades on another chain: it opens once its
 /// executor says the other station exists, and every valuation waits for
@@ -33,6 +37,14 @@ contract CrossChainTest is Fixture {
     Vault internal vault;
     Station internal station;
     bytes32 internal bundle;
+
+    function newFactory(
+        VaultFactory.Deps memory deps,
+        VaultConfig memory config,
+        ChainName[] memory chains
+    ) internal override returns (VaultFactory) {
+        return new MultiChainFactory(deps, config, chains);
+    }
 
     function setUp() public override {
         super.setUp();
@@ -89,10 +101,10 @@ contract CrossChainTest is Fixture {
 
     // Helpers ---------------------------------------------------------------
 
-    function postOf(uint256 mark, uint256 exit) internal pure returns (StationPost memory post) {
-        post.mark = mark;
-        post.exit = exit;
-        post.transit = new Transit[](0);
+    function postOf(uint256 mark, uint256 exit) internal pure returns (StationPost memory p) {
+        p.mark = mark;
+        p.exit = exit;
+        p.transit = new Transit[](0);
     }
 
     /// Record a valuation at the next slot and return its time.
@@ -129,6 +141,40 @@ contract CrossChainTest is Fixture {
         requestDepositAs(vault, who, amount);
         valueWith(0, 0);
         shares = vault.balanceOf(who) - before;
+    }
+
+    // Lifecycle -------------------------------------------------------------
+
+    /// Another vault on the same two chains, activated but not yet opened.
+    function activating() internal returns (Vault two, bytes32 b) {
+        uint256 id = submitAs(author);
+        b = keccak256(abi.encode("bundle", id));
+        registerTwoChains(id, b);
+        vm.prank(reviewer);
+        reviews.submitReview(id, reviewFor(b, 1));
+        two = activate(id, allowancesCosting(2e6), MINIMUM_TANK);
+        assertTrue(two.state() == VaultState.Activating);
+    }
+
+    function test_a_vault_trading_elsewhere_is_cancelled_if_it_never_opens() public {
+        (Vault two,) = activating();
+        vm.expectRevert(IVault.NotYet.selector);
+        two.cancel();
+        skip(3 days);
+        uint256 before = usd.balanceOf(author);
+        two.cancel();
+        assertTrue(two.state() == VaultState.Cancelled);
+        assertEq(usd.balanceOf(author) - before, MINIMUM_TANK);
+    }
+
+    function test_only_its_executor_confirms_the_stations_and_opens_it() public {
+        (Vault two, bytes32 b) = activating();
+        vm.expectRevert(IVault.NotBlessed.selector);
+        two.confirmStations();
+        blessExecutorKey(executor, address(two), b);
+        vm.prank(executor);
+        two.confirmStations();
+        assertTrue(two.state() == VaultState.Open);
     }
 
     // Posts -----------------------------------------------------------------

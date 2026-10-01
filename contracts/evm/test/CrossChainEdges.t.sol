@@ -15,7 +15,10 @@ import {
     ValuationStatus,
     VaultState
 } from "../src/interfaces/IVault.sol";
+
+import {ChainName, VaultConfig} from "../src/interfaces/IVaultFactory.sol";
 import {Fixture} from "./Fixture.sol";
+import {MultiChainFactory} from "./MultiChainFactory.sol";
 
 /// The edges of pricing across chains: nothing changes the supply or the
 /// units while a valuation waits for posts; a home send made after the home
@@ -31,6 +34,14 @@ contract CrossChainEdgesTest is Fixture {
     Vault internal vault;
     Station internal station;
     bytes32 internal bundle;
+
+    function newFactory(
+        VaultFactory.Deps memory deps,
+        VaultConfig memory config,
+        ChainName[] memory chains
+    ) internal override returns (VaultFactory) {
+        return new MultiChainFactory(deps, config, chains);
+    }
 
     function setUp() public override {
         super.setUp();

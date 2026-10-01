@@ -4,6 +4,7 @@ pragma solidity ^0.8.30;
 import {LocalDriver} from "../src/LocalDriver.sol";
 import {Station} from "../src/Station.sol";
 import {Vault} from "../src/Vault.sol";
+import {VaultFactory} from "../src/VaultFactory.sol";
 import {ImageKind} from "../src/interfaces/IAttestationRegistry.sol";
 import {Call, Custody, ExitPath, IDriver, ValuationKind} from "../src/interfaces/IDriver.sol";
 import {OrderRequest} from "../src/interfaces/ILocalVenue.sol";
@@ -647,29 +648,17 @@ contract VaultTest is Fixture {
         approxEq(toBob, 50_000e6, 100e6);
     }
 
-    function test_a_vault_trading_elsewhere_activates_and_is_cancelled_if_it_never_opens() public {
-        (uint256 id, bytes32 b) = readyOnTwoChains();
-        Vault two = activate(id, allowancesCosting(2e6), MINIMUM_TANK);
-        assertTrue(two.state() == VaultState.Activating);
-        vm.expectRevert(IVault.NotYet.selector);
-        two.cancel();
-        skip(3 days);
-        uint256 before = usd.balanceOf(author);
-        two.cancel();
-        assertTrue(two.state() == VaultState.Cancelled);
-        assertEq(usd.balanceOf(author) - before, MINIMUM_TANK);
-        b;
-    }
-
-    function test_the_executor_confirms_the_stations_and_the_vault_opens() public {
-        (uint256 id, bytes32 b) = readyOnTwoChains();
-        Vault two = activate(id, allowancesCosting(2e6), MINIMUM_TANK);
-        vm.expectRevert(IVault.NotBlessed.selector);
-        two.confirmStations();
-        blessExecutorKey(executor, address(two), b);
-        vm.prank(executor);
-        two.confirmStations();
-        assertTrue(two.state() == VaultState.Open);
+    function test_a_strategy_trading_on_another_chain_cannot_be_activated_yet() public {
+        (uint256 id,) = readyOnTwoChains();
+        (, string memory text) = factory.restrictedFor(id);
+        bytes memory statement = statementBy(authorKey, factory.predictVault(id), author, text);
+        bytes32 terms = factory.terms();
+        give(author, MINIMUM_TANK);
+        vm.startPrank(author);
+        usd.approve(address(factory), MINIMUM_TANK);
+        vm.expectRevert(VaultFactory.OtherChainsNotYet.selector);
+        factory.activate(id, allowancesCosting(2e6), 500, MINIMUM_TANK, 0, statement, terms);
+        vm.stopPrank();
     }
 
     function readyOnTwoChains() internal returns (uint256 id, bytes32 b) {
