@@ -130,10 +130,11 @@ tasks:
         --api-url "{{.URL_API_DEV}}"
 
   keeper:
-    desc: "The keeper: crystallises fees, settles claims, freezes"
+    desc: "The keeper: collects bills, values and settles, serves claims, stops and closes halted vaults"
     cmds:
       - >-
         cargo run -q -p shonin-keeper --
         {{.SERVICE_ARGS}}
         --port {{.PORT_KEEPER}}
         --api-url "{{.URL_API_DEV}}"
+        --executor-url "{{.URL_EXECUTOR_DEV}}"
