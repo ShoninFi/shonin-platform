@@ -231,7 +231,7 @@ async fn serve(
     // Keep it blessed, and keep the venue's approval following the blessing:
     // a key that stopped attesting stops being able to trade.
     let approving = key.clone();
-    chain::attest::keep_blessed(
+    let _renewing = AbortOnDrop(chain::attest::keep_blessed(
         chain.clone(),
         deployments.clone(),
         "executor",
@@ -256,7 +256,7 @@ async fn serve(
                 }
             });
         },
-    );
+    ));
 
     // A strategy's `run` is meant never to return, so the report cannot wait
     // for it: the counters are shared and sent while it is still running, and
@@ -392,6 +392,16 @@ async fn serve(
         }
         tracing::warn!(%vault, "restarting the strategy");
         tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// Stops the task it holds when the vault it serves is let go, however
+/// `serve` returns.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
