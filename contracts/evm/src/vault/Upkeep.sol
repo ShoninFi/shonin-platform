@@ -178,7 +178,7 @@ library Upkeep {
         VaultState state = s.state;
         if (
             s.tank.keepAt > s.tank.balance && !s.tank.fillPending && state != VaultState.Activating
-                && state != VaultState.Closed && state != VaultState.Cancelled
+                && state != VaultState.Closed && state != VaultState.Cancelled && !s.readyToClose()
         ) {
             s.tank.fillPending = true;
             s.queue(s.author, RequestKind.TankFill, s.tank.keepAt - s.tank.balance, 1);
@@ -279,7 +279,10 @@ library Upkeep {
         Layout storage s = VaultStorage.layout();
         _authorOnly(s);
         VaultState state = s.state;
-        if (state == VaultState.Activating || state == VaultState.Closed || state == VaultState.Cancelled) {
+        if (
+            state == VaultState.Activating || state == VaultState.Closed || state == VaultState.Cancelled
+                || s.readyToClose()
+        ) {
             revert IVault.WrongState();
         }
         if (shares == 0) revert IVault.TooSmall();

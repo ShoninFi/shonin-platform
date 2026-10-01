@@ -61,6 +61,10 @@ contract Station is IStation, ReentrancyGuardTransient {
     function initialize(StationSpec calldata spec_) external {
         if (address(factory) != address(0)) revert AlreadyInitialized();
         factory = IStationFactory(msg.sender);
+        // Each driver and bridge once: a name listed twice would count its
+        // venue twice and close a fraction of it twice.
+        _unique(spec_.drivers);
+        _unique(spec_.bridges);
         _spec = spec_;
     }
 
@@ -345,6 +349,14 @@ contract Station is IStation, ReentrancyGuardTransient {
 
     function _asset() private view returns (IERC20) {
         return IERC20(factory.asset());
+    }
+
+    function _unique(bytes32[] calldata list) private pure {
+        for (uint256 i = 0; i < list.length; i++) {
+            for (uint256 j = i + 1; j < list.length; j++) {
+                if (list[i] == list[j]) revert NotAllowed();
+            }
+        }
     }
 
     function _contains(bytes32[] storage list, bytes32 item) private view returns (bool) {

@@ -7,7 +7,7 @@ import {OrderRequest} from "../src/interfaces/ILocalVenue.sol";
 import {IVault, VaultState} from "../src/interfaces/IVault.sol";
 import {Fixture} from "./Fixture.sol";
 
-/// A close done in one transaction can't be held off by a `keep`, and the
+/// A close can't be held off by a `keep`, and the
 /// holding fee's dilution lowers the profit fee owed as section 6 says.
 contract CloseAndFeeProbesTest is Fixture {
     Vault internal vault;
@@ -51,18 +51,11 @@ contract CloseAndFeeProbesTest is Fixture {
         station.stop();
         station.unwind(1e18);
 
-        // A griefer lands a keep between every settle and close.
-        for (uint256 i = 0; i < 3; i++) {
-            value(vault);
-            vault.keep(0, 0, "");
-            vm.expectRevert(IVault.Unsettled.selector);
-            vault.close();
-        }
-        // Done in one transaction, the close goes through.
-        uint256 t = vm.getBlockTimestamp();
-        vm.warp(t - (t % SLOT) + SLOT);
-        vault.recordValuation();
-        vault.settle(type(uint256).max);
+        // Once a valuation has found the station empty, a keep queues no
+        // fill, so a griefer's keep between the valuation and the close
+        // holds nothing off.
+        value(vault);
+        vault.keep(0, 0, "");
         vault.close();
         assertTrue(vault.state() == VaultState.Closed);
     }

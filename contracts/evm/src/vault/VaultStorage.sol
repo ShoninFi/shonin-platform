@@ -239,6 +239,16 @@ library VaultStorage {
         return s.valuations[s.lastPriced - 1];
     }
 
+    /// Halted, and a valuation since has found the stations empty: nothing
+    /// is left to price, and the vault only waits to close. No new request
+    /// is taken, so nobody can hold the close off a slot at a time; holders
+    /// redeem once it has closed, fee-free.
+    function readyToClose(Layout storage s) internal view returns (bool) {
+        if (!halted(s) || s.lastPriced == 0) return false;
+        Valuation storage v = latest(s);
+        return v.time > s.haltedAt && v.gross == v.cash + 1;
+    }
+
     function queue(
         Layout storage s,
         address owner,
