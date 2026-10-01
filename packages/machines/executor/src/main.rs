@@ -357,6 +357,9 @@ async fn serve(
             // A dry tank stops the agent where it is, positions left as they
             // are, until the author tops it up.
             _ = until(dry.clone()) => true,
+            // Once the grace is over the station has stopped, and the agent
+            // is let go wherever it is.
+            _ = until_finished(&chain, vault) => false,
         };
         watching.abort();
 
@@ -368,6 +371,21 @@ async fn serve(
         }
         if stopped_dry {
             continue;
+        }
+        // An agent that ends once it was told the vault is halting has done
+        // its part; it waits out the grace instead of starting again.
+        let halted = chain
+            .read(
+                vault,
+                chain::bindings::station::IStationVault::haltedAtCall {},
+            )
+            .await?;
+        if halted != 0 {
+            tracing::info!(%vault, "the agent ended while the vault halts");
+            while !finished(&chain, vault).await? {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            return Ok(());
         }
         if let Ok(mut counters) = counters.lock() {
             counters.restarts += 1;
@@ -381,6 +399,16 @@ async fn serve(
 async fn until(flag: Arc<AtomicBool>) {
     while !flag.load(Ordering::SeqCst) {
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Resolve once the vault has nothing left to run.
+async fn until_finished(chain: &Client, vault: Address) {
+    loop {
+        if matches!(finished(chain, vault).await, Ok(true)) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
