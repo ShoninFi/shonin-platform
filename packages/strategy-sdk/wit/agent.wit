@@ -28,6 +28,49 @@ interface drivers {
     account-state: async func(driver: driver-name, query: payload) -> result<payload, string>;
 }
 
+/// Moving the vault's own money between its own accounts.
+///
+/// Every move is a call the contracts check: money only ever goes from the
+/// vault's cash to its station, between a station and the venue accounts it
+/// owns, back home, and over a declared bridge to the same station address on
+/// another chain. The vault's idle floor holds whatever the agent asks for.
+/// Amounts are in the dollar's smallest unit, millionths of a dollar.
+interface transfers {
+    use types.{driver-name};
+
+    /// A venue account a station owns: on that chain, through that driver.
+    record venue-account {
+        chain: string,
+        driver: driver-name,
+    }
+
+    /// One of the vault's own accounts. Chains are named as `shonin.toml`
+    /// names them.
+    variant account {
+        /// The vault's cash, on the vault's own chain.
+        vault,
+        /// A station's idle dollars.
+        station(string),
+        venue(venue-account),
+    }
+
+    record balance {
+        account: account,
+        amount: u64,
+    }
+
+    /// The vault's own chain.
+    home-chain: func() -> string;
+    /// Move between two accounts on one chain. Moving from the vault's cash
+    /// to a venue goes through the station on the way.
+    move: async func(source: account, destination: account, amount: u64) -> result<_, string>;
+    /// Send a station's idle dollars over a declared bridge to the same
+    /// station on another chain.
+    bridge: async func(name: string, source-chain: string, destination-chain: string, amount: u64) -> result<_, string>;
+    /// What each of the vault's accounts holds now.
+    balances: async func() -> list<balance>;
+}
+
 /// What the vault tells the agent about itself.
 interface vault {
     variant vault-event {
@@ -37,6 +80,10 @@ interface vault {
         /// The vault is stopping. The agent has a grace period to unwind
         /// itself before the contract does it.
         halting(string),
+        /// The vault's cash is short of what waiting withdrawals and the idle
+        /// floor need, by this many millionths of a dollar. Bringing money
+        /// home now saves a leaver from waiting for a claim.
+        buffer-low(u64),
     }
 
     events: func() -> stream<vault-event>;
@@ -113,6 +160,7 @@ interface inference {
 world agent {
     import types;
     import drivers;
+    import transfers;
     import vault;
     import data;
     import websocket;

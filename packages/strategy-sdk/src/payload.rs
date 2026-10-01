@@ -33,3 +33,10 @@ pub fn to_payload<T: Serialize>(value: &T) -> Vec<u8> {
 pub fn from_payload<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
     ciborium::from_reader(bytes).map_err(|error| error.to_string())
 }
+
+/// Dollars as the millionths `transfers` moves, rounded down, so an agent
+/// never asks to move more than it meant to. Zero for a negative amount.
+pub fn millionths(dollars: Decimal) -> u64 {
+    let units = (dollars * Decimal::from(1_000_000u32)).floor();
+    u64::try_from(units).unwrap_or(0)
+}

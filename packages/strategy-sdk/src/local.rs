@@ -17,17 +17,6 @@ pub enum Side {
     Sell,
 }
 
-/// One of the vault's own accounts. There are two, and nothing else exists to
-/// name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Account {
-    /// The balance sitting on the vault's own contract.
-    Idle,
-    /// The vault's account on the venue.
-    Venue,
-}
-
 /// An order. Every order is immediate-or-cancel against the venue's current
 /// bid and ask, and `limit_price` is the worst price it may fill at.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -45,12 +34,6 @@ pub struct Order {
 #[serde(rename_all = "kebab-case")]
 pub enum Action {
     Place(Order),
-    /// Move the vault's own money between the vault's own accounts.
-    MoveCapital {
-        from: Account,
-        to: Account,
-        amount: Decimal,
-    },
 }
 
 /// What came back inside an accepted verdict.
@@ -63,11 +46,6 @@ pub enum Receipt {
         size: Decimal,
         price: Decimal,
         notional: Decimal,
-    },
-    Moved {
-        from: Account,
-        to: Account,
-        amount: Decimal,
     },
 }
 
@@ -129,8 +107,10 @@ pub struct AccountState {
     pub exit_value: Decimal,
     /// The whole vault at mark, including the part not on the venue.
     pub vault_value: Decimal,
-    /// The part of the vault sitting on its own contract.
+    /// The vault's cash, on its own contract.
     pub idle: Decimal,
+    /// The station's idle dollars, beside the venue account.
+    pub station_idle: Decimal,
     /// What a perp position has to be backed by, in basis points.
     pub margin_bps: u32,
     pub positions: Vec<PositionState>,
