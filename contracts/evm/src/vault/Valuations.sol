@@ -310,7 +310,9 @@ library Valuations {
         s.lastHolding = uint64(block.timestamp);
         uint256 rate = uint256(s.fees.holdingBps) * elapsed * WAD / (BPS * YEAR);
         if (rate == 0 || rate >= WAD) return;
-        uint256 minted = (s.totalSupply + OFFSET).mulDiv(rate, WAD - rate);
+        // Not on closed claims' shares: they own a fixed amount, and the
+        // holding fee on it would fall on the stayers.
+        uint256 minted = (s.totalSupply + OFFSET - s.closedShares).mulDiv(rate, WAD - rate);
         s.mint(address(this), minted);
         s.unpaidHolding += minted;
         emit IVault.HoldingSynced(minted);
@@ -486,7 +488,7 @@ library Valuations {
             uint256 owned = home + s.claimCash[r.ref];
             s.claimCash[r.ref] = 0;
             if (owned > s.free()) owned = s.free();
-            uint256 fee = s.feeOf(owned, shares);
+            uint256 fee = s.feeAt(owned, shares, s.claimMark[r.ref]);
             // The valuation already prices the stayers without it.
             slice = fee == 0 ? 0 : fee.mulDiv(v.supply, v.grossExit, Math.Rounding.Ceil);
             if (slice > shares) slice = shares;

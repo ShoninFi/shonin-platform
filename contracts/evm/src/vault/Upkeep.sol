@@ -401,6 +401,7 @@ library Upkeep {
         s.claimHome[claimId] = home;
         s.reservedCash += reserve;
         if (home == 0) s.coveredReserved += reserve;
+        s.claimMark[claimId] = s.mark;
         claim.state = ClaimState.Queued;
         claim.lastAttemptAt = uint64(block.timestamp);
         s.queuedClaims += 1;

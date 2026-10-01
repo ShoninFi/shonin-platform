@@ -36,6 +36,7 @@ contract StationFactory is IStationFactory {
     error NotBlessed();
     error WrongChain();
     error UnknownDriver();
+    error UnknownBridge();
     error OutOfRange();
 
     constructor(address initializer_) {
@@ -101,6 +102,9 @@ contract StationFactory is IStationFactory {
         // stop or unwind the station.
         for (uint256 i = 0; i < spec.drivers.length; i++) {
             if (registry.unwindDriver(spec.drivers[i]) == address(0)) revert UnknownDriver();
+        }
+        for (uint256 i = 0; i < spec.bridges.length; i++) {
+            if (registry.bridgeOf(spec.bridges[i]) == address(0)) revert UnknownBridge();
         }
         return _create(spec);
     }

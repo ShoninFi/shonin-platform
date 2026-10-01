@@ -99,6 +99,9 @@ struct Layout {
     /// as it stood then: together, all its shares own once it is closed.
     mapping(uint256 => uint256) claimHome;
     mapping(uint256 => uint256) claimCash;
+    /// The high-water mark when a claim was queued: its profit fee is owed
+    /// against that, whatever a payday does to the mark before it is priced.
+    mapping(uint256 => uint256) claimMark;
     /// The shares of queued claims whose fraction is already home: they own
     /// cash, and none of what the stations still hold.
     uint256 closedShares;
@@ -213,7 +216,16 @@ library VaultStorage {
     /// The profit fee owed on `gross` with `supply` shares: a share of what
     /// the vault is worth above the high-water mark, never below zero.
     function feeOf(Layout storage s, uint256 gross, uint256 supply) internal view returns (uint256) {
-        uint256 basis = s.mark.mulDiv(supply, PRICE, Math.Rounding.Ceil);
+        return feeAt(s, gross, supply, s.mark);
+    }
+
+    function feeAt(
+        Layout storage s,
+        uint256 gross,
+        uint256 supply,
+        uint256 mark
+    ) internal view returns (uint256) {
+        uint256 basis = mark.mulDiv(supply, PRICE, Math.Rounding.Ceil);
         if (gross <= basis) return 0;
         return (gross - basis).mulDiv(uint256(s.fees.authorBps) + s.fees.platformBps, BPS);
     }
