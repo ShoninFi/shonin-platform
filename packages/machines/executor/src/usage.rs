@@ -22,7 +22,7 @@ use alloy::primitives::{Address, U256};
 use anyhow::{Context, Result};
 use chain::bindings::vault::IVault;
 use chain::{Client, KeyClient};
-use shared::{DeclaredAllowances, Prices};
+use shared::{Allowances, Prices};
 
 use crate::scale::ASSET_DECIMALS;
 
@@ -31,7 +31,7 @@ use crate::scale::ASSET_DECIMALS;
 const DAY: u64 = 86_400;
 
 /// Meter one vault and say what it cost, once a day.
-pub async fn run(chain: Client, key: KeyClient, vault: Address, allowances: DeclaredAllowances) {
+pub async fn run(chain: Client, key: KeyClient, vault: Address, allowances: Allowances) {
     // Nothing is charged for the time before this instance took the vault on.
     let mut since = Instant::now();
     loop {
@@ -50,7 +50,7 @@ async fn state(
     chain: &Client,
     key: &KeyClient,
     vault: Address,
-    allowances: DeclaredAllowances,
+    allowances: Allowances,
     since: Instant,
 ) -> Result<Option<Instant>> {
     let now = chain.block_timestamp().await?;
@@ -96,7 +96,7 @@ async fn state(
 }
 
 /// What holding those allowances for that long costs, at the published prices.
-fn cost(seconds: u64, allowances: DeclaredAllowances) -> U256 {
+fn cost(seconds: u64, allowances: Allowances) -> U256 {
     let day = Prices::published().daily_cap(&allowances);
     let dollars = day * (seconds.min(DAY) as f64 / DAY as f64);
     let units = (dollars * 10f64.powi(ASSET_DECIMALS as i32))

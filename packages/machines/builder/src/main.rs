@@ -1,37 +1,42 @@
 //! The build service.
 //!
-//! An author submits a project; the service compiles it with a pinned recipe,
-//! loads the component, and signs what it made with a key the registry blessed
-//! for the image it is. The queue is public and
-//! first come, first served, one job in flight per author, and a failed build
-//! is as public as one that worked.
+//! An author uploads a project, then pays to publish it from the same wallet.
+//! The payment admits the job and gives the agent its id. The reviewer reads
+//! the source before anything is built; if it lets the source through, the
+//! service compiles it with a pinned recipe, loads the component, and
+//! registers what it made, with the reviewer's go-ahead and its own signature.
+//!
+//! The queue is public and first come, first served, one job in flight per
+//! author. A job ends ready, refused or failed, and shows nothing more than
+//! that: no build log is ever kept.
 
 mod build;
 mod store;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::primitives::{Address, B256, U256, keccak256};
-use anyhow::{Context, Result};
+use alloy::primitives::{Address, B256, Bytes, keccak256};
+use alloy::rpc::types::Filter;
+use alloy::sol_types::SolEvent;
+use anyhow::{Context, Result, anyhow};
 use axum::Json;
 use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
-use chain::bindings::factory::IVaultFactory;
-use chain::bindings::strategies::IStrategyRegistry;
-use chain::bindings::vault::{IVault, VaultState};
+use chain::bindings::publishing::IPublishing;
+use chain::bindings::strategies::{ChainNeed, IStrategyRegistry};
 use chain::{Client, Deployments, Served};
 use clap::Parser;
-use shared::manifest::{Manifest, hash_bytes, hash_to_bytes};
+use shared::manifest::{Canonical, Manifest, hash_bytes, hash_to_bytes};
 use shared::model::registry::{Job, JobState};
-use shared::{Chain, Submission, SubmissionAccepted, SubmissionSource};
+use shared::{Catalogue, Chain, Failure, ReviewAnswer, ReviewRequest, Upload, UploadAccepted};
 use tokio::sync::Mutex;
 
 #[derive(Parser)]
-#[command(about = "Compiles submitted strategies into signed bundles")]
+#[command(about = "Reviews, then compiles, submitted agents into signed bundles")]
 struct Args {
     #[command(flatten)]
     chain_args: chain::ChainArgs,
@@ -44,31 +49,38 @@ struct Args {
     /// against whatever it asked for.
     #[arg(long)]
     sdk: PathBuf,
+    /// The reviewer, which reads every submission before it is built.
+    #[arg(long, env = "SHONIN_REVIEWER_URL")]
+    reviewer_url: String,
     #[arg(long, default_value_t = 19_084)]
     port: u16,
 }
 
 struct Service {
-    /// Every vault chain it builds for: a build is registered on the chain its
-    /// vault is on.
+    /// Every vault chain it builds for: an agent is published on its vault
+    /// chain.
     chains: Vec<Served>,
+    /// `local`, `testnet` or `mainnet`: which drivers are on offer.
+    network: String,
+    catalogue: Catalogue,
     store: PathBuf,
     builds: PathBuf,
     sdk: PathBuf,
+    reviewer: String,
+    http: reqwest::Client,
     /// The queue, oldest first.
     jobs: Mutex<Vec<Entry>>,
     /// Where the queue is kept, so restarting the service does not lose a
-    /// build someone paid for.
+    /// job someone paid for.
     queue_file: PathBuf,
 }
 
 impl Service {
-    /// The chain a build for this vault chain is registered on.
     fn on(&self, chain: Chain) -> Result<&Served> {
         self.chains
             .iter()
             .find(|served| served.vault_chain == chain)
-            .ok_or_else(|| anyhow::anyhow!("this build service does not serve {chain}"))
+            .ok_or_else(|| anyhow!("this build service does not serve {chain}"))
     }
 }
 
@@ -76,16 +88,16 @@ impl Service {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Entry {
     job: Job,
-    submission: Submission,
-    /// The submitted source, base64 as it arrived, so a restart can still
-    /// build it.
+    /// The reference the author pays against.
+    upload: B256,
+    /// The wallet the upload named: only its payment starts the job.
+    author: Address,
+    /// The project, base64, as it arrived, so a restart can still build it.
     archive: String,
-}
-
-impl Entry {
-    fn bytes(&self) -> Result<Vec<u8>> {
-        decode(&self.archive)
-    }
+    /// Where the agent's `shonin.toml` is, inside the project.
+    manifest_path: String,
+    /// The cargo package to build.
+    package: String,
 }
 
 #[tokio::main]
@@ -98,12 +110,13 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let network = args.chain_args.network.to_string();
     let chains = args.chain_args.connect_all().await?;
     for served in &chains {
         bless(&served.client, &served.deployments).await?;
     }
 
-    // A build someone funded should survive this service restarting, so the
+    // A job someone paid for should survive this service restarting, so the
     // queue is on disk rather than only in memory.
     let queue_file = args.store.join("queue.json");
     let waiting: Vec<Entry> = std::fs::read(&queue_file)
@@ -116,12 +129,31 @@ async fn main() -> Result<()> {
 
     let service = Arc::new(Service {
         chains,
+        network,
+        catalogue: Catalogue::published(),
         store: args.store,
         builds: args.builds,
         sdk: args.sdk,
+        reviewer: args.reviewer_url.trim_end_matches('/').to_string(),
+        http: reqwest::Client::new(),
         jobs: Mutex::new(waiting),
         queue_file,
     });
+
+    // Payments, on every chain.
+    for index in 0..service.chains.len() {
+        let watcher = service.clone();
+        tokio::spawn(async move {
+            let mut from = watcher.chains[index].deployments.deployed_block;
+            loop {
+                match admit(&watcher, index, from).await {
+                    Ok(next) => from = next,
+                    Err(error) => tracing::warn!(%error, "could not read payments"),
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
 
     let worker = service.clone();
     tokio::spawn(async move {
@@ -137,7 +169,7 @@ async fn main() -> Result<()> {
         .route("/health", get(|| async { "builder" }))
         .route("/jobs", get(list_jobs))
         .route("/jobs/{id}", get(one_job))
-        .route("/{chain}/submissions", post(submit))
+        .route("/{chain}/uploads", post(upload))
         .with_state(service);
 
     let address = SocketAddr::from(([127, 0, 0, 1], args.port));
@@ -165,72 +197,158 @@ async fn bless(chain: &Client, deployments: &Deployments) -> Result<()> {
     Ok(())
 }
 
-// The queue ------------------------------------------------------------------
+// Uploads and payments --------------------------------------------------------
 
-async fn submit(
+type Refusal = (StatusCode, String);
+
+fn bad(message: impl Into<String>) -> Refusal {
+    (StatusCode::BAD_REQUEST, message.into())
+}
+
+/// Take a project, check what can be checked before anyone pays, and hand
+/// back the reference to pay against. A manifest the platform won't accept,
+/// or source over the limit, is refused here, before the $1 is spent.
+async fn upload(
     State(service): State<Arc<Service>>,
-    axum::extract::Path(chain): axum::extract::Path<Chain>,
-    Json(submission): Json<Submission>,
-) -> Result<Json<SubmissionAccepted>, (StatusCode, String)> {
-    let archive = match &submission.source {
-        SubmissionSource::Archive { base64 } => {
-            decode(base64).map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?
-        }
-        SubmissionSource::Repository { .. } => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "this build service takes a packed project, not a repository".to_string(),
-            ));
-        }
-    };
+    UrlPath(chain): UrlPath<Chain>,
+    Json(upload): Json<Upload>,
+) -> Result<Json<UploadAccepted>, Refusal> {
+    service.on(chain).map_err(|error| bad(error.to_string()))?;
+    let author: Address = upload
+        .author
+        .parse()
+        .map_err(|_| bad("the author is not an address"))?;
+    let archive = shared::base64::decode(&upload.archive_base64).map_err(bad)?;
     let source_hash = hash_bytes(&archive);
-    if let Err(error) = service.on(chain) {
-        return Err((StatusCode::BAD_REQUEST, error.to_string()));
-    }
+
+    // Read it the way the build will, in a directory of its own.
+    let scratch = service
+        .builds
+        .join(format!("upload-{}", &source_hash[7..23]));
+    let _ = std::fs::remove_dir_all(&scratch);
+    shared::archive::unpack(&archive, &scratch)
+        .map_err(|error| bad(format!("the archive: {error}")))?;
+    let checked = check(&service, &scratch, upload.package.as_deref(), chain);
+    let _ = std::fs::remove_dir_all(&scratch);
+    let (manifest, manifest_path, package) = checked.map_err(bad)?;
 
     let mut jobs = service.jobs.lock().await;
     let id = format!("{}", 8_800 + jobs.len());
-    let now = now();
-    let position = jobs
-        .iter()
-        .filter(|entry| matches!(entry.job.state, JobState::Queued { .. }))
-        .count() as u32
-        + 1;
-
+    // Unique to this author, this source and this job, so a second upload of
+    // the same project is a second job with its own reference.
+    let reference = keccak256(
+        [
+            author.as_slice(),
+            &hash_to_bytes(&source_hash).unwrap_or_default(),
+            id.as_bytes(),
+        ]
+        .concat(),
+    );
     let job = Job {
         id: id.clone(),
         chain,
-        subject: format!("{} v{}", submission.strategy_id, submission.version),
-        author: submission.author.clone(),
-        state: JobState::Queued { position },
-        submitted: now,
+        strategy_id: None,
+        title: manifest.description.title.clone(),
+        author: format!("{author:#x}"),
+        state: JobState::AwaitingPayment,
+        submitted: now(),
         duration_seconds: 0,
-        source_hash: source_hash.clone(),
+        source_hash,
+        sealed: upload.sealed,
         bundle_hash: None,
-        log: vec![build::plain(format!(
-            "queued  {} v{}",
-            submission.strategy_id, submission.version
-        ))],
-        // What this build is for, from the moment it is queued: a build that
-        // fails never registers a strategy, and its page still has to be able
-        // to find the log that says why.
-        strategy_slug: Some(format!(
-            "{}-v{}",
-            submission.strategy_id, submission.version
-        )),
+        review: None,
+        strategy_slug: None,
     };
     jobs.push(Entry {
-        job: job.clone(),
-        submission,
-        archive: encode(&archive),
+        job,
+        upload: reference,
+        author,
+        archive: upload.archive_base64,
+        manifest_path,
+        package,
     });
     write_queue(&service, &jobs);
-
-    tracing::info!(id, "a submission joined the queue");
-    Ok(Json(SubmissionAccepted {
+    tracing::info!(id, "an upload is waiting for its payment");
+    Ok(Json(UploadAccepted {
+        upload: format!("{reference:#x}"),
         job_id: id,
-        source_hash,
     }))
+}
+
+/// Everything about a project that can be refused before it is paid for.
+fn check(
+    service: &Service,
+    source: &Path,
+    package: Option<&str>,
+    chain: Chain,
+) -> Result<(Manifest, String, String), String> {
+    if build::source_size(source) > build::SIZE_LIMIT {
+        return Err(Failure::TooLarge.label().into());
+    }
+    let path = build::find_manifest(source, package)?;
+    let manifest = build::read_manifest(&path)?;
+    manifest.check(&service.catalogue, &service.network)?;
+    if manifest.vault_chain()? != chain {
+        return Err(format!(
+            "shonin.toml puts the vault on {}, and this upload is for {chain}",
+            manifest.vault.chain
+        ));
+    }
+    let package = build::package_of(&path).ok_or("no Cargo.toml beside shonin.toml")?;
+    let relative = path
+        .strip_prefix(source)
+        .map_err(|_| "the manifest is outside the project")?
+        .to_string_lossy()
+        .to_string();
+    Ok((manifest, relative, package))
+}
+
+/// Read the payments on one chain since `from`, and admit the jobs they pay
+/// for. A payment starts a job only if it came from the wallet the upload
+/// named, so a copied payment from anyone else starts nothing.
+async fn admit(service: &Arc<Service>, index: usize, from: u64) -> Result<u64> {
+    let on = &service.chains[index];
+    let head = on.client.block_number().await?;
+    if head < from {
+        return Ok(from);
+    }
+    let logs = on
+        .client
+        .logs(
+            &Filter::new()
+                .address(on.deployments.publishing)
+                .event_signature(IPublishing::Submitted::SIGNATURE_HASH)
+                .from_block(from)
+                .to_block(head),
+        )
+        .await?;
+    if logs.is_empty() {
+        return Ok(head + 1);
+    }
+    let mut jobs = service.jobs.lock().await;
+    for log in logs {
+        let Ok(paid) = log.log_decode::<IPublishing::Submitted>() else {
+            continue;
+        };
+        let paid = paid.inner.data;
+        let Some(entry) = jobs.iter_mut().find(|entry| {
+            entry.upload == paid.upload
+                && entry.author == paid.author
+                && entry.job.chain == on.vault_chain
+                && entry.job.state == JobState::AwaitingPayment
+        }) else {
+            continue;
+        };
+        let id: u64 = paid
+            .strategyId
+            .try_into()
+            .context("a strategy id past u64")?;
+        entry.job.strategy_id = Some(id);
+        entry.job.state = JobState::Queued { position: 0 };
+        tracing::info!(job = entry.job.id, id, "paid for, and queued");
+    }
+    write_queue(service, &jobs);
+    Ok(head + 1)
 }
 
 async fn list_jobs(State(service): State<Arc<Service>>) -> Json<Vec<Job>> {
@@ -251,8 +369,7 @@ async fn one_job(
 }
 
 /// The queue as it stands now. A waiting job's position is counted when it is
-/// asked for, not when it was submitted, so a queue that drains is a queue
-/// that visibly drains.
+/// asked for, so a queue that drains is a queue that visibly drains.
 fn placed(jobs: &[Entry]) -> Vec<Job> {
     let mut waiting = 0;
     jobs.iter()
@@ -267,162 +384,194 @@ fn placed(jobs: &[Entry]) -> Vec<Job> {
         .collect()
 }
 
-/// What the build cost, at the platform's published prices, charged to the
-/// vault's tank. A build is processor time and nothing else, so that is what
-/// it is billed as.
-async fn charge_build(service: &Arc<Service>, chain: Chain, vault: Address, seconds: u32) {
-    let Ok(on) = service.on(chain) else {
-        return;
-    };
-    let dollars = seconds as f64 / 3_600.0 * shared::Prices::published().vcpu_hour;
-    let amount = U256::from((dollars * 1_000_000.0).round().max(0.0) as u128);
-    if let Err(error) = on
-        .client
-        .send(
-            on.deployments.roles.builder,
-            vault,
-            IVault::chargeBuildCall { amount },
-        )
-        .await
-    {
-        // The build still happened and the vault still opens: an uncharged
-        // build costs the platform, never the author or the depositors.
-        tracing::warn!(%vault, %error, "the build could not be charged");
-    }
-}
+// The queue ------------------------------------------------------------------
 
-/// Take the oldest job whose vault is ready, and build it.
+/// Take the oldest paid job, have it reviewed, and build it.
 async fn take_one(service: &Arc<Service>) -> Result<()> {
     let next = {
         let jobs = service.jobs.lock().await;
         // First come, first served, and one job in flight per author: nobody
         // can fill the queue with their own work.
-        let busy: Vec<String> = jobs
+        let busy: Vec<Address> = jobs
             .iter()
-            .filter(|entry| matches!(entry.job.state, JobState::Building { .. }))
-            .map(|entry| entry.job.author.clone())
+            .filter(|entry| matches!(entry.job.state, JobState::Reviewing | JobState::Building))
+            .map(|entry| entry.author)
             .collect();
         jobs.iter()
             .find(|entry| {
-                matches!(entry.job.state, JobState::Queued { .. })
-                    && !busy.contains(&entry.job.author)
+                matches!(entry.job.state, JobState::Queued { .. }) && !busy.contains(&entry.author)
             })
             .cloned()
     };
     let Some(entry) = next else {
         return Ok(());
     };
-
-    // A build is admitted once its vault exists and its tank covers the
-    // minimum. Until then the job waits, and nothing was built for free.
-    let chain = entry.job.chain;
-    let Some(vault) = vault_for(service, chain, &entry.submission).await? else {
-        return Ok(());
-    };
-
-    set_state(
-        service,
-        &entry.job.id,
-        JobState::Building {
-            step: "compiling".to_string(),
-            percent: 10,
-        },
-        None,
-    )
-    .await;
-
-    let source = service.builds.join(&entry.job.id).join("source");
-    let _ = std::fs::remove_dir_all(source.parent().unwrap_or(&source));
-    shared::archive::unpack(&entry.bytes()?, &source)?;
-
-    let sdk = service.sdk.clone();
-    let claimed = (
-        entry.submission.strategy_id.clone(),
-        entry.submission.version,
-    );
-    let built = tokio::task::spawn_blocking(move || {
-        build::build(&source, &sdk, "sha256:dev-builder", (&claimed.0, claimed.1))
-    })
-    .await?;
-
-    // A build that ran is charged, whichever way it ended. The vault's
-    // contract believes the figure only up to a day at the allowances its
-    // author declared.
-    let ran = match &built {
-        Ok(built) => built.seconds,
-        Err(failed) => failed.seconds,
-    };
-    charge_build(service, chain, vault, ran).await;
-
-    match built {
-        Ok(built) => finish(service, chain, &entry, vault, built).await,
-        Err(failed) => {
-            tracing::warn!(id = entry.job.id, reason = failed.reason, "a build failed");
+    let started = std::time::Instant::now();
+    match run(service, &entry).await {
+        Ok((state, bundle_hash)) => {
+            set_state(service, &entry.job.id, state, bundle_hash, started).await
+        }
+        Err(error) => {
+            // The fee is spent all the same: a free retry is something anyone
+            // could trigger.
+            tracing::warn!(id = entry.job.id, %error, "a job failed on our side");
             set_state(
                 service,
                 &entry.job.id,
                 JobState::Failed {
-                    reason: failed.reason.clone(),
+                    outcome: Failure::Service,
                 },
-                Some(failed.log),
+                None,
+                started,
             )
             .await;
-            // The build ran, so the tank is charged for it, and the vault
-            // closes with the rest returned to its author.
-            let on = service.on(chain)?;
-            on.client
-                .send(
-                    on.deployments.roles.builder,
-                    vault,
-                    IVault::failBuildCall {
-                        reasonHash: keccak256(failed.reason.as_bytes()),
-                    },
-                )
-                .await
-                .ok();
-            Ok(())
         }
     }
+    Ok(())
 }
 
-/// Sign what was built and put it on the registry, then write everything the
-/// site will show into the store.
-async fn finish(
-    service: &Arc<Service>,
-    chain: Chain,
-    entry: &Entry,
-    vault: Address,
-    built: build::Built,
-) -> Result<()> {
-    let on = service.on(chain)?;
-    let submission = &entry.submission;
-    let author: Address = submission.author.parse().context("the author's address")?;
-    let strategy_id = name_to_bytes(&submission.strategy_id);
-    let source_hash = hash_to_bytes(&entry.job.source_hash).context("the source hash")?;
-    let bundle_hash = hash_to_bytes(&built.bundle_hash).context("the bundle hash")?;
-    let manifest_hash = hash_to_bytes(&built.manifest_hash).context("the manifest hash")?;
+/// One job, from review to registration. Returns how it ended, and the
+/// bundle it made if it made one.
+async fn run(service: &Arc<Service>, entry: &Entry) -> Result<(JobState, Option<String>)> {
+    let chain = entry.job.chain;
+    let strategy_id = entry.job.strategy_id.context("a queued job has an id")?;
+    let started = std::time::Instant::now();
 
+    // The review comes first: nothing is compiled, so no build script or
+    // procedural macro runs, before the reviewer has read the source.
+    set_state(service, &entry.job.id, JobState::Reviewing, None, started).await;
+    let answer: ReviewAnswer = service
+        .http
+        .post(format!("{}/{chain}/reviews", service.reviewer))
+        .json(&ReviewRequest {
+            strategy_id,
+            archive_base64: entry.archive.clone(),
+            sealed: entry.job.sealed,
+            manifest_path: entry.manifest_path.clone(),
+        })
+        .timeout(Duration::from_secs(30 * 60))
+        .send()
+        .await
+        .context("the reviewer did not answer")?
+        .error_for_status()
+        .context("the reviewer could not review it")?
+        .json()
+        .await
+        .context("the reviewer's answer")?;
+    let Some(clearance) = answer.clearance else {
+        tracing::info!(id = entry.job.id, "the reviewer refused it");
+        return Ok((JobState::Refused, None));
+    };
+    anyhow::ensure!(
+        answer.source_hash == entry.job.source_hash,
+        "the reviewer read different source"
+    );
+
+    set_state(service, &entry.job.id, JobState::Building, None, started).await;
+    let source = service.builds.join(&entry.job.id).join("source");
+    let _ = std::fs::remove_dir_all(source.parent().unwrap_or(&source));
+    let archive = shared::base64::decode(&entry.archive).map_err(|error| anyhow!(error))?;
+    shared::archive::unpack(&archive, &source)?;
+
+    let sdk = service.sdk.clone();
+    let package = entry.package.clone();
+    let built = tokio::task::spawn_blocking(move || build::build(&source, &sdk, &package)).await?;
+    let built = match built {
+        Ok(built) => built,
+        Err((outcome, _)) => {
+            tracing::info!(
+                id = entry.job.id,
+                outcome = outcome.label(),
+                "a build failed"
+            );
+            return Ok((JobState::Failed { outcome }, None));
+        }
+    };
+
+    let bundle_hash = built.bundle_hash.clone();
+    register(service, entry, strategy_id, &archive, built, &clearance).await?;
+    Ok((JobState::Ready, Some(bundle_hash)))
+}
+
+/// Write what was built into the store, then put it on the registry with the
+/// reviewer's go-ahead and the builder's own signature.
+async fn register(
+    service: &Arc<Service>,
+    entry: &Entry,
+    strategy_id: u64,
+    archive: &[u8],
+    built: build::Built,
+    clearance: &str,
+) -> Result<()> {
+    let chain = entry.job.chain;
+    let on = service.on(chain)?;
+    let source = service.builds.join(&entry.job.id).join("source");
+    let manifest =
+        build::read_manifest(&source.join(&entry.manifest_path)).map_err(|error| anyhow!(error))?;
+
+    let canonical = Canonical {
+        strategy_id,
+        vault_chain: chain,
+        author: format!("{:#x}", entry.author),
+        bundle_hash: built.bundle_hash.clone(),
+        component_hash: built.component_hash.clone(),
+        source_hash: entry.job.source_hash.clone(),
+        sealed: entry.job.sealed,
+        world: build::WORLD.into(),
+        toolchain: build::TOOLCHAIN.into(),
+        builder_image: format!("{:#x}", chain::attest::image_digest("builder")),
+        manifest: manifest.clone(),
+    };
+    let manifest_hash = canonical.hash();
+
+    let chains: Vec<ChainNeed> = manifest
+        .chains(&service.catalogue)
+        .map_err(|error| anyhow!(error))?
+        .into_iter()
+        .map(|need| ChainNeed {
+            chain: name(need.chain.name()),
+            drivers: need.drivers.iter().map(|driver| name(driver)).collect(),
+        })
+        .collect();
+    let bridges: Vec<B256> = manifest
+        .bridge_names()
+        .iter()
+        .map(|bridge| name(bridge))
+        .collect();
+    let restricted: Vec<B256> = manifest
+        .restricted(&service.catalogue)
+        .iter()
+        .map(|code| name(code))
+        .collect();
+
+    let bytes =
+        |hash: &str| -> Result<B256> { Ok(B256::from(hash_to_bytes(hash).context("a hash")?)) };
+    let (source_hash, bundle_hash, manifest_bytes) = (
+        bytes(&entry.job.source_hash)?,
+        bytes(&built.bundle_hash)?,
+        bytes(&manifest_hash)?,
+    );
     let digest = on
         .client
         .read(
             on.deployments.strategies,
             IStrategyRegistry::registrationDigestCall {
-                strategyId: strategy_id.into(),
-                version: submission.version,
-                author,
-                sourceHash: source_hash.into(),
-                bundleHash: bundle_hash.into(),
-                manifestHash: manifest_hash.into(),
+                strategyId: alloy::primitives::U256::from(strategy_id),
+                author: entry.author,
+                sourceHash: source_hash,
+                bundleHash: bundle_hash,
+                manifestHash: manifest_bytes,
+                chains: chains.clone(),
+                bridges: bridges.clone(),
+                restricted: restricted.clone(),
             },
         )
         .await?;
     let signature = on.client.sign(on.deployments.roles.builder, digest).await?;
 
-    // Everything the site shows about a build lives in the store, addressed
-    // by the hashes the chain holds. It is written before the registration,
-    // because a registry pointing at bytes nobody has is worse than bytes
-    // nobody has looked up yet: the reviewer reads the source the moment the
-    // version appears.
+    // Everything a page shows about a build lives in the store, addressed by
+    // the hashes the chain holds, written before the registration so the
+    // registry never points at bytes nobody has.
     store::put(
         &service.store,
         &built.bundle_hash,
@@ -435,15 +584,7 @@ async fn finish(
         "bundle.tar",
         &built.bundle,
     )?;
-    store::put_json(
-        &service.store,
-        &built.bundle_hash,
-        "manifest.json",
-        &built.manifest,
-    )?;
-    store::put_json(&service.store, &built.bundle_hash, "log.json", &built.log)?;
-    // The hashes this build produced, beside the bytes they name, so a page
-    // can show them and a reader can check them.
+    store::put_json(&service.store, &manifest_hash, "manifest.json", &canonical)?;
     store::put_json(
         &service.store,
         &built.bundle_hash,
@@ -451,143 +592,87 @@ async fn finish(
         &serde_json::json!({
             "component": built.component_hash,
             "bundle": built.bundle_hash,
-            "manifest": built.manifest_hash,
+            "manifest": manifest_hash,
             "source": entry.job.source_hash,
-            "toolchain": built.toolchain,
+            "toolchain": build::TOOLCHAIN,
             "seconds": built.seconds,
         }),
     )?;
-    // The source is kept either way, because the reviewer reads it either way
-    // and a rebuild has to be possible for as long as the vault lives. A
-    // sealed one is kept under a name the public store refuses to serve, so
-    // sealing changes who can read the source and nothing else.
+    // The source is kept either way, because a rebuild has to be possible
+    // for as long as the vault lives. A sealed one is kept under a name the
+    // public store refuses to serve.
     store::put(
         &service.store,
         &entry.job.source_hash,
-        if submission.sealed {
+        if entry.job.sealed {
             "source.sealed.tar"
         } else {
             "source.tar"
         },
-        &entry.bytes()?,
+        archive,
     )?;
 
-    let (supersedes_id, supersedes_version) = supersedes(&built.manifest);
+    let clearance: Bytes = clearance.parse().context("the reviewer's go-ahead")?;
     on.client
         .send(
             on.deployments.roles.builder,
             on.deployments.strategies,
             IStrategyRegistry::registerCall {
-                strategyId: strategy_id.into(),
-                version: submission.version,
-                author,
-                sourceHash: source_hash.into(),
-                bundleHash: bundle_hash.into(),
-                manifestHash: manifest_hash.into(),
-                supersedesId: supersedes_id.into(),
-                supersedesVersion: supersedes_version,
+                strategyId: alloy::primitives::U256::from(strategy_id),
+                author: entry.author,
+                sourceHash: source_hash,
+                bundleHash: bundle_hash,
+                manifestHash: manifest_bytes,
+                chains,
+                bridges,
+                restricted,
                 builderSignature: signature,
+                reviewerClearance: clearance,
             },
         )
         .await
         .context("the registry would not take the registration")?;
 
-    // Anyone may open a vault once the registry holds its bundle.
-    on.client
-        .send(on.deployments.roles.builder, vault, IVault::openCall {})
-        .await
-        .context("the vault would not open")?;
-
-    let slug = built.manifest.slug();
-    tracing::info!(id = entry.job.id, slug, "built, signed and registered");
-    set_state_full(
-        service,
-        &entry.job.id,
-        JobState::Succeeded,
-        Some(built.log),
-        Some(built.bundle_hash),
-        Some(slug),
-        built.seconds,
-    )
-    .await;
+    tracing::info!(
+        id = entry.job.id,
+        strategy_id,
+        "built, signed and registered"
+    );
     Ok(())
 }
 
-/// The vault a submission belongs to, once it exists and is still waiting for
-/// its build.
-async fn vault_for(
-    service: &Arc<Service>,
-    chain: Chain,
-    submission: &Submission,
-) -> Result<Option<Address>> {
-    let on = service.on(chain)?;
-    let vault = on
-        .client
-        .read(
-            on.deployments.factory,
-            IVaultFactory::vaultOfCall {
-                strategyId: name_to_bytes(&submission.strategy_id).into(),
-                version: submission.version,
-            },
-        )
-        .await?;
-    if vault == Address::ZERO {
-        return Ok(None);
-    }
-    let state = on.client.read(vault, IVault::stateCall {}).await?;
-    Ok(matches!(state, VaultState::Building).then_some(vault))
-}
-
-fn supersedes(manifest: &Manifest) -> ([u8; 32], u32) {
-    let Some(claim) = &manifest.strategy.supersedes else {
-        return ([0u8; 32], 0);
-    };
-    match claim.rsplit_once('@') {
-        Some((id, version)) => (name_to_bytes(id), version.parse().unwrap_or(0)),
-        None => ([0u8; 32], 0),
-    }
+/// A short name as the chain stores it: the text, then zeros.
+fn name(text: &str) -> B256 {
+    let mut out = [0u8; 32];
+    let bytes = text.as_bytes();
+    let take = bytes.len().min(32);
+    out[..take].copy_from_slice(&bytes[..take]);
+    B256::from(out)
 }
 
 async fn set_state(
     service: &Arc<Service>,
     id: &str,
     state: JobState,
-    log: Option<Vec<shared::model::bundle::LogLine>>,
-) {
-    set_state_full(service, id, state, log, None, None, 0).await;
-}
-
-async fn set_state_full(
-    service: &Arc<Service>,
-    id: &str,
-    state: JobState,
-    log: Option<Vec<shared::model::bundle::LogLine>>,
     bundle_hash: Option<String>,
-    slug: Option<String>,
-    seconds: u32,
+    started: std::time::Instant,
 ) {
     let mut jobs = service.jobs.lock().await;
     if let Some(entry) = jobs.iter_mut().find(|entry| entry.job.id == id) {
-        entry.job.state = state;
-        if let Some(log) = log {
-            entry.job.log = log;
+        if state.is_finished() {
+            entry.job.duration_seconds = started.elapsed().as_secs() as u32;
         }
+        entry.job.state = state;
         if let Some(hash) = bundle_hash {
             entry.job.bundle_hash = Some(hash);
-        }
-        if let Some(slug) = slug {
-            entry.job.strategy_slug = Some(slug);
-        }
-        if seconds != 0 {
-            entry.job.duration_seconds = seconds;
         }
     }
     write_queue(service, &jobs);
 }
 
-/// Keep the queue on disk. A build that cannot be written down is still built;
+/// Keep the queue on disk. A job that cannot be written down is still built;
 /// the note about it is what would be lost.
-fn write_queue(service: &Arc<Service>, jobs: &[Entry]) {
+fn write_queue(service: &Service, jobs: &[Entry]) {
     if let Some(parent) = service.queue_file.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -601,63 +686,9 @@ fn write_queue(service: &Arc<Service>, jobs: &[Entry]) {
     }
 }
 
-/// A short name as the chain stores it: the text, then zeros.
-fn name_to_bytes(name: &str) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    let bytes = name.as_bytes();
-    let take = bytes.len().min(32);
-    out[..take].copy_from_slice(&bytes[..take]);
-    out
-}
-
 fn now() -> time::PrimitiveDateTime {
     let now = time::OffsetDateTime::now_utc();
     time::PrimitiveDateTime::new(now.date(), now.time())
-}
-
-/// Base64, without pulling in a crate for sixty lines of table lookup.
-fn decode(text: &str) -> Result<Vec<u8>> {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut table = [255u8; 256];
-    for (index, byte) in ALPHABET.iter().enumerate() {
-        table[*byte as usize] = index as u8;
-    }
-    let mut out = Vec::with_capacity(text.len() / 4 * 3);
-    let mut accumulator = 0u32;
-    let mut bits = 0u32;
-    for byte in text.bytes() {
-        if byte == b'=' || byte == b'\n' || byte == b'\r' {
-            continue;
-        }
-        let value = table[byte as usize];
-        anyhow::ensure!(value != 255, "that is not an archive");
-        accumulator = (accumulator << 6) | u32::from(value);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((accumulator >> bits) as u8);
-        }
-    }
-    Ok(out)
-}
-
-/// The other direction, for whoever is packing one.
-pub fn encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let mut buffer = [0u8; 3];
-        buffer[..chunk.len()].copy_from_slice(chunk);
-        let value = u32::from_be_bytes([0, buffer[0], buffer[1], buffer[2]]);
-        for index in 0..4 {
-            if index <= chunk.len() {
-                out.push(ALPHABET[((value >> (18 - index * 6)) & 0x3f) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -665,54 +696,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn base64_survives_a_round_trip() {
-        for body in [
-            b"".to_vec(),
-            b"a".to_vec(),
-            b"ab".to_vec(),
-            b"abc".to_vec(),
-            (0u8..=255).collect::<Vec<u8>>(),
-        ] {
-            let text = encode(&body);
-            assert_eq!(
-                decode(&text).unwrap(),
-                body,
-                "round trip of {} bytes",
-                body.len()
-            );
-        }
-    }
-
-    #[test]
     fn a_name_becomes_the_bytes_the_chain_holds() {
-        let bytes = name_to_bytes("funding-basis");
-        assert_eq!(&bytes[..13], b"funding-basis");
-        assert_eq!(bytes[13], 0);
-    }
-
-    #[test]
-    fn a_supersession_claim_is_read_as_a_version() {
-        let manifest = Manifest::from_toml(
-            r#"
-[strategy]
-id = "x"
-version = 2
-supersedes = "funding-basis@1"
-[description]
-title = "t"
-text = "t"
-[runtime.allowances]
-fuel_per_sec = 1
-memory_mib = 1
-requests_per_min = 1
-bytes_per_day = 1
-streams = 1
-inference_ms_per_min = 0
-"#,
-        )
-        .unwrap();
-        let (id, version) = supersedes(&manifest);
-        assert_eq!(&id[..13], b"funding-basis");
-        assert_eq!(version, 1);
+        let bytes = name("local-bridge");
+        assert_eq!(&bytes[..12], b"local-bridge");
+        assert_eq!(bytes[12], 0);
     }
 }

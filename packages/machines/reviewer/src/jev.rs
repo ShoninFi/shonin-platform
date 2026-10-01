@@ -5,8 +5,8 @@
 //! than a moving alias, because a review commits which model answered it and
 //! an alias that moved would make that claim false.
 //!
-//! The answers are the model's. The score is not: it is computed from them in
-//! [`crate::battery`], with weights this repository publishes.
+//! The answers are the model's. The ratings are not: they are computed from
+//! them in [`crate::battery`], with thresholds this repository publishes.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::battery::{Answer, Battery, Calibrated};
+use crate::battery::{Answer, Battery};
 
 /// Where the questions go. Overridable so a test can point at a stub.
 pub const ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
@@ -98,8 +98,9 @@ impl Client {
         &self.model
     }
 
-    /// Put the whole battery to the model over one piece of source.
-    pub async fn ask(&self, battery: &Battery, source: &str) -> Result<Calibrated> {
+    /// Put the whole battery to the model over one piece of source, and
+    /// return its answers and the exact version that gave them.
+    pub async fn ask(&self, battery: &Battery, source: &str) -> Result<(String, Vec<Answer>)> {
         let questions: BTreeMap<String, Question> = battery
             .questions
             .iter()
@@ -108,9 +109,8 @@ impl Client {
                     question.id.clone(),
                     Question {
                         // Every question is a yes or a no with a probability
-                        // behind it. A rubric would put the judgement of how
-                        // much a thing matters back into the model, and that
-                        // judgement is the battery's weights.
+                        // behind it. How much an answer matters is the
+                        // battery's thresholds, not the model's judgement.
                         kind: "noul",
                         instructions: &question.instructions,
                     },
@@ -147,13 +147,7 @@ impl Client {
             );
         }
 
-        let (score, working) = battery.score(&answers);
-        Ok(Calibrated {
-            score,
-            model: reply.model,
-            answers,
-            working,
-        })
+        Ok((reply.model, answers))
     }
 
     /// Send it, waiting out a refusal to serve rather than failing the review.

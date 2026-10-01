@@ -25,6 +25,7 @@ use alloy::primitives::{Address, B256, keccak256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use chain::bindings::factory::IVaultFactory;
+use chain::bindings::strategies::IStrategyRegistry;
 use chain::bindings::vault::{IVault, VaultState};
 use chain::{Client, Deployments};
 use clap::Parser;
@@ -134,6 +135,7 @@ async fn sweep(
         let engine = engine.clone();
         let store = args.store.clone();
         let api = args.api_url.clone();
+        let network = args.chain_args.network.to_string();
         let task = tokio::spawn(async move {
             if let Err(error) = serve(
                 client,
@@ -144,6 +146,7 @@ async fn sweep(
                 bundle,
                 store,
                 api,
+                network,
             )
             .await
             {
@@ -167,6 +170,7 @@ async fn serve(
     bundle: B256,
     store: PathBuf,
     api: String,
+    network: String,
 ) -> Result<()> {
     // The key is made here and never written down. Deriving it from the image
     // and the vault means a restart picks the same one back up, so the
@@ -249,7 +253,22 @@ async fn serve(
         }
     });
 
-    let (config, allowances) = manifest_for(&store, bundle);
+    // The executor reads the manifest the builder recorded, and refuses one
+    // naming a driver this image doesn't carry.
+    let strategy_id = chain.read(vault, IVault::strategyIdCall {}).await?;
+    let registered = chain
+        .read(
+            deployments.strategies,
+            IStrategyRegistry::strategyOfCall {
+                strategyId: strategy_id,
+            },
+        )
+        .await?;
+    let driver = driver_for(&store, registered.manifestHash, &network)?;
+    // The vault holds its author's allowances as a daily cap; until it records
+    // the allowances themselves, the host holds every agent to the modest
+    // shape.
+    let allowances = shared::Allowances::modest();
 
     // What the day cost, said once a day and charged to the author's tank.
     tokio::spawn(usage::run(chain.clone(), key.clone(), vault, allowances));
@@ -274,8 +293,7 @@ async fn serve(
             key: key.clone(),
             vault,
             venue: deployments.venue,
-            venue_id: "local".to_string(),
-            config: config.clone(),
+            driver: driver.clone(),
             allowances,
         };
         let outcome = runner
@@ -307,24 +325,33 @@ async fn serve(
     }
 }
 
-/// What the manifest asked for: the config the strategy's `run` receives, and
-/// the compute it declared, which is what its vault's tank is charged for and
-/// so what the host holds it to.
-fn manifest_for(store: &std::path::Path, bundle: B256) -> (Vec<u8>, shared::DeclaredAllowances) {
-    let modest = shared::DeclaredAllowances::modest();
-    let path = store
-        .join(format!("sha256-{}", alloy::hex::encode(bundle)))
-        .join("manifest.json");
-    let Ok(bytes) = std::fs::read(path) else {
-        return (Vec::new(), modest);
-    };
-    let Ok(manifest) = serde_json::from_slice::<shared::Manifest>(&bytes) else {
-        return (Vec::new(), modest);
-    };
-    (
-        strategy_sdk::to_payload(&manifest.config),
-        manifest.runtime.allowances,
-    )
+/// The driver an agent trades through, from the manifest the builder
+/// recorded. A manifest naming a driver this image doesn't carry, or one not
+/// offered on this network, is refused.
+fn driver_for(store: &std::path::Path, manifest_hash: B256, network: &str) -> Result<String> {
+    let hash = format!("sha256:{}", alloy::hex::encode(manifest_hash));
+    let path = store.join(hash.replace(':', "-")).join("manifest.json");
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let canonical: shared::Canonical =
+        serde_json::from_slice(&bytes).context("the recorded manifest")?;
+    // The store is only believed where its bytes match what the chain holds.
+    anyhow::ensure!(
+        canonical.hash() == hash,
+        "the stored manifest is not the one the registry recorded"
+    );
+    let catalogue = shared::Catalogue::published();
+    canonical
+        .manifest
+        .check(&catalogue, network)
+        .map_err(|why| anyhow::anyhow!("this image won't run it: {why}"))?;
+    // This image carries one driver's executor half: the stand-in venue's.
+    let drivers: Vec<&String> = canonical.manifest.drivers.keys().collect();
+    match drivers.as_slice() {
+        [only] if only.as_str() == "local" => Ok((*only).clone()),
+        _ => anyhow::bail!(
+            "this image carries the local driver only, and the manifest names {drivers:?}"
+        ),
+    }
 }
 
 /// Where a bundle's component lives once the build service has written it.

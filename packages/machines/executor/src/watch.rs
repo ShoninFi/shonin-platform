@@ -17,7 +17,7 @@ use crate::host::market_name;
 use crate::scale::{ASSET_DECIMALS, SIZE_DECIMALS, signed_to_decimal, to_decimal};
 
 /// What the vault's stream carries, in the shape the bindings generate.
-pub use crate::host::shonin::strategy::vault::VaultEvent;
+pub use crate::host::shonin::agent::vault::VaultEvent;
 
 /// Follow one vault: what the venue does to its account, and what the vault
 /// says about itself.
