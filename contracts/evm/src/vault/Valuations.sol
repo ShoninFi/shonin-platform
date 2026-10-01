@@ -95,6 +95,7 @@ library Valuations {
 
         syncHolding(s);
         (uint256 markValue, uint256 exitValue) = IStation(s.homeStation).value();
+        if (_outsideBand(s, markValue, exitValue)) s.wide[count] = true;
         s.sentAtValuation[count] = s.sentTotal;
         uint256 units = s.liveUnits();
         if (units != 0) {
@@ -186,6 +187,7 @@ library Valuations {
         uint256[] storage chains = s.otherChains;
         for (uint256 i = 0; i < chains.length; i++) {
             Post storage p = s.posts[index][chains[i]];
+            if (_outsideBand(s, p.mark, p.exit)) s.wide[index] = true;
             v.gross += p.mark.mulDiv(keep, WAD);
             v.grossExit += p.exit.mulDiv(keep, WAD);
         }
@@ -232,6 +234,16 @@ library Valuations {
         }
         markValue = post.mark + moving;
         exitValue = post.exit + moving;
+    }
+
+    /// A station's exit-side value further below its mark than the exit
+    /// band: a close couldn't fill there, so nobody is paid as if it could.
+    function _outsideBand(
+        Layout storage s,
+        uint256 markValue,
+        uint256 exitValue
+    ) private view returns (bool) {
+        return exitValue < markValue.mulDiv(BPS - s.exitBandBps, BPS, Math.Rounding.Ceil);
     }
 
     function _isOtherChain(Layout storage s, uint256 chainId) private view returns (bool) {
@@ -356,7 +368,7 @@ library Valuations {
             }
             if (!found) break;
             r.done = true;
-            _settleOne(s, r, i + 1, s.valuations[vi]);
+            _settleOne(s, r, i + 1, s.valuations[vi], s.wide[vi]);
             i++;
             settled++;
         }
@@ -364,16 +376,22 @@ library Valuations {
         s.valuationCursor = vi;
     }
 
-    function _settleOne(Layout storage s, Request storage r, uint256 id, Valuation storage v) private {
+    function _settleOne(
+        Layout storage s,
+        Request storage r,
+        uint256 id,
+        Valuation storage v,
+        bool wide
+    ) private {
         RequestKind kind = r.kind;
         if (kind == RequestKind.Deposit) {
             _deposit(s, r, id, v);
         } else if (kind == RequestKind.Redeem) {
-            _redeem(s, r, id, v);
+            _redeem(s, r, id, v, wide);
         } else if (kind == RequestKind.Claim) {
-            _claim(s, r, id, v);
+            _claim(s, r, id, v, wide);
         } else {
-            _fill(s, r, v);
+            _fill(s, r, v, wide);
         }
     }
 
@@ -435,10 +453,16 @@ library Valuations {
         s.burn(from, burned);
     }
 
-    function _redeem(Layout storage s, Request storage r, uint256 id, Valuation storage v) private {
+    function _redeem(
+        Layout storage s,
+        Request storage r,
+        uint256 id,
+        Valuation storage v,
+        bool wide
+    ) private {
         uint256 shares = r.amount;
         (uint256 slice, uint256 burned, uint256 payout) = exitOf(s, v, shares);
-        if (payout <= s.free()) {
+        if (!wide && payout <= s.free()) {
             s.pendingShares -= shares;
             _distribute(s, address(this), slice, burned);
             s.cash -= payout;
@@ -446,8 +470,10 @@ library Valuations {
             emit IVault.Withdrawn(id, r.owner, shares, payout, slice);
             return;
         }
-        // The cash can't pay it: a claim, its shares still pending and still
-        // outstanding, so the leaver bears the close with everyone else.
+        // The cash can't pay it, or a market sat outside the exit band at the
+        // valuation: a claim, its shares still pending and still outstanding,
+        // served by a close inside the band or priced again once the market
+        // is back.
         s.claims.push(
             Claim({
                 owner: r.owner,
@@ -464,13 +490,19 @@ library Valuations {
     /// A claim the cash covered when it was tried, priced like any
     /// withdrawal. If the cash no longer covers it, it waits to be tried
     /// again: nothing was closed for it.
-    function _claim(Layout storage s, Request storage r, uint256 id, Valuation storage v) private {
+    function _claim(
+        Layout storage s,
+        Request storage r,
+        uint256 id,
+        Valuation storage v,
+        bool wide
+    ) private {
         Claim storage claim = s.claims[r.ref - 1];
         if (claim.state != ClaimState.Queued) return;
         s.queuedClaims -= 1;
         uint256 shares = claim.shares;
         (uint256 slice, uint256 burned, uint256 payout) = exitOf(s, v, shares);
-        if (payout > s.cash) {
+        if (wide || payout > s.cash) {
             claim.state = ClaimState.Pending;
             emit IVault.ClaimTried(r.ref, true);
             return;
@@ -489,13 +521,13 @@ library Valuations {
     /// The author's shares, redeemed into the tank like any withdrawal, from
     /// cash only, and never as a claim: what the cash or the shares don't
     /// cover is simply not filled.
-    function _fill(Layout storage s, Request storage r, Valuation storage v) private {
+    function _fill(Layout storage s, Request storage r, Valuation storage v, bool wide) private {
         address author = s.author;
         uint256 shares = r.amount;
-        if (r.ref == 1) {
-            s.tank.fillPending = false;
-            shares = _sharesFor(s, v, r.amount);
-        }
+        if (r.ref == 1) s.tank.fillPending = false;
+        // Not at a price the vault would refuse to sell at.
+        if (wide) return;
+        if (r.ref == 1) shares = _sharesFor(s, v, r.amount);
         uint256 held = s.balanceOf[author];
         if (shares > held) shares = held;
         if (shares == 0) return;
@@ -678,7 +710,9 @@ library Valuations {
         // are owed part of what is out (sending more would need a price), or
         // while a claim's cash is home waiting to be priced: taking it back
         // out would leave the claim unpaid.
-        if (!s.live() || s.halted() || s.units != 0 || s.queuedClaims != 0) revert IVault.WrongState();
+        if (!s.live() || s.halted() || s.units != 0 || s.queuedClaims != 0 || s.valuing()) {
+            revert IVault.WrongState();
+        }
         // The stations as last valued, the cash as it is now, and what was
         // sent out since: money that joined or left counts, and a run of
         // pulls can't shrink the value the floor is measured on.

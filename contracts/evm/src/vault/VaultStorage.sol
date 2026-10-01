@@ -88,6 +88,10 @@ struct Layout {
     /// Valuations at which some station reported money on its way, counted
     /// or not: a vault isn't empty while any is, so it can't close on one.
     mapping(uint256 => bool) moving;
+    /// Valuations at which some station's exit-side value sat further below
+    /// its mark than the exit band: nobody is paid from cash at a price the
+    /// vault would refuse to sell at, so withdrawals wait.
+    mapping(uint256 => bool) wide;
     mapping(uint256 => mapping(uint256 => Post)) posts;
     /// The open valuation's unit fraction and when it was recorded, so the
     /// posts that complete it are counted as of the same moment.

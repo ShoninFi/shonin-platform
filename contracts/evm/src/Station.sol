@@ -103,7 +103,7 @@ contract Station is IStation, ReentrancyGuardTransient {
         // A passer-by can't cut off a key whose blessing stands, and can't
         // keep one whose blessing has gone.
         if (!stopped && _isKey(key, ImageKind.Executor)) revert StillBlessed();
-        _revoke(driver, key);
+        _revoke(driver, key, true);
     }
 
     // Moving money ----------------------------------------------------------
@@ -202,6 +202,7 @@ contract Station is IStation, ReentrancyGuardTransient {
 
         IERC20 dollar = _asset();
         uint256 idleBefore = dollar.balanceOf(address(this));
+        uint256 brought;
         for (uint256 i = 0; i < count; i++) {
             address[] memory targets = drivers[i].targets();
             uint256 before = dollar.balanceOf(address(this));
@@ -211,9 +212,11 @@ contract Station is IStation, ReentrancyGuardTransient {
             // proceeds left at the venue would still belong to everyone.
             uint256 swept = dollar.balanceOf(address(this)) - before;
             if (swept < freed[i].mulDiv(BPS - _spec.exitBandBps, BPS)) revert ShortSweep();
+            // Never more than the fraction's worth: anything a venue sends
+            // beyond it stays here, everyone's.
+            brought += swept < freed[i] ? swept : freed[i];
         }
-        sentHome = dollar.balanceOf(address(this)) - idleBefore
-            + idleBefore.mulDiv(fraction, WAD, Math.Rounding.Floor);
+        sentHome = brought + idleBefore.mulDiv(fraction, WAD, Math.Rounding.Floor);
 
         if (sentHome != 0) {
             if (isHome()) {
@@ -277,15 +280,19 @@ contract Station is IStation, ReentrancyGuardTransient {
         stopped = true;
         for (uint256 i = 0; i < _spec.drivers.length; i++) {
             address key = _approvedKey[_spec.drivers[i]];
-            if (key != address(0)) _revoke(_spec.drivers[i], key);
+            // A venue that refuses the revoke can't keep the station from
+            // stopping: the key loses the station's driver either way.
+            if (key != address(0)) _revoke(_spec.drivers[i], key, false);
         }
         emit Stopped(reason, haltedAt);
     }
 
-    function _revoke(bytes32 driver, address key) private {
+    function _revoke(bytes32 driver, address key, bool strict) private {
         _declaredDriver(driver);
         address implementation = _unwindDriver(driver);
-        _run(IDriver(implementation).revokeKey(address(this), key), IDriver(implementation).targets());
+        _call(
+            IDriver(implementation).revokeKey(address(this), key), IDriver(implementation).targets(), strict
+        );
         if (_approvedKey[driver] == key) delete _approvedKey[driver];
         emit KeyRevoked(driver, key);
     }
@@ -315,6 +322,12 @@ contract Station is IStation, ReentrancyGuardTransient {
     /// Make each call after checking where it goes: to one of the driver's
     /// targets, or to the dollar only to approve one of them.
     function _run(Call[] memory calls, address[] memory targets) private {
+        _call(calls, targets, true);
+    }
+
+    /// Make each call after checking where it goes; a call that fails stops
+    /// everything only if `strict`.
+    function _call(Call[] memory calls, address[] memory targets, bool strict) private {
         address dollar = address(_asset());
         for (uint256 i = 0; i < calls.length; i++) {
             Call memory c = calls[i];
@@ -326,7 +339,7 @@ contract Station is IStation, ReentrancyGuardTransient {
                 revert BadCall();
             }
             (bool ok, bytes memory reason) = c.target.call{value: c.value}(c.data);
-            if (!ok) {
+            if (!ok && strict) {
                 assembly {
                     revert(add(reason, 32), mload(reason))
                 }
