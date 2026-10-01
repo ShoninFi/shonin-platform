@@ -338,11 +338,19 @@ library Valuations {
             s.closedShares -= shares;
             // Its fraction left the stations when it was closed: it owns
             // what that brought home and its share of the rest of the cash,
-            // and none of what the stations made since.
+            // and none of what the stations made or lost since. The profit
+            // fee is measured on that, and paid in shares at the price of
+            // those who stay, so their price is unchanged.
             uint256 free = s.free();
             if (home > free) home = free;
             uint256 owned = home + (free - home).mulDiv(shares, s.totalSupply);
-            if (payout > owned) payout = owned;
+            uint256 fee = s.feeOf(owned, shares);
+            uint256 stayers = v.grossExit > owned ? v.grossExit - owned : 0;
+            slice = fee == 0 || stayers == 0 ? 0 : fee.mulDiv(v.supply - shares, stayers, Math.Rounding.Ceil);
+            if (slice > shares) slice = shares;
+            burned = shares - slice;
+            uint256 gross = owned - fee;
+            payout = gross - gross.mulDiv(s.fees.transactionBps, BPS, Math.Rounding.Ceil);
         }
         if (payout > s.free()) {
             claim.state = ClaimState.Pending;
