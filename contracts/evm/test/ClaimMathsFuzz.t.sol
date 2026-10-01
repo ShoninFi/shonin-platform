@@ -82,7 +82,7 @@ contract ClaimMathsFuzzTest is Fixture {
     ) public {
         amount = uint96(bound(amount, 10e6, 10_000_000e6));
         spreadBps = uint16(bound(spreadBps, 0, 150));
-        pullPct = uint8(bound(pullPct, 50, 95));
+        pullPct = uint8(bound(pullPct, 50, 94)); // the idle floor is 5%, rounded up
         depositAs(vault, bob, 100_000e6);
         uint256 aliceShares = depositAs(vault, alice, amount);
         uint256 total = vault.cash();

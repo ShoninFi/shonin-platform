@@ -96,6 +96,9 @@ library Valuations {
         syncHolding(s);
         (uint256 markValue, uint256 exitValue) = IStation(s.homeStation).value();
         if (_outsideBand(s, markValue, exitValue)) s.wide[count] = true;
+        // A bid above the mark is what the holdings could be sold for: a
+        // deposit pays that, so it can't buy below the pool's worth.
+        if (exitValue > markValue) markValue = exitValue;
         s.sentAtValuation[count] = s.sentTotal;
         uint256 units = s.liveUnits();
         if (units != 0) {
@@ -154,6 +157,10 @@ library Valuations {
         // dollar amount that could exist would leave the valuation open for
         // good, with every way out waiting behind it.
         if (markValue > MAX_POST || exitValue > MAX_POST) revert IVault.NotAllowed();
+        // Each post on its own: two posts that disagree don't make a spread
+        // neither of them saw.
+        if (_outsideBand(s, markValue, exitValue)) s.wide[index] = true;
+        if (exitValue > markValue) markValue = exitValue;
         Post storage p = s.posts[index][stationChain];
         if (post.transit.length != 0 || post.inFlightFromHome.length != 0) s.moving[index] = true;
         if (!p.posted) {
@@ -187,7 +194,6 @@ library Valuations {
         uint256[] storage chains = s.otherChains;
         for (uint256 i = 0; i < chains.length; i++) {
             Post storage p = s.posts[index][chains[i]];
-            if (_outsideBand(s, p.mark, p.exit)) s.wide[index] = true;
             v.gross += p.mark.mulDiv(keep, WAD);
             v.grossExit += p.exit.mulDiv(keep, WAD);
         }

@@ -318,8 +318,10 @@ library Upkeep {
         if (state != ClaimState.Pending && state != ClaimState.Waiting && state != ClaimState.Queued) {
             revert IVault.NotAllowed();
         }
-        uint64 since = claim.lastAttemptAt > claim.bookedAt ? claim.lastAttemptAt : claim.bookedAt;
-        if (block.timestamp < since + s.timers.freezeAfter) revert IVault.NotYet();
+        // Counted from when it was booked, whatever was tried since: a leaver
+        // left unpaid this long is reason enough to stop, whether the market
+        // or anyone else kept them waiting.
+        if (block.timestamp < claim.bookedAt + s.timers.freezeAfter) revert IVault.NotYet();
         if (!s.live()) revert IVault.WrongState();
         _halt(s, "frozen");
         _setState(s, VaultState.Frozen);

@@ -515,12 +515,11 @@ contract VaultTest is Fixture {
         assertTrue(vault.claimAt(claimId).state == ClaimState.Waiting);
     }
 
-    function test_a_claim_nobody_tried_for_a_week_freezes_the_vault_and_a_try_resets_the_clock() public {
+    function test_a_claim_unpaid_for_a_week_freezes_the_vault_whatever_was_tried() public {
         (uint256 claimId,) = bookClaim();
         setPrice(SPOT, PRICE, 600);
         skip(6 days);
         vault.settleClaim(claimId);
-        skip(6 days);
         vm.expectRevert(IVault.NotYet.selector);
         vault.freeze(claimId);
         skip(1 days);

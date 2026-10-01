@@ -25,6 +25,10 @@ abstract contract ClaimBase is Fixture {
         (carol, carolKey) = makeAddrAndKey("carol");
         (vault, bundle) = openVault();
         station = stationOf(vault);
+        // The stand-in venue is every trade's counterparty: give it the
+        // reserves a real venue's other traders would be, so a gain can
+        // always be withdrawn.
+        give(address(venue), 10_000_000e6);
     }
 
     function depositCarol(uint256 amount) internal returns (uint256 shares) {

@@ -102,7 +102,10 @@ contract Station is IStation, ReentrancyGuardTransient {
     function revokeKey(bytes32 driver, address key) external nonReentrant {
         // A passer-by can't cut off a key whose blessing stands, and can't
         // keep one whose blessing has gone.
-        if (!stopped && _isKey(key, ImageKind.Executor)) revert StillBlessed();
+        // Once the driver no longer trades, its key goes too.
+        if (!stopped && _isKey(key, ImageKind.Executor) && _registry().tradingDriver(driver) != address(0)) {
+            revert StillBlessed();
+        }
         _revoke(driver, key, true);
     }
 
@@ -289,10 +292,17 @@ contract Station is IStation, ReentrancyGuardTransient {
 
     function _revoke(bytes32 driver, address key, bool strict) private {
         _declaredDriver(driver);
-        address implementation = _unwindDriver(driver);
-        _call(
-            IDriver(implementation).revokeKey(address(this), key), IDriver(implementation).targets(), strict
-        );
+        IDriver implementation = IDriver(_unwindDriver(driver));
+        if (strict) {
+            _call(implementation.revokeKey(address(this), key), implementation.targets(), true);
+        } else {
+            // A stop goes through whatever the driver or the venue does.
+            try implementation.revokeKey(address(this), key) returns (Call[] memory calls) {
+                try implementation.targets() returns (address[] memory targets) {
+                    _call(calls, targets, false);
+                } catch {}
+            } catch {}
+        }
         if (_approvedKey[driver] == key) delete _approvedKey[driver];
         emit KeyRevoked(driver, key);
     }
