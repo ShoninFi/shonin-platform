@@ -96,7 +96,7 @@ contract Fixture is Test {
         usd = new LocalUsd();
         venue = new LocalVenue(usd, operator, MARGIN_BPS);
         verifier = new DevAttestationVerifier(attestor);
-        attestation = new AttestationRegistry(admin, verifier, TIMELOCK, BLESSING_TTL);
+        attestation = new AttestationRegistry(admin, verifier, TIMELOCK, 0, BLESSING_TTL);
         publishing = new Publishing(IERC20(address(usd)), platform, PUBLISH_FEE);
         prices = new Prices(admin, PRICE_NOTICE, publishedPrices());
         strategies = new StrategyRegistry(attestation, publishing);

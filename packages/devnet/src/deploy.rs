@@ -19,6 +19,10 @@ use chain::{ChainKey, Client, Deployments, NetworkName, Role, Roles};
 /// a local chain. Its clock runs an hour a second, so the full two days pass
 /// in under a minute and the timelock's path is exercised every run.
 const LOCAL_TIMELOCK: u64 = 2 * 24 * 60 * 60;
+/// The shortest the timelock may ever be where depositors' money is at
+/// stake. Fixed in the registry when it is deployed, so it can't be lowered
+/// later; development chains have none.
+const MAINNET_MIN_TIMELOCK: u64 = 2 * 24 * 60 * 60;
 /// How long a blessing lasts before an executor has to attest again.
 const BLESSING_TTL: u64 = 72 * 60 * 60;
 /// What publishing costs, in the asset's own units: a flat dollar, for the
@@ -84,10 +88,12 @@ async fn deploy(
     chains: &[(String, u64)],
 ) -> Result<Deployments> {
     // None on testnets: nobody else's money is at stake there, and their
-    // clocks run in real time, so two days would be two real days.
-    let (timelock, price_notice) = match network {
-        NetworkName::Local => (LOCAL_TIMELOCK, LOCAL_PRICE_NOTICE),
-        _ => (0, 0),
+    // clocks run in real time, so two days would be two real days. Mainnet
+    // gets a floor the admin can never go under.
+    let (timelock, min_timelock, price_notice) = match network {
+        NetworkName::Local => (LOCAL_TIMELOCK, 0, LOCAL_PRICE_NOTICE),
+        NetworkName::Testnet => (0, 0, 0),
+        NetworkName::Mainnet => (MAINNET_MIN_TIMELOCK, MAINNET_MIN_TIMELOCK, 0),
     };
     let roles = Roles {
         admin: client.account(Role::Admin)?,
@@ -126,7 +132,7 @@ async fn deploy(
         artifacts,
         admin,
         "AttestationRegistry",
-        (admin, verifier, timelock, BLESSING_TTL).abi_encode_params(),
+        (admin, verifier, timelock, min_timelock, BLESSING_TTL).abi_encode_params(),
     )
     .await?;
     let publishing = put(

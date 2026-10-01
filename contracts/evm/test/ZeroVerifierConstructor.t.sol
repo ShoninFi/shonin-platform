@@ -10,6 +10,6 @@ import {Fixture} from "./Fixture.sol";
 contract ZeroVerifierConstructorTest is Fixture {
     function test_the_constructor_refuses_a_zero_checker_like_propose_does() public {
         vm.expectRevert(AttestationRegistry.NoImplementation.selector);
-        new AttestationRegistry(admin, IAttestationVerifier(address(0)), TIMELOCK, BLESSING_TTL);
+        new AttestationRegistry(admin, IAttestationVerifier(address(0)), TIMELOCK, 0, BLESSING_TTL);
     }
 }
