@@ -90,9 +90,8 @@ library Valuations {
         if (s.units != 0) {
             // The stations' value belongs partly to the fallback's unit
             // holders, who hold it outside the shares.
-            uint256 all = s.totalSupply + s.units;
-            markValue = markValue.mulDiv(s.totalSupply, all);
-            exitValue = exitValue.mulDiv(s.totalSupply, all);
+            markValue = markValue.mulDiv(WAD - s.units, WAD);
+            exitValue = exitValue.mulDiv(WAD - s.units, WAD);
         }
         uint32 missing = uint32(s.otherChains.length);
         s.valuations.push(
@@ -358,6 +357,10 @@ library Valuations {
         if (payout > s.cash) {
             shares = shares.mulDiv(s.cash, payout);
             (slice, burned, payout) = exitOf(s, v, shares);
+            // The rescaled figure rounds on its own and can still land a unit
+            // over; the shares then buy a unit less, never more cash than is
+            // there.
+            if (payout > s.cash) payout = s.cash;
         }
         if (payout == 0) return;
         _distribute(s, author, slice, burned);
@@ -425,14 +428,19 @@ library Valuations {
     /// their fraction of whatever the stations hold.
     function _proRata(Layout storage s, address owner, uint256 shares) private {
         uint256 assets = s.cash.mulDiv(shares, s.totalSupply);
+        // The shares own what the units don't; these shares' part of that
+        // is the leaver's for good, whatever fees are minted later.
+        uint256 fraction = shares.mulDiv(WAD - s.units, s.totalSupply);
         s.burn(address(this), shares);
         s.cash -= assets;
-        _accrue(s, owner);
-        s.unitsOf[owner] += shares;
-        s.units += shares;
-        s.unitDebt[owner] = s.unitsOf[owner].mulDiv(s.perUnit, UNIT_SCALE);
+        if (fraction != 0) {
+            _accrue(s, owner);
+            s.unitsOf[owner] += fraction;
+            s.units += fraction;
+            s.unitDebt[owner] = s.unitsOf[owner].mulDiv(s.perUnit, UNIT_SCALE);
+        }
         s.pay(owner, assets);
-        emit IVault.ProRataTaken(owner, shares, assets, shares);
+        emit IVault.ProRataTaken(owner, shares, assets, fraction);
     }
 
     function _accrue(Layout storage s, address holder) private {
@@ -457,15 +465,14 @@ library Valuations {
     /// the same proportions as before.
     function serveProRata(address holder) external {
         Layout storage s = VaultStorage.layout();
-        uint256 held = s.unitsOf[holder];
-        if (held == 0) revert IVault.Nothing();
-        uint256 fraction = held.mulDiv(WAD, s.totalSupply + s.units);
+        uint256 fraction = s.unitsOf[holder];
+        if (fraction == 0) revert IVault.Nothing();
         s.serving = holder;
         (, bool blocked) = IStation(s.homeStation).unwind(fraction);
         s.serving = address(0);
         if (blocked) revert IVault.NotYet();
         _accrue(s, holder);
-        s.units -= held;
+        s.units -= fraction;
         s.unitsOf[holder] = 0;
         s.unitDebt[holder] = 0;
     }
@@ -507,7 +514,7 @@ library Valuations {
         }
         uint256 toUnits;
         if (s.units != 0) {
-            toUnits = amount.mulDiv(s.units, s.totalSupply + s.units);
+            toUnits = amount.mulDiv(s.units, WAD);
             s.perUnit += toUnits.mulDiv(UNIT_SCALE, s.units);
             s.unitReserve += toUnits;
         }

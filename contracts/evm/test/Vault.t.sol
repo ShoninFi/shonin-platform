@@ -546,8 +546,9 @@ contract VaultTest is Fixture {
 
         // About half of the 50k left in cash, and units for the rest.
         approxEq(usd.balanceOf(alice), 25_000e6, 50e6);
+        // Her units are her fraction of the station: about half of it.
         (uint256 held,) = vault.unitsOf(alice);
-        assertEq(held, aliceShares);
+        assertApproxEqRel(held, 0.5e18, 0.01e18);
 
         // Nothing goes out to the station while units are owed.
         vm.prank(executor);

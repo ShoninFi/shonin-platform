@@ -84,6 +84,9 @@ struct Layout {
     uint256 queuedClaims;
     mapping(uint256 => mapping(uint256 => Post)) posts;
     // The pro-rata fallback -------------------------------------------------
+    /// The fraction of the stations, scaled by `WAD`, that the fallback's
+    /// unit holders own between them. A holder's units are their own
+    /// fraction, fixed when they left, so later fee shares can't dilute it.
     uint256 units;
     uint256 unitReserve;
     /// What each unit has received, scaled by `UNIT_SCALE`.

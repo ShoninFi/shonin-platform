@@ -315,13 +315,22 @@ library Upkeep {
             revert IVault.NotAllowed();
         }
         if (s.state == VaultState.Closed || s.state == VaultState.Cancelled) revert IVault.WrongState();
-        uint256 fraction = claim.shares.mulDiv(WAD, s.totalSupply + s.units, Math.Rounding.Ceil);
+        // The leaver's part of what the shares own of the stations.
+        uint256 fraction = claim.shares.mulDiv(WAD - s.units, s.totalSupply, Math.Rounding.Ceil);
         if (fraction > WAD) fraction = WAD;
-        claim.lastAttemptAt = uint64(block.timestamp);
-        (, bool blocked) = IStation(s.homeStation).unwind(fraction);
+        if (fraction == 0) fraction = 1;
+        (uint256 home, bool blocked) = IStation(s.homeStation).unwind(fraction);
         if (blocked) {
+            // A market outside the band is a real try: the clock restarts.
             claim.state = ClaimState.Waiting;
+            claim.lastAttemptAt = uint64(block.timestamp);
+        } else if (home == 0) {
+            // A close that brought nothing home served nobody, so it doesn't
+            // count as a try, and the freeze clock keeps running.
+            claim.state = ClaimState.Waiting;
+            blocked = true;
         } else {
+            claim.lastAttemptAt = uint64(block.timestamp);
             claim.state = ClaimState.Queued;
             s.queuedClaims += 1;
             s.queue(claim.owner, RequestKind.Claim, claim.shares, claimId);

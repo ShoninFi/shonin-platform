@@ -47,8 +47,6 @@ contract ProRataServesExactlyTest is Fixture {
         value(vault);
         uint256 priceBefore = vault.sharePrice();
         (uint256 aliceUnits,) = vault.unitsOf(alice);
-        (uint256 allUnits,) = vault.units();
-        uint256 everyone = vault.totalSupply() + allUnits;
 
         vault.serveProRata(alice);
         vm.prank(alice);
@@ -60,7 +58,7 @@ contract ProRataServesExactlyTest is Fixture {
 
         // And alice got her fraction of the station at exit prices, 30k of
         // cash and two BTC at the bid, and no more.
-        uint256 fair = (30_000e6 + 2 * 59_700e6) * aliceUnits / everyone;
+        uint256 fair = (30_000e6 + 2 * 59_700e6) * aliceUnits / 1e18;
         assertLe(served, fair + 1, "alice was paid more than her exit-side fraction");
     }
 }
