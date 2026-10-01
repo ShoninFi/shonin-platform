@@ -60,6 +60,9 @@ pub enum EventKind {
     Frozen,
     Killed,
     Blessed,
+    Valued,
+    Retired,
+    Refunded,
 }
 
 impl EventKind {
@@ -76,6 +79,9 @@ impl EventKind {
             Self::Frozen => "frozen",
             Self::Killed => "killed",
             Self::Blessed => "keys blessed",
+            Self::Valued => "valued",
+            Self::Retired => "retired",
+            Self::Refunded => "deposit returned",
         }
     }
 }

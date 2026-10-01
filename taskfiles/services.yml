@@ -66,6 +66,7 @@ tasks:
         {{.SERVICE_ARGS}}
         --port {{.PORT_API}}
         --builder-url "{{.URL_BUILDER_DEV}}"
+        --executor-url "{{.URL_EXECUTOR_DEV}}"
 
   indexer:
     desc: "The reference indexer on its own: reads the chain into the record"

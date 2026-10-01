@@ -13,13 +13,14 @@ use alloy::rpc::types::Filter;
 use alloy::sol_types::SolEvent;
 use anyhow::Result;
 use chain::bindings::attestation::IAttestationRegistry;
-use chain::bindings::erc20::IERC20;
 use chain::bindings::factory::IVaultFactory;
 use chain::bindings::profiles::IAuthorProfiles;
 use chain::bindings::reviews::IReviewRegistry;
+use chain::bindings::station::IStationVault;
 use chain::bindings::strategies::IStrategyRegistry;
 use chain::bindings::vault::{
-    ClaimState as ChainClaimState, IVault, VaultState as ChainVaultState,
+    ClaimState as ChainClaimState, IVault, RequestKind as ChainRequestKind,
+    VaultState as ChainVaultState,
 };
 use chain::bindings::venue::ILocalVenue;
 use chain::{Client, Deployments};
@@ -30,7 +31,9 @@ use shared::model::common::{Chain, Point};
 use shared::model::registry::{Author, FeedEvent, FeedKind, Job, JobState};
 use shared::model::review::{Rating, Review};
 use shared::model::strategy::{Record, Standing, Strategy};
-use shared::model::vault::{Claim, ClaimState, Fees, Tank, Vault, VaultState};
+use shared::model::vault::{
+    Claim, ClaimState, Fees, Halt, PendingFloor, Request, RequestKind, Tank, Vault, VaultState,
+};
 use shared::model::venue::{Custody, ExitClass, ExitPath, Leg, Valuation, VenueStatus};
 use time::{Date, OffsetDateTime, PrimitiveDateTime};
 
@@ -162,7 +165,7 @@ async fn one(
     )
     .await?;
     let events = read_events(chain, address).await?;
-    let legs = read_legs(chain, deployments, address, &vault).await?;
+    let legs = read_legs(chain, deployments, &vault).await?;
     let review = read_review(chain, deployments, store, strategy_id).await?;
     let attestation = read_attestation(chain, deployments, address, now).await?;
     let bundle = read_bundle(store, &registered, bundle_hash);
@@ -232,7 +235,8 @@ fn standing(state: &ChainVaultState, days_live: u64) -> Standing {
     match state {
         ChainVaultState::Killed => Standing::Killed,
         ChainVaultState::Frozen => Standing::Frozen,
-        ChainVaultState::Closed => Standing::Closed,
+        ChainVaultState::Closed | ChainVaultState::Cancelled => Standing::Closed,
+        ChainVaultState::WindingDown => Standing::Retiring,
         _ if days_live >= Strategy::DAYS_NEW as u64 => Standing::Listed,
         _ => Standing::New,
     }
@@ -247,17 +251,27 @@ async fn read_vault(
     let fees = chain.read(address, IVault::feesCall {}).await?;
     let tank = chain.read(address, IVault::tankCall {}).await?;
     let value = chain.read(address, IVault::totalValueCall {}).await?;
-    let idle = chain.read(address, IVault::idleCall {}).await?;
+    let cash = chain.read(address, IVault::cashCall {}).await?;
+    let escrow = chain.read(address, IVault::escrowCall {}).await?;
     let share_price = chain.read(address, IVault::sharePriceCall {}).await?;
-    let high_water = chain.read(address, IVault::highWaterMarkCall {}).await?;
-    let crystallised = chain.read(address, IVault::lastCrystallisedCall {}).await?;
+    let mark = chain.read(address, IVault::markCall {}).await?;
+    let last_payment = chain.read(address, IVault::lastPaymentCall {}).await?;
     let created = chain.read(address, IVault::createdAtCall {}).await?;
-    let freeze_after = chain.read(address, IVault::freezeAfterCall {}).await?;
+    let timers = chain.read(address, IVault::timersCall {}).await?;
     let exit_band = chain.read(address, IVault::exitBandBpsCall {}).await?;
-    let claim_count = chain.read(address, IVault::claimCountCall {}).await?;
+    let station = chain.read(address, IVault::homeStationCall {}).await?;
+    let floor = chain.read(address, IVault::idleFloorCall {}).await?;
+    let allowances = chain.read(address, IVault::allowancesCall {}).await?;
+    let restricted = chain.read(address, IVault::restrictedCall {}).await?;
+    let halted = chain.read(address, IStationVault::haltedAtCall {}).await?;
+    let supply = chain.read(address, IVault::totalSupplyCall {}).await?;
 
     let mut claims = Vec::new();
-    let count: u64 = claim_count.try_into().unwrap_or(0);
+    let count: u64 = chain
+        .read(address, IVault::claimCountCall {})
+        .await?
+        .try_into()
+        .unwrap_or(0);
     for id in 1..=count {
         let claim = chain
             .read(
@@ -267,45 +281,66 @@ async fn read_vault(
                 },
             )
             .await?;
+        let fraction = if supply.is_zero() {
+            0.0
+        } else {
+            shares(claim.shares) / shares(supply)
+        };
         claims.push(Claim {
             id: id as u32,
             owner: address_of(claim.owner),
             shares: shares(claim.shares),
-            fraction_closed: shares(claim.fractionClosed),
-            booked: day(claim.bookedAt as u64),
+            fraction_closed: fraction,
+            booked: day(claim.bookedAt),
             state: match claim.state {
                 ChainClaimState::Paid => ClaimState::Paid,
                 ChainClaimState::Waiting => ClaimState::Waiting,
+                ChainClaimState::Queued => ClaimState::Queued,
+                ChainClaimState::Fallback => ClaimState::Fallback,
                 _ => ClaimState::Pending,
             },
-            settled_for: (claim.settledFor > U256::ZERO).then(|| dollars(claim.settledFor)),
+            settled_for: (claim.paid > U256::ZERO).then(|| dollars(claim.paid)),
         });
     }
 
+    let daily = shared::Prices::published().daily_cap(&shared_allowances(&allowances));
     Ok(Vault {
         address: address_of(address),
         chain: vault_chain,
         asset: vault_chain.dollar().to_string(),
         state: match state {
+            ChainVaultState::Activating => VaultState::Activating,
             ChainVaultState::Open => VaultState::Open,
+            ChainVaultState::WindingDown => VaultState::WindingDown,
             ChainVaultState::Frozen => VaultState::Frozen,
             ChainVaultState::Killed => VaultState::Killed,
+            ChainVaultState::Cancelled => VaultState::Cancelled,
             _ => VaultState::Closed,
         },
-        created: day(created as u64),
+        created: day(created),
+        station: address_of(station),
         value: dollars(value),
-        idle: dollars(idle),
-        shares: shares(
-            chain
-                .read(address, IERC20::totalSupplyCall {})
-                .await
-                .unwrap_or(U256::ZERO),
-        ),
+        idle: dollars(cash),
+        escrow: dollars(escrow),
+        shares: shares(supply),
         share_price: dollars(share_price),
-        high_water_mark: dollars(high_water),
-        last_crystallised: day(crystallised as u64),
+        // `1e18` is $1.00 a share.
+        high_water_mark: shares(mark),
+        last_crystallised: day(last_payment),
+        idle_floor_bps: floor.bps as u32,
+        pending_floor: (floor.pendingAt != 0).then(|| PendingFloor {
+            bps: floor.pendingBps as u32,
+            from: moment(floor.pendingAt),
+        }),
+        allowances: shared_allowances(&allowances),
+        requests: read_requests(chain, address).await.unwrap_or_default(),
+        restricted: restricted.iter().map(|code| name_of(*code)).collect(),
+        halt: (halted != 0).then(|| Halt {
+            at: moment(halted),
+            reason: String::new(),
+        }),
         fees: Fees {
-            holding_bps: fees.streamingBps as u32,
+            holding_bps: fees.holdingBps as u32,
             author_bps: fees.authorBps as u32,
             platform_bps: fees.platformBps as u32,
             transaction_bps: fees.transactionBps as u32,
@@ -313,24 +348,74 @@ async fn read_vault(
         exit_band_bps: exit_band as u32,
         tank: Tank {
             balance: dollars(tank.balance),
-            // What it is actually charging, once it has charged anything.
-            // Before that the cap is the only honest answer.
-            daily_charge: if tank.lastCharge.is_zero() {
-                dollars(tank.dailyCap)
-            } else {
-                dollars(tank.lastCharge)
-            },
-            target: dollars(tank.target),
-            autofill_bps: tank.autofillBps as u32,
-            debt: dollars(tank.debt),
+            daily_charge: daily,
+            keep_at: dollars(tank.keepAt),
+            usage_settled: dollars(tank.usageSettled),
         },
-        // Every venue this vault trades is on its own chain, so the contract
+        // Every venue this vault trades is on its own chain, so the station
         // serves every claim itself and nobody has to be there for it.
         exit_class: ExitClass::Direct,
-        freeze_after_days: freeze_after / 86_400,
+        freeze_after_days: (timers.freezeAfter / 86_400) as u32,
         claims,
         in_transit: None,
     })
+}
+
+/// The requests still waiting to be priced: the newest few dozen, which is
+/// every one there is between two valuations.
+async fn read_requests(chain: &Client, address: Address) -> Result<Vec<Request>> {
+    let count: u64 = chain
+        .read(address, IVault::requestCountCall {})
+        .await?
+        .try_into()
+        .unwrap_or(0);
+    let mut waiting = Vec::new();
+    for id in (count.saturating_sub(50) + 1..=count).rev() {
+        let request = chain
+            .read(
+                address,
+                IVault::requestAtCall {
+                    requestId: U256::from(id),
+                },
+            )
+            .await?;
+        if request.done {
+            continue;
+        }
+        let kind = match request.kind {
+            ChainRequestKind::Deposit => RequestKind::Deposit,
+            ChainRequestKind::Redeem => RequestKind::Withdrawal,
+            ChainRequestKind::Claim => RequestKind::Claim,
+            _ => RequestKind::TankFill,
+        };
+        let in_dollars = matches!(kind, RequestKind::Deposit)
+            || (matches!(kind, RequestKind::TankFill) && request.r#ref == U256::from(1u64));
+        waiting.push(Request {
+            id,
+            owner: address_of(request.owner),
+            kind,
+            amount: if in_dollars {
+                dollars(request.amount)
+            } else {
+                shares(request.amount)
+            },
+            earliest: moment(request.earliest),
+        });
+    }
+    waiting.reverse();
+    Ok(waiting)
+}
+
+fn shared_allowances(on_chain: &chain::bindings::prices::Allowances) -> shared::Allowances {
+    shared::Allowances {
+        fuel_per_sec: on_chain.fuelPerSec,
+        memory_mib: on_chain.memoryMib,
+        requests_per_min: on_chain.requestsPerMin,
+        bytes_per_day: on_chain.bytesPerDay,
+        streams: on_chain.streams,
+        inference_ms_per_min: on_chain.inferenceMsPerMin,
+        gas_per_day: on_chain.gasPerDay as f64 / 1_000_000.0,
+    }
 }
 
 /// The record, sampled from the vault itself at each past block.
@@ -483,72 +568,91 @@ async fn read_events(chain: &Client, address: Address) -> Result<Vec<VaultEvent>
         let (kind, summary, amount) = if let Ok(event) = log.log_decode::<IVault::Deposited>() {
             (
                 EventKind::Deposited,
-                "a depositor came in".to_string(),
+                "a deposit was priced".to_string(),
                 Some(dollars(event.inner.data.assets)),
             )
         } else if let Ok(event) = log.log_decode::<IVault::Withdrawn>() {
             (
                 EventKind::Withdrawn,
-                "a depositor left".to_string(),
+                "a withdrawal was priced and paid".to_string(),
+                Some(dollars(event.inner.data.assets)),
+            )
+        } else if let Ok(event) = log.log_decode::<IVault::Refunded>() {
+            (
+                EventKind::Refunded,
+                "a deposit the vault could no longer take went back".to_string(),
                 Some(dollars(event.inner.data.assets)),
             )
         } else if let Ok(event) = log.log_decode::<IVault::ClaimBooked>() {
             (
                 EventKind::ClaimBooked,
                 format!(
-                    "a withdrawal the idle balance could not cover: claim {}",
+                    "a withdrawal the cash could not cover: claim {}",
                     event.inner.data.claimId
                 ),
                 None,
             )
-        } else if let Ok(event) = log.log_decode::<IVault::ClaimSettled>() {
+        } else if let Ok(event) = log.log_decode::<IVault::ClaimPaid>() {
             (
                 EventKind::ClaimSettled,
-                format!("claim {} settled", event.inner.data.claimId),
+                format!("claim {} paid", event.inner.data.claimId),
                 Some(dollars(event.inner.data.assets)),
             )
-        } else if log.log_decode::<IVault::Crystallised>().is_ok() {
+        } else if log.log_decode::<IVault::FeesPaid>().is_ok() {
             (
                 EventKind::Crystallised,
-                "fees crystallised as new shares".to_string(),
+                "the week's fees were paid as new shares".to_string(),
                 None,
             )
-        } else if let Ok(event) = log.log_decode::<IVault::CapitalMoved>() {
+        } else if let Ok(event) = log.log_decode::<IVault::ToStation>() {
             (
                 EventKind::CapitalMoved,
-                format!(
-                    "{} to {}",
-                    name_of(event.inner.data.from),
-                    name_of(event.inner.data.to)
-                ),
-                Some(dollars(event.inner.data.amount)),
+                "cash to the station".to_string(),
+                Some(dollars(event.inner.data.assets)),
+            )
+        } else if let Ok(event) = log.log_decode::<IVault::FromStation>() {
+            (
+                EventKind::CapitalMoved,
+                "the station to cash".to_string(),
+                Some(dollars(event.inner.data.assets)),
             )
         } else if let Ok(event) = log.log_decode::<IVault::TankFunded>() {
             (
                 EventKind::TankFunded,
                 "the tank was topped up".to_string(),
-                Some(dollars(event.inner.data.amount)),
+                Some(dollars(event.inner.data.assets)),
+            )
+        } else if let Ok(event) = log.log_decode::<IVault::TankFilled>() {
+            (
+                EventKind::TankFunded,
+                "the tank was topped up from the author's shares".to_string(),
+                Some(dollars(event.inner.data.assets)),
             )
         } else if let Ok(event) = log.log_decode::<IVault::TankCharged>() {
             (
                 EventKind::TankCharged,
-                format!("the tank paid for {}", name_of(event.inner.data.kind)),
-                Some(dollars(event.inner.data.amount)),
+                "the tank paid for running the agent".to_string(),
+                Some(dollars(event.inner.data.charged)),
             )
-        } else if log.log_decode::<IVault::Frozen>().is_ok() {
-            (
-                EventKind::Frozen,
-                "a claim went unserved and the vault froze".to_string(),
-                None,
-            )
-        } else if log.log_decode::<IVault::Killed>().is_ok() {
-            (EventKind::Killed, "the vault was stopped".to_string(), None)
-        } else if let Ok(event) = log.log_decode::<IVault::KeyApproved>() {
-            (
-                EventKind::Blessed,
-                format!("{:?} may trade this vault", event.inner.data.key),
-                None,
-            )
+        } else if let Ok(event) = log.log_decode::<IVault::Halted>() {
+            match name_of(event.inner.data.reason).as_str() {
+                "frozen" => (
+                    EventKind::Frozen,
+                    "a claim went untried and the vault froze".to_string(),
+                    None,
+                ),
+                "retired" => (
+                    EventKind::Retired,
+                    "the author's wind-down ended".to_string(),
+                    None,
+                ),
+                "sealed" => (
+                    EventKind::Killed,
+                    "the vault is being wound down".to_string(),
+                    None,
+                ),
+                _ => (EventKind::Killed, "the vault was stopped".to_string(), None),
+            }
         } else {
             continue;
         };
@@ -563,22 +667,18 @@ async fn read_events(chain: &Client, address: Address) -> Result<Vec<VaultEvent>
     Ok(events)
 }
 
-async fn read_legs(
-    chain: &Client,
-    deployments: &Deployments,
-    address: Address,
-    vault: &Vault,
-) -> Result<Vec<Leg>> {
+async fn read_legs(chain: &Client, deployments: &Deployments, vault: &Vault) -> Result<Vec<Leg>> {
+    let station: Address = vault.station.parse().unwrap_or_default();
     let on_venue = chain
         .read(
             deployments.venue,
-            ILocalVenue::accountValueCall { master: address },
+            ILocalVenue::accountValueCall { master: station },
         )
         .await?;
     let held = chain
         .read(
             deployments.venue,
-            ILocalVenue::marketsHeldByCall { master: address },
+            ILocalVenue::marketsHeldByCall { master: station },
         )
         .await?;
     let share = if vault.value > 0.0 {
@@ -597,8 +697,8 @@ async fn read_legs(
         valuation: Valuation::OnChain {
             source: "the venue's own account reads".to_string(),
         },
-        account: address_of(address),
-        key: "an agent the vault approved, trade-only".to_string(),
+        account: address_of(station),
+        key: "an agent the vault's station approved, trade-only".to_string(),
         can: vec![
             "place and cancel orders".to_string(),
             format!(
@@ -616,7 +716,7 @@ async fn read_legs(
         cannot: vec![
             "withdraw anything".to_string(),
             "approve another key".to_string(),
-            "send a dollar anywhere but back to the vault".to_string(),
+            "send a dollar anywhere but the vault's own accounts".to_string(),
         ],
         status: VenueStatus::Ok,
         note: None,

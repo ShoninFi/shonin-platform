@@ -79,7 +79,7 @@ pub struct Config {
 /// every one of them read from the contract that enforces it. A page that
 /// states one of these as a fact quotes this rather than a number written into
 /// the app, so the app cannot go stale against the chain it is talking to.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Terms {
     /// The least a vault may be activated with, so an agent that can't run is
     /// never activated. The factory refuses anything under it.
@@ -94,8 +94,11 @@ pub struct Terms {
     pub freeze_after_days: f64,
     /// How long a proposed runtime image waits before it may be blessed.
     pub image_timelock_days: f64,
-    /// Days of charges auto-fill aims to keep in a tank.
-    pub tank_target_days: u32,
+    /// The least a deposit may be.
+    pub minimum_deposit: f64,
+    /// The hash of these terms, which an author's activation names so it
+    /// can't land on terms they never read.
+    pub terms_hash: String,
 }
 
 /// Where each contract lives, as hex strings, because that is what a
@@ -111,6 +114,7 @@ pub struct Addresses {
     pub reviews: String,
     pub profiles: String,
     pub factory: String,
+    pub station_factory: String,
 }
 
 /// The development chain's offer: an account it already holds the key for, so

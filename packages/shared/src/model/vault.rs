@@ -1,32 +1,42 @@
-//! The vault: shares, value, the tank, claims and kills.
+//! The vault: shares, value, requests, the tank, claims and stopping.
 
 use serde::{Deserialize, Serialize};
-use time::Date;
+use time::{Date, PrimitiveDateTime};
 
 use super::common::Chain;
 use super::venue::ExitClass;
+use crate::manifest::Allowances;
 
 /// What a vault is doing right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum VaultState {
+    /// Created, waiting for its stations on other chains.
+    Activating,
     /// Taking deposits, trading.
     Open,
-    /// Frozen after a claim went unserved: no new deposits.
+    /// Retired by its author: no deposits; the agent runs out its wind-down.
+    WindingDown,
+    /// Frozen after a claim went untried: no new deposits.
     Frozen,
-    /// Stopped by the admin key; positions unwound, everyone paid out.
+    /// Stopped by the admin key.
     Killed,
-    /// Nothing left to do: the strategy is retired and the tank reclaimed.
+    /// Nothing at the stations: the value is cash, and fees have stopped.
     Closed,
+    /// Never opened; the tank went back to its author.
+    Cancelled,
 }
 
 impl VaultState {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Activating => "activating",
             Self::Open => "open",
+            Self::WindingDown => "winding down",
             Self::Frozen => "frozen",
             Self::Killed => "killed",
             Self::Closed => "closed",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -35,21 +45,19 @@ impl VaultState {
     }
 }
 
-/// The author's balance for the strategy's running costs. Never depositors'
+/// The author's balance for the agent's running costs. Never depositors'
 /// money: it is excluded from the value shares are worth.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Tank {
     pub balance: f64,
-    /// What the last day's usage statement charged, or, before there is one,
-    /// the most a day may charge at the allowances the author declared.
+    /// What a day costs at the allowances the author set and the published
+    /// prices: the most a day can be charged.
     pub daily_charge: f64,
-    /// What auto-fill tops it back up to.
-    pub target: f64,
-    /// The share of each author fee that refills the tank, in basis points.
-    pub autofill_bps: u32,
-    /// Unpaid charges, repaid from future author fees before anything reaches
-    /// the author.
-    pub debt: f64,
+    /// "Keep my tank at": what it is topped back up to from the author's
+    /// shares. Zero is off.
+    pub keep_at: f64,
+    /// The running usage total collected so far.
+    pub usage_settled: f64,
 }
 
 impl Tank {
@@ -60,6 +68,56 @@ impl Tank {
         }
         self.balance / self.daily_charge
     }
+}
+
+/// A request waiting for a valuation to price it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Request {
+    pub id: u64,
+    pub owner: String,
+    pub kind: RequestKind,
+    /// Dollars for a deposit or a tank fill asked in dollars; shares
+    /// otherwise.
+    pub amount: f64,
+    /// The first valuation it can be priced at.
+    pub earliest: PrimitiveDateTime,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RequestKind {
+    Deposit,
+    Withdrawal,
+    /// A claim, priced again after its fraction was closed.
+    Claim,
+    /// The author's shares, into the tank.
+    TankFill,
+}
+
+impl RequestKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Deposit => "deposit",
+            Self::Withdrawal => "withdrawal",
+            Self::Claim => "claim",
+            Self::TankFill => "tank top-up",
+        }
+    }
+}
+
+/// Why a vault stopped, and when.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Halt {
+    pub at: PrimitiveDateTime,
+    /// `killed`, `frozen`, `retired` or `sealed`.
+    pub reason: String,
+}
+
+/// A lowering of the idle floor that applies later.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingFloor {
+    pub bps: u32,
+    pub from: PrimitiveDateTime,
 }
 
 /// A withdrawal the idle balance could not pay: the leaver's shares are
@@ -85,8 +143,13 @@ pub enum ClaimState {
     /// A settlement was tried and the market was outside the exit band, so
     /// nothing was sold badly. It is retried.
     Waiting,
-    /// Closed, valued again, burned at the marks, and paid.
+    /// Its fraction was closed; it is priced at the next valuation.
+    Queued,
+    /// Priced, burned and paid.
     Paid,
+    /// Taken through the fallback: the cash's share now, the rest as the
+    /// stations bring it home.
+    Fallback,
 }
 
 impl ClaimState {
@@ -94,7 +157,9 @@ impl ClaimState {
         match self {
             Self::Pending => "pending",
             Self::Waiting => "waiting for the market",
+            Self::Queued => "closed, being priced",
             Self::Paid => "paid",
+            Self::Fallback => "taken pro rata",
         }
     }
 }
@@ -133,16 +198,33 @@ pub struct Vault {
     pub asset: String,
     pub state: VaultState,
     pub created: Date,
-    /// Everything the vault is worth, less the tank.
+    /// The vault's station on its own chain: the master of its venue
+    /// accounts.
+    pub station: String,
+    /// Everything the vault is worth at its last valuation, less the tank.
     pub value: f64,
-    /// The part sitting in the contract, which pays withdrawals at once.
+    /// Its cash, which pays withdrawals without closing anything.
     pub idle: f64,
+    /// Deposits waiting for a valuation, held apart.
+    pub escrow: f64,
     pub shares: f64,
-    /// Value divided by shares.
+    /// Value per share after the fees owed, at the last valuation.
     pub share_price: f64,
-    /// The highest share price fees have been crystallised at.
+    /// The high-water mark: no profit fee is owed below it.
     pub high_water_mark: f64,
+    /// When fees were last paid; they are paid on the first valuation on or
+    /// after Monday.
     pub last_crystallised: Date,
+    /// The share of value kept as cash, which the station can't take.
+    pub idle_floor_bps: u32,
+    pub pending_floor: Option<PendingFloor>,
+    /// What the agent may use, which caps what the tank is charged.
+    pub allowances: Allowances,
+    /// Requests waiting to be priced.
+    pub requests: Vec<Request>,
+    /// Who can't deposit, as the vault holds the list.
+    pub restricted: Vec<String>,
+    pub halt: Option<Halt>,
     pub fees: Fees,
     /// How far either side of the venue's price a claim may close. Fixed when
     /// the vault was created, like its fees.

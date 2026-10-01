@@ -41,6 +41,9 @@ struct Args {
     /// Where the build service answers, for the queue and for submissions.
     #[arg(long)]
     builder_url: String,
+    /// Where the executor serves each vault's signed usage total.
+    #[arg(long)]
+    executor_url: String,
     #[arg(long, default_value_t = 19_081)]
     port: u16,
 }
@@ -48,6 +51,7 @@ struct Args {
 struct Service {
     indexer: Arc<Indexer>,
     builder: String,
+    executor: String,
 }
 
 #[tokio::main]
@@ -72,6 +76,7 @@ async fn main() -> Result<()> {
     let service = Arc::new(Service {
         indexer,
         builder: args.builder_url.clone(),
+        executor: args.executor_url.clone(),
     });
 
     let app = axum::Router::new()
@@ -85,6 +90,7 @@ async fn main() -> Result<()> {
         .route("/api/{chain}/portfolio/{address}", get(portfolio))
         .route("/api/{chain}/uploads", post(uploads))
         .route("/api/{chain}/health", post(post_health))
+        .route("/api/{chain}/usage/{vault}", get(usage))
         .route("/api/store/{hash}/{name}", get(store_file))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(service);
@@ -168,6 +174,7 @@ async fn config(
             reviews: format!("{:?}", deployments.reviews),
             profiles: format!("{:?}", deployments.profiles),
             factory: format!("{:?}", deployments.factory),
+            station_factory: format!("{:?}", deployments.station_factory),
         },
         asset_symbol: chain.dollar().to_string(),
         asset_decimals: 6,
@@ -321,20 +328,25 @@ async fn terms(on: Chain, chain: &Client, deployments: &chain::Deployments) -> R
         .read(deployments.publishing, IPublishing::feeCall {})
         .await
         .with_context(|| format!("reading the terms on {on}"))?;
+    let terms_hash = chain
+        .read(deployments.factory, IVaultFactory::termsCall {})
+        .await
+        .with_context(|| format!("reading the terms on {on}"))?;
 
     Ok(Terms {
         minimum_tank: dollars(vaults.minimumTank),
         publish_fee: dollars(publish_fee),
         fees: shared::Fees {
-            holding_bps: vaults.streamingBps as u32,
+            holding_bps: vaults.holdingBps as u32,
             author_bps: vaults.authorBps as u32,
             platform_bps: vaults.platformBps as u32,
             transaction_bps: vaults.transactionBps as u32,
         },
         exit_band_bps: vaults.exitBandBps as u32,
-        freeze_after_days: vaults.freezeAfter as f64 / DAY,
+        freeze_after_days: vaults.timers.freezeAfter as f64 / DAY,
         image_timelock_days: timelock as f64 / DAY,
-        tank_target_days: vaults.tankTargetDays,
+        minimum_deposit: dollars(vaults.minimumDeposit),
+        terms_hash: format!("{terms_hash:?}"),
     })
 }
 
@@ -471,6 +483,34 @@ fn recover(post: &HealthPost) -> Result<Address> {
     signature
         .recover_address_from_msg(digest.as_slice())
         .context("recovering the signer")
+}
+
+/// A vault's running usage total, as its executor signed it: what an author
+/// withdrawing from the tank settles first. Carried, not checked: the vault's
+/// contract checks the signature.
+async fn usage(
+    State(service): State<Arc<Service>>,
+    UrlPath((chain, vault)): UrlPath<(Chain, String)>,
+) -> impl IntoResponse {
+    let Some(served) = service.indexer.on(chain) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let url = format!(
+        "{}/usage/{}/{}",
+        service.executor, served.deployments.chain_id, vault
+    );
+    match reqwest::get(&url).await {
+        Ok(reply) if reply.status().is_success() => match reply.text().await {
+            Ok(body) => (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response(),
+            Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+        },
+        Ok(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    }
 }
 
 /// Anything the store holds, to whoever has its hash.
