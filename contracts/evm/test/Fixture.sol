@@ -4,12 +4,16 @@ pragma solidity ^0.8.30;
 import {AttestationRegistry} from "../src/AttestationRegistry.sol";
 import {AuthorProfiles} from "../src/AuthorProfiles.sol";
 import {DevAttestationVerifier} from "../src/DevAttestationVerifier.sol";
+import {LocalBridge} from "../src/LocalBridge.sol";
+import {LocalDriver} from "../src/LocalDriver.sol";
 import {LocalUsd} from "../src/LocalUsd.sol";
 import {LocalVenue} from "../src/LocalVenue.sol";
 
 import {Prices} from "../src/Prices.sol";
 import {Publishing} from "../src/Publishing.sol";
 import {ReviewRegistry} from "../src/ReviewRegistry.sol";
+import {Station} from "../src/Station.sol";
+import {StationFactory} from "../src/StationFactory.sol";
 import {StrategyRegistry} from "../src/StrategyRegistry.sol";
 import {Vault} from "../src/Vault.sol";
 import {VaultFactory} from "../src/VaultFactory.sol";
@@ -17,8 +21,8 @@ import {ImageKind} from "../src/interfaces/IAttestationRegistry.sol";
 import {Allowances, UnitPrices} from "../src/interfaces/IPrices.sol";
 import {Review} from "../src/interfaces/IReviewRegistry.sol";
 import {ChainNeed} from "../src/interfaces/IStrategyRegistry.sol";
-
-import {VaultConfig} from "../src/interfaces/IVaultFactory.sol";
+import {Timers} from "../src/interfaces/IVault.sol";
+import {ChainName, VaultConfig} from "../src/interfaces/IVaultFactory.sol";
 import {Test} from "forge-std/Test.sol";
 import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
 
@@ -45,13 +49,20 @@ contract Fixture is Test {
     uint64 internal constant BLESSING_TTL = 72 hours;
     uint256 internal constant PUBLISH_FEE = 1e6;
     uint256 internal constant MINIMUM_TANK = 40e6;
+    uint256 internal constant DEAD_ASSETS = 0.01e6;
+    uint256 internal constant MINIMUM_DEPOSIT = 10e6;
+    uint64 internal constant SLOT = 10;
+    uint64 internal constant HALT_GRACE = 10 minutes;
     uint64 internal constant PRICE_NOTICE = 30 days;
 
     address internal admin = makeAddr("admin");
     address internal platform = makeAddr("platform");
-    address internal author = makeAddr("author");
-    address internal alice = makeAddr("alice");
-    address internal bob = makeAddr("bob");
+    address internal author;
+    uint256 internal authorKey;
+    address internal alice;
+    uint256 internal aliceKey;
+    address internal bob;
+    uint256 internal bobKey;
     address internal operator = makeAddr("operator");
 
     address internal attestor = vm.addr(ATTESTOR_KEY);
@@ -69,8 +80,15 @@ contract Fixture is Test {
     ReviewRegistry internal reviews;
     AuthorProfiles internal profiles;
     VaultFactory internal factory;
+    LocalDriver internal driver;
+    LocalBridge internal bridge;
+    StationFactory internal stations;
 
     function setUp() public virtual {
+        (author, authorKey) = makeAddrAndKey("author");
+        (alice, aliceKey) = makeAddrAndKey("alice");
+        (bob, bobKey) = makeAddrAndKey("bob");
+
         // A date far enough in that a timelock and a blessing have room behind
         // them; a chain that starts at zero makes both meaningless.
         vm.warp(365 days);
@@ -84,29 +102,25 @@ contract Fixture is Test {
         strategies = new StrategyRegistry(attestation, publishing);
         reviews = new ReviewRegistry(attestation, strategies, publishing);
         profiles = new AuthorProfiles();
+        driver = new LocalDriver(venue, IERC20(address(usd)));
+        bridge = new LocalBridge(IERC20(address(usd)), operator);
+        stations = new StationFactory(address(this));
         factory = new VaultFactory(
             VaultFactory.Deps({
                 asset: IERC20(address(usd)),
-                venue: venue,
                 attestation: attestation,
                 strategies: strategies,
                 reviews: reviews,
                 prices: prices,
+                stationFactory: stations,
+                vaultImplementation: address(new Vault()),
                 admin: admin,
                 platform: platform
             }),
-            VaultConfig({
-                streamingBps: 100,
-                authorBps: 1000,
-                platformBps: 500,
-                transactionBps: 10,
-                exitBandBps: 100,
-                defaultAutofillBps: 10_000,
-                freezeAfter: 7 days,
-                tankTargetDays: 30,
-                minimumTank: MINIMUM_TANK
-            })
+            vaultConfig(),
+            chainNames()
         );
+        stations.initialize(address(attestation), address(usd), address(factory), address(new Station()));
 
         vm.startPrank(operator);
         venue.listMarket(SPOT, false, PRICE);
@@ -118,11 +132,55 @@ contract Fixture is Test {
         attestation.proposeImage(BUILDER_IMAGE, ImageKind.Builder);
         attestation.proposeImage(REVIEWER_IMAGE, ImageKind.Reviewer);
         attestation.proposeProject(PROJECT);
+        attestation.proposeDriver("local", address(driver));
+        attestation.proposeBridge("local-bridge", address(bridge));
         vm.stopPrank();
         skip(TIMELOCK);
 
         blessServiceKey(BUILDER_IMAGE, builder);
         blessServiceKey(REVIEWER_IMAGE, reviewer);
+    }
+
+    // Configuration ---------------------------------------------------------
+
+    function timers() internal pure returns (Timers memory) {
+        return Timers({
+            slotInterval: SLOT,
+            slotLead: 5,
+            slotWindow: 3,
+            postDeadline: 60,
+            transitTimeout: 1 hours,
+            fallbackAfter: 24 hours,
+            usageFreshness: 10 minutes,
+            tankEscapeDelay: 1 days,
+            floorDelay: 1 days,
+            haltGrace: HALT_GRACE,
+            freezeAfter: 7 days,
+            windDown: 7 days,
+            activationWindow: 3 days
+        });
+    }
+
+    function vaultConfig() internal pure returns (VaultConfig memory) {
+        return VaultConfig({
+            holdingBps: 100,
+            authorBps: 1000,
+            platformBps: 500,
+            transactionBps: 10,
+            exitBandBps: 100,
+            minimumDeposit: MINIMUM_DEPOSIT,
+            minimumTank: MINIMUM_TANK,
+            deadAssets: DEAD_ASSETS,
+            timers: timers()
+        });
+    }
+
+    /// This chain is base; hyperliquid stands for a chain a strategy may also
+    /// trade on.
+    function chainNames() internal view returns (ChainName[] memory list) {
+        list = new ChainName[](2);
+        list[0] = ChainName({name: "base", chainId: block.chainid});
+        list[1] = ChainName({name: "hyperliquid", chainId: 999});
     }
 
     // Helpers ---------------------------------------------------------------
@@ -271,24 +329,114 @@ contract Fixture is Test {
         reviews.submitReview(id, reviewFor(bundleHash, 1));
     }
 
-    /// Publish and activate a vault the way an author does, with a daily
-    /// usage cap of 2 dollars.
-    function openVault() internal returns (Vault vault, bytes32 bundle) {
-        uint256 id;
-        (id, bundle) = ready();
-        give(author, MINIMUM_TANK);
+    /// The depositor's statement, signed by `key`, for the list as `vault`
+    /// would carry it. Computed by hand so it can be signed before the vault
+    /// exists, as an author does.
+    function statementBy(
+        uint256 key,
+        address vault,
+        address depositor,
+        string memory restrictedText
+    ) internal view returns (bytes memory) {
+        bytes32 domain = keccak256(
+            abi.encode(
+                keccak256(
+                    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+                ),
+                keccak256("Shonin Vault"),
+                keccak256("1"),
+                block.chainid,
+                vault
+            )
+        );
+        bytes32 statement = keccak256(
+            abi.encode(
+                keccak256("Statement(address depositor,string statement,string restricted)"),
+                depositor,
+                keccak256("I am not a restricted person for this vault, and I am not acting for one."),
+                keccak256(bytes(restrictedText))
+            )
+        );
+        (uint8 v, bytes32 r, bytes32 sig) =
+            vm.sign(key, keccak256(abi.encodePacked("\x19\x01", domain, statement)));
+        return abi.encodePacked(r, sig, v);
+    }
+
+    /// Activate a ready strategy as its author.
+    function activate(
+        uint256 id,
+        Allowances memory allowances,
+        uint256 tank
+    ) internal returns (Vault vault) {
+        (, string memory text) = factory.restrictedFor(id);
+        bytes memory statement = statementBy(authorKey, factory.predictVault(id), author, text);
+        bytes32 terms = factory.terms();
+        give(author, tank);
         vm.startPrank(author);
-        usd.approve(address(factory), MINIMUM_TANK);
-        vault = Vault(factory.activate(id, allowancesCosting(2e6), MINIMUM_TANK));
+        usd.approve(address(factory), tank);
+        vault = Vault(factory.activate(id, allowances, 500, tank, 0, statement, terms));
         vm.stopPrank();
     }
 
-    function depositAs(Vault vault, address who, uint256 amount) internal returns (uint256 shares) {
+    /// Publish and activate a vault the way an author does, with allowances
+    /// costing 2 dollars a day, and bless its executor.
+    function openVault() internal returns (Vault vault, bytes32 bundle) {
+        uint256 id;
+        (id, bundle) = ready();
+        vault = activate(id, allowancesCosting(2e6), MINIMUM_TANK);
+        blessExecutorKey(executor, address(vault), bundle);
+    }
+
+    function stationOf(Vault vault) internal view returns (Station) {
+        return Station(vault.homeStation());
+    }
+
+    function keyOf(address who) internal view returns (uint256) {
+        if (who == alice) return aliceKey;
+        if (who == bob) return bobKey;
+        if (who == author) return authorKey;
+        revert("no key for that address");
+    }
+
+    /// Ask to deposit, with the depositor's statement.
+    function requestDepositAs(Vault vault, address who, uint256 amount) internal returns (uint256 id) {
+        bytes memory statement = statementBy(keyOf(who), address(vault), who, vault.restrictedText());
         give(who, amount);
         vm.startPrank(who);
         usd.approve(address(vault), amount);
-        shares = vault.deposit(amount, who);
+        id = vault.requestDeposit(amount, who, statement);
         vm.stopPrank();
+    }
+
+    /// Move to the next slot boundary, record a valuation there and settle
+    /// everything it prices.
+    function value(Vault vault) internal {
+        uint256 t = vm.getBlockTimestamp();
+        vm.warp(t - (t % SLOT) + SLOT);
+        vault.recordValuation();
+        vault.settle(type(uint256).max);
+    }
+
+    /// Deposit and have it priced. Returns the shares it bought.
+    function depositAs(Vault vault, address who, uint256 amount) internal returns (uint256 shares) {
+        uint256 before = vault.balanceOf(who);
+        requestDepositAs(vault, who, amount);
+        value(vault);
+        shares = vault.balanceOf(who) - before;
+    }
+
+    /// Ask to redeem and have it priced. Returns what it paid.
+    function redeemAs(Vault vault, address who, uint256 shares) internal returns (uint256 paid) {
+        uint256 before = usd.balanceOf(who);
+        vm.prank(who);
+        vault.requestRedeem(shares, who);
+        value(vault);
+        paid = usd.balanceOf(who) - before;
+    }
+
+    /// The executor's signed running usage total.
+    function usage(Vault vault, uint256 total, uint64 asOf) internal view returns (bytes memory) {
+        return signed(EXECUTOR_KEY, vault.usageDigest(total, asOf));
     }
 }
 

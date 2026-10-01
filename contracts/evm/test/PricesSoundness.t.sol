@@ -101,4 +101,25 @@ contract PricesSoundnessTest is Fixture {
         assertEq(prices.costOf(a, t, t + 1), 1);
         assertEq(prices.costOf(a, t, t + 1 days), 86_400);
     }
+
+    /// A long history doesn't make a recent interval dear to price: only the
+    /// periods it touches are read, and the answer is the same.
+    function test_a_long_history_prices_a_recent_interval_the_same_and_cheaply() public {
+        Allowances memory a = thinking();
+        UnitPrices memory p = publishedPrices();
+        for (uint256 i = 0; i < 200; i++) {
+            p.vcpuHour += 1;
+            vm.prank(admin);
+            prices.schedule(p);
+            skip(1 days);
+        }
+        skip(PRICE_NOTICE);
+        uint64 from = uint64(block.timestamp);
+        uint64 to = from + 1 days;
+        uint256 before = gasleft();
+        uint256 cost = prices.costOf(a, from, to);
+        uint256 used = before - gasleft();
+        assertLt(used, 60_000, "a recent day reads a handful of periods, not the whole history");
+        assertApproxEqAbs(cost, prices.dailyCost(a), 1);
+    }
 }

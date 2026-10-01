@@ -2,8 +2,10 @@
 pragma solidity ^0.8.30;
 
 import {AttestationRegistry} from "../src/AttestationRegistry.sol";
+import {ReviewRegistry} from "../src/ReviewRegistry.sol";
 import {StrategyRegistry} from "../src/StrategyRegistry.sol";
 import {ImageKind} from "../src/interfaces/IAttestationRegistry.sol";
+import {Review} from "../src/interfaces/IReviewRegistry.sol";
 import {ChainNeed} from "../src/interfaces/IStrategyRegistry.sol";
 import {Fixture} from "./Fixture.sol";
 
@@ -56,5 +58,15 @@ contract RegistryInputsTest is Fixture {
             builderSig,
             clearance
         );
+    }
+
+    /// A refusal is recorded against the source it read, so it must name one.
+    function test_a_refusal_names_the_source_it_read() public {
+        uint256 id = submitAs(author);
+        Review memory refusal = reviewFor(bytes32(0), 3);
+        refusal.sourceHash = bytes32(0);
+        vm.prank(reviewer);
+        vm.expectRevert(ReviewRegistry.NoSource.selector);
+        reviews.submitRefusal(id, refusal);
     }
 }

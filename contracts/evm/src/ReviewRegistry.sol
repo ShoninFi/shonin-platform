@@ -27,6 +27,7 @@ contract ReviewRegistry is IReviewRegistry {
     error WrongBundle();
     error AlreadyReviewed();
     error BadRating();
+    error NoSource();
 
     constructor(IAttestationRegistry attestation_, IStrategyRegistry strategies_, IPublishing publishing_) {
         attestation = attestation_;
@@ -53,6 +54,8 @@ contract ReviewRegistry is IReviewRegistry {
         if (publishing.submissionOf(strategyId).author == address(0)) revert NotSubmitted();
         if (strategies.isRegistered(strategyId)) revert AlreadyRegistered();
         if (review.bundleHash != bytes32(0)) revert WrongBundle();
+        // A refusal is recorded against the source it read.
+        if (review.sourceHash == bytes32(0)) revert NoSource();
 
         _record(strategyId, review);
         _refused[strategyId] = true;

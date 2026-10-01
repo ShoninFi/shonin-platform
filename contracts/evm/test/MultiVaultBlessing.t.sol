@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.30;
 
+import {Station} from "../src/Station.sol";
 import {Vault} from "../src/Vault.sol";
 import {Fixture} from "./Fixture.sol";
 
@@ -78,27 +79,26 @@ contract MultiVaultBlessingTest is Fixture {
     /// anyone) revokes the agent and the vault stops trading.
     function test_a_stranger_cannot_cut_off_a_live_vaults_executor() public {
         (Vault vault, bytes32 liveBundle) = openVault();
+        Station station = stationOf(vault);
         bundle = liveBundle;
         (bytes memory journal, bytes32[] memory proofLive, bytes32[] memory proofOther) =
             twoVaultJournal(executor, address(vault), vaultB);
         bytes memory seal = sealOf(journal);
         attestation.bless(seal, journal, block.chainid, address(vault), bundle, proofLive);
-
-        bytes32 venueId = vault.VENUE_ID();
-        vault.approveKey(venueId, executor);
-        assertTrue(venue.isAgent(address(vault), executor));
+        station.approveKey("local", executor);
+        assertTrue(venue.isAgent(address(station), executor));
 
         // A stranger may not revoke a key whose blessing stands...
         vm.prank(alice);
-        vm.expectRevert(Vault.NotBlessed.selector);
-        vault.revokeKey(venueId, executor);
+        vm.expectRevert(Station.StillBlessed.selector);
+        station.revokeKey("local", executor);
 
         // ...but can make it not stand, with the public seal and the other leaf.
         vm.startPrank(alice);
         attestation.bless(seal, journal, block.chainid, vaultB, bundle, proofOther);
-        vm.expectRevert(Vault.NotBlessed.selector);
-        vault.revokeKey(venueId, executor);
+        vm.expectRevert(Station.StillBlessed.selector);
+        station.revokeKey("local", executor);
         vm.stopPrank();
-        assertTrue(venue.isAgent(address(vault), executor), "a stranger revoked the live executor");
+        assertTrue(venue.isAgent(address(station), executor), "a stranger revoked the live executor");
     }
 }

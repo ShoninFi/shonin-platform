@@ -3,6 +3,8 @@ pragma solidity ^0.8.30;
 
 import {AttestationRegistry} from "../src/AttestationRegistry.sol";
 import {DevAttestationVerifier} from "../src/DevAttestationVerifier.sol";
+
+import {Station} from "../src/Station.sol";
 import {Vault} from "../src/Vault.sol";
 import {ImageKind} from "../src/interfaces/IAttestationRegistry.sol";
 import {Fixture} from "./Fixture.sol";
@@ -36,6 +38,7 @@ contract VerifierRetirementTest is Fixture {
 
     function test_retiring_a_checker_stops_the_keys_it_blessed() public {
         (Vault vault, bytes32 bundle) = openVault();
+        Station station = stationOf(vault);
         address forged = makeAddr("forged executor");
 
         // Whoever holds the leaked key attests any journal they like: the
@@ -47,9 +50,8 @@ contract VerifierRetirementTest is Fixture {
         assertTrue(attestation.isBlessedFor(forged, block.chainid, address(vault), bundle));
 
         // And the vault lets that key trade the depositors' account.
-        bytes32 venueId = vault.VENUE_ID();
-        vault.approveKey(venueId, forged);
-        assertTrue(venue.isAgent(address(vault), forged));
+        station.approveKey("local", forged);
+        assertTrue(venue.isAgent(address(station), forged));
 
         // The admin finds out and retires the checker at once.
         vm.prank(admin);
@@ -62,8 +64,10 @@ contract VerifierRetirementTest is Fixture {
         );
         // Which is what lets anyone cut it off at the venue.
         vm.prank(alice);
-        vault.revokeKey(venueId, forged);
-        assertFalse(venue.isAgent(address(vault), forged), "the forged key still trades after the retirement");
+        station.revokeKey("local", forged);
+        assertFalse(
+            venue.isAgent(address(station), forged), "the forged key still trades after the retirement"
+        );
     }
 
     function test_retiring_a_checker_stops_the_service_keys_it_blessed() public {

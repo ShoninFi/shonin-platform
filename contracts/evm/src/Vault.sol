@@ -1,545 +1,393 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.30;
 
-import {IAttestationRegistry, ImageKind} from "./interfaces/IAttestationRegistry.sol";
-import {ILocalVenue, OrderRequest, Position} from "./interfaces/ILocalVenue.sol";
-import {Claim, ClaimState, Fees, IVault, Tank, VaultState} from "./interfaces/IVault.sol";
-import {ERC20} from "openzeppelin/token/ERC20/ERC20.sol";
-import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
-import {SafeERC20} from "openzeppelin/token/ERC20/utils/SafeERC20.sol";
-import {ECDSA} from "openzeppelin/utils/cryptography/ECDSA.sol";
-import {MessageHashUtils} from "openzeppelin/utils/cryptography/MessageHashUtils.sol";
+import {Allowances} from "./interfaces/IPrices.sol";
+import {
+    Claim,
+    Fees,
+    IVault,
+    Request,
+    Tank,
+    Timers,
+    Valuation,
+    VaultInit,
+    VaultState
+} from "./interfaces/IVault.sol";
+import {Upkeep} from "./vault/Upkeep.sol";
+import {Valuations} from "./vault/Valuations.sol";
+import {Layout, VaultStorage} from "./vault/VaultStorage.sol";
+
+import {ReentrancyGuardTransient} from "openzeppelin/utils/ReentrancyGuardTransient.sol";
 import {Math} from "openzeppelin/utils/math/Math.sol";
 
 /// Pooled capital behind one strategy.
 ///
-/// The contract works out what it is worth by reading the chain in the same
-/// transaction, so nobody reports a value to it and nobody has to be believed.
-/// A depositor can always leave: at once from the idle balance, or as a claim
-/// the contract serves itself by closing their fraction of every position
-/// inside an exit band. Their shares stay outstanding until it settles, so
-/// they bear the cost of that close alongside everyone who stayed.
-///
-/// Shares follow ERC-4626's accounting -- one asset, pro-rata claims, rounding
-/// against whoever is moving -- but `redeem` may book a claim instead of
-/// paying, so this is deliberately not a compliant ERC-4626 vault.
-contract Vault is IVault, ERC20 {
-    using SafeERC20 for IERC20;
+/// Every vault is a clone of this one, created by the factory when an author
+/// activates a strategy. It holds shares, cash, the tank, requests and claims,
+/// and never trades: its home station does. What it is worth comes from the
+/// last valuation, never from its own token balance, so money sent to it by
+/// anyone else is ignored. The work is split into libraries over one storage
+/// layout so each part fits the size limit; this contract is the door.
+contract Vault is IVault, ReentrancyGuardTransient {
+    using VaultStorage for Layout;
     using Math for uint256;
 
-    /// The vault's two accounts, and the only two destinations that exist.
-    bytes32 public constant ACCOUNT_IDLE = "idle";
-    bytes32 public constant ACCOUNT_VENUE = "venue";
-    /// The venue a capital movement or a key approval names.
-    bytes32 public constant VENUE_ID = "local";
-
-    /// Shares carry 18 decimals and the asset 6, so a share starts life worth
-    /// one dollar. The same offset is the virtual supply that makes the first
-    /// deposit safe.
-    uint256 private constant SHARE_OFFSET = 1e12;
-    uint256 private constant BPS = 10_000;
-    uint256 private constant YEAR = 365 days;
-    uint256 private constant WAD = 1e18;
-
-    IERC20 public immutable asset;
-    ILocalVenue public immutable venue;
-    IAttestationRegistry public immutable attestation;
-    address public immutable platform;
-    address public immutable admin;
-
-    uint256 public immutable strategyId;
-    bytes32 public immutable sourceHash;
-    /// The bundle this vault runs, fixed for its life.
-    bytes32 public immutable bundleHash;
-    address public immutable author;
-    uint64 public immutable createdAt;
-    uint16 public immutable exitBandBps;
-    uint32 public immutable freezeAfter;
-
-    VaultState private _state;
-    Fees private _fees;
-    Tank private _tank;
-    uint256 public highWaterMark;
-    uint64 public lastCrystallised;
-    uint256 public pendingShares;
-
-    Claim[] private _claims;
-    address[] private _approvedKeys;
-    mapping(address => bool) private _isApprovedKey;
-
-    error WrongState();
-    error NotTheAuthor();
-    error NotTheAdmin();
-    error NotBlessed();
-    error NoSuchAccount();
-    error NothingToDo();
-    error NotYetFrozenable();
-    error TooMuch();
-    error DayAlreadyCharged();
-    error DayNotOver();
-    error AlreadyPaid();
-
-    struct Init {
-        IERC20 asset;
-        ILocalVenue venue;
-        IAttestationRegistry attestation;
-        address platform;
-        address admin;
-        address author;
-        uint256 strategyId;
-        bytes32 bundleHash;
-        bytes32 sourceHash;
-        Fees fees;
-        uint16 exitBandBps;
-        uint32 freezeAfter;
-        uint256 dailyUsageCap;
-        uint256 tankTarget;
-        uint16 autofillBps;
+    /// The implementation itself is never a vault.
+    constructor() {
+        VaultStorage.layout().factory = address(1);
     }
 
-    constructor(Init memory init) ERC20("Shonin vault share", "SHARE") {
-        asset = init.asset;
-        venue = init.venue;
-        attestation = init.attestation;
-        platform = init.platform;
-        admin = init.admin;
-        author = init.author;
-        strategyId = init.strategyId;
-        bundleHash = init.bundleHash;
-        sourceHash = init.sourceHash;
-        createdAt = uint64(block.timestamp);
-        _fees = init.fees;
-        exitBandBps = init.exitBandBps;
-        freezeAfter = init.freezeAfter;
-        _tank.dailyCap = init.dailyUsageCap;
-        // Nothing before the day it opened can be charged.
-        _tank.lastChargedDay = uint64(block.timestamp / 1 days) - 1;
-        _tank.target = init.tankTarget;
-        _tank.autofillBps = init.autofillBps;
-        // A vault is only created for a strategy that is built and reviewed,
-        // so it opens at once.
-        _state = VaultState.Open;
-        highWaterMark = 10 ** 6;
-        lastCrystallised = uint64(block.timestamp);
-    }
-
-    // What it is worth ------------------------------------------------------
-
-    /// The balance on this contract that belongs to depositors. The tank is
-    /// the author's, so it never counts.
-    function idle() public view returns (uint256) {
-        uint256 held = asset.balanceOf(address(this));
-        return held > _tank.balance ? held - _tank.balance : 0;
-    }
-
-    function totalValue() public view returns (uint256) {
-        return idle() + venue.accountValue(address(this));
-    }
-
-    function exitValue() public view returns (uint256) {
-        return idle() + venue.exitValue(address(this));
-    }
-
-    function sharePrice() public view returns (uint256) {
-        return _toAssets(WAD, totalValue(), Math.Rounding.Floor);
-    }
-
-    function _toShares(
-        uint256 assets,
-        uint256 total,
-        Math.Rounding rounding
-    ) private view returns (uint256) {
-        return assets.mulDiv(totalSupply() + SHARE_OFFSET, total + 1, rounding);
-    }
-
-    function _toAssets(
-        uint256 shares,
-        uint256 total,
-        Math.Rounding rounding
-    ) private view returns (uint256) {
-        return shares.mulDiv(total + 1, totalSupply() + SHARE_OFFSET, rounding);
+    function initialize(VaultInit calldata init, uint256 tankFunding, uint256 deadAssets) external {
+        Upkeep.initialize(init, tankFunding, deadAssets);
     }
 
     // Depositors ------------------------------------------------------------
 
-    function deposit(uint256 assets, address receiver) external returns (uint256 shares) {
-        if (_state != VaultState.Open) revert WrongState();
-        if (assets == 0) revert NothingToDo();
-        crystallise();
-
-        // The fee never leaves the pool: it lifts the value of every share
-        // that stays, so moving in and out around a price change takes
-        // nothing from the depositors who didn't.
-        uint256 fee = assets.mulDiv(_fees.transactionBps, BPS, Math.Rounding.Ceil);
-        // Read the value before the assets arrive, or they would pay for
-        // themselves.
-        shares = _toShares(assets - fee, totalValue(), Math.Rounding.Floor);
-
-        asset.safeTransferFrom(msg.sender, address(this), assets);
-        _mint(receiver, shares);
-        emit Deposited(receiver, assets, shares);
+    function requestDeposit(
+        uint256 assets,
+        address receiver,
+        bytes calldata statement
+    ) external nonReentrant returns (uint256) {
+        if (statement.length != 0) Upkeep.recordStatement(receiver, statement);
+        return Valuations.requestDeposit(assets, receiver);
     }
 
-    function redeem(uint256 shares, address receiver) external returns (uint256 assets, uint256 claimId) {
-        if (_state == VaultState.None) revert WrongState();
-        if (shares == 0) revert NothingToDo();
-        crystallise();
-
-        uint256 gross = _toAssets(shares, exitValue(), Math.Rounding.Floor);
-        if (gross <= idle()) {
-            uint256 fee = gross.mulDiv(_fees.transactionBps, BPS, Math.Rounding.Ceil);
-            assets = gross - fee;
-            _burn(msg.sender, shares);
-            asset.safeTransfer(receiver, assets);
-            emit Withdrawn(receiver, shares, assets);
-            return (assets, 0);
-        }
-
-        // The idle balance cannot cover it, so the shares are marked pending
-        // and the contract books a claim. They stay outstanding until it
-        // settles: the leaver bears their share of the close, like everyone
-        // else in the vault.
-        uint256 fraction = shares.mulDiv(WAD, totalSupply(), Math.Rounding.Floor);
-        _transfer(msg.sender, address(this), shares);
-        pendingShares += shares;
-        _claims.push(
-            Claim({
-                owner: receiver,
-                shares: shares,
-                fractionClosed: fraction,
-                bookedAt: uint64(block.timestamp),
-                state: ClaimState.Pending,
-                settledFor: 0
-            })
-        );
-        claimId = _claims.length;
-        emit ClaimBooked(claimId, receiver, shares, fraction);
+    function requestRedeem(uint256 shares, address receiver) external nonReentrant returns (uint256) {
+        return Valuations.requestRedeem(shares, receiver);
     }
 
-    function settle(uint256 claimId) external {
-        Claim storage claim = _claims[claimId - 1];
-        if (claim.state == ClaimState.Paid) revert AlreadyPaid();
-        crystallise();
-
-        uint256 fraction = claim.shares.mulDiv(WAD, totalSupply(), Math.Rounding.Ceil);
-        string memory failure = _closeFraction(fraction);
-        if (bytes(failure).length != 0) {
-            claim.state = ClaimState.Waiting;
-            emit ClaimWaiting(claimId, failure);
-            return;
-        }
-
-        uint256 gross = _toAssets(claim.shares, exitValue(), Math.Rounding.Floor);
-        _bringHome(gross);
-        if (gross > idle()) {
-            claim.state = ClaimState.Waiting;
-            emit ClaimWaiting(claimId, "the close did not raise enough");
-            return;
-        }
-
-        uint256 fee = gross.mulDiv(_fees.transactionBps, BPS, Math.Rounding.Ceil);
-        uint256 paid = gross - fee;
-        _burn(address(this), claim.shares);
-        pendingShares -= claim.shares;
-        claim.state = ClaimState.Paid;
-        claim.settledFor = paid;
-        asset.safeTransfer(claim.owner, paid);
-        emit ClaimSettled(claimId, paid);
+    function recordValuation() external nonReentrant {
+        Valuations.recordValuation();
     }
 
-    function freeze() external {
-        uint256 oldest = _oldestOutstandingClaim();
-        if (oldest == 0) revert NothingToDo();
-        if (block.timestamp < _claims[oldest - 1].bookedAt + freezeAfter) revert NotYetFrozenable();
-        if (_state == VaultState.Killed || _state == VaultState.Closed) revert WrongState();
-
-        // No new deposits, and no trading approvals left on the venue, so the
-        // only thing anyone can still do here is unwind.
-        _state = VaultState.Frozen;
-        _revokeEveryKey();
-        emit Frozen(oldest);
+    function settle(uint256 max) external nonReentrant returns (uint256) {
+        return Valuations.settle(max);
     }
 
-    // Closing positions -----------------------------------------------------
-
-    /// Close `fraction` of every position with reduce-only orders bounded by
-    /// the exit band. Returns why it could not, or an empty string.
-    function _closeFraction(uint256 fraction) private returns (string memory) {
-        bytes32[] memory held = venue.marketsHeldBy(address(this));
-        for (uint256 i = 0; i < held.length; i++) {
-            Position memory position = venue.positionOf(address(this), held[i]);
-            if (position.size == 0) continue;
-
-            bool isLong = position.size > 0;
-            uint256 outstanding = uint256(isLong ? position.size : -position.size);
-            uint256 size = outstanding.mulDiv(fraction, WAD, Math.Rounding.Ceil);
-            if (size == 0) continue;
-            if (size > outstanding) size = outstanding;
-
-            uint256 oracle = venue.marketOf(held[i]).oracle;
-            // A long is sold, so its worst acceptable price is below the
-            // oracle; a short is bought back above it.
-            uint256 limit = isLong
-                ? oracle.mulDiv(BPS - exitBandBps, BPS, Math.Rounding.Floor)
-                : oracle.mulDiv(BPS + exitBandBps, BPS, Math.Rounding.Ceil);
-
-            OrderRequest[] memory orders = new OrderRequest[](1);
-            orders[0] = OrderRequest({
-                market: held[i],
-                isBuy: !isLong,
-                size: size,
-                limitPrice: limit,
-                reduceOnly: true
-            });
-            if (!venue.place(address(this), orders)[0].accepted) {
-                return "the market is outside the exit band";
-            }
-        }
-        return "";
+    function settleClaim(uint256 claimId) external nonReentrant {
+        Upkeep.settleClaim(claimId);
     }
 
-    /// Bring enough of the venue's cash back to pay `wanted`, if it is there.
-    function _bringHome(uint256 wanted) private {
-        uint256 here = idle();
-        if (here >= wanted) return;
-        int256 there = venue.cashOf(address(this));
-        if (there <= 0) return;
-        uint256 take = wanted - here;
-        if (take > uint256(there)) take = uint256(there);
-        venue.withdraw(take);
-        emit CapitalMoved(ACCOUNT_VENUE, ACCOUNT_IDLE, take);
+    function freeze(uint256 claimId) external nonReentrant {
+        Upkeep.freeze(claimId);
     }
 
-    function _oldestOutstandingClaim() private view returns (uint256) {
-        for (uint256 i = 0; i < _claims.length; i++) {
-            if (_claims[i].state == ClaimState.Pending || _claims[i].state == ClaimState.Waiting) {
-                return i + 1;
-            }
-        }
-        return 0;
+    function takeProRata(uint256 requestId) external nonReentrant {
+        Valuations.takeProRata(requestId);
     }
 
-    // Fees ------------------------------------------------------------------
-
-    function crystallise() public {
-        if (_state == VaultState.Closed) return;
-        uint256 elapsed = block.timestamp - lastCrystallised;
-        if (elapsed == 0) return;
-        lastCrystallised = uint64(block.timestamp);
-
-        uint256 total = totalValue();
-        if (total == 0) return;
-
-        uint256 streaming = total.mulDiv(_fees.streamingBps, BPS) * elapsed / YEAR;
-        uint256 streamingShares = _mintFee(streaming, total, platform);
-
-        uint256 afterStreaming = total - streaming;
-        uint256 valuePerShare = _toAssets(WAD, afterStreaming, Math.Rounding.Floor);
-        uint256 authorShares;
-        uint256 platformShares;
-        if (valuePerShare > highWaterMark) {
-            uint256 gain = (valuePerShare - highWaterMark).mulDiv(totalSupply(), WAD, Math.Rounding.Floor);
-            uint256 authorFee = gain.mulDiv(_fees.authorBps, BPS, Math.Rounding.Floor);
-            uint256 platformFee = gain.mulDiv(_fees.platformBps, BPS, Math.Rounding.Floor);
-            authorShares = _mintFee(authorFee, afterStreaming, author);
-            platformShares = _mintFee(platformFee, afterStreaming - authorFee, platform);
-            _autofill(authorFee);
-            highWaterMark = _toAssets(WAD, totalValue(), Math.Rounding.Floor);
-        }
-        emit Crystallised(streamingShares, authorShares, platformShares, highWaterMark);
+    function takeProRataClaim(uint256 claimId) external nonReentrant {
+        Valuations.takeProRataClaim(claimId);
     }
 
-    /// Mint the shares that hand `value` out of a pool worth `total` to
-    /// `to`. Paying a fee in shares never forces the strategy to sell.
-    function _mintFee(uint256 value, uint256 total, address to) private returns (uint256 minted) {
-        if (value == 0 || total <= value) return 0;
-        minted = value.mulDiv(totalSupply() + SHARE_OFFSET, total - value + 1, Math.Rounding.Floor);
-        if (minted == 0) return 0;
-        _mint(to, minted);
+    function collectUnits() external nonReentrant returns (uint256) {
+        return Valuations.collectUnits();
     }
 
-    /// Move a share of the author's fee into the tank, as far as the idle
-    /// balance reaches. It never books a claim: an author's running costs
-    /// don't get to jump the queue in front of a depositor.
-    function _autofill(uint256 authorFee) private {
-        if (_tank.autofillBps == 0) return;
-        uint256 want = authorFee.mulDiv(_tank.autofillBps, BPS, Math.Rounding.Floor) + _tank.debt;
-        uint256 room = _tank.target > _tank.balance ? _tank.target - _tank.balance : 0;
-        if (_tank.debt > room) room = _tank.debt;
-        if (want > room) want = room;
-        if (want > idle()) want = idle();
-        if (want == 0) return;
+    function serveProRata(address holder) external nonReentrant {
+        Valuations.serveProRata(holder);
+    }
 
-        uint256 shares = _toShares(want, totalValue(), Math.Rounding.Ceil);
-        uint256 held = balanceOf(author);
-        if (shares > held) shares = held;
-        if (shares == 0) return;
-        uint256 moved = _toAssets(shares, totalValue(), Math.Rounding.Floor);
-        _burn(author, shares);
+    function redeemClosed(uint256 shares, address receiver) external nonReentrant returns (uint256) {
+        return Upkeep.redeemClosed(shares, receiver);
+    }
 
-        if (_tank.debt >= moved) {
-            _tank.debt -= moved;
-            asset.safeTransfer(platform, moved);
-            emit TankCharged("debt", moved, _tank.debt);
-        } else {
-            uint256 clearing = _tank.debt;
-            _tank.debt = 0;
-            if (clearing != 0) asset.safeTransfer(platform, clearing);
-            _tank.balance += moved - clearing;
-            emit TankFunded(author, moved - clearing);
-        }
+    function claimClosed(uint256 claimId) external nonReentrant returns (uint256) {
+        return Upkeep.claimClosed(claimId);
+    }
+
+    function collectHeld() external nonReentrant returns (uint256) {
+        return Upkeep.collectHeld();
+    }
+
+    // The home station ------------------------------------------------------
+
+    /// Not guarded: the station sends money home through this while the vault
+    /// is asking it to unwind.
+    function toStation(uint256 amount) external {
+        Valuations.toStation(amount);
+    }
+
+    function fromStation(uint256 amount) external {
+        Valuations.fromStation(amount);
+    }
+
+    function haltedAt() external view returns (uint64) {
+        return VaultStorage.layout().haltedAt;
+    }
+
+    function haltGrace() external view returns (uint64) {
+        return VaultStorage.layout().timers.haltGrace;
     }
 
     // The tank --------------------------------------------------------------
 
-    function fundTank(uint256 assets) external {
-        asset.safeTransferFrom(msg.sender, address(this), assets);
-        _tank.balance += assets;
-        emit TankFunded(msg.sender, assets);
+    function fundTank(uint256 assets) external nonReentrant {
+        Upkeep.fundTank(assets);
     }
 
-    function submitUsage(uint64 day, uint256 amount, bytes calldata signature) external {
-        if (day <= _tank.lastChargedDay) revert DayAlreadyCharged();
-        // A day is charged once it is over, so the bill can never run ahead
-        // of the time the strategy has had.
-        if (day >= block.timestamp / 1 days) revert DayNotOver();
-        bytes32 digest = MessageHashUtils.toEthSignedMessageHash(usageDigest(day, amount));
-        (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, signature);
-        if (err != ECDSA.RecoverError.NoError) revert NotBlessed();
-        if (!_isExecutor(signer)) revert NotBlessed();
-
-        // The statement says what a day cost; the contract believes it only up
-        // to the allowances the author declared at the published prices.
-        uint256 charge = amount > _tank.dailyCap ? _tank.dailyCap : amount;
-        _tank.lastChargedDay = day;
-        _tank.lastCharge = charge;
-
-        uint256 paid = charge > _tank.balance ? _tank.balance : charge;
-        _tank.balance -= paid;
-        _tank.debt += charge - paid;
-        if (paid != 0) asset.safeTransfer(platform, paid);
-        emit TankCharged("usage", charge, _tank.debt);
+    function keep(uint256 total, uint64 asOf, bytes calldata signature) external nonReentrant {
+        Upkeep.keep(total, asOf, signature);
     }
 
-    function setAutofill(uint16 bps) external {
-        if (msg.sender != author) revert NotTheAuthor();
-        if (bps > BPS) revert TooMuch();
-        _tank.autofillBps = bps;
+    function withdrawTank(
+        uint256 assets,
+        uint256 total,
+        uint64 asOf,
+        bytes calldata signature
+    ) external nonReentrant {
+        Upkeep.withdrawTank(assets, total, asOf, signature);
     }
 
-    function usageDigest(uint64 day, uint256 amount) public view returns (bytes32) {
-        return keccak256(abi.encode(block.chainid, address(this), "shonin-usage", day, amount));
+    function requestTankWithdrawal() external nonReentrant {
+        Upkeep.requestTankWithdrawal();
     }
 
-    // The strategy's own key ------------------------------------------------
-
-    function moveCapital(bytes32 from, bytes32 to, uint256 amount) external {
-        if (!_isExecutor(msg.sender)) {
-            revert NotBlessed();
-        }
-        if (_state != VaultState.Open) revert WrongState();
-
-        if (from == ACCOUNT_IDLE && to == ACCOUNT_VENUE) {
-            if (amount > idle()) revert TooMuch();
-            asset.forceApprove(address(venue), amount);
-            venue.deposit(amount);
-        } else if (from == ACCOUNT_VENUE && to == ACCOUNT_IDLE) {
-            venue.withdraw(amount);
-        } else {
-            revert NoSuchAccount();
-        }
-        emit CapitalMoved(from, to, amount);
+    function withdrawTankUnsigned(uint256 assets) external nonReentrant {
+        Upkeep.withdrawTankUnsigned(assets);
     }
 
-    // Lifecycle -------------------------------------------------------------
-
-    function kill() external {
-        if (msg.sender != admin) revert NotTheAdmin();
-        if (_state != VaultState.Open && _state != VaultState.Frozen) revert WrongState();
-        crystallise();
-
-        // A kill moves money in one direction only: out of positions and back
-        // to the people who own it.
-        _closeFraction(WAD);
-        int256 there = venue.cashOf(address(this));
-        if (there > 0) {
-            venue.withdraw(uint256(there));
-            emit CapitalMoved(ACCOUNT_VENUE, ACCOUNT_IDLE, uint256(there));
-        }
-        _revokeEveryKey();
-        _state = VaultState.Killed;
-        emit Killed(msg.sender);
+    function topUpFromShares(uint256 shares) external nonReentrant {
+        Upkeep.topUpFromShares(shares);
     }
 
-    // Venue approvals -------------------------------------------------------
-
-    function approveKey(bytes32 venueId, address key) external {
-        if (venueId != VENUE_ID) revert NoSuchAccount();
-        if (_state != VaultState.Open) revert WrongState();
-        if (!_isExecutor(key)) revert NotBlessed();
-        uint64 until = attestation.blessedUntil(key, block.chainid, address(this), bundleHash);
-        venue.approveAgent(key, until);
-        if (!_isApprovedKey[key]) {
-            _isApprovedKey[key] = true;
-            _approvedKeys.push(key);
-        }
-        emit KeyApproved(venueId, key, until);
+    function setTankKeep(uint256 assets) external nonReentrant {
+        Upkeep.setTankKeep(assets);
     }
 
-    function revokeKey(bytes32 venueId, address key) external {
-        if (venueId != VENUE_ID) revert NoSuchAccount();
-        bool stillBlessed = attestation.isBlessedFor(key, block.chainid, address(this), bundleHash);
-        bool unwindingOnly = _state == VaultState.Frozen || _state == VaultState.Killed;
-        // Anyone may revoke, and the contract obeys only what the registry
-        // says: a key whose blessing still stands cannot be cut off by a
-        // passer-by, and one whose blessing has lapsed cannot be kept.
-        if (stillBlessed && !unwindingOnly) revert NotBlessed();
-        venue.revokeAgent(key);
-        _isApprovedKey[key] = false;
-        emit KeyRevoked(venueId, key);
+    function setAllowances(Allowances calldata allowances_) external nonReentrant {
+        Upkeep.setAllowances(allowances_);
     }
 
-    /// A key blessed for this vault and its bundle, as an executor: only an
-    /// executor trades and bills; an unwinder blessed for the same vault only
-    /// ever closes.
-    function _isExecutor(address key) private view returns (bool) {
-        return attestation.isBlessedFor(key, block.chainid, address(this), bundleHash)
-            && attestation.keyInfo(key).kind == ImageKind.Executor;
+    function usageDigest(uint256 total, uint64 asOf) external view returns (bytes32) {
+        return Upkeep.usageDigest(total, asOf);
     }
 
-    function _revokeEveryKey() private {
-        for (uint256 i = 0; i < _approvedKeys.length; i++) {
-            address key = _approvedKeys[i];
-            if (!_isApprovedKey[key]) continue;
-            _isApprovedKey[key] = false;
-            venue.revokeAgent(key);
-            emit KeyRevoked(VENUE_ID, key);
-        }
+    // Who may deposit -------------------------------------------------------
+
+    function recordStatement(address depositor, bytes calldata signature) external nonReentrant {
+        Upkeep.recordStatement(depositor, signature);
+    }
+
+    function refreshRestricted() external nonReentrant {
+        Upkeep.refreshRestricted();
+    }
+
+    function statementDigest(address depositor) external view returns (bytes32) {
+        return Upkeep.statementDigest(depositor);
+    }
+
+    function restricted() external view returns (bytes32[] memory) {
+        return VaultStorage.layout().restricted;
+    }
+
+    function restrictedText() external view returns (string memory) {
+        return Upkeep.restrictedText();
+    }
+
+    function statementOf(address depositor) external view returns (bytes32) {
+        return VaultStorage.layout().statementOf[depositor];
+    }
+
+    // The author and the admin ----------------------------------------------
+
+    function setIdleFloor(uint16 bps) external nonReentrant {
+        Upkeep.setIdleFloor(bps);
+    }
+
+    function retire() external nonReentrant {
+        Upkeep.retire();
+    }
+
+    function kill() external nonReentrant {
+        Upkeep.kill("killed");
+    }
+
+    /// The root key is lost: stop, so positions are unwound and everyone is
+    /// paid while the machines that hold the keys still run.
+    function windDownSealed() external nonReentrant {
+        Upkeep.kill("sealed");
+    }
+
+    // Lifecycle, open to anyone ---------------------------------------------
+
+    function confirmStations() external nonReentrant {
+        Upkeep.confirmStations();
+    }
+
+    function cancel() external nonReentrant {
+        Upkeep.cancel();
+    }
+
+    function evict() external nonReentrant {
+        Upkeep.evict();
+    }
+
+    function close() external nonReentrant {
+        Upkeep.close();
+    }
+
+    // What it is worth, at the last valuation -------------------------------
+
+    function sharePrice() external view returns (uint256) {
+        Layout storage s = VaultStorage.layout();
+        if (s.lastPriced == 0) return 1e6;
+        Valuation storage v = s.latest();
+        return (v.gross - v.fee).mulDiv(1e18, v.supply);
+    }
+
+    function totalValue() external view returns (uint256) {
+        Layout storage s = VaultStorage.layout();
+        return s.lastPriced == 0 ? s.cash : s.latest().gross - 1;
+    }
+
+    function exitValue() external view returns (uint256) {
+        Layout storage s = VaultStorage.layout();
+        return s.lastPriced == 0 ? s.cash : s.latest().grossExit - 1;
+    }
+
+    // Shares, which never move between holders -------------------------------
+
+    function name() external pure returns (string memory) {
+        return "Shonin vault share";
+    }
+
+    function symbol() external pure returns (string memory) {
+        return "SHARE";
+    }
+
+    function decimals() external pure returns (uint8) {
+        return 18;
+    }
+
+    function totalSupply() external view returns (uint256) {
+        return VaultStorage.layout().totalSupply;
+    }
+
+    function balanceOf(address owner) external view returns (uint256) {
+        return VaultStorage.layout().balanceOf[owner];
+    }
+
+    function transfer(address, uint256) external pure returns (bool) {
+        revert NotTransferable();
+    }
+
+    function transferFrom(address, address, uint256) external pure returns (bool) {
+        revert NotTransferable();
+    }
+
+    function approve(address, uint256) external pure returns (bool) {
+        revert NotTransferable();
+    }
+
+    function allowance(address, address) external pure returns (uint256) {
+        return 0;
     }
 
     // What the page shows ---------------------------------------------------
 
     function state() external view returns (VaultState) {
-        return _state;
+        return VaultStorage.layout().state;
     }
 
     function fees() external view returns (Fees memory) {
-        return _fees;
+        return VaultStorage.layout().fees;
+    }
+
+    function timers() external view returns (Timers memory) {
+        return VaultStorage.layout().timers;
     }
 
     function tank() external view returns (Tank memory) {
-        return _tank;
+        return VaultStorage.layout().tank;
+    }
+
+    function allowances() external view returns (Allowances memory) {
+        return VaultStorage.layout().allowances;
+    }
+
+    function cash() external view returns (uint256) {
+        return VaultStorage.layout().cash;
+    }
+
+    function escrow() external view returns (uint256) {
+        return VaultStorage.layout().escrow;
+    }
+
+    function mark() external view returns (uint256) {
+        return VaultStorage.layout().mark;
+    }
+
+    function lastPayment() external view returns (uint64) {
+        return VaultStorage.layout().lastPayment;
+    }
+
+    function idleFloor() external view returns (uint16, uint16, uint64) {
+        Layout storage s = VaultStorage.layout();
+        return (s.floorBps, s.pendingFloorBps, s.pendingFloorAt);
+    }
+
+    function requestCount() external view returns (uint256) {
+        return VaultStorage.layout().requests.length;
+    }
+
+    function requestAt(uint256 requestId) external view returns (Request memory) {
+        return VaultStorage.layout().requests[requestId - 1];
+    }
+
+    function valuationCount() external view returns (uint256) {
+        return VaultStorage.layout().valuations.length;
+    }
+
+    function valuationAt(uint256 index) external view returns (Valuation memory) {
+        return VaultStorage.layout().valuations[index];
     }
 
     function claimCount() external view returns (uint256) {
-        return _claims.length;
+        return VaultStorage.layout().claims.length;
     }
 
     function claimAt(uint256 claimId) external view returns (Claim memory) {
-        return _claims[claimId - 1];
+        return VaultStorage.layout().claims[claimId - 1];
     }
 
-    function approvedKeys() external view returns (address[] memory) {
-        return _approvedKeys;
+    function units() external view returns (uint256, uint256) {
+        Layout storage s = VaultStorage.layout();
+        return (s.units, s.unitReserve);
+    }
+
+    function unitsOf(address holder) external view returns (uint256 held, uint256 claimable) {
+        Layout storage s = VaultStorage.layout();
+        held = s.unitsOf[holder];
+        claimable =
+            s.unitCredit[holder] + held.mulDiv(s.perUnit, VaultStorage.UNIT_SCALE) - s.unitDebt[holder];
+    }
+
+    function heldFor(address owner) external view returns (uint256) {
+        return VaultStorage.layout().held[owner];
+    }
+
+    function homeStation() external view returns (address) {
+        return VaultStorage.layout().homeStation;
+    }
+
+    function strategyId() external view returns (uint256) {
+        return VaultStorage.layout().strategyId;
+    }
+
+    function bundleHash() external view returns (bytes32) {
+        return VaultStorage.layout().bundleHash;
+    }
+
+    function author() external view returns (address) {
+        return VaultStorage.layout().author;
+    }
+
+    function exitBandBps() external view returns (uint16) {
+        return VaultStorage.layout().exitBandBps;
+    }
+
+    function createdAt() external view returns (uint64) {
+        return VaultStorage.layout().createdAt;
     }
 }

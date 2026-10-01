@@ -2,6 +2,8 @@
 pragma solidity ^0.8.30;
 
 import {DevAttestationVerifier} from "../src/DevAttestationVerifier.sol";
+
+import {Station} from "../src/Station.sol";
 import {Vault} from "../src/Vault.sol";
 import {ImageKind} from "../src/interfaces/IAttestationRegistry.sol";
 import {Fixture} from "./Fixture.sol";
@@ -27,11 +29,11 @@ contract VerifierRotationTest is Fixture {
     /// keep attesting through the overlap, then the old checker is retired.
     function test_retiring_the_old_checker_after_the_overlap_keeps_keys_the_new_one_accepts() public {
         (Vault vault, bytes32 bundle) = openVault();
+        Station station = stationOf(vault);
         // Attested during the overlap, while both checkers are allowed.
         blessExecutorKey(executor, address(vault), bundle);
         assertTrue(attestation.isBlessedFor(executor, block.chainid, address(vault), bundle));
-        bytes32 venueId = vault.VENUE_ID();
-        vault.approveKey(venueId, executor);
+        station.approveKey("local", executor);
 
         // The overlap ends.
         vm.prank(admin);
@@ -43,8 +45,8 @@ contract VerifierRotationTest is Fixture {
         );
         // Which is what lets anyone cut the live executor off at the venue.
         vm.prank(alice);
-        vm.expectRevert(Vault.NotBlessed.selector);
-        vault.revokeKey(venueId, executor);
+        vm.expectRevert(Station.StillBlessed.selector);
+        station.revokeKey("local", executor);
     }
 
     /// A key blessed through the old checker alone, before the new one was

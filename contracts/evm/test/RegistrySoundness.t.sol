@@ -228,17 +228,17 @@ contract RegistrySoundnessTest is Fixture {
         VaultConfig memory before = factory.config();
         // A second read: a memory struct assigned from `before` would alias it.
         VaultConfig memory next = factory.config();
-        next.streamingBps = 500;
+        next.holdingBps = 500;
         next.authorBps = 2000;
         next.transactionBps = 50;
-        next.freezeAfter = 1 days;
+        next.timers.freezeAfter = 1 days;
         vm.prank(admin);
         factory.setConfig(next);
 
-        assertEq(vault.fees().streamingBps, before.streamingBps);
+        assertEq(vault.fees().holdingBps, before.holdingBps);
         assertEq(vault.fees().authorBps, before.authorBps);
         assertEq(vault.fees().transactionBps, before.transactionBps);
-        assertEq(vault.freezeAfter(), before.freezeAfter);
+        assertEq(vault.timers().freezeAfter, before.timers.freezeAfter);
     }
 
     /// Activation is for the strategy's author alone and for a strategy with
@@ -254,11 +254,12 @@ contract RegistrySoundnessTest is Fixture {
         assertTrue(strategies.isRegistered(id));
         assertFalse(reviews.hasReview(id));
 
+        bytes32 terms = factory.terms();
         give(author, MINIMUM_TANK);
         vm.startPrank(author);
         usd.approve(address(factory), MINIMUM_TANK);
         vm.expectRevert();
-        factory.activate(id, allowancesCosting(2e6), MINIMUM_TANK);
+        factory.activate(id, allowancesCosting(2e6), 500, MINIMUM_TANK, 0, "", terms);
         vm.stopPrank();
     }
 }

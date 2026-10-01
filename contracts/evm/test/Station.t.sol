@@ -133,28 +133,22 @@ contract StationTest is Fixture {
     bytes32 internal constant UNWINDER_IMAGE = keccak256("unwinder image");
     bytes32 internal constant BUNDLE = keccak256("bundle");
 
-    LocalDriver internal driver;
-    LocalBridge internal localBridge;
-    StationFactory internal stations;
+    StationFactory internal ownStations;
     FakeVault internal vault;
     Station internal station;
 
     function setUp() public override {
         super.setUp();
-        driver = new LocalDriver(venue, IERC20(address(usd)));
-        localBridge = new LocalBridge(IERC20(address(usd)), operator);
-        vm.startPrank(admin);
-        attestation.proposeDriver("local", address(driver));
-        attestation.proposeBridge("local-bridge", address(localBridge));
+        vm.prank(admin);
         attestation.proposeImage(UNWINDER_IMAGE, ImageKind.Unwinder);
-        vm.stopPrank();
         skip(TIMELOCK);
+        blessServiceKey(BUILDER_IMAGE, builder);
 
-        stations = new StationFactory(address(this));
-        stations.initialize(address(attestation), address(usd), address(this), address(new Station()));
+        ownStations = new StationFactory(address(this));
+        ownStations.initialize(address(attestation), address(usd), address(this), address(new Station()));
 
         vault = new FakeVault(IERC20(address(usd)));
-        station = Station(stations.createHome(address(vault), BUNDLE, locals(), bridges(), 100));
+        station = Station(ownStations.createHome(address(vault), BUNDLE, locals(), bridges(), 100));
         vault.setStation(address(station));
         give(address(vault), 100_000e6);
         vault.fund(100_000e6);
@@ -195,11 +189,11 @@ contract StationTest is Fixture {
         vm.stopPrank();
     }
 
-    // Where stations are ----------------------------------------------------
+    // Where ownStations are ----------------------------------------------------
 
     function test_a_station_is_where_the_factory_says_on_every_chain() public view {
-        assertEq(stations.stationOf(HOME, address(vault)), address(station));
-        assertTrue(stations.exists(HOME, address(vault)));
+        assertEq(ownStations.stationOf(HOME, address(vault)), address(station));
+        assertTrue(ownStations.exists(HOME, address(vault)));
         assertTrue(station.isHome());
         StationSpec memory spec = station.spec();
         assertEq(spec.vault, address(vault));
@@ -207,13 +201,13 @@ contract StationTest is Fixture {
     }
 
     function test_creating_again_returns_the_same_station() public {
-        assertEq(stations.createHome(address(vault), BUNDLE, locals(), bridges(), 100), address(station));
+        assertEq(ownStations.createHome(address(vault), BUNDLE, locals(), bridges(), 100), address(station));
     }
 
     function test_only_the_vault_factory_creates_a_home_station() public {
         vm.prank(alice);
         vm.expectRevert(StationFactory.NotVaultFactory.selector);
-        stations.createHome(address(1), BUNDLE, locals(), bridges(), 100);
+        ownStations.createHome(address(1), BUNDLE, locals(), bridges(), 100);
     }
 
     function test_only_the_named_key_initialises_the_factory_and_only_once() public {
@@ -231,7 +225,7 @@ contract StationTest is Fixture {
         StationSpec memory spec = station.spec();
         vm.expectRevert(Station.AlreadyInitialized.selector);
         station.initialize(spec);
-        Station implementation = Station(stations.implementation());
+        Station implementation = Station(ownStations.implementation());
         vm.expectRevert(Station.AlreadyInitialized.selector);
         implementation.initialize(spec);
     }
@@ -350,7 +344,8 @@ contract StationTest is Fixture {
         for (uint8 how = 0; how < 3; how++) {
             spec.drivers[how] = bytes32(uint256(keccak256(abi.encode("greedy", how))));
         }
-        Station greedyStation = Station(stations.createHome(spec.vault, BUNDLE, spec.drivers, bridges(), 100));
+        Station greedyStation =
+            Station(ownStations.createHome(spec.vault, BUNDLE, spec.drivers, bridges(), 100));
         give(address(greedyStation), 1000e6);
         blessExecutorKey(executor, spec.vault, BUNDLE);
 
@@ -439,7 +434,8 @@ contract StationTest is Fixture {
 
     function builderSigns(StationSpec memory spec) internal view returns (bytes memory) {
         return signed(
-            BUILDER_KEY, stations.stationDigest(spec.vaultChain, spec.bundleHash, spec.drivers, spec.bridges)
+            BUILDER_KEY,
+            ownStations.stationDigest(spec.vaultChain, spec.bundleHash, spec.drivers, spec.bridges)
         );
     }
 
@@ -448,16 +444,16 @@ contract StationTest is Fixture {
         bytes memory word = builderSigns(spec);
         vm.prank(executor);
         vm.expectRevert(StationFactory.NotBlessed.selector);
-        stations.create(spec, word);
+        ownStations.create(spec, word);
 
         blessFor(EXECUTOR_IMAGE, executor, 8453, address(vault));
         vm.prank(executor);
         vm.expectRevert(StationFactory.NotBlessed.selector);
-        stations.create(spec, signed(REVIEWER_KEY, keccak256("anything")));
+        ownStations.create(spec, signed(REVIEWER_KEY, keccak256("anything")));
 
         vm.prank(executor);
-        Station remote = Station(stations.create(spec, word));
-        assertEq(address(remote), stations.stationOf(8453, address(vault)));
+        Station remote = Station(ownStations.create(spec, word));
+        assertEq(address(remote), ownStations.stationOf(8453, address(vault)));
         assertFalse(remote.isHome());
     }
 
@@ -470,7 +466,7 @@ contract StationTest is Fixture {
         assertEq(sent.length, 1);
         assertEq(sent[0].toChain, 8453);
         assertEq(sent[0].amount, 1000e6);
-        assertEq(usd.balanceOf(address(localBridge)), 1000e6);
+        assertEq(usd.balanceOf(address(bridge)), 1000e6);
 
         vm.prank(executor);
         vm.expectRevert(Station.NotDeclared.selector);
@@ -482,7 +478,7 @@ contract StationTest is Fixture {
         blessFor(EXECUTOR_IMAGE, executor, 8453, address(vault));
         bytes memory word = builderSigns(spec);
         vm.prank(executor);
-        Station remote = Station(stations.create(spec, word));
+        Station remote = Station(ownStations.create(spec, word));
 
         bytes32 digest = remote.stopDigest("killed", uint64(block.timestamp));
         vm.expectRevert(Station.NotBlessed.selector);

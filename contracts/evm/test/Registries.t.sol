@@ -4,6 +4,8 @@ pragma solidity ^0.8.30;
 import {AttestationRegistry} from "../src/AttestationRegistry.sol";
 import {DevAttestationVerifier} from "../src/DevAttestationVerifier.sol";
 import {ReviewRegistry} from "../src/ReviewRegistry.sol";
+
+import {Station} from "../src/Station.sol";
 import {StrategyRegistry} from "../src/StrategyRegistry.sol";
 import {Vault} from "../src/Vault.sol";
 import {ImageKind, KeyInfo} from "../src/interfaces/IAttestationRegistry.sol";
@@ -147,13 +149,13 @@ contract RegistriesTest is Fixture {
         blessServiceKey(BUILDER_IMAGE, builder);
         blessServiceKey(REVIEWER_IMAGE, reviewer);
         (Vault vault, bytes32 bundle) = openVault();
+        Station station = stationOf(vault);
         address unwinder = makeAddr("unwinder");
         bytes memory journal = journalFor(unwinderImage, unwinder, leafFor(address(vault), bundle));
         attestation.bless(sealOf(journal), journal, block.chainid, address(vault), bundle, new bytes32[](0));
         assertTrue(attestation.isBlessedFor(unwinder, block.chainid, address(vault), bundle));
-        bytes32 venueId = vault.VENUE_ID();
-        vm.expectRevert(Vault.NotBlessed.selector);
-        vault.approveKey(venueId, unwinder);
+        vm.expectRevert(Station.NotBlessed.selector);
+        station.approveKey("local", unwinder);
     }
 
     // Drivers and bridges ---------------------------------------------------
@@ -161,85 +163,85 @@ contract RegistriesTest is Fixture {
     function test_a_driver_waits_out_the_timelock() public {
         address v1 = makeAddr("driver v1");
         vm.prank(admin);
-        attestation.proposeDriver("local", v1);
-        assertEq(attestation.tradingDriver("local"), address(0));
-        assertEq(attestation.unwindDriver("local"), address(0));
+        attestation.proposeDriver("test-driver", v1);
+        assertEq(attestation.tradingDriver("test-driver"), address(0));
+        assertEq(attestation.unwindDriver("test-driver"), address(0));
         skip(TIMELOCK);
-        assertEq(attestation.tradingDriver("local"), v1);
-        assertEq(attestation.unwindDriver("local"), v1);
+        assertEq(attestation.tradingDriver("test-driver"), v1);
+        assertEq(attestation.unwindDriver("test-driver"), v1);
     }
 
     function test_a_new_driver_version_replaces_the_old_only_when_ready() public {
         address v1 = makeAddr("driver v1");
         address v2 = makeAddr("driver v2");
         vm.prank(admin);
-        attestation.proposeDriver("local", v1);
+        attestation.proposeDriver("test-driver", v1);
         skip(TIMELOCK);
         vm.prank(admin);
-        attestation.proposeDriver("local", v2);
-        assertEq(attestation.tradingDriver("local"), v1);
+        attestation.proposeDriver("test-driver", v2);
+        assertEq(attestation.tradingDriver("test-driver"), v1);
         skip(TIMELOCK);
-        assertEq(attestation.tradingDriver("local"), v2);
+        assertEq(attestation.tradingDriver("test-driver"), v2);
     }
 
     function test_revoking_a_driver_stops_trading_but_not_unwinding() public {
         address v1 = makeAddr("driver v1");
         vm.prank(admin);
-        attestation.proposeDriver("local", v1);
+        attestation.proposeDriver("test-driver", v1);
         skip(TIMELOCK);
         vm.prank(admin);
-        attestation.revokeDriver("local");
-        assertEq(attestation.tradingDriver("local"), address(0));
-        assertEq(attestation.unwindDriver("local"), v1);
+        attestation.revokeDriver("test-driver");
+        assertEq(attestation.tradingDriver("test-driver"), address(0));
+        assertEq(attestation.unwindDriver("test-driver"), v1);
     }
 
     function test_revoking_withdraws_a_proposal_still_waiting() public {
         address v1 = makeAddr("driver v1");
         address bad = makeAddr("bad driver");
         vm.startPrank(admin);
-        attestation.proposeDriver("local", v1);
+        attestation.proposeDriver("test-driver", v1);
         skip(TIMELOCK);
-        attestation.proposeDriver("local", bad);
-        attestation.revokeDriver("local");
+        attestation.proposeDriver("test-driver", bad);
+        attestation.revokeDriver("test-driver");
         vm.stopPrank();
         skip(TIMELOCK);
         // The waiting proposal never counts, and the one in force is revoked.
-        assertEq(attestation.tradingDriver("local"), address(0));
-        assertEq(attestation.unwindDriver("local"), v1);
+        assertEq(attestation.tradingDriver("test-driver"), address(0));
+        assertEq(attestation.unwindDriver("test-driver"), v1);
     }
 
     function test_a_fix_proposed_after_a_revocation_trades_again() public {
         address v1 = makeAddr("driver v1");
         address v2 = makeAddr("driver v2");
         vm.startPrank(admin);
-        attestation.proposeDriver("local", v1);
+        attestation.proposeDriver("test-driver", v1);
         skip(TIMELOCK);
-        attestation.revokeDriver("local");
-        attestation.proposeDriver("local", v2);
+        attestation.revokeDriver("test-driver");
+        attestation.proposeDriver("test-driver", v2);
         vm.stopPrank();
         skip(TIMELOCK);
-        assertEq(attestation.tradingDriver("local"), v2);
+        assertEq(attestation.tradingDriver("test-driver"), v2);
     }
 
     function test_the_first_bridge_proposal_can_be_withdrawn() public {
         vm.startPrank(admin);
-        attestation.proposeBridge("local-bridge", makeAddr("wrong bridge"));
-        attestation.revokeBridge("local-bridge");
+        attestation.proposeBridge("test-bridge", makeAddr("wrong bridge"));
+        attestation.revokeBridge("test-bridge");
         vm.stopPrank();
         skip(TIMELOCK);
-        assertEq(attestation.bridgeOf("local-bridge"), address(0));
+        assertEq(attestation.bridgeOf("test-bridge"), address(0));
     }
 
     function test_bridges_are_approved_the_same_way() public {
         address bridge = makeAddr("bridge");
         vm.prank(admin);
-        attestation.proposeBridge("local-bridge", bridge);
-        assertEq(attestation.bridgeOf("local-bridge"), address(0));
+        attestation.proposeBridge("test-bridge", bridge);
+        assertEq(attestation.bridgeOf("test-bridge"), address(0));
         skip(TIMELOCK);
-        assertEq(attestation.bridgeOf("local-bridge"), bridge);
+        assertEq(attestation.bridgeOf("test-bridge"), bridge);
         vm.prank(admin);
-        attestation.revokeBridge("local-bridge");
-        assertEq(attestation.bridgeOf("local-bridge"), address(0));
+        attestation.revokeBridge("test-bridge");
+        assertEq(attestation.bridgeOf("test-bridge"), address(0));
     }
 
     // Blessing --------------------------------------------------------------
