@@ -44,12 +44,26 @@ mod tests {
             .map(|strategy| strategy.standing)
             .collect();
 
-        for wanted in [Standing::New, Standing::Superseded, Standing::BuildFailed] {
+        for wanted in [Standing::New, Standing::Killed] {
             assert!(
                 standings.contains(&wanted),
                 "nothing in the fixture is {wanted:?}"
             );
         }
+        assert!(
+            snapshot
+                .strategies
+                .iter()
+                .any(|strategy| strategy.review.is_some()),
+            "no agent has a review"
+        );
+        assert!(
+            snapshot
+                .jobs
+                .iter()
+                .any(|job| job.state == shared::JobState::Ready),
+            "no agent is ready and waiting to be activated"
+        );
         assert!(
             snapshot
                 .strategies
@@ -62,7 +76,7 @@ mod tests {
                 .jobs
                 .iter()
                 .any(|job| matches!(job.state, shared::JobState::Failed { .. })),
-            "no failed build in the queue"
+            "no failed job in the queue"
         );
         assert!(!snapshot.authors.is_empty(), "nobody published anything");
         assert!(!snapshot.feed.is_empty(), "nothing has happened");

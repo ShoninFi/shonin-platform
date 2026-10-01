@@ -251,9 +251,7 @@ pub fn pending() -> Mutable<Pending> {
     PENDING.with(|pending| pending.clone())
 }
 
-pub use send::{
-    buy_review, connect, deposit, fund_tank, move_to, publish, refresh, resume, settle, withdraw,
-};
+pub use send::{activate, connect, deposit, fund_tank, refresh, resume, settle, submit, withdraw};
 
 /// The same surface where there is no browser to ask. The build-time
 /// pre-render compiles the whole app natively to write its pages out; nothing
@@ -278,22 +276,21 @@ mod send {
     pub async fn settle(_slug: &str, _claim: u64) -> Result<String, String> {
         Err(NOWHERE.to_string())
     }
-    pub async fn move_to(_from: &str, _to: &str) -> Result<String, String> {
-        Err(NOWHERE.to_string())
-    }
     pub async fn fund_tank(_slug: &str, _assets: f64) -> Result<String, String> {
         Err(NOWHERE.to_string())
     }
-    pub async fn buy_review(_slug: &str) -> Result<String, String> {
-        Err(NOWHERE.to_string())
-    }
-    pub async fn publish(
-        _id: &str,
-        _version: u32,
-        _tank: f64,
-        _allowance: &str,
+    pub async fn submit(
+        _chain: shared::Chain,
         _archive: &[u8],
         _sealed: bool,
+    ) -> Result<String, String> {
+        Err(NOWHERE.to_string())
+    }
+    pub async fn activate(
+        _chain: shared::Chain,
+        _id: u64,
+        _allowance: &str,
+        _tank: f64,
     ) -> Result<String, String> {
         Err(NOWHERE.to_string())
     }
@@ -306,7 +303,7 @@ mod send {
     use alloy_sol_types::SolCall;
     use chain::bindings::erc20::IERC20;
     use chain::bindings::factory::IVaultFactory;
-    use chain::bindings::reviews::IReviewRegistry;
+    use chain::bindings::publishing::IPublishing;
     use chain::bindings::vault::IVault;
     use wasm_bindgen::JsValue;
     use wasm_bindgen_futures::JsFuture;
@@ -448,38 +445,6 @@ mod send {
         hash
     }
 
-    /// Move a position to a strategy's successor: a withdrawal from one vault
-    /// and a deposit into the other, which is all a move can ever be.
-    pub async fn move_to(from_slug: &str, to_slug: &str) -> Result<String, String> {
-        let shares = holdings()
-            .lock_ref()
-            .position(from_slug)
-            .map_or(0.0, |held| held.shares);
-        if shares <= 0.0 {
-            return Err("You hold nothing in this vault.".to_string());
-        }
-        let chain_of = |slug: &str| data::strategy(slug).map(|strategy| strategy.vault.chain);
-        if chain_of(from_slug) != chain_of(to_slug) {
-            return Err(
-                "These vaults are on different chains, so moving between them means bringing \
-                 the cash across first."
-                    .to_string(),
-            );
-        }
-        let balance_before = holdings().lock_ref().balance;
-        withdraw(from_slug, shares).await?;
-        let moved = holdings().lock_ref().balance - balance_before;
-        if moved <= 0.0 {
-            return Err(
-                "More than the idle balance, so a claim was booked instead. Once it settles \
-                 the cash is in your wallet, and depositing it into the new vault is a second \
-                 step you take when you are ready."
-                    .to_string(),
-            );
-        }
-        deposit(to_slug, moved).await
-    }
-
     /// Top up the tank that pays a strategy's running costs. Anyone may.
     pub async fn fund_tank(slug: &str, assets: f64) -> Result<String, String> {
         let (strategy, from) = about(slug)?;
@@ -514,38 +479,74 @@ mod send {
         hash
     }
 
-    /// Publish a strategy: create its vault, funding the tank in the same
-    /// transaction, then hand the source to the build service.
-    ///
-    /// The vault comes first because the build service will not admit a job
-    /// until one exists with a funded tank. Nothing is ever compiled for free.
-    pub async fn publish(
-        id: &str,
-        version: u32,
-        tank: f64,
-        allowance: &str,
+    /// Submit an agent: upload its source, then pay the $1 against the upload
+    /// from the same wallet, which admits the job and gives it its id. Returns
+    /// the job.
+    pub async fn submit(
+        chain: shared::Chain,
         archive: &[u8],
         sealed: bool,
     ) -> Result<String, String> {
-        let holdings = holdings();
-        let from = {
-            let held = holdings.lock_ref();
-            if !held.can_sign() {
-                return Err("Connect a wallet that can sign first.".to_string());
+        let from = signer()?;
+        let setup = setup(chain)?;
+        let publishing = address_of(&setup.addresses.publishing)?;
+        let usd = asset_address(chain)?;
+
+        working("Uploading the source");
+        let accepted = api::upload(
+            chain,
+            &shared::Upload {
+                author: from.clone(),
+                archive_base64: shared::base64::encode(archive),
+                sealed,
+                package: None,
+            },
+        )
+        .await
+        .inspect_err(|_| done())?;
+        let upload: alloy_primitives::B256 = accepted
+            .upload
+            .parse()
+            .map_err(|_| "the build service's reference".to_string())?;
+
+        working("Approving the $1");
+        send(
+            chain,
+            &from,
+            usd,
+            IERC20::approveCall {
+                spender: publishing,
+                value: units(setup.terms.publish_fee),
             }
-            held.address.clone().ok_or("Connect a wallet first.")?
-        };
-        // A publish from the app creates its vault on base.
-        let chain = shared::Chain::Base;
+            .abi_encode(),
+        )
+        .await?;
+
+        working("Paying to publish");
+        send(
+            chain,
+            &from,
+            publishing,
+            IPublishing::submitCall { upload }.abi_encode(),
+        )
+        .await?;
+        done();
+        Ok(accepted.job_id)
+    }
+
+    /// Activate a reviewed and built agent: create its vault, with the
+    /// allowances its tank is charged against and a starting tank. Returns the
+    /// agent's slug.
+    pub async fn activate(
+        chain: shared::Chain,
+        id: u64,
+        allowance: &str,
+        tank: f64,
+    ) -> Result<String, String> {
+        let from = signer()?;
         let factory = address_of(&setup(chain)?.addresses.factory)?;
         let usd = asset_address(chain)?;
         let funding = units(tank);
-
-        // The hash of exactly these bytes is what the vault is created with,
-        // so the chain and the build service are talking about one thing.
-        let source_hash = shared::manifest::hash_bytes(archive);
-        let hash_bytes = shared::manifest::hash_to_bytes(&source_hash)
-            .ok_or("that archive could not be hashed")?;
 
         working("Approving the tank");
         send(
@@ -560,110 +561,33 @@ mod send {
         )
         .await?;
 
-        working("Creating the vault");
+        working("Activating");
         send(
             chain,
             &from,
             factory,
-            IVaultFactory::createCall {
-                strategyId: name_to_bytes(id),
-                version,
-                sourceHash: alloy_primitives::FixedBytes(hash_bytes),
+            IVaultFactory::activateCall {
+                strategyId: U256::from(id),
+                allowances: chain::allowances(&shared::Allowances::shape(allowance)),
                 tankFunding: funding,
-                // A day at the allowances the author declared, priced as the
-                // platform publishes; the contract will not let a usage
-                // statement charge a tank more than this in a day.
-                dailyUsageCap: units(daily_cap(allowance)),
             }
             .abi_encode(),
         )
         .await?;
-
-        working("Submitting the source");
-        let accepted = api::submit(
-            chain,
-            &shared::Submission {
-                strategy_id: id.to_string(),
-                version,
-                author: from.clone(),
-                source: shared::SubmissionSource::Archive {
-                    base64: base64(archive),
-                },
-                package: id.to_string(),
-                sealed,
-            },
-        )
-        .await?;
         done();
-        Ok(accepted.job_id)
+        Ok(shared::Strategy::slug_for(chain, id))
     }
 
-    /// What a day at a shape of allowances costs at the published prices. The
-    /// floor is there because a vault with no cap at all could not charge for
-    /// the build that made it.
-    fn daily_cap(allowance: &str) -> f64 {
-        shared::Prices::published()
-            .daily_cap(&shared::DeclaredAllowances::shape(allowance))
-            .max(1.0)
-    }
-
-    /// The archive, as the API carries it.
-    fn base64(bytes: &[u8]) -> String {
-        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-        for chunk in bytes.chunks(3) {
-            let mut buffer = [0u8; 3];
-            buffer[..chunk.len()].copy_from_slice(chunk);
-            let value = u32::from_be_bytes([0, buffer[0], buffer[1], buffer[2]]);
-            for index in 0..4 {
-                if index <= chunk.len() {
-                    out.push(ALPHABET[((value >> (18 - index * 6)) & 0x3f) as usize] as char);
-                } else {
-                    out.push('=');
-                }
-            }
+    /// The connected address, if it can sign.
+    fn signer() -> Result<String, String> {
+        let holdings = holdings();
+        let held = holdings.lock_ref();
+        if !held.can_sign() {
+            return Err("Connect a wallet that can sign first.".to_string());
         }
-        out
-    }
-
-    /// Buy a fresh review of a strategy. Anyone may, at any time.
-    pub async fn buy_review(slug: &str) -> Result<String, String> {
-        let (strategy, from) = about(slug)?;
-        let chain = strategy.vault.chain;
-        let setup = setup(chain)?;
-        let reviews = address_of(&setup.addresses.reviews)?;
-        let usd = asset_address(chain)?;
-        // Approving exactly what the registry will pull, as the registry
-        // itself reports it.
-        let fee = units(setup.terms.review_fee);
-
-        working("Approving");
-        send(
-            chain,
-            &from,
-            usd,
-            IERC20::approveCall {
-                spender: reviews,
-                value: fee,
-            }
-            .abi_encode(),
-        )
-        .await?;
-
-        working("Buying a review");
-        let hash = send(
-            chain,
-            &from,
-            reviews,
-            IReviewRegistry::requestReviewCall {
-                strategyId: name_to_bytes(&strategy.id),
-                version: strategy.version,
-            }
-            .abi_encode(),
-        )
-        .await;
-        done();
-        hash
+        held.address
+            .clone()
+            .ok_or_else(|| "Connect a wallet first.".to_string())
     }
 
     // The plumbing -----------------------------------------------------------
@@ -718,14 +642,6 @@ mod send {
     /// Shares carry eighteen.
     fn share_units(shares: f64) -> U256 {
         U256::from((shares.max(0.0) * 1e18).round() as u128)
-    }
-
-    fn name_to_bytes(name: &str) -> alloy_primitives::FixedBytes<32> {
-        let mut out = [0u8; 32];
-        let bytes = name.as_bytes();
-        let take = bytes.len().min(32);
-        out[..take].copy_from_slice(&bytes[..take]);
-        alloy_primitives::FixedBytes(out)
     }
 
     /// Send a transaction, whichever way the viewer is connected.

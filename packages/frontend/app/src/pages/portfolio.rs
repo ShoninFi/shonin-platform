@@ -1,9 +1,9 @@
 //! What the viewer holds: positions across vaults, claims waiting to settle,
-//! and how correlated any of it is.
+//! and what each has done.
 
 use std::rc::Rc;
 
-use dominator::{Dom, html, text};
+use dominator::{Dom, html};
 use futures_signals::signal::SignalExt;
 use shared::Strategy;
 
@@ -73,7 +73,6 @@ fn connected(holdings: &Holdings) -> Dom {
         .child(wallet_card(holdings))
         .child(positions(holdings, &held))
         .child(claims(holdings))
-        .child(correlations(&held))
     })
 }
 
@@ -118,7 +117,7 @@ fn positions(holdings: &Holdings, held: &[(Rc<Strategy>, f64, f64)]) -> Dom {
                 parts::path_of(strategy),
                 vec![
                     html!("div", {
-                        .child(html!("div", { .class("table__primary").text(&strategy.name()) }))
+                        .child(html!("div", { .class("table__primary").text(strategy.name()) }))
                         .child(html!("div", {
                             .class(["faint", "small"])
                             .text(&format!("by {}", strategy.author))
@@ -128,10 +127,10 @@ fn positions(holdings: &Holdings, held: &[(Rc<Strategy>, f64, f64)]) -> Dom {
                     ui::number(&fmt::money_exact(*value)),
                     ui::number(&fmt::money_exact(*cost)),
                     ui::signed(profit, &fmt::money_exact(profit)),
-                    ui::signed(
-                        performance.normalised_annualised,
-                        &fmt::percent_signed(performance.normalised_annualised, 1),
-                    ),
+                    match performance.return_30d {
+                        Some(value) => ui::signed(value, &fmt::percent_signed(value, 1)),
+                        None => ui::muted("—"),
+                    },
                     parts::spark(strategy),
                 ],
             )
@@ -148,7 +147,7 @@ fn positions(holdings: &Holdings, held: &[(Rc<Strategy>, f64, f64)]) -> Dom {
                     Column::num("Worth"),
                     Column::num("Paid"),
                     Column::num("Profit and loss"),
-                    Column::num("Normalised"),
+                    Column::num("30 days"),
                     Column::new("Shape"),
                 ],
                 rows,
@@ -174,7 +173,7 @@ fn claims(holdings: &Holdings) -> Dom {
                     .child(html!("a", {
                         .class("table__primary")
                         .attr("href", &parts::path_of(&strategy))
-                        .text(&strategy.name())
+                        .text(strategy.name())
                     }))
                     .child(ui::badge(
                         claim.state.label(),
@@ -217,108 +216,4 @@ fn claims(holdings: &Holdings) -> Dom {
             html!("div", { .class(["grid", "grid--2"]).children(cards) }),
         ],
     )
-}
-
-fn correlations(held: &[(Rc<Strategy>, f64, f64)]) -> Dom {
-    if held.is_empty() {
-        return html!("span");
-    }
-
-    let series = |strategy: &Strategy| {
-        strategy
-            .record
-            .as_ref()
-            .map(|record| record.value_per_share.clone())
-            .unwrap_or_default()
-    };
-
-    let benchmarks = data::benchmarks();
-    let mut columns = vec![Column::new("Against").wide()];
-    for (strategy, _, _) in held {
-        columns.push(Column::num(strategy.name()));
-    }
-    for benchmark in &benchmarks {
-        columns.push(Column::num(benchmark.label.clone()));
-    }
-
-    let rows: Vec<Row> = held
-        .iter()
-        .map(|(strategy, _, _)| {
-            let own = series(strategy);
-            let mut cells = vec![html!("span", {
-                .class("table__primary")
-                .text(&strategy.name())
-            })];
-
-            for (other, _, _) in held {
-                let value = data::correlation(&own, &series(other));
-                cells.push(correlation_cell(value, strategy.slug == other.slug));
-            }
-            for benchmark in &benchmarks {
-                cells.push(correlation_cell(
-                    data::correlation(&own, &benchmark.series),
-                    false,
-                ));
-            }
-            Row::new(cells)
-        })
-        .collect();
-
-    // The closest pair, which is the one worth saying something about.
-    let worst = held
-        .iter()
-        .flat_map(|(a, _, _)| {
-            held.iter()
-                .filter(move |(b, _, _)| a.slug != b.slug)
-                .map(move |(b, _, _)| {
-                    (
-                        a.name(),
-                        b.name(),
-                        data::correlation(&series(a), &series(b)),
-                    )
-                })
-        })
-        .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
-
-    let mut children = vec![
-        ui::note(
-            "How each position has moved with the others and with a few benchmarks. Two things \
-             that move together are more of one risk, not less.",
-        ),
-        table(columns, rows),
-    ];
-
-    if let Some((a, b, value)) = worst
-        && value > 0.6
-    {
-        children.push(ui::notice(
-            Tone::Warn,
-            "Two of your positions move together",
-            &format!(
-                "{a} and {b} are {} correlated over the days they share.",
-                fmt::number(value, 2)
-            ),
-        ));
-    }
-
-    ui::section("How correlated your holdings are", children)
-}
-
-fn correlation_cell(value: f64, own: bool) -> Dom {
-    if own {
-        return ui::muted("—");
-    }
-    html!("span", {
-        .class("num")
-        .apply(|dom| {
-            if value >= 0.6 {
-                dom.class("down")
-            } else if value <= 0.2 {
-                dom.class("up")
-            } else {
-                dom
-            }
-        })
-        .child(text(&fmt::number(value, 2)))
-    })
 }

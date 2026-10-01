@@ -1,5 +1,6 @@
-//! The code tab: the bundle, the project it was compiled from, and the log of
-//! the build that made it.
+//! The code tab: the bundle, the project it was compiled from, what its
+//! `shonin.toml` declares, and how to rebuild it. There is no build log: one
+//! could quote sealed source, so no job keeps one.
 
 use std::rc::Rc;
 
@@ -8,7 +9,7 @@ use std::sync::OnceLock;
 use dominator::{Dom, clone, events, html};
 use futures_signals::map_ref;
 use futures_signals::signal::{Mutable, SignalExt};
-use shared::{LogLevel, Source, Strategy};
+use shared::{Source, Strategy};
 
 use crate::format as fmt;
 use crate::ui::primitives as ui;
@@ -27,8 +28,7 @@ pub fn render(strategy: &Rc<Strategy>) -> Dom {
         .child(identity(strategy))
         .child(source(strategy))
         .child(models(strategy))
-        .child(allowances(strategy))
-        .child(build_log(strategy))
+        .child(declared(strategy))
         .child(rebuilding(strategy))
     })
 }
@@ -208,82 +208,30 @@ fn models(strategy: &Rc<Strategy>) -> Dom {
     )
 }
 
-fn allowances(strategy: &Rc<Strategy>) -> Dom {
-    let allowances = &strategy.bundle.allowances;
-    let secrets = &strategy.bundle.secrets;
-
-    let mut children = vec![
-        ui::kv(vec![
-            (
-                "Fuel".to_string(),
-                ui::number(&format!(
-                    "{} a second",
-                    fmt::number(allowances.fuel_per_sec as f64, 0)
-                )),
-            ),
-            (
-                "Memory".to_string(),
-                ui::number(&format!("{} MiB", allowances.memory_mib)),
-            ),
-            (
-                "Bandwidth".to_string(),
-                ui::number(&format!(
-                    "{} requests a minute · {} a day · {} streams",
-                    fmt::count(allowances.requests_per_min),
-                    fmt::bytes(u32::try_from(allowances.bytes_per_day).unwrap_or(u32::MAX)),
-                    allowances.streams
-                )),
-            ),
-            (
-                "Inference".to_string(),
-                ui::number(&format!("{} ms a minute", allowances.inference_ms_per_min)),
-            ),
-            ("Placement".to_string(), ui::value(&allowances.placement)),
-        ]),
-        ui::note(
-            "The compute this agent declared: each one a cap, metered to the vault's tank at \
-             published prices.",
-        ),
-    ];
-
-    if !secrets.is_empty() {
-        children.push(ui::subheading("Sealed secrets"));
-        children.push(ui::bullets(secrets.iter().cloned()));
-        children.push(ui::note(
-            "Sealed to this bundle's hash, so only an attested executor running exactly this \
-             bundle can read them.",
-        ));
-    }
-
-    ui::section("What it may use", children)
-}
-
-fn build_log(strategy: &Rc<Strategy>) -> Dom {
-    let lines: Vec<Dom> = strategy
-        .bundle
-        .build_log
-        .iter()
-        .enumerate()
-        .map(|(index, line)| {
-            html!("div", {
-                .class("log__line")
-                .apply(|dom| match line.level {
-                    LogLevel::Error => dom.class("log__line--err"),
-                    LogLevel::Warn => dom.class("log__line--warn"),
-                    LogLevel::Plain => dom,
-                })
-                .child(html!("span", { .class("log__num").text(&(index + 1).to_string()) }))
-                .child(html!("span", { .text(&line.text) }))
-            })
-        })
-        .collect();
-
+/// What its `shonin.toml` declares, shown even when the source is sealed.
+fn declared(strategy: &Rc<Strategy>) -> Dom {
+    let list = |items: &[String]| {
+        if items.is_empty() {
+            "none".to_string()
+        } else {
+            items.join(", ")
+        }
+    };
     ui::section(
-        "The build log",
+        "What its shonin.toml declares",
         vec![
-            html!("div", { .class("log").children(lines) }),
+            ui::kv(vec![
+                (
+                    "Vault chain".to_string(),
+                    ui::value(strategy.vault.chain.label()),
+                ),
+                ("Drivers".to_string(), ui::value(&list(&strategy.drivers))),
+                ("Bridges".to_string(), ui::value(&list(&strategy.bridges))),
+                ("Title".to_string(), ui::value(&strategy.title)),
+            ]),
             ui::note(
-                "Every build runs the same pinned recipe, and an attested builder signs what came out of it.",
+                "The same file the reviewer read beside the code, shown whether or not the source \
+                 is sealed. Its claims are on the overview, and its hash is above.",
             ),
         ],
     )

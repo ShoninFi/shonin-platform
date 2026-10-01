@@ -124,8 +124,8 @@ fn area_of(points: &[Point], bounds: &Bounds, baseline: f64) -> String {
     )
 }
 
-/// A line chart with a hover readout: value per share against its
-/// risk-normalised twin, or anything else measured day by day.
+/// A line chart with a hover readout: value per share, the money in a vault,
+/// or anything else measured day by day.
 pub fn line_chart(series: Vec<Series>, format: impl Fn(f64) -> String + 'static) -> Dom {
     chart(series, Rc::new(format), false)
 }

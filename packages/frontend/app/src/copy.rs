@@ -11,21 +11,13 @@
 
 use shared::Strategy;
 
-/// Live days before the leaderboard will rank a strategy.
-const DAYS_TO_RANK: u32 = Strategy::DAYS_TO_RANK;
+/// Live days before an agent leaves the "new" list for the leaderboard.
+const DAYS_NEW: u32 = Strategy::DAYS_NEW;
 
-/// The annualised volatility every record is rescaled to, as a percentage.
-const VOLATILITY_TARGET_PCT: f64 = Strategy::VOLATILITY_TARGET * 100.0;
-
-/// The volatility every record is normalised to, as a sentence says it.
-pub fn volatility_target() -> String {
-    format!("{VOLATILITY_TARGET_PCT:.0}%")
-}
-
-/// The live days a strategy needs before the leaderboard will rank it, as a
-/// sentence says it.
-pub fn days_to_rank() -> String {
-    DAYS_TO_RANK.to_string()
+/// The live days an agent needs before it is on the leaderboard, as a sentence
+/// says it.
+pub fn days_new() -> String {
+    DAYS_NEW.to_string()
 }
 
 /// The line the whole product hangs on.
@@ -67,7 +59,7 @@ pub const GUARANTEES: [(&str, &str, &str); 6] = [
     ),
     (
         "Nothing changes under you",
-        "A published agent is frozen. A new version is a separate vault you choose to join.",
+        "A published agent is frozen. A changed agent is a new agent, with a vault of its own.",
         "Rules out being switched onto an agent you didn't pick.",
     ),
     (
@@ -86,22 +78,22 @@ pub const HALT_NEVER_STEAL: &str = "Every lever anyone has ends in a halt, never
 pub fn how_it_works() -> [(&'static str, String); 4] {
     [
         (
-            "An author publishes source",
-            "An attested builder compiles the Rust project with a pinned recipe and signs the \
-             mapping from the source it read to the bundle it made."
+            "An attested reviewer reads the source",
+            "Before anything is built, a pinned model rates the code in six areas and lists \
+             what a careful reader would worry about. Only malicious code is refused."
                 .to_string(),
         ),
         (
-            "An attested reviewer reads it",
-            "A pinned model scores whether the code is reasonable and lists what a careful \
-             reader would worry about. A score, not a gate."
+            "An attested builder compiles it",
+            "With a pinned recipe, signing the mapping from the source it read to the bundle it \
+             made."
                 .to_string(),
         ),
         (
-            "A vault opens, and depositors choose",
+            "Its author activates a vault, and depositors choose",
             format!(
                 "Shares are minted at the value the contract computes from the chain. The \
-                 agent is labelled new until it has {DAYS_TO_RANK} live days."
+                 agent is labelled new until it has {DAYS_NEW} live days."
             ),
         ),
         (
@@ -113,8 +105,9 @@ pub fn how_it_works() -> [(&'static str, String); 4] {
     ]
 }
 
-pub const FEE_NOTE: &str = "Fees crystallise daily as new shares, so paying them never forces a sale. Profit fees are \
-     only taken on a new high-water mark. The transaction fee stays in the pool, so timing a \
+pub const FEE_NOTE: &str = "Fees are worked out daily and paid every Monday as new shares, so paying them never forces a \
+     sale, and the share value shown is always after fees. Profit fees are only taken on a new \
+     high-water mark. The transaction fee stays in the pool, so timing a \
      deposit around a price update can't take value from the depositors who stay.";
 
 pub const TANK_NOTE: &str = "Running costs are the author's, not the depositors'. Each vault has a tank the author funds \
@@ -162,33 +155,33 @@ pub fn publish_steps() -> [(&'static str, String); 5] {
         (
             "Start from a template",
             "An ordinary Cargo project: your code, your dependencies, a pinned toolchain, and a \
-             manifest that describes the agent, its venues, its config and the compute it \
-             needs."
+             shonin.toml naming the chain your vault lives on, what the agent does and claims, \
+             and the drivers it trades through."
                 .to_string(),
         ),
         (
             "Write your limits in code",
             "There is no platform risk policy. A leverage cap or a drawdown stop is code you \
-             write, and code the reviewer reads."
+             write, claimed in your shonin.toml, and checked by the reviewer."
                 .to_string(),
         ),
         (
-            "Submit, and fund the vault's tank",
-            "Pack the project and upload it, sealed if you would rather nobody else read it. \
-             The build and the review are the tank's first charges."
+            "Submit it for $1",
+            "Upload the project, sealed if you would rather nobody else read it, and pay $1 from \
+             the same wallet. The payment gives your agent its id."
                 .to_string(),
         ),
         (
-            "The queue builds it, and the reviewer reads it",
-            "The build runs offline on a pinned recipe, and the reviewer reads the same \
-             source. The log is public either way."
+            "It is reviewed, then built",
+            "The reviewer reads the source first; then the build runs offline on a pinned recipe. \
+             The queue shows how it ended, never a build log."
                 .to_string(),
         ),
         (
-            "The vault opens",
+            "Activate it when you're ready",
             format!(
-                "Deposits from the moment it is registered, labelled new until it has \
-                 {DAYS_TO_RANK} live days."
+                "Read the review, then activate: choose its allowances and fund its tank, and the \
+                 vault opens, labelled new until it has {DAYS_NEW} live days."
             ),
         ),
     ]
@@ -203,18 +196,16 @@ pub fn ranking() -> [(String, String); 4] {
                 .to_string(),
         ),
         (
-            "Normalised for risk".to_string(),
-            format!(
-                "Returns are rescaled to a common {VOLATILITY_TARGET_PCT:.0}% annualised \
-                 volatility, estimated only from the days before each one, so the list doesn't \
-                 simply reward leverage."
-            ),
+            "Plain facts, sorted as you like".to_string(),
+            "The return over 30 days and since opening, the deepest drop and the money in the \
+             vault, each read from the vault's own contract. Pick the column to sort by."
+                .to_string(),
         ),
         (
-            format!("{DAYS_TO_RANK} days before ranking"),
+            format!("{DAYS_NEW} days before the leaderboard"),
             format!(
-                "An agent is open for deposits from its first day, labelled new. It isn't \
-                 ranked until it has {DAYS_TO_RANK} live days."
+                "An agent is open for deposits from its first day, listed separately as new \
+                 until it has {DAYS_NEW} live days."
             ),
         ),
         (
@@ -226,8 +217,8 @@ pub fn ranking() -> [(String, String); 4] {
     ]
 }
 
-pub const REVIEW_NOTE: &str = "The reviewer reads the source, sealed or not, and scores whether the code is reasonable. It \
-     never rates expected profit, and it is never a gate.";
+pub const REVIEW_NOTE: &str = "The reviewer reads the source, sealed or not, before it is built, and rates it in six areas. \
+     It never rates expected profit, and it only refuses code written to do harm.";
 
 /// Shown in place of a figure the platform has not answered for yet. A page
 /// says nothing rather than a number it made up.
@@ -248,8 +239,7 @@ pub fn exit_note(band: &str) -> String {
 pub const TERMS: [(&str, &str); 12] = [
     (
         "vault",
-        "Pooled capital behind one agent version, with its own accounts on every venue that \
-         agent uses.",
+        "Pooled capital behind one agent, with its own accounts on every venue that agent uses.",
     ),
     (
         "bundle",
@@ -263,8 +253,8 @@ pub const TERMS: [(&str, &str); 12] = [
     ),
     (
         "high-water mark",
-        "The highest value per share a vault has crystallised fees at. Profit fees are only \
-         taken above it.",
+        "The highest value per share a vault has paid fees at. Profit fees are only taken above \
+         it.",
     ),
     (
         "tank",
@@ -296,8 +286,8 @@ pub const TERMS: [(&str, &str); 12] = [
          until its expiry.",
     ),
     (
-        "normalised return",
-        "An agent's return after rescaling to a common volatility target.",
+        "deepest drop",
+        "The largest fall in value per share from an earlier high.",
     ),
     (
         "sealed source",

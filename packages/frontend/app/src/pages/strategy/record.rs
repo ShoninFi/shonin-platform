@@ -10,7 +10,6 @@ use futures_signals::map_ref;
 use futures_signals::signal::Mutable;
 use shared::Strategy;
 
-use crate::copy;
 use crate::data;
 use crate::format as fmt;
 use crate::pages::parts;
@@ -121,15 +120,15 @@ fn summary(strategy: &Rc<Strategy>) -> Dom {
             )),
         ),
         (
-            "Total return".to_string(),
+            "Since opening".to_string(),
             ui::signed(
-                performance.total_return,
-                &fmt::percent_signed(performance.total_return, 1),
+                performance.return_since_open,
+                &fmt::percent_signed(performance.return_since_open, 1),
             ),
         ),
         (
-            "Realised volatility".to_string(),
-            ui::number(&fmt::percent(performance.volatility, 1)),
+            "Deepest drop".to_string(),
+            ui::number(&fmt::percent_signed(performance.deepest_drop, 1)),
         ),
         (
             "Capital behind it".to_string(),
@@ -150,18 +149,12 @@ fn main_chart(strategy: &Rc<Strategy>, line: Line) -> Dom {
         Line::Value => html!("div", {
             .class("stack-sm")
             .child(chart::line_chart(
-                vec![
-                    Series::new("value per share", record.value_per_share.clone()),
-                    Series::reference("normalised", record.normalised.clone()),
-                ],
+                vec![Series::new("value per share", record.value_per_share.clone())],
                 fmt::share_price,
             ))
-            .child(ui::note(&format!(
-                "The solid line is what the vault's contract computed. The dashed line is the \
-                 same record rescaled to {} annualised volatility, which the leaderboard ranks \
-                 on.",
-                copy::volatility_target()
-            )))
+            .child(ui::note(
+                "Value per share, as the vault's contract computed it, after fees.",
+            ))
         }),
         Line::Drawdown => html!("div", {
             .class("stack-sm")
