@@ -317,8 +317,20 @@ library Upkeep {
             revert IVault.NotAllowed();
         }
         if (s.state == VaultState.Closed || s.state == VaultState.Cancelled) revert IVault.WrongState();
-        // The leaver's part of what the shares own of the stations.
-        uint256 fraction = claim.shares.mulDiv(WAD - s.liveUnits(), s.totalSupply, Math.Rounding.Ceil);
+        // Cash at home that already covers it: priced as it stands, with
+        // nothing to close.
+        if (s.lastPriced != 0) {
+            uint256 covered = _expectedPayout(s, claim.shares);
+            if (covered <= s.free()) {
+                _queueClaim(s, claim, claimId, covered, 0);
+                emit IVault.ClaimTried(claimId, false);
+                return;
+            }
+        }
+        // The leaver's part of what the shares own of the stations. Shares
+        // whose fraction is already home own none of what is left there.
+        uint256 fraction =
+            claim.shares.mulDiv(WAD - s.liveUnits(), s.totalSupply - s.closedShares, Math.Rounding.Ceil);
         if (fraction > WAD) fraction = WAD;
         if (fraction == 0) fraction = 1;
         uint256 home;
@@ -345,19 +357,31 @@ library Upkeep {
             claim.state = ClaimState.Waiting;
             blocked = true;
         } else {
-            // What the claim is expected to be paid is set aside, so nothing
-            // priced ahead of it can take it. The freeze clock is left alone:
-            // only a claim that is paid has been served.
             uint256 expected = s.lastPriced == 0 ? home : _expectedPayout(s, claim.shares);
-            uint256 reserve = expected < s.free() ? expected : s.free();
-            s.claimReserved[claimId] = reserve;
-            s.claimHome[claimId] = home;
-            s.reservedCash += reserve;
-            claim.state = ClaimState.Queued;
-            s.queuedClaims += 1;
-            s.claimRequest[claimId] = s.queue(claim.owner, RequestKind.Claim, claim.shares, claimId);
+            uint256 free = s.free();
+            _queueClaim(s, claim, claimId, expected < free ? expected : free, home);
+            s.closedShares += claim.shares;
         }
         emit IVault.ClaimTried(claimId, blocked);
+    }
+
+    /// Queue a served claim to be priced at the next valuation. What it is
+    /// expected to be paid is set aside, so nothing priced ahead of it can
+    /// take it, and the try restarts its clock.
+    function _queueClaim(
+        Layout storage s,
+        Claim storage claim,
+        uint256 claimId,
+        uint256 reserve,
+        uint256 home
+    ) private {
+        s.claimReserved[claimId] = reserve;
+        s.claimHome[claimId] = home;
+        s.reservedCash += reserve;
+        claim.state = ClaimState.Queued;
+        claim.lastAttemptAt = uint64(block.timestamp);
+        s.queuedClaims += 1;
+        s.claimRequest[claimId] = s.queue(claim.owner, RequestKind.Claim, claim.shares, claimId);
     }
 
     function _expectedPayout(Layout storage s, uint256 shares) private view returns (uint256 payout) {

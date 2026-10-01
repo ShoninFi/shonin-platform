@@ -328,8 +328,11 @@ library Valuations {
         // to it first.
         s.reservedCash -= s.claimReserved[r.ref];
         s.claimReserved[r.ref] = 0;
-        s.claimHome[r.ref] = 0;
         uint256 shares = claim.shares;
+        if (s.claimHome[r.ref] != 0) {
+            s.claimHome[r.ref] = 0;
+            s.closedShares -= shares;
+        }
         (uint256 slice, uint256 burned, uint256 payout) = exitOf(s, v, shares);
         if (payout > s.free()) {
             claim.state = ClaimState.Pending;
@@ -433,18 +436,24 @@ library Valuations {
             _proRata(s, claim.owner, claim.shares);
             return;
         }
-        // Its fraction of the stations is already home: it takes what that
-        // close brought, its share of the rest of the cash, and no units.
         Request storage r = s.requests[s.claimRequest[claimId] - 1];
         if (s.lastPriced != 0 && s.latest().time >= r.earliest) revert IVault.NotAllowed();
         s.queuedClaims -= 1;
         r.done = true;
         s.reservedCash -= s.claimReserved[claimId];
         s.claimReserved[claimId] = 0;
-        uint256 free = s.free();
         uint256 home = s.claimHome[claimId];
-        if (home > free) home = free;
+        if (home == 0) {
+            // Queued on the cash alone: nothing was closed for it.
+            _proRata(s, claim.owner, claim.shares);
+            return;
+        }
+        // Its fraction of the stations is already home: it takes what that
+        // close brought, its share of the rest of the cash, and no units.
         s.claimHome[claimId] = 0;
+        s.closedShares -= claim.shares;
+        uint256 free = s.free();
+        if (home > free) home = free;
         uint256 assets = home + (free - home).mulDiv(claim.shares, s.totalSupply);
         s.burn(address(this), claim.shares);
         s.cash -= assets;
@@ -458,7 +467,7 @@ library Valuations {
         uint256 assets = s.free().mulDiv(shares, s.totalSupply);
         // The shares own what the units don't; these shares' part of that
         // is the leaver's for good, whatever fees are minted later.
-        uint256 fraction = shares.mulDiv(WAD - s.liveUnits(), s.totalSupply);
+        uint256 fraction = shares.mulDiv(WAD - s.liveUnits(), s.totalSupply - s.closedShares);
         uint256 raw = fraction.mulDiv(WAD, s.scale());
         s.burn(address(this), shares);
         s.cash -= assets;

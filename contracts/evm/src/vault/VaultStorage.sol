@@ -89,6 +89,9 @@ struct Layout {
     mapping(uint256 => uint256) claimRequest;
     /// What a queued claim's close brought home.
     mapping(uint256 => uint256) claimHome;
+    /// The shares of queued claims whose fraction is already home: they own
+    /// cash, and none of what the stations still hold.
+    uint256 closedShares;
     mapping(uint256 => mapping(uint256 => Post)) posts;
     // The pro-rata fallback -------------------------------------------------
     /// The fallback's units, as raw amounts. A holder's live fraction of the
