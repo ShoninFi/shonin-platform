@@ -104,16 +104,20 @@ library Valuations {
             exitValue = exitValue.mulDiv(WAD - units, WAD);
         }
         uint32 missing = uint32(s.otherChains.length);
+        // Claims whose fraction was closed own a fixed amount, set aside, and
+        // are paid exactly that: everyone else is priced without them, so a
+        // move at the stations after a close is the stayers' alone.
+        uint256 pooled = s.cash - (s.reservedCash - s.coveredReserved);
         s.valuations.push(
             Valuation({
                 time: time,
                 status: ValuationStatus.Open,
-                gross: s.cash + markValue + 1,
-                grossExit: s.cash + exitValue + 1,
+                gross: pooled + markValue + 1,
+                grossExit: pooled + exitValue + 1,
                 supply: 0,
                 fee: 0,
                 feeExit: 0,
-                cash: s.cash,
+                cash: pooled,
                 postsMissing: missing
             })
         );
@@ -258,7 +262,7 @@ library Valuations {
         // An exit is never worth more than the mark: a bid above it would pay
         // a leaver more than the pool holds for them.
         if (v.grossExit > gross) v.grossExit = gross;
-        uint256 supply = s.totalSupply + OFFSET;
+        uint256 supply = s.totalSupply + OFFSET - s.closedShares;
         if (s.state != VaultState.Closed && v.time >= VaultStorage.nextMonday(s.lastPayment)) {
             supply = payday(s, gross, supply, v.time);
         }
@@ -483,8 +487,8 @@ library Valuations {
             s.claimCash[r.ref] = 0;
             if (owned > s.free()) owned = s.free();
             uint256 fee = s.feeOf(owned, shares);
-            uint256 stayers = v.grossExit > owned ? v.grossExit - owned : 0;
-            slice = fee == 0 || stayers == 0 ? 0 : fee.mulDiv(v.supply - shares, stayers, Math.Rounding.Ceil);
+            // The valuation already prices the stayers without it.
+            slice = fee == 0 ? 0 : fee.mulDiv(v.supply, v.grossExit, Math.Rounding.Ceil);
             if (slice > shares) slice = shares;
             burned = shares - slice;
             uint256 gross = owned - fee;

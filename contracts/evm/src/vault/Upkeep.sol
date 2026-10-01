@@ -322,7 +322,11 @@ library Upkeep {
         }
         // A vault ready to close pays its claims from the closed vault, so a
         // try now could only hold the close off.
-        if (s.state == VaultState.Closed || s.state == VaultState.Cancelled || s.readyToClose()) {
+        // Nor while a valuation waits for posts: what closed claims own is
+        // left out of its price, as they stood when it was recorded.
+        if (
+            s.state == VaultState.Closed || s.state == VaultState.Cancelled || s.readyToClose() || s.valuing()
+        ) {
             revert IVault.WrongState();
         }
         // Cash at home that already covers it: priced as it stands, with
