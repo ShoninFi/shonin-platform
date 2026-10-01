@@ -112,6 +112,9 @@ struct Layout {
     /// A claim's close is under way: what it brings home is the claim's,
     /// none of it the unit holders'.
     bool closing;
+    /// What the home station took since the last valuation looked at it, so
+    /// the idle floor is measured on a value pulls can't shrink.
+    uint256 sentSinceValued;
     // Who may deposit -------------------------------------------------------
     bytes32[] restricted;
     bytes32 restrictedHash;

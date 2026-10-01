@@ -94,6 +94,7 @@ library Valuations {
 
         syncHolding(s);
         (uint256 markValue, uint256 exitValue) = IStation(s.homeStation).value();
+        s.sentSinceValued = 0;
         uint256 units = s.liveUnits();
         if (units != 0) {
             // The stations' value belongs partly to the fallback's unit
@@ -336,11 +337,19 @@ library Valuations {
         s.reservedCash -= s.claimReserved[r.ref];
         s.claimReserved[r.ref] = 0;
         uint256 shares = claim.shares;
-        if (s.claimHome[r.ref] != 0) {
+        uint256 home = s.claimHome[r.ref];
+        (uint256 slice, uint256 burned, uint256 payout) = exitOf(s, v, shares);
+        if (home != 0) {
             s.claimHome[r.ref] = 0;
             s.closedShares -= shares;
+            // Its fraction left the stations when it was closed: it owns
+            // what that brought home and its share of the rest of the cash,
+            // and none of what the stations made since.
+            uint256 free = s.free();
+            if (home > free) home = free;
+            uint256 owned = home + (free - home).mulDiv(shares, s.totalSupply);
+            if (payout > owned) payout = owned;
         }
-        (uint256 slice, uint256 burned, uint256 payout) = exitOf(s, v, shares);
         if (payout > s.free()) {
             claim.state = ClaimState.Pending;
             emit IVault.ClaimTried(r.ref, true);
@@ -542,9 +551,10 @@ library Valuations {
         // while a claim's cash is home waiting to be priced: taking it back
         // out would leave the claim unpaid.
         if (!s.live() || s.halted() || s.units != 0 || s.queuedClaims != 0) revert IVault.WrongState();
-        // The stations as last valued, and the cash as it is now, so money
-        // that joined or left since the snapshot counts.
-        uint256 value = s.cash + 1;
+        // The stations as last valued, the cash as it is now, and what was
+        // sent out since: money that joined or left counts, and a run of
+        // pulls can't shrink the value the floor is measured on.
+        uint256 value = s.cash + s.sentSinceValued + 1;
         if (s.lastPriced != 0) {
             Valuation storage v = s.latest();
             value += v.gross - 1 - v.cash;
@@ -552,6 +562,7 @@ library Valuations {
         uint256 floor = value.mulDiv(floorNow(s), BPS, Math.Rounding.Ceil);
         if (amount > s.free() || s.free() - amount < floor) revert IVault.BelowFloor();
         s.cash -= amount;
+        s.sentSinceValued += amount;
         IERC20(s.asset).safeTransfer(msg.sender, amount);
         emit IVault.ToStation(amount);
     }
