@@ -242,7 +242,9 @@ library Upkeep {
         // The bill is settled first, against a total recent enough to cover
         // what the agent has used.
         if (uint256(asOf) + s.timers.usageFreshness < block.timestamp) revert IVault.Stale();
-        _collect(s, total, asOf, signature);
+        // A bill somebody has already collected needn't be collected again:
+        // the author's withdrawal goes ahead on it.
+        if (total != s.tank.usageSettled || asOf != s.tank.usageAsOf) _collect(s, total, asOf, signature);
         _payTank(s, assets);
     }
 
@@ -316,7 +318,7 @@ library Upkeep {
         }
         if (s.state == VaultState.Closed || s.state == VaultState.Cancelled) revert IVault.WrongState();
         // The leaver's part of what the shares own of the stations.
-        uint256 fraction = claim.shares.mulDiv(WAD - s.units, s.totalSupply, Math.Rounding.Ceil);
+        uint256 fraction = claim.shares.mulDiv(WAD - s.liveUnits(), s.totalSupply, Math.Rounding.Ceil);
         if (fraction > WAD) fraction = WAD;
         if (fraction == 0) fraction = 1;
         (uint256 home, bool blocked) = IStation(s.homeStation).unwind(fraction);
@@ -330,12 +332,22 @@ library Upkeep {
             claim.state = ClaimState.Waiting;
             blocked = true;
         } else {
-            claim.lastAttemptAt = uint64(block.timestamp);
+            // What the claim is expected to be paid is set aside, so nothing
+            // priced ahead of it can take it. The freeze clock is left alone:
+            // only a claim that is paid has been served.
+            uint256 expected = s.lastPriced == 0 ? home : _expectedPayout(s, claim.shares);
+            uint256 reserve = expected < s.free() ? expected : s.free();
+            s.claimReserved[claimId] = reserve;
+            s.reservedCash += reserve;
             claim.state = ClaimState.Queued;
             s.queuedClaims += 1;
-            s.queue(claim.owner, RequestKind.Claim, claim.shares, claimId);
+            s.claimRequest[claimId] = s.queue(claim.owner, RequestKind.Claim, claim.shares, claimId);
         }
         emit IVault.ClaimTried(claimId, blocked);
+    }
+
+    function _expectedPayout(Layout storage s, uint256 shares) private view returns (uint256 payout) {
+        (,, payout) = Valuations.exitOf(s, s.latest(), shares);
     }
 
     /// A claim nobody has tried to serve for `freezeAfter` freezes the vault.

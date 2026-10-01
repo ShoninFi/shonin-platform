@@ -82,12 +82,20 @@ struct Layout {
     /// Claims whose fraction was closed and brought home, waiting to be
     /// priced. Their cash stays at home until they are.
     uint256 queuedClaims;
+    /// Cash set aside for those claims, which nothing else may pay from.
+    uint256 reservedCash;
+    mapping(uint256 => uint256) claimReserved;
+    /// The request a queued claim is priced by.
+    mapping(uint256 => uint256) claimRequest;
     mapping(uint256 => mapping(uint256 => Post)) posts;
     // The pro-rata fallback -------------------------------------------------
-    /// The fraction of the stations, scaled by `WAD`, that the fallback's
-    /// unit holders own between them. A holder's units are their own
-    /// fraction, fixed when they left, so later fee shares can't dilute it.
+    /// The fallback's units, as raw amounts. A holder's live fraction of the
+    /// stations is their raw units times `unitScale`; the scale grows each
+    /// time a holder is served, since what is left is then everyone else's
+    /// in the same proportions. Fee shares minted later can't dilute them.
     uint256 units;
+    /// Zero means `WAD`.
+    uint256 unitScale;
     uint256 unitReserve;
     /// What each unit has received, scaled by `UNIT_SCALE`.
     uint256 perUnit;
@@ -199,6 +207,21 @@ library VaultStorage {
 
     function halted(Layout storage s) internal view returns (bool) {
         return s.haltedAt != 0;
+    }
+
+    /// The fraction of the stations, scaled by `WAD`, the unit holders own.
+    function liveUnits(Layout storage s) internal view returns (uint256) {
+        return s.units == 0 ? 0 : s.units.mulDiv(scale(s), WAD);
+    }
+
+    function scale(Layout storage s) internal view returns (uint256) {
+        return s.unitScale == 0 ? WAD : s.unitScale;
+    }
+
+    /// Cash nothing has set aside: what withdrawals, fills and the station
+    /// may draw on.
+    function free(Layout storage s) internal view returns (uint256) {
+        return s.cash - s.reservedCash;
     }
 
     function latest(Layout storage s) internal view returns (Valuation storage) {

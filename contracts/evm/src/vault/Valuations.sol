@@ -87,11 +87,12 @@ library Valuations {
 
         syncHolding(s);
         (uint256 markValue, uint256 exitValue) = IStation(s.homeStation).value();
-        if (s.units != 0) {
+        uint256 units = s.liveUnits();
+        if (units != 0) {
             // The stations' value belongs partly to the fallback's unit
             // holders, who hold it outside the shares.
-            markValue = markValue.mulDiv(WAD - s.units, WAD);
-            exitValue = exitValue.mulDiv(WAD - s.units, WAD);
+            markValue = markValue.mulDiv(WAD - units, WAD);
+            exitValue = exitValue.mulDiv(WAD - units, WAD);
         }
         uint32 missing = uint32(s.otherChains.length);
         s.valuations.push(
@@ -296,7 +297,7 @@ library Valuations {
     function _redeem(Layout storage s, Request storage r, uint256 id, Valuation storage v) private {
         uint256 shares = r.amount;
         (uint256 slice, uint256 burned, uint256 payout) = exitOf(s, v, shares);
-        if (payout <= s.cash) {
+        if (payout <= s.free()) {
             s.pendingShares -= shares;
             _distribute(s, address(this), slice, burned);
             s.cash -= payout;
@@ -323,6 +324,10 @@ library Valuations {
         Claim storage claim = s.claims[r.ref - 1];
         if (claim.state != ClaimState.Queued) return;
         s.queuedClaims -= 1;
+        // Its own cash, set aside when its fraction came home, is released
+        // to it first.
+        s.reservedCash -= s.claimReserved[r.ref];
+        s.claimReserved[r.ref] = 0;
         uint256 shares = claim.shares;
         (uint256 slice, uint256 burned, uint256 payout) = exitOf(s, v, shares);
         if (payout > s.cash) {
@@ -354,13 +359,14 @@ library Valuations {
         if (shares > held) shares = held;
         if (shares == 0) return;
         (uint256 slice, uint256 burned, uint256 payout) = exitOf(s, v, shares);
-        if (payout > s.cash) {
-            shares = shares.mulDiv(s.cash, payout);
+        uint256 available = s.free();
+        if (payout > available) {
+            shares = shares.mulDiv(available, payout);
             (slice, burned, payout) = exitOf(s, v, shares);
             // The rescaled figure rounds on its own and can still land a unit
             // over; the shares then buy a unit less, never more cash than is
             // there.
-            if (payout > s.cash) payout = s.cash;
+            if (payout > available) payout = available;
         }
         if (payout == 0) return;
         _distribute(s, author, slice, burned);
@@ -413,7 +419,8 @@ library Valuations {
         Layout storage s = VaultStorage.layout();
         Claim storage claim = s.claims[claimId - 1];
         if (msg.sender != claim.owner) revert IVault.NotAllowed();
-        if (claim.state != ClaimState.Pending && claim.state != ClaimState.Waiting) {
+        ClaimState state = claim.state;
+        if (state != ClaimState.Pending && state != ClaimState.Waiting && state != ClaimState.Queued) {
             revert IVault.NotAllowed();
         }
         uint256 since = s.lastPriced == 0 ? s.createdAt : s.latest().time;
@@ -421,22 +428,38 @@ library Valuations {
         if (block.timestamp < since + s.timers.fallbackAfter) revert IVault.NotYet();
         claim.state = ClaimState.Fallback;
         s.pendingShares -= claim.shares;
-        _proRata(s, claim.owner, claim.shares);
+        if (state != ClaimState.Queued) {
+            _proRata(s, claim.owner, claim.shares);
+            return;
+        }
+        // Its fraction of the stations is already home and set aside: it
+        // takes that, and its share of the rest of the cash, and no units.
+        s.queuedClaims -= 1;
+        s.requests[s.claimRequest[claimId] - 1].done = true;
+        uint256 reserved = s.claimReserved[claimId];
+        s.claimReserved[claimId] = 0;
+        s.reservedCash -= reserved;
+        uint256 assets = reserved + (s.free() - reserved).mulDiv(claim.shares, s.totalSupply);
+        s.burn(address(this), claim.shares);
+        s.cash -= assets;
+        s.pay(claim.owner, assets);
+        emit IVault.ProRataTaken(claim.owner, claim.shares, assets, 0);
     }
 
     /// No fee: nothing can be priced. The leaver's units are a claim on
     /// their fraction of whatever the stations hold.
     function _proRata(Layout storage s, address owner, uint256 shares) private {
-        uint256 assets = s.cash.mulDiv(shares, s.totalSupply);
+        uint256 assets = s.free().mulDiv(shares, s.totalSupply);
         // The shares own what the units don't; these shares' part of that
         // is the leaver's for good, whatever fees are minted later.
-        uint256 fraction = shares.mulDiv(WAD - s.units, s.totalSupply);
+        uint256 fraction = shares.mulDiv(WAD - s.liveUnits(), s.totalSupply);
+        uint256 raw = fraction.mulDiv(WAD, s.scale());
         s.burn(address(this), shares);
         s.cash -= assets;
-        if (fraction != 0) {
+        if (raw != 0) {
             _accrue(s, owner);
-            s.unitsOf[owner] += fraction;
-            s.units += fraction;
+            s.unitsOf[owner] += raw;
+            s.units += raw;
             s.unitDebt[owner] = s.unitsOf[owner].mulDiv(s.perUnit, UNIT_SCALE);
         }
         s.pay(owner, assets);
@@ -465,15 +488,25 @@ library Valuations {
     /// the same proportions as before.
     function serveProRata(address holder) external {
         Layout storage s = VaultStorage.layout();
-        uint256 fraction = s.unitsOf[holder];
-        if (fraction == 0) revert IVault.Nothing();
+        uint256 raw = s.unitsOf[holder];
+        if (raw == 0) revert IVault.Nothing();
+        uint256 fraction = raw.mulDiv(s.scale(), WAD);
+        if (fraction > WAD) fraction = WAD;
+        if (fraction == 0) fraction = 1;
         s.serving = holder;
         (, bool blocked) = IStation(s.homeStation).unwind(fraction);
         s.serving = address(0);
         if (blocked) revert IVault.NotYet();
         _accrue(s, holder);
-        s.units -= fraction;
+        s.units -= raw;
         s.unitsOf[holder] = 0;
+        // What is left at the stations is everyone else's, in the same
+        // proportions as before: every remaining fraction grows to match.
+        if (s.units == 0) {
+            s.unitScale = 0;
+        } else if (fraction < WAD) {
+            s.unitScale = s.scale().mulDiv(WAD, WAD - fraction);
+        }
         s.unitDebt[holder] = 0;
     }
 
@@ -495,7 +528,7 @@ library Valuations {
             value += v.gross - 1 - v.cash;
         }
         uint256 floor = value.mulDiv(floorNow(s), BPS, Math.Rounding.Ceil);
-        if (amount > s.cash || s.cash - amount < floor) revert IVault.BelowFloor();
+        if (amount > s.free() || s.free() - amount < floor) revert IVault.BelowFloor();
         s.cash -= amount;
         IERC20(s.asset).safeTransfer(msg.sender, amount);
         emit IVault.ToStation(amount);
@@ -514,7 +547,7 @@ library Valuations {
         }
         uint256 toUnits;
         if (s.units != 0) {
-            toUnits = amount.mulDiv(s.units, WAD);
+            toUnits = amount.mulDiv(s.liveUnits(), WAD);
             s.perUnit += toUnits.mulDiv(UNIT_SCALE, s.units);
             s.unitReserve += toUnits;
         }

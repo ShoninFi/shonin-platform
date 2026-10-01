@@ -353,14 +353,14 @@ contract Vault is IVault, ReentrancyGuardTransient {
 
     function units() external view returns (uint256, uint256) {
         Layout storage s = VaultStorage.layout();
-        return (s.units, s.unitReserve);
+        return (s.liveUnits(), s.unitReserve);
     }
 
     function unitsOf(address holder) external view returns (uint256 held, uint256 claimable) {
         Layout storage s = VaultStorage.layout();
-        held = s.unitsOf[holder];
-        claimable =
-            s.unitCredit[holder] + held.mulDiv(s.perUnit, VaultStorage.UNIT_SCALE) - s.unitDebt[holder];
+        uint256 raw = s.unitsOf[holder];
+        held = raw.mulDiv(s.scale(), VaultStorage.WAD);
+        claimable = s.unitCredit[holder] + raw.mulDiv(s.perUnit, VaultStorage.UNIT_SCALE) - s.unitDebt[holder];
     }
 
     function heldFor(address owner) external view returns (uint256) {
