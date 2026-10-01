@@ -59,6 +59,13 @@ library Valuations {
             revert IVault.WrongState();
         }
         if (shares == 0 || receiver == address(0)) revert IVault.TooSmall();
+        // A halted vault whose station has been found empty is ready to
+        // close: new leavers redeem once it has, fee-free, so nobody can
+        // hold the close off with a request every slot.
+        if (s.halted() && s.lastPriced != 0) {
+            Valuation storage v = s.latest();
+            if (v.time > s.haltedAt && v.gross == v.cash + 1) revert IVault.WrongState();
+        }
         s.move(msg.sender, address(this), shares);
         s.pendingShares += shares;
         return s.queue(receiver, RequestKind.Redeem, shares, 0);
@@ -553,6 +560,11 @@ library Valuations {
         Layout storage s = VaultStorage.layout();
         if (msg.sender != s.homeStation) revert IVault.NotAllowed();
         IERC20(s.asset).safeTransferFrom(msg.sender, address(this), amount);
+        if (s.closing) {
+            s.cash += amount;
+            emit IVault.FromStation(amount, 0);
+            return;
+        }
         address serving = s.serving;
         if (serving != address(0)) {
             s.unitCredit[serving] += amount;

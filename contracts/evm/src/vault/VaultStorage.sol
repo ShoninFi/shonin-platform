@@ -109,6 +109,9 @@ struct Layout {
     mapping(address => uint256) unitCredit;
     /// The holder a `serveProRata` is bringing money home for.
     address serving;
+    /// A claim's close is under way: what it brings home is the claim's,
+    /// none of it the unit holders'.
+    bool closing;
     // Who may deposit -------------------------------------------------------
     bytes32[] restricted;
     bytes32 restrictedHash;

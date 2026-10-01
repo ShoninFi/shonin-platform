@@ -335,6 +335,7 @@ library Upkeep {
         if (fraction == 0) fraction = 1;
         uint256 home;
         bool blocked;
+        s.closing = true;
         try IStation(s.homeStation).unwind(fraction) returns (uint256 sent, bool outside) {
             (home, blocked) = (sent, outside);
         } catch (bytes memory reason) {
@@ -347,6 +348,7 @@ library Upkeep {
                 }
             }
         }
+        s.closing = false;
         if (blocked) {
             // A market outside the band is a real try: the clock restarts.
             claim.state = ClaimState.Waiting;
@@ -361,6 +363,9 @@ library Upkeep {
             uint256 free = s.free();
             _queueClaim(s, claim, claimId, expected < free ? expected : free, home);
             s.closedShares += claim.shares;
+            // The close came from the shares' part alone: the unit holders
+            // own the same as before, now a larger fraction of what is left.
+            if (s.units != 0 && fraction < WAD) s.unitScale = s.scale().mulDiv(WAD, WAD - fraction);
         }
         emit IVault.ClaimTried(claimId, blocked);
     }

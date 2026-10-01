@@ -57,6 +57,7 @@ contract VaultFactory is IVaultFactory {
     error OutOfRange();
     error TermsChanged();
     error UnknownChain(bytes32 name);
+    error UnknownDriver();
 
     struct Deps {
         IERC20 asset;
@@ -233,7 +234,8 @@ contract VaultFactory is IVaultFactory {
         }
         for (uint256 i = 0; i < drivers.length; i++) {
             address implementation = attestation.unwindDriver(drivers[i]);
-            if (implementation == address(0)) continue;
+            // A driver nobody approved could never value or stop the station.
+            if (implementation == address(0)) revert UnknownDriver();
             bytes32[] memory codes = IDriver(implementation).restricted();
             for (uint256 j = 0; j < codes.length; j++) {
                 list = Codes.with(list, codes[j]);
