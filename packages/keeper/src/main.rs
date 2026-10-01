@@ -20,7 +20,7 @@ use alloy::primitives::{Address, Bytes, U256};
 use anyhow::{Context, Result};
 use chain::bindings::factory::IVaultFactory;
 use chain::bindings::station::{IStation, IStationVault};
-use chain::bindings::vault::{ClaimState, IVault, VaultState};
+use chain::bindings::vault::{ClaimState, IVault, ValuationStatus, VaultState};
 use chain::{Client, Deployments, Role};
 use clap::Parser;
 use serde::Deserialize;
@@ -160,6 +160,7 @@ async fn keep_one(client: &Client, keeper: Address, executor: &str, vault: Addre
         now,
         timers.slotInterval,
         timers.slotWindow,
+        timers.postDeadline,
     )
     .await;
     claims(client, keeper, vault, now, timers.freezeAfter).await?;
@@ -183,6 +184,7 @@ async fn price(
     now: u64,
     interval: u64,
     window: u64,
+    post_deadline: u64,
 ) {
     let slot = now - now % interval;
     let count = client
@@ -203,6 +205,30 @@ async fn price(
             .map(|valuation| valuation.time)
             .unwrap_or(0)
     };
+    // A valuation waiting for other chains' posts is closed once their
+    // deadline has passed: priced, or void so its requests roll on.
+    if !count.is_zero() {
+        if let Ok(open) = client
+            .read(
+                vault,
+                IVault::valuationAtCall {
+                    index: count - U256::from(1u64),
+                },
+            )
+            .await
+        {
+            if matches!(open.status, ValuationStatus::Open) && now > open.time + post_deadline {
+                send(
+                    client,
+                    keeper,
+                    vault,
+                    IVault::closeValuationCall { time: open.time },
+                    "close the valuation",
+                )
+                .await;
+            }
+        }
+    }
     let settle = IVault::settleCall {
         max: U256::from(100u64),
     };

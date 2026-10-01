@@ -32,6 +32,8 @@ const PUBLISH_FEE: u64 = 1_000_000;
 const MINIMUM_TANK: u64 = 10_000_000;
 /// The least a deposit may be.
 const MINIMUM_DEPOSIT: u64 = 10_000_000;
+/// The most an unwinder may report as one claim's exit cost: fifty dollars.
+const MAX_EXIT_COST: u64 = 50_000_000;
 /// The cent every vault mints to the dead address when it opens.
 const DEAD_ASSETS: u64 = 10_000;
 /// The standard deterministic deployer, present on anvil and on the public
@@ -275,6 +277,7 @@ async fn deploy(
                 U256::from(MINIMUM_DEPOSIT),
                 U256::from(MINIMUM_TANK),
                 U256::from(DEAD_ASSETS),
+                U256::from(MAX_EXIT_COST),
                 timers(network),
             ),
             names,
