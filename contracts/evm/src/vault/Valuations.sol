@@ -337,13 +337,13 @@ library Valuations {
             s.claimHome[r.ref] = 0;
             s.closedShares -= shares;
             // Its fraction left the stations when it was closed: it owns
-            // what that brought home and its share of the rest of the cash,
-            // and none of what the stations made or lost since. The profit
-            // fee is measured on that, and paid in shares at the price of
-            // those who stay, so their price is unchanged.
-            uint256 free = s.free();
-            if (home > free) home = free;
-            uint256 owned = home + (free - home).mulDiv(shares, s.totalSupply);
+            // what that brought home and its part of the cash then, and
+            // nothing that joined, left or changed since. The profit fee is
+            // measured on that, and paid in shares at the price of those who
+            // stay, so their price is unchanged.
+            uint256 owned = home + s.claimCash[r.ref];
+            s.claimCash[r.ref] = 0;
+            if (owned > s.free()) owned = s.free();
             uint256 fee = s.feeOf(owned, shares);
             uint256 stayers = v.grossExit > owned ? v.grossExit - owned : 0;
             slice = fee == 0 || stayers == 0 ? 0 : fee.mulDiv(v.supply - shares, stayers, Math.Rounding.Ceil);
@@ -467,12 +467,12 @@ library Valuations {
             return;
         }
         // Its fraction of the stations is already home: it takes what that
-        // close brought, its share of the rest of the cash, and no units.
+        // close brought and its part of the cash then, and no units.
         s.claimHome[claimId] = 0;
         s.closedShares -= claim.shares;
-        uint256 free = s.free();
-        if (home > free) home = free;
-        uint256 assets = home + (free - home).mulDiv(claim.shares, s.totalSupply);
+        uint256 assets = home + s.claimCash[claimId];
+        s.claimCash[claimId] = 0;
+        if (assets > s.free()) assets = s.free();
         s.burn(address(this), claim.shares);
         s.cash -= assets;
         s.pay(claim.owner, assets);

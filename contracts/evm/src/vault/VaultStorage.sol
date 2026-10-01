@@ -87,8 +87,10 @@ struct Layout {
     mapping(uint256 => uint256) claimReserved;
     /// The request a queued claim is priced by.
     mapping(uint256 => uint256) claimRequest;
-    /// What a queued claim's close brought home.
+    /// What a queued claim's close brought home, and its share of the cash
+    /// as it stood then: together, all its shares own once it is closed.
     mapping(uint256 => uint256) claimHome;
+    mapping(uint256 => uint256) claimCash;
     /// The shares of queued claims whose fraction is already home: they own
     /// cash, and none of what the stations still hold.
     uint256 closedShares;

@@ -336,6 +336,8 @@ library Upkeep {
             claim.shares.mulDiv(WAD - s.liveUnits(), s.totalSupply - s.closedShares, Math.Rounding.Ceil);
         if (fraction > WAD) fraction = WAD;
         if (fraction == 0) fraction = 1;
+        // And its part of the cash, as it stands before the close.
+        uint256 cashShare = s.free().mulDiv(claim.shares, s.totalSupply - s.closedShares);
         uint256 home;
         bool blocked;
         s.closing = true;
@@ -362,9 +364,12 @@ library Upkeep {
             claim.state = ClaimState.Waiting;
             blocked = true;
         } else {
-            uint256 expected = s.lastPriced == 0 ? home : _expectedPayout(s, claim.shares);
+            // What its shares own from now on is fixed: what came home and
+            // its part of the cash then. All of it is set aside for it.
+            uint256 owned = home + cashShare;
             uint256 free = s.free();
-            _queueClaim(s, claim, claimId, expected < free ? expected : free, home);
+            _queueClaim(s, claim, claimId, owned < free ? owned : free, home);
+            s.claimCash[claimId] = cashShare;
             s.closedShares += claim.shares;
             // The close came from the shares' part alone: the unit holders
             // own the same as before, now a larger fraction of what is left.
