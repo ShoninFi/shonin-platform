@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use alloy::primitives::{Address, B256, keccak256};
+use alloy::primitives::{Address, B256, U256, keccak256};
 use alloy::sol_types::SolValue;
 use anyhow::{Context, Result, bail};
 
@@ -43,8 +43,9 @@ impl Sender {
     }
 }
 
-/// What an instance attests to. It matches `AttestationRegistry.Journal`.
-type Journal = (B256, B256, Address, B256);
+/// What an instance attests to. It matches `AttestationRegistry.Journal`:
+/// image, project, key, the root of its leaves, and when it attested.
+type Journal = (B256, B256, Address, B256, u64);
 
 /// What a service's image is. There is no enclave here to measure, so the
 /// service's name stands for its digest and the registry treats it exactly as
@@ -107,12 +108,27 @@ async fn bless(
     let image = image_digest(service);
     // The one pair this instance holds a key for. A larger instance would
     // commit to a root over many and prove one of them here.
-    let root = if vault == Address::ZERO {
-        B256::ZERO
+    // The vault is on this chain: a vault on another chain is served by its
+    // station here, which is blessed against the vault chain's id.
+    let vault_chain = if vault == Address::ZERO {
+        U256::ZERO
     } else {
-        keccak256(keccak256((vault, bundle).abi_encode()))
+        U256::from(deployments.chain_id)
     };
-    let journal: Journal = (image, project_id(), key, root);
+    // The one leaf this instance holds a key for: a vault and its bundle, or
+    // for a builder or a reviewer, no vault, on this chain. A larger instance
+    // would commit to a root over many and prove one of them here.
+    let this_chain = U256::from(deployments.chain_id);
+    let root = keccak256(keccak256(
+        (vault_chain, vault, bundle, this_chain).abi_encode(),
+    ));
+    // A blessing runs a TTL from when the instance attested, by the chain's
+    // own clock.
+    let issued_at = chain
+        .block_timestamp()
+        .await
+        .context("reading the chain's clock")?;
+    let journal: Journal = (image, project_id(), key, root, issued_at);
     let encoded = journal.abi_encode_params();
     let seal = chain
         .sign(deployments.roles.attestor, keccak256(&encoded))
@@ -140,6 +156,7 @@ async fn bless(
                     IAttestationRegistry::blessCall {
                         seal: seal.clone(),
                         journal: encoded.clone().into(),
+                        vaultChain: vault_chain,
                         vault,
                         strategyHash: bundle,
                         merkleProof: Vec::new(),

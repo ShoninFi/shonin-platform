@@ -1,9 +1,8 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["score", "summary", "findings", "limits"],
+  "required": ["summary", "findings", "limits", "answers"],
   "properties": {
-    "score": { "type": "integer", "minimum": 0, "maximum": 100 },
     "summary": {
       "type": "string",
       "description": "What the code does, in the reviewer's own words, beside the author's."
@@ -13,18 +12,17 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["category", "severity", "summary", "detail", "file", "line"],
+        "required": ["area", "severity", "summary", "detail", "file", "line"],
         "properties": {
-          "category": {
+          "area": {
             "type": "string",
             "enum": [
-              "unbounded-risk",
-              "missing-failure-handling",
-              "model-dependence",
-              "external-dependence",
-              "known-failure-pattern",
-              "hidden-behaviour",
-              "unaudited-dependencies"
+              "security",
+              "financial-risk",
+              "reliability",
+              "reproducibility",
+              "outside-influence",
+              "accurate-description"
             ]
           },
           "severity": { "type": "string", "enum": ["note", "concern", "serious"] },
@@ -39,6 +37,20 @@
       "type": "array",
       "items": { "type": "string" },
       "description": "What this review could not see."
+    },
+    "answers": {
+      "type": "array",
+      "description": "One answer for every question in the battery.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "probability", "confidence"],
+        "properties": {
+          "id": { "type": "string" },
+          "probability": { "type": "number", "minimum": 0, "maximum": 1 },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+        }
+      }
     }
   }
 }

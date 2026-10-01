@@ -1,7 +1,7 @@
 //! An author's page: everything they have ever published.
 
 use dominator::{Dom, html};
-use shared::Standing;
+use shared::JobState;
 
 use crate::copy;
 use crate::data;
@@ -26,10 +26,43 @@ pub fn render(handle: &str) -> Dom {
         .filter(|strategy| strategy.standing.is_live())
         .map(|strategy| strategy.capital())
         .sum();
-    let lowest = published
+    let alarming = published
         .iter()
-        .filter_map(|strategy| strategy.review.as_ref().map(|review| review.score))
-        .min();
+        .filter(|strategy| {
+            strategy
+                .review
+                .as_ref()
+                .is_some_and(|review| review.is_alarming())
+        })
+        .count();
+    // Everything submitted that never got a vault: refused, failed, or ready
+    // and not yet activated. It is part of the record too.
+    let unopened: Vec<Row> = data::jobs()
+        .iter()
+        .filter(|job| job.author.eq_ignore_ascii_case(handle))
+        .filter(|job| {
+            matches!(
+                job.state,
+                JobState::Ready | JobState::Refused | JobState::Failed { .. }
+            )
+        })
+        .map(|job| {
+            Row::linked(
+                format!("/queue/{}", job.id),
+                vec![
+                    html!("span", { .class("table__primary").text(&job.title) }),
+                    ui::badge(
+                        job.state.label(),
+                        match job.state {
+                            JobState::Ready => Tone::Ok,
+                            _ => Tone::Error,
+                        },
+                    ),
+                    ui::muted(&fmt::date(job.submitted.date())),
+                ],
+            )
+        })
+        .collect();
 
     let rows: Vec<Row> = published
         .iter()
@@ -39,7 +72,7 @@ pub fn render(handle: &str) -> Dom {
                 parts::path_of(strategy),
                 vec![
                     html!("div", {
-                        .child(html!("div", { .class("table__primary").text(&strategy.name()) }))
+                        .child(html!("div", { .class("table__primary").text(strategy.name()) }))
                         .child(html!("div", {
                             .class(["faint", "small"])
                             .text(&strategy.title)
@@ -48,14 +81,10 @@ pub fn render(handle: &str) -> Dom {
                     parts::standing_badge(strategy.standing),
                     ui::muted(&fmt::date(strategy.registered)),
                     ui::number(&fmt::days(strategy.days_live)),
-                    if strategy.standing == Standing::BuildFailed {
-                        ui::muted("—")
-                    } else {
-                        ui::signed(
-                            performance.normalised_annualised,
-                            &fmt::percent_signed(performance.normalised_annualised, 1),
-                        )
-                    },
+                    ui::signed(
+                        performance.return_since_open,
+                        &fmt::percent_signed(performance.return_since_open, 1),
+                    ),
                     parts::review_badge(strategy),
                     ui::number(&fmt::money_compact(strategy.capital())),
                     parts::spark(strategy),
@@ -84,9 +113,9 @@ pub fn render(handle: &str) -> Dom {
                 Some("across live agents"),
             ),
             ui::stat(
-                "Lowest review score",
-                &lowest.map_or_else(|| "—".to_string(), |score| score.to_string()),
-                Some("of everything they've published"),
+                "Serious concerns",
+                &alarming.to_string(),
+                Some("agents whose review flags one"),
             ),
         ]))
         .child(ui::section(
@@ -98,7 +127,7 @@ pub fn render(handle: &str) -> Dom {
                         Column::new("Standing"),
                         Column::new("Registered"),
                         Column::num("Live"),
-                        Column::num("Normalised"),
+                        Column::num("Since opening"),
                         Column::num("Review"),
                         Column::num("Capital"),
                         Column::new("Shape"),
@@ -108,15 +137,22 @@ pub fn render(handle: &str) -> Dom {
                 ui::notice(
                     Tone::Info,
                     "This is the whole list",
-                    "Live, new, superseded, retired, and the builds that failed. Nothing here can be \
-                     hidden by its author.",
+                    "Live and stopped, and below, everything submitted that never opened a vault. \
+                     Nothing here can be hidden by its author.",
                 ),
                 ui::note(&format!(
                     "An author can publish under a fresh identity, but every agent needs {} \
-                     live days before it is ranked.",
-                    copy::days_to_rank()
+                     live days before it is on the leaderboard.",
+                    copy::days_new()
                 )),
             ],
         ))
+        .apply_if(!unopened.is_empty(), |dom| dom.child(ui::section(
+            "Submitted, and never opened",
+            vec![table(
+                vec![Column::new("Agent").wide(), Column::new("How it ended"), Column::new("Submitted")],
+                unopened,
+            )],
+        )))
     })
 }

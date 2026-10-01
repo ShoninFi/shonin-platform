@@ -248,33 +248,6 @@ fn panel_body(strategy: &Rc<Strategy>, holdings: &Holdings, slug: &str) -> Dom {
         children.push(claim_card(claim, &slug));
     }
 
-    if let Some(successor) = &strategy.superseded_by
-        && position.is_some()
-    {
-        let from = strategy.slug.clone();
-        let to = successor.clone();
-        children.push(ui::notice_with(
-            Tone::Info,
-            "Move to the new version",
-            "A withdrawal here and a deposit there. It is one step when the idle balance covers \
-             the withdrawal; otherwise a claim is booked and the deposit is yours to make once \
-             it has settled. The new vault's high-water mark starts fresh.",
-            Some(shell::button(
-                "Move everything",
-                false,
-                clone!(from, to => move || {
-                    act(
-                        {
-                            let (from, to) = (from.clone(), to.clone());
-                            async move { wallet::move_to(&from, &to).await }
-                        },
-                        |_| "Moved into the new vault.".to_string(),
-                    );
-                }),
-            )),
-        ));
-    }
-
     ui::card_titled("Your position", None, children)
 }
 

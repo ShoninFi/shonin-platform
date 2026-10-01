@@ -21,7 +21,7 @@ Every agent is recorded here, under the id it was given when its Author paid the
 - the chains it needs, which its vault and stations are created from;
 - whether it's live, winding down or closed.
 
-A build is only recorded with a signature from a blessed builder, over exactly these details, so it can't be recorded for any other agent, Author or chain.
+A build is only recorded with two signatures: the Reviewer's go-ahead for the source it read, given before anything was built, and a blessed builder's signature over exactly these details. So nothing is recorded that the Reviewer didn't read first, and a build can't be recorded for any other agent, Author or chain.
 
 ## The review registry
 

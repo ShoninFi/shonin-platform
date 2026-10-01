@@ -20,7 +20,7 @@ use axum::routing::{get, post};
 use chain::bindings::attestation::IAttestationRegistry;
 use chain::bindings::erc20::IERC20;
 use chain::bindings::factory::IVaultFactory;
-use chain::bindings::reviews::IReviewRegistry;
+use chain::bindings::publishing::IPublishing;
 use chain::bindings::vault::IVault;
 use chain::{Client, Role, Served};
 use clap::Parser;
@@ -28,7 +28,7 @@ use indexer::{Indexer, read};
 use shared::model::registry::Job;
 use shared::{
     Addresses, Chain, ChainInfo, Config, DevMode, HealthPost, HeldClaim, Holding, Portfolio,
-    Snapshot, Submission, SubmissionAccepted, Terms,
+    Snapshot, Terms, Upload, UploadAccepted,
 };
 
 #[derive(Parser)]
@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
         // One vault chain, named in the path.
         .route("/api/{chain}/config", get(config))
         .route("/api/{chain}/portfolio/{address}", get(portfolio))
-        .route("/api/{chain}/submissions", post(submissions))
+        .route("/api/{chain}/uploads", post(uploads))
         .route("/api/{chain}/health", post(post_health))
         .route("/api/store/{hash}/{name}", get(store_file))
         .layer(tower_http::cors::CorsLayer::permissive())
@@ -160,6 +160,8 @@ async fn config(
         rpc_url: served.client.rpc_url.clone(),
         addresses: Addresses {
             usd: format!("{:?}", deployments.usd),
+            publishing: format!("{:?}", deployments.publishing),
+            prices: format!("{:?}", deployments.prices),
             venue: format!("{:?}", deployments.venue),
             attestation: format!("{:?}", deployments.attestation),
             strategies: format!("{:?}", deployments.strategies),
@@ -315,16 +317,16 @@ async fn terms(on: Chain, chain: &Client, deployments: &chain::Deployments) -> R
         )
         .await
         .with_context(|| format!("reading the terms on {on}"))?;
-    let review_fee = chain
-        .read(deployments.reviews, IReviewRegistry::reviewFeeCall {})
+    let publish_fee = chain
+        .read(deployments.publishing, IPublishing::feeCall {})
         .await
         .with_context(|| format!("reading the terms on {on}"))?;
 
     Ok(Terms {
         minimum_tank: dollars(vaults.minimumTank),
-        review_fee: dollars(review_fee),
+        publish_fee: dollars(publish_fee),
         fees: shared::Fees {
-            streaming_bps: vaults.streamingBps as u32,
+            holding_bps: vaults.streamingBps as u32,
             author_bps: vaults.authorBps as u32,
             platform_bps: vaults.platformBps as u32,
             transaction_bps: vaults.transactionBps as u32,
@@ -344,6 +346,7 @@ async fn jobs(State(service): State<Arc<Service>>) -> Json<Vec<Job>> {
     Json(service.indexer.snapshot.read().await.jobs.clone())
 }
 
+/// One job, as fresh as the build service has it, with what the chain adds.
 async fn job(
     State(service): State<Arc<Service>>,
     UrlPath(id): UrlPath<String>,
@@ -358,20 +361,33 @@ async fn job(
         .ok_or(StatusCode::NOT_FOUND)?
         .await
         .ok();
-    found.map(Json).ok_or(StatusCode::NOT_FOUND)
+    let job = found.ok_or(StatusCode::NOT_FOUND)?;
+    let job = match service.indexer.on(job.chain) {
+        Some(served) => {
+            indexer::read::job(
+                &served.client,
+                &served.deployments,
+                &service.indexer.store,
+                job,
+            )
+            .await
+        }
+        None => job,
+    };
+    Ok(Json(job))
 }
 
-/// Submissions go straight to the build service; the API only carries them.
-async fn submissions(
+/// Uploads go straight to the build service; the API only carries them.
+async fn uploads(
     State(service): State<Arc<Service>>,
     UrlPath(chain): UrlPath<Chain>,
-    Json(submission): Json<Submission>,
-) -> Result<Json<SubmissionAccepted>, (StatusCode, Json<shared::ApiError>)> {
+    Json(upload): Json<Upload>,
+) -> Result<Json<UploadAccepted>, (StatusCode, Json<shared::ApiError>)> {
     served(&service, chain)?;
     let fail = |status: StatusCode, message: String| (status, Json(shared::ApiError { message }));
     let reply = reqwest::Client::new()
-        .post(format!("{}/{chain}/submissions", service.builder))
-        .json(&submission)
+        .post(format!("{}/{chain}/uploads", service.builder))
+        .json(&upload)
         .send()
         .await
         .map_err(|error| {
@@ -423,6 +439,7 @@ async fn post_health(
             served.deployments.attestation,
             IAttestationRegistry::isBlessedForCall {
                 signer,
+                vaultChain: alloy::primitives::U256::from(served.deployments.chain_id),
                 vault,
                 strategyHash: bundle,
             },

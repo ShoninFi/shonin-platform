@@ -4,7 +4,7 @@
 
 use dominator::{Dom, events, html, link, svg, text};
 use futures_signals::signal::{Mutable, SignalExt};
-use shared::{AuditStatus, HealthLevel, ScoreBand};
+use shared::{HealthLevel, Rating};
 
 use crate::format as fmt;
 use crate::ui::icon;
@@ -60,11 +60,13 @@ impl Tone {
     }
 
     /// The tone an audit's status reads in.
-    pub fn from_audit(status: AuditStatus) -> Self {
-        match status {
-            AuditStatus::Audited => Self::Ok,
-            AuditStatus::InProgress => Self::Warn,
-            AuditStatus::Unaudited => Self::Neutral,
+    /// How a review's rating of one area should read.
+    pub fn from_rating(rating: Rating) -> Self {
+        match rating {
+            Rating::LooksFine => Self::Ok,
+            Rating::SomeConcerns => Self::Warn,
+            Rating::SeriousConcerns => Self::Error,
+            Rating::CouldntTell => Self::Neutral,
         }
     }
 }
@@ -196,17 +198,9 @@ pub fn badges(children: Vec<Dom>) -> Dom {
 }
 
 /// A review score, coloured by band, out of 100.
-pub fn score(value: u8, band: ScoreBand) -> Dom {
-    html!("span", {
-        .class("score")
-        .class(match band {
-            ScoreBand::High => "score--high",
-            ScoreBand::Middling => "score--mid",
-            ScoreBand::Low => "score--low",
-        })
-        .child(html!("span", { .class("score__value").text(&value.to_string()) }))
-        .child(html!("span", { .class("score__max").text("/100") }))
-    })
+/// One area's rating, as a badge.
+pub fn rating(rating: Rating) -> Dom {
+    badge(rating.label(), Tone::from_rating(rating))
 }
 
 /// A list of labels and values.

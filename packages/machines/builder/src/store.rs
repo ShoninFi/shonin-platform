@@ -1,6 +1,6 @@
 //! Where everything a build produced is kept, addressed by its own hash.
 //!
-//! Source, bundles, build logs and review reports all live here. A hash is the
+//! Source, bundles, manifests and review reports all live here. A hash is the
 //! whole address: anyone with the hash from the chain can ask for the bytes
 //! and check for themselves that they are the bytes the hash names.
 

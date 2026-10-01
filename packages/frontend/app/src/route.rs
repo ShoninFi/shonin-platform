@@ -287,8 +287,8 @@ impl Route {
             ),
             Self::Strategies => page(
                 "Agents · Shonin",
-                "Every agent on the platform, ranked on live on-chain records normalised to \
-                 one level of risk, with the size each record was earned at.",
+                "Every agent on the platform, with its return over 30 days and since opening, \
+                 its deepest drop and the money in its vault, all read from the chain.",
             ),
             Self::Strategy { slug, tab } => {
                 let Some(strategy) = data::strategy(slug) else {
@@ -310,15 +310,15 @@ impl Route {
                     Tab::Code => page(
                         &format!("{name} code · Shonin"),
                         &format!(
-                            "The bundle {name} runs, the source it was compiled from, its build \
-                             log and the components it pins."
+                            "The bundle {name} runs, the source it was compiled from, the \
+                             recipe it was built with and the hashes that tie them together."
                         ),
                     ),
                     Tab::Review => page(
                         &format!("{name} review · Shonin"),
                         &format!(
-                            "The attested review of {name}: a score for whether the code is \
-                             reasonable, with the findings behind it."
+                            "The attested review of {name}: six areas rated, with the findings \
+                             behind each."
                         ),
                     ),
                     Tab::Verify => page(
@@ -340,8 +340,7 @@ impl Route {
             Self::Author { handle } => page(
                 &format!("{handle} · Shonin"),
                 &format!(
-                    "Every agent {handle} has published — live, new, superseded, retired and \
-                     the builds that failed — with their records."
+                    "Every agent {handle} has published, live or stopped, with their records."
                 ),
             ),
             Self::Portfolio => page(
@@ -350,26 +349,25 @@ impl Route {
                  connected.",
             ),
             Self::Queue => page(
-                "Build queue · Shonin",
-                "Every build, first come first served, with its full log whether it succeeded or \
-                 failed.",
+                "Publishing queue · Shonin",
+                "Every publishing job, first come first served, and how each one ended.",
             ),
             Self::Job { id } => {
                 let Some(job) = data::job(id) else {
                     return Self::NotFound.page();
                 };
                 page(
-                    &format!("Build {} · {} · Shonin", job.id, job.subject),
+                    &format!("Job {} · {} · Shonin", job.id, job.title),
                     &format!(
-                        "The build of {} by {}: its state, its recipe and its full log.",
-                        job.subject, job.author
+                        "Publishing {} by {}: its review, its build, and how it ended.",
+                        job.title, job.author
                     ),
                 )
             }
             Self::Publish => page(
                 "Publish an agent · Shonin",
-                "Submit a Rust project; an attested builder compiles it, an attested reviewer \
-                 reads it, and its vault opens for deposits.",
+                "Submit a Rust project for $1: an attested reviewer reads it, an attested \
+                 builder compiles it, and you activate its vault when you're ready.",
             ),
             Self::Status => page(
                 "Status · Shonin",

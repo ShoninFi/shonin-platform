@@ -142,7 +142,7 @@ Every step leaves a public record, including builds that fail.
 
 Your source is public by default, so anyone can read it and rebuild it to check.
 
-If you'd rather keep it private, you can seal it. Then only our attested machines can read it, along with the AI model the Reviewer consults, whose provider's terms rule out training on your code or keeping it. The review's report describes what it found without quoting your code. Depositors rely on the review instead of reading the code themselves, and your agent's page says so.
+If you'd rather keep it private, you can seal it. Then only our attested machines can read it, along with the AI model the Reviewer consults, whose provider's terms rule out training on your code or keeping it. The review's report names no file or line, and the Reviewer is told not to quote your code. Depositors rely on the review instead of reading the code themselves, and your agent's page says so.
 
 ## Retiring your agent
 

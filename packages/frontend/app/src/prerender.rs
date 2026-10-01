@@ -6,8 +6,6 @@
 //! link previews and anyone without JavaScript see the real page; the app
 //! replaces it with the interactive version when it boots.
 
-use shared::Standing;
-
 use crate::copy;
 use crate::data;
 use crate::format as fmt;
@@ -209,15 +207,15 @@ fn home() -> String {
             .map(|(title, body)| format!("{} {}", el("strong", "", &esc(title)), esc(&body))),
     );
 
-    let rows: Vec<Vec<String>> = ranked()
+    let rows: Vec<Vec<String>> = listed()
         .into_iter()
         .take(5)
         .map(|strategy| {
             let performance = performance(&strategy);
             vec![
-                link(&format!("/agents/{}", strategy.slug), &strategy.name()),
+                link(&format!("/agents/{}", strategy.slug), strategy.name()),
                 esc(&strategy.author),
-                esc(&fmt::annualised(performance.normalised_annualised)),
+                esc(&thirty_days(&performance)),
                 esc(&fmt::money_compact(strategy.capital())),
             ]
         })
@@ -243,10 +241,10 @@ fn home() -> String {
             )),
         ),
         (
-            "Ranked".to_string(),
+            "On the leaderboard".to_string(),
             esc(&format!(
                 "{}, and {} more labelled new",
-                data::ranked().len(),
+                data::listed().len(),
                 data::newest().len()
             )),
         ),
@@ -270,8 +268,8 @@ fn home() -> String {
             "The agents",
             &format!(
                 "{}{}",
-                table(&["Agent", "Author", "Normalised return", "Capital"], &rows),
-                para_link("/agents", "Every agent, ranked")
+                table(&["Agent", "Author", "Last 30 days", "In the vault"], &rows),
+                para_link("/agents", "The whole leaderboard")
             ),
         ),
     ]
@@ -282,22 +280,25 @@ fn para_link(href: &str, text: &str) -> String {
     el("p", "", &link(href, text))
 }
 
-use data::{performance, ranked};
+use data::{listed, performance};
+
+/// The 30-day return, or a dash before there are 30 days of it.
+fn thirty_days(performance: &shared::Performance) -> String {
+    performance
+        .return_30d
+        .map_or_else(|| "—".to_string(), |value| fmt::percent_signed(value, 1))
+}
 
 fn strategies() -> String {
     let row = |strategy: &shared::Strategy| {
         let performance = performance(strategy);
         vec![
-            link(&format!("/agents/{}", strategy.slug), &strategy.name()),
+            link(&format!("/agents/{}", strategy.slug), strategy.name()),
             link(&format!("/authors/{}", strategy.author), &strategy.author),
             esc(&fmt::days(strategy.days_live)),
-            esc(&fmt::annualised(performance.normalised_annualised)),
-            esc(&fmt::annualised(performance.raw_annualised)),
-            esc(&fmt::percent_signed(performance.max_drawdown, 1)),
-            strategy
-                .review
-                .as_ref()
-                .map_or_else(|| "pending".to_string(), |review| review.score.to_string()),
+            esc(&thirty_days(&performance)),
+            esc(&fmt::percent_signed(performance.return_since_open, 1)),
+            esc(&fmt::percent_signed(performance.deepest_drop, 1)),
             esc(&fmt::money_compact(strategy.capital())),
         ]
     };
@@ -306,25 +307,22 @@ fn strategies() -> String {
         "Agent",
         "Author",
         "Live",
-        "Normalised return",
-        "Raw return",
-        "Max drawdown",
-        "Review",
-        "Capital",
+        "Last 30 days",
+        "Since opening",
+        "Deepest drop",
+        "In the vault",
     ];
 
-    let ranked_rows: Vec<Vec<String>> = ranked().iter().map(|strategy| row(strategy)).collect();
-    let new_rows: Vec<Vec<String>> = data::vaults()
+    let listed_rows: Vec<Vec<String>> = listed().iter().map(|strategy| row(strategy)).collect();
+    let new_rows: Vec<Vec<String>> = data::newest()
         .iter()
-        .filter(|strategy| strategy.standing == Standing::New)
         .map(|strategy| row(strategy))
         .collect();
-    let rest_rows: Vec<Vec<String>> = data::vaults()
+    let rest_rows: Vec<Vec<String>> = data::past()
         .into_iter()
-        .filter(|strategy| !strategy.standing.is_live())
         .map(|strategy| {
             vec![
-                link(&format!("/agents/{}", strategy.slug), &strategy.name()),
+                link(&format!("/agents/{}", strategy.slug), strategy.name()),
                 link(&format!("/authors/{}", strategy.author), &strategy.author),
                 esc(strategy.standing.label()),
                 esc(&fmt::days(strategy.days_live)),
@@ -341,23 +339,23 @@ fn strategies() -> String {
     [
         heading(1, "Agents"),
         para(
-            "Ranked on live on-chain records, rescaled to one level of risk, with the size each \
-             record was earned at.",
+            "Every agent's return over 30 days and since opening, its deepest drop and the money \
+             in its vault, read from its own contract.",
         ),
-        section("Ranked", &table(&headers, &ranked_rows)),
+        section("The leaderboard", &table(&headers, &listed_rows)),
         section(
             "New",
             &format!(
                 "{}{}",
                 para(&format!(
-                    "Open for deposits, and not ranked until they have {} live days.",
-                    copy::days_to_rank()
+                    "Open for deposits, and on the leaderboard once they have {} live days.",
+                    copy::days_new()
                 )),
                 table(&headers, &new_rows)
             ),
         ),
         section(
-            "Superseded, retired and stopped",
+            "Stopped",
             &table(&["Agent", "Author", "Standing", "Live"], &rest_rows),
         ),
         section("How this list is built", &rules),
@@ -393,7 +391,7 @@ fn strategy(slug: &str, tab: Tab) -> String {
 
     let header = format!(
         "{}{}{}",
-        heading(1, &strategy.name()),
+        heading(1, strategy.name()),
         para(&format!(
             "{} · by {} · {} · {}",
             strategy.title,
@@ -427,20 +425,6 @@ fn strategy_overview(strategy: &shared::Strategy) -> String {
         ));
     }
 
-    if let Some(successor) = &strategy.superseded_by {
-        out.push(section(
-            "A newer version exists",
-            &format!(
-                "{}{}",
-                para(
-                    "This vault runs exactly as it always has. A new version is a separate vault, \
-                     which depositors choose to move to."
-                ),
-                para_link(&format!("/agents/{successor}"), "See the new version")
-            ),
-        ));
-    }
-
     if let Some(record) = &strategy.record {
         out.push(section(
             "The record",
@@ -453,17 +437,14 @@ fn strategy_overview(strategy: &shared::Strategy) -> String {
                         fmt::count(record.trades)
                     )),
                 ),
+                ("Last 30 days".to_string(), esc(&thirty_days(&performance))),
                 (
-                    "Normalised return".to_string(),
-                    esc(&fmt::annualised(performance.normalised_annualised)),
+                    "Since opening".to_string(),
+                    esc(&fmt::percent_signed(performance.return_since_open, 1)),
                 ),
                 (
-                    "Raw return".to_string(),
-                    esc(&fmt::annualised(performance.raw_annualised)),
-                ),
-                (
-                    "Max drawdown".to_string(),
-                    esc(&fmt::percent_signed(performance.max_drawdown, 1)),
+                    "Deepest drop".to_string(),
+                    esc(&fmt::percent_signed(performance.deepest_drop, 1)),
                 ),
                 (
                     "Size it was earned at".to_string(),
@@ -482,12 +463,7 @@ fn strategy_overview(strategy: &shared::Strategy) -> String {
             "The review",
             &format!(
                 "{}{}{}",
-                para(&format!(
-                    "Score {} out of 100, with {} finding{}.",
-                    review.score,
-                    review.findings.len(),
-                    if review.findings.len() == 1 { "" } else { "s" }
-                )),
+                ratings(review),
                 para(&review.summary),
                 para_link(
                     &format!("/agents/{}/review", strategy.slug),
@@ -543,7 +519,10 @@ fn strategy_overview(strategy: &shared::Strategy) -> String {
                 ("Value".to_string(), esc(&fmt::money(vault.value))),
                 (
                     "Value per share".to_string(),
-                    esc(&fmt::share_price(vault.share_price)),
+                    esc(&format!(
+                        "{}, after fees, including this week's so far",
+                        fmt::share_price(vault.share_price)
+                    )),
                 ),
                 (
                     "High-water mark".to_string(),
@@ -567,22 +546,6 @@ fn strategy_overview(strategy: &shared::Strategy) -> String {
             ]),
         ));
 
-        let audit_rows: Vec<Vec<String>> = vault
-            .audits
-            .iter()
-            .map(|audit| {
-                vec![
-                    esc(&audit.subject),
-                    esc(audit.status.label()),
-                    esc(&audit.note),
-                ]
-            })
-            .collect();
-        out.push(section(
-            "Audit status",
-            &table(&["What", "Status", "Notes"], &audit_rows),
-        ));
-
         out.push(section(
             "Fees",
             &format!(
@@ -599,42 +562,72 @@ fn strategy_overview(strategy: &shared::Strategy) -> String {
         ));
     }
 
-    if !strategy.limits.is_empty() {
+    if !strategy.claims.is_empty() {
         out.push(section(
-            "What it will not do",
+            "What it claims about itself",
             &format!(
                 "{}{}",
                 para(
-                    "There is no platform risk policy. These limits live in the agent's own \
-                     code, where the reviewer reads them."
+                    "In the author's words. Any limit lives in the agent's own code, and the \
+                     review checks each claim against it."
                 ),
-                list(strategy.limits.iter().map(|limit| esc(limit)))
+                list(strategy.claims.iter().map(|claim| esc(claim)))
             ),
         ));
     }
 
-    if !strategy.dependencies.is_empty() {
-        out.push(section(
-            "What it depends on",
-            &list(strategy.dependencies.iter().map(|item| esc(item))),
-        ));
-    }
+    out.push(section(
+        "Who can't deposit",
+        &format!(
+            "{}{}",
+            list(
+                strategy
+                    .restricted
+                    .iter()
+                    .map(|code| esc(&restricted_name(code)))
+            ),
+            para(
+                "A deposit carries the depositor's signed statement that they aren't one of them. \
+                 Withdrawing is never restricted."
+            )
+        ),
+    ));
 
     out.concat()
+}
+
+/// A review's six ratings, as a list.
+fn ratings(review: &shared::Review) -> String {
+    list(shared::Area::ALL.into_iter().map(|area| {
+        format!(
+            "{}: {}",
+            el("strong", "", &esc(area.label())),
+            esc(review.rating(area).label())
+        )
+    }))
+}
+
+/// A restricted-list code, as a sentence names it.
+fn restricted_name(code: &str) -> String {
+    match code {
+        "US" => "US persons".to_string(),
+        "SANCTIONED" => "Sanctioned persons".to_string(),
+        other => format!("Residents of {other}"),
+    }
 }
 
 fn fee_table(fees: &shared::Fees) -> String {
     let rows = vec![
         vec![
-            esc("Streaming fee"),
+            esc("Holding fee"),
             esc("The vault's value"),
             esc("Shonin"),
-            esc(&format!("{} a year", fmt::from_bps(fees.streaming_bps))),
+            esc(&format!("{} a year", fmt::from_bps(fees.holding_bps))),
         ],
         vec![
             esc("Author fee"),
-            esc("Gains above the high-water mark, daily"),
-            esc("The author, filling the vault's tank first"),
+            esc("Gains above the high-water mark, paid weekly"),
+            esc("The author"),
             esc(&format!("{} of profit", fmt::from_bps(fees.author_bps))),
         ],
         vec![
@@ -715,25 +708,14 @@ fn strategy_record(strategy: &shared::Strategy) -> String {
                         record.value_per_share.last().map_or(1.0, |p| p.value),
                     )),
                 ),
+                ("Last 30 days".to_string(), esc(&thirty_days(&performance))),
                 (
-                    "Total return".to_string(),
-                    esc(&fmt::percent_signed(performance.total_return, 1)),
+                    "Since opening".to_string(),
+                    esc(&fmt::percent_signed(performance.return_since_open, 1)),
                 ),
                 (
-                    "Normalised".to_string(),
-                    esc(&fmt::annualised(performance.normalised_annualised)),
-                ),
-                (
-                    "Raw".to_string(),
-                    esc(&fmt::annualised(performance.raw_annualised)),
-                ),
-                (
-                    "Realised volatility".to_string(),
-                    esc(&fmt::percent(performance.volatility, 1)),
-                ),
-                (
-                    "Max drawdown".to_string(),
-                    esc(&fmt::percent_signed(performance.max_drawdown, 1)),
+                    "Deepest drop".to_string(),
+                    esc(&fmt::percent_signed(performance.deepest_drop, 1)),
                 ),
                 ("Trades".to_string(), esc(&fmt::count(record.trades))),
                 (
@@ -817,59 +799,21 @@ fn strategy_code(strategy: &shared::Strategy) -> String {
         ));
     }
 
-    if !bundle.allowances.placement.is_empty() {
-        out.push(section(
-            "What it may use",
-            &facts(&[
-                (
-                    "Fuel".to_string(),
-                    esc(&format!(
-                        "{} a second",
-                        fmt::count(
-                            u32::try_from(bundle.allowances.fuel_per_sec).unwrap_or(u32::MAX)
-                        )
-                    )),
-                ),
-                (
-                    "Memory".to_string(),
-                    esc(&format!("{} MiB", bundle.allowances.memory_mib)),
-                ),
-                (
-                    "Bandwidth".to_string(),
-                    esc(&format!(
-                        "{} requests a minute, {} a day, {} streams",
-                        fmt::count(bundle.allowances.requests_per_min),
-                        fmt::bytes(
-                            u32::try_from(bundle.allowances.bytes_per_day).unwrap_or(u32::MAX)
-                        ),
-                        bundle.allowances.streams
-                    )),
-                ),
-                (
-                    "Inference".to_string(),
-                    esc(&format!(
-                        "{} ms a minute",
-                        bundle.allowances.inference_ms_per_min
-                    )),
-                ),
-                ("Placement".to_string(), esc(&bundle.allowances.placement)),
-            ]),
-        ));
-    }
-
-    if !bundle.secrets.is_empty() {
-        out.push(section(
-            "Sealed secrets",
-            &format!(
-                "{}{}",
-                para(
-                    "Values sealed to this bundle's hash. Only an attested executor running \
-                     exactly this bundle can read them, and they never appear in a record."
-                ),
-                list(bundle.secrets.iter().map(|name| esc(name)))
+    out.push(section(
+        "What its shonin.toml declares",
+        &facts(&[
+            ("Vault chain".to_string(), esc(strategy.vault.chain.label())),
+            ("Drivers".to_string(), esc(&strategy.drivers.join(", "))),
+            (
+                "Bridges".to_string(),
+                esc(&if strategy.bridges.is_empty() {
+                    "none".to_string()
+                } else {
+                    strategy.bridges.join(", ")
+                }),
             ),
-        ));
-    }
+        ]),
+    ));
 
     if let Some(manifest) = bundle
         .source_files
@@ -904,27 +848,23 @@ fn strategy_code(strategy: &shared::Strategy) -> String {
         }
     }
 
-    let log: String = bundle
-        .build_log
-        .iter()
-        .map(|line| line.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    out.push(section("The build log", &code_block(&log)));
-
     out.concat()
 }
 
 fn strategy_review(strategy: &shared::Strategy) -> String {
-    let Some(review) = &strategy.review else {
-        return section(
+    match &strategy.review {
+        Some(review) => review_report(review),
+        None => section(
             "Review pending",
             &para(
-                "The reviewer hasn't scored this agent yet. The score appears here when it is signed.",
+                "The reviewer hasn't posted its report card yet. It appears here when it is signed.",
             ),
-        );
-    };
+        ),
+    }
+}
 
+/// A review in full: what the strategy page and the job page both show.
+fn review_report(review: &shared::Review) -> String {
     let findings: String = if review.findings.is_empty() {
         para("No findings.")
     } else {
@@ -932,21 +872,23 @@ fn strategy_review(strategy: &shared::Strategy) -> String {
             .findings
             .iter()
             .map(|finding| {
+                let place = match (&finding.file, finding.line) {
+                    (Some(file), Some(line)) => format!(" · {file}:{line}"),
+                    (Some(file), None) => format!(" · {file}"),
+                    _ => String::new(),
+                };
                 el(
                     "article",
                     "class=\"card stack-sm\"",
                     &format!(
-                        "{}{}{}{}",
+                        "{}{}{}",
                         heading(3, &finding.summary),
                         para(&format!(
-                            "{} · {} · {}:{}",
-                            finding.category.label(),
-                            finding.severity.label(),
-                            finding.file,
-                            finding.line
+                            "{} · {}{place}",
+                            finding.area.label(),
+                            finding.severity.label()
                         )),
-                        para(&finding.detail),
-                        String::new()
+                        para(&finding.detail)
                     ),
                 )
             })
@@ -955,10 +897,15 @@ fn strategy_review(strategy: &shared::Strategy) -> String {
 
     [
         section(
-            "The score",
+            "The report card",
             &format!(
-                "{}{}{}",
-                para(&format!("{} out of 100.", review.score)),
+                "{}{}{}{}",
+                if review.refused {
+                    para("Refused as malicious: nothing was built.")
+                } else {
+                    String::new()
+                },
+                ratings(review),
                 para(&review.summary),
                 para(copy::REVIEW_NOTE)
             ),
@@ -970,9 +917,11 @@ fn strategy_review(strategy: &shared::Strategy) -> String {
                 ("Reviewed".to_string(), esc(&fmt::date(review.reviewed))),
                 ("Reviewer image".to_string(), esc(&review.reviewer_image)),
                 ("Model".to_string(), esc(&review.model_id_hash)),
-                ("Prompt and schema".to_string(), esc(&review.prompt_hash)),
+                (
+                    "Prompt, schema and battery".to_string(),
+                    esc(&review.prompt_hash),
+                ),
                 ("Full report".to_string(), esc(&review.report_hash)),
-                ("Paid for by".to_string(), esc(&review.bought_by)),
             ]),
         ),
         section(
@@ -1022,7 +971,7 @@ fn strategy_verify(strategy: &shared::Strategy) -> String {
     [
         heading(2, "Which code is trading this vault?"),
         facts(&[
-            ("Agent".to_string(), esc(&strategy.name())),
+            ("Agent".to_string(), esc(strategy.name())),
             ("Bundle".to_string(), esc(&strategy.bundle.bundle_hash)),
             (
                 "Built from".to_string(),
@@ -1034,10 +983,9 @@ fn strategy_verify(strategy: &shared::Strategy) -> String {
             (
                 "Executor image".to_string(),
                 esc(&format!(
-                    "{} · allowlisted {} · audit {}",
+                    "{} · allowlisted {}",
                     attestation.image.digest,
-                    fmt::date(attestation.image.allowlisted),
-                    attestation.image.audit.label()
+                    fmt::date(attestation.image.allowlisted)
                 )),
             ),
             ("Trust root".to_string(), esc(&attestation.trust_root)),
@@ -1138,13 +1086,13 @@ fn author(handle: &str) -> String {
         .iter()
         .map(|strategy| {
             vec![
-                link(&format!("/agents/{}", strategy.slug), &strategy.name()),
+                link(&format!("/agents/{}", strategy.slug), strategy.name()),
                 esc(strategy.standing.label()),
                 esc(&fmt::days(strategy.days_live)),
-                strategy
-                    .review
-                    .as_ref()
-                    .map_or_else(|| "—".to_string(), |review| review.score.to_string()),
+                esc(&fmt::percent_signed(
+                    performance(strategy).return_since_open,
+                    1,
+                )),
                 esc(&fmt::money_compact(strategy.capital())),
             ]
         })
@@ -1159,10 +1107,13 @@ fn author(handle: &str) -> String {
             &format!(
                 "{}{}",
                 para(
-                    "Every agent an author has registered is here: live, new, superseded, \
-                     retired, and the builds that failed. Publishing leaves a permanent record."
+                    "Every agent an author has activated is here, live or stopped, and the queue \
+                     shows everything they submitted. Publishing leaves a permanent record."
                 ),
-                table(&["Agent", "Standing", "Live", "Review", "Capital"], &rows)
+                table(
+                    &["Agent", "Standing", "Live", "Since opening", "In the vault"],
+                    &rows
+                )
             ),
         ),
     ]
@@ -1173,8 +1124,7 @@ fn portfolio() -> String {
     [
         heading(1, "Your positions"),
         para(
-            "What you hold across vaults, with your pending claims and how correlated your \
-             holdings are with each other.",
+            "What you hold across vaults, with your pending claims and what each has done.",
         ),
         para("This page shows what one address holds, read from the chain, so there is nothing to show until you connect a wallet."),
         para_link("/agents", "Browse the agents"),
@@ -1188,7 +1138,7 @@ fn queue() -> String {
         .map(|job| {
             vec![
                 link(&format!("/queue/{}", job.id), &job.id),
-                esc(&job.subject),
+                esc(&job.title),
                 esc(&job.author),
                 esc(job.state.label()),
                 esc(&fmt::ago(job.submitted, data::now())),
@@ -1197,13 +1147,13 @@ fn queue() -> String {
         .collect();
 
     [
-        heading(1, "Build queue"),
+        heading(1, "Publishing queue"),
         para(
-            "First come, first served, one job in flight per author. Every job shows its state \
-             and its full log, whether it succeeded or failed — an author can't quietly try \
-             twenty times and show you the twentieth.",
+            "First come, first served, one job in flight per author. Every job shows how it \
+             ended, refused and failed ones too, so an author can't quietly try twenty times and \
+             show you the twentieth. No job keeps a build log, which could leak sealed source.",
         ),
-        table(&["Build", "Subject", "Author", "State", "Submitted"], &rows),
+        table(&["Job", "Agent", "Author", "State", "Submitted"], &rows),
     ]
     .concat()
 }
@@ -1213,16 +1163,10 @@ fn job(id: &str) -> String {
         return not_found();
     };
 
-    let log: String = job
-        .log
-        .iter()
-        .map(|line| line.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-
     let mut facts_rows = vec![
-        ("Subject".to_string(), esc(&job.subject)),
+        ("Agent".to_string(), esc(&job.title)),
         ("Author".to_string(), esc(&job.author)),
+        ("Vault chain".to_string(), esc(job.chain.label())),
         ("State".to_string(), esc(job.state.label())),
         ("Submitted".to_string(), esc(&fmt::timestamp(job.submitted))),
         ("Source hash".to_string(), esc(&job.source_hash)),
@@ -1237,38 +1181,32 @@ fn job(id: &str) -> String {
         ));
     }
 
-    let mut out = vec![heading(1, &format!("Build {}", job.id)), facts(&facts_rows)];
-
-    if let shared::JobState::Failed { reason } = &job.state {
-        out.push(section(
+    let mut out = vec![heading(1, &job.title), facts(&facts_rows)];
+    match &job.state {
+        shared::JobState::Failed { outcome } => out.push(section(
             "It failed",
-            &format!(
-                "{}{}",
-                para(reason),
-                para(
-                    "The build is charged, because it ran. The vault closes and the author \
-                     reclaims the rest of its tank. A fixed resubmission is a new vault."
-                )
-            ),
-        ));
+            &para(&format!(
+                "{}. The $1 is spent and nothing was created. To see why a build failed, run the \
+                 same recipe yourself.",
+                outcome.label()
+            )),
+        )),
+        shared::JobState::Refused => out.push(section(
+            "Refused as malicious",
+            &para("The reviewer found code written to do harm, so nothing was built."),
+        )),
+        shared::JobState::Ready => out.push(section(
+            "Ready to activate",
+            &para("Reviewed, built and registered. Its author activates it when they're ready."),
+        )),
+        _ => {}
     }
-
     if let Some(slug) = &job.strategy_slug {
-        out.push(para_link(
-            &format!("/agents/{slug}"),
-            "The agent this build belongs to",
-        ));
+        out.push(para_link(&format!("/agents/{slug}"), "The agent's page"));
     }
-
-    out.push(section(
-        "The log",
-        &if log.is_empty() {
-            para("Nothing yet: this job is still waiting for a builder.")
-        } else {
-            code_block(&log)
-        },
-    ));
-
+    if let Some(review) = &job.review {
+        out.push(review_report(review));
+    }
     out.concat()
 }
 
@@ -1282,9 +1220,9 @@ fn publish() -> String {
     [
         heading(1, "Publish an agent"),
         para(
-            "You submit a Rust project; we compile it. The bundle a vault runs is an artifact of \
-             our build, not a file someone handed us, so every agent on the platform has \
-             source behind it that the reviewer read.",
+            "You submit a Rust project for $1; the reviewer reads it, then we compile it. The \
+             bundle a vault runs is an artifact of our build, not a file someone handed us, so \
+             every agent on the platform has source behind it that the reviewer read first.",
         ),
         section("How it goes", &steps),
         section(
@@ -1292,9 +1230,8 @@ fn publish() -> String {
             &format!(
                 "{}{}",
                 para(
-                    "There is no publishing fee. Creating the vault funds its tank, and the \
-                     build and the review are its first charges: the metered build, a flat $1 \
-                     review, and enough for a week at the allowances the agent declares."
+                    "A flat $1 to submit, covering the review and the build, spent whatever the \
+                     outcome. When you activate, a starting tank pays the agent's running costs."
                 ),
                 para(copy::TANK_NOTE)
             ),
@@ -1307,7 +1244,7 @@ fn publish() -> String {
                  changes is who else can read the source.",
             ),
         ),
-        para_link("/queue", "Watch the build queue"),
+        para_link("/queue", "Watch the queue"),
     ]
     .concat()
 }
@@ -1356,24 +1293,6 @@ fn verify() -> String {
         .map(|(claim, how, needs)| vec![esc(claim), esc(how), esc(needs)])
         .collect();
 
-    let audits: Vec<Vec<String>> = data::vaults()
-        .first()
-        .map(|strategy| {
-            strategy
-                .vault
-                .audits
-                .iter()
-                .map(|audit| {
-                    vec![
-                        esc(&audit.subject),
-                        esc(audit.status.label()),
-                        esc(&audit.note),
-                    ]
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
     [
         heading(1, "Verify"),
         para(
@@ -1385,17 +1304,6 @@ fn verify() -> String {
             &table(&["Claim", "How to check it", "What you need"], &checks),
         ),
         section("The limit of it", &para(copy::VERIFY_LIMIT)),
-        section(
-            "Audit status",
-            &format!(
-                "{}{}",
-                para(
-                    "Vaults open to deposits before every audit is finished, and every vault page \
-                     shows where each one stands, so you can size your own exposure."
-                ),
-                table(&["What", "Status", "Notes"], &audits)
-            ),
-        ),
         section(
             "Changing the code that runs vaults",
             &para(&format!(
@@ -1540,7 +1448,7 @@ mod tests {
             });
 
             assert!(
-                html.contains(&esc(&strategy.name())),
+                html.contains(&esc(strategy.name())),
                 "{}: no name",
                 strategy.slug
             );
@@ -1556,11 +1464,14 @@ mod tests {
             );
 
             if let Some(review) = &strategy.review {
-                assert!(
-                    html.contains(&format!("Score {} out of 100", review.score)),
-                    "{}: no review score",
-                    strategy.slug
-                );
+                for area in shared::Area::ALL {
+                    assert!(
+                        html.contains(&esc(review.rating(area).label())),
+                        "{}: no {} rating",
+                        strategy.slug,
+                        area.label()
+                    );
+                }
             }
             let vault = &strategy.vault;
             assert!(
@@ -1593,9 +1504,9 @@ mod tests {
         assert!(html.contains(&esc(copy::PITCH)));
         assert!(html.contains(&esc(&fmt::money_compact(data::total_vault_capital()))));
         assert!(html.contains(&esc(&fmt::count(data::total_trades()))));
-        for strategy in data::ranked().into_iter().take(5) {
+        for strategy in data::listed().into_iter().take(5) {
             assert!(
-                html.contains(&esc(&strategy.name())),
+                html.contains(&esc(strategy.name())),
                 "the home page doesn't list {}",
                 strategy.slug
             );

@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use time::PrimitiveDateTime;
 
-use crate::model::common::{Chain, Point};
+use crate::model::common::Chain;
 use crate::model::health::Health;
 use crate::model::registry::{Author, FeedEvent, Job};
 use crate::model::strategy::Strategy;
@@ -32,8 +32,6 @@ pub struct Snapshot {
     pub authors: Vec<Author>,
     pub jobs: Vec<Job>,
     pub feed: Vec<FeedEvent>,
-    /// Simple things to compare a record against.
-    pub benchmarks: Vec<Benchmark>,
     pub totals: Totals,
 }
 
@@ -51,15 +49,6 @@ impl Snapshot {
     pub fn chain(&self, chain: Chain) -> Option<&ChainInfo> {
         self.chains.iter().find(|info| info.chain == chain)
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Benchmark {
-    pub label: String,
-    /// What it is, said plainly, because a benchmark nobody can place is
-    /// worse than none.
-    pub note: String,
-    pub series: Vec<Point>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -92,11 +81,11 @@ pub struct Config {
 /// the app, so the app cannot go stale against the chain it is talking to.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Terms {
-    /// The least a vault may be created with: the build, the review and a
-    /// minimum run. The factory refuses anything under it.
+    /// The least a vault may be activated with, so an agent that can't run is
+    /// never activated. The factory refuses anything under it.
     pub minimum_tank: f64,
-    /// A flat fee for one review, charged whoever asks for it.
-    pub review_fee: f64,
+    /// The flat fee to publish, covering the review and the build.
+    pub publish_fee: f64,
     /// The fee schedule a vault created today carries for its whole life.
     pub fees: crate::Fees,
     /// How far either side of the venue's price a claim may close.
@@ -114,6 +103,8 @@ pub struct Terms {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Addresses {
     pub usd: String,
+    pub publishing: String,
+    pub prices: String,
     pub venue: String,
     pub attestation: String,
     pub strategies: String,
@@ -171,37 +162,53 @@ pub struct HeldClaim {
     pub settled_for: Option<f64>,
 }
 
-/// A strategy offered to the build service.
+/// An agent's source, uploaded to `/api/{chain}/uploads` before its author
+/// pays to publish it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-/// A strategy offered to be built, posted to `/api/{chain}/submissions`: the
-/// vault chain its vault was created on, where the build is registered.
-pub struct Submission {
-    pub strategy_id: String,
-    pub version: u32,
-    /// The address that will own it, and whose vault pays for the build.
+pub struct Upload {
+    /// The wallet that will pay. Only a payment from it starts the job.
     pub author: String,
-    pub source: SubmissionSource,
-    /// Which package of the submitted project is the strategy.
-    pub package: String,
-    /// Sealed source is still built and still reviewed; it is only the
-    /// publishing of it that stops.
+    /// The project as a canonical tar ([`crate::archive::pack`]), as base64.
+    pub archive_base64: String,
+    /// Sealed source is still reviewed and built; only its publishing stops.
     pub sealed: bool,
+    /// Which package of a workspace is the agent, when the project holds more
+    /// than one `shonin.toml`.
+    #[serde(default)]
+    pub package: Option<String>,
 }
 
+/// What the build service says when it takes an upload: the reference to pay
+/// against, and the job that will follow it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", tag = "kind")]
-pub enum SubmissionSource {
-    /// A canonical archive of the project, as the publisher packs it.
-    Archive { base64: String },
-    /// A public repository and a commit, which the build service reads itself.
-    Repository { url: String, commit: String },
-}
-
-/// What the build service says when it takes a submission.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SubmissionAccepted {
+pub struct UploadAccepted {
+    /// `0x`-prefixed 32 bytes: what `Publishing.submit` takes.
+    pub upload: String,
     pub job_id: String,
+}
+
+/// What the build service hands the reviewer, before anything is built:
+/// `POST /{chain}/reviews`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReviewRequest {
+    pub strategy_id: u64,
+    /// The source, exactly as uploaded. The reviewer hashes it itself.
+    pub archive_base64: String,
+    pub sealed: bool,
+    /// Where the agent's `shonin.toml` is inside the archive.
+    pub manifest_path: String,
+}
+
+/// The reviewer's answer: its go-ahead for the build, or a refusal it has
+/// already recorded on the chain.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReviewAnswer {
+    /// The source hash the reviewer computed and signed for.
     pub source_hash: String,
+    pub report_hash: String,
+    /// The signed go-ahead `StrategyRegistry.register` needs, as `0x` hex.
+    /// None when the code was refused.
+    pub clearance: Option<String>,
 }
 
 /// A health report, as the executor signs and posts it.
@@ -240,4 +247,43 @@ impl HealthPost {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ApiError {
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::health::{Health, Signal};
+
+    /// A reader recovers the signer from the report as it arrived, so any
+    /// value that reads back even slightly different names someone else.
+    #[test]
+    fn a_health_report_digests_the_same_after_travelling_as_json() {
+        let signals = (1..2000)
+            .map(|i| Signal {
+                name: "runway".into(),
+                value: i as f64 / 7.3 + 1e-9 * i as f64,
+                unit: "days".into(),
+                warn_at: 1.0 / i as f64,
+                error_at: (i as f64).sqrt(),
+                lower_is_worse: true,
+                window: "now".into(),
+                note: None,
+            })
+            .collect();
+        let report = Health {
+            signals,
+            entries: vec![],
+            updated: time::PrimitiveDateTime::new(
+                time::Date::from_ordinal_date(2026, 274).unwrap(),
+                time::Time::from_hms_nano(5, 38, 52, 757_106_000).unwrap(),
+            ),
+            signed_by: "0x0".into(),
+        };
+        let arrived: Health =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        assert_eq!(
+            HealthPost::digest("0xA", &report),
+            HealthPost::digest("0xA", &arrived)
+        );
+    }
 }

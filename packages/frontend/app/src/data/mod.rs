@@ -16,8 +16,7 @@ use std::rc::Rc;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use shared::model::registry::{Author, FeedEvent, Job};
 use shared::model::strategy::Strategy;
-use shared::record;
-use shared::{Benchmark, ChainInfo, Config, Performance, Point, Snapshot, Totals};
+use shared::{ChainInfo, Config, Performance, Snapshot, Totals};
 use time::{Date, PrimitiveDateTime};
 
 /// Everything the app knows, as of one moment on the chain.
@@ -32,7 +31,6 @@ pub struct Dataset {
     pub authors: Vec<Rc<Author>>,
     pub jobs: Vec<Rc<Job>>,
     pub feed: Vec<Rc<FeedEvent>>,
-    pub benchmarks: Vec<Benchmark>,
     pub totals: Totals,
 }
 
@@ -46,7 +44,6 @@ impl From<Snapshot> for Dataset {
             authors: snapshot.authors.into_iter().map(Rc::new).collect(),
             jobs: snapshot.jobs.into_iter().map(Rc::new).collect(),
             feed: snapshot.feed.into_iter().map(Rc::new).collect(),
-            benchmarks: snapshot.benchmarks,
             totals: snapshot.totals,
         }
     }
@@ -125,9 +122,7 @@ pub fn dev() -> Option<shared::DevMode> {
     configs().into_iter().find_map(|config| config.dev.clone())
 }
 
-/// The build that made this strategy, if the queue still holds it, and why it
-/// failed if it did. A failure has one reason and the page says that one
-/// rather than the commonest one.
+/// The job that published this agent, if the queue still holds it.
 pub fn build_of(slug: &str) -> Option<Rc<Job>> {
     jobs()
         .into_iter()
@@ -138,7 +133,7 @@ pub fn build_of(slug: &str) -> Option<Rc<Job>> {
 /// carries, the exit band, the timelocks and what publishing costs. Every page
 /// that states one of these as a fact reads it here rather than spelling it
 /// out, so nothing in the app can drift from the chain it is talking to. A
-/// page quotes base's, the vault chain a publish from the app goes to.
+/// page quotes base's, where the app publishes to.
 pub fn terms() -> Option<shared::Terms> {
     config(shared::Chain::Base).map(|config| config.terms)
 }
@@ -219,51 +214,33 @@ pub fn feed() -> Vec<Rc<FeedEvent>> {
         .unwrap_or_default()
 }
 
-pub fn benchmarks() -> Vec<Benchmark> {
-    current()
-        .map(|dataset| dataset.benchmarks.clone())
-        .unwrap_or_default()
-}
-
-/// A strategy's record, summarised. Computed from the series the chain gave
-/// it, by the same maths the indexer uses.
+/// An agent's record, summarised. Computed from the series the chain gave it,
+/// by the same arithmetic the indexer uses.
 pub fn performance(strategy: &Strategy) -> Performance {
     strategy
         .record
         .as_ref()
         .map(|held| held.performance())
-        .unwrap_or(Performance {
-            raw_annualised: 0.0,
-            normalised_annualised: 0.0,
-            volatility: 0.0,
-            max_drawdown: 0.0,
-            total_return: 0.0,
-            days: 0,
-        })
+        .unwrap_or_default()
 }
 
-/// How two records moved together.
-pub fn correlation(left: &[Point], right: &[Point]) -> f64 {
-    record::correlation(left, right)
-}
-
-/// Every live vault with enough history to be ranked, best normalised return
-/// first.
-pub fn ranked() -> Vec<Rc<Strategy>> {
+/// Every live vault with 30 days of history, best 30-day return first: the
+/// leaderboard's default order.
+pub fn listed() -> Vec<Rc<Strategy>> {
     let mut live: Vec<Rc<Strategy>> = vaults()
         .into_iter()
-        .filter(|strategy| strategy.standing == shared::Standing::Ranked)
+        .filter(|strategy| strategy.standing == shared::Standing::Listed)
         .collect();
+    let key = |strategy: &Strategy| performance(strategy).return_30d.unwrap_or(f64::MIN);
     live.sort_by(|a, b| {
-        performance(b)
-            .normalised_annualised
-            .partial_cmp(&performance(a).normalised_annualised)
+        key(b)
+            .partial_cmp(&key(a))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     live
 }
 
-/// Live vaults too new to be ranked, newest first.
+/// Live vaults with less than 30 days of history, newest first.
 pub fn newest() -> Vec<Rc<Strategy>> {
     let mut new: Vec<Rc<Strategy>> = vaults()
         .into_iter()
@@ -273,7 +250,7 @@ pub fn newest() -> Vec<Rc<Strategy>> {
     new
 }
 
-/// Vaults that are no longer taking a record forward.
+/// Vaults that are no longer trading: frozen, killed or closed.
 pub fn past() -> Vec<Rc<Strategy>> {
     vaults()
         .into_iter()

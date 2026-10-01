@@ -1,14 +1,14 @@
-package shonin:strategy@0.1.0;
+package shonin:agent@0.1.0;
 
 /// The small vocabulary every other interface is written in.
 interface types {
-    /// Which venue an action or a query is for, as the manifest names it.
-    type venue-id = string;
-    /// Bytes a venue's own adapter understands. The host decodes them inside
-    /// the measured image; a strategy builds them with a typed crate.
+    /// Which driver an action or a query is for, as `shonin.toml` names it.
+    type driver-name = string;
+    /// Bytes a driver understands. Its executor half decodes them inside the
+    /// measured image; an agent builds them with the driver's typed crate.
     type payload = list<u8>;
 
-    /// What the adapter did with one action.
+    /// What the driver did with one action.
     variant verdict {
         /// Its receipt: a fill, an order id, whatever the venue returns.
         accepted(payload),
@@ -16,24 +16,25 @@ interface types {
     }
 }
 
-/// The only way out to a venue. A strategy submits actions and is told what
-/// happened to them; it never holds a key and never signs anything.
-interface venues {
-    use types.{venue-id, payload, verdict};
+/// The only way out to a venue. An agent submits actions through a driver
+/// and is told what happened to them; it never holds a key and never signs
+/// anything.
+interface drivers {
+    use types.{driver-name, payload, verdict};
 
-    submit: async func(venue: venue-id, actions: list<payload>) -> list<verdict>;
+    submit: async func(driver: driver-name, actions: list<payload>) -> list<verdict>;
     /// Fills, order updates and liquidations on the vault's own account.
-    account-events: func(venue: venue-id) -> stream<payload>;
-    account-state: async func(venue: venue-id, query: payload) -> result<payload, string>;
+    account-events: func(driver: driver-name) -> stream<payload>;
+    account-state: async func(driver: driver-name, query: payload) -> result<payload, string>;
 }
 
-/// What the vault tells the strategy about itself.
+/// What the vault tells the agent about itself.
 interface vault {
     variant vault-event {
         /// A depositor is leaving and their fraction is being closed. The
         /// payload carries which fraction.
         claim-pending(list<u8>),
-        /// The vault is stopping. The strategy has a grace period to unwind
+        /// The vault is stopping. The agent has a grace period to unwind
         /// itself before the contract does it.
         halting(string),
     }
@@ -42,15 +43,15 @@ interface vault {
 }
 
 /// Shared, cached reads: prices, order books, anything the executor can fetch
-/// once and hand to every strategy that wants it.
+/// once and hand to every agent that wants it.
 interface data {
-    use types.{venue-id, payload};
+    use types.{driver-name, payload};
 
     query: async func(source: string, request: payload) -> result<payload, string>;
-    subscribe: func(venue: venue-id, feed: payload) -> result<stream<payload>, string>;
+    subscribe: func(driver: driver-name, feed: payload) -> result<stream<payload>, string>;
 }
 
-/// A socket to any host, terminated by the executor so the strategy never
+/// A socket to any host, terminated by the executor so the agent never
 /// holds a certificate or a key.
 interface websocket {
     resource connection {
@@ -61,14 +62,14 @@ interface websocket {
     connect: async func(url: string, headers: list<tuple<string, string>>) -> result<connection, string>;
 }
 
-/// Values sealed to the bundle's own hash. The strategy can use them and
+/// Values sealed to the bundle's own hash. The agent can use them and
 /// nobody, including the platform, can read them.
 interface secrets {
     get: func(name: string) -> option<string>;
 }
 
-/// A per-strategy cache. It usually survives a restart and is promised to
-/// nobody: a strategy rebuilds what it needs from the venue's own state.
+/// A per-agent cache. It usually survives a restart and is promised to
+/// nobody: an agent rebuilds what it needs from the venue's own state.
 interface state {
     get: func(key: string) -> option<list<u8>>;
     set: func(key: string, value: list<u8>);
@@ -76,7 +77,7 @@ interface state {
 }
 
 /// Running a model the bundle carries. Inference is budgeted, and going over
-/// budget is an error the strategy handles rather than a stall.
+/// budget is an error the agent handles rather than a stall.
 interface inference {
     variant tensor-data {
         float32(list<f32>),
@@ -108,10 +109,10 @@ interface inference {
 }
 
 /// One long-lived program. The host starts `run` once and never schedules it
-/// again: everything the strategy does, it does inside that call.
-world strategy {
+/// again: everything the agent does, it does inside that call.
+world agent {
     import types;
-    import venues;
+    import drivers;
     import vault;
     import data;
     import websocket;
@@ -119,5 +120,5 @@ world strategy {
     import inference;
     import secrets;
 
-    export run: async func(config: list<u8>) -> result<_, string>;
+    export run: async func() -> result<_, string>;
 }

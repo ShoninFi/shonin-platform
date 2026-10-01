@@ -6,13 +6,21 @@ import {AuthorProfiles} from "../src/AuthorProfiles.sol";
 import {DevAttestationVerifier} from "../src/DevAttestationVerifier.sol";
 import {LocalUsd} from "../src/LocalUsd.sol";
 import {LocalVenue} from "../src/LocalVenue.sol";
+
+import {Prices} from "../src/Prices.sol";
+import {Publishing} from "../src/Publishing.sol";
 import {ReviewRegistry} from "../src/ReviewRegistry.sol";
 import {StrategyRegistry} from "../src/StrategyRegistry.sol";
 import {Vault} from "../src/Vault.sol";
 import {VaultFactory} from "../src/VaultFactory.sol";
 import {ImageKind} from "../src/interfaces/IAttestationRegistry.sol";
+import {Allowances, UnitPrices} from "../src/interfaces/IPrices.sol";
+import {Review} from "../src/interfaces/IReviewRegistry.sol";
+import {ChainNeed} from "../src/interfaces/IStrategyRegistry.sol";
+
 import {VaultConfig} from "../src/interfaces/IVaultFactory.sol";
 import {Test} from "forge-std/Test.sol";
+import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
 
 /// The whole platform, deployed the way the development chain deploys it, so
 /// every test starts from the arrangement the running system actually has.
@@ -35,8 +43,9 @@ contract Fixture is Test {
 
     uint64 internal constant TIMELOCK = 2 days;
     uint64 internal constant BLESSING_TTL = 72 hours;
-    uint256 internal constant REVIEW_FEE = 1e6;
+    uint256 internal constant PUBLISH_FEE = 1e6;
     uint256 internal constant MINIMUM_TANK = 40e6;
+    uint64 internal constant PRICE_NOTICE = 30 days;
 
     address internal admin = makeAddr("admin");
     address internal platform = makeAddr("platform");
@@ -54,6 +63,8 @@ contract Fixture is Test {
     LocalVenue internal venue;
     DevAttestationVerifier internal verifier;
     AttestationRegistry internal attestation;
+    Publishing internal publishing;
+    Prices internal prices;
     StrategyRegistry internal strategies;
     ReviewRegistry internal reviews;
     AuthorProfiles internal profiles;
@@ -68,17 +79,22 @@ contract Fixture is Test {
         venue = new LocalVenue(usd, operator, MARGIN_BPS);
         verifier = new DevAttestationVerifier(attestor);
         attestation = new AttestationRegistry(admin, verifier, TIMELOCK, BLESSING_TTL);
-        strategies = new StrategyRegistry(attestation);
-        reviews = new ReviewRegistry(attestation, strategies, usd, platform, REVIEW_FEE);
+        publishing = new Publishing(IERC20(address(usd)), platform, PUBLISH_FEE);
+        prices = new Prices(admin, PRICE_NOTICE, publishedPrices());
+        strategies = new StrategyRegistry(attestation, publishing);
+        reviews = new ReviewRegistry(attestation, strategies, publishing);
         profiles = new AuthorProfiles();
         factory = new VaultFactory(
-            usd,
-            venue,
-            attestation,
-            strategies,
-            reviews,
-            admin,
-            platform,
+            VaultFactory.Deps({
+                asset: IERC20(address(usd)),
+                venue: venue,
+                attestation: attestation,
+                strategies: strategies,
+                reviews: reviews,
+                prices: prices,
+                admin: admin,
+                platform: platform
+            }),
             VaultConfig({
                 streamingBps: 100,
                 authorBps: 1000,
@@ -121,17 +137,19 @@ contract Fixture is Test {
         venue.setPrices(market, price, price, price - half, price + half);
     }
 
+    /// What an instance attests to, attested now.
     function journalFor(
         bytes32 image,
         address signer,
         bytes32 vaultsRoot
-    ) internal pure returns (bytes memory) {
+    ) internal view returns (bytes memory) {
         return abi.encode(
             AttestationRegistry.Journal({
                 imageDigest: image,
                 projectId: PROJECT,
                 signer: signer,
-                vaultsRoot: vaultsRoot
+                vaultsRoot: vaultsRoot,
+                issuedAt: uint64(block.timestamp)
             })
         );
     }
@@ -144,47 +162,125 @@ contract Fixture is Test {
 
     /// A builder or a reviewer key: it serves every strategy and no vault.
     function blessServiceKey(bytes32 image, address signer) internal {
-        bytes memory journal = journalFor(image, signer, bytes32(0));
-        attestation.bless(sealOf(journal), journal, address(0), bytes32(0), new bytes32[](0));
+        bytes memory journal = journalFor(image, signer, serviceLeaf());
+        attestation.bless(sealOf(journal), journal, 0, address(0), bytes32(0), new bytes32[](0));
+    }
+
+    /// The leaf a builder or a reviewer commits to: no vault, on this chain.
+    function serviceLeaf() internal view returns (bytes32) {
+        return
+            keccak256(bytes.concat(keccak256(abi.encode(uint256(0), address(0), bytes32(0), block.chainid))));
+    }
+
+    /// The leaf an instance commits to for one vault and one bundle, on this
+    /// chain.
+    function leafFor(address vault, bytes32 strategyHash) internal view returns (bytes32) {
+        return
+            keccak256(bytes.concat(keccak256(abi.encode(block.chainid, vault, strategyHash, block.chainid))));
     }
 
     /// An executor key: it may act for one vault running one bundle.
     function blessExecutorKey(address signer, address vault, bytes32 strategyHash) internal {
-        bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(vault, strategyHash))));
-        bytes memory journal = journalFor(EXECUTOR_IMAGE, signer, leaf);
-        attestation.bless(sealOf(journal), journal, vault, strategyHash, new bytes32[](0));
+        bytes memory journal = journalFor(EXECUTOR_IMAGE, signer, leafFor(vault, strategyHash));
+        attestation.bless(sealOf(journal), journal, block.chainid, vault, strategyHash, new bytes32[](0));
     }
 
-    /// Register a version the way the build service does, then open its vault.
-    function registerAndOpen(Vault vault, bytes32 strategyId, uint32 version, bytes32 bundleHash) internal {
+    /// The prices the Rust side publishes: $0.15 a core-hour, $0.01 a
+    /// GiB-hour, $0.15 a GB, and inference at the processor rate.
+    function publishedPrices() internal pure returns (UnitPrices memory) {
+        return UnitPrices({
+            vcpuHour: 0.15e18,
+            gibHour: 0.01e18,
+            gbEgress: 0.15e18,
+            inferenceSecond: uint128(0.15e18) / 3600
+        });
+    }
+
+    /// Allowances whose day costs exactly `perDay`: all of it gas, which is
+    /// charged at face value.
+    function allowancesCosting(uint64 perDay) internal pure returns (Allowances memory a) {
+        a.gasPerDay = perDay;
+    }
+
+    function signed(uint256 key, bytes32 digest) internal pure returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, MessageHashUtilsLite.toEthSignedMessageHash(digest));
+        return abi.encodePacked(r, s, v);
+    }
+
+    /// Pay to publish, as the author.
+    function submitAs(address who) internal returns (uint256 id) {
+        give(who, PUBLISH_FEE);
+        vm.startPrank(who);
+        usd.approve(address(publishing), PUBLISH_FEE);
+        id = publishing.submit(keccak256(abi.encode("upload", who, publishing.count())));
+        vm.stopPrank();
+    }
+
+    function oneChain() internal pure returns (ChainNeed[] memory chains) {
+        chains = new ChainNeed[](1);
+        chains[0].chain = "base";
+        chains[0].drivers = new bytes32[](1);
+        chains[0].drivers[0] = "local";
+    }
+
+    /// Register a strategy the way the build service does: the reviewer's
+    /// go-ahead, then the builder's signature over what it built.
+    function register(uint256 id, address who, bytes32 bundleHash) internal {
+        ChainNeed[] memory chains = oneChain();
+        bytes32[] memory none = new bytes32[](0);
+        bytes32[] memory restricted = new bytes32[](2);
+        restricted[0] = "SANCTIONED";
+        restricted[1] = "US";
         bytes32 digest = strategies.registrationDigest(
-            strategyId, version, author, keccak256("source"), bundleHash, keccak256("manifest")
+            id, who, keccak256("source"), bundleHash, keccak256("manifest"), chains, none, restricted
         );
-        (uint8 v, bytes32 r, bytes32 s) =
-            vm.sign(BUILDER_KEY, MessageHashUtilsLite.toEthSignedMessageHash(digest));
         strategies.register(
-            strategyId,
-            version,
-            author,
+            id,
+            who,
             keccak256("source"),
             bundleHash,
             keccak256("manifest"),
-            bytes32(0),
-            0,
-            abi.encodePacked(r, s, v)
+            chains,
+            none,
+            restricted,
+            signed(BUILDER_KEY, digest),
+            signed(REVIEWER_KEY, strategies.clearanceDigest(id, keccak256("source")))
         );
-        vault.open();
     }
 
-    /// Create a vault the way an author does, and open it.
-    function openVault(bytes32 strategyId, uint32 version) internal returns (Vault vault, bytes32 bundle) {
+    function reviewFor(bytes32 bundleHash, uint8 rating) internal view returns (Review memory r) {
+        r.bundleHash = bundleHash;
+        r.sourceHash = keccak256("source");
+        r.reviewerImage = REVIEWER_IMAGE;
+        r.modelIdHash = keccak256("model");
+        r.promptHash = keccak256("prompt");
+        r.reportHash = keccak256("report");
+        for (uint256 i = 0; i < 6; i++) {
+            r.ratings[i] = rating;
+        }
+        r.findingCount = 2;
+        r.reviewedAt = uint64(block.timestamp);
+    }
+
+    /// Submitted, reviewed and built: ready for its author to activate.
+    function ready() internal returns (uint256 id, bytes32 bundleHash) {
+        id = submitAs(author);
+        bundleHash = keccak256(abi.encode("bundle", id));
+        register(id, author, bundleHash);
+        vm.prank(reviewer);
+        reviews.submitReview(id, reviewFor(bundleHash, 1));
+    }
+
+    /// Publish and activate a vault the way an author does, with a daily
+    /// usage cap of 2 dollars.
+    function openVault() internal returns (Vault vault, bytes32 bundle) {
+        uint256 id;
+        (id, bundle) = ready();
         give(author, MINIMUM_TANK);
         vm.startPrank(author);
         usd.approve(address(factory), MINIMUM_TANK);
-        vault = Vault(factory.create(strategyId, version, keccak256("source"), MINIMUM_TANK, 2e6));
+        vault = Vault(factory.activate(id, allowancesCosting(2e6), MINIMUM_TANK));
         vm.stopPrank();
-        bundle = keccak256(abi.encode("bundle", strategyId, version));
-        registerAndOpen(vault, strategyId, version, bundle);
     }
 
     function depositAs(Vault vault, address who, uint256 amount) internal returns (uint256 shares) {

@@ -31,22 +31,6 @@ pub fn numbered(files: &[(String, String)]) -> Result<String> {
     Ok(out)
 }
 
-/// The source of a published version, out of the content-addressed store.
-///
-/// Sealed or not, the reviewer reads the code: sealing decides who else may
-/// read it, never whether it was read.
-pub fn from_store(store: &Path, source_hash: &str) -> Result<String> {
-    let held = store.join(source_hash.replace(':', "-"));
-    let published = held.join("source.tar");
-    let sealed = held.join("source.sealed.tar");
-    let archive = if published.exists() {
-        std::fs::read(published)?
-    } else {
-        std::fs::read(sealed)?
-    };
-    from_archive(&archive)
-}
-
 /// The source inside a packed project.
 pub fn from_archive(archive: &[u8]) -> Result<String> {
     let mut reader = tar::Archive::new(std::io::Cursor::new(archive));

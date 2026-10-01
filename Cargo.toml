@@ -40,7 +40,7 @@ ui = { path = "packages/frontend/ui", package = "shonin-ui" }
 anyhow = "1.0.104"
 thiserror = "2.0.20"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
 ciborium = "0.2.2"
 toml = "1.1.6"
 sha2 = "0.11.0"

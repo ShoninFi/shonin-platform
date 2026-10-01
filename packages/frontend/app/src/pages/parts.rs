@@ -1,12 +1,11 @@
-//! Pieces that more than one page shows: how a strategy is labelled, how a
-//! record is summarised, and the card a strategy appears as in a list.
+//! Pieces that more than one page shows: how an agent is labelled, how a
+//! record is summarised, and the card an agent appears as in a list.
 
 use dominator::{Dom, html, link, text};
-use shared::{Custody, ExitClass, HealthLevel, Leg, Standing, Strategy, VaultState};
+use shared::{
+    ClaimState, Custody, ExitClass, HealthLevel, Leg, Rating, Standing, Strategy, VaultState,
+};
 
-use shared::model::registry::JobState;
-
-use crate::copy;
 use crate::data;
 use crate::format as fmt;
 use crate::ui::chart;
@@ -21,10 +20,10 @@ pub fn path_of(strategy: &Strategy) -> String {
 /// How a strategy's standing reads.
 pub fn standing_badge(standing: Standing) -> Dom {
     let tone = match standing {
-        Standing::Ranked => Tone::Accent,
+        Standing::Listed => Tone::Accent,
         Standing::New => Tone::Info,
-        Standing::Superseded | Standing::Retired => Tone::Neutral,
-        Standing::Killed | Standing::BuildFailed => Tone::Error,
+        Standing::Closed => Tone::Neutral,
+        Standing::Frozen | Standing::Killed => Tone::Error,
     };
     ui::badge(standing.label(), tone)
 }
@@ -41,10 +40,43 @@ pub fn source_badge(strategy: &Strategy) -> Dom {
     )
 }
 
-/// The review score, or that it hasn't arrived.
+/// The review at a glance: its worst rating, loudly if it is serious, or that
+/// it hasn't arrived.
 pub fn review_badge(strategy: &Strategy) -> Dom {
     match &strategy.review {
-        Some(review) => ui::score(review.score, review.band()),
+        Some(review) => {
+            let serious = review
+                .ratings
+                .iter()
+                .filter(|r| **r == Rating::SeriousConcerns)
+                .count();
+            let some = review
+                .ratings
+                .iter()
+                .filter(|r| **r == Rating::SomeConcerns)
+                .count();
+            if serious > 0 {
+                ui::badge(
+                    &format!(
+                        "{serious} serious concern{}",
+                        if serious == 1 { "" } else { "s" }
+                    ),
+                    Tone::Error,
+                )
+            } else if some > 0 {
+                ui::badge(
+                    &format!(
+                        "{some} area{} with concerns",
+                        if some == 1 { "" } else { "s" }
+                    ),
+                    Tone::Warn,
+                )
+            } else if review.ratings.iter().all(|r| *r == Rating::CouldntTell) {
+                ui::badge("review couldn't tell", Tone::Neutral)
+            } else {
+                ui::badge("review looks fine", Tone::Ok)
+            }
+        }
         None => ui::badge("review pending", Tone::Neutral),
     }
 }
@@ -123,7 +155,7 @@ pub fn strategy_card(strategy: &Strategy) -> Dom {
         .child(html!("div", {
             .class(["row", "row--between", "row--top"])
             .child(html!("div", {
-                .child(html!("div", { .class("table__primary").text(&strategy.name()) }))
+                .child(html!("div", { .class("table__primary").text(strategy.name()) }))
                 .child(html!("div", {
                     .class(["faint", "small"])
                     .text(&format!("by {}", strategy.author))
@@ -133,10 +165,13 @@ pub fn strategy_card(strategy: &Strategy) -> Dom {
         }))
         .child(html!("div", {
             .class(["row", "row--between"])
-            .child(ui::signed(
-                performance.normalised_annualised,
-                &fmt::annualised(performance.normalised_annualised),
-            ))
+            .child(match performance.return_30d {
+                Some(value) => ui::signed(value, &format!("{} · 30 days", fmt::percent_signed(value, 1))),
+                None => ui::signed(
+                    performance.return_since_open,
+                    &format!("{} · since opening", fmt::percent_signed(performance.return_since_open, 1)),
+                ),
+            })
             .child(spark(strategy))
         }))
         .child(html!("div", {
@@ -153,25 +188,25 @@ pub fn record_stats(strategy: &Strategy) -> Dom {
     let trades = strategy.record.as_ref().map_or(0, |record| record.trades);
 
     ui::stats(vec![
+        match performance.return_30d {
+            Some(value) => ui::stat_toned(
+                "Last 30 days",
+                &fmt::percent_signed(value, 1),
+                Some("value per share"),
+                tone_of(value),
+            ),
+            None => ui::stat("Last 30 days", "—", Some("not 30 days old yet")),
+        },
         ui::stat_toned(
-            "Normalised return",
-            &fmt::annualised(performance.normalised_annualised),
-            Some(&format!(
-                "rescaled to {} volatility",
-                copy::volatility_target()
-            )),
-            tone_of(performance.normalised_annualised),
+            "Since opening",
+            &fmt::percent_signed(performance.return_since_open, 1),
+            Some("value per share"),
+            tone_of(performance.return_since_open),
         ),
         ui::stat_toned(
-            "Raw return",
-            &fmt::annualised(performance.raw_annualised),
-            Some("as the vault actually traded"),
-            tone_of(performance.raw_annualised),
-        ),
-        ui::stat_toned(
-            "Max drawdown",
-            &fmt::percent_signed(performance.max_drawdown, 1),
-            Some("deepest fall from a peak"),
+            "Deepest drop",
+            &fmt::percent_signed(performance.deepest_drop, 1),
+            Some("largest fall from an earlier high"),
             Tone::Neutral,
         ),
         ui::stat(
@@ -266,29 +301,6 @@ pub fn venue_split(legs: &[Leg]) -> Dom {
 pub fn vault_notices(strategy: &Strategy) -> Vec<Dom> {
     let mut notices = Vec::new();
 
-    if strategy.standing == Standing::BuildFailed {
-        // Every tab of a failed build would otherwise be an empty state with
-        // no explanation of why it is empty.
-        let build = data::build_of(&strategy.slug);
-        let why = build
-            .as_ref()
-            .and_then(|job| match &job.state {
-                JobState::Failed { reason } => Some(reason.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| "The build did not finish".to_string());
-
-        notices.push(ui::notice_with(
-            Tone::Error,
-            "This build failed, so there is no bundle and no vault",
-            &format!(
-                "{why}, so nothing was published. There is no record, no review and no running \
-                 code, only the public log."
-            ),
-            build.map(|job| ui::action_link(&format!("/queue/{}", job.id), "The build log")),
-        ));
-    }
-
     if let Some(kill) = &strategy.kill {
         notices.push(ui::notice(
             Tone::Error,
@@ -297,22 +309,13 @@ pub fn vault_notices(strategy: &Strategy) -> Vec<Dom> {
         ));
     }
 
-    if let Some(successor) = &strategy.superseded_by {
-        notices.push(ui::notice_with(
-            Tone::Info,
-            "A newer version of this agent exists",
-            "This vault runs exactly as it always has. Moving means withdrawing here and \
-             depositing there.",
-            Some(ui::action_link(
-                &format!("/agents/{successor}"),
-                "See what changed",
-            )),
-        ));
-    }
-
     {
         let vault = &strategy.vault;
-        for claim in &vault.claims {
+        for claim in vault
+            .claims
+            .iter()
+            .filter(|claim| claim.state != ClaimState::Paid)
+        {
             let age = (data::as_of() - claim.booked).whole_days();
             let left = i64::from(vault.freeze_after_days) - age;
             notices.push(ui::notice(

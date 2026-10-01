@@ -56,29 +56,54 @@ pub mod bindings {
             }
         }
     }
+    /// Every interface under `contracts/evm/src/interfaces`, read as one,
+    /// so the types they share are defined once. See `build.rs`.
+    mod all {
+        include!(concat!(env!("OUT_DIR"), "/interfaces.rs"));
+    }
     pub mod usd {
-        alloy_sol_types::sol!("../../contracts/evm/src/interfaces/ILocalUsd.sol");
+        pub use super::all::*;
     }
     pub mod venue {
-        alloy_sol_types::sol!("../../contracts/evm/src/interfaces/ILocalVenue.sol");
+        pub use super::all::*;
     }
     pub mod attestation {
-        alloy_sol_types::sol!("../../contracts/evm/src/interfaces/IAttestationRegistry.sol");
+        pub use super::all::*;
+    }
+    pub mod publishing {
+        pub use super::all::*;
+    }
+    pub mod prices {
+        pub use super::all::*;
     }
     pub mod strategies {
-        alloy_sol_types::sol!("../../contracts/evm/src/interfaces/IStrategyRegistry.sol");
+        pub use super::all::*;
     }
     pub mod reviews {
-        alloy_sol_types::sol!("../../contracts/evm/src/interfaces/IReviewRegistry.sol");
+        pub use super::all::*;
     }
     pub mod profiles {
-        alloy_sol_types::sol!("../../contracts/evm/src/interfaces/IAuthorProfiles.sol");
+        pub use super::all::*;
     }
     pub mod factory {
-        alloy_sol_types::sol!("../../contracts/evm/src/interfaces/IVaultFactory.sol");
+        pub use super::all::*;
     }
     pub mod vault {
-        alloy_sol_types::sol!("../../contracts/evm/src/interfaces/IVault.sol");
+        pub use super::all::*;
+    }
+}
+
+/// Allowances as the contracts take them: gas in the asset's units, six
+/// decimals, rather than in dollars.
+pub fn allowances(allowances: &shared::Allowances) -> bindings::prices::Allowances {
+    bindings::prices::Allowances {
+        fuelPerSec: allowances.fuel_per_sec,
+        memoryMib: allowances.memory_mib,
+        requestsPerMin: allowances.requests_per_min,
+        bytesPerDay: allowances.bytes_per_day,
+        streams: allowances.streams,
+        inferenceMsPerMin: allowances.inference_ms_per_min,
+        gasPerDay: (allowances.gas_per_day.max(0.0) * 1_000_000.0).round() as u64,
     }
 }
 

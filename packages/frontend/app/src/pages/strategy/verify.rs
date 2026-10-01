@@ -30,7 +30,6 @@ pub fn render(strategy: &Rc<Strategy>) -> Dom {
         .child(keys(attestation))
         .child(approvals(attestation))
         .child(checks())
-        .child(audits(strategy))
         .child(changing())
     })
 }
@@ -47,7 +46,7 @@ fn panel(strategy: &Rc<Strategy>, attestation: &shared::Attestation) -> Dom {
         vec![
             ui::note("Everything in this panel is on-chain and can be checked without asking us."),
             ui::kv(vec![
-                ("Agent".to_string(), ui::value(&strategy.name())),
+                ("Agent".to_string(), ui::value(strategy.name())),
                 (
                     "Bundle".to_string(),
                     html!("div", {
@@ -69,10 +68,9 @@ fn panel(strategy: &Rc<Strategy>, attestation: &shared::Attestation) -> Dom {
                         .child(html!("div", {
                             .class(["faint", "small"])
                             .text(&format!(
-                                "from source {} · allowlisted {} · audit {}",
+                                "from source {} · allowlisted {}",
                                 fmt::short_hash(&strategy.bundle.source_hash),
-                                fmt::date(attestation.builder.allowlisted),
-                                attestation.builder.audit.label()
+                                fmt::date(attestation.builder.allowlisted)
                             ))
                         }))
                     }),
@@ -84,10 +82,9 @@ fn panel(strategy: &Rc<Strategy>, attestation: &shared::Attestation) -> Dom {
                         .child(html!("div", {
                             .class(["faint", "small"])
                             .text(&format!(
-                                "allowlisted {} · this vault was created {} · audit {}",
+                                "allowlisted {} · this vault was created {}",
                                 fmt::date(attestation.image.allowlisted),
-                                fmt::date(strategy.vault.created),
-                                attestation.image.audit.label()
+                                fmt::date(strategy.vault.created)
                             ))
                         }))
                     }),
@@ -232,39 +229,6 @@ fn checks() -> Dom {
     )
 }
 
-fn audits(strategy: &Rc<Strategy>) -> Dom {
-    let rows: Vec<Row> = strategy
-        .vault
-        .audits
-        .iter()
-        .map(|audit| {
-            Row::new(vec![
-                html!("span", { .class("table__primary").text(&audit.subject) }),
-                ui::badge(audit.status.label(), Tone::from_audit(audit.status)),
-                ui::muted(&audit.note),
-            ])
-        })
-        .collect();
-
-    ui::section(
-        "Audit status",
-        vec![
-            table(
-                vec![
-                    Column::new("What"),
-                    Column::new("Status"),
-                    Column::new("Notes").wide(),
-                ],
-                rows,
-            ),
-            ui::note(
-                "A vault opens before every audit is finished, so the page says where each one \
-                 stands.",
-            ),
-        ],
-    )
-}
-
 fn changing() -> Dom {
     ui::section(
         "What can change, and what can't",
@@ -274,7 +238,7 @@ fn changing() -> Dom {
                 .child(ui::card(vec![
                     ui::subheading("The agent never changes"),
                     ui::para(
-                        "A published bundle is frozen. A new version is a new bundle with its own vault.",
+                        "A published bundle is frozen. A changed agent is a new agent, with its own vault.",
                     ),
                 ]))
                 .child(ui::card(vec![

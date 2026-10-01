@@ -6,217 +6,109 @@
 //!
 //! It is built once. What a depositor relies on is that an attested image ran
 //! this recipe over that source and signed what came out, and the image
-//! cannot misreport what it did. Building a second time on the same machine,
-//! seconds later, would test almost nothing that the first build did not:
-//! reproducing a bundle elsewhere is a property of a hermetic recipe, not of
-//! running the same one twice, and a project that reaches for a clock or a
-//! random number while it compiles is something the reviewer reads.
+//! cannot misreport what it did. Reproducing a bundle elsewhere is a property
+//! of a hermetic recipe, and a project that reaches for a clock or a random
+//! number while it compiles is something the reviewer reads.
+//!
+//! A build keeps no log. A compiler's output can quote file names, paths and
+//! source, which would leak sealed code, so a build ends with an outcome and
+//! nothing else; an author sees why a build failed by running the same recipe.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use shared::Failure;
 use shared::manifest::{Manifest, hash_bytes};
-use shared::model::bundle::{LogLevel, LogLine};
 
 /// The recipe. Every submission is built with exactly this, whatever it asked
 /// for, so the same source builds the same way for everyone.
 pub const TOOLCHAIN: &str = "rust 1.98.1 · wasm32-wasip2";
 
+/// The world every component must implement.
+pub const WORLD: &str = "shonin:agent@0.1.0";
+
+/// The longest a build may run.
+pub const TIME_LIMIT: Duration = Duration::from_secs(20 * 60);
+
+/// The most source a submission may carry, unpacked, not counting its models.
+pub const SIZE_LIMIT: u64 = 2 * 1024 * 1024;
+
 /// What a finished build produced.
 pub struct Built {
-    pub manifest: Manifest,
     pub component: Vec<u8>,
     pub bundle: Vec<u8>,
     pub component_hash: String,
     pub bundle_hash: String,
-    pub manifest_hash: String,
-    pub log: Vec<LogLine>,
-    pub seconds: u32,
-    /// The recipe this was built with, which anyone repeating it needs.
-    pub toolchain: String,
-}
-
-/// What went wrong, and the log that shows it.
-pub struct Failed {
-    pub reason: String,
-    pub log: Vec<LogLine>,
-    /// How long it ran before it failed. A build that ran is charged, so a
-    /// failure has to say how much of the machine it used.
     pub seconds: u32,
 }
 
-pub fn plain(text: impl Into<String>) -> LogLine {
-    LogLine {
-        text: text.into(),
-        level: LogLevel::Plain,
+/// Where the agent's manifest is in an unpacked project: the one `shonin.toml`
+/// there is, or the one beside the named package's `Cargo.toml`.
+pub fn find_manifest(source: &Path, package: Option<&str>) -> Result<PathBuf, String> {
+    let found: Vec<PathBuf> = walk(source, 6)
+        .into_iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == "shonin.toml"))
+        .collect();
+    match package {
+        Some(package) => found
+            .into_iter()
+            .find(|path| package_of(path).as_deref() == Some(package))
+            .ok_or_else(|| format!("no shonin.toml beside a package called {package}")),
+        None => match found.as_slice() {
+            [one] => Ok(one.clone()),
+            [] => Err("no shonin.toml in the project".into()),
+            _ => Err("more than one shonin.toml in the project: name the package".into()),
+        },
     }
 }
 
-fn warn(text: impl Into<String>) -> LogLine {
-    LogLine {
-        text: text.into(),
-        level: LogLevel::Warn,
-    }
+pub fn read_manifest(path: &Path) -> Result<Manifest, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|_| "shonin.toml could not be read".to_string())?;
+    Manifest::from_toml(&text)
 }
 
-fn error(text: impl Into<String>) -> LogLine {
-    LogLine {
-        text: text.into(),
-        level: LogLevel::Error,
-    }
+/// The package a manifest belongs to: the name in the `Cargo.toml` beside it.
+pub fn package_of(manifest: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(manifest.with_file_name("Cargo.toml")).ok()?;
+    text.lines().find_map(|line| {
+        line.strip_prefix("name = ")
+            .map(|name| name.trim().trim_matches('"').to_string())
+    })
 }
 
-/// Build a project that has already been unpacked. `claimed` is the strategy
-/// and version the vault was created for: the manifest inside has to say the
-/// same, or the bundle and the vault would be about different things.
-pub fn build(
-    source: &Path,
-    sdk: &Path,
-    image: &str,
-    claimed: (&str, u32),
-) -> Result<Built, Failed> {
-    let started = std::time::Instant::now();
-    let mut log = vec![
-        plain(format!("builder {image} (allowlisted, timelock cleared)")),
-        plain("reading the manifest"),
-    ];
+/// How much source a project carries, not counting the models it ships,
+/// which have limits of their own.
+pub fn source_size(source: &Path) -> u64 {
+    walk(source, 32)
+        .iter()
+        .filter(|path| path.extension().is_none_or(|ext| ext != "onnx"))
+        .filter_map(|path| std::fs::metadata(path).ok())
+        .map(|meta| meta.len())
+        .sum()
+}
 
-    let manifest = match read_manifest(source) {
-        Ok(manifest) => manifest,
-        Err(error_text) => {
-            log.push(error(error_text.to_string()));
-            return Err(Failed {
-                reason: "the manifest could not be read".to_string(),
-                log,
-                seconds: started.elapsed().as_secs() as u32,
-            });
-        }
-    };
-    if manifest.strategy.id != claimed.0 || manifest.strategy.version != claimed.1 {
-        log.push(error(format!(
-            "the vault was created for {} v{}, and the manifest says {} v{}",
-            claimed.0, claimed.1, manifest.strategy.id, manifest.strategy.version
-        )));
-        return Err(Failed {
-            reason: "the manifest names a different agent than the vault".to_string(),
-            log,
-            seconds: started.elapsed().as_secs() as u32,
-        });
-    }
-
-    let package = package_name(source, &manifest);
-    log.push(plain(format!(
-        "{} v{}, package {package}",
-        manifest.strategy.id, manifest.strategy.version
-    )));
+/// Build a project that has already been unpacked, its manifest checked.
+pub fn build(source: &Path, sdk: &Path, package: &str) -> Result<Built, (Failure, u32)> {
+    let started = Instant::now();
+    let seconds = || started.elapsed().as_secs() as u32;
 
     // The SDK is the build service's own copy, not whatever a submission
     // might point at.
-    if let Err(problem) = pin_sdk(source, sdk) {
-        log.push(error(problem.to_string()));
-        return Err(Failed {
-            reason: "the SDK could not be pinned".to_string(),
-            log,
-            seconds: started.elapsed().as_secs() as u32,
-        });
-    }
-    log.push(plain("the SDK is the build service's own copy"));
-
-    log.push(plain(format!(
-        "cargo build --release --locked --target wasm32-wasip2 -p {package}"
-    )));
-    let component = match compile(source, &package) {
-        Ok((bytes, output)) => {
-            for line in output.lines().take(40) {
-                log.push(plain(line.to_string()));
-            }
-            log.push(plain(format!("built {} bytes", bytes.len())));
-            bytes
-        }
-        Err(output) => {
-            for line in output.lines() {
-                log.push(error(line.to_string()));
-            }
-            return Err(Failed {
-                reason: "the agent did not compile".to_string(),
-                log,
-                seconds: started.elapsed().as_secs() as u32,
-            });
-        }
-    };
-
-    if let Err(problem) = instantiate(&component) {
-        log.push(error(problem.to_string()));
-        return Err(Failed {
-            reason: "the component would not load".to_string(),
-            log,
-            seconds: started.elapsed().as_secs() as u32,
-        });
-    }
-    log.push(plain(
-        "instantiating the component in the executor's runtime",
-    ));
-    log.push(plain(format!(
-        "world {} satisfied",
-        "shonin:strategy@0.1.0"
-    )));
-
-    let bundle = match shared::archive::bundle(&component, &[]) {
-        Ok(bundle) => bundle,
-        Err(problem) => {
-            log.push(error(problem.to_string()));
-            return Err(Failed {
-                reason: "the bundle could not be made".to_string(),
-                log,
-                seconds: started.elapsed().as_secs() as u32,
-            });
-        }
-    };
-    if manifest.runtime.capabilities.is_empty() {
-        log.push(plain("no extra capabilities declared"));
-    } else {
-        log.push(warn(format!(
-            "capabilities declared: {}",
-            manifest.runtime.capabilities.join(", ")
-        )));
-    }
-
-    let seconds = started.elapsed().as_secs() as u32;
-    log.push(plain(format!("build finished in {seconds}s")));
+    pin_sdk(source, sdk).map_err(|_| (Failure::Service, seconds()))?;
+    let component = compile(source, package).map_err(|failure| (failure, seconds()))?;
+    instantiate(&component).map_err(|_| (Failure::Build, seconds()))?;
+    let bundle =
+        shared::archive::bundle(&component, &[]).map_err(|_| (Failure::Service, seconds()))?;
 
     Ok(Built {
         component_hash: hash_bytes(&component),
         bundle_hash: hash_bytes(&bundle),
-        manifest_hash: manifest.hash(),
-        manifest,
         component,
         bundle,
-        log,
-        seconds,
-        toolchain: TOOLCHAIN.to_string(),
+        seconds: seconds(),
     })
-}
-
-fn read_manifest(source: &Path) -> Result<Manifest> {
-    let path = find_manifest(source).context("no shonin.toml in the submission")?;
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    Manifest::from_toml(&text).context("the manifest is not valid")
-}
-
-/// A submission may be one package or a workspace; the manifest is wherever
-/// the strategy is.
-fn find_manifest(source: &Path) -> Option<PathBuf> {
-    let direct = source.join("shonin.toml");
-    if direct.exists() {
-        return Some(direct);
-    }
-    // A submission is the whole workspace a strategy belongs to, so its
-    // manifest usually sits a few directories in.
-    walk(source, 6)
-        .into_iter()
-        .find(|path| path.file_name().is_some_and(|name| name == "shonin.toml"))
 }
 
 fn walk(directory: &Path, depth: usize) -> Vec<PathBuf> {
@@ -230,6 +122,9 @@ fn walk(directory: &Path, depth: usize) -> Vec<PathBuf> {
     let mut entries: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
     entries.sort();
     for path in entries {
+        if path.is_symlink() {
+            continue;
+        }
         if path.is_dir() {
             found.extend(walk(&path, depth - 1));
         } else {
@@ -239,29 +134,10 @@ fn walk(directory: &Path, depth: usize) -> Vec<PathBuf> {
     found
 }
 
-/// Which cargo package to build. The manifest's strategy id is the package
-/// name by convention; a submission that disagrees says so in its own
-/// `Cargo.toml`.
-fn package_name(source: &Path, manifest: &Manifest) -> String {
-    let Some(path) = find_manifest(source) else {
-        return manifest.strategy.id.clone();
-    };
-    let cargo = path.with_file_name("Cargo.toml");
-    let Ok(text) = std::fs::read_to_string(&cargo) else {
-        return manifest.strategy.id.clone();
-    };
-    text.lines()
-        .find_map(|line| {
-            line.strip_prefix("name = ")
-                .map(|name| name.trim().trim_matches('"').to_string())
-        })
-        .unwrap_or_else(|| manifest.strategy.id.clone())
-}
-
 /// Point the submission's SDK at the one this build service carries, whatever
 /// it asked for. An author declares a version; the build service decides what
 /// that version is.
-fn pin_sdk(source: &Path, sdk: &Path) -> Result<()> {
+fn pin_sdk(source: &Path, sdk: &Path) -> std::io::Result<()> {
     let directory = source.join(".cargo");
     std::fs::create_dir_all(&directory)?;
     std::fs::write(
@@ -270,15 +146,13 @@ fn pin_sdk(source: &Path, sdk: &Path) -> Result<()> {
             "# Written by the build service.\n[patch.crates-io]\nshonin-strategy-sdk = {{ path = \"{}\" }}\n",
             sdk.display()
         ),
-    )?;
-    Ok(())
+    )
 }
 
-/// One pass. Each writes to its own directory, so neither can see what the
-/// other left behind.
-fn compile(source: &Path, package: &str) -> Result<(Vec<u8>, String), String> {
+fn compile(source: &Path, package: &str) -> Result<Vec<u8>, Failure> {
     let target = source.join("../build");
-    let output = Command::new("cargo")
+    // The compiler's output is never kept: it could quote sealed source.
+    let mut child = Command::new("cargo")
         .current_dir(source)
         .env("CARGO_TARGET_DIR", &target)
         .args([
@@ -290,42 +164,44 @@ fn compile(source: &Path, package: &str) -> Result<(Vec<u8>, String), String> {
             "-p",
             package,
         ])
-        .output()
-        .map_err(|error| format!("cargo would not start: {error}"))?;
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| Failure::Service)?;
 
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if !output.status.success() {
-        return Err(text);
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() > TIME_LIMIT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Failure::TimedOut);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(250)),
+            Err(_) => return Err(Failure::Service),
+        }
+    };
+    if !status.success() {
+        return Err(Failure::Build);
     }
 
     let wasm = target
         .join("wasm32-wasip2/release")
         .join(format!("{}.wasm", package.replace('-', "_")));
-    let bytes = std::fs::read(&wasm).map_err(|error| {
-        format!(
-            "the build produced no component at {}: {error}",
-            wasm.display()
-        )
-    })?;
-    Ok((bytes, text))
+    std::fs::read(&wasm).map_err(|_| Failure::Build)
 }
 
 /// Load the component the way the executor will, so a bundle that cannot run
 /// never reaches a vault.
-fn instantiate(component: &[u8]) -> Result<()> {
+fn instantiate(component: &[u8]) -> Result<(), String> {
     let mut config = wasmtime::Config::new();
     config
         .wasm_component_model_async(true)
         .consume_fuel(true)
         .epoch_interruption(true);
-    let engine = wasmtime::Engine::new(&config)
-        .map_err(|error| anyhow::anyhow!("starting the runtime: {error}"))?;
-    wasmtime::component::Component::new(&engine, component)
-        .map_err(|error| anyhow::anyhow!("the component is not loadable: {error}"))?;
+    let engine = wasmtime::Engine::new(&config).map_err(|error| error.to_string())?;
+    wasmtime::component::Component::new(&engine, component).map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -333,57 +209,52 @@ fn instantiate(component: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn scratch(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("shonin-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
     #[test]
     fn a_manifest_is_found_deep_inside_a_workspace() {
-        let root = std::env::temp_dir().join(format!("shonin-deep-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = scratch("deep");
         let nested = root.join("packages/agents/funding-basis");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(root.join("Cargo.toml"), b"[workspace]").unwrap();
         std::fs::write(nested.join("shonin.toml"), b"").unwrap();
-        assert_eq!(find_manifest(&root), Some(nested.join("shonin.toml")));
+        assert_eq!(find_manifest(&root, None), Ok(nested.join("shonin.toml")));
     }
 
     #[test]
-    fn a_manifest_is_found_wherever_the_strategy_is() {
-        let root = std::env::temp_dir().join(format!("shonin-find-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let nested = root.join("packages/agents/one");
-        std::fs::create_dir_all(&nested).unwrap();
-        std::fs::write(nested.join("shonin.toml"), b"").unwrap();
-        assert_eq!(find_manifest(&root), Some(nested.join("shonin.toml")));
+    fn a_workspace_of_several_agents_names_the_package() {
+        let root = scratch("several");
+        for name in ["one", "two"] {
+            let dir = root.join("packages/agents").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("shonin.toml"), b"").unwrap();
+            std::fs::write(
+                dir.join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\n"),
+            )
+            .unwrap();
+        }
+        assert!(find_manifest(&root, None).is_err());
+        assert_eq!(
+            find_manifest(&root, Some("two")),
+            Ok(root.join("packages/agents/two/shonin.toml"))
+        );
+        assert_eq!(
+            package_of(&root.join("packages/agents/two/shonin.toml")).as_deref(),
+            Some("two")
+        );
     }
 
     #[test]
-    fn the_package_comes_from_the_cargo_manifest_beside_it() {
-        let root = std::env::temp_dir().join(format!("shonin-package-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("shonin.toml"), b"").unwrap();
-        std::fs::write(
-            root.join("Cargo.toml"),
-            b"[package]\nname = \"a-different-name\"\n",
-        )
-        .unwrap();
-
-        let manifest = Manifest::from_toml(
-            r#"
-[strategy]
-id = "the-id"
-version = 1
-[description]
-title = "t"
-text = "t"
-[runtime.allowances]
-fuel_per_sec = 1
-memory_mib = 1
-requests_per_min = 1
-bytes_per_day = 1
-streams = 1
-inference_ms_per_min = 0
-"#,
-        )
-        .unwrap();
-        assert_eq!(package_name(&root, &manifest), "a-different-name");
+    fn models_do_not_count_towards_the_size_limit() {
+        let root = scratch("size");
+        std::fs::write(root.join("lib.rs"), vec![b'x'; 100]).unwrap();
+        std::fs::write(root.join("model.onnx"), vec![0u8; 5000]).unwrap();
+        assert_eq!(source_size(&root), 100);
     }
 }

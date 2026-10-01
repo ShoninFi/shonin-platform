@@ -3,7 +3,6 @@ pragma solidity ^0.8.30;
 
 import {IAttestationRegistry, ImageKind} from "./interfaces/IAttestationRegistry.sol";
 import {ILocalVenue, OrderRequest, Position} from "./interfaces/ILocalVenue.sol";
-import {IStrategyRegistry} from "./interfaces/IStrategyRegistry.sol";
 import {Claim, ClaimState, Fees, IVault, Tank, VaultState} from "./interfaces/IVault.sol";
 import {ERC20} from "openzeppelin/token/ERC20/ERC20.sol";
 import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
@@ -12,7 +11,7 @@ import {ECDSA} from "openzeppelin/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "openzeppelin/utils/cryptography/MessageHashUtils.sol";
 import {Math} from "openzeppelin/utils/math/Math.sol";
 
-/// Pooled capital behind one strategy version.
+/// Pooled capital behind one strategy.
 ///
 /// The contract works out what it is worth by reading the chain in the same
 /// transaction, so nobody reports a value to it and nobody has to be believed.
@@ -45,21 +44,19 @@ contract Vault is IVault, ERC20 {
     IERC20 public immutable asset;
     ILocalVenue public immutable venue;
     IAttestationRegistry public immutable attestation;
-    IStrategyRegistry public immutable strategies;
     address public immutable platform;
     address public immutable admin;
 
-    bytes32 public immutable strategyId;
-    uint32 public immutable version;
+    uint256 public immutable strategyId;
     bytes32 public immutable sourceHash;
+    /// The bundle this vault runs, fixed for its life.
+    bytes32 public immutable bundleHash;
     address public immutable author;
     uint64 public immutable createdAt;
     uint16 public immutable exitBandBps;
     uint32 public immutable freezeAfter;
 
     VaultState private _state;
-    /// The build is charged once, whether it succeeded or failed.
-    bool private _buildCharged;
     Fees private _fees;
     Tank private _tank;
     uint256 public highWaterMark;
@@ -73,25 +70,24 @@ contract Vault is IVault, ERC20 {
     error WrongState();
     error NotTheAuthor();
     error NotTheAdmin();
-    error NotTheBuilder();
     error NotBlessed();
     error NoSuchAccount();
     error NothingToDo();
     error NotYetFrozenable();
     error TooMuch();
     error DayAlreadyCharged();
+    error DayNotOver();
     error AlreadyPaid();
 
     struct Init {
         IERC20 asset;
         ILocalVenue venue;
         IAttestationRegistry attestation;
-        IStrategyRegistry strategies;
         address platform;
         address admin;
         address author;
-        bytes32 strategyId;
-        uint32 version;
+        uint256 strategyId;
+        bytes32 bundleHash;
         bytes32 sourceHash;
         Fees fees;
         uint16 exitBandBps;
@@ -105,21 +101,24 @@ contract Vault is IVault, ERC20 {
         asset = init.asset;
         venue = init.venue;
         attestation = init.attestation;
-        strategies = init.strategies;
         platform = init.platform;
         admin = init.admin;
         author = init.author;
         strategyId = init.strategyId;
-        version = init.version;
+        bundleHash = init.bundleHash;
         sourceHash = init.sourceHash;
         createdAt = uint64(block.timestamp);
         _fees = init.fees;
         exitBandBps = init.exitBandBps;
         freezeAfter = init.freezeAfter;
         _tank.dailyCap = init.dailyUsageCap;
+        // Nothing before the day it opened can be charged.
+        _tank.lastChargedDay = uint64(block.timestamp / 1 days) - 1;
         _tank.target = init.tankTarget;
         _tank.autofillBps = init.autofillBps;
-        _state = VaultState.Building;
+        // A vault is only created for a strategy that is built and reviewed,
+        // so it opens at once.
+        _state = VaultState.Open;
         highWaterMark = 10 ** 6;
         lastCrystallised = uint64(block.timestamp);
     }
@@ -182,7 +181,7 @@ contract Vault is IVault, ERC20 {
     }
 
     function redeem(uint256 shares, address receiver) external returns (uint256 assets, uint256 claimId) {
-        if (_state == VaultState.Building) revert WrongState();
+        if (_state == VaultState.None) revert WrongState();
         if (shares == 0) revert NothingToDo();
         crystallise();
 
@@ -323,7 +322,7 @@ contract Vault is IVault, ERC20 {
     // Fees ------------------------------------------------------------------
 
     function crystallise() public {
-        if (_state == VaultState.Building || _state == VaultState.Closed) return;
+        if (_state == VaultState.Closed) return;
         uint256 elapsed = block.timestamp - lastCrystallised;
         if (elapsed == 0) return;
         lastCrystallised = uint64(block.timestamp);
@@ -401,10 +400,13 @@ contract Vault is IVault, ERC20 {
 
     function submitUsage(uint64 day, uint256 amount, bytes calldata signature) external {
         if (day <= _tank.lastChargedDay) revert DayAlreadyCharged();
+        // A day is charged once it is over, so the bill can never run ahead
+        // of the time the strategy has had.
+        if (day >= block.timestamp / 1 days) revert DayNotOver();
         bytes32 digest = MessageHashUtils.toEthSignedMessageHash(usageDigest(day, amount));
         (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, signature);
         if (err != ECDSA.RecoverError.NoError) revert NotBlessed();
-        if (!attestation.isBlessedFor(signer, address(this), bundleHash())) revert NotBlessed();
+        if (!_isExecutor(signer)) revert NotBlessed();
 
         // The statement says what a day cost; the contract believes it only up
         // to the allowances the author declared at the published prices.
@@ -432,7 +434,9 @@ contract Vault is IVault, ERC20 {
     // The strategy's own key ------------------------------------------------
 
     function moveCapital(bytes32 from, bytes32 to, uint256 amount) external {
-        if (!attestation.isBlessedFor(msg.sender, address(this), bundleHash())) revert NotBlessed();
+        if (!_isExecutor(msg.sender)) {
+            revert NotBlessed();
+        }
         if (_state != VaultState.Open) revert WrongState();
 
         if (from == ACCOUNT_IDLE && to == ACCOUNT_VENUE) {
@@ -448,48 +452,6 @@ contract Vault is IVault, ERC20 {
     }
 
     // Lifecycle -------------------------------------------------------------
-
-    function open() external {
-        if (_state != VaultState.Building) revert WrongState();
-        bytes32 bundle = bundleHash();
-        if (bundle == bytes32(0)) revert NothingToDo();
-        _state = VaultState.Open;
-        lastCrystallised = uint64(block.timestamp);
-        emit Opened(bundle);
-    }
-
-    function chargeBuild(uint256 amount) external {
-        if (_state != VaultState.Building) revert WrongState();
-        if (!attestation.isBlessedAs(msg.sender, ImageKind.Builder)) {
-            revert NotTheBuilder();
-        }
-        if (_buildCharged) revert DayAlreadyCharged();
-        _buildCharged = true;
-
-        // The builder says what the build cost; the contract believes it only
-        // up to a day at the allowances the author declared, which is the same
-        // bound a day of running is held to.
-        uint256 charge = amount > _tank.dailyCap ? _tank.dailyCap : amount;
-        _tank.lastCharge = charge;
-        uint256 paid = charge > _tank.balance ? _tank.balance : charge;
-        _tank.balance -= paid;
-        _tank.debt += charge - paid;
-        if (paid != 0) asset.safeTransfer(platform, paid);
-        emit TankCharged("build", charge, _tank.debt);
-    }
-
-    function failBuild(bytes32 reasonHash) external {
-        if (_state != VaultState.Building) revert WrongState();
-        if (!attestation.isBlessedAs(msg.sender, ImageKind.Builder)) {
-            revert NotTheBuilder();
-        }
-        uint256 refund = _tank.balance;
-        _tank.balance = 0;
-        _state = VaultState.Closed;
-        if (refund != 0) asset.safeTransfer(author, refund);
-        emit BuildFailed(reasonHash);
-        emit Closed();
-    }
 
     function kill() external {
         if (msg.sender != admin) revert NotTheAdmin();
@@ -514,8 +476,8 @@ contract Vault is IVault, ERC20 {
     function approveKey(bytes32 venueId, address key) external {
         if (venueId != VENUE_ID) revert NoSuchAccount();
         if (_state != VaultState.Open) revert WrongState();
-        if (!attestation.isBlessedFor(key, address(this), bundleHash())) revert NotBlessed();
-        uint64 until = attestation.keyInfo(key).blessedUntil;
+        if (!_isExecutor(key)) revert NotBlessed();
+        uint64 until = attestation.blessedUntil(key, block.chainid, address(this), bundleHash);
         venue.approveAgent(key, until);
         if (!_isApprovedKey[key]) {
             _isApprovedKey[key] = true;
@@ -526,7 +488,7 @@ contract Vault is IVault, ERC20 {
 
     function revokeKey(bytes32 venueId, address key) external {
         if (venueId != VENUE_ID) revert NoSuchAccount();
-        bool stillBlessed = attestation.isBlessedFor(key, address(this), bundleHash());
+        bool stillBlessed = attestation.isBlessedFor(key, block.chainid, address(this), bundleHash);
         bool unwindingOnly = _state == VaultState.Frozen || _state == VaultState.Killed;
         // Anyone may revoke, and the contract obeys only what the registry
         // says: a key whose blessing still stands cannot be cut off by a
@@ -535,6 +497,14 @@ contract Vault is IVault, ERC20 {
         venue.revokeAgent(key);
         _isApprovedKey[key] = false;
         emit KeyRevoked(venueId, key);
+    }
+
+    /// A key blessed for this vault and its bundle, as an executor: only an
+    /// executor trades and bills; an unwinder blessed for the same vault only
+    /// ever closes.
+    function _isExecutor(address key) private view returns (bool) {
+        return attestation.isBlessedFor(key, block.chainid, address(this), bundleHash)
+            && attestation.keyInfo(key).kind == ImageKind.Executor;
     }
 
     function _revokeEveryKey() private {
@@ -548,10 +518,6 @@ contract Vault is IVault, ERC20 {
     }
 
     // What the page shows ---------------------------------------------------
-
-    function bundleHash() public view returns (bytes32) {
-        return strategies.bundleHashOf(strategyId, version);
-    }
 
     function state() external view returns (VaultState) {
         return _state;

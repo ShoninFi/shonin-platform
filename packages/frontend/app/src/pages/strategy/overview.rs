@@ -1,11 +1,11 @@
-//! What a depositor reads before deciding: what the strategy does, what the
+//! What a depositor reads before deciding: what the agent does, what the
 //! review found, where the money sits, who is stopping it leaving, and how
 //! they would get it back.
 
 use std::rc::Rc;
 
 use dominator::{Dom, html, text};
-use shared::{ExitClass, Strategy, Valuation};
+use shared::{Area, ExitClass, Strategy, Valuation};
 
 use crate::copy;
 use crate::format as fmt;
@@ -29,7 +29,8 @@ pub fn render(strategy: &Rc<Strategy>) -> Dom {
             .child(review(strategy))
             .child(where_the_money_is(strategy))
             .child(leaving(strategy))
-            .child(limits(strategy))
+            .child(claims(strategy))
+            .child(who_cannot_deposit(strategy))
         }))
         .child(html!("div", {
             .class("stack")
@@ -46,7 +47,7 @@ fn what_it_does(strategy: &Rc<Strategy>) -> Dom {
             html!("p", {
                 .class(["faint", "small"])
                 .text(
-                    "The author's own words. The review reads the code, not the description."
+                    "The author's own words. The review checks the code against them."
                 )
             }),
         ],
@@ -81,16 +82,16 @@ fn record(strategy: &Rc<Strategy>) -> Dom {
                     fmt::money_compact(record.peak_aum)
                 ),
             ),
-            if strategy.days_live < Strategy::DAYS_TO_RANK {
+            if strategy.days_live < Strategy::DAYS_NEW {
                 ui::notice(
                     Tone::Warn,
                     "This agent is labelled new",
                     &format!(
-                        "It has run for {} and made {} trades. It is open for deposits, and won't be ranked \
-                         until it has {} live days.",
+                        "It has run for {} and made {} trades. It is open for deposits, and joins the \
+                         leaderboard once it has {} live days.",
                         fmt::days(strategy.days_live),
                         fmt::count(record.trades),
-                        Strategy::DAYS_TO_RANK
+                        Strategy::DAYS_NEW
                     ),
                 )
             } else {
@@ -108,28 +109,18 @@ fn review(strategy: &Rc<Strategy>) -> Dom {
         return ui::section(
             "The review",
             vec![ui::empty(
-                "Review pending. The score appears here when the reviewer has signed it.",
+                "Review pending. The report card appears here when the reviewer has signed it.",
             )],
         );
     };
 
-    let findings: Vec<Dom> = review
-        .findings
-        .iter()
-        .take(2)
-        .map(|finding| {
-            html!("li", {
-                .child(html!("span", { .text(&finding.summary) }))
-                .child(text(" "))
-                .child(html!("span", {
-                    .class(["faint", "small"])
-                    .text(&format!("{} · {}", finding.category.label(), finding.severity.label()))
-                }))
-            })
+    let ratings = Area::ALL.into_iter().map(|area| {
+        html!("div", {
+            .class(["row", "row--between", "row--wrap"])
+            .child(ui::value(area.label()))
+            .child(ui::rating(review.rating(area)))
         })
-        .collect();
-
-    let more = review.findings.len().saturating_sub(2);
+    });
 
     ui::section_with_aside(
         "The review",
@@ -138,27 +129,13 @@ fn review(strategy: &Rc<Strategy>) -> Dom {
             "The full report",
         )),
         vec![
-            html!("div", {
-                .class(["row", "row--wrap"])
-                .child(ui::score(review.score, review.band()))
-                .child(ui::muted(&format!(
-                    "{} finding{}",
-                    review.findings.len(),
-                    if review.findings.len() == 1 { "" } else { "s" }
-                )))
-            }),
+            html!("div", { .class("stack-sm").children(ratings) }),
             html!("p", { .text(&review.summary) }),
-            if findings.is_empty() {
-                ui::note("No findings.")
-            } else {
-                html!("div", {
-                    .class("stack-sm")
-                    .child(html!("ul", { .children(findings) }))
-                    .apply_if(more > 0, |dom| dom.child(ui::note(&format!(
-                        "and {more} more in the full report"
-                    ))))
-                })
-            },
+            ui::muted(&format!(
+                "{} finding{} in the full report",
+                review.findings.len(),
+                if review.findings.len() == 1 { "" } else { "s" }
+            )),
             ui::note(copy::REVIEW_NOTE),
         ],
     )
@@ -308,25 +285,44 @@ fn leaving(strategy: &Rc<Strategy>) -> Dom {
     ui::section("Leaving", children)
 }
 
-fn limits(strategy: &Rc<Strategy>) -> Dom {
-    if strategy.limits.is_empty() && strategy.dependencies.is_empty() {
+fn claims(strategy: &Rc<Strategy>) -> Dom {
+    if strategy.claims.is_empty() {
         return html!("span");
     }
+    ui::section(
+        "What it claims about itself",
+        vec![
+            ui::note(
+                "In the author's words. Any limit lives in the agent's own code, and the review \
+                 checks each claim against it. There is no platform risk policy.",
+            ),
+            ui::bullets(strategy.claims.iter().cloned()),
+        ],
+    )
+}
 
-    let mut children = Vec::new();
-    if !strategy.limits.is_empty() {
-        children.push(ui::note(
-            "These limits live in the agent's own code, where the reviewer reads them. There \
-             is no platform risk policy.",
-        ));
-        children.push(ui::bullets(strategy.limits.iter().cloned()));
-    }
-    if !strategy.dependencies.is_empty() {
-        children.push(ui::subheading("What it depends on"));
-        children.push(ui::bullets(strategy.dependencies.iter().cloned()));
-    }
-
-    ui::section("What it will not do", children)
+/// Who the vault refuses, by the code its contract records.
+fn who_cannot_deposit(strategy: &Rc<Strategy>) -> Dom {
+    let names: Vec<String> = strategy
+        .restricted
+        .iter()
+        .map(|code| match code.as_str() {
+            "US" => "US persons".to_string(),
+            "SANCTIONED" => "sanctioned persons".to_string(),
+            other => format!("residents of {other}"),
+        })
+        .collect();
+    ui::section(
+        "Who can't deposit",
+        vec![
+            ui::bullets(names.into_iter()),
+            ui::note(
+                "Every vault refuses US and sanctioned persons, and each venue it trades on adds \
+                 its own exclusions. A deposit carries the depositor's signed statement that they \
+                 aren't one of them. Withdrawing is never restricted.",
+            ),
+        ],
+    )
 }
 
 fn aside(strategy: &Rc<Strategy>) -> Vec<Dom> {
@@ -341,7 +337,13 @@ fn aside(strategy: &Rc<Strategy>) -> Vec<Dom> {
                 ("Value".to_string(), ui::number(&fmt::money(vault.value))),
                 (
                     "Value per share".to_string(),
-                    ui::number(&fmt::share_price(vault.share_price)),
+                    html!("div", {
+                        .child(ui::number(&fmt::share_price(vault.share_price)))
+                        .child(html!("div", {
+                            .class(["faint", "small"])
+                            .text("after fees, including this week's so far")
+                        }))
+                    }),
                 ),
                 (
                     "High-water mark".to_string(),
@@ -418,31 +420,6 @@ fn aside(strategy: &Rc<Strategy>) -> Vec<Dom> {
         "Fees",
         None,
         vec![fee_table(&strategy.vault.fees), ui::note(copy::FEE_NOTE)],
-    ));
-
-    let audits: Vec<Dom> = vault
-        .audits
-        .iter()
-        .map(|audit| {
-            html!("div", {
-                .class("stack-sm")
-                .child(html!("div", {
-                    .class(["row", "row--between", "row--wrap"])
-                    .child(ui::value(&audit.subject))
-                    .child(ui::badge(audit.status.label(), Tone::from_audit(audit.status)))
-                }))
-                .child(html!("div", { .class(["faint", "small"]).text(&audit.note) }))
-            })
-        })
-        .collect();
-
-    cards.push(ui::card_titled(
-        "Audit status",
-        None,
-        vec![
-            ui::note("Vaults open before every audit is finished, so the page says where each one stands."),
-            html!("div", { .class("stack").children(audits) }),
-        ],
     ));
 
     cards.push(ui::card_titled(

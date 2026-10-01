@@ -3,15 +3,13 @@
 use serde::{Deserialize, Serialize};
 use time::Date;
 
-use super::common::{Audit, Chain};
+use super::common::Chain;
 use super::venue::ExitClass;
 
 /// What a vault is doing right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum VaultState {
-    /// The build service is compiling the submitted source.
-    Building,
     /// Taking deposits, trading.
     Open,
     /// Frozen after a claim went unserved: no new deposits.
@@ -25,7 +23,6 @@ pub enum VaultState {
 impl VaultState {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Building => "building",
             Self::Open => "open",
             Self::Frozen => "frozen",
             Self::Killed => "killed",
@@ -117,8 +114,8 @@ pub struct InTransit {
 /// running vault.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Fees {
-    /// Charged on value, per year, to the platform.
-    pub streaming_bps: u32,
+    /// The holding fee: charged on value, per year, to the platform.
+    pub holding_bps: u32,
     /// Charged on gains above the high-water mark, to the author.
     pub author_bps: u32,
     /// Charged on the same gains, to the platform.
@@ -127,7 +124,7 @@ pub struct Fees {
     pub transaction_bps: u32,
 }
 
-/// Pooled capital behind one strategy version.
+/// Pooled capital behind one agent.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Vault {
     pub address: String,
@@ -156,7 +153,6 @@ pub struct Vault {
     pub freeze_after_days: u32,
     pub claims: Vec<Claim>,
     pub in_transit: Option<InTransit>,
-    pub audits: Vec<Audit>,
 }
 
 impl Vault {

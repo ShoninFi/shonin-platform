@@ -7,73 +7,78 @@
 
 use std::path::{Path, PathBuf};
 
+use alloy::primitives::U256;
 use anyhow::{Context, Result, bail};
 use chain::bindings::factory::IVaultFactory;
+use chain::bindings::usd::ILocalUsd;
 use chain::bindings::vault::IVault;
 use chain::{Client, Deployments, Role};
 use shared::model::registry::JobState;
 
 /// What the site needs on it before every page has something to show.
 struct Plan {
-    /// What to call it, and which version.
-    id: &'static str,
-    version: u32,
-    /// The version it claims to replace.
-    supersedes: Option<&'static str>,
+    /// The title it is published under, since a changed agent is a new agent.
+    title: &'static str,
     /// Keep the source out of the store.
     sealed: bool,
-    /// Break it on purpose, so a failed build is on the queue where anyone
-    /// can read why.
+    /// Break it on purpose, so a failed build is on the queue.
     broken: bool,
+    /// Activate it once it is ready.
+    activate: bool,
+    /// A depositor puts money in once it is open.
+    deposit: bool,
     /// Stop it once it is running.
     killed: bool,
 }
 
 const PLAN: &[Plan] = &[
     Plan {
-        id: "funding-basis",
-        version: 1,
-        supersedes: None,
+        title: "Funding basis",
         sealed: false,
         broken: false,
+        activate: true,
+        deposit: true,
         killed: false,
     },
     Plan {
-        id: "funding-basis",
-        version: 2,
-        supersedes: Some("funding-basis@1"),
-        sealed: false,
-        broken: false,
-        killed: false,
-    },
-    Plan {
-        id: "funding-basis",
-        version: 3,
-        supersedes: None,
+        title: "Funding basis, sealed",
         sealed: true,
         broken: false,
+        activate: true,
+        deposit: false,
         killed: false,
     },
     Plan {
-        id: "funding-basis",
-        version: 4,
-        supersedes: None,
+        title: "Funding basis, broken",
         sealed: false,
         broken: true,
+        activate: false,
+        deposit: false,
         killed: false,
     },
     Plan {
-        id: "funding-basis",
-        version: 5,
-        supersedes: None,
+        title: "Funding basis, not yet activated",
         sealed: false,
         broken: false,
+        activate: false,
+        deposit: false,
+        killed: false,
+    },
+    Plan {
+        title: "Funding basis, stopped",
+        sealed: false,
+        broken: false,
+        activate: true,
+        deposit: false,
         killed: true,
     },
 ];
 
-/// Publish one project as it stands, at the version its manifest names: what
-/// an author does from the web app, run from a checkout of their work.
+/// What the seeded depositor puts into the live vault.
+const DEPOSIT: u64 = 25_000_000_000;
+
+/// Publish one project as it stands: what an author does from the web app,
+/// run from a checkout of their work. It is activated once it is ready.
 pub async fn one(
     client: &Client,
     vault_chain: shared::Chain,
@@ -102,15 +107,15 @@ pub async fn one(
         project,
         author,
         false,
+        true,
     )
     .await?;
     match published.outcome {
-        JobState::Succeeded => {
-            tracing::info!(slug = published.slug, vault = %published.vault, job = published.job_id, "built and registered");
+        JobState::Ready => {
+            tracing::info!(slug = published.slug(vault_chain), vault = ?published.vault, job = published.job_id, "published and activated");
             Ok(())
         }
-        JobState::Failed { reason } => bail!("the build failed ({}): {reason}", published.job_id),
-        other => bail!("the build is {}", other.label()),
+        other => bail!("job {} ended {}", published.job_id, other.label()),
     }
 }
 
@@ -120,7 +125,6 @@ pub async fn run(
     deployments: &Deployments,
     api: &str,
     agents: Option<&Path>,
-    store: &Path,
 ) -> Result<()> {
     let agents = agents
         .map(Path::to_path_buf)
@@ -137,10 +141,9 @@ pub async fn run(
     let work = std::env::temp_dir().join("shonin-seed");
     let _ = std::fs::remove_dir_all(&work);
 
-    for plan in PLAN {
-        let prepared = prepare(&agents, &agent, &work, plan)?;
-        tracing::info!(id = plan.id, version = plan.version, "publishing");
-
+    for (index, plan) in PLAN.iter().enumerate() {
+        let prepared = prepare(&agents, &agent, &work.join(index.to_string()), plan)?;
+        tracing::info!(title = plan.title, "publishing");
         let published = crate::publish::publish(
             client,
             vault_chain,
@@ -149,35 +152,61 @@ pub async fn run(
             &prepared,
             author,
             plan.sealed,
+            plan.activate,
         )
         .await?;
-
-        match &published.outcome {
-            JobState::Succeeded => tracing::info!(slug = published.slug, "published"),
-            JobState::Failed { reason } => {
+        let slug = published.slug(vault_chain).unwrap_or_default();
+        match (&published.outcome, plan.broken) {
+            (JobState::Failed { outcome }, true) => {
                 tracing::info!(
-                    slug = published.slug,
-                    reason,
+                    slug,
+                    outcome = outcome.label(),
                     "the build failed, as intended"
                 )
             }
-            other => tracing::warn!(state = other.label(), "the build did not finish"),
+            (JobState::Ready, false) => tracing::info!(slug, "published"),
+            (other, _) => bail!("{} ended {}, not as planned", plan.title, other.label()),
         }
 
-        if plan.killed && matches!(published.outcome, JobState::Succeeded) {
+        let Some(vault) = published.vault else {
+            continue;
+        };
+        if plan.deposit {
+            let viewer = client.account(Role::Viewer)?;
+            let amount = U256::from(DEPOSIT);
+            client
+                .send(
+                    viewer,
+                    deployments.usd,
+                    ILocalUsd::approveCall {
+                        spender: vault,
+                        value: amount,
+                    },
+                )
+                .await?;
+            client
+                .send(
+                    viewer,
+                    vault,
+                    IVault::depositCall {
+                        assets: amount,
+                        receiver: viewer,
+                    },
+                )
+                .await
+                .context("the seeded deposit")?;
+            tracing::info!(slug, "and a depositor put money in");
+        }
+        if plan.killed {
             let admin = client.account(Role::Admin)?;
             client
-                .send(admin, published.vault, IVault::killCall {})
+                .send(admin, vault, IVault::killCall {})
                 .await
                 .context("the vault would not stop")?;
-            tracing::info!(
-                slug = published.slug,
-                "and then stopped, so the feed has a kill"
-            );
+            tracing::info!(slug, "and then stopped, so the feed has a kill");
         }
     }
 
-    let _ = store;
     let vaults = client
         .read(deployments.factory, IVaultFactory::vaultsCall {})
         .await?;
@@ -185,36 +214,35 @@ pub async fn run(
     Ok(())
 }
 
-/// Copy the agent into a scratch tree, with the manifest a plan asks for.
-fn prepare(agents: &Path, agent: &Path, work: &Path, plan: &Plan) -> Result<PathBuf> {
-    let into = work.join(format!("{}-v{}", plan.id, plan.version));
-    copy_tree(agents, &into)?;
-
+/// Copy the agent into a scratch tree, under the title a plan asks for.
+fn prepare(agents: &Path, agent: &Path, into: &Path, plan: &Plan) -> Result<PathBuf> {
+    copy_tree(agents, into)?;
     let relative = agent
         .strip_prefix(agents)
         .unwrap_or(Path::new("packages/agents/funding-basis"));
     let project = into.join(relative);
 
     let manifest_path = project.join("shonin.toml");
-    let mut manifest = std::fs::read_to_string(&manifest_path)?;
-    manifest = manifest.replace("version = 1", &format!("version = {}", plan.version));
-    if let Some(claim) = plan.supersedes {
-        manifest = manifest.replace(
-            &format!("version = {}", plan.version),
-            &format!("version = {}\nsupersedes = \"{claim}\"", plan.version),
-        );
-    }
-    std::fs::write(&manifest_path, manifest)?;
+    let manifest: String = std::fs::read_to_string(&manifest_path)?
+        .lines()
+        .map(|line| {
+            if line.starts_with("title = ") {
+                format!("title = \"{}\"", plan.title)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&manifest_path, manifest + "\n")?;
 
     if plan.broken {
-        // A line that will not compile, so the queue has a failure on it with
-        // the compiler's own words underneath.
+        // A line that will not compile, so the queue has a failure on it.
         let source = project.join("src/lib.rs");
         let mut text = std::fs::read_to_string(&source)?;
-        text.push_str("\nfn this_does_not_compile() -> Decimal { \"not a decimal\" }\n");
+        text.push_str("\nfn this_does_not_compile() -> u8 { \"not a number\" }\n");
         std::fs::write(&source, text)?;
     }
-
     Ok(project)
 }
 

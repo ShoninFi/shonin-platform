@@ -54,8 +54,8 @@ fn totals() -> Dom {
             Some("every one of them public"),
         ),
         ui::stat(
-            "Ranked",
-            &data::ranked().len().to_string(),
+            "On the leaderboard",
+            &data::listed().len().to_string(),
             Some(&format!("{} more labelled new", data::newest().len())),
         ),
     ])
@@ -81,7 +81,7 @@ fn guarantees() -> Dom {
 }
 
 fn featured() -> Dom {
-    let cards: Vec<Dom> = data::ranked()
+    let cards: Vec<Dom> = data::listed()
         .into_iter()
         .take(4)
         .map(|strategy| parts::strategy_card(&strategy))
@@ -92,8 +92,8 @@ fn featured() -> Dom {
         Some(ui::action_link("/agents", "The whole leaderboard")),
         vec![
             ui::note(
-                "Ranked on live on-chain records, rescaled to one level of risk, with the size \
-                 each record was earned at.",
+                "The best 30 days on the leaderboard, read from each vault's own contract, with \
+                 the size each record was earned at.",
             ),
             html!("div", {
                 .class(["grid", "grid--4"])

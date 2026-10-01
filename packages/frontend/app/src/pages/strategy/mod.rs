@@ -55,7 +55,7 @@ fn header(strategy: &Strategy, current: Tab) -> Dom {
         .child(html!("div", {
             .class(["row", "row--wrap", "row--between", "row--top"])
             .child(html!("div", {
-                .child(html!("h1", { .class("title").text(&strategy.name()) }))
+                .child(html!("h1", { .class("title").text(strategy.name()) }))
                 .child(parts::byline(strategy))
             }))
             .child(parts::labels(strategy))
@@ -65,7 +65,6 @@ fn header(strategy: &Strategy, current: Tab) -> Dom {
     })
 }
 
-/// The fee schedule, which both products show the same way.
 /// A vault's fee schedule, read from the vault. It never changes under a
 /// running vault, so what a page shows is what that vault charges rather than
 /// what the platform charges today.
@@ -75,15 +74,15 @@ pub fn fee_table(fees: &shared::Fees) -> Dom {
 
     let rows = [
         (
-            "Streaming fee",
+            "Holding fee",
             "The vault's value",
             "Shonin",
-            format!("{} a year", fmt::from_bps(fees.streaming_bps)),
+            format!("{} a year", fmt::from_bps(fees.holding_bps)),
         ),
         (
             "Author fee",
-            "Gains above the high-water mark, daily",
-            "The author, filling the vault's tank first",
+            "Gains above the high-water mark, paid weekly",
+            "The author",
             format!("{} of profit", fmt::from_bps(fees.author_bps)),
         ),
         (

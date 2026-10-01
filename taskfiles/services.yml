@@ -85,6 +85,7 @@ tasks:
         --port {{.PORT_BUILDER}}
         --builds "{{.PATH_BUILDS}}"
         --sdk "{{.PATH_PACKAGE_SDK}}"
+        --reviewer-url "{{.URL_REVIEWER_DEV}}"
 
   reviewer:
     desc: "The reviewer"

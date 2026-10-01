@@ -1,86 +1,121 @@
-//! The attested review: a pinned model reads a strategy's source and scores
-//! whether it is reasonable. A score, never a gate, and never about profit.
+//! The attested review: a pinned model reads an agent's source before it is
+//! built and rates it in six areas. A report card, never an overall score,
+//! never a gate except for malicious code, and never about profit.
 
 use serde::{Deserialize, Serialize};
 use time::Date;
 
-/// The fixed categories a finding can fall into. The reviewer image pins
-/// them, so a score means the same thing across strategies.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The six areas a review rates, in the order the contract stores them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum FindingCategory {
-    UnboundedRisk,
-    MissingFailureHandling,
-    ModelDependence,
-    ExternalDependence,
-    KnownFailurePattern,
-    HiddenBehaviour,
-    UnauditedDependencies,
+pub enum Area {
+    Security,
+    FinancialRisk,
+    Reliability,
+    Reproducibility,
+    OutsideInfluence,
+    AccurateDescription,
 }
 
-impl FindingCategory {
+impl Area {
+    pub const ALL: [Area; 6] = [
+        Self::Security,
+        Self::FinancialRisk,
+        Self::Reliability,
+        Self::Reproducibility,
+        Self::OutsideInfluence,
+        Self::AccurateDescription,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
-            Self::UnboundedRisk => "Unbounded risk",
-            Self::MissingFailureHandling => "Missing failure handling",
-            Self::ModelDependence => "Model dependence",
-            Self::ExternalDependence => "External dependence",
-            Self::KnownFailurePattern => "Known failure pattern",
-            Self::HiddenBehaviour => "Hidden behaviour",
-            Self::UnauditedDependencies => "Unaudited dependencies",
+            Self::Security => "Security",
+            Self::FinancialRisk => "Financial risk",
+            Self::Reliability => "Reliability",
+            Self::Reproducibility => "Reproducibility",
+            Self::OutsideInfluence => "Outside influence",
+            Self::AccurateDescription => "Accurate description",
         }
     }
 
-    /// What the reviewer is looking for in this category.
+    /// What the reviewer looks for in this area.
     pub fn description(self) -> &'static str {
         match self {
-            Self::UnboundedRisk => {
-                "Position sizing that can grow without a ceiling, leverage the code never \
-                 bounds, or what happens to positions after a losing streak."
+            Self::Security => {
+                "Code written to do harm, logic that changes after a date, an address or a signal, \
+                 text addressed to the reviewer, and little-used crates."
             }
-            Self::MissingFailureHandling => {
-                "Rejected orders, venue errors, a host that is down, or a restart with an \
-                 empty state cache."
+            Self::FinancialRisk => {
+                "Size or leverage with no ceiling, no response to a losing streak, sizing shapes that \
+                 have failed before, a model sizing positions unchecked, and markets whose price can \
+                 be moved cheaply or whose price feed someone else controls."
             }
-            Self::ModelDependence => {
-                "A model's output sizing a position directly, with no bound and no fallback \
-                 when inference fails or runs over budget."
+            Self::Reliability => {
+                "Rejected orders, venue errors, failed reads, and a restart with an empty cache."
             }
-            Self::ExternalDependence => {
-                "Hosts the strategy depends on, especially any the author controls, and data \
-                 feeds whose owner depositors would be trusting."
+            Self::Reproducibility => {
+                "A build script or procedural macro that reads the clock, the network, the \
+                 environment or a random number."
             }
-            Self::KnownFailurePattern => {
-                "Shapes that have failed before: martingale or short-volatility sizing, hedges \
-                 resting on one oracle, strategies that only work with unbounded capital."
+            Self::OutsideInfluence => {
+                "Hosts, feeds and signals the agent follows, especially any its author controls."
             }
-            Self::HiddenBehaviour => {
-                "Code paths that behave very differently from the rest, such as logic that \
-                 trades differently after a date or a signal, or a build that compiles to \
-                 something different each time it runs."
-            }
-            Self::UnauditedDependencies => {
-                "Crates with little use elsewhere, pulled into code that holds depositors' \
-                 money."
+            Self::AccurateDescription => {
+                "The author's description and claims, compared with what the code does."
             }
         }
     }
 
-    pub fn all() -> [FindingCategory; 7] {
-        [
-            Self::UnboundedRisk,
-            Self::MissingFailureHandling,
-            Self::ModelDependence,
-            Self::ExternalDependence,
-            Self::KnownFailurePattern,
-            Self::HiddenBehaviour,
-            Self::UnauditedDependencies,
-        ]
+    pub fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|area| *area == self)
+            .expect("every area is listed")
     }
 }
 
-/// How much a finding weighs on the score.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// How one area reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Rating {
+    LooksFine,
+    SomeConcerns,
+    SeriousConcerns,
+    CouldntTell,
+}
+
+impl Rating {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LooksFine => "looks fine",
+            Self::SomeConcerns => "some concerns",
+            Self::SeriousConcerns => "serious concerns",
+            Self::CouldntTell => "couldn't tell",
+        }
+    }
+
+    /// The number the contract stores: `Rating` in `IReviewRegistry.sol`.
+    pub fn code(self) -> u8 {
+        match self {
+            Self::LooksFine => 1,
+            Self::SomeConcerns => 2,
+            Self::SeriousConcerns => 3,
+            Self::CouldntTell => 4,
+        }
+    }
+
+    pub fn from_code(code: u8) -> Option<Rating> {
+        match code {
+            1 => Some(Self::LooksFine),
+            2 => Some(Self::SomeConcerns),
+            3 => Some(Self::SeriousConcerns),
+            4 => Some(Self::CouldntTell),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Severity {
     Note,
@@ -98,58 +133,72 @@ impl Severity {
     }
 }
 
-/// One thing a careful reader would worry about, tied to a file and line.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// One thing a careful reader would worry about. For sealed source it carries
+/// no file, line or quote, so the report can't leak the code it read.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Finding {
-    pub category: FindingCategory,
+    pub area: Area,
     pub severity: Severity,
     pub summary: String,
     pub detail: String,
-    pub file: String,
-    pub line: u32,
+    pub file: Option<String>,
+    pub line: Option<u32>,
 }
 
 /// A signed review, as it is stored and as the page shows it.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Review {
-    /// 0 to 100; higher is more reasonable, and it never predicts profit.
-    pub score: u8,
+    /// One rating per area, in [`Area::ALL`]'s order.
+    pub ratings: [Rating; 6],
     pub findings: Vec<Finding>,
     /// The reviewer's own summary of what the code does, beside the author's.
     pub summary: String,
     pub reviewed: Date,
-    /// The image, model and prompt the score came from. Changing any of them
-    /// is an image change behind the allowlist timelock.
+    /// Whether the code was refused as malicious, and so never built.
+    pub refused: bool,
+    /// Whether the source is sealed, in which case findings name no file.
+    pub sealed: bool,
+    /// The image, model and prompt it came from. Changing any of them is an
+    /// image change behind the allowlist timelock.
     pub reviewer_image: String,
     pub model_id_hash: String,
     pub prompt_hash: String,
     pub report_hash: String,
     /// What the review could not see, said plainly.
     pub limits: Vec<String>,
-    /// Who paid for it: the vault's tank at creation, or whoever bought it.
-    pub bought_by: String,
 }
 
 impl Review {
-    pub fn band(&self) -> ScoreBand {
-        match self.score {
-            0..=59 => ScoreBand::Low,
-            60..=79 => ScoreBand::Middling,
-            _ => ScoreBand::High,
-        }
+    pub fn rating(&self, area: Area) -> Rating {
+        self.ratings[area.index()]
     }
 
-    pub fn count(&self, category: FindingCategory) -> usize {
+    pub fn findings_in(&self, area: Area) -> impl Iterator<Item = &Finding> {
         self.findings
             .iter()
-            .filter(|f| f.category == category)
-            .count()
+            .filter(move |finding| finding.area == area)
+    }
+
+    /// Whether any area reads as a serious concern, which a page shows loudly.
+    pub fn is_alarming(&self) -> bool {
+        self.refused || self.ratings.contains(&Rating::SeriousConcerns)
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScoreBand {
-    Low,
-    Middling,
-    High,
+/// The full report a reviewer writes to the store, under the hash its review
+/// on the chain names. A page reads its ratings from the chain and the rest
+/// from here.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Report {
+    pub ratings: [Rating; 6],
+    pub refused: bool,
+    pub sealed: bool,
+    pub summary: String,
+    pub findings: Vec<Finding>,
+    pub limits: Vec<String>,
+    /// Which model, or models, answered.
+    pub answered_by: String,
+    /// The battery's answers the ratings were computed from, so a reader can
+    /// see which answer moved which rating.
+    pub answers: serde_json::Value,
 }

@@ -85,7 +85,7 @@ async fn tick(
 
     for vault in vaults {
         let state = client.read(vault, IVault::stateCall {}).await?;
-        if matches!(state, VaultState::Building | VaultState::Closed) {
+        if matches!(state, VaultState::Closed) {
             continue;
         }
 

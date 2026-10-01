@@ -1,35 +1,38 @@
 //! The reviewer.
 //!
-//! It asks a pinned model whether a strategy's code is reasonable and signs
-//! the score it got back. The score is never a gate: nothing here can stop a
-//! vault opening or a depositor depositing, and a low score is loud rather
-//! than blocking. The prompt and the output schema are in this repository, so
-//! an author can run the same review over their own code before submitting it.
+//! The build service hands it each paid submission before anything is built.
+//! It reads the source and the author's description with a pinned model, and
+//! rates the code in six areas from a battery of narrow questions. Code found
+//! to be malicious is refused, and the refusal is recorded on the chain;
+//! anything else gets the reviewer's signed go-ahead, without which the
+//! registry takes no build, and its review is posted once the build is
+//! registered. The prompt, the schema and the battery are in this repository,
+//! so an author can run the same review over their own code first.
 
-use shonin_reviewer::{battery, jev, source};
-
-use std::collections::HashMap;
-
-/// How many times a review is attempted before it is left alone.
-const ATTEMPTS: u32 = 5;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::primitives::{B256, keccak256};
-use alloy::rpc::types::Filter;
-use alloy::sol_types::SolEvent;
-use anyhow::{Context, Result, bail};
+use alloy::primitives::{B256, U256, keccak256};
+use anyhow::{Context, Result, anyhow, bail};
+use axum::Json;
+use axum::extract::{Path as UrlPath, State};
+use axum::http::StatusCode;
+use axum::routing::{get, post};
 use chain::bindings::reviews::{IReviewRegistry, Review as SignedReview};
 use chain::bindings::strategies::IStrategyRegistry;
-use chain::{Client, Deployments};
+use chain::{NetworkName, Served};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use shared::Chain;
-use shared::manifest::hash_bytes;
-use shared::model::review::Finding;
+use shared::manifest::{Manifest, hash_bytes};
+use shared::model::review::{Finding, Rating, Report};
+use shared::{Chain, ReviewAnswer, ReviewRequest};
+use shonin_reviewer::battery::{Answer, Battery};
+use shonin_reviewer::{jev, source};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 
 /// The prompt and the schema this image is pinned to. Changing either would
 /// be an image change, behind the same timelock as any other.
@@ -37,46 +40,79 @@ const PROMPT: &str = include_str!("../review/prompt.md");
 const SCHEMA: &str = include_str!("../review/schema.json");
 
 #[derive(Parser)]
-#[command(about = "Scores whether a strategy's code is reasonable")]
+#[command(about = "Reads and rates an agent's code before it is built")]
 struct Args {
     #[command(flatten)]
     chain_args: chain::ChainArgs,
     #[arg(long)]
     store: PathBuf,
-    /// The model this image is pinned to. Without it, every strategy simply
-    /// shows "review pending", which is a state the site has to handle anyway.
+    /// The model this image is pinned to. Without it, on a local chain or a
+    /// testnet, the reviewer lets everything through and rates every area
+    /// "couldn't tell", saying why; on mainnet it refuses to start.
     #[arg(long, env = "SHONIN_REVIEW_MODEL")]
     model: Option<String>,
-    /// The key for the model that answers the battery. Without it the score
-    /// is the prose model's own, and the report says so.
+    /// The key for the model that answers the battery. Without it the pinned
+    /// model answers the battery itself.
     #[arg(long, env = "SHONIN_CALIBRATOR_KEY")]
     calibrator_key: Option<String>,
-    /// Where to ask it. Defaults to the published endpoint.
     #[arg(long, env = "SHONIN_CALIBRATOR_URL")]
     calibrator_url: Option<String>,
-    /// Which version to ask. Defaults to the version this image pins.
     #[arg(long, env = "SHONIN_CALIBRATOR_MODEL")]
     calibrator_model: Option<String>,
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 19_086)]
     port: u16,
 }
 
-/// What the model is asked to return, and what the store keeps.
-///
-/// The prose comes from one model and, where this image is configured for it,
-/// the score comes from another: a fixed battery of narrow questions, weighted
-/// in this repository. Both go into the report, so a reader can see which
-/// question moved the number.
+/// What the pinned model is asked to return.
 #[derive(Clone, Serialize, Deserialize)]
-struct Report {
-    score: u8,
+struct Prose {
     summary: String,
-    findings: Vec<Finding>,
+    findings: Vec<ProseFinding>,
     limits: Vec<String>,
-    /// Absent when this image had no battery to ask, in which case the score
-    /// above is the prose model's own.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    calibrated: Option<battery::Calibrated>,
+    answers: Vec<Answer>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ProseFinding {
+    area: shared::Area,
+    severity: shared::Severity,
+    summary: String,
+    detail: String,
+    file: String,
+    line: u32,
+}
+
+/// A review the reviewer gave its go-ahead for, waiting for the build to be
+/// registered so it can be posted. Kept on disk, so a restart posts it all
+/// the same.
+#[derive(Clone, Serialize, Deserialize)]
+struct Pending {
+    chain: Chain,
+    strategy_id: u64,
+    source_hash: B256,
+    report_hash: B256,
+    model_id_hash: B256,
+    ratings: [u8; 6],
+    finding_count: u16,
+}
+
+struct Reviewer {
+    chains: Vec<Served>,
+    store: PathBuf,
+    model: Option<String>,
+    calibrator: Option<jev::Client>,
+    battery: Battery,
+    pending: Mutex<Vec<Pending>>,
+    pending_file: PathBuf,
+}
+
+impl Reviewer {
+    fn on(&self, chain: Chain) -> Result<&Served> {
+        self.chains
+            .iter()
+            .find(|served| served.vault_chain == chain)
+            .ok_or_else(|| anyhow!("this reviewer does not serve {chain}"))
+    }
 }
 
 #[tokio::main]
@@ -89,10 +125,13 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let served = args.chain_args.connect_all().await?;
+    if args.model.is_none() && args.chain_args.network == NetworkName::Mainnet {
+        bail!("a review model is required on mainnet: set SHONIN_REVIEW_MODEL");
+    }
+    let chains = args.chain_args.connect_all().await?;
     // Blessed on every vault chain it serves, since each chain's registry
     // decides for itself which keys may post a review there.
-    for served in &served {
+    for served in &chains {
         let key = served.deployments.roles.reviewer;
         chain::attest::bless_service(&served.client, &served.deployments, "reviewer", key).await?;
         chain::attest::keep_blessed(
@@ -106,258 +145,339 @@ async fn main() -> Result<()> {
             || {},
         );
     }
-    let key = served
-        .first()
-        .map(|served| served.deployments.roles.reviewer)
-        .unwrap_or_default();
 
-    let Some(model) = args.model.clone() else {
-        tracing::info!("no model is pinned, so nothing is reviewed and every strategy says so");
-        forever(args.port).await;
-        return Ok(());
-    };
-    // The battery is asked only when this image was given somewhere to ask
-    // it. Without that a review still goes out, scored by the prose model, and
-    // says as much in its report.
     let calibrator = jev::Client::configured(
         args.calibrator_key.clone(),
         args.calibrator_url.clone(),
         args.calibrator_model.clone(),
     );
-    match &calibrator {
-        Some(client) => {
-            tracing::info!(%key, model, calibrator = client.model(), "the reviewer is up")
+    match (&args.model, &calibrator) {
+        (Some(model), Some(client)) => {
+            tracing::info!(model, calibrator = client.model(), "the reviewer is up")
         }
-        None => tracing::info!(
-            %key,
+        (Some(model), None) => tracing::info!(
             model,
-            "the reviewer is up; no battery is configured, so the prose model scores too"
+            "the reviewer is up; the model answers the battery itself"
+        ),
+        (None, _) => tracing::warn!(
+            "no review model: every area will read couldn't tell, and the report says why"
         ),
     }
 
-    if args.port != 0 {
-        tokio::spawn(serve_status(SocketAddr::from(([127, 0, 0, 1], args.port))));
-    }
+    let pending_file = args.store.join("pending-reviews.json");
+    let pending: Vec<Pending> = std::fs::read(&pending_file)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    let reviewer = Arc::new(Reviewer {
+        chains,
+        store: args.store,
+        model: args.model,
+        calibrator,
+        battery: Battery::pinned(),
+        pending: Mutex::new(pending),
+        pending_file,
+    });
 
-    // Each vault chain is swept on its own, so a slow chain holds up no other.
-    let mut chains = tokio::task::JoinSet::new();
-    for served in served {
-        let store = args.store.clone();
-        let model = model.clone();
-        let calibrator = calibrator.clone();
-        chains.spawn(async move {
-            let mut refused: HashMap<(B256, u32, u32), u32> = HashMap::new();
-            loop {
-                if let Err(error) = sweep(
-                    served.vault_chain,
-                    &served.client,
-                    &served.deployments,
-                    &store,
-                    &model,
-                    calibrator.as_ref(),
-                    &mut refused,
-                )
-                .await
-                {
-                    tracing::warn!(chain = %served.key, %error, "could not look for work");
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
+    let poster = reviewer.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = post_pending(&poster).await {
+                tracing::warn!(%error, "could not post a review");
             }
-        });
-    }
-    while chains.join_next().await.is_some() {}
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
+
+    let app = axum::Router::new()
+        .route("/health", get(|| async { "reviewer" }))
+        .route("/{chain}/reviews", post(review))
+        .with_state(reviewer);
+    let address = SocketAddr::from(([127, 0, 0, 1], args.port));
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    tracing::info!(%address, "the reviewer is open");
+    axum::serve(listener, app).await?;
     Ok(())
 }
 
-/// Anyone can buy a review at any time; every request that has not been served
-/// is work.
-async fn sweep(
-    chain: Chain,
-    client: &Client,
-    deployments: &Deployments,
-    store: &std::path::Path,
-    model: &str,
-    calibrator: Option<&jev::Client>,
-    refused: &mut HashMap<(B256, u32, u32), u32>,
-) -> Result<()> {
-    let logs = client
-        .logs(
-            &Filter::new()
-                .address(deployments.reviews)
-                .event_signature(IReviewRegistry::ReviewRequested::SIGNATURE_HASH)
-                .from_block(deployments.deployed_block),
-        )
-        .await?;
-
-    // Every request is one paid review. Counting the requests for a version
-    // against the reviews the registry already holds is what decides whether
-    // this one has been served, so a restart never re-reviews and a second
-    // purchase is never dropped.
-    let mut asked: HashMap<(B256, u32), u32> = HashMap::new();
-
-    for log in logs {
-        let Ok(request) = log.log_decode::<IReviewRegistry::ReviewRequested>() else {
-            continue;
-        };
-        let (strategy_id, version) = (request.inner.strategyId, request.inner.version);
-        let nth = {
-            let counted = asked.entry((strategy_id, version)).or_default();
-            *counted += 1;
-            *counted
-        };
-        // A review this reviewer cannot produce is tried a few times and then
-        // left alone: the first failures are usually a build that has not
-        // finished writing its source, and the last one is a real problem
-        // that belongs in the log rather than in a loop.
-        if refused
-            .get(&(strategy_id, version, nth))
-            .copied()
-            .unwrap_or(0)
-            >= ATTEMPTS
-        {
-            continue;
-        }
-
-        let registered = client
-            .read(
-                deployments.strategies,
-                IStrategyRegistry::versionOfCall {
-                    strategyId: strategy_id,
-                    version,
-                },
-            )
-            .await?;
-        // A request can arrive before the build finishes; there is nothing to
-        // read until it has.
-        if registered.bundleHash == B256::ZERO {
-            continue;
-        }
-        let already = client
-            .read(
-                deployments.reviews,
-                IReviewRegistry::reviewCountCall {
-                    strategyId: strategy_id,
-                    version,
-                },
-            )
-            .await?;
-        if already >= alloy::primitives::U256::from(nth) {
-            continue;
-        }
-
-        match review_one(
-            client,
-            deployments,
-            store,
-            model,
-            calibrator,
-            strategy_id,
-            version,
-            &registered,
-            request.inner.by,
-        )
+async fn review(
+    State(reviewer): State<Arc<Reviewer>>,
+    UrlPath(chain): UrlPath<Chain>,
+    Json(request): Json<ReviewRequest>,
+) -> Result<Json<ReviewAnswer>, (StatusCode, String)> {
+    review_one(&reviewer, chain, request)
         .await
-        {
-            Ok(score) => tracing::info!(%chain, version, score, nth, "reviewed"),
-            Err(error) => {
-                let tried = refused.entry((strategy_id, version, nth)).or_default();
-                *tried += 1;
-                if *tried >= ATTEMPTS {
-                    tracing::warn!(%chain, %error, version, "giving up on this review");
-                } else {
-                    tracing::debug!(%chain, %error, version, "could not review this one yet");
-                }
-            }
-        }
-    }
-    Ok(())
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "a review could not be made");
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+        })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Read one submission and answer: a go-ahead, or a refusal on the chain.
 async fn review_one(
-    chain: &Client,
-    deployments: &Deployments,
-    store: &std::path::Path,
-    model: &str,
-    calibrator: Option<&jev::Client>,
-    strategy_id: B256,
-    version: u32,
-    registered: &chain::bindings::strategies::StrategyVersion,
-    bought_by: alloy::primitives::Address,
-) -> Result<u8> {
-    let source_hash = format!("sha256:{}", alloy::hex::encode(registered.sourceHash));
-    let source = source::from_store(store, &source_hash)
-        .context("the source is not in the store; a sealed strategy is still reviewed, and this one has no bytes here")?;
+    reviewer: &Reviewer,
+    chain: Chain,
+    request: ReviewRequest,
+) -> Result<ReviewAnswer> {
+    let on = reviewer.on(chain)?;
+    let archive =
+        shared::base64::decode(&request.archive_base64).map_err(|error| anyhow!(error))?;
+    // The reviewer hashes what it received itself, and signs for that.
+    let source_hash = hash_bytes(&archive);
+    let manifest = manifest_in(&archive, &request.manifest_path)?;
+    let source = source::from_archive(&archive)?;
 
-    let mut report = ask(model, &source).await?;
-
-    // The calibrated half, when this image has somewhere to ask it. The score
-    // then comes from a fixed battery of narrow questions weighted by this
-    // repository, rather than from one model's opinion of a number, and the
-    // working goes out with the report so a reader can argue with a question
-    // instead of with the total.
-    let battery = battery::Battery::pinned();
-    let calibrated = match calibrator {
-        Some(client) => match client.ask(&battery, &source).await {
-            Ok(calibrated) => Some(calibrated),
-            Err(error) => {
-                // A review still goes out. Losing the calibrated score costs
-                // precision; losing the review costs the author their fee.
-                tracing::warn!(%error, version, "the battery went unanswered");
-                None
-            }
-        },
-        None => None,
+    let (prose, answers, answered_by) = match &reviewer.model {
+        Some(model) => {
+            let prose = ask(model, &reviewer.battery, &manifest, &source, request.sealed).await?;
+            // The battery's answers come from the calibrator when there is
+            // one, and from the pinned model otherwise.
+            let (answered_by, answers) = match &reviewer.calibrator {
+                Some(client) => match client.ask(&reviewer.battery, &source).await {
+                    Ok((calibrator, answers)) => (format!("{model}+{calibrator}"), answers),
+                    Err(error) => {
+                        tracing::warn!(%error, "the battery went unanswered; the model's own answers stand");
+                        (model.clone(), prose.answers.clone())
+                    }
+                },
+                None => (model.clone(), prose.answers.clone()),
+            };
+            (prose, answers, answered_by)
+        }
+        None => (unread(), Vec::new(), "none".to_string()),
     };
-    if let Some(calibrated) = &calibrated {
-        report.score = calibrated.score;
-    }
-    report.calibrated = calibrated;
+    let (ratings, refused) = reviewer.battery.rate(&answers);
 
+    let findings: Vec<Finding> = prose
+        .findings
+        .into_iter()
+        .take(50)
+        .map(|finding| Finding {
+            area: finding.area,
+            severity: finding.severity,
+            summary: finding.summary,
+            detail: finding.detail,
+            // Sealed source is reviewed all the same; its report just never
+            // says where in the code anything is.
+            file: (!request.sealed && !finding.file.is_empty()).then_some(finding.file),
+            line: (!request.sealed && finding.line != 0).then_some(finding.line),
+        })
+        .collect();
+    let mut limits = prose.limits;
+    if limits.is_empty() {
+        limits.push("A review is one reading of the code, not a proof about it.".to_string());
+    }
+    let report = Report {
+        ratings,
+        refused,
+        sealed: request.sealed,
+        summary: prose.summary,
+        findings,
+        limits,
+        answered_by: answered_by.clone(),
+        answers: serde_json::to_value(&answers)?,
+    };
     let body = serde_json::to_vec_pretty(&report)?;
     let report_hash = hash_bytes(&body);
-    write(store, &report_hash, "report.json", &body)?;
+    write(&reviewer.store, &report_hash, "report.json", &body)?;
 
-    let signed = SignedReview {
-        bundleHash: registered.bundleHash,
-        sourceHash: registered.sourceHash,
+    let source_bytes = to_b256(&source_hash)?;
+    let report_bytes = to_b256(&report_hash)?;
+    let model_id_hash = keccak256(answered_by.as_bytes());
+    let codes = ratings.map(Rating::code);
+    let finding_count = report.findings.len() as u16;
+
+    if refused {
+        on.client
+            .send(
+                on.deployments.roles.reviewer,
+                on.deployments.reviews,
+                IReviewRegistry::submitRefusalCall {
+                    strategyId: U256::from(request.strategy_id),
+                    review: signed(
+                        B256::ZERO,
+                        source_bytes,
+                        report_bytes,
+                        model_id_hash,
+                        codes,
+                        finding_count,
+                    ),
+                },
+            )
+            .await
+            .context("the registry would not record the refusal")?;
+        tracing::info!(%chain, id = request.strategy_id, "refused as malicious");
+        return Ok(ReviewAnswer {
+            source_hash,
+            report_hash,
+            clearance: None,
+        });
+    }
+
+    let digest = on
+        .client
+        .read(
+            on.deployments.strategies,
+            IStrategyRegistry::clearanceDigestCall {
+                strategyId: U256::from(request.strategy_id),
+                sourceHash: source_bytes,
+            },
+        )
+        .await?;
+    let clearance = on
+        .client
+        .sign(on.deployments.roles.reviewer, digest)
+        .await?;
+
+    let mut pending = reviewer.pending.lock().await;
+    pending.push(Pending {
+        chain,
+        strategy_id: request.strategy_id,
+        source_hash: source_bytes,
+        report_hash: report_bytes,
+        model_id_hash,
+        ratings: codes,
+        finding_count,
+    });
+    write_pending(reviewer, &pending);
+    tracing::info!(%chain, id = request.strategy_id, "read, and cleared to build");
+    Ok(ReviewAnswer {
+        source_hash,
+        report_hash,
+        clearance: Some(format!("{clearance}")),
+    })
+}
+
+/// Post every review whose build has been registered since it was cleared.
+async fn post_pending(reviewer: &Reviewer) -> Result<()> {
+    let waiting = reviewer.pending.lock().await.clone();
+    let mut done = Vec::new();
+    for (index, review) in waiting.iter().enumerate() {
+        let on = reviewer.on(review.chain)?;
+        let id = U256::from(review.strategy_id);
+        let reviews = on.deployments.reviews;
+        let already = on
+            .client
+            .read(reviews, IReviewRegistry::reviewOfCall { strategyId: id })
+            .await?;
+        if already.review.reviewedAt != 0 {
+            done.push(index);
+            continue;
+        }
+        let bundle = on
+            .client
+            .read(
+                on.deployments.strategies,
+                IStrategyRegistry::bundleHashOfCall { strategyId: id },
+            )
+            .await?;
+        // Not built yet, or never will be: a failed build has nothing to post
+        // against, and its review stays in the store.
+        if bundle == B256::ZERO {
+            continue;
+        }
+        on.client
+            .send(
+                on.deployments.roles.reviewer,
+                reviews,
+                IReviewRegistry::submitReviewCall {
+                    strategyId: id,
+                    review: signed(
+                        bundle,
+                        review.source_hash,
+                        review.report_hash,
+                        review.model_id_hash,
+                        review.ratings,
+                        review.finding_count,
+                    ),
+                },
+            )
+            .await
+            .context("the registry would not take the review")?;
+        tracing::info!(chain = %review.chain, id = review.strategy_id, "review posted");
+        done.push(index);
+    }
+    if !done.is_empty() {
+        let mut pending = reviewer.pending.lock().await;
+        let posted: Vec<(Chain, u64)> = done
+            .iter()
+            .map(|&i| (waiting[i].chain, waiting[i].strategy_id))
+            .collect();
+        pending.retain(|review| !posted.contains(&(review.chain, review.strategy_id)));
+        write_pending(reviewer, &pending);
+    }
+    Ok(())
+}
+
+fn signed(
+    bundle: B256,
+    source: B256,
+    report: B256,
+    model: B256,
+    ratings: [u8; 6],
+    findings: u16,
+) -> SignedReview {
+    SignedReview {
+        bundleHash: bundle,
+        sourceHash: source,
+        // The registry records the image it knows the reviewer key by, and
+        // the time it received this; what is sent here is only a courtesy.
         reviewerImage: chain::attest::image_digest("reviewer"),
-        // Both models, when two answered: a review says what read the code.
-        modelIdHash: keccak256(models(model, report.calibrated.as_ref()).as_bytes()),
-        // The prompt and the output schema together: a review is what the
-        // model was asked and the shape it had to answer in, so changing
-        // either changes the review this one can be compared with.
+        modelIdHash: model,
+        // What the model was asked, the shape it had to answer in, and the
+        // questions the ratings come from, together.
         promptHash: keccak256(
             [
                 PROMPT.as_bytes(),
                 SCHEMA.as_bytes(),
-                battery::BATTERY.as_bytes(),
+                shonin_reviewer::battery::BATTERY.as_bytes(),
             ]
             .concat(),
         ),
-        reportHash: hash_to_bytes(&report_hash)?,
-        score: report.score,
-        findingCount: report.findings.len() as u16,
-        reviewedAt: chain.block_timestamp().await? as u64,
-        boughtBy: bought_by,
-    };
-    chain
-        .send(
-            deployments.roles.reviewer,
-            deployments.reviews,
-            IReviewRegistry::submitReviewCall {
-                strategyId: strategy_id,
-                version,
-                review: signed,
-            },
-        )
-        .await
-        .context("the registry would not take the review")?;
-    Ok(report.score)
+        reportHash: report,
+        ratings,
+        findingCount: findings,
+        reviewedAt: 0,
+    }
 }
 
-/// Run the pinned model over the source, with the schema it must answer in.
-async fn ask(model: &str, source: &str) -> Result<Report> {
+/// What a review says when there is no model to read with.
+fn unread() -> Prose {
+    Prose {
+        summary: "No review model is configured on this network, so the code was not read.".into(),
+        findings: Vec::new(),
+        limits: vec!["Nothing was read: every area reads couldn't tell.".into()],
+        answers: Vec::new(),
+    }
+}
+
+/// Run the pinned model over the description and the source, with the schema
+/// it must answer in.
+async fn ask(
+    model: &str,
+    battery: &Battery,
+    manifest: &Manifest,
+    source: &str,
+    sealed: bool,
+) -> Result<Prose> {
+    let description = format!(
+        "Title: {}\n\n{}\n\nClaims:\n{}\n\nThe source is {}.",
+        manifest.description.title,
+        manifest.description.text,
+        manifest
+            .description
+            .claims
+            .iter()
+            .map(|claim| format!("- {claim}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        if sealed { "sealed" } else { "published" },
+    );
+    let prompt = PROMPT
+        .replace("{battery}", &battery.as_prompt())
+        .replace("{description}", &description);
+
     let mut child = tokio::process::Command::new("claude")
         .args([
             "-p",
@@ -373,14 +493,12 @@ async fn ask(model: &str, source: &str) -> Result<Report> {
         .stderr(Stdio::null())
         .spawn()
         .context("the reviewer's model could not be started")?;
-
     if let Some(mut stdin) = child.stdin.take() {
         stdin
-            .write_all(format!("{PROMPT}\n\n{source}\n").as_bytes())
+            .write_all(format!("{prompt}\n\n{source}\n").as_bytes())
             .await?;
         stdin.shutdown().await?;
     }
-
     let output = child.wait_with_output().await?;
     if !output.status.success() {
         bail!("the reviewer's model did not answer");
@@ -391,101 +509,93 @@ async fn ask(model: &str, source: &str) -> Result<Report> {
         .get("structured_output")
         .cloned()
         .context("the reviewer's model answered outside its schema")?;
-    let report: Report =
-        serde_json::from_value(structured).context("the report did not match the schema")?;
-    Ok(sanitise(report))
+    serde_json::from_value(structured).context("the report did not match the schema")
 }
 
-/// The model answers inside a schema, and the score is still clamped here: a
-/// reviewer's own bounds should not be something a prompt can argue with.
-fn sanitise(mut report: Report) -> Report {
-    report.score = report.score.min(100);
-    report.findings.truncate(50);
-    if report.limits.is_empty() {
-        report.limits =
-            vec!["A review is one reading of the code, not a proof about it.".to_string()];
+/// The manifest at `path` inside a packed project.
+fn manifest_in(archive: &[u8], path: &str) -> Result<Manifest> {
+    let mut reader = tar::Archive::new(std::io::Cursor::new(archive));
+    for entry in reader.entries()?.flatten() {
+        let mut entry = entry;
+        if entry.path()?.to_string_lossy() == path {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut text)?;
+            return Manifest::from_toml(&text).map_err(|error| anyhow!(error));
+        }
     }
-    report
+    bail!("no {path} in the project")
 }
 
-/// What answered, as a review records it. One name when the prose model scored
-/// it too, both when a battery did.
-fn models(prose: &str, calibrated: Option<&battery::Calibrated>) -> String {
-    match calibrated {
-        Some(calibrated) => format!("{prose}+{}", calibrated.model),
-        None => prose.to_string(),
-    }
-}
-
-fn write(store: &std::path::Path, hash: &str, name: &str, bytes: &[u8]) -> Result<()> {
+fn write(store: &Path, hash: &str, name: &str, bytes: &[u8]) -> Result<()> {
     let directory = store.join(hash.replace(':', "-"));
     std::fs::create_dir_all(&directory)?;
     std::fs::write(directory.join(name), bytes)?;
     Ok(())
 }
 
-fn hash_to_bytes(hash: &str) -> Result<B256> {
+fn write_pending(reviewer: &Reviewer, pending: &[Pending]) {
+    if let Some(parent) = reviewer.pending_file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec(pending)
+        && let Err(error) = std::fs::write(&reviewer.pending_file, bytes)
+    {
+        tracing::warn!(%error, "the reviews waiting to be posted could not be written down");
+    }
+}
+
+fn to_b256(hash: &str) -> Result<B256> {
     let bytes = shared::manifest::hash_to_bytes(hash).context("a hash")?;
     Ok(B256::from(bytes))
 }
 
-async fn serve_status(address: SocketAddr) {
-    let app = axum::Router::new().route("/health", axum::routing::get(|| async { "reviewer" }));
-    if let Ok(listener) = tokio::net::TcpListener::bind(address).await {
-        let _ = axum::serve(listener, app).await;
-    }
-}
-
-async fn forever(port: u16) {
-    if port != 0 {
-        serve_status(SocketAddr::from(([127, 0, 0, 1], port))).await;
-    } else {
-        std::future::pending::<()>().await;
-    }
-}
-
-/// Keep the categories and severities the schema names in step with the model
-/// the rest of the platform reads.
+/// Keep the areas and severities the schema names in step with the model the
+/// rest of the platform reads, and every battery question in the prompt.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared::model::review::{FindingCategory, Severity};
+    use shared::{Area, Severity};
+
+    fn schema() -> serde_json::Value {
+        serde_json::from_str(SCHEMA).expect("the schema parses")
+    }
 
     #[test]
-    fn every_category_the_schema_names_is_one_the_platform_knows() {
-        let schema: serde_json::Value = serde_json::from_str(SCHEMA).expect("the schema parses");
-        let names = schema["properties"]["findings"]["items"]["properties"]["category"]["enum"]
+    fn every_area_the_schema_names_is_one_the_platform_knows() {
+        let names = schema()["properties"]["findings"]["items"]["properties"]["area"]["enum"]
             .as_array()
-            .expect("the categories are listed");
-        assert_eq!(names.len(), FindingCategory::all().len());
+            .expect("the areas are listed")
+            .clone();
+        assert_eq!(names.len(), Area::ALL.len());
         for name in names {
-            let text = format!("\"{}\"", name.as_str().expect("a name"));
-            serde_json::from_str::<FindingCategory>(&text).expect("the platform knows it");
+            serde_json::from_value::<Area>(name).expect("the platform knows it");
         }
     }
 
     #[test]
     fn every_severity_the_schema_names_is_one_the_platform_knows() {
-        let schema: serde_json::Value = serde_json::from_str(SCHEMA).expect("the schema parses");
-        let names = schema["properties"]["findings"]["items"]["properties"]["severity"]["enum"]
+        let names = schema()["properties"]["findings"]["items"]["properties"]["severity"]["enum"]
             .as_array()
-            .expect("the severities are listed");
+            .expect("the severities are listed")
+            .clone();
         for name in names {
-            let text = format!("\"{}\"", name.as_str().expect("a name"));
-            serde_json::from_str::<Severity>(&text).expect("the platform knows it");
+            serde_json::from_value::<Severity>(name).expect("the platform knows it");
         }
     }
 
     #[test]
-    fn a_score_past_a_hundred_is_brought_back() {
-        let report = sanitise(Report {
-            score: 240,
-            summary: String::new(),
-            findings: Vec::new(),
-            limits: Vec::new(),
-            calibrated: None,
-        });
-        assert_eq!(report.score, 100);
-        assert!(!report.limits.is_empty());
+    fn the_prompt_carries_the_battery_and_the_description() {
+        assert!(PROMPT.contains("{battery}") && PROMPT.contains("{description}"));
+        let listed = Battery::pinned().as_prompt();
+        for question in Battery::pinned().questions {
+            assert!(listed.contains(&question.id));
+        }
+    }
+
+    #[test]
+    fn with_no_model_every_area_reads_couldnt_tell() {
+        let (ratings, refused) = Battery::pinned().rate(&unread().answers);
+        assert_eq!(ratings, [Rating::CouldntTell; 6]);
+        assert!(!refused);
     }
 }

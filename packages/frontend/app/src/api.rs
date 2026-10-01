@@ -71,14 +71,14 @@ pub async fn portfolio(chain: shared::Chain, address: &str) -> Result<shared::Po
     fetch(&format!("{chain}/portfolio/{address}")).await
 }
 
-/// Offer a strategy to the build service, for a vault on this chain.
+/// Upload an agent's source to the build service, for a vault on this chain.
 #[cfg(target_arch = "wasm32")]
-pub async fn submit(
+pub async fn upload(
     chain: shared::Chain,
-    submission: &shared::Submission,
-) -> Result<shared::SubmissionAccepted, String> {
-    let reply = gloo_net::http::Request::post(&format!("{BASE}/{chain}/submissions"))
-        .json(submission)
+    upload: &shared::Upload,
+) -> Result<shared::UploadAccepted, String> {
+    let reply = gloo_net::http::Request::post(&format!("{BASE}/{chain}/uploads"))
+        .json(upload)
         .map_err(|error| error.to_string())?
         .send()
         .await

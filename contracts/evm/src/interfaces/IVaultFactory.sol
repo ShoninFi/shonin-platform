@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.30;
 
+import {Allowances} from "./IPrices.sol";
+
 /// The terms every new vault is created with. Changing them never touches a
 /// vault that already exists.
 struct VaultConfig {
@@ -16,33 +18,28 @@ struct VaultConfig {
     uint32 freezeAfter;
     /// Days of charges auto-fill aims to keep in the tank.
     uint32 tankTargetDays;
-    /// The least an author may create a vault with: the build, the review and
-    /// a minimum run.
+    /// The least an author may activate a vault with, so an agent that can't
+    /// run is never activated.
     uint256 minimumTank;
 }
 
-/// One vault per strategy version. Creating it is how a strategy is published:
-/// the author funds the tank in the same transaction, and the build and the
-/// review are its first charges.
+/// One vault per strategy. Activating a built and reviewed strategy is what
+/// creates it, from the strategy's own record, so its author never chooses
+/// which code or which chains it runs.
 interface IVaultFactory {
-    event VaultCreated(
-        bytes32 indexed strategyId,
-        uint32 indexed version,
-        address indexed author,
-        address vault,
-        uint256 tankFunding
-    );
+    event Activated(uint256 indexed strategyId, address indexed author, address vault, uint256 tankFunding);
     event ConfigSet();
 
-    function create(
-        bytes32 strategyId,
-        uint32 version,
-        bytes32 sourceHash,
-        uint256 tankFunding,
-        uint256 dailyUsageCap
+    /// The strategy's author only, once it is registered and reviewed: create
+    /// its vault, with the allowances its tank is charged against and a
+    /// starting tank of at least the minimum.
+    function activate(
+        uint256 strategyId,
+        Allowances calldata allowances,
+        uint256 tankFunding
     ) external returns (address vault);
 
-    function vaultOf(bytes32 strategyId, uint32 version) external view returns (address);
+    function vaultOf(uint256 strategyId) external view returns (address);
     function vaults() external view returns (address[] memory);
     function config() external view returns (VaultConfig memory);
     /// Admin only.

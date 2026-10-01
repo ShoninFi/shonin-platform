@@ -143,6 +143,7 @@ vars:
   URL_DOCS_PROD: "https://docs.shonin.fi"
   URL_API_DEV: "http://localhost:{{.PORT_API}}"
   URL_BUILDER_DEV: "http://localhost:{{.PORT_BUILDER}}"
+  URL_REVIEWER_DEV: "http://localhost:{{.PORT_REVIEWER}}"
   URL_DASHBOARD_DEV: "http://localhost:{{.PORT_DEVNET}}"
 
   # The local EVM chains, standing in for base, hyperliquid and robinhood.

@@ -1,9 +1,20 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.30;
 
-/// A score a reviewer signed. It says whether the code is reasonable, and
-/// never what it might earn.
+/// How one area of the code reads to the reviewer.
+enum Rating {
+    None,
+    LooksFine,
+    SomeConcerns,
+    SeriousConcerns,
+    CouldntTell
+}
+
+/// The report card a reviewer signed. It says how the code reads, area by
+/// area, and never what it might earn. There is no overall score.
 struct Review {
+    /// The bundle built from the source; zero in a refusal, where nothing was
+    /// built.
     bytes32 bundleHash;
     bytes32 sourceHash;
     bytes32 reviewerImage;
@@ -12,39 +23,35 @@ struct Review {
     bytes32 promptHash;
     /// The full report, which the page links.
     bytes32 reportHash;
-    /// 0 to 100; higher is more reasonable.
-    uint8 score;
+    /// One `Rating` per area, in order: security, financial risk,
+    /// reliability, reproducibility, outside influence, accurate description.
+    uint8[6] ratings;
     uint16 findingCount;
     uint64 reviewedAt;
-    /// Who paid for it.
-    address boughtBy;
 }
 
-/// Every review ever signed, by strategy version. Reviews accumulate: a newer
-/// one never erases an older one.
+/// One review per strategy, read once, at submission.
+///
+/// A review is advice with one exception: code found to be malicious is
+/// refused before it is built, and the refusal is recorded here against the
+/// source it refused. Nobody can buy a fresh review, so nobody can probe a
+/// sealed strategy's code by asking again.
 interface IReviewRegistry {
-    event ReviewRequested(
-        bytes32 indexed strategyId, uint32 indexed version, address indexed by, uint256 fee
-    );
     event ReviewSubmitted(
-        bytes32 indexed strategyId,
-        uint32 indexed version,
-        address indexed reviewer,
-        uint8 score,
-        bytes32 reportHash
+        uint256 indexed strategyId, address indexed reviewer, uint8[6] ratings, bytes32 reportHash
+    );
+    event Refused(
+        uint256 indexed strategyId, address indexed reviewer, bytes32 sourceHash, bytes32 reportHash
     );
 
-    /// Pay for a review of this version. Anyone may buy one at any time.
-    function requestReview(bytes32 strategyId, uint32 version) external;
-    /// A blessed reviewer key posts what its model returned.
-    function submitReview(bytes32 strategyId, uint32 version, Review calldata review) external;
+    /// A blessed reviewer key posts the review of a registered strategy. The
+    /// hashes must be the ones the strategy registry holds.
+    function submitReview(uint256 strategyId, Review calldata review) external;
+    /// A blessed reviewer key records that it refused a submitted strategy's
+    /// source. A refused strategy is never built or registered.
+    function submitRefusal(uint256 strategyId, Review calldata review) external;
 
-    function reviewCount(bytes32 strategyId, uint32 version) external view returns (uint256);
-    function reviewAt(
-        bytes32 strategyId,
-        uint32 version,
-        uint256 index
-    ) external view returns (Review memory);
-    function latestReview(bytes32 strategyId, uint32 version) external view returns (Review memory);
-    function reviewFee() external view returns (uint256);
+    /// The review, and whether it was a refusal. Zeros if there is none.
+    function reviewOf(uint256 strategyId) external view returns (Review memory review, bool refused);
+    function hasReview(uint256 strategyId) external view returns (bool);
 }

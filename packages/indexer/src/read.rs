@@ -17,7 +17,7 @@ use chain::bindings::erc20::IERC20;
 use chain::bindings::factory::IVaultFactory;
 use chain::bindings::profiles::IAuthorProfiles;
 use chain::bindings::reviews::IReviewRegistry;
-use chain::bindings::strategies::{IStrategyRegistry, VersionStatus};
+use chain::bindings::strategies::IStrategyRegistry;
 use chain::bindings::vault::{
     ClaimState as ChainClaimState, IVault, VaultState as ChainVaultState,
 };
@@ -25,10 +25,10 @@ use chain::bindings::venue::ILocalVenue;
 use chain::{Client, Deployments};
 use shared::model::activity::{EventKind, Kill, Side, Trade, VaultEvent};
 use shared::model::attestation::{Approval, Attestation, BlessedKey, Image, KeyRole};
-use shared::model::bundle::{Allowances, Bundle, LogLine, ModelFile};
-use shared::model::common::{Audit, AuditStatus, Chain, Point};
-use shared::model::registry::{Author, FeedEvent, FeedKind};
-use shared::model::review::{Finding, Review};
+use shared::model::bundle::{Bundle, ModelFile};
+use shared::model::common::{Chain, Point};
+use shared::model::registry::{Author, FeedEvent, FeedKind, Job, JobState};
+use shared::model::review::{Rating, Review};
 use shared::model::strategy::{Record, Standing, Strategy};
 use shared::model::vault::{Claim, ClaimState, Fees, Tank, Vault, VaultState};
 use shared::model::venue::{Custody, ExitClass, ExitPath, Leg, Valuation, VenueStatus};
@@ -44,9 +44,6 @@ pub struct History {
     pub aum: HashMap<Address, Vec<Point>>,
     /// The last block each vault was sampled at.
     pub sampled_to: HashMap<Address, u64>,
-    /// The venue's own spot price, for something to compare a record against.
-    pub spot: Vec<Point>,
-    pub spot_sampled_to: u64,
 }
 
 /// A moment in chain time.
@@ -119,24 +116,6 @@ pub async fn strategies(
         }
     }
 
-    // A successor names what it replaces; the page it replaces has to know.
-    let claims: Vec<(String, String)> = out
-        .iter()
-        .filter_map(|strategy| {
-            strategy
-                .supersedes
-                .clone()
-                .map(|earlier| (earlier, strategy.slug.clone()))
-        })
-        .collect();
-    for (earlier, successor) in claims {
-        if let Some(target) = out.iter_mut().find(|strategy| strategy.slug == earlier) {
-            target.superseded_by = Some(successor);
-            if target.standing.is_live() {
-                target.standing = Standing::Superseded;
-            }
-        }
-    }
     Ok(out)
 }
 
@@ -153,7 +132,7 @@ async fn one(
     now: u64,
 ) -> Result<Strategy> {
     let strategy_id = chain.read(address, IVault::strategyIdCall {}).await?;
-    let version = chain.read(address, IVault::versionCall {}).await?;
+    let id: u64 = strategy_id.try_into().unwrap_or_default();
     let author = chain.read(address, IVault::authorCall {}).await?;
     let created = chain.read(address, IVault::createdAtCall {}).await?;
     let state = chain.read(address, IVault::stateCall {}).await?;
@@ -161,18 +140,16 @@ async fn one(
     let registered = chain
         .read(
             deployments.strategies,
-            IStrategyRegistry::versionOfCall {
+            IStrategyRegistry::strategyOfCall {
                 strategyId: strategy_id,
-                version,
             },
         )
         .await?;
 
-    let id = name_of(strategy_id);
-    let slug = format!("{id}-v{version}");
+    let slug = Strategy::slug_for(vault_chain, id);
     let days_live = (now.saturating_sub(created as u64)) / 86_400;
 
-    let vault = read_vault(chain, vault_chain, deployments, address, &state, now).await?;
+    let vault = read_vault(chain, vault_chain, address, &state).await?;
     let (trades, trade_count) = read_trades(chain, deployments, address).await?;
     let record = sample(
         chain,
@@ -186,11 +163,11 @@ async fn one(
     .await?;
     let events = read_events(chain, address).await?;
     let legs = read_legs(chain, deployments, address, &vault).await?;
-    let review = read_review(chain, deployments, store, strategy_id, version).await?;
+    let review = read_review(chain, deployments, store, strategy_id).await?;
     let attestation = read_attestation(chain, deployments, address, now).await?;
-    let bundle = read_bundle(store, &registered, bundle_hash, store.job_log(&slug));
+    let bundle = read_bundle(store, &registered, bundle_hash);
 
-    let standing = standing(&state, &registered.status, days_live, bundle_hash);
+    let standing = standing(&state, days_live);
     let kill = events
         .iter()
         .find(|event| event.kind == EventKind::Killed)
@@ -201,71 +178,62 @@ async fn one(
             reference: event.reference.clone(),
         });
 
-    let manifest = store.manifest(&hash_of(bundle_hash));
+    let manifest = store
+        .manifest(&hash_of(registered.manifestHash))
+        .map(|canonical| canonical.manifest);
     Ok(Strategy {
         id,
         slug,
-        version,
         title: manifest
             .as_ref()
             .map(|manifest| manifest.description.title.clone())
-            .unwrap_or_else(|| "Waiting for its build".to_string()),
+            .unwrap_or_else(|| format!("Agent {id}")),
         description: manifest
             .as_ref()
             .map(|manifest| manifest.description.text.clone())
-            .unwrap_or_else(|| {
-                "This agent's source has been submitted and is waiting to be built.".to_string()
-            }),
+            .unwrap_or_else(|| "Its manifest is not in the store.".to_string()),
+        claims: manifest
+            .as_ref()
+            .map(|manifest| manifest.description.claims.clone())
+            .unwrap_or_default(),
         author: handle_of(chain, deployments, author).await,
         standing,
-        registered: day(if registered.registeredAt == 0 {
-            created as u64
-        } else {
-            registered.registeredAt as u64
-        }),
+        registered: day(registered.registeredAt),
         days_live: days_live as u32,
-        supersedes: (registered.supersedesVersion != 0).then(|| {
-            format!(
-                "{}-v{}",
-                name_of(registered.supersedesId),
-                registered.supersedesVersion
-            )
-        }),
-        superseded_by: None,
         bundle,
         vault,
         legs,
         review,
-        past_reviews: Vec::new(),
         health: health.get(&address).cloned(),
         attestation,
         record,
         trades,
         events,
         kill,
-        limits: manifest
-            .as_ref()
-            .map(|manifest| manifest.description.limits.clone())
-            .unwrap_or_default(),
-        dependencies: manifest
-            .map(|manifest| manifest.description.dependencies.clone())
-            .unwrap_or_default(),
+        restricted: registered
+            .restricted
+            .iter()
+            .map(|code| name_of(*code))
+            .collect(),
+        drivers: registered
+            .chains
+            .iter()
+            .flat_map(|need| need.drivers.iter().map(|driver| name_of(*driver)))
+            .collect(),
+        bridges: registered
+            .bridges
+            .iter()
+            .map(|bridge| name_of(*bridge))
+            .collect(),
     })
 }
 
-fn standing(
-    state: &ChainVaultState,
-    status: &VersionStatus,
-    days_live: u64,
-    bundle: B256,
-) -> Standing {
+fn standing(state: &ChainVaultState, days_live: u64) -> Standing {
     match state {
         ChainVaultState::Killed => Standing::Killed,
-        ChainVaultState::Closed if bundle == B256::ZERO => Standing::BuildFailed,
-        ChainVaultState::Closed => Standing::Retired,
-        _ if matches!(status, VersionStatus::Retired) => Standing::Retired,
-        ChainVaultState::Building => Standing::New,
-        _ if days_live >= Strategy::DAYS_TO_RANK as u64 => Standing::Ranked,
+        ChainVaultState::Frozen => Standing::Frozen,
+        ChainVaultState::Closed => Standing::Closed,
+        _ if days_live >= Strategy::DAYS_NEW as u64 => Standing::Listed,
         _ => Standing::New,
     }
 }
@@ -273,10 +241,8 @@ fn standing(
 async fn read_vault(
     chain: &Client,
     vault_chain: Chain,
-    deployments: &Deployments,
     address: Address,
     state: &ChainVaultState,
-    now: u64,
 ) -> Result<Vault> {
     let fees = chain.read(address, IVault::feesCall {}).await?;
     let tank = chain.read(address, IVault::tankCall {}).await?;
@@ -289,10 +255,6 @@ async fn read_vault(
     let freeze_after = chain.read(address, IVault::freezeAfterCall {}).await?;
     let exit_band = chain.read(address, IVault::exitBandBpsCall {}).await?;
     let claim_count = chain.read(address, IVault::claimCountCall {}).await?;
-    let supply = chain
-        .read(address, IVault::pendingSharesCall {})
-        .await
-        .unwrap_or(U256::ZERO);
 
     let mut claims = Vec::new();
     let count: u64 = claim_count.try_into().unwrap_or(0);
@@ -320,13 +282,11 @@ async fn read_vault(
         });
     }
 
-    let _ = (deployments, now, supply);
     Ok(Vault {
         address: address_of(address),
         chain: vault_chain,
         asset: vault_chain.dollar().to_string(),
         state: match state {
-            ChainVaultState::Building => VaultState::Building,
             ChainVaultState::Open => VaultState::Open,
             ChainVaultState::Frozen => VaultState::Frozen,
             ChainVaultState::Killed => VaultState::Killed,
@@ -345,7 +305,7 @@ async fn read_vault(
         high_water_mark: dollars(high_water),
         last_crystallised: day(crystallised as u64),
         fees: Fees {
-            streaming_bps: fees.streamingBps as u32,
+            holding_bps: fees.streamingBps as u32,
             author_bps: fees.authorBps as u32,
             platform_bps: fees.platformBps as u32,
             transaction_bps: fees.transactionBps as u32,
@@ -370,18 +330,6 @@ async fn read_vault(
         freeze_after_days: freeze_after / 86_400,
         claims,
         in_transit: None,
-        audits: vec![
-            Audit {
-                subject: "Vault and factory".to_string(),
-                status: AuditStatus::Unaudited,
-                note: "Not yet audited. A vault's page says so from the day it opens.".to_string(),
-            },
-            Audit {
-                subject: "Attestation registry".to_string(),
-                status: AuditStatus::Unaudited,
-                note: "Not yet audited.".to_string(),
-            },
-        ],
     })
 }
 
@@ -675,38 +623,32 @@ async fn read_legs(
     }])
 }
 
-async fn read_review(
+/// A strategy's one review, from the chain, with the rest of its report from
+/// the store. Refusals have no vault, so they are read with the job instead.
+pub async fn read_review(
     chain: &Client,
     deployments: &Deployments,
     store: &Store,
-    strategy_id: B256,
-    version: u32,
+    strategy_id: U256,
 ) -> Result<Option<Review>> {
-    let count = chain
+    let entry = chain
         .read(
             deployments.reviews,
-            IReviewRegistry::reviewCountCall {
+            IReviewRegistry::reviewOfCall {
                 strategyId: strategy_id,
-                version,
             },
         )
         .await?;
-    if count == U256::ZERO {
+    let signed = entry.review;
+    if signed.reviewedAt == 0 {
         return Ok(None);
     }
-    let signed = chain
-        .read(
-            deployments.reviews,
-            IReviewRegistry::latestReviewCall {
-                strategyId: strategy_id,
-                version,
-            },
-        )
-        .await?;
-
     let report = store.report(&hash_of(signed.reportHash));
+    let missing = || "The report is not in the store.".to_string();
     Ok(Some(Review {
-        score: signed.score,
+        ratings: signed
+            .ratings
+            .map(|code| Rating::from_code(code).unwrap_or(Rating::CouldntTell)),
         findings: report
             .as_ref()
             .map(|report| report.findings.clone())
@@ -714,16 +656,17 @@ async fn read_review(
         summary: report
             .as_ref()
             .map(|report| report.summary.clone())
-            .unwrap_or_else(|| "The report is not in the store.".to_string()),
-        reviewed: day(signed.reviewedAt as u64),
+            .unwrap_or_else(missing),
+        reviewed: day(signed.reviewedAt),
+        refused: entry.refused,
+        sealed: report.as_ref().is_some_and(|report| report.sealed),
         reviewer_image: hash_of(signed.reviewerImage),
         model_id_hash: hash_of(signed.modelIdHash),
         prompt_hash: hash_of(signed.promptHash),
         report_hash: hash_of(signed.reportHash),
         limits: report
             .map(|report| report.limits)
-            .unwrap_or_else(|| vec!["The report is not in the store.".to_string()]),
-        bought_by: address_of(signed.boughtBy),
+            .unwrap_or_else(|| vec![missing()]),
     }))
 }
 
@@ -795,7 +738,6 @@ async fn read_attestation(
         image: Image {
             digest: hash_of(alloy::primitives::keccak256("shonin-dev-image:executor")),
             allowlisted: day(image.allowedAt as u64),
-            audit: AuditStatus::Unaudited,
             kind: "executor".to_string(),
         },
         keys,
@@ -807,7 +749,6 @@ async fn read_attestation(
         builder: Image {
             digest: hash_of(alloy::primitives::keccak256("shonin-dev-image:builder")),
             allowlisted: day(builder.allowedAt as u64),
-            audit: AuditStatus::Unaudited,
             kind: "builder".to_string(),
         },
         trust_root: "dev-local".to_string(),
@@ -817,56 +758,31 @@ async fn read_attestation(
 
 fn read_bundle(
     store: &Store,
-    registered: &chain::bindings::strategies::StrategyVersion,
+    registered: &chain::bindings::strategies::Strategy,
     bundle_hash: B256,
-    log: Vec<LogLine>,
 ) -> Bundle {
     let hash = hash_of(bundle_hash);
-    let manifest = store.manifest(&hash);
-    let allowances = manifest
-        .as_ref()
-        .map(|manifest| manifest.runtime.allowances)
-        .unwrap_or_else(shared::manifest::Allowances::modest);
-
+    let canonical = store.manifest(&hash_of(registered.manifestHash));
     Bundle {
         bundle_hash: hash.clone(),
         component_hash: store
             .component_hash(&hash)
-            .unwrap_or_else(|| "waiting for the build".to_string()),
+            .unwrap_or_else(|| "not in the store".to_string()),
         source_hash: hash_of(registered.sourceHash),
         manifest_hash: hash_of(registered.manifestHash),
-        world: "shonin:strategy@0.1.0".to_string(),
+        world: canonical
+            .as_ref()
+            .map(|canonical| canonical.world.clone())
+            .unwrap_or_else(|| "shonin:agent@0.1.0".to_string()),
         toolchain: store
             .toolchain(&hash)
-            .unwrap_or_else(|| "waiting for the build".to_string()),
-        builder_image: hash_of(alloy::primitives::keccak256("shonin-dev-image:builder")),
+            .unwrap_or_else(|| "not in the store".to_string()),
+        builder_image: canonical
+            .map(|canonical| canonical.builder_image)
+            .unwrap_or_else(|| hash_of(alloy::primitives::keccak256("shonin-dev-image:builder"))),
         models: Vec::<ModelFile>::new(),
-        allowances: Allowances {
-            fuel_per_sec: allowances.fuel_per_sec,
-            memory_mib: allowances.memory_mib,
-            requests_per_min: allowances.requests_per_min,
-            bytes_per_day: allowances.bytes_per_day,
-            streams: allowances.streams,
-            inference_ms_per_min: allowances.inference_ms_per_min,
-            placement: "anywhere".to_string(),
-        },
-        secrets: manifest
-            .as_ref()
-            .map(|manifest| manifest.secrets.clone())
-            .unwrap_or_default(),
-        config: manifest
-            .as_ref()
-            .map(|manifest| {
-                manifest
-                    .config
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            })
-            .unwrap_or_default(),
         source: store.source(&hash_of(registered.sourceHash)),
         source_files: store.source_files(&hash_of(registered.sourceHash)),
-        build_log: log,
         built_in_seconds: store.built_in_seconds(&hash),
     }
 }
@@ -931,6 +847,7 @@ pub async fn authors(chain: &Client, deployments: &Deployments) -> Result<Vec<Au
 /// What is worth announcing, newest first.
 pub async fn feed(
     chain: &Client,
+    vault_chain: Chain,
     deployments: &Deployments,
     strategies: &[Strategy],
 ) -> Result<Vec<FeedEvent>> {
@@ -948,17 +865,17 @@ pub async fn feed(
         let Ok(event) = log.log_decode::<IStrategyRegistry::Registered>() else {
             continue;
         };
-        let slug = format!(
-            "{}-v{}",
-            name_of(event.inner.strategyId),
-            event.inner.version
-        );
+        let id: u64 = event.inner.strategyId.try_into().unwrap_or_default();
         out.push(FeedEvent {
             at: moment(log.block_timestamp.unwrap_or_default()),
             kind: FeedKind::StrategyRegistered,
-            title: format!("{slug} was registered"),
-            detail: "An allowlisted build service compiled it and signed what it made.".to_string(),
-            link: Some(format!("/agents/{slug}")),
+            title: format!("Agent {id} on {} was registered", vault_chain.label()),
+            detail: "The reviewer read it first, then an allowlisted build service compiled it and signed what it made."
+                .to_string(),
+            link: strategies
+                .iter()
+                .any(|strategy| strategy.id == id)
+                .then(|| format!("/agents/{}", Strategy::slug_for(vault_chain, id))),
             reference: hash_of(event.inner.data.bundleHash),
         });
     }
@@ -990,7 +907,7 @@ pub async fn feed(
             out.push(FeedEvent {
                 at: kill.at,
                 kind: FeedKind::Kill,
-                title: format!("{} was stopped", strategy.slug),
+                title: format!("{} was stopped", strategy.title),
                 detail: kill.outcome.clone(),
                 link: Some(format!("/agents/{}", strategy.slug)),
                 reference: kill.reference.clone(),
@@ -1000,7 +917,7 @@ pub async fn feed(
             out.push(FeedEvent {
                 at: moment(0),
                 kind: FeedKind::VaultFrozen,
-                title: format!("{} froze", strategy.slug),
+                title: format!("{} froze", strategy.title),
                 detail: "A claim went unserved, so no new deposits and only unwinding is left."
                     .to_string(),
                 link: Some(format!("/agents/{}", strategy.slug)),
@@ -1011,8 +928,12 @@ pub async fn feed(
             out.push(FeedEvent {
                 at: moment(0),
                 kind: FeedKind::ReviewPublished,
-                title: format!("{} was reviewed", strategy.slug),
-                detail: format!("It scored {} out of 100.", review.score),
+                title: format!("{} was reviewed", strategy.title),
+                detail: if review.is_alarming() {
+                    "Its report card has serious concerns.".to_string()
+                } else {
+                    "Its report card is published.".to_string()
+                },
                 link: Some(format!("/agents/{}/review", strategy.slug)),
                 reference: review.report_hash.clone(),
             });
@@ -1023,57 +944,32 @@ pub async fn feed(
     Ok(out)
 }
 
-/// The venue's own spot price, so a record has something to be read against.
-pub async fn benchmark(
-    chain: &Client,
-    deployments: &Deployments,
-    history: &mut History,
-    head: u64,
-) -> Result<Vec<shared::Benchmark>> {
-    const EVERY: u64 = 12;
-    let mut block = history.spot_sampled_to.max(1);
-    let mut taken = 0;
-    while block <= head && taken < 400 {
-        if (block.is_multiple_of(EVERY) || block == head)
-            && let Ok(market) = chain
-                .read_at(
-                    deployments.venue,
-                    ILocalVenue::marketOfCall {
-                        market: market_id("BTC"),
-                    },
-                    BlockId::number(block),
-                )
-                .await
-        {
-            let timestamp = chain.block_timestamp_at(block).await.unwrap_or_default();
-            history.spot.push(Point {
-                date: day(timestamp),
-                value: dollars(market.mark),
-            });
-            taken += 1;
-        }
-        block += 1;
+/// A job, as the builder reports it, with what the chain adds: its review
+/// (a refusal's included), whether it has been activated, and who its author
+/// is called.
+pub async fn job(chain: &Client, deployments: &Deployments, store: &Store, mut job: Job) -> Job {
+    if let Ok(author) = job.author.parse::<Address>() {
+        job.author = handle_of(chain, deployments, author).await;
     }
-    history.spot_sampled_to = block;
-
-    Ok(vec![shared::Benchmark {
-        label: "The asset itself".to_string(),
-        note: "Holding the spot asset over the same stretch, on the same venue.".to_string(),
-        series: daily(&history.spot),
-    }])
-}
-
-fn market_id(name: &str) -> B256 {
-    let mut out = [0u8; 32];
-    let bytes = name.as_bytes();
-    out[..bytes.len()].copy_from_slice(bytes);
-    B256::from(out)
-}
-
-/// Findings, as the reviewer's report holds them.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct Report {
-    pub summary: String,
-    pub findings: Vec<Finding>,
-    pub limits: Vec<String>,
+    let Some(id) = job.strategy_id else {
+        return job;
+    };
+    let strategy_id = U256::from(id);
+    if let Ok(review) = read_review(chain, deployments, store, strategy_id).await {
+        job.review = review;
+    }
+    if let Ok(vault) = chain
+        .read(
+            deployments.factory,
+            IVaultFactory::vaultOfCall {
+                strategyId: strategy_id,
+            },
+        )
+        .await
+        && vault != Address::ZERO
+    {
+        job.state = JobState::Activated;
+        job.strategy_slug = Some(Strategy::slug_for(job.chain, id));
+    }
+    job
 }

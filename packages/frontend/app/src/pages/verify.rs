@@ -26,7 +26,6 @@ pub fn render() -> Dom {
         }))
         .child(checks())
         .child(images())
-        .child(audits())
         .child(changing())
     })
 }
@@ -76,7 +75,6 @@ fn images() -> Dom {
                 ui::badge(&image.kind, Tone::Accent),
                 ui::hash(&image.digest),
                 ui::value(&fmt::date(image.allowlisted)),
-                ui::badge(image.audit.label(), Tone::from_audit(image.audit)),
             ])
         })
         .collect();
@@ -89,7 +87,6 @@ fn images() -> Dom {
                     Column::new("Kind"),
                     Column::new("Digest").wide(),
                     Column::new("Allowlisted"),
-                    Column::new("Audit"),
                 ],
                 allowlisted,
             ),
@@ -102,46 +99,6 @@ fn images() -> Dom {
     )
 }
 
-fn audits() -> Dom {
-    let vaults = data::vaults();
-    let Some(strategy) = vaults.first() else {
-        return html!("span");
-    };
-
-    let rows: Vec<Row> = strategy
-        .vault
-        .audits
-        .iter()
-        .map(|audit| {
-            Row::new(vec![
-                html!("span", { .class("table__primary").text(&audit.subject) }),
-                ui::badge(audit.status.label(), Tone::from_audit(audit.status)),
-                ui::muted(&audit.note),
-            ])
-        })
-        .collect();
-
-    ui::section(
-        "Audit status",
-        vec![
-            table(
-                vec![
-                    Column::new("What"),
-                    Column::new("Status"),
-                    Column::new("Notes").wide(),
-                ],
-                rows,
-            ),
-            ui::notice(
-                Tone::Warn,
-                "Vaults open before every audit is finished",
-                "Every vault page shows where each audit stands, so a depositor can size their own \
-                 exposure.",
-            ),
-        ],
-    )
-}
-
 fn changing() -> Dom {
     ui::section(
         "What can change under a running vault",
@@ -150,8 +107,8 @@ fn changing() -> Dom {
             .child(ui::card(vec![
                 ui::subheading("The agent: nothing"),
                 ui::para(
-                    "A published bundle is frozen. A new version is a new bundle with its own vault, \
-                     which a depositor chooses to move to.",
+                    "A published bundle is frozen. A changed agent is a new agent with its own \
+                     vault, which a depositor chooses whether to join.",
                 ),
             ]))
             .child(ui::card(vec![

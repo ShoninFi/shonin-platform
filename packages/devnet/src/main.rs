@@ -199,7 +199,6 @@ async fn main() -> Result<()> {
                         &deployments,
                         &api,
                         agents.as_deref(),
-                        &args.store,
                     )
                     .await
                 }

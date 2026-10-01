@@ -18,7 +18,7 @@ use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::WasiCtxBuilder;
 
-use crate::host::{Counters, Ctx, Strategy};
+use crate::host::{Agent, Counters, Ctx};
 use crate::watch::VaultEvent;
 
 /// The least fuel a second any strategy gets, whatever its manifest says. A
@@ -39,11 +39,11 @@ pub struct Runner {
     pub key: KeyClient,
     pub vault: Address,
     pub venue: Address,
-    pub venue_id: String,
-    pub config: Vec<u8>,
+    /// The driver this agent's manifest named.
+    pub driver: String,
     /// What the manifest declared and the vault's tank is charged for. The
     /// host holds the strategy to it rather than to one figure for everyone.
-    pub allowances: shared::DeclaredAllowances,
+    pub allowances: shared::Allowances,
 }
 
 impl Runner {
@@ -64,7 +64,7 @@ impl Runner {
         let mut linker: Linker<Ctx> = Linker::new(engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)
             .map_err(|error| anyhow!("the WASI imports: {error}"))?;
-        Strategy::add_to_linker::<_, HasSelf<Ctx>>(&mut linker, |ctx| ctx)
+        Agent::add_to_linker::<_, HasSelf<Ctx>>(&mut linker, |ctx| ctx)
             .map_err(|error| anyhow!("the platform's imports: {error}"))?;
 
         let fuel = self.allowances.fuel_per_sec.max(FUEL_FLOOR);
@@ -82,7 +82,7 @@ impl Runner {
                 key: self.key.clone(),
                 vault: self.vault,
                 venue: self.venue,
-                venue_id: self.venue_id.clone(),
+                driver: self.driver.clone(),
                 cache: Default::default(),
                 account_events: Some(account_events),
                 vault_events: Some(vault_events),
@@ -101,13 +101,12 @@ impl Runner {
         store.set_epoch_deadline(1);
         store.epoch_deadline_async_yield_and_update(1);
 
-        let instance = Strategy::instantiate_async(&mut store, &component, &linker)
+        let instance = Agent::instantiate_async(&mut store, &component, &linker)
             .await
             .map_err(|error| anyhow!("instantiating the strategy: {error}"))?;
 
-        let config = self.config.clone();
         let outcome = store
-            .run_concurrent(async |accessor| instance.call_run(accessor, config).await)
+            .run_concurrent(async |accessor| instance.call_run(accessor).await)
             .await;
 
         let fault = |why: String| {

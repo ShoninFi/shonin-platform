@@ -5,6 +5,8 @@ import {IAttestationRegistry} from "../src/interfaces/IAttestationRegistry.sol";
 import {IAuthorProfiles} from "../src/interfaces/IAuthorProfiles.sol";
 import {ILocalUsd} from "../src/interfaces/ILocalUsd.sol";
 import {ILocalVenue} from "../src/interfaces/ILocalVenue.sol";
+import {IPrices} from "../src/interfaces/IPrices.sol";
+import {IPublishing} from "../src/interfaces/IPublishing.sol";
 import {IReviewRegistry} from "../src/interfaces/IReviewRegistry.sol";
 import {IStrategyRegistry} from "../src/interfaces/IStrategyRegistry.sol";
 import {IVault} from "../src/interfaces/IVault.sol";
@@ -28,9 +30,25 @@ contract InterfacesTest is Fixture {
     function test_the_registries_answer_to_their_interfaces() public view {
         assertEq(IAttestationRegistry(address(attestation)).timelock(), TIMELOCK);
         assertTrue(IAttestationRegistry(address(attestation)).isImageAllowed(BUILDER_IMAGE));
-        assertEq(IStrategyRegistry(address(strategies)).bundleHashOf("nothing", 1), bytes32(0));
-        assertEq(IReviewRegistry(address(reviews)).reviewFee(), REVIEW_FEE);
+        assertEq(IStrategyRegistry(address(strategies)).bundleHashOf(1), bytes32(0));
+        assertFalse(IReviewRegistry(address(reviews)).hasReview(1));
         assertEq(IAuthorProfiles(address(profiles)).authorOfHandle("nobody"), address(0));
+    }
+
+    function test_publishing_and_prices_answer_to_their_interfaces() public {
+        IPublishing asPublishing = IPublishing(address(publishing));
+        assertEq(asPublishing.fee(), PUBLISH_FEE);
+        assertEq(asPublishing.asset(), address(usd));
+        assertEq(asPublishing.platform(), platform);
+        uint256 id = submitAs(author);
+        assertEq(asPublishing.count(), 1);
+        assertEq(asPublishing.submissionOf(id).author, author);
+
+        IPrices asPrices = IPrices(address(prices));
+        assertEq(asPrices.notice(), PRICE_NOTICE);
+        assertEq(asPrices.history().length, 1);
+        assertEq(asPrices.current().vcpuHour, 0.15e18);
+        assertEq(asPrices.dailyCost(allowancesCosting(5e6)), 5e6);
     }
 
     function test_the_factory_and_its_vaults_answer_to_their_interfaces() public {
@@ -38,12 +56,12 @@ contract InterfacesTest is Fixture {
         assertEq(asFactory.config().minimumTank, MINIMUM_TANK);
         assertEq(asFactory.vaults().length, 0);
 
-        (, bytes32 bundle) = openVault("interfaces", 1);
+        (, bytes32 bundle) = openVault();
         IVault asVault = IVault(asFactory.vaults()[0]);
-        assertEq(asVault.strategyId(), "interfaces");
+        assertEq(asVault.strategyId(), 1);
         assertEq(asVault.sharePrice(), 1e6);
         assertEq(asVault.fees().transactionBps, 10);
-        assertEq(asVault.tank().balance, MINIMUM_TANK - REVIEW_FEE);
+        assertEq(asVault.tank().balance, MINIMUM_TANK);
         assertEq(asVault.exitBandBps(), 100);
         assertEq(asVault.claimCount(), 0);
         assertTrue(bundle != bytes32(0));

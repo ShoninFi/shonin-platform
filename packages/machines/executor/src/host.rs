@@ -26,16 +26,16 @@ use crate::scale::{ASSET_DECIMALS, SIZE_DECIMALS, signed_to_decimal, to_decimal,
 
 wasmtime::component::bindgen!({
     path: "../../strategy-sdk/wit",
-    world: "strategy",
+    world: "agent",
     imports: { default: async | store | trappable },
     exports: { default: async },
 });
 
-use shonin::strategy::types::Verdict;
-use shonin::strategy::vault::VaultEvent;
+use shonin::agent::types::Verdict;
+use shonin::agent::vault::VaultEvent;
 /// A socket to the outside world. This deployment opens none, so no value of
 /// this type is ever made.
-use shonin::strategy::websocket::Connection;
+use shonin::agent::websocket::Connection;
 
 /// What the strategy is allowed to know about, and how to act for it.
 pub struct Ctx {
@@ -47,8 +47,9 @@ pub struct Ctx {
     pub key: KeyClient,
     pub vault: Address,
     pub venue: Address,
-    /// The venue this strategy's manifest named.
-    pub venue_id: String,
+    /// The driver this agent's manifest named. The executor refuses a
+    /// manifest naming one this image doesn't carry.
+    pub driver: String,
     /// The per-strategy cache. It is promised to nobody: a restart on another
     /// machine starts with none of it, and a strategy rebuilds what it needs
     /// from the venue.
@@ -140,34 +141,34 @@ impl WasiView for Ctx {
 }
 
 // The interfaces with no host state of their own still need their marker.
-impl shonin::strategy::types::Host for Ctx {}
-impl shonin::strategy::venues::Host for Ctx {}
-impl shonin::strategy::vault::Host for Ctx {}
-impl shonin::strategy::data::Host for Ctx {}
-impl shonin::strategy::websocket::Host for Ctx {}
-impl shonin::strategy::secrets::Host for Ctx {}
-impl shonin::strategy::state::Host for Ctx {}
-impl shonin::strategy::inference::Host for Ctx {}
+impl shonin::agent::types::Host for Ctx {}
+impl shonin::agent::drivers::Host for Ctx {}
+impl shonin::agent::vault::Host for Ctx {}
+impl shonin::agent::data::Host for Ctx {}
+impl shonin::agent::websocket::Host for Ctx {}
+impl shonin::agent::secrets::Host for Ctx {}
+impl shonin::agent::state::Host for Ctx {}
+impl shonin::agent::inference::Host for Ctx {}
 
-// Venues ---------------------------------------------------------------------
+// Drivers ---------------------------------------------------------------------
 
-impl shonin::strategy::venues::HostWithStore<Ctx> for HasSelf<Ctx> {
+impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
     /// The one way out. Each action is decoded here, inside the measured
     /// image; anything that does not decode, or names an account this vault
     /// does not own, is refused before it reaches a key.
     async fn submit(
         accessor: &Accessor<Ctx, Self>,
-        venue: String,
+        driver: String,
         actions: Vec<Vec<u8>>,
     ) -> HostResult<Vec<Verdict>> {
         let (key, vault, venue_address, expected) = accessor.with(|mut access| {
             refuel(&mut access);
             let ctx = access.get();
-            (ctx.key.clone(), ctx.vault, ctx.venue, ctx.venue_id.clone())
+            (ctx.key.clone(), ctx.vault, ctx.venue, ctx.driver.clone())
         });
 
-        if venue != expected {
-            let refusal = format!("this strategy trades {expected}, not {venue}");
+        if driver != expected {
+            let refusal = format!("this agent trades through {expected}, not {driver}");
             return Ok(actions
                 .iter()
                 .map(|_| Verdict::Rejected(refusal.clone()))
@@ -203,20 +204,17 @@ impl shonin::strategy::venues::HostWithStore<Ctx> for HasSelf<Ctx> {
     /// it because a strategy sizes against the vault rather than the venue.
     async fn account_state(
         accessor: &Accessor<Ctx, Self>,
-        venue: String,
+        driver: String,
         _query: Vec<u8>,
     ) -> HostResult<Result<Vec<u8>, String>> {
         let (chain, vault, venue_address, expected) = accessor.with(|mut access| {
             let ctx = access.get();
-            (
-                ctx.chain.clone(),
-                ctx.vault,
-                ctx.venue,
-                ctx.venue_id.clone(),
-            )
+            (ctx.chain.clone(), ctx.vault, ctx.venue, ctx.driver.clone())
         });
-        if venue != expected {
-            return Ok(Err(format!("this strategy trades {expected}, not {venue}")));
+        if driver != expected {
+            return Ok(Err(format!(
+                "this agent trades through {expected}, not {driver}"
+            )));
         }
         match read_account_state(&chain, vault, venue_address).await {
             Ok(state) => Ok(Ok(strategy_sdk::to_payload(&state))),
@@ -226,7 +224,7 @@ impl shonin::strategy::venues::HostWithStore<Ctx> for HasSelf<Ctx> {
 
     async fn account_events(
         mut access: Access<'_, Ctx, Self>,
-        _venue: String,
+        _driver: String,
     ) -> HostResult<StreamReader<Vec<u8>>> {
         refuel(&mut access);
         let events = access.get().account_events.take();
@@ -236,7 +234,7 @@ impl shonin::strategy::venues::HostWithStore<Ctx> for HasSelf<Ctx> {
 
 // The vault ------------------------------------------------------------------
 
-impl shonin::strategy::vault::HostWithStore<Ctx> for HasSelf<Ctx> {
+impl shonin::agent::vault::HostWithStore<Ctx> for HasSelf<Ctx> {
     async fn events(mut access: Access<'_, Ctx, Self>) -> HostResult<StreamReader<VaultEvent>> {
         refuel(&mut access);
         let events = access.get().vault_events.take();
@@ -263,7 +261,7 @@ where
 
 // The shared data layer ------------------------------------------------------
 
-impl shonin::strategy::data::HostWithStore<Ctx> for HasSelf<Ctx> {
+impl shonin::agent::data::HostWithStore<Ctx> for HasSelf<Ctx> {
     /// One source: the venue's own markets, cached and shared, so ten
     /// strategies watching the same book cost the executor one read.
     async fn query(
@@ -303,7 +301,7 @@ impl shonin::strategy::data::HostWithStore<Ctx> for HasSelf<Ctx> {
 
 // Sockets --------------------------------------------------------------------
 
-impl shonin::strategy::websocket::HostWithStore<Ctx> for HasSelf<Ctx> {
+impl shonin::agent::websocket::HostWithStore<Ctx> for HasSelf<Ctx> {
     async fn connect(
         _accessor: &Accessor<Ctx, Self>,
         _url: String,
@@ -317,7 +315,7 @@ impl shonin::strategy::websocket::HostWithStore<Ctx> for HasSelf<Ctx> {
     }
 }
 
-impl shonin::strategy::websocket::HostConnectionWithStore<Ctx> for HasSelf<Ctx> {
+impl shonin::agent::websocket::HostConnectionWithStore<Ctx> for HasSelf<Ctx> {
     /// `Connection` has no values, because `connect` never returns one, so
     /// there is never anything here to let go of.
     async fn drop(_accessor: &Accessor<Ctx, Self>, _rep: Resource<Connection>) -> HostResult<()> {
@@ -340,11 +338,11 @@ impl shonin::strategy::websocket::HostConnectionWithStore<Ctx> for HasSelf<Ctx> 
     }
 }
 
-impl shonin::strategy::websocket::HostConnection for Ctx {}
+impl shonin::agent::websocket::HostConnection for Ctx {}
 
 // Secrets, state and inference -----------------------------------------------
 
-impl shonin::strategy::secrets::HostWithStore<Ctx> for HasSelf<Ctx> {
+impl shonin::agent::secrets::HostWithStore<Ctx> for HasSelf<Ctx> {
     async fn get(_access: Access<'_, Ctx, Self>, _name: String) -> HostResult<Option<String>> {
         // Secrets are sealed to a bundle's hash and unsealed inside the
         // enclave. This deployment holds none, and a strategy that reads one
@@ -353,7 +351,7 @@ impl shonin::strategy::secrets::HostWithStore<Ctx> for HasSelf<Ctx> {
     }
 }
 
-impl shonin::strategy::state::HostWithStore<Ctx> for HasSelf<Ctx> {
+impl shonin::agent::state::HostWithStore<Ctx> for HasSelf<Ctx> {
     async fn get(mut access: Access<'_, Ctx, Self>, key: String) -> HostResult<Option<Vec<u8>>> {
         refuel(&mut access);
         Ok(access.get().cache.get(&key).cloned())
@@ -370,24 +368,24 @@ impl shonin::strategy::state::HostWithStore<Ctx> for HasSelf<Ctx> {
     }
 }
 
-impl shonin::strategy::inference::HostWithStore<Ctx> for HasSelf<Ctx> {
+impl shonin::agent::inference::HostWithStore<Ctx> for HasSelf<Ctx> {
     async fn infer(
         _accessor: &Accessor<Ctx, Self>,
         model: String,
-        _inputs: Vec<shonin::strategy::inference::NamedTensor>,
+        _inputs: Vec<shonin::agent::inference::NamedTensor>,
     ) -> HostResult<
         Result<
-            Vec<shonin::strategy::inference::NamedTensor>,
-            shonin::strategy::inference::InferenceError,
+            Vec<shonin::agent::inference::NamedTensor>,
+            shonin::agent::inference::InferenceError,
         >,
     > {
         // Models are carried in a bundle and run by the executor's own
         // runtime. This deployment loads none, so every name is unknown, and
         // an unknown model is an error the strategy handles rather than a
         // stall.
-        Ok(Err(
-            shonin::strategy::inference::InferenceError::UnknownModel(model),
-        ))
+        Ok(Err(shonin::agent::inference::InferenceError::UnknownModel(
+            model,
+        )))
     }
 }
 

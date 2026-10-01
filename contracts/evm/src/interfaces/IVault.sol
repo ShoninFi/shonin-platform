@@ -4,8 +4,6 @@ pragma solidity ^0.8.30;
 /// What a vault is doing right now.
 enum VaultState {
     None,
-    /// The build service is compiling the submitted source.
-    Building,
     /// Taking deposits, trading.
     Open,
     /// A claim went unserved for too long: no new deposits, and the trading
@@ -73,7 +71,7 @@ struct Tank {
     uint256 lastCharge;
 }
 
-/// Pooled capital behind one strategy version.
+/// Pooled capital behind one strategy.
 ///
 /// Its shares are an ordinary ERC-20, so nothing about them is described
 /// here: a wallet, an aggregator or another contract holds and moves them
@@ -106,8 +104,6 @@ interface IVault {
     event CapitalMoved(bytes32 indexed from, bytes32 indexed to, uint256 amount);
     event KeyApproved(bytes32 indexed venue, address indexed key, uint64 validUntil);
     event KeyRevoked(bytes32 indexed venue, address indexed key);
-    event Opened(bytes32 bundleHash);
-    event BuildFailed(bytes32 reasonHash);
     event Killed(address by);
     event Closed();
 
@@ -159,16 +155,6 @@ interface IVault {
 
     // Lifecycle -------------------------------------------------------------
 
-    /// Anyone, once the registry holds this version: the vault opens.
-    function open() external;
-    /// A blessed builder key charges the build's metered compute. A build runs
-    /// before the vault has a bundle, so the key is checked as a builder
-    /// rather than as this vault's own key. It may be charged once, and never
-    /// more than a day at the allowances the author declared.
-    function chargeBuild(uint256 amount) external;
-    /// A blessed builder key reports that the build failed. The vault closes
-    /// and the author reclaims what is left of the tank.
-    function failBuild(bytes32 reasonHash) external;
     /// The admin key stops the vault: every position closed, all cash home,
     /// every withdrawal paid from the idle balance afterwards.
     function kill() external;
@@ -184,8 +170,7 @@ interface IVault {
     function state() external view returns (VaultState);
     /// The bundle this vault's strategy is, as the registry holds it.
     function bundleHash() external view returns (bytes32);
-    function strategyId() external view returns (bytes32);
-    function version() external view returns (uint32);
+    function strategyId() external view returns (uint256);
     function author() external view returns (address);
     function sourceHash() external view returns (bytes32);
     function createdAt() external view returns (uint64);
