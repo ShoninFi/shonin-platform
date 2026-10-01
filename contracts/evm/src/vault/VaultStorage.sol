@@ -11,6 +11,7 @@ import {
     Tank,
     Timers,
     Valuation,
+    ValuationStatus,
     VaultState
 } from "../interfaces/IVault.sol";
 import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
@@ -98,7 +99,9 @@ struct Layout {
     /// The open valuation's unit fraction and when it was recorded, so the
     /// posts that complete it are counted as of the same moment.
     uint256 openUnits;
-    uint64 openedAt;
+    /// How many sends the home station had made when it was valued: the ones
+    /// after it are still in its value.
+    uint256 sendsAtOpen;
     /// Exit costs an unwinder reported for a claim, and who is paid them.
     uint256 maxExitCost;
     mapping(uint256 => uint256) exitCost;
@@ -122,9 +125,11 @@ struct Layout {
     /// A claim's close is under way: what it brings home is the claim's,
     /// none of it the unit holders'.
     bool closing;
-    /// What the home station took since the last valuation looked at it, so
-    /// the idle floor is measured on a value pulls can't shrink.
-    uint256 sentSinceValued;
+    /// Everything the home station has ever taken, and how much it had taken
+    /// when each valuation looked at it, so the idle floor is measured on a
+    /// value pulls can't shrink, whatever became of the valuations since.
+    uint256 sentTotal;
+    mapping(uint256 => uint256) sentAtValuation;
     // Who may deposit -------------------------------------------------------
     bytes32[] restricted;
     bytes32 restrictedHash;
@@ -253,6 +258,13 @@ library VaultStorage {
     /// is left to price, and the vault only waits to close. No new request
     /// is taken, so nobody can hold the close off a slot at a time; holders
     /// redeem once it has closed, fee-free.
+    /// A valuation is waiting for other chains' posts: until it is closed,
+    /// nothing may change the supply or the units it will be priced on.
+    function valuing(Layout storage s) internal view returns (bool) {
+        uint256 count = s.valuations.length;
+        return count != 0 && s.valuations[count - 1].status == ValuationStatus.Open;
+    }
+
     function readyToClose(Layout storage s) internal view returns (bool) {
         if (!halted(s) || s.lastPriced == 0) return false;
         Valuation storage v = latest(s);

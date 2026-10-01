@@ -58,6 +58,7 @@ contract VaultFactory is IVaultFactory {
     error TermsChanged();
     error UnknownChain(bytes32 name);
     error UnknownDriver();
+    error ChainTwice();
 
     struct Deps {
         IERC20 asset;
@@ -204,6 +205,10 @@ contract VaultFactory is IVaultFactory {
         for (uint256 i = 0; i < record.chains.length; i++) {
             ChainNeed memory need = record.chains[i];
             uint256 id = _idOf(need.chain);
+            // A chain named twice would wait for a post that never comes.
+            for (uint256 j = 0; j < i; j++) {
+                if (_idOf(record.chains[j].chain) == id) revert ChainTwice();
+            }
             if (id == block.chainid) {
                 drivers = need.drivers;
             } else {

@@ -92,7 +92,7 @@ library Valuations {
 
         syncHolding(s);
         (uint256 markValue, uint256 exitValue) = IStation(s.homeStation).value();
-        s.sentSinceValued = 0;
+        s.sentAtValuation[count] = s.sentTotal;
         uint256 units = s.liveUnits();
         if (units != 0) {
             // The stations' value belongs partly to the fallback's unit
@@ -118,7 +118,7 @@ library Valuations {
             price(s, count);
         } else {
             s.openUnits = units;
-            s.openedAt = uint64(block.timestamp);
+            s.sendsAtOpen = IStation(s.homeStation).sends().length;
             emit IVault.ValuationOpened(count, time, missing);
         }
     }
@@ -212,13 +212,11 @@ library Valuations {
         }
         Send[] memory sends = IStation(s.homeStation).sends();
         uint256 seen;
-        for (uint256 i = 0; i < sends.length; i++) {
+        // Sends made after the home station was valued are still in its
+        // value, so only the ones before count as on their way.
+        for (uint256 i = 0; i < s.sendsAtOpen; i++) {
             if (sends[i].toChain != stationChain) continue;
-            // A send after the home station was valued is still in its value.
-            if (
-                seen >= post.landedFromHome && sends[i].sentAt <= s.openedAt
-                    && sends[i].sentAt + timeout >= time
-            ) {
+            if (seen >= post.landedFromHome && sends[i].sentAt + timeout >= time) {
                 moving += sends[i].amount;
             }
             seen++;
@@ -550,7 +548,7 @@ library Valuations {
         if ((!deposit && r.kind != RequestKind.Redeem) || r.done || msg.sender != r.owner) {
             revert IVault.NotAllowed();
         }
-        if (block.timestamp < r.earliest + s.timers.fallbackAfter) revert IVault.NotYet();
+        if (block.timestamp < r.earliest + s.timers.fallbackAfter || s.valuing()) revert IVault.NotYet();
         // Not while a valuation could price it: the fallback is for when
         // nothing can, not a way round the fee.
         if (s.lastPriced != 0 && s.latest().time >= r.earliest) revert IVault.NotAllowed();
@@ -575,7 +573,7 @@ library Valuations {
         }
         uint256 since = s.lastPriced == 0 ? s.createdAt : s.latest().time;
         if (claim.bookedAt > since) since = claim.bookedAt;
-        if (block.timestamp < since + s.timers.fallbackAfter) revert IVault.NotYet();
+        if (block.timestamp < since + s.timers.fallbackAfter || s.valuing()) revert IVault.NotYet();
         claim.state = ClaimState.Fallback;
         s.pendingShares -= claim.shares;
         if (state != ClaimState.Queued) {
@@ -690,6 +688,7 @@ library Valuations {
         Layout storage s = VaultStorage.layout();
         uint256 raw = s.unitsOf[holder];
         if (raw == 0) revert IVault.Nothing();
+        if (s.valuing()) revert IVault.NotYet();
         uint256 fraction = raw.mulDiv(s.scale(), WAD);
         if (fraction > WAD) fraction = WAD;
         if (fraction == 0) fraction = 1;
@@ -723,15 +722,15 @@ library Valuations {
         // The stations as last valued, the cash as it is now, and what was
         // sent out since: money that joined or left counts, and a run of
         // pulls can't shrink the value the floor is measured on.
-        uint256 value = s.cash + s.sentSinceValued + 1;
+        uint256 value = s.cash + s.sentTotal + 1;
         if (s.lastPriced != 0) {
             Valuation storage v = s.latest();
-            value += v.gross - 1 - v.cash;
+            value = value + (v.gross - 1 - v.cash) - s.sentAtValuation[s.lastPriced - 1];
         }
         uint256 floor = value.mulDiv(floorNow(s), BPS, Math.Rounding.Ceil);
         if (amount > s.free() || s.free() - amount < floor) revert IVault.BelowFloor();
         s.cash -= amount;
-        s.sentSinceValued += amount;
+        s.sentTotal += amount;
         IERC20(s.asset).safeTransfer(msg.sender, amount);
         emit IVault.ToStation(amount);
     }
