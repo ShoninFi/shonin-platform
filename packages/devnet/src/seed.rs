@@ -184,18 +184,25 @@ pub async fn run(
                     },
                 )
                 .await?;
+            // A deposit is a request: the keeper's next valuation prices it.
+            let restricted = client.read(vault, IVault::restrictedTextCall {}).await?;
+            let statement = client.sign_typed(
+                viewer,
+                chain::statement::digest(client.chain_id, vault, viewer, &restricted),
+            )?;
             client
                 .send(
                     viewer,
                     vault,
-                    IVault::depositCall {
+                    IVault::requestDepositCall {
                         assets: amount,
                         receiver: viewer,
+                        statement,
                     },
                 )
                 .await
                 .context("the seeded deposit")?;
-            tracing::info!(slug, "and a depositor put money in");
+            tracing::info!(slug, "and a depositor asked to put money in");
         }
         if plan.killed {
             let admin = client.account(Role::Admin)?;

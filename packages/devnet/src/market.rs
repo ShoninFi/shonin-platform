@@ -103,7 +103,20 @@ pub async fn run(client: &Client, deployments: &Deployments, seconds_per_block: 
 
 /// Each block moves the chain's clock by a fixed stretch, so time passes
 /// faster than it does here.
+///
+/// A vault's valuation counts only within seconds of a ten-second boundary,
+/// so the next block is put on one first; with a stretch that is a multiple
+/// of ten, every block after it lands on one too, and a valuation recorded in
+/// any block is inside its window.
 async fn set_clock(client: &Client, seconds_per_block: u64) -> Result<()> {
+    const SLOT: u64 = 10;
+    let now = client.block_timestamp().await?;
+    let aligned = now - now % SLOT + SLOT;
+    client
+        .raw_request("evm_setNextBlockTimestamp", serde_json::json!([aligned]))
+        .await
+        .context("putting the next block on a slot boundary")?;
+    let seconds_per_block = seconds_per_block.div_ceil(SLOT) * SLOT;
     client
         .raw_request(
             "anvil_setBlockTimestampInterval",

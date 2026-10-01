@@ -81,6 +81,15 @@ interface IStation {
 interface IStationFactory {
     event StationCreated(uint256 indexed vaultChain, address indexed vault, address station);
 
+    /// Set what differs between chains, once, by the key the creation code
+    /// names.
+    function initialize(
+        address attestation_,
+        address asset_,
+        address vaultFactory_,
+        address implementation_
+    ) external;
+
     /// The vault's own chain, called by the vault factory inside `activate`.
     function createHome(
         address vault,

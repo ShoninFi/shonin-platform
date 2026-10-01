@@ -305,6 +305,32 @@ impl Client {
     }
 
     /// Deploy a contract from its bytecode and constructor arguments.
+    /// Send bytes that are not a call of ours, such as a creation through the
+    /// deterministic deployer.
+    pub async fn send_raw(
+        &self,
+        from: Address,
+        to: Address,
+        data: alloy_primitives::Bytes,
+    ) -> Result<TransactionReceipt> {
+        let request = TransactionRequest::default()
+            .with_from(from)
+            .with_to(to)
+            .with_input(data);
+        let receipt = self
+            .provider
+            .send_transaction(request)
+            .await
+            .context("sending")?
+            .get_receipt()
+            .await
+            .context("waiting for a receipt")?;
+        if !receipt.status() {
+            bail!("the transaction reverted");
+        }
+        Ok(receipt)
+    }
+
     pub async fn deploy(&self, from: Address, bytecode: Vec<u8>) -> Result<Address> {
         let request = TransactionRequest::default()
             .with_from(from)
@@ -337,6 +363,18 @@ impl Client {
             .await
             .with_context(|| format!("asking the chain to sign as {who}"))?;
         Ok(signature)
+    }
+
+    /// Sign a digest as it is, with no message prefix: what an EIP-712
+    /// signature is. Only for accounts whose keys this client holds.
+    pub fn sign_typed(&self, who: Address, digest: B256) -> Result<Bytes> {
+        let key = self
+            .keys
+            .as_ref()
+            .and_then(|keys| keys.get(&who))
+            .ok_or_else(|| anyhow!("no key for {who} to sign typed data with"))?;
+        let signature = key.sign_hash_sync(&digest).context("signing")?;
+        Ok(Bytes::from(signature.as_bytes().to_vec()))
     }
 
     /// Ask the node something the contracts do not cover, such as how fast a
