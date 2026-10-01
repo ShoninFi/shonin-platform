@@ -83,8 +83,8 @@ fn card(review: &Review) -> Dom {
         children.push(ui::notice(
             Tone::Info,
             "The source is sealed",
-            "The reviewer read every line of it. The report says what it found without naming a \
-             file or quoting the code.",
+            "The reviewer read every line of it. The report names no file or line, and the \
+             reviewer is told not to quote the code.",
         ));
     }
     children.extend([

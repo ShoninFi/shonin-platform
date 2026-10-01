@@ -131,8 +131,15 @@ fn detail_of(state: &JobState) -> String {
 }
 
 pub fn detail(id: &str) -> Dom {
+    // A job just paid for reaches the queue with the next snapshot, a few
+    // seconds after its author is sent here.
     let Some(job) = data::job(id) else {
-        return crate::pages::not_found::render();
+        return ui::notice(
+            Tone::Info,
+            &format!("Job {id} isn't in the queue yet"),
+            "A job just submitted appears here within a few seconds of its payment. If it \
+             doesn't, check the number on the queue.",
+        );
     };
 
     html!("div", {

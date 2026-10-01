@@ -303,8 +303,8 @@ fn sealed_note() -> Dom {
         None,
         vec![ui::para(
             "Source is public by default. Sealing it changes who can read it, not whether the \
-             reviewer read it or the builder compiled it. Its report names no file and quotes no \
-             code.",
+             reviewer read it or the builder compiled it. Its report names no file or line, and the \
+             reviewer is told not to quote the code.",
         )],
     )
 }

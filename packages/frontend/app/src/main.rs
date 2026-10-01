@@ -45,7 +45,7 @@ fn app() -> Dom {
         let route = Route::from_path(&path_of(&url));
         let page = route.page();
         document().set_title(&page.title);
-        scroll_to_top();
+        scroll_to_top_of(&url);
         vec![
             shell::skip_link(),
             shell::masthead(&route),
@@ -94,9 +94,19 @@ fn unreachable(why: &str) -> Dom {
 }
 
 /// Following a link should start at the top of the new page, the way loading
-/// one does.
-fn scroll_to_top() {
-    if let Some(window) = web_sys::window() {
+/// one does. A newer snapshot redraws the same page where the reader is.
+fn scroll_to_top_of(url: &str) {
+    thread_local! {
+        static SHOWN: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    }
+    let moved = SHOWN.with(|shown| {
+        let moved = *shown.borrow() != url;
+        if moved {
+            *shown.borrow_mut() = url.to_string();
+        }
+        moved
+    });
+    if moved && let Some(window) = web_sys::window() {
         window.scroll_to_with_x_and_y(0.0, 0.0);
     }
 }
