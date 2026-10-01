@@ -55,10 +55,10 @@ library Claims {
 
         // The holding fee up to now falls on every share, the leaver's too.
         Valuations.syncHolding(s);
-        uint256 supply = s.totalSupply;
+        uint256 supply = s.totalSupply + VaultStorage.OFFSET;
         // The leaver's part of what the shares own of the stations, and of
         // the cash as it stands before the close.
-        uint256 fraction = shares.mulDiv(WAD - s.liveUnits(), supply, Math.Rounding.Ceil);
+        uint256 fraction = shares.mulDiv(WAD - s.liveUnits(), supply);
         if (fraction > WAD) fraction = WAD;
         if (fraction == 0) fraction = 1;
         uint256 cashShare = s.cash.mulDiv(shares, supply);

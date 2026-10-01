@@ -571,7 +571,11 @@ library Valuations {
         if (state != ClaimState.Pending && state != ClaimState.Waiting && state != ClaimState.Queued) {
             revert IVault.NotAllowed();
         }
-        if (cost > s.maxExitCost || cost <= s.exitCost[claimId] || payTo == address(0)) {
+        // Exit costs pay for bringing money home from another chain.
+        if (
+            s.otherChains.length == 0 || cost > s.maxExitCost || cost <= s.exitCost[claimId]
+                || payTo == address(0)
+        ) {
             revert IVault.NotAllowed();
         }
         bytes32 digest = MessageHashUtils.toEthSignedMessageHash(exitCostDigest(claimId, cost, payTo));
@@ -643,10 +647,15 @@ library Valuations {
         uint256 fraction = raw.mulDiv(s.scale(), WAD);
         if (fraction > WAD) fraction = WAD;
         if (fraction == 0) fraction = 1;
+        (, uint256 exitBefore) = IStation(s.homeStation).value();
         s.serving = holder;
-        (, bool blocked) = IStation(s.homeStation).unwind(fraction);
+        (uint256 home, bool blocked) = IStation(s.homeStation).unwind(fraction);
         s.serving = address(0);
-        if (blocked) revert IVault.NotYet();
+        // Units are only burned for what came home for them: nothing home
+        // from a station that held something, or from a vault whose stations
+        // are elsewhere too, is not a serve. Units of an empty station are
+        // worth nothing and can be cleared.
+        if (blocked || (home == 0 && (exitBefore != 0 || s.otherChains.length != 0))) revert IVault.NotYet();
         _accrue(s, holder);
         s.units -= raw;
         s.unitsOf[holder] = 0;
