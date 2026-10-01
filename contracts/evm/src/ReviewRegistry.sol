@@ -2,82 +2,94 @@
 pragma solidity ^0.8.30;
 
 import {IAttestationRegistry, ImageKind} from "./interfaces/IAttestationRegistry.sol";
-import {IReviewRegistry, Review} from "./interfaces/IReviewRegistry.sol";
-import {IStrategyRegistry, VersionStatus} from "./interfaces/IStrategyRegistry.sol";
-import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
-import {SafeERC20} from "openzeppelin/token/ERC20/utils/SafeERC20.sol";
+import {IPublishing} from "./interfaces/IPublishing.sol";
+import {IReviewRegistry, Rating, Review} from "./interfaces/IReviewRegistry.sol";
+import {IStrategyRegistry} from "./interfaces/IStrategyRegistry.sol";
 
-/// Every review ever signed, by strategy version.
+/// Every strategy's one review.
 ///
-/// A review is one model's opinion of whether code is reasonable, signed by
-/// the image that ran it. It is never a gate: nothing here can stop a vault
-/// opening or a depositor depositing. Reviews accumulate, because a newer
-/// opinion should not be able to bury an older one -- anyone can buy a fresh
-/// review, and both stay on the page.
+/// A review is a model's reading of code, signed by the image that ran it. It
+/// is never a gate for anything but malicious code, which the reviewer refuses
+/// before it is built. Everything else is shown, however it reads, and the
+/// depositor decides.
 contract ReviewRegistry is IReviewRegistry {
-    using SafeERC20 for IERC20;
-
     IAttestationRegistry public immutable attestation;
     IStrategyRegistry public immutable strategies;
-    IERC20 public immutable asset;
-    address public immutable platform;
-    uint256 public immutable reviewFee;
+    IPublishing public immutable publishing;
 
-    mapping(bytes32 => mapping(uint32 => Review[])) private _reviews;
+    mapping(uint256 => Review) private _review;
+    mapping(uint256 => bool) private _refused;
 
     error NotTheReviewer();
-    error NoSuchVersion();
+    error NotRegistered();
+    error AlreadyRegistered();
+    error NotSubmitted();
     error WrongBundle();
-    error NoReviewYet();
+    error AlreadyReviewed();
+    error BadRating();
 
-    constructor(
-        IAttestationRegistry attestation_,
-        IStrategyRegistry strategies_,
-        IERC20 asset_,
-        address platform_,
-        uint256 reviewFee_
-    ) {
+    constructor(IAttestationRegistry attestation_, IStrategyRegistry strategies_, IPublishing publishing_) {
         attestation = attestation_;
         strategies = strategies_;
-        asset = asset_;
-        platform = platform_;
-        reviewFee = reviewFee_;
+        publishing = publishing_;
     }
 
-    function requestReview(bytes32 strategyId, uint32 version) external {
-        asset.safeTransferFrom(msg.sender, platform, reviewFee);
-        emit ReviewRequested(strategyId, version, msg.sender, reviewFee);
-    }
-
-    function submitReview(bytes32 strategyId, uint32 version, Review calldata review) external {
-        if (!attestation.isBlessedAs(msg.sender, ImageKind.Reviewer)) revert NotTheReviewer();
-        if (strategies.versionOf(strategyId, version).status == VersionStatus.None) revert NoSuchVersion();
+    function submitReview(uint256 strategyId, Review calldata review) external {
+        _check(strategyId, review);
+        if (!strategies.isRegistered(strategyId)) revert NotRegistered();
         // A review is of one bundle built from one source; saying otherwise
-        // would let a good score follow code nobody scored.
+        // would let a good report follow code nobody read.
         if (
-            strategies.versionOf(strategyId, version).bundleHash != review.bundleHash
-                || strategies.versionOf(strategyId, version).sourceHash != review.sourceHash
+            strategies.bundleHashOf(strategyId) != review.bundleHash
+                || strategies.strategyOf(strategyId).sourceHash != review.sourceHash
         ) revert WrongBundle();
 
-        _reviews[strategyId][version].push(review);
-        emit ReviewSubmitted(strategyId, version, msg.sender, review.score, review.reportHash);
+        _record(strategyId, review);
+        emit ReviewSubmitted(strategyId, msg.sender, review.ratings, review.reportHash);
     }
 
-    function reviewCount(bytes32 strategyId, uint32 version) external view returns (uint256) {
-        return _reviews[strategyId][version].length;
+    function submitRefusal(uint256 strategyId, Review calldata review) external {
+        _check(strategyId, review);
+        if (publishing.submissionOf(strategyId).author == address(0)) revert NotSubmitted();
+        if (strategies.isRegistered(strategyId)) revert AlreadyRegistered();
+        if (review.bundleHash != bytes32(0)) revert WrongBundle();
+
+        _record(strategyId, review);
+        _refused[strategyId] = true;
+        emit Refused(strategyId, msg.sender, review.sourceHash, review.reportHash);
     }
 
-    function reviewAt(
-        bytes32 strategyId,
-        uint32 version,
-        uint256 index
-    ) external view returns (Review memory) {
-        return _reviews[strategyId][version][index];
+    /// The image and the time are the registry's own knowledge, not the
+    /// reviewer's claim.
+    function _record(uint256 strategyId, Review calldata review) private {
+        Review storage stored = _review[strategyId];
+        stored.bundleHash = review.bundleHash;
+        stored.sourceHash = review.sourceHash;
+        stored.reviewerImage = attestation.keyInfo(msg.sender).imageDigest;
+        stored.modelIdHash = review.modelIdHash;
+        stored.promptHash = review.promptHash;
+        stored.reportHash = review.reportHash;
+        stored.ratings = review.ratings;
+        stored.findingCount = review.findingCount;
+        stored.reviewedAt = uint64(block.timestamp);
     }
 
-    function latestReview(bytes32 strategyId, uint32 version) external view returns (Review memory) {
-        Review[] storage all = _reviews[strategyId][version];
-        if (all.length == 0) revert NoReviewYet();
-        return all[all.length - 1];
+    function _check(uint256 strategyId, Review calldata review) private view {
+        if (!attestation.isBlessedAs(msg.sender, ImageKind.Reviewer)) revert NotTheReviewer();
+        // One review per strategy, ever.
+        if (_review[strategyId].reviewedAt != 0) revert AlreadyReviewed();
+        for (uint256 i = 0; i < 6; i++) {
+            if (review.ratings[i] == uint8(Rating.None) || review.ratings[i] > uint8(Rating.CouldntTell)) {
+                revert BadRating();
+            }
+        }
+    }
+
+    function reviewOf(uint256 strategyId) external view returns (Review memory review, bool refused) {
+        return (_review[strategyId], _refused[strategyId]);
+    }
+
+    function hasReview(uint256 strategyId) external view returns (bool) {
+        return _review[strategyId].reviewedAt != 0 && !_refused[strategyId];
     }
 }

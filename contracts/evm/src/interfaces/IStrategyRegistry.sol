@@ -1,68 +1,79 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.30;
 
-enum VersionStatus {
-    None,
-    Registered,
-    Retired
+/// One chain a strategy trades on, by its name in `shonin.toml` ("base",
+/// "hyperliquid", ...), with the drivers it trades through there.
+struct ChainNeed {
+    bytes32 chain;
+    bytes32[] drivers;
 }
 
-/// One published strategy version. A new version is a new entry and a new
-/// vault; nothing here is ever edited.
-struct StrategyVersion {
+/// One registered strategy. A changed strategy is a new strategy with a new
+/// id; nothing here is ever edited.
+struct Strategy {
     address author;
-    /// The source the builder read.
+    /// The source the builder and the reviewer read.
     bytes32 sourceHash;
     /// The bundle it produced: the component and its models.
     bytes32 bundleHash;
     bytes32 manifestHash;
-    /// The version this one claims to replace. A claim, not a mechanism.
-    bytes32 supersedesId;
-    uint32 supersedesVersion;
     uint64 registeredAt;
-    VersionStatus status;
+    /// Every chain the strategy trades on, which its vault's stations are
+    /// created from. Nobody chooses them but this record.
+    ChainNeed[] chains;
+    bytes32[] bridges;
+    /// Who its vault refuses deposits from: every driver's list on every
+    /// chain, plus the author's additions, sorted and without repeats.
+    bytes32[] restricted;
 }
 
-/// Every strategy version there is, and the builder's signature that put it
-/// there. An entry without a valid builder signature is refused, so the only
-/// bundles on the registry are ones an allowlisted builder compiled.
+/// Every strategy there is, under the id it was given when its author paid.
+///
+/// An entry needs two attested signatures: the reviewer's go-ahead, given
+/// after it read the source and before anything was built, and the builder's,
+/// over exactly what it built. So the only bundles here are ones an
+/// allowlisted builder compiled from source an allowlisted reviewer read
+/// first and did not refuse.
 interface IStrategyRegistry {
     event Registered(
-        bytes32 indexed strategyId,
-        uint32 indexed version,
+        uint256 indexed strategyId,
         address indexed author,
         bytes32 bundleHash,
         bytes32 sourceHash,
         bytes32 manifestHash
     );
-    event Retired(bytes32 indexed strategyId, uint32 indexed version);
 
-    /// Anyone may send this; only a signature from a blessed builder key makes
-    /// it stick.
+    /// Anyone may send this; only the two signatures make it stick.
     function register(
-        bytes32 strategyId,
-        uint32 version,
+        uint256 strategyId,
         address author,
         bytes32 sourceHash,
         bytes32 bundleHash,
         bytes32 manifestHash,
-        bytes32 supersedesId,
-        uint32 supersedesVersion,
-        bytes calldata builderSignature
+        ChainNeed[] calldata chains,
+        bytes32[] calldata bridges,
+        bytes32[] calldata restricted,
+        bytes calldata builderSignature,
+        bytes calldata reviewerClearance
     ) external;
 
-    /// The author stops their own strategy. The record stays.
-    function retire(bytes32 strategyId, uint32 version) external;
+    function isRegistered(uint256 strategyId) external view returns (bool);
+    function strategyOf(uint256 strategyId) external view returns (Strategy memory);
+    /// Zero until registered.
+    function bundleHashOf(uint256 strategyId) external view returns (bytes32);
+    function authorOf(uint256 strategyId) external view returns (address);
 
-    function versionOf(bytes32 strategyId, uint32 version) external view returns (StrategyVersion memory);
-    function bundleHashOf(bytes32 strategyId, uint32 version) external view returns (bytes32);
     /// What a builder key signs over.
     function registrationDigest(
-        bytes32 strategyId,
-        uint32 version,
+        uint256 strategyId,
         address author,
         bytes32 sourceHash,
         bytes32 bundleHash,
-        bytes32 manifestHash
+        bytes32 manifestHash,
+        ChainNeed[] calldata chains,
+        bytes32[] calldata bridges,
+        bytes32[] calldata restricted
     ) external view returns (bytes32);
+    /// What a reviewer key signs to let source be built and registered.
+    function clearanceDigest(uint256 strategyId, bytes32 sourceHash) external view returns (bytes32);
 }

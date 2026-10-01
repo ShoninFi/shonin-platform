@@ -10,7 +10,6 @@ import {Fixture} from "./Fixture.sol";
 /// whoever is moving, it lets anyone leave, and nothing anybody runs can move
 /// a dollar anywhere but back to the people who own it.
 contract VaultTest is Fixture {
-    bytes32 internal constant STRATEGY = "funding-basis";
     // Named here rather than read from the vault in each call: reading them is
     // itself a call, and it would swallow the prank meant for the next one.
     bytes32 internal constant IDLE = "idle";
@@ -22,7 +21,7 @@ contract VaultTest is Fixture {
 
     function setUp() public override {
         super.setUp();
-        (vault, bundle) = openVault(STRATEGY, 1);
+        (vault, bundle) = openVault();
         blessExecutorKey(executor, address(vault), bundle);
         vault.approveKey(VENUE_ID, executor);
     }
@@ -61,12 +60,12 @@ contract VaultTest is Fixture {
         assertGt(vault.totalValue(), 2000e6 - 1e6);
     }
 
-    function test_the_tank_is_never_the_depositors_money() public {
+    function test_the_tank_is_never_the_depositors_money() public view {
         // The vault holds the author's tank, and it counts for nothing.
         assertEq(vault.totalValue(), 0);
         assertEq(vault.idle(), 0);
-        assertEq(vault.tank().balance, MINIMUM_TANK - REVIEW_FEE);
-        assertEq(usd.balanceOf(address(vault)), MINIMUM_TANK - REVIEW_FEE);
+        assertEq(vault.tank().balance, MINIMUM_TANK);
+        assertEq(usd.balanceOf(address(vault)), MINIMUM_TANK);
     }
 
     function test_the_vault_reads_its_own_value_from_the_venue() public {
@@ -258,7 +257,7 @@ contract VaultTest is Fixture {
     }
 
     function test_a_late_crystallisation_costs_nothing() public {
-        (Vault other,) = openVault("another", 1);
+        (Vault other,) = openVault();
         depositAs(vault, alice, 100_000e6);
         depositAs(other, alice, 100_000e6);
 
@@ -291,12 +290,13 @@ contract VaultTest is Fixture {
 
     function test_usage_is_charged_to_the_tank_and_capped_at_the_allowances() public {
         uint64 day = uint64(block.timestamp / 1 days);
+        skip(1 days);
         uint256 asked = 50e6; // far past the 2 USDC a day this vault declared
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(EXECUTOR_KEY, ethSigned(vault.usageDigest(day, asked)));
         vault.submitUsage(day, asked, abi.encodePacked(r, s, v));
 
         assertEq(vault.tank().lastCharge, 2e6);
-        assertEq(usd.balanceOf(platform), REVIEW_FEE + 2e6);
+        assertEq(usd.balanceOf(platform), PUBLISH_FEE + 2e6);
     }
 
     function test_a_statement_nobody_blessed_charges_nothing() public {
@@ -308,6 +308,9 @@ contract VaultTest is Fixture {
 
     function test_an_empty_tank_becomes_a_debt_rather_than_a_stop() public {
         uint64 day = uint64(block.timestamp / 1 days);
+        skip(25 days);
+        // Its key has been renewed all along.
+        blessExecutorKey(executor, address(vault), bundle);
         for (uint256 i = 0; i < 25; i++) {
             (uint8 v, bytes32 r, bytes32 s) =
                 vm.sign(EXECUTOR_KEY, ethSigned(vault.usageDigest(day + uint64(i), 2e6)));
@@ -392,85 +395,5 @@ contract VaultTest is Fixture {
         (uint256 assets, uint256 claimId) = vault.redeem(shares, alice);
         assertEq(claimId, 0);
         assertApproxEqRel(assets, 100_000e6, 0.01e18);
-    }
-
-    // The build -------------------------------------------------------------
-
-    function test_a_vault_takes_no_money_until_its_strategy_is_built() public {
-        give(author, MINIMUM_TANK);
-        vm.startPrank(author);
-        usd.approve(address(factory), MINIMUM_TANK);
-        Vault pending = Vault(factory.create("unbuilt", 1, keccak256("source"), MINIMUM_TANK, 2e6));
-        vm.stopPrank();
-
-        assertTrue(pending.state() == VaultState.Building);
-        give(alice, 1e6);
-        vm.startPrank(alice);
-        usd.approve(address(pending), 1e6);
-        vm.expectRevert();
-        pending.deposit(1e6, alice);
-        vm.stopPrank();
-    }
-
-    function test_a_failed_build_is_charged_and_the_rest_is_returned() public {
-        give(author, MINIMUM_TANK);
-        vm.startPrank(author);
-        usd.approve(address(factory), MINIMUM_TANK);
-        Vault failing = Vault(factory.create("broken", 1, keccak256("source"), MINIMUM_TANK, 2e6));
-        vm.stopPrank();
-
-        vm.prank(alice);
-        vm.expectRevert();
-        failing.failBuild(keccak256("the two passes disagreed"));
-
-        // The build ran, so the build is charged, and then the vault closes.
-        vm.prank(builder);
-        failing.chargeBuild(0.5e6);
-        vm.prank(builder);
-        failing.failBuild(keccak256("the two passes disagreed"));
-        assertTrue(failing.state() == VaultState.Closed);
-        assertEq(usd.balanceOf(author), MINIMUM_TANK - REVIEW_FEE - 0.5e6);
-    }
-
-    function test_only_a_builder_charges_a_build_and_only_once() public {
-        give(author, MINIMUM_TANK);
-        vm.startPrank(author);
-        usd.approve(address(factory), MINIMUM_TANK);
-        Vault building = Vault(factory.create("slow", 1, keccak256("source"), MINIMUM_TANK, 2e6));
-        vm.stopPrank();
-
-        vm.prank(alice);
-        vm.expectRevert();
-        building.chargeBuild(1e6);
-
-        vm.prank(builder);
-        building.chargeBuild(1e6);
-        assertEq(building.tank().balance, MINIMUM_TANK - REVIEW_FEE - 1e6);
-
-        vm.prank(builder);
-        vm.expectRevert();
-        building.chargeBuild(1e6);
-    }
-
-    function test_a_build_cannot_charge_more_than_a_day_of_the_declared_allowances() public {
-        give(author, MINIMUM_TANK);
-        vm.startPrank(author);
-        usd.approve(address(factory), MINIMUM_TANK);
-        Vault building = Vault(factory.create("greedy", 1, keccak256("source"), MINIMUM_TANK, 2e6));
-        vm.stopPrank();
-
-        // The daily cap is 2 USDC, so a builder claiming 30 is believed for 2.
-        vm.prank(builder);
-        building.chargeBuild(30e6);
-        assertEq(building.tank().balance, MINIMUM_TANK - REVIEW_FEE - 2e6);
-    }
-
-    function test_a_vault_cannot_be_created_without_enough_in_its_tank() public {
-        give(author, MINIMUM_TANK);
-        vm.startPrank(author);
-        usd.approve(address(factory), MINIMUM_TANK);
-        vm.expectRevert();
-        factory.create("thin", 1, keccak256("source"), MINIMUM_TANK - 1, 2e6);
-        vm.stopPrank();
     }
 }
