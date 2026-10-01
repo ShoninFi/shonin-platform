@@ -493,17 +493,15 @@ contract VaultTest is Fixture {
         assertEq(claimId, 1);
     }
 
-    function test_a_withdrawal_the_cash_cant_pay_becomes_a_claim_and_is_paid_after_its_close() public {
+    function test_a_withdrawal_the_cash_cant_pay_becomes_a_claim_and_is_paid_at_its_close() public {
         (uint256 claimId, uint256 shares) = bookClaim();
         assertTrue(vault.claimAt(claimId).state == ClaimState.Pending);
         assertEq(vault.balanceOf(address(vault)), shares + vault.balanceOf(address(vault)) - shares);
 
         vault.settleClaim(claimId);
-        assertTrue(vault.claimAt(claimId).state == ClaimState.Queued);
         vm.expectRevert(IVault.NotAllowed.selector);
         vault.settleClaim(claimId);
 
-        value(vault);
         Claim memory c = vault.claimAt(claimId);
         assertTrue(c.state == ClaimState.Paid);
         approxEq(c.paid, 100_000e6 * 999 / 1000, 300e6);

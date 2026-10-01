@@ -372,8 +372,6 @@ contract CrossChainTest is Fixture {
         assertEq(payTo, payee);
 
         vault.settleClaim(1);
-        assertTrue(vault.claimAt(1).state == ClaimState.Queued);
-        valueWith(0, 0);
         assertTrue(vault.claimAt(1).state == ClaimState.Paid);
         assertEq(usd.balanceOf(payee), 10e6);
         assertEq(vault.claimAt(1).paid, usd.balanceOf(alice));

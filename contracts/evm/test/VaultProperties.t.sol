@@ -146,13 +146,12 @@ contract VaultPropertiesTest is Fixture {
         assertEq(vault.claimCount(), 2);
         assertSolvent("after the claims were booked");
 
-        // Both are served: each closes its own fraction, then is priced.
+        // Both are served: each closes its own fraction and is paid.
+        uint256 mark = vault.mark();
         vault.settleClaim(1);
         assertSolvent("after the first close");
         vault.settleClaim(2);
         assertSolvent("after the second close");
-        uint256 mark = vault.mark();
-        value(vault);
         Claim memory a = vault.claimAt(1);
         Claim memory b = vault.claimAt(2);
         assertTrue(a.state == ClaimState.Paid && b.state == ClaimState.Paid, "a claim went unpaid");
@@ -168,7 +167,9 @@ contract VaultPropertiesTest is Fixture {
         uint256 aliceOwed = aliceFraction - (aliceFraction - mark * aliceShares / 1e30) * 1500 / 10_000;
         assertApproxEqAbs(a.paid, aliceOwed - aliceOwed / 1000, 1e6, "alice got less than her fraction");
         uint256 bobOwed = bobFraction - (bobFraction - mark * bobShares / 1e30) * 1500 / 10_000;
-        assertApproxEqAbs(b.paid, bobOwed - bobOwed / 1000, 1e6, "bob got less than his fraction");
+        // Bob was still in the pool when alice's transaction fee was kept in
+        // it, so he may get a little more, never less.
+        assertGe(b.paid + 1e6, bobOwed - bobOwed / 1000, "bob got less than his fraction");
         assertSolvent("after the claims were paid");
 
         // The author is the last holder: the station still holds their part
@@ -210,7 +211,9 @@ contract VaultPropertiesTest is Fixture {
         vault.redeemClosed(platformFeeShares, platform);
         assertSolvent("after the close");
         assertEq(vault.totalSupply(), vault.balanceOf(DEAD), "shares remain that nobody holds");
-        assertLe(vault.cash(), DEAD_ASSETS + 1e6, "cash remains after everyone was paid");
+        // What remains is the dead shares' part of the pool, and the
+        // transaction fee the last leaver left in it.
+        assertLe(vault.cash(), DEAD_ASSETS + authorPaid / 900, "cash remains after everyone was paid");
     }
 
     // 3. The admin key: propose, revoke, kill, and nothing else ---------------

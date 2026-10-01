@@ -104,20 +104,16 @@ library Valuations {
             exitValue = exitValue.mulDiv(WAD - units, WAD);
         }
         uint32 missing = uint32(s.otherChains.length);
-        // Claims whose fraction was closed own a fixed amount, set aside, and
-        // are paid exactly that: everyone else is priced without them, so a
-        // move at the stations after a close is the stayers' alone.
-        uint256 pooled = s.cash - (s.reservedCash - s.coveredReserved);
         s.valuations.push(
             Valuation({
                 time: time,
                 status: ValuationStatus.Open,
-                gross: pooled + markValue + 1,
-                grossExit: pooled + exitValue + 1,
+                gross: s.cash + markValue + 1,
+                grossExit: s.cash + exitValue + 1,
                 supply: 0,
                 fee: 0,
                 feeExit: 0,
-                cash: pooled,
+                cash: s.cash,
                 postsMissing: missing
             })
         );
@@ -262,7 +258,7 @@ library Valuations {
         // An exit is never worth more than the mark: a bid above it would pay
         // a leaver more than the pool holds for them.
         if (v.grossExit > gross) v.grossExit = gross;
-        uint256 supply = s.totalSupply + OFFSET - s.closedShares;
+        uint256 supply = s.totalSupply + OFFSET;
         if (s.state != VaultState.Closed && v.time >= VaultStorage.nextMonday(s.lastPayment)) {
             supply = payday(s, gross, supply, v.time);
         }
@@ -310,9 +306,7 @@ library Valuations {
         s.lastHolding = uint64(block.timestamp);
         uint256 rate = uint256(s.fees.holdingBps) * elapsed * WAD / (BPS * YEAR);
         if (rate == 0 || rate >= WAD) return;
-        // Not on closed claims' shares: they own a fixed amount, and the
-        // holding fee on it would fall on the stayers.
-        uint256 minted = (s.totalSupply + OFFSET - s.closedShares).mulDiv(rate, WAD - rate);
+        uint256 minted = (s.totalSupply + OFFSET).mulDiv(rate, WAD - rate);
         s.mint(address(this), minted);
         s.unpaidHolding += minted;
         emit IVault.HoldingSynced(minted);
@@ -467,36 +461,16 @@ library Valuations {
         emit IVault.ClaimBooked(s.claims.length, r.owner, shares);
     }
 
+    /// A claim the cash covered when it was tried, priced like any
+    /// withdrawal. If the cash no longer covers it, it waits to be tried
+    /// again: nothing was closed for it.
     function _claim(Layout storage s, Request storage r, uint256 id, Valuation storage v) private {
         Claim storage claim = s.claims[r.ref - 1];
         if (claim.state != ClaimState.Queued) return;
         s.queuedClaims -= 1;
-        // Its own cash, set aside when its fraction came home, is released
-        // to it first.
-        s.release(r.ref);
         uint256 shares = claim.shares;
-        uint256 home = s.claimHome[r.ref];
         (uint256 slice, uint256 burned, uint256 payout) = exitOf(s, v, shares);
-        if (home != 0) {
-            s.claimHome[r.ref] = 0;
-            s.closedShares -= shares;
-            // Its fraction left the stations when it was closed: it owns
-            // what that brought home and its part of the cash then, and
-            // nothing that joined, left or changed since. The profit fee is
-            // measured on that, and paid in shares at the price of those who
-            // stay, so their price is unchanged.
-            uint256 owned = home + s.claimCash[r.ref];
-            s.claimCash[r.ref] = 0;
-            if (owned > s.free()) owned = s.free();
-            uint256 fee = s.feeAt(owned, shares, s.claimMark[r.ref]);
-            // The valuation already prices the stayers without it.
-            slice = fee == 0 ? 0 : fee.mulDiv(v.supply, v.grossExit, Math.Rounding.Ceil);
-            if (slice > shares) slice = shares;
-            burned = shares - slice;
-            uint256 gross = owned - fee;
-            payout = gross - gross.mulDiv(s.fees.transactionBps, BPS, Math.Rounding.Ceil);
-        }
-        if (payout > s.free()) {
+        if (payout > s.cash) {
             claim.state = ClaimState.Pending;
             emit IVault.ClaimTried(r.ref, true);
             return;
@@ -505,7 +479,7 @@ library Valuations {
         _distribute(s, address(this), slice, burned);
         s.cash -= payout;
         claim.state = ClaimState.Paid;
-        payout -= _payExitCost(s, r.ref, payout);
+        payout -= payExitCost(s, r.ref, payout);
         claim.paid = payout;
         s.pay(claim.owner, payout);
         emit IVault.Withdrawn(id, claim.owner, shares, payout, slice);
@@ -580,50 +554,7 @@ library Valuations {
             return;
         }
         s.pendingShares -= r.amount;
-        _proRata(s, r.owner, r.amount);
-    }
-
-    function takeProRataClaim(uint256 claimId) external {
-        Layout storage s = VaultStorage.layout();
-        Claim storage claim = s.claims[claimId - 1];
-        if (msg.sender != claim.owner) revert IVault.NotAllowed();
-        ClaimState state = claim.state;
-        if (state != ClaimState.Pending && state != ClaimState.Waiting && state != ClaimState.Queued) {
-            revert IVault.NotAllowed();
-        }
-        uint256 since = s.lastPriced == 0 ? s.createdAt : s.latest().time;
-        if (claim.bookedAt > since) since = claim.bookedAt;
-        if (block.timestamp < since + s.timers.fallbackAfter || s.valuing()) revert IVault.NotYet();
-        claim.state = ClaimState.Fallback;
-        s.pendingShares -= claim.shares;
-        if (state != ClaimState.Queued) {
-            _proRata(s, claim.owner, claim.shares);
-            return;
-        }
-        Request storage r = s.requests[s.claimRequest[claimId] - 1];
-        if (s.lastPriced != 0 && s.latest().time >= r.earliest) revert IVault.NotAllowed();
-        s.queuedClaims -= 1;
-        r.done = true;
-        s.passDone();
-        s.release(claimId);
-        uint256 home = s.claimHome[claimId];
-        if (home == 0) {
-            // Queued on the cash alone: nothing was closed for it.
-            _proRata(s, claim.owner, claim.shares);
-            return;
-        }
-        // Its fraction of the stations is already home: it takes what that
-        // close brought and its part of the cash then, and no units.
-        s.claimHome[claimId] = 0;
-        s.closedShares -= claim.shares;
-        uint256 assets = home + s.claimCash[claimId];
-        s.claimCash[claimId] = 0;
-        if (assets > s.free()) assets = s.free();
-        s.burn(address(this), claim.shares);
-        s.cash -= assets;
-        assets -= _payExitCost(s, claimId, assets);
-        s.pay(claim.owner, assets);
-        emit IVault.ProRataTaken(claim.owner, claim.shares, assets, 0);
+        proRata(s, r.owner, r.amount);
     }
 
     /// The cost of bringing a claim's fraction home from another chain, as
@@ -656,7 +587,7 @@ library Valuations {
     }
 
     /// Pay a claim's exit cost out of what it is paid, and say how much.
-    function _payExitCost(Layout storage s, uint256 claimId, uint256 payout) private returns (uint256 cost) {
+    function payExitCost(Layout storage s, uint256 claimId, uint256 payout) internal returns (uint256 cost) {
         cost = s.exitCost[claimId];
         if (cost == 0) return 0;
         if (cost > payout) cost = payout;
@@ -666,15 +597,11 @@ library Valuations {
 
     /// No fee: nothing can be priced. The leaver's units are a claim on
     /// their fraction of whatever the stations hold.
-    function _proRata(Layout storage s, address owner, uint256 shares) private {
-        // Claims whose fraction was closed own their set-aside cash and none
-        // of the rest, so the cash is shared over the other shares, with what
-        // is set aside for claims queued on the cash alone among it.
-        uint256 assets = s.sharedCash().mulDiv(shares, s.totalSupply - s.closedShares);
-        if (assets > s.free()) assets = s.free();
+    function proRata(Layout storage s, address owner, uint256 shares) internal {
+        uint256 assets = s.cash.mulDiv(shares, s.totalSupply);
         // The shares own what the units don't; these shares' part of that
         // is the leaver's for good, whatever fees are minted later.
-        uint256 fraction = shares.mulDiv(WAD - s.liveUnits(), s.totalSupply - s.closedShares);
+        uint256 fraction = shares.mulDiv(WAD - s.liveUnits(), s.totalSupply);
         uint256 raw = fraction.mulDiv(WAD, s.scale());
         s.burn(address(this), shares);
         s.cash -= assets;

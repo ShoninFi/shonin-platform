@@ -8,8 +8,8 @@ import {ClaimState, IVault} from "../src/interfaces/IVault.sol";
 import {FaultingDriver} from "./FaultingDriverEscape.t.sol";
 import {Fixture} from "./Fixture.sol";
 
-/// A claim whose fraction is home but can't be priced takes the fallback
-/// like any other request, and is paid the cash set aside for it.
+/// A claim the cash covered, queued to be priced, takes the fallback like
+/// any other request when nothing can be priced, and is paid its fraction.
 contract QueuedClaimFallbackTest is Fixture {
     Vault internal vault;
     bytes32 internal bundle;
@@ -44,12 +44,14 @@ contract QueuedClaimFallbackTest is Fixture {
         vm.prank(alice);
         vault.requestRedeem(aliceShares, alice);
         value(vault);
-        blessExecutorKey(executor, address(vault), bundle);
+        // The strategy brings its idle dollars home: the cash covers her now.
+        vm.startPrank(executor);
+        station.withdraw("local", 100_000e6);
+        station.push(100_000e6);
+        vm.stopPrank();
         vault.settleClaim(1);
         assertTrue(vault.claimAt(1).state == ClaimState.Queued);
         uint256 claimRequest = vault.requestCount();
-        uint256 cashHome = vault.cash();
-        assertGt(cashHome, 100_000e6);
 
         // The venue pauses: its driver's reads revert, no valuation can be
         // recorded, and the fix takes the registry's timelock.
@@ -62,22 +64,24 @@ contract QueuedClaimFallbackTest is Fixture {
         vm.expectRevert();
         vault.recordValuation();
 
-        // Bob leaves through the fallback with his share of the cash nobody
-        // set aside: alice's close brought hers home for her alone.
+        // Bob leaves through the fallback: half the cash, and units for half
+        // the station.
         vm.prank(bob);
         uint256 bobRequest = vault.requestRedeem(bobShares, bob);
         skip(24 hours + SLOT);
+        uint256 cash = vault.cash();
         vm.prank(bob);
         vault.takeProRata(bobRequest);
-        assertLt(usd.balanceOf(bob), 10_000e6, "bob took the claim's cash");
+        assertApproxEqRel(usd.balanceOf(bob), cash / 2, 0.001e18);
 
-        // Alice's queued claim takes the fallback too, and gets her
-        // fraction that came home.
+        // Alice's queued claim takes the fallback too, through its own door.
         vm.prank(alice);
         vm.expectRevert(IVault.NotAllowed.selector);
         vault.takeProRata(claimRequest);
         vm.prank(alice);
         vault.takeProRataClaim(1);
-        assertGt(usd.balanceOf(alice), 90_000e6, "a queued claim had no way out");
+        assertApproxEqRel(usd.balanceOf(alice), cash / 2, 0.001e18, "a queued claim had no way out");
+        (uint256 aliceUnits,) = vault.unitsOf(alice);
+        assertGt(aliceUnits, 0, "she was given no part of the station");
     }
 }

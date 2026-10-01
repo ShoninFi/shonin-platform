@@ -14,6 +14,7 @@ import {
     VaultInit,
     VaultState
 } from "./interfaces/IVault.sol";
+import {Claims} from "./vault/Claims.sol";
 import {Upkeep} from "./vault/Upkeep.sol";
 import {Valuations} from "./vault/Valuations.sol";
 import {Layout, VaultStorage} from "./vault/VaultStorage.sol";
@@ -87,7 +88,7 @@ contract Vault is IVault, ReentrancyGuardTransient {
     }
 
     function settleClaim(uint256 claimId) external nonReentrant {
-        Upkeep.settleClaim(claimId);
+        Claims.settleClaim(claimId);
     }
 
     function freeze(uint256 claimId) external nonReentrant {
@@ -99,7 +100,7 @@ contract Vault is IVault, ReentrancyGuardTransient {
     }
 
     function takeProRataClaim(uint256 claimId) external nonReentrant {
-        Valuations.takeProRataClaim(claimId);
+        Claims.takeProRataClaim(claimId);
     }
 
     function reportExitCost(

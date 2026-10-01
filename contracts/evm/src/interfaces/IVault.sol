@@ -84,7 +84,8 @@ enum ClaimState {
     Pending,
     /// The last attempt found a market outside the exit band.
     Waiting,
-    /// Its fraction was closed; it is priced at the next valuation.
+    /// The cash covered it when it was tried: priced at the next valuation,
+    /// like any withdrawal. A claim whose fraction is closed is paid at once.
     Queued,
     Paid,
     /// Taken through the pro-rata fallback.
@@ -291,6 +292,8 @@ interface IVault is IStationVault {
         StationPost calldata post
     ) external view returns (bytes32);
     function settle(uint256 max) external returns (uint256 settled);
+    /// Close the leaver's fraction of every position and pay them in the same
+    /// transaction, or queue the claim if the cash already covers it.
     function settleClaim(uint256 claimId) external;
     function freeze(uint256 claimId) external;
     function takeProRata(uint256 requestId) external;

@@ -80,31 +80,14 @@ struct Layout {
     /// The newest priced valuation, plus one; zero before any.
     uint256 lastPriced;
     Claim[] claims;
-    /// Claims whose fraction was closed and brought home, waiting to be
-    /// priced. Their cash stays at home until they are.
+    /// Claims the cash covered when they were tried, waiting to be priced:
+    /// nothing goes out to a station while any is.
     uint256 queuedClaims;
-    /// Cash set aside for those claims, which nothing else may pay from.
-    uint256 reservedCash;
-    /// The part of it set aside for claims queued on the cash alone, with
-    /// nothing closed: their shares still own their fraction of everything,
-    /// so this cash is still shared with them until they are priced.
-    uint256 coveredReserved;
-    mapping(uint256 => uint256) claimReserved;
     /// The request a queued claim is priced by.
     mapping(uint256 => uint256) claimRequest;
     /// Valuations at which some station reported money on its way, counted
     /// or not: a vault isn't empty while any is, so it can't close on one.
     mapping(uint256 => bool) moving;
-    /// What a queued claim's close brought home, and its share of the cash
-    /// as it stood then: together, all its shares own once it is closed.
-    mapping(uint256 => uint256) claimHome;
-    mapping(uint256 => uint256) claimCash;
-    /// The high-water mark when a claim was queued: its profit fee is owed
-    /// against that, whatever a payday does to the mark before it is priced.
-    mapping(uint256 => uint256) claimMark;
-    /// The shares of queued claims whose fraction is already home: they own
-    /// cash, and none of what the stations still hold.
-    uint256 closedShares;
     mapping(uint256 => mapping(uint256 => Post)) posts;
     /// The open valuation's unit fraction and when it was recorded, so the
     /// posts that complete it are counted as of the same moment.
@@ -216,16 +199,7 @@ library VaultStorage {
     /// The profit fee owed on `gross` with `supply` shares: a share of what
     /// the vault is worth above the high-water mark, never below zero.
     function feeOf(Layout storage s, uint256 gross, uint256 supply) internal view returns (uint256) {
-        return feeAt(s, gross, supply, s.mark);
-    }
-
-    function feeAt(
-        Layout storage s,
-        uint256 gross,
-        uint256 supply,
-        uint256 mark
-    ) internal view returns (uint256) {
-        uint256 basis = mark.mulDiv(supply, PRICE, Math.Rounding.Ceil);
+        uint256 basis = s.mark.mulDiv(supply, PRICE, Math.Rounding.Ceil);
         if (gross <= basis) return 0;
         return (gross - basis).mulDiv(uint256(s.fees.authorBps) + s.fees.platformBps, BPS);
     }
@@ -266,32 +240,13 @@ library VaultStorage {
     /// Cash nothing has set aside: what withdrawals, fills and the station
     /// may draw on.
     function free(Layout storage s) internal view returns (uint256) {
-        return s.cash - s.reservedCash;
-    }
-
-    /// The free cash the shares that still own the stations share between
-    /// them: the free cash and what is set aside for claims queued on the
-    /// cash alone, whose shares are among them.
-    function sharedCash(Layout storage s) internal view returns (uint256) {
-        return free(s) + s.coveredReserved;
-    }
-
-    /// Release a queued claim's set-aside cash.
-    function release(Layout storage s, uint256 claimId) internal {
-        uint256 reserve = s.claimReserved[claimId];
-        s.reservedCash -= reserve;
-        if (s.claimHome[claimId] == 0) s.coveredReserved -= reserve;
-        s.claimReserved[claimId] = 0;
+        return s.cash;
     }
 
     function latest(Layout storage s) internal view returns (Valuation storage) {
         return s.valuations[s.lastPriced - 1];
     }
 
-    /// Halted, and a valuation since has found the stations empty: nothing
-    /// is left to price, and the vault only waits to close. No new request
-    /// is taken, so nobody can hold the close off a slot at a time; holders
-    /// redeem once it has closed, fee-free.
     /// A valuation is waiting for other chains' posts: until it is closed,
     /// nothing may change the supply or the units it will be priced on.
     function valuing(Layout storage s) internal view returns (bool) {
@@ -299,6 +254,10 @@ library VaultStorage {
         return count != 0 && s.valuations[count - 1].status == ValuationStatus.Open;
     }
 
+    /// Halted, and a valuation since has found the stations empty: nothing
+    /// is left to price, and the vault only waits to close. No new request
+    /// is taken, so nobody can hold the close off a slot at a time; holders
+    /// redeem once it has closed, fee-free.
     function readyToClose(Layout storage s) internal view returns (bool) {
         if (!halted(s) || s.lastPriced == 0) return false;
         Valuation storage v = latest(s);
