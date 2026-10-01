@@ -663,7 +663,9 @@ library Valuations {
     /// No fee: nothing can be priced. The leaver's units are a claim on
     /// their fraction of whatever the stations hold.
     function _proRata(Layout storage s, address owner, uint256 shares) private {
-        uint256 assets = s.free().mulDiv(shares, s.totalSupply);
+        // Queued claims' shares own their set-aside cash and none of the
+        // rest, so the free cash is shared over the other shares.
+        uint256 assets = s.free().mulDiv(shares, s.totalSupply - s.closedShares);
         // The shares own what the units don't; these shares' part of that
         // is the leaver's for good, whatever fees are minted later.
         uint256 fraction = shares.mulDiv(WAD - s.liveUnits(), s.totalSupply - s.closedShares);

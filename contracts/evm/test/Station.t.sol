@@ -258,6 +258,10 @@ contract StationTest is Fixture {
     function test_one_executor_at_a_time() public {
         station.approveKey("local", executor);
         blessExecutorKey(otherExecutor, address(vault), BUNDLE);
+        // The new instance takes over itself; a passer-by can't do it for it.
+        vm.expectRevert(Station.NotAllowed.selector);
+        station.approveKey("local", otherExecutor);
+        vm.prank(otherExecutor);
         station.approveKey("local", otherExecutor);
         assertFalse(venue.isAgent(address(station), executor));
         assertTrue(venue.isAgent(address(station), otherExecutor));

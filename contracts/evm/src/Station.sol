@@ -80,6 +80,15 @@ contract Station is IStation, ReentrancyGuardTransient {
         // One executor at a time: the key in place is withdrawn first, so an
         // instance that has been replaced can no longer trade.
         address current = _approvedKey[driver];
+        // While the key in place is still blessed, only the key being
+        // approved may take its place: nobody else can hand the venue back
+        // and forth between two blessed instances during a handover.
+        if (
+            current != address(0) && current != key && msg.sender != key
+                && _isKey(current, ImageKind.Executor)
+        ) {
+            revert NotAllowed();
+        }
         if (current != address(0) && current != key) {
             _run(IDriver(implementation).revokeKey(address(this), current), IDriver(implementation).targets());
             emit KeyRevoked(driver, current);

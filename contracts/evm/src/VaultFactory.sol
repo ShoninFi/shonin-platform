@@ -273,7 +273,8 @@ contract VaultFactory is IVaultFactory {
                 || config_.minimumTank <= config_.deadAssets || config_.minimumDeposit == 0
                 || config_.timers.slotInterval == 0 || config_.timers.slotWindow >= config_.timers.slotInterval
                 || config_.timers.slotLead <= config_.timers.slotWindow || config_.timers.freezeAfter < 1 days
-                || config_.timers.fallbackAfter == 0
+                || config_.timers.fallbackAfter < 1 days
+                || config_.timers.postDeadline <= config_.timers.slotWindow
         ) revert OutOfRange();
     }
 }
