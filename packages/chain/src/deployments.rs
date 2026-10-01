@@ -21,6 +21,8 @@ pub struct Deployments {
     pub venue: Address,
     pub attestation_verifier: Address,
     pub attestation: Address,
+    pub publishing: Address,
+    pub prices: Address,
     pub strategies: Address,
     pub reviews: Address,
     pub profiles: Address,

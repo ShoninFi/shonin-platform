@@ -4,7 +4,6 @@
 use serde::{Deserialize, Serialize};
 use time::{Date, PrimitiveDateTime};
 
-use super::common::AuditStatus;
 use super::venue::Custody;
 
 /// A measured image on the allowlist.
@@ -13,7 +12,6 @@ pub struct Image {
     pub digest: String,
     /// When the timelock on it ran out and it became blessable.
     pub allowlisted: Date,
-    pub audit: AuditStatus,
     /// `executor`, `unwinder`, `builder` or `reviewer`.
     pub kind: String,
 }

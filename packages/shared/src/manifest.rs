@@ -1,84 +1,252 @@
 //! What an author commits, and the hashes that pin it.
 //!
-//! The manifest is the `shonin.toml` in a strategy's project: what it is, what
-//! it may use, and which accounts it trades. The build service hashes it, the
-//! registry stores the hash, and the vault's page shows what it said, so an
-//! author's declaration and the thing that runs are the same object.
+//! The manifest is the `shonin.toml` in an agent's project. It only declares,
+//! for the platform: the chain its vault lives on, the author's description
+//! and claims, the drivers it trades through, the bridges it moves money over,
+//! and who else may not deposit. The agent's own settings are constants in its
+//! code, and its allowances and idle floor are set on the vault, so none of
+//! those are here.
 //!
-//! Hashing is canonical on purpose. The same manifest hashes to the same
-//! bytes on every machine, so two people who build the same source can compare
-//! one number and know whether they got the same strategy.
+//! The builder adds what the author doesn't write (the strategy's id, the
+//! hashes, the toolchain) and hashes the two together, canonically, so the
+//! same manifest hashes to the same bytes on every machine.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// The version of this format. It is hashed along with the manifest, so a
-/// later format can never collide with this one.
-pub const SPEC_VERSION: &str = "shonin-strategy/1";
+use crate::catalogue::{Catalogue, DriverChain};
+use crate::model::common::Chain;
 
-/// What an author declares about a strategy.
+/// The version of the canonical format. It is hashed along with the manifest,
+/// so a later format can never collide with this one.
+pub const SPEC_VERSION: &str = "shonin-agent/1";
+
+/// Who every vault refuses, whatever its drivers: US persons and sanctioned
+/// persons.
+pub const BASELINE_RESTRICTED: [&str; 2] = ["SANCTIONED", "US"];
+
+/// What an author declares, as `shonin.toml` says it.
 ///
-/// Maps are ordered, so the canonical encoding is the same whatever order the
-/// author wrote them in.
+/// Unknown keys are refused, so a manifest written for an older format fails
+/// with a message rather than being half read.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
-    pub strategy: StrategySection,
+    pub vault: VaultSection,
     pub description: Description,
-    /// Passed to `run`. Decimals are strings, so no float ever rounds
-    /// differently on two machines.
+    /// One table per driver, from the published list, with that driver's
+    /// settings. Maps are ordered, so the hash doesn't depend on the order
+    /// the author wrote them in.
     #[serde(default)]
-    pub config: BTreeMap<String, String>,
-    /// The venues it trades, and which of the vault's accounts it uses on
-    /// each. The vault registers exactly these and no others.
+    pub drivers: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
-    pub venues: BTreeMap<String, VenueSection>,
-    pub runtime: Runtime,
-    /// The names of the sealed secrets it reads. Never the values.
-    #[serde(default)]
-    pub secrets: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct StrategySection {
-    /// Stable across versions.
-    pub id: String,
-    pub version: u32,
-    /// The version this one claims to replace, as `id@version`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supersedes: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Description {
-    pub title: String,
-    /// The author's own words, shown as the author's words.
-    pub text: String,
-    /// The limits the strategy sets in its own code, said plainly, so a reader
-    /// can check the page against the source.
-    #[serde(default)]
-    pub limits: Vec<String>,
-    /// The hosts and feeds it depends on.
-    #[serde(default)]
-    pub dependencies: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct VenueSection {
-    pub accounts: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Runtime {
-    pub allowances: Allowances,
-    /// Extras the strategy asks for beyond the world's own imports.
-    #[serde(default)]
+    pub bridges: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Depositors::is_empty")]
+    pub depositors: Depositors,
+    /// Extras the agent asks for beyond the world's own imports.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
 }
 
-/// The compute a strategy may use. Declared here, enforced as caps by the
-/// executor, and charged to the vault's tank at the published prices.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultSection {
+    /// `base`, `hyperliquid`, `robinhood` or `solana`.
+    pub chain: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Description {
+    /// The name people see.
+    pub title: String,
+    /// The author's own words, shown as the author's words.
+    pub text: String,
+    /// What the agent promises about itself, one plain sentence each. The
+    /// review checks the code against them.
+    #[serde(default)]
+    pub claims: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Depositors {
+    /// Places whose residents may not deposit, as ISO 3166 country codes, on
+    /// top of what the drivers and the platform already exclude. An author
+    /// can only add to the list.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+impl Depositors {
+    pub fn is_empty(&self) -> bool {
+        self.exclude.is_empty()
+    }
+}
+
+/// One chain the agent trades on, with the drivers it uses there: what the
+/// strategy registry records and the vault's stations are created from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainNeed {
+    pub chain: Chain,
+    pub drivers: Vec<String>,
+}
+
+impl Manifest {
+    /// Read a manifest from the `shonin.toml` in a project.
+    pub fn from_toml(text: &str) -> Result<Self, String> {
+        toml::from_str(text).map_err(|error| format!("shonin.toml: {}", error.message()))
+    }
+
+    pub fn to_toml(&self) -> String {
+        toml::to_string_pretty(self).expect("a manifest serialises")
+    }
+
+    /// The vault chain, if it names one there is.
+    pub fn vault_chain(&self) -> Result<Chain, String> {
+        self.vault.chain.parse()
+    }
+
+    /// Check the manifest against the published list, as it is offered on
+    /// `network` (`local`, `testnet` or `mainnet`). The builder refuses a
+    /// manifest this rejects, before anything is reviewed or built.
+    pub fn check(&self, catalogue: &Catalogue, network: &str) -> Result<(), String> {
+        let vault_chain = self.vault_chain()?;
+        if self.description.title.trim().is_empty() {
+            return Err("[description] needs a title".into());
+        }
+        if self.drivers.is_empty() {
+            return Err("name at least one driver, as a [drivers.<name>] table".into());
+        }
+        for name in self.drivers.keys() {
+            let driver = catalogue.drivers.get(name).ok_or_else(|| {
+                format!("there is no driver called {name:?} on the published list")
+            })?;
+            if !driver.networks.iter().any(|offered| offered == network) {
+                return Err(format!("the {name} driver isn't offered on {network} yet"));
+            }
+            if !self.drivers[name].is_empty() {
+                return Err(format!("the {name} driver takes no settings"));
+            }
+        }
+        for name in self.bridges.keys() {
+            let bridge = catalogue.bridges.get(name).ok_or_else(|| {
+                format!("there is no bridge called {name:?} on the published list")
+            })?;
+            if !bridge.networks.iter().any(|offered| offered == network) {
+                return Err(format!("the {name} bridge isn't offered on {network} yet"));
+            }
+            if !self.bridges[name].is_empty() {
+                return Err(format!("the {name} bridge takes no settings"));
+            }
+        }
+        let needs = self.chains(catalogue)?;
+        if needs.iter().any(|need| need.chain != vault_chain) && self.bridges.is_empty() {
+            return Err(
+                "a driver on another chain than the vault's needs a bridge, as a [bridges.<name>] table"
+                    .into(),
+            );
+        }
+        for code in &self.depositors.exclude {
+            let ok = code.len() == 2 && code.bytes().all(|b| b.is_ascii_uppercase());
+            if !ok {
+                return Err(format!(
+                    "[depositors] exclude takes two-letter country codes, like \"GB\", not {code:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every chain the agent trades on, with its drivers there, the vault's
+    /// own chain first.
+    pub fn chains(&self, catalogue: &Catalogue) -> Result<Vec<ChainNeed>, String> {
+        let vault_chain = self.vault_chain()?;
+        let mut by_chain: BTreeMap<Chain, Vec<String>> = BTreeMap::new();
+        for name in self.drivers.keys() {
+            let driver = catalogue.drivers.get(name).ok_or_else(|| {
+                format!("there is no driver called {name:?} on the published list")
+            })?;
+            let chain = match driver.chain {
+                DriverChain::Vault => vault_chain,
+                DriverChain::On(chain) => chain,
+            };
+            by_chain.entry(chain).or_default().push(name.clone());
+        }
+        let mut needs: Vec<ChainNeed> = Vec::new();
+        if let Some(drivers) = by_chain.remove(&vault_chain) {
+            needs.push(ChainNeed {
+                chain: vault_chain,
+                drivers,
+            });
+        }
+        needs.extend(
+            by_chain
+                .into_iter()
+                .map(|(chain, drivers)| ChainNeed { chain, drivers }),
+        );
+        Ok(needs)
+    }
+
+    /// Who the vault refuses: the platform's baseline, every driver's list,
+    /// and the author's additions, sorted and without repeats.
+    pub fn restricted(&self, catalogue: &Catalogue) -> Vec<String> {
+        let mut all: BTreeSet<String> = BASELINE_RESTRICTED
+            .iter()
+            .map(|code| code.to_string())
+            .collect();
+        for name in self.drivers.keys() {
+            if let Some(driver) = catalogue.drivers.get(name) {
+                all.extend(driver.restricted.iter().cloned());
+            }
+        }
+        all.extend(self.depositors.exclude.iter().cloned());
+        all.into_iter().collect()
+    }
+
+    pub fn bridge_names(&self) -> Vec<String> {
+        self.bridges.keys().cloned().collect()
+    }
+}
+
+/// The manifest as the builder hashes it: the author's file, and what the
+/// builder worked out inside the attested machine. Nothing here is taken from
+/// the author but the file itself.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Canonical {
+    pub strategy_id: u64,
+    pub vault_chain: Chain,
+    /// The wallet that paid to publish.
+    pub author: String,
+    pub bundle_hash: String,
+    pub component_hash: String,
+    pub source_hash: String,
+    pub sealed: bool,
+    pub world: String,
+    pub toolchain: String,
+    pub builder_image: String,
+    pub manifest: Manifest,
+}
+
+impl Canonical {
+    /// The hash the registry stores and the builder signs over.
+    ///
+    /// The format's name is hashed first, so the same bytes read under a later
+    /// format can never produce the same hash.
+    pub fn hash(&self) -> String {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(self, &mut bytes).expect("a manifest encodes");
+        let mut hasher = Sha256::new();
+        hasher.update(SPEC_VERSION.as_bytes());
+        hasher.update(&bytes);
+        format!("sha256:{}", hex::encode(hasher.finalize()))
+    }
+}
+
+/// The compute an agent may use, set by its author on the live vault and
+/// charged to its tank at the published prices. Not part of the manifest.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Allowances {
     pub fuel_per_sec: u64,
@@ -87,10 +255,12 @@ pub struct Allowances {
     pub bytes_per_day: u64,
     pub streams: u32,
     pub inference_ms_per_min: u32,
+    /// Gas, in dollars a day.
+    pub gas_per_day: f64,
 }
 
 impl Allowances {
-    /// Enough for a strategy that watches one venue and trades on a signal
+    /// Enough for an agent that watches one venue and trades on a signal
     /// rather than on every tick.
     pub fn modest() -> Self {
         Self {
@@ -100,10 +270,11 @@ impl Allowances {
             bytes_per_day: 50_000_000,
             streams: 4,
             inference_ms_per_min: 0,
+            gas_per_day: 1.0,
         }
     }
 
-    /// A strategy that carries a model: the same shape as a modest one, with
+    /// An agent that carries a model: the same shape as a modest one, with
     /// room to think and the bandwidth to fetch what it thinks about.
     pub fn thinking() -> Self {
         Self {
@@ -115,7 +286,7 @@ impl Allowances {
         }
     }
 
-    /// A strategy that quotes: it answers every tick, so it needs the fuel to
+    /// An agent that quotes: it answers every tick, so it needs the fuel to
     /// price one and the request rate to place what it priced.
     pub fn quoting() -> Self {
         Self {
@@ -125,12 +296,12 @@ impl Allowances {
             bytes_per_day: 5_000_000_000,
             streams: 64,
             inference_ms_per_min: 0,
+            gas_per_day: 5.0,
         }
     }
 
-    /// The shapes an author picks between, named. They are starting points
-    /// rather than a menu: a manifest may declare any allowances it likes, and
-    /// what it declares is what its vault is capped at.
+    /// The shapes an author picks between when activating, named. They are
+    /// starting points rather than a menu.
     pub const SHAPES: [&'static str; 3] = ["modest", "thinking", "quoting"];
 
     /// One of [`Allowances::SHAPES`] by name. An unknown name is the modest
@@ -145,7 +316,8 @@ impl Allowances {
 }
 
 /// The published price of each unit of an allowance, which is how a day's
-/// declared allowances become the cap the vault's contract enforces.
+/// allowances become the cap the vault's contract enforces. The contract
+/// keeps the same list; this copy is for showing estimates.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Prices {
     /// A full core, per hour.
@@ -169,7 +341,7 @@ impl Prices {
     }
 
     /// What a day at these allowances costs, which is the most a day's usage
-    /// statement may charge a tank.
+    /// may charge a tank.
     pub fn daily_cap(&self, allowances: &Allowances) -> f64 {
         // Fuel stands for processor time: the executor's measured mapping is
         // what turns one into the other, and until it is measured a million
@@ -183,35 +355,7 @@ impl Prices {
             + memory_gib * self.gib_hour * 24.0
             + egress_gb * self.gb_egress
             + inference_seconds * self.inference_second
-    }
-}
-
-impl Manifest {
-    /// Read a manifest from the `shonin.toml` in a project.
-    pub fn from_toml(text: &str) -> Result<Self, toml::de::Error> {
-        toml::from_str(text)
-    }
-
-    pub fn to_toml(&self) -> String {
-        toml::to_string_pretty(self).expect("a manifest serialises")
-    }
-
-    /// `id@version`: what a vault, a URL and a supersession claim all name.
-    pub fn slug(&self) -> String {
-        format!("{}-v{}", self.strategy.id, self.strategy.version)
-    }
-
-    /// The hash the registry stores and the builder signs over.
-    ///
-    /// The format's name is hashed first, so the same bytes read under a later
-    /// format can never produce the same hash.
-    pub fn hash(&self) -> String {
-        let mut bytes = Vec::new();
-        ciborium::into_writer(self, &mut bytes).expect("a manifest encodes");
-        let mut hasher = Sha256::new();
-        hasher.update(SPEC_VERSION.as_bytes());
-        hasher.update(&bytes);
-        format!("sha256:{}", hex::encode(hasher.finalize()))
+            + allowances.gas_per_day
     }
 }
 
@@ -237,62 +381,133 @@ mod tests {
 
     fn example() -> &'static str {
         r#"
-[strategy]
-id = "funding-basis"
-version = 1
+[vault]
+chain = "base"
 
 [description]
 title = "Funding basis"
 text = "Holds spot, shorts the perp, collects funding."
-limits = ["gross leverage at most 2x"]
-dependencies = ["the venue's own price stream"]
+claims = ["gross leverage at most 2x"]
 
-[config]
-entry_apr = "0.12"
-exit_apr = "0.04"
+[drivers.local]
 
-[venues.local]
-accounts = ["venue"]
-
-[runtime.allowances]
-fuel_per_sec = 2000000
-memory_mib = 256
-requests_per_min = 120
-bytes_per_day = 50000000
-streams = 4
-inference_ms_per_min = 0
+[depositors]
+exclude = ["GB"]
 "#
+    }
+
+    fn catalogue() -> Catalogue {
+        Catalogue::published()
     }
 
     #[test]
     fn a_manifest_reads_and_writes_the_same_thing() {
         let manifest = Manifest::from_toml(example()).expect("it parses");
-        assert_eq!(manifest.strategy.id, "funding-basis");
-        assert_eq!(manifest.slug(), "funding-basis-v1");
-        assert_eq!(manifest.config["entry_apr"], "0.12");
-        assert_eq!(manifest.venues["local"].accounts, vec!["venue"]);
-        assert_eq!(manifest.runtime.allowances.memory_mib, 256);
-
+        assert_eq!(manifest.vault_chain(), Ok(Chain::Base));
+        assert_eq!(
+            manifest.description.claims,
+            vec!["gross leverage at most 2x"]
+        );
+        assert!(manifest.drivers.contains_key("local"));
         let round_tripped = Manifest::from_toml(&manifest.to_toml()).expect("it parses again");
         assert_eq!(round_tripped, manifest);
     }
 
     #[test]
-    fn the_hash_does_not_depend_on_how_it_was_written() {
-        let one = Manifest::from_toml(example()).expect("it parses");
-        let reordered = example().replace(
-            "entry_apr = \"0.12\"\nexit_apr = \"0.04\"",
-            "exit_apr = \"0.04\"\nentry_apr = \"0.12\"",
+    fn an_older_manifest_is_refused_with_a_message() {
+        let old = "[strategy]\nid = \"x\"\nversion = 1\n";
+        let error = Manifest::from_toml(old).expect_err("it is refused");
+        assert!(error.contains("strategy"), "{error}");
+    }
+
+    #[test]
+    fn a_manifest_is_checked_against_the_published_list() {
+        let manifest = Manifest::from_toml(example()).expect("it parses");
+        assert_eq!(manifest.check(&catalogue(), "local"), Ok(()));
+        // The stand-in venue is never offered on mainnet.
+        assert!(manifest.check(&catalogue(), "mainnet").is_err());
+
+        let unknown = example().replace("[drivers.local]", "[drivers.nowhere]");
+        let unknown = Manifest::from_toml(&unknown).expect("it parses");
+        assert!(
+            unknown
+                .check(&catalogue(), "local")
+                .unwrap_err()
+                .contains("nowhere")
         );
-        let two = Manifest::from_toml(&reordered).expect("it parses");
-        assert_eq!(one.hash(), two.hash());
+
+        let not_yet = example().replace("[drivers.local]", "[drivers.hyperliquid]");
+        let not_yet = Manifest::from_toml(&not_yet).expect("it parses");
+        assert!(
+            not_yet
+                .check(&catalogue(), "local")
+                .unwrap_err()
+                .contains("isn't offered")
+        );
+
+        let bad_code = example().replace("[\"GB\"]", "[\"Britain\"]");
+        let bad_code = Manifest::from_toml(&bad_code).expect("it parses");
+        assert!(bad_code.check(&catalogue(), "local").is_err());
+    }
+
+    #[test]
+    fn the_stand_in_driver_trades_on_the_vault_chain() {
+        let manifest =
+            Manifest::from_toml(&example().replace("\"base\"", "\"robinhood\"")).unwrap();
+        let chains = manifest.chains(&catalogue()).unwrap();
+        assert_eq!(
+            chains,
+            vec![ChainNeed {
+                chain: Chain::Robinhood,
+                drivers: vec!["local".into()]
+            }]
+        );
+    }
+
+    #[test]
+    fn the_restricted_list_adds_the_baseline_the_drivers_and_the_author() {
+        let manifest = Manifest::from_toml(example()).expect("it parses");
+        assert_eq!(
+            manifest.restricted(&catalogue()),
+            vec!["GB", "SANCTIONED", "US"]
+        );
+    }
+
+    fn canonical(manifest: Manifest) -> Canonical {
+        Canonical {
+            strategy_id: 7,
+            vault_chain: Chain::Base,
+            author: "0xa11ce".into(),
+            bundle_hash: hash_bytes(b"bundle"),
+            component_hash: hash_bytes(b"component"),
+            source_hash: hash_bytes(b"source"),
+            sealed: false,
+            world: "shonin:agent@0.1.0".into(),
+            toolchain: "rust".into(),
+            builder_image: "sha256:builder".into(),
+            manifest,
+        }
+    }
+
+    #[test]
+    fn the_hash_does_not_depend_on_how_it_was_written() {
+        let two_drivers = "[vault]\nchain = \"base\"\n[description]\ntitle = \"t\"\ntext = \"x\"\n";
+        let one = Manifest::from_toml(&format!(
+            "{two_drivers}[drivers.local]\n[bridges.local-bridge]\n"
+        ))
+        .unwrap();
+        let two = Manifest::from_toml(&format!(
+            "{two_drivers}[bridges.local-bridge]\n[drivers.local]\n"
+        ))
+        .unwrap();
+        assert_eq!(canonical(one).hash(), canonical(two).hash());
     }
 
     #[test]
     fn a_different_manifest_hashes_differently() {
-        let one = Manifest::from_toml(example()).expect("it parses");
+        let one = canonical(Manifest::from_toml(example()).unwrap());
         let mut two = one.clone();
-        two.strategy.version = 2;
+        two.strategy_id = 8;
         assert_ne!(one.hash(), two.hash());
     }
 
@@ -304,11 +519,15 @@ inference_ms_per_min = 0
         assert!(hash_to_bytes("not a hash").is_none());
     }
 
+    /// The contract's `Prices.dailyCost` gives 7,267,500 for the same shape
+    /// without gas; this is the same figure in dollars.
     #[test]
-    fn a_days_allowances_cost_what_the_published_prices_say() {
-        let cap = Prices::published().daily_cap(&Allowances::modest());
-        // Two million units of fuel a second is two cores, so most of the
-        // cost is the processor, and the whole day is a few dollars.
-        assert!(cap > 5.0 && cap < 20.0, "a day cost {cap}");
+    fn a_days_allowances_cost_what_the_contract_says() {
+        let mut modest = Allowances::modest();
+        modest.gas_per_day = 0.0;
+        let cap = Prices::published().daily_cap(&modest);
+        assert!((cap - 7.2675).abs() < 1e-9, "a day cost {cap}");
+        modest.gas_per_day = 2.0;
+        assert!((Prices::published().daily_cap(&modest) - 9.2675).abs() < 1e-9);
     }
 }

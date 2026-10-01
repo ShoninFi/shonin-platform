@@ -69,35 +69,6 @@ impl std::str::FromStr for Chain {
     }
 }
 
-/// How far along an audit of one contract or image is. Shown on every vault
-/// page, because vaults open before every audit is finished.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum AuditStatus {
-    Audited,
-    InProgress,
-    Unaudited,
-}
-
-impl AuditStatus {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Audited => "audited",
-            Self::InProgress => "in progress",
-            Self::Unaudited => "unaudited",
-        }
-    }
-}
-
-/// One line of the audit table: what was audited, and how far along it is.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Audit {
-    pub subject: String,
-    pub status: AuditStatus,
-    /// Who did it, when it landed, or what is still outstanding.
-    pub note: String,
-}
-
 /// A point in a daily series: the day, and the value on it.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Point {
@@ -105,18 +76,15 @@ pub struct Point {
     pub value: f64,
 }
 
-/// A window of a series, summarised the way the record pages show it.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+/// A record, summarised the way the leaderboard shows it: plain facts anyone
+/// can recompute from the vault's value per share.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct Performance {
-    /// Annualised return of the raw series.
-    pub raw_annualised: f64,
-    /// Annualised return after rescaling to the platform's volatility target.
-    pub normalised_annualised: f64,
-    /// Realised annualised volatility of the raw series.
-    pub volatility: f64,
-    /// Deepest peak-to-trough fall, as a negative fraction.
-    pub max_drawdown: f64,
-    /// Total return over the whole series.
-    pub total_return: f64,
+    /// The return over the last 30 days, once there are 30 days of history.
+    pub return_30d: Option<f64>,
+    pub return_since_open: f64,
+    /// The largest fall in value per share from an earlier high, as a
+    /// negative fraction.
+    pub deepest_drop: f64,
     pub days: u32,
 }

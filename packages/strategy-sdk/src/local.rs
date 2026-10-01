@@ -1,9 +1,10 @@
-//! What a strategy says to a venue, and what it hears back.
+//! What an agent says to the `local` driver, and what it hears back.
 //!
-//! These are the typed payloads for the venue the platform runs against
-//! locally. Each venue has its own crate of these; the host decodes them
-//! inside the measured image and refuses anything that does not decode or
-//! names an account the vault does not own.
+//! These are the typed payloads for the stand-in venue the platform runs
+//! against on local chains and testnets. Each driver has its own crate of
+//! these; its executor half decodes them inside the measured image and
+//! refuses anything that does not decode or names an account the vault does
+//! not own.
 
 use serde::{Deserialize, Serialize};
 
