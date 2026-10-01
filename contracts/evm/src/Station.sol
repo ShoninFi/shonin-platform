@@ -17,7 +17,8 @@ import {Math} from "openzeppelin/utils/math/Math.sol";
 /// Every venue call is the station's own, prepared by a driver the registry
 /// approves and checked here against that driver's targets before it is made.
 /// A call to the dollar is only ever an approval of one of those targets, so
-/// no driver, however wrong, can send the station's dollars anywhere else.
+/// the station's dollars can only reach a target its driver declared, and a
+/// driver reaches a station only through the registry's public timelock.
 /// Trading keys are the venue's agents: they can trade the account and can't
 /// take from it. A bridge send names the station's own address as recipient,
 /// which is the same address on every chain.
