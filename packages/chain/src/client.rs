@@ -450,6 +450,7 @@ impl Client {
             provider,
             signer,
             address,
+            sending: Default::default(),
         })
     }
 
@@ -493,20 +494,30 @@ pub struct KeyClient {
     provider: DynProvider,
     signer: PrivateKeySigner,
     pub address: Address,
+    /// One transaction at a time from this key. Several tasks act with the
+    /// same key, and two sends at once would take the same nonce, leaving one
+    /// of them waiting for a receipt that never comes.
+    sending: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
+
+/// How long to wait for a transaction to land before giving up on it, so a
+/// dropped one is an error rather than a task that never wakes.
+const RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl KeyClient {
     pub async fn send<C: SolCall>(&self, to: Address, call: C) -> Result<TransactionReceipt> {
+        let _turn = self.sending.lock().await;
         let request = TransactionRequest::default()
             .with_to(to)
             .with_input(call.abi_encode());
-        let receipt = self
+        let pending = self
             .provider
             .send_transaction(request)
             .await
-            .with_context(|| format!("sending {}", C::SIGNATURE))?
-            .get_receipt()
+            .with_context(|| format!("sending {}", C::SIGNATURE))?;
+        let receipt = tokio::time::timeout(RECEIPT_TIMEOUT, pending.get_receipt())
             .await
+            .map_err(|_| anyhow!("{} never landed", C::SIGNATURE))?
             .with_context(|| format!("waiting for {}", C::SIGNATURE))?;
         if !receipt.status() {
             bail!("{} was reverted by the chain", C::SIGNATURE);
