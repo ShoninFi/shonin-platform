@@ -139,6 +139,7 @@ contract Station is IStation, ReentrancyGuardTransient {
         bytes calldata extra
     ) external nonReentrant {
         _executorOnly();
+        if (toChain == block.chainid) revert NoRoute();
         _send(name, toChain, amount, extra);
     }
 

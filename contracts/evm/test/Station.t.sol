@@ -435,7 +435,9 @@ contract StationTest is Fixture {
     function builderSigns(StationSpec memory spec) internal view returns (bytes memory) {
         return signed(
             BUILDER_KEY,
-            ownStations.stationDigest(spec.vaultChain, spec.bundleHash, spec.drivers, spec.bridges)
+            ownStations.stationDigest(
+                spec.vaultChain, spec.bundleHash, spec.drivers, spec.bridges, spec.exitBandBps
+            )
         );
     }
 

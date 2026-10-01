@@ -86,7 +86,7 @@ contract StationFactory is IStationFactory {
         // ...and the builder that built the bundle said what this chain's
         // station holds.
         bytes32 digest = MessageHashUtils.toEthSignedMessageHash(
-            stationDigest(spec.vaultChain, spec.bundleHash, spec.drivers, spec.bridges)
+            stationDigest(spec.vaultChain, spec.bundleHash, spec.drivers, spec.bridges, spec.exitBandBps)
         );
         (address builder, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, builderSignature);
         if (err != ECDSA.RecoverError.NoError || !registry.isBlessedAs(builder, ImageKind.Builder)) {
@@ -107,7 +107,8 @@ contract StationFactory is IStationFactory {
         uint256 vaultChain,
         bytes32 bundleHash,
         bytes32[] calldata drivers,
-        bytes32[] calldata bridges
+        bytes32[] calldata bridges,
+        uint16 exitBandBps
     ) public view returns (bytes32) {
         return keccak256(
             abi.encode(
@@ -117,7 +118,8 @@ contract StationFactory is IStationFactory {
                 vaultChain,
                 bundleHash,
                 keccak256(abi.encode(drivers)),
-                keccak256(abi.encode(bridges))
+                keccak256(abi.encode(bridges)),
+                exitBandBps
             )
         );
     }

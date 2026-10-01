@@ -115,8 +115,13 @@ contract VaultFactory is IVaultFactory {
         vault = Clones.cloneDeterministic(vaultImplementation, bytes32(strategyId));
         _vaultOf[strategyId] = vault;
         _vaults.push(vault);
-        address station =
-            stationFactory.createHome(vault, record.bundleHash, drivers, record.bridges, cfg.exitBandBps);
+        address station = stationFactory.createHome(
+            vault,
+            record.bundleHash,
+            drivers,
+            others.length == 0 ? new bytes32[](0) : record.bridges,
+            cfg.exitBandBps
+        );
 
         asset.safeTransferFrom(msg.sender, vault, tankFunding);
         IVault(vault).initialize(

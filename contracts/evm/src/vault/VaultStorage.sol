@@ -88,6 +88,9 @@ struct Layout {
     mapping(uint256 => uint256) claimReserved;
     /// The request a queued claim is priced by.
     mapping(uint256 => uint256) claimRequest;
+    /// Valuations at which some station reported money on its way, counted
+    /// or not: a vault isn't empty while any is, so it can't close on one.
+    mapping(uint256 => bool) moving;
     /// What a queued claim's close brought home, and its share of the cash
     /// as it stood then: together, all its shares own once it is closed.
     mapping(uint256 => uint256) claimHome;
@@ -268,7 +271,7 @@ library VaultStorage {
     function readyToClose(Layout storage s) internal view returns (bool) {
         if (!halted(s) || s.lastPriced == 0) return false;
         Valuation storage v = latest(s);
-        return v.time > s.haltedAt && v.gross == v.cash + 1;
+        return v.time > s.haltedAt && v.gross == v.cash + 1 && !s.moving[s.lastPriced - 1];
     }
 
     function queue(

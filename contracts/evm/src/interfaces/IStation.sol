@@ -118,7 +118,8 @@ interface IStationFactory {
         uint256 vaultChain,
         bytes32 bundleHash,
         bytes32[] calldata drivers,
-        bytes32[] calldata bridges
+        bytes32[] calldata bridges,
+        uint16 exitBandBps
     ) external view returns (bytes32);
 
     function attestation() external view returns (address);

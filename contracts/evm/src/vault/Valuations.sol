@@ -42,6 +42,8 @@ library Valuations {
     uint256 private constant WAD = VaultStorage.WAD;
     uint256 private constant YEAR = VaultStorage.YEAR;
     uint256 private constant UNIT_SCALE = VaultStorage.UNIT_SCALE;
+    /// A trillion trillion dollars in the asset's six decimals.
+    uint256 private constant MAX_POST = 1e30;
 
     // Requests --------------------------------------------------------------
 
@@ -146,7 +148,12 @@ library Valuations {
         if (err != ECDSA.RecoverError.NoError || !_blessed(s, signer, false)) revert IVault.NotBlessed();
 
         (uint256 markValue, uint256 exitValue) = _counted(s, time, stationChain, post);
+        // No figure a valuation can't add up and price: a post beyond any
+        // dollar amount that could exist would leave the valuation open for
+        // good, with every way out waiting behind it.
+        if (markValue > MAX_POST || exitValue > MAX_POST) revert IVault.NotAllowed();
         Post storage p = s.posts[index][stationChain];
+        if (post.transit.length != 0 || post.inFlightFromHome.length != 0) s.moving[index] = true;
         if (!p.posted) {
             p.posted = true;
             p.mark = markValue;
