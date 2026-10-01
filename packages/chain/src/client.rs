@@ -117,6 +117,29 @@ pub struct Client {
     keys: Option<Arc<HashMap<Address, PrivateKeySigner>>>,
 }
 
+/// How a client that signs for itself fills a transaction in. The nonce is
+/// asked of the chain each time rather than counted here, so a send that
+/// fails before it is broadcast leaves no gap that strands every later one.
+fn signing_builder() -> ProviderBuilder<
+    alloy::providers::Identity,
+    alloy::providers::fillers::JoinFill<
+        alloy::providers::fillers::JoinFill<
+            alloy::providers::fillers::JoinFill<
+                alloy::providers::Identity,
+                alloy::providers::fillers::GasFiller,
+            >,
+            alloy::providers::fillers::NonceFiller<alloy::providers::fillers::SimpleNonceManager>,
+        >,
+        alloy::providers::fillers::ChainIdFiller,
+    >,
+    alloy::network::Ethereum,
+> {
+    ProviderBuilder::default()
+        .with_gas_estimation()
+        .with_simple_nonce_management()
+        .fetch_chain_id()
+}
+
 impl Client {
     /// Connect, waiting for the chain to answer: `task dev` starts everything
     /// at once, so a service usually arrives before the chain does.
@@ -129,12 +152,11 @@ impl Client {
                 for key in &keys[1..] {
                     wallet.register_signer(key.clone());
                 }
-                ProviderBuilder::new()
-                    .wallet(wallet)
-                    .connect_http(url)
-                    .erased()
+                signing_builder().wallet(wallet).connect_http(url).erased()
             }
-            _ => ProviderBuilder::new().connect_http(url).erased(),
+            // The node holds unlocked accounts' keys and numbers their
+            // transactions itself.
+            _ => ProviderBuilder::default().connect_http(url).erased(),
         };
 
         let mut waited = Duration::ZERO;
@@ -294,9 +316,9 @@ impl Client {
             .send_transaction(request)
             .await
             .with_context(|| format!("sending {}", C::SIGNATURE))?;
-        let receipt = pending
-            .get_receipt()
+        let receipt = tokio::time::timeout(RECEIPT_TIMEOUT, pending.get_receipt())
             .await
+            .map_err(|_| anyhow!("{} never landed", C::SIGNATURE))?
             .with_context(|| format!("waiting for {}", C::SIGNATURE))?;
         if !receipt.status() {
             bail!("{} was reverted by the chain", C::SIGNATURE);
@@ -442,7 +464,7 @@ impl Client {
     pub fn with_key(&self, signer: PrivateKeySigner) -> Result<KeyClient> {
         let address = signer.address();
         let url = self.rpc_url.parse().context("the chain's address")?;
-        let provider = ProviderBuilder::new()
+        let provider = signing_builder()
             .wallet(EthereumWallet::from(signer.clone()))
             .connect_http(url)
             .erased();
