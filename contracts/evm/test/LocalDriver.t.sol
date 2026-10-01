@@ -97,7 +97,7 @@ contract LocalDriverTest is Test {
         assertEq(venue.positionOf(address(station), PERP).size, -0.75e18);
 
         uint256 before = usd.balanceOf(address(station));
-        station.run(driver.sweep(address(station), 0.25e18));
+        station.run(driver.sweep(address(station), 25_000e6));
         assertEq(usd.balanceOf(address(station)) - before, 25_000e6);
     }
 
@@ -114,7 +114,7 @@ contract LocalDriverTest is Test {
         hedged();
         (Call[] memory calls,) = driver.close(address(station), 1e18, 100);
         station.run(calls);
-        station.run(driver.sweep(address(station), 1e18));
+        station.run(driver.sweep(address(station), 100_000e6));
         assertEq(venue.positionOf(address(station), SPOT).size, 0);
         assertEq(venue.positionOf(address(station), PERP).size, 0);
         assertEq(usd.balanceOf(address(station)), 100_000e6);

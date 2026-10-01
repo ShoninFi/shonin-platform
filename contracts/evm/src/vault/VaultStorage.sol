@@ -79,6 +79,9 @@ struct Layout {
     /// The newest priced valuation, plus one; zero before any.
     uint256 lastPriced;
     Claim[] claims;
+    /// Claims whose fraction was closed and brought home, waiting to be
+    /// priced. Their cash stays at home until they are.
+    uint256 queuedClaims;
     mapping(uint256 => mapping(uint256 => Post)) posts;
     // The pro-rata fallback -------------------------------------------------
     uint256 units;

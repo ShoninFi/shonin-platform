@@ -353,16 +353,24 @@ contract VaultTest is Fixture {
         approxEq(usd.balanceOf(platform) - before, 2e6, 1);
         Tank memory t = vault.tank();
         assertEq(t.usageSettled, 50e6);
-        // The rest is written off: no debt, and asking again charges nothing.
-        vault.keep(50e6, asOf, usage(vault, 50e6, asOf));
+        // The rest is written off: no debt, and the same bill can't be
+        // collected twice.
+        bytes memory again = usage(vault, 50e6, asOf);
+        vm.expectRevert(IVault.Stale.selector);
+        vault.keep(50e6, asOf, again);
         approxEq(usd.balanceOf(platform) - before, 2e6, 1);
     }
 
     function test_a_block_of_bills_cannot_charge_more_than_the_time_elapsed() public {
         uint64 asOf = uint64(vm.getBlockTimestamp());
         uint256 before = usd.balanceOf(platform);
-        for (uint256 i = 1; i <= 30; i++) {
-            vault.keep(i * 2e6, asOf, usage(vault, i * 2e6, asOf));
+        vault.keep(2e6, asOf, usage(vault, 2e6, asOf));
+        // Every later bill in the same moment is refused: each must be signed
+        // later than the last.
+        for (uint256 i = 2; i <= 30; i++) {
+            bytes memory bill = usage(vault, i * 2e6, asOf);
+            vm.expectRevert(IVault.Stale.selector);
+            vault.keep(i * 2e6, asOf, bill);
         }
         assertEq(usd.balanceOf(platform), before, "no time passed, so nothing was earned");
     }

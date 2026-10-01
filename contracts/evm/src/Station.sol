@@ -168,8 +168,14 @@ contract Station is IStation, ReentrancyGuardTransient {
         uint256 count = _spec.drivers.length;
         IDriver[] memory drivers = new IDriver[](count);
         Call[][] memory closes = new Call[][](count);
+        uint256[] memory freed = new uint256[](count);
         for (uint256 i = 0; i < count; i++) {
             drivers[i] = IDriver(_unwindDriver(_spec.drivers[i]));
+            // What the fraction is worth at exit prices before the close:
+            // exactly what selling it realises, and all that comes home for
+            // it. The rest stays with whoever still owns it.
+            (, uint256 exitBefore) = drivers[i].valueOf(address(this));
+            freed[i] = exitBefore.mulDiv(fraction, WAD, Math.Rounding.Floor);
             bool outside;
             (closes[i], outside) = drivers[i].close(address(this), fraction, _spec.exitBandBps);
             if (outside) {
@@ -183,10 +189,10 @@ contract Station is IStation, ReentrancyGuardTransient {
         for (uint256 i = 0; i < count; i++) {
             address[] memory targets = drivers[i].targets();
             _run(closes[i], targets);
-            _run(drivers[i].sweep(address(this), fraction), targets);
+            _run(drivers[i].sweep(address(this), freed[i]), targets);
         }
-        uint256 freed = dollar.balanceOf(address(this)) - idleBefore;
-        sentHome = freed + idleBefore.mulDiv(fraction, WAD, Math.Rounding.Floor);
+        sentHome = dollar.balanceOf(address(this)) - idleBefore
+            + idleBefore.mulDiv(fraction, WAD, Math.Rounding.Floor);
 
         if (sentHome != 0) {
             if (isHome()) {

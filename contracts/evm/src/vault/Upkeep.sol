@@ -197,7 +197,9 @@ library Upkeep {
                 || !registry.isBlessedFor(signer, block.chainid, address(this), s.bundleHash)
                 || registry.keyInfo(signer).kind != ImageKind.Executor
         ) revert IVault.NotBlessed();
-        if (total < s.tank.usageSettled || asOf < s.tank.usageAsOf || asOf > block.timestamp) {
+        // Each total is signed later than the last, so an old statement can't be
+        // replayed to reset the cap that is carried forward.
+        if (total < s.tank.usageSettled || asOf <= s.tank.usageAsOf || asOf > block.timestamp) {
             revert IVault.Stale();
         }
 
@@ -321,6 +323,7 @@ library Upkeep {
             claim.state = ClaimState.Waiting;
         } else {
             claim.state = ClaimState.Queued;
+            s.queuedClaims += 1;
             s.queue(claim.owner, RequestKind.Claim, claim.shares, claimId);
         }
         emit IVault.ClaimTried(claimId, blocked);

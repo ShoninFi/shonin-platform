@@ -323,6 +323,7 @@ library Valuations {
     function _claim(Layout storage s, Request storage r, uint256 id, Valuation storage v) private {
         Claim storage claim = s.claims[r.ref - 1];
         if (claim.state != ClaimState.Queued) return;
+        s.queuedClaims -= 1;
         uint256 shares = claim.shares;
         (uint256 slice, uint256 burned, uint256 payout) = exitOf(s, v, shares);
         if (payout > s.cash) {
@@ -380,17 +381,27 @@ library Valuations {
 
     // The pro-rata fallback -------------------------------------------------
 
-    /// A redemption nothing has priced for `fallbackAfter`: take the cash's
-    /// share now and hold units for the rest of what the stations hold.
+    /// A request nothing has priced for `fallbackAfter`. A redemption takes
+    /// the cash's share now and holds units for the rest of what the stations
+    /// hold; a deposit, whose money never left, takes it back.
     function takeProRata(uint256 requestId) external {
         Layout storage s = VaultStorage.layout();
         Request storage r = s.requests[requestId - 1];
-        if (r.kind != RequestKind.Redeem || r.done || msg.sender != r.owner) revert IVault.NotAllowed();
+        bool deposit = r.kind == RequestKind.Deposit;
+        if ((!deposit && r.kind != RequestKind.Redeem) || r.done || msg.sender != r.owner) {
+            revert IVault.NotAllowed();
+        }
         if (block.timestamp < r.earliest + s.timers.fallbackAfter) revert IVault.NotYet();
         // Not while a valuation could price it: the fallback is for when
         // nothing can, not a way round the fee.
         if (s.lastPriced != 0 && s.latest().time >= r.earliest) revert IVault.NotAllowed();
         r.done = true;
+        if (deposit) {
+            s.escrow -= r.amount;
+            s.pay(r.owner, r.amount);
+            emit IVault.Refunded(requestId, r.owner, r.amount);
+            return;
+        }
         s.pendingShares -= r.amount;
         _proRata(s, r.owner, r.amount);
     }
@@ -464,9 +475,11 @@ library Valuations {
     function toStation(uint256 amount) external {
         Layout storage s = VaultStorage.layout();
         if (msg.sender != s.homeStation) revert IVault.NotAllowed();
-        // Nothing goes out while the vault is stopping, or while unit holders
-        // are owed part of what is out: sending more would need a price.
-        if (!s.live() || s.halted() || s.units != 0) revert IVault.WrongState();
+        // Nothing goes out while the vault is stopping, while unit holders
+        // are owed part of what is out (sending more would need a price), or
+        // while a claim's cash is home waiting to be priced: taking it back
+        // out would leave the claim unpaid.
+        if (!s.live() || s.halted() || s.units != 0 || s.queuedClaims != 0) revert IVault.WrongState();
         // The stations as last valued, and the cash as it is now, so money
         // that joined or left since the snapshot counts.
         uint256 value = s.cash + 1;

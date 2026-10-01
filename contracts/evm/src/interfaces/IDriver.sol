@@ -73,9 +73,9 @@ interface IDriver {
         uint256 fraction,
         uint16 bandBps
     ) external view returns (Call[] memory calls, bool blocked);
-    /// Bring `fraction` of what the account is worth back to the station as
-    /// idle dollars, after a close has freed it.
-    function sweep(address station, uint256 fraction) external view returns (Call[] memory);
+    /// Bring `amount` of the account's dollars back to the station as idle
+    /// dollars, after a close has freed them, or as much as there is.
+    function sweep(address station, uint256 amount) external view returns (Call[] memory);
     /// What the station holds at the venue, at mark and at exit-side prices.
     function valueOf(address station) external view returns (uint256 mark, uint256 exit);
 }

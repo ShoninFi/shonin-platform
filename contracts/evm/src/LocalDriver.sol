@@ -111,8 +111,7 @@ contract LocalDriver is IDriver {
         calls = _one(abi.encodeCall(ILocalVenue.place, (station, orders)));
     }
 
-    function sweep(address station, uint256 fraction) external view returns (Call[] memory) {
-        uint256 amount = venue.accountValue(station).mulDiv(fraction, WAD, Math.Rounding.Floor);
+    function sweep(address station, uint256 amount) external view returns (Call[] memory) {
         int256 cash = venue.cashOf(station);
         if (cash <= 0) return new Call[](0);
         if (amount > uint256(cash)) amount = uint256(cash);
