@@ -7,6 +7,7 @@ import {
     Fees,
     IVault,
     Request,
+    StationPost,
     Tank,
     Timers,
     Valuation,
@@ -60,6 +61,27 @@ contract Vault is IVault, ReentrancyGuardTransient {
         Valuations.recordValuation();
     }
 
+    function postStation(
+        uint64 time,
+        uint256 stationChain,
+        StationPost calldata post,
+        bytes calldata signature
+    ) external nonReentrant {
+        Valuations.postStation(time, stationChain, post, signature);
+    }
+
+    function closeValuation(uint64 time) external nonReentrant {
+        Valuations.closeValuation(time);
+    }
+
+    function postDigest(
+        uint64 time,
+        uint256 stationChain,
+        StationPost calldata post
+    ) external view returns (bytes32) {
+        return Valuations.postDigest(time, stationChain, post);
+    }
+
     function settle(uint256 max) external nonReentrant returns (uint256) {
         return Valuations.settle(max);
     }
@@ -78,6 +100,28 @@ contract Vault is IVault, ReentrancyGuardTransient {
 
     function takeProRataClaim(uint256 claimId) external nonReentrant {
         Valuations.takeProRataClaim(claimId);
+    }
+
+    function reportExitCost(
+        uint256 claimId,
+        uint256 cost,
+        address payTo,
+        bytes calldata signature
+    ) external nonReentrant {
+        Valuations.reportExitCost(claimId, cost, payTo, signature);
+    }
+
+    function exitCostDigest(uint256 claimId, uint256 cost, address payTo) external view returns (bytes32) {
+        return Valuations.exitCostDigest(claimId, cost, payTo);
+    }
+
+    function exitCostOf(uint256 claimId) external view returns (uint256 cost, address payTo) {
+        Layout storage s = VaultStorage.layout();
+        return (s.exitCost[claimId], s.exitCostTo[claimId]);
+    }
+
+    function maxExitCost() external view returns (uint256) {
+        return VaultStorage.layout().maxExitCost;
     }
 
     function collectUnits() external nonReentrant returns (uint256) {

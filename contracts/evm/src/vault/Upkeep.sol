@@ -68,6 +68,7 @@ library Upkeep {
         s.timers = init.timers;
         s.minimumDeposit = init.minimumDeposit;
         s.otherChains = init.otherChains;
+        s.maxExitCost = init.maxExitCost;
         s.drivers = IStation(init.homeStation).spec().drivers;
         s.restricted = init.restricted;
         s.restrictedHash = keccak256(abi.encode(init.restricted));

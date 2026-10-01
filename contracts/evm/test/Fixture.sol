@@ -50,6 +50,7 @@ contract Fixture is Test {
     uint256 internal constant PUBLISH_FEE = 1e6;
     uint256 internal constant MINIMUM_TANK = 40e6;
     uint256 internal constant DEAD_ASSETS = 0.01e6;
+    uint256 internal constant MAX_EXIT_COST = 50e6;
     uint256 internal constant MINIMUM_DEPOSIT = 10e6;
     uint64 internal constant SLOT = 10;
     uint64 internal constant HALT_GRACE = 10 minutes;
@@ -171,6 +172,7 @@ contract Fixture is Test {
             minimumDeposit: MINIMUM_DEPOSIT,
             minimumTank: MINIMUM_TANK,
             deadAssets: DEAD_ASSETS,
+            maxExitCost: MAX_EXIT_COST,
             timers: timers()
         });
     }

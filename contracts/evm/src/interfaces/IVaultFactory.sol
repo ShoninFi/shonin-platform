@@ -19,6 +19,8 @@ struct VaultConfig {
     uint256 minimumTank;
     /// What becomes the dead shares nobody can redeem.
     uint256 deadAssets;
+    /// The most an unwinder may report as one claim's exit cost.
+    uint256 maxExitCost;
     Timers timers;
 }
 

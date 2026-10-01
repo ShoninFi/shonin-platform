@@ -91,6 +91,27 @@ enum ClaimState {
     Fallback
 }
 
+/// Money a station sent over a bridge that has not landed yet.
+struct Transit {
+    uint256 amount;
+    uint64 sentAt;
+}
+
+/// What a station on another chain reports for one valuation, signed by a
+/// key blessed for the vault.
+struct StationPost {
+    /// What the station holds, at mark and at exit-side prices, computed on
+    /// its own chain.
+    uint256 mark;
+    uint256 exit;
+    /// The station chain's first block at or after the valuation's time.
+    uint64 blockNumber;
+    /// Sends from this station that have not landed.
+    Transit[] transit;
+    /// How many of the home station's sends to this chain have landed.
+    uint64 landedFromHome;
+}
+
 /// A withdrawal the cash could not pay.
 struct Claim {
     address owner;
@@ -172,6 +193,8 @@ struct VaultInit {
     bytes32[] restricted;
     /// The chains the strategy trades on besides the vault's own.
     uint256[] otherChains;
+    /// The most an unwinder may report as one claim's exit cost.
+    uint256 maxExitCost;
 }
 
 /// Pooled capital behind one strategy.
@@ -201,6 +224,10 @@ interface IVault is IStationVault {
     );
     event ValuationOpened(uint256 indexed index, uint64 time, uint32 postsMissing);
     event ValuationVoided(uint256 indexed index, uint64 time);
+    event StationPosted(
+        uint256 indexed index, uint256 indexed stationChain, address signer, uint256 mark, uint256 exit
+    );
+    event ExitCostReported(uint256 indexed claimId, uint256 cost, address payTo);
     event HoldingSynced(uint256 shares);
     event FeesPaid(uint256 authorShares, uint256 platformShares, uint256 holdingShares, uint256 mark);
     event MarkRaised(uint256 mark);
@@ -249,11 +276,34 @@ interface IVault is IStationVault {
     ) external returns (uint256 requestId);
     function requestRedeem(uint256 shares, address receiver) external returns (uint256 requestId);
     function recordValuation() external;
+    function postStation(
+        uint64 time,
+        uint256 stationChain,
+        StationPost calldata post,
+        bytes calldata signature
+    ) external;
+    function closeValuation(uint64 time) external;
+    function postDigest(
+        uint64 time,
+        uint256 stationChain,
+        StationPost calldata post
+    ) external view returns (bytes32);
     function settle(uint256 max) external returns (uint256 settled);
     function settleClaim(uint256 claimId) external;
     function freeze(uint256 claimId) external;
     function takeProRata(uint256 requestId) external;
     function takeProRataClaim(uint256 claimId) external;
+    /// An unwinder's cost of bringing a claim's fraction home from another
+    /// chain: taken from the leaver's payout and paid to `payTo`.
+    function reportExitCost(
+        uint256 claimId,
+        uint256 cost,
+        address payTo,
+        bytes calldata signature
+    ) external;
+    function exitCostDigest(uint256 claimId, uint256 cost, address payTo) external view returns (bytes32);
+    function exitCostOf(uint256 claimId) external view returns (uint256 cost, address payTo);
+    function maxExitCost() external view returns (uint256);
     function collectUnits() external returns (uint256);
     function serveProRata(address holder) external;
     function redeemClosed(uint256 shares, address receiver) external returns (uint256);

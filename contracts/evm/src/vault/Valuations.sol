@@ -1,20 +1,24 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.30;
 
-import {IStation} from "../interfaces/IStation.sol";
+import {IAttestationRegistry, ImageKind} from "../interfaces/IAttestationRegistry.sol";
+import {IStation, Send} from "../interfaces/IStation.sol";
 import {
     Claim,
     ClaimState,
     IVault,
     Request,
     RequestKind,
+    StationPost,
     Valuation,
     ValuationStatus,
     VaultState
 } from "../interfaces/IVault.sol";
-import {Layout, VaultStorage} from "./VaultStorage.sol";
+import {Layout, Post, VaultStorage} from "./VaultStorage.sol";
 import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
 import {SafeERC20} from "openzeppelin/token/ERC20/utils/SafeERC20.sol";
+import {ECDSA} from "openzeppelin/utils/cryptography/ECDSA.sol";
+import {MessageHashUtils} from "openzeppelin/utils/cryptography/MessageHashUtils.sol";
 import {Math} from "openzeppelin/utils/math/Math.sol";
 
 /// Requests, valuations and settlement: how money joins and leaves a vault,
@@ -113,8 +117,131 @@ library Valuations {
         if (missing == 0) {
             price(s, count);
         } else {
+            s.openUnits = units;
+            s.openedAt = uint64(block.timestamp);
             emit IVault.ValuationOpened(count, time, missing);
         }
+    }
+
+    /// One station's word on what it held at the valuation's time. Posts may
+    /// disagree: the highest mark prices deposits and the lowest exit prices
+    /// withdrawals, so neither side is priced in its own favour.
+    function postStation(
+        uint64 time,
+        uint256 stationChain,
+        StationPost calldata post,
+        bytes calldata signature
+    ) external {
+        Layout storage s = VaultStorage.layout();
+        uint256 index = s.valuations.length;
+        if (index == 0) revert IVault.NotAllowed();
+        index -= 1;
+        Valuation storage v = s.valuations[index];
+        if (v.time != time || v.status != ValuationStatus.Open) revert IVault.NotAllowed();
+        if (block.timestamp > time + s.timers.postDeadline) revert IVault.OutsideWindow();
+        if (!_isOtherChain(s, stationChain)) revert IVault.NotAllowed();
+
+        bytes32 digest = MessageHashUtils.toEthSignedMessageHash(postDigest(time, stationChain, post));
+        (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, signature);
+        if (err != ECDSA.RecoverError.NoError || !_blessed(s, signer, false)) revert IVault.NotBlessed();
+
+        (uint256 markValue, uint256 exitValue) = _counted(s, time, stationChain, post);
+        Post storage p = s.posts[index][stationChain];
+        if (!p.posted) {
+            p.posted = true;
+            p.mark = markValue;
+            p.exit = exitValue;
+            v.postsMissing -= 1;
+        } else {
+            if (markValue > p.mark) p.mark = markValue;
+            if (exitValue < p.exit) p.exit = exitValue;
+        }
+        emit IVault.StationPosted(index, stationChain, signer, markValue, exitValue);
+    }
+
+    /// Once the post deadline has passed: price the valuation if every
+    /// station posted, or void it so its requests roll on to the next.
+    function closeValuation(uint64 time) external {
+        Layout storage s = VaultStorage.layout();
+        uint256 index = s.valuations.length;
+        if (index == 0) revert IVault.NotAllowed();
+        index -= 1;
+        Valuation storage v = s.valuations[index];
+        if (v.time != time || v.status != ValuationStatus.Open) revert IVault.NotAllowed();
+        if (block.timestamp <= time + s.timers.postDeadline) revert IVault.NotYet();
+        if (v.postsMissing != 0) {
+            v.status = ValuationStatus.Void;
+            emit IVault.ValuationVoided(index, time);
+            return;
+        }
+        uint256 keep = WAD - s.openUnits;
+        uint256[] storage chains = s.otherChains;
+        for (uint256 i = 0; i < chains.length; i++) {
+            Post storage p = s.posts[index][chains[i]];
+            v.gross += p.mark.mulDiv(keep, WAD);
+            v.grossExit += p.exit.mulDiv(keep, WAD);
+        }
+        price(s, index);
+    }
+
+    function postDigest(
+        uint64 time,
+        uint256 stationChain,
+        StationPost calldata post
+    ) public view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                block.chainid, address(this), "shonin-post", time, stationChain, keccak256(abi.encode(post))
+            )
+        );
+    }
+
+    /// A post's value with the money in transit to or from its station: at
+    /// par while it is younger than the transit timeout, at zero after.
+    /// Sends from the home station count until the post says they landed.
+    function _counted(
+        Layout storage s,
+        uint64 time,
+        uint256 stationChain,
+        StationPost calldata post
+    ) private view returns (uint256 markValue, uint256 exitValue) {
+        uint256 timeout = s.timers.transitTimeout;
+        uint256 moving;
+        for (uint256 i = 0; i < post.transit.length; i++) {
+            if (post.transit[i].sentAt + timeout >= time) moving += post.transit[i].amount;
+        }
+        Send[] memory sends = IStation(s.homeStation).sends();
+        uint256 seen;
+        for (uint256 i = 0; i < sends.length; i++) {
+            if (sends[i].toChain != stationChain) continue;
+            // A send after the home station was valued is still in its value.
+            if (
+                seen >= post.landedFromHome && sends[i].sentAt <= s.openedAt
+                    && sends[i].sentAt + timeout >= time
+            ) {
+                moving += sends[i].amount;
+            }
+            seen++;
+        }
+        markValue = post.mark + moving;
+        exitValue = post.exit + moving;
+    }
+
+    function _isOtherChain(Layout storage s, uint256 chainId) private view returns (bool) {
+        uint256[] storage chains = s.otherChains;
+        for (uint256 i = 0; i < chains.length; i++) {
+            if (chains[i] == chainId) return true;
+        }
+        return false;
+    }
+
+    /// A key blessed for this vault and its bundle on this chain: an
+    /// unwinder, or (unless only an unwinder will do) an executor.
+    function _blessed(Layout storage s, address signer, bool unwinderOnly) private view returns (bool) {
+        IAttestationRegistry registry = IAttestationRegistry(s.attestation);
+        if (!registry.isBlessedFor(signer, block.chainid, address(this), s.bundleHash)) return false;
+        ImageKind kind = registry.keyInfo(signer).kind;
+        return kind == ImageKind.Unwinder || (!unwinderOnly && kind == ImageKind.Executor);
     }
 
     /// Fix the valuation's prices: run payday if it is due, then snapshot.
@@ -361,6 +488,7 @@ library Valuations {
         _distribute(s, address(this), slice, burned);
         s.cash -= payout;
         claim.state = ClaimState.Paid;
+        payout -= _payExitCost(s, r.ref, payout);
         claim.paid = payout;
         s.pay(claim.owner, payout);
         emit IVault.Withdrawn(id, claim.owner, shares, payout, slice);
@@ -475,8 +603,47 @@ library Valuations {
         if (assets > s.free()) assets = s.free();
         s.burn(address(this), claim.shares);
         s.cash -= assets;
+        assets -= _payExitCost(s, claimId, assets);
         s.pay(claim.owner, assets);
         emit IVault.ProRataTaken(claim.owner, claim.shares, assets, 0);
+    }
+
+    /// The cost of bringing a claim's fraction home from another chain, as
+    /// its unwinder reports it: the claim's running total, signed, never more
+    /// than the deployment's limit, and only ever raised.
+    function reportExitCost(
+        uint256 claimId,
+        uint256 cost,
+        address payTo,
+        bytes calldata signature
+    ) external {
+        Layout storage s = VaultStorage.layout();
+        ClaimState state = s.claims[claimId - 1].state;
+        if (state != ClaimState.Pending && state != ClaimState.Waiting && state != ClaimState.Queued) {
+            revert IVault.NotAllowed();
+        }
+        if (cost > s.maxExitCost || cost <= s.exitCost[claimId] || payTo == address(0)) {
+            revert IVault.NotAllowed();
+        }
+        bytes32 digest = MessageHashUtils.toEthSignedMessageHash(exitCostDigest(claimId, cost, payTo));
+        (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, signature);
+        if (err != ECDSA.RecoverError.NoError || !_blessed(s, signer, true)) revert IVault.NotBlessed();
+        s.exitCost[claimId] = cost;
+        s.exitCostTo[claimId] = payTo;
+        emit IVault.ExitCostReported(claimId, cost, payTo);
+    }
+
+    function exitCostDigest(uint256 claimId, uint256 cost, address payTo) public view returns (bytes32) {
+        return keccak256(abi.encode(block.chainid, address(this), "shonin-exit-cost", claimId, cost, payTo));
+    }
+
+    /// Pay a claim's exit cost out of what it is paid, and say how much.
+    function _payExitCost(Layout storage s, uint256 claimId, uint256 payout) private returns (uint256 cost) {
+        cost = s.exitCost[claimId];
+        if (cost == 0) return 0;
+        if (cost > payout) cost = payout;
+        s.exitCost[claimId] = 0;
+        s.pay(s.exitCostTo[claimId], cost);
     }
 
     /// No fee: nothing can be priced. The leaver's units are a claim on

@@ -95,6 +95,14 @@ struct Layout {
     /// cash, and none of what the stations still hold.
     uint256 closedShares;
     mapping(uint256 => mapping(uint256 => Post)) posts;
+    /// The open valuation's unit fraction and when it was recorded, so the
+    /// posts that complete it are counted as of the same moment.
+    uint256 openUnits;
+    uint64 openedAt;
+    /// Exit costs an unwinder reported for a claim, and who is paid them.
+    uint256 maxExitCost;
+    mapping(uint256 => uint256) exitCost;
+    mapping(uint256 => address) exitCostTo;
     // The pro-rata fallback -------------------------------------------------
     /// The fallback's units, as raw amounts. A holder's live fraction of the
     /// stations is their raw units times `unitScale`; the scale grows each

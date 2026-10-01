@@ -140,7 +140,8 @@ contract VaultFactory is IVaultFactory {
                 allowances: allowances,
                 tankKeep: tankKeep,
                 restricted: _restricted(record, drivers),
-                otherChains: others
+                otherChains: others,
+                maxExitCost: cfg.maxExitCost
             }),
             tankFunding,
             cfg.deadAssets
