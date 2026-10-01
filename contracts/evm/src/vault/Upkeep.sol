@@ -321,7 +321,20 @@ library Upkeep {
         uint256 fraction = claim.shares.mulDiv(WAD - s.liveUnits(), s.totalSupply, Math.Rounding.Ceil);
         if (fraction > WAD) fraction = WAD;
         if (fraction == 0) fraction = 1;
-        (uint256 home, bool blocked) = IStation(s.homeStation).unwind(fraction);
+        uint256 home;
+        bool blocked;
+        try IStation(s.homeStation).unwind(fraction) returns (uint256 sent, bool outside) {
+            (home, blocked) = (sent, outside);
+        } catch (bytes memory reason) {
+            // Proceeds a venue keeps as margin leave the close undone, so a
+            // claim that can't come home sells nothing however often it is
+            // tried.
+            if (bytes4(reason) != IStation.ShortSweep.selector) {
+                assembly ("memory-safe") {
+                    revert(add(reason, 32), mload(reason))
+                }
+            }
+        }
         if (blocked) {
             // A market outside the band is a real try: the clock restarts.
             claim.state = ClaimState.Waiting;
@@ -338,6 +351,7 @@ library Upkeep {
             uint256 expected = s.lastPriced == 0 ? home : _expectedPayout(s, claim.shares);
             uint256 reserve = expected < s.free() ? expected : s.free();
             s.claimReserved[claimId] = reserve;
+            s.claimHome[claimId] = home;
             s.reservedCash += reserve;
             claim.state = ClaimState.Queued;
             s.queuedClaims += 1;

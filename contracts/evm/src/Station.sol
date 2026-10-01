@@ -29,6 +29,7 @@ contract Station is IStation, ReentrancyGuardTransient {
     using Math for uint256;
 
     uint256 private constant WAD = 1e18;
+    uint256 private constant BPS = 10_000;
     bytes4 private constant APPROVE = IERC20.approve.selector;
 
     IStationFactory public factory;
@@ -188,8 +189,13 @@ contract Station is IStation, ReentrancyGuardTransient {
         uint256 idleBefore = dollar.balanceOf(address(this));
         for (uint256 i = 0; i < count; i++) {
             address[] memory targets = drivers[i].targets();
+            uint256 before = dollar.balanceOf(address(this));
             _run(closes[i], targets);
             _run(drivers[i].sweep(address(this), freed[i]), targets);
+            // Selling the fraction is only a serve if its worth comes home:
+            // proceeds left at the venue would still belong to everyone.
+            uint256 swept = dollar.balanceOf(address(this)) - before;
+            if (swept < freed[i].mulDiv(BPS - _spec.exitBandBps, BPS)) revert ShortSweep();
         }
         sentHome = dollar.balanceOf(address(this)) - idleBefore
             + idleBefore.mulDiv(fraction, WAD, Math.Rounding.Floor);

@@ -42,6 +42,11 @@ interface IStation {
     event Unwound(uint256 fraction, uint256 sentHome, bool blocked);
     event Stopped(bytes32 reason, uint64 haltedAt);
 
+    /// A close inside the band that couldn't bring its worth home: margin a
+    /// position was bought on still holds the proceeds at the venue. The
+    /// whole unwind is undone.
+    error ShortSweep();
+
     /// Let `key` trade through `driver`, replacing the key approved for it
     /// now. Anyone may call it; it obeys only the registry.
     function approveKey(bytes32 driver, address key) external;
@@ -64,7 +69,9 @@ interface IStation {
     function stop(bytes32 reason, uint64 haltedAt, bytes calldata signature) external;
     /// Close `fraction` (1e18 is all) of every position inside the exit band
     /// and send that fraction's dollars home. `blocked` is true, and nothing
-    /// is closed, when a market is outside the band.
+    /// is closed, when a market is outside the band. It reverts with
+    /// `ShortSweep` when what a venue sends home falls short of the closed
+    /// fraction's worth by more than the band.
     function unwind(uint256 fraction) external returns (uint256 sentHome, bool blocked);
     /// What the station holds, at mark and at exit-side prices.
     function value() external view returns (uint256 mark, uint256 exit);

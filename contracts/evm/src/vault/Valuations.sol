@@ -328,9 +328,10 @@ library Valuations {
         // to it first.
         s.reservedCash -= s.claimReserved[r.ref];
         s.claimReserved[r.ref] = 0;
+        s.claimHome[r.ref] = 0;
         uint256 shares = claim.shares;
         (uint256 slice, uint256 burned, uint256 payout) = exitOf(s, v, shares);
-        if (payout > s.cash) {
+        if (payout > s.free()) {
             claim.state = ClaimState.Pending;
             emit IVault.ClaimTried(r.ref, true);
             return;
@@ -432,14 +433,19 @@ library Valuations {
             _proRata(s, claim.owner, claim.shares);
             return;
         }
-        // Its fraction of the stations is already home and set aside: it
-        // takes that, and its share of the rest of the cash, and no units.
+        // Its fraction of the stations is already home: it takes what that
+        // close brought, its share of the rest of the cash, and no units.
+        Request storage r = s.requests[s.claimRequest[claimId] - 1];
+        if (s.lastPriced != 0 && s.latest().time >= r.earliest) revert IVault.NotAllowed();
         s.queuedClaims -= 1;
-        s.requests[s.claimRequest[claimId] - 1].done = true;
-        uint256 reserved = s.claimReserved[claimId];
+        r.done = true;
+        s.reservedCash -= s.claimReserved[claimId];
         s.claimReserved[claimId] = 0;
-        s.reservedCash -= reserved;
-        uint256 assets = reserved + (s.free() - reserved).mulDiv(claim.shares, s.totalSupply);
+        uint256 free = s.free();
+        uint256 home = s.claimHome[claimId];
+        if (home > free) home = free;
+        s.claimHome[claimId] = 0;
+        uint256 assets = home + (free - home).mulDiv(claim.shares, s.totalSupply);
         s.burn(address(this), claim.shares);
         s.cash -= assets;
         s.pay(claim.owner, assets);
