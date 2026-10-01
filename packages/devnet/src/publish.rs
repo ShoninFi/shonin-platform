@@ -1,32 +1,42 @@
-//! Publishing a strategy, the way the web app does it: create the vault from
-//! the author's account, then hand the source to the API.
+//! Publishing an agent, the way the web app does it: upload the project, pay
+//! the $1 from the same wallet, follow the job, and, once it is reviewed and
+//! built, activate it.
 //!
-//! Creating the vault is publishing: the author funds its tank in the same
-//! transaction, and the build and the review are the first things that tank
-//! pays for. The build service will not admit the job until that vault is
-//! there, so nothing is ever built for free.
+//! Publishing and activating are separate on purpose. Nothing is spent but
+//! the $1 until the author has read the review and chosen to open a vault.
 
 use std::path::Path;
 use std::time::Duration;
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use anyhow::{Context, Result, bail};
 use chain::bindings::factory::IVaultFactory;
+use chain::bindings::publishing::IPublishing;
+use chain::bindings::reviews::IReviewRegistry;
 use chain::bindings::usd::ILocalUsd;
 use chain::{Client, Deployments};
-use shared::manifest::{Manifest, Prices, hash_bytes, hash_to_bytes};
-use shared::model::registry::JobState;
-use shared::{Submission, SubmissionAccepted, SubmissionSource};
+use shared::model::registry::{Job, JobState};
+use shared::{Allowances, Strategy, Upload, UploadAccepted};
 
 /// What a publish produced.
 pub struct Published {
-    pub slug: String,
-    pub vault: Address,
     pub job_id: String,
     pub outcome: JobState,
+    /// Assigned when the $1 was paid.
+    pub strategy_id: Option<u64>,
+    /// Set once it is activated.
+    pub vault: Option<Address>,
 }
 
-/// Pack a project, create its vault, and submit it to be built.
+impl Published {
+    pub fn slug(&self, chain: shared::Chain) -> Option<String> {
+        self.strategy_id.map(|id| Strategy::slug_for(chain, id))
+    }
+}
+
+/// Upload a project, pay for it, and follow it until it is ready, refused or
+/// failed. If it is ready and `activate` is set, activate it too.
+#[allow(clippy::too_many_arguments)]
 pub async fn publish(
     chain: &Client,
     vault_chain: shared::Chain,
@@ -35,55 +45,101 @@ pub async fn publish(
     project: &Path,
     author: Address,
     sealed: bool,
+    activate: bool,
 ) -> Result<Published> {
-    let manifest = read_manifest(project)?;
-    let slug = manifest.slug();
-    let archive = crate::publish::pack(project)?;
-    let source_hash = hash_bytes(&archive);
-
-    let vault = create_vault(chain, deployments, &manifest, author, &source_hash).await?;
-    tracing::debug!(%vault, slug, "the vault is open for its build");
-
-    let submission = Submission {
-        strategy_id: manifest.strategy.id.clone(),
-        version: manifest.strategy.version,
-        author: format!("{author:?}"),
-        source: SubmissionSource::Archive {
-            base64: encode(&archive),
+    let archive = pack(project)?;
+    let accepted = upload(
+        api,
+        vault_chain,
+        &Upload {
+            author: format!("{author:#x}"),
+            archive_base64: shared::base64::encode(&archive),
+            sealed,
+            package: package_of(project),
         },
-        package: manifest.strategy.id.clone(),
-        sealed,
-    };
-    let accepted = offer(api, vault_chain, &submission).await?;
+    )
+    .await?;
 
-    let outcome = follow(api, &accepted.job_id).await?;
-    Ok(Published {
-        slug,
-        vault,
+    let reference: B256 = accepted.upload.parse().context("the upload's reference")?;
+    pay(chain, deployments, author, reference).await?;
+
+    let job = follow(api, &accepted.job_id).await?;
+    let mut published = Published {
         job_id: accepted.job_id,
-        outcome,
-    })
+        outcome: job.state.clone(),
+        strategy_id: job.strategy_id,
+        vault: None,
+    };
+    if activate && job.state == JobState::Ready {
+        let id = job.strategy_id.context("a ready job has an id")?;
+        published.vault = Some(activate_it(chain, deployments, author, id).await?);
+    }
+    Ok(published)
 }
 
-/// Create the vault, funding its tank in the same transaction.
-async fn create_vault(
+/// Pay the $1 against the upload, from the wallet that uploaded it.
+async fn pay(
     chain: &Client,
     deployments: &Deployments,
-    manifest: &Manifest,
     author: Address,
-    source_hash: &str,
-) -> Result<Address> {
-    let config = chain
-        .read(deployments.factory, IVaultFactory::configCall {})
+    upload: B256,
+) -> Result<()> {
+    let fee = chain
+        .read(deployments.publishing, IPublishing::feeCall {})
         .await?;
-    let tank = config.minimumTank;
+    chain
+        .send(
+            author,
+            deployments.usd,
+            ILocalUsd::approveCall {
+                spender: deployments.publishing,
+                value: fee,
+            },
+        )
+        .await
+        .context("the fee could not be approved")?;
+    chain
+        .send(
+            author,
+            deployments.publishing,
+            IPublishing::submitCall { upload },
+        )
+        .await
+        .context("the fee could not be paid")?;
+    Ok(())
+}
 
-    // What a day at the allowances this strategy declared costs, at the
-    // published prices. The contract will not let a usage statement charge
-    // more than this.
-    let daily = Prices::published().daily_cap(&manifest.runtime.allowances);
-    let daily_cap = U256::from((daily * 1_000_000.0).ceil() as u128);
+/// Wait for the review to be posted, then activate with the minimum tank and
+/// the modest allowances.
+async fn activate_it(
+    chain: &Client,
+    deployments: &Deployments,
+    author: Address,
+    id: u64,
+) -> Result<Address> {
+    let strategy_id = U256::from(id);
+    for attempt in 0.. {
+        let reviewed = chain
+            .read(
+                deployments.reviews,
+                IReviewRegistry::hasReviewCall {
+                    strategyId: strategy_id,
+                },
+            )
+            .await?;
+        if reviewed {
+            break;
+        }
+        if attempt == 120 {
+            bail!("the review of {id} was never posted");
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 
+    let tank = chain
+        .read(deployments.factory, IVaultFactory::configCall {})
+        .await?
+        .minimumTank;
     chain
         .send(
             author,
@@ -95,73 +151,40 @@ async fn create_vault(
         )
         .await
         .context("the tank could not be approved")?;
-
-    let strategy_id = name_to_bytes(&manifest.strategy.id);
-    let hash = hash_to_bytes(source_hash).context("the source hash")?;
-
-    // A version is published once. Saying so here is kinder than a reverted
-    // transaction, and the answer is always the same: bump the version in the
-    // manifest, because a new version is a new vault.
-    let existing = chain
-        .read(
-            deployments.factory,
-            IVaultFactory::vaultOfCall {
-                strategyId: strategy_id.into(),
-                version: manifest.strategy.version,
-            },
-        )
-        .await
-        .context("asking whether this version already has a vault")?;
-    if existing != alloy::primitives::Address::ZERO {
-        anyhow::bail!(
-            "{} v{} already has a vault at {existing:?}. A version is published once: raise \
-             `version` in the manifest and publish that.",
-            manifest.strategy.id,
-            manifest.strategy.version
-        );
-    }
     chain
         .send(
             author,
             deployments.factory,
-            IVaultFactory::createCall {
-                strategyId: strategy_id.into(),
-                version: manifest.strategy.version,
-                sourceHash: hash.into(),
+            IVaultFactory::activateCall {
+                strategyId: strategy_id,
+                allowances: chain::allowances(&Allowances::modest()),
                 tankFunding: tank,
-                dailyUsageCap: daily_cap,
             },
         )
         .await
-        .context("the vault could not be created")?;
-
-    let vault = chain
+        .context("the vault could not be activated")?;
+    chain
         .read(
             deployments.factory,
             IVaultFactory::vaultOfCall {
-                strategyId: strategy_id.into(),
-                version: manifest.strategy.version,
+                strategyId: strategy_id,
             },
         )
-        .await?;
-    Ok(vault)
+        .await
+        .context("reading the new vault")
 }
 
-/// Offer the submission, waiting for the build service to be ready.
+/// Offer the project, waiting for the build service to be ready.
 ///
 /// A service that starts with the chain waits out its image's timelock before
 /// it can sign anything, so arriving early is ordinary rather than an error.
-async fn offer(
-    api: &str,
-    chain: shared::Chain,
-    submission: &Submission,
-) -> Result<SubmissionAccepted> {
+async fn upload(api: &str, chain: shared::Chain, upload: &Upload) -> Result<UploadAccepted> {
     let client = reqwest::Client::new();
     let mut last = String::new();
     for attempt in 0..60 {
         let reply = client
-            .post(format!("{api}/api/{chain}/submissions"))
-            .json(submission)
+            .post(format!("{api}/api/{chain}/uploads"))
+            .json(upload)
             .send()
             .await;
         match reply {
@@ -171,10 +194,19 @@ async fn offer(
                     .await
                     .context("the build service said something unexpected");
             }
+            // A refusal of the project itself won't change by waiting.
+            Ok(reply) if reply.status() == reqwest::StatusCode::BAD_REQUEST => {
+                bail!(
+                    "the build service refused the project: {}",
+                    reply.text().await.unwrap_or_default()
+                );
+            }
             Ok(reply) => {
                 let status = reply.status();
-                last = reply.text().await.unwrap_or_default();
-                last = format!("{status}: {}", last.trim());
+                last = format!(
+                    "{status}: {}",
+                    reply.text().await.unwrap_or_default().trim()
+                );
             }
             Err(error) => last = error.to_string(),
         }
@@ -183,15 +215,16 @@ async fn offer(
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    bail!("the build service never took the submission ({last})")
+    bail!("the build service never took the upload ({last})")
 }
 
 /// Watch a job until it finishes. The queue is public, so this is the same
 /// view anyone else has of it.
-async fn follow(api: &str, job_id: &str) -> Result<JobState> {
+async fn follow(api: &str, job_id: &str) -> Result<Job> {
     let client = reqwest::Client::new();
-    for _ in 0..600 {
-        let job: shared::model::registry::Job = client
+    // A review by a model takes minutes; a build, a minute or two more.
+    for _ in 0..1_800 {
+        let job: Job = client
             .get(format!("{api}/api/jobs/{job_id}"))
             .send()
             .await
@@ -199,32 +232,34 @@ async fn follow(api: &str, job_id: &str) -> Result<JobState> {
             .json()
             .await
             .context("the queue said something unexpected")?;
-        match &job.state {
-            JobState::Succeeded | JobState::Failed { .. } => return Ok(job.state),
-            _ => tokio::time::sleep(Duration::from_secs(1)).await,
+        if job.state.is_finished() {
+            return Ok(job);
         }
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    bail!("the build is still running after ten minutes")
+    bail!("job {job_id} is still running after half an hour")
 }
 
-fn read_manifest(project: &Path) -> Result<Manifest> {
-    let path = project.join("shonin.toml");
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    Manifest::from_toml(&text).context("the manifest is not valid")
+/// The cargo package a project is, from its `Cargo.toml`.
+fn package_of(project: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(project.join("Cargo.toml")).ok()?;
+    text.lines().find_map(|line| {
+        line.strip_prefix("name = ")
+            .map(|name| name.trim().trim_matches('"').to_string())
+    })
 }
 
 /// Pack the project the way the build service unpacks it: the whole tree the
-/// strategy lives in, so a workspace builds the same way here and there.
+/// agent lives in, so a workspace builds the same way here and there.
 pub fn pack(project: &Path) -> Result<Vec<u8>> {
     let root = workspace_root(project);
     shared::archive::pack(&root).with_context(|| format!("packing {}", root.display()))
 }
 
-/// The directory a build has to start from: the workspace the strategy is a
+/// The directory a build has to start from: the workspace the agent is a
 /// member of, if there is one.
 ///
-/// A strategy usually sits a few directories down from its workspace, with
+/// An agent usually sits a few directories down from its workspace, with
 /// nothing but folders in between, so the search keeps climbing past a
 /// directory that holds no manifest at all.
 fn workspace_root(project: &Path) -> std::path::PathBuf {
@@ -246,49 +281,24 @@ fn workspace_root(project: &Path) -> std::path::PathBuf {
     found
 }
 
-fn name_to_bytes(name: &str) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    let bytes = name.as_bytes();
-    let take = bytes.len().min(32);
-    out[..take].copy_from_slice(&bytes[..take]);
-    out
-}
-
-fn encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let mut buffer = [0u8; 3];
-        buffer[..chunk.len()].copy_from_slice(chunk);
-        let value = u32::from_be_bytes([0, buffer[0], buffer[1], buffer[2]]);
-        for index in 0..4 {
-            if index <= chunk.len() {
-                out.push(ALPHABET[((value >> (18 - index * 6)) & 0x3f) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn a_strategy_packs_the_workspace_it_belongs_to() {
+    fn an_agent_packs_the_workspace_it_belongs_to() {
         let root = std::env::temp_dir().join(format!("shonin-root-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let project = root.join("packages/agents/one");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(root.join("Cargo.toml"), b"[workspace]\nmembers = []\n").unwrap();
-        std::fs::write(project.join("Cargo.toml"), b"[package]\n").unwrap();
+        std::fs::write(project.join("Cargo.toml"), b"[package]\nname = \"one\"\n").unwrap();
         assert_eq!(workspace_root(&project), root);
+        assert_eq!(package_of(&project).as_deref(), Some("one"));
     }
 
     #[test]
-    fn a_strategy_with_no_workspace_packs_itself() {
+    fn an_agent_with_no_workspace_packs_itself() {
         let root = std::env::temp_dir().join(format!("shonin-alone-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();

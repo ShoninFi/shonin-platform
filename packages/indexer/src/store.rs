@@ -6,10 +6,9 @@
 
 use std::path::PathBuf;
 
-use shared::manifest::{Manifest, hash_bytes};
-use shared::model::bundle::{LogLine, Source, SourceFile};
-
-use crate::read::Report;
+use shared::Report;
+use shared::manifest::{Canonical, hash_bytes};
+use shared::model::bundle::{Source, SourceFile};
 
 pub struct Store {
     root: PathBuf,
@@ -28,8 +27,11 @@ impl Store {
         std::fs::read(self.directory(hash).join(name)).ok()
     }
 
-    pub fn manifest(&self, bundle_hash: &str) -> Option<Manifest> {
-        let bytes = self.bytes(bundle_hash, "manifest.json")?;
+    /// The manifest the builder recorded: the author's file and what the
+    /// builder added. It is filed under its own hash, since one bundle can
+    /// be published under several manifests.
+    pub fn manifest(&self, manifest_hash: &str) -> Option<Canonical> {
+        let bytes = self.bytes(manifest_hash, "manifest.json")?;
         serde_json::from_slice(&bytes).ok()
     }
 
@@ -64,10 +66,6 @@ impl Store {
         self.hashes(bundle_hash)
             .and_then(|hashes| hashes["seconds"].as_u64())
             .unwrap_or(0) as u32
-    }
-
-    pub fn job_log(&self, _slug: &str) -> Vec<LogLine> {
-        Vec::new()
     }
 
     /// Whether the source was published, and where to read it.

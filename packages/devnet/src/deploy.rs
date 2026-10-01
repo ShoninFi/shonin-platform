@@ -20,11 +20,14 @@ use chain::{ChainKey, Client, Deployments, NetworkName, Role, Roles};
 const LOCAL_TIMELOCK: u64 = 2 * 24 * 60 * 60;
 /// How long a blessing lasts before an executor has to attest again.
 const BLESSING_TTL: u64 = 72 * 60 * 60;
-/// What a review costs, in the asset's own units.
-const REVIEW_FEE: u64 = 1_000_000;
-/// The least an author may create a vault with: the build, the review and a
-/// week at the allowances a modest strategy declares.
-const MINIMUM_TANK: u64 = 40_000_000;
+/// What publishing costs, in the asset's own units: a flat dollar, for the
+/// review and the build.
+const PUBLISH_FEE: u64 = 1_000_000;
+/// The least an author may activate a vault with.
+const MINIMUM_TANK: u64 = 10_000_000;
+/// How long before a new price list takes effect, on a local chain: the
+/// published thirty days, which pass in twelve minutes here.
+const LOCAL_PRICE_NOTICE: u64 = 30 * 24 * 60 * 60;
 /// What the venue asks a perp position to be backed by.
 const MARGIN_BPS: u64 = 1_000;
 /// What every account starts with, so nobody has to ask for money first.
@@ -69,9 +72,9 @@ async fn deploy(
 ) -> Result<Deployments> {
     // None on testnets: nobody else's money is at stake there, and their
     // clocks run in real time, so two days would be two real days.
-    let timelock = match network {
-        NetworkName::Local => LOCAL_TIMELOCK,
-        _ => 0,
+    let (timelock, price_notice) = match network {
+        NetworkName::Local => (LOCAL_TIMELOCK, LOCAL_PRICE_NOTICE),
+        _ => (0, 0),
     };
     let roles = Roles {
         admin: client.account(Role::Admin)?,
@@ -113,12 +116,41 @@ async fn deploy(
         (admin, verifier, timelock, BLESSING_TTL).abi_encode_params(),
     )
     .await?;
+    let publishing = put(
+        client,
+        artifacts,
+        admin,
+        "Publishing",
+        (usd, roles.platform, U256::from(PUBLISH_FEE)).abi_encode_params(),
+    )
+    .await?;
+    let prices = put(
+        client,
+        artifacts,
+        admin,
+        "Prices",
+        (
+            admin,
+            price_notice,
+            // The published prices, in dollars scaled by 1e18, in the order
+            // `UnitPrices` declares them: a core-hour, a GiB-hour, a GB of
+            // egress, a second of inference.
+            (
+                150_000_000_000_000_000u128,
+                10_000_000_000_000_000u128,
+                150_000_000_000_000_000u128,
+                150_000_000_000_000_000u128 / 3_600,
+            ),
+        )
+            .abi_encode_params(),
+    )
+    .await?;
     let strategies = put(
         client,
         artifacts,
         admin,
         "StrategyRegistry",
-        (attestation,).abi_encode_params(),
+        (attestation, publishing).abi_encode_params(),
     )
     .await?;
     let reviews = put(
@@ -126,14 +158,7 @@ async fn deploy(
         artifacts,
         admin,
         "ReviewRegistry",
-        (
-            attestation,
-            strategies,
-            usd,
-            roles.platform,
-            U256::from(REVIEW_FEE),
-        )
-            .abi_encode_params(),
+        (attestation, strategies, publishing).abi_encode_params(),
     )
     .await?;
     let profiles = put(
@@ -150,17 +175,22 @@ async fn deploy(
         admin,
         "VaultFactory",
         (
-            usd,
-            venue,
-            attestation,
-            strategies,
-            reviews,
-            admin,
-            roles.platform,
+            // What the factory reads, in the order `VaultFactory.Deps`
+            // declares it.
+            (
+                usd,
+                venue,
+                attestation,
+                strategies,
+                reviews,
+                prices,
+                admin,
+                roles.platform,
+            ),
             // The terms every vault is created with, in the order
             // `VaultConfig` declares them.
             (
-                100u16,              // streaming, a year
+                100u16,              // the holding fee, a year
                 1_000u16,            // of gains, to the author
                 500u16,              // of the same gains, to the platform
                 10u16,               // on a deposit or a withdrawal, kept in the pool
@@ -184,6 +214,8 @@ async fn deploy(
         venue,
         attestation_verifier: verifier,
         attestation,
+        publishing,
+        prices,
         strategies,
         reviews,
         profiles,

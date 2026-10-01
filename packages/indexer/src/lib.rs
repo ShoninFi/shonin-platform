@@ -40,7 +40,6 @@ struct Read {
     strategies: Vec<shared::Strategy>,
     authors: Vec<Author>,
     feed: Vec<FeedEvent>,
-    benchmarks: Vec<shared::Benchmark>,
 }
 
 /// The record, as read from every vault chain, and what it needs to keep
@@ -104,7 +103,7 @@ impl Indexer {
         )
         .await;
 
-        let mut reads: Vec<Read> = self
+        let reads: Vec<Read> = self
             .readers
             .iter()
             .zip(reads)
@@ -116,15 +115,13 @@ impl Indexer {
                 }
             })
             .collect();
-        let mut jobs = self.fetch_jobs().await.unwrap_or_default();
-        qualify_shared_slugs(&mut reads, &mut jobs);
+        let jobs = self.jobs().await.unwrap_or_default();
 
         let mut infos = Vec::new();
         let mut latest = 0;
         let mut strategies = Vec::new();
         let mut authors: Vec<Author> = Vec::new();
         let mut feed = Vec::new();
-        let mut benchmarks: Vec<shared::Benchmark> = Vec::new();
         for read in reads {
             infos.push(read.info);
             latest = latest.max(read.now);
@@ -136,20 +133,11 @@ impl Indexer {
                     authors.push(author);
                 }
             }
-            for benchmark in read.benchmarks {
-                if !benchmarks
-                    .iter()
-                    .any(|known| known.label == benchmark.label)
-                {
-                    benchmarks.push(benchmark);
-                }
-            }
         }
         feed.sort_by_key(|event| std::cmp::Reverse(event.at));
 
         let totals = Totals {
-            // Every vault still holding depositors' money, which includes one
-            // whose author has published a successor: it carries on as it was.
+            // Every vault still holding depositors' money.
             vault_capital: strategies
                 .iter()
                 .filter(|strategy| {
@@ -175,7 +163,6 @@ impl Indexer {
         snapshot.authors = authors;
         snapshot.jobs = jobs;
         snapshot.feed = feed;
-        snapshot.benchmarks = benchmarks;
         snapshot.totals = totals;
         Ok(())
     }
@@ -210,11 +197,7 @@ impl Indexer {
             .await?
         };
         let authors = read::authors(chain, &served.deployments).await?;
-        let feed = read::feed(chain, &served.deployments, &strategies).await?;
-        let benchmarks = {
-            let mut history = reader.history.write().await;
-            read::benchmark(chain, &served.deployments, &mut history, head).await?
-        };
+        let feed = read::feed(chain, served.vault_chain, &served.deployments, &strategies).await?;
         Ok(Read {
             info: ChainInfo {
                 chain: served.vault_chain,
@@ -225,73 +208,30 @@ impl Indexer {
             strategies,
             authors,
             feed,
-            benchmarks,
         })
     }
 
-    async fn fetch_jobs(&self) -> Result<Vec<Job>> {
+    /// The builder's queue, with what the chain adds to each job.
+    async fn jobs(&self) -> Result<Vec<Job>> {
         let Some(builder) = &self.builder else {
             return Ok(Vec::new());
         };
-        let jobs = reqwest::Client::new()
+        let jobs: Vec<Job> = reqwest::Client::new()
             .get(format!("{builder}/jobs"))
             .send()
             .await?
             .json()
             .await?;
-        Ok(jobs)
-    }
-}
-
-/// A strategy's slug names it in the app. The same id and version can be
-/// published on two vault chains, so a slug more than one chain uses is
-/// qualified with the chain's name on each of them, everywhere it appears:
-/// the strategy, its supersession links, its feed links and its build.
-fn qualify_shared_slugs(reads: &mut [Read], jobs: &mut [Job]) {
-    let mut chains_of: HashMap<String, usize> = HashMap::new();
-    for read in reads.iter() {
-        let mut seen = std::collections::HashSet::new();
-        for strategy in &read.strategies {
-            if seen.insert(strategy.slug.clone()) {
-                *chains_of.entry(strategy.slug.clone()).or_default() += 1;
-            }
-        }
-    }
-    for read in reads.iter_mut() {
-        let chain = read.info.chain;
-        let qualified = |slug: &str| format!("{slug}-{}", chain.name());
-        let shared = |slug: &str| chains_of.get(slug).is_some_and(|count| *count > 1);
-        for strategy in &mut read.strategies {
-            for slug in [
-                Some(&mut strategy.slug),
-                strategy.supersedes.as_mut(),
-                strategy.superseded_by.as_mut(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if shared(slug) {
-                    *slug = qualified(slug);
+        let mut out = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            out.push(match self.on(job.chain) {
+                Some(served) => {
+                    read::job(&served.client, &served.deployments, &self.store, job).await
                 }
-            }
+                None => job,
+            });
         }
-        for event in &mut read.feed {
-            if let Some(link) = event.link.as_mut()
-                && let Some(slug) = link.strip_prefix("/agents/")
-            {
-                let slug = slug.split('/').next().unwrap_or_default().to_string();
-                if shared(&slug) {
-                    *link = link.replacen(&slug, &qualified(&slug), 1);
-                }
-            }
-        }
-        for job in jobs.iter_mut().filter(|job| job.chain == chain) {
-            if let Some(slug) = job.strategy_slug.as_mut()
-                && shared(slug)
-            {
-                *slug = qualified(slug);
-            }
-        }
+        Ok(out)
     }
 }
 
@@ -311,7 +251,6 @@ fn empty_snapshot(served: &[Served]) -> Snapshot {
         authors: Vec::new(),
         jobs: Vec::new(),
         feed: Vec::new(),
-        benchmarks: Vec::new(),
         totals: Totals {
             vault_capital: 0.0,
             trades: 0,
