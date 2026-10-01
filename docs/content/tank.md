@@ -99,7 +99,7 @@ After that, a successful agent can pay its own way. The Author can top the tank 
 
 ## Taking money out
 
-The Author can take money out whenever they like, say if they've put in more than they need: the tab is paid first, the rest goes to their wallet, and whatever they leave in keeps the agent running.
+The Author can take money out whenever they like, say if they've put in more than they need: the tab is paid first, the rest goes to their wallet, and whatever they leave in keeps the agent running. If nothing is running to say what the tab is, the Author asks, waits a day so a final bill can still be collected, and then takes it out.
 
 ## If it runs dry
 

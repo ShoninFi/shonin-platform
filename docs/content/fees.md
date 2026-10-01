@@ -14,7 +14,7 @@ The profit and holding fees are paid every Monday, by creating new shares for th
 
 It's only charged on **new** profit. Each vault remembers the most a share has been worth on a payday, its **high-water mark**, and the fee only applies to gains above that. So if a vault dips and then recovers, nobody pays again on the way back up. And if an agent stops making money, the profit fee stops too: the Author earns nothing until it's back above its high-water mark.
 
-Every vault's page shows its mark next to today's share value. If you join while a vault is below its mark, its recovery up to the mark is fee-free for you.
+Every vault's page shows its mark next to today's share value. If you join while a vault is below its mark, its recovery up to the mark is fee-free for you. If you join while it's above its mark, the mark moves up to take in the price you paid, so you never pay for gains you weren't there for.
 
 ## The holding fee
 

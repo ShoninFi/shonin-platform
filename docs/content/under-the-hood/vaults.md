@@ -110,29 +110,34 @@ The leaver pays the spread, the transaction fee, and the costs of their own exit
 
 ## Fees
 
-Fees are worked out every day and paid every Monday, as **new shares**, so paying them never forces a sale.
+Fees are measured at every valuation and paid on the first valuation on or after Monday 00:00 UTC, as **new shares**, so paying them never forces a sale.
 
 ```text
-every day, what is owed so far is worked out and taken out of value per share:
+at every valuation, what is owed so far is worked out and taken out of value per share:
 
-  holding fee  = value × 1% × (days since the last payment) / 365
-  if value per share (after the holding fee) > high-water mark:
-      gains      = (value per share − high-water mark) × shares
+  holding fee  = value × 1% × (time since the last valuation) / 365 days
+  if value (after the holding fee) > high-water mark × shares:
+      gains      = value − high-water mark × shares
       author fee = gains × 10%
       platform   = gains × 5%
 
-once a day, keep() collects the tank's bill, and every Monday at 00:00 UTC:
+at the first valuation on or after Monday 00:00 UTC:
   what is owed then is paid as new shares          → the Author, the platform
   high-water mark = value per share, if that is a new high
 
-on every deposit and withdrawal:
+on every deposit:
   transaction fee = 0.1% of the amount              → stays in the pool
-  a withdrawal pays what its own shares owe so far
+  money joining above the high-water mark joins at its own price:
+  the mark becomes the average, so nobody else's fee or price moves
+
+on every withdrawal:
+  transaction fee = 0.1% of the amount              → stays in the pool
+  the leaver pays the profit fee their own shares owe, with a slice of those shares
 ```
 
 - **Value per share is always after fees.** What's owed so far is already taken out of the number a Depositor sees, so there's no drop on payday.
 - **Fees owed can shrink.** If the vault gives back its gains before the week is out, what it owes shrinks with them. A gain that vanishes within the week is never charged for.
-- **The high-water mark is the vault's own:** its highest value per share at a weekly payment. Profit fees are only ever taken on new highs.
+- **The high-water mark is the vault's own:** its highest value per share at a weekly payment, averaged up when money joins above it. Profit fees are only ever taken on new highs, and money that joins never pays for gains it wasn't there for.
 - **The transaction fee is nobody's.** It stays in the pool and raises value per share for the Depositors who stay, so timing a deposit or withdrawal around a price update costs the one timing it.
 
 The schedule is fixed when the vault is created and never changes under it. A vault's page shows its own schedule, not today's default.
@@ -141,9 +146,9 @@ The schedule is fixed when the vault is created and never changes under it. A va
 
 Each vault has a **tank**: a plain dollar balance, held by the vault but not counted in what shares are worth, that pays for running the agent. The Author fills it when activating, and whenever they like after that.
 
-- **What's charged is capped.** The executor keeps a running total of what the agent uses, signed with the vault's own blessed key, and stops the agent the moment the unpaid part reaches the tank. Once a day, `keep` collects it, pays fees on the weekly day, and runs auto-fill. Anyone may send it; Shonin normally does, and pays its gas. The vault only believes the total up to the Author's allowances at our published prices, so a wrong total can never charge more than the Author agreed to.
-- **Earnings can pay for it.** The Author's fee shares are theirs. They can turn some into tank money in one transaction, or set **auto-fill**, "keep my tank at $X", and each day just enough of their shares are turned into cash to top it up.
-- **The Author can take it out** at any time. The latest bill is paid first, and the rest comes back at once.
+- **What's charged is capped.** The executor keeps a running total of what the agent uses, signed with the vault's own blessed key, and stops the agent the moment the unpaid part reaches the tank. Once a day, `keep` collects it and tops the tank up if the Author asked for that. Anyone may send it; Shonin normally does, and pays its gas. The vault only believes the total up to the Author's allowances at our published prices, for the time that has passed, so a wrong total can never charge more than the Author agreed to.
+- **Earnings can pay for it.** The Author's fee shares are theirs. They can turn some into tank money, or set **auto-fill**, "keep my tank at $X", and each day just enough of their shares are turned into cash to top it up. Either way the shares are redeemed like any withdrawal, at the next valuation and only from cash, so nobody else pays for it.
+- **The Author can take it out** at any time. The latest bill is paid first, and the rest comes back at once. If no executor is running to sign a bill, the Author asks, waits a day so anyone can collect a final bill, and then takes it out without one.
 - **A dry tank stops the agent,** until anyone tops it up. Its positions stay as they are, and the vault's page says so. Withdrawals never draw on the tank, so an empty one can't hold anyone up. A final bill bigger than the tank takes what's there, and the rest is written off.
 
 ## Retiring
