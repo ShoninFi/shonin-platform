@@ -380,6 +380,19 @@ async fn stop_and_close(client: &Client, keeper: Address, vault: Address, now: u
     }
     let value = client.read(station, IStation::valueCall {}).await?;
     if !value.mark.is_zero() {
+        // A stopped station unwinds only once the last priced valuation has
+        // settled, so what the sale brings home never pays a withdrawal
+        // priced before it.
+        if client.read(vault, IStationVault::unsettledCall {}).await? {
+            send(
+                client,
+                keeper,
+                vault,
+                IVault::settleCall { max: U256::MAX },
+                "settle before the unwind",
+            )
+            .await;
+        }
         send(
             client,
             keeper,
