@@ -161,6 +161,8 @@ struct Layout {
     // Payouts a receiver refused --------------------------------------------
     mapping(address => uint256) held;
     uint256 heldTotal;
+    // Deposits paid by someone other than their receiver --------------------
+    mapping(uint256 => address) payerOf;
 }
 
 /// The vault's storage, and the bookkeeping every part of it shares.
@@ -315,6 +317,12 @@ library VaultStorage {
         if (end > count) end = count;
         while (i < end && s.requests[i].done) i++;
         s.requestCursor = i;
+    }
+
+    /// Where a deposit's money goes when it is sent back: to whoever paid it.
+    function refundTo(Layout storage s, uint256 requestId, address owner) internal view returns (address) {
+        address payer = s.payerOf[requestId];
+        return payer == address(0) ? owner : payer;
     }
 
     function queue(

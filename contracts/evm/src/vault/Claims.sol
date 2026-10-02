@@ -94,20 +94,15 @@ library Claims {
         emit IVault.ClaimTried(claimId, blocked);
     }
 
-    /// Close `fraction` at the home station. Proceeds a venue keeps as margin
-    /// leave the close undone, so a claim that can't come home sells nothing
-    /// however often it is tried.
+    /// Close `fraction` at the home station. A close that fails, whether
+    /// proceeds a venue keeps as margin leave it undone or the venue refuses
+    /// it outright, sells nothing and brings nothing home: it is not a try,
+    /// and the claim waits as it was, however often it is tried.
     function _close(Layout storage s, uint256 fraction) private returns (uint256 home, bool blocked) {
         s.closing = true;
         try IStation(s.homeStation).unwind(fraction) returns (uint256 sent, bool outside) {
             (home, blocked) = (sent, outside);
-        } catch (bytes memory reason) {
-            if (bytes4(reason) != IStation.ShortSweep.selector) {
-                assembly ("memory-safe") {
-                    revert(add(reason, 32), mload(reason))
-                }
-            }
-        }
+        } catch {}
         s.closing = false;
     }
 

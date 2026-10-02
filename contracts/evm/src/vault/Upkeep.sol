@@ -266,11 +266,13 @@ library Upkeep {
 
     /// With no executor running nobody can sign a total. After a delay long
     /// enough for anyone to collect a final bill, the author can withdraw
-    /// without one.
+    /// without one, within the same length of time again: a request lapses,
+    /// so it can't be armed early and used once an executor runs again.
     function requestTankWithdrawal() external {
         Layout storage s = VaultStorage.layout();
         _authorOnly(s);
         s.tank.escapeRequestedAt = uint64(block.timestamp);
+        emit IVault.TankWithdrawalRequested(uint64(block.timestamp) + s.timers.tankEscapeDelay);
     }
 
     function withdrawTankUnsigned(uint256 assets) external {
@@ -278,7 +280,9 @@ library Upkeep {
         _authorOnly(s);
         if (s.state != VaultState.Closed && s.state != VaultState.Cancelled) {
             uint64 asked = s.tank.escapeRequestedAt;
-            if (asked == 0 || block.timestamp < asked + s.timers.tankEscapeDelay) revert IVault.NotYet();
+            uint256 delay = s.timers.tankEscapeDelay;
+            if (asked == 0 || block.timestamp < asked + delay) revert IVault.NotYet();
+            if (block.timestamp > asked + 2 * delay) revert IVault.NotAllowed();
             s.tank.escapeRequestedAt = 0;
         }
         _payTank(s, assets);
@@ -420,6 +424,15 @@ library Upkeep {
         }
         Valuations.syncHolding(s);
         Valuations.payday(s, s.cash + 1, s.totalSupply + OFFSET, uint64(block.timestamp));
+        // The dead shares' part, which no holder can ever redeem, goes to the
+        // author who paid for them, into the tank they can take at once.
+        uint256 dead = s.balanceOf[VaultStorage.DEAD];
+        if (dead != 0) {
+            uint256 theirs = s.cash.mulDiv(dead, s.totalSupply);
+            s.burn(VaultStorage.DEAD, dead);
+            s.cash -= theirs;
+            s.tank.balance += theirs;
+        }
         _setState(s, VaultState.Closed);
     }
 
@@ -445,8 +458,9 @@ library Upkeep {
         r.done = true;
         if (kind == RequestKind.Deposit) {
             s.escrow -= r.amount;
-            s.pay(r.owner, r.amount);
-            emit IVault.Refunded(requestId, r.owner, r.amount);
+            address to = s.refundTo(requestId, r.owner);
+            s.pay(to, r.amount);
+            emit IVault.Refunded(requestId, to, r.amount);
         } else if (kind == RequestKind.Redeem) {
             assets = s.cash.mulDiv(r.amount, s.totalSupply);
             s.pendingShares -= r.amount;
@@ -467,7 +481,10 @@ library Upkeep {
         if (state != ClaimState.Pending && state != ClaimState.Waiting && state != ClaimState.Queued) {
             revert IVault.NotAllowed();
         }
-        if (state == ClaimState.Queued) s.requests[s.claimRequest[claimId] - 1].done = true;
+        if (state == ClaimState.Queued) {
+            s.requests[s.claimRequest[claimId] - 1].done = true;
+            s.queuedClaims -= 1;
+        }
         assets = s.cash.mulDiv(claim.shares, s.totalSupply);
         s.pendingShares -= claim.shares;
         s.burn(address(this), claim.shares);

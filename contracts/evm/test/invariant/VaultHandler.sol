@@ -1171,21 +1171,40 @@ contract VaultHandler is Test {
             _record();
             try vault.settle(type(uint256).max) {} catch {}
             still = false;
-            vm.prank(keeper);
-            try vault.close() {
-                _hit("windDown");
-            } catch {}
+            if (_closeVault()) _hit("windDown");
         }
         _end(false, "windDown");
     }
 
     function _close() internal {
         _begin();
+        if (_closeVault()) _hit("close");
+        _end(false, "close");
+    }
+
+    /// The keeper closes the vault. The dead shares' part goes to the
+    /// author's tank: never more than they owned of the cash before the
+    /// close's payday minted anything.
+    uint256 internal deadPartAtClose;
+
+    function _closeVault() internal returns (bool closed) {
+        uint256 tankBefore = vault.tank().balance;
+        uint256 cashBefore = vault.cash();
+        uint256 dead = vault.balanceOf(DEAD);
+        uint256 supply = vault.totalSupply();
         vm.prank(keeper);
         try vault.close() {
-            _hit("close");
-        } catch {}
-        _end(false, "close");
+            closed = true;
+        } catch {
+            return false;
+        }
+        uint256 added = vault.tank().balance - tankBefore;
+        tankIn += added;
+        deadPartAtClose = added;
+        if (added > cashBefore.mulDiv(dead, supply) || vault.balanceOf(DEAD) != 0) {
+            tankBreaks++;
+            _break("the close gave the author other than the dead shares' part");
+        }
     }
 
     function _redeemClosed(uint256 who, uint256 pct) internal {
@@ -2195,8 +2214,10 @@ contract VaultHandler is Test {
                 _requested(l, what);
             }
         }
-        // A payday with no valuation after it is the close's, on its cash.
-        if (r.payday) _checkPayday(r, vault.cash() + 1, what);
+        // A payday with no valuation after it is the close's, on its cash,
+        // the dead shares' part included, which the close then moved.
+        if (r.payday) _checkPayday(r, vault.cash() + deadPartAtClose + 1, what);
+        deadPartAtClose = 0;
         _match(g, what);
         return r.holdingMinted;
     }

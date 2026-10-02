@@ -53,7 +53,10 @@ library Valuations {
         if (s.statementOf[receiver] != s.restrictedHash) revert IVault.NoStatement();
         IERC20(s.asset).safeTransferFrom(msg.sender, address(this), assets);
         s.escrow += assets;
-        return s.queue(receiver, RequestKind.Deposit, assets, 0);
+        uint256 id = s.queue(receiver, RequestKind.Deposit, assets, 0);
+        // Sent back, it goes to whoever paid it, not to the receiver named.
+        if (msg.sender != receiver) s.payerOf[id] = msg.sender;
+        return id;
     }
 
     function requestRedeem(uint256 shares, address receiver) external returns (uint256) {
@@ -312,14 +315,19 @@ library Valuations {
         }
     }
 
+    function _refund(Layout storage s, uint256 id, address owner, uint256 assets) private {
+        address to = s.refundTo(id, owner);
+        s.pay(to, assets);
+        emit IVault.Refunded(id, to, assets);
+    }
+
     function _deposit(Layout storage s, Request storage r, uint256 id) private {
         uint256 assets = r.amount;
         s.escrow -= assets;
         // A vault that stopped taking deposits, or a list the depositor
         // hasn't signed for, sends the money back.
         if (s.state != VaultState.Open || s.statementOf[r.owner] != s.restrictedHash) {
-            s.pay(r.owner, assets);
-            emit IVault.Refunded(id, r.owner, assets);
+            _refund(s, id, r.owner, assets);
             return;
         }
         uint256 net = s.depositNet;
@@ -327,8 +335,7 @@ library Valuations {
         uint256 shares =
             (assets - assets.mulDiv(s.fees.transactionBps, BPS, Math.Rounding.Ceil)).mulDiv(supply, net);
         if (shares == 0) {
-            s.pay(r.owner, assets);
-            emit IVault.Refunded(id, r.owner, assets);
+            _refund(s, id, r.owner, assets);
             return;
         }
         // Money joining above the mark joins at its own price: the mark
@@ -494,8 +501,7 @@ library Valuations {
         s.passDone();
         if (deposit) {
             s.escrow -= r.amount;
-            s.pay(r.owner, r.amount);
-            emit IVault.Refunded(requestId, r.owner, r.amount);
+            _refund(s, requestId, r.owner, r.amount);
             return;
         }
         s.pendingShares -= r.amount;
@@ -606,9 +612,10 @@ library Valuations {
         // Units worth less than one unit of the dollar are worth nothing and
         // are cleared rather than left to block the station.
         // Judged on every station: this one now, and all of them as the
-        // last valuation counted them.
+        // last valuation counted them; once the vault has closed its
+        // stations were found empty, and only what this one holds now counts.
         uint256 stations = exitBefore;
-        if (s.lastPriced != 0) {
+        if (s.lastPriced != 0 && s.state != VaultState.Closed) {
             Valuation storage last = s.latest();
             uint256 counted = last.grossExit - 1 - last.cash;
             if (counted > stations) stations = counted;

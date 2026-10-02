@@ -292,7 +292,12 @@ contract VaultFactory is IVaultFactory {
                 || config_.timers.slotInterval == 0 || config_.timers.slotWindow >= config_.timers.slotInterval
                 || config_.timers.slotLead <= config_.timers.slotWindow || config_.timers.freezeAfter < 1 days
                 || config_.timers.fallbackAfter < 1 days
-                || config_.timers.postDeadline <= config_.timers.slotWindow || config_.maxExitCost > MAX_EXIT_COST
+                || config_.timers.postDeadline <= config_.timers.slotWindow
+                || config_.timers.transitTimeout <= config_.timers.postDeadline
+                || config_.timers.usageFreshness == 0 || config_.timers.usageFreshness > 1 days
+                || config_.timers.tankEscapeDelay < 1 days || config_.timers.floorDelay < 1 days
+                || config_.timers.haltGrace < 10 minutes || config_.timers.windDown < 7 days
+                || config_.timers.activationWindow < 1 days || config_.maxExitCost > MAX_EXIT_COST
                 || config_.minimumDeposit > MAX_MINIMUM_DEPOSIT || _tooLong(config_.timers)
         ) revert OutOfRange();
     }

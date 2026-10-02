@@ -370,7 +370,9 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
         assertGe(a.mark, b.mark, "the mark fell");
         assertGe(a.lastPayment, b.lastPayment, "the last payday went backwards");
         assertTrue(legal(b.state, a.state), "the state moved backwards");
-        assertEq(a.dead, b.dead, "the dead shares moved");
+        // Only the close moves the dead shares: their part goes to the author.
+        if (a.state == VaultState.Closed && b.state != VaultState.Closed) assertEq(a.dead, 0);
+        else assertEq(a.dead, b.dead, "the dead shares moved");
         for (uint256 i = 0; i < b.done.length; i++) {
             if (b.done[i]) assertTrue(a.done[i], "a settled request was unsettled");
         }
@@ -624,7 +626,7 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
         address caller = pick >= 128 && id != 0 && id <= vault.requestCount()
             ? vault.requestAt(id).owner
             : pickCaller(pick, random);
-        skip(bound(wait, 0, 2 days));
+        skip(bound(wait, 0, 3 days));
         World memory b = look(caller, address(0));
         Request memory r;
         if (id != 0 && id <= b.requests) r = vault.requestAt(id);
@@ -653,7 +655,7 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
         address caller = pick >= 128 && id != 0 && id <= vault.requestCount()
             ? vault.requestAt(id).owner
             : pickCaller(pick, random);
-        skip(bound(wait, 0, 2 days));
+        skip(bound(wait, 0, 3 days));
         World memory b = look(caller, address(0));
         Request memory r;
         if (id != 0 && id <= b.requests) r = vault.requestAt(id);
@@ -715,7 +717,7 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
         address caller = pick >= 128 && id != 0 && id <= vault.claimCount()
             ? vault.claimAt(id).owner
             : pickCaller(pick, random);
-        skip(bound(wait, 0, 2 days));
+        skip(bound(wait, 0, 3 days));
         World memory b = look(caller, address(0));
         (bool ok, bytes4 err) = callAs(caller, address(vault), abi.encodeCall(IVault.takeProRataClaim, (id)));
         if (id == 0 || id > b.claims) {
@@ -1040,7 +1042,7 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
             vm.prank(author);
             vault.requestTankWithdrawal();
         }
-        skip(bound(wait, 0, 2 days));
+        skip(bound(wait, 0, 3 days));
         World memory b = look(caller, address(0));
         Tank memory t = vault.tank();
         bytes4 want;
@@ -1051,6 +1053,8 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
                 && (t.escapeRequestedAt == 0 || vm.getBlockTimestamp() < t.escapeRequestedAt + 1 days)
         ) {
             want = IVault.NotYet.selector;
+        } else if (!isClosed(b) && vm.getBlockTimestamp() > t.escapeRequestedAt + 2 days) {
+            want = IVault.NotAllowed.selector;
         }
         (bool ok, bytes4 err) =
             callAs(caller, address(vault), abi.encodeCall(IVault.withdrawTankUnsigned, (assets)));

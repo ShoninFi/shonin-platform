@@ -67,6 +67,10 @@ contract AttestationRegistry is IAttestationRegistry {
     /// The longest the timelock can be set to, so a slip of the admin's
     /// finger can't put everything out of reach for good.
     uint64 public constant MAX_TIMELOCK = 365 days;
+    /// The gas a checker's `verify` is given: several times what a Groth16
+    /// proof costs to check, so one that burns its gas can't make every
+    /// blessing fail at an ordinary budget.
+    uint256 public constant VERIFIER_GAS = 1_000_000;
     /// The shortest the timelock can ever be on this deployment, fixed when
     /// it is made: two days where depositors' money is at stake, so nothing
     /// the admin proposes can apply before they have had time to leave, and
@@ -456,8 +460,9 @@ contract AttestationRegistry is IAttestationRegistry {
             // A checker that chokes on a proof meant for another one, or
             // answers in a shape nobody asked for, is just a checker that
             // didn't accept it.
-            (bool ok, bytes memory answer) =
-                verifier.staticcall(abi.encodeCall(IAttestationVerifier.verify, (seal, journal)));
+            (bool ok, bytes memory answer) = verifier.staticcall{gas: VERIFIER_GAS}(
+                abi.encodeCall(IAttestationVerifier.verify, (seal, journal))
+            );
             if (ok && answer.length == 32 && abi.decode(answer, (uint256)) == 1) {
                 return IAttestationVerifier(verifier);
             }

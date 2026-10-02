@@ -229,7 +229,12 @@ interface IVault is IStationVault {
         uint256 indexed requestId, address indexed owner, RequestKind kind, uint64 earliest, uint256 amount
     );
     event Deposited(uint256 indexed requestId, address indexed owner, uint256 assets, uint256 shares);
-    event Refunded(uint256 indexed requestId, address indexed owner, uint256 assets);
+    /// A deposit sent back, to whoever paid it.
+    /// The author asked to withdraw the tank without a signed total; they
+    /// can from `readyAt`, for as long again, so a final bill can be
+    /// collected meanwhile.
+    event TankWithdrawalRequested(uint64 readyAt);
+    event Refunded(uint256 indexed requestId, address indexed to, uint256 assets);
     event Withdrawn(
         uint256 indexed requestId, address indexed owner, uint256 shares, uint256 assets, uint256 feeShares
     );
