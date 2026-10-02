@@ -202,15 +202,16 @@ contract CrossChainEdgesTest is Fixture {
 
     /// A send the home station makes after it was valued, even in the same
     /// block, is still in its value and isn't counted again as transit.
-    function test_a_home_send_in_the_valuations_own_block_is_counted_once() public {
+    function test_a_home_send_after_the_open_waits_for_the_close() public {
         depositTwo(vault, alice, 100_000e6);
         vm.prank(executor);
         station.pull(5000e6);
 
-        // The valuation is recorded with 5000 idle at the home station...
+        // The valuation is recorded with 5000 idle at the home station; the
+        // executor can't bridge it out until the valuation is closed.
         uint64 time = open(vault);
-        // ...and in the same block, after it, the executor bridges it out.
         vm.prank(executor);
+        vm.expectRevert(Station.NotAllowed.selector);
         station.bridge("local-bridge", OTHER, 5000e6, "");
 
         // The other station's honest post: nothing held, nothing landed.

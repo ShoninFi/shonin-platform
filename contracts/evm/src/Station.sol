@@ -154,6 +154,10 @@ contract Station is IStation, ReentrancyGuardTransient {
     ) external nonReentrant {
         _executorOnly();
         if (toChain == block.chainid) revert NoRoute();
+        // Nothing leaves the home station while a valuation waits for the
+        // other chains' posts: it was counted here at the open, and landing
+        // there before their posts it would be counted twice.
+        if (isHome() && IStationVault(_spec.vault).valuing()) revert NotAllowed();
         _send(name, toChain, amount, extra);
     }
 

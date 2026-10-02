@@ -519,12 +519,13 @@ library Valuations {
         // out, never a way round the fee.
         if (s.lastPriced != 0) {
             Valuation storage last = s.latest();
-            // The leaver's own part of the fee owed on the pool as that
-            // valuation's settlement left it: the net price per share `p` is
-            // the snapshot's (settlement never moves it), the mark `m` is as
-            // the slot's deposits left it, and with `r` the fee rate the
-            // pool's gross price is (p - r m) / (1 - r). The part of a share
-            // owed as fee is then r (p - m) / (p - r m).
+            // The leaver's own part of the fee owed: with `p` the net price
+            // per share, `m` the mark as the slot's deposits left it and `r`
+            // the fee rate, the pool's gross price is (p - r m) / (1 - r) and
+            // the part of a share owed as fee is r (p - m) / (p - r m). `p`
+            // is the snapshot's net exit price; exits paid below the mark
+            // since raise the real one a little, so the slice can come out a
+            // little small, at the fee recipients' cost only.
             uint256 rate = uint256(s.fees.authorBps) + s.fees.platformBps;
             uint256 p = (last.grossExit - last.feeExit).mulDiv(PRICE, last.supply);
             uint256 m = s.mark;

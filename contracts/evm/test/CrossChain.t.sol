@@ -346,7 +346,9 @@ contract CrossChainTest is Fixture {
         station.bridge("local-bridge", OTHER, 1000e6, "");
         vm.stopPrank();
         uint64 time = open();
+        // No send leaves home while the valuation waits for posts.
         vm.prank(executor);
+        vm.expectRevert(Station.NotAllowed.selector);
         station.bridge("local-bridge", OTHER, 1000e6, "");
 
         uint64[] memory twice = new uint64[](2);

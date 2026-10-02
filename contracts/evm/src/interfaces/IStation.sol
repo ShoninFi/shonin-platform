@@ -145,4 +145,6 @@ interface IStationVault {
     /// When the vault halted; zero while it runs.
     function haltedAt() external view returns (uint64);
     function haltGrace() external view returns (uint64);
+    /// Whether a valuation is waiting for other chains' posts.
+    function valuing() external view returns (bool);
 }
