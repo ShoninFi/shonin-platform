@@ -480,6 +480,21 @@ library Valuations {
     /// A request nothing has priced for `fallbackAfter`. A redemption takes
     /// the cash's share now and holds units for the rest of what the stations
     /// hold; a deposit, whose money never left, takes it back.
+    /// Whether the home station could be valued now inside the band.
+    function _priceable(Layout storage s) private view returns (bool) {
+        IStation station = IStation(s.homeStation);
+        try station.outsideBand() returns (bool wide) {
+            if (wide) return false;
+        } catch {
+            return false;
+        }
+        try station.value() returns (uint256, uint256) {
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
     function takeProRata(uint256 requestId) external {
         Layout storage s = VaultStorage.layout();
         Request storage r = s.requests[requestId - 1];
@@ -497,6 +512,10 @@ library Valuations {
         // Not while a valuation could price it: the fallback is for when
         // nothing can, not a way round the fee.
         if (s.lastPriced != 0 && s.latest().time >= r.earliest) revert IVault.NotAllowed();
+        // A deposit goes back only when a valuation now would price nothing
+        // either: otherwise its owner could record one, see the price, and
+        // choose between buying and taking the money back.
+        if (deposit && s.otherChains.length == 0 && _priceable(s)) revert IVault.NotAllowed();
         r.done = true;
         s.passDone();
         if (deposit) {
