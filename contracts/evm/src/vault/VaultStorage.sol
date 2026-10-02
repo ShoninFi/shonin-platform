@@ -25,6 +25,10 @@ struct Post {
     /// The highest deposit-side figure any post gave: its mark plus how far
     /// its exit side sat above it.
     uint256 top;
+    /// Money its posts named on its way, and the part of it past the
+    /// transit timeout: the most any of its posts named.
+    uint256 moving;
+    uint256 overdue;
 }
 
 /// Everything a vault holds, in one place, so the vault and the libraries it
@@ -112,6 +116,9 @@ struct Layout {
     /// The open valuation's unit fraction and when it was recorded, so the
     /// posts that complete it are counted as of the same moment.
     uint256 openUnits;
+    /// When each valuation was opened: the home station's moment. A send to
+    /// home is on its way until it has landed by then.
+    mapping(uint256 => uint64) openedAt;
     /// When the last valuation waiting for posts was closed: the next opens
     /// a slot later at the soonest, so every cycle leaves room to leave.
     uint64 closedAt;

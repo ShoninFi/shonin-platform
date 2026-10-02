@@ -46,17 +46,18 @@ library Posts {
         (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, signature);
         if (err != ECDSA.RecoverError.NoError || !_blessed(s, signer, false)) revert IVault.NotBlessed();
 
-        (uint256 markValue, uint256 exitValue, bool late, uint256 inTransit) =
+        (uint256 markValue, uint256 exitValue, uint256 overdue, uint256 moving) =
             _counted(s, time, stationChain, post);
         // No figure a valuation can't add up and price: a post beyond any
         // dollar amount that could exist would leave the valuation open for
         // good, with every way out waiting behind it.
         if (markValue > MAX_POST || exitValue > MAX_POST) revert IVault.NotAllowed();
-        if (post.outsideBand || late) s.wide[index] = true;
+        if (post.outsideBand) s.wide[index] = true;
         uint256 extra;
         if (exitValue > markValue) (extra, exitValue) = (exitValue - markValue, markValue);
         Post storage p = s.posts[index][stationChain];
-        if (inTransit != 0) s.moving[index] = true;
+        if (moving > p.moving) p.moving = moving;
+        if (overdue > p.overdue) p.overdue = overdue;
         if (!p.posted) {
             p.posted = true;
             p.mark = markValue;
@@ -84,13 +85,24 @@ library Posts {
         if (v.time != time || v.status != ValuationStatus.Open) revert IVault.NotAllowed();
         if (block.timestamp <= time + s.timers.postDeadline) revert IVault.NotYet();
         s.closedAt = uint64(block.timestamp);
-        if (v.postsMissing != 0 || s.wide[index]) {
+        // Money on its way, and the part past its timeout, judged on every
+        // chain together: dust in all is neither waited for nor voids.
+        uint256[] storage chains = s.otherChains;
+        uint256 moving;
+        uint256 overdue;
+        for (uint256 i = 0; i < chains.length; i++) {
+            Post storage p = s.posts[index][chains[i]];
+            moving += p.moving;
+            overdue += p.overdue;
+        }
+        uint256 dust = s.minimumDeposit / 10;
+        if (moving > dust) s.moving[index] = true;
+        if (v.postsMissing != 0 || s.wide[index] || overdue > dust) {
             v.status = ValuationStatus.Void;
             emit IVault.ValuationVoided(index, time);
             return;
         }
         uint256 keep = WAD - s.openUnits;
-        uint256[] storage chains = s.otherChains;
         for (uint256 i = 0; i < chains.length; i++) {
             Post storage p = s.posts[index][chains[i]];
             v.gross += p.mark.mulDiv(keep, WAD);
@@ -120,16 +132,13 @@ library Posts {
         uint64 time,
         uint256 stationChain,
         StationPost calldata post
-    ) private view returns (uint256 markValue, uint256 exitValue, bool late, uint256 inTransit) {
+    ) private view returns (uint256 markValue, uint256 exitValue, uint256 overdue, uint256 moving) {
         uint256 timeout = s.timers.transitTimeout;
         // Everything on its way counts at par. Money still on its way past
         // the timeout has no price anyone can trust: counting it at zero
         // would sell shares cheap to whoever sees it is about to land, so
-        // such a valuation prices nothing. Dust in transit in all (a tenth
-        // of the minimum deposit or less, what anyone could set moving) is
-        // neither waited for nor voids.
-        uint256 moving;
-        uint256 overdue;
+        // such a valuation prices nothing (judged at the close, on every
+        // chain together).
         for (uint256 i = 0; i < post.transit.length; i++) {
             // A send after the post's moment is still in the station's value.
             if (post.transit[i].sentAt > post.asOf) revert IVault.NotAllowed();
@@ -149,9 +158,6 @@ library Posts {
             if (sent.sentAt + timeout < time) overdue += sent.amount;
             moving += sent.amount;
         }
-        uint256 dust = s.minimumDeposit / 10;
-        late = overdue > dust;
-        if (moving > dust) inTransit = moving;
         markValue = post.mark + moving;
         exitValue = post.exit + moving;
     }

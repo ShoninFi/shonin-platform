@@ -105,6 +105,7 @@ library Valuations {
         uint256 extra;
         if (exitValue > markValue) (extra, exitValue) = (exitValue - markValue, markValue);
         s.sentAtValuation[count] = s.sentTotal;
+        s.openedAt[count] = uint64(block.timestamp);
         uint256 units = s.liveUnits();
         if (units != 0) {
             // The stations' value belongs partly to the fallback's unit
