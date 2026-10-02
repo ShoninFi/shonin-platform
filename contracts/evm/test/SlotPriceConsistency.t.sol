@@ -80,13 +80,14 @@ contract SlotPriceConsistencyTest is ClaimBase {
 
         // Everything lands in the queue for one slot: bob's claim, queued on
         // the cash (the 110k covers him at the last valuation's exit price),
-        // carol's and alice's deposits, carol's redeem of half her shares,
-        // and the author's fill from their fee shares.
+        // carol's and alice's deposits, carol's redeem of a tenth of her
+        // shares, and the author's fill from their fee shares. The exits are
+        // paid from the cash the valuation saw, before the deposits join.
         vault.settleClaim(claimId);
         assertTrue(vault.claimAt(claimId).state == ClaimState.Queued, "bob's claim was not queued");
         requestDeposit(carol, 50_000e6);
         requestDeposit(alice, 20_000e6);
-        uint256 carolRedeems = carolShares / 2;
+        uint256 carolRedeems = carolShares / 10;
         vm.prank(carol);
         vault.requestRedeem(carolRedeems, carol);
         uint256 authorHad = vault.balanceOf(author);
@@ -107,7 +108,7 @@ contract SlotPriceConsistencyTest is ClaimBase {
         // the balance.
         (uint256 fillShares, uint256 filled) = tankFilled(vm.getRecordedLogs());
 
-        // Deposits: shares per net dollar. Carol kept half her old shares.
+        // Deposits: shares per net dollar. Carol kept nine tenths of her old shares.
         uint256 carolGot = vault.balanceOf(carol) - (carolShares - carolRedeems);
         uint256 aliceGot = vault.balanceOf(alice) - aliceBefore;
         uint256 carolPerDollar = carolGot * 1e18 / (50_000e6 - 50e6);

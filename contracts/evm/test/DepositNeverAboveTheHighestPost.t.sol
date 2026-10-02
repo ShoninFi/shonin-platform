@@ -33,7 +33,7 @@ contract DepositNeverAboveTheHighestPostTest is TwoChainVault {
         vm.warp(time + DEADLINE + 1);
         vault.closeValuation(time);
         Valuation memory v = latest();
-        assertEq(v.gross, v.cash + 11_000e6 + 1, "the highest mark");
+        assertEq(v.gross, v.cash + 10_000e6 + 1, "the lowest mark");
         assertEq(v.grossExit, v.cash + 9000e6 + 1, "the lowest exit");
 
         // What bob's deposit would buy at the highest deposit-side figure

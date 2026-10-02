@@ -203,6 +203,8 @@ library Claims {
             // Not while a priced valuation could settle it.
             Request storage r = s.requests[s.claimRequest[claimId] - 1];
             if (s.lastPriced != 0 && s.latest().time >= r.earliest) revert IVault.NotAllowed();
+            // Queued, it is a request like any other, and falls back as one.
+            if (block.timestamp < r.earliest + s.timers.fallbackAfter) revert IVault.NotYet();
             s.queuedClaims -= 1;
             r.done = true;
             s.passDone();

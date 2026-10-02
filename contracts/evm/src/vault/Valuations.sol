@@ -160,12 +160,12 @@ library Valuations {
         (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, signature);
         if (err != ECDSA.RecoverError.NoError || !_blessed(s, signer, false)) revert IVault.NotBlessed();
 
-        (uint256 markValue, uint256 exitValue) = _counted(s, time, stationChain, post);
+        (uint256 markValue, uint256 exitValue, bool late) = _counted(s, time, stationChain, post);
         // No figure a valuation can't add up and price: a post beyond any
         // dollar amount that could exist would leave the valuation open for
         // good, with every way out waiting behind it.
         if (markValue > MAX_POST || exitValue > MAX_POST) revert IVault.NotAllowed();
-        if (post.outsideBand) s.wide[index] = true;
+        if (post.outsideBand || late) s.wide[index] = true;
         uint256 extra;
         if (exitValue > markValue) (extra, exitValue) = (exitValue - markValue, markValue);
         Post storage p = s.posts[index][stationChain];
@@ -177,8 +177,10 @@ library Valuations {
             p.top = markValue + extra;
             v.postsMissing -= 1;
         } else {
+            // Deposits pay the highest figure (`top`); fees and payday are
+            // measured on the lowest mark, withdrawals on the lowest exit.
             if (markValue + extra > p.top) p.top = markValue + extra;
-            if (markValue > p.mark) p.mark = markValue;
+            if (markValue < p.mark) p.mark = markValue;
             if (exitValue < p.exit) p.exit = exitValue;
         }
         emit IVault.StationPosted(index, stationChain, signer, markValue, exitValue);
@@ -230,11 +232,15 @@ library Valuations {
         uint64 time,
         uint256 stationChain,
         StationPost calldata post
-    ) private view returns (uint256 markValue, uint256 exitValue) {
+    ) private view returns (uint256 markValue, uint256 exitValue, bool late) {
         uint256 timeout = s.timers.transitTimeout;
         uint256 moving;
+        // Money still on its way past the timeout has no price anyone can
+        // trust: counting it at zero would sell shares cheap to whoever sees
+        // it is about to land. Such a valuation prices nothing.
         for (uint256 i = 0; i < post.transit.length; i++) {
-            if (post.transit[i].sentAt + timeout >= time) moving += post.transit[i].amount;
+            if (post.transit[i].sentAt + timeout < time) late = true;
+            moving += post.transit[i].amount;
         }
         // Each home send the post names as still on its way, once: only one
         // made before the home station was valued (a later one is still in
@@ -246,7 +252,8 @@ library Valuations {
             if (index >= s.sendsAtOpen || (i != 0 && index <= inFlight[i - 1])) revert IVault.NotAllowed();
             Send memory sent = home.sendAt(index);
             if (sent.toChain != stationChain) revert IVault.NotAllowed();
-            if (sent.sentAt + timeout >= time) moving += sent.amount;
+            if (sent.sentAt + timeout < time) late = true;
+            moving += sent.amount;
         }
         markValue = post.mark + moving;
         exitValue = post.exit + moving;
@@ -361,40 +368,46 @@ library Valuations {
 
     function settle(uint256 max) external returns (uint256 settled) {
         Layout storage s = VaultStorage.layout();
+        if (s.lastPriced == 0) return 0;
+        // Every request still owed belongs to the last priced valuation: a
+        // new one can't open while any is. Its exits settle first and its
+        // deposits after, so each exit meets the pool exactly as the
+        // snapshot found it, and each deposit blends the mark into the pool
+        // the exits left.
+        uint256 index = s.lastPriced - 1;
+        uint64 time = s.valuations[index].time;
         uint256 i = s.requestCursor;
-        uint256 vi = s.valuationCursor;
+        uint256 j = s.exitCursor;
+        if (j < i) j = i;
         uint256 count = s.requests.length;
         // Every request passed counts toward `max`, done or not, so no number
         // of requests taken through the fallback can make one call too long.
         uint256 steps;
-        while (steps < max && i < count) {
+        while (steps < max && j < count) {
+            Request storage r = s.requests[j];
+            if (r.earliest > time) break;
             steps++;
-            Request storage r = s.requests[i];
-            if (r.done) {
-                i++;
-                continue;
+            if (!r.done && r.kind != RequestKind.Deposit) {
+                r.done = true;
+                _settleOne(s, r, j + 1, index);
+                settled++;
             }
-            // The first priced valuation at or after its earliest. A void one
-            // passes its requests on; an open one isn't decided yet.
-            bool found;
-            while (vi < s.valuations.length) {
-                Valuation storage candidate = s.valuations[vi];
-                if (candidate.status == ValuationStatus.Open) break;
-                if (candidate.status == ValuationStatus.Void || candidate.time < r.earliest) {
-                    vi++;
-                    continue;
+            j++;
+        }
+        s.exitCursor = j;
+        if (j == count || s.requests[j].earliest > time) {
+            while (steps < max && i < j) {
+                steps++;
+                Request storage r = s.requests[i];
+                if (!r.done) {
+                    r.done = true;
+                    _settleOne(s, r, i + 1, index);
+                    settled++;
                 }
-                found = true;
-                break;
+                i++;
             }
-            if (!found) break;
-            r.done = true;
-            _settleOne(s, r, i + 1, vi);
-            i++;
-            settled++;
         }
         s.requestCursor = i;
-        s.valuationCursor = vi;
     }
 
     function _settleOne(Layout storage s, Request storage r, uint256 id, uint256 index) private {

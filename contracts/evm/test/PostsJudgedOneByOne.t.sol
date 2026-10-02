@@ -35,8 +35,8 @@ contract PostsJudgedOneByOneTest is TwoChainVault {
         closeAfterDeadline(time);
 
         Valuation memory v = latest();
-        // The combined figure the vault priced on: highest mark, lowest exit.
-        assertEq(v.gross, v.cash + 10_100e6 + 1);
+        // The combined figure the vault priced on: lowest mark, lowest exit.
+        assertEq(v.gross, v.cash + 10_000e6 + 1);
         assertEq(v.grossExit, v.cash + 9950e6 + 1);
 
         // Alice's shares are worth about 105k and the cash is 200k, so the

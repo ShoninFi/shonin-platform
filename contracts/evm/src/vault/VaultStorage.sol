@@ -79,7 +79,8 @@ struct Layout {
     Request[] requests;
     uint256 requestCursor;
     Valuation[] valuations;
-    uint256 valuationCursor;
+    /// How far this valuation's exits are settled; its deposits follow.
+    uint256 exitCursor;
     /// The newest priced valuation, plus one; zero before any.
     uint256 lastPriced;
     Claim[] claims;

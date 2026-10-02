@@ -35,6 +35,10 @@ contract ConfigBoundsTest is Fixture {
         config = factory.config();
         config.exitBandBps = uint16(factory.MAX_EXIT_BAND_BPS() + 1);
         refused(config);
+
+        config = factory.config();
+        config.maxExitCost = factory.MAX_EXIT_COST() + 1;
+        refused(config);
     }
 
     function test_the_timers_and_amounts_must_make_sense() public {

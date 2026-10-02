@@ -195,15 +195,25 @@ contract CrossChainTest is Fixture {
         assertGt(vault.balanceOf(alice), 0);
     }
 
-    function test_disagreeing_posts_price_deposits_high_and_withdrawals_low() public {
+    function test_disagreeing_posts_price_deposits_high_and_fees_and_withdrawals_low() public {
+        requestDepositAs(vault, bob, 100_000e6);
+        uint256 mark = vault.mark();
         uint64 time = open();
         post(time, postOf(10_000e6, 9000e6), EXECUTOR_KEY);
         post(time, postOf(12_000e6, 8000e6), UNWINDER_KEY);
         post(time, postOf(11_000e6, 8500e6), EXECUTOR_KEY);
         closeAfterDeadline(time);
         Valuation memory v = latest();
-        assertEq(v.gross, v.cash + 12_000e6 + 1, "deposits were not priced at the highest mark");
+        assertEq(v.gross, v.cash + 10_000e6 + 1, "fees were not measured on the lowest mark");
         assertEq(v.grossExit, v.cash + 8000e6 + 1, "withdrawals were not priced at the lowest exit");
+        // Bob's deposit pays the highest mark any post carried.
+        uint256 top = v.cash + 12_000e6 + 1;
+        uint256 basis = (mark * v.supply + 1e30 - 1) / 1e30;
+        uint256 feeAtTop = top > basis ? (top - basis) * 1500 / 10_000 : 0;
+        vault.settle(type(uint256).max);
+        uint256 atHighest = (100_000e6 - 100e6) * v.supply / (top - feeAtTop);
+        assertLe(vault.balanceOf(bob), atHighest, "a deposit bought below the highest mark");
+        assertApproxEqRel(vault.balanceOf(bob), atHighest, 1e12);
     }
 
     function test_a_valuation_nobody_posted_for_is_void_and_its_requests_roll_on() public {
@@ -257,17 +267,25 @@ contract CrossChainTest is Fixture {
 
     // Transit ---------------------------------------------------------------
 
-    function test_money_in_transit_counts_at_par_until_it_times_out() public {
+    function test_money_in_transit_counts_at_par_and_late_money_prices_nothing() public {
         uint64 time = open();
         StationPost memory p = postOf(0, 0);
+        p.transit = new Transit[](1);
+        p.transit[0] = Transit({amount: 5000e6, sentAt: time - 30 minutes});
+        post(time, p, EXECUTOR_KEY);
+        closeAfterDeadline(time);
+        Valuation memory v = latest();
+        assertEq(v.gross, v.cash + 5000e6 + 1, "a send younger than the timeout counts at par");
+        assertEq(v.grossExit, v.gross);
+
+        // A send older than the timeout has no price: the valuation is void.
+        time = open();
         p.transit = new Transit[](2);
         p.transit[0] = Transit({amount: 5000e6, sentAt: time - 30 minutes});
         p.transit[1] = Transit({amount: 7000e6, sentAt: time - 2 hours});
         post(time, p, EXECUTOR_KEY);
         closeAfterDeadline(time);
-        Valuation memory v = latest();
-        assertEq(v.gross, v.cash + 5000e6 + 1, "only the send younger than the timeout counts");
-        assertEq(v.grossExit, v.gross);
+        assertTrue(latest().status == ValuationStatus.Void, "a valuation counting late money was priced");
     }
 
     function inFlight(uint64 a) internal pure returns (uint64[] memory list) {

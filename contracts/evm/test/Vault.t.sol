@@ -176,7 +176,11 @@ contract VaultTest is Fixture {
         vm.warp(vm.getBlockTimestamp() + SLOT);
         vm.expectRevert(IVault.Unsettled.selector);
         vault.recordValuation();
-        // Anyone can settle them, and then it can.
+        // Anyone can settle them, and then it can. A deposit is passed twice:
+        // once while the slot's exits settle, once to settle it.
+        vault.settle(1);
+        vm.expectRevert(IVault.Unsettled.selector);
+        vault.recordValuation();
         vault.settle(1);
         vault.recordValuation();
     }

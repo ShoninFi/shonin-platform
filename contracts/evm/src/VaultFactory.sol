@@ -33,6 +33,9 @@ contract VaultFactory is IVaultFactory {
     uint256 public constant MAX_PROFIT_BPS = 5000;
     uint256 public constant MAX_TRANSACTION_BPS = 100;
     uint256 public constant MAX_EXIT_BAND_BPS = 1000;
+    /// The most an unwinder may charge one claim for bringing it home: a
+    /// thousand of the vault's six-decimal dollar.
+    uint256 public constant MAX_EXIT_COST = 1000e6;
 
     IERC20 public immutable asset;
     IAttestationRegistry public immutable attestation;
@@ -274,7 +277,7 @@ contract VaultFactory is IVaultFactory {
                 || config_.timers.slotInterval == 0 || config_.timers.slotWindow >= config_.timers.slotInterval
                 || config_.timers.slotLead <= config_.timers.slotWindow || config_.timers.freezeAfter < 1 days
                 || config_.timers.fallbackAfter < 1 days
-                || config_.timers.postDeadline <= config_.timers.slotWindow
+                || config_.timers.postDeadline <= config_.timers.slotWindow || config_.maxExitCost > MAX_EXIT_COST
         ) revert OutOfRange();
     }
 }
