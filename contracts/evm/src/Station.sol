@@ -119,7 +119,7 @@ contract Station is IStation, ReentrancyGuardTransient {
             // A key still blessed must be withdrawn; one whose blessing has
             // lapsed is withdrawn if the driver can, and replaced either way.
             if (_isKey(current, ImageKind.Executor)) {
-                _revokeStrict(driver, current);
+                _revokeStrict(driver, current, false);
                 emit KeyRevoked(driver, current);
             } else if (_revokeBestEffort(driver, current)) {
                 emit KeyRevoked(driver, current);
@@ -217,8 +217,12 @@ contract Station is IStation, ReentrancyGuardTransient {
 
     function unwind(uint256 fraction) external nonReentrant returns (uint256 sentHome, bool blocked) {
         if (fraction == 0 || fraction > WAD) revert NotAllowed();
-        bool permitted = (isHome() && msg.sender == _spec.vault) || _isKey(msg.sender, ImageKind.Executor)
-            || _isKey(msg.sender, ImageKind.Unwinder) || (stopped && fraction == WAD);
+        // Once stopped, a fraction is closed only for the vault's own claims
+        // and serves, which wait for settlement themselves; the rest is a
+        // full unwind, which `_unwindStopped` holds until settlement too.
+        bool permitted = (isHome() && msg.sender == _spec.vault)
+            || (!stopped && (_isKey(msg.sender, ImageKind.Executor) || _isKey(msg.sender, ImageKind.Unwinder)))
+            || (stopped && fraction == WAD);
         if (!permitted) revert NotAllowed();
         if (stopped && fraction == WAD) return _unwindStopped(_spec.drivers);
 
@@ -443,17 +447,17 @@ contract Station is IStation, ReentrancyGuardTransient {
     }
 
     function _revoke(bytes32 driver, address key) private {
-        _revokeStrict(driver, key);
+        _revokeStrict(driver, key, false);
         if (_approvedKey[driver] == key) delete _approvedKey[driver];
         emit KeyRevoked(driver, key);
     }
 
     /// Withdraw `key` at the venue through the pinned driver; every call
     /// must go through.
-    function _revokeStrict(bytes32 driver, address key) private {
+    function _revokeStrict(bytes32 driver, address key, bool capped) private {
         IDriver implementation = IDriver(_pinned(driver));
         Call[] memory calls = implementation.revokeKey(address(this), key);
-        if (calls.length > MAX_REVOKE_CALLS) revert BadCall();
+        if (capped && calls.length > MAX_REVOKE_CALLS) revert BadCall();
         _run(calls, implementation.targets());
     }
 
@@ -469,7 +473,7 @@ contract Station is IStation, ReentrancyGuardTransient {
 
     function revokeOnce(bytes32 driver, address key) external {
         if (msg.sender != address(this)) revert NotAllowed();
-        _revokeStrict(driver, key);
+        _revokeStrict(driver, key, true);
     }
 
     function _send(bytes32 name, uint256 toChain, uint256 amount, bytes memory extra) private {

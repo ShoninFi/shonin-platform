@@ -532,8 +532,10 @@ contract StationExternalFunctionsTest is ClaimBase, Calls {
         else fraction = bound(fraction, 0, 1.1e18);
         Books memory b = books(caller);
         uint256 cash = vault.cash();
-        bool permitted =
-            caller == address(vault) || isExecutor(caller) || (stage == STOPPED && fraction == 1e18);
+        // Once stopped, a fraction is closed only for the vault itself; the
+        // rest is a full unwind, open to anyone.
+        bool permitted = caller == address(vault) || (stage != STOPPED && isExecutor(caller))
+            || (stage == STOPPED && fraction == 1e18);
         bytes4 want;
         if (fraction == 0 || fraction > 1e18 || !permitted) want = Station.NotAllowed.selector;
         (bool ok, bytes4 err) = callAs(caller, address(station), abi.encodeCall(Station.unwind, (fraction)));

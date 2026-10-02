@@ -103,8 +103,9 @@ library Valuations {
         (uint256 markValue, uint256 exitValue) = IStation(s.homeStation).value();
         if (IStation(s.homeStation).outsideBand()) s.wide[count] = true;
         // An exit side above the mark is what the holdings could be sold
-        // for: a deposit pays it on top, so it can't buy below the pool's
-        // worth; but nobody is paid it, and no fee is charged on it.
+        // for: a deposit pays it on top, net of the profit fee a sale there
+        // would owe, so it can't buy below the pool's realisable worth; but
+        // nobody is paid it, and no withdrawal or fee is measured on it.
         uint256 extra;
         if (exitValue > markValue) (extra, exitValue) = (exitValue - markValue, markValue);
         s.sentAtValuation[count] = s.sentTotal;
@@ -624,7 +625,14 @@ library Valuations {
         if (fraction == 0) fraction = 1;
         (, uint256 exitBefore) = IStation(s.homeStation).value();
         s.serving = holder;
-        (uint256 home, bool blocked) = IStation(s.homeStation).unwind(fraction);
+        // A close that fails (one that would bring the holder nothing, say)
+        // brings nothing home; whether that clears the units as dust or
+        // leaves them waiting is judged below.
+        uint256 home;
+        bool blocked;
+        try IStation(s.homeStation).unwind(fraction) returns (uint256 sent, bool outside) {
+            (home, blocked) = (sent, outside);
+        } catch {}
         s.serving = address(0);
         // Units are only burned for what came home for them: nothing home
         // from a station that held something, or from a vault whose stations
