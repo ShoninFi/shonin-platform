@@ -18,6 +18,19 @@ remappings = [
     "openzeppelin/=lib/openzeppelin-contracts/contracts/",
 ]
 
+# What `forge test` (and so CI) runs: every fuzz test 256 times, which keeps
+# running the suite to seconds; compiling it is most of CI's time. A test that
+# needs another number says so with a `/// forge-config: default.fuzz.runs`
+# line.
+[profile.default.fuzz]
+runs = 256
+
+# A longer soak, run by hand: `FOUNDRY_PROFILE=deep forge test`. Fuzz tests
+# run this many times; the invariant suite and the bank run carry their own
+# `deep.` settings beside their `default.` ones.
+[profile.deep.fuzz]
+runs = 10_000
+
 [fmt]
 line_length = 110
 tab_width = 4

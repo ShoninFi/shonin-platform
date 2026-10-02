@@ -237,14 +237,19 @@ contract LocalVenue is ILocalVenue {
         int256 nextValue = _valueAt(master, PriceKind.Mark)
             + (order.isBuy ? atMark - signedNotional : signedNotional - atMark);
 
-        if (!m.isPerp && (nextSize < 0 || nextCash < 0)) {
+        // Spot can't be borrowed: no buying into debt, no selling what isn't
+        // held. A sale always raises the cash, so it is never refused for it.
+        if (!m.isPerp && (nextSize < 0 || (order.isBuy && nextCash < 0))) {
             return _reject(master, order.market, "spot cannot be borrowed against");
         }
-        if (nextValue < 0) {
+        // An order that only reduces a position is always taken, as venues
+        // take reduce-only orders: closing can't be held up by the margin a
+        // position needed to be opened.
+        if (!order.reduceOnly && nextValue < 0) {
             return _reject(master, order.market, "would leave the account underwater");
         }
         if (
-            m.isPerp
+            m.isPerp && !order.reduceOnly
                 && uint256(nextValue) * BPS < _grossPerpNotionalWith(master, order.market, nextSize) * marginBps
         ) {
             return _reject(master, order.market, "not enough margin");

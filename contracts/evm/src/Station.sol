@@ -199,7 +199,12 @@ contract Station is IStation, ReentrancyGuardTransient {
             // What the fraction is worth at exit prices before the close:
             // exactly what selling it realises, and all that comes home for
             // it. The rest stays with whoever still owns it.
-            (, uint256 exitBefore) = drivers[i].valueOf(address(this));
+            (uint256 markBefore, uint256 exitBefore) = drivers[i].valueOf(address(this));
+            // An account worth something at the mark and nothing at exit
+            // prices is underwater at the bid: selling a fraction of it would
+            // bring the leaver nothing and leave the loss with everyone else.
+            // Only a full unwind, which everyone shares, may sell it.
+            if (exitBefore == 0 && markBefore != 0 && fraction < WAD) revert ShortSweep();
             freed[i] = exitBefore.mulDiv(fraction, WAD, Math.Rounding.Floor);
             bool outside;
             (closes[i], outside) = drivers[i].close(address(this), fraction, _spec.exitBandBps);

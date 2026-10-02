@@ -54,7 +54,7 @@ flowchart TB
 
 An agent never talks to a venue directly. It builds its orders with the driver's typed library from the SDK, hands them over, and the driver checks and signs them inside the attested machine.
 
-**A driver never holds money.** The station owns the vault's account at the venue, and makes every call there itself: the driver only prepares each call and checks it. Whatever a driver says, the station still keeps its own rules, so money only ever goes to the vault's own addresses: it only calls the targets the driver declared, and never the vault, the station itself, its factory or the registry, whatever the driver lists. A driver with a bug could prepare a bad call, but it can't move money by itself, and it can never reach the vault's cash.
+**A driver never holds money.** The station owns the vault's account at the venue, and makes every call there itself: the driver only prepares each call and checks it. Whatever a driver says, the station still keeps its own rules: it only calls the targets the driver declared, and never the vault, the station itself, its factory or the registry, whatever the driver lists. A driver with a bug could prepare a bad call, but it can't move money by itself or call the vault. A driver also says what the station's holdings are worth, and the vault prices every deposit and withdrawal on it, so a driver is trusted the way the code that runs the vault is: it changes only after the same public wait, and anyone who doesn't trust a change can leave before it applies.
 
 **One driver serves everyone.** Each venue has one driver on its chain, shared by every station there. A fixed version reaches running vaults the same way a fix to a machine image does, after the same public wait, so nothing needs redeploying.
 
