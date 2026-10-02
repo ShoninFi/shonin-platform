@@ -13,8 +13,10 @@ import {StdInvariant} from "forge-std/StdInvariant.sol";
 /// valuations, partial settles, the executor's pulls, pushes and trades,
 /// market moves inside and outside the band, claims, both fallbacks, units,
 /// the tank and its bills, allowances, the idle floor, retiring, freezing,
-/// killing, stopping, closing, paying out a closed vault, paydays, and every
-/// call the admin key can make.
+/// killing, stopping, closing, paying out a closed vault, paydays, every
+/// call the admin key can make, and the admin acting over time: bringing in
+/// its own checker, images, project, drivers and bridges through the
+/// timelock and using keys it blesses for itself.
 ///
 /// CI runs a short campaign per invariant, set below. Locally each was also
 /// run at 256 runs of 500 calls, by raising the two settings below.
@@ -54,7 +56,7 @@ contract VaultInvariantsTest is Fixture {
         );
         handler.bootstrap();
 
-        bytes4[] memory actions = new bytes4[](14);
+        bytes4[] memory actions = new bytes4[](15);
         actions[0] = VaultHandler.requestDeposit.selector;
         actions[1] = VaultHandler.requestRedeem.selector;
         actions[2] = VaultHandler.recordValuation.selector;
@@ -69,6 +71,7 @@ contract VaultInvariantsTest is Fixture {
         actions[11] = VaultHandler.lifecycleAct.selector;
         actions[12] = VaultHandler.closedAct.selector;
         actions[13] = VaultHandler.experimentAct.selector;
+        actions[14] = VaultHandler.adminPlan.selector;
         targetContract(address(handler));
         targetSelector(StdInvariant.FuzzSelector({addr: address(handler), selectors: actions}));
     }
@@ -146,15 +149,27 @@ contract VaultInvariantsTest is Fixture {
 
     // 7. Money only moves between the vault's own accounts ----------------------
 
-    /// Dollars leave the vault only for its station or someone it may pay
-    /// (a depositor, the author, the platform), the station's only for the
-    /// vault or its venue account, the venue's only for the station.
+    /// Every dollar that leaves the vault is a payment one of its events
+    /// announces (a withdrawal, a claim, a deposit sent back, the fallback,
+    /// units collected, a payout held for a receiver who refused it and
+    /// collected later, the tank to the author, a bill to the platform, a
+    /// claim's fee to the author and the platform, a send to the station),
+    /// made to whom the event names and of what it names, and every payment
+    /// an event announces was made. Whom it names is who asked, by the
+    /// handler's own record of each request and claim; what it names is what
+    /// the shares come to at the price that applies, recomputed from the pool
+    /// as the handler read it. The station's dollars go only to the vault or
+    /// its venue account, the venue's only to the station, and what the
+    /// station sent home is what the vault booked.
     function invariant_7_money_only_moves_between_the_vaults_own_accounts() public view {
         assertEq(handler.moneyBreaks(), 0, handler.lastBreak());
     }
 
     /// No pull by the home station leaves the cash under the idle floor in
-    /// force, measured on the value at the last valuation.
+    /// force, measured on the pool as the handler reads it, not as the vault
+    /// reckons it: the cash, the station as the handler read it just before
+    /// the last valuation, and what went out to the station and came back
+    /// since. Each valuation must record the pool the handler read.
     function invariant_7_the_home_station_never_pulls_below_the_idle_floor() public view {
         assertEq(handler.floorBreaks(), 0, handler.lastBreak());
     }
@@ -179,6 +194,23 @@ contract VaultInvariantsTest is Fixture {
     function invariant_12_the_admin_key_moves_no_money() public view {
         assertEq(handler.adminBreaks(), 0, handler.lastBreak());
         assertEq(handler.graceBreaks(), 0, handler.lastBreak());
+    }
+
+    /// Over time the admin can bring in an attestation checker, images and a
+    /// project of its own, a driver of its own under the vault's driver name,
+    /// a taking driver under another name and a bridge that keeps what it
+    /// carries, wait out the timelock, bless keys it holds as the vault's
+    /// executor and unwinder and use them as those keys can. Across any such
+    /// sequence nothing the admin controls ever receives a dollar, and every
+    /// dollar that leaves the vault is still a payment owed to a depositor,
+    /// or to the author and the platform as their fees, tank and running
+    /// costs (the running costs within the author's allowances, as the
+    /// tank's own invariant holds).
+    function invariant_12_over_time_nothing_the_admin_controls_is_paid() public view {
+        assertEq(handler.adminHoldings(), 0, "something the admin controls holds dollars");
+        assertEq(handler.adminBreaks(), 0, handler.lastBreak());
+        assertEq(handler.moneyBreaks(), 0, handler.lastBreak());
+        assertEq(handler.tankBreaks(), 0, handler.lastBreak());
     }
 
     /// What the walk reached, with `-vv`.

@@ -2,6 +2,7 @@
 pragma solidity ^0.8.30;
 
 import {AttestationRegistry} from "../../src/AttestationRegistry.sol";
+import {DevAttestationVerifier} from "../../src/DevAttestationVerifier.sol";
 import {LocalDriver} from "../../src/LocalDriver.sol";
 import {LocalUsd} from "../../src/LocalUsd.sol";
 import {LocalVenue} from "../../src/LocalVenue.sol";
@@ -10,6 +11,7 @@ import {Station} from "../../src/Station.sol";
 import {Vault} from "../../src/Vault.sol";
 import {VaultFactory} from "../../src/VaultFactory.sol";
 import {ImageKind} from "../../src/interfaces/IAttestationRegistry.sol";
+import {Call, Custody, ExitPath, IBridge, IDriver, ValuationKind} from "../../src/interfaces/IDriver.sol";
 import {ILocalVenue, Market, OrderRequest} from "../../src/interfaces/ILocalVenue.sol";
 import {Allowances, UnitPrices} from "../../src/interfaces/IPrices.sol";
 import {
@@ -25,7 +27,121 @@ import {
 import {VaultConfig} from "../../src/interfaces/IVaultFactory.sol";
 import {Test} from "forge-std/Test.sol";
 import {Vm} from "forge-std/Vm.sol";
+import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
 import {Math} from "openzeppelin/utils/math/Math.sol";
+
+/// A bridge the admin wrote: whatever a station gives it to send goes to the
+/// admin instead.
+contract KeepingBridge is IBridge {
+    IERC20 public immutable asset;
+    address public immutable keeper;
+
+    constructor(IERC20 asset_, address keeper_) {
+        asset = asset_;
+        keeper = keeper_;
+    }
+
+    function name() external pure returns (bytes32) {
+        return "keeping-bridge";
+    }
+
+    function targets() public view returns (address[] memory list) {
+        list = new address[](1);
+        list[0] = address(this);
+    }
+
+    function send(
+        address,
+        uint256,
+        address,
+        uint256 amount,
+        bytes calldata
+    ) external view returns (Call[] memory calls) {
+        calls = new Call[](2);
+        calls[0] = Call(address(asset), 0, abi.encodeCall(IERC20.approve, (address(this), amount)));
+        calls[1] = Call(address(this), 0, abi.encodeCall(this.take, (amount)));
+    }
+
+    /// Take from whoever approved it.
+    function take(uint256 amount) external {
+        asset.transferFrom(msg.sender, keeper, amount);
+    }
+}
+
+/// A driver the admin wrote: every call it prepares hands the station's
+/// dollars to the admin.
+contract TakingDriver is IDriver {
+    IERC20 public immutable asset;
+    address public immutable keeper;
+
+    constructor(IERC20 asset_, address keeper_) {
+        asset = asset_;
+        keeper = keeper_;
+    }
+
+    function name() external pure returns (bytes32) {
+        return "taking";
+    }
+
+    function targets() public view returns (address[] memory list) {
+        list = new address[](1);
+        list[0] = address(this);
+    }
+
+    function restricted() external pure returns (bytes32[] memory) {
+        return new bytes32[](0);
+    }
+
+    function custody() external pure returns (Custody) {
+        return Custody.Venue;
+    }
+
+    function exitPath() external pure returns (ExitPath) {
+        return ExitPath.Contract;
+    }
+
+    function valuation() external pure returns (ValuationKind) {
+        return ValuationKind.OnChain;
+    }
+
+    function approveKey(address station, address, uint64) external view returns (Call[] memory) {
+        return _takeAll(station);
+    }
+
+    function revokeKey(address station, address) external view returns (Call[] memory) {
+        return _takeAll(station);
+    }
+
+    function deposit(address station, uint256) external view returns (Call[] memory) {
+        return _takeAll(station);
+    }
+
+    function withdraw(address station, uint256) external view returns (Call[] memory) {
+        return _takeAll(station);
+    }
+
+    function close(address station, uint256, uint16) external view returns (Call[] memory, bool) {
+        return (_takeAll(station), false);
+    }
+
+    function sweep(address station, uint256) external view returns (Call[] memory) {
+        return _takeAll(station);
+    }
+
+    function valueOf(address) external pure returns (uint256, uint256) {
+        return (0, 0);
+    }
+
+    function take(address from) external {
+        asset.transferFrom(from, keeper, asset.balanceOf(from));
+    }
+
+    function _takeAll(address station) private view returns (Call[] memory calls) {
+        calls = new Call[](2);
+        calls[0] = Call(address(asset), 0, abi.encodeCall(IERC20.approve, (address(this), type(uint256).max)));
+        calls[1] = Call(address(this), 0, abi.encodeCall(this.take, (station)));
+    }
+}
 
 /// What the handler drives: one single-chain vault and the platform around it.
 struct Deps {
@@ -100,6 +216,31 @@ contract VaultHandler is Test {
     address internal newcomer;
     address[] internal actors;
     mapping(address => uint256) internal keyOf;
+    /// Who trades for the station: the executor, or a key the admin holds.
+    address internal trader;
+
+    // What the admin can bring in over time ------------------------------------
+
+    /// Keys the admin holds: one from an executor image of its own, one from
+    /// an unwinder image of its own, and one passed off as the platform's
+    /// executor by a checker of its own.
+    address public adminKey;
+    address public adminUnwinder;
+    address public adminImposter;
+    /// The key behind the admin's own attestation checker.
+    uint256 internal adminAttestorKey;
+    DevAttestationVerifier public adminVerifier;
+    bytes32 internal constant ADMIN_IMAGE = keccak256("the admin's executor image");
+    bytes32 internal constant ADMIN_UNWINDER_IMAGE = keccak256("the admin's unwinder image");
+    bytes32 internal constant ADMIN_PROJECT = keccak256("the admin's project");
+    /// A working driver the admin deploys and puts in under the vault's
+    /// driver name, a taking one, and a bridge that keeps what it is given.
+    LocalDriver internal adminDriver;
+    TakingDriver internal takingDriver;
+    KeepingBridge internal keepingBridge;
+    /// Every address the admin controls: none may ever receive a dollar.
+    address[] public adminAddresses;
+    mapping(address => bool) internal adminOwns;
 
     /// The venue's price, which every move starts from.
     uint256 public price = START_PRICE;
@@ -137,14 +278,57 @@ contract VaultHandler is Test {
     uint16 internal floorBps;
     uint16 internal pendingFloorBps;
     uint64 internal pendingFloorAt;
-    /// What the stations held at the last priced valuation and what was
-    /// pulled since it.
+    /// The shares' part of the station at the last priced valuation, as the
+    /// handler read the station itself just before the vault did, and the
+    /// dollars that went from the vault to the station and back since, as
+    /// the dollar's own transfers tell it.
     uint256 internal stationsAtValuation;
-    uint256 internal sentSince;
+    uint256 internal pulledSince;
+    uint256 internal pushedSince;
     uint256 internal lastPricedIndex;
     uint256 internal lastMark;
     /// Dollars that left the vault, its station or the venue in this step.
     uint256 internal outflows;
+
+    /// The pool as the handler measured it just before a valuation: what the
+    /// vault must record.
+    struct Measured {
+        bool set;
+        uint256 gross;
+        uint256 grossExit;
+        uint256 stations;
+    }
+
+    Measured internal measured;
+
+    /// Every request as it was asked for: who asked, what for and how much,
+    /// from the handler's own calls, never from the vault's records. A claim's
+    /// owner and shares as it was booked, and the shares each holder has
+    /// asked to redeem and not yet been paid, booked or sent to the fallback
+    /// for.
+    mapping(uint256 => address) internal askedBy;
+    mapping(uint256 => uint256) internal askedFor;
+    mapping(uint256 => RequestKind) internal askedKind;
+    mapping(uint256 => uint256) internal claimOfRequest;
+    mapping(uint256 => address) internal claimOwner;
+    mapping(uint256 => uint256) internal claimShares;
+    mapping(address => uint256) internal redeeming;
+
+    /// One payment out of the vault: to whom and how much.
+    struct Payment {
+        address to;
+        uint256 amount;
+    }
+
+    /// The payments this step's events say the vault made, and the ones the
+    /// step itself expects that no event announces (collecting a held
+    /// payout).
+    Payment[] internal owedOut;
+    /// Who the step pays and what for, when the vault's event names nobody
+    /// the handler can check against a request.
+    address internal stepPayee;
+    uint256 internal stepRequest;
+    uint256 internal stepClaimable;
 
     // Breaks, by invariant ------------------------------------------------------
 
@@ -180,6 +364,7 @@ contract VaultHandler is Test {
         uint256 tank;
         uint256 adminUsd;
         uint256 reserve;
+        VaultState state;
     }
 
     Before internal before;
@@ -218,6 +403,35 @@ contract VaultHandler is Test {
         uint256 newcomerKey;
         (newcomer, newcomerKey) = makeAddrAndKey("newcomer");
         keyOf[newcomer] = newcomerKey;
+        trader = executor;
+
+        uint256 secret;
+        (adminKey, secret) = makeAddrAndKey("the admin's executor key");
+        keyOf[adminKey] = secret;
+        (adminUnwinder, secret) = makeAddrAndKey("the admin's unwinder key");
+        keyOf[adminUnwinder] = secret;
+        (adminImposter, secret) = makeAddrAndKey("the admin's imposter key");
+        keyOf[adminImposter] = secret;
+        address adminAttestor;
+        (adminAttestor, adminAttestorKey) = makeAddrAndKey("the admin's attestor");
+        adminVerifier = new DevAttestationVerifier(adminAttestor);
+        adminDriver = new LocalDriver(venue, IERC20(address(usd)));
+        takingDriver = new TakingDriver(IERC20(address(usd)), admin);
+        keepingBridge = new KeepingBridge(IERC20(address(usd)), admin);
+        address[8] memory owned = [
+            admin,
+            adminKey,
+            adminUnwinder,
+            adminImposter,
+            adminAttestor,
+            address(adminVerifier),
+            address(takingDriver),
+            address(keepingBridge)
+        ];
+        for (uint256 i = 0; i < owned.length; i++) {
+            adminAddresses.push(owned[i]);
+            adminOwns[owned[i]] = true;
+        }
 
         _entitle(author);
         _entitle(platform);
@@ -243,7 +457,7 @@ contract VaultHandler is Test {
         vm.prank(executor);
         station.approveKey("local", executor);
         vm.warp(_nextSlot());
-        vault.recordValuation();
+        _record();
         vault.settle(type(uint256).max);
         _end(true, "bootstrap");
     }
@@ -381,8 +595,9 @@ contract VaultHandler is Test {
         usd.mint(a, amount);
         vm.startPrank(a);
         usd.approve(address(vault), amount);
-        try vault.requestDeposit(amount, receiver, statement) {
+        try vault.requestDeposit(amount, receiver, statement) returns (uint256 id) {
             _entitle(a);
+            _noteAsk(id, receiver, amount, RequestKind.Deposit);
             _hit("requestDeposit");
         } catch {}
         vm.stopPrank();
@@ -395,7 +610,9 @@ contract VaultHandler is Test {
         if (shares == 0) return;
         _begin();
         vm.prank(a);
-        try vault.requestRedeem(shares, a) {
+        try vault.requestRedeem(shares, a) returns (uint256 id) {
+            _noteAsk(id, a, shares, RequestKind.Redeem);
+            redeeming[a] += shares;
             _hit("requestRedeem");
         } catch {}
         _end(true, "requestRedeem");
@@ -411,9 +628,7 @@ contract VaultHandler is Test {
         if (late % 3 != 0) try vault.settle(type(uint256).max) {} catch {}
         // Mostly inside the slot's window, sometimes just past it.
         vm.warp(_nextSlot() + (late % 10 < 8 ? late % 4 : 4));
-        try vault.recordValuation() {
-            _hit("recordValuation");
-        } catch {}
+        if (_record()) _hit("recordValuation");
         _end(calm || late % 3 == 0, "recordValuation");
     }
 
@@ -443,7 +658,9 @@ contract VaultHandler is Test {
                 vm.prank(keeper);
                 try vault.settleClaim(id) {
                     _hit("settleClaimRefusing");
-                } catch {}
+                } catch {
+                    _dropReverted();
+                }
             }
         } else {
             try vault.settle(type(uint256).max) {
@@ -459,10 +676,13 @@ contract VaultHandler is Test {
 
     function _collectHeld(uint256 who) internal {
         address a = who % 3 == 0 ? platform : _actor(who);
-        if (vault.heldFor(a) == 0) return;
+        uint256 held_ = vault.heldFor(a);
+        if (held_ == 0) return;
         _begin();
         vm.prank(a);
         try vault.collectHeld() {
+            // No event announces it: what was held for them, to them.
+            _expect(a, held_);
             _hit("collectHeld");
         } catch {}
         _end(true, "collectHeld");
@@ -540,28 +760,47 @@ contract VaultHandler is Test {
         // priced valuation waits.
         try vault.settle(type(uint256).max) {} catch {}
         uint256 amount = vault.cash() * _bound(pct, 1, 100) / 100;
-        uint256 cashBefore = vault.cash();
-        uint256 value = cashBefore + sentSince + 1 + stationsAtValuation;
-        uint256 floor = value.mulDiv(_floorNow(), BPS, Math.Rounding.Ceil);
-        vm.prank(executor);
+        uint256 floor = _floorFor(vault.cash());
+        vm.prank(trader);
         try station.pull(amount) {
-            _hit("pull");
+            _hit(trader == executor ? bytes32("pull") : bytes32("pull by an admin's key"));
+            if (floor != 0 && vault.cash() < floor + floor / 50) _hit("~pull near the floor");
             // The home station can't pull cash below the idle floor.
             if (vault.cash() < floor) {
                 floorBreaks++;
-                _break(string.concat("a pull left cash under the floor: ", vm.toString(vault.cash())));
+                _break(
+                    string.concat(
+                        "a pull left cash of ",
+                        vm.toString(vault.cash()),
+                        " under a floor of ",
+                        vm.toString(floor)
+                    )
+                );
             }
         } catch {}
         _end(calm, "pull");
+    }
+
+    /// The idle floor in force, measured on the pool's value as the handler
+    /// reads it, not as the vault reckons it: the cash now, the shares' part
+    /// of the station as the handler read it at the last valuation, and the
+    /// dollars that went out to the station since less those that came back.
+    /// Money sent home is taken off even when it was never counted at the
+    /// station (a donation, say), so this is never above the value the vault
+    /// should use, and a pull that leaves the cash under it took too much.
+    function _floorFor(uint256 cash) internal view returns (uint256) {
+        uint256 value = cash + stationsAtValuation + pulledSince + 1;
+        value = value > pushedSince ? value - pushedSince : 0;
+        return value.mulDiv(_floorNow(), BPS, Math.Rounding.Ceil);
     }
 
     function _push(uint256 pct) internal {
         uint256 amount = usd.balanceOf(address(station)) * _bound(pct, 1, 100) / 100;
         if (amount == 0) return;
         _begin();
-        vm.prank(executor);
+        vm.prank(trader);
         try station.push(amount) {
-            _hit("push");
+            _hit(trader == executor ? bytes32("push") : bytes32("push by an admin's key"));
         } catch {}
         _end(true, "push");
     }
@@ -573,9 +812,9 @@ contract VaultHandler is Test {
         // hole: that is the strategy's loss, not anyone's move.
         bool solvent = _venueSolvent();
         _begin();
-        vm.prank(executor);
+        vm.prank(trader);
         try station.deposit("local", amount) {
-            _hit("venueDeposit");
+            _hit(trader == executor ? bytes32("venueDeposit") : bytes32("venueDeposit by an admin's key"));
         } catch {}
         _end(solvent, "venueDeposit");
     }
@@ -586,9 +825,9 @@ contract VaultHandler is Test {
         uint256 amount = uint256(cash) * _bound(pct, 1, 100) / 100;
         if (amount == 0) return;
         _begin();
-        vm.prank(executor);
+        vm.prank(trader);
         try station.withdraw("local", amount) {
-            _hit("venueWithdraw");
+            _hit(trader == executor ? bytes32("venueWithdraw") : bytes32("venueWithdraw by an admin's key"));
         } catch {}
         _end(true, "venueWithdraw");
     }
@@ -611,10 +850,10 @@ contract VaultHandler is Test {
             limitPrice: isBuy ? type(uint256).max : 0,
             reduceOnly: reduceOnly
         });
-        vm.prank(executor);
+        vm.prank(trader);
         try venue.place(address(station), orders) {
             still = false;
-            _hit("trade");
+            _hit(trader == executor ? bytes32("trade") : bytes32("trade by an admin's key"));
         } catch {}
         _end(false, "trade");
     }
@@ -623,10 +862,10 @@ contract VaultHandler is Test {
     function _executorUnwind(uint256 fractionBps) internal {
         uint256 fraction = _bound(fractionBps, 1, BPS) * WAD / BPS;
         _begin();
-        vm.prank(executor);
+        vm.prank(trader);
         try station.unwind(fraction) {
             still = false;
-            _hit("executorUnwind");
+            _hit(trader == executor ? bytes32("executorUnwind") : bytes32("unwind by an admin's key"));
         } catch {}
         _end(false, "executorUnwind");
     }
@@ -640,7 +879,9 @@ contract VaultHandler is Test {
         vm.prank(keeper);
         try vault.settleClaim(id) {
             _hit("settleClaim");
-        } catch {}
+        } catch {
+            _dropReverted();
+        }
         _end(true, "settleClaim");
     }
 
@@ -648,10 +889,13 @@ contract VaultHandler is Test {
         uint256 id = _openRequest(seed);
         if (id == 0) return;
         _begin();
+        stepRequest = id;
         vm.prank(vault.requestAt(id).owner);
         try vault.claimInstead(id) {
             _hit("claimInstead");
-        } catch {}
+        } catch {
+            _dropReverted();
+        }
         _end(true, "claimInstead");
     }
 
@@ -659,10 +903,13 @@ contract VaultHandler is Test {
         uint256 id = _openRequest(seed);
         if (id == 0) return;
         _begin();
+        (stepPayee, stepRequest) = (askedBy[id], id);
         vm.prank(vault.requestAt(id).owner);
         try vault.takeProRata(id) {
             _hit("takeProRata");
-        } catch {}
+        } catch {
+            _dropReverted();
+        }
         _end(true, "takeProRata");
     }
 
@@ -670,10 +917,13 @@ contract VaultHandler is Test {
         uint256 id = _openClaim(seed);
         if (id == 0) return;
         _begin();
+        stepPayee = claimOwner[id];
         vm.prank(vault.claimAt(id).owner);
         try vault.takeProRataClaim(id) {
             _hit("takeProRataClaim");
-        } catch {}
+        } catch {
+            _dropReverted();
+        }
         _end(true, "takeProRataClaim");
     }
 
@@ -684,7 +934,9 @@ contract VaultHandler is Test {
         vm.prank(keeper);
         try vault.freeze(id) {
             _hit("freeze");
-        } catch {}
+        } catch {
+            _dropReverted();
+        }
         _end(true, "freeze");
     }
 
@@ -696,7 +948,9 @@ contract VaultHandler is Test {
         vm.prank(byHolder ? a : keeper);
         try vault.serveProRata(a) {
             _hit("serveProRata");
-        } catch {}
+        } catch {
+            _dropReverted();
+        }
         _end(true, "serveProRata");
     }
 
@@ -704,10 +958,14 @@ contract VaultHandler is Test {
         address a = _unitHolder(who);
         if (a == address(0)) return;
         _begin();
+        stepPayee = a;
+        (, stepClaimable) = vault.unitsOf(a);
         vm.prank(a);
         try vault.collectUnits() {
             _hit("collectUnits");
-        } catch {}
+        } catch {
+            _dropReverted();
+        }
         _end(true, "collectUnits");
     }
 
@@ -910,7 +1168,7 @@ contract VaultHandler is Test {
             // at the bid: unwind whenever either side shows value.
             (uint256 m, uint256 mx) = station.value();
             if (m != 0 || mx != 0) try station.unwind(WAD) {} catch {}
-            try vault.recordValuation() {} catch {}
+            _record();
             try vault.settle(type(uint256).max) {} catch {}
             still = false;
             vm.prank(keeper);
@@ -1073,7 +1331,11 @@ contract VaultHandler is Test {
             _break(string.concat("the admin key got through call ", vm.toString(w)));
         }
         _end(true, "admin");
-        // Whatever it called, no money moved and no book changed.
+        _nothingMoved(string.concat("an admin call moved money: ", vm.toString(w)));
+    }
+
+    /// No money moved in the step and no book changed.
+    function _nothingMoved(string memory why) internal {
         (, uint256 reserve) = vault.units();
         if (
             outflows != 0 || usd.balanceOf(address(vault)) != before.vaultUsd
@@ -1083,7 +1345,7 @@ contract VaultHandler is Test {
                 || usd.balanceOf(admin) != before.adminUsd || reserve != before.reserve
         ) {
             adminBreaks++;
-            _break(string.concat("an admin call moved money: ", vm.toString(w)));
+            _break(why);
         }
     }
 
@@ -1141,6 +1403,201 @@ contract VaultHandler is Test {
         orders = new OrderRequest[](1);
         orders[0] =
             OrderRequest({market: SPOT, isBuy: false, size: amount * 1e12, limitPrice: 0, reduceOnly: true});
+    }
+
+    // The admin over time -----------------------------------------------------------
+
+    /// The admin acting over time, as far as the registry lets it. It
+    /// proposes an attestation checker, images and a project of its own, a
+    /// working driver of its own under the vault's driver name, a taking
+    /// driver and a keeping bridge, and shorter or longer timelocks; it
+    /// waits the timelock out; it blesses keys it holds as this vault's
+    /// executor and unwinder, through the platform's checker (the hardware
+    /// honestly running the admin's own image) or through its own; and those
+    /// keys then do everything an executor or an unwinder can.
+    ///
+    /// A driver is code that runs for every vault naming it, so one that
+    /// hands a station's dollars away is for the timelock to stop: proposing
+    /// it is public, and depositors have the timelock to leave before it
+    /// applies. The walk proposes the taking driver only under a name this
+    /// vault doesn't use; what it could do under the vault's own name is
+    /// shown separately.
+    ///
+    /// Whatever the sequence, nothing the admin controls ever receives a
+    /// dollar, and every dollar that leaves the vault is a payment one of its
+    /// events announces, to whom it is owed and of what it is owed.
+    function adminPlan(uint256 op, uint256 seed) public {
+        uint256 k = op % 10;
+        if (k >= 6) {
+            _adminKeysAct(k, seed);
+            return;
+        }
+        _begin();
+        if (k >= 4) {
+            vm.warp(block.timestamp + attestation.timelock() + 1);
+            _renew();
+            _hit("admin waited out the timelock");
+        } else {
+            bool ok;
+            vm.startPrank(admin);
+            if (k == 0) {
+                // Its own checker, executor and unwinder images, and project.
+                (ok,) = address(attestation).call(
+                    abi.encodeCall(AttestationRegistry.proposeVerifier, (address(adminVerifier)))
+                );
+                (bool image,) = address(attestation).call(
+                    abi.encodeCall(AttestationRegistry.proposeImage, (ADMIN_IMAGE, ImageKind.Executor))
+                );
+                (bool unwinder,) = address(attestation).call(
+                    abi.encodeCall(
+                        AttestationRegistry.proposeImage, (ADMIN_UNWINDER_IMAGE, ImageKind.Unwinder)
+                    )
+                );
+                (bool project_,) = address(attestation).call(
+                    abi.encodeCall(AttestationRegistry.proposeProject, (ADMIN_PROJECT))
+                );
+                ok = ok || image || unwinder || project_;
+            } else if (k == 1) {
+                (ok,) = address(attestation).call(
+                    seed % 2 == 0
+                        ? abi.encodeCall(AttestationRegistry.proposeDriver, ("local", address(adminDriver)))
+                        : abi.encodeCall(AttestationRegistry.proposeDriver, ("other", address(takingDriver)))
+                );
+            } else if (k == 2) {
+                (ok,) = address(attestation).call(
+                    abi.encodeCall(
+                        AttestationRegistry.proposeBridge,
+                        (
+                            seed % 2 == 0 ? bytes32("local-bridge") : bytes32("keeping-bridge"),
+                            address(keepingBridge)
+                        )
+                    )
+                );
+            } else {
+                (ok,) = address(attestation).call(
+                    abi.encodeCall(AttestationRegistry.setTimelock, (uint64(_bound(seed, 0, 4 days))))
+                );
+            }
+            vm.stopPrank();
+            if (ok) _hit("admin proposed");
+        }
+        _end(true, "adminPlan");
+        _nothingMoved("a proposal of the admin's moved money");
+    }
+
+    /// The admin's keys at work.
+    function _adminKeysAct(uint256 k, uint256 seed) internal {
+        if (k == 6) {
+            _blessAdminKeys(seed);
+            return;
+        }
+        trader = seed % 2 == 0 ? adminKey : adminImposter;
+        uint256 a = seed >> 8;
+        uint256 b = seed >> 72;
+        // It keeps its keys blessed, and its executor key holding the venue,
+        // where the registry lets it.
+        _blessAs(adminKey, ADMIN_IMAGE, ADMIN_PROJECT, true);
+        _blessAs(adminKey, ADMIN_IMAGE, ADMIN_PROJECT, false);
+        _blessAs(adminUnwinder, ADMIN_UNWINDER_IMAGE, ADMIN_PROJECT, true);
+        _blessAs(adminUnwinder, ADMIN_UNWINDER_IMAGE, ADMIN_PROJECT, false);
+        _blessAs(adminImposter, executorImage, project, false);
+        if (!station.stopped()) {
+            vm.prank(trader);
+            try station.approveKey("local", trader) {} catch {}
+        }
+        if (k == 7) {
+            // Everything the executor does.
+            executorAct(seed >> 160, a, b);
+        } else if (k == 8) {
+            // Its bills: kept by anyone, or collected as the author takes
+            // from the tank.
+            if (seed % 3 == 0) _withdrawTank(a, b);
+            else _keep(a, true);
+        } else {
+            _begin();
+            // The unwinder closes any fraction it likes, and the executor
+            // key tries to bridge the station's dollars anywhere and to cut
+            // the platform's executor off.
+            uint256 fraction = _bound(a, 1, BPS) * WAD / BPS;
+            vm.prank(adminUnwinder);
+            try station.unwind(fraction) {
+                still = false;
+                _hit("unwind by the admin's unwinder");
+            } catch {}
+            uint256 amount = usd.balanceOf(address(station)) * _bound(b, 1, 100) / 100;
+            vm.startPrank(trader);
+            try station.bridge(
+                seed % 4 < 2 ? bytes32("local-bridge") : bytes32("keeping-bridge"),
+                seed % 2 == 0 ? 999 : block.chainid,
+                amount,
+                ""
+            ) {
+                _hit("bridge by an admin's key");
+            } catch {}
+            try station.revokeKey("local", executor) {
+                _hit("admin's key revoked executor");
+            } catch {}
+            vm.stopPrank();
+            _end(false, "adminKeys");
+        }
+        trader = executor;
+    }
+
+    /// Bless the admin's keys for this vault: its own executor image's key
+    /// through the platform's checker or its own, its unwinder, and a key
+    /// passed off as the platform's executor through its own checker. Each
+    /// executor key then takes the venue.
+    function _blessAdminKeys(uint256 seed) internal {
+        _begin();
+        _blessAs(adminKey, ADMIN_IMAGE, ADMIN_PROJECT, seed % 2 == 0);
+        _blessAs(adminUnwinder, ADMIN_UNWINDER_IMAGE, ADMIN_PROJECT, seed % 3 == 0);
+        _blessAs(adminImposter, executorImage, project, false);
+        address taker = seed % 5 < 2 ? adminKey : seed % 5 < 4 ? adminImposter : address(0);
+        if (taker != address(0) && !station.stopped()) {
+            vm.prank(taker);
+            try station.approveKey("local", taker) {
+                _hit("admin's key took the venue");
+            } catch {}
+        }
+        _end(true, "blessAdminKeys");
+        _nothingMoved("blessing the admin's keys moved money");
+    }
+
+    /// A journal for `signer` running `image`, sealed by the platform's
+    /// checker's key or the admin's own.
+    function _blessAs(address signer, bytes32 image, bytes32 project_, bool platformChecker) internal {
+        bytes32 leaf = keccak256(
+            bytes.concat(keccak256(abi.encode(block.chainid, address(vault), bundle, block.chainid)))
+        );
+        bytes memory journal = abi.encode(
+            AttestationRegistry.Journal({
+                imageDigest: image,
+                projectId: project_,
+                signer: signer,
+                vaultsRoot: leaf,
+                issuedAt: uint64(block.timestamp)
+            })
+        );
+        (uint8 v, bytes32 r, bytes32 s) =
+            vm.sign(platformChecker ? attestorKey : adminAttestorKey, _ethSigned(keccak256(journal)));
+        // With a gas limit: a checker the walk proposed at a precompile's
+        // address burns all the gas it is given.
+        try attestation.bless{gas: 3_000_000}(
+            abi.encodePacked(r, s, v), journal, block.chainid, address(vault), bundle, new bytes32[](0)
+        ) {
+            _hit(
+                platformChecker
+                    ? bytes32("admin key blessed by platform")
+                    : bytes32("admin key blessed by its own")
+            );
+        } catch {}
+    }
+
+    /// The dollars every address the admin controls holds.
+    function adminHoldings() external view returns (uint256 total) {
+        for (uint256 i = 0; i < adminAddresses.length; i++) {
+            total += usd.balanceOf(adminAddresses[i]);
+        }
     }
 
     // Thought experiments ---------------------------------------------------------
@@ -1512,6 +1969,10 @@ contract VaultHandler is Test {
         before.tank = vault.tank().balance;
         before.adminUsd = usd.balanceOf(admin);
         (, before.reserve) = vault.units();
+        before.state = vault.state();
+        delete owedOut;
+        (stepPayee, stepRequest, stepClaimable) = (address(0), 0, 0);
+        measured.set = false;
     }
 
     function _end(bool checkPrice, string memory what) internal {
@@ -1578,6 +2039,33 @@ contract VaultHandler is Test {
         uint256 markBefore;
     }
 
+    /// What a step's dollars did, as the dollar's own transfers tell it,
+    /// beside what the vault's events say: the two are matched at the end.
+    struct Ledger {
+        /// Every dollar that left the vault, and every payout held for a
+        /// receiver who refused it instead: to whom and how much.
+        Payment[] paid;
+        uint256 count;
+        /// The vault's cash before the step, less what its closed-vault
+        /// payouts and fallbacks have paid so far.
+        uint256 cash;
+        /// What the station sent the vault this step, and what the vault's
+        /// events say came home.
+        uint256 home;
+        uint256 booked;
+        /// The last holder whose shares were burned, and how many.
+        address burnFrom;
+        uint256 burned;
+        /// The withdrawal just announced, when the next event is the claim
+        /// it paid.
+        bool withdrawn;
+        uint256 wId;
+        address wOwner;
+        uint256 wShares;
+        uint256 wAssets;
+        uint256 wSlice;
+    }
+
     function _readLogs(string memory what) internal returns (uint256) {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         Reading memory r = Reading({
@@ -1589,29 +2077,33 @@ contract VaultHandler is Test {
             mintedSupply: 0,
             markBefore: 0
         });
+        Ledger memory g;
+        g.paid = new Payment[](logs.length);
+        g.cash = before.cash;
         for (uint256 i = 0; i < logs.length; i++) {
             Vm.Log memory l = logs[i];
             if (l.topics.length == 0) continue;
             bytes32 topic = l.topics[0];
             if (l.emitter == address(usd)) {
-                if (topic == TRANSFER) {
-                    _route(
-                        address(uint160(uint256(l.topics[1]))),
-                        address(uint160(uint256(l.topics[2]))),
-                        abi.decode(l.data, (uint256)),
-                        what
-                    );
-                }
+                if (topic == TRANSFER) _dollarMoved(l, g, what);
                 continue;
             }
             if (l.emitter != address(vault)) continue;
+            // Whether the event just before this one was a withdrawal: a
+            // claim's payment is announced by the two together.
+            bool afterWithdrawal = g.withdrawn;
+            g.withdrawn = false;
             if (topic == TRANSFER) {
                 address from = address(uint160(uint256(l.topics[1])));
                 address to = address(uint160(uint256(l.topics[2])));
                 uint256 amount = abi.decode(l.data, (uint256));
                 if (from == address(0)) r.supply += amount;
-                if (to == address(0)) r.supply -= amount;
-                else if (amount != 0) _noteHolder(to);
+                if (to == address(0)) {
+                    r.supply -= amount;
+                    (g.burnFrom, g.burned) = (from, amount);
+                } else if (amount != 0) {
+                    _noteHolder(to);
+                }
             } else if (topic == IVault.HoldingSynced.selector) {
                 uint256 minted = abi.decode(l.data, (uint256));
                 _checkHolding(minted, r.supply - minted, what);
@@ -1634,23 +2126,37 @@ contract VaultHandler is Test {
             } else if (topic == IVault.MarkRaised.selector) {
                 r.mark = abi.decode(l.data, (uint256));
             } else if (topic == IVault.Valued.selector) {
-                uint256 index = uint256(l.topics[1]);
-                (, uint256 gross,, uint256 supply,) =
-                    abi.decode(l.data, (uint64, uint256, uint256, uint256, uint256));
-                lastPricedIndex = index + 1;
-                still = true;
-                sentSince = 0;
-                stationsAtValuation = gross - 1 - vault.valuationAt(index).cash;
-                if (r.payday) {
-                    if (supply != r.mintedSupply) {
-                        feeBreaks++;
-                        _break(string.concat(what, ": payday priced on a supply it didn't mint to"));
-                    }
-                    _checkPayday(r, gross, what);
-                    r.payday = false;
-                }
+                _valued(l, r, what);
             } else if (topic == IVault.Withdrawn.selector) {
                 _checkSlice(l, what);
+                _withdrawn(logs, i, r, g, what);
+            } else if (topic == IVault.ClaimPaid.selector) {
+                _hit("~claimPaid");
+                _claimPaid(l, r, g, afterWithdrawal, what);
+            } else if (topic == IVault.Refunded.selector) {
+                _hit("~refunded");
+                _refunded(l, what);
+            } else if (topic == IVault.ProRataTaken.selector) {
+                _hit("~proRataTaken");
+                _proRataTaken(l, r, g, what);
+            } else if (topic == IVault.UnitsPaid.selector) {
+                _hit("~unitsPaid");
+                address owner = address(uint160(uint256(l.topics[1])));
+                uint256 assets = abi.decode(l.data, (uint256));
+                // Units are paid to the holder who collects them, what they
+                // could collect.
+                if (owner != stepPayee || assets != stepClaimable) {
+                    _moneyBreak(
+                        string.concat(what, ": units paid ", vm.toString(assets), " to the wrong holder")
+                    );
+                }
+                _expect(owner, assets);
+            } else if (topic == IVault.Held.selector) {
+                _hit("~held");
+                // Held for a receiver who refused it: paid, as far as the
+                // event that announced it goes.
+                g.paid[g.count++] =
+                    Payment(address(uint160(uint256(l.topics[1]))), abi.decode(l.data, (uint256)));
             } else if (topic == IVault.TankFunded.selector) {
                 tankIn += abi.decode(l.data, (uint256));
             } else if (topic == IVault.TankFilled.selector) {
@@ -1660,33 +2166,454 @@ contract VaultHandler is Test {
                 (, uint256 charged,) = abi.decode(l.data, (uint256, uint256, uint256));
                 tankCharged += charged;
                 _checkCharge(charged, what);
+                // The running costs go to the platform.
+                _expect(platform, charged);
             } else if (topic == IVault.TankWithdrawn.selector) {
-                tankOut += abi.decode(l.data, (uint256));
+                uint256 assets = abi.decode(l.data, (uint256));
+                tankOut += assets;
+                // The tank is the author's.
+                _expect(author, assets);
             } else if (topic == IVault.ToStation.selector) {
-                sentSince += abi.decode(l.data, (uint256));
+                _expect(address(station), abi.decode(l.data, (uint256)));
+            } else if (topic == IVault.FromStation.selector) {
+                (uint256 assets,) = abi.decode(l.data, (uint256, uint256));
+                g.booked += assets;
             } else if (topic == IVault.ClaimBooked.selector) {
                 _hit("~claimBooked");
-            } else if (topic == IVault.ClaimPaid.selector) {
-                _hit("~claimPaid");
-            } else if (topic == IVault.ProRataTaken.selector) {
-                _hit("~proRataTaken");
-            } else if (topic == IVault.UnitsPaid.selector) {
-                _hit("~unitsPaid");
-            } else if (topic == IVault.Held.selector) {
-                _hit("~held");
+                _claimBooked(l, what);
             } else if (topic == IVault.ValuationVoided.selector) {
                 _hit("~void");
             } else if (topic == IVault.Deposited.selector) {
                 _hit("~deposited");
-            } else if (topic == IVault.Refunded.selector) {
-                _hit("~refunded");
             } else if (topic == IVault.Requested.selector) {
                 _entitle(address(uint160(uint256(l.topics[2]))));
+                _requested(l, what);
             }
         }
         // A payday with no valuation after it is the close's, on its cash.
         if (r.payday) _checkPayday(r, vault.cash() + 1, what);
+        _match(g, what);
         return r.holdingMinted;
+    }
+
+    /// One dollar transfer: where it went, and what it adds to the ledger.
+    function _dollarMoved(Vm.Log memory l, Ledger memory g, string memory what) internal {
+        address from = address(uint160(uint256(l.topics[1])));
+        address to = address(uint160(uint256(l.topics[2])));
+        uint256 amount = abi.decode(l.data, (uint256));
+        _route(from, to, amount, what);
+        if (amount == 0) return;
+        // Nothing the admin controls is ever paid, whoever pays it.
+        if (adminOwns[to] && from != address(0)) {
+            adminBreaks++;
+            _break(string.concat(what, ": ", vm.toString(amount), " reached the admin at ", vm.toString(to)));
+        }
+        if (from == address(vault)) {
+            g.paid[g.count++] = Payment(to, amount);
+            if (to == address(station)) pulledSince += amount;
+        } else if (from == address(station) && to == address(vault)) {
+            pushedSince += amount;
+            g.home += amount;
+        }
+    }
+
+    /// Every dollar that left the vault is one an event announced, to the
+    /// one it names and of the amount it names, and every payment an event
+    /// announced was made (or held for its receiver); and what came home from
+    /// the station is what the vault booked.
+    function _match(Ledger memory g, string memory what) internal {
+        bool[] memory used = new bool[](g.count);
+        for (uint256 k = 0; k < owedOut.length; k++) {
+            Payment memory e = owedOut[k];
+            if (e.amount == 0) continue;
+            bool found;
+            for (uint256 j = 0; j < g.count; j++) {
+                if (!used[j] && g.paid[j].to == e.to && g.paid[j].amount == e.amount) {
+                    (used[j], found) = (true, true);
+                    break;
+                }
+            }
+            if (!found) {
+                _moneyBreak(
+                    string.concat(
+                        what,
+                        ": an event says ",
+                        vm.toString(e.to),
+                        " was paid ",
+                        vm.toString(e.amount),
+                        " and nothing paid it"
+                    )
+                );
+            }
+        }
+        for (uint256 j = 0; j < g.count; j++) {
+            if (used[j]) continue;
+            _hit("~unannounced");
+            _moneyBreak(
+                string.concat(
+                    what,
+                    ": ",
+                    vm.toString(g.paid[j].amount),
+                    " left the vault for ",
+                    vm.toString(g.paid[j].to),
+                    " and no event paid it"
+                )
+            );
+        }
+        if (g.home != g.booked) {
+            _moneyBreak(
+                string.concat(
+                    what,
+                    ": the station sent ",
+                    vm.toString(g.home),
+                    " home and the vault booked ",
+                    vm.toString(g.booked)
+                )
+            );
+        }
+        if (g.count != 0) _hit("~matched");
+    }
+
+    /// A valuation: what it recorded is the pool the handler read just
+    /// before it, on the supply the handler's own books hold, and the fee it
+    /// owes is the fee rate on what is above the mark.
+    function _valued(Vm.Log memory l, Reading memory r, string memory what) internal {
+        uint256 index = uint256(l.topics[1]);
+        (, uint256 gross, uint256 grossExit, uint256 supply,) =
+            abi.decode(l.data, (uint64, uint256, uint256, uint256, uint256));
+        lastPricedIndex = index + 1;
+        still = true;
+        (pulledSince, pushedSince) = (0, 0);
+        if (measured.set) {
+            _hit("~measured");
+            if (gross != measured.gross || grossExit != measured.grossExit) {
+                feeBreaks++;
+                _break(
+                    string.concat(
+                        what,
+                        ": a valuation recorded ",
+                        vm.toString(gross),
+                        " and ",
+                        vm.toString(grossExit),
+                        " for a pool of ",
+                        vm.toString(measured.gross),
+                        " and ",
+                        vm.toString(measured.grossExit)
+                    )
+                );
+            }
+            stationsAtValuation = measured.stations;
+            measured.set = false;
+        } else {
+            stationsAtValuation = gross - 1 - vault.valuationAt(index).cash;
+        }
+        if (supply != r.supply + OFFSET) {
+            feeBreaks++;
+            _break(string.concat(what, ": a valuation priced on a supply the shares don't add up to"));
+        }
+        Valuation memory v = vault.valuationAt(index);
+        if (v.fee != _feeOn(gross, supply, r.mark) || v.feeExit != _feeOn(grossExit, supply, r.mark)) {
+            feeBreaks++;
+            _break(string.concat(what, ": a valuation owed a fee that isn't the rate on the gain"));
+        }
+        if (r.payday) {
+            if (supply != r.mintedSupply) {
+                feeBreaks++;
+                _break(string.concat(what, ": payday priced on a supply it didn't mint to"));
+            }
+            _checkPayday(r, gross, what);
+            r.payday = false;
+        }
+    }
+
+    /// A withdrawal paid: to the one who asked, for the shares they asked to
+    /// redeem, at the price of the valuation that priced it or, once the
+    /// vault has closed, at the closed vault's price. A withdrawal followed
+    /// by the claim it paid is judged with the claim.
+    function _withdrawn(
+        Vm.Log[] memory logs,
+        uint256 i,
+        Reading memory r,
+        Ledger memory g,
+        string memory what
+    ) internal {
+        Vm.Log memory l = logs[i];
+        uint256 id = uint256(l.topics[1]);
+        address owner = address(uint160(uint256(l.topics[2])));
+        (uint256 shares, uint256 assets, uint256 slice) = abi.decode(l.data, (uint256, uint256, uint256));
+        if (_nextVaultTopic(logs, i) == IVault.ClaimPaid.selector) {
+            (g.withdrawn, g.wId, g.wOwner, g.wShares, g.wAssets, g.wSlice) =
+                (true, id, owner, shares, assets, slice);
+            return;
+        }
+        if (id == 0) {
+            // A closed vault redeeming shares at once: the holder whose
+            // shares were burned is the one paid.
+            if (g.burnFrom != owner || g.burned != shares) {
+                _moneyBreak(
+                    string.concat(what, ": a closed vault paid someone other than the holder who redeemed")
+                );
+            }
+            _closedPayout(assets, shares, r, g, what);
+        } else {
+            if (askedBy[id] != owner || askedKind[id] != RequestKind.Redeem || askedFor[id] != shares) {
+                _moneyBreak(
+                    string.concat(
+                        what, ": withdrawal ", vm.toString(id), " was paid to someone other than who asked"
+                    )
+                );
+            }
+            _unask(owner, shares, what);
+            if (before.state == VaultState.Closed) _closedPayout(assets, shares, r, g, what);
+            else _pricedPayout(assets, shares, slice, what);
+        }
+        _expect(owner, assets);
+    }
+
+    /// A claim paid: to the one who booked it, for its shares, at its close
+    /// (its fraction of what came home and of the cash, less its own fee and
+    /// the transaction fee), at a valuation's price when the cash covered it,
+    /// or at the closed vault's price.
+    function _claimPaid(
+        Vm.Log memory l,
+        Reading memory r,
+        Ledger memory g,
+        bool afterWithdrawal,
+        string memory what
+    ) internal {
+        uint256 claimId = uint256(l.topics[1]);
+        uint256 assets = abi.decode(l.data, (uint256));
+        address owner = claimOwner[claimId];
+        uint256 shares = claimShares[claimId];
+        if (afterWithdrawal) {
+            if (g.wOwner != owner || g.wShares != shares || g.wAssets != assets) {
+                _moneyBreak(
+                    string.concat(
+                        what, ": claim ", vm.toString(claimId), " was paid to someone other than its owner"
+                    )
+                );
+            }
+            if (g.wId == 0) {
+                _hit("~claimClosed");
+                _closeOfClaim(assets, shares, r, g, what);
+            } else {
+                _hit("~claimPriced");
+                if (askedKind[g.wId] != RequestKind.Claim || claimOfRequest[g.wId] != claimId) {
+                    _moneyBreak(string.concat(what, ": a claim was paid through another's request"));
+                }
+                _pricedPayout(assets, shares, g.wSlice, what);
+            }
+        } else {
+            _closedPayout(assets, shares, r, g, what);
+        }
+        _expect(owner, assets);
+    }
+
+    /// At its close a claim is paid its shares' part of the cash as it stood
+    /// and all the close brought home, less the profit fee those shares owe
+    /// (paid to the author and the platform, ten to five) and the transaction
+    /// fee.
+    function _closeOfClaim(
+        uint256 assets,
+        uint256 shares,
+        Reading memory r,
+        Ledger memory g,
+        string memory what
+    ) internal {
+        // The supply after the close's holding sync and before its burn.
+        uint256 supply = r.supply + shares + OFFSET;
+        uint256 owned = g.home + g.cash.mulDiv(shares, supply);
+        if (owned > g.cash + g.home) owned = g.cash + g.home;
+        uint256 fee = _feeOn(owned, shares, r.mark);
+        uint256 gross = owned - fee;
+        uint256 payout = gross - gross.mulDiv(vault.fees().transactionBps, BPS, Math.Rounding.Ceil);
+        if (assets != payout) {
+            _moneyBreak(
+                string.concat(
+                    what,
+                    ": a claim's close paid ",
+                    vm.toString(assets),
+                    " where its fraction came to ",
+                    vm.toString(payout)
+                )
+            );
+        }
+        if (fee != 0) {
+            uint256 toAuthor =
+                fee.mulDiv(vault.fees().authorBps, uint256(vault.fees().authorBps) + vault.fees().platformBps);
+            _expect(author, toAuthor);
+            _expect(platform, fee - toAuthor);
+        }
+    }
+
+    /// What `shares` are paid at the last priced valuation's exit price,
+    /// after the fee slice and the transaction fee.
+    function _pricedPayout(uint256 assets, uint256 shares, uint256 slice, string memory what) internal {
+        Valuation memory v = vault.valuationAt(lastPricedIndex - 1);
+        uint256 owedSlice = v.feeExit == 0 ? 0 : shares.mulDiv(v.feeExit, v.grossExit, Math.Rounding.Ceil);
+        uint256 gross = (shares - owedSlice).mulDiv(v.grossExit, v.supply);
+        uint256 payout = gross - gross.mulDiv(vault.fees().transactionBps, BPS, Math.Rounding.Ceil);
+        if (assets != payout || slice != owedSlice) {
+            _moneyBreak(
+                string.concat(
+                    what,
+                    ": a withdrawal paid ",
+                    vm.toString(assets),
+                    " where its shares came to ",
+                    vm.toString(payout)
+                )
+            );
+        }
+    }
+
+    /// A closed vault pays each share its part of the cash.
+    function _closedPayout(
+        uint256 assets,
+        uint256 shares,
+        Reading memory r,
+        Ledger memory g,
+        string memory what
+    ) internal {
+        // The supply just before these shares were burned.
+        uint256 payout = g.cash.mulDiv(shares, r.supply + shares);
+        if (assets != payout) {
+            _moneyBreak(
+                string.concat(
+                    what,
+                    ": a closed vault paid ",
+                    vm.toString(assets),
+                    " where the shares came to ",
+                    vm.toString(payout)
+                )
+            );
+        }
+        g.cash -= payout > g.cash ? g.cash : payout;
+    }
+
+    /// A deposit sent back: to the one who asked, all of it.
+    function _refunded(Vm.Log memory l, string memory what) internal {
+        uint256 id = uint256(l.topics[1]);
+        address owner = address(uint160(uint256(l.topics[2])));
+        uint256 assets = abi.decode(l.data, (uint256));
+        if (askedBy[id] != owner || askedKind[id] != RequestKind.Deposit || askedFor[id] != assets) {
+            _moneyBreak(
+                string.concat(what, ": deposit ", vm.toString(id), " was sent back to the wrong place")
+            );
+        }
+        _expect(owner, assets);
+    }
+
+    /// The fallback: to the one whose request or claim it is, their shares'
+    /// part of the cash as it stood, less the transaction fee.
+    function _proRataTaken(Vm.Log memory l, Reading memory r, Ledger memory g, string memory what) internal {
+        address owner = address(uint160(uint256(l.topics[1])));
+        (uint256 shares, uint256 assets,) = abi.decode(l.data, (uint256, uint256, uint256));
+        if (owner != stepPayee) {
+            _moneyBreak(string.concat(what, ": the fallback paid someone other than the leaver"));
+        }
+        // The supply after the slice moved and before the rest was burned.
+        uint256 gross = g.cash.mulDiv(shares, r.supply + shares + OFFSET);
+        uint256 payout = gross - gross.mulDiv(vault.fees().transactionBps, BPS, Math.Rounding.Ceil);
+        if (assets != payout) {
+            _moneyBreak(
+                string.concat(
+                    what,
+                    ": the fallback paid ",
+                    vm.toString(assets),
+                    " where the cash's share came to ",
+                    vm.toString(payout)
+                )
+            );
+        }
+        g.cash -= payout > g.cash ? g.cash : payout;
+        if (stepRequest != 0 && askedKind[stepRequest] == RequestKind.Redeem) {
+            _unask(owner, askedFor[stepRequest], what);
+        }
+        _expect(owner, assets);
+    }
+
+    /// A claim booked: for someone who asked to redeem at least those shares.
+    function _claimBooked(Vm.Log memory l, string memory what) internal {
+        uint256 claimId = uint256(l.topics[1]);
+        address owner = address(uint160(uint256(l.topics[2])));
+        uint256 shares = abi.decode(l.data, (uint256));
+        (claimOwner[claimId], claimShares[claimId]) = (owner, shares);
+        if (
+            stepRequest != 0
+                && (
+                    askedBy[stepRequest] != owner || askedFor[stepRequest] != shares
+                        || askedKind[stepRequest] != RequestKind.Redeem
+                )
+        ) {
+            _moneyBreak(string.concat(what, ": a claim was booked for someone other than who asked"));
+        }
+        _unask(owner, shares, what);
+    }
+
+    /// A request: as the handler asked it; or, asked by nobody the handler
+    /// called for, the author's tank fill or a claim the cash covers, priced
+    /// as a request.
+    function _requested(Vm.Log memory l, string memory what) internal {
+        uint256 id = uint256(l.topics[1]);
+        address owner = address(uint160(uint256(l.topics[2])));
+        (RequestKind kind,, uint256 amount) = abi.decode(l.data, (RequestKind, uint64, uint256));
+        if (askedBy[id] != address(0)) {
+            if (askedBy[id] != owner || askedFor[id] != amount || askedKind[id] != kind) {
+                _moneyBreak(string.concat(what, ": request ", vm.toString(id), " is not what was asked"));
+            }
+            return;
+        }
+        if (kind == RequestKind.TankFill) {
+            if (owner != author) _moneyBreak(string.concat(what, ": a tank fill for someone not the author"));
+        } else if (kind == RequestKind.Claim) {
+            uint256 claimId = vault.requestAt(id).ref;
+            if (owner != claimOwner[claimId] || amount != claimShares[claimId]) {
+                _moneyBreak(string.concat(what, ": a claim's request for someone other than its owner"));
+            }
+            claimOfRequest[id] = claimId;
+        } else {
+            _moneyBreak(string.concat(what, ": a request nobody asked for"));
+        }
+        _noteAsk(id, owner, amount, kind);
+    }
+
+    /// The topic of the vault's next event after `i`, if any.
+    function _nextVaultTopic(Vm.Log[] memory logs, uint256 i) internal view returns (bytes32) {
+        for (uint256 j = i + 1; j < logs.length; j++) {
+            if (logs[j].emitter == address(vault) && logs[j].topics.length != 0) return logs[j].topics[0];
+        }
+        return bytes32(0);
+    }
+
+    /// The profit fee owed on `gross` for `supply` shares at mark `m`.
+    function _feeOn(uint256 gross, uint256 supply, uint256 m) internal view returns (uint256) {
+        uint256 basis = m.mulDiv(supply, 1e30, Math.Rounding.Ceil);
+        if (gross <= basis) return 0;
+        return (gross - basis).mulDiv(uint256(vault.fees().authorBps) + vault.fees().platformBps, BPS);
+    }
+
+    function _noteAsk(uint256 id, address who, uint256 amount, RequestKind kind) internal {
+        (askedBy[id], askedFor[id], askedKind[id]) = (who, amount, kind);
+    }
+
+    /// Shares a holder asked to redeem have been paid, booked as a claim or
+    /// taken through the fallback.
+    function _unask(address owner, uint256 shares, string memory what) internal {
+        if (redeeming[owner] < shares) {
+            _moneyBreak(string.concat(what, ": shares were paid out that their owner never asked to redeem"));
+            redeeming[owner] = 0;
+        } else {
+            redeeming[owner] -= shares;
+        }
+    }
+
+    function _expect(address to, uint256 amount) internal {
+        owedOut.push(Payment(to, amount));
+    }
+
+    function _moneyBreak(string memory why) internal {
+        moneyBreaks++;
+        _break(why);
     }
 
     /// Dollars leave the vault only for its station or someone it may pay;
@@ -1820,9 +2747,31 @@ contract VaultHandler is Test {
         usd.mint(who, amount);
         vm.startPrank(who);
         usd.approve(address(vault), amount);
-        vault.requestDeposit(amount, who, _statement(who));
+        uint256 id = vault.requestDeposit(amount, who, _statement(who));
         vm.stopPrank();
+        _noteAsk(id, who, amount, RequestKind.Deposit);
         _entitle(who);
+    }
+
+    /// Read the station as the vault is about to, then record a valuation:
+    /// what the vault records must be the pool that was there.
+    function _record() internal returns (bool ok) {
+        (uint256 atMark, uint256 atExit) = station.value();
+        (uint256 units,) = vault.units();
+        if (atExit > atMark) atExit = atMark;
+        uint256 cash = vault.cash();
+        uint256 shares = atMark.mulDiv(WAD - units, WAD);
+        measured = Measured({
+            set: true,
+            gross: cash + shares + 1,
+            grossExit: cash + atExit.mulDiv(WAD - units, WAD) + 1,
+            stations: shares
+        });
+        try vault.recordValuation() {
+            ok = true;
+        } catch {
+            measured.set = false;
+        }
     }
 
     /// Settle what is owed, then a valuation at the next slot and its
@@ -1886,8 +2835,10 @@ contract VaultHandler is Test {
         return abi.encodePacked(r, s, v);
     }
 
+    /// A running total signed by whichever key trades for the station.
     function _usage(uint256 total, uint64 asOf) internal view returns (bytes memory) {
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(executorKey, _ethSigned(vault.usageDigest(total, asOf)));
+        uint256 key = trader == executor ? executorKey : keyOf[trader];
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, _ethSigned(vault.usageDigest(total, asOf)));
         return abi.encodePacked(r, s, v);
     }
 
@@ -1975,6 +2926,13 @@ contract VaultHandler is Test {
     function _hit(bytes32 name) internal {
         if (hits[name] == 0) hitNames.push(name);
         hits[name]++;
+    }
+
+    /// A call that reverted leaves nothing behind, but the logs it emitted
+    /// before reverting are still recorded: drop them, so the books never
+    /// count what was undone. Only for a step whose one call it was.
+    function _dropReverted() internal {
+        vm.getRecordedLogs();
     }
 
     function _break(string memory why) internal {
