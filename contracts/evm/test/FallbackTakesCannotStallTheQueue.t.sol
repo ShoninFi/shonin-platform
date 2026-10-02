@@ -54,6 +54,7 @@ contract FallbackTakesCannotStallTheQueueTest is TwoChainVault {
         uint256 t = vm.getBlockTimestamp();
         vm.warp(t - (t % SLOT) + SLOT);
         uint256 gasBefore = gasleft();
+        vm.prank(executor);
         vault.recordValuation();
         assertLt(gasBefore - gasleft(), BOUNDED, "the valuation walked the queue");
     }

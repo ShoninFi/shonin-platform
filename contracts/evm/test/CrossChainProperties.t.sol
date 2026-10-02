@@ -74,6 +74,7 @@ contract CrossChainPropertiesTest is TwoChainVault {
         two.confirmStations();
 
         uint64 time = open();
+        vm.prank(executor);
         two.recordValuation();
         StationPost memory p = postOf(1_000_000e6, 1_000_000e6);
         bytes memory forOne = signed(EXECUTOR_KEY, vault.postDigest(time, OTHER, p));

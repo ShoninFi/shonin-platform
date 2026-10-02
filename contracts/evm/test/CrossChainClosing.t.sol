@@ -103,6 +103,7 @@ contract CrossChainClosingTest is Fixture {
         uint256 t = vm.getBlockTimestamp();
         time = uint64(t - (t % SLOT) + SLOT);
         vm.warp(time);
+        vm.prank(executor);
         vault.recordValuation();
     }
 

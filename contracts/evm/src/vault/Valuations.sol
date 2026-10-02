@@ -80,6 +80,10 @@ library Valuations {
             state == VaultState.None || state == VaultState.Activating || state == VaultState.Closed
                 || state == VaultState.Cancelled
         ) revert IVault.WrongState();
+        // A valuation that waits for other chains' posts is opened by a key
+        // blessed for the vault: anyone else could keep one open for ever,
+        // and an open valuation holds the fallback shut.
+        if (s.otherChains.length != 0 && !_blessed(s, msg.sender, false)) revert IVault.NotBlessed();
 
         uint256 interval = s.timers.slotInterval;
         uint64 time = uint64(block.timestamp - (block.timestamp % interval));
@@ -580,6 +584,8 @@ library Valuations {
             revert IVault.NotAllowed();
         }
         if (block.timestamp < r.earliest + s.timers.fallbackAfter || s.valuing()) revert IVault.NotYet();
+        // A closing vault pays its holders through its own door.
+        if (!deposit && s.readyToClose()) revert IVault.WrongState();
         // Not while a valuation could price it: the fallback is for when
         // nothing can, not a way round the fee.
         if (s.lastPriced != 0 && s.latest().time >= r.earliest) revert IVault.NotAllowed();
@@ -642,6 +648,18 @@ library Valuations {
     function proRata(Layout storage s, address owner, uint256 shares) internal {
         // The holding fee up to now falls on every share, the leaver's too.
         syncHolding(s);
+        // And the profit fee the shares owed at the last priced valuation,
+        // as a slice of them, as a withdrawal pays it: the fallback is a way
+        // out, never a way round the fee.
+        if (s.lastPriced != 0) {
+            Valuation storage last = s.latest();
+            if (last.feeExit != 0) {
+                uint256 slice = shares.mulDiv(last.feeExit, last.grossExit, Math.Rounding.Ceil);
+                if (slice > shares) slice = shares;
+                _distribute(s, address(this), slice, 0);
+                shares -= slice;
+            }
+        }
         uint256 assets = s.cash.mulDiv(shares, s.totalSupply + OFFSET);
         // The shares own what the units don't; these shares' part of that
         // is the leaver's for good, whatever fees are minted later.
@@ -706,7 +724,11 @@ library Valuations {
             if (counted > stations) stations = counted;
         }
         bool worthSomething = stations.mulDiv(fraction, WAD) != 0;
-        if (blocked || (home == 0 && worthSomething)) revert IVault.NotYet();
+        // On a vault that trades on other chains a serve here reaches only
+        // this chain's station, so it is only for clearing dust.
+        if (blocked || (home == 0 && worthSomething) || (s.otherChains.length != 0 && worthSomething)) {
+            revert IVault.NotYet();
+        }
         _accrue(s, holder);
         s.units -= raw;
         s.unitsOf[holder] = 0;

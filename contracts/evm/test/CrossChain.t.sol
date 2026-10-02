@@ -112,6 +112,7 @@ contract CrossChainTest is Fixture {
         uint256 t = vm.getBlockTimestamp();
         time = uint64(t - (t % SLOT) + SLOT);
         vm.warp(time);
+        vm.prank(executor);
         vault.recordValuation();
     }
 
@@ -247,6 +248,7 @@ contract CrossChainTest is Fixture {
         uint64 time = open();
         vm.warp(time + SLOT);
         vm.expectRevert(IVault.Unsettled.selector);
+        vm.prank(executor);
         vault.recordValuation();
         vm.warp(time + DEADLINE + 1);
         vault.closeValuation(time);
