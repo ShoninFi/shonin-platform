@@ -233,29 +233,35 @@ contract Station is IStation, ReentrancyGuardTransient {
         IDriver[] memory drivers = new IDriver[](count);
         Call[][] memory closes = new Call[][](count);
         uint256[] memory freed = new uint256[](count);
+        bool[] memory skipped = new bool[](count);
         for (uint256 i = 0; i < count; i++) {
             drivers[i] = IDriver(_pinned(_spec.drivers[i]));
             // What the fraction is worth at exit prices before the close:
             // exactly what selling it realises, and all that comes home for
             // it. The rest stays with whoever still owns it.
             (uint256 markBefore, uint256 exitBefore) = drivers[i].valueOf(address(this));
-            // An account worth no more than a few dollar-units is dust: a
-            // fraction of it is left where it is rather than let its rounding
-            // hold every leaver's close. A full unwind still sells it.
-            if (fraction < WAD && markBefore <= count + 1) continue;
-            // An account worth something at the mark and nothing at exit
-            // prices is underwater at the bid: selling a fraction of it would
-            // bring the leaver nothing and leave the loss with everyone else.
-            // Only a full unwind, which everyone shares, may sell it.
-            freed[i] = exitBefore.mulDiv(fraction, WAD, Math.Rounding.Floor);
-            // Nor a fraction worth something at the mark and nothing at exit
-            // prices: the sale would bring the leaver nothing too.
-            if (freed[i] == 0 && markBefore.mulDiv(fraction, WAD) != 0 && fraction < WAD) revert ShortSweep();
+            // The band first, for every account: a market outside it closes
+            // nothing anywhere, whatever any account reads as.
             bool outside;
             (closes[i], outside) = drivers[i].close(address(this), fraction, _spec.exitBandBps);
             if (outside) {
                 emit Unwound(fraction, 0, true);
                 return (0, true);
+            }
+            // An account worth no more than a few dollar-units is dust: a
+            // fraction of it is left where it is rather than let its rounding
+            // hold every leaver's close. A full unwind still sells it.
+            if (fraction < WAD && markBefore <= count + 1) {
+                skipped[i] = true;
+                continue;
+            }
+            freed[i] = exitBefore.mulDiv(fraction, WAD, Math.Rounding.Floor);
+            // A fraction worth more than dust at the mark and nothing at exit
+            // prices (an account under water at the bid) is never sold for
+            // the leaver: it would bring them nothing and leave the loss with
+            // everyone else. Only a full unwind, which everyone shares, may.
+            if (freed[i] == 0 && markBefore.mulDiv(fraction, WAD) > count + 1 && fraction < WAD) {
+                revert ShortSweep();
             }
         }
 
@@ -263,6 +269,7 @@ contract Station is IStation, ReentrancyGuardTransient {
         uint256 idleBefore = dollar.balanceOf(address(this));
         uint256 brought;
         for (uint256 i = 0; i < count; i++) {
+            if (skipped[i]) continue;
             address[] memory targets = drivers[i].targets();
             uint256 before = dollar.balanceOf(address(this));
             _run(closes[i], targets);

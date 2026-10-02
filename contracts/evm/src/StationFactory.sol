@@ -51,7 +51,10 @@ contract StationFactory is IStationFactory {
         if (implementation != address(0)) revert AlreadyInitialized();
         // Zero would leave it uninitialised and open to a second call, or
         // brick every station it creates.
-        if (implementation_ == address(0) || attestation_ == address(0) || asset_ == address(0)) {
+        if (
+            implementation_ == address(0) || attestation_ == address(0) || asset_ == address(0)
+                || vaultFactory_ == address(0)
+        ) {
             revert NotInitialized();
         }
         attestation = attestation_;
