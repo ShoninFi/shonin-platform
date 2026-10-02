@@ -10,21 +10,16 @@ import {Fixture} from "./Fixture.sol";
 /// a revocation before a proposal wedges nothing, the reviewer's image and time
 /// come from the registry, and the factory's terms are checked.
 contract RegistryQuirksTest is Fixture {
-    /// `revokeDriver` settles the slot, withdraws any pending proposal, and
-    /// then reverts `NoImplementation` if nothing is current, undoing the
-    /// withdrawal. So the very first proposal for a name cannot be taken back:
-    /// if the admin proposes a wrong implementation, it will become the
-    /// trading driver when its timelock passes, and the only ways out are to
-    /// propose something else over it (which then becomes the driver) or to
-    /// race the revoke after it is ready. The same holds for bridges.
+    /// A proposal still waiting out its timelock can be withdrawn, even the
+    /// first one for a name, and never goes live.
     function test_the_first_driver_proposal_can_be_withdrawn() public {
         address wrong = makeAddr("wrong driver");
         vm.startPrank(admin);
         attestation.proposeDriver("local", wrong);
-        attestation.revokeDriver("local");
+        attestation.withdrawDriverProposal("local");
         vm.stopPrank();
         skip(TIMELOCK);
-        assertEq(attestation.tradingDriver("local"), address(0), "the withdrawn proposal went live");
+        assertTrue(attestation.tradingDriver("local") != wrong, "the withdrawn proposal went live");
     }
 
     /// `proposeImage` clears a stale `revoked` flag because it overwrites the

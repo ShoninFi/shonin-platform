@@ -27,11 +27,9 @@ contract FaultingDriverEscapeTest is Fixture {
         uint256 id = requestDepositAs(vault, bob, 500e6);
 
         // The venue's contract starts reverting on reads: the driver that
-        // reaches it faults. (Here: a replacement driver that faults, which
-        // the registry delivers through its ordinary timelock.)
+        // reaches it faults.
         FaultingDriver faulting = new FaultingDriver();
-        vm.prank(admin);
-        attestation.proposeDriver("local", address(faulting));
+        pinnedDriverActsAs(address(faulting));
         skip(TIMELOCK);
 
         // No valuation can be recorded, so bob's deposit stays in escrow.

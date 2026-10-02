@@ -62,8 +62,10 @@ interface IAttestationRegistry {
     event VerifierRetired(address indexed verifier);
     event DriverProposed(bytes32 indexed name, address indexed implementation, uint64 readyAt);
     event DriverRevoked(bytes32 indexed name, address indexed implementation);
+    event DriverProposalWithdrawn(bytes32 indexed name, address indexed implementation);
     event BridgeProposed(bytes32 indexed name, address indexed implementation, uint64 readyAt);
     event BridgeRevoked(bytes32 indexed name, address indexed implementation);
+    event BridgeProposalWithdrawn(bytes32 indexed name, address indexed implementation);
     /// The timelock in force changes at `effectiveAt`: at once when raised,
     /// after the current timelock when lowered.
     event TimelockSet(uint64 timelock, uint64 effectiveAt);
@@ -129,24 +131,32 @@ interface IAttestationRegistry {
     /// At once.
     function retireVerifier(address verifier) external;
 
-    /// The on-chain half of a driver, by its name in `shonin.toml`. A newer
-    /// implementation replaces the current one when its timelock passes.
+    /// The on-chain half of a driver, by its name in `shonin.toml`. It is
+    /// approved once its timelock passes, and then only for stations created
+    /// afterwards: a station pins the implementations in force when it is
+    /// created and keeps them for good, so nothing approved later reaches a
+    /// running vault.
     function proposeDriver(bytes32 name, address implementation) external;
-    /// Stops trading through the current implementation at once. Valuing and
-    /// unwinding through it keep working.
-    function revokeDriver(bytes32 name) external;
-    /// The implementation to trade through: zero while none is ready, or
-    /// after a revocation.
+    /// Withdraw the proposal still waiting out its timelock; nothing in force
+    /// changes.
+    function withdrawDriverProposal(bytes32 name) external;
+    /// At once: stations that pin `implementation` stop trading through it,
+    /// and keep valuing and closing through it, so an exit never depends on
+    /// a driver's approval.
+    function revokeDriver(bytes32 name, address implementation) external;
+    /// What a station created now pins: zero while none is approved, or once
+    /// the latest approval is revoked.
     function tradingDriver(bytes32 name) external view returns (address);
-    /// The implementation to value and unwind through: the latest that became
-    /// ready, even if revoked, so an exit never depends on a driver's approval.
-    function unwindDriver(bytes32 name) external view returns (address);
+    function isDriverRevoked(bytes32 name, address implementation) external view returns (bool);
 
-    /// A bridge, by its name in `shonin.toml`, approved the same way.
+    /// A bridge, by its name in `shonin.toml`, approved and pinned the same
+    /// way. A station sends nothing through a revoked bridge, even home.
     function proposeBridge(bytes32 name, address implementation) external;
-    function revokeBridge(bytes32 name) external;
-    /// Zero while none is ready, or after a revocation.
+    function withdrawBridgeProposal(bytes32 name) external;
+    function revokeBridge(bytes32 name, address implementation) external;
+    /// Zero while none is approved, or once the latest approval is revoked.
     function bridgeOf(bytes32 name) external view returns (address);
+    function isBridgeRevoked(bytes32 name, address implementation) external view returns (bool);
 
     /// Admin only. Raising applies at once; lowering applies after the
     /// timelock in force when it was asked for.

@@ -132,15 +132,16 @@ contract RemoteStationUnwindTest is Fixture {
     }
 
     /// A stopped remote station whose only bridge the registry has revoked
-    /// can't send anything home until a replacement passes the timelock; the
-    /// unwind reverts whole, so nothing is sold into a station that can't
-    /// move it.
+    /// can't send anything home, since it keeps the bridge it was created
+    /// with; the unwind reverts whole, so nothing is sold into a station that
+    /// can't move it.
     function test_a_revoked_bridge_leaves_the_unwind_whole() public {
         deployed();
         bytes32 digest = remote.stopDigest("killed", uint64(block.timestamp));
         remote.stop("killed", uint64(block.timestamp), signed(UNWINDER_KEY, digest));
+        address pinned = remote.pinnedBridge("local-bridge");
         vm.prank(admin);
-        attestation.revokeBridge("local-bridge");
+        attestation.revokeBridge("local-bridge", pinned);
         vm.prank(alice);
         vm.expectRevert(Station.NotApproved.selector);
         remote.unwind(1e18);

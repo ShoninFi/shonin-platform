@@ -287,6 +287,7 @@ contract StationExternalFunctionsTest is ClaimBase, Calls {
         if (caller != address(factory)) want = StationFactory.NotVaultFactory.selector;
         else if (band > 1000) want = StationFactory.OutOfRange.selector;
         else if (fresh && list.length == 2 && list[0] == list[1]) want = Station.NotAllowed.selector;
+        else if (fresh && list[0] != "local") want = Station.NotApproved.selector;
         bytes32 specBefore = keccak256(abi.encode(station.spec()));
         (bool ok, bytes4 err) = callAs(
             caller,
@@ -381,10 +382,13 @@ contract StationExternalFunctionsTest is ClaimBase, Calls {
         address key = k % 3 == 0 ? executor : k % 3 == 1 ? second : otherKey;
         Books memory b = books(caller);
         bytes4 want;
-        if (stage != STOPPED && isExecutor(key) && attestation.tradingDriver(driver) != address(0)) {
-            want = Station.StillBlessed.selector;
-        } else if (driver != "local") {
+        if (driver != "local") {
             want = Station.NotDeclared.selector;
+        } else if (
+            stage != STOPPED && isExecutor(key)
+                && !attestation.isDriverRevoked(driver, station.pinnedDriver(driver))
+        ) {
+            want = Station.StillBlessed.selector;
         }
         (bool ok, bytes4 err) =
             callAs(caller, address(station), abi.encodeCall(Station.revokeKey, (driver, key)));
@@ -639,12 +643,11 @@ contract RemoteStationExternalFunctionsTest is Fixture, Calls {
             want = StationFactory.NotBlessed.selector;
         } else if (!builderSigns && !attestation.isBlessedAs(vm.addr(key), ImageKind.Builder)) {
             want = StationFactory.NotBlessed.selector;
-        } else if (!knownDriver) {
-            want = StationFactory.UnknownDriver.selector;
-        } else if (!knownBridge) {
-            want = StationFactory.UnknownBridge.selector;
         } else if (spec.exitBandBps > 1000) {
             want = StationFactory.OutOfRange.selector;
+        } else if (!knownDriver || !knownBridge) {
+            // The station pins this chain's approvals as it is created.
+            want = Station.NotApproved.selector;
         }
         (bool ok, bytes4 err) =
             callAs(caller, address(stations), abi.encodeCall(StationFactory.create, (spec, word)));
@@ -768,9 +771,9 @@ contract RegistryExternalFunctionsTest is Fixture, Calls {
         else if (which == 4) call = abi.encodeCall(AttestationRegistry.proposeVerifier, (implementation));
         else if (which == 5) call = abi.encodeCall(AttestationRegistry.retireVerifier, (implementation));
         else if (which == 6) call = abi.encodeCall(AttestationRegistry.proposeDriver, (name, implementation));
-        else if (which == 7) call = abi.encodeCall(AttestationRegistry.revokeDriver, (name));
+        else if (which == 7) call = abi.encodeCall(AttestationRegistry.revokeDriver, (name, implementation));
         else if (which == 8) call = abi.encodeCall(AttestationRegistry.proposeBridge, (name, implementation));
-        else call = abi.encodeCall(AttestationRegistry.revokeBridge, (name));
+        else call = abi.encodeCall(AttestationRegistry.revokeBridge, (name, implementation));
 
         bool imageBefore = attestation.isImageAllowed(name);
         bool projectBefore = attestation.isProjectAllowed(name);
@@ -790,7 +793,8 @@ contract RegistryExternalFunctionsTest is Fixture, Calls {
             errs(
                 AttestationRegistry.AlreadyProposed.selector,
                 AttestationRegistry.NoKind.selector,
-                AttestationRegistry.NoImplementation.selector
+                AttestationRegistry.NoImplementation.selector,
+                AttestationRegistry.NotApproved.selector
             ),
             "an allowlist change"
         );
@@ -812,10 +816,13 @@ contract RegistryExternalFunctionsTest is Fixture, Calls {
         }
         if (which == 6) assertEq(attestation.tradingDriver(name), tradingBefore, "a driver counted early");
         if (which == 7) {
-            assertEq(attestation.tradingDriver(name), address(0), "a revoked driver still trades");
+            assertTrue(attestation.isDriverRevoked(name, implementation), "a revoked driver still trades");
+            assertTrue(attestation.tradingDriver(name) != implementation, "a revoked driver is still pinned");
         }
         if (which == 8) assertEq(attestation.bridgeOf(name), bridgeBefore, "a bridge counted early");
-        if (which == 9) assertEq(attestation.bridgeOf(name), address(0), "a revoked bridge still carries");
+        if (which == 9) {
+            assertTrue(attestation.isBridgeRevoked(name, implementation), "a revoked bridge still carries");
+        }
     }
 
     /// What an instance attests to, and where its key is to serve.

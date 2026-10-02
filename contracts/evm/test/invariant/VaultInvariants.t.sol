@@ -191,6 +191,17 @@ contract VaultInvariantsTest is Fixture {
     /// The admin key can propose, revoke and kill, and none of it moves a
     /// dollar or changes a book; every other money-moving call it tries is
     /// refused. The station only stops once the halt's grace has passed.
+    /// Whatever the admin proposed, waited out and approved over the walk,
+    /// the vault's station runs the driver and bridge it was created with.
+    function invariant_12_a_running_vaults_drivers_never_change() public view {
+        Station station = Station(vault.homeStation());
+        assertEq(station.pinnedDriver("local"), address(driver), "a running vault's driver changed");
+        bytes32[] memory bridges = station.spec().bridges;
+        for (uint256 i = 0; i < bridges.length; i++) {
+            assertEq(station.pinnedBridge(bridges[i]), address(bridge), "a running vault's bridge changed");
+        }
+    }
+
     function invariant_12_the_admin_key_moves_no_money() public view {
         assertEq(handler.adminBreaks(), 0, handler.lastBreak());
         assertEq(handler.graceBreaks(), 0, handler.lastBreak());

@@ -58,11 +58,9 @@ contract StopAlwaysGoesThroughTest is Fixture {
     /// depends on the driver's view being callable.
     function test_a_halted_station_can_still_be_stopped_when_the_drivers_revoke_view_reverts() public {
         deployed();
-        // The venue pauses; its driver's `revokeKey` reads it and faults. The
-        // registry delivers that driver like any other, after the timelock.
+        // The venue pauses; its driver's `revokeKey` reads it and faults.
         RevokeFaultingDriver faulting = new RevokeFaultingDriver(venue, IERC20(address(usd)));
-        vm.prank(admin);
-        attestation.proposeDriver("local", address(faulting));
+        pinnedDriverActsAs(address(faulting));
         skip(TIMELOCK);
 
         vm.prank(admin);

@@ -29,13 +29,10 @@ contract DriverCannotReachTheVaultTest is Fixture {
         uint256 cashBefore = vault.cash();
         assertApproxEqAbs(cashBefore, 100_000e6, 1e6);
 
-        // A replacement driver goes through the registry's ordinary timelock.
+        // The vault's own driver turns out hostile.
         address taker = address(new Taker());
         HostileDriver hostile = new HostileDriver(IERC20(address(usd)), vault, taker);
-        vm.prank(admin);
-        attestation.proposeDriver("local", address(hostile));
-        skip(TIMELOCK);
-        assertEq(attestation.unwindDriver("local"), address(hostile));
+        pinnedDriverActsAs(address(hostile));
 
         // A stranger "revokes" an address that was never a key: the station
         // refuses the driver's call to the vault.

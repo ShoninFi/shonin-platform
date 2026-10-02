@@ -26,23 +26,19 @@ contract AdminFootgunsTest is Fixture {
         attestation.proposeVerifier(address(next));
     }
 
-    /// `revokeDriver` marks the implementation address revoked for that name
-    /// and nothing ever clears it. Proposing the same address again (the
-    /// revoke was a mistake, or the problem was elsewhere) is accepted, waits
-    /// out a full timelock, becomes the effective implementation -- and is
-    /// still refused for trading, while `unwindDriver` returns it. The admin's
-    /// only way out is a redeploy at a new address. The same holds for bridges.
+    /// Proposing a revoked implementation again (the revoke was a mistake)
+    /// approves it again once a full timelock has passed.
     function test_a_revoked_driver_proposed_again_trades_again_after_its_timelock() public {
         address v1 = makeAddr("driver v1");
         vm.startPrank(admin);
         attestation.proposeDriver("local", v1);
         skip(TIMELOCK);
-        attestation.revokeDriver("local");
+        attestation.revokeDriver("local", v1);
         assertEq(attestation.tradingDriver("local"), address(0));
         attestation.proposeDriver("local", v1);
         vm.stopPrank();
         skip(TIMELOCK);
-        assertEq(attestation.unwindDriver("local"), v1);
+        assertFalse(attestation.isDriverRevoked("local", v1));
         assertEq(attestation.tradingDriver("local"), v1, "a re-proposed implementation never trades again");
     }
 }

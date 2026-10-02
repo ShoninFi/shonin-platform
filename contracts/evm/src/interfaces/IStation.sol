@@ -44,6 +44,9 @@ interface IStation {
     event Bridged(bytes32 indexed bridge, uint256 indexed sequence, uint256 indexed toChain, uint256 amount);
     event Unwound(uint256 fraction, uint256 sentHome, bool blocked);
     event Stopped(bytes32 reason, uint64 haltedAt);
+    /// A driver failed during a stopped station's full unwind; the others
+    /// went ahead.
+    event DriverFailed(bytes32 indexed driver);
 
     /// A close inside the band that couldn't bring its worth home: margin a
     /// position was bought on still holds the proceeds at the venue. The
@@ -71,7 +74,9 @@ interface IStation {
     /// vault, carried from the vault's chain.
     function stop(bytes32 reason, uint64 haltedAt, bytes calldata signature) external;
     /// Close `fraction` (1e18 is all) of every position inside the exit band
-    /// and send that fraction's dollars home. `blocked` is true, and nothing
+    /// and send that fraction's dollars home. A stopped station's full
+    /// unwind closes each venue on its own inside `stoppedBand()`, skipping
+    /// one that fails, and sends everything idle home. `blocked` is true, and nothing
     /// is closed, when a market is outside the band. It reverts with
     /// `ShortSweep` when what a venue sends home falls short of the closed
     /// fraction's worth by more than the band.
@@ -86,6 +91,16 @@ interface IStation {
     function isHome() external view returns (bool);
     function stopped() external view returns (bool);
     function approvedKey(bytes32 driver) external view returns (address);
+    /// The implementation pinned at creation for a declared driver or bridge.
+    function pinnedDriver(bytes32 driver) external view returns (address);
+    function pinnedBridge(bytes32 name) external view returns (address);
+    /// When it stopped; zero while it runs.
+    function stoppedAt() external view returns (uint64);
+    /// The band its full unwind closes inside now: the exit band, widening
+    /// after it has been stopped a while.
+    function stoppedBand() external view returns (uint16);
+    /// Only the station itself calls it, during a stopped full unwind.
+    function closeAll(bytes32 driver, uint16 band) external returns (bool outside);
     function sends() external view returns (Send[] memory);
     function sendCount() external view returns (uint256);
     function sendAt(uint256 index) external view returns (Send memory);

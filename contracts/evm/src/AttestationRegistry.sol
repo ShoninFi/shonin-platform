@@ -92,6 +92,7 @@ contract AttestationRegistry is IAttestationRegistry {
     error WrongKindForVault();
     error NotAmongTheVaults();
     error NoImplementation();
+    error NotApproved();
     error Stale();
     error TooLong();
     error TooShort();
@@ -241,17 +242,22 @@ contract AttestationRegistry is IAttestationRegistry {
         emit DriverProposed(name, implementation, readyAt);
     }
 
-    function revokeDriver(bytes32 name) external onlyAdmin {
-        address revoked = _revoke(_driver[name], _driverRevoked[name]);
-        emit DriverRevoked(name, revoked);
+    function withdrawDriverProposal(bytes32 name) external onlyAdmin {
+        address withdrawn = _withdraw(_driver[name], _driverRevoked[name]);
+        emit DriverProposalWithdrawn(name, withdrawn);
+    }
+
+    function revokeDriver(bytes32 name, address implementation) external onlyAdmin {
+        _revoke(_driver[name], _driverRevoked[name], implementation);
+        emit DriverRevoked(name, implementation);
     }
 
     function tradingDriver(bytes32 name) external view returns (address) {
         return _trading(_driver[name], _driverRevoked[name]);
     }
 
-    function unwindDriver(bytes32 name) external view returns (address) {
-        return _effective(_driver[name]);
+    function isDriverRevoked(bytes32 name, address implementation) external view returns (bool) {
+        return _isRevoked(_driver[name], _driverRevoked[name], implementation);
     }
 
     function proposeBridge(bytes32 name, address implementation) external onlyAdmin {
@@ -259,13 +265,22 @@ contract AttestationRegistry is IAttestationRegistry {
         emit BridgeProposed(name, implementation, readyAt);
     }
 
-    function revokeBridge(bytes32 name) external onlyAdmin {
-        address revoked = _revoke(_bridge[name], _bridgeRevoked[name]);
-        emit BridgeRevoked(name, revoked);
+    function withdrawBridgeProposal(bytes32 name) external onlyAdmin {
+        address withdrawn = _withdraw(_bridge[name], _bridgeRevoked[name]);
+        emit BridgeProposalWithdrawn(name, withdrawn);
+    }
+
+    function revokeBridge(bytes32 name, address implementation) external onlyAdmin {
+        _revoke(_bridge[name], _bridgeRevoked[name], implementation);
+        emit BridgeRevoked(name, implementation);
     }
 
     function bridgeOf(bytes32 name) external view returns (address) {
         return _trading(_bridge[name], _bridgeRevoked[name]);
+    }
+
+    function isBridgeRevoked(bytes32 name, address implementation) external view returns (bool) {
+        return _isRevoked(_bridge[name], _bridgeRevoked[name], implementation);
     }
 
     function _effective(Slot storage slot) private view returns (address) {
@@ -273,14 +288,28 @@ contract AttestationRegistry is IAttestationRegistry {
         return slot.current;
     }
 
-    /// A revocation holds against what is in force. A proposal that has
-    /// waited out its timelock is a fresh approval, whatever it replaced.
+    /// What a station created now pins: the latest approval, unless it was
+    /// revoked. A proposal that has waited out its timelock is a fresh
+    /// approval, whatever it replaced.
     function _trading(
         Slot storage slot,
         mapping(address => bool) storage revoked
-    ) private view returns (address) {
-        if (slot.next != address(0) && block.timestamp >= slot.nextReadyAt) return slot.next;
-        return revoked[slot.current] ? address(0) : slot.current;
+    ) private view returns (address implementation) {
+        implementation = _effective(slot);
+        if (_isRevoked(slot, revoked, implementation)) return address(0);
+    }
+
+    /// Whether `implementation` stands revoked. One proposed again and past
+    /// its timelock is approved again, even before anything settles it.
+    function _isRevoked(
+        Slot storage slot,
+        mapping(address => bool) storage revoked,
+        address implementation
+    ) private view returns (bool) {
+        if (implementation == slot.next && slot.next != address(0) && block.timestamp >= slot.nextReadyAt) {
+            return false;
+        }
+        return revoked[implementation];
     }
 
     function _settle(Slot storage slot, mapping(address => bool) storage revoked) private {
@@ -306,20 +335,31 @@ contract AttestationRegistry is IAttestationRegistry {
         slot.nextReadyAt = readyAt;
     }
 
-    function _revoke(
+    /// Withdraw the proposal still waiting out its timelock. What is in
+    /// force, and every station that pinned it, is untouched.
+    function _withdraw(
         Slot storage slot,
         mapping(address => bool) storage revoked
-    ) private returns (address implementation) {
+    ) private returns (address withdrawn) {
         _settle(slot, revoked);
-        // A proposal still waiting is simply withdrawn: it never counted.
-        bool withdrew = slot.next != address(0);
+        withdrawn = slot.next;
+        if (withdrawn == address(0)) revert NoImplementation();
         delete slot.next;
         delete slot.nextReadyAt;
-        implementation = slot.current;
-        if (implementation == address(0)) {
-            if (!withdrew) revert NoImplementation();
-            return implementation;
-        }
+    }
+
+    /// Revoke an implementation that was approved: the one in force, or an
+    /// older one stations still pin. They stop trading through it at once
+    /// and keep valuing and closing through it.
+    function _revoke(
+        Slot storage slot,
+        mapping(address => bool) storage revoked,
+        address implementation
+    ) private {
+        _settle(slot, revoked);
+        if (implementation == address(0)) revert NoImplementation();
+        // A proposal still waiting has not been approved: withdraw it.
+        if (implementation == slot.next) revert NotApproved();
         revoked[implementation] = true;
     }
 

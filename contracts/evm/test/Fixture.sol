@@ -85,6 +85,14 @@ contract Fixture is Test {
     LocalBridge internal bridge;
     StationFactory internal stations;
 
+    /// Gives the driver every station here pins new code. A running vault
+    /// keeps the driver it was created with, so this is how a test stands in
+    /// for one whose venue changed under it (a pause, a new interface) or one
+    /// that was hostile from the start.
+    function pinnedDriverActsAs(address replacement) internal {
+        vm.etch(address(driver), replacement.code);
+    }
+
     function setUp() public virtual {
         (author, authorKey) = makeAddrAndKey("author");
         (alice, aliceKey) = makeAddrAndKey("alice");

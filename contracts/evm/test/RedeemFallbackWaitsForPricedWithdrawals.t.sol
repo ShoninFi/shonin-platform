@@ -30,10 +30,7 @@ contract RedeemFallbackWaitsForPricedWithdrawalsTest is Fixture {
         uint256 cash = vault.cash();
         assertApproxEqAbs(cash, 10_000e6, 1e6);
 
-        // A driver that faults is proposed; it lands after the timelock.
         FaultingDriver faulting = new FaultingDriver();
-        vm.prank(admin);
-        attestation.proposeDriver("local", address(faulting));
 
         // Bob asks for 8k back; a valuation prices it (payable from cash),
         // and it is left unsettled.
@@ -48,6 +45,7 @@ contract RedeemFallbackWaitsForPricedWithdrawalsTest is Fixture {
         // driver faults for good: no valuation can be recorded.
         vm.prank(alice);
         uint256 aliceRequest = vault.requestRedeem(aliceShares, alice);
+        pinnedDriverActsAs(address(faulting));
         skip(TIMELOCK);
         t = vm.getBlockTimestamp();
         vm.warp(t - (t % SLOT) + SLOT);

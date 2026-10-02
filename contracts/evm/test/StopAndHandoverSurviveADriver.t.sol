@@ -40,8 +40,7 @@ contract StopAndHandoverSurviveADriverTest is Fixture {
     function test_a_halted_station_can_still_be_stopped_when_the_drivers_revoke_names_a_bad_target() public {
         deployed();
         BadRevokeDriver bad = new BadRevokeDriver(venue, IERC20(address(usd)), alice);
-        vm.prank(admin);
-        attestation.proposeDriver("local", address(bad));
+        pinnedDriverActsAs(address(bad));
         skip(TIMELOCK);
 
         vm.prank(admin);
@@ -64,8 +63,7 @@ contract StopAndHandoverSurviveADriverTest is Fixture {
     function test_a_lapsed_key_can_be_replaced_while_the_drivers_revoke_view_faults() public {
         deployed();
         RevokeFaultingDriver faulting = new RevokeFaultingDriver(venue, IERC20(address(usd)));
-        vm.prank(admin);
-        attestation.proposeDriver("local", address(faulting));
+        pinnedDriverActsAs(address(faulting));
         skip(TIMELOCK);
 
         // The old key lapsed; a new instance is blessed.

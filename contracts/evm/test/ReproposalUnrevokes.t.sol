@@ -19,7 +19,7 @@ contract ReproposalUnrevokesTest is Fixture {
         skip(TIMELOCK);
         assertEq(attestation.tradingDriver("local"), v1);
 
-        attestation.revokeDriver("local");
+        attestation.revokeDriver("local", v1);
         assertEq(attestation.tradingDriver("local"), address(0));
 
         // The admin changes its mind (or a compromised admin key wants it
@@ -39,15 +39,15 @@ contract ReproposalUnrevokesTest is Fixture {
         assertEq(attestation.tradingDriver("local"), v1);
     }
 
-    /// The same when the revocation also withdrew a waiting proposal: the
-    /// admin had v1 in force and v2 waiting, revoked the name, then put v1
-    /// back.
+    /// The same when a waiting proposal was withdrawn first: the admin had
+    /// v1 in force and v2 waiting, withdrew v2, revoked v1, then put v1 back.
     function test_the_same_after_a_revocation_that_withdrew_a_waiting_proposal() public {
         vm.startPrank(admin);
         attestation.proposeDriver("local", v1);
         skip(TIMELOCK);
         attestation.proposeDriver("local", v2);
-        attestation.revokeDriver("local");
+        attestation.withdrawDriverProposal("local");
+        attestation.revokeDriver("local", v1);
         assertEq(attestation.tradingDriver("local"), address(0));
         attestation.proposeDriver("local", v1);
         vm.stopPrank();
@@ -60,7 +60,7 @@ contract ReproposalUnrevokesTest is Fixture {
         attestation.proposeBridge("local-bridge", bridge);
         skip(TIMELOCK);
         assertEq(attestation.bridgeOf("local-bridge"), bridge);
-        attestation.revokeBridge("local-bridge");
+        attestation.revokeBridge("local-bridge", bridge);
         assertEq(attestation.bridgeOf("local-bridge"), address(0));
         attestation.proposeBridge("local-bridge", bridge);
         vm.stopPrank();

@@ -36,6 +36,10 @@ library Upkeep {
     uint256 private constant OFFSET = VaultStorage.OFFSET;
     uint256 private constant BPS = VaultStorage.BPS;
     uint256 private constant WAD = VaultStorage.WAD;
+    /// What a driver may spend, and how many codes it may name, when its
+    /// restricted list is read again.
+    uint256 private constant RESTRICTED_GAS = 200_000;
+    uint256 private constant MAX_RESTRICTED = 64;
 
     string internal constant STATEMENT =
         "I am not a restricted person for this vault, and I am not acting for one.";
@@ -116,16 +120,26 @@ library Upkeep {
         emit IVault.StatementRecorded(depositor, s.restrictedHash);
     }
 
-    /// Read the same-chain drivers' lists again. The list only ever grows,
-    /// and a depositor signs again for the longer one.
+    /// Read the same-chain drivers' lists again, from the implementation the
+    /// registry approves now: a venue's terms can exclude more people after a
+    /// vault was created, and its pinned driver can't learn that. The list
+    /// only ever grows, and a depositor signs again for the longer one. Only
+    /// a list is read, never a call made, and a driver that fails or answers
+    /// with an outsized list is skipped.
     function refreshRestricted() external {
         Layout storage s = VaultStorage.layout();
         IAttestationRegistry registry = IAttestationRegistry(s.attestation);
         bool added;
         for (uint256 i = 0; i < s.drivers.length; i++) {
-            address implementation = registry.unwindDriver(s.drivers[i]);
+            address implementation = registry.tradingDriver(s.drivers[i]);
             if (implementation == address(0)) continue;
-            bytes32[] memory codes = IDriver(implementation).restricted();
+            bytes32[] memory codes;
+            try IDriver(implementation).restricted{gas: RESTRICTED_GAS}() returns (bytes32[] memory list) {
+                codes = list;
+            } catch {
+                continue;
+            }
+            if (codes.length > MAX_RESTRICTED) continue;
             for (uint256 j = 0; j < codes.length; j++) {
                 if (_insert(s.restricted, codes[j])) {
                     added = true;

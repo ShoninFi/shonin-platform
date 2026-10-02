@@ -265,8 +265,9 @@ contract VaultFactory is IVaultFactory {
             list = Codes.with(list, record.restricted[i]);
         }
         for (uint256 i = 0; i < drivers.length; i++) {
-            address implementation = attestation.unwindDriver(drivers[i]);
-            // A driver nobody approved could never value or stop the station.
+            // The implementation the home station pins in this same
+            // transaction; a driver nobody approved could never value it.
+            address implementation = attestation.tradingDriver(drivers[i]);
             if (implementation == address(0)) revert UnknownDriver();
             bytes32[] memory codes = IDriver(implementation).restricted();
             for (uint256 j = 0; j < codes.length; j++) {

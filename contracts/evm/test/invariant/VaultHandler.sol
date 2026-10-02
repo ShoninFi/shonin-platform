@@ -1291,7 +1291,9 @@ contract VaultHandler is Test {
             );
         } else if (w == 8) {
             bytes32 name = seed % 5 == 0 ? bytes32("local") : bytes32("other");
-            (ok,) = address(attestation).call(abi.encodeCall(AttestationRegistry.revokeDriver, (name)));
+            (ok,) = address(attestation).call(
+                abi.encodeCall(AttestationRegistry.revokeDriver, (name, attestation.tradingDriver(name)))
+            );
         } else if (w == 9) {
             (ok,) = address(attestation).call(
                 abi.encodeCall(
@@ -1299,8 +1301,11 @@ contract VaultHandler is Test {
                 )
             );
         } else if (w == 10) {
-            (ok,) =
-                address(attestation).call(abi.encodeCall(AttestationRegistry.revokeBridge, ("other-bridge")));
+            (ok,) = address(attestation).call(
+                abi.encodeCall(
+                    AttestationRegistry.revokeBridge, ("other-bridge", attestation.bridgeOf("other-bridge"))
+                )
+            );
         } else if (w == 11) {
             UnitPrices memory p = UnitPrices({
                 vcpuHour: uint128(_bound(seed, 0, 1e18)),
