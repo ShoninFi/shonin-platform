@@ -34,7 +34,7 @@ The words you'll meet throughout these docs: first who does what, then the handf
 : A computer that can prove exactly what code it's running, so nobody can quietly change it or read what's inside.
 
 **Booked withdrawal**
-: A withdrawal bigger than the cash the vault has at home. The contract closes your share of its positions and pays you once that cash is back.
+: A withdrawal bigger than the cash the vault has at home. The contract closes your share of its positions and pays you in that same transaction.
 
 **[Bridge](../writing/bridges.md)**
 : Another company's service for moving money between chains. An agent only uses the ones it names, and its station checks the money will arrive at the vault's own address.
@@ -93,10 +93,10 @@ The words you'll meet throughout these docs: first who does what, then the handf
 : The on-chain record that one key, made on one image, may act for one vault running one build, until it expires. Renewed by attesting again.
 
 **Claim**
-: The contract's name for a booked withdrawal. It's *pending*, then *waiting* if the market was too far from its price to close, then *paid*.
+: The contract's name for a booked withdrawal. It's *pending*, *waiting* if the market was too far from its price to close, *queued* if the cash covered it when it was tried, and then *paid*.
 
 **[Exit band](../under-the-hood/vaults.md#the-exit-band)**
-: How far from the venue's own price a booked withdrawal may close positions, 1% by default. It limits what one person leaving can cost everyone else.
+: How far from the venue's own price a booked withdrawal may close positions, 1% by default. It limits what one person leaving can cost everyone else. A valuation that finds a market outside it prices nothing.
 
 **Freeze**
 : What anyone can do to a vault whose booked withdrawal has gone unpaid for seven days: no new deposits, and only winding down left.
@@ -111,13 +111,16 @@ The words you'll meet throughout these docs: first who does what, then the handf
 : A venue's own reference price, used to value a deposit. A withdrawal is valued at **exit-side marks** instead: what a position would actually sell for.
 
 **Settle**
-: The public function that closes a booked withdrawal's positions, brings the cash home and pays the leaver. Anyone can send it.
+: Paying out what a valuation priced (`settle`), or a booked withdrawal (`settleClaim`), which closes the leaver's share of the positions and pays them in the same transaction. Anyone can send either.
 
 **Strategy**
 : The contracts' word for an agent, as in `strategyId` and `StrategyRegistry`. These docs only use it when naming something in the contracts or the SDK.
 
 **Usage total**
 : The running total of what an agent has used, kept and signed by its attested machine. The agent stops when the unpaid part reaches the tank, and Shonin collects from it, never past the allowances.
+
+**[Valuation](../under-the-hood/vaults.md#priced-after-you-ask)**
+: A snapshot of what a vault holds, taken on a ten-second clock. Every deposit and withdrawal is priced at the first one at least a few seconds after it's asked for. A valuation that finds a market outside the exit band is **void**: it prices nothing, and its requests roll on to the next.
 
 **Value per share**
 : A vault's value divided by its shares. It's the share price, and the whole of a vault's record is how it changes.

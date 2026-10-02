@@ -60,11 +60,11 @@ This page puts the last few pages together: where a vault's money sits, who pays
 </svg>
 </div>
 
-A vault's money is always in one of two places: **at home**, in the vault contract, or **trading**, out at its stations and venues. Shares are a claim on both. Fees are paid by creating new shares, so they never move cash. Cash only leaves the vault when someone turns shares back into dollars, and it's paid from home first.
+A vault's money is always in one of two places: **at home**, in the vault contract, or **trading**, out at its stations and venues. Shares are a claim on both. Fees are paid by creating new shares, so they don't move cash; the one exception is a booked withdrawal paid as its positions close, which pays its own profit fee in cash. Cash only leaves the vault when someone turns shares back into dollars, and it's paid from home first.
 
 ## Try it
 
-This simulator runs one vault a day at a time, by the rules above. Change the numbers, step through the days, and read the log to see what the daily `keep` call does: it collects the tab from the tank, pays fees on payday, then runs auto-fill.
+This simulator runs one vault a day at a time, by the rules above. Change the numbers, step through the days, and read the log to see what happens each day: the daily `keep` call collects the tab from the tank and asks for auto-fill, fees are paid at the week's first valuation, and auto-fill is paid at the next valuation, from cash at home.
 
 **Trading gain per week** stands in for how well the agent trades: how much the money it has out trading grows, or shrinks, each week.
 

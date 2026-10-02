@@ -67,7 +67,7 @@ Not everyone can. The venues an agent trades on don't accept everyone, and a vau
 - **Each venue adds its own list.** Some also exclude residents of the UK, Canada and a few other places. A vault's list is the lists of every venue it trades on put together, and its Author can add to it but never take away.
 - **Each vault's page shows who can't deposit,** and which venue each exclusion comes from.
 
-When you deposit, your wallet signs a short statement: that you aren't one of the people the vault excludes, and aren't acting for one. The vault's contract checks that signature and records it, and won't take a deposit without it. Nobody checks your identity; the statement is yours, and it's on the chain.
+When you deposit, your wallet signs a short statement: that you aren't one of the people the vault excludes, and aren't acting for one. Your deposit carries it, and the vault's contract checks that signature and records it, and won't take a deposit without it. Nobody checks your identity; the statement is yours, and it's on the chain.
 
 Getting out is never restricted. Whoever holds shares can always [withdraw](#getting-out).
 
@@ -98,11 +98,13 @@ You can ask for your money back at any time. Like a deposit, a withdrawal is pri
 
 **Paid from cash.** The vault keeps some cash at home, in the contract itself. If there's enough to cover your withdrawal, you're paid within seconds.
 
-**Booked.** If there isn't enough cash at home, your withdrawal is booked. The contract closes your share of each of the vault's positions, and pays you once that cash is back. Anyone can push this through, including you, so it doesn't depend on us.
+**Booked.** If there isn't enough cash at home, your withdrawal is booked. The contract closes your share of each of the vault's positions and pays you in that same transaction: what the close brought home, plus your share of the cash. Anyone can push this through, including you, so it doesn't depend on us.
 
-Vaults that trade on other chains, or at venues that keep their accounts off-chain, rely on an **unwinder** to finish a booked withdrawal: an attested machine any approved operator can run, though at launch that's only us. Their page says so. And if a vault can't be valued at all for a day, you can still take your share of its cash at once, with the rest paid as the money comes home.
+Vaults that trade on other chains, or at venues that keep their accounts off-chain, rely on an **unwinder** to finish a booked withdrawal: an attested machine any approved operator can run, though at launch that's only us. Their page says so.
 
-**What it costs.** Your shares are valued at the prices the vault could actually sell at, not the middle of the market, and there's the 0.1% [withdrawal fee](fees.md#the-deposit-and-withdrawal-fee), which stays in the vault for the people still in it.
+**If nothing can be priced.** A vault only prices withdrawals while its markets are within the [exit band](under-the-hood/vaults.md#the-exit-band) of their venues' own prices. If your withdrawal goes a day without being priced, you choose: take your share of the vault's cash at once, with the rest paid as the money comes home, or turn it into a booked withdrawal.
+
+**What it costs.** Your shares are valued at the prices the vault could actually sell at, not the middle of the market. You pay the [profit fee](fees.md#the-profit-fee) your own shares owe, and the 0.1% [withdrawal fee](fees.md#the-deposit-and-withdrawal-fee), which stays in the vault for the people still in it.
 
 ## What can still go wrong
 
@@ -110,7 +112,7 @@ Vaults that trade on other chains, or at venues that keep their accounts off-cha
 
 **The agent can stop.** If its tank runs dry, it stops until someone tops it up, and its open positions sit there with nothing managing them. You can still leave whenever you like.
 
-**A withdrawal can be delayed.** If a booked withdrawal still isn't paid after seven days, anyone can freeze the vault. It stops taking deposits, so nobody new joins a vault that can't pay out, and from then on it can only wind down.
+**A withdrawal can be delayed.** A market outside the exit band holds up pricing and closing until it's back. If a booked withdrawal still isn't paid seven days after it was booked, anyone can freeze the vault. It stops taking deposits, so nobody new joins a vault that can't pay out, and from then on it can only wind down.
 
 **The agent can be retired.** Its Author can retire it at any time. The vault then stops taking deposits and gives everyone a week to leave as usual, after which the agent stops for good and its positions are closed at market, which can lock in a loss.
 

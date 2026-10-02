@@ -29,6 +29,6 @@ Its vault's page shows them before anyone deposits.
 
 Money is exposed to a bridge while it crosses. If a bridge fails, or is hacked, money in it can be lost, and that's a risk you choose on your Depositors' behalf by naming it.
 
-**Money in transit** still counts in the vault's value for up to an hour. If it hasn't arrived by then, it counts as zero until it does, and the vault's page flags it, so nobody deposits or withdraws at a value that includes money that may not come.
+**Money in transit** still counts in the vault's value for up to an hour. If it hasn't arrived by then, the vault prices nothing until it does, and the vault's page flags it, so nobody deposits or withdraws at a value that guesses at money that may or may not come. If it stays stuck for a day, Depositors can still leave through the [fallback](../under-the-hood/vaults.md#leaving).
 
 [Next: publishing →](publishing.md){ .md-button .md-button--primary }

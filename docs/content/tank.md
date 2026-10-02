@@ -95,11 +95,11 @@ Every vault's page shows how full its tank is and its recent charges. The Author
 
 Publishing costs $1, which covers the review and the build, and nothing goes in the tank until the Author activates their agent. They have to put something in, since an agent with an empty tank doesn't run, and about a week of running is a wise start.
 
-After that, a successful agent can pay its own way. The Author can top the tank up from their earnings with one click, or switch on **auto-fill** and pick a number, "keep my tank at $X", and it tops itself up every day. The [Money flow](flow.md) page shows how that plays out.
+After that, a successful agent can pay its own way. The Author can top the tank up from their earnings with one click, or switch on **auto-fill** and pick a number, "keep my tank at $X", and it tops itself up every day: the daily `keep` call collects the signed bill, then cashes in just enough of the Author's shares to bring the tank back to that level. Those shares are priced like any withdrawal, at the next valuation and from cash at home. The [Money flow](flow.md) page shows how that plays out.
 
 ## Taking money out
 
-The Author can take money out whenever they like, say if they've put in more than they need: the tab is paid first, the rest goes to their wallet, and whatever they leave in keeps the agent running. If nothing is running to say what the tab is, the Author asks, waits a day so a final bill can still be collected, and then takes it out.
+The Author can take money out whenever they like, say if they've put in more than they need: the tab, as the executor signed it, is paid first, the rest goes to their wallet, and whatever they leave in keeps the agent running. If nothing is running to sign the tab, the Author asks, waits a day so a final bill can still be collected, and then takes it out.
 
 ## If it runs dry
 

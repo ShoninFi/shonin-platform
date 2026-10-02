@@ -8,13 +8,15 @@ Two fees pay the Author and Shonin. The profit fee is a share of the profit an a
 | Holding fee | 1% a year | Shonin |
 | Deposit and withdrawal fee | 0.1% each way | The vault: it raises every share's value |
 
-The profit and holding fees are paid every Monday, by creating new shares for the Author and Shonin rather than taking cash out of the vault.
+The profit and holding fees are worked out at every valuation and paid once a week, at the first valuation on or after Monday 00:00 UTC, by creating new shares for the Author and Shonin rather than taking cash out of the vault.
 
 ## The profit fee
 
 It's only charged on **new** profit. Each vault remembers the most a share has been worth on a payday, its **high-water mark**, and the fee only applies to gains above that. So if a vault dips and then recovers, nobody pays again on the way back up. And if an agent stops making money, the profit fee stops too: the Author earns nothing until it's back above its high-water mark.
 
-Every vault's page shows its mark next to today's share value. If you join while a vault is below its mark, its recovery up to the mark is fee-free for you. If you join while it's above its mark, the mark moves up to take in the price you paid, so you never pay for gains you weren't there for.
+Every vault's page shows its mark next to today's share value. If you join while a vault is below its mark, its recovery up to the mark is fee-free for you. If you join while it's above its mark, you join at your own price: the mark moves up to take in the price you paid, so you never pay for gains you weren't there for, and nobody else's fee jumps because you joined.
+
+When you leave, you pay the profit fee your own shares owe, and nobody else's comes due early. A withdrawal paid from cash pays it with a slice of your shares; a [booked withdrawal](under-the-hood/vaults.md#leaving) paid as its positions close pays it in cash.
 
 ## The holding fee
 

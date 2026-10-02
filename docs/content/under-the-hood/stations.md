@@ -4,6 +4,7 @@ A station is a vault's contract on a chain its agent trades on. It holds the mon
 
 Every vault has a station on each chain its agent trades on, its own chain included. [Smart contracts](../basics/smart-contracts.md#where-they-live) shows how they fit together.
 
+
 ## How one is made
 
 **Beside the vault,** the station is created in the same transaction that activates the vault, so the two always exist together.
@@ -18,7 +19,7 @@ Each station's address is fixed in advance from its vault, so asking twice just 
 
 ## Drivers
 
-A station has a [driver](../writing/drivers.md) plugged in for each venue on its chain that its agent uses. The station itself knows nothing about any venue, but it owns the vault's accounts there and makes every call itself. Its drivers only prepare and check those calls: approving the vault's trade-only keys, working out what the station holds there, and closing positions when someone withdraws. [Drivers](../writing/drivers.md) explains them in full, including how each venue's money is kept in.
+A station has a [driver](../writing/drivers.md) plugged in for each venue on its chain that its agent uses. The station itself knows nothing about any venue, but it owns the vault's accounts there and makes every call itself. Its drivers only prepare and check those calls: approving the vault's trade-only keys, working out what the station holds there, and closing positions when someone withdraws. The station only makes a call to one of the targets its driver declared, and never to the vault, the station itself, its factory or the registry, whatever the driver lists, so a driver can never reach the vault's cash. [Drivers](../writing/drivers.md) explains them in full, including how each venue's money is kept in.
 
 ## One executor at a time
 
@@ -37,17 +38,17 @@ Getting that figure to the vault depends on where the station is:
 | Where the station is | How the vault learns what it holds |
 | --- | --- |
 | **On the vault's own chain** | The vault reads it directly, in the same transaction |
-| **On another chain** | The vault's executor, or any unwinder blessed for the vault, reads it there, at that chain's first block at or after the vault's [valuation time](vaults.md#priced-after-you-ask), and carries it to the vault, signed. The vault only accepts it from a key blessed for this vault, and only for that valuation time |
+| **On another chain** | The vault's executor, or any unwinder blessed for the vault, reads it there, at that chain's first block a slot or more after the vault's [valuation](vaults.md#priced-after-you-ask) opened, and carries it to the vault, signed, with whether any market there was outside the exit band. The vault only accepts it from a key blessed for this vault, and only for that valuation time |
 | **At a venue that keeps its accounts off-chain** | An unwinder reads the account through the venue's own service and signs its value. The vault's page marks this as an **attested read**, one step below a value worked out on-chain |
 
-A figure is carried when someone needs it, for a deposit or withdrawal waiting on a valuation, so there's no standing cost. If two carried figures for the same moment disagree, deposits use the higher and withdrawals the lower. An unwinder can carry it too, and any approved operator can run one, so in time a withdrawal won't depend on us; at launch, we're the only operator. Each vault's page shows how much of its value is on its own chain, carried from another chain, or an attested read.
+A figure is carried when someone needs it, for a deposit or withdrawal waiting on a valuation, so there's no standing cost. If two carried figures for the same moment disagree, deposits use the higher, withdrawals the lower, and fees the lower mark. An unwinder can carry it too, and any approved operator can run one, so in time a withdrawal won't depend on us; at launch, we're the only operator. Each vault's page shows how much of its value is on its own chain, carried from another chain, or an attested read.
 
 ## Moving money
 
 Money only ever moves between the vault and its stations, and between a station's own accounts at its venues. Every destination is one of the vault's own, fixed when the vault is created, and the contracts refuse anything else.
 
-- **Between chains,** money only travels over the [bridges](../writing/bridges.md) the agent names, and the station itself checks, on the chain, that it will arrive at the vault's own address on the other side.
-- **Money in transit** still counts in the vault's value for up to an hour. After that it counts as zero until it arrives, and the vault's page flags it.
+- **Between chains,** money only travels over the [bridges](../writing/bridges.md) the agent names, and the station itself checks, on the chain, that it will arrive at the vault's own address on the other side. A station on another chain only ever sends money home, and nothing leaves home while a valuation waits for the other chains' figures.
+- **Money in transit** still counts in the vault's value for up to an hour. Past that, a valuation prices nothing until it arrives, and the vault's page flags it.
 - **The idle floor** limits what can leave the vault at all: the vault won't send money to its stations if that would leave less than the Author's floor at home.
 
 ## Getting money out
@@ -56,8 +57,8 @@ When a withdrawal needs positions closed, it depends on where they are:
 
 | | When | Who closes the positions |
 | --- | --- | --- |
-| **Direct** | Every station is on the vault's own chain | The contracts alone. Anyone can send the transaction that settles the claim |
-| **Served** | Any station on another chain, or any venue that keeps its accounts off-chain | An [unwinder](machines.md#the-unwinder), run by any approved operator, with keys blessed for this vault. It closes the positions, brings the money home over the declared bridges, and is repaid its costs from that money |
+| **Direct** | Every station is on the vault's own chain | The contracts alone. Anyone can send the transaction that settles the claim, which closes the leaver's share and pays them in the same transaction |
+| **Served** | Any station on another chain, or any venue that keeps its accounts off-chain | An [unwinder](machines.md#the-unwinder), run by any approved operator, with keys blessed for this vault. It closes the positions, brings the money home over the declared bridges, and is repaid its costs from that money. The claim is paid once the cash at home covers it |
 
 A served vault's page shows how many operators can run an unwinder for it, and what each venue's last resort is if none does.
 

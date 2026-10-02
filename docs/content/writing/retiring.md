@@ -16,7 +16,7 @@ When you're done with your agent, retire it from its page in the web app. It can
 
 ## Afterwards
 
-The vault stays on-chain for good, holding only cash, with no deadline for anyone. Depositors withdraw whenever they like, each paying their own transaction fee as usual, and so do you: whatever's left in the tank, and your fee shares, like any Depositor's.
+The vault stays on-chain for good, holding only cash, with no deadline for anyone. Once a valuation finds nothing left at the stations, the vault closes and its fees stop. Depositors withdraw whenever they like, each paying only their own network fee, and so do you: whatever's left in the tank, and your fee shares, like any Depositor's.
 
 A retired agent can't come back. To carry on with a changed version, [publish](publishing.md) it as a new agent.
 

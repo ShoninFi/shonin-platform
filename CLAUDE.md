@@ -2,7 +2,7 @@
 
 The Shonin platform: EVM contracts (`contracts/evm`, Foundry) and Solana programs (`contracts/solana`, Anchor), one Cargo workspace (`packages/*`: the frontends under `frontend/`, the attested machines under `machines/`, and the api, indexer, keeper and devnet), the chain config (`config/`), the images (`deploy/gcp`) and the public documentation site (`docs/`), driven by Task. See `README.md` for the layout, the quickstart and the local development conventions.
 
-The vocabulary follows the docs. The **machines** are the four attested images: reviewer, builder, executor, unwinder. The **services** are everything untrusted: the api (the app's server), the indexer (the reference record), the keeper (the daily clockwork) and, locally, the devnet.
+The vocabulary follows the docs. The **machines** are the four attested images: reviewer, builder, executor, unwinder. The **services** are everything untrusted: the api (the app's server), the indexer (the reference record), the keeper (the vaults' clockwork: valuations, settling, claims and the daily bill) and, locally, the devnet.
 
 ## Rules
 
