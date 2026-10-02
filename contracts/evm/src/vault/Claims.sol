@@ -75,7 +75,21 @@ library Claims {
         if (fraction == 0) fraction = 1;
         uint256 cashShare = s.cash.mulDiv(shares, supply);
 
+        // A station that can't be valued is never judged to hold dust.
+        uint256 stationsBefore = type(uint256).max / WAD;
+        try IStation(s.homeStation).value() returns (uint256, uint256 exit) {
+            stationsBefore = exit;
+        } catch {}
         (uint256 home, bool blocked) = _close(s, fraction);
+        // A claim worth fewer dollar-units at the stations than they have
+        // parts brings nothing home however often it is closed: it is dust,
+        // paid its cash share and done, so it can't hold a vault open or
+        // freeze it.
+        if (!blocked && home == 0 && stationsBefore.mulDiv(fraction, WAD) <= s.drivers.length + 1) {
+            _pay(s, claim, claimId, cashShare);
+            emit IVault.ClaimTried(claimId, false);
+            return;
+        }
         if (blocked) {
             // A market outside the band is a real try: the clock restarts.
             claim.state = ClaimState.Waiting;

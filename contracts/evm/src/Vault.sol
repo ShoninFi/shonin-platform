@@ -190,6 +190,10 @@ contract Vault is IVault, ReentrancyGuardTransient {
         return VaultStorage.layout().valuing();
     }
 
+    function unsettled() external view returns (bool) {
+        return Valuations.owed(VaultStorage.layout());
+    }
+
     // The tank --------------------------------------------------------------
 
     function fundTank(uint256 assets) external nonReentrant {

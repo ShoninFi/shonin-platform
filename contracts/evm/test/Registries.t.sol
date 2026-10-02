@@ -222,13 +222,14 @@ contract RegistriesTest is Fixture {
         assertEq(attestation.tradingDriver("test-driver"), v2, "revoking an older one touched the newer");
     }
 
-    function test_a_proposal_still_waiting_is_withdrawn_not_revoked() public {
+    function test_revoking_a_proposal_still_waiting_withdraws_it() public {
         address v1 = makeAddr("driver v1");
         vm.startPrank(admin);
         attestation.proposeDriver("test-driver", v1);
-        vm.expectRevert(AttestationRegistry.NotApproved.selector);
         attestation.revokeDriver("test-driver", v1);
         vm.stopPrank();
+        skip(TIMELOCK);
+        assertEq(attestation.tradingDriver("test-driver"), address(0), "the revoked proposal went live");
     }
 
     function test_a_fix_proposed_after_a_revocation_trades_again() public {

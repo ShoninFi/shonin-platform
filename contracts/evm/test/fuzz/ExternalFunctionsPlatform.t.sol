@@ -828,8 +828,7 @@ contract RegistryExternalFunctionsTest is Fixture, Calls {
             errs(
                 AttestationRegistry.AlreadyProposed.selector,
                 AttestationRegistry.NoKind.selector,
-                AttestationRegistry.NoImplementation.selector,
-                AttestationRegistry.NotApproved.selector
+                AttestationRegistry.NoImplementation.selector
             ),
             "an allowlist change"
         );

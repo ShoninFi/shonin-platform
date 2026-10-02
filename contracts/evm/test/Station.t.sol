@@ -22,6 +22,7 @@ contract FakeVault is IStationVault {
     uint64 public constant haltGrace = 10 minutes;
     uint256 public cash;
     bool public valuing;
+    bool public unsettled;
 
     constructor(IERC20 dollar_) {
         dollar = dollar_;

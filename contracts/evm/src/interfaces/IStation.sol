@@ -165,4 +165,6 @@ interface IStationVault {
     function haltGrace() external view returns (uint64);
     /// Whether a valuation is waiting for other chains' posts.
     function valuing() external view returns (bool);
+    /// Whether a priced valuation still has requests to settle.
+    function unsettled() external view returns (bool);
 }

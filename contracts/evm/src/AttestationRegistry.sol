@@ -96,7 +96,6 @@ contract AttestationRegistry is IAttestationRegistry {
     error WrongKindForVault();
     error NotAmongTheVaults();
     error NoImplementation();
-    error NotApproved();
     error Stale();
     error TooLong();
     error TooShort();
@@ -362,9 +361,13 @@ contract AttestationRegistry is IAttestationRegistry {
     ) private {
         _settle(slot, revoked);
         if (implementation == address(0)) revert NoImplementation();
-        // A proposal still waiting has not been approved: withdraw it. The
-        // one in force can be revoked even while it is proposed again.
-        if (implementation == slot.next && implementation != slot.current) revert NotApproved();
+        // A proposal of the same implementation still waiting is withdrawn
+        // with it, so the revocation can't lapse when that proposal would
+        // have come due.
+        if (implementation == slot.next) {
+            delete slot.next;
+            delete slot.nextReadyAt;
+        }
         revoked[implementation] = true;
     }
 

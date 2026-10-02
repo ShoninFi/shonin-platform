@@ -272,6 +272,11 @@ contract Station is IStation, ReentrancyGuardTransient {
     /// stop, so a venue that refuses or a market still outside the band
     /// leaves only its own money behind. Everything idle then goes home.
     function _unwindStopped(bytes32[] memory drivers) private returns (uint256 sentHome, bool blocked) {
+        // Not between a valuation's pricing and its settlement: what this
+        // sale brings home must not pay withdrawals priced before it.
+        if (isHome() && (IStationVault(_spec.vault).valuing() || IStationVault(_spec.vault).unsettled())) {
+            revert NotAllowed();
+        }
         uint16 band = stoppedBand();
         for (uint256 i = 0; i < drivers.length; i++) {
             _pinned(drivers[i]);
