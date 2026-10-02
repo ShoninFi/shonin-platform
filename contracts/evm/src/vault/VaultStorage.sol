@@ -281,11 +281,12 @@ library VaultStorage {
         return v.time > s.haltedAt && empty(s, v) && !s.moving[s.lastPriced - 1];
     }
 
-    /// The stations held nothing at `v` beyond dust nobody can be made to
-    /// own (a tenth of the minimum deposit), so a stranger's micro-dollar
-    /// can't hold a halted vault's close off.
+    /// The stations held nothing at `v` (the latest priced valuation) beyond
+    /// dust nobody can be made to own (a tenth of the minimum deposit), so a
+    /// stranger's micro-dollar can't hold a halted vault's close off. Judged
+    /// on the highest figure any post carried, never the lowest.
     function empty(Layout storage s, Valuation storage v) internal view returns (bool) {
-        return v.gross <= v.cash + 1 + s.minimumDeposit / 10;
+        return v.gross + s.depositExtra[s.lastPriced - 1] <= v.cash + 1 + s.minimumDeposit / 10;
     }
 
     /// Move the queue's cursor past requests already done (taken through the

@@ -160,7 +160,8 @@ library Valuations {
         (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, signature);
         if (err != ECDSA.RecoverError.NoError || !_blessed(s, signer, false)) revert IVault.NotBlessed();
 
-        (uint256 markValue, uint256 exitValue, bool late) = _counted(s, time, stationChain, post);
+        (uint256 markValue, uint256 exitValue, bool late, uint256 inTransit) =
+            _counted(s, time, stationChain, post);
         // No figure a valuation can't add up and price: a post beyond any
         // dollar amount that could exist would leave the valuation open for
         // good, with every way out waiting behind it.
@@ -169,7 +170,7 @@ library Valuations {
         uint256 extra;
         if (exitValue > markValue) (extra, exitValue) = (exitValue - markValue, markValue);
         Post storage p = s.posts[index][stationChain];
-        if (post.transit.length != 0 || post.inFlightFromHome.length != 0) s.moving[index] = true;
+        if (inTransit != 0) s.moving[index] = true;
         if (!p.posted) {
             p.posted = true;
             p.mark = markValue;
@@ -232,13 +233,17 @@ library Valuations {
         uint64 time,
         uint256 stationChain,
         StationPost calldata post
-    ) private view returns (uint256 markValue, uint256 exitValue, bool late) {
+    ) private view returns (uint256 markValue, uint256 exitValue, bool late, uint256 inTransit) {
         uint256 timeout = s.timers.transitTimeout;
         uint256 moving;
         // Money still on its way past the timeout has no price anyone can
         // trust: counting it at zero would sell shares cheap to whoever sees
         // it is about to land. Such a valuation prices nothing.
+        // Dust in transit (a tenth of the minimum deposit or less, what
+        // anyone could set moving) is neither counted nor waited for.
+        uint256 dust = s.minimumDeposit / 10;
         for (uint256 i = 0; i < post.transit.length; i++) {
+            if (post.transit[i].amount <= dust) continue;
             if (post.transit[i].sentAt + timeout < time) late = true;
             moving += post.transit[i].amount;
         }
@@ -252,9 +257,11 @@ library Valuations {
             if (index >= s.sendsAtOpen || (i != 0 && index <= inFlight[i - 1])) revert IVault.NotAllowed();
             Send memory sent = home.sendAt(index);
             if (sent.toChain != stationChain) revert IVault.NotAllowed();
+            if (sent.amount <= dust) continue;
             if (sent.sentAt + timeout < time) late = true;
             moving += sent.amount;
         }
+        inTransit = moving;
         markValue = post.mark + moving;
         exitValue = post.exit + moving;
     }
@@ -383,6 +390,13 @@ library Valuations {
         // Every request passed counts toward `max`, done or not, so no number
         // of requests taken through the fallback can make one call too long.
         uint256 steps;
+        // Requests already done (taken through the fallback) are passed
+        // whatever their slot, so no order of fallbacks can hold the cursor.
+        while (steps < max && i < count && s.requests[i].done) {
+            steps++;
+            i++;
+        }
+        if (j < i) j = i;
         while (steps < max && j < count) {
             Request storage r = s.requests[j];
             if (r.earliest > time) break;
@@ -670,8 +684,17 @@ library Valuations {
         // out, never a way round the fee.
         if (s.lastPriced != 0) {
             Valuation storage last = s.latest();
-            if (last.feeExit != 0) {
-                uint256 slice = shares.mulDiv(last.feeExit, last.grossExit, Math.Rounding.Ceil);
+            // The leaver's own part of the fee owed on the pool as that
+            // valuation's settlement left it: the net price per share `p` is
+            // the snapshot's (settlement never moves it), the mark `m` is as
+            // the slot's deposits left it, and with `r` the fee rate the
+            // pool's gross price is (p - r m) / (1 - r). The part of a share
+            // owed as fee is then r (p - m) / (p - r m).
+            uint256 rate = uint256(s.fees.authorBps) + s.fees.platformBps;
+            uint256 p = (last.grossExit - last.feeExit).mulDiv(PRICE, last.supply);
+            uint256 m = s.mark;
+            if (p > m) {
+                uint256 slice = shares.mulDiv(rate * (p - m), BPS * p - rate * m, Math.Rounding.Ceil);
                 if (slice > shares) slice = shares;
                 _distribute(s, address(this), slice, 0);
                 shares -= slice;
