@@ -272,6 +272,8 @@ async fn deploy(
                 vault_implementation,
                 admin,
                 roles.platform,
+                // The factory this one replaces: none on a fresh deployment.
+                Address::ZERO,
             ),
             // The terms every vault is created with, in the order
             // `VaultConfig` declares them.

@@ -556,6 +556,7 @@ library Valuations {
         assets -= kept;
         if (raw != 0) {
             _accrue(s, owner);
+            if (s.unitsOf[owner] == 0) s.unitsSince[owner] = uint64(block.timestamp);
             s.unitsOf[owner] += raw;
             s.units += raw;
             s.unitDebt[owner] = s.unitsOf[owner].mulDiv(s.perUnit, UNIT_SCALE, Math.Rounding.Ceil);
@@ -627,6 +628,7 @@ library Valuations {
         _accrue(s, holder);
         s.units -= raw;
         s.unitsOf[holder] = 0;
+        s.unitsSince[holder] = 0;
         // What is left at the stations is everyone else's, in the same
         // proportions as before: every remaining fraction grows to match.
         if (s.units == 0) {

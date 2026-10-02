@@ -23,6 +23,7 @@ pragma solidity ^0.8.30;
 //   settle                   VaultExternalFunctionsTest.testFuzz_settle
 //   settleClaim              VaultExternalFunctionsTest.testFuzz_settleClaim
 //   freeze                   VaultExternalFunctionsTest.testFuzz_freeze
+//   freezeUnits              VaultExternalFunctionsTest.testFuzz_freezeUnits
 //   takeProRata              VaultExternalFunctionsTest.testFuzz_takeProRata
 //   claimInstead             VaultExternalFunctionsTest.testFuzz_claimInstead
 //   settleClosed             VaultExternalFunctionsTest.testFuzz_settleClosed
@@ -80,12 +81,15 @@ pragma solidity ^0.8.30;
 //   Station.stop(bytes32,uint64,bytes)    RemoteStationExternalFunctionsTest.testFuzz_carried_stop,
 //                                         StationExternalFunctionsTest.testFuzz_stop (refused at home)
 //   Station.unwind                        StationExternalFunctionsTest.testFuzz_unwind
+//   Station.closeAll                      StationExternalFunctionsTest.testFuzz_closeAll
 //   AttestationRegistry.setTimelock       RegistryExternalFunctionsTest.testFuzz_setTimelock
 //   AttestationRegistry.proposeImage,
 //     revokeImage, proposeProject,
 //     revokeProject, proposeVerifier,
 //     retireVerifier, proposeDriver,
+//     withdrawDriverProposal,
 //     revokeDriver, proposeBridge,
+//     withdrawBridgeProposal,
 //     revokeBridge                        RegistryExternalFunctionsTest.testFuzz_admin_only
 //   AttestationRegistry.bless             RegistryExternalFunctionsTest.testFuzz_bless
 //   StrategyRegistry.register             RegistryExternalFunctionsTest.testFuzz_register
@@ -610,6 +614,32 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
         }
         (bool ok, bytes4 err) = callAs(caller, address(vault), abi.encodeCall(IVault.freeze, (id)));
         expectOutcome(ok, err, want, "freeze");
+        if (ok) {
+            assertTrue(vault.state() == VaultState.Frozen);
+            assertEq(vault.haltedAt(), vm.getBlockTimestamp());
+        }
+        consistent(b, nobody());
+    }
+
+    function testFuzz_freezeUnits(uint8 stage, uint8 pick, address random, uint8 who, uint32 wait) public {
+        stage = arrange(stage);
+        address caller = pickCaller(pick, random);
+        address holder = pickCaller(who, random);
+        skip(bound(wait, 0, 10 days));
+        World memory b = look(caller, address(0));
+        (uint256 held,) = vault.unitsOf(holder);
+        uint64 since = vault.unitsSince(holder);
+        bytes4 want;
+        held;
+        if (since == 0) {
+            want = IVault.NotAllowed.selector;
+        } else if (vm.getBlockTimestamp() < since + 7 days) {
+            want = IVault.NotYet.selector;
+        } else if (b.state != VaultState.Open && b.state != VaultState.WindingDown) {
+            want = IVault.WrongState.selector;
+        }
+        (bool ok, bytes4 err) = callAs(caller, address(vault), abi.encodeCall(IVault.freezeUnits, (holder)));
+        expectOutcome(ok, err, want, "freezeUnits");
         if (ok) {
             assertTrue(vault.state() == VaultState.Frozen);
             assertEq(vault.haltedAt(), vm.getBlockTimestamp());

@@ -346,6 +346,20 @@ library Upkeep {
         _setState(s, VaultState.Frozen);
     }
 
+    /// Units nobody could serve for as long as an unpaid claim waits freeze
+    /// the vault the same way: a close that can't come home must not keep a
+    /// unit holder out for good either. Only where anyone may serve them; on
+    /// a vault that trades on other chains only their holder can.
+    function freezeUnits(address holder) external {
+        Layout storage s = VaultStorage.layout();
+        uint64 since = s.unitsSince[holder];
+        if (s.unitsOf[holder] == 0 || s.otherChains.length != 0) revert IVault.NotAllowed();
+        if (block.timestamp < since + s.timers.freezeAfter) revert IVault.NotYet();
+        if (!s.live()) revert IVault.WrongState();
+        _halt(s, "frozen");
+        _setState(s, VaultState.Frozen);
+    }
+
     // Lifecycle -------------------------------------------------------------
 
     /// A key blessed as this vault's executor says every station on another

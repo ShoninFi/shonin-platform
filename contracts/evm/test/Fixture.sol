@@ -22,7 +22,7 @@ import {Allowances, UnitPrices} from "../src/interfaces/IPrices.sol";
 import {Review} from "../src/interfaces/IReviewRegistry.sol";
 import {ChainNeed} from "../src/interfaces/IStrategyRegistry.sol";
 import {Timers} from "../src/interfaces/IVault.sol";
-import {ChainName, VaultConfig} from "../src/interfaces/IVaultFactory.sol";
+import {ChainName, IVaultFactory, VaultConfig} from "../src/interfaces/IVaultFactory.sol";
 import {Test} from "forge-std/Test.sol";
 import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
 
@@ -124,7 +124,8 @@ contract Fixture is Test {
                 stationFactory: stations,
                 vaultImplementation: address(new Vault()),
                 admin: admin,
-                platform: platform
+                platform: platform,
+                previous: IVaultFactory(address(0))
             }),
             vaultConfig(),
             chainNames()

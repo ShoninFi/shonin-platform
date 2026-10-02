@@ -163,6 +163,8 @@ struct Layout {
     uint256 heldTotal;
     // Deposits paid by someone other than their receiver --------------------
     mapping(uint256 => address) payerOf;
+    // Since when each holder's units have been waiting to be served ---------
+    mapping(address => uint64) unitsSince;
 }
 
 /// The vault's storage, and the bookkeeping every part of it shares.

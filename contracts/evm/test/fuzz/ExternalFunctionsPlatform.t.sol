@@ -541,6 +541,18 @@ contract StationExternalFunctionsTest is ClaimBase, Calls {
         if (ok) assertGe(vault.cash(), cash, "an unwind took cash from the vault");
         nothingLeft(b);
     }
+
+    /// One driver's part of a stopped full unwind: only the station itself
+    /// may call it.
+    function testFuzz_closeAll(uint8 stage, uint8 pick, address random, bytes32 driver, uint16 band) public {
+        arrange(stage);
+        address caller = pickCaller(pick, random);
+        Books memory b = books(caller);
+        (bool ok, bytes4 err) =
+            callAs(caller, address(station), abi.encodeCall(Station.closeAll, (driver, band)));
+        expectOutcome(ok, err, Station.NotAllowed.selector, "closeAll");
+        nothingLeft(b);
+    }
 }
 
 /// The venue's errors, for the station tests.
@@ -758,7 +770,7 @@ contract RegistryExternalFunctionsTest is Fixture, Calls {
         uint8 kind
     ) public {
         address caller = pickCaller(pick, random);
-        which %= 10;
+        which %= 12;
         if (uint256(name) % 3 == 0) {
             name = which < 2 ? EXECUTOR_IMAGE : which < 4 ? PROJECT : bytes32("local");
         }
@@ -773,7 +785,9 @@ contract RegistryExternalFunctionsTest is Fixture, Calls {
         else if (which == 6) call = abi.encodeCall(AttestationRegistry.proposeDriver, (name, implementation));
         else if (which == 7) call = abi.encodeCall(AttestationRegistry.revokeDriver, (name, implementation));
         else if (which == 8) call = abi.encodeCall(AttestationRegistry.proposeBridge, (name, implementation));
-        else call = abi.encodeCall(AttestationRegistry.revokeBridge, (name, implementation));
+        else if (which == 9) call = abi.encodeCall(AttestationRegistry.revokeBridge, (name, implementation));
+        else if (which == 10) call = abi.encodeCall(AttestationRegistry.withdrawDriverProposal, (name));
+        else call = abi.encodeCall(AttestationRegistry.withdrawBridgeProposal, (name));
 
         bool imageBefore = attestation.isImageAllowed(name);
         bool projectBefore = attestation.isProjectAllowed(name);
@@ -822,6 +836,13 @@ contract RegistryExternalFunctionsTest is Fixture, Calls {
         if (which == 8) assertEq(attestation.bridgeOf(name), bridgeBefore, "a bridge counted early");
         if (which == 9) {
             assertTrue(attestation.isBridgeRevoked(name, implementation), "a revoked bridge still carries");
+        }
+        // Withdrawing a waiting proposal leaves what is in force alone.
+        if (which == 10) {
+            assertEq(attestation.tradingDriver(name), tradingBefore, "a withdrawal changed the driver");
+        }
+        if (which == 11) {
+            assertEq(attestation.bridgeOf(name), bridgeBefore, "a withdrawal changed the bridge");
         }
     }
 

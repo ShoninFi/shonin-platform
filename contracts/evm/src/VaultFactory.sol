@@ -53,6 +53,9 @@ contract VaultFactory is IVaultFactory {
     address public immutable vaultImplementation;
     address public immutable admin;
     address public immutable platform;
+    /// The factory this one replaces, if any: a strategy that already has a
+    /// vault from it, or from any before it, gets no second one here.
+    IVaultFactory public immutable previous;
 
     VaultConfig private _config;
     ChainName[] private _chains;
@@ -81,6 +84,7 @@ contract VaultFactory is IVaultFactory {
         address vaultImplementation;
         address admin;
         address platform;
+        IVaultFactory previous;
     }
 
     constructor(Deps memory deps, VaultConfig memory config_, ChainName[] memory chains_) {
@@ -93,6 +97,7 @@ contract VaultFactory is IVaultFactory {
         vaultImplementation = deps.vaultImplementation;
         admin = deps.admin;
         platform = deps.platform;
+        previous = deps.previous;
         _checked(config_);
         _config = config_;
         for (uint256 i = 0; i < chains_.length; i++) {
@@ -109,7 +114,7 @@ contract VaultFactory is IVaultFactory {
         bytes calldata statement,
         bytes32 terms_
     ) external returns (address vault) {
-        if (_vaultOf[strategyId] != address(0)) revert VaultExists();
+        if (vaultOf(strategyId) != address(0)) revert VaultExists();
         // The author is held to what they read: a change of terms between
         // reading and activating stops the activation.
         if (terms_ != terms()) revert TermsChanged();
@@ -189,8 +194,10 @@ contract VaultFactory is IVaultFactory {
         return keccak256(abi.encode(_config));
     }
 
-    function vaultOf(uint256 strategyId) external view returns (address) {
-        return _vaultOf[strategyId];
+    /// The strategy's vault, from this factory or any it replaced.
+    function vaultOf(uint256 strategyId) public view returns (address vault) {
+        vault = _vaultOf[strategyId];
+        if (vault == address(0) && address(previous) != address(0)) vault = previous.vaultOf(strategyId);
     }
 
     function vaults() external view returns (address[] memory) {

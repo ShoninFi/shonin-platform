@@ -697,6 +697,39 @@ contract VaultTest is Fixture {
         assertLe(vault.cash(), 1, "money was stranded in the closed vault");
     }
 
+    /// A factory that replaces another never activates a strategy that
+    /// already has a vault from it.
+    function test_a_replacement_factory_refuses_a_strategy_that_has_a_vault() public {
+        (uint256 id,) = ready();
+        activate(id, allowancesCosting(2e6), MINIMUM_TANK);
+        uint256 otherId;
+        (otherId,) = ready();
+
+        VaultFactory.Deps memory deps = VaultFactory.Deps({
+            asset: IERC20(address(usd)),
+            attestation: attestation,
+            strategies: strategies,
+            reviews: reviews,
+            prices: prices,
+            stationFactory: stations,
+            vaultImplementation: address(new Vault()),
+            admin: admin,
+            platform: platform,
+            previous: factory
+        });
+        VaultFactory replacement = new VaultFactory(deps, vaultConfig(), chainNames());
+        assertEq(replacement.vaultOf(id), factory.vaultOf(id), "the replacement can't see the old vault");
+        assertEq(replacement.vaultOf(otherId), address(0));
+
+        bytes32 terms = replacement.terms();
+        give(author, MINIMUM_TANK);
+        vm.startPrank(author);
+        usd.approve(address(replacement), MINIMUM_TANK);
+        vm.expectRevert(VaultFactory.VaultExists.selector);
+        replacement.activate(id, allowancesCosting(2e6), 500, MINIMUM_TANK, 0, "", terms);
+        vm.stopPrank();
+    }
+
     function test_a_strategy_trading_on_another_chain_cannot_be_activated_yet() public {
         (uint256 id,) = readyOnTwoChains();
         (, string memory text) = factory.restrictedFor(id);
