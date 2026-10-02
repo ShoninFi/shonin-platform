@@ -55,7 +55,9 @@ enum ValuationStatus {
     /// Recorded, waiting for posts from stations on other chains.
     Open,
     Priced,
-    /// A station never posted: its requests roll on to the next valuation.
+    /// Prices nothing (a station never posted, a market sat outside the
+    /// exit band, or money on its way was past its timeout): its requests
+    /// roll on to the next valuation.
     Void
 }
 

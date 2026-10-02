@@ -61,6 +61,14 @@ contract ConfigBoundsTest is Fixture {
         config = factory.config();
         config.minimumDeposit = 0;
         refused(config);
+
+        config = factory.config();
+        config.timers.fallbackAfter = type(uint64).max;
+        refused(config);
+
+        config = factory.config();
+        config.timers.haltGrace = factory.MAX_TIMER() + 1;
+        refused(config);
     }
 
     function test_an_activation_is_on_the_terms_the_author_read() public {

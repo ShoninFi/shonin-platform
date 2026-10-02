@@ -93,12 +93,12 @@ struct Layout {
     uint256 queuedClaims;
     /// The request a queued claim is priced by.
     mapping(uint256 => uint256) claimRequest;
-    /// Valuations at which some station reported money on its way, counted
-    /// or not: a vault isn't empty while any is, so it can't close on one.
+    /// Valuations at which money was on its way between the stations, more
+    /// than dust across every chain: a vault isn't empty while any is, so it
+    /// can't close on one.
     mapping(uint256 => bool) moving;
-    /// Valuations at which some station's exit-side value sat further below
-    /// its mark than the exit band: nobody is paid from cash at a price the
-    /// vault would refuse to sell at, so withdrawals wait.
+    /// Valuations at which a market sat outside the exit band: such a
+    /// valuation is void, prices nothing, and its requests roll on.
     mapping(uint256 => bool) wide;
     /// What the stations' exit side was worth above their mark at each
     /// valuation: a deposit pays it, so it can't buy below what the holdings
@@ -113,8 +113,8 @@ struct Layout {
     uint256 depositSupply;
     uint256 depositsFor;
     mapping(uint256 => mapping(uint256 => Post)) posts;
-    /// The open valuation's unit fraction and when it was recorded, so the
-    /// posts that complete it are counted as of the same moment.
+    /// The open valuation's unit fraction, so the posts that complete it are
+    /// scaled as the home station was.
     uint256 openUnits;
     /// When each valuation was opened: the home station's moment. A send to
     /// home is on its way until it has landed by then.

@@ -7,7 +7,7 @@ import {Allowances, IPrices} from "./interfaces/IPrices.sol";
 import {IReviewRegistry} from "./interfaces/IReviewRegistry.sol";
 import {IStationFactory} from "./interfaces/IStation.sol";
 import {ChainNeed, IStrategyRegistry, Strategy} from "./interfaces/IStrategyRegistry.sol";
-import {Fees, IVault, VaultInit} from "./interfaces/IVault.sol";
+import {Fees, IVault, Timers, VaultInit} from "./interfaces/IVault.sol";
 import {ChainName, IVaultFactory, VaultConfig} from "./interfaces/IVaultFactory.sol";
 import {Codes} from "./vault/Codes.sol";
 
@@ -39,6 +39,10 @@ contract VaultFactory is IVaultFactory {
     /// The highest minimum deposit, a hundred of the six-decimal dollar: a
     /// tenth of it is the dust the vault ignores at its stations.
     uint256 public constant MAX_MINIMUM_DEPOSIT = 100e6;
+    /// The longest any of a vault's waits may be, so none can be set so long
+    /// that the time it ends at can't be written down, and the way out it
+    /// opens never opens.
+    uint64 public constant MAX_TIMER = 365 days;
 
     IERC20 public immutable asset;
     IAttestationRegistry public immutable attestation;
@@ -271,6 +275,13 @@ contract VaultFactory is IVaultFactory {
         }
     }
 
+    function _tooLong(Timers memory t) private pure returns (bool) {
+        return t.slotInterval > MAX_TIMER || t.postDeadline > MAX_TIMER || t.transitTimeout > MAX_TIMER
+            || t.fallbackAfter > MAX_TIMER || t.usageFreshness > MAX_TIMER || t.tankEscapeDelay > MAX_TIMER
+            || t.floorDelay > MAX_TIMER || t.haltGrace > MAX_TIMER || t.freezeAfter > MAX_TIMER
+            || t.windDown > MAX_TIMER || t.activationWindow > MAX_TIMER;
+    }
+
     function _checked(VaultConfig memory config_) private pure {
         if (
             config_.holdingBps > MAX_HOLDING_BPS || config_.transactionBps > MAX_TRANSACTION_BPS
@@ -281,7 +292,7 @@ contract VaultFactory is IVaultFactory {
                 || config_.timers.slotLead <= config_.timers.slotWindow || config_.timers.freezeAfter < 1 days
                 || config_.timers.fallbackAfter < 1 days
                 || config_.timers.postDeadline <= config_.timers.slotWindow || config_.maxExitCost > MAX_EXIT_COST
-                || config_.minimumDeposit > MAX_MINIMUM_DEPOSIT
+                || config_.minimumDeposit > MAX_MINIMUM_DEPOSIT || _tooLong(config_.timers)
         ) revert OutOfRange();
     }
 }
