@@ -233,6 +233,7 @@ contract Station is IStation, ReentrancyGuardTransient {
         IDriver[] memory drivers = new IDriver[](count);
         Call[][] memory closes = new Call[][](count);
         uint256[] memory freed = new uint256[](count);
+        uint256[] memory before = new uint256[](count);
         bool[] memory skipped = new bool[](count);
         for (uint256 i = 0; i < count; i++) {
             drivers[i] = IDriver(_pinned(_spec.drivers[i]));
@@ -256,6 +257,7 @@ contract Station is IStation, ReentrancyGuardTransient {
                 continue;
             }
             freed[i] = exitBefore.mulDiv(fraction, WAD, Math.Rounding.Floor);
+            before[i] = exitBefore;
             // A fraction worth more than dust at the mark and nothing at exit
             // prices (an account under water at the bid) is never sold for
             // the leaver: it would bring them nothing and leave the loss with
@@ -271,13 +273,21 @@ contract Station is IStation, ReentrancyGuardTransient {
         for (uint256 i = 0; i < count; i++) {
             if (skipped[i]) continue;
             address[] memory targets = drivers[i].targets();
-            uint256 before = dollar.balanceOf(address(this));
+            uint256 held = dollar.balanceOf(address(this));
             _run(closes[i], targets);
             _run(drivers[i].sweep(address(this), freed[i]), targets);
             // Selling the fraction is only a serve if its worth comes home:
             // proceeds left at the venue would still belong to everyone.
-            uint256 swept = dollar.balanceOf(address(this)) - before;
+            uint256 swept = dollar.balanceOf(address(this)) - held;
             if (swept < freed[i].mulDiv(BPS - _spec.exitBandBps, BPS)) revert ShortSweep();
+            // A shortfall is the leaver's own fill, never the stayers' gain:
+            // proceeds that went to repay the account's margin debt, so the
+            // account is left worth more than the stayers' share, still
+            // belong to the leaver, and the close is undone.
+            if (swept < freed[i]) {
+                (, uint256 exitAfter) = drivers[i].valueOf(address(this));
+                if (exitAfter > before[i] - freed[i] + 1) revert ShortSweep();
+            }
             // Never more than the fraction's worth: anything a venue sends
             // beyond it stays here, everyone's.
             brought += swept < freed[i] ? swept : freed[i];

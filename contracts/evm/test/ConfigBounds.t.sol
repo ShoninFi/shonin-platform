@@ -111,6 +111,10 @@ contract ConfigBoundsTest is Fixture {
         config = factory.config();
         config.timers.freezeAfter = config.timers.fallbackAfter;
         refused(config);
+
+        config = factory.config();
+        config.timers.slotLead = factory.MAX_TIMER() + 1;
+        refused(config);
     }
 
     function test_an_activation_is_on_the_terms_the_author_read() public {

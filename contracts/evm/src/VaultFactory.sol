@@ -284,10 +284,10 @@ contract VaultFactory is IVaultFactory {
     }
 
     function _tooLong(Timers memory t) private pure returns (bool) {
-        return t.slotInterval > MAX_TIMER || t.postDeadline > MAX_TIMER || t.transitTimeout > MAX_TIMER
-            || t.fallbackAfter > MAX_TIMER || t.usageFreshness > MAX_TIMER || t.tankEscapeDelay > MAX_TIMER
-            || t.floorDelay > MAX_TIMER || t.haltGrace > MAX_TIMER || t.freezeAfter > MAX_TIMER
-            || t.windDown > MAX_TIMER || t.activationWindow > MAX_TIMER;
+        return t.slotInterval > MAX_TIMER || t.slotLead > MAX_TIMER || t.postDeadline > MAX_TIMER
+            || t.transitTimeout > MAX_TIMER || t.fallbackAfter > MAX_TIMER || t.usageFreshness > MAX_TIMER
+            || t.tankEscapeDelay > MAX_TIMER || t.floorDelay > MAX_TIMER || t.haltGrace > MAX_TIMER
+            || t.freezeAfter > MAX_TIMER || t.windDown > MAX_TIMER || t.activationWindow > MAX_TIMER;
     }
 
     function _checked(VaultConfig memory config_) private pure {

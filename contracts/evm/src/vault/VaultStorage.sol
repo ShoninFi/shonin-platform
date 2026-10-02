@@ -321,6 +321,15 @@ library VaultStorage {
         s.requestCursor = i;
     }
 
+    /// What a close or a serve may leave behind and still have served nobody
+    /// short beyond rounding: the station rounds each part down on its own
+    /// and leaves alone any account worth no more than one dollar-unit more
+    /// than it has drivers, so with `d` drivers up to `(d + 1)^2` units.
+    function dust(Layout storage s) internal view returns (uint256) {
+        uint256 parts = s.drivers.length + 1;
+        return parts * parts;
+    }
+
     /// Where a deposit's money goes when it is sent back: to whoever paid it.
     function refundTo(Layout storage s, uint256 requestId, address owner) internal view returns (address) {
         address payer = s.payerOf[requestId];

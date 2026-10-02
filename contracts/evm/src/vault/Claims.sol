@@ -96,8 +96,7 @@ library Claims {
         // paid its cash share and done, so it can't hold a vault open or
         // freeze it. Only a close that went through can show that; one that
         // failed proves nothing.
-        if (!failed && !blocked && home == 0 && stationsBefore.mulDiv(fraction, WAD) <= s.drivers.length + 1)
-        {
+        if (!failed && !blocked && home == 0 && stationsBefore.mulDiv(fraction, WAD) <= s.dust()) {
             _pay(s, claim, claimId, cashShare);
             emit IVault.ClaimTried(claimId, false);
             return;

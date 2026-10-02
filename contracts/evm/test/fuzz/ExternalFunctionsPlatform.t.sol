@@ -395,7 +395,7 @@ contract StationExternalFunctionsTest is ClaimBase, Calls {
         expectOutcome(ok, err, want, "revokeKey");
         if (ok) {
             assertFalse(venue.isAgent(address(station), key), "a revoked key still trades");
-            assertTrue(station.approvedKey("local") != key);
+            if (key != address(0)) assertTrue(station.approvedKey("local") != key);
         }
         nothingLeft(b);
     }
