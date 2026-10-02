@@ -36,6 +36,9 @@ contract VaultFactory is IVaultFactory {
     /// The most an unwinder may charge one claim for bringing it home: a
     /// thousand of the vault's six-decimal dollar.
     uint256 public constant MAX_EXIT_COST = 1000e6;
+    /// The highest minimum deposit, a hundred of the six-decimal dollar: a
+    /// tenth of it is the dust the vault ignores at its stations.
+    uint256 public constant MAX_MINIMUM_DEPOSIT = 100e6;
 
     IERC20 public immutable asset;
     IAttestationRegistry public immutable attestation;
@@ -278,6 +281,7 @@ contract VaultFactory is IVaultFactory {
                 || config_.timers.slotLead <= config_.timers.slotWindow || config_.timers.freezeAfter < 1 days
                 || config_.timers.fallbackAfter < 1 days
                 || config_.timers.postDeadline <= config_.timers.slotWindow || config_.maxExitCost > MAX_EXIT_COST
+                || config_.minimumDeposit > MAX_MINIMUM_DEPOSIT
         ) revert OutOfRange();
     }
 }

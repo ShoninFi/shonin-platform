@@ -72,8 +72,8 @@ contract SmallRemoteUnitsKeptFromStrangersTest is Fixture {
     }
 
     function valueWith(uint256 mark, uint256 exit) internal {
-        uint256 t = vm.getBlockTimestamp();
-        uint64 time = uint64(t - (t % SLOT) + SLOT);
+        uint256 t = vm.getBlockTimestamp() + 2 * SLOT - 1;
+        uint64 time = uint64(t - (t % SLOT));
         vm.warp(time);
         vm.prank(executor);
         vault.recordValuation();

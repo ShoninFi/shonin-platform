@@ -99,9 +99,11 @@ contract CrossChainClosingTest is Fixture {
         p.transit = new Transit[](0);
     }
 
+    /// The next slot a valuation may open in: a full slot after the last
+    /// one closed.
     function open() internal returns (uint64 time) {
-        uint256 t = vm.getBlockTimestamp();
-        time = uint64(t - (t % SLOT) + SLOT);
+        uint256 t = vm.getBlockTimestamp() + 2 * SLOT - 1;
+        time = uint64(t - (t % SLOT));
         vm.warp(time);
         vm.prank(executor);
         vault.recordValuation();

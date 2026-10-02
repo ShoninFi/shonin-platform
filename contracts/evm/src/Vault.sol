@@ -15,6 +15,7 @@ import {
     VaultState
 } from "./interfaces/IVault.sol";
 import {Claims} from "./vault/Claims.sol";
+import {Posts} from "./vault/Posts.sol";
 import {Upkeep} from "./vault/Upkeep.sol";
 import {Valuations} from "./vault/Valuations.sol";
 import {Layout, VaultStorage} from "./vault/VaultStorage.sol";
@@ -68,11 +69,11 @@ contract Vault is IVault, ReentrancyGuardTransient {
         StationPost calldata post,
         bytes calldata signature
     ) external nonReentrant {
-        Valuations.postStation(time, stationChain, post, signature);
+        Posts.postStation(time, stationChain, post, signature);
     }
 
     function closeValuation(uint64 time) external nonReentrant {
-        Valuations.closeValuation(time);
+        Posts.closeValuation(time);
     }
 
     function postDigest(
@@ -80,7 +81,7 @@ contract Vault is IVault, ReentrancyGuardTransient {
         uint256 stationChain,
         StationPost calldata post
     ) external view returns (bytes32) {
-        return Valuations.postDigest(time, stationChain, post);
+        return Posts.postDigest(time, stationChain, post);
     }
 
     function settle(uint256 max) external nonReentrant returns (uint256) {
@@ -117,11 +118,11 @@ contract Vault is IVault, ReentrancyGuardTransient {
         address payTo,
         bytes calldata signature
     ) external nonReentrant {
-        Valuations.reportExitCost(claimId, cost, payTo, signature);
+        Posts.reportExitCost(claimId, cost, payTo, signature);
     }
 
     function exitCostDigest(uint256 claimId, uint256 cost, address payTo) external view returns (bytes32) {
-        return Valuations.exitCostDigest(claimId, cost, payTo);
+        return Posts.exitCostDigest(claimId, cost, payTo);
     }
 
     function exitCostOf(uint256 claimId) external view returns (uint256 cost, address payTo) {

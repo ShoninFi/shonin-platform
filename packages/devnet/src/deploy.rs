@@ -221,10 +221,11 @@ async fn deploy(
     )
     .await?;
 
-    // The vault is too large for one contract: its logic is in three
+    // The vault is too large for one contract: its logic is in four
     // libraries linked into it.
     let valuations = put(client, artifacts, admin, "Valuations", Vec::new()).await?;
     let claims = put(client, artifacts, admin, "Claims", Vec::new()).await?;
+    let posts = put(client, artifacts, admin, "Posts", Vec::new()).await?;
     let upkeep = put_linked(
         client,
         artifacts,
@@ -244,6 +245,7 @@ async fn deploy(
             ("Valuations", valuations),
             ("Upkeep", upkeep),
             ("Claims", claims),
+            ("Posts", posts),
         ],
     )
     .await?;

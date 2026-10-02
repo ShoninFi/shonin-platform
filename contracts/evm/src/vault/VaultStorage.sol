@@ -100,13 +100,21 @@ struct Layout {
     /// valuation: a deposit pays it, so it can't buy below what the holdings
     /// could be sold for. Fees and withdrawals never count it.
     mapping(uint256 => uint256) depositExtra;
-    /// The profit fee a deposit at each valuation is priced net of, fixed
-    /// when it is priced, so every deposit in it pays the same price.
-    mapping(uint256 => uint256) depositFee;
+    /// What the exits of the valuation being settled have paid out, and the
+    /// price its deposits pay: the pool those exits left (its net value and
+    /// supply), fixed once they are settled, for the valuation `depositsFor`
+    /// (its index plus one). Every deposit in a slot pays the same price.
+    uint256 exitPaid;
+    uint256 depositNet;
+    uint256 depositSupply;
+    uint256 depositsFor;
     mapping(uint256 => mapping(uint256 => Post)) posts;
     /// The open valuation's unit fraction and when it was recorded, so the
     /// posts that complete it are counted as of the same moment.
     uint256 openUnits;
+    /// When the last valuation waiting for posts was closed: the next opens
+    /// a slot later at the soonest, so every cycle leaves room to leave.
+    uint64 closedAt;
     /// How many sends the home station had made when it was valued: the ones
     /// after it are still in its value.
     uint256 sendsAtOpen;
