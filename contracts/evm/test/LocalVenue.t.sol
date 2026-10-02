@@ -47,6 +47,20 @@ contract LocalVenueTest is Fixture {
         });
     }
 
+    /// The markets an account holds are the ones it holds now: a closed
+    /// position drops off the list a driver asks about.
+    function test_a_closed_market_drops_off_the_accounts_list() public {
+        vm.startPrank(agent);
+        venue.place(master, buy(SPOT, 1e18, PRICE * 2, false));
+        venue.place(master, sell(PERP, 1e18, 0, false));
+        assertEq(venue.marketsHeldBy(master).length, 2);
+        venue.place(master, sell(SPOT, 1e18, 0, true));
+        vm.stopPrank();
+        bytes32[] memory held = venue.marketsHeldBy(master);
+        assertEq(held.length, 1, "a closed market is still listed");
+        assertEq(held[0], PERP);
+    }
+
     function test_an_agent_can_trade_the_account() public {
         vm.prank(agent);
         Fill[] memory fills = venue.place(master, buy(SPOT, 1e18, PRICE * 2, false));
