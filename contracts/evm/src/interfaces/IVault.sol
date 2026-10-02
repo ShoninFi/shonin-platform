@@ -105,9 +105,12 @@ struct StationPost {
     /// its own chain.
     uint256 mark;
     uint256 exit;
-    /// The station chain's first block at or after the valuation's time.
-    uint64 blockNumber;
-    /// Sends from this station that have not landed.
+    /// The time of the station chain's first block at or after the
+    /// valuation's time: the moment every figure in the post is as of. Every
+    /// post reads its station at that one moment, so money moving between
+    /// chains while the posts come in is counted once, on the chain it left.
+    uint64 asOf;
+    /// Sends from this station that had not landed by `asOf`.
     Transit[] transit;
     /// The home station's sends to this chain that have not landed, by their
     /// place in its list, in increasing order. Bridges may land out of

@@ -101,6 +101,7 @@ contract TwoChainVault is Fixture {
     }
 
     function post(uint64 time, StationPost memory p, uint256 key) internal {
+        if (p.asOf == 0) p.asOf = time;
         vault.postStation(time, OTHER, p, signed(key, vault.postDigest(time, OTHER, p)));
     }
 

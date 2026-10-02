@@ -38,6 +38,9 @@ library Posts {
         if (v.time != time || v.status != ValuationStatus.Open) revert IVault.NotAllowed();
         if (block.timestamp > time + s.timers.postDeadline) revert IVault.OutsideWindow();
         if (!_isOtherChain(s, stationChain)) revert IVault.NotAllowed();
+        // As of the station chain's first block at or after the valuation's
+        // time, and no later than the post window allows.
+        if (post.asOf < time || post.asOf > time + s.timers.postDeadline) revert IVault.NotAllowed();
 
         bytes32 digest = MessageHashUtils.toEthSignedMessageHash(postDigest(time, stationChain, post));
         (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, signature);
@@ -128,6 +131,8 @@ library Posts {
         uint256 moving;
         uint256 overdue;
         for (uint256 i = 0; i < post.transit.length; i++) {
+            // A send after the post's moment is still in the station's value.
+            if (post.transit[i].sentAt > post.asOf) revert IVault.NotAllowed();
             if (post.transit[i].sentAt + timeout < time) overdue += post.transit[i].amount;
             moving += post.transit[i].amount;
         }

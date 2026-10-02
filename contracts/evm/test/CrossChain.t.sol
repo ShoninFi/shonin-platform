@@ -119,6 +119,7 @@ contract CrossChainTest is Fixture {
     }
 
     function post(uint64 time, StationPost memory p, uint256 key) internal {
+        if (p.asOf == 0) p.asOf = time;
         vault.postStation(time, OTHER, p, signed(key, vault.postDigest(time, OTHER, p)));
     }
 
@@ -233,6 +234,7 @@ contract CrossChainTest is Fixture {
     function test_only_a_blessed_key_posts_inside_the_deadline_for_a_declared_chain() public {
         uint64 time = open();
         StationPost memory p = postOf(1, 1);
+        p.asOf = time;
 
         bytes memory stranger = signed(0xBAD, vault.postDigest(time, OTHER, p));
         vm.expectRevert(IVault.NotBlessed.selector);
@@ -245,6 +247,7 @@ contract CrossChainTest is Fixture {
         // A post signed for one figure can't carry another.
         bytes memory forOne = signed(EXECUTOR_KEY, vault.postDigest(time, OTHER, p));
         StationPost memory changed = postOf(1_000_000e6, 1);
+        changed.asOf = time;
         vm.expectRevert(IVault.NotBlessed.selector);
         vault.postStation(time, OTHER, changed, forOne);
 
@@ -282,6 +285,7 @@ contract CrossChainTest is Fixture {
 
         // A send older than the timeout has no price: the valuation is void.
         time = open();
+        p.asOf = time;
         p.transit = new Transit[](2);
         p.transit[0] = Transit({amount: 5000e6, sentAt: time - 30 minutes});
         p.transit[1] = Transit({amount: 7000e6, sentAt: time - 2 hours});
@@ -355,6 +359,7 @@ contract CrossChainTest is Fixture {
         uint64[][3] memory refused = [inFlight(1), inFlight(5), twice];
         for (uint256 i = 0; i < refused.length; i++) {
             StationPost memory p = postOf(0, 0);
+            p.asOf = time;
             p.inFlightFromHome = refused[i];
             bytes memory sig = signed(EXECUTOR_KEY, vault.postDigest(time, OTHER, p));
             vm.expectRevert(IVault.NotAllowed.selector);

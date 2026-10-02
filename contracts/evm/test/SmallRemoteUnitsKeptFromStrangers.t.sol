@@ -81,6 +81,7 @@ contract SmallRemoteUnitsKeptFromStrangersTest is Fixture {
         p.mark = mark;
         p.exit = exit;
         p.transit = new Transit[](0);
+        p.asOf = time;
         vault.postStation(time, OTHER, p, signed(EXECUTOR_KEY, vault.postDigest(time, OTHER, p)));
         vm.warp(time + DEADLINE + 1);
         vault.closeValuation(time);
