@@ -340,44 +340,45 @@ async fn deploy(
     Ok(deployments)
 }
 
+/// The thirteen timers, in seconds.
+type Timers = (
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+);
+
 /// Every timer a vault runs on, in the order `Timers` declares them. The
 /// local chains move an hour per block, so anything a transaction has to beat
 /// is stretched to survive a block or two.
-fn timers(
-    network: NetworkName,
-) -> (
-    u64,
-    u64,
-    u64,
-    u64,
-    u64,
-    u64,
-    u64,
-    u64,
-    u64,
-    u64,
-    u64,
-    u64,
-    u64,
-) {
+fn timers(network: NetworkName) -> Timers {
     const MINUTE: u64 = 60;
     const HOUR: u64 = 60 * MINUTE;
     const DAY: u64 = 24 * HOUR;
     let local = network == NetworkName::Local;
     (
-        10,                                         // slot interval
-        5,                                          // slot lead
-        3,                                          // slot window
-        if local { 2 * HOUR } else { MINUTE },      // post deadline
-        if local { 3 * HOUR } else { HOUR },        // transit timeout
-        DAY,                                        // fallback after
-        if local { 3 * HOUR } else { 10 * MINUTE }, // usage freshness
-        DAY,                                        // tank escape delay
-        DAY,                                        // floor delay
-        10 * MINUTE,                                // halt grace
-        7 * DAY,                                    // freeze after
-        7 * DAY,                                    // wind down
-        3 * DAY,                                    // activation window
+        10,                                    // slot interval
+        5,                                     // slot lead
+        3,                                     // slot window
+        if local { 2 * HOUR } else { MINUTE }, // post deadline
+        if local { 3 * HOUR } else { HOUR },   // transit timeout
+        DAY,                                   // fallback after
+        if local { DAY } else { 10 * MINUTE }, // usage freshness: many local blocks pass between the executor's signings
+        DAY,                                   // tank escape delay
+        DAY,                                   // floor delay
+        10 * MINUTE,                           // halt grace
+        7 * DAY,                               // freeze after
+        7 * DAY,                               // wind down
+        3 * DAY,                               // activation window
     )
 }
 

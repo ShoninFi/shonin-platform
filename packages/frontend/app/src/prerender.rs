@@ -531,7 +531,7 @@ fn strategy_overview(strategy: &shared::Strategy) -> String {
                 (
                     "Idle balance".to_string(),
                     esc(&format!(
-                        "{} — withdrawals up to this are paid in one transaction",
+                        "{} — withdrawals up to this are paid from cash at the next valuation",
                         fmt::money(vault.idle)
                     )),
                 ),

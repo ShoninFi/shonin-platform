@@ -117,23 +117,23 @@ pub struct Client {
     keys: Option<Arc<HashMap<Address, PrivateKeySigner>>>,
 }
 
+/// The fillers a signing client runs: gas, then the nonce, then the chain id.
+type SigningFillers = alloy::providers::fillers::JoinFill<
+    alloy::providers::fillers::JoinFill<
+        alloy::providers::fillers::JoinFill<
+            alloy::providers::Identity,
+            alloy::providers::fillers::GasFiller,
+        >,
+        alloy::providers::fillers::NonceFiller<alloy::providers::fillers::SimpleNonceManager>,
+    >,
+    alloy::providers::fillers::ChainIdFiller,
+>;
+
 /// How a client that signs for itself fills a transaction in. The nonce is
 /// asked of the chain each time rather than counted here, so a send that
 /// fails before it is broadcast leaves no gap that strands every later one.
-fn signing_builder() -> ProviderBuilder<
-    alloy::providers::Identity,
-    alloy::providers::fillers::JoinFill<
-        alloy::providers::fillers::JoinFill<
-            alloy::providers::fillers::JoinFill<
-                alloy::providers::Identity,
-                alloy::providers::fillers::GasFiller,
-            >,
-            alloy::providers::fillers::NonceFiller<alloy::providers::fillers::SimpleNonceManager>,
-        >,
-        alloy::providers::fillers::ChainIdFiller,
-    >,
-    alloy::network::Ethereum,
-> {
+fn signing_builder()
+-> ProviderBuilder<alloy::providers::Identity, SigningFillers, alloy::network::Ethereum> {
     ProviderBuilder::default()
         .with_gas_estimation()
         .with_simple_nonce_management()

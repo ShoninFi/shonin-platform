@@ -208,7 +208,7 @@ async fn serve(
         &deployments,
         "executor",
         key.address,
-        chain::attest::Sender::Own(key.clone()),
+        chain::attest::Sender::Own(Box::new(key.clone())),
         vault,
         bundle,
     )
@@ -236,7 +236,7 @@ async fn serve(
         deployments.clone(),
         "executor",
         key.address,
-        chain::attest::Sender::Own(key.clone()),
+        chain::attest::Sender::Own(Box::new(key.clone())),
         vault,
         bundle,
         move || {

@@ -252,8 +252,9 @@ pub fn pending() -> Mutable<Pending> {
 }
 
 pub use send::{
-    activate, connect, deposit, fund_tank, refresh, resume, retire, set_allowances, set_idle_floor,
-    set_tank_keep, settle, submit, withdraw, withdraw_tank,
+    activate, claim_closed, claim_instead, connect, deposit, fund_tank, refresh, resume, retire,
+    set_allowances, set_idle_floor, set_tank_keep, settle, submit, take_pro_rata,
+    take_pro_rata_claim, withdraw, withdraw_tank,
 };
 
 /// The same surface where there is no browser to ask. The build-time
@@ -277,6 +278,18 @@ mod send {
         Err(NOWHERE.to_string())
     }
     pub async fn settle(_slug: &str, _claim: u64) -> Result<String, String> {
+        Err(NOWHERE.to_string())
+    }
+    pub async fn claim_closed(_slug: &str, _claim: u64) -> Result<String, String> {
+        Err(NOWHERE.to_string())
+    }
+    pub async fn take_pro_rata(_slug: &str, _request: u64) -> Result<String, String> {
+        Err(NOWHERE.to_string())
+    }
+    pub async fn claim_instead(_slug: &str, _request: u64) -> Result<String, String> {
+        Err(NOWHERE.to_string())
+    }
+    pub async fn take_pro_rata_claim(_slug: &str, _claim: u64) -> Result<String, String> {
         Err(NOWHERE.to_string())
     }
     pub async fn fund_tank(_slug: &str, _assets: f64) -> Result<String, String> {
@@ -425,11 +438,30 @@ mod send {
     }
 
     /// Ask to leave a vault. The next valuation prices it: paid from cash if
-    /// the cash covers it, and booked as a claim if it does not.
+    /// the cash covers it, and booked as a claim if it does not. A closed
+    /// vault is all cash and pays at once.
     pub async fn withdraw(slug: &str, shares: f64) -> Result<String, String> {
         let (strategy, from) = about(slug)?;
         let chain = strategy.vault.chain;
         let vault = address_of(&strategy.vault.address)?;
+
+        if strategy.vault.state == shared::model::vault::VaultState::Closed {
+            working("Withdrawing from the closed vault");
+            let hash = send(
+                chain,
+                &from,
+                vault,
+                IVault::redeemClosedCall {
+                    shares: share_units(shares),
+                    receiver: address_of(&from)?,
+                }
+                .abi_encode(),
+            )
+            .await;
+            done();
+            refresh().await;
+            return hash;
+        }
 
         working("Asking to withdraw");
         let hash = send(
@@ -466,6 +498,70 @@ mod send {
             .abi_encode(),
         )
         .await;
+        done();
+        refresh().await;
+        hash
+    }
+
+    /// A claim still unpaid when its vault closed, paid from the closed
+    /// vault's cash. Anyone may send it; it pays the claim's owner.
+    pub async fn claim_closed(slug: &str, claim: u64) -> Result<String, String> {
+        holder_call(slug, "Collecting from the closed vault", |_| {
+            IVault::claimClosedCall {
+                claimId: U256::from(claim),
+            }
+            .abi_encode()
+        })
+        .await
+    }
+
+    /// A withdrawal nothing has priced for the fallback delay: the holder's
+    /// share of the cash now, and units for their share of what is at the
+    /// stations.
+    pub async fn take_pro_rata(slug: &str, request: u64) -> Result<String, String> {
+        holder_call(slug, "Taking your share now", |_| {
+            IVault::takeProRataCall {
+                requestId: U256::from(request),
+            }
+            .abi_encode()
+        })
+        .await
+    }
+
+    /// The same withdrawal, made a claim instead: a close is tried for it,
+    /// and it counts toward freezing a vault that leaves it unpaid.
+    pub async fn claim_instead(slug: &str, request: u64) -> Result<String, String> {
+        holder_call(slug, "Making it a claim", |_| {
+            IVault::claimInsteadCall {
+                requestId: U256::from(request),
+            }
+            .abi_encode()
+        })
+        .await
+    }
+
+    /// A claim nobody could serve for the fallback delay from its booking:
+    /// its share of the cash now, and units for the rest.
+    pub async fn take_pro_rata_claim(slug: &str, claim: u64) -> Result<String, String> {
+        holder_call(slug, "Taking your share now", |_| {
+            IVault::takeProRataClaimCall {
+                claimId: U256::from(claim),
+            }
+            .abi_encode()
+        })
+        .await
+    }
+
+    async fn holder_call(
+        slug: &str,
+        what: &str,
+        call: impl Fn(Address) -> Vec<u8>,
+    ) -> Result<String, String> {
+        // The contract says when it isn't the holder's to send, or not yet.
+        let (strategy, from) = about(slug)?;
+        let vault = address_of(&strategy.vault.address)?;
+        working(what);
+        let hash = send(strategy.vault.chain, &from, vault, call(vault)).await;
         done();
         refresh().await;
         hash

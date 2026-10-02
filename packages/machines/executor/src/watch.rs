@@ -8,7 +8,7 @@ use alloy::primitives::{Address, U256};
 use alloy::rpc::types::Filter;
 use anyhow::Result;
 use chain::Client;
-use chain::bindings::vault::{IVault, RequestKind};
+use chain::bindings::vault::{ClaimState, IVault, RequestKind};
 use chain::bindings::venue::ILocalVenue;
 use strategy_sdk::{AccountEvent, ClaimPending, Side};
 use tokio::sync::mpsc::UnboundedSender;
@@ -152,8 +152,9 @@ async fn read(
     Ok((account, news))
 }
 
-/// How far the vault's cash falls short of what leavers are waiting for plus
-/// the idle floor: what the agent should bring home.
+/// How far the vault's cash falls short of what leavers are waiting for
+/// (withdrawals not yet priced and claims not yet paid) plus the idle floor:
+/// what the agent should bring home.
 async fn shortfall(chain: &Client, vault: Address) -> Result<U256> {
     let cash = chain.read(vault, IVault::cashCall {}).await?;
     let price = chain.read(vault, IVault::sharePriceCall {}).await?;
@@ -173,6 +174,23 @@ async fn shortfall(chain: &Client, vault: Address) -> Result<U256> {
             .await?;
         if !request.done && matches!(request.kind, RequestKind::Redeem) {
             waiting += request.amount * price / one;
+        }
+        id -= U256::from(1u64);
+    }
+    // And the claims not yet paid: each is paid from what comes home for it,
+    // or from cash the next valuation finds.
+    let claims = chain.read(vault, IVault::claimCountCall {}).await?;
+    let first = claims.saturating_sub(U256::from(50u64));
+    let mut id = claims;
+    while id > first {
+        let claim = chain
+            .read(vault, IVault::claimAtCall { claimId: id })
+            .await?;
+        if matches!(
+            claim.state,
+            ClaimState::Pending | ClaimState::Waiting | ClaimState::Queued
+        ) {
+            waiting += claim.shares * price / one;
         }
         id -= U256::from(1u64);
     }

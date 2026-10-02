@@ -20,7 +20,7 @@ use alloy::primitives::{Address, Bytes, U256};
 use anyhow::{Context, Result};
 use chain::bindings::factory::IVaultFactory;
 use chain::bindings::station::{IStation, IStationVault};
-use chain::bindings::vault::{ClaimState, IVault, ValuationStatus, VaultState};
+use chain::bindings::vault::{ClaimState, IVault, RequestKind, ValuationStatus, VaultState};
 use chain::{Client, Deployments, Role};
 use clap::Parser;
 use serde::Deserialize;
@@ -122,7 +122,8 @@ async fn keep_one(client: &Client, keeper: Address, executor: &str, vault: Addre
     let timers = client.read(vault, IVault::timersCall {}).await?;
 
     match state {
-        VaultState::Closed | VaultState::Cancelled | VaultState::None => return Ok(()),
+        VaultState::Closed => return paid_out(client, keeper, vault).await,
+        VaultState::Cancelled | VaultState::None => return Ok(()),
         VaultState::Activating => {
             let created = client.read(vault, IVault::createdAtCall {}).await?;
             if now >= created + timers.activationWindow {
@@ -207,8 +208,8 @@ async fn price(
     };
     // A valuation waiting for other chains' posts is closed once their
     // deadline has passed: priced, or void so its requests roll on.
-    if !count.is_zero() {
-        if let Ok(open) = client
+    if !count.is_zero()
+        && let Ok(open) = client
             .read(
                 vault,
                 IVault::valuationAtCall {
@@ -216,18 +217,17 @@ async fn price(
                 },
             )
             .await
-        {
-            if matches!(open.status, ValuationStatus::Open) && now > open.time + post_deadline {
-                send(
-                    client,
-                    keeper,
-                    vault,
-                    IVault::closeValuationCall { time: open.time },
-                    "close the valuation",
-                )
-                .await;
-            }
-        }
+        && matches!(open.status, ValuationStatus::Open)
+        && now > open.time + post_deadline
+    {
+        send(
+            client,
+            keeper,
+            vault,
+            IVault::closeValuationCall { time: open.time },
+            "close the valuation",
+        )
+        .await;
     }
     let settle = IVault::settleCall {
         max: U256::from(100u64),
@@ -266,17 +266,19 @@ async fn claims(
             .read(vault, IVault::claimAtCall { claimId: claim_id })
             .await?;
         match claim.state {
-            ClaimState::Pending | ClaimState::Waiting => {
-                send(
-                    client,
-                    keeper,
-                    vault,
-                    IVault::settleClaimCall { claimId: claim_id },
-                    "serve a claim",
-                )
-                .await;
-                let since = claim.lastAttemptAt.max(claim.bookedAt);
-                if now >= since + freeze_after {
+            ClaimState::Pending | ClaimState::Waiting | ClaimState::Queued => {
+                if !matches!(claim.state, ClaimState::Queued) {
+                    send(
+                        client,
+                        keeper,
+                        vault,
+                        IVault::settleClaimCall { claimId: claim_id },
+                        "serve a claim",
+                    )
+                    .await;
+                }
+                // Counted from its booking, as the vault counts it.
+                if now >= claim.bookedAt + freeze_after {
                     send(
                         client,
                         keeper,
@@ -288,6 +290,67 @@ async fn claims(
                 }
             }
             _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// A closed vault pays out what was still waiting when it closed: requests
+/// asked for after its last valuation (a withdrawal at the closed price, a
+/// deposit sent back) and claims not yet paid. Each pays its own owner, so
+/// anyone may send them.
+async fn paid_out(client: &Client, keeper: Address, vault: Address) -> Result<()> {
+    let requests: u64 = client
+        .read(vault, IVault::requestCountCall {})
+        .await?
+        .try_into()
+        .unwrap_or(0);
+    for id in (1..=requests).rev() {
+        let request_id = U256::from(id);
+        let request = client
+            .read(
+                vault,
+                IVault::requestAtCall {
+                    requestId: request_id,
+                },
+            )
+            .await?;
+        if request.done || matches!(request.kind, RequestKind::Claim) {
+            continue;
+        }
+        send(
+            client,
+            keeper,
+            vault,
+            IVault::settleClosedCall {
+                requestId: request_id,
+            },
+            "settle a request at the closed price",
+        )
+        .await;
+    }
+    let claims: u64 = client
+        .read(vault, IVault::claimCountCall {})
+        .await?
+        .try_into()
+        .unwrap_or(0);
+    for id in 1..=claims {
+        let claim_id = U256::from(id);
+        let claim = client
+            .read(vault, IVault::claimAtCall { claimId: claim_id })
+            .await?;
+        if matches!(
+            claim.state,
+            ClaimState::Pending | ClaimState::Waiting | ClaimState::Queued
+        ) {
+            send(
+                client,
+                keeper,
+                vault,
+                IVault::claimClosedCall { claimId: claim_id },
+                "pay a claim from the closed vault",
+            )
+            .await;
         }
     }
     Ok(())

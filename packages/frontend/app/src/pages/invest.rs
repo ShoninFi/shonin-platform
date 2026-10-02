@@ -267,6 +267,50 @@ fn panel_body(strategy: &Rc<Strategy>, holdings: &Holdings, slug: &str) -> Dom {
             "A request is priced at the next valuation, a few seconds after it is made, so \
              nobody who moves can pick the price they move at.",
         ));
+        // A withdrawal nothing has priced for a day (a market outside the
+        // exit band, a keeper that stopped): the holder chooses a way out.
+        let stuck: Vec<u64> = mine
+            .iter()
+            .filter(|request| {
+                request.kind == shared::RequestKind::Withdrawal
+                    && request.earliest + time::Duration::DAY < data::now()
+            })
+            .map(|request| request.id)
+            .collect();
+        for id in stuck {
+            children.push(ui::note(
+                "Nothing has priced this withdrawal for a day. Take your share of the cash now \
+                 and units for your share of what is at the venue, paid as it comes home; or \
+                 make it a claim, which closes your fraction when the market allows and \
+                 counts toward freezing a vault that leaves it unpaid for a week.",
+            ));
+            children.push(shell::button(
+                "Take your share now",
+                true,
+                clone!(slug => move || {
+                    act(
+                        {
+                            let slug = slug.clone();
+                            async move { wallet::take_pro_rata(&slug, id).await }
+                        },
+                        |_| "Sent. Your share of the cash is paid, and the rest is held as units.".to_string(),
+                    );
+                }),
+            ));
+            children.push(shell::button(
+                "Make it a claim",
+                false,
+                clone!(slug => move || {
+                    act(
+                        {
+                            let slug = slug.clone();
+                            async move { wallet::claim_instead(&slug, id).await }
+                        },
+                        |_| "Sent. Your withdrawal is now a claim.".to_string(),
+                    );
+                }),
+            ));
+        }
     }
 
     if position.is_none() {
@@ -280,7 +324,11 @@ fn panel_body(strategy: &Rc<Strategy>, holdings: &Holdings, slug: &str) -> Dom {
     }
 
     for claim in claims {
-        children.push(claim_card(claim, &slug));
+        children.push(claim_card(
+            claim,
+            &slug,
+            vault.state == shared::model::vault::VaultState::Closed,
+        ));
     }
 
     let is_author = holdings
@@ -441,7 +489,7 @@ fn clone_slug(slug: &str) -> String {
     slug.to_string()
 }
 
-fn claim_card(claim: &shared::HeldClaim, slug: &str) -> Dom {
+fn claim_card(claim: &shared::HeldClaim, slug: &str, closed: bool) -> Dom {
     let slug = slug.to_string();
     let id = claim.id;
     let state = claim.state;
@@ -453,9 +501,9 @@ fn claim_card(claim: &shared::HeldClaim, slug: &str) -> Dom {
         ),
         (
             ClaimState::Queued,
-            "Your fraction closed and brought home, being priced",
+            "The cash covers it: priced at the next valuation",
         ),
-        (ClaimState::Paid, "Priced at the exit side, burned and paid"),
+        (ClaimState::Paid, "Paid"),
     ];
     let reached = steps
         .iter()
@@ -498,15 +546,53 @@ fn claim_card(claim: &shared::HeldClaim, slug: &str) -> Dom {
             Tone::Ok,
             "Paid",
             &format!(
-                "{} reached your balance, priced at the exit side once your fraction was home.",
+                "{} reached your balance: what your fraction brought home and your part of \
+                 the cash, less your profit fee and the transaction fee.",
                 fmt::money_exact(claim.settled_for.unwrap_or_default())
             ),
         ));
+    } else if closed {
+        children.push(ui::note(
+            "The vault has closed with everything at home. Your claim is paid from its cash at \
+             the closed price; anyone may send this, and it pays you.",
+        ));
+        children.push(shell::button(
+            "Collect from the closed vault",
+            true,
+            clone!(slug => move || {
+                act(
+                    {
+                        let slug = slug.clone();
+                        async move { wallet::claim_closed(&slug, id).await }
+                    },
+                    |_| "Sent. The closed vault pays your claim.".to_string(),
+                );
+            }),
+        ));
     } else {
+        if state != ClaimState::Queued && claim.booked + time::Duration::DAY < data::now() {
+            children.push(ui::note(
+                "Nobody has been able to serve this claim for a day. You can take your share \
+                 of the cash now and units for the rest, paid as it comes home.",
+            ));
+            children.push(shell::button(
+                "Take your share now",
+                false,
+                clone!(slug => move || {
+                    act(
+                        {
+                            let slug = slug.clone();
+                            async move { wallet::take_pro_rata_claim(&slug, id).await }
+                        },
+                        |_| "Sent. Your share of the cash is paid, and the rest is held as units.".to_string(),
+                    );
+                }),
+            ));
+        }
         children.push(ui::note(
             "Anyone can serve a claim: it closes your fraction of every position inside the \
-             exit band and brings it home, and the next valuation pays you. Your shares stay \
-             outstanding until then, so the close is borne pro rata.",
+             exit band, brings it home and pays you in the same transaction, less your own \
+             profit fee. A market outside the band holds the close until it is back.",
         ));
         children.push(shell::button(
             "Serve this claim",
@@ -517,7 +603,7 @@ fn claim_card(claim: &shared::HeldClaim, slug: &str) -> Dom {
                         let slug = slug.clone();
                         async move { wallet::settle(&slug, id).await }
                     },
-                    |_| "Sent. The claim is paid at the next valuation if the close filled.".to_string(),
+                    |_| "Sent. If the market was inside the band, the claim is paid.".to_string(),
                 );
             }),
         ));

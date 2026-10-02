@@ -177,7 +177,12 @@ async fn one(
         .map(|event| Kill {
             at: event.at,
             reason: "the admin key stopped it".to_string(),
-            outcome: "every position was closed and the cash brought home".to_string(),
+            outcome: if matches!(state, ChainVaultState::Closed) {
+                "every position was closed and the cash brought home; holders are paid from it"
+                    .to_string()
+            } else {
+                "its positions are being closed and the cash brought home".to_string()
+            },
             reference: event.reference.clone(),
         });
 
@@ -336,10 +341,14 @@ async fn read_vault(
         allowances: shared_allowances(&allowances),
         requests: read_requests(chain, address).await.unwrap_or_default(),
         restricted: restricted.iter().map(|code| name_of(*code)).collect(),
-        halt: (halted != 0).then(|| Halt {
-            at: moment(halted),
-            reason: String::new(),
-        }),
+        halt: if halted != 0 {
+            Some(Halt {
+                at: moment(halted),
+                reason: halt_reason(chain, address).await.unwrap_or_default(),
+            })
+        } else {
+            None
+        },
         fees: Fees {
             holding_bps: fees.holdingBps as u32,
             author_bps: fees.authorBps as u32,
@@ -555,18 +564,111 @@ async fn read_trades(
     Ok((trades, count))
 }
 
+/// Why the vault halted, from its `Halted` log, in words.
+async fn halt_reason(chain: &Client, address: Address) -> Result<String> {
+    let logs = chain
+        .logs(
+            &Filter::new()
+                .address(address)
+                .event_signature(<IVault::Halted as alloy::sol_types::SolEvent>::SIGNATURE_HASH)
+                .from_block(0u64),
+        )
+        .await?;
+    let Some(log) = logs.last() else {
+        return Ok(String::new());
+    };
+    let reason = name_of(log.log_decode::<IVault::Halted>()?.inner.data.reason);
+    Ok(match reason.as_str() {
+        "killed" => "the admin key stopped it".to_string(),
+        "frozen" => "a claim went unpaid for its whole freeze period".to_string(),
+        "retired" => "its author retired it and the wind-down ended".to_string(),
+        "sealed" => "it is being wound down".to_string(),
+        other => other.to_string(),
+    })
+}
+
 async fn read_events(chain: &Client, address: Address) -> Result<Vec<VaultEvent>> {
     let logs = chain
         .logs(&Filter::new().address(address).from_block(0u64))
         .await?;
+    // The newest sixty the feed shows, counted after the logs it doesn't
+    // show (share transfers and the like) are left out.
     let mut events = Vec::new();
-    for log in logs.iter().rev().take(60) {
+    for log in logs.iter().rev() {
+        if events.len() == 60 {
+            break;
+        }
         let at = moment(log.block_timestamp.unwrap_or_default());
         let reference = log
             .transaction_hash
             .map(|hash| format!("{hash:?}"))
             .unwrap_or_default();
-        let (kind, summary, amount) = if let Ok(event) = log.log_decode::<IVault::Deposited>() {
+        let (kind, summary, amount) = if let Ok(event) = log.log_decode::<IVault::Requested>() {
+            let event = event.inner.data;
+            match event.kind {
+                ChainRequestKind::Deposit => (
+                    EventKind::Requested,
+                    "a deposit was asked for, to be priced at a later valuation".to_string(),
+                    Some(dollars(event.amount)),
+                ),
+                ChainRequestKind::Redeem => (
+                    EventKind::Requested,
+                    "a withdrawal was asked for, to be priced at a later valuation".to_string(),
+                    None,
+                ),
+                ChainRequestKind::Claim => (
+                    EventKind::Requested,
+                    "a claim the cash covers was queued, to be priced at the next valuation"
+                        .to_string(),
+                    None,
+                ),
+                _ => (
+                    EventKind::Requested,
+                    "the tank asked to be topped up from the author's shares".to_string(),
+                    None,
+                ),
+            }
+        } else if let Ok(event) = log.log_decode::<IVault::ClaimTried>() {
+            let event = event.inner.data;
+            (
+                EventKind::ClaimTried,
+                if event.blocked {
+                    format!(
+                        "claim {} was tried; a market outside the exit band held its close",
+                        event.claimId
+                    )
+                } else {
+                    format!("claim {} was tried", event.claimId)
+                },
+                None,
+            )
+        } else if let Ok(event) = log.log_decode::<IVault::ProRataTaken>() {
+            (
+                EventKind::FallbackTaken,
+                "a holder nothing could price took the pro-rata fallback".to_string(),
+                Some(dollars(event.inner.data.assets)),
+            )
+        } else if let Ok(event) = log.log_decode::<IVault::UnitsPaid>() {
+            (
+                EventKind::FallbackTaken,
+                "a fallback holder was paid for their units".to_string(),
+                Some(dollars(event.inner.data.assets)),
+            )
+        } else if let Ok(event) = log.log_decode::<IVault::StateChanged>() {
+            match event.inner.data.state {
+                ChainVaultState::Closed => (
+                    EventKind::Closed,
+                    "the vault closed; its holders are paid from its cash".to_string(),
+                    None,
+                ),
+                ChainVaultState::Cancelled => (
+                    EventKind::Closed,
+                    "the activation was cancelled and the tank returned".to_string(),
+                    None,
+                ),
+                _ => continue,
+            }
+        } else if let Ok(event) = log.log_decode::<IVault::Deposited>() {
             (
                 EventKind::Deposited,
                 "a deposit was priced".to_string(),

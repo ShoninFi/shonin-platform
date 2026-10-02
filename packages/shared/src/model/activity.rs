@@ -63,6 +63,10 @@ pub enum EventKind {
     Valued,
     Retired,
     Refunded,
+    Requested,
+    ClaimTried,
+    FallbackTaken,
+    Closed,
 }
 
 impl EventKind {
@@ -82,6 +86,10 @@ impl EventKind {
             Self::Valued => "valued",
             Self::Retired => "retired",
             Self::Refunded => "deposit returned",
+            Self::Requested => "requested",
+            Self::ClaimTried => "claim tried",
+            Self::FallbackTaken => "fallback taken",
+            Self::Closed => "closed",
         }
     }
 }

@@ -156,8 +156,8 @@ fn consequences(strategy: &Rc<Strategy>, level: HealthLevel) -> Dom {
             Tone::Warn,
             "What happens if this doesn't recover",
             "The admin key can kill a vault by hand. Every position is closed reduce-only inside \
-             the exit band and the cash brought home, so every withdrawal afterwards is paid in \
-             one transaction.",
+             the exit band and the cash brought home; once the vault has closed, every holder is \
+             paid from its cash in one transaction.",
         ));
     }
 

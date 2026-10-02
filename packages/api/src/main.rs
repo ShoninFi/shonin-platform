@@ -24,7 +24,7 @@ use chain::bindings::publishing::IPublishing;
 use chain::bindings::vault::IVault;
 use chain::{Client, Role, Served};
 use clap::Parser;
-use indexer::{Indexer, read};
+use indexer::Indexer;
 use shared::model::registry::Job;
 use shared::{
     Addresses, Chain, ChainInfo, Config, DevMode, HealthPost, HeldClaim, Holding, Portfolio,
@@ -248,7 +248,7 @@ async fn portfolio(
                     shares: claim.shares,
                     fraction_closed: claim.fraction_closed,
                     state: claim.state,
-                    booked: read::moment(0),
+                    booked: claim.booked.midnight(),
                     settled_for: claim.settled_for,
                 });
             }

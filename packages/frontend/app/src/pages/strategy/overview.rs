@@ -359,7 +359,7 @@ fn aside(strategy: &Rc<Strategy>) -> Vec<Dom> {
                         .child(ui::number(&fmt::money(vault.idle)))
                         .child(html!("div", {
                             .class(["faint", "small"])
-                            .text("withdrawals up to this are paid in one transaction")
+                            .text("withdrawals up to this are paid from cash at the next valuation")
                         }))
                     }),
                 ),
