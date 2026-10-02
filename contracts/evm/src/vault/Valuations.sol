@@ -552,16 +552,21 @@ library Valuations {
             _accrue(s, owner);
             s.unitsOf[owner] += raw;
             s.units += raw;
-            s.unitDebt[owner] = s.unitsOf[owner].mulDiv(s.perUnit, UNIT_SCALE);
+            s.unitDebt[owner] = s.unitsOf[owner].mulDiv(s.perUnit, UNIT_SCALE, Math.Rounding.Ceil);
         }
         s.pay(owner, assets);
         emit IVault.ProRataTaken(owner, shares, assets, fraction);
     }
 
+    /// What a holder's units have earned since they last looked: measured
+    /// down, from a starting point measured up, so no holder is ever credited
+    /// more than came home for them, whatever the rounding of the others.
     function _accrue(Layout storage s, address holder) private {
-        uint256 earned = s.unitsOf[holder].mulDiv(s.perUnit, UNIT_SCALE);
-        s.unitCredit[holder] += earned - s.unitDebt[holder];
-        s.unitDebt[holder] = earned;
+        uint256 units = s.unitsOf[holder];
+        uint256 earned = units.mulDiv(s.perUnit, UNIT_SCALE);
+        uint256 debt = s.unitDebt[holder];
+        if (earned > debt) s.unitCredit[holder] += earned - debt;
+        s.unitDebt[holder] = units.mulDiv(s.perUnit, UNIT_SCALE, Math.Rounding.Ceil);
     }
 
     function collectUnits() external returns (uint256 assets) {

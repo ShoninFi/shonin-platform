@@ -426,7 +426,9 @@ contract Vault is IVault, ReentrancyGuardTransient {
         Layout storage s = VaultStorage.layout();
         uint256 raw = s.unitsOf[holder];
         held = raw.mulDiv(s.scale(), VaultStorage.WAD);
-        claimable = s.unitCredit[holder] + raw.mulDiv(s.perUnit, VaultStorage.UNIT_SCALE) - s.unitDebt[holder];
+        uint256 earned = raw.mulDiv(s.perUnit, VaultStorage.UNIT_SCALE);
+        uint256 debt = s.unitDebt[holder];
+        claimable = s.unitCredit[holder] + (earned > debt ? earned - debt : 0);
     }
 
     function heldFor(address owner) external view returns (uint256) {
