@@ -46,7 +46,13 @@ contract StopAlwaysGoesThroughTest is Fixture {
         station.stop();
         vm.clearMockedCalls();
         assertTrue(station.stopped());
+        // The key whose revoke the venue refused stays on record, and anyone
+        // may withdraw it once the venue takes the call.
+        assertEq(station.approvedKey("local"), executor, "a refused revoke was recorded as done");
+        vm.prank(bob);
+        station.revokeKey("local", executor);
         assertEq(station.approvedKey("local"), address(0));
+        assertFalse(venue.isAgent(address(station), executor));
         // And anyone can bring everything home.
         vm.prank(bob);
         station.unwind(1e18);

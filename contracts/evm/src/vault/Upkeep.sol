@@ -408,10 +408,10 @@ library Upkeep {
         Layout storage s = VaultStorage.layout();
         if (msg.sender != s.admin) revert IVault.NotAllowed();
         VaultState state = s.state;
-        if (
-            state != VaultState.Activating && state != VaultState.Open && state != VaultState.WindingDown
-                && state != VaultState.Frozen
-        ) revert IVault.WrongState();
+        // A vault still activating is cancelled, not killed: it never opened.
+        if (state != VaultState.Open && state != VaultState.WindingDown && state != VaultState.Frozen) {
+            revert IVault.WrongState();
+        }
         _halt(s, reason);
         _setState(s, VaultState.Killed);
     }

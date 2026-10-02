@@ -38,9 +38,11 @@ contract Station is IStation, ReentrancyGuardTransient {
     /// A stopped station's full unwind keeps the exit band this long after
     /// the stop, then the band doubles each time this passes again.
     uint64 public constant WIDEN_AFTER = 7 days;
-    /// What each step of a best-effort revoke may spend: far more than a
-    /// venue's revoke costs, far less than a block.
-    uint256 private constant BEST_EFFORT_GAS = 1_000_000;
+    /// What a best-effort revoke may spend in all: far more than a venue's
+    /// revoke costs, far less than a block.
+    uint256 private constant BEST_EFFORT_GAS = 2_000_000;
+    /// The most calls a driver may prepare to revoke a key.
+    uint256 private constant MAX_REVOKE_CALLS = 8;
     bytes4 private constant APPROVE = IERC20.approve.selector;
 
     IStationFactory public factory;
@@ -116,8 +118,15 @@ contract Station is IStation, ReentrancyGuardTransient {
         if (current != address(0) && current != key) {
             // A key still blessed must be withdrawn; one whose blessing has
             // lapsed is withdrawn if the driver can, and replaced either way.
-            _revokeVia(IDriver(implementation), current, _isKey(current, ImageKind.Executor));
-            emit KeyRevoked(driver, current);
+            if (_isKey(current, ImageKind.Executor)) {
+                _revokeStrict(driver, current);
+                emit KeyRevoked(driver, current);
+            } else if (_revokeBestEffort(driver, current)) {
+                emit KeyRevoked(driver, current);
+            } else {
+                // Anyone may still withdraw it, strictly, with `revokeKey`.
+                emit RevokeSkipped(driver, current);
+            }
         }
         uint64 until = _registry().blessedUntil(key, _spec.vaultChain, _spec.vault, _spec.bundleHash);
         _run(IDriver(implementation).approveKey(address(this), key, until), IDriver(implementation).targets());
@@ -136,7 +145,7 @@ contract Station is IStation, ReentrancyGuardTransient {
         ) {
             revert StillBlessed();
         }
-        _revoke(driver, key, true);
+        _revoke(driver, key);
     }
 
     // Moving money ----------------------------------------------------------
@@ -230,8 +239,10 @@ contract Station is IStation, ReentrancyGuardTransient {
             // prices is underwater at the bid: selling a fraction of it would
             // bring the leaver nothing and leave the loss with everyone else.
             // Only a full unwind, which everyone shares, may sell it.
-            if (exitBefore == 0 && markBefore != 0 && fraction < WAD) revert ShortSweep();
             freed[i] = exitBefore.mulDiv(fraction, WAD, Math.Rounding.Floor);
+            // Nor a fraction worth something at the mark and nothing at exit
+            // prices: the sale would bring the leaver nothing too.
+            if (freed[i] == 0 && markBefore.mulDiv(fraction, WAD) != 0 && fraction < WAD) revert ShortSweep();
             bool outside;
             (closes[i], outside) = drivers[i].close(address(this), fraction, _spec.exitBandBps);
             if (outside) {
@@ -415,36 +426,50 @@ contract Station is IStation, ReentrancyGuardTransient {
         stopped = true;
         stoppedAt = uint64(block.timestamp);
         for (uint256 i = 0; i < _spec.drivers.length; i++) {
-            address key = _approvedKey[_spec.drivers[i]];
-            // A venue that refuses the revoke can't keep the station from
-            // stopping: the key loses the station's driver either way.
-            if (key != address(0)) _revoke(_spec.drivers[i], key, false);
+            bytes32 driver = _spec.drivers[i];
+            address key = _approvedKey[driver];
+            if (key == address(0)) continue;
+            // A venue or a driver that refuses the revoke can't keep the
+            // station from stopping. A key whose revoke didn't go through
+            // stays recorded, and anyone may withdraw it with `revokeKey`.
+            if (_revokeBestEffort(driver, key)) {
+                delete _approvedKey[driver];
+                emit KeyRevoked(driver, key);
+            } else {
+                emit RevokeSkipped(driver, key);
+            }
         }
         emit Stopped(reason, haltedAt);
     }
 
-    function _revoke(bytes32 driver, address key, bool strict) private {
-        _declaredDriver(driver);
-        _revokeVia(IDriver(_pinned(driver)), key, strict);
+    function _revoke(bytes32 driver, address key) private {
+        _revokeStrict(driver, key);
         if (_approvedKey[driver] == key) delete _approvedKey[driver];
         emit KeyRevoked(driver, key);
     }
 
-    /// Withdraw `key` through `implementation`. Unless `strict`, whatever the
-    /// driver or the venue does, the station carries on: a stop, or a
-    /// lapsed key's replacement, goes through.
-    function _revokeVia(IDriver implementation, address key, bool strict) private {
-        if (strict) {
-            _call(implementation.revokeKey(address(this), key), implementation.targets(), true);
-            return;
-        }
-        // Each step gets a bounded budget, so a driver that burns its gas
-        // can't keep a station from stopping.
-        try implementation.revokeKey{gas: BEST_EFFORT_GAS}(address(this), key) returns (Call[] memory calls) {
-            try implementation.targets{gas: BEST_EFFORT_GAS}() returns (address[] memory targets) {
-                _call(calls, targets, false);
-            } catch {}
+    /// Withdraw `key` at the venue through the pinned driver; every call
+    /// must go through.
+    function _revokeStrict(bytes32 driver, address key) private {
+        IDriver implementation = IDriver(_pinned(driver));
+        Call[] memory calls = implementation.revokeKey(address(this), key);
+        if (calls.length > MAX_REVOKE_CALLS) revert BadCall();
+        _run(calls, implementation.targets());
+    }
+
+    /// The same, inside a self-call with one fixed budget: whatever the
+    /// driver or the venue does (burns its gas, returns a list that doesn't
+    /// decode, refuses), the station carries on, and learns whether the key
+    /// is really gone.
+    function _revokeBestEffort(bytes32 driver, address key) private returns (bool done) {
+        try this.revokeOnce{gas: BEST_EFFORT_GAS}(driver, key) {
+            done = true;
         } catch {}
+    }
+
+    function revokeOnce(bytes32 driver, address key) external {
+        if (msg.sender != address(this)) revert NotAllowed();
+        _revokeStrict(driver, key);
     }
 
     function _send(bytes32 name, uint256 toChain, uint256 amount, bytes memory extra) private {
@@ -475,20 +500,13 @@ contract Station is IStation, ReentrancyGuardTransient {
 
     /// Make each call after checking where it goes: to one of the driver's
     /// targets, or to the dollar only to approve one of them.
+    /// Nothing a driver prepares reaches the vault, the station itself, its
+    /// factory or the registry, as a target or as a spender, whatever the
+    /// driver lists; a call the station would refuse is never made.
     function _run(Call[] memory calls, address[] memory targets) private {
-        _call(calls, targets, true);
-    }
-
-    /// Make each call after checking where it goes; a call that fails stops
-    /// everything only if `strict`. Nothing a driver prepares reaches the
-    /// vault, the station itself, its factory or the registry, as a target
-    /// or as a spender, whatever the driver lists.
-    function _call(Call[] memory calls, address[] memory targets, bool strict) private {
         address dollar = address(_asset());
         for (uint256 i = 0; i < calls.length; i++) {
             Call memory c = calls[i];
-            // A call the station would refuse is never made; outside a
-            // strict run it is skipped rather than stopping everything.
             bool allowed;
             if (c.target == dollar) {
                 if (c.data.length == 68 && bytes4(c.data) == APPROVE) {
@@ -498,14 +516,9 @@ contract Station is IStation, ReentrancyGuardTransient {
             } else {
                 allowed = _includes(targets, c.target) && !_ours(c.target);
             }
-            if (!allowed) {
-                if (strict) revert BadCall();
-                continue;
-            }
-            (bool ok, bytes memory reason) = strict
-                ? c.target.call{value: c.value}(c.data)
-                : c.target.call{value: c.value, gas: BEST_EFFORT_GAS}(c.data);
-            if (!ok && strict) {
+            if (!allowed) revert BadCall();
+            (bool ok, bytes memory reason) = c.target.call{value: c.value}(c.data);
+            if (!ok) {
                 assembly {
                     revert(add(reason, 32), mload(reason))
                 }

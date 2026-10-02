@@ -37,6 +37,9 @@ struct StationSpec {
 interface IStation {
     event KeyApproved(bytes32 indexed driver, address indexed key, uint64 validUntil);
     event KeyRevoked(bytes32 indexed driver, address indexed key);
+    /// A best-effort revoke (at a stop, or a lapsed key's replacement) didn't
+    /// go through at the venue; anyone may withdraw the key with `revokeKey`.
+    event RevokeSkipped(bytes32 indexed driver, address indexed key);
     event Pulled(uint256 amount);
     event Pushed(uint256 amount);
     event Deposited(bytes32 indexed driver, uint256 amount);
@@ -102,6 +105,8 @@ interface IStation {
     /// A stopped station's full unwind through the named drivers only, then
     /// everything idle home; anyone may call it.
     function unwindStopped(bytes32[] calldata drivers) external returns (uint256 sentHome, bool blocked);
+    /// Only the station itself calls it, for a best-effort revoke.
+    function revokeOnce(bytes32 driver, address key) external;
     /// Only the station itself calls it, during a stopped full unwind.
     function closeAll(bytes32 driver, uint16 band) external returns (bool outside);
     function sends() external view returns (Send[] memory);

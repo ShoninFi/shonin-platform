@@ -14,12 +14,12 @@ contract DepositAtALaggingMarkTest is ClaimBase {
         uint256 bobShares = depositAs(vault, bob, 100_000e6);
         deploySpot(190_000e6, 190_000e6, 3e18); // 180k of BTC, 10k of venue cash, 10k of vault cash
 
-        // The market rallies and the venue's bid leads its mark by 2%; the
+        // The market rallies and the venue's bid leads its mark by 0.8%, inside the band; the
         // mark will catch up a slot later. The pool is worth 10k + 10k +
-        // 3 x 61,200 = 203.6k to anyone who could sell it now.
+        // 3 x 60,480 = 201.44k to anyone who could sell it now.
         vm.prank(operator);
-        venue.setPrices(SPOT, PRICE, PRICE, PRICE * 102 / 100, PRICE * 103 / 100);
-        assertApproxEqAbs(worth(bobShares), 101_800e6, 100e6);
+        venue.setPrices(SPOT, PRICE, PRICE, PRICE * 1008 / 1000, PRICE * 1009 / 1000);
+        assertApproxEqAbs(worth(bobShares), 100_720e6, 100e6);
         // What bob's shares are worth net of the profit fee they owe, which
         // is what a newcomer joins against (the blended mark).
         value(vault);
@@ -32,7 +32,7 @@ contract DepositAtALaggingMarkTest is ClaimBase {
         assertEq(v.grossExit, v.gross, "the clamp did not hold the exit side at the mark");
 
         // The mark catches up to where the bid already was.
-        setPrice(SPOT, PRICE * 102 / 100, 0);
+        setPrice(SPOT, PRICE * 1008 / 1000, 0);
         value(vault);
 
         emit log_named_uint("bob's realisable worth before carol joined", bobRealisable);
