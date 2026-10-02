@@ -48,8 +48,8 @@ pub const GUARANTEES: [(&str, &str, &str); 6] = [
     ),
     (
         "Exit any time",
-        "A withdrawal is paid from the idle balance at once, or booked as a claim the contract \
-         settles itself.",
+        "A withdrawal is priced at the next valuation, seconds away, and paid from the cash; \
+         one the cash can't cover becomes a claim that anyone can settle.",
         "Rules out gated redemptions and depending on one operator.",
     ),
     (
@@ -230,10 +230,10 @@ pub const REACHING: &str = "Reaching the platform for the terms it is running un
 pub fn exit_note(band: &str) -> String {
     format!(
         "A withdrawal is valued at exit-side marks, so the leaver pays the spread rather than \
-         the pool. If the idle balance covers it, the shares are burned and paid in the same \
-         transaction. If not, a claim is booked: the leaver's fraction of every position is \
-         closed inside a {band} band around the venue's oracle price, and once the cash is home \
-         the claim is paid. Anyone can send the settle transaction."
+         the pool. It is priced at the next valuation, seconds away: if the cash covers it, the \
+         shares are burned and paid then. If not, a claim is booked: the leaver's fraction of \
+         every position is closed inside a {band} band around the venue's oracle price and paid \
+         in the same transaction. Anyone can send it."
     )
 }
 

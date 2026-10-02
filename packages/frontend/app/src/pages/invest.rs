@@ -676,8 +676,9 @@ fn deposit_modal(strategy: &Rc<Strategy>) -> Dom {
                     })))
                 }),
                 ui::note(
-                    "The contract computes the vault's value from on-chain state in the same \
-                     transaction and mints at that. The fee stays in the pool.",
+                    "Your deposit is a request: the next valuation, seconds away, computes the \
+                     vault's value from on-chain state and mints at that, so nobody can pick \
+                     the price they join at. The fee stays in the pool.",
                 ),
                 modal_actions(vec![
                     shell::button("Cancel", false, || depositing().set(None)),
@@ -761,8 +762,8 @@ fn withdraw_modal(strategy: &Rc<Strategy>) -> Dom {
                                     "This will likely book a claim",
                                     &format!(
                                         "It is more than the vault's cash of {}, so once it is priced \
-                                         your shares stay pending while your fraction of every position is \
-                                         closed and brought home. The next valuation after that pays you.",
+                                         your shares stay pending until your fraction of every position is \
+                                         closed inside the exit band and brought home, which pays you at once.",
                                         fmt::money(held.vault.idle)
                                     ),
                                 )

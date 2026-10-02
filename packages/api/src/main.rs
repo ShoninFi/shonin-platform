@@ -267,39 +267,44 @@ async fn portfolio(
 /// What an address paid for what it still holds: everything it put in, less
 /// everything it took out. The vault's own log is the whole of it.
 async fn cost_basis(chain: &Client, vault: Address, who: Address) -> Option<f64> {
+    use alloy::primitives::B256;
     use alloy::rpc::types::Filter;
     use alloy::sol_types::SolEvent;
     use chain::bindings::vault::IVault;
 
+    // The owner is the second indexed field of a deposit or a withdrawal
+    // (after the request's id), and the first of a fallback's payments.
+    let logs = |signature: B256, owner_topic: usize| {
+        let mut filter = Filter::new()
+            .address(vault)
+            .event_signature(signature)
+            .from_block(0u64);
+        filter = if owner_topic == 2 {
+            filter.topic2(who.into_word())
+        } else {
+            filter.topic1(who.into_word())
+        };
+        async move { chain.logs(&filter).await.ok() }
+    };
+
     let mut paid = 0.0;
-    let deposits = chain
-        .logs(
-            &Filter::new()
-                .address(vault)
-                .event_signature(IVault::Deposited::SIGNATURE_HASH)
-                .topic1(who.into_word())
-                .from_block(0u64),
-        )
-        .await
-        .ok()?;
-    for log in deposits {
+    for log in logs(IVault::Deposited::SIGNATURE_HASH, 2).await? {
         if let Ok(event) = log.log_decode::<IVault::Deposited>() {
             paid += dollars(event.inner.data.assets);
         }
     }
-
-    let withdrawals = chain
-        .logs(
-            &Filter::new()
-                .address(vault)
-                .event_signature(IVault::Withdrawn::SIGNATURE_HASH)
-                .topic1(who.into_word())
-                .from_block(0u64),
-        )
-        .await
-        .ok()?;
-    for log in withdrawals {
+    for log in logs(IVault::Withdrawn::SIGNATURE_HASH, 2).await? {
         if let Ok(event) = log.log_decode::<IVault::Withdrawn>() {
+            paid -= dollars(event.inner.data.assets);
+        }
+    }
+    for log in logs(IVault::ProRataTaken::SIGNATURE_HASH, 1).await? {
+        if let Ok(event) = log.log_decode::<IVault::ProRataTaken>() {
+            paid -= dollars(event.inner.data.assets);
+        }
+    }
+    for log in logs(IVault::UnitsPaid::SIGNATURE_HASH, 1).await? {
+        if let Ok(event) = log.log_decode::<IVault::UnitsPaid>() {
             paid -= dollars(event.inner.data.assets);
         }
     }
