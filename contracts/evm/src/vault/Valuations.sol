@@ -615,7 +615,8 @@ library Valuations {
         Layout storage s = VaultStorage.layout();
         uint256 raw = s.unitsOf[holder];
         if (raw == 0) revert IVault.Nothing();
-        if (s.valuing()) revert IVault.NotYet();
+        // Not between a valuation's pricing and its settlement, as claims.
+        if (s.valuing() || owed(s)) revert IVault.NotYet();
         // On a vault that trades on other chains a serve here reaches only
         // this chain's station, and nothing on this chain can say what the
         // others hold: only the holder may accept it.
@@ -623,7 +624,7 @@ library Valuations {
         uint256 fraction = raw.mulDiv(s.scale(), WAD);
         if (fraction > WAD) fraction = WAD;
         if (fraction == 0) fraction = 1;
-        (, uint256 exitBefore) = IStation(s.homeStation).value();
+        (uint256 markBefore,) = IStation(s.homeStation).value();
         s.serving = holder;
         // A close that fails (one that would bring the holder nothing, say)
         // brings nothing home; whether that clears the units as dust or
@@ -640,13 +641,16 @@ library Valuations {
         // worth nothing and can be cleared.
         // Units worth less than one unit of the dollar are worth nothing and
         // are cleared rather than left to block the station.
-        // Judged on every station: this one now, and all of them as the
-        // last valuation counted them; once the vault has closed its
-        // stations were found empty, and only what this one holds now counts.
-        uint256 stations = exitBefore;
+        // Judged at the mark, on every station: this one now, and all of them
+        // as the last valuation counted them, whichever is more, as a claim's
+        // dust is; a close refused because it would pay the holder nothing
+        // at exit prices proves nothing, and the units wait. Once the vault
+        // has closed its stations were found empty, and only what this one
+        // holds now counts.
+        uint256 stations = markBefore;
         if (s.lastPriced != 0 && s.state != VaultState.Closed) {
             Valuation storage last = s.latest();
-            uint256 counted = last.grossExit - 1 - last.cash;
+            uint256 counted = last.gross - 1 - last.cash;
             if (counted > stations) stations = counted;
         }
         // The station rounds each venue's part and its idle part down on its

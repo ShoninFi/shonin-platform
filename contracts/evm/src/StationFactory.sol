@@ -49,8 +49,11 @@ contract StationFactory is IStationFactory {
     ) external {
         if (msg.sender != initializer) revert NotInitializer();
         if (implementation != address(0)) revert AlreadyInitialized();
-        // Zero would leave it uninitialised and open to a second call.
-        if (implementation_ == address(0)) revert NotInitialized();
+        // Zero would leave it uninitialised and open to a second call, or
+        // brick every station it creates.
+        if (implementation_ == address(0) || attestation_ == address(0) || asset_ == address(0)) {
+            revert NotInitialized();
+        }
         attestation = attestation_;
         asset = asset_;
         vaultFactory = vaultFactory_;

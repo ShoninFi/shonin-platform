@@ -239,6 +239,10 @@ contract Station is IStation, ReentrancyGuardTransient {
             // exactly what selling it realises, and all that comes home for
             // it. The rest stays with whoever still owns it.
             (uint256 markBefore, uint256 exitBefore) = drivers[i].valueOf(address(this));
+            // An account worth no more than a few dollar-units is dust: a
+            // fraction of it is left where it is rather than let its rounding
+            // hold every leaver's close. A full unwind still sells it.
+            if (fraction < WAD && markBefore <= count + 1) continue;
             // An account worth something at the mark and nothing at exit
             // prices is underwater at the bid: selling a fraction of it would
             // bring the leaver nothing and leave the loss with everyone else.
