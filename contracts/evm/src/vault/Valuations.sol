@@ -640,7 +640,10 @@ library Valuations {
             uint256 counted = last.grossExit - 1 - last.cash;
             if (counted > stations) stations = counted;
         }
-        bool worthSomething = stations.mulDiv(fraction, WAD) != 0;
+        // The station rounds each venue's part and its idle part down on its
+        // own, so units worth fewer dollar-units than it has parts may bring
+        // nothing home however often they are served: they are dust.
+        bool worthSomething = stations.mulDiv(fraction, WAD) > s.drivers.length + 1;
         if (blocked || (home == 0 && worthSomething)) {
             revert IVault.NotYet();
         }

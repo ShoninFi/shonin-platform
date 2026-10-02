@@ -82,6 +82,7 @@ pragma solidity ^0.8.30;
 //                                         StationExternalFunctionsTest.testFuzz_stop (refused at home)
 //   Station.unwind                        StationExternalFunctionsTest.testFuzz_unwind
 //   Station.closeAll                      StationExternalFunctionsTest.testFuzz_closeAll
+//   Station.unwindStopped                 StationExternalFunctionsTest.testFuzz_unwindStopped
 //   AttestationRegistry.setTimelock       RegistryExternalFunctionsTest.testFuzz_setTimelock
 //   AttestationRegistry.proposeImage,
 //     revokeImage, proposeProject,
@@ -608,7 +609,9 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
                 want = IVault.NotAllowed.selector;
             } else if (vm.getBlockTimestamp() < c.bookedAt + 7 days) {
                 want = IVault.NotYet.selector;
-            } else if (b.state != VaultState.Open && b.state != VaultState.WindingDown) {
+            } else if (
+                (b.state != VaultState.Open && b.state != VaultState.WindingDown) || vault.haltedAt() != 0
+            ) {
                 want = IVault.WrongState.selector;
             }
         }
@@ -635,7 +638,8 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
             want = IVault.NotAllowed.selector;
         } else if (vm.getBlockTimestamp() < since + 7 days) {
             want = IVault.NotYet.selector;
-        } else if (b.state != VaultState.Open && b.state != VaultState.WindingDown) {
+        } else if ((b.state != VaultState.Open && b.state != VaultState.WindingDown) || vault.haltedAt() != 0)
+        {
             want = IVault.WrongState.selector;
         }
         (bool ok, bytes4 err) = callAs(caller, address(vault), abi.encodeCall(IVault.freezeUnits, (holder)));

@@ -99,6 +99,9 @@ interface IStation {
     /// The band its full unwind closes inside now: the exit band, widening
     /// after it has been stopped a while.
     function stoppedBand() external view returns (uint16);
+    /// A stopped station's full unwind through the named drivers only, then
+    /// everything idle home; anyone may call it.
+    function unwindStopped(bytes32[] calldata drivers) external returns (uint256 sentHome, bool blocked);
     /// Only the station itself calls it, during a stopped full unwind.
     function closeAll(bytes32 driver, uint16 band) external returns (bool outside);
     function sends() external view returns (Send[] memory);

@@ -341,7 +341,8 @@ library Upkeep {
         // left unpaid this long is reason enough to stop, whether the market
         // or anyone else kept them waiting.
         if (block.timestamp < claim.bookedAt + s.timers.freezeAfter) revert IVault.NotYet();
-        if (!s.live()) revert IVault.WrongState();
+        // A vault already halted (an evicted retirement) is stopping anyway.
+        if (!s.live() || s.halted()) revert IVault.WrongState();
         _halt(s, "frozen");
         _setState(s, VaultState.Frozen);
     }
@@ -355,7 +356,7 @@ library Upkeep {
         uint64 since = s.unitsSince[holder];
         if (s.unitsOf[holder] == 0 || s.otherChains.length != 0) revert IVault.NotAllowed();
         if (block.timestamp < since + s.timers.freezeAfter) revert IVault.NotYet();
-        if (!s.live()) revert IVault.WrongState();
+        if (!s.live() || s.halted()) revert IVault.WrongState();
         _halt(s, "frozen");
         _setState(s, VaultState.Frozen);
     }

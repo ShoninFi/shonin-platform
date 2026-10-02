@@ -362,8 +362,9 @@ contract AttestationRegistry is IAttestationRegistry {
     ) private {
         _settle(slot, revoked);
         if (implementation == address(0)) revert NoImplementation();
-        // A proposal still waiting has not been approved: withdraw it.
-        if (implementation == slot.next) revert NotApproved();
+        // A proposal still waiting has not been approved: withdraw it. The
+        // one in force can be revoked even while it is proposed again.
+        if (implementation == slot.next && implementation != slot.current) revert NotApproved();
         revoked[implementation] = true;
     }
 

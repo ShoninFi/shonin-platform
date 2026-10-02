@@ -89,6 +89,18 @@ contract LocalDriver is IDriver {
             if (size == 0) continue;
 
             Market memory market = venue.marketOf(held[i]);
+            // The full band accepts any price: a stopped station that has
+            // waited long enough sells at whatever the market offers.
+            if (bandBps >= BPS) {
+                orders[count++] = OrderRequest({
+                    market: held[i],
+                    isBuy: !isLong,
+                    size: size,
+                    limitPrice: isLong ? 0 : type(uint256).max,
+                    reduceOnly: true
+                });
+                continue;
+            }
             // A long is sold at the bid, a short bought back at the ask, and
             // neither may be worse than the band around the venue's own price.
             uint256 limit = isLong

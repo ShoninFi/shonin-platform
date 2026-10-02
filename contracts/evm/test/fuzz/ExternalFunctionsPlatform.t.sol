@@ -542,6 +542,27 @@ contract StationExternalFunctionsTest is ClaimBase, Calls {
         nothingLeft(b);
     }
 
+    /// A stopped station's unwind by name: anyone, once stopped; it never
+    /// takes cash from the vault.
+    function testFuzz_unwindStopped(uint8 stage, uint8 pick, address random, uint8 which) public {
+        stage = arrange(stage);
+        address caller = pickCaller(pick, random);
+        bytes32[] memory names = new bytes32[](which % 3);
+        for (uint256 i = 0; i < names.length; i++) {
+            names[i] = which % 5 == 0 ? bytes32("elsewhere") : bytes32("local");
+        }
+        Books memory b = books(caller);
+        uint256 cash = vault.cash();
+        bytes4 want;
+        if (stage != STOPPED) want = Station.NotHalted.selector;
+        else if (which % 5 == 0 && names.length != 0) want = Station.NotDeclared.selector;
+        (bool ok, bytes4 err) =
+            callAs(caller, address(station), abi.encodeCall(Station.unwindStopped, (names)));
+        expectOutcome(ok, err, want, "unwindStopped");
+        if (ok) assertGe(vault.cash(), cash, "an unwind took cash from the vault");
+        nothingLeft(b);
+    }
+
     /// One driver's part of a stopped full unwind: only the station itself
     /// may call it.
     function testFuzz_closeAll(uint8 stage, uint8 pick, address random, bytes32 driver, uint16 band) public {

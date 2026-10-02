@@ -107,6 +107,10 @@ contract ConfigBoundsTest is Fixture {
         config = factory.config();
         config.timers.activationWindow = 1 days - 1;
         refused(config);
+
+        config = factory.config();
+        config.timers.freezeAfter = config.timers.fallbackAfter;
+        refused(config);
     }
 
     function test_an_activation_is_on_the_terms_the_author_read() public {

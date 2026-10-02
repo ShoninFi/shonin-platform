@@ -65,7 +65,8 @@ interface IDriver {
     /// And back.
     function withdraw(address station, uint256 amount) external view returns (Call[] memory);
     /// Close `fraction` (1e18 is all) of every position, each order no worse
-    /// than `bandBps` from the venue's own price. `blocked` is true, with no
+    /// than `bandBps` from the venue's own price; at 10,000 or more, at any
+    /// price, never blocked. `blocked` is true, with no
     /// calls, when a market is outside the band: nothing is closed then, so a
     /// leaver is never sold through a market that has run away.
     function close(

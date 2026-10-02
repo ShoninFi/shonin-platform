@@ -208,7 +208,7 @@ contract Station is IStation, ReentrancyGuardTransient {
         bool permitted = (isHome() && msg.sender == _spec.vault) || _isKey(msg.sender, ImageKind.Executor)
             || _isKey(msg.sender, ImageKind.Unwinder) || (stopped && fraction == WAD);
         if (!permitted) revert NotAllowed();
-        if (stopped && fraction == WAD) return _unwindStopped();
+        if (stopped && fraction == WAD) return _unwindStopped(_spec.drivers);
 
         // Every driver's close is prepared before any is made, so a market
         // outside the band on one venue closes nothing anywhere: a leaver is
@@ -271,14 +271,15 @@ contract Station is IStation, ReentrancyGuardTransient {
     /// driver closes on its own, inside the band as it has widened since the
     /// stop, so a venue that refuses or a market still outside the band
     /// leaves only its own money behind. Everything idle then goes home.
-    function _unwindStopped() private returns (uint256 sentHome, bool blocked) {
+    function _unwindStopped(bytes32[] memory drivers) private returns (uint256 sentHome, bool blocked) {
         uint16 band = stoppedBand();
-        for (uint256 i = 0; i < _spec.drivers.length; i++) {
-            try this.closeAll(_spec.drivers[i], band) returns (bool outside) {
+        for (uint256 i = 0; i < drivers.length; i++) {
+            _pinned(drivers[i]);
+            try this.closeAll(drivers[i], band) returns (bool outside) {
                 if (outside) blocked = true;
             } catch {
                 blocked = true;
-                emit DriverFailed(_spec.drivers[i]);
+                emit DriverFailed(drivers[i]);
             }
         }
         sentHome = _asset().balanceOf(address(this));
@@ -292,6 +293,19 @@ contract Station is IStation, ReentrancyGuardTransient {
             }
         }
         emit Unwound(WAD, sentHome, blocked);
+    }
+
+    /// A stopped station's full unwind through the drivers named, then
+    /// everything idle home; with none named, only the idle dollars. Anyone
+    /// may call it, so a driver that burns its gas can be left out and can't
+    /// keep the other venues' money, or the idle dollars, from coming home.
+    function unwindStopped(bytes32[] calldata drivers)
+        external
+        nonReentrant
+        returns (uint256 sentHome, bool blocked)
+    {
+        if (!stopped) revert NotHalted();
+        return _unwindStopped(drivers);
     }
 
     /// One driver's part of a stopped station's full unwind. Only the

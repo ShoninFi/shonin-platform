@@ -304,6 +304,7 @@ contract VaultFactory is IVaultFactory {
                 || config_.timers.usageFreshness == 0 || config_.timers.usageFreshness > 1 days
                 || config_.timers.tankEscapeDelay < 1 days || config_.timers.floorDelay < 1 days
                 || config_.timers.haltGrace < 10 minutes || config_.timers.windDown < 7 days
+                || config_.timers.freezeAfter <= config_.timers.fallbackAfter
                 || config_.timers.activationWindow < 1 days || config_.maxExitCost > MAX_EXIT_COST
                 || config_.minimumDeposit > MAX_MINIMUM_DEPOSIT || _tooLong(config_.timers)
         ) revert OutOfRange();

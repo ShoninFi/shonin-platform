@@ -8,7 +8,7 @@ The attestation registry decides which machines may hold a key at all. It record
 
 - **Approved images,** each as one kind: Reviewer, builder, executor or unwinder. A new image only counts after a public wait, and a revoked one stops at once ([the allowlist](attestation.md#the-allowlist)).
 - **Approved operators,** whose accounts may run those images, added the same slow, public way.
-- **Approved drivers,** the on-chain half of each, shared by every station on its chain, added the same slow, public way; revoking one stops trading through it at once, while closing positions still works ([drivers](../writing/drivers.md#adding-a-driver)).
+- **Approved drivers and bridges,** the on-chain half of each, added the same slow, public way. A station keeps the versions approved when it was created, for good, so a later approval only reaches vaults created after it; revoking a version stops trading through it at once, while closing positions still works ([drivers](../writing/drivers.md#adding-a-driver)).
 - **Blessed keys:** for each, the image it came from, its kind, and for a vault's key the one vault and exact build it may act for, and when its blessing expires ([blessing a key](attestation.md#blessing-a-key)).
 - **The attestation checker:** the fingerprint of the one proof program it accepts, and the Google root certificate that program trusts ([proving an attestation](attestation.md#proving-an-attestation)). These change only through the same public wait as an image.
 
@@ -44,7 +44,7 @@ One published **admin key** governs the registries at launch, to be replaced by 
 | --- | --- |
 | Propose a new image, operator, driver or attestation checker, which only counts after a public two-day wait | Bless a key, or skip the wait |
 | Revoke an image, operator, driver or checker, at once | Move money anywhere but back to Depositors |
-| [Kill a vault](vaults.md#a-kill) | Change a vault's agent, or anything a vault has recorded |
+| [Kill a vault](vaults.md#a-kill) | Change a vault's agent, its drivers or bridges, or anything a vault has recorded |
 
 The wait itself can be raised at once, but lowering it takes as long as the current wait, so it can never be cut quietly, and it can never go below a floor fixed when the registry was deployed: two days on mainnet. Every vault's page shows it.
 

@@ -19,7 +19,7 @@ Each station's address is fixed in advance from its vault, so asking twice just 
 
 ## Drivers
 
-A station has a [driver](../writing/drivers.md) plugged in for each venue on its chain that its agent uses. The station itself knows nothing about any venue, but it owns the vault's accounts there and makes every call itself. Its drivers only prepare and check those calls: approving the vault's trade-only keys, working out what the station holds there, and closing positions when someone withdraws. The station only makes a call to one of the targets its driver declared, and never to the vault, the station itself, its factory or the registry, whatever the driver lists, so a driver can never reach the vault's cash. [Drivers](../writing/drivers.md) explains them in full, including how each venue's money is kept in.
+A station has a [driver](../writing/drivers.md) plugged in for each venue on its chain that its agent uses. The station itself knows nothing about any venue, but it owns the vault's accounts there and makes every call itself. Its drivers only prepare and check those calls: approving the vault's trade-only keys, working out what the station holds there, and closing positions when someone withdraws. The station only makes a call to one of the targets its driver declared, and never to the vault, the station itself, its factory or the registry, whatever the driver lists, so a driver can never reach the vault's cash. A station keeps the drivers it was created with for good. [Drivers](../writing/drivers.md) explains them in full, including how each venue's money is kept in.
 
 ## One executor at a time
 

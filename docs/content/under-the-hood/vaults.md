@@ -112,9 +112,11 @@ A claim nobody could serve for a day after it was booked can take the fallback t
 
 ### The exit band
 
-A claim's positions are closed with reduce-only orders that fill at once or not at all, at the venue's oracle price plus or minus the **exit band**, 1% by default. Every venue's close is checked before any is made, so a market outside the band on one venue closes nothing anywhere: a leaver is never half-sold. If the market is outside it, nothing fills, the claim waits, and settling is tried again.
+A claim's positions are closed with reduce-only orders that fill at once or not at all, at the venue's oracle price plus or minus the **exit band**, 1% by default. Every venue's close is checked before any is made, so a market outside the band on one venue closes nothing anywhere: a leaver is never half-sold. If the market is outside it, or the venue refuses the close, nothing fills, the claim waits, and settling is tried again.
 
 The same band guards the cash. A valuation at which any market sits outside the band is void, so nobody who widens a spread for a moment can be paid at it, or make anyone else be.
+
+**After a vault stops,** its stations are unwound in full, shared by everyone, each venue on its own. For the first week the same band applies, so nobody's money is dumped into a market that is only briefly broken; after that the band doubles every week, so a market that stays broken for good (a delisted token, a stale price) can't keep the money at the venue forever. A close still takes the best price on offer; the wider band only matters when the market really is that thin. If one venue can't be closed at all, the others are, and every idle dollar still comes home.
 
 The leaver pays the spread, the transaction fee, and the costs of their own exit. A bad fill falls on the leaver alone: they're paid what the close actually brought home, never more than their share was worth at exit prices before it, and if a venue keeps the proceeds instead of sending them home, the whole close is undone. Where a share has to be brought home from another chain, the unwinder's gas and bridge fees come out of that leaver's payout too. The unwinder reports them, signed with its blessed key, and they can never be more than a fixed cap per claim, set in the vault's terms.
 
@@ -164,7 +166,7 @@ Each vault has a **tank**: a plain dollar balance, held by the vault but not cou
 
 - **What's charged is capped.** The executor keeps a running total of what the agent uses, signed with the vault's own blessed key, and stops the agent the moment the unpaid part reaches the tank. Once a day, `keep` collects it and tops the tank up if the Author asked for that. Anyone may send it; Shonin normally does, and pays its gas. The vault only believes the total up to the Author's allowances at our published prices, for the time that has passed, so a wrong total can never charge more than the Author agreed to.
 - **Earnings can pay for it.** The Author's fee shares are theirs. They can turn some into tank money, or set **auto-fill**, "keep my tank at $X", and each day just enough of their shares are turned into cash to top it up. Either way the shares are redeemed like any withdrawal, at the next valuation and only from cash, never as a claim, so nobody else pays for it.
-- **The Author can take it out** at any time. The latest bill, signed by the executor, is paid first, and the rest comes back at once. If no executor is running to sign a bill, the Author asks, waits a day so anyone can collect a final bill, and then takes it out without one. Once the vault has closed, there's no wait.
+- **The Author can take it out** at any time. The latest bill, signed by the executor, is paid first, and the rest comes back at once. If no executor is running to sign a bill, the Author asks, waits a day so anyone can collect a final bill, and then has a day to take it out without one; after that they ask again. Once the vault has closed, there's no wait.
 - **A dry tank stops the agent,** until anyone tops it up. Its positions stay as they are, and the vault's page says so. Withdrawals never draw on the tank, so an empty one can't hold anyone up. A final bill bigger than the tank takes what's there, and the rest is written off.
 
 ## Retiring
