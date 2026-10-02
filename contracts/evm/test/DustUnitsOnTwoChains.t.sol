@@ -4,9 +4,9 @@ pragma solidity ^0.8.30;
 import {IVault, Request} from "../src/interfaces/IVault.sol";
 import {TwoChainVault} from "./TwoChainVault.sol";
 
-/// On a vault that trades on other chains too, units worth nothing on any
-/// station are cleared by a serve that brings nothing home, so dust taken
-/// through the fallback never blocks a pull.
+/// On a vault that trades on other chains too, only the holder may accept a
+/// serve of their units; units worth nothing on any station are cleared by
+/// the holder's serve that brings nothing home, and the pulls resume.
 contract DustUnitsOnTwoChainsTest is TwoChainVault {
     function test_dust_units_on_a_two_chain_vault_are_cleared_and_never_block_a_pull() public {
         depositTwo(alice, 100_000e6);
@@ -29,8 +29,13 @@ contract DustUnitsOnTwoChainsTest is TwoChainVault {
         assertGt(units, 0, "no units were minted");
         assertLt(units, 1e6, "the units are not dust");
 
-        // Worth nothing on any station, they are cleared by a serve that
+        // Nobody else may serve them.
+        vm.expectRevert(IVault.NotAllowed.selector);
+        vault.serveProRata(bob);
+
+        // Worth nothing on any station, they are cleared by bob's serve that
         // brings nothing home.
+        vm.prank(bob);
         vault.serveProRata(bob);
         (units,) = vault.units();
         assertEq(units, 0, "the dust units were not cleared");
@@ -42,6 +47,6 @@ contract DustUnitsOnTwoChainsTest is TwoChainVault {
         // And the strategy can never pull a unit of cash again.
         vm.prank(executor);
         (bool ok,) = address(station).call(abi.encodeWithSignature("pull(uint256)", 1e6));
-        assertTrue(ok, "dust units left by the fallback block the home station's pulls for ever");
+        assertTrue(ok, "the pulls did not resume once the units were cleared");
     }
 }

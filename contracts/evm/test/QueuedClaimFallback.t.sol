@@ -72,15 +72,21 @@ contract QueuedClaimFallbackTest is Fixture {
         uint256 cash = vault.cash();
         vm.prank(bob);
         vault.takeProRata(bobRequest);
-        assertApproxEqRel(usd.balanceOf(bob), cash / 2, 0.001e18);
+        // Half the cash each, less the transaction fee kept in the pool.
+        uint256 half = cash / 2 - (cash / 2) * 10 / 10_000;
+        assertApproxEqRel(usd.balanceOf(bob), half, 0.001e18);
 
         // Alice's queued claim takes the fallback too, through its own door.
         vm.prank(alice);
         vm.expectRevert(IVault.NotAllowed.selector);
         vault.takeProRata(claimRequest);
+        // Hers is the rest of the cash, bob's fee included, less her own.
+        uint256 rest = vault.cash();
         vm.prank(alice);
         vault.takeProRataClaim(1);
-        assertApproxEqRel(usd.balanceOf(alice), cash / 2, 0.001e18, "a queued claim had no way out");
+        assertApproxEqRel(
+            usd.balanceOf(alice), rest - rest * 10 / 10_000, 0.001e18, "a queued claim had no way out"
+        );
         (uint256 aliceUnits,) = vault.unitsOf(alice);
         assertGt(aliceUnits, 0, "she was given no part of the station");
     }

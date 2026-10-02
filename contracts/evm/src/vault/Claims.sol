@@ -156,6 +156,13 @@ library Claims {
         // its share of the cash and units for the rest, whether or not
         // valuations kept being priced meanwhile.
         if (block.timestamp < claim.bookedAt + s.timers.fallbackAfter || s.valuing()) revert IVault.NotYet();
+        // Not while a priced valuation waits to settle, and not for a claim
+        // the cash covers: that one can be served now, at a price.
+        if (Valuations.owed(s)) revert IVault.NotYet();
+        if (state != ClaimState.Queued && s.lastPriced != 0) {
+            (,, uint256 covered) = Valuations.exitOf(s, s.latest(), claim.shares);
+            if (covered <= s.cash) revert IVault.NotAllowed();
+        }
         if (state == ClaimState.Queued) {
             // Not while a priced valuation could settle it.
             Request storage r = s.requests[s.claimRequest[claimId] - 1];

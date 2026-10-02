@@ -48,7 +48,9 @@ contract FallbackBesideACashOnlyClaimTest is TwoChainVault {
 
         // Alice's shares still own their fraction of everything, so bob's
         // share of the cash is his shares over every share, of all the cash.
+        // Less the transaction fee every exit pays into the pool.
         uint256 fair = (cash * bobShares) / supply;
+        fair -= (fair * 10) / 10_000;
         emit log_named_uint("cash", cash);
         emit log_named_uint("reserved for the cash-only claim", reserved);
         emit log_named_uint("paid to bob", paid);
@@ -58,7 +60,7 @@ contract FallbackBesideACashOnlyClaimTest is TwoChainVault {
         (uint256 held,) = vault.unitsOf(bob);
         (, uint256 stationExit) = station.value();
         uint256 bobTotal = paid + (stationExit * held) / 1e18;
-        uint256 bobFair = ((cash + stationExit) * bobShares) / supply;
+        uint256 bobFair = ((cash + stationExit) * bobShares) / supply - (fair * 10) / 10_000;
         emit log_named_uint("bob's total with his units", bobTotal);
         emit log_named_uint("bob's third of the vault", bobFair);
         assertApproxEqRel(bobTotal, bobFair, 0.001e18, "bob left with less than his fraction");

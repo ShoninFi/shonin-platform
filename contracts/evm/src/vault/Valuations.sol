@@ -665,8 +665,11 @@ library Valuations {
         // is the leaver's for good, whatever fees are minted later.
         uint256 fraction = shares.mulDiv(WAD - s.liveUnits(), s.totalSupply);
         uint256 raw = fraction.mulDiv(WAD, s.scale());
+        // The transaction fee stays in the pool, as for every other exit.
+        uint256 kept = assets.mulDiv(s.fees.transactionBps, BPS, Math.Rounding.Ceil);
         s.burn(address(this), shares);
-        s.cash -= assets;
+        s.cash -= assets - kept;
+        assets -= kept;
         if (raw != 0) {
             _accrue(s, owner);
             s.unitsOf[owner] += raw;
@@ -702,6 +705,10 @@ library Valuations {
         uint256 raw = s.unitsOf[holder];
         if (raw == 0) revert IVault.Nothing();
         if (s.valuing()) revert IVault.NotYet();
+        // On a vault that trades on other chains a serve here reaches only
+        // this chain's station, and nothing on this chain can say what the
+        // others hold: only the holder may accept it.
+        if (s.otherChains.length != 0 && msg.sender != holder) revert IVault.NotAllowed();
         uint256 fraction = raw.mulDiv(s.scale(), WAD);
         if (fraction > WAD) fraction = WAD;
         if (fraction == 0) fraction = 1;
@@ -724,9 +731,7 @@ library Valuations {
             if (counted > stations) stations = counted;
         }
         bool worthSomething = stations.mulDiv(fraction, WAD) != 0;
-        // On a vault that trades on other chains a serve here reaches only
-        // this chain's station, so it is only for clearing dust.
-        if (blocked || (home == 0 && worthSomething) || (s.otherChains.length != 0 && worthSomething)) {
+        if (blocked || (home == 0 && worthSomething)) {
             revert IVault.NotYet();
         }
         _accrue(s, holder);
