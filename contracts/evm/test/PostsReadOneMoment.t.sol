@@ -31,7 +31,7 @@ contract PostsReadOneMomentTest is TwoChainVault {
         // all 90k still there.
         vm.warp(time + 30);
         StationPost memory p = postOf(90_000e6, 90_000e6);
-        p.asOf = time;
+        p.asOf = time + SLOT;
         post(time, p, EXECUTOR_KEY);
         closeAfterDeadline(time);
 
@@ -47,8 +47,8 @@ contract PostsReadOneMomentTest is TwoChainVault {
         uint64 time = open();
         StationPost memory p = postOf(0, 0);
 
-        // Dated before the valuation, or past its post window.
-        p.asOf = time - 1;
+        // Dated less than a slot after the open, or past its post window.
+        p.asOf = time + SLOT - 1;
         bytes memory sig = signed(EXECUTOR_KEY, vault.postDigest(time, OTHER, p));
         vm.expectRevert(IVault.NotAllowed.selector);
         vault.postStation(time, OTHER, p, sig);
@@ -58,16 +58,16 @@ contract PostsReadOneMomentTest is TwoChainVault {
         vault.postStation(time, OTHER, p, sig);
 
         // Naming a send made after its moment.
-        p.asOf = time + 5;
+        p.asOf = time + SLOT + 5;
         p.transit = new Transit[](1);
-        p.transit[0] = Transit({amount: 10_000e6, sentAt: time + 6});
+        p.transit[0] = Transit({amount: 10_000e6, sentAt: time + SLOT + 6});
         sig = signed(EXECUTOR_KEY, vault.postDigest(time, OTHER, p));
         vm.expectRevert(IVault.NotAllowed.selector);
         vault.postStation(time, OTHER, p, sig);
 
         // As of its moment, with a send made before it.
-        p.transit[0].sentAt = time + 5;
-        vm.warp(time + 10);
+        p.transit[0].sentAt = time + SLOT + 5;
+        vm.warp(time + SLOT + 10);
         post(time, p, EXECUTOR_KEY);
     }
 }

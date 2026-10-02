@@ -38,11 +38,13 @@ library Posts {
         if (v.time != time || v.status != ValuationStatus.Open) revert IVault.NotAllowed();
         if (block.timestamp > time + s.timers.postDeadline) revert IVault.OutsideWindow();
         if (!_isOtherChain(s, stationChain)) revert IVault.NotAllowed();
-        // As of the station chain's first block at or after the valuation's
-        // open, when the home station was read, and no later than the post
-        // window allows: a send made after it lands at home after the read,
-        // so it is counted once, where it came from.
-        if (post.asOf < s.openedAt[index] || post.asOf > time + s.timers.postDeadline) {
+        // As of the station chain's first block a slot or more after the
+        // valuation's open, when the home station was read (a slot covers
+        // block times and clocks that differ between chains), and no later
+        // than the post window allows: a send made after it lands at home
+        // after the read, so it is counted once, where it came from.
+        if (post.asOf < s.openedAt[index] + s.timers.slotInterval || post.asOf > time + s.timers.postDeadline)
+        {
             revert IVault.NotAllowed();
         }
 

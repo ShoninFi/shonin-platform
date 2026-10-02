@@ -105,9 +105,9 @@ struct StationPost {
     /// its own chain.
     uint256 mark;
     uint256 exit;
-    /// The time of the station chain's first block at or after the
-    /// valuation's open (`openedAt`): the moment every figure in the post is
-    /// as of. A send made after it lands at home after the home station was
+    /// The time of the station chain's first block a slot or more after the
+    /// valuation's open (`openedAt` plus the slot interval): the moment every
+    /// figure in the post is as of. A send made after it lands at home after the home station was
     /// read, so it is counted once, where it came from.
     uint64 asOf;
     /// Sends from this station home, made by `asOf`, that had not landed by

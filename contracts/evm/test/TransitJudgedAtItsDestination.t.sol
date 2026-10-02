@@ -41,7 +41,7 @@ contract TransitJudgedAtItsDestinationTest is TwoChainVault {
         // It had not landed by the open, so the post names it on its way.
         vm.warp(time + 10);
         StationPost memory p = postOf(40_000e6, 40_000e6);
-        p.asOf = time + 6;
+        p.asOf = time + SLOT + 6;
         p.transit = new Transit[](1);
         p.transit[0] = Transit({amount: 50_000e6, sentAt: time - 1 minutes});
         post(time, p, EXECUTOR_KEY);
@@ -71,7 +71,7 @@ contract TransitJudgedAtItsDestinationTest is TwoChainVault {
         // It had landed by the open: no longer on its way. The post reads
         // the other station at or after the open.
         StationPost memory p = postOf(40_000e6, 40_000e6);
-        p.asOf = time + 3;
+        p.asOf = time + SLOT + 3;
         post(time, p, EXECUTOR_KEY);
         closeAfterDeadline(time);
 
@@ -92,7 +92,7 @@ contract TransitJudgedAtItsDestinationTest is TwoChainVault {
         bridge.deliver(OTHER, 1, address(station), 90_000e6);
         vm.warp(time + 10);
         StationPost memory p = postOf(0, 0);
-        p.asOf = time + 6;
+        p.asOf = time + SLOT + 6;
         p.transit = new Transit[](1);
         p.transit[0] = Transit({amount: 90_000e6, sentAt: time - 1 minutes});
         post(time, p, EXECUTOR_KEY);
@@ -165,6 +165,35 @@ contract TransitJudgedAtItsDestinationTest is TwoChainVault {
         vault.postStation(time, OTHER, early, sig);
 
         // As of the open, the 50k had left: 40k there, 50k at home.
+        post(time, postOf(40_000e6, 40_000e6), EXECUTOR_KEY);
+        closeAfterDeadline(time);
+        assertApproxEqRel(latest().gross, 100_000e6, 0.001e18, "the send home was not counted once");
+        uint256 supply = vault.totalSupply();
+        assertApproxEqRel(vault.balanceOf(bob) * 1e18 / supply, 0.5e18, 0.01e18, "bob's price was off");
+    }
+
+    /// Clocks and block times differ between chains, so a post reads its
+    /// station a slot or more after the open: a send home that the open's
+    /// block saw land was made before the post's moment, and is not named.
+    function test_a_post_reads_a_slot_after_the_open_so_a_send_landed_before_it_counts_once() public {
+        ninetyAway();
+        requestDepositAs(vault, bob, 100_000e6);
+        uint64 time = nextTime();
+        vm.warp(time);
+        // The other station's send lands at home just ahead of the open.
+        vm.prank(operator);
+        bridge.deliver(OTHER, 1, address(station), 50_000e6);
+        vm.prank(executor);
+        vault.recordValuation();
+
+        // A post stamped within the slot after the open is refused.
+        StationPost memory early = postOf(90_000e6, 90_000e6);
+        early.asOf = time + SLOT - 1;
+        bytes memory sig = signed(EXECUTOR_KEY, vault.postDigest(time, OTHER, early));
+        vm.expectRevert(IVault.NotAllowed.selector);
+        vault.postStation(time, OTHER, early, sig);
+
+        // A slot on, the send had left and landed: 40k there, nothing named.
         post(time, postOf(40_000e6, 40_000e6), EXECUTOR_KEY);
         closeAfterDeadline(time);
         assertApproxEqRel(latest().gross, 100_000e6, 0.001e18, "the send home was not counted once");

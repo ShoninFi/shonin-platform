@@ -110,7 +110,7 @@ contract CrossChainClosingTest is Fixture {
     }
 
     function post(uint64 time, StationPost memory p, uint256 key) internal {
-        if (p.asOf == 0) p.asOf = vault.openedAt(vault.valuationCount() - 1);
+        if (p.asOf == 0) p.asOf = vault.openedAt(vault.valuationCount() - 1) + SLOT;
         vault.postStation(time, OTHER, p, signed(key, vault.postDigest(time, OTHER, p)));
     }
 
@@ -145,7 +145,7 @@ contract CrossChainClosingTest is Fixture {
         depositTwo(alice, 100_000e6);
         uint64 time = open();
         StationPost memory huge = postOf(type(uint256).max, 0);
-        huge.asOf = time;
+        huge.asOf = time + SLOT;
         bytes memory sig = signed(EXECUTOR_KEY, vault.postDigest(time, OTHER, huge));
         vm.expectRevert(IVault.NotAllowed.selector);
         vault.postStation(time, OTHER, huge, sig);

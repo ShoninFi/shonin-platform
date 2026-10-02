@@ -51,16 +51,6 @@ const PLAN: &[Plan] = &[
         killed: false,
     },
     Plan {
-        title: "Funding basis, sealed",
-        sealed: true,
-        broken: false,
-        activate: true,
-        deposit: false,
-        claim: false,
-        retired: false,
-        killed: false,
-    },
-    Plan {
         title: "Funding basis, broken",
         sealed: false,
         broken: true,
@@ -99,6 +89,17 @@ const PLAN: &[Plan] = &[
         claim: false,
         retired: false,
         killed: true,
+    },
+    // Last, so it is still new on the fast local clock when the seed ends.
+    Plan {
+        title: "Funding basis, sealed",
+        sealed: true,
+        broken: false,
+        activate: true,
+        deposit: false,
+        claim: false,
+        retired: false,
+        killed: false,
     },
 ];
 

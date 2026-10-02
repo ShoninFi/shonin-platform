@@ -170,7 +170,6 @@ async fn one(
     let attestation = read_attestation(chain, deployments, address, now).await?;
     let bundle = read_bundle(store, &registered, bundle_hash);
 
-    let standing = standing(&state, days_live);
     let kill = events
         .iter()
         .find(|event| event.kind == EventKind::Killed)
@@ -185,6 +184,12 @@ async fn one(
             },
             reference: event.reference.clone(),
         });
+    // A vault the admin stopped stays shown as stopped once it has closed:
+    // that is what happened to it.
+    let standing = match standing(&state, days_live) {
+        Standing::Closed if kill.is_some() => Standing::Killed,
+        other => other,
+    };
 
     let manifest = store
         .manifest(&hash_of(registered.manifestHash))
