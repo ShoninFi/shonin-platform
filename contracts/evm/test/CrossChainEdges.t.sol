@@ -121,7 +121,7 @@ contract CrossChainEdgesTest is Fixture {
     }
 
     function post(Vault v, uint64 time, StationPost memory p, uint256 key) internal {
-        if (p.asOf == 0) p.asOf = time;
+        if (p.asOf == 0) p.asOf = v.openedAt(v.valuationCount() - 1);
         v.postStation(time, OTHER, p, signed(key, v.postDigest(time, OTHER, p)));
     }
 

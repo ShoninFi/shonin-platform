@@ -329,8 +329,11 @@ contract Station is IStation, ReentrancyGuardTransient {
 
     function _send(bytes32 name, uint256 toChain, uint256 amount, bytes memory extra) private {
         if (stopped && toChain != _spec.vaultChain) revert AlreadyStopped();
-        // Only to a chain the vault trades on, where a station counts it.
-        if (toChain != _spec.vaultChain && !_listed(_spec.chains, toChain)) revert NoRoute();
+        // Only to a chain the vault trades on, where a station counts it; and
+        // a station on another chain sends only home, so money between two
+        // other chains goes through home, where every send is counted
+        // against one moment, the valuation's open.
+        if (toChain != _spec.vaultChain && (!isHome() || !_listed(_spec.chains, toChain))) revert NoRoute();
         if (!_contains(_spec.bridges, name)) revert NotDeclared();
         address implementation = _registry().bridgeOf(name);
         if (implementation == address(0)) revert NotApproved();

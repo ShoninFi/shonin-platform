@@ -119,6 +119,7 @@ struct Layout {
     /// When each valuation was opened: the home station's moment. A send to
     /// home is on its way until it has landed by then.
     mapping(uint256 => uint64) openedAt;
+    mapping(uint256 => uint64) openedBlock;
     /// When the last valuation waiting for posts was closed: the next opens
     /// a slot later at the soonest, so every cycle leaves room to leave.
     uint64 closedAt;

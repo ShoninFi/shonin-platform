@@ -106,13 +106,14 @@ struct StationPost {
     uint256 mark;
     uint256 exit;
     /// The time of the station chain's first block at or after the
-    /// valuation's time: the moment every figure in the post is as of. Every
-    /// post reads its station at that one moment, so money moving between
-    /// chains while the posts come in is counted once, on the chain it left.
+    /// valuation's open (`openedAt`): the moment every figure in the post is
+    /// as of. A send made after it lands at home after the home station was
+    /// read, so it is counted once, where it came from.
     uint64 asOf;
-    /// Sends from this station, made by `asOf`, that had not landed at their
-    /// destination by its own moment: at home, by the valuation's open
-    /// (`openedAt`); on another chain, by that chain's post's `asOf`.
+    /// Sends from this station home, made by `asOf`, that had not landed by
+    /// the valuation's open: in block and transaction order, before the open
+    /// transaction in block `openedBlock`. A station on another chain sends
+    /// only home.
     Transit[] transit;
     /// The home station's sends to this chain that have not landed, by their
     /// place in its list, in increasing order. Bridges may land out of
@@ -386,6 +387,9 @@ interface IVault is IStationVault {
     /// When a valuation was opened: the home station's moment, by which a
     /// send to home must have landed to be out of transit.
     function openedAt(uint256 index) external view returns (uint64);
+    /// The block the valuation was opened in: a send home that landed in it
+    /// before the open transaction had landed by the open.
+    function openedBlock(uint256 index) external view returns (uint64);
     function requestCount() external view returns (uint256);
     function requestAt(uint256 requestId) external view returns (Request memory);
     function valuationCount() external view returns (uint256);

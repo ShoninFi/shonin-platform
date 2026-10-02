@@ -178,6 +178,10 @@ contract Vault is IVault, ReentrancyGuardTransient {
         return VaultStorage.layout().openedAt[index];
     }
 
+    function openedBlock(uint256 index) external view returns (uint64) {
+        return VaultStorage.layout().openedBlock[index];
+    }
+
     function valuing() external view returns (bool) {
         return VaultStorage.layout().valuing();
     }

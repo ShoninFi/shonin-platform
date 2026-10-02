@@ -102,4 +102,45 @@ contract StationLimitsTest is Fixture {
         Station remote = Station(ownStations.create(spec, word));
         assertEq(remote.spec().exitBandBps, vaultConfig().exitBandBps);
     }
+
+    /// A station on another chain sends only home, even to a chain the vault
+    /// trades on: money between two other chains goes through home.
+    function test_a_remote_station_sends_only_home() public {
+        StationFactory ownStations = new StationFactory(address(this));
+        ownStations.initialize(address(attestation), address(usd), address(this), address(new Station()));
+        address vaultAddr = makeAddr("vault on chain 8453");
+        bytes32 leaf =
+            keccak256(bytes.concat(keccak256(abi.encode(uint256(8453), vaultAddr, BUNDLE, block.chainid))));
+        bytes memory journal = journalFor(EXECUTOR_IMAGE, executor, leaf);
+        attestation.bless(sealOf(journal), journal, 8453, vaultAddr, BUNDLE, new bytes32[](0));
+
+        bytes32[] memory drivers = new bytes32[](1);
+        drivers[0] = "local";
+        bytes32[] memory bridges = new bytes32[](1);
+        bridges[0] = "local-bridge";
+        uint256[] memory chains = new uint256[](1);
+        chains[0] = 42_161;
+        bytes memory word =
+            signed(BUILDER_KEY, ownStations.stationDigest(8453, BUNDLE, drivers, bridges, chains, 100));
+        StationSpec memory spec = StationSpec({
+            vaultChain: 8453,
+            vault: vaultAddr,
+            bundleHash: BUNDLE,
+            drivers: drivers,
+            bridges: bridges,
+            chains: chains,
+            exitBandBps: 100
+        });
+        vm.prank(executor);
+        Station remote = Station(ownStations.create(spec, word));
+        give(address(remote), 10_000e6);
+
+        vm.prank(executor);
+        vm.expectRevert(Station.NoRoute.selector);
+        remote.bridge("local-bridge", 42_161, 5000e6, "");
+
+        vm.prank(executor);
+        remote.bridge("local-bridge", 8453, 5000e6, "");
+        assertEq(remote.sendCount(), 1);
+    }
 }

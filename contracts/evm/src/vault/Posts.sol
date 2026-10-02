@@ -39,8 +39,12 @@ library Posts {
         if (block.timestamp > time + s.timers.postDeadline) revert IVault.OutsideWindow();
         if (!_isOtherChain(s, stationChain)) revert IVault.NotAllowed();
         // As of the station chain's first block at or after the valuation's
-        // time, and no later than the post window allows.
-        if (post.asOf < time || post.asOf > time + s.timers.postDeadline) revert IVault.NotAllowed();
+        // open, when the home station was read, and no later than the post
+        // window allows: a send made after it lands at home after the read,
+        // so it is counted once, where it came from.
+        if (post.asOf < s.openedAt[index] || post.asOf > time + s.timers.postDeadline) {
+            revert IVault.NotAllowed();
+        }
 
         bytes32 digest = MessageHashUtils.toEthSignedMessageHash(postDigest(time, stationChain, post));
         (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, signature);
