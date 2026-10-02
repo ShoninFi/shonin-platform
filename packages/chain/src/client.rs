@@ -117,6 +117,29 @@ pub struct Client {
     keys: Option<Arc<HashMap<Address, PrivateKeySigner>>>,
 }
 
+/// The fillers a signing client runs: gas, then the nonce, then the chain id.
+type SigningFillers = alloy::providers::fillers::JoinFill<
+    alloy::providers::fillers::JoinFill<
+        alloy::providers::fillers::JoinFill<
+            alloy::providers::Identity,
+            alloy::providers::fillers::GasFiller,
+        >,
+        alloy::providers::fillers::NonceFiller<alloy::providers::fillers::SimpleNonceManager>,
+    >,
+    alloy::providers::fillers::ChainIdFiller,
+>;
+
+/// How a client that signs for itself fills a transaction in. The nonce is
+/// asked of the chain each time rather than counted here, so a send that
+/// fails before it is broadcast leaves no gap that strands every later one.
+fn signing_builder()
+-> ProviderBuilder<alloy::providers::Identity, SigningFillers, alloy::network::Ethereum> {
+    ProviderBuilder::default()
+        .with_gas_estimation()
+        .with_simple_nonce_management()
+        .fetch_chain_id()
+}
+
 impl Client {
     /// Connect, waiting for the chain to answer: `task dev` starts everything
     /// at once, so a service usually arrives before the chain does.
@@ -129,12 +152,11 @@ impl Client {
                 for key in &keys[1..] {
                     wallet.register_signer(key.clone());
                 }
-                ProviderBuilder::new()
-                    .wallet(wallet)
-                    .connect_http(url)
-                    .erased()
+                signing_builder().wallet(wallet).connect_http(url).erased()
             }
-            _ => ProviderBuilder::new().connect_http(url).erased(),
+            // The node holds unlocked accounts' keys and numbers their
+            // transactions itself.
+            _ => ProviderBuilder::default().connect_http(url).erased(),
         };
 
         let mut waited = Duration::ZERO;
@@ -294,9 +316,9 @@ impl Client {
             .send_transaction(request)
             .await
             .with_context(|| format!("sending {}", C::SIGNATURE))?;
-        let receipt = pending
-            .get_receipt()
+        let receipt = tokio::time::timeout(RECEIPT_TIMEOUT, pending.get_receipt())
             .await
+            .map_err(|_| anyhow!("{} never landed", C::SIGNATURE))?
             .with_context(|| format!("waiting for {}", C::SIGNATURE))?;
         if !receipt.status() {
             bail!("{} was reverted by the chain", C::SIGNATURE);
@@ -305,6 +327,32 @@ impl Client {
     }
 
     /// Deploy a contract from its bytecode and constructor arguments.
+    /// Send bytes that are not a call of ours, such as a creation through the
+    /// deterministic deployer.
+    pub async fn send_raw(
+        &self,
+        from: Address,
+        to: Address,
+        data: alloy_primitives::Bytes,
+    ) -> Result<TransactionReceipt> {
+        let request = TransactionRequest::default()
+            .with_from(from)
+            .with_to(to)
+            .with_input(data);
+        let receipt = self
+            .provider
+            .send_transaction(request)
+            .await
+            .context("sending")?
+            .get_receipt()
+            .await
+            .context("waiting for a receipt")?;
+        if !receipt.status() {
+            bail!("the transaction reverted");
+        }
+        Ok(receipt)
+    }
+
     pub async fn deploy(&self, from: Address, bytecode: Vec<u8>) -> Result<Address> {
         let request = TransactionRequest::default()
             .with_from(from)
@@ -336,6 +384,30 @@ impl Client {
             .raw_request("eth_sign".into(), (who, Bytes::from(digest.to_vec())))
             .await
             .with_context(|| format!("asking the chain to sign as {who}"))?;
+        Ok(signature)
+    }
+
+    /// Sign a depositor's statement for a vault: EIP-712, so a wallet would
+    /// show the words. With the account's key here it signs the digest
+    /// itself; otherwise the node signs, as a development chain does for its
+    /// own accounts.
+    pub async fn sign_statement(
+        &self,
+        who: Address,
+        vault: Address,
+        restricted: &str,
+    ) -> Result<Bytes> {
+        if let Some(key) = self.keys.as_ref().and_then(|keys| keys.get(&who)) {
+            let digest = crate::statement::digest(self.chain_id, vault, who, restricted);
+            let signature = key.sign_hash_sync(&digest).context("signing")?;
+            return Ok(Bytes::from(signature.as_bytes().to_vec()));
+        }
+        let typed = crate::statement::typed_data(self.chain_id, vault, who, restricted);
+        let signature: Bytes = self
+            .provider
+            .raw_request("eth_signTypedData_v4".into(), (who, typed.to_string()))
+            .await
+            .with_context(|| format!("asking the chain to sign a statement as {who}"))?;
         Ok(signature)
     }
 
@@ -392,7 +464,7 @@ impl Client {
     pub fn with_key(&self, signer: PrivateKeySigner) -> Result<KeyClient> {
         let address = signer.address();
         let url = self.rpc_url.parse().context("the chain's address")?;
-        let provider = ProviderBuilder::new()
+        let provider = signing_builder()
             .wallet(EthereumWallet::from(signer.clone()))
             .connect_http(url)
             .erased();
@@ -400,6 +472,7 @@ impl Client {
             provider,
             signer,
             address,
+            sending: Default::default(),
         })
     }
 
@@ -443,20 +516,30 @@ pub struct KeyClient {
     provider: DynProvider,
     signer: PrivateKeySigner,
     pub address: Address,
+    /// One transaction at a time from this key. Several tasks act with the
+    /// same key, and two sends at once would take the same nonce, leaving one
+    /// of them waiting for a receipt that never comes.
+    sending: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
+
+/// How long to wait for a transaction to land before giving up on it, so a
+/// dropped one is an error rather than a task that never wakes.
+const RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl KeyClient {
     pub async fn send<C: SolCall>(&self, to: Address, call: C) -> Result<TransactionReceipt> {
+        let _turn = self.sending.lock().await;
         let request = TransactionRequest::default()
             .with_to(to)
             .with_input(call.abi_encode());
-        let receipt = self
+        let pending = self
             .provider
             .send_transaction(request)
             .await
-            .with_context(|| format!("sending {}", C::SIGNATURE))?
-            .get_receipt()
+            .with_context(|| format!("sending {}", C::SIGNATURE))?;
+        let receipt = tokio::time::timeout(RECEIPT_TIMEOUT, pending.get_receipt())
             .await
+            .map_err(|_| anyhow!("{} never landed", C::SIGNATURE))?
             .with_context(|| format!("waiting for {}", C::SIGNATURE))?;
         if !receipt.status() {
             bail!("{} was reverted by the chain", C::SIGNATURE);

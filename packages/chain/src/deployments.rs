@@ -27,6 +27,12 @@ pub struct Deployments {
     pub reviews: Address,
     pub profiles: Address,
     pub factory: Address,
+    /// Creates every vault's stations, at the same address on every chain.
+    pub station_factory: Address,
+    /// The stand-in venue's driver and the stand-in bridge, approved through
+    /// the registry under `local` and `local-bridge`.
+    pub driver: Address,
+    pub bridge: Address,
     pub roles: Roles,
 }
 

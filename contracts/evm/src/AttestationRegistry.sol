@@ -67,6 +67,11 @@ contract AttestationRegistry is IAttestationRegistry {
     /// The longest the timelock can be set to, so a slip of the admin's
     /// finger can't put everything out of reach for good.
     uint64 public constant MAX_TIMELOCK = 365 days;
+    /// The shortest the timelock can ever be on this deployment, fixed when
+    /// it is made: two days where depositors' money is at stake, so nothing
+    /// the admin proposes can apply before they have had time to leave, and
+    /// zero on a development chain.
+    uint64 public immutable minTimelock;
 
     address[] private _verifiers;
     mapping(address => uint64) private _verifierReadyAt;
@@ -89,12 +94,21 @@ contract AttestationRegistry is IAttestationRegistry {
     error NoImplementation();
     error Stale();
     error TooLong();
+    error TooShort();
     error NoKind();
     error NotThisInstance();
     error NoSigner();
 
-    constructor(address admin_, IAttestationVerifier verifier_, uint64 timelock_, uint64 blessingTtl_) {
-        if (timelock_ > MAX_TIMELOCK) revert TooLong();
+    constructor(
+        address admin_,
+        IAttestationVerifier verifier_,
+        uint64 timelock_,
+        uint64 minTimelock_,
+        uint64 blessingTtl_
+    ) {
+        if (timelock_ > MAX_TIMELOCK || minTimelock_ > MAX_TIMELOCK) revert TooLong();
+        if (timelock_ < minTimelock_) revert TooShort();
+        minTimelock = minTimelock_;
         if (address(verifier_) == address(0)) revert NoImplementation();
         admin = admin_;
         _timelock = timelock_;
@@ -125,6 +139,7 @@ contract AttestationRegistry is IAttestationRegistry {
 
     function setTimelock(uint64 newTimelock) external onlyAdmin {
         if (newTimelock > MAX_TIMELOCK) revert TooLong();
+        if (newTimelock < minTimelock) revert TooShort();
         uint64 current = timelock();
         _timelock = current;
         delete _pendingTimelock;

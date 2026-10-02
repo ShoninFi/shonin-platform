@@ -18,10 +18,13 @@ Every agent is recorded here, under the id it was given when its Author paid the
 
 - its Author;
 - the fingerprints of its source, its build and its `shonin.toml`;
-- the chains it needs, which its vault and stations are created from;
-- whether it's live, winding down or closed.
+- the chains it needs, and the drivers on each, which its vault and stations are created from;
+- the bridges it may use;
+- who its vault refuses deposits from: every driver's list, plus its Author's additions.
 
-A build is only recorded with two signatures: the Reviewer's go-ahead for the source it read, given before anything was built, and a blessed builder's signature over exactly these details. So nothing is recorded that the Reviewer didn't read first, and a build can't be recorded for any other agent, Author or chain.
+Nothing in a record is ever edited: a changed agent is a new agent, with a new record. Whether its vault is live, winding down or closed is recorded by the vault itself.
+
+A build is only recorded with two signatures: the Reviewer's go-ahead for the source it read, given before anything was built, and a blessed builder's signature over exactly these details. Without the Reviewer's go-ahead, the registry refuses the build, whoever sends it. So nothing is recorded that the Reviewer didn't read first, and a build can't be recorded for any other agent, Author or chain.
 
 ## The review registry
 
@@ -43,7 +46,7 @@ One published **admin key** governs the registries at launch, to be replaced by 
 | Revoke an image, operator, driver or checker, at once | Move money anywhere but back to Depositors |
 | [Kill a vault](vaults.md#a-kill) | Change a vault's agent, or anything a vault has recorded |
 
-The wait itself can be raised at once, but lowering it takes as long as the current wait, so it can never be cut quietly. Every vault's page shows it.
+The wait itself can be raised at once, but lowering it takes as long as the current wait, so it can never be cut quietly, and it can never go below a floor fixed when the registry was deployed: two days on mainnet. Every vault's page shows it.
 
 **Every chain's registry is kept in step, with Solana's as the source of truth.** Every change goes to Solana first and to the other chains after, so no chain is ever ahead of it, and a wait counts from when the change reached Solana, so copying it elsewhere can never shorten it. A revocation is sent to every chain straight away. Anyone can run a published checker that compares every chain's list and flags any difference.
 

@@ -31,5 +31,8 @@ pub use model::health::{
 pub use model::registry::{Author, Failure, FeedEvent, FeedKind, Job, JobState};
 pub use model::review::{Area, Finding, Rating, Report, Review, Severity};
 pub use model::strategy::{Record, Standing, Strategy};
-pub use model::vault::{Claim, ClaimState, Fees, InTransit, Tank, Vault, VaultState};
+pub use model::vault::{
+    Claim, ClaimState, Fees, Halt, InTransit, PendingFloor, Request, RequestKind, Tank, Vault,
+    VaultState,
+};
 pub use model::venue::{Custody, ExitClass, ExitPath, Leg, Valuation, VenueStatus};

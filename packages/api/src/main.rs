@@ -24,7 +24,7 @@ use chain::bindings::publishing::IPublishing;
 use chain::bindings::vault::IVault;
 use chain::{Client, Role, Served};
 use clap::Parser;
-use indexer::{Indexer, read};
+use indexer::Indexer;
 use shared::model::registry::Job;
 use shared::{
     Addresses, Chain, ChainInfo, Config, DevMode, HealthPost, HeldClaim, Holding, Portfolio,
@@ -41,6 +41,9 @@ struct Args {
     /// Where the build service answers, for the queue and for submissions.
     #[arg(long)]
     builder_url: String,
+    /// Where the executor serves each vault's signed usage total.
+    #[arg(long)]
+    executor_url: String,
     #[arg(long, default_value_t = 19_081)]
     port: u16,
 }
@@ -48,6 +51,7 @@ struct Args {
 struct Service {
     indexer: Arc<Indexer>,
     builder: String,
+    executor: String,
 }
 
 #[tokio::main]
@@ -72,6 +76,7 @@ async fn main() -> Result<()> {
     let service = Arc::new(Service {
         indexer,
         builder: args.builder_url.clone(),
+        executor: args.executor_url.clone(),
     });
 
     let app = axum::Router::new()
@@ -85,6 +90,7 @@ async fn main() -> Result<()> {
         .route("/api/{chain}/portfolio/{address}", get(portfolio))
         .route("/api/{chain}/uploads", post(uploads))
         .route("/api/{chain}/health", post(post_health))
+        .route("/api/{chain}/usage/{vault}", get(usage))
         .route("/api/store/{hash}/{name}", get(store_file))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(service);
@@ -168,6 +174,7 @@ async fn config(
             reviews: format!("{:?}", deployments.reviews),
             profiles: format!("{:?}", deployments.profiles),
             factory: format!("{:?}", deployments.factory),
+            station_factory: format!("{:?}", deployments.station_factory),
         },
         asset_symbol: chain.dollar().to_string(),
         asset_decimals: 6,
@@ -241,7 +248,7 @@ async fn portfolio(
                     shares: claim.shares,
                     fraction_closed: claim.fraction_closed,
                     state: claim.state,
-                    booked: read::moment(0),
+                    booked: claim.booked.midnight(),
                     settled_for: claim.settled_for,
                 });
             }
@@ -260,39 +267,44 @@ async fn portfolio(
 /// What an address paid for what it still holds: everything it put in, less
 /// everything it took out. The vault's own log is the whole of it.
 async fn cost_basis(chain: &Client, vault: Address, who: Address) -> Option<f64> {
+    use alloy::primitives::B256;
     use alloy::rpc::types::Filter;
     use alloy::sol_types::SolEvent;
     use chain::bindings::vault::IVault;
 
+    // The owner is the second indexed field of a deposit or a withdrawal
+    // (after the request's id), and the first of a fallback's payments.
+    let logs = |signature: B256, owner_topic: usize| {
+        let mut filter = Filter::new()
+            .address(vault)
+            .event_signature(signature)
+            .from_block(0u64);
+        filter = if owner_topic == 2 {
+            filter.topic2(who.into_word())
+        } else {
+            filter.topic1(who.into_word())
+        };
+        async move { chain.logs(&filter).await.ok() }
+    };
+
     let mut paid = 0.0;
-    let deposits = chain
-        .logs(
-            &Filter::new()
-                .address(vault)
-                .event_signature(IVault::Deposited::SIGNATURE_HASH)
-                .topic1(who.into_word())
-                .from_block(0u64),
-        )
-        .await
-        .ok()?;
-    for log in deposits {
+    for log in logs(IVault::Deposited::SIGNATURE_HASH, 2).await? {
         if let Ok(event) = log.log_decode::<IVault::Deposited>() {
             paid += dollars(event.inner.data.assets);
         }
     }
-
-    let withdrawals = chain
-        .logs(
-            &Filter::new()
-                .address(vault)
-                .event_signature(IVault::Withdrawn::SIGNATURE_HASH)
-                .topic1(who.into_word())
-                .from_block(0u64),
-        )
-        .await
-        .ok()?;
-    for log in withdrawals {
+    for log in logs(IVault::Withdrawn::SIGNATURE_HASH, 2).await? {
         if let Ok(event) = log.log_decode::<IVault::Withdrawn>() {
+            paid -= dollars(event.inner.data.assets);
+        }
+    }
+    for log in logs(IVault::ProRataTaken::SIGNATURE_HASH, 1).await? {
+        if let Ok(event) = log.log_decode::<IVault::ProRataTaken>() {
+            paid -= dollars(event.inner.data.assets);
+        }
+    }
+    for log in logs(IVault::UnitsPaid::SIGNATURE_HASH, 1).await? {
+        if let Ok(event) = log.log_decode::<IVault::UnitsPaid>() {
             paid -= dollars(event.inner.data.assets);
         }
     }
@@ -321,20 +333,25 @@ async fn terms(on: Chain, chain: &Client, deployments: &chain::Deployments) -> R
         .read(deployments.publishing, IPublishing::feeCall {})
         .await
         .with_context(|| format!("reading the terms on {on}"))?;
+    let terms_hash = chain
+        .read(deployments.factory, IVaultFactory::termsCall {})
+        .await
+        .with_context(|| format!("reading the terms on {on}"))?;
 
     Ok(Terms {
         minimum_tank: dollars(vaults.minimumTank),
         publish_fee: dollars(publish_fee),
         fees: shared::Fees {
-            holding_bps: vaults.streamingBps as u32,
+            holding_bps: vaults.holdingBps as u32,
             author_bps: vaults.authorBps as u32,
             platform_bps: vaults.platformBps as u32,
             transaction_bps: vaults.transactionBps as u32,
         },
         exit_band_bps: vaults.exitBandBps as u32,
-        freeze_after_days: vaults.freezeAfter as f64 / DAY,
+        freeze_after_days: vaults.timers.freezeAfter as f64 / DAY,
         image_timelock_days: timelock as f64 / DAY,
-        tank_target_days: vaults.tankTargetDays,
+        minimum_deposit: dollars(vaults.minimumDeposit),
+        terms_hash: format!("{terms_hash:?}"),
     })
 }
 
@@ -471,6 +488,34 @@ fn recover(post: &HealthPost) -> Result<Address> {
     signature
         .recover_address_from_msg(digest.as_slice())
         .context("recovering the signer")
+}
+
+/// A vault's running usage total, as its executor signed it: what an author
+/// withdrawing from the tank settles first. Carried, not checked: the vault's
+/// contract checks the signature.
+async fn usage(
+    State(service): State<Arc<Service>>,
+    UrlPath((chain, vault)): UrlPath<(Chain, String)>,
+) -> impl IntoResponse {
+    let Some(served) = service.indexer.on(chain) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let url = format!(
+        "{}/usage/{}/{}",
+        service.executor, served.deployments.chain_id, vault
+    );
+    match reqwest::get(&url).await {
+        Ok(reply) if reply.status().is_success() => match reply.text().await {
+            Ok(body) => (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response(),
+            Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+        },
+        Ok(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    }
 }
 
 /// Anything the store holds, to whoever has its hash.

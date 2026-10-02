@@ -135,7 +135,7 @@ pub fn build_of(slug: &str) -> Option<Rc<Job>> {
 /// out, so nothing in the app can drift from the chain it is talking to. A
 /// page quotes base's, where the app publishes to.
 pub fn terms() -> Option<shared::Terms> {
-    config(shared::Chain::Base).map(|config| config.terms)
+    config(shared::Chain::Base).map(|config| config.terms.clone())
 }
 
 pub fn set_config(config: Config) {

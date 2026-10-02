@@ -151,6 +151,29 @@ async fn activate_it(
         )
         .await
         .context("the tank could not be approved")?;
+    // The author signs the depositor's statement for the vault before it
+    // exists, as every holder does, and names the terms they read.
+    let vault = chain
+        .read(
+            deployments.factory,
+            IVaultFactory::predictVaultCall {
+                strategyId: strategy_id,
+            },
+        )
+        .await?;
+    let restricted = chain
+        .read(
+            deployments.factory,
+            IVaultFactory::restrictedForCall {
+                strategyId: strategy_id,
+            },
+        )
+        .await?
+        .text;
+    let statement = chain.sign_statement(author, vault, &restricted).await?;
+    let terms = chain
+        .read(deployments.factory, IVaultFactory::termsCall {})
+        .await?;
     chain
         .send(
             author,
@@ -158,7 +181,11 @@ async fn activate_it(
             IVaultFactory::activateCall {
                 strategyId: strategy_id,
                 allowances: chain::allowances(&Allowances::modest()),
+                idleFloorBps: 500,
                 tankFunding: tank,
+                tankKeep: alloy::primitives::U256::ZERO,
+                statement,
+                terms,
             },
         )
         .await

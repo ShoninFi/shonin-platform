@@ -65,6 +65,21 @@ async fn fetch<T: serde::de::DeserializeOwned>(what: &str) -> Result<T, String> 
         .map_err(|error| format!("the API said something unexpected: {error}"))
 }
 
+/// A vault's running usage total, as its executor signed it.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct UsageTotal {
+    pub total: String,
+    pub as_of: u64,
+    pub signature: String,
+}
+
+/// The executor's latest signed total for a vault: what an author settles
+/// before taking money out of the tank.
+#[cfg(target_arch = "wasm32")]
+pub async fn usage(chain: shared::Chain, vault: &str) -> Result<UsageTotal, String> {
+    fetch::<UsageTotal>(&format!("{chain}/usage/{vault}")).await
+}
+
 /// What one address holds on one vault chain, read when a page needs it.
 #[cfg(target_arch = "wasm32")]
 pub async fn portfolio(chain: shared::Chain, address: &str) -> Result<shared::Portfolio, String> {

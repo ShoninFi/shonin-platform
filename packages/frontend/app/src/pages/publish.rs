@@ -246,7 +246,7 @@ pub fn activate_panel(job: &Job) -> Dom {
                     return;
                 }
                 wasm_bindgen_futures::spawn_local(async move {
-                    match wallet::activate(chain, id, &allowance, tank).await {
+                    match wallet::activate(chain, id, &allowance, tank, IDLE_FLOOR_BPS).await {
                         Ok(slug) => {
                             state::notify("Activated. The vault is open for deposits.", Tone::Ok);
                             dominator::routing::go_to_url(&format!("/agents/{slug}"));
@@ -260,7 +260,7 @@ pub fn activate_panel(job: &Job) -> Dom {
 }
 
 /// What each shape is called on the page, and what a day of it costs.
-fn label(shape: &str) -> String {
+pub(crate) fn label(shape: &str) -> String {
     let what = match shape {
         "quoting" => "Quoting: fuel and bandwidth",
         "thinking" => "With models: inference and bandwidth",
@@ -271,7 +271,7 @@ fn label(shape: &str) -> String {
 
 /// What a day at a shape of allowances costs, at the platform's published
 /// prices: the same arithmetic the vault's contract caps a bill with.
-fn daily(allowance: &str) -> f64 {
+pub(crate) fn daily(allowance: &str) -> f64 {
     shared::Prices::published().daily_cap(&shared::Allowances::shape(allowance))
 }
 
@@ -308,3 +308,7 @@ fn sealed_note() -> Dom {
         )],
     )
 }
+
+/// The share of value an agent keeps as cash when it opens: five per cent,
+/// which the author can change on the live vault.
+const IDLE_FLOOR_BPS: u16 = 500;

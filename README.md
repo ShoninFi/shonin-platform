@@ -128,7 +128,7 @@ packages/
     unwinder/     finishes the withdrawals the contracts can't finish alone
   api/            the app's server: runs the indexer in-process and serves /api
   indexer/        the reference indexer: reads the chain into the record
-  keeper/         the vaults' daily housekeeping, so nobody has to
+  keeper/         the vaults' clockwork: valuations, settling, claims and the daily bill
   devnet/         deploys and drives the local chains, and serves the ops dashboard
   strategy-sdk/   Rust bindings for the shonin:agent WIT world
 deploy/gcp/       a Dockerfile per machine and service, and how they launch

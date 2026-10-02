@@ -26,7 +26,7 @@ pub enum Sender {
     /// An account the development chain itself holds the key for.
     Unlocked(Address),
     /// A key made inside the service, which signs its own transactions.
-    Own(KeyClient),
+    Own(Box<KeyClient>),
 }
 
 impl Sender {

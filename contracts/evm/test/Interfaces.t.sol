@@ -61,7 +61,7 @@ contract InterfacesTest is Fixture {
         assertEq(asVault.strategyId(), 1);
         assertEq(asVault.sharePrice(), 1e6);
         assertEq(asVault.fees().transactionBps, 10);
-        assertEq(asVault.tank().balance, MINIMUM_TANK);
+        assertEq(asVault.tank().balance, MINIMUM_TANK - DEAD_ASSETS);
         assertEq(asVault.exitBandBps(), 100);
         assertEq(asVault.claimCount(), 0);
         assertTrue(bundle != bytes32(0));

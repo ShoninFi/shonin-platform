@@ -144,6 +144,7 @@ vars:
   URL_API_DEV: "http://localhost:{{.PORT_API}}"
   URL_BUILDER_DEV: "http://localhost:{{.PORT_BUILDER}}"
   URL_REVIEWER_DEV: "http://localhost:{{.PORT_REVIEWER}}"
+  URL_EXECUTOR_DEV: "http://127.0.0.1:{{.PORT_EXECUTOR}}"
   URL_DASHBOARD_DEV: "http://localhost:{{.PORT_DEVNET}}"
 
   # The local EVM chains, standing in for base, hyperliquid and robinhood.

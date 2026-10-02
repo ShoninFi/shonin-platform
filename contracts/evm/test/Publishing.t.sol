@@ -36,72 +36,75 @@ contract PublishingTest is Fixture {
 
     // Activating ------------------------------------------------------------
 
-    function activateAs(address who, uint256 id, uint256 tank) internal returns (Vault) {
-        give(who, tank);
-        vm.startPrank(who);
-        usd.approve(address(factory), tank);
-        Vault vault = Vault(factory.activate(id, allowancesCosting(2e6), tank));
-        vm.stopPrank();
-        return vault;
-    }
-
-    function test_activation_creates_the_vault_from_the_record() public {
+    function test_activation_creates_the_vault_and_its_station_from_the_record() public {
         (uint256 id, bytes32 bundle) = ready();
-        Vault vault = activateAs(author, id, MINIMUM_TANK);
+        address predicted = factory.predictVault(id);
+        Vault vault = activate(id, allowancesCosting(2e6), MINIMUM_TANK);
+        assertEq(address(vault), predicted);
         assertEq(factory.vaultOf(id), address(vault));
         assertEq(vault.strategyId(), id);
         assertEq(vault.bundleHash(), bundle);
         assertEq(vault.author(), author);
-        assertEq(vault.tank().balance, MINIMUM_TANK);
-        assertEq(vault.tank().dailyCap, 2e6);
+        // The dead shares' cent comes out of the tank.
+        assertEq(vault.tank().balance, MINIMUM_TANK - DEAD_ASSETS);
+        assertEq(vault.cash(), DEAD_ASSETS);
+        assertEq(vault.balanceOf(0x000000000000000000000000000000000000dEaD), DEAD_ASSETS * 1e12);
         assertTrue(vault.state() == VaultState.Open);
+        assertEq(vault.homeStation(), stations.stationOf(block.chainid, address(vault)));
+        // The author signed for the list, like any holder.
+        assertEq(vault.statementOf(author), keccak256(abi.encode(vault.restricted())));
+        assertEq(vault.restrictedText(), "SANCTIONED,US");
     }
 
     function test_only_the_author_activates() public {
+        bytes32 terms = factory.terms();
         (uint256 id,) = ready();
         give(alice, MINIMUM_TANK);
         vm.startPrank(alice);
         usd.approve(address(factory), MINIMUM_TANK);
         vm.expectRevert(VaultFactory.NotTheAuthor.selector);
-        factory.activate(id, allowancesCosting(2e6), MINIMUM_TANK);
+        factory.activate(id, allowancesCosting(2e6), 500, MINIMUM_TANK, 0, "", terms);
         vm.stopPrank();
     }
 
     function test_nothing_activates_before_it_is_built_and_reviewed() public {
+        bytes32 terms = factory.terms();
         uint256 id = submitAs(author);
         give(author, MINIMUM_TANK);
         vm.startPrank(author);
         usd.approve(address(factory), MINIMUM_TANK);
         vm.expectRevert(VaultFactory.NotReady.selector);
-        factory.activate(id, allowancesCosting(2e6), MINIMUM_TANK);
+        factory.activate(id, allowancesCosting(2e6), 500, MINIMUM_TANK, 0, "", terms);
         vm.stopPrank();
 
         // Built, but its review isn't posted yet.
         register(id, author, keccak256("bundle"));
         vm.startPrank(author);
         vm.expectRevert(VaultFactory.NotReady.selector);
-        factory.activate(id, allowancesCosting(2e6), MINIMUM_TANK);
+        factory.activate(id, allowancesCosting(2e6), 500, MINIMUM_TANK, 0, "", terms);
         vm.stopPrank();
     }
 
     function test_a_strategy_activates_once() public {
+        bytes32 terms = factory.terms();
         (uint256 id,) = ready();
-        activateAs(author, id, MINIMUM_TANK);
+        activate(id, allowancesCosting(2e6), MINIMUM_TANK);
         give(author, MINIMUM_TANK);
         vm.startPrank(author);
         usd.approve(address(factory), MINIMUM_TANK);
         vm.expectRevert(VaultFactory.VaultExists.selector);
-        factory.activate(id, allowancesCosting(2e6), MINIMUM_TANK);
+        factory.activate(id, allowancesCosting(2e6), 500, MINIMUM_TANK, 0, "", terms);
         vm.stopPrank();
     }
 
     function test_a_vault_cannot_be_activated_without_enough_in_its_tank() public {
+        bytes32 terms = factory.terms();
         (uint256 id,) = ready();
         give(author, MINIMUM_TANK);
         vm.startPrank(author);
         usd.approve(address(factory), MINIMUM_TANK);
         vm.expectRevert(VaultFactory.TankTooSmall.selector);
-        factory.activate(id, allowancesCosting(2e6), MINIMUM_TANK - 1);
+        factory.activate(id, allowancesCosting(2e6), 500, MINIMUM_TANK - 1, 0, "", terms);
         vm.stopPrank();
     }
 

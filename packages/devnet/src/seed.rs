@@ -9,9 +9,11 @@ use std::path::{Path, PathBuf};
 
 use alloy::primitives::U256;
 use anyhow::{Context, Result, bail};
+use chain::bindings::erc20::IERC20;
 use chain::bindings::factory::IVaultFactory;
+use chain::bindings::station::IStation;
 use chain::bindings::usd::ILocalUsd;
-use chain::bindings::vault::IVault;
+use chain::bindings::vault::{ClaimState, IVault, VaultState};
 use chain::{Client, Deployments, Role};
 use shared::model::registry::JobState;
 
@@ -27,7 +29,13 @@ struct Plan {
     activate: bool,
     /// A depositor puts money in once it is open.
     deposit: bool,
-    /// Stop it once it is running.
+    /// Its author deposits too, then asks it all back while the agent has
+    /// the money at the venue, so a claim is booked and served.
+    claim: bool,
+    /// Its author retires it once a depositor is in.
+    retired: bool,
+    /// Stop it once a depositor's money is at work, then see the vault close
+    /// with its cash home and the depositor paid out.
     killed: bool,
 }
 
@@ -38,14 +46,8 @@ const PLAN: &[Plan] = &[
         broken: false,
         activate: true,
         deposit: true,
-        killed: false,
-    },
-    Plan {
-        title: "Funding basis, sealed",
-        sealed: true,
-        broken: false,
-        activate: true,
-        deposit: false,
+        claim: true,
+        retired: false,
         killed: false,
     },
     Plan {
@@ -54,6 +56,8 @@ const PLAN: &[Plan] = &[
         broken: true,
         activate: false,
         deposit: false,
+        claim: false,
+        retired: false,
         killed: false,
     },
     Plan {
@@ -62,6 +66,18 @@ const PLAN: &[Plan] = &[
         broken: false,
         activate: false,
         deposit: false,
+        claim: false,
+        retired: false,
+        killed: false,
+    },
+    Plan {
+        title: "Funding basis, retired",
+        sealed: false,
+        broken: false,
+        activate: true,
+        deposit: true,
+        claim: false,
+        retired: true,
         killed: false,
     },
     Plan {
@@ -69,13 +85,28 @@ const PLAN: &[Plan] = &[
         sealed: false,
         broken: false,
         activate: true,
-        deposit: false,
+        deposit: true,
+        claim: false,
+        retired: false,
         killed: true,
+    },
+    // Last, so it is still new on the fast local clock when the seed ends.
+    Plan {
+        title: "Funding basis, sealed",
+        sealed: true,
+        broken: false,
+        activate: true,
+        deposit: false,
+        claim: false,
+        retired: false,
+        killed: false,
     },
 ];
 
 /// What the seeded depositor puts into the live vault.
 const DEPOSIT: u64 = 25_000_000_000;
+/// What the author puts in and asks back, to book a claim.
+const CLAIM_DEPOSIT: u64 = 20_000_000_000;
 
 /// Publish one project as it stands: what an author does from the web app,
 /// run from a checkout of their work. It is activated once it is ready.
@@ -173,37 +204,22 @@ pub async fn run(
         };
         if plan.deposit {
             let viewer = client.account(Role::Viewer)?;
-            let amount = U256::from(DEPOSIT);
+            deposit(client, deployments, vault, viewer, DEPOSIT).await?;
+            tracing::info!(slug, "and a depositor asked to put money in");
+        }
+        if plan.claim {
+            claim(client, deployments, vault, author, &slug).await?;
+        }
+        if plan.retired {
+            wait_for_shares(client, vault, client.account(Role::Viewer)?).await?;
             client
-                .send(
-                    viewer,
-                    deployments.usd,
-                    ILocalUsd::approveCall {
-                        spender: vault,
-                        value: amount,
-                    },
-                )
-                .await?;
-            client
-                .send(
-                    viewer,
-                    vault,
-                    IVault::depositCall {
-                        assets: amount,
-                        receiver: viewer,
-                    },
-                )
+                .send(author, vault, IVault::retireCall {})
                 .await
-                .context("the seeded deposit")?;
-            tracing::info!(slug, "and a depositor put money in");
+                .context("the vault would not retire")?;
+            tracing::info!(slug, "and then its author retired it");
         }
         if plan.killed {
-            let admin = client.account(Role::Admin)?;
-            client
-                .send(admin, vault, IVault::killCall {})
-                .await
-                .context("the vault would not stop")?;
-            tracing::info!(slug, "and then stopped, so the feed has a kill");
+            killed(client, deployments, vault, &slug).await?;
         }
     }
 
@@ -211,6 +227,198 @@ pub async fn run(
         .read(deployments.factory, IVaultFactory::vaultsCall {})
         .await?;
     tracing::info!(count = vaults.len(), "the platform has something on it");
+    Ok(())
+}
+
+/// Ask to deposit, with the depositor's signed statement. The next valuation
+/// prices it.
+async fn deposit(
+    client: &Client,
+    deployments: &Deployments,
+    vault: alloy::primitives::Address,
+    who: alloy::primitives::Address,
+    amount: u64,
+) -> Result<()> {
+    let amount = U256::from(amount);
+    client
+        .send(
+            who,
+            deployments.usd,
+            ILocalUsd::approveCall {
+                spender: vault,
+                value: amount,
+            },
+        )
+        .await?;
+    let restricted = client.read(vault, IVault::restrictedTextCall {}).await?;
+    let statement = client.sign_statement(who, vault, &restricted).await?;
+    client
+        .send(
+            who,
+            vault,
+            IVault::requestDepositCall {
+                assets: amount,
+                receiver: who,
+                statement,
+            },
+        )
+        .await
+        .context("the seeded deposit")?;
+    Ok(())
+}
+
+/// Wait until a deposit has been priced and `who` holds shares.
+async fn wait_for_shares(
+    client: &Client,
+    vault: alloy::primitives::Address,
+    who: alloy::primitives::Address,
+) -> Result<U256> {
+    for _ in 0..120 {
+        let held = client
+            .read(vault, IVault::balanceOfCall { owner: who })
+            .await?;
+        if !held.is_zero() {
+            return Ok(held);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    bail!("a deposit was never priced: is the keeper running?")
+}
+
+/// The author deposits, waits for the agent to put the money to work, then
+/// asks for all of it back: more than the vault's cash, so a claim is booked
+/// and the keeper serves it.
+async fn claim(
+    client: &Client,
+    deployments: &Deployments,
+    vault: alloy::primitives::Address,
+    author: alloy::primitives::Address,
+    slug: &str,
+) -> Result<()> {
+    deposit(client, deployments, vault, author, CLAIM_DEPOSIT).await?;
+    let shares = wait_for_shares(client, vault, author).await?;
+    // The agent keeps a buffer at home and puts the rest to work.
+    for _ in 0..120 {
+        let cash = client.read(vault, IVault::cashCall {}).await?;
+        if cash < U256::from(CLAIM_DEPOSIT) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    client
+        .send(
+            author,
+            vault,
+            IVault::requestRedeemCall {
+                shares,
+                receiver: author,
+            },
+        )
+        .await
+        .context("the seeded withdrawal")?;
+    let mut booked = false;
+    for _ in 0..120 {
+        if !client
+            .read(vault, IVault::claimCountCall {})
+            .await?
+            .is_zero()
+        {
+            booked = true;
+            tracing::info!(slug, "and a withdrawal larger than the cash booked a claim");
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    if !booked {
+        tracing::warn!(
+            slug,
+            "the withdrawal was paid from cash, so no claim was booked"
+        );
+        return Ok(());
+    }
+    // The keeper serves it: the leaver's fraction is closed and paid at once.
+    for _ in 0..180 {
+        let claim = client
+            .read(
+                vault,
+                IVault::claimAtCall {
+                    claimId: U256::from(1u64),
+                },
+            )
+            .await?;
+        if matches!(claim.state, ClaimState::Paid) {
+            tracing::info!(slug, paid = %claim.paid, "and the claim was paid");
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    bail!("a claim was booked but never paid: is the keeper running?")
+}
+
+/// The depositor's money goes to work; the admin stops the vault; the keeper
+/// stops the station once the grace has passed, brings everything home and
+/// closes the vault; the depositor is paid from the closed vault.
+async fn killed(
+    client: &Client,
+    deployments: &Deployments,
+    vault: alloy::primitives::Address,
+    slug: &str,
+) -> Result<()> {
+    let viewer = client.account(Role::Viewer)?;
+    let shares = wait_for_shares(client, vault, viewer).await?;
+    for _ in 0..120 {
+        let cash = client.read(vault, IVault::cashCall {}).await?;
+        if cash < U256::from(DEPOSIT) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let admin = client.account(Role::Admin)?;
+    client
+        .send(admin, vault, IVault::killCall {})
+        .await
+        .context("the vault would not stop")?;
+    tracing::info!(slug, "and then stopped with a depositor's money at work");
+
+    let mut closed = false;
+    for _ in 0..300 {
+        if matches!(
+            client.read(vault, IVault::stateCall {}).await?,
+            VaultState::Closed
+        ) {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    if !closed {
+        bail!("a stopped vault never closed: is the keeper running?");
+    }
+    let station = client.read(vault, IVault::homeStationCall {}).await?;
+    let left = client.read(station, IStation::valueCall {}).await?;
+    let before = client
+        .read(deployments.usd, IERC20::balanceOfCall { account: viewer })
+        .await?;
+    client
+        .send(
+            viewer,
+            vault,
+            IVault::redeemClosedCall {
+                shares,
+                receiver: viewer,
+            },
+        )
+        .await
+        .context("the depositor's withdrawal from the closed vault")?;
+    let after = client
+        .read(deployments.usd, IERC20::balanceOfCall { account: viewer })
+        .await?;
+    let paid = after - before;
+    tracing::info!(slug, %paid, station_mark = %left.mark, "and closed with its cash home; the depositor was paid");
+    // Paid in full, less the transaction fee and fees for the time it ran.
+    if paid < U256::from(DEPOSIT) * U256::from(95u64) / U256::from(100u64) {
+        bail!("the depositor of a closed vault was paid {paid} of {DEPOSIT}");
+    }
     Ok(())
 }
 

@@ -22,7 +22,7 @@ pub fn standing_badge(standing: Standing) -> Dom {
     let tone = match standing {
         Standing::Listed => Tone::Accent,
         Standing::New => Tone::Info,
-        Standing::Closed => Tone::Neutral,
+        Standing::Closed | Standing::Retiring => Tone::Neutral,
         Standing::Frozen | Standing::Killed => Tone::Error,
     };
     ui::badge(standing.label(), tone)
@@ -314,7 +314,7 @@ pub fn vault_notices(strategy: &Strategy) -> Vec<Dom> {
         for claim in vault
             .claims
             .iter()
-            .filter(|claim| claim.state != ClaimState::Paid)
+            .filter(|claim| !matches!(claim.state, ClaimState::Paid | ClaimState::Fallback))
         {
             let age = (data::as_of() - claim.booked).whole_days();
             let left = i64::from(vault.freeze_after_days) - age;

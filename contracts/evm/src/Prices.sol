@@ -61,7 +61,17 @@ contract Prices is IPrices {
         if (to <= from) return 0;
         uint256 total;
         uint256 n = _history.length;
-        for (uint256 i = 0; i < n; i++) {
+        // Only the periods the interval touches: from the last one that began
+        // at or before `from`, found by halving, to the first that begins at
+        // or after `to`. A long history costs nothing for a recent interval.
+        uint256 first;
+        uint256 hiIndex = n;
+        while (first + 1 < hiIndex) {
+            uint256 mid = (first + hiIndex) / 2;
+            if (_history[mid].effectiveFrom <= from) first = mid;
+            else hiIndex = mid;
+        }
+        for (uint256 i = first; i < n && _history[i].effectiveFrom < to; i++) {
             uint64 start = _history[i].effectiveFrom;
             uint64 end = i + 1 < n ? _history[i + 1].effectiveFrom : type(uint64).max;
             // The overlap of [from, to) with this period.

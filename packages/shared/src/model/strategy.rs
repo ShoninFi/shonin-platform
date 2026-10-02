@@ -20,6 +20,8 @@ pub enum Standing {
     Listed,
     /// Live, but its record is still short: listed separately, labelled new.
     New,
+    /// Retired by its author: no deposits, winding down.
+    Retiring,
     /// A claim went unserved: no new deposits, only unwinding.
     Frozen,
     /// Stopped by the admin key, with the reason on the page.
@@ -33,6 +35,7 @@ impl Standing {
         match self {
             Self::Listed => "listed",
             Self::New => "new",
+            Self::Retiring => "retiring",
             Self::Frozen => "frozen",
             Self::Killed => "killed",
             Self::Closed => "closed",
@@ -80,6 +83,9 @@ pub struct Strategy {
     pub claims: Vec<String>,
     /// The author's handle.
     pub author: String,
+    /// The author's address, which the vault takes the author's controls
+    /// from.
+    pub author_address: String,
     pub standing: Standing,
     pub registered: Date,
     pub days_live: u32,

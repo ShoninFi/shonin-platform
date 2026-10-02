@@ -128,10 +128,19 @@ async fn main() -> Result<()> {
 
     match args.command {
         Some(Command::Deploy) => {
+            let names = chain_names(&target);
             for (key, config) in evm_chains(&target) {
                 let client = connect_to(target.network, &key, &config).await?;
                 let file = Deployments::file_in(&target.deployments_dir, &key);
-                deploy::ensure(&client, target.network, &key, &args.artifacts, &file).await?;
+                deploy::ensure(
+                    &client,
+                    target.network,
+                    &key,
+                    &args.artifacts,
+                    &file,
+                    &names,
+                )
+                .await?;
             }
             Ok(())
         }
@@ -226,7 +235,9 @@ async fn main() -> Result<()> {
             if local {
                 // Each chain is deployed to and driven on its own, so a slow
                 // one holds up nobody else.
+                let names = chain_names(&target);
                 for (key, config) in evm_chains(&target) {
+                    let names = names.clone();
                     let artifacts = args.artifacts.clone();
                     let file = Deployments::file_in(&target.deployments_dir, &key);
                     let seconds_per_block = args.seconds_per_block;
@@ -234,7 +245,8 @@ async fn main() -> Result<()> {
                     running.spawn(async move {
                         let client = connect_to(network, &key, &config).await?;
                         let deployments =
-                            deploy::ensure(&client, network, &key, &artifacts, &file).await?;
+                            deploy::ensure(&client, network, &key, &artifacts, &file, &names)
+                                .await?;
                         tracing::info!(chain = %key, label = config.label, "the chain is up");
                         market::run(&client, &deployments, seconds_per_block)
                             .await
@@ -314,6 +326,18 @@ fn evm_chains(target: &Target) -> Vec<(ChainKey, ChainConfig)> {
     chains.sort_by(|a, b| a.0.cmp(&b.0));
     chains.dedup_by(|a, b| a.0 == b.0);
     chains
+}
+
+/// Each EVM chain of the network by the name `shonin.toml` uses and its chain
+/// id, which is how a vault factory finds the chains a strategy trades on.
+fn chain_names(target: &Target) -> Vec<(String, u64)> {
+    let Some(network) = target.configs.network(target.network) else {
+        return Vec::new();
+    };
+    network
+        .iter()
+        .filter_map(|(chain, key)| key.evm_chain_id().map(|id| (chain.name().to_string(), id)))
+        .collect()
 }
 
 /// `name=value`, for the arguments that pair the two.

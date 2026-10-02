@@ -359,7 +359,7 @@ fn aside(strategy: &Rc<Strategy>) -> Vec<Dom> {
                         .child(ui::number(&fmt::money(vault.idle)))
                         .child(html!("div", {
                             .class(["faint", "small"])
-                            .text("withdrawals up to this are paid in one transaction")
+                            .text("withdrawals up to this are paid from cash at the next valuation")
                         }))
                     }),
                 ),
@@ -408,8 +408,12 @@ fn aside(strategy: &Rc<Strategy>) -> Vec<Dom> {
                     ui::number(&fmt::per_day(vault.tank.daily_charge)),
                 ),
                 (
-                    "Auto-fill target".to_string(),
-                    ui::number(&fmt::money_exact(vault.tank.target)),
+                    "Kept at".to_string(),
+                    ui::number(&if vault.tank.keep_at > 0.0 {
+                        fmt::money_exact(vault.tank.keep_at)
+                    } else {
+                        "not topped up".to_string()
+                    }),
                 ),
             ]),
             ui::note(copy::TANK_NOTE),

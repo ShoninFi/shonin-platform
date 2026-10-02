@@ -1,0 +1,464 @@
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.30;
+
+import {IAttestationRegistry, ImageKind} from "./interfaces/IAttestationRegistry.sol";
+import {Call, IBridge, IDriver} from "./interfaces/IDriver.sol";
+import {IStation, IStationFactory, IStationVault, Send, StationSpec} from "./interfaces/IStation.sol";
+import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
+import {SafeERC20} from "openzeppelin/token/ERC20/utils/SafeERC20.sol";
+
+import {ReentrancyGuardTransient} from "openzeppelin/utils/ReentrancyGuardTransient.sol";
+import {ECDSA} from "openzeppelin/utils/cryptography/ECDSA.sol";
+import {MessageHashUtils} from "openzeppelin/utils/cryptography/MessageHashUtils.sol";
+import {Math} from "openzeppelin/utils/math/Math.sol";
+
+/// A vault's account-holder on one chain: the master of its venue accounts.
+///
+/// Every venue call is the station's own, prepared by a driver the registry
+/// approves and checked here against that driver's targets before it is made.
+/// A call to the dollar is only ever an approval of one of those targets, so
+/// the station's dollars can only reach a target its driver declared, and a
+/// driver reaches a station only through the registry's public timelock.
+/// Trading keys are the venue's agents: they can trade the account and can't
+/// take from it. A bridge send names the station's own address as recipient,
+/// which is the same address on every chain.
+///
+/// It has no signature function of its own, so nothing a venue accepts from
+/// an account's owner by signature can ever come from a station.
+contract Station is IStation, ReentrancyGuardTransient {
+    using SafeERC20 for IERC20;
+    using Math for uint256;
+
+    uint256 private constant WAD = 1e18;
+    uint256 private constant BPS = 10_000;
+    bytes4 private constant APPROVE = IERC20.approve.selector;
+
+    IStationFactory public factory;
+    StationSpec private _spec;
+    bool public stopped;
+    mapping(bytes32 => address) private _approvedKey;
+    Send[] private _sends;
+
+    error AlreadyInitialized();
+    error NotBlessed();
+    error NotHome();
+    error IsHome();
+    error AlreadyStopped();
+    error NotDeclared();
+    error NotApproved();
+    error NotAllowed();
+    error StillBlessed();
+    error NotHalted();
+    error BadCall();
+    error NoRoute();
+
+    /// The implementation every station is a clone of is never a station
+    /// itself.
+    constructor() {
+        factory = IStationFactory(address(1));
+    }
+
+    function initialize(StationSpec calldata spec_) external {
+        if (address(factory) != address(0)) revert AlreadyInitialized();
+        factory = IStationFactory(msg.sender);
+        // Each driver and bridge once: a name listed twice would count its
+        // venue twice and close a fraction of it twice.
+        _unique(spec_.drivers);
+        _unique(spec_.bridges);
+        _spec = spec_;
+    }
+
+    // Keys ------------------------------------------------------------------
+
+    function approveKey(bytes32 driver, address key) external nonReentrant {
+        if (stopped) revert AlreadyStopped();
+        _declaredDriver(driver);
+        if (!_isKey(key, ImageKind.Executor)) revert NotBlessed();
+        address implementation = _registry().tradingDriver(driver);
+        if (implementation == address(0)) revert NotApproved();
+
+        // One executor at a time: the key in place is withdrawn first, so an
+        // instance that has been replaced can no longer trade.
+        address current = _approvedKey[driver];
+        // While the key in place is still blessed, only the key being
+        // approved may take its place: nobody else can hand the venue back
+        // and forth between two blessed instances during a handover.
+        if (
+            current != address(0) && current != key && msg.sender != key
+                && _isKey(current, ImageKind.Executor)
+        ) {
+            revert NotAllowed();
+        }
+        if (current != address(0) && current != key) {
+            // A key still blessed must be withdrawn; one whose blessing has
+            // lapsed is withdrawn if the driver can, and replaced either way.
+            _revokeVia(IDriver(implementation), current, _isKey(current, ImageKind.Executor));
+            emit KeyRevoked(driver, current);
+        }
+        uint64 until = _registry().blessedUntil(key, _spec.vaultChain, _spec.vault, _spec.bundleHash);
+        _run(IDriver(implementation).approveKey(address(this), key, until), IDriver(implementation).targets());
+        _approvedKey[driver] = key;
+        emit KeyApproved(driver, key, until);
+    }
+
+    function revokeKey(bytes32 driver, address key) external nonReentrant {
+        // A passer-by can't cut off a key whose blessing stands, and can't
+        // keep one whose blessing has gone.
+        // Once the driver no longer trades, its key goes too.
+        if (!stopped && _isKey(key, ImageKind.Executor) && _registry().tradingDriver(driver) != address(0)) {
+            revert StillBlessed();
+        }
+        _revoke(driver, key, true);
+    }
+
+    // Moving money ----------------------------------------------------------
+
+    function pull(uint256 amount) external nonReentrant {
+        _executorOnly();
+        if (!isHome()) revert NotHome();
+        IStationVault(_spec.vault).toStation(amount);
+        emit Pulled(amount);
+    }
+
+    function push(uint256 amount) external nonReentrant {
+        _executorOnly();
+        if (!isHome()) revert NotHome();
+        _sendHome(amount);
+        emit Pushed(amount);
+    }
+
+    function deposit(bytes32 driver, uint256 amount) external nonReentrant {
+        _executorOnly();
+        _declaredDriver(driver);
+        address implementation = _registry().tradingDriver(driver);
+        if (implementation == address(0)) revert NotApproved();
+        _run(IDriver(implementation).deposit(address(this), amount), IDriver(implementation).targets());
+        emit Deposited(driver, amount);
+    }
+
+    function withdraw(bytes32 driver, uint256 amount) external nonReentrant {
+        _executorOnly();
+        _declaredDriver(driver);
+        // Bringing money out never depends on the driver still being
+        // approved to trade.
+        address implementation = _unwindDriver(driver);
+        _run(IDriver(implementation).withdraw(address(this), amount), IDriver(implementation).targets());
+        emit Withdrawn(driver, amount);
+    }
+
+    function bridge(
+        bytes32 name,
+        uint256 toChain,
+        uint256 amount,
+        bytes calldata extra
+    ) external nonReentrant {
+        _executorOnly();
+        if (toChain == block.chainid) revert NoRoute();
+        // Nothing leaves the home station while a valuation waits for the
+        // other chains' posts: it was counted here at the open, and landing
+        // there before their posts it would be counted twice.
+        if (isHome() && IStationVault(_spec.vault).valuing()) revert NotAllowed();
+        _send(name, toChain, amount, extra);
+    }
+
+    // Stopping and unwinding ------------------------------------------------
+
+    function stop() external nonReentrant {
+        if (!isHome()) revert NotHome();
+        uint64 haltedAt = IStationVault(_spec.vault).haltedAt();
+        if (haltedAt == 0 || block.timestamp < haltedAt + IStationVault(_spec.vault).haltGrace()) {
+            revert NotHalted();
+        }
+        _stop("halted", haltedAt);
+    }
+
+    function stop(bytes32 reason, uint64 haltedAt, bytes calldata signature) external nonReentrant {
+        if (isHome()) revert IsHome();
+        bytes32 digest = MessageHashUtils.toEthSignedMessageHash(stopDigest(reason, haltedAt));
+        (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, signature);
+        if (err != ECDSA.RecoverError.NoError) revert NotBlessed();
+        if (!_isKey(signer, ImageKind.Executor) && !_isKey(signer, ImageKind.Unwinder)) revert NotBlessed();
+        _stop(reason, haltedAt);
+    }
+
+    function unwind(uint256 fraction) external nonReentrant returns (uint256 sentHome, bool blocked) {
+        if (fraction == 0 || fraction > WAD) revert NotAllowed();
+        bool permitted = (isHome() && msg.sender == _spec.vault) || _isKey(msg.sender, ImageKind.Executor)
+            || _isKey(msg.sender, ImageKind.Unwinder) || (stopped && fraction == WAD);
+        if (!permitted) revert NotAllowed();
+
+        // Every driver's close is prepared before any is made, so a market
+        // outside the band on one venue closes nothing anywhere: a leaver is
+        // never half-sold.
+        uint256 count = _spec.drivers.length;
+        IDriver[] memory drivers = new IDriver[](count);
+        Call[][] memory closes = new Call[][](count);
+        uint256[] memory freed = new uint256[](count);
+        for (uint256 i = 0; i < count; i++) {
+            drivers[i] = IDriver(_unwindDriver(_spec.drivers[i]));
+            // What the fraction is worth at exit prices before the close:
+            // exactly what selling it realises, and all that comes home for
+            // it. The rest stays with whoever still owns it.
+            (, uint256 exitBefore) = drivers[i].valueOf(address(this));
+            freed[i] = exitBefore.mulDiv(fraction, WAD, Math.Rounding.Floor);
+            bool outside;
+            (closes[i], outside) = drivers[i].close(address(this), fraction, _spec.exitBandBps);
+            if (outside) {
+                emit Unwound(fraction, 0, true);
+                return (0, true);
+            }
+        }
+
+        IERC20 dollar = _asset();
+        uint256 idleBefore = dollar.balanceOf(address(this));
+        uint256 brought;
+        for (uint256 i = 0; i < count; i++) {
+            address[] memory targets = drivers[i].targets();
+            uint256 before = dollar.balanceOf(address(this));
+            _run(closes[i], targets);
+            _run(drivers[i].sweep(address(this), freed[i]), targets);
+            // Selling the fraction is only a serve if its worth comes home:
+            // proceeds left at the venue would still belong to everyone.
+            uint256 swept = dollar.balanceOf(address(this)) - before;
+            if (swept < freed[i].mulDiv(BPS - _spec.exitBandBps, BPS)) revert ShortSweep();
+            // Never more than the fraction's worth: anything a venue sends
+            // beyond it stays here, everyone's.
+            brought += swept < freed[i] ? swept : freed[i];
+        }
+        sentHome = brought + idleBefore.mulDiv(fraction, WAD, Math.Rounding.Floor);
+
+        if (sentHome != 0) {
+            if (isHome()) {
+                _sendHome(sentHome);
+            } else if (_spec.bridges.length != 0) {
+                _send(_spec.bridges[0], _spec.vaultChain, sentHome, "");
+            } else {
+                revert NoRoute();
+            }
+        }
+        emit Unwound(fraction, sentHome, false);
+    }
+
+    // What it holds ---------------------------------------------------------
+
+    function value() external view returns (uint256 mark, uint256 exit) {
+        uint256 idle = _asset().balanceOf(address(this));
+        mark = idle;
+        exit = idle;
+        for (uint256 i = 0; i < _spec.drivers.length; i++) {
+            // Valued through the driver it can unwind through, so a revoked
+            // driver's holdings still count.
+            (uint256 m, uint256 x) = IDriver(_unwindDriver(_spec.drivers[i])).valueOf(address(this));
+            mark += m;
+            exit += x;
+        }
+    }
+
+    function outsideBand() external view returns (bool) {
+        for (uint256 i = 0; i < _spec.drivers.length; i++) {
+            (, bool blocked) =
+                IDriver(_unwindDriver(_spec.drivers[i])).close(address(this), WAD, _spec.exitBandBps);
+            if (blocked) return true;
+        }
+        return false;
+    }
+
+    function spec() external view returns (StationSpec memory) {
+        return _spec;
+    }
+
+    function isHome() public view returns (bool) {
+        return _spec.vaultChain == block.chainid;
+    }
+
+    function approvedKey(bytes32 driver) external view returns (address) {
+        return _approvedKey[driver];
+    }
+
+    function sends() external view returns (Send[] memory) {
+        return _sends;
+    }
+
+    function sendCount() external view returns (uint256) {
+        return _sends.length;
+    }
+
+    function sendAt(uint256 index) external view returns (Send memory) {
+        return _sends[index];
+    }
+
+    function stopDigest(bytes32 reason, uint64 haltedAt) public view returns (bytes32) {
+        return keccak256(abi.encode(block.chainid, address(this), "shonin-stop", reason, haltedAt));
+    }
+
+    // Internals -------------------------------------------------------------
+
+    function _stop(bytes32 reason, uint64 haltedAt) private {
+        if (stopped) revert AlreadyStopped();
+        stopped = true;
+        for (uint256 i = 0; i < _spec.drivers.length; i++) {
+            address key = _approvedKey[_spec.drivers[i]];
+            // A venue that refuses the revoke can't keep the station from
+            // stopping: the key loses the station's driver either way.
+            if (key != address(0)) _revoke(_spec.drivers[i], key, false);
+        }
+        emit Stopped(reason, haltedAt);
+    }
+
+    function _revoke(bytes32 driver, address key, bool strict) private {
+        _declaredDriver(driver);
+        _revokeVia(IDriver(_unwindDriver(driver)), key, strict);
+        if (_approvedKey[driver] == key) delete _approvedKey[driver];
+        emit KeyRevoked(driver, key);
+    }
+
+    /// Withdraw `key` through `implementation`. Unless `strict`, whatever the
+    /// driver or the venue does, the station carries on: a stop, or a
+    /// lapsed key's replacement, goes through.
+    function _revokeVia(IDriver implementation, address key, bool strict) private {
+        if (strict) {
+            _call(implementation.revokeKey(address(this), key), implementation.targets(), true);
+            return;
+        }
+        try implementation.revokeKey(address(this), key) returns (Call[] memory calls) {
+            try implementation.targets() returns (address[] memory targets) {
+                _call(calls, targets, false);
+            } catch {}
+        } catch {}
+    }
+
+    function _send(bytes32 name, uint256 toChain, uint256 amount, bytes memory extra) private {
+        if (stopped && toChain != _spec.vaultChain) revert AlreadyStopped();
+        // Only to a chain the vault trades on, where a station counts it; and
+        // a station on another chain sends only home, so money between two
+        // other chains goes through home, where every send is counted
+        // against one moment, the valuation's open.
+        if (toChain != _spec.vaultChain && (!isHome() || !_listed(_spec.chains, toChain))) revert NoRoute();
+        if (!_contains(_spec.bridges, name)) revert NotDeclared();
+        address implementation = _registry().bridgeOf(name);
+        if (implementation == address(0)) revert NotApproved();
+        // The recipient is this station's own address, which is the vault's
+        // station on every chain, so a send can only reach the vault's own.
+        _run(
+            IBridge(implementation).send(address(this), toChain, address(this), amount, extra),
+            IBridge(implementation).targets()
+        );
+        _sends.push(Send({toChain: toChain, amount: amount, sentAt: uint64(block.timestamp)}));
+        // Numbered from zero, as `sendAt` and a post's in-flight list name it.
+        emit Bridged(name, _sends.length - 1, toChain, amount);
+    }
+
+    function _sendHome(uint256 amount) private {
+        _asset().forceApprove(_spec.vault, amount);
+        IStationVault(_spec.vault).fromStation(amount);
+    }
+
+    /// Make each call after checking where it goes: to one of the driver's
+    /// targets, or to the dollar only to approve one of them.
+    function _run(Call[] memory calls, address[] memory targets) private {
+        _call(calls, targets, true);
+    }
+
+    /// Make each call after checking where it goes; a call that fails stops
+    /// everything only if `strict`. Nothing a driver prepares reaches the
+    /// vault, the station itself, its factory or the registry, as a target
+    /// or as a spender, whatever the driver lists.
+    function _call(Call[] memory calls, address[] memory targets, bool strict) private {
+        address dollar = address(_asset());
+        for (uint256 i = 0; i < calls.length; i++) {
+            Call memory c = calls[i];
+            // A call the station would refuse is never made; outside a
+            // strict run it is skipped rather than stopping everything.
+            bool allowed;
+            if (c.target == dollar) {
+                if (c.data.length == 68 && bytes4(c.data) == APPROVE) {
+                    (address spender,) = abi.decode(_args(c.data), (address, uint256));
+                    allowed = _includes(targets, spender) && !_ours(spender);
+                }
+            } else {
+                allowed = _includes(targets, c.target) && !_ours(c.target);
+            }
+            if (!allowed) {
+                if (strict) revert BadCall();
+                continue;
+            }
+            (bool ok, bytes memory reason) = c.target.call{value: c.value}(c.data);
+            if (!ok && strict) {
+                assembly {
+                    revert(add(reason, 32), mload(reason))
+                }
+            }
+        }
+    }
+
+    function _ours(address target) private view returns (bool) {
+        return target == _spec.vault || target == address(this) || target == address(factory)
+            || target == address(_registry());
+    }
+
+    function _args(bytes memory data) private pure returns (bytes memory args) {
+        args = new bytes(data.length - 4);
+        for (uint256 i = 0; i < args.length; i++) {
+            args[i] = data[i + 4];
+        }
+    }
+
+    function _executorOnly() private view {
+        if (stopped) revert AlreadyStopped();
+        if (!_isKey(msg.sender, ImageKind.Executor)) revert NotBlessed();
+    }
+
+    /// A key blessed, on this chain, for this vault and its bundle, from an
+    /// image of that kind.
+    function _isKey(address key, ImageKind kind) private view returns (bool) {
+        IAttestationRegistry registry = _registry();
+        return registry.isBlessedFor(key, _spec.vaultChain, _spec.vault, _spec.bundleHash)
+            && registry.keyInfo(key).kind == kind;
+    }
+
+    function _declaredDriver(bytes32 driver) private view {
+        if (!_contains(_spec.drivers, driver)) revert NotDeclared();
+    }
+
+    function _unwindDriver(bytes32 driver) private view returns (address implementation) {
+        implementation = _registry().unwindDriver(driver);
+        if (implementation == address(0)) revert NotApproved();
+    }
+
+    function _registry() private view returns (IAttestationRegistry) {
+        return IAttestationRegistry(factory.attestation());
+    }
+
+    function _asset() private view returns (IERC20) {
+        return IERC20(factory.asset());
+    }
+
+    function _listed(uint256[] storage list, uint256 item) private view returns (bool) {
+        for (uint256 i = 0; i < list.length; i++) {
+            if (list[i] == item) return true;
+        }
+        return false;
+    }
+
+    function _unique(bytes32[] calldata list) private pure {
+        for (uint256 i = 0; i < list.length; i++) {
+            for (uint256 j = i + 1; j < list.length; j++) {
+                if (list[i] == list[j]) revert NotAllowed();
+            }
+        }
+    }
+
+    function _contains(bytes32[] storage list, bytes32 item) private view returns (bool) {
+        for (uint256 i = 0; i < list.length; i++) {
+            if (list[i] == item) return true;
+        }
+        return false;
+    }
+
+    function _includes(address[] memory list, address item) private pure returns (bool) {
+        for (uint256 i = 0; i < list.length; i++) {
+            if (list[i] == item) return true;
+        }
+        return false;
+    }
+}

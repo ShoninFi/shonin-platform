@@ -223,15 +223,15 @@
         if (s.tank >= cost) {
           s.tank -= cost;
           s.collected += cost;
-          lines.push(`Keeper, step 1: collects the ${money(cost)} tab from the tank.`);
+          lines.push(`The daily keep call collects the ${money(cost)} tab from the tank.`);
         } else {
           s.collected += s.tank;
-          lines.push(`Keeper, step 1: collects the last ${money(s.tank)} from the tank. The tab reached what the tank held, so the agent stops.`);
+          lines.push(`The daily keep call collects the last ${money(s.tank)} from the tank. The tab reached what the tank held, so the agent stops.`);
           s.tank = 0;
           s.running = false;
         }
       } else {
-        lines.push("Keeper, step 1: nothing to collect; the agent isn't running.");
+        lines.push("The daily keep call has nothing to collect; the agent isn't running.");
       }
 
       // 2. Fees: worked out today, paid on payday.
@@ -252,11 +252,11 @@
         if (paidUp > s.hwm) s.hwm = paidUp;
         lines.push(
           o.gain > 0
-            ? `Keeper, step 2: payday. The week's fees, ${money(total)}, are paid as new shares: ${count(newAuthor)} to the Author for their ${money(o.author)}, and ${count(newShonin)} to Shonin for its ${money(o.shonin)} profit share and ${money(o.holding)} holding fee.`
-            : `Keeper, step 2: payday, but there's no new profit above the high-water mark, so no profit fee. Only the ${money(o.holding)} holding fee is paid, as ${count(newShonin)} new shares to Shonin.`,
+            ? `Payday, at the week's first valuation. The week's fees, ${money(total)}, are paid as new shares: ${count(newAuthor)} to the Author for their ${money(o.author)}, and ${count(newShonin)} to Shonin for its ${money(o.shonin)} profit share and ${money(o.holding)} holding fee.`
+            : `Payday, at the week's first valuation, but there's no new profit above the high-water mark, so no profit fee. Only the ${money(o.holding)} holding fee is paid, as ${count(newShonin)} new shares to Shonin.`,
         );
       } else {
-        lines.push(`Keeper, step 2: not payday. Fees owed this week so far: ${money(owedTotal(o))}.`);
+        lines.push(`Not payday. Fees owed this week so far: ${money(owedTotal(o))}.`);
       }
 
       // 3. Auto-fill, from the Author's shares, using cash at home.
@@ -269,14 +269,14 @@
           s.authorShares -= amount / pps;
           s.home -= amount;
           s.tank += amount;
-          lines.push(`Keeper, step 3: auto-fill cashes in ${money(amount)} of the Author's shares, from home, into the tank.`);
+          lines.push(`Auto-fill cashes in ${money(amount)} of the Author's shares at the next valuation, from home, into the tank.`);
         } else if (s.authorShares * pps < 0.01) {
-          lines.push("Keeper, step 3: auto-fill has nothing to use; the Author has no shares yet.");
+          lines.push("Auto-fill has nothing to use; the Author has no shares yet.");
         } else {
-          lines.push("Keeper, step 3: auto-fill waits; there's no cash at home.");
+          lines.push("Auto-fill waits; there's no cash at home.");
         }
       } else {
-        lines.push("Keeper, step 3: the tank is full; auto-fill has nothing to do.");
+        lines.push("The tank is full; auto-fill has nothing to do.");
       }
 
       if (!s.running && s.tank >= read("cost") && s.tank > 0) {
@@ -311,7 +311,7 @@
         s.trading -= fromTrading;
         s.home += (fromHome + fromTrading) * MOVE_FEE;
         s.depositorShares -= worth / pps;
-        lines.push(`A Depositor cashes in ${money(worth)}, more than is at home, so it takes the slower path: the vault closes their ${(f * 100).toFixed(1)}% of every position and pays them ${money(paid)} once that cash is home.`);
+        lines.push(`A Depositor cashes in ${money(worth)}, more than is at home, so it takes the slower path: the vault closes their ${(f * 100).toFixed(1)}% of every position and pays them ${money(paid)} in the same transaction, from what came home and their share of the cash.`);
       }
       s.netIn -= worth;
       log(`Day ${s.day}: a withdrawal`, lines);

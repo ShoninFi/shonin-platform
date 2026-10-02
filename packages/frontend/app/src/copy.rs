@@ -48,8 +48,8 @@ pub const GUARANTEES: [(&str, &str, &str); 6] = [
     ),
     (
         "Exit any time",
-        "A withdrawal is paid from the idle balance at once, or booked as a claim the contract \
-         settles itself.",
+        "A withdrawal is priced at the next valuation, seconds away, and paid from the cash; \
+         one the cash can't cover becomes a claim that anyone can settle.",
         "Rules out gated redemptions and depending on one operator.",
     ),
     (
@@ -105,13 +105,15 @@ pub fn how_it_works() -> [(&'static str, String); 4] {
     ]
 }
 
-pub const FEE_NOTE: &str = "Fees are worked out daily and paid every Monday as new shares, so paying them never forces a \
-     sale, and the share value shown is always after fees. Profit fees are only taken on a new \
-     high-water mark. The transaction fee stays in the pool, so timing a \
-     deposit around a price update can't take value from the depositors who stay.";
+pub const FEE_NOTE: &str = "Fees are measured at every valuation and paid on the first one on or after Monday as new \
+     shares, so paying them never forces a sale, and the share value shown is always after fees. \
+     Profit fees are only taken above the high-water mark, and money joining above it joins at its \
+     own price. A leaver pays the fee their own shares owe. The transaction fee stays in the pool, \
+     so timing a deposit around a price update can't take value from the depositors who stay.";
 
 pub const TANK_NOTE: &str = "Running costs are the author's, not the depositors'. Each vault has a tank the author funds \
-     and their fees refill: metered compute, and gas where a chain charges it.";
+     and can keep topped up from their own shares: metered compute, and gas where a chain charges \
+     it, never more than the allowances the author set.";
 
 /// What anyone can check for themselves, how, and what they need to do it.
 pub const VERIFY_CHECKS: [(&str, &str, &str); 5] = [
@@ -228,10 +230,10 @@ pub const REACHING: &str = "Reaching the platform for the terms it is running un
 pub fn exit_note(band: &str) -> String {
     format!(
         "A withdrawal is valued at exit-side marks, so the leaver pays the spread rather than \
-         the pool. If the idle balance covers it, the shares are burned and paid in the same \
-         transaction. If not, a claim is booked: the leaver's fraction of every position is \
-         closed inside a {band} band around the venue's oracle price, and once the cash is home \
-         the claim is paid. Anyone can send the settle transaction."
+         the pool. It is priced at the next valuation, seconds away: if the cash covers it, the \
+         shares are burned and paid then. If not, a claim is booked: the leaver's fraction of \
+         every position is closed inside a {band} band around the venue's oracle price and paid \
+         in the same transaction. Anyone can send it."
     )
 }
 

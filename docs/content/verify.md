@@ -97,7 +97,7 @@ What trading does allow is losing money, even on purpose, through bad trades. Th
 
 Yes, and on most vaults without anyone's help. On a vault whose stations are all on its own chain, even if everything we run went dark tonight, you could withdraw by going to the vault's contract directly.
 
-If there's enough cash at home, you're paid within seconds, priced just after you asked. If not, the contract books your withdrawal and closes your share of its positions, and anyone, including you, can push it through.
+If there's enough cash at home, you're paid within seconds, priced just after you asked. If not, the contract books your withdrawal, closes your share of its positions and pays you in the same transaction, and anyone, including you, can push it through.
 
 Vaults that trade on other chains, or at venues that keep their accounts off-chain, can't finish every withdrawal through the contracts alone. There, an **unwinder** finishes the job: an attested machine that only closes positions and sends the cash home. Any approved operator can run one, but at launch that's only us, so on these vaults a withdrawal that needs one waits until one runs. Those vaults' pages say so up front.
 

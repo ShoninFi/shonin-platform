@@ -25,6 +25,9 @@ pub mod bindings {
         async: [
             "shonin:agent/drivers@0.1.0#submit",
             "shonin:agent/drivers@0.1.0#account-state",
+            "shonin:agent/transfers@0.1.0#move",
+            "shonin:agent/transfers@0.1.0#bridge",
+            "shonin:agent/transfers@0.1.0#balances",
             "shonin:agent/data@0.1.0#query",
             "shonin:agent/websocket@0.1.0#connect",
             "shonin:agent/websocket@0.1.0#[method]connection.send",
@@ -43,13 +46,13 @@ pub mod sizing;
 pub use bindings::Guest as Agent;
 pub use bindings::shonin::agent::types::Verdict;
 pub use bindings::shonin::agent::{
-    data, drivers, inference, secrets, state, types, vault, websocket,
+    data, drivers, inference, secrets, state, transfers, types, vault, websocket,
 };
 pub use local::{
-    Account, AccountEvent, AccountState, Action, ClaimPending, MarketState, Order, PositionState,
-    Receipt, Side,
+    AccountEvent, AccountState, Action, ClaimPending, MarketState, Order, PositionState, Receipt,
+    Side,
 };
-pub use payload::{Decimal, decimal, from_payload, to_payload};
+pub use payload::{Decimal, decimal, from_payload, millionths, to_payload};
 pub use sizing::{Limits, size_for};
 
 /// Declare the agent the host should run.

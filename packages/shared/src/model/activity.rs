@@ -60,6 +60,13 @@ pub enum EventKind {
     Frozen,
     Killed,
     Blessed,
+    Valued,
+    Retired,
+    Refunded,
+    Requested,
+    ClaimTried,
+    FallbackTaken,
+    Closed,
 }
 
 impl EventKind {
@@ -76,6 +83,13 @@ impl EventKind {
             Self::Frozen => "frozen",
             Self::Killed => "killed",
             Self::Blessed => "keys blessed",
+            Self::Valued => "valued",
+            Self::Retired => "retired",
+            Self::Refunded => "deposit returned",
+            Self::Requested => "requested",
+            Self::ClaimTried => "claim tried",
+            Self::FallbackTaken => "fallback taken",
+            Self::Closed => "closed",
         }
     }
 }

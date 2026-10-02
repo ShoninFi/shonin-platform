@@ -91,6 +91,12 @@ pub mod bindings {
     pub mod vault {
         pub use super::all::*;
     }
+    pub mod station {
+        pub use super::all::*;
+    }
+    pub mod driver {
+        pub use super::all::*;
+    }
 }
 
 /// Allowances as the contracts take them: gas in the asset's units, six
@@ -107,25 +113,109 @@ pub fn allowances(allowances: &shared::Allowances) -> bindings::prices::Allowanc
     }
 }
 
-/// The two accounts a vault can move capital between, and the venue it names.
-/// They are `bytes32` on the contract, which is a short ASCII name padded with
-/// zeros.
-pub mod accounts {
+/// What a depositor signs to be allowed to hold a vault's shares: EIP-712,
+/// domain `("Shonin Vault", "1", chainId, vault)`, so a wallet shows the
+/// person the words and the list they are agreeing to.
+pub mod statement {
+    use alloy_primitives::{Address, B256, U256, keccak256};
+    use alloy_sol_types::SolValue;
+
+    pub const TEXT: &str =
+        "I am not a restricted person for this vault, and I am not acting for one.";
+
+    /// The same statement as a wallet is asked to sign it.
+    pub fn typed_data(
+        chain_id: u64,
+        vault: Address,
+        depositor: Address,
+        restricted: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"},
+                ],
+                "Statement": [
+                    {"name": "depositor", "type": "address"},
+                    {"name": "statement", "type": "string"},
+                    {"name": "restricted", "type": "string"},
+                ],
+            },
+            "primaryType": "Statement",
+            "domain": {
+                "name": "Shonin Vault",
+                "version": "1",
+                "chainId": chain_id,
+                "verifyingContract": format!("{vault:?}"),
+            },
+            "message": {
+                "depositor": format!("{depositor:?}"),
+                "statement": TEXT,
+                "restricted": restricted,
+            },
+        })
+    }
+
+    /// The digest the vault checks for `depositor`, against the list as the
+    /// vault writes it (`SANCTIONED,US`).
+    pub fn digest(chain_id: u64, vault: Address, depositor: Address, restricted: &str) -> B256 {
+        let domain = keccak256(
+            (
+                keccak256(
+                    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+                ),
+                keccak256("Shonin Vault"),
+                keccak256("1"),
+                U256::from(chain_id),
+                vault,
+            )
+                .abi_encode(),
+        );
+        let statement = keccak256(
+            (
+                keccak256("Statement(address depositor,string statement,string restricted)"),
+                depositor,
+                keccak256(TEXT),
+                keccak256(restricted),
+            )
+                .abi_encode(),
+        );
+        let mut bytes = Vec::with_capacity(66);
+        bytes.extend_from_slice(b"\x19\x01");
+        bytes.extend_from_slice(domain.as_slice());
+        bytes.extend_from_slice(statement.as_slice());
+        keccak256(bytes)
+    }
+}
+
+/// Names the contracts hold as `bytes32`: a driver, a bridge, a chain, a
+/// market. A short ASCII name padded with zeros, as Solidity writes
+/// `bytes32("local")`.
+pub mod names {
     use alloy_primitives::{B256, FixedBytes};
 
-    pub const IDLE: B256 = name(b"idle");
-    pub const VENUE: B256 = name(b"venue");
-    pub const VENUE_ID: B256 = name(b"local");
+    /// The stand-in venue's driver.
+    pub const LOCAL_DRIVER: B256 = name(b"local");
+    /// The stand-in bridge.
+    pub const LOCAL_BRIDGE: B256 = name(b"local-bridge");
 
-    /// Solidity's `bytes32("idle")`: the bytes, then zeros.
-    const fn name(text: &[u8]) -> B256 {
+    pub const fn name(text: &[u8]) -> B256 {
         let mut out = [0u8; 32];
         let mut i = 0;
-        while i < text.len() {
+        while i < text.len() && i < 32 {
             out[i] = text[i];
             i += 1;
         }
         FixedBytes(out)
+    }
+
+    /// A name read back from the contract: the bytes before the padding.
+    pub fn text(name: B256) -> String {
+        let end = name.0.iter().position(|byte| *byte == 0).unwrap_or(32);
+        String::from_utf8_lossy(&name.0[..end]).into_owned()
     }
 }
 
@@ -136,23 +226,22 @@ mod tests {
 
     #[test]
     fn a_call_encodes_to_its_selector() {
-        let call = bindings::vault::IVault::depositCall {
-            assets: alloy_primitives::U256::from(1_000_000u64),
+        let call = bindings::vault::IVault::requestRedeemCall {
+            shares: alloy_primitives::U256::from(1_000_000u64),
             receiver: alloy_primitives::Address::ZERO,
         };
         let encoded = call.abi_encode();
         assert_eq!(
             &encoded[..4],
-            &bindings::vault::IVault::depositCall::SELECTOR
+            &bindings::vault::IVault::requestRedeemCall::SELECTOR
         );
         assert_eq!(encoded.len(), 4 + 64);
     }
 
     #[test]
-    fn an_account_name_is_what_solidity_would_write() {
-        assert_eq!(&accounts::IDLE.0[..4], b"idle");
-        assert_eq!(accounts::IDLE.0[4], 0);
-        assert_eq!(&accounts::VENUE.0[..5], b"venue");
-        assert_eq!(&accounts::VENUE_ID.0[..5], b"local");
+    fn a_name_is_what_solidity_would_write() {
+        assert_eq!(&names::LOCAL_DRIVER.0[..5], b"local");
+        assert_eq!(names::LOCAL_DRIVER.0[5], 0);
+        assert_eq!(names::text(names::LOCAL_BRIDGE), "local-bridge");
     }
 }

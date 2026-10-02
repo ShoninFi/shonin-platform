@@ -1,20 +1,23 @@
 //! What a strategy can reach, and what happens when it does.
 //!
-//! Every import of the `shonin:strategy` world is implemented here. The shape
-//! of the thing is the point: a strategy asks, the host decides, and the only
-//! request that can move money is a submission the venue's adapter has decoded
-//! and the vault's own contract has agreed to. Nothing a strategy can say
-//! reaches a key.
+//! Every import of the `shonin:agent` world is implemented here. The shape of
+//! the thing is the point: an agent asks, the host decides, and the only
+//! requests that can move money are a submission the driver has decoded and a
+//! transfer the vault's station has checked. Nothing an agent can say reaches
+//! a key.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use alloy::primitives::Address;
-use anyhow::Result;
+use alloy::primitives::{Address, Bytes, U256};
+use anyhow::{Result, anyhow};
+use chain::bindings::erc20::IERC20;
+use chain::bindings::factory::IVaultFactory;
+use chain::bindings::station::IStation;
 use chain::bindings::vault::IVault;
 use chain::bindings::venue::{ILocalVenue, OrderRequest};
 use chain::{Client, KeyClient};
-use strategy_sdk::{Account, Action, MarketState, PositionState, Receipt, Side};
+use strategy_sdk::{Action, MarketState, PositionState, Receipt, Side};
 use tokio::sync::mpsc::UnboundedReceiver;
 use wasmtime::AsContextMut;
 use wasmtime::Result as HostResult;
@@ -31,6 +34,7 @@ wasmtime::component::bindgen!({
     exports: { default: async },
 });
 
+use shonin::agent::transfers::{Account, Balance, VenueAccount};
 use shonin::agent::types::Verdict;
 use shonin::agent::vault::VaultEvent;
 /// A socket to the outside world. This deployment opens none, so no value of
@@ -46,7 +50,14 @@ pub struct Ctx {
     /// Acting on it, as the key blessed for this vault.
     pub key: KeyClient,
     pub vault: Address,
+    /// The vault's station on this chain: the master of its venue account,
+    /// and the only thing that moves its money.
+    pub station: Address,
     pub venue: Address,
+    pub usd: Address,
+    pub factory: Address,
+    /// The vault's own chain, as `shonin.toml` names it.
+    pub home_chain: String,
     /// The driver this agent's manifest named. The executor refuses a
     /// manifest naming one this image doesn't carry.
     pub driver: String,
@@ -143,6 +154,7 @@ impl WasiView for Ctx {
 // The interfaces with no host state of their own still need their marker.
 impl shonin::agent::types::Host for Ctx {}
 impl shonin::agent::drivers::Host for Ctx {}
+impl shonin::agent::transfers::Host for Ctx {}
 impl shonin::agent::vault::Host for Ctx {}
 impl shonin::agent::data::Host for Ctx {}
 impl shonin::agent::websocket::Host for Ctx {}
@@ -161,10 +173,10 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
         driver: String,
         actions: Vec<Vec<u8>>,
     ) -> HostResult<Vec<Verdict>> {
-        let (key, vault, venue_address, expected) = accessor.with(|mut access| {
+        let (key, station, venue_address, expected) = accessor.with(|mut access| {
             refuel(&mut access);
             let ctx = access.get();
-            (ctx.key.clone(), ctx.vault, ctx.venue, ctx.driver.clone())
+            (ctx.key.clone(), ctx.station, ctx.venue, ctx.driver.clone())
         });
 
         if driver != expected {
@@ -179,7 +191,7 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
         let mut refused = 0;
         for bytes in &actions {
             let (verdict, counts) = match strategy_sdk::from_payload::<Action>(bytes) {
-                Ok(action) => act(&key, vault, venue_address, action).await,
+                Ok(action) => act(&key, station, venue_address, action).await,
                 Err(error) => (
                     Verdict::Rejected(format!("that is not an action: {error}")),
                     true,
@@ -207,16 +219,23 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
         driver: String,
         _query: Vec<u8>,
     ) -> HostResult<Result<Vec<u8>, String>> {
-        let (chain, vault, venue_address, expected) = accessor.with(|mut access| {
+        let (chain, vault, station, venue_address, usd, expected) = accessor.with(|mut access| {
             let ctx = access.get();
-            (ctx.chain.clone(), ctx.vault, ctx.venue, ctx.driver.clone())
+            (
+                ctx.chain.clone(),
+                ctx.vault,
+                ctx.station,
+                ctx.venue,
+                ctx.usd,
+                ctx.driver.clone(),
+            )
         });
         if driver != expected {
             return Ok(Err(format!(
                 "this agent trades through {expected}, not {driver}"
             )));
         }
-        match read_account_state(&chain, vault, venue_address).await {
+        match read_account_state(&chain, vault, station, venue_address, usd).await {
             Ok(state) => Ok(Ok(strategy_sdk::to_payload(&state))),
             Err(error) => Ok(Err(error.to_string())),
         }
@@ -230,6 +249,223 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
         let events = access.get().account_events.take();
         stream_of(&mut access, events)
     }
+}
+
+// Transfers --------------------------------------------------------------------
+
+/// One call a move is made of, sent to the station as the vault's key.
+enum Step {
+    Pull,
+    Push,
+    Deposit,
+    Withdraw,
+}
+
+/// The calls that take money from one account to another on the vault's own
+/// chain. Anything else is refused here, and the station would refuse it too.
+fn route(
+    home: &str,
+    driver: &str,
+    source: &Account,
+    destination: &Account,
+) -> Result<Vec<Step>, String> {
+    let here = |chain: &str| {
+        if chain == home {
+            Ok(())
+        } else {
+            Err(format!(
+                "this executor serves the vault's station on {home} only, not on {chain}"
+            ))
+        }
+    };
+    let venue = |account: &VenueAccount| {
+        here(&account.chain)?;
+        if account.driver == driver {
+            Ok(())
+        } else {
+            Err(format!(
+                "this agent trades through {driver}, not {}",
+                account.driver
+            ))
+        }
+    };
+    match (source, destination) {
+        (Account::Vault, Account::Station(chain)) => here(chain).map(|_| vec![Step::Pull]),
+        (Account::Station(chain), Account::Vault) => here(chain).map(|_| vec![Step::Push]),
+        (Account::Station(chain), Account::Venue(to)) => {
+            here(chain)?;
+            venue(to).map(|_| vec![Step::Deposit])
+        }
+        (Account::Venue(from), Account::Station(chain)) => {
+            here(chain)?;
+            venue(from).map(|_| vec![Step::Withdraw])
+        }
+        (Account::Vault, Account::Venue(to)) => venue(to).map(|_| vec![Step::Pull, Step::Deposit]),
+        (Account::Venue(from), Account::Vault) => {
+            venue(from).map(|_| vec![Step::Withdraw, Step::Push])
+        }
+        _ => Err("money only moves between different accounts of the vault's own".to_string()),
+    }
+}
+
+impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
+    async fn home_chain(mut access: Access<'_, Ctx, Self>) -> HostResult<String> {
+        refuel(&mut access);
+        Ok(access.get().home_chain.clone())
+    }
+
+    async fn move_(
+        accessor: &Accessor<Ctx, Self>,
+        source: Account,
+        destination: Account,
+        amount: u64,
+    ) -> HostResult<Result<(), String>> {
+        let (key, station, home, driver) = accessor.with(|mut access| {
+            refuel(&mut access);
+            let ctx = access.get();
+            (
+                ctx.key.clone(),
+                ctx.station,
+                ctx.home_chain.clone(),
+                ctx.driver.clone(),
+            )
+        });
+        let steps = match route(&home, &driver, &source, &destination) {
+            Ok(steps) => steps,
+            Err(why) => return Ok(Err(why)),
+        };
+        let amount = U256::from(amount);
+        let name = chain::names::name(driver.as_bytes());
+        for step in steps {
+            let sent = match step {
+                Step::Pull => key.send(station, IStation::pullCall { amount }).await,
+                Step::Push => key.send(station, IStation::pushCall { amount }).await,
+                Step::Deposit => {
+                    key.send(
+                        station,
+                        IStation::depositCall {
+                            driver: name,
+                            amount,
+                        },
+                    )
+                    .await
+                }
+                Step::Withdraw => {
+                    key.send(
+                        station,
+                        IStation::withdrawCall {
+                            driver: name,
+                            amount,
+                        },
+                    )
+                    .await
+                }
+            };
+            if let Err(error) = sent {
+                accessor.with(|mut access| access.get().count(|c| c.rejections += 1));
+                return Ok(Err(format!("{error:#}")));
+            }
+        }
+        Ok(Ok(()))
+    }
+
+    async fn bridge(
+        accessor: &Accessor<Ctx, Self>,
+        name: String,
+        source_chain: String,
+        destination_chain: String,
+        amount: u64,
+    ) -> HostResult<Result<(), String>> {
+        let (chain, key, station, factory, home) = accessor.with(|mut access| {
+            refuel(&mut access);
+            let ctx = access.get();
+            (
+                ctx.chain.clone(),
+                ctx.key.clone(),
+                ctx.station,
+                ctx.factory,
+                ctx.home_chain.clone(),
+            )
+        });
+        if source_chain != home {
+            return Ok(Err(format!(
+                "this executor serves the vault's station on {home} only, not on {source_chain}"
+            )));
+        }
+        let to_chain = match chain_id_of(&chain, factory, &destination_chain).await {
+            Ok(id) => id,
+            Err(error) => return Ok(Err(format!("{error:#}"))),
+        };
+        let sent = key
+            .send(
+                station,
+                IStation::bridgeCall {
+                    name: chain::names::name(name.as_bytes()),
+                    toChain: to_chain,
+                    amount: U256::from(amount),
+                    extra: Bytes::new(),
+                },
+            )
+            .await;
+        Ok(sent.map(|_| ()).map_err(|error| format!("{error:#}")))
+    }
+
+    async fn balances(accessor: &Accessor<Ctx, Self>) -> HostResult<Vec<Balance>> {
+        let (chain, vault, station, venue, usd, home, driver) = accessor.with(|mut access| {
+            refuel(&mut access);
+            let ctx = access.get();
+            (
+                ctx.chain.clone(),
+                ctx.vault,
+                ctx.station,
+                ctx.venue,
+                ctx.usd,
+                ctx.home_chain.clone(),
+                ctx.driver.clone(),
+            )
+        });
+        let units = |value: U256| u64::try_from(value).unwrap_or(u64::MAX);
+        let mut out = Vec::new();
+        if let Ok(cash) = chain.read(vault, IVault::cashCall {}).await {
+            out.push(Balance {
+                account: Account::Vault,
+                amount: units(cash),
+            });
+        }
+        if let Ok(idle) = chain
+            .read(usd, IERC20::balanceOfCall { account: station })
+            .await
+        {
+            out.push(Balance {
+                account: Account::Station(home.clone()),
+                amount: units(idle),
+            });
+        }
+        if let Ok(value) = chain
+            .read(venue, ILocalVenue::accountValueCall { master: station })
+            .await
+        {
+            out.push(Balance {
+                account: Account::Venue(VenueAccount {
+                    chain: home,
+                    driver,
+                }),
+                amount: units(value),
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// A chain's id from its name, as the vault factory on this chain knows it.
+async fn chain_id_of(chain: &Client, factory: Address, name: &str) -> Result<U256> {
+    let wanted = chain::names::name(name.as_bytes());
+    let chains = chain.read(factory, IVaultFactory::chainsCall {}).await?;
+    chains
+        .into_iter()
+        .find(|known| known.name == wanted)
+        .map(|known| known.chainId)
+        .ok_or_else(|| anyhow!("no chain called {name} here"))
 }
 
 // The vault ------------------------------------------------------------------
@@ -395,12 +631,9 @@ impl shonin::agent::inference::HostWithStore<Ctx> for HasSelf<Ctx> {
 /// health. An order that found nobody at its price is the market's answer, not
 /// the venue's: a strategy whose orders are not crossing is trading, and one
 /// whose orders are being refused is not.
-async fn act(key: &KeyClient, vault: Address, venue: Address, action: Action) -> (Verdict, bool) {
+async fn act(key: &KeyClient, station: Address, venue: Address, action: Action) -> (Verdict, bool) {
     let done = match action {
-        Action::Place(order) => place(key, vault, venue, &order).await,
-        Action::MoveCapital { from, to, amount } => {
-            move_capital(key, vault, from, to, amount).await
-        }
+        Action::Place(order) => place(key, station, venue, &order).await,
     };
     match done {
         Ok(receipt) => (Verdict::Accepted(strategy_sdk::to_payload(&receipt)), false),
@@ -430,7 +663,7 @@ impl From<anyhow::Error> for Refusal {
 
 async fn place(
     key: &KeyClient,
-    vault: Address,
+    station: Address,
     venue: Address,
     order: &strategy_sdk::Order,
 ) -> std::result::Result<Receipt, Refusal> {
@@ -445,7 +678,7 @@ async fn place(
         .send(
             venue,
             ILocalVenue::placeCall {
-                master: vault,
+                master: station,
                 orders: vec![request],
             },
         )
@@ -476,47 +709,34 @@ async fn place(
     ))
 }
 
-async fn move_capital(
-    key: &KeyClient,
-    vault: Address,
-    from: Account,
-    to: Account,
-    amount: strategy_sdk::Decimal,
-) -> std::result::Result<Receipt, Refusal> {
-    key.send(
-        vault,
-        IVault::moveCapitalCall {
-            from: account_id(from),
-            to: account_id(to),
-            amount: to_units(amount, ASSET_DECIMALS)?,
-        },
-    )
-    .await?;
-    Ok(Receipt::Moved { from, to, amount })
-}
-
 // Reading the chain ----------------------------------------------------------
 
 pub async fn read_account_state(
     chain: &Client,
     vault: Address,
+    station: Address,
     venue: Address,
+    usd: Address,
 ) -> Result<strategy_sdk::AccountState> {
     let cash = chain
-        .read(venue, ILocalVenue::cashOfCall { master: vault })
+        .read(venue, ILocalVenue::cashOfCall { master: station })
         .await?;
     let value = chain
-        .read(venue, ILocalVenue::accountValueCall { master: vault })
+        .read(venue, ILocalVenue::accountValueCall { master: station })
         .await?;
     let exit = chain
-        .read(venue, ILocalVenue::exitValueCall { master: vault })
+        .read(venue, ILocalVenue::exitValueCall { master: station })
         .await?;
     let margin = chain.read(venue, ILocalVenue::marginBpsCall {}).await?;
     let held = chain
-        .read(venue, ILocalVenue::marketsHeldByCall { master: vault })
+        .read(venue, ILocalVenue::marketsHeldByCall { master: station })
         .await?;
-    let vault_value = chain.read(vault, IVault::totalValueCall {}).await?;
-    let idle = chain.read(vault, IVault::idleCall {}).await?;
+    let idle = chain.read(vault, IVault::cashCall {}).await?;
+    let station_idle = chain
+        .read(usd, IERC20::balanceOfCall { account: station })
+        .await?;
+    // What the agent sizes against: everything the vault holds now, at mark.
+    let vault_value = idle + station_idle + value;
 
     let mut positions = Vec::new();
     for market in held {
@@ -524,7 +744,7 @@ pub async fn read_account_state(
             .read(
                 venue,
                 ILocalVenue::positionOfCall {
-                    master: vault,
+                    master: station,
                     market,
                 },
             )
@@ -541,6 +761,7 @@ pub async fn read_account_state(
         exit_value: to_decimal(exit, ASSET_DECIMALS)?,
         vault_value: to_decimal(vault_value, ASSET_DECIMALS)?,
         idle: to_decimal(idle, ASSET_DECIMALS)?,
+        station_idle: to_decimal(station_idle, ASSET_DECIMALS)?,
         margin_bps: margin.try_into().unwrap_or(u32::MAX),
         positions,
         markets: read_markets(chain, venue).await?,
@@ -580,11 +801,4 @@ pub fn market_id(name: &str) -> alloy::primitives::FixedBytes<32> {
 pub fn market_name(id: alloy::primitives::FixedBytes<32>) -> String {
     let end = id.0.iter().position(|byte| *byte == 0).unwrap_or(32);
     String::from_utf8_lossy(&id.0[..end]).to_string()
-}
-
-fn account_id(account: Account) -> alloy::primitives::FixedBytes<32> {
-    match account {
-        Account::Idle => chain::accounts::IDLE,
-        Account::Venue => chain::accounts::VENUE,
-    }
 }

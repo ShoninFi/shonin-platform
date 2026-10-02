@@ -236,22 +236,260 @@ fn panel_body(strategy: &Rc<Strategy>, holdings: &Holdings, slug: &str) -> Dom {
         })))
     }));
 
+    // What this holder has asked for that hasn't been priced yet.
+    let mine: Vec<&shared::Request> = holdings
+        .address
+        .as_deref()
+        .map(|address| {
+            vault
+                .requests
+                .iter()
+                .filter(|request| request.owner.eq_ignore_ascii_case(address))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !mine.is_empty() {
+        children.push(ui::kv_rows(
+            mine.iter()
+                .map(|request| {
+                    let amount = match request.kind {
+                        shared::RequestKind::Deposit => fmt::money_exact(request.amount),
+                        _ => format!("{} shares", fmt::number(request.amount, 2)),
+                    };
+                    (
+                        format!("Waiting: {}", request.kind.label()),
+                        ui::number(&amount),
+                    )
+                })
+                .collect(),
+        ));
+        children.push(ui::note(
+            "A request is priced at the next valuation, a few seconds after it is made, so \
+             nobody who moves can pick the price they move at.",
+        ));
+        // A withdrawal nothing has priced for a day (a market outside the
+        // exit band, a keeper that stopped): the holder chooses a way out.
+        let stuck: Vec<u64> = mine
+            .iter()
+            .filter(|request| {
+                request.kind == shared::RequestKind::Withdrawal
+                    && request.earliest + time::Duration::DAY < data::now()
+            })
+            .map(|request| request.id)
+            .collect();
+        for id in stuck {
+            children.push(ui::note(
+                "Nothing has priced this withdrawal for a day. Take your share of the cash now \
+                 and units for your share of what is at the venue, paid as it comes home; or \
+                 make it a claim, which closes your fraction when the market allows and \
+                 counts toward freezing a vault that leaves it unpaid for a week.",
+            ));
+            children.push(shell::button(
+                "Take your share now",
+                true,
+                clone!(slug => move || {
+                    act(
+                        {
+                            let slug = slug.clone();
+                            async move { wallet::take_pro_rata(&slug, id).await }
+                        },
+                        |_| "Sent. Your share of the cash is paid, and the rest is held as units.".to_string(),
+                    );
+                }),
+            ));
+            children.push(shell::button(
+                "Make it a claim",
+                false,
+                clone!(slug => move || {
+                    act(
+                        {
+                            let slug = slug.clone();
+                            async move { wallet::claim_instead(&slug, id).await }
+                        },
+                        |_| "Sent. Your withdrawal is now a claim.".to_string(),
+                    );
+                }),
+            ));
+        }
+    }
+
     if position.is_none() {
         children.push(ui::note(&format!(
-            "Shares are minted at the value the contract computes in the same transaction, after \
-             a {} transaction fee that stays in the pool.",
-            wallet::transaction_fee_label(vault)
+            "A deposit is a request, priced at the next valuation after a {} transaction fee \
+             that stays in the pool. You sign a statement that you are not a restricted person \
+             for this vault: {}.",
+            wallet::transaction_fee_label(vault),
+            restricted_text(vault)
         )));
     }
 
     for claim in claims {
-        children.push(claim_card(claim, &slug));
+        children.push(claim_card(
+            claim,
+            &slug,
+            vault.state == shared::model::vault::VaultState::Closed,
+        ));
     }
 
-    ui::card_titled("Your position", None, children)
+    let is_author = holdings
+        .address
+        .as_deref()
+        .is_some_and(|address| address.eq_ignore_ascii_case(&strategy.author_address));
+    let position_card = ui::card_titled("Your position", None, children);
+    if is_author {
+        html!("div", {
+            .class("stack")
+            .child(position_card)
+            .child(author_card(strategy, &slug))
+        })
+    } else {
+        position_card
+    }
 }
 
-fn claim_card(claim: &shared::HeldClaim, slug: &str) -> Dom {
+/// What the author's controls are holding while they are typed into. Kept
+/// apart from the page, which is drawn again whenever the chain moves.
+struct AuthorDraft {
+    keep_at: Mutable<String>,
+    withdraw: Mutable<String>,
+    allowance: Mutable<String>,
+    floor: Mutable<String>,
+}
+
+fn author_draft() -> &'static AuthorDraft {
+    static DRAFT: std::sync::OnceLock<AuthorDraft> = std::sync::OnceLock::new();
+    DRAFT.get_or_init(|| AuthorDraft {
+        keep_at: Mutable::new(String::new()),
+        withdraw: Mutable::new(String::new()),
+        allowance: Mutable::new("modest".to_string()),
+        floor: Mutable::new(String::new()),
+    })
+}
+
+/// The author's own controls: the tank, the allowances, the idle floor, and
+/// retiring. The contract refuses anyone else.
+fn author_card(strategy: &Rc<Strategy>, slug: &str) -> Dom {
+    let vault = &strategy.vault;
+    let draft = author_draft();
+    let chain = vault.chain;
+    let floor_now = format!("{}%", fmt::number(vault.idle_floor_bps as f64 / 100.0, 2));
+    let floor_pending = vault.pending_floor.as_ref().map(|pending| {
+        format!(
+            "lowering to {}% from {}",
+            fmt::number(pending.bps as f64 / 100.0, 2),
+            fmt::timestamp(pending.from)
+        )
+    });
+
+    let mut rows = vec![
+        (
+            "Tank".to_string(),
+            ui::number(&fmt::money_exact(vault.tank.balance)),
+        ),
+        (
+            "Charged at most".to_string(),
+            ui::number(&fmt::per_day(vault.tank.daily_charge)),
+        ),
+        ("Idle floor".to_string(), ui::number(&floor_now)),
+    ];
+    if let Some(pending) = floor_pending {
+        rows.push(("Pending".to_string(), ui::muted(&pending)));
+    }
+
+    let keep = clone_slug(slug);
+    let take = clone_slug(slug);
+    let allow = clone_slug(slug);
+    let floor = clone_slug(slug);
+    let retiring = clone_slug(slug);
+    let retire_open = vault.state == shared::VaultState::Open;
+
+    ui::card_titled(
+        "Your agent",
+        Some(ui::badge("author", Tone::Info)),
+        vec![
+            ui::kv_rows(rows),
+            form::field(
+                "Keep the tank at",
+                Some("Topped back up from your shares each day; zero turns it off"),
+                form::amount(&draft.keep_at, chain.dollar(), 100_000.0),
+            ),
+            shell::button("Set", false, move || {
+                let assets = form::parse_amount(&author_draft().keep_at.get_cloned());
+                let slug = keep.clone();
+                act(
+                    async move { wallet::set_tank_keep(&slug, assets).await },
+                    |_| "The tank's level is set.".to_string(),
+                );
+            }),
+            form::field(
+                "Take from the tank",
+                Some("The bill so far is settled first"),
+                form::amount(&draft.withdraw, chain.dollar(), vault.tank.balance),
+            ),
+            shell::button("Withdraw", false, move || {
+                let assets = form::parse_amount(&author_draft().withdraw.get_cloned());
+                let slug = take.clone();
+                act(
+                    async move { wallet::withdraw_tank(&slug, assets).await },
+                    |_| "Taken from the tank.".to_string(),
+                );
+            }),
+            form::field(
+                "Allowances",
+                Some("What the agent may use: the most its tank can be charged"),
+                form::select(
+                    shared::Allowances::SHAPES
+                        .iter()
+                        .map(|shape| ((*shape).to_string(), crate::pages::publish::label(shape)))
+                        .collect(),
+                    &draft.allowance,
+                ),
+            ),
+            shell::button("Change", false, move || {
+                let shape = author_draft().allowance.get_cloned();
+                let slug = allow.clone();
+                act(
+                    async move { wallet::set_allowances(&slug, &shape).await },
+                    |_| "The allowances apply from now.".to_string(),
+                );
+            }),
+            form::field(
+                "Idle floor, %",
+                Some("Raising it applies at once; lowering it waits a day"),
+                form::input(&draft.floor, "5"),
+            ),
+            shell::button("Set", false, move || {
+                let percent = form::parse_amount(&author_draft().floor.get_cloned());
+                let bps = (percent * 100.0).round().clamp(0.0, 10_000.0) as u16;
+                let slug = floor.clone();
+                act(
+                    async move { wallet::set_idle_floor(&slug, bps).await },
+                    |_| "The idle floor is set.".to_string(),
+                );
+            }),
+            ui::note(
+                "Retiring stops deposits at once. The agent keeps running for the wind-down, \
+                 then the vault closes its positions and everyone takes their share of the cash.",
+            ),
+            shell::button("Retire", false, move || {
+                if !retire_open {
+                    state::notify("Only an open vault can be retired.", Tone::Warn);
+                    return;
+                }
+                let slug = retiring.clone();
+                act(async move { wallet::retire(&slug).await }, |_| {
+                    "Retired. Deposits have stopped.".to_string()
+                });
+            }),
+        ],
+    )
+}
+
+fn clone_slug(slug: &str) -> String {
+    slug.to_string()
+}
+
+fn claim_card(claim: &shared::HeldClaim, slug: &str, closed: bool) -> Dom {
     let slug = slug.to_string();
     let id = claim.id;
     let state = claim.state;
@@ -262,9 +500,10 @@ fn claim_card(claim: &shared::HeldClaim, slug: &str) -> Dom {
             "Waiting for a market inside the exit band",
         ),
         (
-            ClaimState::Paid,
-            "Closed, valued again, burned at the marks, and paid",
+            ClaimState::Queued,
+            "The cash covers it: priced at the next valuation",
         ),
+        (ClaimState::Paid, "Paid"),
     ];
     let reached = steps
         .iter()
@@ -307,17 +546,56 @@ fn claim_card(claim: &shared::HeldClaim, slug: &str) -> Dom {
             Tone::Ok,
             "Paid",
             &format!(
-                "{} reached your balance, valued at exit-side marks once the cash was home.",
+                "{} reached your balance: what your fraction brought home and your part of \
+                 the cash, less your profit fee and the transaction fee.",
                 fmt::money_exact(claim.settled_for.unwrap_or_default())
             ),
         ));
-    } else {
+    } else if closed {
         children.push(ui::note(
-            "Anyone can send the next transaction. Your shares stay outstanding until the last \
-             one, so the close is borne pro rata.",
+            "The vault has closed with everything at home. Your claim is paid from its cash at \
+             the closed price; anyone may send this, and it pays you.",
         ));
         children.push(shell::button(
-            "Send the next settle transaction",
+            "Collect from the closed vault",
+            true,
+            clone!(slug => move || {
+                act(
+                    {
+                        let slug = slug.clone();
+                        async move { wallet::claim_closed(&slug, id).await }
+                    },
+                    |_| "Sent. The closed vault pays your claim.".to_string(),
+                );
+            }),
+        ));
+    } else {
+        if state != ClaimState::Queued && claim.booked + time::Duration::DAY < data::now() {
+            children.push(ui::note(
+                "Nobody has been able to serve this claim for a day. You can take your share \
+                 of the cash now and units for the rest, paid as it comes home.",
+            ));
+            children.push(shell::button(
+                "Take your share now",
+                false,
+                clone!(slug => move || {
+                    act(
+                        {
+                            let slug = slug.clone();
+                            async move { wallet::take_pro_rata_claim(&slug, id).await }
+                        },
+                        |_| "Sent. Your share of the cash is paid, and the rest is held as units.".to_string(),
+                    );
+                }),
+            ));
+        }
+        children.push(ui::note(
+            "Anyone can serve a claim: it closes your fraction of every position inside the \
+             exit band, brings it home and pays you in the same transaction, less your own \
+             profit fee. A market outside the band holds the close until it is back.",
+        ));
+        children.push(shell::button(
+            "Serve this claim",
             true,
             clone!(slug => move || {
                 act(
@@ -325,7 +603,7 @@ fn claim_card(claim: &shared::HeldClaim, slug: &str) -> Dom {
                         let slug = slug.clone();
                         async move { wallet::settle(&slug, id).await }
                     },
-                    |_| "Settlement sent. The claim pays once the close has filled.".to_string(),
+                    |_| "Sent. If the market was inside the band, the claim is paid.".to_string(),
                 );
             }),
         ));
@@ -398,8 +676,9 @@ fn deposit_modal(strategy: &Rc<Strategy>) -> Dom {
                     })))
                 }),
                 ui::note(
-                    "The contract computes the vault's value from on-chain state in the same \
-                     transaction and mints at that. The fee stays in the pool.",
+                    "Your deposit is a request: the next valuation, seconds away, computes the \
+                     vault's value from on-chain state and mints at that, so nobody can pick \
+                     the price they join at. The fee stays in the pool.",
                 ),
                 modal_actions(vec![
                     shell::button("Cancel", false, || depositing().set(None)),
@@ -413,8 +692,8 @@ fn deposit_modal(strategy: &Rc<Strategy>) -> Dom {
                             },
                             move |_| {
                                 format!(
-                                    "Deposited {}. Shares were minted at the value the contract \
-                                     computed in the same transaction.",
+                                    "Asked to deposit {}. It is priced at the next valuation, a \
+                                     few seconds from now, and your shares follow.",
                                     fmt::money_exact(value)
                                 )
                             },
@@ -480,21 +759,21 @@ fn withdraw_modal(strategy: &Rc<Strategy>) -> Dom {
                             .child(if quote.books_claim {
                                 ui::notice(
                                     Tone::Warn,
-                                    "This books a claim",
+                                    "This will likely book a claim",
                                     &format!(
-                                        "It is more than the vault's idle balance of {}, so your shares are pending while \
-                                         the contract closes your fraction of every position. Once the \
-                                         cash is home you are paid.",
+                                        "It is more than the vault's cash of {}, so once it is priced \
+                                         your shares stay pending until your fraction of every position is \
+                                         closed inside the exit band and brought home, which pays you at once.",
                                         fmt::money(held.vault.idle)
                                     ),
                                 )
                             } else {
                                 ui::notice(
                                     Tone::Ok,
-                                    "Paid in one transaction",
+                                    "Paid at the next valuation",
                                     &format!(
-                                        "The vault's idle balance of {} covers it, so the shares \
-                                         are burned and you are paid in the same transaction.",
+                                        "The vault's cash of {} covers it, so the next valuation, a \
+                                         few seconds away, prices it, burns the shares and pays you.",
                                         fmt::money(held.vault.idle)
                                     ),
                                 )
@@ -554,4 +833,22 @@ pub fn holdings_summary() -> Dom {
         })
         .child(html!("span", { .child(text("")) }))
     })
+}
+
+/// Who can't deposit in this vault, as words.
+fn restricted_text(vault: &shared::Vault) -> String {
+    let named: Vec<String> = vault
+        .restricted
+        .iter()
+        .map(|code| match code.as_str() {
+            "US" => "US persons".to_string(),
+            "SANCTIONED" => "sanctioned persons".to_string(),
+            other => format!("persons in {other}"),
+        })
+        .collect();
+    if named.is_empty() {
+        "nobody is excluded".to_string()
+    } else {
+        named.join(", ")
+    }
 }
