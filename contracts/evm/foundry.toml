@@ -25,8 +25,9 @@ remappings = [
 [profile.default.fuzz]
 runs = 256
 
-# A longer soak, run by hand: `FOUNDRY_PROFILE=deep forge test`. The per-test
-# `default.` lines don't apply under it, so every test runs this many times.
+# A longer soak, run by hand: `FOUNDRY_PROFILE=deep forge test`. Fuzz tests
+# run this many times; the invariant suite and the bank run carry their own
+# `deep.` settings beside their `default.` ones.
 [profile.deep.fuzz]
 runs = 10_000
 

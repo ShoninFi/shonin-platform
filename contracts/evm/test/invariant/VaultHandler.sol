@@ -906,8 +906,10 @@ contract VaultHandler is Test {
             if (t <= block.timestamp) t = block.timestamp + 1;
             vm.warp(t.ceilDiv(SLOT) * SLOT);
             if (!station.stopped()) try station.stop() {} catch {}
-            (uint256 m,) = station.value();
-            if (m != 0) try station.unwind(WAD) {} catch {}
+            // A levered account can be worth nothing at mark and something
+            // at the bid: unwind whenever either side shows value.
+            (uint256 m, uint256 mx) = station.value();
+            if (m != 0 || mx != 0) try station.unwind(WAD) {} catch {}
             try vault.recordValuation() {} catch {}
             try vault.settle(type(uint256).max) {} catch {}
             still = false;
@@ -1328,8 +1330,8 @@ contract VaultHandler is Test {
                 return (true, "the station could not be stopped");
             }
         }
-        (uint256 m,) = station.value();
-        if (m != 0) {
+        (uint256 m, uint256 mx) = station.value();
+        if (m != 0 || mx != 0) {
             try station.unwind(WAD) returns (uint256, bool blocked) {
                 // A market that left the band since: nothing to judge.
                 if (blocked) return (false, "");
@@ -1391,11 +1393,14 @@ contract VaultHandler is Test {
                     // owes the holder nothing more: what came home is in the
                     // reserve they collect from.
                     (, uint256 left) = station.value();
-                    if (left == 0 && bytes4(reason) == IVault.NotYet.selector) continue;
-                    return (
-                        true,
-                        string.concat(vm.toString(h), "'s units could not be served: ", vm.toString(reason))
-                    );
+                    if (left != 0 || bytes4(reason) != IVault.NotYet.selector) {
+                        return (
+                            true,
+                            string.concat(
+                                vm.toString(h), "'s units could not be served: ", vm.toString(reason)
+                            )
+                        );
+                    }
                 }
             }
             (, uint256 claimable) = vault.unitsOf(h);

@@ -19,8 +19,10 @@ import {StdInvariant} from "forge-std/StdInvariant.sol";
 /// CI runs a short campaign per invariant, set below. Locally each was also
 /// run at 256 runs of 500 calls, by raising the two settings below.
 ///
-/// forge-config: default.invariant.runs = 64
-/// forge-config: default.invariant.depth = 250
+/// forge-config: default.invariant.runs = 128
+/// forge-config: default.invariant.depth = 400
+/// forge-config: deep.invariant.runs = 512
+/// forge-config: deep.invariant.depth = 1000
 contract VaultInvariantsTest is Fixture {
     address internal constant DEAD = 0x000000000000000000000000000000000000dEaD;
 

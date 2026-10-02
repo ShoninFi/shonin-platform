@@ -60,12 +60,18 @@ contract BankRunTest is Fixture {
         station.approveKey("local", executor);
     }
 
+    /// The withdrawals settled in the current slot: shares and what each was
+    /// paid, to compare their prices.
+    uint256[] internal slotShares;
+    uint256[] internal slotPaid;
+
     function rnd() internal returns (uint256) {
         return uint256(keccak256(abi.encode(seed, step++)));
     }
 
     /// Locally also run at 1000 runs, by raising the setting below.
     /// forge-config: default.fuzz.runs = 64
+    /// forge-config: deep.fuzz.runs = 5000
     function testFuzz_a_bank_run_pays_everyone_their_fraction(
         uint256 seed_,
         uint256 count,
@@ -214,7 +220,24 @@ contract BankRunTest is Fixture {
             uint256 paid = usd.balanceOf(r.owner) - before[id];
             assertLe(paid, shares * v.grossExit / v.supply + 1, "a leaver was paid above their fraction");
             settledExits++;
+            // Every withdrawal of one slot, the fee holders' too, is paid the
+            // same per share, up to the rounding of each payout: fee shares
+            // get no priority, and nobody is paid ahead of anyone else.
+            if (r.kind != RequestKind.Redeem || paid == 0) continue;
+            for (uint256 k = 0; k < slotShares.length; k++) {
+                uint256 x = paid * slotShares[k];
+                uint256 y = slotPaid[k] * shares;
+                assertLe(
+                    x > y ? x - y : y - x,
+                    3 * (shares + slotShares[k]),
+                    "two leavers of one slot were paid different prices"
+                );
+            }
+            slotShares.push(shares);
+            slotPaid.push(paid);
         }
+        delete slotShares;
+        delete slotPaid;
         assertGe(exitPerShare() * (1e9 + 1) / 1e9 + 1, stayers, "a stayer paid for someone's exit");
     }
 
