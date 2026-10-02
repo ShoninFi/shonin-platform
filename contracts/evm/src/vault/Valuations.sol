@@ -583,7 +583,11 @@ library Valuations {
         if ((!deposit && r.kind != RequestKind.Redeem) || r.done || msg.sender != r.owner) {
             revert IVault.NotAllowed();
         }
-        if (block.timestamp < r.earliest + s.timers.fallbackAfter || s.valuing()) revert IVault.NotYet();
+        // Nor while a priced valuation waits to settle: its withdrawals are
+        // paid from the cash first.
+        if (block.timestamp < r.earliest + s.timers.fallbackAfter || s.valuing() || owed(s)) {
+            revert IVault.NotYet();
+        }
         // A closing vault pays its holders through its own door.
         if (!deposit && s.readyToClose()) revert IVault.WrongState();
         // Not while a valuation could price it: the fallback is for when
@@ -663,7 +667,7 @@ library Valuations {
         uint256 assets = s.cash.mulDiv(shares, s.totalSupply + OFFSET);
         // The shares own what the units don't; these shares' part of that
         // is the leaver's for good, whatever fees are minted later.
-        uint256 fraction = shares.mulDiv(WAD - s.liveUnits(), s.totalSupply);
+        uint256 fraction = shares.mulDiv(WAD - s.liveUnits(), s.totalSupply + OFFSET);
         uint256 raw = fraction.mulDiv(WAD, s.scale());
         // The transaction fee stays in the pool, as for every other exit.
         uint256 kept = assets.mulDiv(s.fees.transactionBps, BPS, Math.Rounding.Ceil);

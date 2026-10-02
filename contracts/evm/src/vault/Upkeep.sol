@@ -9,6 +9,7 @@ import {
     Claim,
     ClaimState,
     IVault,
+    Request,
     RequestKind,
     Valuation,
     ValuationStatus,
@@ -397,9 +398,12 @@ library Upkeep {
         if (v.time <= s.haltedAt || !s.empty(v) || s.moving[s.lastPriced - 1]) {
             revert IVault.NotYet();
         }
-        if (s.valuations[s.valuations.length - 1].status == ValuationStatus.Open) revert IVault.Unsettled();
         s.passDone();
-        if (s.requestCursor != s.requests.length) revert IVault.Unsettled();
+        // What the last valuation priced is settled at its price; anything
+        // asked for after it is settled at the closed vault's (`settleClosed`).
+        if (s.valuations[s.valuations.length - 1].status == ValuationStatus.Open || Valuations.owed(s)) {
+            revert IVault.Unsettled();
+        }
         Valuations.syncHolding(s);
         Valuations.payday(s, s.cash + 1, s.totalSupply + OFFSET, uint64(block.timestamp));
         _setState(s, VaultState.Closed);
@@ -415,6 +419,32 @@ library Upkeep {
         emit IVault.Withdrawn(0, receiver, shares, assets, 0);
     }
 
+    /// A request nothing priced before the vault closed: a deposit goes back,
+    /// a withdrawal is paid as `redeemClosed` pays, a tank fill lapses, and a
+    /// claim's request is settled through `claimClosed`.
+    function settleClosed(uint256 requestId) external returns (uint256 assets) {
+        Layout storage s = VaultStorage.layout();
+        if (s.state != VaultState.Closed) revert IVault.WrongState();
+        Request storage r = s.requests[requestId - 1];
+        RequestKind kind = r.kind;
+        if (r.done || kind == RequestKind.Claim) revert IVault.NotAllowed();
+        r.done = true;
+        if (kind == RequestKind.Deposit) {
+            s.escrow -= r.amount;
+            s.pay(r.owner, r.amount);
+            emit IVault.Refunded(requestId, r.owner, r.amount);
+        } else if (kind == RequestKind.Redeem) {
+            assets = s.cash.mulDiv(r.amount, s.totalSupply);
+            s.pendingShares -= r.amount;
+            s.burn(address(this), r.amount);
+            s.cash -= assets;
+            s.pay(r.owner, assets);
+            emit IVault.Withdrawn(requestId, r.owner, r.amount, assets, 0);
+        } else if (r.ref == 1) {
+            s.tank.fillPending = false;
+        }
+    }
+
     function claimClosed(uint256 claimId) external returns (uint256 assets) {
         Layout storage s = VaultStorage.layout();
         if (s.state != VaultState.Closed) revert IVault.WrongState();
@@ -423,6 +453,7 @@ library Upkeep {
         if (state != ClaimState.Pending && state != ClaimState.Waiting && state != ClaimState.Queued) {
             revert IVault.NotAllowed();
         }
+        if (state == ClaimState.Queued) s.requests[s.claimRequest[claimId] - 1].done = true;
         assets = s.cash.mulDiv(claim.shares, s.totalSupply);
         s.pendingShares -= claim.shares;
         s.burn(address(this), claim.shares);

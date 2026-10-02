@@ -301,6 +301,9 @@ interface IVault is IStationVault {
     function freeze(uint256 claimId) external;
     function takeProRata(uint256 requestId) external;
     function takeProRataClaim(uint256 claimId) external;
+    /// A withdrawal nothing has priced for the fallback delay becomes a
+    /// claim, booked from when it was due.
+    function claimInstead(uint256 requestId) external returns (uint256 claimId);
     /// An unwinder's cost of bringing a claim's fraction home from another
     /// chain: taken from the leaver's payout and paid to `payTo`.
     function reportExitCost(
@@ -316,6 +319,9 @@ interface IVault is IStationVault {
     function serveProRata(address holder) external;
     function redeemClosed(uint256 shares, address receiver) external returns (uint256);
     function claimClosed(uint256 claimId) external returns (uint256);
+    /// A request nothing priced before the vault closed, settled at the
+    /// closed vault's price (a deposit is sent back).
+    function settleClosed(uint256 requestId) external returns (uint256);
     function collectHeld() external returns (uint256);
 
     // The tank

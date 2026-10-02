@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.30;
 
-import {ClaimState, Valuation} from "../src/interfaces/IVault.sol";
+import {ClaimState, IVault, Valuation} from "../src/interfaces/IVault.sol";
 import {ClaimBase} from "./ClaimBase.sol";
 
-/// The mark blend stays exact when a claim's close burns shares between a
-/// valuation's pricing and its settlement: the fee owed moves only by the
-/// profit fee on the transaction fee the leaver left in the pool.
-contract BlendAfterAClaimCloseTest is ClaimBase {
+/// A claim's close waits while a valuation's deposits are unsettled, so the
+/// mark blend is exact at the snapshot: the fee owed moves only by the
+/// profit fee on the transaction fee the depositor left in the pool.
+contract ClaimWaitsForPricedDepositsTest is ClaimBase {
     function netPerShare() internal view returns (uint256) {
         (uint256 markValue,) = station.value();
         uint256 total = vault.cash() + markValue + 1;
@@ -25,9 +25,7 @@ contract BlendAfterAClaimCloseTest is ClaimBase {
         return total > basis ? (total - basis) * 1500 / 10_000 : 0;
     }
 
-    function test_a_deposit_blends_the_mark_exactly_after_a_claim_closed_between_pricing_and_settlement()
-        public
-    {
+    function test_a_claim_waits_for_the_deposits_priced_before_it_and_the_blend_stays_exact() public {
         uint256 aliceShares = depositAs(vault, alice, 100_000e6);
         uint256 bobShares = depositAs(vault, bob, 100_000e6);
         deploySpot(190_000e6, 190_000e6, 3e18);
@@ -41,9 +39,8 @@ contract BlendAfterAClaimCloseTest is ClaimBase {
         // Bob's whole holding can't be paid from 10k: a claim.
         uint256 id = claimFor(bob, bobShares);
 
-        // Carol's deposit is priced at the next valuation; bob's claim is
-        // closed after that valuation is priced and before carol's deposit
-        // is settled.
+        // Carol's deposit is priced at the next valuation; bob's claim can't
+        // be closed until it is settled.
         bytes memory statement = statementBy(carolKey, address(vault), carol, vault.restrictedText());
         give(carol, 100_000e6);
         vm.startPrank(carol);
@@ -54,8 +51,8 @@ contract BlendAfterAClaimCloseTest is ClaimBase {
         vm.warp(t - (t % SLOT) + SLOT);
         vault.recordValuation();
         Valuation memory v = latest();
+        vm.expectRevert(IVault.NotYet.selector);
         vault.settleClaim(id);
-        assertTrue(vault.claimAt(id).state == ClaimState.Paid, "bob's claim did not close");
         uint256 feeBefore = feeOwed();
         uint256 aliceBefore = netPerShare();
         uint256 markBefore = vault.mark();
@@ -81,5 +78,9 @@ contract BlendAfterAClaimCloseTest is ClaimBase {
         uint256 expected = (100_000e6 - kept) * v.supply / net;
         assertApproxEqAbs(carolShares, expected, 1e6, "carol was not priced at the snapshot");
         aliceShares;
+
+        // Then bob's claim closes.
+        vault.settleClaim(id);
+        assertTrue(vault.claimAt(id).state == ClaimState.Paid, "bob's claim did not close");
     }
 }

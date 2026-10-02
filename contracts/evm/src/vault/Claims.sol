@@ -53,6 +53,10 @@ library Claims {
             }
         }
 
+        // Cash a priced withdrawal is to be paid from is not for a close's
+        // cash share: those are settled first.
+        if (Valuations.owed(s)) revert IVault.NotYet();
+
         // On a vault that trades on other chains a close here reaches only
         // this chain's station, while the leaver owns a share of every one:
         // the claim waits until the cash at home covers it.
@@ -134,6 +138,38 @@ library Claims {
         s.pay(claim.owner, payout);
         emit IVault.Withdrawn(0, claim.owner, shares, payout, 0);
         emit IVault.ClaimPaid(claimId, payout);
+    }
+
+    /// A withdrawal nothing has priced for `fallbackAfter` (a market outside
+    /// the band voids every valuation, say) may become a claim instead of
+    /// taking the fallback: served by a close, and counted toward a freeze
+    /// from when it was due to be priced.
+    function claimInstead(uint256 requestId) external returns (uint256 claimId) {
+        Layout storage s = VaultStorage.layout();
+        Request storage r = s.requests[requestId - 1];
+        if (r.kind != RequestKind.Redeem || r.done || msg.sender != r.owner) revert IVault.NotAllowed();
+        if (s.state == VaultState.Closed || s.state == VaultState.Cancelled || s.readyToClose()) {
+            revert IVault.WrongState();
+        }
+        if (block.timestamp < r.earliest + s.timers.fallbackAfter || s.valuing() || Valuations.owed(s)) {
+            revert IVault.NotYet();
+        }
+        if (s.lastPriced != 0 && s.latest().time >= r.earliest) revert IVault.NotAllowed();
+        r.done = true;
+        s.passDone();
+        // The shares stay pending, held by the vault, as a claim's are.
+        s.claims.push(
+            Claim({
+                owner: r.owner,
+                shares: r.amount,
+                bookedAt: r.earliest,
+                lastAttemptAt: 0,
+                state: ClaimState.Pending,
+                paid: 0
+            })
+        );
+        claimId = s.claims.length;
+        emit IVault.ClaimBooked(claimId, r.owner, r.amount);
     }
 
     /// A claim nothing has priced for `fallbackAfter` takes the pro-rata

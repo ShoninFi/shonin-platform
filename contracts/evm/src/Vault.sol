@@ -99,6 +99,14 @@ contract Vault is IVault, ReentrancyGuardTransient {
         Valuations.takeProRata(requestId);
     }
 
+    function claimInstead(uint256 requestId) external nonReentrant returns (uint256) {
+        return Claims.claimInstead(requestId);
+    }
+
+    function settleClosed(uint256 requestId) external nonReentrant returns (uint256) {
+        return Upkeep.settleClosed(requestId);
+    }
+
     function takeProRataClaim(uint256 claimId) external nonReentrant {
         Claims.takeProRataClaim(claimId);
     }

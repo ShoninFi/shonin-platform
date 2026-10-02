@@ -77,13 +77,13 @@ contract ClaimPropertiesTest is ClaimBase {
         assertSolvent("after the claim");
     }
 
-    // 2. A claim served between a priced valuation and its settlement --------
+    // 2. A claim tried between a priced valuation and its settlement --------
 
-    /// The leaver's close happens at spot while a deposit and a redeem are
-    /// already priced at the snapshot. The depositor's shares must still be
+    /// A deposit and a redeem are priced at the snapshot; the leaver's close
+    /// waits until they are settled. The depositor's shares must still be
     /// worth what they paid, the redeemer must get no more than their
     /// fraction, and the stayer's per-share worth must not drop.
-    function test_a_claim_served_between_a_valuation_and_its_settlement_cheats_nobody() public {
+    function test_a_claim_tried_between_a_valuation_and_its_settlement_waits_and_cheats_nobody() public {
         uint256 aliceShares = depositAs(vault, alice, 100_000e6);
         uint256 bobShares = depositAs(vault, bob, 100_000e6);
         uint256 carolShares = depositCarol(100_000e6);
@@ -106,16 +106,18 @@ contract ClaimPropertiesTest is ClaimBase {
         vm.warp(t - (t % SLOT) + SLOT);
         vault.recordValuation();
 
-        // Alice's claim is served now, at spot.
+        // Alice's claim waits for the snapshot to settle first.
+        vm.expectRevert(IVault.NotYet.selector);
+        vault.settleClaim(id);
+        uint256 bobFair = worth(bobShares / 10);
+        vault.settle(type(uint256).max);
+        uint256 bobPaid = usd.balanceOf(bob);
+
+        // Then it is served, at spot.
         uint256 carolBefore = perShare();
         vault.settleClaim(id);
         assertTrue(vault.claimAt(id).state == ClaimState.Paid);
         assertGe(perShare() + 1, carolBefore, "the stayer paid for the claim");
-
-        // Now the snapshot settles.
-        uint256 bobFair = worth(bobShares / 10);
-        vault.settle(type(uint256).max);
-        uint256 bobPaid = usd.balanceOf(bob);
         assertLe(bobPaid, bobFair + 1, "the redeemer was paid above their fraction");
         uint256 carolNew = vault.balanceOf(carol) - carolShares;
         assertApproxEqRel(worth(carolNew), 50_000e6 * 999 / 1000, 0.002e18, "the depositor's shares are off");

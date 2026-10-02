@@ -6,8 +6,8 @@ import {ClaimBase} from "./ClaimBase.sol";
 
 /// A closing vault pays its holders through its own door: a redeem asked
 /// for just before the valuation that finds the stations empty can't take
-/// the fee-free fallback; the next valuation prices it, fee and all, and the
-/// vault closes.
+/// the fallback and doesn't hold off the close; it is settled after the
+/// close at the closed vault's price, fee and all, as everyone else is.
 contract ClosingVaultRefusesTheFallbackTest is ClaimBase {
     function test_a_redeem_asked_just_before_the_empty_valuation_pays_the_fee() public {
         uint256 aliceShares = depositAs(vault, alice, 100_000e6);
@@ -43,28 +43,22 @@ contract ClosingVaultRefusesTheFallbackTest is ClaimBase {
         vm.prank(bob);
         vm.expectRevert(IVault.WrongState.selector);
         vault.requestRedeem(1, bob);
-        // ...and a claim's fallback would be refused. The close waits for
-        // her request.
-        vm.expectRevert(IVault.Unsettled.selector);
-        vault.close();
-
-        // A day passes with no valuation recorded. Her redeem's fallback is
-        // open: her fraction of the cash, no fee.
+        // ...her fallback is refused...
         skip(1 days + SLOT);
-        uint256 cash = vault.cash();
-        uint256 supply = vault.totalSupply();
         vm.prank(alice);
         vm.expectRevert(IVault.WrongState.selector);
         vault.takeProRata(id);
-        // The next valuation prices her redeem, fee and all.
-        value(vault);
-        uint256 paid = usd.balanceOf(alice);
-        emit log_named_uint("alice took through the fallback", paid);
-        emit log_named_uint("her fraction of the cash", cash * aliceShares / supply);
-
-        // Everyone else is paid after the close's payday.
+        // ...and her request doesn't hold off the close.
         vault.close();
         assertTrue(vault.state() == VaultState.Closed);
+        // Anyone settles it at the closed vault's price.
+        vault.settleClosed(id);
+        assertTrue(vault.requestAt(id).done);
+        uint256 paid = usd.balanceOf(alice);
+        vm.expectRevert(IVault.NotAllowed.selector);
+        vault.settleClosed(id);
+
+        // Bob, with the same shares, is paid through the closed door.
         uint256 bobShares = vault.balanceOf(bob);
         vm.prank(bob);
         vault.redeemClosed(bobShares, bob);
@@ -74,8 +68,8 @@ contract ClosingVaultRefusesTheFallbackTest is ClaimBase {
             "fee shares minted at the close", vault.balanceOf(author) + vault.balanceOf(platform)
         );
 
-        // Same shares, same cash: alice left with more than bob because she
-        // skipped the profit fee the close charged him.
-        assertLe(paid, bobPaid + 1, "a redeem's fallback while the vault was closing skipped the close's fee");
+        // One price for both, after the close's fee.
+        assertApproxEqRel(paid * bobShares, bobPaid * aliceShares, 1e9, "the two were paid different prices");
+        assertGt(vault.balanceOf(author) + vault.balanceOf(platform), 0, "the close charged no fee");
     }
 }

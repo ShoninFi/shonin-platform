@@ -353,7 +353,9 @@ contract Station is IStation, ReentrancyGuardTransient {
     }
 
     /// Make each call after checking where it goes; a call that fails stops
-    /// everything only if `strict`.
+    /// everything only if `strict`. Nothing a driver prepares reaches the
+    /// vault, the station itself, its factory or the registry, as a target
+    /// or as a spender, whatever the driver lists.
     function _call(Call[] memory calls, address[] memory targets, bool strict) private {
         address dollar = address(_asset());
         for (uint256 i = 0; i < calls.length; i++) {
@@ -364,10 +366,10 @@ contract Station is IStation, ReentrancyGuardTransient {
             if (c.target == dollar) {
                 if (c.data.length == 68 && bytes4(c.data) == APPROVE) {
                     (address spender,) = abi.decode(_args(c.data), (address, uint256));
-                    allowed = _includes(targets, spender);
+                    allowed = _includes(targets, spender) && !_ours(spender);
                 }
             } else {
-                allowed = _includes(targets, c.target);
+                allowed = _includes(targets, c.target) && !_ours(c.target);
             }
             if (!allowed) {
                 if (strict) revert BadCall();
@@ -380,6 +382,11 @@ contract Station is IStation, ReentrancyGuardTransient {
                 }
             }
         }
+    }
+
+    function _ours(address target) private view returns (bool) {
+        return target == _spec.vault || target == address(this) || target == address(factory)
+            || target == address(_registry());
     }
 
     function _args(bytes memory data) private pure returns (bytes memory args) {
