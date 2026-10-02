@@ -229,7 +229,8 @@ library Valuations {
     /// Whether a priced valuation still has requests waiting on it. A new
     /// valuation waits until they are settled, so each prices only its own.
     function owed(Layout storage s) internal view returns (bool) {
-        if (s.lastPriced == 0) return false;
+        // A closed vault settles what is left through its own doors.
+        if (s.lastPriced == 0 || s.state == VaultState.Closed) return false;
         uint256 i = s.requestCursor;
         if (i == s.requests.length) return false;
         Request storage r = s.requests[i];

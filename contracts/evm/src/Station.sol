@@ -38,6 +38,9 @@ contract Station is IStation, ReentrancyGuardTransient {
     /// A stopped station's full unwind keeps the exit band this long after
     /// the stop, then the band doubles each time this passes again.
     uint64 public constant WIDEN_AFTER = 7 days;
+    /// What each step of a best-effort revoke may spend: far more than a
+    /// venue's revoke costs, far less than a block.
+    uint256 private constant BEST_EFFORT_GAS = 1_000_000;
     bytes4 private constant APPROVE = IERC20.approve.selector;
 
     IStationFactory public factory;
@@ -435,8 +438,10 @@ contract Station is IStation, ReentrancyGuardTransient {
             _call(implementation.revokeKey(address(this), key), implementation.targets(), true);
             return;
         }
-        try implementation.revokeKey(address(this), key) returns (Call[] memory calls) {
-            try implementation.targets() returns (address[] memory targets) {
+        // Each step gets a bounded budget, so a driver that burns its gas
+        // can't keep a station from stopping.
+        try implementation.revokeKey{gas: BEST_EFFORT_GAS}(address(this), key) returns (Call[] memory calls) {
+            try implementation.targets{gas: BEST_EFFORT_GAS}() returns (address[] memory targets) {
                 _call(calls, targets, false);
             } catch {}
         } catch {}
@@ -497,7 +502,9 @@ contract Station is IStation, ReentrancyGuardTransient {
                 if (strict) revert BadCall();
                 continue;
             }
-            (bool ok, bytes memory reason) = c.target.call{value: c.value}(c.data);
+            (bool ok, bytes memory reason) = strict
+                ? c.target.call{value: c.value}(c.data)
+                : c.target.call{value: c.value, gas: BEST_EFFORT_GAS}(c.data);
             if (!ok && strict) {
                 assembly {
                     revert(add(reason, 32), mload(reason))

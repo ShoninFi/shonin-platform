@@ -2,7 +2,9 @@
 pragma solidity ^0.8.30;
 
 import {IStation} from "../interfaces/IStation.sol";
-import {Claim, ClaimState, IVault, Request, RequestKind, VaultState} from "../interfaces/IVault.sol";
+import {
+    Claim, ClaimState, IVault, Request, RequestKind, Valuation, VaultState
+} from "../interfaces/IVault.sol";
 import {Valuations} from "./Valuations.sol";
 import {Layout, VaultStorage} from "./VaultStorage.sol";
 import {Math} from "openzeppelin/utils/math/Math.sol";
@@ -75,17 +77,27 @@ library Claims {
         if (fraction == 0) fraction = 1;
         uint256 cashShare = s.cash.mulDiv(shares, supply);
 
-        // A station that can't be valued is never judged to hold dust.
+        // What the stations hold, at the mark now and as the last priced
+        // valuation counted them, whichever is more: a bid pushed for one
+        // block can't make a claim look like dust. A station that can't be
+        // valued is never judged to hold dust.
         uint256 stationsBefore = type(uint256).max / WAD;
-        try IStation(s.homeStation).value() returns (uint256, uint256 exit) {
-            stationsBefore = exit;
+        try IStation(s.homeStation).value() returns (uint256 mark, uint256) {
+            stationsBefore = mark;
+            if (s.lastPriced != 0) {
+                Valuation storage last = s.latest();
+                uint256 counted = last.gross - 1 - last.cash;
+                if (counted > stationsBefore) stationsBefore = counted;
+            }
         } catch {}
-        (uint256 home, bool blocked) = _close(s, fraction);
+        (uint256 home, bool blocked, bool failed) = _close(s, fraction);
         // A claim worth fewer dollar-units at the stations than they have
         // parts brings nothing home however often it is closed: it is dust,
         // paid its cash share and done, so it can't hold a vault open or
-        // freeze it.
-        if (!blocked && home == 0 && stationsBefore.mulDiv(fraction, WAD) <= s.drivers.length + 1) {
+        // freeze it. Only a close that went through can show that; one that
+        // failed proves nothing.
+        if (!failed && !blocked && home == 0 && stationsBefore.mulDiv(fraction, WAD) <= s.drivers.length + 1)
+        {
             _pay(s, claim, claimId, cashShare);
             emit IVault.ClaimTried(claimId, false);
             return;
@@ -112,11 +124,16 @@ library Claims {
     /// proceeds a venue keeps as margin leave it undone or the venue refuses
     /// it outright, sells nothing and brings nothing home: it is not a try,
     /// and the claim waits as it was, however often it is tried.
-    function _close(Layout storage s, uint256 fraction) private returns (uint256 home, bool blocked) {
+    function _close(
+        Layout storage s,
+        uint256 fraction
+    ) private returns (uint256 home, bool blocked, bool failed) {
         s.closing = true;
         try IStation(s.homeStation).unwind(fraction) returns (uint256 sent, bool outside) {
             (home, blocked) = (sent, outside);
-        } catch {}
+        } catch {
+            failed = true;
+        }
         s.closing = false;
     }
 
