@@ -95,6 +95,12 @@ contract LocalDriver is IDriver {
                 ? market.oracle.mulDiv(BPS - bandBps, BPS, Math.Rounding.Ceil)
                 : market.oracle.mulDiv(BPS + bandBps, BPS, Math.Rounding.Floor);
             if (isLong ? market.bid < limit : market.ask > limit) return (new Call[](0), true);
+            // Nor while the venue's mark, which values the position, sits
+            // further from its own price than the band on either side: a
+            // valuation there would price everyone at a mark nobody trusts.
+            uint256 low = market.oracle.mulDiv(BPS - bandBps, BPS, Math.Rounding.Ceil);
+            uint256 high = market.oracle.mulDiv(BPS + bandBps, BPS, Math.Rounding.Floor);
+            if (market.mark < low || market.mark > high) return (new Call[](0), true);
 
             orders[count++] = OrderRequest({
                 market: held[i],

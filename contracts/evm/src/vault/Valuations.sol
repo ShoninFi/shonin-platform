@@ -126,7 +126,7 @@ library Valuations {
             })
         );
         if (missing == 0) {
-            price(s, count);
+            _priceOrVoid(s, count);
         } else {
             s.openUnits = units;
             s.sendsAtOpen = IStation(s.homeStation).sendCount();
@@ -190,7 +190,7 @@ library Valuations {
         Valuation storage v = s.valuations[index];
         if (v.time != time || v.status != ValuationStatus.Open) revert IVault.NotAllowed();
         if (block.timestamp <= time + s.timers.postDeadline) revert IVault.NotYet();
-        if (v.postsMissing != 0) {
+        if (v.postsMissing != 0 || s.wide[index]) {
             v.status = ValuationStatus.Void;
             emit IVault.ValuationVoided(index, time);
             return;
@@ -263,6 +263,19 @@ library Valuations {
         if (!registry.isBlessedFor(signer, block.chainid, address(this), s.bundleHash)) return false;
         ImageKind kind = registry.keyInfo(signer).kind;
         return kind == ImageKind.Unwinder || (!unwinderOnly && kind == ImageKind.Executor);
+    }
+
+    /// Price a single-chain valuation, or void it when a market was outside
+    /// the band: such a valuation prices nothing at all (no deposit, no
+    /// withdrawal, no fill, no payday), and its requests roll on.
+    function _priceOrVoid(Layout storage s, uint256 index) private {
+        if (s.wide[index]) {
+            Valuation storage v = s.valuations[index];
+            v.status = ValuationStatus.Void;
+            emit IVault.ValuationVoided(index, v.time);
+            return;
+        }
+        price(s, index);
     }
 
     /// Fix the valuation's prices: run payday if it is due, then snapshot.
@@ -382,16 +395,15 @@ library Valuations {
 
     function _settleOne(Layout storage s, Request storage r, uint256 id, uint256 index) private {
         Valuation storage v = s.valuations[index];
-        bool wide = s.wide[index];
         RequestKind kind = r.kind;
         if (kind == RequestKind.Deposit) {
             _deposit(s, r, id, v, s.depositExtra[index], s.depositFee[index]);
         } else if (kind == RequestKind.Redeem) {
-            _redeem(s, r, id, v, wide);
+            _redeem(s, r, id, v);
         } else if (kind == RequestKind.Claim) {
-            _claim(s, r, id, v, wide);
+            _claim(s, r, id, v);
         } else {
-            _fill(s, r, v, wide);
+            _fill(s, r, v);
         }
     }
 
@@ -461,16 +473,10 @@ library Valuations {
         s.burn(from, burned);
     }
 
-    function _redeem(
-        Layout storage s,
-        Request storage r,
-        uint256 id,
-        Valuation storage v,
-        bool wide
-    ) private {
+    function _redeem(Layout storage s, Request storage r, uint256 id, Valuation storage v) private {
         uint256 shares = r.amount;
         (uint256 slice, uint256 burned, uint256 payout) = exitOf(s, v, shares);
-        if (!wide && payout <= s.free()) {
+        if (payout <= s.free()) {
             s.pendingShares -= shares;
             _distribute(s, address(this), slice, burned);
             s.cash -= payout;
@@ -478,10 +484,8 @@ library Valuations {
             emit IVault.Withdrawn(id, r.owner, shares, payout, slice);
             return;
         }
-        // The cash can't pay it, or a market sat outside the exit band at the
-        // valuation: a claim, its shares still pending and still outstanding,
-        // served by a close inside the band or priced again once the market
-        // is back.
+        // The cash can't pay it: a claim, its shares still pending and still
+        // outstanding, served by a close inside the band.
         s.claims.push(
             Claim({
                 owner: r.owner,
@@ -498,19 +502,13 @@ library Valuations {
     /// A claim the cash covered when it was tried, priced like any
     /// withdrawal. If the cash no longer covers it, it waits to be tried
     /// again: nothing was closed for it.
-    function _claim(
-        Layout storage s,
-        Request storage r,
-        uint256 id,
-        Valuation storage v,
-        bool wide
-    ) private {
+    function _claim(Layout storage s, Request storage r, uint256 id, Valuation storage v) private {
         Claim storage claim = s.claims[r.ref - 1];
         if (claim.state != ClaimState.Queued) return;
         s.queuedClaims -= 1;
         uint256 shares = claim.shares;
         (uint256 slice, uint256 burned, uint256 payout) = exitOf(s, v, shares);
-        if (wide || payout > s.cash) {
+        if (payout > s.cash) {
             claim.state = ClaimState.Pending;
             emit IVault.ClaimTried(r.ref, true);
             return;
@@ -529,13 +527,13 @@ library Valuations {
     /// The author's shares, redeemed into the tank like any withdrawal, from
     /// cash only, and never as a claim: what the cash or the shares don't
     /// cover is simply not filled.
-    function _fill(Layout storage s, Request storage r, Valuation storage v, bool wide) private {
+    function _fill(Layout storage s, Request storage r, Valuation storage v) private {
         address author = s.author;
         uint256 shares = r.amount;
-        if (r.ref == 1) s.tank.fillPending = false;
-        // Not at a price the vault would refuse to sell at.
-        if (wide) return;
-        if (r.ref == 1) shares = _sharesFor(s, v, r.amount);
+        if (r.ref == 1) {
+            s.tank.fillPending = false;
+            shares = _sharesFor(s, v, r.amount);
+        }
         uint256 held = s.balanceOf[author];
         if (shares > held) shares = held;
         if (shares == 0) return;
@@ -644,7 +642,7 @@ library Valuations {
     function proRata(Layout storage s, address owner, uint256 shares) internal {
         // The holding fee up to now falls on every share, the leaver's too.
         syncHolding(s);
-        uint256 assets = s.cash.mulDiv(shares, s.totalSupply);
+        uint256 assets = s.cash.mulDiv(shares, s.totalSupply + OFFSET);
         // The shares own what the units don't; these shares' part of that
         // is the leaver's for good, whatever fees are minted later.
         uint256 fraction = shares.mulDiv(WAD - s.liveUnits(), s.totalSupply);
@@ -699,8 +697,16 @@ library Valuations {
         // worth nothing and can be cleared.
         // Units worth less than one unit of the dollar are worth nothing and
         // are cleared rather than left to block the station.
-        bool worthSomething = exitBefore.mulDiv(fraction, WAD) != 0;
-        if (blocked || (home == 0 && (worthSomething || s.otherChains.length != 0))) revert IVault.NotYet();
+        // Judged on every station: this one now, and all of them as the
+        // last valuation counted them.
+        uint256 stations = exitBefore;
+        if (s.lastPriced != 0) {
+            Valuation storage last = s.latest();
+            uint256 counted = last.grossExit - 1 - last.cash;
+            if (counted > stations) stations = counted;
+        }
+        bool worthSomething = stations.mulDiv(fraction, WAD) != 0;
+        if (blocked || (home == 0 && worthSomething)) revert IVault.NotYet();
         _accrue(s, holder);
         s.units -= raw;
         s.unitsOf[holder] = 0;

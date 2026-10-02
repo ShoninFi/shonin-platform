@@ -179,66 +179,30 @@ contract ClaimPathPropertiesTest is ClaimBase {
 
     // 5. A dust claim under the band rule holds pulls for one slot only ------
 
-    function test_a_dust_claim_blocks_the_stations_pulls_for_one_slot_only() public {
-        depositAs(vault, alice, 100_000e6);
-        depositAs(vault, bob, 100_000e6);
-        deploySpot(100_000e6, 100_000e6, 1.5e18);
-        vm.prank(alice);
-        vault.requestRedeem(1, alice);
-        setPrice(SPOT, PRICE, 2000); // wide at the valuation
-        value(vault);
-        assertEq(vault.claimCount(), 1, "a wide valuation did not book the dust claim");
-        setPrice(SPOT, PRICE, 0);
-
-        vault.settleClaim(1);
-        assertTrue(vault.claimAt(1).state == ClaimState.Queued);
-        vm.prank(executor);
-        vm.expectRevert(IVault.WrongState.selector);
-        station.pull(1);
-
-        value(vault);
-        assertTrue(vault.claimAt(1).state == ClaimState.Paid, "a dust claim never clears");
-        vm.prank(executor);
-        station.pull(1);
-    }
-
     // 6. The band rule: re-queued claims and the exits that stay shut --------
 
     /// A market the strategy keeps wide (a small position in a market with
-    /// a 30% spread) makes every valuation wide: no withdrawal is paid from
-    /// cash, every redeem is a claim, and each queued claim is sent back.
-    /// The freeze clock runs from the booking, though, so a week on anyone
-    /// can freeze the vault: no strategy keeps a leaver out for good.
-    function test_a_strategy_holding_a_wide_market_cannot_keep_a_leaver_out_for_more_than_a_week() public {
+    /// a 30% spread) makes every valuation price nothing; but with nothing
+    /// priced for a day the pro-rata fallback opens, so no strategy keeps a
+    /// leaver out: she takes her share of the cash and units for the rest.
+    function test_a_strategy_holding_a_wide_market_cannot_keep_a_leaver_out() public {
         uint256 aliceShares = depositAs(vault, alice, 100_000e6);
         depositAs(vault, bob, 100_000e6);
-        // 95% of the pool is cash; 5% is at the venue in a market whose
-        // spread is 30% around an honest mark.
         deploySpot(10_000e6, 10_000e6, 0.16e18); // 9.6k of BTC, 400 of venue cash
         setPrice(SPOT, PRICE, 3000);
-        (uint256 markValue, uint256 exitValue) = station.value();
-        assertLt(exitValue, markValue * 99 / 100, "the station is not wide");
+        assertTrue(station.outsideBand(), "the station is not wide");
 
         vm.prank(alice);
-        vault.requestRedeem(aliceShares, alice);
-        value(vault);
-        assertEq(vault.claimCount(), 1, "alice was paid from cash at a wide valuation");
-        assertEq(usd.balanceOf(alice), 0);
-
-        // Anyone re-queues her claim each day, and every valuation sends it
-        // back; but the freeze clock runs from her booking, so a week on
-        // anyone freezes the vault, whatever was tried meanwhile.
-        for (uint256 day = 0; day < 6; day++) {
-            vault.settleClaim(1);
-            assertTrue(vault.claimAt(1).state == ClaimState.Queued, "a queue was refused");
-            skip(1 days);
+        uint256 id = vault.requestRedeem(aliceShares, alice);
+        for (uint256 i = 0; i < 3; i++) {
             value(vault);
-            assertTrue(vault.claimAt(1).state == ClaimState.Pending, "paid through a wide market");
-            vm.expectRevert(IVault.NotYet.selector);
-            vault.freeze(1);
+            assertEq(usd.balanceOf(alice), 0, "alice was paid at a wide valuation");
         }
         skip(1 days);
-        vault.freeze(1);
-        assertTrue(vault.state() == VaultState.Frozen, "a strategy held a leaver's exit shut for good");
+        vm.prank(alice);
+        vault.takeProRata(id);
+        assertApproxEqRel(usd.balanceOf(alice), 95_000e6, 0.001e18, "she didn't get her share of the cash");
+        (uint256 units,) = vault.unitsOf(alice);
+        assertApproxEqRel(units, 0.5e18, 0.001e18, "she didn't get units for her share of the station");
     }
 }

@@ -28,11 +28,14 @@ contract NoClaimClosesInThePostWindowTest is TwoChainVault {
         closeAfterDeadline(time);
         assertApproxEqRel(vault.sharePrice(), priceBefore, 0.0001e18, "the price moved");
 
-        // Once it is closed, the claim is served and paid; bob's price is
-        // where it was.
+        // Once it is closed, and the cash is home to cover it, the claim is
+        // queued and paid at the next valuation; bob's price is where it was.
+        vm.prank(executor);
+        station.push(190_000e6);
         vault.settleClaim(1);
-        assertTrue(vault.claimAt(1).state == ClaimState.Paid);
+        assertTrue(vault.claimAt(1).state == ClaimState.Queued);
         valueWith(0, 0);
+        assertTrue(vault.claimAt(1).state == ClaimState.Paid);
         assertApproxEqRel(usd.balanceOf(alice), 100_000e6, 0.01e18);
         // It can only rise: the transaction fee she paid stays in the pool.
         assertGe(vault.sharePrice(), priceBefore, "bob paid for alice's close");

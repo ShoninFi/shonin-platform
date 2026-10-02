@@ -14,21 +14,18 @@ contract DustUnitsAreClearedTest is ClaimBase {
         deploySpot(100_000e6, 100_000e6, 1.5e18);
 
         // Bob asks to redeem a sliver of shares: a fraction of the station
-        // worth a tenth of one unit of the dollar.
+        // worth a tenth of one unit of the dollar. The market stays outside
+        // the band for a day, so nothing prices it, and he takes the
+        // fallback: cash and dust units.
         uint256 dust = vault.totalSupply() / 1e12;
         vm.prank(bob);
-        vault.requestRedeem(dust, bob);
-        // The slot that prices it finds the market wide, so it is a claim.
+        uint256 id = vault.requestRedeem(dust, bob);
         setPrice(SPOT, PRICE, 2000);
         value(vault);
-        setPrice(SPOT, PRICE, 0);
-        assertEq(vault.claimCount(), 1, "the dust redeem was not booked as a claim");
-
-        // A day on, he takes the claim's fallback and holds dust units.
-        skip(24 hours);
-        vault.settleClaim(1);
+        skip(1 days);
         vm.prank(bob);
-        vault.takeProRataClaim(1);
+        vault.takeProRata(id);
+        setPrice(SPOT, PRICE, 0);
         (uint256 units,) = vault.units();
         assertGt(units, 0, "no units were minted");
 

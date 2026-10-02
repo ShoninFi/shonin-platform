@@ -53,6 +53,14 @@ library Claims {
             }
         }
 
+        // On a vault that trades on other chains a close here reaches only
+        // this chain's station, while the leaver owns a share of every one:
+        // the claim waits until the cash at home covers it.
+        if (s.otherChains.length != 0) {
+            claim.state = ClaimState.Waiting;
+            emit IVault.ClaimTried(claimId, true);
+            return;
+        }
         // The holding fee up to now falls on every share, the leaver's too.
         Valuations.syncHolding(s);
         uint256 supply = s.totalSupply + VaultStorage.OFFSET;
@@ -134,6 +142,11 @@ library Claims {
         Layout storage s = VaultStorage.layout();
         Claim storage claim = s.claims[claimId - 1];
         if (msg.sender != claim.owner) revert IVault.NotAllowed();
+        // A vault that is closing or closed pays its claims from the closed
+        // vault (`claimClosed`), fees stopped.
+        if (s.state == VaultState.Closed || s.state == VaultState.Cancelled || s.readyToClose()) {
+            revert IVault.WrongState();
+        }
         ClaimState state = claim.state;
         if (state != ClaimState.Pending && state != ClaimState.Waiting && state != ClaimState.Queued) {
             revert IVault.NotAllowed();

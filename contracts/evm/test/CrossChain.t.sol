@@ -371,7 +371,16 @@ contract CrossChainTest is Fixture {
         assertEq(cost, 10e6);
         assertEq(payTo, payee);
 
+        // On a vault with stations elsewhere a claim waits for the cash: the
+        // strategy brings it home, the claim queues, and the next valuation
+        // pays it, less the exit cost.
         vault.settleClaim(1);
+        assertTrue(vault.claimAt(1).state == ClaimState.Waiting);
+        vm.prank(executor);
+        station.push(190_000e6);
+        vault.settleClaim(1);
+        assertTrue(vault.claimAt(1).state == ClaimState.Queued);
+        valueWith(0, 0);
         assertTrue(vault.claimAt(1).state == ClaimState.Paid);
         assertEq(usd.balanceOf(payee), 10e6);
         assertEq(vault.claimAt(1).paid, usd.balanceOf(alice));

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.30;
 
-import {ClaimState, Valuation} from "../src/interfaces/IVault.sol";
+import {ClaimState, Valuation, ValuationStatus} from "../src/interfaces/IVault.sol";
 import {ClaimBase} from "./ClaimBase.sol";
 
 /// Nobody is paid at a price the vault would refuse to sell at. When a
@@ -35,20 +35,13 @@ contract NobodyPaidOutsideTheBandTest is ClaimBase {
         // would be refused at this price.
         setPrice(SPOT, PRICE, 2000);
         value(vault);
-        Valuation memory v = latest();
-        assertEq(v.gross, v.cash + 100_000e6 + 1, "the mark side moved");
-        assertLt(v.grossExit, v.gross * (BPS - vault.exitBandBps()) / BPS, "the exit side is inside the band");
-
-        // She is not paid at that price: her withdrawal waits as a claim.
-        assertEq(vault.claimCount(), 1, "she was paid outside the band");
+        // That valuation prices nothing: she is not paid at that price.
+        assertTrue(latest().status == ValuationStatus.Void, "a valuation outside the band was priced");
         assertEq(usd.balanceOf(alice), 0);
 
-        // The spread closes again; the claim, which the cash covers, is
-        // priced at the next valuation and pays her fraction.
+        // The spread closes again, and the next valuation pays her fraction.
         setPrice(SPOT, PRICE, 0);
-        vault.settleClaim(1);
         value(vault);
-        assertTrue(vault.claimAt(1).state == ClaimState.Paid);
         uint256 paid = usd.balanceOf(alice);
         assertApproxEqRel(paid, 100_000e6 * 999 / 1000, 0.001e18);
         assertGe(worth(bobShares) + 1e6, bobBefore, "the holder who stayed paid for her exit");
