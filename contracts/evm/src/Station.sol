@@ -337,7 +337,8 @@ contract Station is IStation, ReentrancyGuardTransient {
             IBridge(implementation).targets()
         );
         _sends.push(Send({toChain: toChain, amount: amount, sentAt: uint64(block.timestamp)}));
-        emit Bridged(name, _sends.length, toChain, amount);
+        // Numbered from zero, as `sendAt` and a post's in-flight list name it.
+        emit Bridged(name, _sends.length - 1, toChain, amount);
     }
 
     function _sendHome(uint256 amount) private {

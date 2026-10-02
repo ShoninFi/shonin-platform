@@ -62,7 +62,14 @@ contract FallbackBesideACashOnlyClaimTest is TwoChainVault {
         emit log_named_uint("bob's total with his units", bobTotal);
         emit log_named_uint("bob's third of the vault", bobFair);
         assertApproxEqRel(bobTotal, bobFair, 0.001e18, "bob left with less than his fraction");
-        assertEq(paid, fair, "the fallback left the cash-only claim's set-aside cash out of what it shares");
+        // Less only the holding fee up to the moment he left.
+        assertApproxEqRel(
+            paid,
+            fair,
+            0.0001e18,
+            "the fallback left the cash-only claim's set-aside cash out of what it shares"
+        );
+        assertLe(paid, fair);
     }
 
     /// Mirror of `Valuations.exitOf(...).payout` at the latest valuation.

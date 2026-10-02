@@ -19,6 +19,13 @@ contract UnitsKeepTheirFractionTest is Fixture {
         station = stationOf(vault);
     }
 
+    /// Move to the first Monday after the last payday, never backwards: if
+    /// that Monday has passed, the next valuation is payday anyway.
+    function toPayday() internal {
+        uint256 monday = nextMondayAfter(vault.lastPayment()) + 1;
+        if (monday > vm.getBlockTimestamp()) vm.warp(monday);
+    }
+
     function nextMondayAfter(uint256 t) internal pure returns (uint256) {
         uint256 day = t / 1 days;
         return (day - ((day + 3) % 7)) * 1 days + 7 days;
@@ -42,10 +49,10 @@ contract UnitsKeepTheirFractionTest is Fixture {
         assertLt(units, 0.51e18);
 
         // The station gains 30k, and payday comes.
-        vm.warp(nextMondayAfter(vault.lastPayment()) + 1);
+        toPayday();
         value(vault);
         give(address(station), 30_000e6);
-        vm.warp(nextMondayAfter(vault.lastPayment()) + 1);
+        toPayday();
         value(vault);
         assertGt(vault.balanceOf(author), 0, "the profit fee was paid in shares");
 

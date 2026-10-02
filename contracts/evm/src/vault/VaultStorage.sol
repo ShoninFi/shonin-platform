@@ -22,8 +22,9 @@ struct Post {
     bool posted;
     uint256 mark;
     uint256 exit;
-    /// How far the exit side sat above the mark: what a deposit pays on top.
-    uint256 extra;
+    /// The highest deposit-side figure any post gave: its mark plus how far
+    /// its exit side sat above it.
+    uint256 top;
 }
 
 /// Everything a vault holds, in one place, so the vault and the libraries it
@@ -98,6 +99,9 @@ struct Layout {
     /// valuation: a deposit pays it, so it can't buy below what the holdings
     /// could be sold for. Fees and withdrawals never count it.
     mapping(uint256 => uint256) depositExtra;
+    /// The profit fee a deposit at each valuation is priced net of, fixed
+    /// when it is priced, so every deposit in it pays the same price.
+    mapping(uint256 => uint256) depositFee;
     mapping(uint256 => mapping(uint256 => Post)) posts;
     /// The open valuation's unit fraction and when it was recorded, so the
     /// posts that complete it are counted as of the same moment.
@@ -226,8 +230,10 @@ library VaultStorage {
     function nextMonday(uint256 t) internal pure returns (uint256) {
         uint256 day = t / 1 days;
         // The first of January 1970 was a Thursday, three days after a Monday.
-        uint256 monday = (day - ((day + 3) % 7)) * 1 days;
-        return monday + 7 days;
+        // Days since the Monday before it, counted so the first week can't
+        // underflow on a chain whose clock starts near zero.
+        uint256 sinceMonday = day + 3;
+        return (sinceMonday - (sinceMonday % 7) + 4) * 1 days;
     }
 
     function live(Layout storage s) internal view returns (bool) {

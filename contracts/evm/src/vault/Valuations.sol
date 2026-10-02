@@ -170,10 +170,10 @@ library Valuations {
             p.posted = true;
             p.mark = markValue;
             p.exit = exitValue;
-            p.extra = extra;
+            p.top = markValue + extra;
             v.postsMissing -= 1;
         } else {
-            if (extra > p.extra) p.extra = extra;
+            if (markValue + extra > p.top) p.top = markValue + extra;
             if (markValue > p.mark) p.mark = markValue;
             if (exitValue < p.exit) p.exit = exitValue;
         }
@@ -200,7 +200,7 @@ library Valuations {
         for (uint256 i = 0; i < chains.length; i++) {
             Post storage p = s.posts[index][chains[i]];
             v.gross += p.mark.mulDiv(keep, WAD);
-            s.depositExtra[index] += p.extra.mulDiv(keep, WAD);
+            s.depositExtra[index] += (p.top - p.mark).mulDiv(keep, WAD);
             v.grossExit += p.exit.mulDiv(keep, WAD);
         }
         price(s, index);
@@ -279,6 +279,8 @@ library Valuations {
         v.supply = supply;
         v.fee = s.feeOf(gross, supply);
         v.feeExit = s.feeOf(v.grossExit, supply);
+        uint256 extra = s.depositExtra[index];
+        if (extra != 0) s.depositFee[index] = s.feeOf(gross + extra, supply);
         v.status = ValuationStatus.Priced;
         s.lastPriced = index + 1;
         emit IVault.Valued(index, v.time, gross, v.grossExit, supply, v.fee);
@@ -383,7 +385,7 @@ library Valuations {
         bool wide = s.wide[index];
         RequestKind kind = r.kind;
         if (kind == RequestKind.Deposit) {
-            _deposit(s, r, id, v, s.depositExtra[index]);
+            _deposit(s, r, id, v, s.depositExtra[index], s.depositFee[index]);
         } else if (kind == RequestKind.Redeem) {
             _redeem(s, r, id, v, wide);
         } else if (kind == RequestKind.Claim) {
@@ -398,7 +400,8 @@ library Valuations {
         Request storage r,
         uint256 id,
         Valuation storage v,
-        uint256 extra
+        uint256 extra,
+        uint256 depositFee
     ) private {
         uint256 assets = r.amount;
         s.escrow -= assets;
@@ -410,7 +413,7 @@ library Valuations {
             return;
         }
         uint256 gross = v.gross + extra;
-        uint256 net = gross - (extra == 0 ? v.fee : s.feeOf(gross, v.supply));
+        uint256 net = gross - (extra == 0 ? v.fee : depositFee);
         uint256 shares =
             (assets - assets.mulDiv(s.fees.transactionBps, BPS, Math.Rounding.Ceil)).mulDiv(v.supply, net);
         if (shares == 0) {
@@ -639,6 +642,8 @@ library Valuations {
     /// No fee: nothing can be priced. The leaver's units are a claim on
     /// their fraction of whatever the stations hold.
     function proRata(Layout storage s, address owner, uint256 shares) internal {
+        // The holding fee up to now falls on every share, the leaver's too.
+        syncHolding(s);
         uint256 assets = s.cash.mulDiv(shares, s.totalSupply);
         // The shares own what the units don't; these shares' part of that
         // is the leaver's for good, whatever fees are minted later.
@@ -692,7 +697,10 @@ library Valuations {
         // from a station that held something, or from a vault whose stations
         // are elsewhere too, is not a serve. Units of an empty station are
         // worth nothing and can be cleared.
-        if (blocked || (home == 0 && (exitBefore != 0 || s.otherChains.length != 0))) revert IVault.NotYet();
+        // Units worth less than one unit of the dollar are worth nothing and
+        // are cleared rather than left to block the station.
+        bool worthSomething = exitBefore.mulDiv(fraction, WAD) != 0;
+        if (blocked || (home == 0 && (worthSomething || s.otherChains.length != 0))) revert IVault.NotYet();
         _accrue(s, holder);
         s.units -= raw;
         s.unitsOf[holder] = 0;
@@ -715,7 +723,9 @@ library Valuations {
         // are owed part of what is out (sending more would need a price), or
         // while a claim's cash is home waiting to be priced: taking it back
         // out would leave the claim unpaid.
-        if (!s.live() || s.halted() || s.units != 0 || s.queuedClaims != 0 || s.valuing()) {
+        // Nor between a valuation and its settlement: cash its withdrawals
+        // were priced to be paid from stays home until they are.
+        if (!s.live() || s.halted() || s.units != 0 || s.queuedClaims != 0 || s.valuing() || owed(s)) {
             revert IVault.WrongState();
         }
         // The stations as last valued, the cash as it is now, and what was

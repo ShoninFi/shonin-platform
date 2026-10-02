@@ -30,7 +30,7 @@ contract FillNeverExceedsCashTest is Fixture {
         payout = gross - gross.mulDiv(vault.fees().transactionBps, 10_000, Math.Rounding.Ceil);
     }
 
-    function test_a_short_tank_fill_can_block_the_queue_for_good() public {
+    function testFuzz_a_short_tank_fill_never_pays_more_than_the_cash(uint256 short) public {
         depositAs(vault, author, 100_000e6);
         depositAs(vault, alice, 100_000e6);
 
@@ -39,36 +39,20 @@ contract FillNeverExceedsCashTest is Fixture {
         vm.prank(author);
         vault.topUpFromShares(shares);
 
-        // The valuation that prices it is recorded, not yet settled.
+        // Leave the vault just short of what the fill would pay, by any amount
+        // up to 40k units, so the fill is scaled down to the cash.
+        Valuation memory v = vault.valuationAt(vault.valuationCount() - 1);
+        uint256 payout = exitOf(v, shares);
+        uint256 cash = payout - bound(short, 1, 40_000);
+        uint256 surplus = vault.cash() - cash;
+        vm.prank(executor);
+        station.pull(surplus);
+        assertEq(vault.cash(), cash);
+
+        // It settles for no more than the cash, and the queue moves on.
         uint256 t = vm.getBlockTimestamp();
         vm.warp(t - (t % SLOT) + SLOT);
         vault.recordValuation();
-        Valuation memory v = vault.valuationAt(vault.valuationCount() - 1);
-        uint256 payout = exitOf(v, shares);
-
-        // Look for a cash amount just under the payout for which the
-        // scaled-down fill pays more than the cash.
-        uint256 cash;
-        bool found;
-        for (uint256 d = 1; d < 40_000; d++) {
-            cash = payout - d;
-            uint256 scaled = shares.mulDiv(cash, payout);
-            if (exitOf(v, scaled) > cash) {
-                found = true;
-                break;
-            }
-        }
-        assertTrue(found, "no overshooting cash value within 40k units of the payout");
-
-        // Put exactly that much cash in the vault (the 5% floor is ~10k).
-        uint256 now_ = vault.cash();
-        assertGt(now_, cash);
-        vm.prank(executor);
-        station.pull(now_ - cash);
-        assertEq(vault.cash(), cash);
-
-        // A fill the cash can't cover settles for what the cash covers, and
-        // never stops the queue.
         vault.settle(1);
         assertLe(vault.tank().balance - MINIMUM_TANK + DEAD_ASSETS, cash, "the fill paid more than the cash");
         vm.warp(vm.getBlockTimestamp() + SLOT);
