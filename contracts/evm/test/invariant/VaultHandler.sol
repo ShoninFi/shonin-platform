@@ -14,6 +14,7 @@ import {ImageKind} from "../../src/interfaces/IAttestationRegistry.sol";
 import {Call, Custody, ExitPath, IBridge, IDriver, ValuationKind} from "../../src/interfaces/IDriver.sol";
 import {ILocalVenue, Market, OrderRequest} from "../../src/interfaces/ILocalVenue.sol";
 import {Allowances, UnitPrices} from "../../src/interfaces/IPrices.sol";
+import {IStation} from "../../src/interfaces/IStation.sol";
 import {
     ClaimState,
     IVault,
@@ -313,6 +314,21 @@ contract VaultHandler is Test {
     mapping(uint256 => address) internal claimOwner;
     mapping(uint256 => uint256) internal claimShares;
     mapping(address => uint256) internal redeeming;
+    /// Who paid each deposit, when it wasn't the receiver named: a deposit
+    /// sent back goes to them.
+    mapping(uint256 => address) internal paidBy;
+    /// When the station stopped and when the author asked for the tank's
+    /// escape, as the handler saw those calls go through: the band a
+    /// stopped station closes inside and the window the escape opens in
+    /// follow from these alone.
+    uint64 internal stoppedAtBooks;
+    uint64 internal escapeAskedBooks;
+    /// Since when each holder's units have waited to be served: from the
+    /// fallback's events, cleared by the serves the handler made.
+    mapping(address => uint64) internal unitsSinceBooks;
+    /// The unit reserve as the vault's own events tell it: what came home
+    /// for units, less what their holders collected.
+    uint256 public unitReserveBooks;
 
     /// One payment out of the vault: to whom and how much.
     struct Payment {
@@ -343,6 +359,13 @@ contract VaultHandler is Test {
     uint256 public floorBreaks;
     uint256 public adminBreaks;
     uint256 public graceBreaks;
+    /// A valuation priced with a market outside the band, a close made
+    /// through one, or a stopped station's band other than the time since
+    /// the stop gives.
+    uint256 public bandBreaks;
+    /// A freeze, a stopped unwind or the tank's escape that opened when it
+    /// shouldn't or stayed shut when it should have opened.
+    uint256 public lifecycleBreaks;
     string public lastBreak;
 
     /// How often each action got through, for tuning the walk; names that
@@ -472,9 +495,10 @@ contract VaultHandler is Test {
 
     // Grouped actions ------------------------------------------------------------
 
-    /// The executor: pull, push, the venue account, orders, and unwinding.
+    /// The executor: pull, push, the venue account, orders, unwinding, and
+    /// leaving a speck at the venue.
     function executorAct(uint256 op, uint256 a, uint256 b) public {
-        uint256 k = op % 12;
+        uint256 k = op % 14;
         if (k <= 2) {
             // Put cash to work: pull it, move it to the venue and buy.
             _pull(a);
@@ -495,14 +519,18 @@ contract VaultHandler is Test {
             _venueWithdraw(a);
         } else if (k <= 10) {
             _trade(b % 2 == 0, (b >> 1) % 2 == 0, a, (b >> 2) % 4 == 0);
-        } else {
+        } else if (k == 11) {
             _executorUnwind(a);
+        } else if (k == 12) {
+            _leaveDust(a);
+        } else {
+            _leverUp(a);
         }
     }
 
     /// Claims, the fallbacks, freezing and units.
     function claimAct(uint256 op, uint256 seed, bool flag) public {
-        uint256 k = op % 14;
+        uint256 k = op % 15;
         if (k <= 2) {
             _settleClaim(seed);
         } else if (k == 3) {
@@ -524,10 +552,12 @@ contract VaultHandler is Test {
             _warp(1, 0);
             if (flag) _takeProRata(vault.requestCount());
             else _claimInstead(vault.requestCount());
-        } else {
+        } else if (k == 13) {
             // A claim nobody could serve for a day takes the fallback.
             _warp(1, 0);
             _takeProRataClaim(seed);
+        } else {
+            _freezeUnits(seed, flag);
         }
     }
 
@@ -544,16 +574,18 @@ contract VaultHandler is Test {
         else _setIdleFloor(a);
     }
 
-    /// Retiring, evicting, killing, stopping, unwinding and closing.
+    /// Retiring, evicting, killing, stopping, unwinding (all of it, or by
+    /// the drivers named) and closing.
     function lifecycleAct(uint256 op, uint256 seed) public {
-        uint256 k = op % 7;
+        uint256 k = op % 8;
         if (k == 0) _retire(seed);
         else if (k == 1) _evict();
         else if (k == 2) _kill(seed);
         else if (k == 3) _stopStation();
         else if (k == 4) _unwindStation();
         else if (k == 5) _windDown(seed);
-        else _close();
+        else if (k == 6) _close();
+        else _unwindStoppedByName(seed);
     }
 
     /// A closed vault's doors, and payouts held for a refusing receiver.
@@ -584,21 +616,27 @@ contract VaultHandler is Test {
 
     // Depositors ----------------------------------------------------------------
 
-    /// Ask to deposit, signing the statement or not, or for a receiver who
-    /// never signed (which must be refused).
+    /// Ask to deposit, signing the statement or not, for a receiver who
+    /// never signed (which must be refused), or paying for another holder
+    /// who has.
     function requestDeposit(uint256 who, uint256 amount, uint8 mode) public {
         address a = _actor(who);
         amount = _bound(amount, 1e6, 300_000e6);
         _begin();
-        address receiver = mode % 16 == 15 ? stranger : a;
-        bytes memory statement = mode % 3 == 0 || receiver == stranger ? bytes("") : _statement(a);
+        address receiver = mode % 16 == 15 ? stranger : mode % 16 == 14 ? _actor(who % actors.length + 1) : a;
+        bytes memory statement = mode % 3 == 0 || receiver != a ? bytes("") : _statement(a);
         usd.mint(a, amount);
         vm.startPrank(a);
         usd.approve(address(vault), amount);
         try vault.requestDeposit(amount, receiver, statement) returns (uint256 id) {
             _entitle(a);
             _noteAsk(id, receiver, amount, RequestKind.Deposit);
-            _hit("requestDeposit");
+            if (receiver != a) {
+                paidBy[id] = a;
+                _hit("requestDeposit for another");
+            } else {
+                _hit("requestDeposit");
+            }
         } catch {}
         vm.stopPrank();
         _end(true, "requestDeposit");
@@ -690,23 +728,35 @@ contract VaultHandler is Test {
 
     // Time ---------------------------------------------------------------------
 
-    /// A few seconds to a few days, sometimes straight across a Monday. The
-    /// executor renews its blessing and its venue approval.
+    /// A few seconds to a couple of weeks, sometimes straight across a
+    /// Monday. The executor renews its blessing and its venue approval.
     function _warp(uint256 kind, uint256 amount) internal {
-        _begin();
         uint256 t = block.timestamp;
-        uint256 k = kind % 5;
+        uint256 k = kind % 7;
         if (k == 0) {
-            vm.warp(t + _bound(amount, 1, 1 hours));
+            _jump(t + _bound(amount, 1, 1 hours));
         } else if (k == 1) {
-            vm.warp(t + 1 days + SLOT);
+            _jump(t + 1 days + SLOT);
         } else if (k == 2) {
-            vm.warp(_nextMonday(t) + _bound(amount, 0, 2 hours));
+            _jump(_nextMonday(t) + _bound(amount, 0, 2 hours));
         } else if (k == 3) {
-            vm.warp(t + 3 days);
+            _jump(t + 3 days);
+        } else if (k == 4) {
+            _jump(t + 10 minutes + 1);
+        } else if (k == 5) {
+            // A week and a bit: a stopped station's band widens, units
+            // nobody served can freeze the vault.
+            _jump(t + 7 days + SLOT);
         } else {
-            vm.warp(t + 10 minutes + 1);
+            _jump(t + 15 days);
         }
+    }
+
+    /// Move to `to`, renew the executor's blessing and venue approval, and
+    /// judge the step.
+    function _jump(uint256 to) internal {
+        _begin();
+        vm.warp(to);
         _renew();
         _hit("warp");
         _end(true, "warp");
@@ -715,8 +765,9 @@ contract VaultHandler is Test {
     // The market ---------------------------------------------------------------
 
     /// Move both markets: inside the exit band, with the bid outside it,
-    /// with the venue's mark off its own price, or with the bid above the
-    /// mark.
+    /// with the venue's mark off its own price, with the bid above the mark
+    /// but inside the band, with both sides pushed up past the band, or
+    /// with the ask alone past it.
     function movePrice(uint256 moveBps, bool up, uint256 spreadBps, uint8 mode) public {
         _begin();
         moveBps = _bound(moveBps, 0, 800);
@@ -724,7 +775,7 @@ contract VaultHandler is Test {
         if (p < START_PRICE / 2) p = START_PRICE / 2;
         if (p > START_PRICE * 2) p = START_PRICE * 2;
         price = p;
-        uint256 m = mode % 8;
+        uint256 m = mode % 10;
         uint256 mark = p;
         uint256 bid;
         uint256 ask;
@@ -738,9 +789,17 @@ contract VaultHandler is Test {
         } else if (m == 6) {
             mark = p * (BPS + _bound(spreadBps, 120, 400)) / BPS;
             (bid, ask) = (p, p);
-        } else {
+        } else if (m == 7) {
             bid = p * (BPS + _bound(spreadBps, 1, 80)) / BPS;
             ask = bid + p / 1000;
+        } else if (m == 8) {
+            // A bid pushed up past the band for a block: a leaver must not
+            // be paid it, nor a deposit charged it.
+            bid = p * (BPS + _bound(spreadBps, 120, 400)) / BPS;
+            ask = bid + p / 1000;
+        } else {
+            bid = p;
+            ask = p * (BPS + _bound(spreadBps, 120, 400)) / BPS;
         }
         vm.startPrank(operator);
         venue.setPrices(SPOT, mark, p, bid, ask);
@@ -756,14 +815,19 @@ contract VaultHandler is Test {
     function _pull(uint256 pct) internal {
         _begin();
         bool calm = still;
-        // The executor settles what is owed first: nothing leaves while a
-        // priced valuation waits.
-        try vault.settle(type(uint256).max) {} catch {}
+        // Usually the executor settles what is owed first; sometimes it
+        // doesn't, and then nothing may leave while a priced valuation's
+        // requests wait, by the handler's own reading of the queue.
+        if (pct % 2 == 0) try vault.settle(type(uint256).max) {} catch {}
+        bool waiting = _pricedRequestsWait();
         uint256 amount = vault.cash() * _bound(pct, 1, 100) / 100;
         uint256 floor = _floorFor(vault.cash());
         vm.prank(trader);
         try station.pull(amount) {
             _hit(trader == executor ? bytes32("pull") : bytes32("pull by an admin's key"));
+            if (waiting) {
+                _moneyBreak("pull: cash went out to the station while a priced valuation waited to settle");
+            }
             if (floor != 0 && vault.cash() < floor + floor / 50) _hit("~pull near the floor");
             // The home station can't pull cash below the idle floor.
             if (vault.cash() < floor) {
@@ -779,6 +843,19 @@ contract VaultHandler is Test {
             }
         } catch {}
         _end(calm, "pull");
+    }
+
+    /// Whether a request the last priced valuation is to settle is still
+    /// waiting: one not yet done, due at or before that valuation's time.
+    function _pricedRequestsWait() internal view returns (bool) {
+        if (lastPricedIndex == 0 || vault.state() == VaultState.Closed) return false;
+        uint64 time = vault.valuationAt(lastPricedIndex - 1).time;
+        uint256 n = vault.requestCount();
+        for (uint256 id = 1; id <= n; id++) {
+            Request memory r = vault.requestAt(id);
+            if (!r.done && r.earliest <= time) return true;
+        }
+        return false;
     }
 
     /// The idle floor in force, measured on the pool's value as the handler
@@ -870,19 +947,196 @@ contract VaultHandler is Test {
         _end(false, "executorUnwind");
     }
 
+    /// The executor puts most of the cash to work and levers the book: spot
+    /// bought outright with most of the venue's cash and a perp at two to
+    /// four times the equity beside it, so the account runs a margin debt
+    /// and a claim's close meets it.
+    function _leverUp(uint256 seed) internal {
+        if (station.stopped() || !_venueSolvent()) return;
+        _begin();
+        try vault.settle(type(uint256).max) {} catch {}
+        vm.startPrank(trader);
+        uint256 amount = vault.cash() * _bound(seed, 50, 90) / 100;
+        try station.pull(amount) {} catch {}
+        uint256 idle = usd.balanceOf(address(station));
+        if (idle != 0) try station.deposit("local", idle) {} catch {}
+        int256 cash = venue.cashOf(address(station));
+        if (cash > 0) {
+            OrderRequest[] memory orders = new OrderRequest[](2);
+            orders[0] = OrderRequest({
+                market: SPOT,
+                isBuy: true,
+                size: uint256(cash) * 40 / 100 * 1e18 / price,
+                limitPrice: type(uint256).max,
+                reduceOnly: false
+            });
+            orders[1] = OrderRequest({
+                market: PERP,
+                isBuy: true,
+                size: uint256(cash) * (2 + seed % 3) * 1e18 / price,
+                limitPrice: type(uint256).max,
+                reduceOnly: false
+            });
+            try venue.place(address(station), orders) {} catch {}
+        }
+        vm.stopPrank();
+        still = false;
+        _hit(venue.cashOf(address(station)) < 0 ? bytes32("leverUp into margin debt") : bytes32("leverUp"));
+        _end(false, "leverUp");
+    }
+
+    /// The executor sells everything, brings the venue's cash out, and
+    /// leaves a speck there: a couple of dollar-units of cash and a position
+    /// worth one, which a fractional close leaves where it is. Half the time
+    /// the idle dollars go home too, so a claim is worth dust at the
+    /// stations and is paid its cash share and done.
+    function _leaveDust(uint256 seed) internal {
+        if (station.stopped() || !_venueSolvent()) return;
+        _begin();
+        vm.startPrank(trader);
+        bytes32[2] memory markets = [SPOT, PERP];
+        OrderRequest[] memory orders = new OrderRequest[](2);
+        uint256 n;
+        for (uint256 i = 0; i < 2; i++) {
+            int256 size = venue.positionOf(address(station), markets[i]).size;
+            if (size == 0) continue;
+            orders[n++] = OrderRequest({
+                market: markets[i],
+                isBuy: size < 0,
+                size: uint256(size < 0 ? -size : size),
+                limitPrice: size < 0 ? type(uint256).max : 0,
+                reduceOnly: true
+            });
+        }
+        if (n != 0) {
+            assembly {
+                mstore(orders, n)
+            }
+            try venue.place(address(station), orders) {} catch {}
+        }
+        int256 cash = venue.cashOf(address(station));
+        if (cash > 0) try station.withdraw("local", uint256(cash)) {} catch {}
+        if (usd.balanceOf(address(station)) >= 2) {
+            try station.deposit("local", 2) {
+                OrderRequest[] memory speck = new OrderRequest[](1);
+                speck[0] = OrderRequest({
+                    market: SPOT,
+                    isBuy: true,
+                    size: 1e18 / price,
+                    limitPrice: type(uint256).max,
+                    reduceOnly: false
+                });
+                try venue.place(address(station), speck) {} catch {}
+            } catch {}
+        }
+        uint256 idle = usd.balanceOf(address(station));
+        if (seed % 2 == 0 && idle != 0) try station.push(idle) {} catch {}
+        vm.stopPrank();
+        still = false;
+        _hit("leaveDust");
+        _end(false, "leaveDust");
+    }
+
     // Claims and the fallback --------------------------------------------------
 
+    /// What a claim's close is about to meet, read before it is tried: the
+    /// positions and cash at the venue, whether a market sits outside the
+    /// band, the venue account's worth, and what the station itself would
+    /// answer the close with (run on a copy of the chain and thrown away).
+    struct CloseProbe {
+        ClaimState state;
+        uint256 fraction;
+        uint256 spot;
+        uint256 perp;
+        int256 venueCash;
+        bool wide;
+        bool debt;
+        uint256 venueMark;
+        bytes4 answer;
+    }
+
+    /// The keeper tries a claim that can be closed, settling what is owed
+    /// first as a keeper does.
     function _settleClaim(uint256 seed) internal {
-        uint256 id = _openClaim(seed);
+        uint256 id = _closableClaim(seed);
         if (id == 0) return;
+        _begin();
+        try vault.settle(type(uint256).max) {} catch {}
+        _end(still, "settle before a claim");
+        CloseProbe memory p = _probeClose(vault.claimAt(id).shares);
+        p.state = vault.claimAt(id).state;
         _begin();
         vm.prank(keeper);
         try vault.settleClaim(id) {
             _hit("settleClaim");
+            ClaimState after_ = vault.claimAt(id).state;
+            bool paid = after_ == ClaimState.Paid;
+            if (p.state != ClaimState.Queued && paid) {
+                _checkSold(p, "settleClaim", "a claim's close");
+                if (p.venueMark != 0 && p.venueMark <= 2 && _unsold(p)) _hit("~dustSkipped");
+                if (_unsold(p)) _hit("~claimDust");
+            } else {
+                if (after_ == ClaimState.Queued) {
+                    _hit("~claimQueued");
+                } else if (p.answer == IStation.ShortSweep.selector) {
+                    _hit(p.debt ? bytes32("~marginDebtUndone") : bytes32("~shortSweepUndone"));
+                } else if (p.wide) {
+                    _hit("~claimWaitsForTheBand");
+                } else {
+                    _hit("~claimWaits");
+                }
+                // A close that was blocked, undone or refused sold nothing.
+                if (!_unsold(p)) {
+                    _moneyBreak("settleClaim: a close that paid nobody sold something");
+                }
+            }
         } catch {
             _dropReverted();
         }
         _end(true, "settleClaim");
+    }
+
+    /// Everything a close of `shares` is about to meet. The station's own
+    /// answer is read on a copy of the chain, from the vault's seat.
+    function _probeClose(uint256 shares) internal returns (CloseProbe memory p) {
+        (uint256 units,) = vault.units();
+        p.fraction = shares.mulDiv(WAD - units, vault.totalSupply() + OFFSET);
+        if (p.fraction > WAD) p.fraction = WAD;
+        if (p.fraction == 0) p.fraction = 1;
+        (p.spot, p.perp) = _sizes();
+        p.venueCash = venue.cashOf(address(station));
+        p.debt = p.venueCash < 0;
+        p.wide = _marketOutsideBand(vault.exitBandBps());
+        p.venueMark = venue.accountValue(address(station));
+        uint256 snap = vm.snapshotState();
+        vm.prank(address(vault));
+        try station.unwind(p.fraction) returns (uint256, bool blocked) {
+            p.answer = blocked ? bytes4("band") : bytes4("sold");
+        } catch (bytes memory reason) {
+            p.answer = bytes4(reason);
+        }
+        vm.revertToStateAndDelete(snap);
+    }
+
+    /// A close that paid its leaver sold at most their fraction of each
+    /// position, and never through a market outside the band.
+    function _checkSold(CloseProbe memory p, string memory what, string memory which) internal {
+        if (p.wide && !_unsold(p)) {
+            bandBreaks++;
+            _break(string.concat(what, ": ", which, " went through a market outside the band"));
+        }
+        (uint256 spot, uint256 perp) = _sizes();
+        if (
+            spot + _ceilFraction(p.spot, p.fraction) < p.spot
+                || perp + _ceilFraction(p.perp, p.fraction) < p.perp
+        ) {
+            _moneyBreak(string.concat(what, ": ", which, " sold more than the leaver's fraction"));
+        }
+    }
+
+    function _unsold(CloseProbe memory p) internal view returns (bool) {
+        (uint256 spot, uint256 perp) = _sizes();
+        return spot == p.spot && perp == p.perp && venue.cashOf(address(station)) == p.venueCash;
     }
 
     function _claimInstead(uint256 seed) internal {
@@ -899,16 +1153,26 @@ contract VaultHandler is Test {
         _end(true, "claimInstead");
     }
 
+    /// A request's owner takes the fallback. A deposit goes back this way
+    /// only while nothing could price it: a market outside the band, by the
+    /// handler's own reading of the venue.
     function _takeProRata(uint256 seed) internal {
         uint256 id = _openRequest(seed);
         if (id == 0) return;
+        bool deposit = askedKind[id] == RequestKind.Deposit;
+        bool priceable = !_marketOutsideBand(vault.exitBandBps());
         _begin();
         (stepPayee, stepRequest) = (askedBy[id], id);
         vm.prank(vault.requestAt(id).owner);
         try vault.takeProRata(id) {
-            _hit("takeProRata");
+            _hit(deposit ? bytes32("takeProRata deposit") : bytes32("takeProRata"));
+            if (deposit && priceable) {
+                bandBreaks++;
+                _break("takeProRata: a deposit went back while a valuation could have priced it");
+            }
         } catch {
             _dropReverted();
+            if (deposit && priceable) _hit("~depositFallbackRefusedPriceable");
         }
         _end(true, "takeProRata");
     }
@@ -940,16 +1204,60 @@ contract VaultHandler is Test {
         _end(true, "freeze");
     }
 
-    /// Serve a unit holder, asked by them or by anyone.
+    /// Units nobody served for the freeze period let anyone freeze the
+    /// vault, and nothing else does: it goes through exactly when the
+    /// holder's units have waited that long by the handler's own clock and
+    /// the vault is live and unhalted. Sometimes the wait is made first.
+    function _freezeUnits(uint256 who, bool wait) internal {
+        address a = _unitHolder(who);
+        if (a == address(0)) a = _actor(who);
+        uint64 since = unitsSinceBooks[a];
+        uint64 freezeAfter = vault.timers().freezeAfter;
+        if (wait && since != 0 && block.timestamp < since + freezeAfter) _jump(since + freezeAfter + 1);
+        bool live = vault.state() == VaultState.Open || vault.state() == VaultState.WindingDown;
+        bool due = since != 0 && block.timestamp >= since + freezeAfter;
+        bool expected = due && live && vault.haltedAt() == 0;
+        _begin();
+        vm.prank(keeper);
+        try vault.freezeUnits(a) {
+            _hit("freezeUnits");
+            if (!expected || vault.state() != VaultState.Frozen) {
+                lifecycleBreaks++;
+                _break("freezeUnits: the vault froze for units that hadn't waited the freeze period");
+            }
+        } catch {
+            _dropReverted();
+            if (expected) {
+                lifecycleBreaks++;
+                _break("freezeUnits: units nobody served for the freeze period could not freeze the vault");
+            }
+        }
+        _end(true, "freezeUnits");
+    }
+
+    /// Serve a unit holder, asked by them or by anyone. A serve that went
+    /// through sold at most the holder's fraction, and never through a
+    /// market outside the band; one refused sold nothing.
     function _serveProRata(uint256 who, bool byHolder) internal {
         address a = _unitHolder(who);
         if (a == address(0)) return;
+        (uint256 fraction,) = vault.unitsOf(a);
+        CloseProbe memory p;
+        p.fraction = fraction > WAD ? WAD : fraction == 0 ? 1 : fraction;
+        (p.spot, p.perp) = _sizes();
+        p.venueCash = venue.cashOf(address(station));
+        p.wide = _marketOutsideBand(vault.exitBandBps());
         _begin();
         vm.prank(byHolder ? a : keeper);
         try vault.serveProRata(a) {
             _hit("serveProRata");
+            unitsSinceBooks[a] = 0;
+            _checkSold(p, "serveProRata", "a serve");
+            if (_unsold(p)) _hit("~unitsDust");
         } catch {
             _dropReverted();
+            if (!_unsold(p)) _moneyBreak("serveProRata: a serve that was refused sold something");
+            _hit(p.wide ? bytes32("~serveWaitsForTheBand") : bytes32("~serveWaits"));
         }
         _end(true, "serveProRata");
     }
@@ -1043,18 +1351,38 @@ contract VaultHandler is Test {
     }
 
     /// The escape for a vault with no executor running: ask, wait a day,
-    /// withdraw unsigned.
+    /// withdraw unsigned within the day after. By the handler's own clock
+    /// it opens exactly then (at once on a closed or cancelled vault), and
+    /// is shut before and after.
     function _withdrawTankUnsigned(uint256 amount, bool ask) internal {
         _begin();
         vm.startPrank(author);
         if (ask) {
             try vault.requestTankWithdrawal() {
+                escapeAskedBooks = uint64(block.timestamp);
                 _hit("requestTankWithdrawal");
             } catch {}
         } else {
+            VaultState state = vault.state();
+            bool over = state == VaultState.Closed || state == VaultState.Cancelled;
+            uint256 delay = vault.timers().tankEscapeDelay;
+            bool lapsed = escapeAskedBooks != 0 && block.timestamp > escapeAskedBooks + 2 * delay;
+            bool open =
+                over || (escapeAskedBooks != 0 && block.timestamp >= escapeAskedBooks + delay && !lapsed);
             try vault.withdrawTankUnsigned(_bound(amount, 0, 100e6)) {
-                _hit("withdrawTankUnsigned");
-            } catch {}
+                _hit(over ? bytes32("withdrawTankUnsigned closed") : bytes32("withdrawTankUnsigned"));
+                if (!open) {
+                    tankBreaks++;
+                    _break("withdrawTankUnsigned: the tank's escape opened outside its window");
+                }
+                if (!over) escapeAskedBooks = 0;
+            } catch {
+                if (open) {
+                    tankBreaks++;
+                    _break("withdrawTankUnsigned: the tank's escape stayed shut inside its window");
+                }
+                if (lapsed) _hit("~escapeLapsed");
+            }
         }
         vm.stopPrank();
         _end(true, "withdrawTankUnsigned");
@@ -1133,6 +1461,7 @@ contract VaultHandler is Test {
                 graceBreaks++;
                 _break("the station stopped inside the halt's grace");
             }
+            stoppedAtBooks = uint64(block.timestamp);
             _hit("stopStation");
         } catch {}
         _end(true, "stopStation");
@@ -1140,13 +1469,86 @@ contract VaultHandler is Test {
 
     /// Anyone may unwind a stopped station, all of it.
     function _unwindStation() internal {
+        CloseProbe memory p = _probeFullUnwind();
         _begin();
         vm.prank(keeper);
-        try station.unwind(WAD) {
+        try station.unwind(WAD) returns (uint256, bool blocked) {
             still = false;
             _hit("unwindStation");
+            _checkFullUnwind(p, blocked, "unwindStation");
         } catch {}
         _end(false, "unwindStation");
+    }
+
+    /// Anyone may unwind a stopped station through the drivers they name,
+    /// or bring only its idle dollars home by naming none.
+    function _unwindStoppedByName(uint256 seed) internal {
+        bytes32[] memory names = new bytes32[](seed % 3 == 0 ? 0 : 1);
+        if (names.length != 0) names[0] = seed % 5 == 0 ? bytes32("other") : bytes32("local");
+        CloseProbe memory p = _probeFullUnwind();
+        bool stopped = station.stopped();
+        uint256 idle = usd.balanceOf(address(station));
+        uint256 cash = vault.cash();
+        _begin();
+        vm.prank(keeper);
+        try station.unwindStopped(names) returns (uint256 sentHome, bool blocked) {
+            still = false;
+            if (!stopped) {
+                lifecycleBreaks++;
+                _break("unwindStopped: a station that hadn't stopped was unwound by name");
+            }
+            if (names.length == 0) {
+                _hit("unwindStopped idle only");
+                // Only the idle dollars: the venue is untouched and every
+                // one of them came home.
+                if (!_unsold(p) || sentHome != idle || usd.balanceOf(address(station)) != 0) {
+                    _moneyBreak("unwindStopped: naming no driver moved other than the idle dollars");
+                }
+            } else {
+                _hit("unwindStopped by name");
+                _checkFullUnwind(p, blocked, "unwindStopped");
+            }
+            if (vault.cash() < cash) _moneyBreak("unwindStopped: the unwind took cash from the vault");
+        } catch {
+            if (stopped && names.length != 0 && names[0] == "other") _hit("~unwindStopped undeclared");
+        }
+        _end(false, "unwindStopped");
+    }
+
+    /// What a stopped station's full unwind meets: the band widened by the
+    /// time since the stop, by the handler's own clock, and whether the
+    /// market sits outside it.
+    function _probeFullUnwind() internal view returns (CloseProbe memory p) {
+        p.fraction = WAD;
+        (p.spot, p.perp) = _sizes();
+        p.venueCash = venue.cashOf(address(station));
+        uint16 band = station.stopped() ? _stoppedBandBooks() : vault.exitBandBps();
+        p.wide = _marketOutsideBand(band);
+        p.debt = band > vault.exitBandBps();
+    }
+
+    /// A full unwind of a stopped station closes everything when the market
+    /// is inside the band as it has widened, and nothing when it isn't.
+    function _checkFullUnwind(CloseProbe memory p, bool blocked, string memory what) internal {
+        if (!station.stopped()) return;
+        bool open = p.spot != 0 || p.perp != 0;
+        (uint256 spot, uint256 perp) = _sizes();
+        if (p.wide) {
+            if (!blocked || spot != p.spot || perp != p.perp) {
+                bandBreaks++;
+                _break(string.concat(what, ": a stopped station sold through a market outside its band"));
+            }
+            _hit(p.debt ? bytes32("~stoppedUnwindBlockedWidened") : bytes32("~stoppedUnwindBlocked"));
+        } else if (open) {
+            if (blocked || spot != 0 || perp != 0) {
+                bandBreaks++;
+                _break(string.concat(what, ": a stopped station inside its band left positions open"));
+            }
+            _hit(p.debt ? bytes32("~stoppedUnwindWidened") : bytes32("~stoppedUnwind"));
+        }
+        if (!blocked && usd.balanceOf(address(station)) != 0) {
+            _moneyBreak(string.concat(what, ": a stopped station's unwind left idle dollars behind"));
+        }
     }
 
     /// The whole way down in one step: halt if it isn't, wait out the
@@ -1163,7 +1565,11 @@ contract VaultHandler is Test {
             uint256 t = halted + vault.haltGrace();
             if (t <= block.timestamp) t = block.timestamp + 1;
             vm.warp(t.ceilDiv(SLOT) * SLOT);
-            if (!station.stopped()) try station.stop() {} catch {}
+            if (!station.stopped()) {
+                try station.stop() {
+                    stoppedAtBooks = uint64(block.timestamp);
+                } catch {}
+            }
             // A levered account can be worth nothing at mark and something
             // at the bid: unwind whenever either side shows value.
             (uint256 m, uint256 mx) = station.value();
@@ -1183,15 +1589,15 @@ contract VaultHandler is Test {
     }
 
     /// The keeper closes the vault. The dead shares' part goes to the
-    /// author's tank: never more than they owned of the cash before the
-    /// close's payday minted anything.
+    /// author's tank: exactly their part of the cash as it stood, on the
+    /// supply the close's payday left (what remains plus the dead shares
+    /// burned), and the dead shares are gone.
     uint256 internal deadPartAtClose;
 
     function _closeVault() internal returns (bool closed) {
         uint256 tankBefore = vault.tank().balance;
         uint256 cashBefore = vault.cash();
         uint256 dead = vault.balanceOf(DEAD);
-        uint256 supply = vault.totalSupply();
         vm.prank(keeper);
         try vault.close() {
             closed = true;
@@ -1201,9 +1607,18 @@ contract VaultHandler is Test {
         uint256 added = vault.tank().balance - tankBefore;
         tankIn += added;
         deadPartAtClose = added;
-        if (added > cashBefore.mulDiv(dead, supply) || vault.balanceOf(DEAD) != 0) {
+        if (added != 0) _hit("~deadSharesToTank");
+        uint256 theirs = dead == 0 ? 0 : cashBefore.mulDiv(dead, vault.totalSupply() + dead);
+        if (added != theirs || vault.balanceOf(DEAD) != 0) {
             tankBreaks++;
-            _break("the close gave the author other than the dead shares' part");
+            _break(
+                string.concat(
+                    "the close gave the author ",
+                    vm.toString(added),
+                    " where the dead shares' part came to ",
+                    vm.toString(theirs)
+                )
+            );
         }
     }
 
@@ -2027,6 +2442,33 @@ contract VaultHandler is Test {
             _break(string.concat(what, ": the tank was charged above the allowances"));
         }
 
+        // A stopped station's band is the exit band for a week after the
+        // stop the handler saw, then doubles each week: no key moves it.
+        if (station.stopped() && station.stoppedBand() != _stoppedBandBooks()) {
+            bandBreaks++;
+            _break(
+                string.concat(
+                    what,
+                    ": a stopped station's band is ",
+                    vm.toString(station.stoppedBand()),
+                    " where the time since the stop gives ",
+                    vm.toString(_stoppedBandBooks())
+                )
+            );
+        }
+        if (station.stoppedBand() > vault.exitBandBps()) _hit("~bandWidened");
+
+        // Units wait from when their holder took the fallback, by the
+        // handler's clock, until a serve clears them.
+        for (uint256 i = 0; i < holders.length; i++) {
+            if (vault.unitsSince(holders[i]) != unitsSinceBooks[holders[i]]) {
+                lifecycleBreaks++;
+                _break(
+                    string.concat(what, ": the vault's record of since when units wait is not the clock's")
+                );
+            }
+        }
+
         // A passive holder's price never drops for anyone else's move,
         // beyond rounding and the holding fee the step synced.
         if (checkPrice) {
@@ -2174,6 +2616,7 @@ contract VaultHandler is Test {
                         string.concat(what, ": units paid ", vm.toString(assets), " to the wrong holder")
                     );
                 }
+                unitReserveBooks -= assets;
                 _expect(owner, assets);
             } else if (topic == IVault.Held.selector) {
                 _hit("~held");
@@ -2200,8 +2643,9 @@ contract VaultHandler is Test {
             } else if (topic == IVault.ToStation.selector) {
                 _expect(address(station), abi.decode(l.data, (uint256)));
             } else if (topic == IVault.FromStation.selector) {
-                (uint256 assets,) = abi.decode(l.data, (uint256, uint256));
+                (uint256 assets, uint256 toUnits) = abi.decode(l.data, (uint256, uint256));
                 g.booked += assets;
+                unitReserveBooks += toUnits;
             } else if (topic == IVault.ClaimBooked.selector) {
                 _hit("~claimBooked");
                 _claimBooked(l, what);
@@ -2516,17 +2960,20 @@ contract VaultHandler is Test {
         g.cash -= payout > g.cash ? g.cash : payout;
     }
 
-    /// A deposit sent back: to the one who asked, all of it.
+    /// A deposit sent back: all of it, to whoever paid it, which is the
+    /// receiver named unless someone else did.
     function _refunded(Vm.Log memory l, string memory what) internal {
         uint256 id = uint256(l.topics[1]);
-        address owner = address(uint160(uint256(l.topics[2])));
+        address to = address(uint160(uint256(l.topics[2])));
         uint256 assets = abi.decode(l.data, (uint256));
-        if (askedBy[id] != owner || askedKind[id] != RequestKind.Deposit || askedFor[id] != assets) {
+        address payer = paidBy[id] == address(0) ? askedBy[id] : paidBy[id];
+        if (payer != to || askedKind[id] != RequestKind.Deposit || askedFor[id] != assets) {
             _moneyBreak(
                 string.concat(what, ": deposit ", vm.toString(id), " was sent back to the wrong place")
             );
         }
-        _expect(owner, assets);
+        if (paidBy[id] != address(0)) _hit("~refundedToPayer");
+        _expect(to, assets);
     }
 
     /// The fallback: to the one whose request or claim it is, their shares'
@@ -2555,6 +3002,9 @@ contract VaultHandler is Test {
         if (stepRequest != 0 && askedKind[stepRequest] == RequestKind.Redeem) {
             _unask(owner, askedFor[stepRequest], what);
         }
+        // Units that start waiting now wait from now, by the handler's clock.
+        (uint256 raw,) = vault.unitsOf(owner);
+        if (raw != 0 && unitsSinceBooks[owner] == 0) unitsSinceBooks[owner] = uint64(block.timestamp);
         _expect(owner, assets);
     }
 
@@ -2793,8 +3243,21 @@ contract VaultHandler is Test {
             grossExit: cash + atExit.mulDiv(WAD - units, WAD) + 1,
             stations: shares
         });
+        bool wide = _marketOutsideBand(vault.exitBandBps());
         try vault.recordValuation() {
             ok = true;
+            // A market outside the band, on either side, by the handler's
+            // own reading of the venue: the valuation is void, and prices
+            // nothing. Inside it, the valuation is priced.
+            bool voided = vault.valuationAt(vault.valuationCount() - 1).status == ValuationStatus.Void;
+            if (voided != wide) {
+                bandBreaks++;
+                _break(
+                    wide
+                        ? "a valuation was priced with a market outside the band"
+                        : "a valuation was voided with every market inside the band"
+                );
+            }
         } catch {
             measured.set = false;
         }
@@ -2872,6 +3335,51 @@ contract VaultHandler is Test {
         return keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", digest));
     }
 
+    /// Whether a market the station holds sits outside `band` of the
+    /// venue's own price, on either side, by its mark, bid or ask: read from
+    /// the venue itself, as each driver must read it. The full band is
+    /// never outside.
+    function _marketOutsideBand(uint256 band) internal view returns (bool) {
+        if (band >= BPS) return false;
+        bytes32[2] memory markets = [SPOT, PERP];
+        for (uint256 i = 0; i < 2; i++) {
+            if (venue.positionOf(address(station), markets[i]).size == 0) continue;
+            Market memory m = venue.marketOf(markets[i]);
+            uint256 low = m.oracle.mulDiv(BPS - band, BPS, Math.Rounding.Ceil);
+            uint256 high = m.oracle.mulDiv(BPS + band, BPS, Math.Rounding.Floor);
+            if (m.mark < low || m.mark > high || m.bid < low || m.bid > high || m.ask < low || m.ask > high) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// The band a stopped station closes inside, from the stop the handler
+    /// saw: the exit band for the first week, doubling each week after,
+    /// until any price is accepted.
+    function _stoppedBandBooks() internal view returns (uint16) {
+        uint256 band = vault.exitBandBps();
+        if (block.timestamp < uint256(stoppedAtBooks) + 7 days) return uint16(band);
+        uint256 weeks_ = (block.timestamp - stoppedAtBooks) / 7 days;
+        if (band == 0) band = 1;
+        for (uint256 i = 0; i < weeks_ && band < BPS; i++) {
+            band *= 2;
+        }
+        return uint16(band > BPS ? BPS : band);
+    }
+
+    /// The station's positions, as sizes without their sign.
+    function _sizes() internal view returns (uint256 spot, uint256 perp) {
+        int256 s = venue.positionOf(address(station), SPOT).size;
+        int256 p = venue.positionOf(address(station), PERP).size;
+        spot = uint256(s < 0 ? -s : s);
+        perp = uint256(p < 0 ? -p : p);
+    }
+
+    function _ceilFraction(uint256 size, uint256 fraction) internal pure returns (uint256) {
+        return (size * fraction + WAD - 1) / WAD;
+    }
+
     /// The station's venue account is worth something, or holds nothing.
     function _venueSolvent() internal view returns (bool) {
         if (venue.accountValue(address(station)) != 0) return true;
@@ -2910,6 +3418,17 @@ contract VaultHandler is Test {
         for (uint256 i = 0; i < n && i < 32; i++) {
             uint256 id = 1 + (seed % n + i) % n;
             if (!vault.requestAt(id).done) return id;
+        }
+        return 0;
+    }
+
+    /// A claim a close can serve: booked, or waiting for the band.
+    function _closableClaim(uint256 seed) internal view returns (uint256) {
+        uint256 n = vault.claimCount();
+        for (uint256 i = 0; i < n && i < 32; i++) {
+            uint256 id = 1 + (seed % n + i) % n;
+            ClaimState s = vault.claimAt(id).state;
+            if (s == ClaimState.Pending || s == ClaimState.Waiting) return id;
         }
         return 0;
     }

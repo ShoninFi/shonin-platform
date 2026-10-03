@@ -9,14 +9,18 @@ import {Fixture} from "../Fixture.sol";
 import {Deps, VaultHandler} from "./VaultHandler.sol";
 import {StdInvariant} from "forge-std/StdInvariant.sol";
 
-/// The vault's invariants over long random walks: deposits, withdrawals,
-/// valuations, partial settles, the executor's pulls, pushes and trades,
-/// market moves inside and outside the band, claims, both fallbacks, units,
-/// the tank and its bills, allowances, the idle floor, retiring, freezing,
-/// killing, stopping, closing, paying out a closed vault, paydays, every
-/// call the admin key can make, and the admin acting over time: bringing in
-/// its own checker, images, project, drivers and bridges through the
-/// timelock and using keys it blesses for itself.
+/// The vault's invariants over long random walks: deposits (paid by the
+/// receiver or by another holder), withdrawals, valuations, partial
+/// settles, the executor's pulls, pushes and trades, a speck left at the
+/// venue, market moves inside and outside the band on either side, claims,
+/// both fallbacks, units and the freeze they can bring, the tank, its bills
+/// and its unsigned escape, allowances, the idle floor, retiring, freezing,
+/// killing, stopping, unwinding a stopped station (all of it or by the
+/// drivers named, inside a band that widens with the weeks), closing,
+/// paying out a closed vault, paydays, every call the admin key can make,
+/// and the admin acting over time: bringing in its own checker, images,
+/// project, drivers and bridges through the timelock and using keys it
+/// blesses for itself.
 ///
 /// CI runs a short campaign per invariant, set below. Locally each was also
 /// run at 256 runs of 500 calls, by raising the two settings below.
@@ -85,6 +89,13 @@ contract VaultInvariantsTest is Fixture {
         assertGe(usd.balanceOf(address(vault)), handler.owed(), "the vault holds less than it owes");
         (, uint256 reserve) = vault.units();
         assertGe(reserve, handler.unitClaims(), "the unit reserve is less than its holders can collect");
+    }
+
+    /// The unit reserve is exactly what the vault's events say came home
+    /// for units, less what their holders collected.
+    function invariant_1_the_unit_reserve_is_what_came_home_for_units() public view {
+        (, uint256 reserve) = vault.units();
+        assertEq(reserve, handler.unitReserveBooks(), "the unit reserve is not what came home for units");
     }
 
     /// At any moment everyone can be let out at the exit side: halting,
@@ -184,6 +195,26 @@ contract VaultInvariantsTest is Fixture {
             if (vault.balanceOf(h) == 0) continue;
             assertTrue(vault.statementOf(h) != bytes32(0), "a holder never signed the statement");
         }
+    }
+
+    // 10. Forward pricing under adversarial timing -----------------------------------
+
+    /// By the handler's own reading of the venue, a market outside the band
+    /// on either side voids the valuation and blocks every close, a market
+    /// inside it prices the valuation, a deposit goes back by the fallback
+    /// only while nothing could price it, and a stopped station's band is
+    /// the exit band for a week after the stop and doubles each week after.
+    function invariant_10_a_market_outside_the_band_prices_nothing_and_closes_nothing() public view {
+        assertEq(handler.bandBreaks(), 0, handler.lastBreak());
+    }
+
+    /// Units nobody served for the freeze period freeze the vault and
+    /// nothing less does; a stopped station unwinds by name only once
+    /// stopped; the tank's escape opens a day after it is asked for and
+    /// lapses a day later.
+    function invariant_10_every_timer_opens_its_door_exactly_when_it_is_due() public view {
+        assertEq(handler.lifecycleBreaks(), 0, handler.lastBreak());
+        assertEq(handler.tankBreaks(), 0, handler.lastBreak());
     }
 
     // 12. Access control -----------------------------------------------------------

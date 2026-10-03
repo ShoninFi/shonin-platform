@@ -21,8 +21,8 @@ import {PricePeriod, UnitPrices} from "../../src/interfaces/IPrices.sol";
 import {Review} from "../../src/interfaces/IReviewRegistry.sol";
 import {StationSpec} from "../../src/interfaces/IStation.sol";
 import {Strategy} from "../../src/interfaces/IStrategyRegistry.sol";
-import {Fees, IVault, Tank, VaultState} from "../../src/interfaces/IVault.sol";
-import {VaultConfig} from "../../src/interfaces/IVaultFactory.sol";
+import {Fees, IVault, Tank, Timers, VaultState} from "../../src/interfaces/IVault.sol";
+import {IVaultFactory, VaultConfig} from "../../src/interfaces/IVaultFactory.sol";
 import {ClaimBase} from "../ClaimBase.sol";
 import {Fixture} from "../Fixture.sol";
 import {Calls} from "./Calls.sol";
@@ -105,19 +105,111 @@ contract VaultFactoryExternalFunctionsTest is Fixture, Calls {
         }
     }
 
-    /// The factory's terms as the contract bounds them, restated.
+    /// The factory's terms as the handbook bounds them, restated: the fee
+    /// ceilings, and for every timer its floor, its ceiling of a year, and
+    /// its order against the timers it must outlast.
     function inRange(VaultConfig memory c) internal pure returns (bool) {
+        Timers memory t = c.timers;
         return c.holdingBps <= 500 && c.transactionBps <= 100 && c.exitBandBps <= 1000
             && uint256(c.authorBps) + c.platformBps <= 5000 && c.deadAssets != 0 && c.minimumTank > c.deadAssets
-            && c.minimumDeposit != 0 && c.timers.slotInterval != 0 && c.timers.slotWindow < c.timers.slotInterval
-            && c.timers.slotLead > c.timers.slotWindow && c.timers.freezeAfter >= 1 days
-            && c.timers.fallbackAfter >= 1 days && c.timers.postDeadline > c.timers.slotWindow
-            && c.maxExitCost <= 1000e6 && c.minimumDeposit <= 100e6 && c.timers.slotInterval <= 365 days
-            && c.timers.postDeadline <= 365 days && c.timers.transitTimeout <= 365 days
-            && c.timers.fallbackAfter <= 365 days && c.timers.usageFreshness <= 365 days
-            && c.timers.tankEscapeDelay <= 365 days && c.timers.floorDelay <= 365 days
-            && c.timers.haltGrace <= 365 days && c.timers.freezeAfter <= 365 days && c.timers.windDown <= 365 days
-            && c.timers.activationWindow <= 365 days;
+            && c.minimumDeposit != 0 && c.minimumDeposit <= 100e6 && c.maxExitCost <= 1000e6
+            && t.slotInterval != 0 && t.slotWindow < t.slotInterval && t.slotLead > t.slotWindow
+            && t.postDeadline > t.slotWindow && t.transitTimeout > t.postDeadline && t.usageFreshness != 0
+            && t.usageFreshness <= 1 days && t.fallbackAfter >= 1 days && t.freezeAfter > t.fallbackAfter
+            && t.tankEscapeDelay >= 1 days && t.floorDelay >= 1 days && t.haltGrace >= 10 minutes
+            && t.windDown >= 7 days && t.activationWindow >= 1 days && t.slotInterval <= 365 days
+            && t.slotLead <= 365 days && t.postDeadline <= 365 days && t.transitTimeout <= 365 days
+            && t.fallbackAfter <= 365 days && t.usageFreshness <= 365 days && t.tankEscapeDelay <= 365 days
+            && t.floorDelay <= 365 days && t.haltGrace <= 365 days && t.freezeAfter <= 365 days
+            && t.windDown <= 365 days && t.activationWindow <= 365 days;
+    }
+
+    /// One timer at a time moved to just inside or just outside one of its
+    /// bounds, the rest as the fixture has them: the factory refuses the
+    /// terms, at deployment and on a change, exactly when a bound is
+    /// crossed.
+    function testFuzz_every_timer_bound_is_enforced_on_its_own(
+        uint8 which,
+        uint8 side,
+        uint32 nudge
+    ) public {
+        VaultConfig memory c = vaultConfig();
+        Timers memory t = c.timers;
+        uint256 w = which % 13;
+        bool atFloor = side % 2 == 0;
+        bool above = side % 4 < 2;
+        uint256 n = bound(nudge, 0, 1 hours);
+        // Each timer's floor and ceiling, given the others as the fixture
+        // sets them.
+        uint64[13] memory floors = [
+            uint64(t.slotWindow + 1),
+            t.slotWindow + 1,
+            0,
+            t.slotWindow + 1,
+            t.postDeadline + 1,
+            1 days,
+            1,
+            1 days,
+            1 days,
+            10 minutes,
+            t.fallbackAfter + 1,
+            7 days,
+            1 days
+        ];
+        uint64 lesser = t.slotLead < t.slotInterval ? t.slotLead : t.slotInterval;
+        uint64[13] memory ceilings = [
+            uint64(365 days),
+            365 days,
+            lesser - 1,
+            t.transitTimeout - 1,
+            365 days,
+            t.freezeAfter - 1,
+            1 days,
+            365 days,
+            365 days,
+            365 days,
+            365 days,
+            365 days,
+            365 days
+        ];
+        uint256 edge = atFloor ? floors[w] : ceilings[w];
+        uint64 v = uint64(above ? edge + n : edge > n ? edge - n : 0);
+        if (w == 0) t.slotInterval = v;
+        else if (w == 1) t.slotLead = v;
+        else if (w == 2) t.slotWindow = v;
+        else if (w == 3) t.postDeadline = v;
+        else if (w == 4) t.transitTimeout = v;
+        else if (w == 5) t.fallbackAfter = v;
+        else if (w == 6) t.usageFreshness = v;
+        else if (w == 7) t.tankEscapeDelay = v;
+        else if (w == 8) t.floorDelay = v;
+        else if (w == 9) t.haltGrace = v;
+        else if (w == 10) t.freezeAfter = v;
+        else if (w == 11) t.windDown = v;
+        else t.activationWindow = v;
+        c.timers = t;
+        bytes4 want = inRange(c) ? bytes4(0) : VaultFactory.OutOfRange.selector;
+        (bool ok, bytes4 err) = callAs(admin, address(factory), abi.encodeCall(VaultFactory.setConfig, (c)));
+        expectOutcome(ok, err, want, "setConfig at a timer's bound");
+        assertEq(ok, inRange(c), "a timer crossed its bound unrefused, or was refused inside it");
+        VaultFactory.Deps memory deps = VaultFactory.Deps({
+            asset: factory.asset(),
+            attestation: attestation,
+            strategies: strategies,
+            reviews: reviews,
+            prices: prices,
+            stationFactory: stations,
+            vaultImplementation: factory.vaultImplementation(),
+            admin: admin,
+            platform: platform,
+            previous: IVaultFactory(address(0))
+        });
+        if (inRange(c)) {
+            new VaultFactory(deps, c, chainNames());
+        } else {
+            vm.expectRevert(VaultFactory.OutOfRange.selector);
+            new VaultFactory(deps, c, chainNames());
+        }
     }
 
     /// Only the admin sets the terms, only inside their ceilings, and a

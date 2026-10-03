@@ -196,14 +196,30 @@ contract BankRunTest is Fixture {
 
     // The steps ---------------------------------------------------------------
 
-    /// Value at the next slot and settle it. Each payout is at most the
-    /// leaver's shares at the exit side of the valuation that priced it,
-    /// and the holders who stay keep their exit-side price.
+    /// Value at the next slot and settle it. What the valuation records is
+    /// the pool as the run read it just before, from the station and the
+    /// cash: at the mark, and at the lower of the mark and the exit side.
+    /// Each payout is at most the leaver's shares at that exit side, and
+    /// the holders who stay keep their exit-side price.
     function settleRound() internal {
         nextSlot();
+        (uint256 markNow, uint256 exitNow) = station.value();
+        (uint256 unitsNow,) = vault.units();
+        uint256 cashNow = vault.cash();
         vault.recordValuation();
         Valuation memory v = vault.valuationAt(vault.valuationCount() - 1);
         if (v.status != ValuationStatus.Priced) return;
+        if (exitNow > markNow) exitNow = markNow;
+        assertEq(
+            v.gross,
+            cashNow + markNow * (WAD - unitsNow) / WAD + 1,
+            "a valuation recorded other than the pool"
+        );
+        assertEq(
+            v.grossExit,
+            cashNow + exitNow * (WAD - unitsNow) / WAD + 1,
+            "a valuation recorded other than the pool at exit prices"
+        );
         uint256 count = vault.requestCount();
         uint256[] memory before = new uint256[](count + 1);
         bool[] memory open = new bool[](count + 1);

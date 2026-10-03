@@ -626,6 +626,14 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
 
     function testFuzz_freezeUnits(uint8 stage, uint8 pick, address random, uint8 who, uint32 wait) public {
         stage = arrange(stage);
+        // Units on a vault already halted though still live (an evicted
+        // retirement): it is stopping anyway.
+        if (stage == UNITS && wait % 3 == 0) {
+            vm.prank(author);
+            vault.retire();
+            skip(7 days);
+            vault.evict();
+        }
         address caller = pickCaller(pick, random);
         address holder = pickCaller(who, random);
         skip(bound(wait, 0, 10 days));
@@ -845,6 +853,7 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
         World memory b = look(caller, receiver);
         bytes4 want;
         if (!isClosed(b)) want = IVault.WrongState.selector;
+        else if (receiver == address(0)) want = IVault.TooSmall.selector;
         else if (shares > held) want = PANIC;
         uint256 owed = isClosed(b) ? vault.cash() * shares / vault.totalSupply() : 0;
         (bool ok, bytes4 err) =

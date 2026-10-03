@@ -5,8 +5,11 @@ import {LocalDriver} from "../src/LocalDriver.sol";
 import {LocalVenue} from "../src/LocalVenue.sol";
 import {Station} from "../src/Station.sol";
 import {Vault} from "../src/Vault.sol";
+import {Call} from "../src/interfaces/IDriver.sol";
+
+import {OrderRequest} from "../src/interfaces/ILocalVenue.sol";
 import {ChainNeed} from "../src/interfaces/IStrategyRegistry.sol";
-import {ClaimState, IVault, VaultState} from "../src/interfaces/IVault.sol";
+import {ClaimState, IVault, Valuation, VaultState} from "../src/interfaces/IVault.sol";
 import {Fixture} from "./Fixture.sol";
 import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
 
@@ -111,5 +114,125 @@ contract DustClaimIsPaidTest is Fixture {
         vm.expectRevert(IVault.NotAllowed.selector);
         vault.freeze(claimId);
         assertTrue(vault.state() != VaultState.Frozen, "a few millionths of a dollar froze the vault");
+    }
+
+    /// The same dust claim, while the second venue refuses every close: a
+    /// close that failed proves nothing, so the claim is not judged dust. It
+    /// waits with its shares intact, not counted as a try, and is paid as
+    /// dust once a close goes through.
+    function test_a_dust_claim_whose_close_fails_waits_and_is_paid_as_dust_once_a_close_goes_through()
+        public
+    {
+        depositAs(vault, alice, 90_000e6);
+        vm.startPrank(executor);
+        station.pull(vault.cash());
+        station.deposit("local", 30_000e6);
+        station.deposit("local2", 30_000e6);
+        vm.stopPrank();
+        assertEq(vault.cash(), 0);
+        value(vault);
+        vm.prank(alice);
+        vault.requestRedeem(2.9e12, alice);
+        value(vault);
+        uint256 claimId = vault.claimCount();
+        assertEq(claimId, 1, "no claim was booked");
+        uint256 shares = vault.claimAt(claimId).shares;
+
+        // The second venue starts refusing closes; it still answers reads.
+        (uint256 worth,) = station.value();
+        bytes memory honest = address(driver2).code;
+        vm.etch(
+            address(driver2),
+            address(new CloseRefusingDriver(new LocalDriver(venue2, IERC20(address(usd))))).code
+        );
+        (uint256 atMark,) = station.value();
+        assertEq(atMark, worth, "the stations no longer read their worth");
+        vm.prank(address(vault));
+        vm.expectRevert(CloseRefusingDriver.Refused.selector);
+        station.unwind(1);
+
+        vault.settleClaim(claimId);
+        assertTrue(vault.claimAt(claimId).state == ClaimState.Waiting, "a failed close was judged dust");
+        assertEq(vault.claimAt(claimId).shares, shares, "the claim's shares changed");
+        assertEq(vault.claimAt(claimId).lastAttemptAt, 0, "a failed close counted as a try");
+        assertEq(vault.claimAt(claimId).paid, 0);
+
+        // The venue answers again: the close goes through, and it is dust.
+        vm.etch(address(driver2), honest);
+        vault.settleClaim(claimId);
+        assertTrue(vault.claimAt(claimId).state == ClaimState.Paid, "the dust claim was not settled");
+    }
+
+    /// A claim the last valuation counted above dust, whose fraction of the
+    /// stations now reads below a unit at exit prices after a crash: a close
+    /// would sell a sliver of the position and bring nothing home. It is not
+    /// dust, so the close is refused outright and nothing it sold stands.
+    function test_a_claim_counted_above_dust_whose_close_would_bring_nothing_home_is_refused_and_sells_nothing(
+    ) public {
+        depositAs(vault, alice, 90_000e6);
+        // Everything at the first venue, almost all of it in 1.49 BTC spot.
+        vm.startPrank(executor);
+        station.pull(vault.cash());
+        station.approveKey("local", executor);
+        station.deposit("local", 90_000e6);
+        OrderRequest[] memory orders = new OrderRequest[](1);
+        orders[0] =
+            OrderRequest({market: SPOT, isBuy: true, size: 1.49e18, limitPrice: PRICE, reduceOnly: false});
+        venue.place(address(station), orders);
+        vm.stopPrank();
+        assertEq(vault.cash(), 0);
+        value(vault);
+
+        // Alice asks out for 1.5e-10 of the vault; the empty cash can't pay
+        // it, so it is booked as a claim, counted at about 13.5 units of the
+        // stations: above the dust of nine.
+        uint256 shares = vault.totalSupply() * 15 / 1e11;
+        vm.prank(alice);
+        vault.requestRedeem(shares, alice);
+        value(vault);
+        uint256 claimId = vault.claimCount();
+        assertEq(claimId, 1, "no claim was booked");
+        Valuation memory last = vault.valuationAt(vault.valuationCount() - 1);
+        uint256 fraction = shares * 1e18 / vault.totalSupply();
+        assertGt((last.gross - 1 - last.cash) * fraction / 1e18, 9, "the claim was counted as dust");
+
+        // BTC crashes to a twentieth: the claim's part now reads under a
+        // unit at exit prices.
+        setPrice(SPOT, PRICE / 20, 0);
+        (, uint256 exitNow) = station.value();
+        assertLt(exitNow * fraction / 1e18, 1, "the claim's part still reads a unit");
+        int256 size = venue.positionOf(address(station), SPOT).size;
+        int256 venueCash = venue.cashOf(address(station));
+
+        vm.expectRevert(IVault.NotYet.selector);
+        vault.settleClaim(claimId);
+        assertTrue(vault.claimAt(claimId).state == ClaimState.Pending, "the claim moved on");
+        assertEq(venue.positionOf(address(station), SPOT).size, size, "a close that paid nobody sold");
+        assertEq(venue.cashOf(address(station)), venueCash, "a close that paid nobody moved the venue's cash");
+    }
+}
+
+/// A venue's driver that reads as the honest one but refuses every close.
+contract CloseRefusingDriver {
+    error Refused();
+
+    LocalDriver internal immutable honest;
+
+    constructor(LocalDriver honest_) {
+        honest = honest_;
+    }
+
+    function close(address, uint256, uint16) external pure returns (Call[] memory, bool) {
+        revert Refused();
+    }
+
+    fallback(bytes calldata data) external returns (bytes memory) {
+        (bool ok, bytes memory out) = address(honest).staticcall(data);
+        if (!ok) {
+            assembly {
+                revert(add(out, 32), mload(out))
+            }
+        }
+        return out;
     }
 }
