@@ -62,6 +62,17 @@ jobs:
           version: 3.x
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # Compiling every contract and test through the IR pipeline at once
+      # needs about 13 GB at its peak, more than the runner's memory beside
+      # everything else; swap on the runner's spare disk carries the peak.
+      - name: Swap for the contract build
+        run: |
+          sudo fallocate -l 16G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
       - name: Check
         run: task check
 
