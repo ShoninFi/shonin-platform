@@ -18,7 +18,7 @@ concurrency:
 jobs:
   ci:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -63,15 +63,17 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       # Compiling every contract and test through the IR pipeline at once
-      # needs about 13 GB at its peak, more than the runner's memory beside
-      # everything else; swap on the runner's spare disk carries the peak.
-      # The swap is sized to the free disk, leaving room for the builds.
-      - name: Swap for the contract build
+      # peaks at about 13 GB, more than the runner's memory. The runner image
+      # carries toolchains this build never uses; removing them leaves disk
+      # for swap that carries the peak.
+      - name: Room and swap for the contract build
         run: |
-          df -h / /mnt
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift
+          df -h /
           free_gb=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
-          size=$(( free_gb - 24 ))
-          if [ "$size" -gt 12 ]; then size=12; fi
+          size=$(( free_gb - 20 ))
+          if [ "$size" -gt 16 ]; then size=16; fi
           if [ "$size" -ge 4 ]; then
             sudo fallocate -l "${size}G" /swapfile-build
             sudo chmod 600 /swapfile-build
