@@ -17,8 +17,12 @@ import {Math} from "openzeppelin/utils/math/Math.sol";
 /// Every venue call is the station's own, prepared by a driver the registry
 /// approves and checked here against that driver's targets before it is made.
 /// A call to the dollar is only ever an approval of one of those targets, so
-/// the station's dollars can only reach a target its driver declared, and a
-/// driver reaches a station only through the registry's public timelock.
+/// the station's dollars can only reach a target its driver declared.
+///
+/// It pins its drivers and bridges when it is created: the implementations
+/// the registry approved then are the only ones it ever calls, so nothing
+/// anybody approves later reaches it. Revoking a pinned driver stops trading
+/// through it and leaves valuing and closing working.
 /// Trading keys are the venue's agents: they can trade the account and can't
 /// take from it. A bridge send names the station's own address as recipient,
 /// which is the same address on every chain.
@@ -31,6 +35,14 @@ contract Station is IStation, ReentrancyGuardTransient {
 
     uint256 private constant WAD = 1e18;
     uint256 private constant BPS = 10_000;
+    /// A stopped station's full unwind keeps the exit band this long after
+    /// the stop, then the band doubles each time this passes again.
+    uint64 public constant WIDEN_AFTER = 7 days;
+    /// What a best-effort revoke may spend in all: far more than a venue's
+    /// revoke costs, far less than a block.
+    uint256 private constant BEST_EFFORT_GAS = 2_000_000;
+    /// The most calls a driver may prepare to revoke a key.
+    uint256 private constant MAX_REVOKE_CALLS = 8;
     bytes4 private constant APPROVE = IERC20.approve.selector;
 
     IStationFactory public factory;
@@ -38,6 +50,9 @@ contract Station is IStation, ReentrancyGuardTransient {
     bool public stopped;
     mapping(bytes32 => address) private _approvedKey;
     Send[] private _sends;
+    mapping(bytes32 => address) private _pinnedDriver;
+    mapping(bytes32 => address) private _pinnedBridge;
+    uint64 public stoppedAt;
 
     error AlreadyInitialized();
     error NotBlessed();
@@ -66,6 +81,18 @@ contract Station is IStation, ReentrancyGuardTransient {
         _unique(spec_.drivers);
         _unique(spec_.bridges);
         _spec = spec_;
+        // Pin what the registry approves now, for good.
+        IAttestationRegistry registry = _registry();
+        for (uint256 i = 0; i < spec_.drivers.length; i++) {
+            address implementation = registry.tradingDriver(spec_.drivers[i]);
+            if (implementation == address(0)) revert NotApproved();
+            _pinnedDriver[spec_.drivers[i]] = implementation;
+        }
+        for (uint256 i = 0; i < spec_.bridges.length; i++) {
+            address implementation = registry.bridgeOf(spec_.bridges[i]);
+            if (implementation == address(0)) revert NotApproved();
+            _pinnedBridge[spec_.bridges[i]] = implementation;
+        }
     }
 
     // Keys ------------------------------------------------------------------
@@ -74,8 +101,7 @@ contract Station is IStation, ReentrancyGuardTransient {
         if (stopped) revert AlreadyStopped();
         _declaredDriver(driver);
         if (!_isKey(key, ImageKind.Executor)) revert NotBlessed();
-        address implementation = _registry().tradingDriver(driver);
-        if (implementation == address(0)) revert NotApproved();
+        address implementation = _tradable(driver);
 
         // One executor at a time: the key in place is withdrawn first, so an
         // instance that has been replaced can no longer trade.
@@ -92,8 +118,15 @@ contract Station is IStation, ReentrancyGuardTransient {
         if (current != address(0) && current != key) {
             // A key still blessed must be withdrawn; one whose blessing has
             // lapsed is withdrawn if the driver can, and replaced either way.
-            _revokeVia(IDriver(implementation), current, _isKey(current, ImageKind.Executor));
-            emit KeyRevoked(driver, current);
+            if (_isKey(current, ImageKind.Executor)) {
+                _revokeStrict(driver, current, false);
+                emit KeyRevoked(driver, current);
+            } else if (_revokeBestEffort(driver, current)) {
+                emit KeyRevoked(driver, current);
+            } else {
+                // Anyone may still withdraw it, strictly, with `revokeKey`.
+                emit RevokeSkipped(driver, current);
+            }
         }
         uint64 until = _registry().blessedUntil(key, _spec.vaultChain, _spec.vault, _spec.bundleHash);
         _run(IDriver(implementation).approveKey(address(this), key, until), IDriver(implementation).targets());
@@ -105,10 +138,14 @@ contract Station is IStation, ReentrancyGuardTransient {
         // A passer-by can't cut off a key whose blessing stands, and can't
         // keep one whose blessing has gone.
         // Once the driver no longer trades, its key goes too.
-        if (!stopped && _isKey(key, ImageKind.Executor) && _registry().tradingDriver(driver) != address(0)) {
+        address implementation = _pinned(driver);
+        if (
+            !stopped && _isKey(key, ImageKind.Executor)
+                && !_registry().isDriverRevoked(driver, implementation)
+        ) {
             revert StillBlessed();
         }
-        _revoke(driver, key, true);
+        _revoke(driver, key);
     }
 
     // Moving money ----------------------------------------------------------
@@ -129,19 +166,16 @@ contract Station is IStation, ReentrancyGuardTransient {
 
     function deposit(bytes32 driver, uint256 amount) external nonReentrant {
         _executorOnly();
-        _declaredDriver(driver);
-        address implementation = _registry().tradingDriver(driver);
-        if (implementation == address(0)) revert NotApproved();
+        address implementation = _tradable(driver);
         _run(IDriver(implementation).deposit(address(this), amount), IDriver(implementation).targets());
         emit Deposited(driver, amount);
     }
 
     function withdraw(bytes32 driver, uint256 amount) external nonReentrant {
         _executorOnly();
-        _declaredDriver(driver);
         // Bringing money out never depends on the driver still being
         // approved to trade.
-        address implementation = _unwindDriver(driver);
+        address implementation = _pinned(driver);
         _run(IDriver(implementation).withdraw(address(this), amount), IDriver(implementation).targets());
         emit Withdrawn(driver, amount);
     }
@@ -183,9 +217,14 @@ contract Station is IStation, ReentrancyGuardTransient {
 
     function unwind(uint256 fraction) external nonReentrant returns (uint256 sentHome, bool blocked) {
         if (fraction == 0 || fraction > WAD) revert NotAllowed();
-        bool permitted = (isHome() && msg.sender == _spec.vault) || _isKey(msg.sender, ImageKind.Executor)
-            || _isKey(msg.sender, ImageKind.Unwinder) || (stopped && fraction == WAD);
+        // Once stopped, a fraction is closed only for the vault's own claims
+        // and serves, which wait for settlement themselves; the rest is a
+        // full unwind, which `_unwindStopped` holds until settlement too.
+        bool permitted = (isHome() && msg.sender == _spec.vault)
+            || (!stopped && (_isKey(msg.sender, ImageKind.Executor) || _isKey(msg.sender, ImageKind.Unwinder)))
+            || (stopped && fraction == WAD);
         if (!permitted) revert NotAllowed();
+        if (stopped && fraction == WAD) return _unwindStopped(_spec.drivers);
 
         // Every driver's close is prepared before any is made, so a market
         // outside the band on one venue closes nothing anywhere: a leaver is
@@ -194,23 +233,40 @@ contract Station is IStation, ReentrancyGuardTransient {
         IDriver[] memory drivers = new IDriver[](count);
         Call[][] memory closes = new Call[][](count);
         uint256[] memory freed = new uint256[](count);
+        uint256[] memory before = new uint256[](count);
+        bool[] memory skipped = new bool[](count);
         for (uint256 i = 0; i < count; i++) {
-            drivers[i] = IDriver(_unwindDriver(_spec.drivers[i]));
+            drivers[i] = IDriver(_pinned(_spec.drivers[i]));
             // What the fraction is worth at exit prices before the close:
             // exactly what selling it realises, and all that comes home for
             // it. The rest stays with whoever still owns it.
             (uint256 markBefore, uint256 exitBefore) = drivers[i].valueOf(address(this));
-            // An account worth something at the mark and nothing at exit
-            // prices is underwater at the bid: selling a fraction of it would
-            // bring the leaver nothing and leave the loss with everyone else.
-            // Only a full unwind, which everyone shares, may sell it.
-            if (exitBefore == 0 && markBefore != 0 && fraction < WAD) revert ShortSweep();
-            freed[i] = exitBefore.mulDiv(fraction, WAD, Math.Rounding.Floor);
+            // The band first, for every account: a market outside it closes
+            // nothing anywhere, whatever any account reads as.
             bool outside;
             (closes[i], outside) = drivers[i].close(address(this), fraction, _spec.exitBandBps);
             if (outside) {
                 emit Unwound(fraction, 0, true);
                 return (0, true);
+            }
+            // An account worth no more than a few dollar-units is dust: a
+            // fraction of it is left where it is rather than let its rounding
+            // hold every leaver's close. A full unwind still sells it.
+            if (fraction < WAD && markBefore <= count + 1) {
+                skipped[i] = true;
+                continue;
+            }
+            freed[i] = exitBefore.mulDiv(fraction, WAD, Math.Rounding.Floor);
+            before[i] = exitBefore;
+            // A fraction worth more than dust at the mark and nothing at exit
+            // prices (an account under water at the bid) is never sold for
+            // the leaver: it would bring them nothing and leave the loss with
+            // everyone else. Only a full unwind, which everyone shares, may.
+            if (
+                freed[i] == 0 && markBefore.mulDiv(fraction, WAD) > (count + 1) * (count + 1)
+                    && fraction < WAD
+            ) {
+                revert ShortSweep();
             }
         }
 
@@ -218,14 +274,26 @@ contract Station is IStation, ReentrancyGuardTransient {
         uint256 idleBefore = dollar.balanceOf(address(this));
         uint256 brought;
         for (uint256 i = 0; i < count; i++) {
+            if (skipped[i]) continue;
             address[] memory targets = drivers[i].targets();
-            uint256 before = dollar.balanceOf(address(this));
+            uint256 held = dollar.balanceOf(address(this));
             _run(closes[i], targets);
             _run(drivers[i].sweep(address(this), freed[i]), targets);
             // Selling the fraction is only a serve if its worth comes home:
             // proceeds left at the venue would still belong to everyone.
-            uint256 swept = dollar.balanceOf(address(this)) - before;
-            if (swept < freed[i].mulDiv(BPS - _spec.exitBandBps, BPS)) revert ShortSweep();
+            uint256 swept = dollar.balanceOf(address(this)) - held;
+            // Nothing home for a fraction worth something is never a fill.
+            if (swept < freed[i].mulDiv(BPS - _spec.exitBandBps, BPS) || (swept == 0 && freed[i] != 0)) {
+                revert ShortSweep();
+            }
+            // A shortfall is the leaver's own fill, never the stayers' gain:
+            // proceeds that went to repay the account's margin debt, so the
+            // account is left worth more than the stayers' share, still
+            // belong to the leaver, and the close is undone.
+            if (swept < freed[i]) {
+                (, uint256 exitAfter) = drivers[i].valueOf(address(this));
+                if (exitAfter > before[i] - freed[i] + 1) revert ShortSweep();
+            }
             // Never more than the fraction's worth: anything a venue sends
             // beyond it stays here, everyone's.
             brought += swept < freed[i] ? swept : freed[i];
@@ -244,6 +312,71 @@ contract Station is IStation, ReentrancyGuardTransient {
         emit Unwound(fraction, sentHome, false);
     }
 
+    /// A stopped station's full unwind, which every holder shares: each
+    /// driver closes on its own, inside the band as it has widened since the
+    /// stop, so a venue that refuses or a market still outside the band
+    /// leaves only its own money behind. Everything idle then goes home.
+    function _unwindStopped(bytes32[] memory drivers) private returns (uint256 sentHome, bool blocked) {
+        // Not between a valuation's pricing and its settlement: what this
+        // sale brings home must not pay withdrawals priced before it.
+        if (isHome() && (IStationVault(_spec.vault).valuing() || IStationVault(_spec.vault).unsettled())) {
+            revert NotAllowed();
+        }
+        uint16 band = stoppedBand();
+        for (uint256 i = 0; i < drivers.length; i++) {
+            _pinned(drivers[i]);
+            try this.closeAll(drivers[i], band) returns (bool outside) {
+                if (outside) blocked = true;
+            } catch {
+                blocked = true;
+                emit DriverFailed(drivers[i]);
+            }
+        }
+        sentHome = _asset().balanceOf(address(this));
+        if (sentHome != 0) {
+            if (isHome()) {
+                _sendHome(sentHome);
+            } else if (_spec.bridges.length != 0) {
+                _send(_spec.bridges[0], _spec.vaultChain, sentHome, "");
+            } else {
+                revert NoRoute();
+            }
+        }
+        emit Unwound(WAD, sentHome, blocked);
+    }
+
+    /// A stopped station's full unwind through the drivers named, then
+    /// everything idle home; with none named, only the idle dollars. Anyone
+    /// may call it, so a driver that burns its gas can be left out and can't
+    /// keep the other venues' money, or the idle dollars, from coming home.
+    function unwindStopped(bytes32[] calldata drivers)
+        external
+        nonReentrant
+        returns (uint256 sentHome, bool blocked)
+    {
+        if (!stopped) revert NotHalted();
+        return _unwindStopped(drivers);
+    }
+
+    /// One driver's part of a stopped station's full unwind. Only the
+    /// station calls it, from `unwind`, so one driver's failure undoes only
+    /// its own part.
+    function closeAll(bytes32 name, uint16 band) external returns (bool outside) {
+        if (msg.sender != address(this)) revert NotAllowed();
+        IDriver driver = IDriver(_pinned(name));
+        (, uint256 exitBefore) = driver.valueOf(address(this));
+        Call[] memory calls;
+        (calls, outside) = driver.close(address(this), WAD, band);
+        if (outside) return true;
+        address[] memory targets = driver.targets();
+        IERC20 dollar = _asset();
+        uint256 before = dollar.balanceOf(address(this));
+        _run(calls, targets);
+        _run(driver.sweep(address(this), exitBefore), targets);
+        uint256 swept = dollar.balanceOf(address(this)) - before;
+        if (swept < exitBefore.mulDiv(BPS - band, BPS)) revert ShortSweep();
+    }
+
     // What it holds ---------------------------------------------------------
 
     function value() external view returns (uint256 mark, uint256 exit) {
@@ -253,7 +386,7 @@ contract Station is IStation, ReentrancyGuardTransient {
         for (uint256 i = 0; i < _spec.drivers.length; i++) {
             // Valued through the driver it can unwind through, so a revoked
             // driver's holdings still count.
-            (uint256 m, uint256 x) = IDriver(_unwindDriver(_spec.drivers[i])).valueOf(address(this));
+            (uint256 m, uint256 x) = IDriver(_pinned(_spec.drivers[i])).valueOf(address(this));
             mark += m;
             exit += x;
         }
@@ -261,8 +394,7 @@ contract Station is IStation, ReentrancyGuardTransient {
 
     function outsideBand() external view returns (bool) {
         for (uint256 i = 0; i < _spec.drivers.length; i++) {
-            (, bool blocked) =
-                IDriver(_unwindDriver(_spec.drivers[i])).close(address(this), WAD, _spec.exitBandBps);
+            (, bool blocked) = IDriver(_pinned(_spec.drivers[i])).close(address(this), WAD, _spec.exitBandBps);
             if (blocked) return true;
         }
         return false;
@@ -274,6 +406,28 @@ contract Station is IStation, ReentrancyGuardTransient {
 
     function isHome() public view returns (bool) {
         return _spec.vaultChain == block.chainid;
+    }
+
+    function pinnedDriver(bytes32 driver) external view returns (address) {
+        return _pinnedDriver[driver];
+    }
+
+    function pinnedBridge(bytes32 name) external view returns (address) {
+        return _pinnedBridge[name];
+    }
+
+    /// The band a stopped station's full unwind closes inside: the exit band
+    /// for `WIDEN_AFTER` after the stop, then doubling each `WIDEN_AFTER`
+    /// until any price is accepted. No key sets it; only time does.
+    function stoppedBand() public view returns (uint16) {
+        uint256 band = _spec.exitBandBps;
+        if (!stopped || block.timestamp < uint256(stoppedAt) + WIDEN_AFTER) return uint16(band);
+        uint256 doublings = (block.timestamp - stoppedAt) / WIDEN_AFTER;
+        if (band == 0) band = 1;
+        // 2^14 bps is past any price, so stop doubling there.
+        if (doublings >= 14) return uint16(BPS);
+        band <<= doublings;
+        return uint16(band > BPS ? BPS : band);
     }
 
     function approvedKey(bytes32 driver) external view returns (address) {
@@ -301,35 +455,52 @@ contract Station is IStation, ReentrancyGuardTransient {
     function _stop(bytes32 reason, uint64 haltedAt) private {
         if (stopped) revert AlreadyStopped();
         stopped = true;
+        stoppedAt = uint64(block.timestamp);
         for (uint256 i = 0; i < _spec.drivers.length; i++) {
-            address key = _approvedKey[_spec.drivers[i]];
-            // A venue that refuses the revoke can't keep the station from
-            // stopping: the key loses the station's driver either way.
-            if (key != address(0)) _revoke(_spec.drivers[i], key, false);
+            bytes32 driver = _spec.drivers[i];
+            address key = _approvedKey[driver];
+            if (key == address(0)) continue;
+            // A venue or a driver that refuses the revoke can't keep the
+            // station from stopping. A key whose revoke didn't go through
+            // stays recorded, and anyone may withdraw it with `revokeKey`.
+            if (_revokeBestEffort(driver, key)) {
+                delete _approvedKey[driver];
+                emit KeyRevoked(driver, key);
+            } else {
+                emit RevokeSkipped(driver, key);
+            }
         }
         emit Stopped(reason, haltedAt);
     }
 
-    function _revoke(bytes32 driver, address key, bool strict) private {
-        _declaredDriver(driver);
-        _revokeVia(IDriver(_unwindDriver(driver)), key, strict);
+    function _revoke(bytes32 driver, address key) private {
+        _revokeStrict(driver, key, false);
         if (_approvedKey[driver] == key) delete _approvedKey[driver];
         emit KeyRevoked(driver, key);
     }
 
-    /// Withdraw `key` through `implementation`. Unless `strict`, whatever the
-    /// driver or the venue does, the station carries on: a stop, or a
-    /// lapsed key's replacement, goes through.
-    function _revokeVia(IDriver implementation, address key, bool strict) private {
-        if (strict) {
-            _call(implementation.revokeKey(address(this), key), implementation.targets(), true);
-            return;
-        }
-        try implementation.revokeKey(address(this), key) returns (Call[] memory calls) {
-            try implementation.targets() returns (address[] memory targets) {
-                _call(calls, targets, false);
-            } catch {}
+    /// Withdraw `key` at the venue through the pinned driver; every call
+    /// must go through.
+    function _revokeStrict(bytes32 driver, address key, bool capped) private {
+        IDriver implementation = IDriver(_pinned(driver));
+        Call[] memory calls = implementation.revokeKey(address(this), key);
+        if (capped && calls.length > MAX_REVOKE_CALLS) revert BadCall();
+        _run(calls, implementation.targets());
+    }
+
+    /// The same, inside a self-call with one fixed budget: whatever the
+    /// driver or the venue does (burns its gas, returns a list that doesn't
+    /// decode, refuses), the station carries on, and learns whether the key
+    /// is really gone.
+    function _revokeBestEffort(bytes32 driver, address key) private returns (bool done) {
+        try this.revokeOnce{gas: BEST_EFFORT_GAS}(driver, key) {
+            done = true;
         } catch {}
+    }
+
+    function revokeOnce(bytes32 driver, address key) external {
+        if (msg.sender != address(this)) revert NotAllowed();
+        _revokeStrict(driver, key, true);
     }
 
     function _send(bytes32 name, uint256 toChain, uint256 amount, bytes memory extra) private {
@@ -340,8 +511,8 @@ contract Station is IStation, ReentrancyGuardTransient {
         // against one moment, the valuation's open.
         if (toChain != _spec.vaultChain && (!isHome() || !_listed(_spec.chains, toChain))) revert NoRoute();
         if (!_contains(_spec.bridges, name)) revert NotDeclared();
-        address implementation = _registry().bridgeOf(name);
-        if (implementation == address(0)) revert NotApproved();
+        address implementation = _pinnedBridge[name];
+        if (_registry().isBridgeRevoked(name, implementation)) revert NotApproved();
         // The recipient is this station's own address, which is the vault's
         // station on every chain, so a send can only reach the vault's own.
         _run(
@@ -360,20 +531,13 @@ contract Station is IStation, ReentrancyGuardTransient {
 
     /// Make each call after checking where it goes: to one of the driver's
     /// targets, or to the dollar only to approve one of them.
+    /// Nothing a driver prepares reaches the vault, the station itself, its
+    /// factory or the registry, as a target or as a spender, whatever the
+    /// driver lists; a call the station would refuse is never made.
     function _run(Call[] memory calls, address[] memory targets) private {
-        _call(calls, targets, true);
-    }
-
-    /// Make each call after checking where it goes; a call that fails stops
-    /// everything only if `strict`. Nothing a driver prepares reaches the
-    /// vault, the station itself, its factory or the registry, as a target
-    /// or as a spender, whatever the driver lists.
-    function _call(Call[] memory calls, address[] memory targets, bool strict) private {
         address dollar = address(_asset());
         for (uint256 i = 0; i < calls.length; i++) {
             Call memory c = calls[i];
-            // A call the station would refuse is never made; outside a
-            // strict run it is skipped rather than stopping everything.
             bool allowed;
             if (c.target == dollar) {
                 if (c.data.length == 68 && bytes4(c.data) == APPROVE) {
@@ -383,12 +547,9 @@ contract Station is IStation, ReentrancyGuardTransient {
             } else {
                 allowed = _includes(targets, c.target) && !_ours(c.target);
             }
-            if (!allowed) {
-                if (strict) revert BadCall();
-                continue;
-            }
+            if (!allowed) revert BadCall();
             (bool ok, bytes memory reason) = c.target.call{value: c.value}(c.data);
-            if (!ok && strict) {
+            if (!ok) {
                 assembly {
                     revert(add(reason, 32), mload(reason))
                 }
@@ -425,9 +586,16 @@ contract Station is IStation, ReentrancyGuardTransient {
         if (!_contains(_spec.drivers, driver)) revert NotDeclared();
     }
 
-    function _unwindDriver(bytes32 driver) private view returns (address implementation) {
-        implementation = _registry().unwindDriver(driver);
-        if (implementation == address(0)) revert NotApproved();
+    /// The implementation pinned at creation for a declared driver.
+    function _pinned(bytes32 driver) private view returns (address implementation) {
+        implementation = _pinnedDriver[driver];
+        if (implementation == address(0)) revert NotDeclared();
+    }
+
+    /// The pinned implementation, if it may still trade.
+    function _tradable(bytes32 driver) private view returns (address implementation) {
+        implementation = _pinned(driver);
+        if (_registry().isDriverRevoked(driver, implementation)) revert NotApproved();
     }
 
     function _registry() private view returns (IAttestationRegistry) {

@@ -92,6 +92,10 @@ contract Vault is IVault, ReentrancyGuardTransient {
         Claims.settleClaim(claimId);
     }
 
+    function freezeUnits(address holder) external nonReentrant {
+        Upkeep.freezeUnits(holder);
+    }
+
     function freeze(uint256 claimId) external nonReentrant {
         Upkeep.freeze(claimId);
     }
@@ -184,6 +188,10 @@ contract Vault is IVault, ReentrancyGuardTransient {
 
     function valuing() external view returns (bool) {
         return VaultStorage.layout().valuing();
+    }
+
+    function unsettled() external view returns (bool) {
+        return Valuations.owed(VaultStorage.layout());
     }
 
     // The tank --------------------------------------------------------------
@@ -420,6 +428,10 @@ contract Vault is IVault, ReentrancyGuardTransient {
     function units() external view returns (uint256, uint256) {
         Layout storage s = VaultStorage.layout();
         return (s.liveUnits(), s.unitReserve);
+    }
+
+    function unitsSince(address holder) external view returns (uint64) {
+        return VaultStorage.layout().unitsSince[holder];
     }
 
     function unitsOf(address holder) external view returns (uint256 held, uint256 claimable) {

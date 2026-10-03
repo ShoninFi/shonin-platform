@@ -37,9 +37,9 @@ enum ValuationKind {
 /// A driver holds nothing and keeps no per-vault state, so one deployment
 /// serves every station on its chain. It never calls anything itself: every
 /// function is a view that returns calls, and the station checks each call's
-/// target against `targets()` before making it. A fix to a driver reaches
-/// every running station when the registry's timelock passes, because
-/// stations look the driver up at call time and store none.
+/// target against `targets()` before making it. A station pins the driver
+/// approved when it was created and uses it for good, so a newer version
+/// reaches only stations created after it is approved.
 interface IDriver {
     /// The name `shonin.toml` writes, zero-padded.
     function name() external view returns (bytes32);
@@ -65,7 +65,8 @@ interface IDriver {
     /// And back.
     function withdraw(address station, uint256 amount) external view returns (Call[] memory);
     /// Close `fraction` (1e18 is all) of every position, each order no worse
-    /// than `bandBps` from the venue's own price. `blocked` is true, with no
+    /// than `bandBps` from the venue's own price; at 10,000 or more, at any
+    /// price, never blocked. `blocked` is true, with no
     /// calls, when a market is outside the band: nothing is closed then, so a
     /// leaver is never sold through a market that has run away.
     function close(

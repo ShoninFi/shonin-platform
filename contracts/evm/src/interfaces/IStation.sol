@@ -37,6 +37,9 @@ struct StationSpec {
 interface IStation {
     event KeyApproved(bytes32 indexed driver, address indexed key, uint64 validUntil);
     event KeyRevoked(bytes32 indexed driver, address indexed key);
+    /// A best-effort revoke (at a stop, or a lapsed key's replacement) didn't
+    /// go through at the venue; anyone may withdraw the key with `revokeKey`.
+    event RevokeSkipped(bytes32 indexed driver, address indexed key);
     event Pulled(uint256 amount);
     event Pushed(uint256 amount);
     event Deposited(bytes32 indexed driver, uint256 amount);
@@ -44,6 +47,9 @@ interface IStation {
     event Bridged(bytes32 indexed bridge, uint256 indexed sequence, uint256 indexed toChain, uint256 amount);
     event Unwound(uint256 fraction, uint256 sentHome, bool blocked);
     event Stopped(bytes32 reason, uint64 haltedAt);
+    /// A driver failed during a stopped station's full unwind; the others
+    /// went ahead.
+    event DriverFailed(bytes32 indexed driver);
 
     /// A close inside the band that couldn't bring its worth home: margin a
     /// position was bought on still holds the proceeds at the venue. The
@@ -71,7 +77,9 @@ interface IStation {
     /// vault, carried from the vault's chain.
     function stop(bytes32 reason, uint64 haltedAt, bytes calldata signature) external;
     /// Close `fraction` (1e18 is all) of every position inside the exit band
-    /// and send that fraction's dollars home. `blocked` is true, and nothing
+    /// and send that fraction's dollars home. A stopped station's full
+    /// unwind closes each venue on its own inside `stoppedBand()`, skipping
+    /// one that fails, and sends everything idle home. `blocked` is true, and nothing
     /// is closed, when a market is outside the band. It reverts with
     /// `ShortSweep` when what a venue sends home falls short of the closed
     /// fraction's worth by more than the band.
@@ -86,6 +94,21 @@ interface IStation {
     function isHome() external view returns (bool);
     function stopped() external view returns (bool);
     function approvedKey(bytes32 driver) external view returns (address);
+    /// The implementation pinned at creation for a declared driver or bridge.
+    function pinnedDriver(bytes32 driver) external view returns (address);
+    function pinnedBridge(bytes32 name) external view returns (address);
+    /// When it stopped; zero while it runs.
+    function stoppedAt() external view returns (uint64);
+    /// The band its full unwind closes inside now: the exit band, widening
+    /// after it has been stopped a while.
+    function stoppedBand() external view returns (uint16);
+    /// A stopped station's full unwind through the named drivers only, then
+    /// everything idle home; anyone may call it.
+    function unwindStopped(bytes32[] calldata drivers) external returns (uint256 sentHome, bool blocked);
+    /// Only the station itself calls it, for a best-effort revoke.
+    function revokeOnce(bytes32 driver, address key) external;
+    /// Only the station itself calls it, during a stopped full unwind.
+    function closeAll(bytes32 driver, uint16 band) external returns (bool outside);
     function sends() external view returns (Send[] memory);
     function sendCount() external view returns (uint256);
     function sendAt(uint256 index) external view returns (Send memory);
@@ -147,4 +170,6 @@ interface IStationVault {
     function haltGrace() external view returns (uint64);
     /// Whether a valuation is waiting for other chains' posts.
     function valuing() external view returns (bool);
+    /// Whether a priced valuation still has requests to settle.
+    function unsettled() external view returns (bool);
 }

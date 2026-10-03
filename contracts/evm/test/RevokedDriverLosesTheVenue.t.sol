@@ -24,7 +24,7 @@ contract RevokedDriverLosesTheVenueTest is Fixture {
 
         // The admin pulls the driver: urgent, immediate.
         vm.prank(admin);
-        attestation.revokeDriver("local");
+        attestation.revokeDriver("local", address(driver));
         assertEq(attestation.tradingDriver("local"), address(0));
 
         // The station refuses new work through it...

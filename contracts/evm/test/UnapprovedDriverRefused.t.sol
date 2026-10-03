@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.30;
 
+import {Station} from "../src/Station.sol";
 import {VaultFactory} from "../src/VaultFactory.sol";
 import {ChainNeed} from "../src/interfaces/IStrategyRegistry.sol";
 import {Fixture} from "./Fixture.sol";
@@ -39,7 +40,7 @@ contract UnapprovedDriverRefusedTest is Fixture {
     }
 
     function test_a_strategy_whose_driver_was_never_approved_cannot_be_activated() public {
-        assertEq(attestation.unwindDriver("nowhere"), address(0));
+        assertEq(attestation.tradingDriver("nowhere"), address(0));
         (uint256 id,) = readyWithDriver("nowhere");
 
         vm.expectRevert(VaultFactory.UnknownDriver.selector);
@@ -49,7 +50,7 @@ contract UnapprovedDriverRefusedTest is Fixture {
         give(author, MINIMUM_TANK);
         vm.startPrank(author);
         usd.approve(address(factory), MINIMUM_TANK);
-        vm.expectRevert(VaultFactory.UnknownDriver.selector);
+        vm.expectRevert(Station.NotApproved.selector);
         factory.activate(id, allowancesCosting(2e6), 500, MINIMUM_TANK, 0, "", terms);
         vm.stopPrank();
     }

@@ -53,7 +53,10 @@ library Valuations {
         if (s.statementOf[receiver] != s.restrictedHash) revert IVault.NoStatement();
         IERC20(s.asset).safeTransferFrom(msg.sender, address(this), assets);
         s.escrow += assets;
-        return s.queue(receiver, RequestKind.Deposit, assets, 0);
+        uint256 id = s.queue(receiver, RequestKind.Deposit, assets, 0);
+        // Sent back, it goes to whoever paid it, not to the receiver named.
+        if (msg.sender != receiver) s.payerOf[id] = msg.sender;
+        return id;
     }
 
     function requestRedeem(uint256 shares, address receiver) external returns (uint256) {
@@ -100,8 +103,9 @@ library Valuations {
         (uint256 markValue, uint256 exitValue) = IStation(s.homeStation).value();
         if (IStation(s.homeStation).outsideBand()) s.wide[count] = true;
         // An exit side above the mark is what the holdings could be sold
-        // for: a deposit pays it on top, so it can't buy below the pool's
-        // worth; but nobody is paid it, and no fee is charged on it.
+        // for: a deposit pays it on top, net of the profit fee a sale there
+        // would owe, so it can't buy below the pool's realisable worth; but
+        // nobody is paid it, and no withdrawal or fee is measured on it.
         uint256 extra;
         if (exitValue > markValue) (extra, exitValue) = (exitValue - markValue, markValue);
         s.sentAtValuation[count] = s.sentTotal;
@@ -226,7 +230,8 @@ library Valuations {
     /// Whether a priced valuation still has requests waiting on it. A new
     /// valuation waits until they are settled, so each prices only its own.
     function owed(Layout storage s) internal view returns (bool) {
-        if (s.lastPriced == 0) return false;
+        // A closed vault settles what is left through its own doors.
+        if (s.lastPriced == 0 || s.state == VaultState.Closed) return false;
         uint256 i = s.requestCursor;
         if (i == s.requests.length) return false;
         Request storage r = s.requests[i];
@@ -312,14 +317,19 @@ library Valuations {
         }
     }
 
+    function _refund(Layout storage s, uint256 id, address owner, uint256 assets) private {
+        address to = s.refundTo(id, owner);
+        s.pay(to, assets);
+        emit IVault.Refunded(id, to, assets);
+    }
+
     function _deposit(Layout storage s, Request storage r, uint256 id) private {
         uint256 assets = r.amount;
         s.escrow -= assets;
         // A vault that stopped taking deposits, or a list the depositor
         // hasn't signed for, sends the money back.
         if (s.state != VaultState.Open || s.statementOf[r.owner] != s.restrictedHash) {
-            s.pay(r.owner, assets);
-            emit IVault.Refunded(id, r.owner, assets);
+            _refund(s, id, r.owner, assets);
             return;
         }
         uint256 net = s.depositNet;
@@ -327,8 +337,7 @@ library Valuations {
         uint256 shares =
             (assets - assets.mulDiv(s.fees.transactionBps, BPS, Math.Rounding.Ceil)).mulDiv(supply, net);
         if (shares == 0) {
-            s.pay(r.owner, assets);
-            emit IVault.Refunded(id, r.owner, assets);
+            _refund(s, id, r.owner, assets);
             return;
         }
         // Money joining above the mark joins at its own price: the mark
@@ -473,6 +482,21 @@ library Valuations {
     /// A request nothing has priced for `fallbackAfter`. A redemption takes
     /// the cash's share now and holds units for the rest of what the stations
     /// hold; a deposit, whose money never left, takes it back.
+    /// Whether the home station could be valued now inside the band.
+    function _priceable(Layout storage s) private view returns (bool) {
+        IStation station = IStation(s.homeStation);
+        try station.outsideBand() returns (bool wide) {
+            if (wide) return false;
+        } catch {
+            return false;
+        }
+        try station.value() returns (uint256, uint256) {
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
     function takeProRata(uint256 requestId) external {
         Layout storage s = VaultStorage.layout();
         Request storage r = s.requests[requestId - 1];
@@ -490,12 +514,15 @@ library Valuations {
         // Not while a valuation could price it: the fallback is for when
         // nothing can, not a way round the fee.
         if (s.lastPriced != 0 && s.latest().time >= r.earliest) revert IVault.NotAllowed();
+        // A deposit goes back only when a valuation now would price nothing
+        // either: otherwise its owner could record one, see the price, and
+        // choose between buying and taking the money back.
+        if (deposit && s.otherChains.length == 0 && _priceable(s)) revert IVault.NotAllowed();
         r.done = true;
         s.passDone();
         if (deposit) {
             s.escrow -= r.amount;
-            s.pay(r.owner, r.amount);
-            emit IVault.Refunded(requestId, r.owner, r.amount);
+            _refund(s, requestId, r.owner, r.amount);
             return;
         }
         s.pendingShares -= r.amount;
@@ -550,6 +577,7 @@ library Valuations {
         assets -= kept;
         if (raw != 0) {
             _accrue(s, owner);
+            if (s.unitsOf[owner] == 0) s.unitsSince[owner] = uint64(block.timestamp);
             s.unitsOf[owner] += raw;
             s.units += raw;
             s.unitDebt[owner] = s.unitsOf[owner].mulDiv(s.perUnit, UNIT_SCALE, Math.Rounding.Ceil);
@@ -587,7 +615,8 @@ library Valuations {
         Layout storage s = VaultStorage.layout();
         uint256 raw = s.unitsOf[holder];
         if (raw == 0) revert IVault.Nothing();
-        if (s.valuing()) revert IVault.NotYet();
+        // Not between a valuation's pricing and its settlement, as claims.
+        if (s.valuing() || owed(s)) revert IVault.NotYet();
         // On a vault that trades on other chains a serve here reaches only
         // this chain's station, and nothing on this chain can say what the
         // others hold: only the holder may accept it.
@@ -595,9 +624,16 @@ library Valuations {
         uint256 fraction = raw.mulDiv(s.scale(), WAD);
         if (fraction > WAD) fraction = WAD;
         if (fraction == 0) fraction = 1;
-        (, uint256 exitBefore) = IStation(s.homeStation).value();
+        (uint256 markBefore,) = IStation(s.homeStation).value();
         s.serving = holder;
-        (uint256 home, bool blocked) = IStation(s.homeStation).unwind(fraction);
+        // A close that fails (one that would bring the holder nothing, say)
+        // brings nothing home; whether that clears the units as dust or
+        // leaves them waiting is judged below.
+        uint256 home;
+        bool blocked;
+        try IStation(s.homeStation).unwind(fraction) returns (uint256 sent, bool outside) {
+            (home, blocked) = (sent, outside);
+        } catch {}
         s.serving = address(0);
         // Units are only burned for what came home for them: nothing home
         // from a station that held something, or from a vault whose stations
@@ -605,21 +641,29 @@ library Valuations {
         // worth nothing and can be cleared.
         // Units worth less than one unit of the dollar are worth nothing and
         // are cleared rather than left to block the station.
-        // Judged on every station: this one now, and all of them as the
-        // last valuation counted them.
-        uint256 stations = exitBefore;
-        if (s.lastPriced != 0) {
+        // Judged at the mark, on every station: this one now, and all of them
+        // as the last valuation counted them, whichever is more, as a claim's
+        // dust is; a close refused because it would pay the holder nothing
+        // at exit prices proves nothing, and the units wait. Once the vault
+        // has closed its stations were found empty, and only what this one
+        // holds now counts.
+        uint256 stations = markBefore;
+        if (s.lastPriced != 0 && s.state != VaultState.Closed) {
             Valuation storage last = s.latest();
-            uint256 counted = last.grossExit - 1 - last.cash;
+            uint256 counted = last.gross - 1 - last.cash;
             if (counted > stations) stations = counted;
         }
-        bool worthSomething = stations.mulDiv(fraction, WAD) != 0;
+        // The station rounds each venue's part and its idle part down on its
+        // own, so units worth fewer dollar-units than it has parts may bring
+        // nothing home however often they are served: they are dust.
+        bool worthSomething = stations.mulDiv(fraction, WAD) > s.dust();
         if (blocked || (home == 0 && worthSomething)) {
             revert IVault.NotYet();
         }
         _accrue(s, holder);
         s.units -= raw;
         s.unitsOf[holder] = 0;
+        s.unitsSince[holder] = 0;
         // What is left at the stations is everyone else's, in the same
         // proportions as before: every remaining fraction grows to match.
         if (s.units == 0) {

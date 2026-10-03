@@ -5,6 +5,7 @@ import {Station} from "../src/Station.sol";
 import {Vault} from "../src/Vault.sol";
 import {OrderRequest} from "../src/interfaces/ILocalVenue.sol";
 import {IStation} from "../src/interfaces/IStation.sol";
+import {IVault} from "../src/interfaces/IVault.sol";
 import {Fixture} from "./Fixture.sol";
 
 /// A unit holder's units are only burned for a close that brings their
@@ -59,7 +60,7 @@ contract ServeNeedsItsWorthHomeTest is Fixture {
         // the account's cash would still be negative, so nothing could come
         // home: the serve is refused.
         vm.prank(bob);
-        vm.expectRevert(IStation.ShortSweep.selector);
+        vm.expectRevert(IVault.NotYet.selector);
         vault.serveProRata(alice);
 
         (uint256 heldAfter, uint256 claimable) = vault.unitsOf(alice);

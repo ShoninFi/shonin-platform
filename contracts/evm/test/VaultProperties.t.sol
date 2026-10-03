@@ -431,7 +431,8 @@ contract VaultPropertiesTest is Fixture {
         vault.close();
         assertTrue(vault.state() == VaultState.Closed);
         // And the dust is still recoverable for the holders afterwards.
+        uint256 closedCash = vault.cash();
         station.unwind(1e18);
-        assertEq(vault.cash(), 100_000e6 + DEAD_ASSETS + 1, "dust lost");
+        assertEq(vault.cash(), closedCash + 1, "dust lost");
     }
 }

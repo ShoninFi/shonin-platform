@@ -257,7 +257,10 @@ contract LocalVenue is ILocalVenue {
 
         _cash[master] = nextCash;
         p.size = nextSize;
-        _remember(master, order.market);
+        // The markets an account holds are the ones it holds now, so a
+        // driver asks about those alone.
+        if (nextSize == 0) _forget(master, order.market);
+        else _remember(master, order.market);
 
         emit Filled(master, order.market, msg.sender, order.isBuy, order.reduceOnly, size, price, notional);
         return Fill({accepted: true, reason: "", size: size, price: price, notional: notional});
@@ -366,6 +369,19 @@ contract LocalVenue is ILocalVenue {
         bytes32[] storage held = _held[master];
         for (uint256 i = 0; i < held.length; i++) {
             _settleFunding(master, held[i]);
+        }
+    }
+
+    function _forget(address master, bytes32 market) private {
+        if (!_isHeld[master][market]) return;
+        _isHeld[master][market] = false;
+        bytes32[] storage held = _held[master];
+        for (uint256 i = 0; i < held.length; i++) {
+            if (held[i] == market) {
+                held[i] = held[held.length - 1];
+                held.pop();
+                return;
+            }
         }
     }
 

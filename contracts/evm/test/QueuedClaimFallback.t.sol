@@ -53,11 +53,10 @@ contract QueuedClaimFallbackTest is Fixture {
         assertTrue(vault.claimAt(1).state == ClaimState.Queued);
         uint256 claimRequest = vault.requestCount();
 
-        // The venue pauses: its driver's reads revert, no valuation can be
-        // recorded, and the fix takes the registry's timelock.
+        // The venue pauses: its driver's reads revert, and no valuation can
+        // be recorded.
         FaultingDriver faulting = new FaultingDriver();
-        vm.prank(admin);
-        attestation.proposeDriver("local", address(faulting));
+        pinnedDriverActsAs(address(faulting));
         skip(TIMELOCK);
         uint256 t = vm.getBlockTimestamp();
         vm.warp(t - (t % SLOT) + SLOT);

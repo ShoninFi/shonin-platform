@@ -22,6 +22,7 @@ contract FakeVault is IStationVault {
     uint64 public constant haltGrace = 10 minutes;
     uint256 public cash;
     bool public valuing;
+    bool public unsettled;
 
     constructor(IERC20 dollar_) {
         dollar = dollar_;
@@ -124,7 +125,9 @@ contract GreedyDriver is IDriver {
     }
 }
 
-contract StationTest is Fixture {
+/// A station on a stand-in vault, with the stand-in venue's driver and
+/// bridge, for the station's own tests.
+abstract contract StationBase is Fixture {
     uint256 internal constant UNWINDER_KEY = 0xD1E;
     uint256 internal constant OTHER_EXECUTOR_KEY = 0xE8ED;
     uint256 internal constant HOME = 31_337;
@@ -195,7 +198,9 @@ contract StationTest is Fixture {
         venue.place(address(station), orders);
         vm.stopPrank();
     }
+}
 
+contract StationTest is StationBase {
     // Where ownStations are ----------------------------------------------------
 
     function test_a_station_is_where_the_factory_says_on_every_chain() public view {
@@ -323,7 +328,7 @@ contract StationTest is Fixture {
         vm.prank(executor);
         venue.place(address(station), closingAll());
         vm.prank(admin);
-        attestation.revokeDriver("local");
+        attestation.revokeDriver("local", address(driver));
 
         vm.prank(executor);
         vm.expectRevert(Station.NotApproved.selector);

@@ -25,7 +25,7 @@ contract EqualDepositsBuyEqualSharesTest is ClaimBase {
         // In the valuation's block the bid sits above the mark: the exit
         // side exceeds the mark side and deposits pay the premium on top.
         vm.prank(operator);
-        venue.setPrices(SPOT, 70_000e6, 70_000e6, 75_000e6, 76_000e6);
+        venue.setPrices(SPOT, 70_000e6, 70_000e6, 70_560e6, 70_630e6);
         uint256 t = vm.getBlockTimestamp();
         vm.warp(t - (t % SLOT) + SLOT);
         vault.recordValuation();

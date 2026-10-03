@@ -165,10 +165,8 @@ contract RegistriesTest is Fixture {
         vm.prank(admin);
         attestation.proposeDriver("test-driver", v1);
         assertEq(attestation.tradingDriver("test-driver"), address(0));
-        assertEq(attestation.unwindDriver("test-driver"), address(0));
         skip(TIMELOCK);
         assertEq(attestation.tradingDriver("test-driver"), v1);
-        assertEq(attestation.unwindDriver("test-driver"), v1);
     }
 
     function test_a_new_driver_version_replaces_the_old_only_when_ready() public {
@@ -184,30 +182,54 @@ contract RegistriesTest is Fixture {
         assertEq(attestation.tradingDriver("test-driver"), v2);
     }
 
-    function test_revoking_a_driver_stops_trading_but_not_unwinding() public {
+    function test_revoking_a_driver_stops_new_stations_pinning_it() public {
         address v1 = makeAddr("driver v1");
         vm.prank(admin);
         attestation.proposeDriver("test-driver", v1);
         skip(TIMELOCK);
         vm.prank(admin);
-        attestation.revokeDriver("test-driver");
+        attestation.revokeDriver("test-driver", v1);
         assertEq(attestation.tradingDriver("test-driver"), address(0));
-        assertEq(attestation.unwindDriver("test-driver"), v1);
+        assertTrue(attestation.isDriverRevoked("test-driver", v1));
     }
 
-    function test_revoking_withdraws_a_proposal_still_waiting() public {
+    function test_withdrawing_a_proposal_leaves_the_driver_in_force() public {
         address v1 = makeAddr("driver v1");
         address bad = makeAddr("bad driver");
         vm.startPrank(admin);
         attestation.proposeDriver("test-driver", v1);
         skip(TIMELOCK);
         attestation.proposeDriver("test-driver", bad);
-        attestation.revokeDriver("test-driver");
+        attestation.withdrawDriverProposal("test-driver");
         vm.stopPrank();
         skip(TIMELOCK);
-        // The waiting proposal never counts, and the one in force is revoked.
-        assertEq(attestation.tradingDriver("test-driver"), address(0));
-        assertEq(attestation.unwindDriver("test-driver"), v1);
+        // The waiting proposal never counts, and the one in force stands.
+        assertEq(attestation.tradingDriver("test-driver"), v1);
+        assertFalse(attestation.isDriverRevoked("test-driver", v1));
+    }
+
+    function test_an_older_driver_stations_still_pin_can_be_revoked() public {
+        address v1 = makeAddr("driver v1");
+        address v2 = makeAddr("driver v2");
+        vm.startPrank(admin);
+        attestation.proposeDriver("test-driver", v1);
+        skip(TIMELOCK);
+        attestation.proposeDriver("test-driver", v2);
+        skip(TIMELOCK);
+        attestation.revokeDriver("test-driver", v1);
+        vm.stopPrank();
+        assertTrue(attestation.isDriverRevoked("test-driver", v1));
+        assertEq(attestation.tradingDriver("test-driver"), v2, "revoking an older one touched the newer");
+    }
+
+    function test_revoking_a_proposal_still_waiting_withdraws_it() public {
+        address v1 = makeAddr("driver v1");
+        vm.startPrank(admin);
+        attestation.proposeDriver("test-driver", v1);
+        attestation.revokeDriver("test-driver", v1);
+        vm.stopPrank();
+        skip(TIMELOCK);
+        assertEq(attestation.tradingDriver("test-driver"), address(0), "the revoked proposal went live");
     }
 
     function test_a_fix_proposed_after_a_revocation_trades_again() public {
@@ -216,7 +238,7 @@ contract RegistriesTest is Fixture {
         vm.startPrank(admin);
         attestation.proposeDriver("test-driver", v1);
         skip(TIMELOCK);
-        attestation.revokeDriver("test-driver");
+        attestation.revokeDriver("test-driver", v1);
         attestation.proposeDriver("test-driver", v2);
         vm.stopPrank();
         skip(TIMELOCK);
@@ -226,7 +248,7 @@ contract RegistriesTest is Fixture {
     function test_the_first_bridge_proposal_can_be_withdrawn() public {
         vm.startPrank(admin);
         attestation.proposeBridge("test-bridge", makeAddr("wrong bridge"));
-        attestation.revokeBridge("test-bridge");
+        attestation.withdrawBridgeProposal("test-bridge");
         vm.stopPrank();
         skip(TIMELOCK);
         assertEq(attestation.bridgeOf("test-bridge"), address(0));
@@ -240,8 +262,9 @@ contract RegistriesTest is Fixture {
         skip(TIMELOCK);
         assertEq(attestation.bridgeOf("test-bridge"), bridge);
         vm.prank(admin);
-        attestation.revokeBridge("test-bridge");
+        attestation.revokeBridge("test-bridge", bridge);
         assertEq(attestation.bridgeOf("test-bridge"), address(0));
+        assertTrue(attestation.isBridgeRevoked("test-bridge", bridge));
     }
 
     // Blessing --------------------------------------------------------------

@@ -442,6 +442,22 @@ contract VaultTest is Fixture {
         assertEq(usd.balanceOf(author), 10e6);
     }
 
+    function test_an_unsigned_tank_request_lapses_a_day_after_it_is_ready() public {
+        vm.startPrank(author);
+        vault.requestTankWithdrawal();
+        skip(2 days + 1);
+        vm.expectRevert(IVault.NotAllowed.selector);
+        vault.withdrawTankUnsigned(10e6);
+        // A fresh request waits its day again.
+        vault.requestTankWithdrawal();
+        vm.expectRevert(IVault.NotYet.selector);
+        vault.withdrawTankUnsigned(10e6);
+        skip(1 days);
+        vault.withdrawTankUnsigned(10e6);
+        vm.stopPrank();
+        assertEq(usd.balanceOf(author), 10e6);
+    }
+
     function test_auto_fill_redeems_the_authors_shares_like_any_withdrawal() public {
         depositAs(vault, alice, 100_000e6);
         freshWeek();
@@ -647,6 +663,71 @@ contract VaultTest is Fixture {
         uint256 toBob = vault.redeemClosed(bobShares, bob);
         approxEq(toAlice, 100_000e6, 200e6);
         approxEq(toBob, 50_000e6, 100e6);
+    }
+
+    function test_a_closed_vault_leaves_nothing_stranded_with_the_dead_shares() public {
+        uint256 aliceShares = depositAs(vault, alice, 100_000e6);
+        vm.prank(admin);
+        vault.kill();
+        skip(HALT_GRACE);
+        station.stop();
+        station.unwind(1e18);
+        value(vault);
+        uint256 tankBefore = vault.tank().balance;
+        uint256 dead = vault.balanceOf(address(0xdEaD));
+        assertGt(dead, 0);
+        uint256 deadPart = vault.cash() * dead / vault.totalSupply();
+        vault.close();
+
+        assertEq(vault.balanceOf(address(0xdEaD)), 0, "the dead shares outlived the close");
+        // A few units less: the close's payday mints the fee shares first.
+        assertApproxEqAbs(
+            vault.tank().balance, tankBefore + deadPart, 10, "the dead shares' part didn't reach the author"
+        );
+        vm.prank(alice);
+        vault.redeemClosed(aliceShares, alice);
+        for (uint256 i = 0; i < 2; i++) {
+            address holder = i == 0 ? platform : author;
+            uint256 shares = vault.balanceOf(holder);
+            if (shares == 0) continue;
+            vm.prank(holder);
+            vault.redeemClosed(shares, holder);
+        }
+        assertEq(vault.totalSupply(), 0);
+        assertLe(vault.cash(), 1, "money was stranded in the closed vault");
+    }
+
+    /// A factory that replaces another never activates a strategy that
+    /// already has a vault from it.
+    function test_a_replacement_factory_refuses_a_strategy_that_has_a_vault() public {
+        (uint256 id,) = ready();
+        activate(id, allowancesCosting(2e6), MINIMUM_TANK);
+        uint256 otherId;
+        (otherId,) = ready();
+
+        VaultFactory.Deps memory deps = VaultFactory.Deps({
+            asset: IERC20(address(usd)),
+            attestation: attestation,
+            strategies: strategies,
+            reviews: reviews,
+            prices: prices,
+            stationFactory: stations,
+            vaultImplementation: address(new Vault()),
+            admin: admin,
+            platform: platform,
+            previous: factory
+        });
+        VaultFactory replacement = new VaultFactory(deps, vaultConfig(), chainNames());
+        assertEq(replacement.vaultOf(id), factory.vaultOf(id), "the replacement can't see the old vault");
+        assertEq(replacement.vaultOf(otherId), address(0));
+
+        bytes32 terms = replacement.terms();
+        give(author, MINIMUM_TANK);
+        vm.startPrank(author);
+        usd.approve(address(replacement), MINIMUM_TANK);
+        vm.expectRevert(VaultFactory.VaultExists.selector);
+        replacement.activate(id, allowancesCosting(2e6), 500, MINIMUM_TANK, 0, "", terms);
+        vm.stopPrank();
     }
 
     function test_a_strategy_trading_on_another_chain_cannot_be_activated_yet() public {

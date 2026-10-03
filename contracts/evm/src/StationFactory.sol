@@ -35,8 +35,6 @@ contract StationFactory is IStationFactory {
     error NotVaultFactory();
     error NotBlessed();
     error WrongChain();
-    error UnknownDriver();
-    error UnknownBridge();
     error OutOfRange();
 
     constructor(address initializer_) {
@@ -51,6 +49,14 @@ contract StationFactory is IStationFactory {
     ) external {
         if (msg.sender != initializer) revert NotInitializer();
         if (implementation != address(0)) revert AlreadyInitialized();
+        // Zero would leave it uninitialised and open to a second call, or
+        // brick every station it creates.
+        if (
+            implementation_ == address(0) || attestation_ == address(0) || asset_ == address(0)
+                || vaultFactory_ == address(0)
+        ) {
+            revert NotInitialized();
+        }
         attestation = attestation_;
         asset = asset_;
         vaultFactory = vaultFactory_;
@@ -98,14 +104,8 @@ contract StationFactory is IStationFactory {
         if (err != ECDSA.RecoverError.NoError || !registry.isBlessedAs(builder, ImageKind.Builder)) {
             revert NotBlessed();
         }
-        // A driver this chain's registry doesn't know could never value,
-        // stop or unwind the station.
-        for (uint256 i = 0; i < spec.drivers.length; i++) {
-            if (registry.unwindDriver(spec.drivers[i]) == address(0)) revert UnknownDriver();
-        }
-        for (uint256 i = 0; i < spec.bridges.length; i++) {
-            if (registry.bridgeOf(spec.bridges[i]) == address(0)) revert UnknownBridge();
-        }
+        // The station pins this chain's approved drivers and bridges when it
+        // is created, and refuses a name with none.
         return _create(spec);
     }
 

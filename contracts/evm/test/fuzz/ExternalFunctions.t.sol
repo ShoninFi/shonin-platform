@@ -23,6 +23,7 @@ pragma solidity ^0.8.30;
 //   settle                   VaultExternalFunctionsTest.testFuzz_settle
 //   settleClaim              VaultExternalFunctionsTest.testFuzz_settleClaim
 //   freeze                   VaultExternalFunctionsTest.testFuzz_freeze
+//   freezeUnits              VaultExternalFunctionsTest.testFuzz_freezeUnits
 //   takeProRata              VaultExternalFunctionsTest.testFuzz_takeProRata
 //   claimInstead             VaultExternalFunctionsTest.testFuzz_claimInstead
 //   settleClosed             VaultExternalFunctionsTest.testFuzz_settleClosed
@@ -80,12 +81,16 @@ pragma solidity ^0.8.30;
 //   Station.stop(bytes32,uint64,bytes)    RemoteStationExternalFunctionsTest.testFuzz_carried_stop,
 //                                         StationExternalFunctionsTest.testFuzz_stop (refused at home)
 //   Station.unwind                        StationExternalFunctionsTest.testFuzz_unwind
+//   Station.closeAll                      StationExternalFunctionsTest.testFuzz_closeAll
+//   Station.unwindStopped                 StationExternalFunctionsTest.testFuzz_unwindStopped
 //   AttestationRegistry.setTimelock       RegistryExternalFunctionsTest.testFuzz_setTimelock
 //   AttestationRegistry.proposeImage,
 //     revokeImage, proposeProject,
 //     revokeProject, proposeVerifier,
 //     retireVerifier, proposeDriver,
+//     withdrawDriverProposal,
 //     revokeDriver, proposeBridge,
+//     withdrawBridgeProposal,
 //     revokeBridge                        RegistryExternalFunctionsTest.testFuzz_admin_only
 //   AttestationRegistry.bless             RegistryExternalFunctionsTest.testFuzz_bless
 //   StrategyRegistry.register             RegistryExternalFunctionsTest.testFuzz_register
@@ -370,7 +375,9 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
         assertGe(a.mark, b.mark, "the mark fell");
         assertGe(a.lastPayment, b.lastPayment, "the last payday went backwards");
         assertTrue(legal(b.state, a.state), "the state moved backwards");
-        assertEq(a.dead, b.dead, "the dead shares moved");
+        // Only the close moves the dead shares: their part goes to the author.
+        if (a.state == VaultState.Closed && b.state != VaultState.Closed) assertEq(a.dead, 0);
+        else assertEq(a.dead, b.dead, "the dead shares moved");
         for (uint256 i = 0; i < b.done.length; i++) {
             if (b.done[i]) assertTrue(a.done[i], "a settled request was unsettled");
         }
@@ -602,12 +609,49 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
                 want = IVault.NotAllowed.selector;
             } else if (vm.getBlockTimestamp() < c.bookedAt + 7 days) {
                 want = IVault.NotYet.selector;
-            } else if (b.state != VaultState.Open && b.state != VaultState.WindingDown) {
+            } else if (
+                (b.state != VaultState.Open && b.state != VaultState.WindingDown) || vault.haltedAt() != 0
+            ) {
                 want = IVault.WrongState.selector;
             }
         }
         (bool ok, bytes4 err) = callAs(caller, address(vault), abi.encodeCall(IVault.freeze, (id)));
         expectOutcome(ok, err, want, "freeze");
+        if (ok) {
+            assertTrue(vault.state() == VaultState.Frozen);
+            assertEq(vault.haltedAt(), vm.getBlockTimestamp());
+        }
+        consistent(b, nobody());
+    }
+
+    function testFuzz_freezeUnits(uint8 stage, uint8 pick, address random, uint8 who, uint32 wait) public {
+        stage = arrange(stage);
+        // Units on a vault already halted though still live (an evicted
+        // retirement): it is stopping anyway.
+        if (stage == UNITS && wait % 3 == 0) {
+            vm.prank(author);
+            vault.retire();
+            skip(7 days);
+            vault.evict();
+        }
+        address caller = pickCaller(pick, random);
+        address holder = pickCaller(who, random);
+        skip(bound(wait, 0, 10 days));
+        World memory b = look(caller, address(0));
+        (uint256 held,) = vault.unitsOf(holder);
+        uint64 since = vault.unitsSince(holder);
+        bytes4 want;
+        held;
+        if (since == 0) {
+            want = IVault.NotAllowed.selector;
+        } else if (vm.getBlockTimestamp() < since + 7 days) {
+            want = IVault.NotYet.selector;
+        } else if ((b.state != VaultState.Open && b.state != VaultState.WindingDown) || vault.haltedAt() != 0)
+        {
+            want = IVault.WrongState.selector;
+        }
+        (bool ok, bytes4 err) = callAs(caller, address(vault), abi.encodeCall(IVault.freezeUnits, (holder)));
+        expectOutcome(ok, err, want, "freezeUnits");
         if (ok) {
             assertTrue(vault.state() == VaultState.Frozen);
             assertEq(vault.haltedAt(), vm.getBlockTimestamp());
@@ -624,7 +668,7 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
         address caller = pick >= 128 && id != 0 && id <= vault.requestCount()
             ? vault.requestAt(id).owner
             : pickCaller(pick, random);
-        skip(bound(wait, 0, 2 days));
+        skip(bound(wait, 0, 3 days));
         World memory b = look(caller, address(0));
         Request memory r;
         if (id != 0 && id <= b.requests) r = vault.requestAt(id);
@@ -653,7 +697,7 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
         address caller = pick >= 128 && id != 0 && id <= vault.requestCount()
             ? vault.requestAt(id).owner
             : pickCaller(pick, random);
-        skip(bound(wait, 0, 2 days));
+        skip(bound(wait, 0, 3 days));
         World memory b = look(caller, address(0));
         Request memory r;
         if (id != 0 && id <= b.requests) r = vault.requestAt(id);
@@ -715,7 +759,7 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
         address caller = pick >= 128 && id != 0 && id <= vault.claimCount()
             ? vault.claimAt(id).owner
             : pickCaller(pick, random);
-        skip(bound(wait, 0, 2 days));
+        skip(bound(wait, 0, 3 days));
         World memory b = look(caller, address(0));
         (bool ok, bytes4 err) = callAs(caller, address(vault), abi.encodeCall(IVault.takeProRataClaim, (id)));
         if (id == 0 || id > b.claims) {
@@ -809,6 +853,7 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
         World memory b = look(caller, receiver);
         bytes4 want;
         if (!isClosed(b)) want = IVault.WrongState.selector;
+        else if (receiver == address(0)) want = IVault.TooSmall.selector;
         else if (shares > held) want = PANIC;
         uint256 owed = isClosed(b) ? vault.cash() * shares / vault.totalSupply() : 0;
         (bool ok, bytes4 err) =
@@ -1040,7 +1085,7 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
             vm.prank(author);
             vault.requestTankWithdrawal();
         }
-        skip(bound(wait, 0, 2 days));
+        skip(bound(wait, 0, 3 days));
         World memory b = look(caller, address(0));
         Tank memory t = vault.tank();
         bytes4 want;
@@ -1051,6 +1096,8 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
                 && (t.escapeRequestedAt == 0 || vm.getBlockTimestamp() < t.escapeRequestedAt + 1 days)
         ) {
             want = IVault.NotYet.selector;
+        } else if (!isClosed(b) && vm.getBlockTimestamp() > t.escapeRequestedAt + 2 days) {
+            want = IVault.NotAllowed.selector;
         }
         (bool ok, bytes4 err) =
             callAs(caller, address(vault), abi.encodeCall(IVault.withdrawTankUnsigned, (assets)));

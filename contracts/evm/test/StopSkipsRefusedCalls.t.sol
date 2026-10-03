@@ -37,11 +37,9 @@ contract StopSkipsRefusedCallsTest is Fixture {
         venue.place(address(station), orders);
         vm.stopPrank();
 
-        // A later driver release prepares the revoke with a stray target.
-        // The registry delivers it like any other, after the timelock.
+        // The driver prepares the revoke with a stray target.
         StrayRevokeDriver stray = new StrayRevokeDriver(venue, IERC20(address(usd)));
-        vm.prank(admin);
-        attestation.proposeDriver("local", address(stray));
+        pinnedDriverActsAs(address(stray));
         skip(TIMELOCK);
 
         vm.prank(admin);

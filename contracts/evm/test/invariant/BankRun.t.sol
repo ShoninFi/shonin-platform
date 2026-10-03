@@ -196,14 +196,30 @@ contract BankRunTest is Fixture {
 
     // The steps ---------------------------------------------------------------
 
-    /// Value at the next slot and settle it. Each payout is at most the
-    /// leaver's shares at the exit side of the valuation that priced it,
-    /// and the holders who stay keep their exit-side price.
+    /// Value at the next slot and settle it. What the valuation records is
+    /// the pool as the run read it just before, from the station and the
+    /// cash: at the mark, and at the lower of the mark and the exit side.
+    /// Each payout is at most the leaver's shares at that exit side, and
+    /// the holders who stay keep their exit-side price.
     function settleRound() internal {
         nextSlot();
+        (uint256 markNow, uint256 exitNow) = station.value();
+        (uint256 unitsNow,) = vault.units();
+        uint256 cashNow = vault.cash();
         vault.recordValuation();
         Valuation memory v = vault.valuationAt(vault.valuationCount() - 1);
         if (v.status != ValuationStatus.Priced) return;
+        if (exitNow > markNow) exitNow = markNow;
+        assertEq(
+            v.gross,
+            cashNow + markNow * (WAD - unitsNow) / WAD + 1,
+            "a valuation recorded other than the pool"
+        );
+        assertEq(
+            v.grossExit,
+            cashNow + exitNow * (WAD - unitsNow) / WAD + 1,
+            "a valuation recorded other than the pool at exit prices"
+        );
         uint256 count = vault.requestCount();
         uint256[] memory before = new uint256[](count + 1);
         bool[] memory open = new bool[](count + 1);
@@ -409,6 +425,7 @@ contract BankRunTest is Fixture {
         (uint256 units, uint256 reserve) = vault.units();
         assertEq(units, 0, "units are still outstanding");
         assertLe(reserve, 1e3, "a unit reserve is left");
+        uint256 deadPart = vault.cash() * vault.balanceOf(DEAD) / vault.totalSupply();
         vault.close();
         address[2] memory feeHolders = [author, platform];
         for (uint256 i = 0; i < 2; i++) {
@@ -418,7 +435,11 @@ contract BankRunTest is Fixture {
             vault.redeemClosed(shares, feeHolders[i]);
         }
         assertEq(vault.totalSupply(), vault.balanceOf(DEAD), "shares remain that nobody can redeem");
-        assertEq(vault.tank().balance, tankAtStart, "the close touched the tank");
+        // The dead shares' part went to the author's tank at the close.
+        assertLe(
+            vault.tank().balance, tankAtStart + deadPart, "the close paid the author more than was theirs"
+        );
+        assertGe(vault.tank().balance, tankAtStart, "the close took from the tank");
         uint256 books = vault.cash() + vault.tank().balance;
         assertGe(usd.balanceOf(address(vault)), books, "the vault ends short");
         assertLe(usd.balanceOf(address(vault)), books + 1e3, "the vault ends holding money nobody is owed");

@@ -229,7 +229,12 @@ interface IVault is IStationVault {
         uint256 indexed requestId, address indexed owner, RequestKind kind, uint64 earliest, uint256 amount
     );
     event Deposited(uint256 indexed requestId, address indexed owner, uint256 assets, uint256 shares);
-    event Refunded(uint256 indexed requestId, address indexed owner, uint256 assets);
+    /// A deposit sent back, to whoever paid it.
+    /// The author asked to withdraw the tank without a signed total; they
+    /// can from `readyAt`, for as long again, so a final bill can be
+    /// collected meanwhile.
+    event TankWithdrawalRequested(uint64 readyAt);
+    event Refunded(uint256 indexed requestId, address indexed to, uint256 assets);
     event Withdrawn(
         uint256 indexed requestId, address indexed owner, uint256 shares, uint256 assets, uint256 feeShares
     );
@@ -307,6 +312,9 @@ interface IVault is IStationVault {
     /// transaction, or queue the claim if the cash already covers it.
     function settleClaim(uint256 claimId) external;
     function freeze(uint256 claimId) external;
+    /// Anyone, once a holder's units have waited `freezeAfter` unserved, on a
+    /// vault that trades on its own chain only.
+    function freezeUnits(address holder) external;
     function takeProRata(uint256 requestId) external;
     function takeProRataClaim(uint256 claimId) external;
     /// A withdrawal nothing has priced for the fallback delay becomes a
@@ -401,6 +409,8 @@ interface IVault is IStationVault {
     function units() external view returns (uint256 total, uint256 reserve);
     function unitsOf(address holder) external view returns (uint256 units, uint256 claimable);
     function heldFor(address owner) external view returns (uint256);
+    /// Since when a holder's units have waited to be served; zero with none.
+    function unitsSince(address holder) external view returns (uint64);
     function homeStation() external view returns (address);
     function strategyId() external view returns (uint256);
     function bundleHash() external view returns (bytes32);

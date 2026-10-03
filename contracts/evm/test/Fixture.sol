@@ -22,7 +22,7 @@ import {Allowances, UnitPrices} from "../src/interfaces/IPrices.sol";
 import {Review} from "../src/interfaces/IReviewRegistry.sol";
 import {ChainNeed} from "../src/interfaces/IStrategyRegistry.sol";
 import {Timers} from "../src/interfaces/IVault.sol";
-import {ChainName, VaultConfig} from "../src/interfaces/IVaultFactory.sol";
+import {ChainName, IVaultFactory, VaultConfig} from "../src/interfaces/IVaultFactory.sol";
 import {Test} from "forge-std/Test.sol";
 import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
 
@@ -85,6 +85,14 @@ contract Fixture is Test {
     LocalBridge internal bridge;
     StationFactory internal stations;
 
+    /// Gives the driver every station here pins new code. A running vault
+    /// keeps the driver it was created with, so this is how a test stands in
+    /// for one whose venue changed under it (a pause, a new interface) or one
+    /// that was hostile from the start.
+    function pinnedDriverActsAs(address replacement) internal {
+        vm.etch(address(driver), replacement.code);
+    }
+
     function setUp() public virtual {
         (author, authorKey) = makeAddrAndKey("author");
         (alice, aliceKey) = makeAddrAndKey("alice");
@@ -116,7 +124,8 @@ contract Fixture is Test {
                 stationFactory: stations,
                 vaultImplementation: address(new Vault()),
                 admin: admin,
-                platform: platform
+                platform: platform,
+                previous: IVaultFactory(address(0))
             }),
             vaultConfig(),
             chainNames()

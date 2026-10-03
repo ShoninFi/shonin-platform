@@ -111,8 +111,11 @@ library Posts {
         uint256 keep = WAD - s.openUnits;
         for (uint256 i = 0; i < chains.length; i++) {
             Post storage p = s.posts[index][chains[i]];
-            v.gross += p.mark.mulDiv(keep, WAD);
-            s.depositExtra[index] += (p.top - p.mark).mulDiv(keep, WAD);
+            uint256 mark = p.mark.mulDiv(keep, WAD);
+            v.gross += mark;
+            // A deposit pays the top figure rounded up, so the unit lost in
+            // rounding the mark down is never the depositor's gain.
+            s.depositExtra[index] += p.top.mulDiv(keep, WAD, Math.Rounding.Ceil) - mark;
             v.grossExit += p.exit.mulDiv(keep, WAD);
         }
         Valuations.price(s, index);

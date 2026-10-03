@@ -46,7 +46,13 @@ contract StopAlwaysGoesThroughTest is Fixture {
         station.stop();
         vm.clearMockedCalls();
         assertTrue(station.stopped());
+        // The key whose revoke the venue refused stays on record, and anyone
+        // may withdraw it once the venue takes the call.
+        assertEq(station.approvedKey("local"), executor, "a refused revoke was recorded as done");
+        vm.prank(bob);
+        station.revokeKey("local", executor);
         assertEq(station.approvedKey("local"), address(0));
+        assertFalse(venue.isAgent(address(station), executor));
         // And anyone can bring everything home.
         vm.prank(bob);
         station.unwind(1e18);
@@ -58,11 +64,9 @@ contract StopAlwaysGoesThroughTest is Fixture {
     /// depends on the driver's view being callable.
     function test_a_halted_station_can_still_be_stopped_when_the_drivers_revoke_view_reverts() public {
         deployed();
-        // The venue pauses; its driver's `revokeKey` reads it and faults. The
-        // registry delivers that driver like any other, after the timelock.
+        // The venue pauses; its driver's `revokeKey` reads it and faults.
         RevokeFaultingDriver faulting = new RevokeFaultingDriver(venue, IERC20(address(usd)));
-        vm.prank(admin);
-        attestation.proposeDriver("local", address(faulting));
+        pinnedDriverActsAs(address(faulting));
         skip(TIMELOCK);
 
         vm.prank(admin);

@@ -231,7 +231,7 @@ contract RegistrySoundnessTest is Fixture {
         next.holdingBps = 500;
         next.authorBps = 2000;
         next.transactionBps = 50;
-        next.timers.freezeAfter = 1 days;
+        next.timers.freezeAfter = 2 days;
         vm.prank(admin);
         factory.setConfig(next);
 

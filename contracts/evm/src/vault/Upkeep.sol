@@ -36,6 +36,10 @@ library Upkeep {
     uint256 private constant OFFSET = VaultStorage.OFFSET;
     uint256 private constant BPS = VaultStorage.BPS;
     uint256 private constant WAD = VaultStorage.WAD;
+    /// What a driver may spend, and how many codes it may name, when its
+    /// restricted list is read again.
+    uint256 private constant RESTRICTED_GAS = 200_000;
+    uint256 private constant MAX_RESTRICTED = 64;
 
     string internal constant STATEMENT =
         "I am not a restricted person for this vault, and I am not acting for one.";
@@ -116,16 +120,26 @@ library Upkeep {
         emit IVault.StatementRecorded(depositor, s.restrictedHash);
     }
 
-    /// Read the same-chain drivers' lists again. The list only ever grows,
-    /// and a depositor signs again for the longer one.
+    /// Read the same-chain drivers' lists again, from the implementation the
+    /// registry approves now: a venue's terms can exclude more people after a
+    /// vault was created, and its pinned driver can't learn that. The list
+    /// only ever grows, and a depositor signs again for the longer one. Only
+    /// a list is read, never a call made, and a driver that fails or answers
+    /// with an outsized list is skipped.
     function refreshRestricted() external {
         Layout storage s = VaultStorage.layout();
         IAttestationRegistry registry = IAttestationRegistry(s.attestation);
         bool added;
         for (uint256 i = 0; i < s.drivers.length; i++) {
-            address implementation = registry.unwindDriver(s.drivers[i]);
+            address implementation = registry.tradingDriver(s.drivers[i]);
             if (implementation == address(0)) continue;
-            bytes32[] memory codes = IDriver(implementation).restricted();
+            bytes32[] memory codes;
+            try IDriver(implementation).restricted{gas: RESTRICTED_GAS}() returns (bytes32[] memory list) {
+                codes = list;
+            } catch {
+                continue;
+            }
+            if (codes.length > MAX_RESTRICTED) continue;
             for (uint256 j = 0; j < codes.length; j++) {
                 if (_insert(s.restricted, codes[j])) {
                     added = true;
@@ -252,11 +266,13 @@ library Upkeep {
 
     /// With no executor running nobody can sign a total. After a delay long
     /// enough for anyone to collect a final bill, the author can withdraw
-    /// without one.
+    /// without one, within the same length of time again: a request lapses,
+    /// so it can't be armed early and used once an executor runs again.
     function requestTankWithdrawal() external {
         Layout storage s = VaultStorage.layout();
         _authorOnly(s);
         s.tank.escapeRequestedAt = uint64(block.timestamp);
+        emit IVault.TankWithdrawalRequested(uint64(block.timestamp) + s.timers.tankEscapeDelay);
     }
 
     function withdrawTankUnsigned(uint256 assets) external {
@@ -264,7 +280,9 @@ library Upkeep {
         _authorOnly(s);
         if (s.state != VaultState.Closed && s.state != VaultState.Cancelled) {
             uint64 asked = s.tank.escapeRequestedAt;
-            if (asked == 0 || block.timestamp < asked + s.timers.tankEscapeDelay) revert IVault.NotYet();
+            uint256 delay = s.timers.tankEscapeDelay;
+            if (asked == 0 || block.timestamp < asked + delay) revert IVault.NotYet();
+            if (block.timestamp > asked + 2 * delay) revert IVault.NotAllowed();
             s.tank.escapeRequestedAt = 0;
         }
         _payTank(s, assets);
@@ -323,7 +341,22 @@ library Upkeep {
         // left unpaid this long is reason enough to stop, whether the market
         // or anyone else kept them waiting.
         if (block.timestamp < claim.bookedAt + s.timers.freezeAfter) revert IVault.NotYet();
-        if (!s.live()) revert IVault.WrongState();
+        // A vault already halted (an evicted retirement) is stopping anyway.
+        if (!s.live() || s.halted()) revert IVault.WrongState();
+        _halt(s, "frozen");
+        _setState(s, VaultState.Frozen);
+    }
+
+    /// Units nobody could serve for as long as an unpaid claim waits freeze
+    /// the vault the same way: a close that can't come home must not keep a
+    /// unit holder out for good either. Only where anyone may serve them; on
+    /// a vault that trades on other chains only their holder can.
+    function freezeUnits(address holder) external {
+        Layout storage s = VaultStorage.layout();
+        uint64 since = s.unitsSince[holder];
+        if (s.unitsOf[holder] == 0 || s.otherChains.length != 0) revert IVault.NotAllowed();
+        if (block.timestamp < since + s.timers.freezeAfter) revert IVault.NotYet();
+        if (!s.live() || s.halted()) revert IVault.WrongState();
         _halt(s, "frozen");
         _setState(s, VaultState.Frozen);
     }
@@ -375,10 +408,10 @@ library Upkeep {
         Layout storage s = VaultStorage.layout();
         if (msg.sender != s.admin) revert IVault.NotAllowed();
         VaultState state = s.state;
-        if (
-            state != VaultState.Activating && state != VaultState.Open && state != VaultState.WindingDown
-                && state != VaultState.Frozen
-        ) revert IVault.WrongState();
+        // A vault still activating is cancelled, not killed: it never opened.
+        if (state != VaultState.Open && state != VaultState.WindingDown && state != VaultState.Frozen) {
+            revert IVault.WrongState();
+        }
         _halt(s, reason);
         _setState(s, VaultState.Killed);
     }
@@ -406,12 +439,22 @@ library Upkeep {
         }
         Valuations.syncHolding(s);
         Valuations.payday(s, s.cash + 1, s.totalSupply + OFFSET, uint64(block.timestamp));
+        // The dead shares' part, which no holder can ever redeem, goes to the
+        // author who paid for them, into the tank they can take at once.
+        uint256 dead = s.balanceOf[VaultStorage.DEAD];
+        if (dead != 0) {
+            uint256 theirs = s.cash.mulDiv(dead, s.totalSupply);
+            s.burn(VaultStorage.DEAD, dead);
+            s.cash -= theirs;
+            s.tank.balance += theirs;
+        }
         _setState(s, VaultState.Closed);
     }
 
     function redeemClosed(uint256 shares, address receiver) external returns (uint256 assets) {
         Layout storage s = VaultStorage.layout();
         if (s.state != VaultState.Closed) revert IVault.WrongState();
+        if (receiver == address(0)) revert IVault.TooSmall();
         assets = s.cash.mulDiv(shares, s.totalSupply);
         s.burn(msg.sender, shares);
         s.cash -= assets;
@@ -431,8 +474,9 @@ library Upkeep {
         r.done = true;
         if (kind == RequestKind.Deposit) {
             s.escrow -= r.amount;
-            s.pay(r.owner, r.amount);
-            emit IVault.Refunded(requestId, r.owner, r.amount);
+            address to = s.refundTo(requestId, r.owner);
+            s.pay(to, r.amount);
+            emit IVault.Refunded(requestId, to, r.amount);
         } else if (kind == RequestKind.Redeem) {
             assets = s.cash.mulDiv(r.amount, s.totalSupply);
             s.pendingShares -= r.amount;
@@ -453,7 +497,10 @@ library Upkeep {
         if (state != ClaimState.Pending && state != ClaimState.Waiting && state != ClaimState.Queued) {
             revert IVault.NotAllowed();
         }
-        if (state == ClaimState.Queued) s.requests[s.claimRequest[claimId] - 1].done = true;
+        if (state == ClaimState.Queued) {
+            s.requests[s.claimRequest[claimId] - 1].done = true;
+            s.queuedClaims -= 1;
+        }
         assets = s.cash.mulDiv(claim.shares, s.totalSupply);
         s.pendingShares -= claim.shares;
         s.burn(address(this), claim.shares);

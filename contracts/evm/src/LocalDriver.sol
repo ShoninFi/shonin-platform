@@ -89,18 +89,34 @@ contract LocalDriver is IDriver {
             if (size == 0) continue;
 
             Market memory market = venue.marketOf(held[i]);
+            // The full band accepts any price: a stopped station that has
+            // waited long enough sells at whatever the market offers.
+            if (bandBps >= BPS) {
+                orders[count++] = OrderRequest({
+                    market: held[i],
+                    isBuy: !isLong,
+                    size: size,
+                    limitPrice: isLong ? 0 : type(uint256).max,
+                    reduceOnly: true
+                });
+                continue;
+            }
             // A long is sold at the bid, a short bought back at the ask, and
             // neither may be worse than the band around the venue's own price.
             uint256 limit = isLong
                 ? market.oracle.mulDiv(BPS - bandBps, BPS, Math.Rounding.Ceil)
                 : market.oracle.mulDiv(BPS + bandBps, BPS, Math.Rounding.Floor);
             if (isLong ? market.bid < limit : market.ask > limit) return (new Call[](0), true);
-            // Nor while the venue's mark, which values the position, sits
-            // further from its own price than the band on either side: a
-            // valuation there would price everyone at a mark nobody trusts.
+            // Nor while the venue's mark, bid or ask sits further from its own
+            // price than the band on either side: a valuation there would
+            // price everyone at a figure nobody trusts, and a bid pushed up
+            // would charge a deposit a premium nobody could sell at.
             uint256 low = market.oracle.mulDiv(BPS - bandBps, BPS, Math.Rounding.Ceil);
             uint256 high = market.oracle.mulDiv(BPS + bandBps, BPS, Math.Rounding.Floor);
-            if (market.mark < low || market.mark > high) return (new Call[](0), true);
+            if (
+                market.mark < low || market.mark > high || market.bid < low || market.bid > high
+                    || market.ask < low || market.ask > high
+            ) return (new Call[](0), true);
 
             orders[count++] = OrderRequest({
                 market: held[i],

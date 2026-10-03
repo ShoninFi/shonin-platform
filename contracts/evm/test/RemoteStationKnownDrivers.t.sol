@@ -55,7 +55,7 @@ contract RemoteStationKnownDriversTest is Fixture {
         StationSpec memory spec = specWith("not-on-this-chain");
         bytes memory word = builderSigns(spec);
         vm.prank(executor);
-        vm.expectRevert(StationFactory.UnknownDriver.selector);
+        vm.expectRevert(Station.NotApproved.selector);
         ownStations.create(spec, word);
 
         StationSpec memory known = specWith("local");

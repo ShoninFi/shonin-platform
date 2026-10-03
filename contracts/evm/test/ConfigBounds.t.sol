@@ -71,6 +71,52 @@ contract ConfigBoundsTest is Fixture {
         refused(config);
     }
 
+    /// Each timer keeps the room its rule needs: money in transit can be
+    /// posted before it counts as late, a signed bill is recent, the author's
+    /// unsigned escape and a lower floor wait a day, a halt gives the agent
+    /// its warning, a retirement its week, and an activation its day.
+    function test_every_timer_has_its_floor() public {
+        VaultConfig memory config = factory.config();
+        config.timers.transitTimeout = config.timers.postDeadline;
+        refused(config);
+
+        config = factory.config();
+        config.timers.usageFreshness = 0;
+        refused(config);
+
+        config = factory.config();
+        config.timers.usageFreshness = 1 days + 1;
+        refused(config);
+
+        config = factory.config();
+        config.timers.tankEscapeDelay = 1 days - 1;
+        refused(config);
+
+        config = factory.config();
+        config.timers.floorDelay = 1 days - 1;
+        refused(config);
+
+        config = factory.config();
+        config.timers.haltGrace = 10 minutes - 1;
+        refused(config);
+
+        config = factory.config();
+        config.timers.windDown = 7 days - 1;
+        refused(config);
+
+        config = factory.config();
+        config.timers.activationWindow = 1 days - 1;
+        refused(config);
+
+        config = factory.config();
+        config.timers.freezeAfter = config.timers.fallbackAfter;
+        refused(config);
+
+        config = factory.config();
+        config.timers.slotLead = factory.MAX_TIMER() + 1;
+        refused(config);
+    }
+
     function test_an_activation_is_on_the_terms_the_author_read() public {
         (uint256 id,) = ready();
         bytes32 read = factory.terms();

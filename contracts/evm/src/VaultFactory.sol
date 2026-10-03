@@ -53,6 +53,9 @@ contract VaultFactory is IVaultFactory {
     address public immutable vaultImplementation;
     address public immutable admin;
     address public immutable platform;
+    /// The factory this one replaces, if any: a strategy that already has a
+    /// vault from it, or from any before it, gets no second one here.
+    IVaultFactory public immutable previous;
 
     VaultConfig private _config;
     ChainName[] private _chains;
@@ -81,6 +84,7 @@ contract VaultFactory is IVaultFactory {
         address vaultImplementation;
         address admin;
         address platform;
+        IVaultFactory previous;
     }
 
     constructor(Deps memory deps, VaultConfig memory config_, ChainName[] memory chains_) {
@@ -93,6 +97,7 @@ contract VaultFactory is IVaultFactory {
         vaultImplementation = deps.vaultImplementation;
         admin = deps.admin;
         platform = deps.platform;
+        previous = deps.previous;
         _checked(config_);
         _config = config_;
         for (uint256 i = 0; i < chains_.length; i++) {
@@ -109,7 +114,7 @@ contract VaultFactory is IVaultFactory {
         bytes calldata statement,
         bytes32 terms_
     ) external returns (address vault) {
-        if (_vaultOf[strategyId] != address(0)) revert VaultExists();
+        if (vaultOf(strategyId) != address(0)) revert VaultExists();
         // The author is held to what they read: a change of terms between
         // reading and activating stops the activation.
         if (terms_ != terms()) revert TermsChanged();
@@ -189,8 +194,10 @@ contract VaultFactory is IVaultFactory {
         return keccak256(abi.encode(_config));
     }
 
-    function vaultOf(uint256 strategyId) external view returns (address) {
-        return _vaultOf[strategyId];
+    /// The strategy's vault, from this factory or any it replaced.
+    function vaultOf(uint256 strategyId) public view returns (address vault) {
+        vault = _vaultOf[strategyId];
+        if (vault == address(0) && address(previous) != address(0)) vault = previous.vaultOf(strategyId);
     }
 
     function vaults() external view returns (address[] memory) {
@@ -265,8 +272,9 @@ contract VaultFactory is IVaultFactory {
             list = Codes.with(list, record.restricted[i]);
         }
         for (uint256 i = 0; i < drivers.length; i++) {
-            address implementation = attestation.unwindDriver(drivers[i]);
-            // A driver nobody approved could never value or stop the station.
+            // The implementation the home station pins in this same
+            // transaction; a driver nobody approved could never value it.
+            address implementation = attestation.tradingDriver(drivers[i]);
             if (implementation == address(0)) revert UnknownDriver();
             bytes32[] memory codes = IDriver(implementation).restricted();
             for (uint256 j = 0; j < codes.length; j++) {
@@ -276,10 +284,10 @@ contract VaultFactory is IVaultFactory {
     }
 
     function _tooLong(Timers memory t) private pure returns (bool) {
-        return t.slotInterval > MAX_TIMER || t.postDeadline > MAX_TIMER || t.transitTimeout > MAX_TIMER
-            || t.fallbackAfter > MAX_TIMER || t.usageFreshness > MAX_TIMER || t.tankEscapeDelay > MAX_TIMER
-            || t.floorDelay > MAX_TIMER || t.haltGrace > MAX_TIMER || t.freezeAfter > MAX_TIMER
-            || t.windDown > MAX_TIMER || t.activationWindow > MAX_TIMER;
+        return t.slotInterval > MAX_TIMER || t.slotLead > MAX_TIMER || t.postDeadline > MAX_TIMER
+            || t.transitTimeout > MAX_TIMER || t.fallbackAfter > MAX_TIMER || t.usageFreshness > MAX_TIMER
+            || t.tankEscapeDelay > MAX_TIMER || t.floorDelay > MAX_TIMER || t.haltGrace > MAX_TIMER
+            || t.freezeAfter > MAX_TIMER || t.windDown > MAX_TIMER || t.activationWindow > MAX_TIMER;
     }
 
     function _checked(VaultConfig memory config_) private pure {
@@ -291,7 +299,13 @@ contract VaultFactory is IVaultFactory {
                 || config_.timers.slotInterval == 0 || config_.timers.slotWindow >= config_.timers.slotInterval
                 || config_.timers.slotLead <= config_.timers.slotWindow || config_.timers.freezeAfter < 1 days
                 || config_.timers.fallbackAfter < 1 days
-                || config_.timers.postDeadline <= config_.timers.slotWindow || config_.maxExitCost > MAX_EXIT_COST
+                || config_.timers.postDeadline <= config_.timers.slotWindow
+                || config_.timers.transitTimeout <= config_.timers.postDeadline
+                || config_.timers.usageFreshness == 0 || config_.timers.usageFreshness > 1 days
+                || config_.timers.tankEscapeDelay < 1 days || config_.timers.floorDelay < 1 days
+                || config_.timers.haltGrace < 10 minutes || config_.timers.windDown < 7 days
+                || config_.timers.freezeAfter <= config_.timers.fallbackAfter
+                || config_.timers.activationWindow < 1 days || config_.maxExitCost > MAX_EXIT_COST
                 || config_.minimumDeposit > MAX_MINIMUM_DEPOSIT || _tooLong(config_.timers)
         ) revert OutOfRange();
     }
