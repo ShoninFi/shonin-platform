@@ -59,8 +59,12 @@ contract StoppedBandTest is Fixture {
     function testFuzz_a_stopped_stations_band_holds_a_week_then_doubles_each_week(uint32 elapsed) public {
         stopStation();
         skip(elapsed);
+        // Measured from the stop itself: valuing after the stop moves the
+        // clock on to the next slot.
         assertEq(
-            station.stoppedBand(), bandAfter(elapsed), "the band is not what the time since the stop gives"
+            station.stoppedBand(),
+            bandAfter(block.timestamp - station.stoppedAt()),
+            "the band is not what the time since the stop gives"
         );
     }
 
