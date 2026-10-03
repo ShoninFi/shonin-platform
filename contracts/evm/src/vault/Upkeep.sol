@@ -454,6 +454,7 @@ library Upkeep {
     function redeemClosed(uint256 shares, address receiver) external returns (uint256 assets) {
         Layout storage s = VaultStorage.layout();
         if (s.state != VaultState.Closed) revert IVault.WrongState();
+        if (receiver == address(0)) revert IVault.TooSmall();
         assets = s.cash.mulDiv(shares, s.totalSupply);
         s.burn(msg.sender, shares);
         s.cash -= assets;

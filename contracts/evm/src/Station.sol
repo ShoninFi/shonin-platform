@@ -262,7 +262,10 @@ contract Station is IStation, ReentrancyGuardTransient {
             // prices (an account under water at the bid) is never sold for
             // the leaver: it would bring them nothing and leave the loss with
             // everyone else. Only a full unwind, which everyone shares, may.
-            if (freed[i] == 0 && markBefore.mulDiv(fraction, WAD) > count + 1 && fraction < WAD) {
+            if (
+                freed[i] == 0 && markBefore.mulDiv(fraction, WAD) > (count + 1) * (count + 1)
+                    && fraction < WAD
+            ) {
                 revert ShortSweep();
             }
         }
@@ -279,7 +282,10 @@ contract Station is IStation, ReentrancyGuardTransient {
             // Selling the fraction is only a serve if its worth comes home:
             // proceeds left at the venue would still belong to everyone.
             uint256 swept = dollar.balanceOf(address(this)) - held;
-            if (swept < freed[i].mulDiv(BPS - _spec.exitBandBps, BPS)) revert ShortSweep();
+            // Nothing home for a fraction worth something is never a fill.
+            if (swept < freed[i].mulDiv(BPS - _spec.exitBandBps, BPS) || (swept == 0 && freed[i] != 0)) {
+                revert ShortSweep();
+            }
             // A shortfall is the leaver's own fill, never the stayers' gain:
             // proceeds that went to repay the account's margin debt, so the
             // account is left worth more than the stayers' share, still

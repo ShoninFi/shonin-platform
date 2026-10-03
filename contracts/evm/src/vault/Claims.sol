@@ -105,6 +105,10 @@ library Claims {
             // A market outside the band is a real try: the clock restarts.
             claim.state = ClaimState.Waiting;
             claim.lastAttemptAt = uint64(block.timestamp);
+        } else if (home == 0 && !failed) {
+            // A close went through and brought nothing home for a claim worth
+            // more than dust: whatever it sold must not stand.
+            revert IVault.NotYet();
         } else if (home == 0) {
             // A close that brought nothing home served nobody, so it doesn't
             // count as a try, and the freeze clock keeps running.
