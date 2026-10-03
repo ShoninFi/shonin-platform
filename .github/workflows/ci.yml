@@ -65,12 +65,19 @@ jobs:
       # Compiling every contract and test through the IR pipeline at once
       # needs about 13 GB at its peak, more than the runner's memory beside
       # everything else; swap on the runner's spare disk carries the peak.
+      # The swap is sized to the free disk, leaving room for the builds.
       - name: Swap for the contract build
         run: |
-          sudo fallocate -l 16G /mnt/swapfile
-          sudo chmod 600 /mnt/swapfile
-          sudo mkswap /mnt/swapfile
-          sudo swapon /mnt/swapfile
+          df -h / /mnt
+          free_gb=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+          size=$(( free_gb - 24 ))
+          if [ "$size" -gt 12 ]; then size=12; fi
+          if [ "$size" -ge 4 ]; then
+            sudo fallocate -l "${size}G" /swapfile-build
+            sudo chmod 600 /swapfile-build
+            sudo mkswap /swapfile-build
+            sudo swapon /swapfile-build
+          fi
           free -h
 
       - name: Check
