@@ -886,11 +886,16 @@ contract VaultHandler is Test {
         uint256 amount = usd.balanceOf(address(station)) * _bound(pct, 1, 100) / 100;
         if (amount == 0) return;
         // Money put into an account the market has left underwater fills the
-        // hole: that is the strategy's loss, not anyone's move.
+        // hole: that is the strategy's loss, not anyone's move. Like a losing
+        // trade, it comes after the last priced valuation, so the requests
+        // that valuation priced are still paid at its price and the loss
+        // falls on the holders who stay: the pool no longer stands where
+        // that valuation found it.
         bool solvent = _venueSolvent();
         _begin();
         vm.prank(trader);
         try station.deposit("local", amount) {
+            if (!solvent) still = false;
             _hit(trader == executor ? bytes32("venueDeposit") : bytes32("venueDeposit by an admin's key"));
         } catch {}
         _end(solvent, "venueDeposit");
@@ -2415,7 +2420,7 @@ contract VaultHandler is Test {
     }
 
     function _end(bool checkPrice, string memory what) internal {
-        uint256 holdingMinted = _readLogs(what);
+        uint256 holdingCost = _readLogs(what);
 
         // The mark never falls.
         uint256 m = vault.mark();
@@ -2474,12 +2479,7 @@ contract VaultHandler is Test {
         if (checkPrice) {
             _hit("~passive");
             uint256 afterwards = netPerShare();
-            uint256 slack = before.price / 1e9 + 1e12;
-            if (holdingMinted != 0) {
-                slack += before.price.mulDiv(
-                    holdingMinted, before.supply + OFFSET + holdingMinted, Math.Rounding.Ceil
-                );
-            }
+            uint256 slack = before.price / 1e9 + 1e12 + holdingCost;
             if (afterwards + slack < before.price) {
                 passiveBreaks++;
                 _break(
@@ -2498,11 +2498,14 @@ contract VaultHandler is Test {
     struct Reading {
         uint256 supply;
         uint256 mark;
-        uint256 holdingMinted;
         bool payday;
         uint256 minted;
         uint256 mintedSupply;
         uint256 markBefore;
+        /// What the holding fee synced in the step took from a share's
+        /// price, on the price the step began at: each sync dilutes the
+        /// shares there are at that moment by the shares it mints.
+        uint256 holdingCost;
     }
 
     /// What a step's dollars did, as the dollar's own transfers tell it,
@@ -2537,11 +2540,11 @@ contract VaultHandler is Test {
         Reading memory r = Reading({
             supply: before.supply,
             mark: before.mark,
-            holdingMinted: 0,
             payday: false,
             minted: 0,
             mintedSupply: 0,
-            markBefore: 0
+            markBefore: 0,
+            holdingCost: 0
         });
         Ledger memory g;
         g.paid = new Payment[](logs.length);
@@ -2574,7 +2577,11 @@ contract VaultHandler is Test {
                 uint256 minted = abi.decode(l.data, (uint256));
                 _checkHolding(minted, r.supply - minted, what);
                 unpaidHolding += minted;
-                r.holdingMinted += minted;
+                // Measured on the supply at the sync, not the one the step
+                // began with: a settle earlier in the step may have burned
+                // leavers' shares, and the fee then dilutes only the shares
+                // left. `r.supply` already counts the shares just minted.
+                r.holdingCost += before.price.mulDiv(minted, r.supply + OFFSET, Math.Rounding.Ceil);
             } else if (topic == IVault.FeesPaid.selector) {
                 (uint256 toAuthor, uint256 toPlatform, uint256 holding, uint256 newMark) =
                     abi.decode(l.data, (uint256, uint256, uint256, uint256));
@@ -2663,7 +2670,7 @@ contract VaultHandler is Test {
         if (r.payday) _checkPayday(r, vault.cash() + deadPartAtClose + 1, what);
         deadPartAtClose = 0;
         _match(g, what);
-        return r.holdingMinted;
+        return r.holdingCost;
     }
 
     /// One dollar transfer: where it went, and what it adds to the ledger.
