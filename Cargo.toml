@@ -58,8 +58,12 @@ reqwest = { version = "0.13.5", features = ["json"] }
 tokio-tungstenite = "0.30.0"
 axum = "0.8.9"
 tower-http = { version = "0.7.1", features = ["cors", "trace"] }
+tower = "0.5.3"
 tar = "0.4.46"
 rand = "0.10.3"
+# Signalling a build's whole process group, which the standard library
+# cannot, without unsafe code of our own.
+rustix = { version = "1.1.5", features = ["process"] }
 
 # Strategy runtime (WASM component model). The executor hosts components with
 # wasmtime's async component model; strategies are built for wasm32-wasip2 and

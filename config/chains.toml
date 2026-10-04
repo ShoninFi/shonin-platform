@@ -7,6 +7,15 @@
 # Paid RPC URLs carry keys, so they only ever go there.
 #
 # `dollar` is the stablecoin a vault on that chain settles in.
+#
+# `native_usd` is what the chain's coin is taken to be worth, for billing an
+# author the gas their agent's key spends. On the local chains it is a stand-in
+# and a testnet's coin is free. A chain without one bills no gas at all, and
+# the executor says so in its log: an author never pays for gas nobody priced.
+#
+# `confirmations` is how many blocks deep a payment must be before the build
+# service reads it: 12 where none is given. The local anvils never reorg and
+# answer from one node, so they read payments at the head.
 
 # --- Local: what `task dev` starts (ports match taskfiles/config.yml) --------
 
@@ -14,16 +23,22 @@
 label = "Base (local)"
 rpc = "http://127.0.0.1:19100"
 dollar = "USDC"
+native_usd = 2500.0
+confirmations = 0
 
 [chains."evm:31338"]
 label = "Hyperliquid (local)"
 rpc = "http://127.0.0.1:19101"
 dollar = "USDC"
+native_usd = 25.0
+confirmations = 0
 
 [chains."evm:31339"]
 label = "Robinhood Chain (local)"
 rpc = "http://127.0.0.1:19102"
 dollar = "USDG"
+native_usd = 2500.0
+confirmations = 0
 
 [chains."solana:localnet"]
 label = "Solana (local)"
@@ -37,16 +52,19 @@ dollar = "USDC"
 label = "Base Sepolia"
 rpc = "https://sepolia.base.org"
 dollar = "USDC"
+native_usd = 0.0
 
 [chains."evm:998"]
 label = "Hyperliquid testnet"
 rpc = "https://rpc.hyperliquid-testnet.xyz/evm"
 dollar = "USDC"
+native_usd = 0.0
 
 [chains."evm:46630"]
 label = "Robinhood Chain testnet"
 rpc = "https://rpc.testnet.chain.robinhood.com"
 dollar = "USDG"
+native_usd = 0.0
 
 [chains."solana:devnet"]
 label = "Solana devnet"

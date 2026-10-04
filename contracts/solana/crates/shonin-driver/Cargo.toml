@@ -1,0 +1,17 @@
+[package]
+name = "shonin-driver"
+version = "0.1.0"
+description = "The interface between a station and the on-chain half of a driver"
+edition = "2021"
+license = "BUSL-1.1"
+publish = false
+
+[features]
+# The types a program's interface description names, when it is built.
+idl-build = ["anchor-lang/idl-build"]
+
+[dependencies]
+anchor-lang = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

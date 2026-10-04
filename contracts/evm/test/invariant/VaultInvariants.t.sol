@@ -148,10 +148,15 @@ contract VaultInvariantsTest is Fixture {
     // 6. The tank never owes -----------------------------------------------------
 
     /// The tank's balance is what came in less what was charged and taken
-    /// out, so it never pays more than it holds; no bill charges more than
-    /// the allowances cost for the time it covers, nor all bills together
-    /// more than the allowances cost since activation; the usage total never
-    /// goes back.
+    /// out, so it never pays more than it holds; the usage total never goes
+    /// back. Priced by the handler from its own record of the allowances:
+    /// no collection charges more than the allowances cost since the last
+    /// collection plus a day's cost at the allowances in force then (the
+    /// most the last can have carried), nor leaves more than a day's cost
+    /// carried; and all collections together charge no more than the
+    /// allowances cost from activation to the latest time the vault can
+    /// have counted them to, nor than they cost from activation to now
+    /// (stopping, either way, at the halt plus its grace).
     function invariant_6_the_tank_never_owes() public view {
         assertEq(handler.tankBreaks(), 0, handler.lastBreak());
         assertEq(vault.tank().balance, handler.tankBooks(), "the tank's balance is not its books");

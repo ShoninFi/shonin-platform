@@ -1,0 +1,16 @@
+[package]
+name = "shonin-common"
+version = "0.1.0"
+description = "What the Shonin programs share: digests, signatures, time and maths"
+edition = "2021"
+license = "BUSL-1.1"
+publish = false
+
+[dependencies]
+anchor-lang = { workspace = true }
+solana-keccak-hasher = { workspace = true }
+solana-sdk-ids = { workspace = true }
+uint = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

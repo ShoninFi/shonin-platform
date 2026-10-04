@@ -1,0 +1,350 @@
+# The crates a strategy may depend on from crates.io: the pinned dependency
+# snapshot every strategy build is made from.
+#
+# A project may depend only on crates inside its own archive (path
+# dependencies that stay within it), the strategy SDK the build service
+# carries, and the exact crates listed here, each by name, version and the
+# checksum crates.io gives its package (as `Cargo.lock` records it). The build
+# service refuses, before an upload is paid for, any project whose
+# `Cargo.lock` is missing or names a git dependency, another registry, a
+# crate or version not listed here, a listed one under another checksum, or
+# a path outside the archive; and a build is compiled `--locked --offline`
+# against a vendored copy of exactly these crates (`builder --vendor-into`).
+#
+# Every crate here is source the reviewer never reads: the platform reads it
+# instead, before it is listed. An addition, or a new version of a crate
+# already listed, is a change to what every strategy may run, so it needs
+# that review first, and the builder image is rebuilt with it.
+#
+# Seeded with the strategy SDK's dependency closure and what the agent
+# template and the reference agents lock.
+
+[[crate]]
+name = "allocator-api2"
+version = "0.2.21"
+checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+
+[[crate]]
+name = "anyhow"
+version = "1.0.104"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[crate]]
+name = "autocfg"
+version = "1.5.1"
+checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
+
+[[crate]]
+name = "bitflags"
+version = "2.13.2"
+checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
+
+[[crate]]
+name = "bnum"
+version = "0.12.1"
+checksum = "f781dba93de3a5ef6dc5b17c9958b208f6f3f021623b360fb605ea51ce443f10"
+
+[[crate]]
+name = "cfg-if"
+version = "1.0.4"
+checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[crate]]
+name = "cfg-if"
+version = "1.0.5"
+checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
+
+[[crate]]
+name = "ciborium"
+version = "0.2.2"
+checksum = "42e69ffd6f0917f5c029256a24d0161db17cea3997d185db0d35926308770f0e"
+
+[[crate]]
+name = "ciborium-io"
+version = "0.2.2"
+checksum = "05afea1e0a06c9be33d539b876f1ce3692f4afea2cb41f740e7743225ed1c757"
+
+[[crate]]
+name = "ciborium-ll"
+version = "0.2.2"
+checksum = "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9"
+
+[[crate]]
+name = "crunchy"
+version = "0.2.4"
+checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
+
+[[crate]]
+name = "equivalent"
+version = "1.0.2"
+checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+
+[[crate]]
+name = "fastnum"
+version = "0.7.5"
+checksum = "020d1b59a944bc239d79903fbac2eda2365138b44890c27979562f6592059dcd"
+
+[[crate]]
+name = "foldhash"
+version = "0.2.0"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[crate]]
+name = "futures"
+version = "0.3.34"
+checksum = "9a31d2a3fbaaeb2af2368bbdd904aa8e812d3c04a1ee10d3171f52d556e5d0a3"
+
+[[crate]]
+name = "futures-channel"
+version = "0.3.34"
+checksum = "b1f9e3d69d39e4862ffed03ed071a76f9a13ba1d9109d355b0f0aa6b15e393c4"
+
+[[crate]]
+name = "futures-core"
+version = "0.3.34"
+checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
+
+[[crate]]
+name = "futures-executor"
+version = "0.3.34"
+checksum = "031b47cf1a3c6cc8bc2fc76cd437f521619387907d469316e7c0bc278f1f5432"
+
+[[crate]]
+name = "futures-io"
+version = "0.3.34"
+checksum = "53c0fa8157de1303bfffdaa1cc2a673bfffb60102f76b0ef4441659124373fed"
+
+[[crate]]
+name = "futures-macro"
+version = "0.3.34"
+checksum = "9fb9654ba8355388abeb8dcb4fc62f511300867002afc858860463bdd9fe0c44"
+
+[[crate]]
+name = "futures-sink"
+version = "0.3.34"
+checksum = "1944426bf7d03f1d14f708785e4b33efd750b36d48a157b836b3efc15ede8e1d"
+
+[[crate]]
+name = "futures-task"
+version = "0.3.34"
+checksum = "cd417de3d1d015fc3bfd2b1ea46dfc7bab72ef86f1cc7cc9c78e728b34a6d1fd"
+
+[[crate]]
+name = "futures-util"
+version = "0.3.34"
+checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
+
+[[crate]]
+name = "half"
+version = "2.7.1"
+checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
+
+[[crate]]
+name = "hashbrown"
+version = "0.17.1"
+checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+
+[[crate]]
+name = "heck"
+version = "0.5.0"
+checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[crate]]
+name = "id-arena"
+version = "2.3.0"
+checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
+
+[[crate]]
+name = "indexmap"
+version = "2.14.2"
+checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
+
+[[crate]]
+name = "itoa"
+version = "1.0.18"
+checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[crate]]
+name = "leb128fmt"
+version = "0.1.0"
+checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
+
+[[crate]]
+name = "libm"
+version = "0.2.16"
+checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[crate]]
+name = "log"
+version = "0.4.34"
+checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+
+[[crate]]
+name = "macro-string"
+version = "0.3.0"
+checksum = "6e7b3a5bbb2f63aaa223a671ea1bd0e7bc16bd30ce387324cf63995deaddbbd2"
+
+[[crate]]
+name = "memchr"
+version = "2.8.3"
+checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[crate]]
+name = "num-integer"
+version = "0.1.47"
+checksum = "7ce2d95d4b3734dc35aa2f45e1aa22cd416814592a4f9d9205e11affd5b8e10b"
+
+[[crate]]
+name = "num-traits"
+version = "0.2.19"
+checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
+
+[[crate]]
+name = "pin-project-lite"
+version = "0.2.17"
+checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[crate]]
+name = "prettyplease"
+version = "0.3.0"
+checksum = "2bfe0f4c752e450fc2faf62654f1c134747922825d5b04ca717b8874f41a40c0"
+
+[[crate]]
+name = "proc-macro2"
+version = "1.0.107"
+checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
+
+[[crate]]
+name = "quote"
+version = "1.0.47"
+checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
+
+[[crate]]
+name = "semver"
+version = "1.0.28"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+
+[[crate]]
+name = "serde"
+version = "1.0.229"
+checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
+
+[[crate]]
+name = "serde-big-array"
+version = "0.5.1"
+checksum = "11fc7cc2c76d73e0f27ee52abbd64eec84d46f370c88371120433196934e4b7f"
+
+[[crate]]
+name = "serde_core"
+version = "1.0.229"
+checksum = "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
+
+[[crate]]
+name = "serde_derive"
+version = "1.0.229"
+checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
+
+[[crate]]
+name = "serde_json"
+version = "1.0.151"
+checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+
+[[crate]]
+name = "slab"
+version = "0.4.12"
+checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[crate]]
+name = "syn"
+version = "2.0.119"
+checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
+
+[[crate]]
+name = "syn"
+version = "3.0.5"
+checksum = "12df2e0110f65b775f769bb17ef989067a1d931b2eb822bd4346631eeada89f9"
+
+[[crate]]
+name = "syn"
+version = "3.0.6"
+checksum = "8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee"
+
+[[crate]]
+name = "unicode-ident"
+version = "1.0.24"
+checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[crate]]
+name = "unicode-ident"
+version = "1.0.26"
+checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
+
+[[crate]]
+name = "wasm-encoder"
+version = "0.259.0"
+checksum = "b1d0246511d901aacf25d2dc9111f0054947de5e093fe662099e709ff7530dc3"
+
+[[crate]]
+name = "wasm-metadata"
+version = "0.259.0"
+checksum = "4e7bf119eb01f4a246864c10bd87c8f26c566350abb25aa4d5273c415bbab338"
+
+[[crate]]
+name = "wasmparser"
+version = "0.259.0"
+checksum = "0f7c12eac7bb587801590f6a67ff0bc84d0748513864b71108e4b311cc3df694"
+
+[[crate]]
+name = "wit-bindgen"
+version = "0.62.0"
+checksum = "53cb4b5556c3a791e86838ea287782bdafa704d55b0e68b5b81a3a16b9ea5f4b"
+
+[[crate]]
+name = "wit-bindgen-core"
+version = "0.62.0"
+checksum = "72ad22a37ecbc0e1fdca34d2b670ba41368cb0920735643e00fdf39a16ee5431"
+
+[[crate]]
+name = "wit-bindgen-rust"
+version = "0.62.0"
+checksum = "84ba5213d4332c260a0d4e69e34b0f7e4b85ddae10b6ebfbac00d9c185ba628a"
+
+[[crate]]
+name = "wit-bindgen-rust-macro"
+version = "0.62.0"
+checksum = "8f19d63da8e478a370ef8192d90ccb517965b7747d6b46cd2d831dd0ef4d2541"
+
+[[crate]]
+name = "wit-component"
+version = "0.259.0"
+checksum = "092f783dee3253265fcde131475055f8c275ac0176a9c0396db1dc7b5544bfb4"
+
+[[crate]]
+name = "wit-parser"
+version = "0.259.0"
+checksum = "6390f4f02493ce678d509c859cf1698e38929fb75c8012a6ee2f7d6b6cb66cd7"
+
+[[crate]]
+name = "zerocopy"
+version = "0.8.57"
+checksum = "d35102a9f36d089ccae9e4c6802bc118be4487b80aaffc0ab4e0cf5ce92d2873"
+
+[[crate]]
+name = "zerocopy"
+version = "0.8.59"
+checksum = "6df92bf3d9227be3d53173901ddbffac2babc27ae50f397776ffd6dc33f800cb"
+
+[[crate]]
+name = "zerocopy-derive"
+version = "0.8.57"
+checksum = "146c01f5ab44258da43cf276c74a2763db2ff3969c9c652c3f2de07041d0b2bc"
+
+[[crate]]
+name = "zerocopy-derive"
+version = "0.8.59"
+checksum = "ac4f328cf2f05d084e496c3e9c3f33ed0a183656a16e1fcec4d464d8373aec82"
+
+[[crate]]
+name = "zmij"
+version = "1.0.23"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"

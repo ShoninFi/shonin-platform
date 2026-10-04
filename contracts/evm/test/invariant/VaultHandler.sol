@@ -269,8 +269,21 @@ contract VaultHandler is Test {
     uint256 public tankCharged;
     uint256 public tankOut;
     uint256 internal lastUsage;
-    uint64 internal lastCollection;
     uint64 internal billAsOf;
+    /// The latest time the vault can have counted the allowances to: the
+    /// latest signed time a collection went through with, or the latest
+    /// change of the allowances (which closes the interval at the old ones),
+    /// each stopping at the halt plus its grace. Nothing the vault charged
+    /// can come from time after it.
+    uint64 internal capReach;
+    /// Where the last collection stopped counting the allowances (its signed
+    /// time, or the latest change of the allowances if later, stopping at the
+    /// halt plus its grace, never before the one before it), and a day's cost
+    /// at the allowances in force then: the
+    /// most it can have left carried for the next. Both from the handler's
+    /// own record, never the vault's.
+    uint64 internal lastCollection;
+    uint256 internal carryAllowed;
     /// The allowances in force and when each was set, so the cap can be
     /// priced independently of the vault.
     uint64[] internal allowanceSince;
@@ -1289,6 +1302,12 @@ contract VaultHandler is Test {
         _begin();
         Tank memory t = vault.tank();
         uint64 asOf = uint64(block.timestamp);
+        // Now and then a total signed a while ago and only collected now,
+        // though still later than the last one collected.
+        if (more % 3 == 0 && asOf > t.usageAsOf + 1) {
+            asOf -= uint64(_bound(more >> 128, 1, asOf - t.usageAsOf - 1));
+            _hit("~olderTotal");
+        }
         uint256 total = t.usageSettled + _bound(more, 0, 30e6);
         bytes memory signature;
         if (signed && asOf > t.usageAsOf) {
@@ -1400,6 +1419,8 @@ contract VaultHandler is Test {
         _begin();
         vm.prank(author);
         try vault.setAllowances(a) {
+            uint64 reach = _capEnd(uint64(block.timestamp));
+            if (reach > capReach) capReach = reach;
             allowanceSince.push(uint64(block.timestamp));
             allowanceAt.push(a);
             _hit("setAllowances");
@@ -2392,6 +2413,12 @@ contract VaultHandler is Test {
         cap = _capBetween(vault.createdAt(), end);
     }
 
+    /// What the allowances cost from activation to the latest time the vault
+    /// can have counted them to (see `capReach`).
+    function capCharged() public view returns (uint256) {
+        return _capBetween(vault.createdAt(), _capEnd(capReach));
+    }
+
     function hitCount() external view returns (uint256) {
         return hitNames.length;
     }
@@ -2445,6 +2472,24 @@ contract VaultHandler is Test {
         if (tankCharged > capSoFar() + allowanceSince.length) {
             tankBreaks++;
             _break(string.concat(what, ": the tank was charged above the allowances"));
+        }
+        // Priced from the handler's own record of the allowances and the
+        // published prices, without the vault's carry: everything charged
+        // is at most what the allowances cost from activation to the latest
+        // time the vault can have counted them to. Each collection prices a
+        // piece of that and rounds down, so the pieces never add up to more.
+        if (tankCharged > capCharged()) {
+            tankBreaks++;
+            _break(
+                string.concat(
+                    what,
+                    ": ",
+                    vm.toString(tankCharged),
+                    " charged in all, over the allowances' cost of ",
+                    vm.toString(capCharged()),
+                    " to the cap's end"
+                )
+            );
         }
 
         // A stopped station's band is the exit band for a week after the
@@ -2637,9 +2682,9 @@ contract VaultHandler is Test {
                 (, uint256 assets) = abi.decode(l.data, (uint256, uint256));
                 tankIn += assets;
             } else if (topic == IVault.TankCharged.selector) {
-                (, uint256 charged,) = abi.decode(l.data, (uint256, uint256, uint256));
+                (uint256 billed, uint256 charged,) = abi.decode(l.data, (uint256, uint256, uint256));
                 tankCharged += charged;
-                _checkCharge(charged, what);
+                _checkCharge(billed, charged, what);
                 // The running costs go to the platform.
                 _expect(platform, charged);
             } else if (topic == IVault.TankWithdrawn.selector) {
@@ -3175,21 +3220,66 @@ contract VaultHandler is Test {
         }
     }
 
-    /// One collection charges at most the allowances' cost for the time it
-    /// covers, from the last collection to its signed time, stopping at the
-    /// halt plus its grace.
-    function _checkCharge(uint256 charged, string memory what) internal {
+    /// One collection charges at most what the allowances cost from where
+    /// the last collection stopped to its own signed time, or to the latest
+    /// change of the allowances if later (a change closes the interval at
+    /// the old ones and carries it, and a total signed a while ago can be
+    /// collected after one), stopping at the halt plus its grace; plus what
+    /// the last collection can have left carried: a day's cost at the
+    /// allowances in force then. Both are priced from
+    /// the handler's own record of the allowances, not from the vault's
+    /// carry. What it leaves carried for the next is at most a day's cost at
+    /// the allowances in force. It also moves the time the vault can have
+    /// counted the allowances to on (see `capReach`), against which
+    /// everything charged is checked in all, in `_end`.
+    function _checkCharge(uint256 billed, uint256 charged, string memory what) internal {
         _hit(charged == 0 ? bytes32("~charge0") : bytes32("~charge"));
         uint64 start = lastCollection;
         uint64 end = _capEnd(billAsOf);
         if (end < start) end = start;
-        uint256 cap = _capBetween(start, end);
-        lastCollection = end;
-        if (charged > cap + allowanceSince.length) {
+        uint64 changed = _capEnd(allowanceSince[allowanceSince.length - 1]);
+        // Where this collection's bound stops: a total signed before the
+        // latest change of the allowances is charged against what that
+        // change carried, so the stretch up to the change is counted here.
+        uint64 counted = changed > end ? changed : end;
+        uint256 since = _capBetween(start, counted);
+        if (charged > since + carryAllowed) {
             tankBreaks++;
             _break(
                 string.concat(
-                    what, ": a bill charged ", vm.toString(charged), " over a cap of ", vm.toString(cap)
+                    what,
+                    ": a collection charged ",
+                    vm.toString(charged),
+                    " over the allowances' cost of ",
+                    vm.toString(since),
+                    " since the last collection and a day's carry of ",
+                    vm.toString(carryAllowed)
+                )
+            );
+        }
+        // The collection drew on what the last one carried, or charged less
+        // than it billed with the tank still holding more: its cap held it.
+        if (charged > since) _hit("~chargeFromCarry");
+        if (charged < billed && charged < before.tank) _hit("~chargeCapped");
+        // The next bound starts where this one stopped, as the vault never
+        // counts time before its latest change of the allowances again: a
+        // bound starting at the older signed time would price that stretch
+        // twice, and let a vault that charged it twice pass.
+        lastCollection = counted;
+        if (counted > capReach) capReach = counted;
+
+        uint256 day = prices.dailyCost(allowanceAt[allowanceAt.length - 1]);
+        carryAllowed = day;
+        uint256 carried = vault.tank().capCarried;
+        if (carried > day) {
+            tankBreaks++;
+            _break(
+                string.concat(
+                    what,
+                    ": a collection carried ",
+                    vm.toString(carried),
+                    " over a day's cost of ",
+                    vm.toString(day)
                 )
             );
         }

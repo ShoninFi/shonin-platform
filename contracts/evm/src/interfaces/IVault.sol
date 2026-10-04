@@ -179,7 +179,8 @@ struct Tank {
     uint64 lastCollection;
     /// When the author asked to withdraw without a signed total.
     uint64 escapeRequestedAt;
-    /// Cap earned under earlier allowances since the last collection.
+    /// Cap earned and not yet charged: what the last collection left unused,
+    /// up to a day's cost, and what earlier allowances earned since it.
     uint256 capCarried;
     /// A tank fill is waiting in the queue.
     bool fillPending;
