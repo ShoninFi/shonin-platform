@@ -1,0 +1,51 @@
+[package]
+name = "shonin-vault"
+version = "0.1.0"
+description = "Pooled capital behind one strategy, and the factory that creates a vault for each: shares, requests, valuations, fees, the tank, claims and the lifecycle"
+edition = "2021"
+license = "BUSL-1.1"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "shonin_vault"
+
+[features]
+# The vault brings the station's allocator (see `shonin_station::heap`), which
+# takes the default's place only when this is set.
+default = ["event-cpi", "custom-heap"]
+# Each valuation's figures are emitted through the program's own instruction
+# data, which a node can't truncate as it truncates logs.
+event-cpi = ["anchor-lang/event-cpi"]
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build", "shonin-driver/idl-build"]
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+# Build with the committed mainnet ids (mainnet-id) instead of the local keypairs'.
+mainnet = [
+    "shonin-registry/mainnet",
+    "shonin-publishing/mainnet",
+    "shonin-prices/mainnet",
+    "shonin-station/mainnet",
+]
+
+[dependencies]
+anchor-lang = { workspace = true }
+anchor-spl = { workspace = true }
+shonin-common = { workspace = true }
+shonin-driver = { path = "../../crates/shonin-driver" }
+shonin-registry = { path = "../shonin-registry", features = ["no-entrypoint"] }
+shonin-publishing = { path = "../shonin-publishing", features = ["no-entrypoint"] }
+shonin-prices = { path = "../shonin-prices", features = ["no-entrypoint"] }
+shonin-station = { path = "../shonin-station", features = ["cpi"] }
+solana-sdk-ids = { workspace = true }
+
+[build-dependencies]
+shonin-program-id = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
