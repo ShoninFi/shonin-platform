@@ -54,9 +54,14 @@ rpc = "https://sepolia.base.org"
 dollar = "USDC"
 native_usd = 0.0
 
+# Hyperliquid's own testnet endpoint (https://rpc.hyperliquid-testnet.xyz/evm)
+# rate-limits a whole stack polling from one address within minutes, so the
+# testnet reads through Chainlink's public endpoint for HyperEVM. It is a
+# proxy over several nodes, some a few blocks behind; the chain client asks a
+# lagging node again.
 [chains."evm:998"]
 label = "Hyperliquid testnet"
-rpc = "https://rpc.hyperliquid-testnet.xyz/evm"
+rpc = "https://rpcs.chain.link/hyperevm/testnet"
 dollar = "USDC"
 native_usd = 0.0
 
