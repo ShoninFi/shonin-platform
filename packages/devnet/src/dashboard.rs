@@ -116,7 +116,6 @@ async fn page(State(dashboard): State<Arc<Dashboard>>) -> Html<String> {
     );
     let deployments: Vec<String> = chains
         .iter()
-        .filter(|(_, key, _)| key.kind == ChainKind::Evm)
         .map(|(_, key, config)| deployment_section(&dashboard, key, config))
         .collect();
     let cloud = cloud_section(&dashboard).await;
@@ -336,11 +335,16 @@ fn deployment_section(dashboard: &Dashboard, key: &ChainKey, config: &ChainConfi
         esc(&key.to_string()),
         esc(&file.display().to_string())
     );
-    let deployments = match std::fs::read_to_string(&file)
+    let read = std::fs::read_to_string(&file)
         .map_err(|error| error.to_string())
-        .and_then(|text| Deployments::from_json(&text).map_err(|error| error.to_string()))
-    {
-        Ok(deployments) => deployments,
+        .and_then(|text| {
+            chain::ChainDeployments::from_json(key, &text).map_err(|error| error.to_string())
+        });
+    let deployments = match read {
+        Ok(chain::ChainDeployments::Evm(deployments)) => deployments,
+        Ok(chain::ChainDeployments::Solana(solana)) => {
+            return solana_section(&title, &solana);
+        }
         Err(error) => {
             return format!(
                 "{title}<p class=\"bad\">No deployment here yet ({}).</p>",
@@ -379,24 +383,62 @@ fn deployment_section(dashboard: &Dashboard, key: &ChainKey, config: &ChainConfi
     .map(|(name, address)| (name, format!("{address:?}")))
     .collect();
 
-    let table = |rows: Vec<(&str, String)>| {
-        let mut out = String::from("<table class=\"pairs\"><tbody>");
-        for (name, value) in rows {
-            out.push_str(&format!(
-                "<tr><th>{}</th><td><code>{}</code></td></tr>",
-                esc(name),
-                esc(&value)
-            ));
-        }
-        out.push_str("</tbody></table>");
-        out
-    };
-
     format!(
         "{title}<p>Deployed at block {} on chain {}.</p><div class=\"columns\"><div><h4>Contracts</h4>{}</div><div><h4>Roles</h4>{}</div></div>",
         deployments.deployed_block,
         deployments.chain_id,
         table(contracts.into_iter().collect()),
+        table(roles),
+    )
+}
+
+fn table(rows: Vec<(&str, String)>) -> String {
+    let mut out = String::from("<table class=\"pairs\"><tbody>");
+    for (name, value) in rows {
+        out.push_str(&format!(
+            "<tr><th>{}</th><td><code>{}</code></td></tr>",
+            esc(name),
+            esc(&value)
+        ));
+    }
+    out.push_str("</tbody></table>");
+    out
+}
+
+/// A Solana cluster's programs and, once it is set up, its dollar and roles.
+fn solana_section(title: &str, deployments: &chain::SolanaDeployments) -> String {
+    let mut programs: Vec<(&str, String)> = deployments
+        .programs
+        .iter()
+        .map(|(name, id)| (name.as_str(), id.clone()))
+        .collect();
+    if let Some(mint) = &deployments.mint {
+        programs.push(("dollar mint", mint.clone()));
+    }
+    let roles: Vec<(&str, String)> = deployments
+        .roles
+        .as_ref()
+        .map(|roles| {
+            vec![
+                ("deployer", roles.deployer.clone()),
+                ("admin", roles.admin.clone()),
+                ("platform", roles.platform.clone()),
+                ("attestor", roles.attestor.clone()),
+                ("builder", roles.builder.clone()),
+                ("reviewer", roles.reviewer.clone()),
+                ("executor", roles.executor.clone()),
+                ("keeper", roles.keeper.clone()),
+                ("operator", roles.operator.clone()),
+                ("author", roles.author.clone()),
+                ("viewer", roles.viewer.clone()),
+            ]
+        })
+        .unwrap_or_default();
+    format!(
+        "{title}<p>Deployed at slot {} of cluster <code>{}</code>.</p><div class=\"columns\"><div><h4>Programs</h4>{}</div><div><h4>Roles</h4>{}</div></div>",
+        deployments.deployed_slot,
+        esc(&deployments.cluster),
+        table(programs),
         table(roles),
     )
 }

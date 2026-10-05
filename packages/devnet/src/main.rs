@@ -18,6 +18,7 @@ mod market;
 mod publish;
 mod seed;
 mod solana;
+mod solana_seed;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -54,6 +55,14 @@ struct Args {
     /// The region the Cloud Run services are listed in.
     #[arg(long)]
     gcp_region: Option<String>,
+    /// The built Solana programs and their keypairs, as `anchor build`
+    /// leaves them.
+    #[arg(
+        long,
+        env = "SHONIN_SOLANA_PROGRAMS",
+        default_value = "contracts/solana/target/deploy"
+    )]
+    solana_programs: PathBuf,
     /// Seconds of chain time each block advances.
     #[arg(long, default_value_t = 3_600)]
     seconds_per_block: u64,
@@ -63,7 +72,8 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Deploy the contracts to every EVM chain of the network and write the
+    /// Deploy the contracts to every EVM chain of the network, and on the
+    /// local network the programs to its Solana cluster, and write the
     /// addresses, then stop. Local and testnet only.
     Deploy,
     /// Show each role's account on every EVM chain of the network, with what
@@ -116,6 +126,9 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let target = args.chain_args.resolve()?;
     let local = target.network == NetworkName::Local;
+    // A vault chain named on the command line: the devnet deploys to and
+    // drives that one alone.
+    let one = args.chain_args.vault_chain.is_some();
     let changes_chains = matches!(
         args.command,
         Some(Command::Deploy | Command::Seed { .. } | Command::Accounts)
@@ -127,7 +140,7 @@ async fn main() -> Result<()> {
     match args.command {
         Some(Command::Deploy) => {
             let names = chain_names(&target);
-            for (key, config) in evm_chains(&target) {
+            for (key, config) in only(&target, one, evm_chains(&target)) {
                 let client = connect_to(target.network, &key, &config).await?;
                 let file = Deployments::file_in(&target.deployments_dir, &key);
                 deploy::ensure(
@@ -139,6 +152,14 @@ async fn main() -> Result<()> {
                     &names,
                 )
                 .await?;
+            }
+            if local {
+                for (key, config) in only(&target, one, solana_clusters(&target)) {
+                    let client = chain::connect_solana(target.network, &key, &config).await?;
+                    let file = Deployments::file_in(&target.deployments_dir, &key);
+                    solana::ensure(&client, &key, &config.rpc, &args.solana_programs, &file)
+                        .await?;
+                }
             }
             Ok(())
         }
@@ -157,7 +178,19 @@ async fn main() -> Result<()> {
                                 file.display()
                             )
                         })?;
-                        all.push(Deployments::from_json(&text)?);
+                        all.push(serde_json::to_value(Deployments::from_json(&text)?)?);
+                    }
+                    // A Solana cluster's file, where its programs are
+                    // deployed, named by its key so a reader can find it.
+                    for (key, _) in solana_clusters(&target) {
+                        let file = Deployments::file_in(&target.deployments_dir, &key);
+                        if let Ok(text) = std::fs::read_to_string(&file) {
+                            let mut solana = chain::SolanaDeployments::from_json(&text)?;
+                            if solana.chain_key.is_empty() {
+                                solana.chain_key = key.to_string();
+                            }
+                            all.push(serde_json::to_value(solana)?);
+                        }
                     }
                     print!(
                         "~{prefix}{}={}",
@@ -180,9 +213,13 @@ async fn main() -> Result<()> {
                 solana::DEPLOYER
             };
             let pair = solana::keypair_from_mnemonic(&solana::testnet_mnemonic()?, index)?;
-            pair.write(&out)?;
-            println!("{}", pair.address());
+            chain::solana::keys::write_keypair(&pair, &out)?;
+            println!("{}", chain::solana::Signer::pubkey(&pair));
             Ok(())
+        }
+        Some(Command::Seed { .. }) if target.key.kind == ChainKind::Solana => {
+            let served = target.serve_solana().await?;
+            solana_seed::run(&served).await
         }
         Some(Command::Seed { api, agents, agent }) => {
             let client = target.connect().await?;
@@ -234,7 +271,7 @@ async fn main() -> Result<()> {
                 // Each chain is deployed to and driven on its own, so a slow
                 // one holds up nobody else.
                 let names = chain_names(&target);
-                for (key, config) in evm_chains(&target) {
+                for (key, config) in only(&target, one, evm_chains(&target)) {
                     let names = names.clone();
                     let artifacts = args.artifacts.clone();
                     let file = Deployments::file_in(&target.deployments_dir, &key);
@@ -249,6 +286,28 @@ async fn main() -> Result<()> {
                         market::run(&client, &deployments, seconds_per_block)
                             .await
                             .map_err(|error| error.context(format!("the market on {key}")))
+                    });
+                }
+                for (key, config) in only(&target, one, solana_clusters(&target)) {
+                    let programs = args.solana_programs.clone();
+                    let file = Deployments::file_in(&target.deployments_dir, &key);
+                    let seconds_per_block = args.seconds_per_block;
+                    let network = target.network;
+                    // A cluster that can't be brought up is said, and the
+                    // EVM chains carry on: Solana needs tools of its own.
+                    running.spawn(async move {
+                        let driven = async {
+                            let client = chain::connect_solana(network, &key, &config).await?;
+                            let deployments =
+                                solana::ensure(&client, &key, &config.rpc, &programs, &file)
+                                    .await?;
+                            tracing::info!(chain = %key, label = config.label, "the cluster is up");
+                            solana::run_market(&client, &deployments, seconds_per_block).await
+                        };
+                        if let Err(error) = driven.await {
+                            tracing::error!(chain = %key, error = format!("{error:#}"), "the Solana cluster is not served");
+                        }
+                        Ok(())
                     });
                 }
             } else {
@@ -302,8 +361,8 @@ async fn accounts(target: &Target) -> Result<()> {
             solana::keypair_from_mnemonic(&solana::testnet_mnemonic()?, solana::DEPLOYER)?;
         let program = solana::keypair_from_mnemonic(&solana::testnet_mnemonic()?, solana::PROGRAM)?;
         println!("Solana devnet");
-        println!("  deployer  {}", deployer.address());
-        println!("  program   {}", program.address());
+        println!("  deployer  {}", chain::solana::Signer::pubkey(&deployer));
+        println!("  program   {}", chain::solana::Signer::pubkey(&program));
     }
     Ok(())
 }
@@ -324,6 +383,34 @@ fn evm_chains(target: &Target) -> Vec<(ChainKey, ChainConfig)> {
     chains.sort_by(|a, b| a.0.cmp(&b.0));
     chains.dedup_by(|a, b| a.0 == b.0);
     chains
+}
+
+/// The chains of `chains` the devnet works on: every one, or with a vault
+/// chain named, only the chain it is.
+fn only(
+    target: &Target,
+    one: bool,
+    chains: Vec<(ChainKey, ChainConfig)>,
+) -> Vec<(ChainKey, ChainConfig)> {
+    chains
+        .into_iter()
+        .filter(|(key, _)| !one || key.same_chain(&target.key))
+        .collect()
+}
+
+/// Every Solana cluster of the network.
+fn solana_clusters(target: &Target) -> Vec<(ChainKey, ChainConfig)> {
+    let Some(network) = target.configs.network(target.network) else {
+        return Vec::new();
+    };
+    let mut clusters: Vec<(ChainKey, ChainConfig)> = network
+        .iter()
+        .filter(|(_, key)| key.kind == ChainKind::Solana)
+        .filter_map(|(_, key)| Some((key.clone(), target.configs.get(key)?.clone())))
+        .collect();
+    clusters.sort_by(|a, b| a.0.cmp(&b.0));
+    clusters.dedup_by(|a, b| a.0 == b.0);
+    clusters
 }
 
 /// Each EVM chain of the network by the name `shonin.toml` uses and its chain

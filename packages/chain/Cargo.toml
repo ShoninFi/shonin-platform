@@ -15,7 +15,37 @@ name = "chain"
 # and sends them through the browser's own wallet.
 rpc = ["dep:alloy", "dep:anyhow", "dep:tokio", "dep:tower", "dep:tracing"]
 # The arguments every service takes to choose its network and chain.
-args = ["rpc", "dep:clap", "dep:tracing-subscriber"]
+args = ["rpc", "solana", "dep:clap", "dep:tracing-subscriber"]
+# Speaking to Solana: the programs' own crates for every account, instruction
+# and event, and a JSON-RPC client for the node. Native only, like `rpc`.
+solana = [
+    "rpc",
+    "dep:anchor-lang",
+    "dep:anchor-spl",
+    "dep:shonin-common",
+    "dep:shonin-driver",
+    "dep:shonin-registry",
+    "dep:shonin-dev-verifier",
+    "dep:shonin-publishing",
+    "dep:shonin-prices",
+    "dep:shonin-profiles",
+    "dep:shonin-station",
+    "dep:shonin-vault",
+    "dep:shonin-local-venue",
+    "dep:shonin-local-driver",
+    "dep:solana-transaction",
+    "dep:solana-keypair",
+    "dep:solana-signer",
+    "dep:solana-compute-budget-interface",
+    "dep:solana-ed25519-program",
+    "dep:reqwest",
+    "dep:bs58",
+    "dep:base64",
+    "dep:sha2",
+    "dep:bincode",
+    "dep:solana-message",
+    "dep:solana-hash",
+]
 
 [dependencies]
 alloy-primitives = { workspace = true, features = ["serde"] }
@@ -32,6 +62,34 @@ tokio = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
+
+# The Solana programs' own crates, built for the host without their entry
+# points: the single source of every account layout, instruction and event.
+anchor-lang = { version = "0.32.1", optional = true }
+anchor-spl = { version = "0.32.1", optional = true, default-features = false, features = ["token", "associated_token"] }
+shonin-common = { path = "../../contracts/solana/crates/shonin-common", optional = true }
+shonin-driver = { path = "../../contracts/solana/crates/shonin-driver", optional = true }
+shonin-registry = { path = "../../contracts/solana/programs/shonin-registry", optional = true, features = ["no-entrypoint"] }
+shonin-dev-verifier = { path = "../../contracts/solana/programs/shonin-dev-verifier", optional = true, features = ["no-entrypoint"] }
+shonin-publishing = { path = "../../contracts/solana/programs/shonin-publishing", optional = true, features = ["no-entrypoint"] }
+shonin-prices = { path = "../../contracts/solana/programs/shonin-prices", optional = true, features = ["no-entrypoint"] }
+shonin-profiles = { path = "../../contracts/solana/programs/shonin-profiles", optional = true, features = ["no-entrypoint"] }
+shonin-station = { path = "../../contracts/solana/programs/shonin-station", optional = true, features = ["no-entrypoint"] }
+shonin-vault = { path = "../../contracts/solana/programs/shonin-vault", optional = true, features = ["no-entrypoint"] }
+shonin-local-venue = { path = "../../contracts/solana/programs/shonin-local-venue", optional = true, features = ["no-entrypoint"] }
+shonin-local-driver = { path = "../../contracts/solana/programs/shonin-local-driver", optional = true, features = ["no-entrypoint"] }
+solana-transaction = { version = "2.2", optional = true, features = ["bincode", "verify"] }
+solana-keypair = { version = "2.2", optional = true }
+solana-signer = { version = "2.2", optional = true }
+solana-message = { version = "2.4", optional = true }
+solana-hash = { version = "2.2", optional = true }
+solana-compute-budget-interface = { version = "2.2", optional = true, features = ["borsh"] }
+solana-ed25519-program = { version = "2.2", optional = true }
+reqwest = { workspace = true, optional = true }
+bs58 = { workspace = true, optional = true }
+base64 = { version = "0.22", optional = true }
+sha2 = { workspace = true, optional = true }
+bincode = { version = "1.3", optional = true }
 
 [dev-dependencies]
 # A paused clock, so a test can wait out a receipt timeout without waiting.

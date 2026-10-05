@@ -32,7 +32,7 @@ const HALF_SPREAD: f64 = 0.0001;
 const FUNDING_PER_DAY: f64 = 3.0;
 
 /// Deterministic noise: the same chain tells the same story every time.
-struct Walk(u64);
+pub(crate) struct Walk(u64);
 
 impl Walk {
     fn new(seed: u64) -> Self {
@@ -52,15 +52,63 @@ impl Walk {
     }
 }
 
+/// The market's story, a block at a time: the spot price, the perpetual's,
+/// and the funding that accrued over the block.
+pub(crate) struct Tape {
+    walk: Walk,
+    spot: f64,
+    basis: f64,
+    hours_per_block: f64,
+}
+
+/// One block of the market.
+pub(crate) struct Tick {
+    pub spot: f64,
+    pub perp: f64,
+    /// What longs pay shorts per unit a day, and paid over this block.
+    pub rate_per_day: f64,
+    pub accrued: f64,
+}
+
+impl Tape {
+    pub(crate) fn new(seconds_per_block: u64) -> Self {
+        Self {
+            walk: Walk::new(0x5_0_1_1_u64.wrapping_mul(2_654_435_761)),
+            spot: STARTING_PRICE as f64,
+            basis: BASIS_MEAN,
+            hours_per_block: seconds_per_block as f64 / 3_600.0,
+        }
+    }
+
+    pub(crate) fn step(&mut self) -> Tick {
+        let hours = self.hours_per_block;
+        self.spot *= 1.0 + HOURLY_VOLATILITY * self.walk.wobble() * hours.sqrt();
+        self.basis += (BASIS_MEAN - self.basis) * BASIS_PULL * hours
+            + BASIS_VOLATILITY * self.walk.wobble() * hours.sqrt();
+        let perp = self.spot * (1.0 + self.basis);
+        // Longs pay shorts while the perpetual trades above the spot, which is
+        // the whole reason a basis strategy exists.
+        let rate_per_day = perp * self.basis * FUNDING_PER_DAY;
+        Tick {
+            spot: self.spot,
+            perp,
+            rate_per_day,
+            accrued: rate_per_day * hours / 24.0,
+        }
+    }
+}
+
+/// Half the spread the venue quotes, as a fraction of the price.
+pub(crate) fn half_spread(price: f64) -> f64 {
+    (price * HALF_SPREAD).max(1.0)
+}
+
 pub async fn run(client: &Client, deployments: &Deployments, seconds_per_block: u64) -> Result<()> {
     set_clock(client, seconds_per_block).await?;
 
     let operator = deployments.roles.operator;
     let venue = deployments.venue;
-    let mut walk = Walk::new(0x5_0_1_1_u64.wrapping_mul(2_654_435_761));
-    let mut spot = STARTING_PRICE as f64;
-    let mut basis = BASIS_MEAN;
-    let hours_per_block = seconds_per_block as f64 / 3_600.0;
+    let mut tape = Tape::new(seconds_per_block);
 
     tracing::info!(
         seconds_per_block,
@@ -69,16 +117,7 @@ pub async fn run(client: &Client, deployments: &Deployments, seconds_per_block: 
 
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
-
-        spot *= 1.0 + HOURLY_VOLATILITY * walk.wobble() * hours_per_block.sqrt();
-        basis += (BASIS_MEAN - basis) * BASIS_PULL * hours_per_block
-            + BASIS_VOLATILITY * walk.wobble() * hours_per_block.sqrt();
-        let perp = spot * (1.0 + basis);
-
-        // Longs pay shorts while the perpetual trades above the spot, which is
-        // the whole reason a basis strategy exists.
-        let rate_per_day = perp * basis * FUNDING_PER_DAY;
-        let accrued = rate_per_day * hours_per_block / 24.0;
+        let tick = tape.step();
 
         // One transaction a block: the chain mines on a timer, and waiting for
         // four receipts would leave the market four blocks behind its own
@@ -87,11 +126,11 @@ pub async fn run(client: &Client, deployments: &Deployments, seconds_per_block: 
             operator,
             venue,
             ILocalVenue::postCall {
-                quotes: vec![quote(SPOT, spot), quote(PERP, perp)],
+                quotes: vec![quote(SPOT, tick.spot), quote(PERP, tick.perp)],
                 funding: vec![Funding {
                     market: market_id(PERP),
-                    ratePerDay: to_signed(rate_per_day),
-                    paidPerUnit: to_signed(accrued),
+                    ratePerDay: to_signed(tick.rate_per_day),
+                    paidPerUnit: to_signed(tick.accrued),
                 }],
             },
         );
@@ -129,7 +168,7 @@ async fn set_clock(client: &Client, seconds_per_block: u64) -> Result<()> {
 
 fn quote(market: &str, price: f64) -> Quote {
     let mark = U256::from(price.max(1.0) as u128);
-    let half = U256::from((price * HALF_SPREAD).max(1.0) as u128);
+    let half = U256::from(half_spread(price) as u128);
     Quote {
         market: market_id(market),
         mark,

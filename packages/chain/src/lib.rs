@@ -21,16 +21,18 @@ pub mod deployments;
 pub mod digest;
 #[cfg(feature = "args")]
 pub mod logs;
+#[cfg(feature = "solana")]
+pub mod solana;
 
 #[cfg(feature = "args")]
-pub use args::{ChainArgs, Served, Target, connect_to, signing_for};
+pub use args::{ChainArgs, Served, SolanaServed, Target, connect_solana, connect_to, signing_for};
 #[cfg(feature = "rpc")]
 pub use client::{
     Client, KeyClient, NeverAcknowledged, NeverLanded, NeverSent, ROLE_COUNT, Reverted, Role,
     Signing, Unanswered, keys_from_mnemonic, may_still_land, unanswered,
 };
 pub use config::{ChainConfig, ChainConfigs, ChainKey, ChainKind, Network, NetworkName};
-pub use deployments::{Deployments, Roles};
+pub use deployments::{ChainDeployments, Deployments, Roles, SolanaDeployments, SolanaRoles};
 #[cfg(feature = "args")]
 pub use logs::{log_filter, log_filter_from};
 

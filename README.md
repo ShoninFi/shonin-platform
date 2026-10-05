@@ -9,7 +9,7 @@ This repository is the platform: the contracts, the frontends, the attested mach
 - [Rust](https://rustup.rs). The toolchain is pinned in `rust-toolchain.toml` and installs itself on first use, with the `wasm32-unknown-unknown` target for the app and `wasm32-wasip2` for strategies.
 - [Task](https://taskfile.dev) and [Trunk](https://trunkrs.dev).
 - [Foundry](https://getfoundry.sh) for the EVM contracts and the local EVM chains (`forge`, `anvil`).
-- The [Solana CLI](https://solana.com/docs/intro/installation) for the local validator (`solana-test-validator`), and [Anchor](https://www.anchor-lang.com) to build the Solana programs.
+- The [Solana CLI](https://solana.com/docs/intro/installation) to deploy the Solana programs, [Anchor](https://www.anchor-lang.com) to build them, and [Surfpool](https://github.com/solana-foundation/surfpool) 1.2.0 or later for the local Solana cluster (earlier versions have no Ed25519 program offline). Set `SURFPOOL=/path/to/surfpool` if the one on your path is older.
 - [Node.js](https://nodejs.org), only to install wrangler.
 - Optional: [Docker](https://www.docker.com) and the [gcloud CLI](https://cloud.google.com/sdk) for the Google Cloud images and tasks.
 - For the commit guard: [gitleaks](https://github.com/gitleaks/gitleaks), [jq](https://jqlang.org) and the [Claude Code](https://claude.com/claude-code) CLI. The reviewer uses the same CLI.
@@ -40,7 +40,7 @@ They are independent: running the services here against the testnets needs only 
 
 ### What `task dev` runs
 
-Three anvils standing in for the EVM vault chains (base, hyperliquid, robinhood) and a Solana validator; the devnet, which deploys the contracts to every EVM chain, then moves their clocks and plays their markets; the four machines; the API, the indexer and the keeper; the app; and the marketing site. Every machine and service serves all three EVM chains at once, and retries until each chain answers and its deployment exists, so they all start at once. `task services:seed` publishes to base, or to `VAULT_CHAIN=hyperliquid` and so on. `task dev:services` is the same without the frontends.
+Three anvils standing in for the EVM vault chains (base, hyperliquid, robinhood) and a Solana cluster (Surfpool, offline); the devnet, which deploys the contracts to every EVM chain and the programs to the Solana cluster, then moves their clocks and plays their markets; the four machines; the API, the indexer and the keeper; the app; and the marketing site. Every machine and service serves all three EVM chains at once, and retries until each chain answers and its deployment exists, so they all start at once. `task services:seed` publishes to base, or to `VAULT_CHAIN=hyperliquid` and so on; `task services:seed VAULT_CHAIN=solana` seeds the Solana cluster (see below). `task dev:services` is the same without the frontends.
 
 | Port | What |
 | --- | --- |
@@ -54,13 +54,13 @@ Three anvils standing in for the EVM vault chains (base, hyperliquid, robinhood)
 | 19090 | The unwinder |
 | 19091 | The reference indexer on its own |
 | 19100–19102 | The anvils: `evm:31337` base, `evm:31338` hyperliquid, `evm:31339` robinhood |
-| 19110–19112 | The Solana validator: RPC, websocket, faucet |
+| 19110–19111 | The Solana cluster (Surfpool): RPC, websocket |
 
 The base port is `SHONIN_START_PORT_DEV` (19080); every other port is a fixed offset from it, listed in `taskfiles/config.yml`.
 
 **The ops dashboard** at `http://localhost:19088/` shows every chain of the network (key, RPC, the chain id or genesis it reports, its head and its clock), every machine and service and whether its `/health` answers, each chain's contract addresses and roles, and, once a Google Cloud project is set, what is running there. It refreshes itself, and it is local only.
 
-**Everything a run writes** lives under `.shonin/<network>` (gitignored; `.shonin/local` for `task dev`): one deployment file per chain in `deployments/`, the content-addressed store, the build directories and the Solana ledger. It is safe to delete; the next run rebuilds it.
+**Everything a run writes** lives under `.shonin/<network>` (gitignored; `.shonin/local` for `task dev`): one deployment file per chain in `deployments/` (`solana-localnet.json` for the Solana cluster), the content-addressed store, the build directories and the Solana cluster's logs. It is safe to delete; the next run rebuilds it.
 
 **The local chains' accounts** come from anvil's published mnemonic. Each role (admin, builder, reviewer, executor, keeper, author, ...) is one of them by index, listed in `.env.example`, so no key is written down anywhere. The app's **development wallet** is one of them: it signs nothing in the browser, because the chain already holds the key. A block is mined every second and advances an hour of chain time, so a vault reaches the thirty live days it needs for the leaderboard in about twelve minutes.
 
@@ -70,9 +70,12 @@ Worth knowing separately:
 task chains:deploy                   # deploy the contracts to every local EVM chain
 task services:seed                   # publish the reference agents: upload, pay $1, review, build, activate
 task services:seed AGENT=funding-basis   # publish one agent, as it stands
-task contracts:solana:build          # anchor build
-task contracts:solana:deploy         # deploy the programs to the local validator
+task contracts:solana:build          # anchor build: needed once before the devnet can deploy the programs
+task contracts:solana:deploy         # build, then deploy and set up the programs on the local cluster
+task services:seed VAULT_CHAIN=solana   # the seed on Solana (below)
 ```
+
+**The local Solana cluster** is Surfpool, started offline and fresh by `task chains:solana`. The devnet deploys the programs from `contracts/solana/target/deploy` through the loader (the development checker and the stand-in driver final, as every checker and driver must be), sets each up with the deployer key, creates the dollar's mint, lists the stand-in venue's markets, proposes the images, the project and the stand-in driver, funds every role, and writes `deployments/solana-localnet.json`; then it moves the cluster's clock an hour a second and posts the venue's prices, as on the anvils. The roles are keys of the same published mnemonic, along Solana's own derivation path. A program's id is compiled into the services from the same keypairs, so build the programs (`task contracts:solana:build`) before the services. The services do not speak to Solana yet, so the seed on Solana plays their parts itself, with each role's development key: it publishes a strategy (paid, registered with the build service's signature and the Reviewer's go-ahead, reviewed), activates vaults, deposits and has them priced, puts money to work at the stand-in venue through the station's guard, books and pays a claim, retires one vault and kills another, which is wound up and closed with its depositor paid, checking each on the cluster.
 
 ### The testnets
 
@@ -89,7 +92,7 @@ The testnets keep their own time, so nothing drives their clocks or their stand-
 
 ### Chains and networks
 
-`config/chains.toml` lists every chain the platform knows, keyed `kind:id` (`evm:8453`, `solana:devnet`), with its label, RPC, websocket and the dollar a vault there settles in, and maps each network to the chain behind each vault chain name. Every service takes `--network`, `--chains` and `--deployments-dir`, and serves every EVM vault chain of the network at once, each with its own client and deployment; `--vault-chain` (or `VAULT_CHAIN=` on a task) narrows it to one. Everything that acts on one chain names it: each per-chain function takes the chain, and so does each API route that acts on one (`/api/{chain}/config`, `/api/{chain}/portfolio/{address}`, `/api/{chain}/submissions`, `/api/{chain}/health`), while `/api/snapshot` and the build queue span every chain and each strategy says which chain its vault is on. Where one id and version is published on two chains, its slug is qualified with the chain (`funding-basis-v1-hyperliquid`). No service speaks to Solana yet.
+`config/chains.toml` lists every chain the platform knows, keyed `kind:id` (`evm:8453`, `solana:devnet`), with its label, RPC, websocket and the dollar a vault there settles in, and maps each network to the chain behind each vault chain name. Every service takes `--network`, `--chains` and `--deployments-dir`, and serves every EVM vault chain of the network at once, each with its own client and deployment; `--vault-chain` (or `VAULT_CHAIN=` on a task) narrows it to one. Everything that acts on one chain names it: each per-chain function takes the chain, and so does each API route that acts on one (`/api/{chain}/config`, `/api/{chain}/portfolio/{address}`, `/api/{chain}/submissions`, `/api/{chain}/health`), while `/api/snapshot` and the build queue span every chain and each strategy says which chain its vault is on. Where one id and version is published on two chains, its slug is qualified with the chain (`funding-basis-v1-hyperliquid`). No service speaks to Solana yet; `packages/chain` has the client they will use (the `solana` module, behind the feature of that name, which `args` includes).
 
 - **To point a chain at another RPC**, set `SHONIN_RPC_<KIND>_<ID>` (or `SHONIN_WS_...`) in `.env`, for example `SHONIN_RPC_EVM_8453`. Paid RPC URLs carry keys, so they go there and never in the file.
 - **To add a chain**, add a `[chains."kind:id"]` entry and name it in a network. A new local chain also needs its process in `taskfiles/chains.yml` and its port in `taskfiles/config.yml`.
@@ -113,7 +116,7 @@ The testnets keep their own time, so nothing drives their clocks or their stand-
 config/           chains.toml, drivers.toml, and the committed mainnet deployments
 contracts/
   evm/            the EVM contracts (Foundry); src/interfaces is what the bindings read
-  solana/         the Solana programs (Anchor): a skeleton for now
+  solana/         the Solana programs (Anchor), and their in-process tests
 packages/
   shared/         types shared by every crate (native and wasm), and the record's maths
   chain/          contract bindings, chain config and deployments (native and wasm)

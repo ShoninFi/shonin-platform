@@ -1,9 +1,10 @@
 //! The arguments every service takes to find its chains, so each one chooses
 //! the network and the vault chains the same way.
 //!
-//! A service serves every vault chain of the network that it can speak to
-//! (the EVM ones), each with its own client and deployment, unless it is told
-//! to serve one.
+//! A service serves every vault chain of the network that it can speak to,
+//! each with its own client and deployment, unless it is told to serve one.
+//! The EVM chains come from [`ChainArgs::targets`] as [`Served`]; the Solana
+//! clusters from [`ChainArgs::solana_targets`] as [`SolanaServed`].
 
 use std::path::PathBuf;
 
@@ -12,7 +13,8 @@ use shared::Chain;
 
 use crate::client::{Client, ROLE_COUNT, Signing, keys_from_mnemonic};
 use crate::config::{ChainConfig, ChainConfigs, ChainKey, ChainKind, NetworkName};
-use crate::deployments::Deployments;
+use crate::deployments::{Deployments, SolanaDeployments};
+use crate::solana::{Platform, SolanaClient};
 
 #[derive(clap::Args, Clone, Debug)]
 pub struct ChainArgs {
@@ -103,6 +105,43 @@ impl ChainArgs {
             }
         }
         Ok(targets)
+    }
+
+    /// Every Solana vault chain this service serves: the one named, if it is
+    /// a Solana one, or every Solana vault chain of the network. The EVM
+    /// chains are [`ChainArgs::targets`]'s.
+    pub fn solana_targets(&self) -> Result<Vec<Target>> {
+        let configs = ChainConfigs::load(&self.chains)?;
+        let wanted: Vec<Chain> = match self.vault_chain {
+            Some(chain) => vec![chain],
+            None => Chain::ALL.to_vec(),
+        };
+        let mut targets: Vec<Target> = Vec::new();
+        for chain in wanted {
+            let target = self.target(&configs, chain)?;
+            if target.key.kind == ChainKind::Solana
+                && !targets
+                    .iter()
+                    .any(|served| served.key.same_chain(&target.key))
+            {
+                targets.push(target);
+            }
+        }
+        Ok(targets)
+    }
+
+    /// Connect to every Solana cluster this service serves, each on its own,
+    /// handing each one over once it is connected and its deployment found,
+    /// as [`ChainArgs::connect_each`] does for the EVM chains.
+    pub fn connect_each_solana(
+        &self,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<SolanaServed>> {
+        Ok(each_until_connected(
+            self.solana_targets()?,
+            |target| target.key.canonical(),
+            |target| async move { target.serve_solana().await },
+            CONNECT_RETRY_FIRST,
+        ))
     }
 
     /// Connect to every chain this service serves and wait for each one's
@@ -233,22 +272,18 @@ impl Target {
     /// are never committed), otherwise from the deployment file once it
     /// appears.
     pub async fn wait_for_deployments(&self, client: &Client) -> Result<Deployments> {
-        match std::env::var(DEPLOYMENTS_JSON)
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-        {
-            Some(json) => {
-                let all: Vec<Deployments> = serde_json::from_str(&json).map_err(|error| {
-                    anyhow!("{DEPLOYMENTS_JSON} is not a list of deployments: {error}")
+        match deployment_from_env(&self.key)? {
+            Some(value) => {
+                let deployments: Deployments = serde_json::from_value(value).map_err(|error| {
+                    anyhow!(
+                        "{DEPLOYMENTS_JSON}'s deployment for {} is not an EVM one: {error}",
+                        self.key
+                    )
                 })?;
-                let key = self.key.to_string();
-                let deployments = all
-                    .into_iter()
-                    .find(|deployments| deployments.chain_key == key)
-                    .ok_or_else(|| anyhow!("{DEPLOYMENTS_JSON} has no deployment for {key}"))?;
                 if deployments.chain_id != client.chain_id {
                     bail!(
-                        "{DEPLOYMENTS_JSON} says {key} is chain {}, and it answers as {}",
+                        "{DEPLOYMENTS_JSON} says {} is chain {}, and it answers as {}",
+                        self.key,
                         deployments.chain_id,
                         client.chain_id
                     );
@@ -258,6 +293,93 @@ impl Target {
             None => client.wait_for_deployments(&self.deployments_file()).await,
         }
     }
+
+    /// Connect to this target's Solana cluster, waiting for it to answer,
+    /// and check it is the cluster its key names.
+    pub async fn connect_solana(&self) -> Result<SolanaClient> {
+        connect_solana(self.network, &self.key, &self.config).await
+    }
+
+    /// Connect to this Solana cluster and wait for its deployment, set up
+    /// and checked against the cluster and the programs this build speaks
+    /// to.
+    pub async fn serve_solana(&self) -> Result<SolanaServed> {
+        let client = self.connect_solana().await?;
+        let deployments = match deployment_from_env(&self.key)? {
+            Some(value) => {
+                let deployments: SolanaDeployments =
+                    serde_json::from_value(value).map_err(|error| {
+                        anyhow!(
+                            "{DEPLOYMENTS_JSON}'s deployment for {} is not a Solana one: {error}",
+                            self.key
+                        )
+                    })?;
+                client.check_deployments(&deployments).await?;
+                deployments
+            }
+            None => {
+                client
+                    .wait_for_deployments(&self.deployments_file())
+                    .await?
+            }
+        };
+        let platform = Platform::from_deployments(&deployments)?;
+        Ok(SolanaServed {
+            vault_chain: self.vault_chain,
+            key: self.key.clone(),
+            client,
+            deployments,
+            platform,
+            public_rpc: self.config.public_rpc.clone(),
+        })
+    }
+}
+
+/// One chain's deployment from `SHONIN_DEPLOYMENTS_JSON`, when it is set
+/// (how a machine in the cloud is handed the testnet deployments, which are
+/// never committed): the entry whose `chain_key` is `key`, as it is, for the
+/// reader to read as its kind of chain's.
+fn deployment_from_env(key: &ChainKey) -> Result<Option<serde_json::Value>> {
+    let Some(json) = std::env::var(DEPLOYMENTS_JSON)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let all: Vec<serde_json::Value> = serde_json::from_str(&json)
+        .map_err(|error| anyhow!("{DEPLOYMENTS_JSON} is not a list of deployments: {error}"))?;
+    let wanted = key.to_string();
+    all.into_iter()
+        .find(|entry| entry["chain_key"].as_str() == Some(wanted.as_str()))
+        .map(Some)
+        .ok_or_else(|| anyhow!("{DEPLOYMENTS_JSON} has no deployment for {wanted}"))
+}
+
+/// One Solana vault chain a service serves: its client, its deployment and
+/// the platform's instructions on it.
+#[derive(Clone)]
+pub struct SolanaServed {
+    pub vault_chain: Chain,
+    pub key: ChainKey,
+    pub client: SolanaClient,
+    pub deployments: SolanaDeployments,
+    pub platform: Platform,
+    /// The cluster's RPC as the chain config file gives it, which may be
+    /// shown to anyone.
+    pub public_rpc: String,
+}
+
+/// Connect to a Solana cluster of a network, and check it is the cluster
+/// its key names. The role keys are the network's: the development ones
+/// locally, the team's on devnet, none on mainnet.
+pub async fn connect_solana(
+    network: NetworkName,
+    key: &ChainKey,
+    config: &ChainConfig,
+) -> Result<SolanaClient> {
+    let client = SolanaClient::connect(network, key, config).await?;
+    tracing::info!(%network, chain = %key, label = config.label, "connected");
+    Ok(client)
 }
 
 /// Every served chain's deployment, handed over whole in the environment as a
