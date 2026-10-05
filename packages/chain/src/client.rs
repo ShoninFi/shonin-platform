@@ -412,8 +412,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// endpoints each limit how fast one address may ask, and a whole stack on
 /// one machine passes any one of their limits. Each request then goes to the
 /// endpoint ranked best by how often and how fast it has answered lately, and
-/// one that refuses (a rate limit included, however it is worded) falls in
-/// the ranking, so the next requests go elsewhere.
+/// to the next when one refuses (a rate limit included, however it is
+/// worded), which also falls in the ranking.
 fn rpc_client(rpc: &str) -> Result<alloy::rpc::client::RpcClient> {
     let http = alloy::transports::http::reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
@@ -437,13 +437,52 @@ fn rpc_client(rpc: &str) -> Result<alloy::rpc::client::RpcClient> {
         let inner = alloy::transports::http::Http::with_client(http.clone(), url);
         transports.push(tower::Layer::layer(&keep, RateLimitIsAFailure { inner }));
     }
+    // Every method the services use goes to one endpoint at a time, best
+    // first, and on to the next when one refuses, so a request fails only
+    // when every endpoint has. A method not listed goes to them all at once
+    // and takes the first answer.
+    let count =
+        std::num::NonZeroUsize::new(transports.len()).unwrap_or(std::num::NonZeroUsize::MIN);
     let fallback = tower::Layer::layer(
         &alloy::transports::layers::FallbackLayer::default()
-            .with_active_transport_count(std::num::NonZeroUsize::MIN),
+            .with_active_transport_count(count)
+            .with_sequential_methods(
+                ONE_ENDPOINT_AT_A_TIME
+                    .iter()
+                    .map(|method| method.to_string())
+                    .collect(),
+            ),
         transports,
     );
     Ok(alloy::rpc::client::ClientBuilder::default().transport(fallback, false))
 }
+
+/// The methods sent to one endpoint at a time: every one the services use.
+/// A send among them must never go to two endpoints at once.
+const ONE_ENDPOINT_AT_A_TIME: [&str; 22] = [
+    "eth_blockNumber",
+    "eth_chainId",
+    "net_version",
+    "eth_call",
+    "eth_estimateGas",
+    "eth_getLogs",
+    "eth_getBalance",
+    "eth_getCode",
+    "eth_getStorageAt",
+    "eth_getTransactionCount",
+    "eth_getBlockByNumber",
+    "eth_getBlockByHash",
+    "eth_getTransactionByHash",
+    "eth_getTransactionReceipt",
+    "eth_gasPrice",
+    "eth_maxPriorityFeePerGas",
+    "eth_feeHistory",
+    "eth_sendRawTransaction",
+    "eth_sendTransaction",
+    "eth_sendRawTransactionSync",
+    "eth_sendTransactionSync",
+    "eth_signTypedData_v4",
+];
 
 /// An answer that is a rate limit, whether as an HTTP status or inside a
 /// JSON-RPC error, taken as the endpoint failing, so a ranking of endpoints
