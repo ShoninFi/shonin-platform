@@ -569,9 +569,103 @@ fn entries(
     entries
 }
 
+/// The vault chains this executor serves, and which of them have connected:
+/// what the status port's `/health` answers by.
+#[derive(Clone)]
+pub struct Chains {
+    expected: Vec<shared::Chain>,
+    connected: Arc<Mutex<std::collections::HashSet<shared::Chain>>>,
+}
+
+impl Chains {
+    /// Every vault chain to be served, none connected yet.
+    pub fn new(expected: Vec<shared::Chain>) -> Self {
+        Self {
+            expected,
+            connected: Default::default(),
+        }
+    }
+
+    /// A vault chain has connected and is being served.
+    pub fn connected(&self, chain: shared::Chain) {
+        self.connected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(chain);
+    }
+
+    /// The machine's health: 200 while every vault chain to be served is
+    /// connected, 503 while one isn't, with a first line short enough for a
+    /// dashboard's row (`executor` when all is well), then a line per chain.
+    pub fn answer(&self) -> (axum::http::StatusCode, String) {
+        let connected = self.connected.lock().unwrap_or_else(|e| e.into_inner());
+        let mut lines = Vec::new();
+        let mut waiting = Vec::new();
+        for chain in &self.expected {
+            if connected.contains(chain) {
+                lines.push(format!("{chain}: connected"));
+            } else {
+                waiting.push(chain);
+                lines.push(format!("{chain}: not connected"));
+            }
+        }
+        let first = match waiting.as_slice() {
+            [] => "executor".to_string(),
+            [one] => format!("executor: {one} not connected"),
+            many => format!("executor: {} chains not connected", many.len()),
+        };
+        let status = if waiting.is_empty() {
+            axum::http::StatusCode::OK
+        } else {
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        };
+        let mut said = first;
+        for line in lines {
+            said.push('\n');
+            said.push_str(&line);
+        }
+        (status, said)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_machine_is_unavailable_until_every_chain_it_serves_has_connected() {
+        use shared::Chain;
+
+        let chains = Chains::new(vec![Chain::Base, Chain::Robinhood]);
+        let (status, said) = chains.answer();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{said}"
+        );
+        assert_eq!(
+            said.lines().next(),
+            Some("executor: 2 chains not connected")
+        );
+
+        chains.connected(Chain::Base);
+        let (status, said) = chains.answer();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{said}"
+        );
+        assert_eq!(
+            said.lines().next(),
+            Some(format!("executor: {} not connected", Chain::Robinhood).as_str())
+        );
+
+        chains.connected(Chain::Robinhood);
+        let (status, said) = chains.answer();
+        assert_eq!(status, axum::http::StatusCode::OK, "{said}");
+        assert_eq!(said.lines().next(), Some("executor"));
+        assert_eq!(said.lines().count(), 3, "{said}");
+    }
 
     fn at(restarts: u64, venue_errors: u64) -> Counters {
         Counters {

@@ -79,13 +79,26 @@ async fn main() -> Result<()> {
     tracing::info!(image = %chain::attest::image_digest("executor"), "the executor is up");
 
     let totals: usage::Totals = Default::default();
+    // Every vault chain to be served, each said connected as it connects: the
+    // status port's health is unavailable until all of them have.
+    let served_chains = health::Chains::new(
+        args.chain_args
+            .targets()?
+            .into_iter()
+            .map(|target| target.vault_chain)
+            .collect(),
+    );
     if let Some(port) = args.port {
         let listener = bind_status(SocketAddr::from(([127, 0, 0, 1], port))).await?;
         tracing::info!(
             port = listener.local_addr()?.port(),
             "the status port is bound"
         );
-        tokio::spawn(serve_status(listener, totals.clone()));
+        tokio::spawn(serve_status(
+            listener,
+            totals.clone(),
+            served_chains.clone(),
+        ));
     }
 
     let engine = runner::engine()?;
@@ -106,6 +119,7 @@ async fn main() -> Result<()> {
     let args = Arc::new(args);
     let mut chains = tokio::task::JoinSet::new();
     while let Some(served) = connecting.recv().await {
+        served_chains.connected(served.vault_chain);
         let engine = engine.clone();
         let args = args.clone();
         let totals = totals.clone();
@@ -2128,11 +2142,22 @@ async fn bind_status(address: SocketAddr) -> Result<tokio::net::TcpListener> {
         .with_context(|| format!("binding the status port at {address}"))
 }
 
-/// The machine's own health, and each vault's signed running total for the
-/// keeper to collect.
-async fn serve_status(listener: tokio::net::TcpListener, totals: usage::Totals) {
+/// The machine's own health (unavailable while a vault chain it serves isn't
+/// connected), and each vault's signed running total for the keeper to
+/// collect.
+async fn serve_status(
+    listener: tokio::net::TcpListener,
+    totals: usage::Totals,
+    chains: health::Chains,
+) {
     let app = axum::Router::new()
-        .route("/health", axum::routing::get(|| async { "executor" }))
+        .route(
+            "/health",
+            axum::routing::get(move || {
+                let chains = chains.clone();
+                async move { chains.answer() }
+            }),
+        )
         .route(
             "/usage/{chain}/{vault}",
             axum::routing::get(

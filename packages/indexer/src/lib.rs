@@ -389,9 +389,10 @@ impl Indexer {
 
     /// Read one chain again and put its part of the snapshot in place. A
     /// chain that can't be read keeps its last part, dated as it was. A read
-    /// that found every vault on it stale is put in place too, each vault
-    /// marked, but is not taken for a read of the chain: its health says so
-    /// once that has lasted (see [`Indexer::health_at`]).
+    /// that found every vault on it stale (a vault never read whole among
+    /// them) is put in place too, each vault marked, but is not taken for a
+    /// read of the chain: its health says so once that has lasted (see
+    /// [`Indexer::health_at`]).
     async fn refresh_chain(&self, reader: &Reader) {
         let health = self.health.read().await.clone();
         match self.read_one(reader, &health).await {
@@ -533,9 +534,12 @@ impl Indexer {
         *self.names.write().unwrap_or_else(|e| e.into_inner()) = names;
 
         let totals = Totals {
-            // Every vault still holding depositors' money.
+            // Every vault still holding depositors' money. A vault never read
+            // whole has no figures to add: it is in the record, marked so,
+            // and in no total.
             vault_capital: strategies
                 .iter()
+                .filter(|strategy| !read::never_read(strategy))
                 .filter(|strategy| {
                     matches!(
                         strategy.vault.state,

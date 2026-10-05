@@ -28,6 +28,10 @@ pub struct Dataset {
     /// Every vault chain the snapshot was read from.
     pub chains: Vec<ChainInfo>,
     pub strategies: Vec<Rc<Strategy>>,
+    /// How many vaults the snapshot lists that have never been read whole:
+    /// it has no figures for them, so they are counted here rather than
+    /// shown among `strategies`.
+    pub unread: usize,
     pub authors: Vec<Rc<Author>>,
     pub jobs: Vec<Rc<Job>>,
     pub feed: Vec<Rc<FeedEvent>>,
@@ -36,17 +40,30 @@ pub struct Dataset {
 
 impl From<Snapshot> for Dataset {
     fn from(snapshot: Snapshot) -> Self {
+        let (unread, strategies): (Vec<Strategy>, Vec<Strategy>) =
+            snapshot.strategies.into_iter().partition(never_read);
         Self {
             version: snapshot.version,
             as_of: snapshot.as_of,
             chains: snapshot.chains,
-            strategies: snapshot.strategies.into_iter().map(Rc::new).collect(),
+            strategies: strategies.into_iter().map(Rc::new).collect(),
+            unread: unread.len(),
             authors: snapshot.authors.into_iter().map(Rc::new).collect(),
             jobs: snapshot.jobs.into_iter().map(Rc::new).collect(),
             feed: snapshot.feed.into_iter().map(Rc::new).collect(),
             totals: snapshot.totals,
         }
     }
+}
+
+/// Whether the snapshot lists a vault that has never been read whole: the
+/// indexer marks one stale as of the Unix epoch, and gives it no figures.
+pub fn never_read(strategy: &Strategy) -> bool {
+    strategy.stale_as_of
+        == Some(PrimitiveDateTime::new(
+            time::OffsetDateTime::UNIX_EPOCH.date(),
+            time::OffsetDateTime::UNIX_EPOCH.time(),
+        ))
 }
 
 /// What the app is showing now, and how it got there.
@@ -164,6 +181,11 @@ pub fn vaults() -> Vec<Rc<Strategy>> {
     current()
         .map(|dataset| dataset.strategies.clone())
         .unwrap_or_default()
+}
+
+/// How many vaults the platform lists and has not read whole yet.
+pub fn unread() -> usize {
+    current().map(|dataset| dataset.unread).unwrap_or_default()
 }
 
 pub fn strategy(slug: &str) -> Option<Rc<Strategy>> {

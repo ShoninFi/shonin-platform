@@ -118,6 +118,8 @@ pub const MOST_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 /// padded bytes, and the whole travels as base64 (4/3 its size) in a JSON
 /// envelope: (2 MiB + 10,000 × 1 KiB + the long names') × 4/3 is about
 /// 17.5 MB. Within this, the build service's own checks say what is wrong.
+/// A paid upload's archive reaches the reviewer the same way, so the
+/// reviewer takes a review request up to this size too.
 pub const MOST_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 
 /// Why an upload past [`MOST_UPLOAD_BYTES`] is turned away, in the author's

@@ -32,13 +32,30 @@ use shared::model::review::{Finding, Rating, Report};
 use shared::{Chain, ReviewAnswer, ReviewRequest};
 use shonin_reviewer::battery::{Answer, Battery};
 use shonin_reviewer::{jev, source};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 /// The prompt and the schema this image is pinned to. Changing either would
 /// be an image change, behind the same timelock as any other.
 const PROMPT: &str = include_str!("../review/prompt.md");
 const SCHEMA: &str = include_str!("../review/schema.json");
+
+/// The longest the pinned model is given to answer one review. The build
+/// service waits 30 minutes for the reviewer before it asks again, so the
+/// model is stopped well before that: a model that hangs is answered 503
+/// (ask again later), and asking again never piles up model processes.
+const MOST_MODEL_SECONDS: u64 = 20 * 60;
+
+/// The environment the pinned model's program is given besides `PATH` and
+/// `HOME`, each only if the reviewer has it: the model's own credentials,
+/// and the user name the program finds a stored login under. Nothing else
+/// of the reviewer's reaches it.
+const MODEL_ENVIRONMENT: [&str; 4] = [
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "USER",
+    "LOGNAME",
+];
 
 #[derive(Parser)]
 #[command(about = "Reads and rates an agent's code before it is built")]
@@ -62,6 +79,10 @@ struct Args {
     calibrator_model: Option<String>,
     #[arg(long, default_value_t = 19_086)]
     port: u16,
+    /// How long, in seconds, the pinned model is given to answer one review.
+    /// Shortened only by tests that run the reviewer as a process.
+    #[arg(long, hide = true, default_value_t = MOST_MODEL_SECONDS)]
+    model_seconds: u64,
 }
 
 /// What the pinned model is asked to return.
@@ -106,6 +127,8 @@ struct Reviewer {
     connected: std::sync::RwLock<BTreeMap<Chain, Arc<Served>>>,
     store: PathBuf,
     model: Option<String>,
+    /// How long the model is given to answer one review.
+    model_wait: Duration,
     calibrator: Option<jev::Client>,
     battery: Battery,
     pending: Mutex<Vec<Pending>>,
@@ -131,6 +154,25 @@ impl std::fmt::Display for Unserved {
 }
 
 impl std::error::Error for Unserved {}
+
+/// A review request that can't be read as one: its archive isn't base64, or
+/// holds no manifest at the path named, or no source the reviewer reads.
+/// Answered 422. Every other way a review goes unmade is the reviewer's own
+/// trouble, answered 503.
+#[derive(Debug)]
+struct Unreadable(String);
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unreadable {}
+
+fn unreadable(error: impl std::fmt::Display) -> anyhow::Error {
+    Unreadable(format!("{error:#}")).into()
+}
 
 impl Reviewer {
     fn on(&self, chain: Chain) -> Result<Arc<Served>, Unserved> {
@@ -186,16 +228,17 @@ async fn main() -> Result<()> {
         ),
     }
 
+    // Each review waiting here is a paid job's: one that is there but can't
+    // be read whole stops the reviewer, rather than be taken for nothing
+    // waiting and lose every review in it.
     let pending_file = args.store.join("pending-reviews.json");
-    let pending: Vec<Pending> = std::fs::read(&pending_file)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
+    let pending = read_pending(&pending_file)?;
     let reviewer = Arc::new(Reviewer {
         configured,
         connected: Default::default(),
         store: args.store,
         model: args.model,
+        model_wait: Duration::from_secs(args.model_seconds),
         calibrator,
         battery: Battery::pinned(),
         pending: Mutex::new(pending),
@@ -219,7 +262,14 @@ async fn main() -> Result<()> {
 
     let app = axum::Router::new()
         .route("/health", get(|| async { "reviewer" }))
-        .route("/{chain}/reviews", post(review))
+        // A review request carries the whole archive of a paid upload, as
+        // the upload did: it is taken up to the same size.
+        .route(
+            "/{chain}/reviews",
+            post(review).layer(axum::extract::DefaultBodyLimit::max(
+                shared::archive::MOST_UPLOAD_BYTES,
+            )),
+        )
         .with_state(reviewer);
     let address = SocketAddr::from(([127, 0, 0, 1], args.port));
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -287,9 +337,29 @@ async fn review(
         .await
         .map(Json)
         .map_err(|error| {
-            tracing::warn!(%error, "a review could not be made");
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+            let status = unanswered(&error);
+            tracing::warn!(
+                status = status.as_u16(),
+                error = format!("{error:#}"),
+                "a review could not be made"
+            );
+            (status, format!("{error:#}"))
         })
+}
+
+/// What a review that could not be made is answered with. Only a verdict
+/// ends a paid job, so nothing here is one: the reviewer's own trouble (its
+/// model could not be started, gave no answer or none in time, its node
+/// refused a send, its store could not be written) is 503, ask again later;
+/// a chain it does not serve is 404; a request it can't read as one is 422.
+fn unanswered(error: &anyhow::Error) -> StatusCode {
+    if error.downcast_ref::<Unreadable>().is_some() {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else if error.downcast_ref::<Unserved>() == Some(&Unserved::NotServed) {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 /// Read one submission and answer: a go-ahead, or a refusal on the chain.
@@ -299,18 +369,18 @@ async fn review_one(
     request: ReviewRequest,
 ) -> Result<ReviewAnswer> {
     let on = reviewer.on(chain)?;
-    let archive =
-        shared::base64::decode(&request.archive_base64).map_err(|error| anyhow!(error))?;
+    let archive = shared::base64::decode(&request.archive_base64).map_err(unreadable)?;
     // The reviewer hashes what it received itself, and signs for that.
     let source_hash = hash_bytes(&archive);
-    let manifest = manifest_in(&archive, &request.manifest_path)?;
-    let source = source::from_archive(&archive)?;
+    let manifest = manifest_in(&archive, &request.manifest_path).map_err(unreadable)?;
+    let source = source::from_archive(&archive).map_err(unreadable)?;
     let dependencies = shared::dependencies::listed(&archive);
 
     let (prose, answers, answered_by) = match &reviewer.model {
         Some(model) => {
             let prose = ask(
                 model,
+                reviewer.model_wait,
                 &reviewer.battery,
                 &manifest,
                 &dependencies,
@@ -421,7 +491,12 @@ async fn review_one(
         ratings: codes,
         finding_count,
     });
-    write_pending(reviewer, &pending);
+    // A go-ahead whose review isn't written down would never be posted once
+    // the reviewer restarts: none is given until it is.
+    if let Err(error) = write_pending(reviewer, &pending) {
+        pending.pop();
+        return Err(error);
+    }
     tracing::info!(%chain, id = request.strategy_id, "read, and cleared to build");
     Ok(ReviewAnswer {
         source_hash,
@@ -456,7 +531,11 @@ async fn post_pending(reviewer: &Reviewer) {
             .map(|&i| (waiting[i].chain, waiting[i].strategy_id))
             .collect();
         pending.retain(|review| !posted.contains(&(review.chain, review.strategy_id)));
-        write_pending(reviewer, &pending);
+        // Not written, the list on disk still holds what was posted: each is
+        // found posted already and dropped again next time.
+        if let Err(error) = write_pending(reviewer, &pending) {
+            tracing::warn!(error = format!("{error:#}"), "trying again later");
+        }
     }
 }
 
@@ -573,6 +652,7 @@ fn unread() -> Prose {
 /// others (see [`shared::dependencies`]).
 async fn ask(
     model: &str,
+    wait: Duration,
     battery: &Battery,
     manifest: &Manifest,
     dependencies: &[(String, String)],
@@ -597,7 +677,27 @@ async fn ask(
         .replace("{battery}", &battery.as_prompt())
         .replace("{description}", &description);
 
-    let mut child = tokio::process::Command::new("claude")
+    let stdout = run_model(model, wait, format!("{prompt}\n\n{source}\n").into_bytes()).await?;
+    let reply: serde_json::Value = serde_json::from_slice(&stdout)
+        .context("the reviewer's model said something unexpected")?;
+    let structured = reply
+        .get("structured_output")
+        .cloned()
+        .context("the reviewer's model answered outside its schema")?;
+    serde_json::from_value(structured).context("the report did not match the schema")
+}
+
+/// Run the pinned model's program over `input`, and what it printed once it
+/// exited answering. It acts on text the author wrote, so it is given as
+/// little as it can answer with: none of the reviewer's environment but a
+/// `PATH`, a `HOME` and the model's own credentials ([`MODEL_ENVIRONMENT`]),
+/// no tools, a working directory of its own that starts empty and is removed
+/// after, and no session kept. It leads a process group of its own, and
+/// given no answer within `wait` the whole group is killed.
+async fn run_model(model: &str, wait: Duration, input: Vec<u8>) -> Result<Vec<u8>> {
+    let directory = Scratch::new().context("the reviewer's model has no directory to run in")?;
+    let mut command = tokio::process::Command::new("claude");
+    command
         .args([
             "-p",
             "--output-format",
@@ -606,29 +706,102 @@ async fn ask(
             SCHEMA,
             "--model",
             model,
+            "--tools",
+            "",
+            "--no-session-persistence",
         ])
+        .env_clear()
+        .current_dir(&directory.0)
+        .process_group(0)
+        .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    for name in ["PATH", "HOME"].into_iter().chain(MODEL_ENVIRONMENT) {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let mut child = command
         .spawn()
         .context("the reviewer's model could not be started")?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(format!("{prompt}\n\n{source}\n").as_bytes())
-            .await?;
-        stdin.shutdown().await?;
+    let group = child.id();
+
+    let talk = async {
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(&input).await?;
+            stdin.shutdown().await?;
+        }
+        let mut stdout = Vec::new();
+        if let Some(mut out) = child.stdout.take() {
+            out.read_to_end(&mut stdout).await?;
+        }
+        let status = child.wait().await?;
+        anyhow::Ok((status, stdout))
+    };
+    match tokio::time::timeout(wait, talk).await {
+        Ok(Ok((status, stdout))) if status.success() => Ok(stdout),
+        Ok(Ok(_)) => bail!("the reviewer's model did not answer"),
+        Ok(Err(error)) => {
+            stop(&mut child, group).await;
+            Err(error.context("the reviewer's model did not answer"))
+        }
+        Err(_) => {
+            stop(&mut child, group).await;
+            bail!(
+                "the reviewer's model did not answer within {} seconds",
+                wait.as_secs()
+            )
+        }
     }
-    let output = child.wait_with_output().await?;
-    if !output.status.success() {
-        bail!("the reviewer's model did not answer");
+}
+
+/// Stop the model's program and everything it started: its whole group,
+/// signalled while its leader is not yet reaped, so the group's id can't
+/// have been given to anyone else.
+async fn stop(child: &mut tokio::process::Child, group: Option<u32>) {
+    use rustix::process::{Pid, Signal, kill_process_group};
+
+    if let Some(leader) = group
+        .and_then(|group| i32::try_from(group).ok())
+        .and_then(Pid::from_raw)
+    {
+        match kill_process_group(leader, Signal::KILL) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+            // macOS answers so for a group whose only member is its leader,
+            // ended and not yet reaped: there is nothing left to kill.
+            #[cfg(target_os = "macos")]
+            Err(rustix::io::Errno::PERM) => {}
+            Err(error) => {
+                tracing::error!(%error, "the reviewer's model could not be stopped");
+            }
+        }
     }
-    let reply: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .context("the reviewer's model said something unexpected")?;
-    let structured = reply
-        .get("structured_output")
-        .cloned()
-        .context("the reviewer's model answered outside its schema")?;
-    serde_json::from_value(structured).context("the report did not match the schema")
+    let _ = child.kill().await;
+}
+
+/// A directory of the reviewer's own, made empty and readable by it alone
+/// under an unguessable name, and removed with everything in it once done.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new() -> std::io::Result<Self> {
+        use std::io::Read;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let mut unguessable = [0u8; 16];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut unguessable)?;
+        let directory =
+            std::env::temp_dir().join(format!("shonin-review-{}", alloy::hex::encode(unguessable)));
+        std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+        Ok(Self(directory))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// The reviewer's go-ahead for a source: its signature over the registry's
@@ -686,15 +859,57 @@ fn write(store: &Path, hash: &str, name: &str, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn write_pending(reviewer: &Reviewer, pending: &[Pending]) {
-    if let Some(parent) = reviewer.pending_file.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(bytes) = serde_json::to_vec(pending)
-        && let Err(error) = std::fs::write(&reviewer.pending_file, bytes)
-    {
-        tracing::warn!(%error, "the reviews waiting to be posted could not be written down");
-    }
+/// The reviews waiting to be posted, as last written down: none if nothing
+/// was ever written, and an error, naming the file, if it is there but can't
+/// be read whole.
+fn read_pending(path: &Path) -> Result<Vec<Pending>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "{} could not be read, so the reviewer is not starting rather than lose \
+                     the reviews waiting in it to be posted",
+                    path.display()
+                )
+            });
+        }
+    };
+    serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "{} is there but is not whole, so the reviewer is not starting rather than lose \
+             the reviews waiting in it to be posted: restore it, or a backup of it",
+            path.display()
+        )
+    })
+}
+
+/// Write down the reviews waiting to be posted, whole or not at all.
+fn write_pending(reviewer: &Reviewer, pending: &[Pending]) -> Result<()> {
+    let bytes = serde_json::to_vec(pending)?;
+    write_atomically(&reviewer.pending_file, &bytes)
+        .context("the reviews waiting to be posted could not be written down")
+}
+
+/// Replace a file whole or not at all: written beside it, flushed to disk,
+/// then renamed over it, so a machine that stops part way leaves the old
+/// file or the new one, never the start of one.
+fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let directory = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(directory)?;
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".new");
+    let fresh = directory.join(name);
+    let mut file = std::fs::File::create(&fresh)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&fresh, path)?;
+    // The rename is kept once the directory is.
+    std::fs::File::open(directory)?.sync_all()
 }
 
 fn to_b256(hash: &str) -> Result<B256> {
@@ -1017,6 +1232,7 @@ mod tests {
             pending_file: store.join("pending-reviews.json"),
             store,
             model: None,
+            model_wait: Duration::from_secs(MOST_MODEL_SECONDS),
             calibrator: None,
             battery: Battery::pinned(),
             pending: Mutex::new(vec![

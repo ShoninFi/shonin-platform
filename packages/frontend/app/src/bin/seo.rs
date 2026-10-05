@@ -81,7 +81,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // A route with no file of its own (a name that would leave its
-    // directory) is skipped, and kept out of the sitemap with it.
+    // directory, or too long for a file name) is skipped, and kept out of
+    // the sitemap with it.
     let mut pages = Route::all_pages();
     pages.retain(|route| {
         let written = route.file().is_some();
@@ -93,17 +94,32 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         written
     });
+    // A page whose file can't be written is skipped, said so and kept out of
+    // the sitemap: one route the filesystem refuses holds up no other page.
+    let mut unwritten = Vec::new();
     for route in pages.iter().chain([&Route::NotFound]) {
         let Some(file) = route.file() else {
             continue;
         };
         let html = render(&shell, base, route);
         let target = dist.join(&file);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
+        let written = match target.parent() {
+            Some(parent) => fs::create_dir_all(parent),
+            None => Ok(()),
         }
-        fs::write(&target, html)?;
+        .and_then(|()| fs::write(&target, html));
+        if let Err(error) = written {
+            if *route == Route::NotFound {
+                return Err(format!("writing {}: {error}", target.display()).into());
+            }
+            println!(
+                "skipping {:?}: {file} could not be written: {error}",
+                route.path()
+            );
+            unwritten.push(route.clone());
+        }
     }
+    pages.retain(|route| !unwritten.contains(route));
 
     let listed: Vec<Route> = Route::indexable()
         .into_iter()

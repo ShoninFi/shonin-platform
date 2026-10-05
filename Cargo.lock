@@ -5431,6 +5431,7 @@ dependencies = [
  "axum",
  "clap",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "shonin-chain",

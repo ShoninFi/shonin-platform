@@ -96,6 +96,11 @@ pub struct Page {
 /// The handbook: the same system explained at length, on a site of its own.
 pub const HANDBOOK: &str = "https://docs.shonin.fi/";
 
+/// The longest name, in bytes, a route's file may have in any one part of its
+/// path: well inside the 255 bytes the usual filesystems take for a file
+/// name, with room for `.html`.
+pub const FILE_NAME_BYTES: usize = 200;
+
 /// An entry in the header's navigation. Most name a page of this app; the
 /// handbook is a separate site, so that one names a URL instead.
 pub enum NavItem {
@@ -225,7 +230,9 @@ impl Route {
     /// `authors/bob b.html`. A route whose decoded path would leave its own
     /// directory (a name that is empty, `.` or `..`, or that holds a slash)
     /// has no file, and `None` says so: no request could reach it anyway, and
-    /// writing it would put a file somewhere it doesn't belong.
+    /// writing it would put a file somewhere it doesn't belong. So has a route
+    /// with a name longer than [`FILE_NAME_BYTES`], which no filesystem may
+    /// take as a file name.
     pub fn file(&self) -> Option<String> {
         let Some(path) = self.path() else {
             return Some("404.html".to_string());
@@ -243,6 +250,7 @@ impl Route {
                 && segment != "."
                 && segment != ".."
                 && !segment.contains(['/', '\\', '\0'])
+                && segment.len() <= FILE_NAME_BYTES
         };
         segments
             .iter()

@@ -65,6 +65,8 @@ pub struct History {
     /// How many refreshes in a row each paid claim's supply before its
     /// payment has gone unanswered, by vault and id.
     unmeasured: HashMap<(Address, u64), u32>,
+    /// What is known of each vault's requests: where its waiting ones start.
+    requests: HashMap<Address, Requests>,
     /// Each vault as last read whole, and the chain time it was: what is
     /// shown while a later read of it fails part-way.
     last_whole: HashMap<Address, (Strategy, u64)>,
@@ -300,7 +302,8 @@ pub async fn strategies(
                 out.push(strategy);
             }
             // A vault that can't be read whole stays shown as it was last
-            // read, marked with when that was, rather than dropped.
+            // read, marked with when that was, rather than dropped; one never
+            // read whole is shown as not read yet (see [`unread`]).
             Err(error) => match history.last_whole.get(address) {
                 Some((strategy, read_at)) => {
                     tracing::warn!(vault = %address, %error, "could not read a vault; kept it as last read");
@@ -309,12 +312,142 @@ pub async fn strategies(
                         ..strategy.clone()
                     });
                 }
-                None => tracing::warn!(vault = %address, %error, "could not read a vault"),
+                None => {
+                    tracing::warn!(vault = %address, %error, "could not read a vault never read whole; shown as not read yet");
+                    out.push(unread(chain, vault_chain, deployments, *address).await);
+                }
             },
         }
     }
 
     Ok(out)
+}
+
+/// When a vault never read whole was last read whole: the Unix epoch, which
+/// no chain read is dated at. An entry so marked carries no figures (see
+/// [`unread`]).
+pub const NEVER_READ: PrimitiveDateTime = PrimitiveDateTime::new(
+    OffsetDateTime::UNIX_EPOCH.date(),
+    OffsetDateTime::UNIX_EPOCH.time(),
+);
+
+/// Whether an entry is a vault the factory lists that has never been read
+/// whole: its identity, as far as it could be read, and no figures.
+pub fn never_read(strategy: &Strategy) -> bool {
+    strategy.stale_as_of == Some(NEVER_READ)
+}
+
+/// A vault the factory lists that has never been read whole, as the record
+/// shows it: by its address and what could be read of who it is (its
+/// strategy id and author), marked stale as of [`NEVER_READ`], with no
+/// figures. It counts toward its chain's staleness as any stale vault does,
+/// and toward no total.
+async fn unread(
+    chain: &Client,
+    vault_chain: Chain,
+    deployments: &Deployments,
+    address: Address,
+) -> Strategy {
+    let id: u64 = match chain.read(address, IVault::strategyIdCall {}).await {
+        Ok(id) => id.try_into().unwrap_or_default(),
+        Err(_) => 0,
+    };
+    let (author, author_address) = match chain.read(address, IVault::authorCall {}).await {
+        Ok(author) => (
+            handle_of(chain, deployments, author).await,
+            address_of(author),
+        ),
+        Err(_) => (String::new(), String::new()),
+    };
+    let unknown = || "not read yet".to_string();
+    let epoch = NEVER_READ.date();
+    Strategy {
+        id,
+        slug: Strategy::slug_for(vault_chain, id),
+        title: if id == 0 {
+            format!("A vault at {}", address_of(address))
+        } else {
+            format!("Agent {id}")
+        },
+        description: "Its vault has not been read whole yet.".to_string(),
+        claims: Vec::new(),
+        author,
+        author_address,
+        standing: Standing::New,
+        registered: epoch,
+        days_live: 0,
+        bundle: Bundle {
+            bundle_hash: unknown(),
+            component_hash: unknown(),
+            source_hash: unknown(),
+            manifest_hash: unknown(),
+            world: unknown(),
+            toolchain: unknown(),
+            builder_image: unknown(),
+            models: Vec::new(),
+            source: shared::model::bundle::Source::Sealed,
+            source_files: Vec::new(),
+            built_in_seconds: 0,
+        },
+        vault: Vault {
+            address: address_of(address),
+            chain: vault_chain,
+            asset: vault_chain.dollar().to_string(),
+            state: VaultState::Activating,
+            created: epoch,
+            station: String::new(),
+            value: 0.0,
+            idle: 0.0,
+            escrow: 0.0,
+            shares: 0.0,
+            share_price: 0.0,
+            high_water_mark: 0.0,
+            last_crystallised: epoch,
+            idle_floor_bps: 0,
+            pending_floor: None,
+            allowances: shared::Allowances {
+                fuel_per_sec: 0,
+                memory_mib: 0,
+                requests_per_min: 0,
+                bytes_per_day: 0,
+                streams: 0,
+                inference_ms_per_min: 0,
+                gas_per_day: 0.0,
+            },
+            requests: Vec::new(),
+            restricted: Vec::new(),
+            halt: None,
+            fees: Fees {
+                holding_bps: 0,
+                author_bps: 0,
+                platform_bps: 0,
+                transaction_bps: 0,
+            },
+            exit_band_bps: 0,
+            tank: Tank {
+                balance: 0.0,
+                daily_charge: 0.0,
+                keep_at: 0.0,
+                usage_settled: 0.0,
+            },
+            exit_class: ExitClass::Direct,
+            freeze_after_days: 0,
+            claims: Vec::new(),
+            in_transit: None,
+        },
+        legs: Vec::new(),
+        review: None,
+        health: None,
+        attestation: None,
+        record: None,
+        trades: Vec::new(),
+        events: Vec::new(),
+        kill: None,
+        restricted: Vec::new(),
+        drivers: Vec::new(),
+        bridges: Vec::new(),
+        stale_as_of: Some(NEVER_READ),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -538,7 +671,7 @@ async fn read_vault(
 
     // A depositor's waiting request unread is not a request gone: the read
     // fails, and the vault is shown as it was last read whole, marked stale.
-    let requests = read_requests(chain, address).await?;
+    let requests = read_requests(chain, history, address).await?;
 
     let daily = shared::Prices::published().daily_cap(&shared_allowances(&allowances));
     Ok(Vault {
@@ -690,16 +823,64 @@ async fn supply_before<'a>(
     Ok(supply)
 }
 
-/// The requests still waiting to be priced: the newest few dozen, which is
-/// every one there is between two valuations.
-async fn read_requests(chain: &Client, address: Address) -> Result<Vec<Request>> {
+/// What is known of a vault's requests from one refresh to the next: a
+/// request once done stays done, so it is not read again.
+#[derive(Default)]
+struct Requests {
+    /// The first request not known to be done: every one before it is.
+    from: u64,
+    /// Requests past `from` known to be done.
+    done: std::collections::HashSet<u64>,
+}
+
+/// The most of a vault's requests read in one refresh. A vault with more
+/// still to read than this is read a page at a time, the rest at the next
+/// refresh; until every one has been read it is not read whole.
+const REQUEST_READS: u32 = 256;
+
+/// Every request still waiting to be priced, oldest first: each request from
+/// the first not known to be done to the latest, those known done passed
+/// over. A refresh reads at most [`REQUEST_READS`] of them; one with more to
+/// read fails, so the vault is shown as last read whole, marked stale, never
+/// with part of its waiting requests as if they were all.
+async fn read_requests(
+    chain: &Client,
+    history: &mut History,
+    address: Address,
+) -> Result<Vec<Request>> {
     let count: u64 = chain
         .read(address, IVault::requestCountCall {})
         .await?
         .try_into()
         .unwrap_or(0);
+    let known = history.requests.entry(address).or_default();
+    known.from = known.from.max(1);
+    let read = waiting_requests(chain, known, address, count).await;
+    // Every request before the first not done is done.
+    while known.done.remove(&known.from) {
+        known.from += 1;
+    }
+    read
+}
+
+async fn waiting_requests(
+    chain: &Client,
+    known: &mut Requests,
+    address: Address,
+    count: u64,
+) -> Result<Vec<Request>> {
     let mut waiting = Vec::new();
-    for id in (count.saturating_sub(50) + 1..=count).rev() {
+    let mut reads = 0;
+    for id in known.from..=count {
+        if known.done.contains(&id) {
+            continue;
+        }
+        if reads == REQUEST_READS {
+            anyhow::bail!(
+                "the vault's requests from {id} to {count} are still to be read; the rest at the next refresh"
+            );
+        }
+        reads += 1;
         let request = chain
             .read(
                 address,
@@ -709,6 +890,7 @@ async fn read_requests(chain: &Client, address: Address) -> Result<Vec<Request>>
             )
             .await?;
         if request.done {
+            known.done.insert(id);
             continue;
         }
         let kind = match request.kind {
@@ -731,7 +913,6 @@ async fn read_requests(chain: &Client, address: Address) -> Result<Vec<Request>>
             earliest: moment(request.earliest),
         });
     }
-    waiting.reverse();
     Ok(waiting)
 }
 
@@ -1664,7 +1845,7 @@ pub async fn feed(
                 .to_string(),
             link: strategies
                 .iter()
-                .any(|strategy| strategy.id == id)
+                .any(|strategy| strategy.id == id && !never_read(strategy))
                 .then(|| format!("/agents/{}", Strategy::slug_for(vault_chain, id))),
             reference: hash_of(registration.bundle_hash),
         });

@@ -161,7 +161,14 @@ async fn a_vault_s_record_is_read_from_the_deployment_not_from_block_one() {
         .await
         .is_ok();
     let asked_before = before_deployment.load(Ordering::SeqCst);
-    let in_record = !indexer.snapshot.read().await.strategies.is_empty();
+    // In the record, and read whole: not merely listed as not read yet.
+    let in_record = indexer
+        .snapshot
+        .read()
+        .await
+        .strategies
+        .iter()
+        .any(|strategy| strategy.stale_as_of.is_none());
     assert!(
         finished && in_record && asked_before == 0,
         "refresh finished in 20 s: {finished}; vault in the record: {in_record}; \

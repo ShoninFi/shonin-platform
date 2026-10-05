@@ -291,6 +291,9 @@ async fn read_portfolio(
         .strategies
         .iter()
         .filter(|strategy| strategy.vault.chain == chain)
+        // A vault never read whole has no share price to value a holding
+        // at: it is shown, as not read yet, in the record alone.
+        .filter(|strategy| !indexer::read::never_read(strategy))
         .cloned()
         .collect();
     // The vaults are read several at a time ([`PORTFOLIO_READS_AT_ONCE`]),
@@ -573,6 +576,9 @@ async fn jobs(State(service): State<Arc<Service>>) -> Json<Vec<Job>> {
 }
 
 /// One job, as fresh as the build service has it, with what the chain adds.
+/// 404 only when the build service says there is no such job; 503 when it
+/// says it can't answer for now; 502 when it can't be reached, or answers
+/// anything else.
 async fn job(
     State(service): State<Arc<Service>>,
     UrlPath(id): UrlPath<String>,
@@ -582,18 +588,29 @@ async fn job(
     if !is_job_id(&id) {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let found: Option<Job> = service
+    let reply = service
         .http
         .get(format!("{}/jobs/{id}", service.builder))
         .send()
         .await
-        .ok()
-        .and_then(|reply| reply.error_for_status().ok())
-        .map(|reply| reply.json())
-        .ok_or(StatusCode::NOT_FOUND)?
-        .await
-        .ok();
-    let job = found.ok_or(StatusCode::NOT_FOUND)?;
+        .map_err(|error| {
+            tracing::warn!(%error, "the build service could not be asked for a job");
+            StatusCode::BAD_GATEWAY
+        })?;
+    let status = reply.status();
+    match status {
+        StatusCode::NOT_FOUND => return Err(StatusCode::NOT_FOUND),
+        StatusCode::SERVICE_UNAVAILABLE => return Err(StatusCode::SERVICE_UNAVAILABLE),
+        status if !status.is_success() => {
+            tracing::warn!(%status, "the build service failed to answer for a job");
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+        _ => {}
+    }
+    let job: Job = reply.json().await.map_err(|error| {
+        tracing::warn!(%error, "the build service's answer for a job could not be read");
+        StatusCode::BAD_GATEWAY
+    })?;
     Ok(Json(service.indexer.complete(job).await))
 }
 

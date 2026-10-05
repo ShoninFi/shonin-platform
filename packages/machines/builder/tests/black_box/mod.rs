@@ -320,6 +320,15 @@ pub static AWAY: AtomicBool = AtomicBool::new(false);
 /// to the job's chain does.
 pub static UNAVAILABLE: AtomicBool = AtomicBool::new(false);
 
+/// Whether the stand-in reviewer answers 500: an error of its own, not one
+/// of the statuses a proxy in front of a reviewer that is away answers with,
+/// and not a verdict whatever its body says.
+pub static ERRORS: AtomicBool = AtomicBool::new(false);
+
+/// Whether the stand-in reviewer answers success with a body that is not a
+/// verdict.
+pub static GARBLED: AtomicBool = AtomicBool::new(false);
+
 /// How many requests the stand-in reviewer has been sent, answered or not.
 pub static ASKED: AtomicU64 = AtomicU64::new(0);
 
@@ -340,6 +349,23 @@ async fn review(
             "base is not connected yet: ask again shortly",
         )
             .into_response();
+    }
+    if ERRORS.load(Ordering::SeqCst) {
+        // With a body that reads as a refusal, as an error page might: an
+        // answer that is not a success is never a verdict, whatever it says.
+        let archive = shared::base64::decode(&request.archive_base64).unwrap();
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(shared::ReviewAnswer {
+                source_hash: shared::manifest::hash_bytes(&archive),
+                report_hash: "sha256:00".to_string(),
+                clearance: None,
+            }),
+        )
+            .into_response();
+    }
+    if GARBLED.load(Ordering::SeqCst) {
+        return (axum::http::StatusCode::OK, "{\"source_hash\": ").into_response();
     }
     seen.lock().unwrap().push(request.strategy_id);
     if CLEARS.load(Ordering::SeqCst) {

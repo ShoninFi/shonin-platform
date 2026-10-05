@@ -481,24 +481,52 @@ async fn main() -> Result<()> {
 }
 
 /// The health route: 503 while the queue is held (see [`held_by`]), naming
-/// what holds it.
+/// what holds it, and while a job has gone back in the queue more than
+/// [`MOST_REVIEWER_AWAY`] times in a row for want of a verdict (it still
+/// waits, and is asked again), naming the jobs.
 async fn health(State(service): State<Arc<Service>>) -> (StatusCode, String) {
-    match service
+    let held = service
         .held
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-    {
-        Some(found) => (
+        .clone();
+    if let Some(found) = held {
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
                 "builder: holding the queue: {} lies above the jobs directory",
                 found.display()
             ),
-        ),
-        None => (StatusCode::OK, "builder".to_string()),
+        );
     }
+    let unreviewed: Vec<String> = service
+        .queue
+        .lock()
+        .await
+        .jobs
+        .iter()
+        .filter(|entry| {
+            matches!(entry.job.state, JobState::Queued { .. })
+                && entry.reviewer_away > MOST_REVIEWER_AWAY
+        })
+        .map(|entry| format!("{} ({} times)", entry.job.id, entry.reviewer_away))
+        .collect();
+    if !unreviewed.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "builder: the reviewer gave no verdict, asked again and again, for {}: the \
+                 jobs wait in the queue and are asked again",
+                unreviewed.join(", ")
+            ),
+        );
+    }
+    (StatusCode::OK, "builder".to_string())
 }
+
+/// How many times in a row a job may go back in the queue for want of a
+/// verdict from the reviewer before the health route says so.
+const MOST_REVIEWER_AWAY: u32 = 3;
 
 /// A `Cargo.toml` or a `.cargo` in the jobs directory or any directory above
 /// it, or `None`. Cargo takes either for every build's own (see
@@ -1600,9 +1628,11 @@ async fn run(service: &Arc<Service>, entry: &Entry) -> Result<(JobState, Option<
     // The review comes first: nothing is compiled, so no build script or
     // procedural macro runs, before the reviewer has read the source.
     set_state(service, &entry.job.id, JobState::Reviewing, None, started).await;
-    // A reviewer that does not answer (restarting, being deployed, or not
-    // yet connected to the job's chain, which it answers 503 for) is our
-    // side's trouble, not the job's: the job goes back in the queue.
+    // Only a verdict ends a paid job. Any other answer from the reviewer (it
+    // is restarting, being deployed, not yet connected to the job's chain,
+    // its model is down, its node refused a send: any status but success, a
+    // body cut short or not a verdict, no answer at all) is our side's
+    // trouble, not the job's: the job goes back in the queue.
     let reply = service
         .http
         .post(format!("{}/{chain}/reviews", service.reviewer))
@@ -1616,23 +1646,20 @@ async fn run(service: &Arc<Service>, entry: &Entry) -> Result<(JobState, Option<
         .send()
         .await
         .map_err(|error| Requeue::ReviewerAway(format!("the reviewer did not answer: {error}")))?;
-    if matches!(
-        reply.status(),
-        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
-    ) {
-        return Err(
-            Requeue::ReviewerAway(format!("the reviewer answered {}", reply.status())).into(),
-        );
+    let status = reply.status();
+    let body = reply.bytes().await.map_err(|error| {
+        Requeue::ReviewerAway(format!("the reviewer's answer was cut short: {error}"))
+    })?;
+    if !status.is_success() {
+        return Err(Requeue::ReviewerAway(format!(
+            "the reviewer answered {status}: {}",
+            String::from_utf8_lossy(&body[..body.len().min(500)])
+        ))
+        .into());
     }
-    let body = reply
-        .error_for_status()
-        .context("the reviewer could not review it")?
-        .bytes()
-        .await
-        .map_err(|error| {
-            Requeue::ReviewerAway(format!("the reviewer's answer was cut short: {error}"))
-        })?;
-    let answer: ReviewAnswer = serde_json::from_slice(&body).context("the reviewer's answer")?;
+    let answer: ReviewAnswer = serde_json::from_slice(&body).map_err(|error| {
+        Requeue::ReviewerAway(format!("the reviewer's answer was not a verdict: {error}"))
+    })?;
     let Some(clearance) = answer.clearance else {
         tracing::info!(id = entry.job.id, "the reviewer refused it");
         return Ok((JobState::Refused, None));
@@ -1726,7 +1753,8 @@ async fn run(service: &Arc<Service>, entry: &Entry) -> Result<(JobState, Option<
 /// take not counted against it: nothing the job or its author did.
 #[derive(Debug)]
 enum Requeue {
-    /// The reviewer did not answer, or answered that it could not yet.
+    /// The reviewer gave no verdict: it did not answer, or answered anything
+    /// else.
     ReviewerAway(String),
     /// Something lies above the job's build that cargo would take for its
     /// own (see [`held_by`]).
