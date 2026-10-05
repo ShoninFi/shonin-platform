@@ -5,9 +5,12 @@
 # too long for every pull request.
 #
 # A few tests need a local Solana cluster and pass, saying they skipped,
-# without one (the chain crate's, the indexer's and the keeper's Solana
-# cluster tests; the executor's is ignored unless asked for). No job here
-# starts a cluster for them yet.
+# without one. The chain crate's start a Surfpool of their own; the
+# `solana-cluster` job gives them one and fails if any skips. The indexer's,
+# the keeper's and the executor's cluster tests need a seeded cluster with
+# the services running, which no job here sets up, so under
+# `workspace-tests` they still skip (the executor's is ignored unless asked
+# for).
 name: Nightly
 
 on:
@@ -58,3 +61,107 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  # The chain crate's Solana tests that start a Surfpool of their own, run
+  # against the programs built here. Without a cluster they pass, saying
+  # they skipped; here a skip fails the job.
+  solana-cluster:
+    name: Chain client against a local Solana cluster
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Room for the builds
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift
+          df -h /
+
+      - name: Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # Compiled dependencies of both workspaces. The build step clears
+      # contracts/solana/target/deploy, so no program binary or keypair from
+      # an earlier run is ever used.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: solana-cluster
+          workspaces: |
+            . -> target
+            contracts/solana -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The same toolchain, cache and install as the Solana job in ci.yml.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: solana-tools
+        with:
+          path: |
+            ~/.local/share/solana-release
+            ~/.local/bin/anchor
+            ~/.cache/solana
+          key: solana-tools-${{ runner.os }}-agave-3.1.13-anchor-0.32.1
+
+      - name: Solana and Anchor
+        if: steps.solana-tools.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.local/share ~/.local/bin
+          curl -sSfL https://github.com/anza-xyz/agave/releases/download/v3.1.13/solana-release-x86_64-unknown-linux-gnu.tar.bz2 \
+            | tar -xj -C ~/.local/share
+          curl -sSfL -o ~/.local/bin/anchor \
+            https://github.com/solana-foundation/anchor/releases/download/v0.32.1/anchor-0.32.1-x86_64-unknown-linux-gnu
+          chmod +x ~/.local/bin/anchor
+
+      - name: Solana and Anchor on the path
+        run: |
+          echo "$HOME/.local/share/solana-release/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Surfpool's release binary, checked against the digest of the
+      # release asset. The tests need 1.2.0 or later.
+      - name: Surfpool
+        env:
+          SURFPOOL_VERSION: v1.6.0
+          SURFPOOL_SHA256: cb471b00aa3b7d603338eb74ebfec1d23959ecba005b5f1be42ba8d174107fc2
+        run: |
+          mkdir -p ~/.local/opt/surfpool
+          curl -sSfL -o "$RUNNER_TEMP/surfpool.tar.gz" \
+            "https://github.com/solana-foundation/surfpool/releases/download/$SURFPOOL_VERSION/surfpool-linux-x64.tar.gz"
+          echo "$SURFPOOL_SHA256  $RUNNER_TEMP/surfpool.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/surfpool.tar.gz" -C ~/.local/opt/surfpool
+          "$HOME/.local/opt/surfpool/surfpool" --version
+          echo "SHONIN_SURFPOOL=$HOME/.local/opt/surfpool/surfpool" >> "$GITHUB_ENV"
+
+      # Fresh program ids every run, as in CI (see ci.yml); the chain crate
+      # compiles in the ids of these keypairs, and the tests deploy these
+      # binaries under them.
+      - name: Build the programs, under fresh program ids
+        working-directory: contracts/solana
+        run: |
+          rm -rf target/deploy
+          anchor build
+          for keypair in target/deploy/*-keypair.json; do
+            echo "$(basename "$keypair" -keypair.json): $(solana-keygen pubkey "$keypair")"
+          done
+
+      # Every test target of the chain crate that starts its own Surfpool,
+      # named one by one: a new such test must be added to this list. The
+      # tests print why they skip (to stderr, shown with --nocapture), and
+      # any skip fails the step.
+      - name: Test
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p shonin-chain --features solana \
+            --test solana_on_a_local_cluster \
+            --test solana_a_station_with_three_drivers_is_activated_and_closed_through_lookup_tables \
+            -- --nocapture 2>&1 | tee "$RUNNER_TEMP/cluster-tests.log"
+          if grep -F ': skipping' "$RUNNER_TEMP/cluster-tests.log"; then
+            echo "::error::a cluster test skipped instead of running"
+            exit 1
+          fi
