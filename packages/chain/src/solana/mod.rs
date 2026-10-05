@@ -31,6 +31,7 @@ pub mod events;
 pub mod executor;
 pub mod keys;
 pub mod platform;
+pub mod pro_rata;
 pub mod rpc;
 pub mod tables;
 pub mod upkeep;
