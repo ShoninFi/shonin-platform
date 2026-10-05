@@ -34,6 +34,9 @@ pub mod bindings {
             "shonin:agent/inference@0.1.0#infer",
             "run",
         ],
+        // The standard WASI packages the world imports are generated here
+        // too, so an agent needs nothing beyond this crate to use them.
+        generate_all,
         pub_export_macro: true,
         default_bindings_module: "strategy_sdk::bindings",
     });
@@ -42,15 +45,23 @@ pub mod bindings {
 pub mod local;
 pub mod payload;
 pub mod sizing;
+pub mod state;
+pub mod streams;
 
 pub use bindings::Guest as Agent;
 pub use bindings::shonin::agent::types::Verdict;
 pub use bindings::shonin::agent::{
-    data, drivers, inference, secrets, state, transfers, types, vault, websocket,
+    data, drivers, inference, secrets, transfers, types, vault, websocket,
 };
+/// Requests to any host, outbound only, if the manifest declares `network`:
+/// the standard `wasi:http` interfaces.
+pub use bindings::wasi::http;
+/// The agent's state: the standard `wasi:keyvalue` interfaces, 64 MiB,
+/// empty every time the agent starts. [`state`] wraps them for the common
+/// case.
+pub use bindings::wasi::keyvalue;
 pub use local::{
-    AccountEvent, AccountState, Action, ClaimPending, MarketState, Order, PositionState, Receipt,
-    Side,
+    AccountEvent, AccountState, Action, MarketState, Order, PositionState, Receipt, Side,
 };
 pub use payload::{Decimal, decimal, from_payload, millionths, to_payload};
 pub use sizing::{Limits, size_for};
@@ -69,4 +80,61 @@ macro_rules! export_agent {
     ($name:ident) => {
         $crate::bindings::export!($name with_types_in $crate::bindings);
     };
+}
+
+impl bindings::shonin::agent::vault::Claim {
+    /// What [`Claim::fraction`](bindings::shonin::agent::vault::Claim) is
+    /// out of: 10^18 is the whole vault.
+    pub const WHOLE: u64 = 1_000_000_000_000_000_000;
+
+    /// The fraction of every position being closed for the claim, as a
+    /// decimal between 0 and 1.
+    pub fn share(&self) -> Decimal {
+        Decimal::from(self.fraction) / Decimal::from(Self::WHOLE)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bindings::shonin::agent::vault::Claim;
+
+    #[test]
+    fn a_claim_s_fraction_reads_as_a_share_of_the_whole_vault() {
+        let quarter = Claim {
+            id: 3,
+            fraction: Claim::WHOLE / 4,
+        };
+        assert_eq!(quarter.share(), decimal("0.25"));
+        let whole = Claim {
+            id: 4,
+            fraction: Claim::WHOLE,
+        };
+        assert_eq!(whole.share(), decimal("1"));
+    }
+
+    #[test]
+    fn a_feed_and_its_values_read_back_as_they_were_written() {
+        use streams::{Book, HyperliquidFeed, HyperliquidValue, Level};
+        let feed = HyperliquidFeed::Book {
+            coin: "BTC".to_string(),
+        };
+        assert_eq!(
+            from_payload::<HyperliquidFeed>(&to_payload(&feed)),
+            Ok(feed)
+        );
+        let value = HyperliquidValue::Book(Book {
+            market: "BTC".to_string(),
+            bids: vec![Level {
+                price: decimal("64000.5"),
+                size: decimal("0.1"),
+                orders: Some(2),
+            }],
+            asks: Vec::new(),
+        });
+        assert_eq!(
+            from_payload::<HyperliquidValue>(&to_payload(&value)),
+            Ok(value)
+        );
+    }
 }

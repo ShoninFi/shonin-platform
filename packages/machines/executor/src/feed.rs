@@ -175,3 +175,59 @@ where
         Poll::Ready(Ok(StreamResult::Completed))
     }
 }
+
+/// The host's end of a `stream<T>` fed from any stream of the host's own:
+/// whatever it yields comes out of the component's stream, in order, and the
+/// component's stream ends when it does. Whatever the stream holds (a
+/// connection's slot in a quota, say) is let go when the component drops its
+/// end.
+pub struct FromStream<S>(pub S);
+
+impl<S, D> StreamProducer<D> for FromStream<S>
+where
+    S: futures::Stream + Send + Unpin + 'static,
+    S::Item: Send + Sync + Unpin + 'static,
+{
+    type Item = S::Item;
+    type Buffer = VecBuffer<S::Item>;
+
+    fn poll_produce<'a>(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut store: StoreContextMut<'a, D>,
+        mut destination: Destination<'a, Self::Item, Self::Buffer>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        let wanted = destination.remaining(&mut store).unwrap_or(32);
+        if wanted == 0 {
+            return Poll::Ready(Ok(StreamResult::Completed));
+        }
+        let mut batch = Vec::new();
+        let mut ended = false;
+        while batch.len() < wanted {
+            match Pin::new(&mut self.0).poll_next(cx) {
+                Poll::Ready(Some(item)) => batch.push(item),
+                Poll::Ready(None) => {
+                    ended = true;
+                    break;
+                }
+                Poll::Pending => break,
+            }
+        }
+        if batch.is_empty() {
+            if ended {
+                return Poll::Ready(Ok(StreamResult::Dropped));
+            }
+            if finish {
+                return Poll::Ready(Ok(StreamResult::Cancelled));
+            }
+            return Poll::Pending;
+        }
+        destination.set_buffer(batch.into());
+        Poll::Ready(Ok(if ended {
+            StreamResult::Dropped
+        } else {
+            StreamResult::Completed
+        }))
+    }
+}

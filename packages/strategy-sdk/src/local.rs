@@ -141,10 +141,3 @@ impl MarketState {
         self.funding_rate / self.mark
     }
 }
-
-/// What the vault says when a depositor is leaving: the fraction of every
-/// position being closed to serve them.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ClaimPending {
-    pub fraction: Decimal,
-}
