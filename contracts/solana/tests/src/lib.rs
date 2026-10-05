@@ -520,11 +520,31 @@ impl Env {
         signers: &[&Keypair],
         table: &[Pubkey],
     ) -> TxResult {
+        self.svm.expire_blockhash();
+        let mut all = vec![
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            ComputeBudgetInstruction::request_heap_frame(shonin_station::heap::MAX_HEAP as u32),
+        ];
+        all.extend(ixs);
+        let tx = self.through_table(&all, signers, table);
+        self.svm.send_transaction(tx)
+    }
+
+    /// `ixs` as a version-0 transaction, the first signer paying, whose
+    /// accounts other than the signers and the programs it calls are found
+    /// through a lookup table holding `table`, which is set up first.
+    /// Checked to fit the wire and the most accounts one transaction may
+    /// lock, as a cluster checks it before it runs.
+    fn through_table(
+        &mut self,
+        ixs: &[Instruction],
+        signers: &[&Keypair],
+        table: &[Pubkey],
+    ) -> solana_transaction::versioned::VersionedTransaction {
         use solana_address_lookup_table_interface::state::{AddressLookupTable, LookupTableMeta};
         use solana_message::{v0, AddressLookupTableAccount, VersionedMessage};
         use solana_transaction::versioned::VersionedTransaction;
 
-        self.svm.expire_blockhash();
         let key = Pubkey::new_unique();
         let state = AddressLookupTable {
             meta: LookupTableMeta {
@@ -548,18 +568,13 @@ impl Env {
                 },
             )
             .unwrap();
-        let mut all = vec![
-            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
-            ComputeBudgetInstruction::request_heap_frame(shonin_station::heap::MAX_HEAP as u32),
-        ];
-        all.extend(ixs);
         let lookup = AddressLookupTableAccount {
             key,
             addresses: table.to_vec(),
         };
         let message = v0::Message::try_compile(
             &signers[0].pubkey(),
-            &all,
+            ixs,
             &[lookup],
             self.svm.latest_blockhash(),
         )
@@ -580,10 +595,16 @@ impl Env {
             size <= PACKET_DATA_SIZE,
             "a transaction of {size} bytes is over the wire's limit"
         );
-        self.svm.send_transaction(tx)
+        tx
     }
 
-    /// Runs `ixs` without keeping anything, for what they return.
+    /// Runs `ixs` without keeping anything, for what they return. Like
+    /// every transaction, it must fit the wire: one that doesn't with every
+    /// account named by address names them through a lookup table, as a
+    /// caller asking a cluster would, and the table is all it leaves
+    /// behind. (LiteSVM doesn't hold a transaction to the wire's limit, and
+    /// one over it can call a program at an index a cluster could never
+    /// receive, which LiteSVM panics on.)
     pub fn simulate(&mut self, ixs: Vec<Instruction>) -> TransactionMetadata {
         self.svm.expire_blockhash();
         let payer = self.payer.insecure_clone();
@@ -592,7 +613,20 @@ impl Env {
             Message::new(&ixs, Some(&payer.pubkey())),
             self.svm.latest_blockhash(),
         );
-        match self.svm.simulate_transaction(tx) {
+        let result = if bincode::serialize(&tx).unwrap().len() <= PACKET_DATA_SIZE {
+            self.svm.simulate_transaction(tx)
+        } else {
+            let mut table: Vec<Pubkey> = Vec::new();
+            for meta in ixs.iter().flat_map(|ix| ix.accounts.iter()) {
+                if !meta.is_signer && meta.pubkey != payer.pubkey() && !table.contains(&meta.pubkey)
+                {
+                    table.push(meta.pubkey);
+                }
+            }
+            let tx = self.through_table(&ixs, &[&payer], &table);
+            self.svm.simulate_transaction(tx)
+        };
+        match result {
             Ok(info) => info.meta,
             Err(failed) => panic!(
                 "simulation failed: {:?}\n{}",
