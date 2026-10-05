@@ -10,6 +10,7 @@ pub mod api;
 pub mod archive;
 pub mod base64;
 pub mod catalogue;
+pub mod dependencies;
 pub mod manifest;
 pub mod model;
 pub mod record;

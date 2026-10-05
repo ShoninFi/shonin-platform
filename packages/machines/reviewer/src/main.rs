@@ -9,6 +9,7 @@
 //! registered. The prompt, the schema and the battery are in this repository,
 //! so an author can run the same review over their own code first.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -97,7 +98,12 @@ struct Pending {
 }
 
 struct Reviewer {
-    chains: Vec<Served>,
+    /// Every vault chain it reviews for, connected yet or not.
+    configured: Vec<Chain>,
+    /// Those of them connected and blessed on so far (see [`take_on`]). A
+    /// review asked for on one not yet connected is answered 503, which the
+    /// build service takes for "ask again later".
+    connected: std::sync::RwLock<BTreeMap<Chain, Arc<Served>>>,
     store: PathBuf,
     model: Option<String>,
     calibrator: Option<jev::Client>,
@@ -106,21 +112,44 @@ struct Reviewer {
     pending_file: PathBuf,
 }
 
+/// Why a chain can't be acted on.
+#[derive(Debug, PartialEq, Eq)]
+enum Unserved {
+    /// It is not one this reviewer reviews for.
+    NotServed,
+    /// It is, and is not connected yet.
+    NotConnected,
+}
+
+impl std::fmt::Display for Unserved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotServed => "this reviewer does not serve that chain",
+            Self::NotConnected => "that chain is not connected yet",
+        })
+    }
+}
+
+impl std::error::Error for Unserved {}
+
 impl Reviewer {
-    fn on(&self, chain: Chain) -> Result<&Served> {
-        self.chains
-            .iter()
-            .find(|served| served.vault_chain == chain)
-            .ok_or_else(|| anyhow!("this reviewer does not serve {chain}"))
+    fn on(&self, chain: Chain) -> Result<Arc<Served>, Unserved> {
+        if !self.configured.contains(&chain) {
+            return Err(Unserved::NotServed);
+        }
+        self.connected
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&chain)
+            .cloned()
+            .ok_or(Unserved::NotConnected)
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(chain::log_filter())
         .with_target(false)
         .init();
 
@@ -128,23 +157,16 @@ async fn main() -> Result<()> {
     if args.model.is_none() && args.chain_args.network == NetworkName::Mainnet {
         bail!("a review model is required on mainnet: set SHONIN_REVIEW_MODEL");
     }
-    let chains = args.chain_args.connect_all().await?;
-    // Blessed on every vault chain it serves, since each chain's registry
-    // decides for itself which keys may post a review there.
-    for served in &chains {
-        let key = served.deployments.roles.reviewer;
-        chain::attest::bless_service(&served.client, &served.deployments, "reviewer", key).await?;
-        chain::attest::keep_blessed(
-            served.client.clone(),
-            served.deployments.clone(),
-            "reviewer",
-            key,
-            chain::attest::Sender::Unlocked(key),
-            alloy::primitives::Address::ZERO,
-            B256::ZERO,
-            || {},
-        );
-    }
+    let configured = args
+        .chain_args
+        .targets()?
+        .iter()
+        .map(|target| target.vault_chain)
+        .collect();
+    // Each chain is taken on as soon as it connects: one out of reach (its
+    // node down, its deployment missing) is tried again in the background,
+    // and keeps the reviewer from no other.
+    let mut connecting = args.chain_args.connect_each()?;
 
     let calibrator = jev::Client::configured(
         args.calibrator_key.clone(),
@@ -170,7 +192,8 @@ async fn main() -> Result<()> {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default();
     let reviewer = Arc::new(Reviewer {
-        chains,
+        configured,
+        connected: Default::default(),
         store: args.store,
         model: args.model,
         calibrator,
@@ -179,12 +202,17 @@ async fn main() -> Result<()> {
         pending_file,
     });
 
+    let joining = reviewer.clone();
+    tokio::spawn(async move {
+        while let Some(served) = connecting.recv().await {
+            tokio::spawn(take_on(joining.clone(), served));
+        }
+    });
+
     let poster = reviewer.clone();
     tokio::spawn(async move {
         loop {
-            if let Err(error) = post_pending(&poster).await {
-                tracing::warn!(%error, "could not post a review");
-            }
+            post_pending(&poster).await;
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
@@ -200,11 +228,61 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Take a chain on once it is connected: get the key blessed there, since
+/// each chain's registry decides for itself which keys may post a review
+/// there, and only then review for it. Blessing is tried again until it is
+/// done, waiting longer each time.
+async fn take_on(reviewer: Arc<Reviewer>, served: Served) {
+    let chain = served.vault_chain;
+    let key = served.deployments.roles.reviewer;
+    let mut wait = Duration::from_secs(5);
+    while let Err(error) =
+        chain::attest::bless_service(&served.client, &served.deployments, "reviewer", key).await
+    {
+        tracing::warn!(%chain, error = format!("{error:#}"), seconds = wait.as_secs(), "the key could not be blessed; trying again");
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(Duration::from_secs(300));
+    }
+    chain::attest::keep_blessed(
+        served.client.clone(),
+        served.deployments.clone(),
+        "reviewer",
+        key,
+        chain::attest::Sender::Unlocked(key),
+        alloy::primitives::Address::ZERO,
+        B256::ZERO,
+        || {},
+    );
+    reviewer
+        .connected
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(chain, Arc::new(served));
+    tracing::info!(%chain, "reviewing on this chain");
+}
+
 async fn review(
     State(reviewer): State<Arc<Reviewer>>,
     UrlPath(chain): UrlPath<Chain>,
     Json(request): Json<ReviewRequest>,
 ) -> Result<Json<ReviewAnswer>, (StatusCode, String)> {
+    // Asked about a chain not connected yet, the build service puts the job
+    // back in its queue and asks again later.
+    match reviewer.on(chain) {
+        Ok(_) => {}
+        Err(Unserved::NotConnected) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("{chain} is not connected yet: ask again shortly"),
+            ));
+        }
+        Err(Unserved::NotServed) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("this reviewer does not serve {chain}"),
+            ));
+        }
+    }
     review_one(&reviewer, chain, request)
         .await
         .map(Json)
@@ -227,10 +305,19 @@ async fn review_one(
     let source_hash = hash_bytes(&archive);
     let manifest = manifest_in(&archive, &request.manifest_path)?;
     let source = source::from_archive(&archive)?;
+    let dependencies = shared::dependencies::listed(&archive);
 
     let (prose, answers, answered_by) = match &reviewer.model {
         Some(model) => {
-            let prose = ask(model, &reviewer.battery, &manifest, &source, request.sealed).await?;
+            let prose = ask(
+                model,
+                &reviewer.battery,
+                &manifest,
+                &dependencies,
+                &source,
+                request.sealed,
+            )
+            .await?;
             // The battery's answers come from the calibrator when there is
             // one, and from the pinned model otherwise.
             let (answered_by, answers) = match &reviewer.calibrator {
@@ -315,20 +402,14 @@ async fn review_one(
         });
     }
 
-    let digest = on
-        .client
-        .read(
-            on.deployments.strategies,
-            IStrategyRegistry::clearanceDigestCall {
-                strategyId: U256::from(request.strategy_id),
-                sourceHash: source_bytes,
-            },
-        )
-        .await?;
-    let clearance = on
-        .client
-        .sign(on.deployments.roles.reviewer, digest)
-        .await?;
+    let clearance = clearance(
+        &on.client,
+        on.deployments.strategies,
+        on.deployments.roles.reviewer,
+        request.strategy_id,
+        source_bytes,
+    )
+    .await?;
 
     let mut pending = reviewer.pending.lock().await;
     pending.push(Pending {
@@ -350,53 +431,23 @@ async fn review_one(
 }
 
 /// Post every review whose build has been registered since it was cleared.
-async fn post_pending(reviewer: &Reviewer) -> Result<()> {
+/// Each is tried on its own: one whose chain can't be read, isn't connected
+/// yet, or whose post the registry would not take is said and left waiting,
+/// to be tried again next time, and holds up none after it.
+async fn post_pending(reviewer: &Reviewer) {
     let waiting = reviewer.pending.lock().await.clone();
     let mut done = Vec::new();
     for (index, review) in waiting.iter().enumerate() {
-        let on = reviewer.on(review.chain)?;
-        let id = U256::from(review.strategy_id);
-        let reviews = on.deployments.reviews;
-        let already = on
-            .client
-            .read(reviews, IReviewRegistry::reviewOfCall { strategyId: id })
-            .await?;
-        if already.review.reviewedAt != 0 {
-            done.push(index);
-            continue;
+        match post_one(reviewer, review).await {
+            Ok(true) => done.push(index),
+            Ok(false) => {}
+            Err(error) if error.downcast_ref() == Some(&Unserved::NotConnected) => {
+                tracing::debug!(chain = %review.chain, id = review.strategy_id, "a review waits for its chain to connect");
+            }
+            Err(error) => {
+                tracing::warn!(chain = %review.chain, id = review.strategy_id, error = format!("{error:#}"), "could not post a review; trying again later");
+            }
         }
-        let bundle = on
-            .client
-            .read(
-                on.deployments.strategies,
-                IStrategyRegistry::bundleHashOfCall { strategyId: id },
-            )
-            .await?;
-        // Not built yet, or never will be: a failed build has nothing to post
-        // against, and its review stays in the store.
-        if bundle == B256::ZERO {
-            continue;
-        }
-        on.client
-            .send(
-                on.deployments.roles.reviewer,
-                reviews,
-                IReviewRegistry::submitReviewCall {
-                    strategyId: id,
-                    review: signed(
-                        bundle,
-                        review.source_hash,
-                        review.report_hash,
-                        review.model_id_hash,
-                        review.ratings,
-                        review.finding_count,
-                    ),
-                },
-            )
-            .await
-            .context("the registry would not take the review")?;
-        tracing::info!(chain = %review.chain, id = review.strategy_id, "review posted");
-        done.push(index);
     }
     if !done.is_empty() {
         let mut pending = reviewer.pending.lock().await;
@@ -407,7 +458,53 @@ async fn post_pending(reviewer: &Reviewer) -> Result<()> {
         pending.retain(|review| !posted.contains(&(review.chain, review.strategy_id)));
         write_pending(reviewer, &pending);
     }
-    Ok(())
+}
+
+/// Post one review if its build has been registered: whether it is done
+/// with (posted now, or already), or still waits for its build.
+async fn post_one(reviewer: &Reviewer, review: &Pending) -> Result<bool> {
+    let on = reviewer.on(review.chain)?;
+    let id = U256::from(review.strategy_id);
+    let reviews = on.deployments.reviews;
+    let already = on
+        .client
+        .read(reviews, IReviewRegistry::reviewOfCall { strategyId: id })
+        .await?;
+    if already.review.reviewedAt != 0 {
+        return Ok(true);
+    }
+    let bundle = on
+        .client
+        .read(
+            on.deployments.strategies,
+            IStrategyRegistry::bundleHashOfCall { strategyId: id },
+        )
+        .await?;
+    // Not built yet, or never will be: a failed build has nothing to post
+    // against, and its review stays in the store.
+    if bundle == B256::ZERO {
+        return Ok(false);
+    }
+    on.client
+        .send(
+            on.deployments.roles.reviewer,
+            reviews,
+            IReviewRegistry::submitReviewCall {
+                strategyId: id,
+                review: signed(
+                    bundle,
+                    review.source_hash,
+                    review.report_hash,
+                    review.model_id_hash,
+                    review.ratings,
+                    review.finding_count,
+                ),
+            },
+        )
+        .await
+        .context("the registry would not take the review")?;
+    tracing::info!(chain = %review.chain, id = review.strategy_id, "review posted");
+    Ok(true)
 }
 
 fn signed(
@@ -442,6 +539,24 @@ fn signed(
     }
 }
 
+/// The crates.io crates a project locks, as the model is told of them.
+fn dependencies_named(dependencies: &[(String, String)]) -> String {
+    if dependencies.is_empty() {
+        return "It depends on no crates.io crate.".into();
+    }
+    format!(
+        "It depends on these crates.io crates, which are not in the source below: each is on \
+         the platform's list of crates it reviewed itself, by version and checksum, and a \
+         project may depend on no others. Crates inside the project are in the source, and \
+         shonin-strategy-sdk is the platform's own SDK.\n{}",
+        dependencies
+            .iter()
+            .map(|(name, version)| format!("- {name} {version}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
 /// What a review says when there is no model to read with.
 fn unread() -> Prose {
     Prose {
@@ -453,16 +568,19 @@ fn unread() -> Prose {
 }
 
 /// Run the pinned model over the description and the source, with the schema
-/// it must answer in.
+/// it must answer in. The crates.io crates the project locks are named, not
+/// shown: the platform reviewed them itself, and a project may depend on no
+/// others (see [`shared::dependencies`]).
 async fn ask(
     model: &str,
     battery: &Battery,
     manifest: &Manifest,
+    dependencies: &[(String, String)],
     source: &str,
     sealed: bool,
 ) -> Result<Prose> {
     let description = format!(
-        "Title: {}\n\n{}\n\nClaims:\n{}\n\nThe source is {}.",
+        "Title: {}\n\n{}\n\nClaims:\n{}\n\nThe source is {}.\n\n{}",
         manifest.description.title,
         manifest.description.text,
         manifest
@@ -473,6 +591,7 @@ async fn ask(
             .collect::<Vec<_>>()
             .join("\n"),
         if sealed { "sealed" } else { "published" },
+        dependencies_named(dependencies),
     );
     let prompt = PROMPT
         .replace("{battery}", &battery.as_prompt())
@@ -512,18 +631,52 @@ async fn ask(
     serde_json::from_value(structured).context("the report did not match the schema")
 }
 
-/// The manifest at `path` inside a packed project.
+/// The reviewer's go-ahead for a source: its signature over the registry's
+/// clearance digest, worked out here as the registry writes it and never read
+/// from the node, which could otherwise hand over the digest of anything the
+/// reviewer's signature counts for and have it signed. The chain id is the
+/// configured one, checked against the node when it connected.
+async fn clearance(
+    client: &chain::Client,
+    registry: alloy::primitives::Address,
+    reviewer: alloy::primitives::Address,
+    strategy_id: u64,
+    source_hash: B256,
+) -> Result<alloy::primitives::Bytes> {
+    let digest = chain::digest::clearance(
+        client.chain_id,
+        registry,
+        U256::from(strategy_id),
+        source_hash,
+    );
+    client.sign(reviewer, digest).await
+}
+
+/// The manifest at `path` inside a packed project: `./shonin.toml` and
+/// `shonin.toml` are the same file, as the builder reads them.
 fn manifest_in(archive: &[u8], path: &str) -> Result<Manifest> {
+    let wanted = parts(Path::new(path));
     let mut reader = tar::Archive::new(std::io::Cursor::new(archive));
     for entry in reader.entries()?.flatten() {
         let mut entry = entry;
-        if entry.path()?.to_string_lossy() == path {
+        if entry.header().entry_type() == tar::EntryType::Regular && parts(&entry.path()?) == wanted
+        {
             let mut text = String::new();
             std::io::Read::read_to_string(&mut entry, &mut text)?;
             return Manifest::from_toml(&text).map_err(|error| anyhow!(error));
         }
     }
     bail!("no {path} in the project")
+}
+
+/// A path's named parts, so `./a/b` and `a/b` are the same path.
+fn parts(path: &Path) -> Vec<std::ffi::OsString> {
+    path.components()
+        .filter_map(|part| match part {
+            std::path::Component::Normal(name) => Some(name.to_os_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn write(store: &Path, hash: &str, name: &str, bytes: &[u8]) -> Result<()> {
@@ -592,10 +745,336 @@ mod tests {
         }
     }
 
+    /// A packed project holding `shonin.toml` at its root.
+    fn packed(path: &str) -> Vec<u8> {
+        let text = "[vault]\nchain = \"base\"\n[description]\ntitle = \"t\"\ntext = \"x\"\n";
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(text.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        builder
+            .append_data(&mut header, path, text.as_bytes())
+            .unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn a_manifest_named_from_the_project_s_root_is_read_however_it_is_spelt() {
+        for packed_as in ["shonin.toml", "./shonin.toml"] {
+            for asked_as in ["shonin.toml", "./shonin.toml"] {
+                let manifest = manifest_in(&packed(packed_as), asked_as);
+                assert!(
+                    manifest.is_ok(),
+                    "{asked_as} was not found in a project packing {packed_as}: {manifest:?}"
+                );
+            }
+        }
+    }
+
+    /// The go-ahead is signed over the clearance digest the registry checks,
+    /// whatever the node says that digest is.
+    #[tokio::test]
+    async fn the_go_ahead_is_signed_under_a_digest_the_reviewer_works_out_itself() {
+        use alloy::signers::local::PrivateKeySigner;
+        use alloy::sol_types::SolCall;
+
+        // A node that answers every `clearanceDigest` with the digest of
+        // another strategy's source.
+        let lie = keccak256("another strategy's source");
+        let app = axum::Router::new().route(
+            "/",
+            post(move |Json(request): Json<serde_json::Value>| async move {
+                let result = match request["method"].as_str().unwrap_or_default() {
+                    "eth_chainId" => serde_json::json!("0x7a69"),
+                    "eth_call" => serde_json::json!(alloy::hex::encode_prefixed(
+                        IStrategyRegistry::clearanceDigestCall::abi_encode_returns(&lie)
+                    )),
+                    _ => serde_json::Value::Null,
+                };
+                Json(serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let key = PrivateKeySigner::random();
+        let reviewer = key.address();
+        let client = chain::Client::connect(
+            &chain::ChainConfig {
+                label: "stand-in".to_string(),
+                rpc: url.clone(),
+                ws: None,
+                dollar: "USDC".to_string(),
+                native_usd: None,
+                public_rpc: url,
+                confirmations: None,
+            },
+            chain::Signing::Keys(vec![key]),
+        )
+        .await
+        .unwrap();
+
+        let registry = alloy::primitives::Address::repeat_byte(0x22);
+        let source = B256::repeat_byte(0xab);
+        let signature = clearance(&client, registry, reviewer, 7, source)
+            .await
+            .unwrap();
+        let signature = alloy::primitives::Signature::try_from(signature.as_ref()).unwrap();
+        let signer_of = |digest: B256| signature.recover_address_from_msg(digest).unwrap();
+        assert_ne!(
+            signer_of(lie),
+            reviewer,
+            "the reviewer signed the digest the node handed it"
+        );
+        assert_eq!(
+            signer_of(chain::digest::clearance(
+                31_337,
+                registry,
+                U256::from(7u64),
+                source
+            )),
+            reviewer,
+            "the go-ahead is not over the registry's clearance digest of this source"
+        );
+    }
+
+    /// A stand-in node answering as chain `chain_id`: `eth_call` with what
+    /// `call` makes of the request (`None` for a refusal), and every other
+    /// method but `eth_chainId` with a refusal. Every call's input is noted
+    /// in `asked`. Where it is.
+    async fn a_node(
+        chain_id: u64,
+        call: fn(&[u8]) -> Option<String>,
+        asked: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    ) -> String {
+        let app = axum::Router::new().route(
+            "/",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let asked = asked.clone();
+                async move {
+                    let id = request["id"].clone();
+                    let answer = match request["method"].as_str().unwrap_or_default() {
+                        "eth_chainId" => Some(format!("0x{chain_id:x}")),
+                        "eth_call" => {
+                            let tx = &request["params"][0];
+                            let input = alloy::hex::decode(
+                                tx["input"].as_str().or(tx["data"].as_str()).unwrap_or("0x"),
+                            )
+                            .unwrap_or_default();
+                            asked.lock().unwrap().push(input.clone());
+                            call(&input)
+                        }
+                        _ => None,
+                    };
+                    Json(match answer {
+                        Some(result) => {
+                            serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
+                        }
+                        None => serde_json::json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "error": {"code": 3, "message": "execution reverted"},
+                        }),
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    /// The chain at `url` as a reviewer serves it, as `vault_chain`.
+    async fn served(url: &str, vault_chain: Chain, chain_id: u64) -> Served {
+        let client = chain::Client::connect(
+            &chain::ChainConfig {
+                label: "stand-in".to_string(),
+                rpc: url.to_string(),
+                ws: None,
+                dollar: "USDC".to_string(),
+                native_usd: None,
+                public_rpc: url.to_string(),
+                confirmations: None,
+            },
+            chain::Signing::ReadOnly,
+        )
+        .await
+        .unwrap();
+        let one = "0x0000000000000000000000000000000000000001";
+        let mut fields = vec![
+            format!(r#""chain_key":"evm:{chain_id}""#),
+            format!(r#""chain_id":{chain_id}"#),
+            r#""rpc_url":"""#.to_string(),
+            r#""deployed_block":0"#.to_string(),
+        ];
+        for name in [
+            "usd",
+            "venue",
+            "attestation_verifier",
+            "attestation",
+            "publishing",
+            "prices",
+            "strategies",
+            "reviews",
+            "profiles",
+            "factory",
+            "station_factory",
+            "driver",
+            "bridge",
+        ] {
+            fields.push(format!(r#""{name}":"{one}""#));
+        }
+        let roles: Vec<String> = [
+            "admin", "platform", "attestor", "builder", "reviewer", "executor", "keeper",
+            "operator", "author", "viewer",
+        ]
+        .iter()
+        .map(|role| format!(r#""{role}":"{one}""#))
+        .collect();
+        fields.push(format!(r#""roles":{{{}}}"#, roles.join(",")));
+        Served {
+            vault_chain,
+            key: format!("evm:{chain_id}").parse().unwrap(),
+            client,
+            deployments: chain::Deployments::from_json(&format!("{{{}}}", fields.join(",")))
+                .unwrap(),
+            native_usd: None,
+            public_rpc: String::new(),
+        }
+    }
+
+    fn waiting(chain: Chain, strategy_id: u64) -> Pending {
+        Pending {
+            chain,
+            strategy_id,
+            source_hash: B256::repeat_byte(1),
+            report_hash: B256::repeat_byte(2),
+            model_id_hash: B256::repeat_byte(3),
+            ratings: [1; 6],
+            finding_count: 0,
+        }
+    }
+
+    /// One pending review whose chain can't be read, and one whose post the
+    /// registry would not take, hold up none after them: a later chain's
+    /// review is still looked at, and is done with, and the two are kept to
+    /// be tried again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_review_that_cannot_be_posted_holds_up_none_after_it() {
+        use alloy::sol_types::SolCall;
+
+        // Base: strategy 1's review can't be read; strategy 2's build is
+        // registered and its post is refused.
+        let base_asked: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Default::default();
+        let base = a_node(
+            31_337,
+            |input| {
+                let selector: [u8; 4] = input.get(..4)?.try_into().ok()?;
+                let id = U256::from_be_slice(input.get(4..36)?);
+                match selector {
+                    IReviewRegistry::reviewOfCall::SELECTOR if id == U256::from(1) => None,
+                    // Never reviewed: every word zero.
+                    IReviewRegistry::reviewOfCall::SELECTOR => {
+                        Some(format!("0x{}", "0".repeat(64 * 40)))
+                    }
+                    IStrategyRegistry::bundleHashOfCall::SELECTOR => {
+                        Some(format!("0x{}", "42".repeat(32)))
+                    }
+                    _ => None,
+                }
+            },
+            base_asked.clone(),
+        )
+        .await;
+        // Robinhood: strategy 3's review is posted already.
+        let robinhood_asked: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Default::default();
+        let robinhood = a_node(
+            46_630,
+            |input| {
+                (input.get(..4)? == IReviewRegistry::reviewOfCall::SELECTOR)
+                    .then(|| format!("0x{}", format!("{:064x}", 1).repeat(40)))
+            },
+            robinhood_asked.clone(),
+        )
+        .await;
+
+        let store =
+            std::env::temp_dir().join(format!("shonin-reviewer-pending-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        let reviewer = Reviewer {
+            configured: vec![Chain::Base, Chain::Robinhood],
+            connected: std::sync::RwLock::new(BTreeMap::from([
+                (
+                    Chain::Base,
+                    Arc::new(served(&base, Chain::Base, 31_337).await),
+                ),
+                (
+                    Chain::Robinhood,
+                    Arc::new(served(&robinhood, Chain::Robinhood, 46_630).await),
+                ),
+            ])),
+            pending_file: store.join("pending-reviews.json"),
+            store,
+            model: None,
+            calibrator: None,
+            battery: Battery::pinned(),
+            pending: Mutex::new(vec![
+                waiting(Chain::Base, 1),
+                waiting(Chain::Base, 2),
+                waiting(Chain::Robinhood, 3),
+            ]),
+        };
+
+        post_pending(&reviewer).await;
+
+        assert!(
+            robinhood_asked
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|input| input.starts_with(&IReviewRegistry::reviewOfCall::SELECTOR)),
+            "a later chain's pending review was never looked at"
+        );
+        let left: Vec<(Chain, u64)> = reviewer
+            .pending
+            .lock()
+            .await
+            .iter()
+            .map(|review| (review.chain, review.strategy_id))
+            .collect();
+        assert_eq!(
+            left,
+            [(Chain::Base, 1), (Chain::Base, 2)],
+            "the posted review is done with, and the two that could not be are kept"
+        );
+        assert!(
+            base_asked
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|input| input.starts_with(&IStrategyRegistry::bundleHashOfCall::SELECTOR)),
+            "the review after an unreadable one on the same chain was never looked at"
+        );
+        let _ = std::fs::remove_dir_all(&reviewer.store);
+    }
+
     #[test]
     fn with_no_model_every_area_reads_couldnt_tell() {
         let (ratings, refused) = Battery::pinned().rate(&unread().answers);
         assert_eq!(ratings, [Rating::CouldntTell; 6]);
         assert!(!refused);
+    }
+
+    /// The model is told which reviewed crates a project depends on, by
+    /// name and version, since their source is not in what it reads.
+    #[test]
+    fn the_model_is_told_every_crate_the_project_depends_on() {
+        let told = dependencies_named(&[
+            ("futures".to_string(), "0.3.34".to_string()),
+            ("serde".to_string(), "1.0.229".to_string()),
+        ]);
+        assert!(told.contains("- futures 0.3.34\n- serde 1.0.229"), "{told}");
+        assert!(dependencies_named(&[]).contains("no crates.io crate"));
     }
 }

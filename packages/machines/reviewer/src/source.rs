@@ -7,48 +7,19 @@
 
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow};
 
-/// A file the reviewer reads. Anything else in the project is carried, hashed
-/// and published, but not put to a model.
-fn worth_reading(path: &str) -> bool {
-    path.ends_with(".rs") || path.ends_with(".toml")
-}
-
-/// The source as a model sees it: each file named, each line numbered, so a
-/// finding can point at one.
+/// The source as a model sees it: every file named, each line numbered, so a
+/// finding can point at one (see [`shared::archive::numbered`]).
 pub fn numbered(files: &[(String, String)]) -> Result<String> {
-    let mut out = String::new();
-    for (path, body) in files {
-        out.push_str(&format!("\n----- {path} -----\n"));
-        for (number, line) in body.lines().enumerate() {
-            out.push_str(&format!("{:>4} {line}\n", number + 1));
-        }
-    }
-    if out.is_empty() {
-        bail!("there is no source to read");
-    }
-    Ok(out)
+    shared::archive::numbered(files).map_err(|error| anyhow!(error))
 }
 
-/// The source inside a packed project.
+/// The source inside a packed project: every file in it, since code can live
+/// in a file of any name, and none that is not text. A project that can't be
+/// read whole is not read at all (see [`shared::archive::reviewed`]).
 pub fn from_archive(archive: &[u8]) -> Result<String> {
-    let mut reader = tar::Archive::new(std::io::Cursor::new(archive));
-    let mut files = Vec::new();
-    for entry in reader.entries()?.flatten() {
-        let path = entry.path()?.display().to_string();
-        if !worth_reading(&path) {
-            continue;
-        }
-        let mut entry = entry;
-        let mut body = String::new();
-        use std::io::Read;
-        if entry.read_to_string(&mut body).is_err() {
-            continue;
-        }
-        files.push((path, body));
-    }
-    numbered(&files)
+    shared::archive::reviewed(archive).map_err(|error| anyhow!(error))
 }
 
 /// The source of a project on disk, for a comparison that has not been
@@ -78,11 +49,9 @@ fn collect(root: &Path, at: &Path, files: &mut Vec<(String, String)>) -> Result<
                 .unwrap_or(&path)
                 .display()
                 .to_string();
-            if worth_reading(&relative)
-                && let Ok(body) = std::fs::read_to_string(&path)
-            {
-                files.push((relative, body));
-            }
+            let body = String::from_utf8(std::fs::read(&path)?)
+                .map_err(|_| anyhow!(shared::archive::not_text(&relative)))?;
+            files.push((relative, body));
         }
     }
     Ok(())

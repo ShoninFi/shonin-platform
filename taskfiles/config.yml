@@ -79,8 +79,14 @@ vars:
   PATH_NETWORK_STATE: '{{joinPath .PATH_ROOT ".shonin" .NETWORK}}'
   # Content-addressed storage: source archives, bundles, build logs, reviews.
   PATH_STORE: '{{joinPath .PATH_NETWORK_STATE "store"}}'
-  # Where the build service compiles submissions.
+  # Where the build service unpacks uploads to check them. Jobs are compiled
+  # elsewhere, in a directory of the build service's own outside this
+  # repository (whose Cargo.toml cargo would otherwise take for theirs).
   PATH_BUILDS: '{{joinPath .PATH_NETWORK_STATE "builds"}}'
+  # The vendored copy of the reviewed crates in config/dependency-allowlist.toml,
+  # the only crates.io crates a build can reach. Made on the builder's first
+  # start; delete it to make it again after the allowlist changes.
+  PATH_VENDOR: '{{joinPath .PATH_ROOT ".shonin" "vendor"}}'
 
   # The devnet binary, with the chain arguments every one of its commands
   # takes. The chain tasks, the Solana deploy and the cloud tasks call it.

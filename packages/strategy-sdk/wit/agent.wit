@@ -89,8 +89,9 @@ interface vault {
     events: func() -> stream<vault-event>;
 }
 
-/// Shared, cached reads: prices, order books, anything the executor can fetch
-/// once and hand to every agent that wants it.
+/// Reads the executor makes for the agent: prices, order books. Each call is
+/// read from the chain as it is made; nothing is yet cached or shared between
+/// agents, and no quota holds an agent's reads down.
 interface data {
     use types.{driver-name, payload};
 

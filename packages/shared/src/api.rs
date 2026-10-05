@@ -21,7 +21,8 @@ pub struct Snapshot {
     /// Rises whenever anything below changes, so the app can ask "is there
     /// anything new?" without reading the rest.
     pub version: u64,
-    /// The chains' own clock, not the reader's: the latest of them. Everything
+    /// The chains' own clock, not the reader's: the latest of them (each
+    /// chain's own is on its [`ChainInfo`]). Everything
     /// dated is relative to its own chain, so a page reads correctly however
     /// fast a chain is running.
     pub as_of: PrimitiveDateTime,
@@ -31,6 +32,14 @@ pub struct Snapshot {
     pub strategies: Vec<Strategy>,
     pub authors: Vec<Author>,
     pub jobs: Vec<Job>,
+    /// When the build service last gave its queue, on the reader's clock.
+    /// None until it first has.
+    #[serde(default)]
+    pub jobs_as_of: Option<PrimitiveDateTime>,
+    /// Whether the build service failed to answer the latest ask: the queue
+    /// is then the one it last gave, as of `jobs_as_of`.
+    #[serde(default)]
+    pub jobs_stale: bool,
     pub feed: Vec<FeedEvent>,
     pub totals: Totals,
 }
@@ -42,6 +51,11 @@ pub struct ChainInfo {
     pub chain_id: u64,
     /// The block the snapshot was built from.
     pub block: u64,
+    /// That block's time, on the chain's own clock: each chain's part of the
+    /// snapshot is read on its own, so each says how fresh it is. None until
+    /// the chain is first read.
+    #[serde(default)]
+    pub as_of: Option<PrimitiveDateTime>,
 }
 
 impl Snapshot {
@@ -229,9 +243,12 @@ pub struct HealthPost {
 }
 
 impl HealthPost {
-    /// What a reporter signs and a reader checks: the vault and the report,
-    /// canonically encoded, so two encodings of one report cannot differ.
-    pub fn digest(vault: &str, report: &Health) -> [u8; 32] {
+    /// What a reporter signs and a reader checks: the vault chain, the vault
+    /// and the report, canonically encoded, so two encodings of one report
+    /// cannot differ. The chain is in it because one key can be blessed for
+    /// the same address on two chains, and a report about one must not pass
+    /// for a report about the other.
+    pub fn digest(chain: Chain, vault: &str, report: &Health) -> [u8; 32] {
         use sha2::{Digest, Sha256};
 
         let mut body = Vec::new();
@@ -240,7 +257,9 @@ impl HealthPost {
         ciborium::into_writer(report, &mut body).expect("a report encodes");
 
         let mut hasher = Sha256::new();
-        hasher.update(b"shonin-health/1");
+        hasher.update(b"shonin-health/2");
+        hasher.update(chain.name().as_bytes());
+        hasher.update(b"/");
         hasher.update(vault.to_ascii_lowercase().as_bytes());
         hasher.update(&body);
         hasher.finalize().into()
@@ -286,8 +305,25 @@ mod tests {
         let arrived: Health =
             serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
         assert_eq!(
-            HealthPost::digest("0xA", &report),
-            HealthPost::digest("0xA", &arrived)
+            HealthPost::digest(Chain::Base, "0xA", &report),
+            HealthPost::digest(Chain::Base, "0xA", &arrived)
+        );
+    }
+
+    #[test]
+    fn a_report_about_one_chain_is_not_a_report_about_another() {
+        let report = Health {
+            signals: vec![],
+            entries: vec![],
+            updated: time::PrimitiveDateTime::new(
+                time::Date::from_ordinal_date(2026, 274).unwrap(),
+                time::Time::MIDNIGHT,
+            ),
+            signed_by: "0x0".into(),
+        };
+        assert_ne!(
+            HealthPost::digest(Chain::Base, "0xA", &report),
+            HealthPost::digest(Chain::Hyperliquid, "0xA", &report)
         );
     }
 }

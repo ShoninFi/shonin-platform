@@ -21,9 +21,10 @@ tasks:
       - cd "{{.PATH_CONTRACTS_EVM}}" && forge build --sizes --skip test --skip script
 
   test:
-    desc: "Run the EVM contracts' tests"
+    desc: "Run the EVM contracts' tests and the Solana programs' tests"
     cmds:
       - cd "{{.PATH_CONTRACTS_EVM}}" && forge test
+      - task: solana:test
 
   fmt:
     desc: "Format the EVM contracts and the Solana programs"
@@ -32,10 +33,11 @@ tasks:
       - cd "{{.PATH_CONTRACTS_SOLANA}}" && cargo fmt --all
 
   lint:
-    desc: "Check the contracts' and the programs' formatting"
+    desc: "Check the contracts' and the programs' formatting, and clippy the programs"
     cmds:
       - cd "{{.PATH_CONTRACTS_EVM}}" && forge fmt --check
       - cd "{{.PATH_CONTRACTS_SOLANA}}" && cargo fmt --all --check
+      - cd "{{.PATH_CONTRACTS_SOLANA}}" && cargo clippy --workspace --all-targets -- -D warnings
 
   clean:
     desc: "Remove the contracts' and the programs' build output"
@@ -52,14 +54,35 @@ tasks:
     desc: "Build the Solana programs and their IDL with Anchor"
     cmds:
       # A program's address is its keypair's, under target/deploy, which is
-      # never committed (see the program's build.rs).
+      # never committed (see crates/shonin-program-id). Anchor makes any
+      # keypair that is missing before it compiles.
       - cd "{{.PATH_CONTRACTS_SOLANA}}" && anchor build
+
+  solana:test:
+    desc: "Build the Solana programs and run their tests in-process (LiteSVM)"
+    cmds:
+      - task: solana:build
+      - cd "{{.PATH_CONTRACTS_SOLANA}}" && cargo test --workspace
+
+  solana:test:deep:
+    desc: "The Solana programs' property tests, deep, under several seeds (RUNS, SEEDS)"
+    vars:
+      RUNS: '{{.RUNS | default "500"}}'
+      SEEDS: '{{.SEEDS | default "1 2 3"}}'
+    cmds:
+      - task: solana:build
+      - |
+        cd "{{.PATH_CONTRACTS_SOLANA}}"
+        for seed in {{.SEEDS}}; do
+          SHONIN_PROPERTY_RUNS={{.RUNS}} SHONIN_PROPERTY_SEED=$seed cargo test -p shonin-solana-tests --test platform_properties
+        done
 
   solana:deploy:
     desc: "Deploy the Solana programs: to the local validator, or with NETWORK=testnet to devnet (mainnet refuses)"
     vars:
       PROGRAM_KEYPAIR: '{{joinPath .PATH_CONTRACTS_SOLANA "target" "deploy" "shonin_registry-keypair.json"}}'
       DEPLOYER_KEYPAIR: '{{joinPath .PATH_ROOT ".shonin" .NETWORK "solana-deployer.json"}}'
+      PROGRAMS: "shonin_registry shonin_dev_verifier shonin_publishing shonin_prices shonin_profiles"
     cmds:
       - |
         set -e
@@ -71,23 +94,34 @@ tasks:
         mkdir -p "$(dirname "$program")" "$(dirname "$deployer")"
         case "{{.NETWORK}}" in
           local)
-            # Throwaway keys, and coin from the validator's own faucet.
+            # Throwaway keys, and coin from the validator's own faucet: enough
+            # for every program's rent and a deploy buffer.
             [ -f "$program" ] || solana-keygen new --no-bip39-passphrase --silent -o "$program"
             [ -f "$deployer" ] || solana-keygen new --no-bip39-passphrase --silent -o "$deployer"
-            solana airdrop 10 "$(solana-keygen pubkey "$deployer")" --url "$rpc" ;;
+            solana airdrop 100 "$(solana-keygen pubkey "$deployer")" --url "$rpc"
+            deploying="{{.PROGRAMS}}" ;;
           testnet)
             # Both from SHONIN_TESTNET_SOLANA_MNEMONIC, so everyone deploying
             # from it deploys the same program id. Fund the deployer first.
             {{.DEVNET}} solana-keypair --role program --out "$program" >/dev/null
-            {{.DEVNET}} solana-keypair --role deployer --out "$deployer" >/dev/null ;;
+            {{.DEVNET}} solana-keypair --role deployer --out "$deployer" >/dev/null
+            # Only the registry's keypair is derived from the mnemonic so far;
+            # any other program's here would be this machine's own, and give
+            # every deployer a different id, so only the registry goes.
+            deploying="shonin_registry" ;;
           *)
             echo "This task does not deploy to mainnet. A program's mainnet id is committed in contracts/solana/programs/<name>/mainnet-id, and a mainnet build uses it with --features mainnet."
             exit 1 ;;
         esac
         cd "{{.PATH_CONTRACTS_SOLANA}}"
         anchor build
-        anchor deploy --provider.cluster "$rpc" --provider.wallet "$deployer"
-        id=$(solana-keygen pubkey "$program")
+        programs='{}'
+        for name in $deploying; do
+          anchor deploy --program-name "$name" --provider.cluster "$rpc" --provider.wallet "$deployer"
+          id=$(solana-keygen pubkey "target/deploy/$name-keypair.json")
+          programs=$(echo "$programs" | jq --arg name "$name" --arg id "$id" '. + {($name): $id}')
+          echo "$name is at $id"
+        done
         mkdir -p "$(dirname "$record")"
-        jq -n --arg id "$id" '{programs: {shonin_registry: $id}}' > "$record"
-        echo "shonin_registry is at $id (recorded in $record)"
+        echo "$programs" | jq '{programs: .}' > "$record"
+        echo "(recorded in $record)"
