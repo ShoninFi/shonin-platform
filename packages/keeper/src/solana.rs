@@ -184,9 +184,8 @@ struct Memory {
     quiet_since: Option<u64>,
     /// Each waiting claim's next try: the slot, and the wait in slots.
     claims_tried: HashMap<u64, (u64, u64)>,
-    /// Each unit holder's next serve, by owner: the slot, and the wait in
-    /// slots (see [`next_units_try`]).
-    units_tried: HashMap<Pubkey, (u64, u64)>,
+    /// Each unit holder's next serve, by owner (see [`next_units_try`]).
+    units_tried: HashMap<Pubkey, UnitsTry>,
     /// The slot the station was last unwound in, and when an unwind found
     /// not worth sending is next simulated: the chain time, and the wait.
     unwound_in: Option<u64>,
@@ -329,23 +328,55 @@ fn worth_an_unwind(brought: u128, dust: u128) -> bool {
     brought >= UNWIND_WORTH_AT_LEAST.max(dust)
 }
 
-/// Whether a holder's units are tried in `slot`, after the try `before`.
-fn units_due(before: Option<(u64, u64)>, slot: u64) -> bool {
-    before.is_none_or(|(next, _)| slot >= next)
+/// When a holder's units are next tried.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct UnitsTry {
+    /// The first slot they may be tried in.
+    next: u64,
+    /// How many slots the last send that landed and failed was told to wait.
+    wait: u64,
+    /// The first of the keeper's rounds (see [`Memory::rounds`]) they may be
+    /// tried in: a cluster whose clock runs fast passes many slots in a
+    /// round, and the wait is whichever of the two is longer.
+    next_round: u64,
 }
 
-/// The next try of a holder's units, after one at `slot` that came to
-/// `outcome` (none when nothing was sent): a send that landed and failed paid
-/// its fee and served nothing, so the wait doubles, up to
-/// [`MOST_SLOTS_BETWEEN_TRIES`] slots; anything else is tried again next
-/// slot, the wait kept, as a refusal costs nothing.
-fn next_units_try(before: Option<(u64, u64)>, outcome: Option<Outcome>, slot: u64) -> (u64, u64) {
+/// Whether a holder's units are tried in `slot` and the keeper's round
+/// `round`, after the try `before`.
+fn units_due(before: Option<UnitsTry>, slot: u64, round: u64) -> bool {
+    before.is_none_or(|before| slot >= before.next && round >= before.next_round)
+}
+
+/// The next try of a holder's units, after one at `slot` in the keeper's
+/// round `round` that came to `outcome` (none when nothing was sent), the
+/// vault's slots `interval` apart: a send that landed and failed paid its fee
+/// and served nothing, so the wait doubles, up to
+/// [`MOST_SECONDS_BETWEEN_REVERTS`], and is as many of the keeper's rounds
+/// too; anything else is tried again next slot, the wait kept, as a refusal
+/// costs nothing.
+fn next_units_try(
+    before: Option<UnitsTry>,
+    outcome: Option<Outcome>,
+    slot: u64,
+    interval: u64,
+    round: u64,
+) -> UnitsTry {
+    let kept = before.map_or(1, |before| before.wait);
     match outcome {
         Some(Outcome::Reverted) => {
-            let wait = before.map_or(1, |(_, wait)| (wait * 2).clamp(1, MOST_SLOTS_BETWEEN_TRIES));
-            (slot + wait, wait)
+            let most = (MOST_SECONDS_BETWEEN_REVERTS / interval.max(1)).max(1);
+            let wait = before.map_or(1, |before| (before.wait * 2).clamp(1, most));
+            UnitsTry {
+                next: slot + wait,
+                wait,
+                next_round: round + wait,
+            }
         }
-        _ => (slot + 1, before.map_or(1, |(_, wait)| wait)),
+        _ => UnitsTry {
+            next: slot + 1,
+            wait: kept,
+            next_round: round,
+        },
     }
 }
 
@@ -847,7 +878,7 @@ impl Keeping {
         let vault = self.platform.vault(&self.client, address).await?;
         let slot = slot_of(now, vault.timers.slot_interval);
         let before = memory.units_tried.get(owner).copied();
-        if !units_due(before, slot) {
+        if !units_due(before, slot, memory.rounds) {
             return Ok(false);
         }
         // Refused while a valuation's settlement is owed: not sent.
@@ -884,9 +915,16 @@ impl Keeping {
                 }
             }
         }
-        memory
-            .units_tried
-            .insert(*owner, next_units_try(before, outcome, slot));
+        memory.units_tried.insert(
+            *owner,
+            next_units_try(
+                before,
+                outcome,
+                slot,
+                vault.timers.slot_interval,
+                memory.rounds,
+            ),
+        );
         Ok(false)
     }
 
@@ -2018,30 +2056,83 @@ mod tests {
     }
 
     #[test]
-    fn a_holder_s_units_are_tried_once_a_slot_and_ever_less_often_after_serves_that_landed_and_failed()
+    fn a_holder_s_units_are_tried_once_a_slot_and_ever_less_often_in_slots_and_rounds_after_serves_that_landed_and_failed()
      {
-        assert!(units_due(None, 5));
+        // Slots a minute apart: an hour is sixty of them.
+        let interval = 60;
+        assert!(units_due(None, 5, 0));
         let mut tried = None;
         let mut waits = Vec::new();
-        let mut slot = 10;
-        for _ in 0..8 {
-            assert!(units_due(tried, slot));
-            let next = next_units_try(tried, Some(Outcome::Reverted), slot);
-            assert!(!units_due(Some(next), slot), "tried again in the same slot");
-            waits.push(next.1);
-            slot = next.0;
+        let (mut slot, mut round) = (10, 3);
+        for _ in 0..9 {
+            assert!(units_due(tried, slot, round));
+            let next = next_units_try(tried, Some(Outcome::Reverted), slot, interval, round);
+            assert!(
+                !units_due(Some(next), slot, round),
+                "tried again in the same slot"
+            );
+            // A clock that runs fast passes the wait in slots within a round:
+            // the rounds hold the try back as long.
+            assert!(
+                !units_due(Some(next), next.next + 1_000, round + next.wait - 1),
+                "tried again before as many rounds passed"
+            );
+            assert!(
+                !units_due(Some(next), next.next - 1, round + 1_000),
+                "tried again before as many slots passed"
+            );
+            assert!(units_due(Some(next), next.next, round + next.wait));
+            waits.push(next.wait);
+            slot = next.next;
+            round = next.next_round;
             tried = Some(next);
         }
-        assert_eq!(waits, [1, 2, 4, 8, 16, 32, 64, 64]);
-        // A refusal costs nothing: next slot, the wait kept for the next
-        // that lands and fails.
-        let refused = next_units_try(tried, Some(Outcome::Refused), 500);
-        assert_eq!(refused, (501, MOST_SLOTS_BETWEEN_TRIES));
-        assert_eq!(next_units_try(None, Some(Outcome::NotSent), 7), (8, 1));
-        assert_eq!(next_units_try(Some((3, 4)), None, 7), (8, 4));
+        assert_eq!(waits, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+        // A refusal costs nothing: next slot and any round, the wait kept
+        // for the next that lands and fails.
+        let refused = next_units_try(tried, Some(Outcome::Refused), 500, interval, 9);
         assert_eq!(
-            next_units_try(Some((0, 4)), Some(Outcome::Reverted), 7),
-            (15, 8)
+            refused,
+            UnitsTry {
+                next: 501,
+                wait: 60,
+                next_round: 9
+            }
+        );
+        assert!(units_due(Some(refused), 501, 9));
+        assert_eq!(
+            next_units_try(None, Some(Outcome::NotSent), 7, interval, 2),
+            UnitsTry {
+                next: 8,
+                wait: 1,
+                next_round: 2
+            }
+        );
+        let waited = UnitsTry {
+            next: 0,
+            wait: 4,
+            next_round: 0,
+        };
+        assert_eq!(
+            next_units_try(Some(waited), None, 7, interval, 2),
+            UnitsTry {
+                next: 8,
+                wait: 4,
+                next_round: 2
+            }
+        );
+        assert_eq!(
+            next_units_try(Some(waited), Some(Outcome::Reverted), 7, interval, 2),
+            UnitsTry {
+                next: 15,
+                wait: 8,
+                next_round: 10
+            }
+        );
+        // Slots longer than an hour still wait one.
+        assert_eq!(
+            next_units_try(Some(waited), Some(Outcome::Reverted), 7, 2 * 60 * MINUTE, 2).wait,
+            1
         );
     }
 

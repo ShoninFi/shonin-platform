@@ -38,7 +38,7 @@ pub mod upkeep;
 
 pub use anchor_lang::prelude::{AccountMeta, Pubkey};
 pub use anchor_lang::solana_program::instruction::Instruction;
-pub use client::{Landed, NeverLanded, SolanaClient, TransactionFailed};
+pub use client::{Landed, MayStillLand, NeverLanded, SolanaClient, TransactionFailed};
 pub use events::{Called, TransactionRecord};
 pub use platform::Platform;
 pub use solana_keypair::Keypair;

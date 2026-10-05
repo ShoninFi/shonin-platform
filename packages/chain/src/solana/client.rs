@@ -45,6 +45,10 @@ const RESEND: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a lookup table just grown is waited on to be usable.
 const WARM_UP_TIMEOUT: Duration = Duration::from_secs(60);
+/// How many times a known lookup table the node answers nothing for is read
+/// before the key's tables are searched for again: a node behind the
+/// cluster answers nothing for an account that is there.
+const TABLE_READS: usize = 5;
 
 /// The public clusters' genesis hashes: a key naming one of them must be
 /// answered by it, and a key naming a local cluster must not be answered by
@@ -114,6 +118,23 @@ impl std::fmt::Display for NeverLanded {
 }
 
 impl std::error::Error for NeverLanded {}
+
+/// A send the node stopped answering about before it landed or its
+/// blockhash expired: it may still land, and its fee be paid, later.
+#[derive(Clone, Debug)]
+pub struct MayStillLand {
+    pub signature: String,
+}
+
+impl std::fmt::Display for MayStillLand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "transaction {} may still land: the node stopped answering",
+            self.signature
+        )
+    }
+}
 
 enum Watch {
     Landed,
@@ -444,9 +465,7 @@ impl SolanaClient {
                 // watched until it does, its blockhash expires, or the
                 // node stays silent too long to say.
                 Err(error) if started.elapsed() > LANDING_TIMEOUT => {
-                    return Err(error.context(format!(
-                        "transaction {signature} may still land: the node stopped answering"
-                    )));
+                    return Err(error.context(MayStillLand { signature }));
                 }
                 Err(_) => {}
             }
@@ -602,22 +621,33 @@ impl SolanaClient {
             *held = Some(self.find_tables(payer).await);
         }
         let known = held.get_or_insert_with(Vec::new);
-        *known = self.read_tables(payer, known).await?;
+        let (readable, unread) = self.read_tables(payer, known).await?;
+        *known = readable.iter().chain(&unread).cloned().collect();
 
-        if let Some(table) = known.iter().find(|table| table.ready_for(&wanted)) {
+        if let Some(table) = readable.iter().find(|table| table.ready_for(&wanted)) {
             return Ok((Some(table.clone()), Vec::new()));
         }
-        if let Some(table) = known.iter().find(|table| table.holds(&wanted)).cloned() {
+        if let Some(table) = readable.iter().find(|table| table.holds(&wanted)).cloned() {
             let table = self.warmed_up(payer, &table, table.extended_in).await?;
             replace(known, &table);
             return Ok((Some(table), Vec::new()));
+        }
+        if !unread.is_empty() {
+            let unread: Vec<String> = unread
+                .iter()
+                .map(|table| table.address.to_string())
+                .collect();
+            bail!(
+                "{payer}'s lookup tables {} could not be read just now: no new one is made while they may still be there",
+                unread.join(", ")
+            );
         }
         let Some(builder) = builder else {
             bail!("the transaction needs a lookup table {payer} has not made yet");
         };
 
         let mut setup = Vec::new();
-        let (address, before, adding) = match tables::to_extend(known, &wanted) {
+        let (address, before, adding) = match tables::to_extend(&readable, &wanted) {
             Some(table) => (
                 table.address,
                 table.addresses.clone(),
@@ -650,18 +680,16 @@ impl SolanaClient {
                 .copied()
                 .collect::<Vec<_>>(),
         );
-        let table = self
-            .warmed_up(
-                payer,
-                &Table {
-                    address,
-                    addresses: expected,
-                    usable: 0,
-                    extended_in: last,
-                },
-                last,
-            )
-            .await?;
+        // Known before it is waited on, so a wait that ends without reading
+        // it leaves the next send to read it rather than make another.
+        let grown = Table {
+            address,
+            addresses: expected,
+            usable: 0,
+            extended_in: last,
+        };
+        replace(known, &grown);
+        let table = self.warmed_up(payer, &grown, last).await?;
         if !table.ready_for(&wanted) {
             bail!(
                 "the lookup table {address} was grown and does not hold the transaction's accounts"
@@ -706,29 +734,79 @@ impl SolanaClient {
     }
 
     /// `known` as the cluster holds each table now, with every address it
-    /// held before still at its index; one that is gone, not `payer`'s,
-    /// deactivated or changed is dropped and never used again.
-    async fn read_tables(&self, payer: &Pubkey, known: &[Table]) -> Result<Vec<Table>> {
+    /// held before still at its index; and those that could not be read,
+    /// as they were. One that is not `payer`'s, deactivated or changed is
+    /// dropped and never used again. One the node answers nothing for is
+    /// read again a few times, and then looked for among `payer`'s tables:
+    /// it is dropped only if that search finds it gone, and kept unread if
+    /// the node won't search.
+    async fn read_tables(
+        &self,
+        payer: &Pubkey,
+        known: &[Table],
+    ) -> Result<(Vec<Table>, Vec<Table>)> {
         if known.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let addresses: Vec<Pubkey> = known.iter().map(|table| table.address).collect();
-        let accounts = self.rpc.accounts(&addresses).await?;
+        let mut accounts = self.rpc.accounts(&addresses).await?;
+        for _ in 1..TABLE_READS {
+            let missing: Vec<usize> = (0..accounts.len())
+                .filter(|at| accounts[*at].is_none())
+                .collect();
+            if missing.is_empty() {
+                break;
+            }
+            tokio::time::sleep(POLL).await;
+            let again: Vec<Pubkey> = missing.iter().map(|at| addresses[*at]).collect();
+            for (at, account) in missing.into_iter().zip(self.rpc.accounts(&again).await?) {
+                accounts[at] = account;
+            }
+        }
+        let mut searched = false;
+        if accounts.iter().any(Option::is_none) {
+            match self
+                .rpc
+                .program_accounts(&tables::PROGRAM, &tables::owned_by(payer))
+                .await
+            {
+                Ok(found) => {
+                    searched = true;
+                    for (address, account) in found {
+                        if let Some(at) = addresses.iter().position(|known| *known == address)
+                            && accounts[at].is_none()
+                        {
+                            accounts[at] = Some(account);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%payer, error = format!("{error:#}"), "the node would not find the key's lookup tables")
+                }
+            }
+        }
         let slot = self.rpc.slot().await?;
-        let mut out = Vec::new();
+        let (mut readable, mut unread) = (Vec::new(), Vec::new());
         for (was, account) in known.iter().zip(accounts) {
-            let read = account
-                .ok_or_else(|| anyhow!("the lookup table {} is gone", was.address))
-                .and_then(|account| Table::read(was.address, &account, payer, slot))
+            let Some(account) = account else {
+                if searched {
+                    tracing::warn!(%payer, table = %was.address, "a lookup table is gone: neither read nor found");
+                } else {
+                    tracing::warn!(%payer, table = %was.address, "a lookup table could not be read: kept");
+                    unread.push(was.clone());
+                }
+                continue;
+            };
+            let read = Table::read(was.address, &account, payer, slot)
                 .and_then(|table| table.agrees_with(&was.addresses).map(|()| table));
             match read {
-                Ok(table) => out.push(table),
+                Ok(table) => readable.push(table),
                 Err(error) => {
                     tracing::warn!(%payer, error = format!("{error:#}"), "a lookup table refused")
                 }
             }
         }
-        Ok(out)
+        Ok((readable, unread))
     }
 
     /// `table` read again once the cluster is past `slot`, the slot it was
@@ -738,11 +816,11 @@ impl SolanaClient {
         let started = Instant::now();
         loop {
             let now = self.rpc.slot().await?;
-            if now > slot {
-                let account =
-                    self.rpc.account(&table.address).await?.ok_or_else(|| {
-                        anyhow!("the lookup table {} is not there", table.address)
-                    })?;
+            // A node behind the cluster answers nothing for a table that
+            // is there: it is asked again until the wait is over.
+            if now > slot
+                && let Some(account) = self.rpc.account(&table.address).await?
+            {
                 let read = Table::read(table.address, &account, payer, now)?;
                 read.agrees_with(&table.addresses)?;
                 if read.usable >= table.addresses.len() {
@@ -751,7 +829,7 @@ impl SolanaClient {
             }
             if started.elapsed() > WARM_UP_TIMEOUT {
                 bail!(
-                    "the lookup table {} never became usable: the cluster stayed at slot {now}",
+                    "the lookup table {} never became usable: the cluster stayed at slot {now}, or the node never read it",
                     table.address
                 );
             }
