@@ -160,6 +160,7 @@ jobs:
           cargo test -p shonin-chain --features solana \
             --test solana_on_a_local_cluster \
             --test solana_a_station_with_three_drivers_is_activated_and_closed_through_lookup_tables \
+            --test solana_units_the_fallback_leaves_are_served_or_freeze_the_vault_and_a_longer_restricted_list_is_read_again \
             -- --nocapture 2>&1 | tee "$RUNNER_TEMP/cluster-tests.log"
           if grep -F ': skipping' "$RUNNER_TEMP/cluster-tests.log"; then
             echo "::error::a cluster test skipped instead of running"
