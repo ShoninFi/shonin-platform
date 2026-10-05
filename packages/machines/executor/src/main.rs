@@ -11,12 +11,15 @@
 //! anyone may, and one loop doing it means no two race for the same slot.
 
 mod ceilings;
+mod data;
 mod feed;
 mod health;
 mod host;
+mod net;
 mod runner;
 mod scale;
 mod solana;
+mod state;
 mod usage;
 mod watch;
 
@@ -63,6 +66,10 @@ struct Args {
     /// The most of each allowance one agent is given here.
     #[command(flatten)]
     ceilings: ceilings::Ceilings,
+    /// Hyperliquid's public WebSocket, which the shared Hyperliquid stream
+    /// reads from: its testnet's unless the network is mainnet.
+    #[arg(long, env = "SHONIN_HYPERLIQUID_STREAM")]
+    hyperliquid_stream: Option<String>,
 }
 
 #[tokio::main]
@@ -73,6 +80,14 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    data::configure(args.hyperliquid_stream.clone().unwrap_or_else(|| {
+        if args.chain_args.network == chain::NetworkName::Mainnet {
+            data::HYPERLIQUID_MAINNET
+        } else {
+            data::HYPERLIQUID_TESTNET
+        }
+        .to_string()
+    }));
     // The EVM chains and the Solana clusters to serve. A Solana vault chain
     // named alone is served alone.
     let solana_targets = args.chain_args.solana_targets()?;
@@ -203,6 +218,10 @@ async fn main() -> Result<()> {
     while chains.join_next().await.is_some() {}
     Ok(())
 }
+
+/// The capability a manifest declares to be given requests and WebSockets
+/// to any host.
+pub const NETWORK: &str = "network";
 
 /// How many blocks deep a vault's collected figure is read, on a chain whose
 /// config gives none.
@@ -1162,6 +1181,7 @@ async fn serve(
             }),
             home_chain: vault_chain.name().to_string(),
             driver: recorded.driver.clone(),
+            network: recorded.network,
             allowances,
             halting_heard: halting_heard.clone(),
             running: running.clone(),
@@ -2063,6 +2083,8 @@ async fn finished(chain: &Client, vault: Address) -> Result<bool> {
 struct Recorded {
     /// The driver the agent trades through.
     driver: String,
+    /// Whether the manifest declares `network`.
+    network: bool,
     /// The hash of the component the bundle was built to: the only bytes
     /// that may be run for it.
     component_hash: String,
@@ -2130,6 +2152,11 @@ fn recorded_in(
     };
     Ok(Recorded {
         driver,
+        network: canonical
+            .manifest
+            .capabilities
+            .iter()
+            .any(|declared| declared == NETWORK),
         component_hash: canonical.component_hash,
     })
 }
@@ -2499,6 +2526,7 @@ mod tests {
             api_url: "http://127.0.0.1:9".to_string(),
             port: None,
             ceilings: Default::default(),
+            hyperliquid_stream: None,
         }
     }
 
@@ -3312,6 +3340,7 @@ mod tests {
             }),
             home_chain: "base".to_string(),
             driver: "local".to_string(),
+            network: false,
             allowances: shared::Allowances::modest(),
             halting_heard: Default::default(),
             running: running.clone(),

@@ -54,9 +54,14 @@ rpc = "https://sepolia.base.org"
 dollar = "USDC"
 native_usd = 0.0
 
+# Every free public endpoint for HyperEVM's testnet limits how fast one
+# address may ask, and a whole stack on one machine passes any one of their
+# limits within minutes, so the testnet names three: the client sends each
+# request to whichever has answered best lately and moves off one that starts
+# refusing. A browser is handed the first, Hyperliquid's own.
 [chains."evm:998"]
 label = "Hyperliquid testnet"
-rpc = "https://rpc.hyperliquid-testnet.xyz/evm"
+rpc = "https://rpc.hyperliquid-testnet.xyz/evm https://hyperliquid-testnet.drpc.org https://rpcs.chain.link/hyperevm/testnet"
 dollar = "USDC"
 native_usd = 0.0
 

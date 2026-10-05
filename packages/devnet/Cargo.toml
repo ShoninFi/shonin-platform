@@ -19,6 +19,10 @@ devnet = ["chain/devnet"]
 
 [dependencies]
 shared.workspace = true
+hyperliquid.workspace = true
+shonin-attestation-core = { path = "../attestation/core" }
+shonin-attestation-deploy = { path = "../attestation/deploy" }
+toml.workspace = true
 chain = { workspace = true, features = ["args"] }
 alloy.workspace = true
 anyhow.workspace = true

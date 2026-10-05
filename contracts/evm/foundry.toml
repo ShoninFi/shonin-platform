@@ -16,6 +16,10 @@ bytecode_hash = "none"
 remappings = [
     "forge-std/=lib/forge-std/src/",
     "openzeppelin/=lib/openzeppelin-contracts/contracts/",
+    # RISC Zero's verifier contracts, vendored at their release tag; they
+    # import OpenZeppelin by its package root.
+    "risc0/=lib/risc0-ethereum/contracts/src/",
+    "lib/risc0-ethereum/:openzeppelin/=lib/openzeppelin-contracts/",
 ]
 
 # What `forge test` (and so CI) runs: every fuzz test 256 times, which keeps

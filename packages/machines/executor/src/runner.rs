@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
+use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::WasiCtxBuilder;
 
@@ -55,6 +55,9 @@ pub struct Runner {
     pub home_chain: String,
     /// The driver this agent's manifest named.
     pub driver: String,
+    /// Whether the manifest declares `network`: requests and WebSockets to
+    /// any host.
+    pub network: bool,
     /// What the manifest declared and the vault's tank is charged for. The
     /// host holds the strategy to it rather than to one figure for everyone.
     pub allowances: shared::Allowances,
@@ -108,12 +111,15 @@ impl Runner {
         let component = COMPILED.get(engine, component)?;
 
         let mut linker: Linker<Ctx> = Linker::new(engine);
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker)
-            .map_err(|error| anyhow!("the WASI imports: {error}"))?;
-        Agent::add_to_linker::<_, HasSelf<Ctx>>(&mut linker, |ctx| ctx)
-            .map_err(|error| anyhow!("the platform's imports: {error}"))?;
+        crate::host::link(&mut linker)?;
 
         let (fuel, memory_mib) = enforced(&self.allowances);
+        let (state, net) = services(
+            self.network,
+            &self.allowances,
+            &self.home_chain,
+            &self.place.vault(),
+        );
         let mut store = Store::new(
             engine,
             Ctx {
@@ -122,12 +128,18 @@ impl Runner {
                 wasi: WasiCtxBuilder::new()
                     .inherit_stdout()
                     .inherit_stderr()
+                    .allow_tcp(false)
+                    .allow_udp(false)
+                    .allow_ip_name_lookup(false)
                     .build(),
                 table: handle_table(),
                 place: self.place.clone(),
                 home_chain: self.home_chain.clone(),
                 driver: self.driver.clone(),
-                cache: Default::default(),
+                state,
+                http: Default::default(),
+                http_hooks: crate::net::Http { net: net.clone() },
+                net,
                 account_events: Some(account_events),
                 vault_events: Some(vault_events),
                 counters: counters.clone(),
@@ -199,6 +211,24 @@ impl Runner {
         }
         Ok(Stopped::Faulted)
     }
+}
+
+/// What a start of an agent is given besides its imports: its state, empty
+/// at every start, so an agent rebuilds from the venue; and its network,
+/// whose usage is the vault's and carries on from one start to the next.
+pub fn services(
+    network: bool,
+    allowances: &shared::Allowances,
+    home_chain: &str,
+    vault: &str,
+) -> (crate::state::Store, crate::net::Net) {
+    let net = crate::net::Net {
+        declared: network,
+        quotas: crate::net::Quotas::of(allowances),
+        usage: crate::net::usage_of(home_chain, vault),
+        reach: crate::net::Reach::Public,
+    };
+    (crate::state::Store::default(), net)
 }
 
 /// How many compiled components are kept: the few last started.
@@ -375,6 +405,31 @@ mod tests {
             .get(&super::engine().unwrap(), &a_component(1))
             .unwrap();
         assert_eq!(compiles(), 5);
+    }
+
+    #[test]
+    fn an_agent_started_again_has_empty_state_and_its_vault_s_bandwidth_so_far() {
+        let allowances = shared::Allowances::modest();
+        let (mut state, net) = services(true, &allowances, "base", "0xrestarted");
+        state.set("state", "peak", b"100".to_vec()).unwrap();
+        net.usage
+            .bytes(&net.quotas, 1_000, std::time::Instant::now())
+            .unwrap();
+        assert!(net.declared);
+
+        // Started again: nothing kept in state, the day's bytes still counted.
+        let (state, net) = services(true, &allowances, "base", "0xrestarted");
+        assert_eq!(state.get("state", "peak"), None);
+        assert_eq!(net.usage.bytes_today(), 1_000);
+        // Held to the vault's allowances.
+        assert_eq!(net.quotas.per_minute, allowances.requests_per_min);
+        assert_eq!(net.quotas.open, allowances.streams);
+        assert_eq!(net.quotas.per_day, allowances.bytes_per_day);
+        assert_eq!(
+            net.reach,
+            crate::net::Reach::Public,
+            "an agent can reach inside the machine"
+        );
     }
 
     #[test]

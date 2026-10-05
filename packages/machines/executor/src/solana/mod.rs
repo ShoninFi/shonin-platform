@@ -470,6 +470,7 @@ impl Cluster {
                 place: Place::Solana(shared.trading.clone()),
                 home_chain: shared::Chain::Solana.name().to_string(),
                 driver: recorded.driver.clone(),
+                network: recorded.network,
                 allowances,
                 halting_heard: halting_heard.clone(),
                 running: shared.running.clone(),

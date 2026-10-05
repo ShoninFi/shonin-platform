@@ -1,0 +1,13 @@
+[package]
+name = "shonin-attestation-methods"
+description = "The attestation guest, built for the RISC Zero zkVM: its ELF and its image id."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[build-dependencies]
+risc0-build = "3.0.6"
+
+[package.metadata.risc0]
+methods = ["guest"]

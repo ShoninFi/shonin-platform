@@ -12,7 +12,12 @@ interface types {
     variant verdict {
         /// Its receipt: a fill, an order id, whatever the venue returns.
         accepted(payload),
+        /// It was refused, or could not be sent at all: nothing happened.
         rejected(string),
+        /// It was sent and no answer came back, so it may still land. Read
+        /// the account before acting as though it didn't: sending it again
+        /// could do it twice.
+        unknown(string),
     }
 }
 
@@ -59,24 +64,59 @@ interface transfers {
         amount: u64,
     }
 
+    /// Where a move stopped short, and why.
+    record partial-move {
+        /// The vault's own account the money reached on the way, and is in
+        /// now.
+        reached: account,
+        /// Why it went no further.
+        reason: string,
+        /// Whether the step after `reached` was sent and went unanswered, in
+        /// which case it may still land and the money may yet arrive.
+        may-still-land: bool,
+    }
+
+    /// How far a move got.
+    variant moved {
+        /// All of it arrived where it was going.
+        done,
+        /// None of it moved: the contracts refused, or it could not be sent.
+        refused(string),
+        /// It was sent and no answer came back, so it may still land. Read
+        /// the balances before moving the same money again.
+        unknown(string),
+        /// It took more than one step and stopped on the way, in one of the
+        /// vault's own accounts.
+        partial(partial-move),
+    }
+
     /// The vault's own chain.
     home-chain: func() -> string;
     /// Move between two accounts on one chain. Moving from the vault's cash
     /// to a venue goes through the station on the way.
-    move: async func(source: account, destination: account, amount: u64) -> result<_, string>;
+    move: async func(source: account, destination: account, amount: u64) -> moved;
     /// Send a station's idle dollars over a declared bridge to the same
     /// station on another chain.
-    bridge: async func(name: string, source-chain: string, destination-chain: string, amount: u64) -> result<_, string>;
+    bridge: async func(name: string, source-chain: string, destination-chain: string, amount: u64) -> moved;
     /// What each of the vault's accounts holds now.
     balances: async func() -> list<balance>;
 }
 
 /// What the vault tells the agent about itself.
 interface vault {
+    /// A withdrawal the vault's cash couldn't pay.
+    record claim {
+        /// The vault's own number for it.
+        id: u64,
+        /// The fraction of every position being closed to pay it, in parts
+        /// per 10^18 (so 10^18 is the whole vault).
+        fraction: u64,
+    }
+
     variant vault-event {
-        /// A depositor is leaving and their fraction is being closed. The
-        /// payload carries which fraction.
-        claim-pending(list<u8>),
+        /// A depositor is leaving and their fraction of every position is
+        /// being closed.
+        claim-pending(claim),
         /// The vault is stopping. The agent has a grace period to unwind
         /// itself before the contract does it.
         halting(string),
@@ -89,22 +129,49 @@ interface vault {
     events: func() -> stream<vault-event>;
 }
 
-/// Reads the executor makes for the agent: prices, order books. Each call is
-/// read from the chain as it is made; nothing is yet cached or shared between
-/// agents, and no quota holds an agent's reads down.
+/// Shonin's shared data: reads the executor makes for the agent, and the
+/// venues' streams, each read once for every agent on the machine.
 interface data {
-    use types.{driver-name, payload};
+    use types.{payload};
 
+    /// One value from a shared stream.
+    record stamped {
+        /// When the executor received it, in milliseconds since the Unix
+        /// epoch, by the machine's clock.
+        received-ms: u64,
+        /// When the source says it was made, where the source says so.
+        source-ms: option<u64>,
+        /// The value, in the payload format the SDK reads for that source.
+        value: payload,
+    }
+
+    /// A read made now, such as the stand-in venue's markets.
     query: async func(source: string, request: payload) -> result<payload, string>;
-    subscribe: func(driver: driver-name, feed: payload) -> result<stream<payload>, string>;
+    /// One of Shonin's shared streams: `source` names the venue (such as
+    /// `hyperliquid`), and `feed` says which of its feeds, built with the
+    /// SDK. The executor holds one connection per venue, whoever listens, so
+    /// an agent never meets the venue's limits on connections. Nothing is
+    /// promised about freshness beyond each value's own stamps; a value an
+    /// agent is too slow to read may be dropped for a newer one.
+    subscribe: func(source: string, feed: payload) -> result<stream<stamped>, string>;
 }
 
-/// A socket to any host, terminated by the executor so the agent never
-/// holds a certificate or a key.
+/// A WebSocket to any host, outbound only. The executor ends TLS, so the
+/// agent never holds a socket or a certificate; it reconnects nothing on the
+/// agent's behalf. Connections, message sizes and the message rate are held
+/// to the vault's allowances, and every byte counts against its bandwidth.
+/// An agent opens them only if its manifest declares `network`.
 interface websocket {
+    variant message {
+        text(string),
+        binary(list<u8>),
+    }
+
     resource connection {
-        send: async func(message: list<u8>) -> result<_, string>;
-        messages: func() -> stream<list<u8>>;
+        send: async func(message: message) -> result<_, string>;
+        /// What the host sends, until it closes the connection or the
+        /// connection fails.
+        messages: func() -> stream<message>;
     }
 
     connect: async func(url: string, headers: list<tuple<string, string>>) -> result<connection, string>;
@@ -114,14 +181,6 @@ interface websocket {
 /// nobody, including the platform, can read them.
 interface secrets {
     get: func(name: string) -> option<string>;
-}
-
-/// A per-agent cache. It usually survives a restart and is promised to
-/// nobody: an agent rebuilds what it needs from the venue's own state.
-interface state {
-    get: func(key: string) -> option<list<u8>>;
-    set: func(key: string, value: list<u8>);
-    delete: func(key: string);
 }
 
 /// Running a model the bundle carries. Inference is budgeted, and going over
@@ -158,6 +217,18 @@ interface inference {
 
 /// One long-lived program. The host starts `run` once and never schedules it
 /// again: everything the agent does, it does inside that call.
+///
+/// Besides Shonin's own interfaces, the agent has the standard WASI packages
+/// under `deps/` (unchanged from the WASI project):
+///
+/// - `wasi:keyvalue` is the agent's state: 64 MiB, counted as the bytes of
+///   every key (with its bucket's name) and value, a write past it refused.
+///   It starts empty every time the agent starts, so an agent always
+///   rebuilds what matters from the venue.
+/// - `wasi:http` sends requests to any host, outbound only, under the same
+///   quotas as `websocket`, if the manifest declares `network`.
+/// - clocks, randomness and somewhere to print, from the WASI 0.2 packages.
+///   No filesystem, no environment and no sockets of its own.
 world agent {
     import types;
     import drivers;
@@ -165,9 +236,12 @@ world agent {
     import vault;
     import data;
     import websocket;
-    import state;
     import inference;
     import secrets;
+    import wasi:keyvalue/store@0.2.0-draft;
+    import wasi:keyvalue/atomics@0.2.0-draft;
+    import wasi:keyvalue/batch@0.2.0-draft;
+    import wasi:http/outgoing-handler@0.2.12;
 
     export run: async func() -> result<_, string>;
 }

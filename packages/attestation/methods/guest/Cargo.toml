@@ -1,0 +1,23 @@
+[package]
+name = "shonin-attestation-guest"
+version = "0.1.0"
+edition = "2024"
+license = "BUSL-1.1"
+publish = false
+
+# Built for the zkVM by the methods crate, in a workspace of its own.
+[workspace]
+
+[dependencies]
+risc0-zkvm = { version = "3.0.6", default-features = false, features = ["std"] }
+shonin-attestation-core = { path = "../../core" }
+
+# RISC Zero's accelerated forks of the same versions: SHA-256 and RSA run on
+# the zkVM's precompiles, which keeps the whole check near 310,000 cycles.
+[patch.crates-io]
+sha2 = { git = "https://github.com/risc0/RustCrypto-hashes", tag = "sha2-v0.10.9-risczero.0" }
+rsa = { git = "https://github.com/risc0/RustCrypto-RSA", tag = "v0.9.9-risczero.0" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

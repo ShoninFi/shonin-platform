@@ -119,7 +119,15 @@ impl ChainArgs {
     /// Every Solana vault chain this service serves: the one named, if it is
     /// a Solana one, or every Solana vault chain of the network. The EVM
     /// chains are [`ChainArgs::targets`]'s.
+    ///
+    /// With [`WITHOUT_SOLANA`] set, none: the service serves the EVM chains
+    /// alone, which any build may, whatever network its Solana program ids
+    /// are for. It is a choice made out loud; a service is never left
+    /// quietly not serving a cluster of its network.
     pub fn solana_targets(&self) -> Result<Vec<Target>> {
+        if without_solana() {
+            return Ok(Vec::new());
+        }
         let configs = ChainConfigs::load(&self.chains)?;
         let wanted: Vec<Chain> = match self.vault_chain {
             Some(chain) => vec![chain],
@@ -200,6 +208,14 @@ impl ChainArgs {
             configs: configs.clone(),
         })
     }
+}
+
+/// Set (to anything but empty or `0`), a service serves the EVM chains of its
+/// network alone and no Solana cluster.
+pub const WITHOUT_SOLANA: &str = "SHONIN_WITHOUT_SOLANA";
+
+fn without_solana() -> bool {
+    std::env::var(WITHOUT_SOLANA).is_ok_and(|value| !value.is_empty() && value != "0")
 }
 
 /// The network whose Solana program ids this build compiled in, by the

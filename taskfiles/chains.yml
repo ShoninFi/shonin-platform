@@ -67,6 +67,17 @@ tasks:
       - "{{.DEVNET}} deploy"
 
   accounts:
-    desc: "Each role's account and gas on every EVM chain, and the Solana deployer: what to fund on a testnet"
+    desc: "Each role's account and gas on every EVM chain, the funders and what they need, and the Solana deployer and roles (NETWORK=testnet)"
     cmds:
       - "{{.DEVNET}} accounts"
+
+  checker:
+    desc: "Deploy the Confidential Space checker and propose it beside the development checker on every EVM chain of the network (local or NETWORK=testnet)"
+    cmds:
+      - task: :contracts:build
+      - "{{.DEVNET}} propose-checker"
+
+  fund:
+    desc: "Top every role up on every EVM testnet from the funder, buying HYPE on HyperCore for HyperEVM; safe to run again (NETWORK=testnet only)"
+    cmds:
+      - "{{.DEVNET}} fund"

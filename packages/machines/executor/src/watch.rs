@@ -13,14 +13,14 @@ use anyhow::Result;
 use chain::Client;
 use chain::bindings::vault::{ClaimState, IVault, RequestKind};
 use chain::bindings::venue::ILocalVenue;
-use strategy_sdk::{AccountEvent, ClaimPending, Side};
+use strategy_sdk::{AccountEvent, Side};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::host::market_name;
 use crate::scale::{ASSET_DECIMALS, SIZE_DECIMALS, signed_to_decimal, to_decimal};
 
 /// What the vault's stream carries, in the shape the bindings generate.
-pub use crate::host::shonin::agent::vault::VaultEvent;
+pub use crate::host::shonin::agent::vault::{Claim, VaultEvent};
 
 /// Follow one vault: what the venue does to its station's account, and what
 /// the vault says about itself. It reads on from the block `next` holds and
@@ -169,17 +169,14 @@ async fn read(
         if let Ok(booked) = log.log_decode::<IVault::ClaimBooked>() {
             // A depositor is leaving and the cash couldn't pay them: their
             // fraction of every position will be closed. The agent is told
-            // what fraction, so it can rebalance what is left.
+            // which claim and what fraction, so it can rebalance what is
+            // left.
             let supply = chain.read(vault, IVault::totalSupplyCall {}).await?;
-            let fraction = if supply.is_zero() {
-                U256::ZERO
-            } else {
-                booked.inner.data.shares * U256::from(10u64.pow(18)) / supply
-            };
-            news.push(VaultEvent::ClaimPending(strategy_sdk::to_payload(
-                &ClaimPending {
-                    fraction: to_decimal(fraction, SIZE_DECIMALS)?,
-                },
+            let booked = booked.inner.data;
+            news.push(VaultEvent::ClaimPending(claim(
+                booked.claimId,
+                booked.shares,
+                supply,
             )));
         } else if let Ok(halted) = log.log_decode::<IVault::Halted>() {
             news.push(halting(halted.inner.data.reason));
@@ -187,6 +184,24 @@ async fn read(
     }
 
     Ok((account, news))
+}
+
+/// A claim's fraction of the whole vault is in parts of this.
+pub const WHOLE: u64 = 1_000_000_000_000_000_000;
+
+/// The claim an agent is told of: its id, and the fraction of the vault its
+/// shares are, in parts per 10^18 (never more than the whole).
+pub fn claim(id: U256, shares: U256, supply: U256) -> Claim {
+    let whole = U256::from(WHOLE);
+    let fraction = if supply.is_zero() {
+        U256::ZERO
+    } else {
+        (shares.saturating_mul(whole) / supply).min(whole)
+    };
+    Claim {
+        id: u64::try_from(id).unwrap_or(u64::MAX),
+        fraction: u64::try_from(fraction).unwrap_or(WHOLE),
+    }
 }
 
 /// What an agent is told when its vault halts, for the reason the vault gave.
@@ -337,6 +352,20 @@ async fn shortfall(chain: &Client, vault: Address) -> Result<U256> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_claim_carries_its_id_and_its_fraction_of_the_vault() {
+        let pending = claim(U256::from(7), U256::from(25), U256::from(100));
+        assert_eq!(pending.id, 7);
+        assert_eq!(pending.fraction, WHOLE / 4);
+        // Never more than the whole vault, and nothing of an empty one.
+        assert_eq!(
+            claim(U256::from(1), U256::from(300), U256::from(100)).fraction,
+            WHOLE
+        );
+        assert_eq!(claim(U256::from(1), U256::from(3), U256::ZERO).fraction, 0);
+        assert_eq!(claim(U256::MAX, U256::ZERO, U256::from(1)).id, u64::MAX);
+    }
 
     use crate::stand_in;
 

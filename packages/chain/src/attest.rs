@@ -18,6 +18,9 @@ use crate::bindings::attestation::{IAttestationRegistry, ImageKind, KeyInfo};
 use crate::client::{Client, KeyClient, NeverSent, Unanswered};
 use crate::deployments::Deployments;
 
+/// How far before the head's time an attestation is dated.
+const ATTESTED_BEFORE_THE_HEAD: u64 = 60;
+
 /// Who puts a blessing on the chain. Anyone may — the proof is what the
 /// registry checks — but a key that holds its own account sends with it, so
 /// two services never reach for the same account's next nonce at once.
@@ -116,14 +119,19 @@ async fn bless(
         (vault_chain, vault, bundle, this_chain).abi_encode(),
     ));
     // A blessing runs a TTL from when the instance attested, by the chain's
-    // own clock.
+    // own clock, dated a little back: a public RPC is often several nodes
+    // behind one name, and the registry refuses an attestation from after
+    // the block it runs in, which a node a block or two behind the one that
+    // gave the time would be. The blessing is that much shorter, never
+    // longer.
     // Nothing is sent until the registry is asked to bless: a failure before
     // that can't land.
     let issued_at = chain
         .block_timestamp()
         .await
         .context("reading the chain's clock")
-        .map_err(NeverSent::wrap)?;
+        .map_err(NeverSent::wrap)?
+        .saturating_sub(ATTESTED_BEFORE_THE_HEAD);
     let journal: Journal = (image, project_id(), key, root, issued_at);
     let encoded = journal.abi_encode_params();
     let seal = chain

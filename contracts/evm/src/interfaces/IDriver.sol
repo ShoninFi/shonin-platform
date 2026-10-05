@@ -22,7 +22,13 @@ enum ExitPath {
     /// The station, inside the exit band, in the leaver's own transaction.
     Contract,
     /// An unwinder, because the venue's state is not readable on-chain.
-    Unwinder
+    Unwinder,
+    /// The station, but the venue acts on its calls after the transaction
+    /// (a venue that executes queued actions after the block): a close is
+    /// placed in one transaction, proved and swept in a later one, and its
+    /// dollars delivered home once they land. The driver also implements
+    /// `IDelayedDriver`.
+    Delayed
 }
 
 /// How a station's holdings at the venue are valued.
@@ -94,4 +100,31 @@ interface IBridge {
         uint256 amount,
         bytes calldata extra
     ) external view returns (Call[] memory);
+}
+
+/// What a station needs from a driver whose venue acts after the
+/// transaction: a close can't be checked by what it brought home in the same
+/// transaction, so it is checked against the positions instead.
+interface IDelayedDriver {
+    /// What the station holds in each market the driver knows, in the
+    /// venue's own units, in a fixed order: what `closed` compares against.
+    function exposure(address station) external view returns (int256[] memory);
+    /// Whether a close of `fraction` placed when the station held `before`
+    /// has happened: every position it would have ordered is at least that
+    /// much smaller now, on the same side.
+    function closed(
+        address station,
+        int256[] calldata before,
+        uint256 fraction
+    ) external view returns (bool);
+    /// What the station's money parked in the venue's own vaults (`held`) is
+    /// worth.
+    function heldValue(address station, address[] calldata held) external view returns (uint256);
+    /// The calls that bring the station's money in one of the venue's own
+    /// vaults back to its account, as soon as the vault's lock allows (none
+    /// before), and what it holds there now.
+    function reclaim(
+        address station,
+        address held
+    ) external view returns (Call[] memory calls, uint256 equity);
 }

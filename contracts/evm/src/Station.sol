@@ -2,8 +2,8 @@
 pragma solidity ^0.8.30;
 
 import {IAttestationRegistry, ImageKind} from "./interfaces/IAttestationRegistry.sol";
-import {Call, IBridge, IDriver} from "./interfaces/IDriver.sol";
-import {IStation, IStationFactory, IStationVault, Send, StationSpec} from "./interfaces/IStation.sol";
+import {Call, ExitPath, IBridge, IDelayedDriver, IDriver} from "./interfaces/IDriver.sol";
+import {IStation, IStationFactory, IStationVault, Send, Stage, StationSpec} from "./interfaces/IStation.sol";
 import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
 import {SafeERC20} from "openzeppelin/token/ERC20/utils/SafeERC20.sol";
 
@@ -29,6 +29,14 @@ import {Math} from "openzeppelin/utils/math/Math.sol";
 ///
 /// It has no signature function of its own, so nothing a venue accepts from
 /// an account's owner by signature can ever come from a station.
+///
+/// A venue that acts on the station's calls only after the transaction (a
+/// `Delayed` driver) can't be closed and checked in one transaction. There a
+/// claim's close is staged: the closing orders are placed and the claim
+/// waits; in a later block anyone proves the positions shrank and sweeps the
+/// fraction's worth home; once it lands, anyone delivers it to the vault as
+/// cash, which then covers the claim at the next valuation, as a claim on a
+/// vault that trades on other chains waits for its cash.
 contract Station is IStation, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
     using Math for uint256;
@@ -53,6 +61,25 @@ contract Station is IStation, ReentrancyGuardTransient {
     mapping(bytes32 => address) private _pinnedDriver;
     mapping(bytes32 => address) private _pinnedBridge;
     uint64 public stoppedAt;
+    /// The close in progress through delayed drivers, if any.
+    Stage private _stage;
+    /// What each delayed driver's account held when the stage was placed,
+    /// and the worth to sweep home from it once the close is proved.
+    mapping(bytes32 => int256[]) private _stagedExposure;
+    mapping(bytes32 => uint256) private _stagedFreed;
+    /// Money found in a venue's own vaults through a driver, counted in the
+    /// station's value and brought back as the vault's lock allows.
+    mapping(bytes32 => address[]) private _held;
+    /// A driver whose key parked money where the station had to reclaim it
+    /// trades no more; closing and valuing through it still work.
+    mapping(bytes32 => bool) public reclaimed;
+
+    /// How long a staged close has to be proved, and its sweep to land,
+    /// before it lapses: whatever it sold stays in the account, counted as
+    /// before, and a later try places a new one.
+    uint64 public constant STAGE_TIMEOUT = 5 minutes;
+    /// The most venue vaults one driver may have reclaimed from.
+    uint256 private constant MAX_HELD = 8;
 
     error AlreadyInitialized();
     error NotBlessed();
@@ -66,6 +93,8 @@ contract Station is IStation, ReentrancyGuardTransient {
     error NotHalted();
     error BadCall();
     error NoRoute();
+    error NotYet();
+    error NothingHeld();
 
     /// The implementation every station is a clone of is never a station
     /// itself.
@@ -100,6 +129,7 @@ contract Station is IStation, ReentrancyGuardTransient {
     function approveKey(bytes32 driver, address key) external nonReentrant {
         if (stopped) revert AlreadyStopped();
         _declaredDriver(driver);
+        if (reclaimed[driver]) revert NotAllowed();
         if (!_isKey(key, ImageKind.Executor)) revert NotBlessed();
         address implementation = _tradable(driver);
 
@@ -140,7 +170,7 @@ contract Station is IStation, ReentrancyGuardTransient {
         // Once the driver no longer trades, its key goes too.
         address implementation = _pinned(driver);
         if (
-            !stopped && _isKey(key, ImageKind.Executor)
+            !stopped && !reclaimed[driver] && _isKey(key, ImageKind.Executor)
                 && !_registry().isDriverRevoked(driver, implementation)
         ) {
             revert StillBlessed();
@@ -225,6 +255,7 @@ contract Station is IStation, ReentrancyGuardTransient {
             || (stopped && fraction == WAD);
         if (!permitted) revert NotAllowed();
         if (stopped && fraction == WAD) return _unwindStopped(_spec.drivers);
+        if (_anyDelayed()) return _stageClose(fraction);
 
         // Every driver's close is prepared before any is made, so a market
         // outside the band on one venue closes nothing anywhere: a leaver is
@@ -369,12 +400,205 @@ contract Station is IStation, ReentrancyGuardTransient {
         (calls, outside) = driver.close(address(this), WAD, band);
         if (outside) return true;
         address[] memory targets = driver.targets();
+        if (driver.exitPath() == ExitPath.Delayed) {
+            // The venue acts after this transaction: place what is left to
+            // close, and sweep home whatever earlier closes freed. Anyone may
+            // call again until nothing is left; while anything was ordered
+            // the unwind is not done.
+            _run(calls, targets);
+            _run(driver.sweep(address(this), type(uint256).max), targets);
+            return calls.length != 0;
+        }
         IERC20 dollar = _asset();
         uint256 before = dollar.balanceOf(address(this));
         _run(calls, targets);
         _run(driver.sweep(address(this), exitBefore), targets);
         uint256 swept = dollar.balanceOf(address(this)) - before;
         if (swept < exitBefore.mulDiv(BPS - band, BPS)) revert ShortSweep();
+    }
+
+    // Delayed venues --------------------------------------------------------
+
+    /// A close through a delayed driver: every driver's band is checked
+    /// first, as for any close; then a delayed driver's closing orders are
+    /// placed and what its account held is recorded, and any other driver is
+    /// closed and swept as usual, its dollars kept here. Nothing goes home in
+    /// this transaction, and the caller is told the close is not done
+    /// (`blocked`), so a claim waits for the cash.
+    function _stageClose(uint256 fraction) private returns (uint256, bool) {
+        // One at a time: a second try while one is in progress closes
+        // nothing more.
+        if (_stage.stagedAt != 0) {
+            emit Unwound(fraction, 0, true);
+            return (0, true);
+        }
+        uint256 count = _spec.drivers.length;
+        IDriver[] memory drivers = new IDriver[](count);
+        Call[][] memory closes = new Call[][](count);
+        for (uint256 i = 0; i < count; i++) {
+            drivers[i] = IDriver(_pinned(_spec.drivers[i]));
+            bool outside;
+            (closes[i], outside) = drivers[i].close(address(this), fraction, _spec.exitBandBps);
+            if (outside) {
+                emit Unwound(fraction, 0, true);
+                return (0, true);
+            }
+        }
+        IERC20 dollar = _asset();
+        uint256 owed = dollar.balanceOf(address(this)).mulDiv(fraction, WAD, Math.Rounding.Floor);
+        for (uint256 i = 0; i < count; i++) {
+            bytes32 name = _spec.drivers[i];
+            (uint256 markBefore, uint256 exitBefore) = drivers[i].valueOf(address(this));
+            if (fraction < WAD && markBefore <= count + 1) continue;
+            uint256 freed = exitBefore.mulDiv(fraction, WAD, Math.Rounding.Floor);
+            // Under water at the exit side: only a full unwind may sell it.
+            if (freed == 0 && markBefore.mulDiv(fraction, WAD) > (count + 1) * (count + 1) && fraction < WAD)
+            {
+                revert ShortSweep();
+            }
+            address[] memory targets = drivers[i].targets();
+            if (drivers[i].exitPath() == ExitPath.Delayed) {
+                _stagedExposure[name] = IDelayedDriver(address(drivers[i])).exposure(address(this));
+                _stagedFreed[name] = freed;
+                _run(closes[i], targets);
+                owed += freed;
+            } else {
+                uint256 held = dollar.balanceOf(address(this));
+                _run(closes[i], targets);
+                _run(drivers[i].sweep(address(this), freed), targets);
+                uint256 swept = dollar.balanceOf(address(this)) - held;
+                if (swept < freed.mulDiv(BPS - _spec.exitBandBps, BPS) || (swept == 0 && freed != 0)) {
+                    revert ShortSweep();
+                }
+                owed += swept < freed ? swept : freed;
+            }
+        }
+        _stage = Stage({
+            fraction: fraction,
+            owed: owed,
+            stagedAt: uint64(block.timestamp),
+            stagedBlock: uint64(block.number),
+            sweptAt: 0,
+            sweptBlock: 0
+        });
+        emit CloseStaged(fraction, owed);
+        emit Unwound(fraction, 0, true);
+        return (0, true);
+    }
+
+    /// Move a staged close on; anyone may call it. In a block after the
+    /// stage: prove every delayed driver's close happened and sweep the
+    /// fraction's worth home (a close not proved in `STAGE_TIMEOUT` lapses,
+    /// moving nothing). In a block after the sweep: deliver what is owed to
+    /// the vault, once it has all landed or the timeout has passed.
+    function settleClose() external nonReentrant {
+        Stage memory current = _stage;
+        if (current.stagedAt == 0) revert NotAllowed();
+        if (current.sweptBlock == 0) {
+            if (block.number <= current.stagedBlock) revert NotYet();
+            bool proved = true;
+            for (uint256 i = 0; i < _spec.drivers.length && proved; i++) {
+                bytes32 name = _spec.drivers[i];
+                address implementation = _pinned(name);
+                if (IDriver(implementation).exitPath() != ExitPath.Delayed) continue;
+                if (_stagedExposure[name].length == 0) continue;
+                proved = IDelayedDriver(implementation).closed(
+                    address(this), _stagedExposure[name], current.fraction
+                );
+            }
+            if (!proved) {
+                if (block.timestamp < current.stagedAt + STAGE_TIMEOUT) revert NotYet();
+                // Whatever it sold stays in the account, everyone's.
+                _clearStage();
+                emit CloseLapsed(current.fraction);
+                return;
+            }
+            for (uint256 i = 0; i < _spec.drivers.length; i++) {
+                bytes32 name = _spec.drivers[i];
+                if (_stagedFreed[name] == 0) continue;
+                IDriver implementation = IDriver(_pinned(name));
+                _run(implementation.sweep(address(this), _stagedFreed[name]), implementation.targets());
+            }
+            _stage.sweptAt = uint64(block.timestamp);
+            _stage.sweptBlock = uint64(block.number);
+            emit CloseSwept(current.fraction);
+            return;
+        }
+        if (block.number <= current.sweptBlock) revert NotYet();
+        uint256 idle = _asset().balanceOf(address(this));
+        uint256 amount = idle < current.owed ? idle : current.owed;
+        // Wait for the sweep to land, but not for good: a send the venue
+        // dropped leaves the dollars in the account, counted there.
+        if (amount < current.owed && block.timestamp < current.sweptAt + STAGE_TIMEOUT) revert NotYet();
+        _clearStage();
+        if (amount != 0) {
+            if (isHome()) {
+                _sendHome(amount);
+            } else if (_spec.bridges.length != 0) {
+                _send(_spec.bridges[0], _spec.vaultChain, amount, "");
+            } else {
+                revert NoRoute();
+            }
+        }
+        emit CloseDelivered(current.fraction, amount);
+    }
+
+    function stage() external view returns (Stage memory) {
+        return _stage;
+    }
+
+    /// Money the station's account put into one of the venue's own vaults
+    /// (which only its trading key could have done): count it from now on,
+    /// bring it back as soon as the vault's lock allows, and end trading
+    /// through that driver, withdrawing its key. Anyone may call it, and
+    /// again to bring the money back once the lock ends.
+    function reclaim(bytes32 driver, address venueVault) external nonReentrant {
+        address implementation = _pinned(driver);
+        (Call[] memory calls, uint256 equity) =
+            IDelayedDriver(implementation).reclaim(address(this), venueVault);
+        address[] storage held = _held[driver];
+        bool listed;
+        for (uint256 i = 0; i < held.length; i++) {
+            if (held[i] == venueVault) listed = true;
+        }
+        if (!listed) {
+            if (equity == 0) revert NothingHeld();
+            if (held.length >= MAX_HELD) revert NotAllowed();
+            held.push(venueVault);
+        }
+        _run(calls, IDriver(implementation).targets());
+        if (!reclaimed[driver]) {
+            reclaimed[driver] = true;
+            address key = _approvedKey[driver];
+            if (key != address(0)) {
+                if (_revokeBestEffort(driver, key)) {
+                    delete _approvedKey[driver];
+                    emit KeyRevoked(driver, key);
+                } else {
+                    emit RevokeSkipped(driver, key);
+                }
+            }
+        }
+        emit Reclaimed(driver, venueVault, equity);
+    }
+
+    function heldIn(bytes32 driver) external view returns (address[] memory) {
+        return _held[driver];
+    }
+
+    function _clearStage() private {
+        for (uint256 i = 0; i < _spec.drivers.length; i++) {
+            delete _stagedExposure[_spec.drivers[i]];
+            delete _stagedFreed[_spec.drivers[i]];
+        }
+        delete _stage;
+    }
+
+    function _anyDelayed() private view returns (bool) {
+        for (uint256 i = 0; i < _spec.drivers.length; i++) {
+            if (IDriver(_pinned(_spec.drivers[i])).exitPath() == ExitPath.Delayed) return true;
+        }
+        return false;
     }
 
     // What it holds ---------------------------------------------------------
@@ -386,9 +610,16 @@ contract Station is IStation, ReentrancyGuardTransient {
         for (uint256 i = 0; i < _spec.drivers.length; i++) {
             // Valued through the driver it can unwind through, so a revoked
             // driver's holdings still count.
-            (uint256 m, uint256 x) = IDriver(_pinned(_spec.drivers[i])).valueOf(address(this));
+            address implementation = _pinned(_spec.drivers[i]);
+            (uint256 m, uint256 x) = IDriver(implementation).valueOf(address(this));
             mark += m;
             exit += x;
+            address[] storage held = _held[_spec.drivers[i]];
+            if (held.length != 0) {
+                uint256 parked = IDelayedDriver(implementation).heldValue(address(this), held);
+                mark += parked;
+                exit += parked;
+            }
         }
     }
 
@@ -595,7 +826,7 @@ contract Station is IStation, ReentrancyGuardTransient {
     /// The pinned implementation, if it may still trade.
     function _tradable(bytes32 driver) private view returns (address implementation) {
         implementation = _pinned(driver);
-        if (_registry().isDriverRevoked(driver, implementation)) revert NotApproved();
+        if (_registry().isDriverRevoked(driver, implementation) || reclaimed[driver]) revert NotApproved();
     }
 
     function _registry() private view returns (IAttestationRegistry) {

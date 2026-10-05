@@ -6,7 +6,6 @@
 //! transfer the vault's station has checked. Nothing an agent can say reaches
 //! a key.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use alloy::primitives::{Address, Bytes, U256};
@@ -31,14 +30,43 @@ wasmtime::component::bindgen!({
     world: "agent",
     imports: { default: async | store | trappable },
     exports: { default: async },
+    with: {
+        // The standard WASI packages are wasmtime's own.
+        "wasi:io": wasmtime_wasi::p2::bindings::io,
+        "wasi:clocks": wasmtime_wasi::p2::bindings::clocks,
+        "wasi:http": wasmtime_wasi_http::p2::bindings::http,
+        "wasi:keyvalue/store.bucket": crate::state::Bucket,
+        "shonin:agent/websocket.connection": crate::net::Connection,
+    },
 });
 
-use shonin::agent::transfers::{Account, Balance, VenueAccount};
+use shonin::agent::transfers::{Account, Balance, Moved, PartialMove, VenueAccount};
 use shonin::agent::types::Verdict;
 use shonin::agent::vault::VaultEvent;
-/// A socket to the outside world. This deployment opens none, so no value of
-/// this type is ever made.
-use shonin::agent::websocket::Connection;
+use wasi::keyvalue::store::{Error as StoreError, KeyResponse};
+
+/// Everything an agent can import, added to `linker`: the standard WASI
+/// packages (no filesystem, environment or sockets are given, so those
+/// imports find nothing), `wasi:http`, and the world's own interfaces.
+pub fn link(linker: &mut wasmtime::component::Linker<Ctx>) -> Result<()> {
+    wasmtime_wasi::p2::add_to_linker_async(linker)
+        .map_err(|error| anyhow!("the WASI imports: {error}"))?;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_async(linker)
+        .map_err(|error| anyhow!("the wasi:http imports: {error}"))?;
+    let ours = |error: wasmtime::Error| anyhow!("the platform's imports: {error}");
+    shonin::agent::types::add_to_linker::<_, HasSelf<Ctx>>(linker, |ctx| ctx).map_err(ours)?;
+    shonin::agent::drivers::add_to_linker::<_, HasSelf<Ctx>>(linker, |ctx| ctx).map_err(ours)?;
+    shonin::agent::transfers::add_to_linker::<_, HasSelf<Ctx>>(linker, |ctx| ctx).map_err(ours)?;
+    shonin::agent::vault::add_to_linker::<_, HasSelf<Ctx>>(linker, |ctx| ctx).map_err(ours)?;
+    shonin::agent::data::add_to_linker::<_, HasSelf<Ctx>>(linker, |ctx| ctx).map_err(ours)?;
+    shonin::agent::websocket::add_to_linker::<_, HasSelf<Ctx>>(linker, |ctx| ctx).map_err(ours)?;
+    shonin::agent::inference::add_to_linker::<_, HasSelf<Ctx>>(linker, |ctx| ctx).map_err(ours)?;
+    shonin::agent::secrets::add_to_linker::<_, HasSelf<Ctx>>(linker, |ctx| ctx).map_err(ours)?;
+    wasi::keyvalue::store::add_to_linker::<_, HasSelf<Ctx>>(linker, |ctx| ctx).map_err(ours)?;
+    wasi::keyvalue::atomics::add_to_linker::<_, HasSelf<Ctx>>(linker, |ctx| ctx).map_err(ours)?;
+    wasi::keyvalue::batch::add_to_linker::<_, HasSelf<Ctx>>(linker, |ctx| ctx).map_err(ours)?;
+    Ok(())
+}
 
 /// What the strategy is allowed to know about, and how to act for it.
 pub struct Ctx {
@@ -51,10 +79,13 @@ pub struct Ctx {
     /// The driver this agent's manifest named. The executor refuses a
     /// manifest naming one this image doesn't carry.
     pub driver: String,
-    /// The per-strategy cache. It is promised to nobody: a restart on another
-    /// machine starts with none of it, and a strategy rebuilds what it needs
-    /// from the venue.
-    pub cache: HashMap<String, Vec<u8>>,
+    /// The agent's state, served as `wasi:keyvalue`. It lives as long as
+    /// this run of the agent, so every start begins with it empty.
+    pub state: crate::state::Store,
+    /// What the agent's network may do, and what its vault has used.
+    pub net: crate::net::Net,
+    pub http: wasmtime_wasi_http::WasiHttpCtx,
+    pub http_hooks: crate::net::Http,
     /// Filled by the watcher, drained by the strategy. Taken when the strategy
     /// first asks for the stream. They are the vault's, so whatever an agent
     /// before this one left unread is read here first.
@@ -310,6 +341,16 @@ impl WasiView for Ctx {
     }
 }
 
+impl wasmtime_wasi_http::WasiHttpView for Ctx {
+    fn http(&mut self) -> wasmtime_wasi_http::WasiHttpCtxView<'_> {
+        wasmtime_wasi_http::WasiHttpCtxView {
+            ctx: &mut self.http,
+            table: &mut self.table,
+            hooks: &mut self.http_hooks,
+        }
+    }
+}
+
 // The interfaces with no host state of their own still need their marker.
 impl shonin::agent::types::Host for Ctx {}
 impl shonin::agent::drivers::Host for Ctx {}
@@ -318,7 +359,10 @@ impl shonin::agent::vault::Host for Ctx {}
 impl shonin::agent::data::Host for Ctx {}
 impl shonin::agent::websocket::Host for Ctx {}
 impl shonin::agent::secrets::Host for Ctx {}
-impl shonin::agent::state::Host for Ctx {}
+impl wasi::keyvalue::store::Host for Ctx {}
+impl wasi::keyvalue::store::HostBucket for Ctx {}
+impl wasi::keyvalue::atomics::Host for Ctx {}
+impl wasi::keyvalue::batch::Host for Ctx {}
 impl shonin::agent::inference::Host for Ctx {}
 
 // Drivers ---------------------------------------------------------------------
@@ -417,11 +461,41 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
 // Transfers --------------------------------------------------------------------
 
 /// One call a move is made of, sent to the station as the vault's key.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Step {
     Pull,
     Push,
     Deposit,
     Withdraw,
+}
+
+impl Step {
+    /// The vault's own account the money is in once this step has landed.
+    fn lands_in(self, home: &str, driver: &str) -> Account {
+        match self {
+            Step::Pull | Step::Withdraw => Account::Station(home.to_string()),
+            Step::Push => Account::Vault,
+            Step::Deposit => Account::Venue(VenueAccount {
+                chain: home.to_string(),
+                driver: driver.to_string(),
+            }),
+        }
+    }
+}
+
+/// What the agent is told of a move that stopped at a step: nothing moved
+/// if it was the first, otherwise as far as the steps before it took the
+/// money; and whether that step may still land.
+fn stopped(reached: Option<Account>, why: String, may_still_land: bool) -> Moved {
+    match reached {
+        None if may_still_land => Moved::Unknown(why),
+        None => Moved::Refused(why),
+        Some(reached) => Moved::Partial(PartialMove {
+            reached,
+            reason: why,
+            may_still_land,
+        }),
+    }
 }
 
 /// The calls that take money from one account to another on the vault's own
@@ -482,7 +556,7 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
         source: Account,
         destination: Account,
         amount: u64,
-    ) -> HostResult<Result<(), String>> {
+    ) -> HostResult<Moved> {
         let (place, home, driver) = accessor.with(|mut access| {
             refuel(&mut access);
             let ctx = access.get();
@@ -494,58 +568,78 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
         });
         let steps = match route(&home, &driver, &source, &destination) {
             Ok(steps) => steps,
-            Err(why) => return Ok(Err(why)),
+            Err(why) => return Ok(Moved::Refused(why)),
         };
-        let (key, station) = match place {
-            Place::Evm(evm) => (evm.key, evm.station),
-            Place::Solana(trading) => {
-                // Counted once however many sends it takes, as below.
-                let moved = trading.carry(&steps, amount).await;
-                let tally = match &moved {
-                    Ok(()) => Tally::Done,
-                    Err(error) => crate::solana::tally_of(error),
-                };
-                accessor.with(|mut access| access.get().count(|c| c.submitted(tally)));
-                return Ok(moved.map_err(|error| format!("{error:#}")));
-            }
-        };
-        let amount = U256::from(amount);
         let name = chain::names::name(driver.as_bytes());
+        let units = U256::from(amount);
         // A move the station is asked to make is a submission like an order,
-        // and counted once however many calls it takes.
+        // and counted once however many calls it takes. Each step is sent
+        // only once the one before it has landed, so a move that stops is
+        // known to have got as far as the last step that landed.
+        let mut reached = None;
         for step in steps {
-            let sent = match step {
-                Step::Pull => key.send(station, IStation::pullCall { amount }).await,
-                Step::Push => key.send(station, IStation::pushCall { amount }).await,
-                Step::Deposit => {
-                    key.send(
-                        station,
-                        IStation::depositCall {
-                            driver: name,
-                            amount,
-                        },
-                    )
-                    .await
+            let (failed, may_still_land) = match &place {
+                Place::Evm(evm) => {
+                    let (key, station) = (&evm.key, evm.station);
+                    let sent = match step {
+                        Step::Pull => {
+                            key.send(station, IStation::pullCall { amount: units })
+                                .await
+                        }
+                        Step::Push => {
+                            key.send(station, IStation::pushCall { amount: units })
+                                .await
+                        }
+                        Step::Deposit => {
+                            key.send(
+                                station,
+                                IStation::depositCall {
+                                    driver: name,
+                                    amount: units,
+                                },
+                            )
+                            .await
+                        }
+                        Step::Withdraw => {
+                            key.send(
+                                station,
+                                IStation::withdrawCall {
+                                    driver: name,
+                                    amount: units,
+                                },
+                            )
+                            .await
+                        }
+                    };
+                    match sent {
+                        Ok(_) => (None, false),
+                        Err(error) => {
+                            let may = chain::may_still_land(&error);
+                            (Some((Tally::of_failure(&error), error)), may)
+                        }
+                    }
                 }
-                Step::Withdraw => {
-                    key.send(
-                        station,
-                        IStation::withdrawCall {
-                            driver: name,
-                            amount,
-                        },
-                    )
-                    .await
+                Place::Solana(trading) => {
+                    match trading.carry(std::slice::from_ref(&step), amount).await {
+                        Ok(()) => (None, false),
+                        Err(error) => {
+                            let tally = crate::solana::tally_of(&error);
+                            // The cluster can't say whether an unanswered send
+                            // was ever broadcast, so it may still land.
+                            let may = matches!(tally, Tally::Unanswered);
+                            (Some((tally, error)), may)
+                        }
+                    }
                 }
             };
-            if let Err(error) = sent {
-                let tally = Tally::of_failure(&error);
+            if let Some((tally, error)) = failed {
                 accessor.with(|mut access| access.get().count(|c| c.submitted(tally)));
-                return Ok(Err(format!("{error:#}")));
+                return Ok(stopped(reached, format!("{error:#}"), may_still_land));
             }
+            reached = Some(step.lands_in(&home, &driver));
         }
         accessor.with(|mut access| access.get().count(|c| c.submitted(Tally::Done)));
-        Ok(Ok(()))
+        Ok(Moved::Done)
     }
 
     async fn bridge(
@@ -554,14 +648,14 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
         source_chain: String,
         destination_chain: String,
         amount: u64,
-    ) -> HostResult<Result<(), String>> {
+    ) -> HostResult<Moved> {
         let (place, home) = accessor.with(|mut access| {
             refuel(&mut access);
             let ctx = access.get();
             (ctx.place.clone(), ctx.home_chain.clone())
         });
         if source_chain != home {
-            return Ok(Err(format!(
+            return Ok(Moved::Refused(format!(
                 "this executor serves the vault's station on {home} only, not on {source_chain}"
             )));
         }
@@ -575,7 +669,7 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
         else {
             // No bridge is offered from a Solana vault yet: the agent's
             // mistake, refused here and counted as nothing.
-            return Ok(Err(format!("no bridge is offered from {home}")));
+            return Ok(Moved::Refused(format!("no bridge is offered from {home}")));
         };
         let to_chain = match chain_id_of(&chain, factory, &destination_chain).await {
             Ok(id) => id,
@@ -586,7 +680,7 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
                 if let Some(tally) = Tally::of_lookup_failure(&error) {
                     accessor.with(|mut access| access.get().count(|c| c.submitted(tally)));
                 }
-                return Ok(Err(format!("{error:#}")));
+                return Ok(Moved::Refused(format!("{error:#}")));
             }
         };
         let sent = key
@@ -607,7 +701,10 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
             Err(error) => Tally::of_failure(error),
         };
         accessor.with(|mut access| access.get().count(|c| c.submitted(tally)));
-        Ok(sent.map(|_| ()).map_err(|error| format!("{error:#}")))
+        Ok(match sent {
+            Ok(_) => Moved::Done,
+            Err(error) => stopped(None, format!("{error:#}"), chain::may_still_land(&error)),
+        })
     }
 
     async fn balances(accessor: &Accessor<Ctx, Self>) -> HostResult<Vec<Balance>> {
@@ -769,18 +866,35 @@ impl shonin::agent::data::HostWithStore<Ctx> for HasSelf<Ctx> {
         }
     }
 
+    /// One of Shonin's shared venue streams. Each subscription holds one of
+    /// the vault's open streams until the agent lets go of it.
     async fn subscribe(
         mut access: Access<'_, Ctx, Self>,
-        _venue: String,
-        _feed: Vec<u8>,
-    ) -> HostResult<Result<StreamReader<Vec<u8>>, String>> {
-        // The account stream already carries every price the venue posts, so
-        // there is nothing a second subscription would add. Saying so is
-        // better than handing back a stream that never speaks.
-        let _ = &mut access;
-        Ok(Err(
-            "prices arrive on the account stream; this executor has no second feed".to_string(),
-        ))
+        source: String,
+        feed: Vec<u8>,
+    ) -> HostResult<Result<StreamReader<shonin::agent::data::Stamped>, String>> {
+        refuel(&mut access);
+        let net = access.get().net.clone();
+        let slot = match net.usage.open(&net.quotas) {
+            Ok(slot) => slot,
+            Err(over) => return Ok(Err(over.to_string())),
+        };
+        let values = match crate::data::hub().subscribe(&source, &feed) {
+            Ok(values) => values,
+            Err(why) => return Ok(Err(why)),
+        };
+        let values = futures::StreamExt::map(values, move |value| {
+            let _held = &slot;
+            shonin::agent::data::Stamped {
+                received_ms: value.received_ms,
+                source_ms: value.source_ms,
+                value: value.value,
+            }
+        });
+        Ok(Ok(StreamReader::new(
+            &mut access,
+            crate::feed::FromStream(values),
+        )?))
     }
 }
 
@@ -788,38 +902,64 @@ impl shonin::agent::data::HostWithStore<Ctx> for HasSelf<Ctx> {
 
 impl shonin::agent::websocket::HostWithStore<Ctx> for HasSelf<Ctx> {
     async fn connect(
-        _accessor: &Accessor<Ctx, Self>,
-        _url: String,
-        _headers: Vec<(String, String)>,
-    ) -> HostResult<Result<Resource<Connection>, String>> {
-        // A strategy that reaches the open internet needs the executor to
-        // terminate the connection for it. This one runs against a chain and
-        // a venue on the same machine and opens nothing outward, so it says
-        // so rather than pretending to connect.
-        Ok(Err("this executor opens no outward sockets".to_string()))
+        accessor: &Accessor<Ctx, Self>,
+        url: String,
+        headers: Vec<(String, String)>,
+    ) -> HostResult<Result<Resource<crate::net::Connection>, String>> {
+        let net = accessor.with(|mut access| {
+            refuel(&mut access);
+            access.get().net.clone()
+        });
+        match crate::net::Connection::open(&net, &url, &headers).await {
+            Ok(connection) => {
+                let held = accessor.with(|mut access| access.get().table.push(connection))?;
+                Ok(Ok(held))
+            }
+            Err(why) => Ok(Err(why)),
+        }
     }
 }
 
 impl shonin::agent::websocket::HostConnectionWithStore<Ctx> for HasSelf<Ctx> {
-    /// `Connection` has no values, because `connect` never returns one, so
-    /// there is never anything here to let go of.
-    async fn drop(_accessor: &Accessor<Ctx, Self>, _rep: Resource<Connection>) -> HostResult<()> {
+    /// Letting go of a connection closes it.
+    async fn drop(
+        accessor: &Accessor<Ctx, Self>,
+        rep: Resource<crate::net::Connection>,
+    ) -> HostResult<()> {
+        accessor.with(|mut access| access.get().table.delete(rep))?;
         Ok(())
     }
 
     async fn send(
-        _accessor: &Accessor<Ctx, Self>,
-        _self_: Resource<Connection>,
-        _message: Vec<u8>,
+        accessor: &Accessor<Ctx, Self>,
+        connection: Resource<crate::net::Connection>,
+        message: shonin::agent::websocket::Message,
     ) -> HostResult<Result<(), String>> {
-        Ok(Err("this executor opens no outward sockets".to_string()))
+        let sender = accessor.with(|mut access| {
+            refuel(&mut access);
+            access
+                .get()
+                .table
+                .get(&connection)
+                .map(|connection| connection.sender())
+        })?;
+        Ok(sender.send(message).await)
     }
 
     async fn messages(
         mut access: Access<'_, Ctx, Self>,
-        _self_: Resource<Connection>,
-    ) -> HostResult<StreamReader<Vec<u8>>> {
-        StreamReader::new(&mut access, Vec::<Vec<u8>>::new())
+        connection: Resource<crate::net::Connection>,
+    ) -> HostResult<StreamReader<shonin::agent::websocket::Message>> {
+        refuel(&mut access);
+        let incoming = access.get().table.get_mut(&connection)?.messages();
+        match incoming {
+            Some(incoming) => StreamReader::new(
+                &mut access,
+                crate::feed::FromStream(tokio_stream::wrappers::ReceiverStream::new(incoming)),
+            ),
+            // Asked for twice: the second is a stream that has ended.
+            None => StreamReader::new(&mut access, Vec::<shonin::agent::websocket::Message>::new()),
+        }
     }
 }
 
@@ -836,20 +976,162 @@ impl shonin::agent::secrets::HostWithStore<Ctx> for HasSelf<Ctx> {
     }
 }
 
-impl shonin::agent::state::HostWithStore<Ctx> for HasSelf<Ctx> {
-    async fn get(mut access: Access<'_, Ctx, Self>, key: String) -> HostResult<Option<Vec<u8>>> {
+/// The bucket a handle names, or the agent's mistake.
+fn bucket_of(ctx: &Ctx, bucket: &Resource<crate::state::Bucket>) -> Result<String, StoreError> {
+    ctx.table
+        .get(bucket)
+        .map(|bucket| bucket.name.clone())
+        .map_err(|error| StoreError::Other(error.to_string()))
+}
+
+impl wasi::keyvalue::store::HostWithStore<Ctx> for HasSelf<Ctx> {
+    /// Any name opens a bucket of the agent's own: buckets are only names,
+    /// and every one of them shares the agent's one allowance.
+    async fn open(
+        mut access: Access<'_, Ctx, Self>,
+        identifier: String,
+    ) -> HostResult<Result<Resource<crate::state::Bucket>, StoreError>> {
         refuel(&mut access);
-        Ok(access.get().cache.get(&key).cloned())
+        Ok(Ok(access
+            .get()
+            .table
+            .push(crate::state::Bucket { name: identifier })?))
+    }
+}
+
+impl wasi::keyvalue::store::HostBucketWithStore<Ctx> for HasSelf<Ctx> {
+    async fn get(
+        mut access: Access<'_, Ctx, Self>,
+        bucket: Resource<crate::state::Bucket>,
+        key: String,
+    ) -> HostResult<Result<Option<Vec<u8>>, StoreError>> {
+        refuel(&mut access);
+        let ctx = access.get();
+        Ok(bucket_of(ctx, &bucket).map(|name| ctx.state.get(&name, &key).cloned()))
     }
 
-    async fn set(mut access: Access<'_, Ctx, Self>, key: String, value: Vec<u8>) -> HostResult<()> {
-        access.get().cache.insert(key, value);
-        Ok(())
+    async fn set(
+        mut access: Access<'_, Ctx, Self>,
+        bucket: Resource<crate::state::Bucket>,
+        key: String,
+        value: Vec<u8>,
+    ) -> HostResult<Result<(), StoreError>> {
+        refuel(&mut access);
+        let ctx = access.get();
+        Ok(bucket_of(ctx, &bucket).and_then(|name| {
+            ctx.state
+                .set(&name, &key, value)
+                .map_err(|refused| StoreError::Other(refused.to_string()))
+        }))
     }
 
-    async fn delete(mut access: Access<'_, Ctx, Self>, key: String) -> HostResult<()> {
-        access.get().cache.remove(&key);
+    async fn delete(
+        mut access: Access<'_, Ctx, Self>,
+        bucket: Resource<crate::state::Bucket>,
+        key: String,
+    ) -> HostResult<Result<(), StoreError>> {
+        refuel(&mut access);
+        let ctx = access.get();
+        Ok(bucket_of(ctx, &bucket).map(|name| ctx.state.delete(&name, &key)))
+    }
+
+    async fn exists(
+        mut access: Access<'_, Ctx, Self>,
+        bucket: Resource<crate::state::Bucket>,
+        key: String,
+    ) -> HostResult<Result<bool, StoreError>> {
+        refuel(&mut access);
+        let ctx = access.get();
+        Ok(bucket_of(ctx, &bucket).map(|name| ctx.state.get(&name, &key).is_some()))
+    }
+
+    async fn list_keys(
+        mut access: Access<'_, Ctx, Self>,
+        bucket: Resource<crate::state::Bucket>,
+        cursor: Option<u64>,
+    ) -> HostResult<Result<KeyResponse, StoreError>> {
+        refuel(&mut access);
+        let ctx = access.get();
+        Ok(bucket_of(ctx, &bucket).map(|name| {
+            let (keys, cursor) = ctx.state.keys(&name, cursor);
+            KeyResponse { keys, cursor }
+        }))
+    }
+
+    async fn drop(
+        accessor: &Accessor<Ctx, Self>,
+        rep: Resource<crate::state::Bucket>,
+    ) -> HostResult<()> {
+        accessor.with(|mut access| access.get().table.delete(rep))?;
         Ok(())
+    }
+}
+
+impl wasi::keyvalue::atomics::HostWithStore<Ctx> for HasSelf<Ctx> {
+    async fn increment(
+        mut access: Access<'_, Ctx, Self>,
+        bucket: Resource<crate::state::Bucket>,
+        key: String,
+        delta: u64,
+    ) -> HostResult<Result<u64, StoreError>> {
+        refuel(&mut access);
+        let ctx = access.get();
+        Ok(bucket_of(ctx, &bucket).and_then(|name| {
+            ctx.state
+                .increment(&name, &key, delta)
+                .map_err(StoreError::Other)
+        }))
+    }
+}
+
+impl wasi::keyvalue::batch::HostWithStore<Ctx> for HasSelf<Ctx> {
+    async fn get_many(
+        mut access: Access<'_, Ctx, Self>,
+        bucket: Resource<crate::state::Bucket>,
+        keys: Vec<String>,
+    ) -> HostResult<Result<Vec<Option<(String, Vec<u8>)>>, StoreError>> {
+        refuel(&mut access);
+        let ctx = access.get();
+        Ok(bucket_of(ctx, &bucket).map(|name| {
+            keys.into_iter()
+                .map(|key| {
+                    let value = ctx.state.get(&name, &key).cloned();
+                    value.map(|value| (key, value))
+                })
+                .collect()
+        }))
+    }
+
+    /// Each pair is set in turn; one that would pass the allowance stops
+    /// the batch there, those before it set.
+    async fn set_many(
+        mut access: Access<'_, Ctx, Self>,
+        bucket: Resource<crate::state::Bucket>,
+        entries: Vec<(String, Vec<u8>)>,
+    ) -> HostResult<Result<(), StoreError>> {
+        refuel(&mut access);
+        let ctx = access.get();
+        Ok(bucket_of(ctx, &bucket).and_then(|name| {
+            entries.into_iter().try_for_each(|(key, value)| {
+                ctx.state
+                    .set(&name, &key, value)
+                    .map_err(|refused| StoreError::Other(refused.to_string()))
+            })
+        }))
+    }
+
+    async fn delete_many(
+        mut access: Access<'_, Ctx, Self>,
+        bucket: Resource<crate::state::Bucket>,
+        keys: Vec<String>,
+    ) -> HostResult<Result<(), StoreError>> {
+        refuel(&mut access);
+        let ctx = access.get();
+        Ok(bucket_of(ctx, &bucket).map(|name| {
+            for key in keys {
+                ctx.state.delete(&name, &key);
+            }
+        }))
     }
 }
 
@@ -932,7 +1214,11 @@ pub fn answer(done: std::result::Result<Receipt, Refusal>) -> (Verdict, Tally) {
         // A refusal is the venue's answer, not a fault: the strategy is told
         // why and decides what to do about it.
         Err(Refusal::Refused(why)) => (Verdict::Rejected(why), Tally::Refused),
-        Err(Refusal::Unanswered(why)) => (Verdict::Rejected(why), Tally::Unanswered),
+        // Sent, and nobody said what became of it: it may still land.
+        Err(Refusal::Unanswered(why)) => (Verdict::Unknown(why), Tally::Unanswered),
+        // The venue was out of reach before anything was sent: nothing
+        // happened, and the venue counts as not having answered.
+        Err(Refusal::NotSent(why)) => (Verdict::Rejected(why), Tally::Unanswered),
     }
 }
 
@@ -945,14 +1231,18 @@ pub enum Refusal {
     NoFill,
     /// The venue would not take it, and said why.
     Refused(String),
-    /// The venue could not be reached, or never answered.
+    /// It was sent, or may have been, and no answer came: it may still land.
     Unanswered(String),
+    /// The venue could not be reached, and nothing was sent.
+    NotSent(String),
 }
 
 impl From<anyhow::Error> for Refusal {
     fn from(error: anyhow::Error) -> Self {
-        if chain::unanswered(&error) {
+        if chain::may_still_land(&error) {
             Refusal::Unanswered(format!("{error}"))
+        } else if chain::unanswered(&error) {
+            Refusal::NotSent(format!("{error}"))
         } else {
             Refusal::Refused(format!("{error}"))
         }
@@ -1253,6 +1543,83 @@ mod tests {
             wasmtime::Instance::new(&mut store, &module, &[]).is_err(),
             "more instances than allowed were made"
         );
+    }
+
+    #[test]
+    fn a_send_that_may_still_land_is_unknown_and_one_never_sent_is_rejected() {
+        // Broadcast and never seen again: it may still land.
+        let lost = anyhow::Error::new(chain::NeverLanded).context("placing an order");
+        let (verdict, tally) = answer(Err(Refusal::from(lost)));
+        assert!(matches!(verdict, Verdict::Unknown(_)), "{verdict:?}");
+        assert!(matches!(tally, Tally::Unanswered));
+        // Refused by the chain: nothing happened, and the agent is told why.
+        let (verdict, tally) = answer(Err(Refusal::from(anyhow!("execution reverted"))));
+        assert!(matches!(verdict, Verdict::Rejected(why) if why.contains("reverted")));
+        assert!(matches!(tally, Tally::Refused));
+        // Out of reach before anything was sent: nothing happened.
+        let (verdict, tally) = answer(Err(Refusal::NotSent("no node".to_string())));
+        assert!(matches!(verdict, Verdict::Rejected(_)));
+        assert!(matches!(tally, Tally::Unanswered));
+        // No fill is the market's answer.
+        let (verdict, tally) = answer(Err(Refusal::NoFill));
+        assert!(matches!(verdict, Verdict::Rejected(why) if why == NO_FILL));
+        assert!(matches!(tally, Tally::Done));
+    }
+
+    #[test]
+    fn a_move_that_stops_on_the_way_says_where_the_money_is() {
+        let (home, driver) = ("base", "local");
+        // From the vault to the venue: pulled to the station, then deposited.
+        let steps = route(
+            home,
+            driver,
+            &Account::Vault,
+            &Account::Venue(VenueAccount {
+                chain: home.to_string(),
+                driver: driver.to_string(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(steps, vec![Step::Pull, Step::Deposit]);
+        // The first step refused: nothing moved.
+        assert!(matches!(
+            stopped(None, "no".to_string(), false),
+            Moved::Refused(_)
+        ));
+        // The first step unanswered: it may still land.
+        assert!(matches!(
+            stopped(None, "silence".to_string(), true),
+            Moved::Unknown(_)
+        ));
+        // The pull landed and the deposit was refused: the money is in the
+        // station, and stays there.
+        let reached = Some(steps[0].lands_in(home, driver));
+        match stopped(reached.clone(), "the venue is shut".to_string(), false) {
+            Moved::Partial(partial) => {
+                assert!(matches!(&partial.reached, Account::Station(chain) if chain == home));
+                assert!(!partial.may_still_land);
+                assert_eq!(partial.reason, "the venue is shut");
+            }
+            other => panic!("{other:?}"),
+        }
+        // The deposit unanswered: the money may yet reach the venue.
+        assert!(matches!(
+            stopped(reached, "silence".to_string(), true),
+            Moved::Partial(PartialMove {
+                may_still_land: true,
+                ..
+            })
+        ));
+        // Each step lands where it says.
+        assert!(matches!(Step::Push.lands_in(home, driver), Account::Vault));
+        assert!(matches!(
+            Step::Withdraw.lands_in(home, driver),
+            Account::Station(_)
+        ));
+        assert!(matches!(
+            Step::Deposit.lands_in(home, driver),
+            Account::Venue(VenueAccount { chain, driver: d }) if chain == home && d == driver
+        ));
     }
 
     #[test]

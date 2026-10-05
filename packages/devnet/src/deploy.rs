@@ -445,7 +445,17 @@ async fn put_everywhere(
     client
         .send_raw(from, CREATE2_DEPLOYER, Bytes::from(data))
         .await?;
-    if !client.has_code(address).await? {
+    // A public RPC is often several nodes behind one name, and the one that
+    // answers next may not have the block yet: give it a moment.
+    let mut landed = false;
+    for _ in 0..15 {
+        if client.has_code(address).await? {
+            landed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    if !landed {
         bail!("{name} did not land at {address}");
     }
     tracing::info!(%address, contract = name, "deployed at its address on every chain");

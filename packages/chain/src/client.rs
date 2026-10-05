@@ -407,17 +407,100 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The connection to a node, with the URL kept out of its errors and every
 /// request bounded in time.
-fn rpc_client(rpc_url: &str) -> Result<alloy::rpc::client::RpcClient> {
-    let url: alloy::transports::http::reqwest::Url = rpc_url
-        .parse()
-        .map_err(|_| anyhow!("the chain's rpc in the chain config is not a URL"))?;
+///
+/// `rpc` may name several endpoints, separated by spaces: free public
+/// endpoints each limit how fast one address may ask, and a whole stack on
+/// one machine passes any one of their limits. Each request then goes to the
+/// endpoint ranked best by how often and how fast it has answered lately, and
+/// one that refuses (a rate limit included, however it is worded) falls in
+/// the ranking, so the next requests go elsewhere.
+fn rpc_client(rpc: &str) -> Result<alloy::rpc::client::RpcClient> {
     let http = alloy::transports::http::reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()
         .context("making the HTTP client")?;
-    Ok(alloy::rpc::client::ClientBuilder::default()
-        .layer(KeepUrlOut::new(rpc_url, &url))
-        .http_with_client(http, url))
+    let urls: Vec<&str> = rpc.split_whitespace().collect();
+    let parse = |url: &str| -> Result<alloy::transports::http::reqwest::Url> {
+        url.parse()
+            .map_err(|_| anyhow!("the chain's rpc in the chain config is not a URL"))
+    };
+    if urls.len() <= 1 {
+        let url = parse(rpc.trim())?;
+        return Ok(alloy::rpc::client::ClientBuilder::default()
+            .layer(KeepUrlOut::new(rpc.trim(), &url))
+            .http_with_client(http, url));
+    }
+    let mut transports = Vec::with_capacity(urls.len());
+    for configured in urls {
+        let url = parse(configured)?;
+        let keep = KeepUrlOut::new(configured, &url);
+        let inner = alloy::transports::http::Http::with_client(http.clone(), url);
+        transports.push(tower::Layer::layer(&keep, RateLimitIsAFailure { inner }));
+    }
+    let fallback = tower::Layer::layer(
+        &alloy::transports::layers::FallbackLayer::default()
+            .with_active_transport_count(std::num::NonZeroUsize::MIN),
+        transports,
+    );
+    Ok(alloy::rpc::client::ClientBuilder::default().transport(fallback, false))
+}
+
+/// An answer that is a rate limit, whether as an HTTP status or inside a
+/// JSON-RPC error, taken as the endpoint failing, so a ranking of endpoints
+/// moves away from it.
+#[derive(Clone)]
+struct RateLimitIsAFailure<S> {
+    inner: S,
+}
+
+impl<S> tower::Service<alloy::rpc::json_rpc::RequestPacket> for RateLimitIsAFailure<S>
+where
+    S: tower::Service<
+            alloy::rpc::json_rpc::RequestPacket,
+            Response = alloy::rpc::json_rpc::ResponsePacket,
+            Error = alloy::transports::TransportError,
+            Future = alloy::transports::TransportFut<'static>,
+        > + Send
+        + Clone
+        + 'static,
+{
+    type Response = alloy::rpc::json_rpc::ResponsePacket;
+    type Error = alloy::transports::TransportError;
+    type Future = alloy::transports::TransportFut<'static>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: alloy::rpc::json_rpc::RequestPacket) -> Self::Future {
+        let answer = self.inner.call(request);
+        Box::pin(async move {
+            let answer = answer.await?;
+            let limited = answer
+                .responses()
+                .iter()
+                .filter_map(|response| response.payload.as_error())
+                .any(|error| is_rate_limit(error.code, &error.message));
+            if limited {
+                return Err(alloy::transports::TransportErrorKind::custom_str(
+                    "the endpoint is limiting the rate of requests",
+                ));
+            }
+            Ok(answer)
+        })
+    }
+}
+
+/// Whether a JSON-RPC error is an endpoint limiting the rate of requests.
+fn is_rate_limit(code: i64, message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    code == 429
+        || message.contains("rate limit")
+        || message.contains("too many requests")
+        || (code == -32005 && !message.contains("range") && !message.contains("results"))
 }
 
 /// Wait for a sent transaction's receipt, for at most `within`. A receipt
@@ -838,8 +921,52 @@ impl Client {
             .with_context(|| format!("asking the chain for {method}"))
     }
 
+    /// The logs a filter matches, through whatever the provider allows.
+    ///
+    /// Public providers refuse ranges wider than they like, each in its own
+    /// words, so a numbered range one refuses as too wide is read in halves
+    /// (and those in halves, as far as one block). Several nodes often
+    /// answer behind one name, and one behind the others may not have the
+    /// range's newest block yet, so a range it says it doesn't have is asked
+    /// again a few times, a second or two apart, before the error is
+    /// returned. A filter with no numbered range is asked once.
     pub async fn logs(&self, filter: &Filter) -> Result<Vec<Log>> {
-        self.provider.get_logs(filter).await.context("reading logs")
+        let range = filter.get_from_block().zip(filter.get_to_block());
+        let Some((from, to)) = range.filter(|(from, to)| from <= to) else {
+            return self.provider.get_logs(filter).await.context("reading logs");
+        };
+        let mut found = Vec::new();
+        let mut pending = vec![(from, to)];
+        while let Some((from, to)) = pending.pop() {
+            let part = filter.clone().from_block(from).to_block(to);
+            let mut tries = 0;
+            loop {
+                match self.provider.get_logs(&part).await {
+                    Ok(logs) => {
+                        found.extend(logs);
+                        break;
+                    }
+                    Err(error) => {
+                        let text = error.to_string();
+                        if to > from && refused_as_too_wide(&text) {
+                            let middle = from + (to - from) / 2;
+                            // Popped last-in first-out: the earlier half first.
+                            pending.push((middle + 1, to));
+                            pending.push((from, middle));
+                            break;
+                        }
+                        if refused_as_not_there_yet(&text) && tries < LOGS_BEHIND_TRIES {
+                            tries += 1;
+                            tokio::time::sleep(Duration::from_millis(1_500)).await;
+                            continue;
+                        }
+                        return Err(anyhow::Error::new(error)
+                            .context(format!("reading logs from block {from} to {to}")));
+                    }
+                }
+            }
+        }
+        Ok(found)
     }
 
     pub async fn block_number(&self) -> Result<u64> {
@@ -1530,6 +1657,44 @@ async fn land(
     Ok(receipt)
 }
 
+/// How many times a range a node says it hasn't reached yet is asked again.
+const LOGS_BEHIND_TRIES: u32 = 4;
+
+/// Whether a provider refused a log range for its width, in any of the ways
+/// providers say so.
+fn refused_as_too_wide(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "range",
+        "too many",
+        "too large",
+        "limit exceeded",
+        "exceeds the limit",
+        "response size",
+        "query returned more than",
+        "block span",
+        "blocks are not supported",
+    ]
+    .iter()
+    .any(|phrase| error.contains(phrase))
+        && !refused_as_not_there_yet(&error)
+}
+
+/// Whether a node refused a log range because it hasn't reached its end yet.
+fn refused_as_not_there_yet(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "block not found",
+        "not available on the upstream",
+        "unknown block",
+        "header not found",
+        "beyond current head",
+        "after last accepted block",
+    ]
+    .iter()
+    .any(|phrase| error.contains(phrase))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1685,5 +1850,42 @@ mod tests {
             format!("{:?}", keys[1].address()),
             "0x70997970c51812dc3a010c7d01b50e0d17dc79c8"
         );
+    }
+
+    #[test]
+    fn a_range_refused_for_its_width_is_told_apart_from_one_not_reached_yet() {
+        for wide in [
+            "error code 35: ranges over 10000 blocks are not supported on free plan",
+            "query returned more than 10000 results",
+            "eth_getLogs block range too large, max is 2000",
+            "error code -32005: limit exceeded",
+            "block range is too wide",
+        ] {
+            assert!(refused_as_too_wide(wide), "{wide}");
+            assert!(!refused_as_not_there_yet(wide), "{wide}");
+        }
+        for behind in [
+            "error code -32603: block not found, because requested block (toBlock 66130301) is not available on the upstream node",
+            "header not found",
+            "unknown block",
+        ] {
+            assert!(refused_as_not_there_yet(behind), "{behind}");
+            assert!(!refused_as_too_wide(behind), "{behind}");
+        }
+        assert!(!refused_as_too_wide("execution reverted"));
+        assert!(!refused_as_not_there_yet("rate limited"));
+    }
+
+    #[test]
+    fn a_rate_limit_is_told_from_a_refusal_of_the_request_itself() {
+        assert!(is_rate_limit(-32005, "rate limited"));
+        assert!(is_rate_limit(-32000, "Too Many Requests"));
+        assert!(is_rate_limit(429, "slow down"));
+        assert!(!is_rate_limit(
+            -32005,
+            "query returned more than 10000 results"
+        ));
+        assert!(!is_rate_limit(3, "execution reverted"));
+        assert!(!is_rate_limit(-32000, "nonce too low"));
     }
 }

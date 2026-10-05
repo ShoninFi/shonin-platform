@@ -611,7 +611,8 @@ pub fn watch_here(mut command: impl Iterator<Item = std::ffi::OsString>) -> i32 
     }
 }
 
-/// Load the component the way the executor will, so a bundle that cannot run
+/// Load the component the way the executor will, and check that it imports
+/// nothing the executor doesn't give an agent, so a bundle that cannot run
 /// never reaches a vault.
 fn instantiate(component: &[u8]) -> Result<(), String> {
     let mut config = wasmtime::Config::new();
@@ -620,13 +621,105 @@ fn instantiate(component: &[u8]) -> Result<(), String> {
         .consume_fuel(true)
         .epoch_interruption(true);
     let engine = wasmtime::Engine::new(&config).map_err(|error| error.to_string())?;
-    wasmtime::component::Component::new(&engine, component).map_err(|error| error.to_string())?;
+    let component = wasmtime::component::Component::new(&engine, component)
+        .map_err(|error| error.to_string())?;
+    for (name, _) in component.component_type().imports(&engine) {
+        if !importable(name) {
+            return Err(format!(
+                "the agent imports {name}, which the executor doesn't give"
+            ));
+        }
+    }
     Ok(())
+}
+
+/// Whether the executor gives an agent the import `name`: the
+/// `shonin:agent` world's own interfaces, `wasi:keyvalue` for its state,
+/// `wasi:http` for its requests, and the WASI 0.2 packages for clocks,
+/// randomness, printing and the like. Never raw sockets: an agent reaches
+/// the network only through the executor.
+pub fn importable(name: &str) -> bool {
+    let Some((interface, version)) = name.split_once('@') else {
+        return false;
+    };
+    let Some((package, _)) = interface.split_once('/') else {
+        return false;
+    };
+    let wasi_0_2 = version.starts_with("0.2.") && !version.contains('-');
+    match package {
+        "shonin:agent" => {
+            version == "0.1.0"
+                && matches!(
+                    &interface["shonin:agent/".len()..],
+                    "types"
+                        | "drivers"
+                        | "transfers"
+                        | "vault"
+                        | "data"
+                        | "websocket"
+                        | "inference"
+                        | "secrets"
+                )
+        }
+        "wasi:keyvalue" => {
+            version == "0.2.0-draft"
+                && matches!(
+                    interface,
+                    "wasi:keyvalue/store" | "wasi:keyvalue/atomics" | "wasi:keyvalue/batch"
+                )
+        }
+        "wasi:http" => {
+            wasi_0_2 && matches!(interface, "wasi:http/types" | "wasi:http/outgoing-handler")
+        }
+        "wasi:io" | "wasi:clocks" | "wasi:random" | "wasi:cli" | "wasi:filesystem" => wasi_0_2,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_may_import_only_what_the_executor_gives() {
+        for given in [
+            "shonin:agent/drivers@0.1.0",
+            "shonin:agent/websocket@0.1.0",
+            "wasi:keyvalue/store@0.2.0-draft",
+            "wasi:keyvalue/atomics@0.2.0-draft",
+            "wasi:keyvalue/batch@0.2.0-draft",
+            "wasi:http/outgoing-handler@0.2.12",
+            "wasi:http/types@0.2.9",
+            "wasi:io/streams@0.2.12",
+            "wasi:clocks/monotonic-clock@0.2.12",
+            "wasi:cli/stdout@0.2.9",
+            "wasi:random/random@0.2.0",
+        ] {
+            assert!(importable(given), "{given} was refused");
+        }
+        for refused in [
+            "shonin:agent/drivers@0.2.0",
+            "shonin:agent/state@0.1.0",
+            "wasi:sockets/tcp@0.2.12",
+            "wasi:http/incoming-handler@0.2.12",
+            "wasi:keyvalue/watcher@0.2.0-draft",
+            "wasi:http/types@0.3.0-rc-2025-09-16",
+            "wasi:io/streams@0.2.0-rc-2023-11-10",
+            "acme:secret/backdoor@1.0.0",
+            "unversioned",
+        ] {
+            assert!(!importable(refused), "{refused} was let through");
+        }
+    }
+
+    #[test]
+    fn a_component_importing_what_the_executor_doesn_t_give_is_refused() {
+        let refused =
+            instantiate(br#"(component (import "acme:secret/backdoor@1.0.0" (instance)))"#)
+                .unwrap_err();
+        assert!(refused.contains("acme:secret/backdoor@1.0.0"), "{refused}");
+        instantiate(br#"(component (import "wasi:cli/stdout@0.2.9" (instance)))"#).unwrap();
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("shonin-{name}-{}", std::process::id()));

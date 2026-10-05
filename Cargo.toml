@@ -15,6 +15,11 @@ members = [
     "packages/keeper",
     "packages/devnet",
     "packages/strategy-sdk",
+    "packages/drivers/hyperliquid",
+    "packages/attestation/core",
+    "packages/attestation/methods",
+    "packages/attestation/host",
+    "packages/attestation/deploy",
 ]
 # The Solana programs are their own workspace, built with Anchor.
 exclude = ["contracts/solana"]
@@ -31,6 +36,7 @@ publish = false
 [workspace.dependencies]
 # Local crates
 shared = { path = "packages/shared", package = "shonin-shared" }
+hyperliquid = { path = "packages/drivers/hyperliquid", package = "shonin-hyperliquid" }
 chain = { path = "packages/chain", package = "shonin-chain" }
 strategy-sdk = { path = "packages/strategy-sdk", package = "shonin-strategy-sdk" }
 indexer = { path = "packages/indexer", package = "shonin-indexer" }
@@ -45,6 +51,7 @@ ciborium = "0.2.2"
 toml = "1.1.6"
 sha2 = "0.11.0"
 hex = "0.4.3"
+rmp-serde = "1"
 url = "2.5.8"
 time = { version = "0.3.55", features = ["serde"] }
 futures = "0.3.34"
@@ -70,6 +77,20 @@ rustix = { version = "1.1.5", features = ["process"] }
 # bind the shonin:strategy world with wit-bindgen.
 wasmtime = { version = "48.0.2", features = ["component-model-async"] }
 wasmtime-wasi = "48.0.2"
+# An agent's outbound requests: wasi:http, sent by the executor's own client
+# so every request is checked and counted (no default sender).
+wasmtime-wasi-http = { version = "48.0.2", default-features = false, features = ["p2"] }
+hyper = { version = "1.11.1", features = ["client", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+http = "1.5.0"
+http-body = "1.1.0"
+http-body-util = "0.1.5"
+bytes = "1.12.1"
+# TLS ended in the executor, against the roots compiled into the image.
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "1.0.9"
+tokio-stream = { version = "0.1.19", features = ["sync"] }
 wit-bindgen = { version = "0.62.0", features = ["async", "futures-stream"] }
 
 # The decimal a strategy and an adapter agree on, on both sides of the

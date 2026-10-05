@@ -190,6 +190,15 @@ pub struct ChainConfig {
     pub public_rpc: String,
 }
 
+impl ChainConfig {
+    /// The first of the chain's endpoints. `rpc` may name several, separated
+    /// by spaces, which the client spreads its requests over; a tool that
+    /// takes one URL, or a browser, is given the first.
+    pub fn first_rpc(&self) -> &str {
+        self.rpc.split_whitespace().next().unwrap_or_default()
+    }
+}
+
 /// Which set of chains: the ones `task dev` starts, the public testnets, or
 /// the mainnets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -295,7 +304,7 @@ impl ChainConfigs {
                 )));
             }
             let suffix = key.env_suffix();
-            config.public_rpc = config.rpc.clone();
+            config.public_rpc = config.first_rpc().to_string();
             if let Some(rpc) = env(&format!("SHONIN_RPC_{suffix}")).filter(|v| !v.is_empty()) {
                 config.rpc = rpc;
             }
