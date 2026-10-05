@@ -9,7 +9,7 @@ id is committed the same way in `devnet-id`, for a `--features devnet` build.
 Any other build takes its address from its local keypair (see
 `contracts/solana/crates/shonin-program-id`).
 
-Testnet deployments are never committed (the programs' devnet ids aside). Like a local run's, they stay on the
-machine that deployed them, under `.shonin/testnet/deployments/` (gitignored).
+Testnet deployments are never committed (the programs' devnet ids aside).
+Like a local run's, they stay on the machine that deployed them, under `.shonin/testnet/deployments/` (gitignored).
 
 Nothing is deployed to mainnet, so `mainnet/` is empty.
