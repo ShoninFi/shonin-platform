@@ -19,6 +19,8 @@ devnet = ["chain/devnet"]
 
 [dependencies]
 shared.workspace = true
+hyperliquid.workspace = true
+toml.workspace = true
 chain = { workspace = true, features = ["args"] }
 alloy.workspace = true
 anyhow.workspace = true

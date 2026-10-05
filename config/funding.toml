@@ -1,0 +1,42 @@
+# What `task chains:fund NETWORK=testnet` tops each role account up to, in the
+# chain's own coin, from the funder (the EVM mnemonic's account
+# m/44'/60'/0'/0/100). A role already holding its amount is left alone, so the
+# task is safe to run again. `default` covers every role not named.
+#
+# The funder keeps `reserve` for itself and funds nothing past it: a role it
+# can't fully top up is reported, not half-funded.
+
+[testnet."evm:84532"] # Base Sepolia, ETH
+reserve = 0.01
+default = 0.004
+admin = 0.03
+executor = 0.01
+keeper = 0.01
+author = 0.008
+
+[testnet."evm:998"] # Hyperliquid testnet's HyperEVM, HYPE
+reserve = 0.05
+default = 0.03
+admin = 0.4
+executor = 0.1
+keeper = 0.1
+author = 0.06
+
+[testnet."evm:46630"] # Robinhood Chain testnet, ETH
+reserve = 0.0015
+default = 0.0003
+admin = 0.004
+executor = 0.001
+keeper = 0.001
+author = 0.001
+
+# On Hyperliquid testnet the funder holds dollars on HyperCore and no HYPE on
+# HyperEVM, so the task buys HYPE on HyperCore's spot market and sends it to
+# HyperEVM itself, never paying more than `max_price` dollars a HYPE or buying
+# more than `max_per_run` HYPE in one run. The deploying account (the admin)
+# is given `activation_usd` on HyperCore so it exists there, and switched to
+# big blocks, since some contracts are larger than a small block's 2M gas.
+[hyperliquid]
+max_price = 35.0
+max_per_run = 3.0
+activation_usd = 2.0

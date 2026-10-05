@@ -67,6 +67,11 @@ tasks:
       - "{{.DEVNET}} deploy"
 
   accounts:
-    desc: "Each role's account and gas on every EVM chain, and the Solana deployer: what to fund on a testnet"
+    desc: "Each role's account and gas on every EVM chain, the funders and what they need, and the Solana deployer and roles (NETWORK=testnet)"
     cmds:
       - "{{.DEVNET}} accounts"
+
+  fund:
+    desc: "Top every role up on every EVM testnet from the funder, buying HYPE on HyperCore for HyperEVM; safe to run again (NETWORK=testnet only)"
+    cmds:
+      - "{{.DEVNET}} fund"

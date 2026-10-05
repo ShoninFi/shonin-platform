@@ -15,6 +15,7 @@
 mod dashboard;
 mod deploy;
 mod devnet_keys;
+mod fund;
 mod market;
 mod publish;
 mod seed;
@@ -26,7 +27,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use chain::{
-    ChainArgs, ChainConfig, ChainKey, ChainKind, Deployments, NetworkName, Role, Target, connect_to,
+    ChainArgs, ChainConfig, ChainKey, ChainKind, Deployments, NetworkName, Target, connect_to,
 };
 use clap::{Parser, Subcommand};
 
@@ -64,6 +65,9 @@ struct Args {
         default_value = "contracts/solana/target/deploy"
     )]
     solana_programs: PathBuf,
+    /// What `fund` tops each testnet role up to.
+    #[arg(long, default_value = "config/funding.toml")]
+    funding: PathBuf,
     /// Seconds of chain time each block advances.
     #[arg(long, default_value_t = 3_600)]
     seconds_per_block: u64,
@@ -77,10 +81,15 @@ enum Command {
     /// local network the programs to its Solana cluster, and write the
     /// addresses, then stop. Local and testnet only.
     Deploy,
-    /// Show each role's account on every EVM chain of the network, with what
-    /// it holds for gas, and the Solana deployer: what to fund before a
-    /// testnet deploy.
+    /// Show the funder and each role's account on every EVM chain of the
+    /// network, with what each holds for gas and what it is short, and the
+    /// Solana deployer, roles and programs: what to fund before a testnet
+    /// deploy.
     Accounts,
+    /// Top every role up on every EVM testnet from the funder, to the amounts
+    /// in the funding file; buys HYPE on HyperCore for HyperEVM. Safe to run
+    /// again; testnet only.
+    Fund,
     /// Print the vault chain's RPC (overrides applied) and its deployment
     /// file, one per line, for the tasks that shell out to other tools.
     Chain,
@@ -139,7 +148,7 @@ async fn main() -> Result<()> {
     let one = args.chain_args.vault_chain.is_some();
     let changes_chains = matches!(
         args.command,
-        Some(Command::Deploy | Command::Seed { .. } | Command::Accounts)
+        Some(Command::Deploy | Command::Seed { .. } | Command::Accounts | Command::Fund)
     );
     if target.network == NetworkName::Mainnet && changes_chains {
         bail!("{MAINNET_MISSING}");
@@ -171,7 +180,15 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Accounts) => accounts(&target).await,
+        Some(Command::Accounts) => accounts(&target, &args.funding).await,
+        Some(Command::Fund) => {
+            fund::run(
+                target.network,
+                only(&target, one, evm_chains(&target)),
+                &args.funding,
+            )
+            .await
+        }
         Some(Command::DeploymentEnv { prefix }) => {
             match target.network {
                 NetworkName::Mainnet => {}
@@ -349,42 +366,95 @@ one development key. It is for local chains and testnets. Mainnet addresses are 
 config/deployments/mainnet.";
 
 /// Each role's account on every EVM chain of the network, with its gas, and
-/// on the testnets the Solana deployer.
-async fn accounts(target: &Target) -> Result<()> {
-    const ROLES: [Role; 10] = [
-        Role::Admin,
-        Role::Builder,
-        Role::Reviewer,
-        Role::Executor,
-        Role::Keeper,
-        Role::Author,
-        Role::Viewer,
-        Role::Operator,
-        Role::Attestor,
-        Role::Platform,
-    ];
+/// on the testnets the funder, what each role is short of its amount in the
+/// funding file, and the Solana deployer, roles and programs.
+async fn accounts(target: &Target, funding_file: &std::path::Path) -> Result<()> {
+    use alloy::primitives::utils::format_ether;
+    let testnet = target.network == NetworkName::Testnet;
+    let funding = if testnet {
+        Some(fund::Funding::read(funding_file)?)
+    } else {
+        None
+    };
+    let funder = if testnet {
+        Some(fund::funder()?.address())
+    } else {
+        None
+    };
     for (key, config) in evm_chains(target) {
         let client = connect_to(target.network, &key, &config).await?;
         println!("{} ({key})", config.label);
-        for role in ROLES {
-            let address = client.account(role)?;
-            let balance = client.balance(address).await?;
-            println!(
-                "  {:<9} {address:?}  {}",
-                role.label(),
-                alloy::primitives::utils::format_ether(balance)
-            );
+        match (&funding, funder) {
+            (Some(funding), Some(funder)) => {
+                let short = fund::shortfalls(funding, &client, &key).await?;
+                let reserve = funding.reserve(&key).unwrap_or_default();
+                let held = client.balance(funder).await?;
+                let needs = (short.total + reserve).saturating_sub(held);
+                println!(
+                    "  {:<9} {funder:?}  {}  (the roles are short {}, the reserve is {}{})",
+                    "FUNDER",
+                    format_ether(held),
+                    format_ether(short.total),
+                    format_ether(reserve),
+                    if needs.is_zero() {
+                        String::new()
+                    } else {
+                        format!("; it needs {} more", format_ether(needs))
+                    }
+                );
+                if let Some(api) = hyperliquid::Api::for_chain(client.chain_id) {
+                    let perp = api.perp_withdrawable(funder).await.unwrap_or(0.0);
+                    let usdc = api.spot_balance(funder, "USDC").await.unwrap_or(0.0);
+                    let hype = api.spot_balance(funder, "HYPE").await.unwrap_or(0.0);
+                    println!(
+                        "  {:<9} on HyperCore: ${perp} perp, ${usdc} spot, {hype} HYPE (chains:fund buys HYPE with it)",
+                        ""
+                    );
+                }
+                for (role, address, balance, need) in short.rows {
+                    println!(
+                        "  {:<9} {address:?}  {}{}",
+                        role.label(),
+                        format_ether(balance),
+                        if need.is_zero() {
+                            String::new()
+                        } else {
+                            format!("  (short {})", format_ether(need))
+                        }
+                    );
+                }
+            }
+            _ => {
+                for role in fund::ROLES {
+                    let address = client.account(role)?;
+                    let balance = client.balance(address).await?;
+                    println!(
+                        "  {:<9} {address:?}  {}",
+                        role.label(),
+                        format_ether(balance)
+                    );
+                }
+            }
         }
     }
-    if target.network == NetworkName::Testnet {
+    if testnet {
         let phrase = solana::testnet_mnemonic()?;
         let deployer = solana::keypair_from_mnemonic(&phrase, solana::DEPLOYER)?;
         println!("Solana devnet");
         println!(
-            "  {:<20} {}",
-            "deployer",
+            "  {:<20} {}  (the Solana funder: it pays for the programs and funds the roles)",
+            "FUNDER (deployer)",
             chain::solana::Signer::pubkey(&deployer)
         );
+        for role in fund::ROLES {
+            let index = chain::solana::keys::ROLE_BASE + role.account_index() as u32;
+            let pair = solana::keypair_from_mnemonic(&phrase, index)?;
+            println!(
+                "  {:<20} {}",
+                role.label(),
+                chain::solana::Signer::pubkey(&pair)
+            );
+        }
         for (name, index) in devnet_keys::PROGRAM_KEYS {
             let program = solana::keypair_from_mnemonic(&phrase, index)?;
             println!("  {name:<20} {}", chain::solana::Signer::pubkey(&program));

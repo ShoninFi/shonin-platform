@@ -98,8 +98,10 @@ vars:
 
   # The devnet binary, with the chain arguments every one of its commands
   # takes. The chain tasks, the Solana deploy and the cloud tasks call it.
+  # Not quiet: a build waiting on another's lock says so rather than sitting
+  # silent.
   DEVNET: >-
-    cargo run -q -p shonin-devnet --
+    cargo run -p shonin-devnet --
     --network "{{.NETWORK}}"
     --chains "{{.PATH_CHAINS}}"
     --deployments-dir "{{.PATH_DEPLOYMENTS_DIR}}"
