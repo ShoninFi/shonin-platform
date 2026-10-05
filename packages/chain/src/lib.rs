@@ -18,13 +18,21 @@ pub mod attest;
 pub mod client;
 pub mod config;
 pub mod deployments;
+pub mod digest;
+#[cfg(feature = "args")]
+pub mod logs;
 
 #[cfg(feature = "args")]
 pub use args::{ChainArgs, Served, Target, connect_to, signing_for};
 #[cfg(feature = "rpc")]
-pub use client::{Client, KeyClient, ROLE_COUNT, Role, Signing, keys_from_mnemonic};
+pub use client::{
+    Client, KeyClient, NeverAcknowledged, NeverLanded, NeverSent, ROLE_COUNT, Reverted, Role,
+    Signing, Unanswered, keys_from_mnemonic, may_still_land, unanswered,
+};
 pub use config::{ChainConfig, ChainConfigs, ChainKey, ChainKind, Network, NetworkName};
 pub use deployments::{Deployments, Roles};
+#[cfg(feature = "args")]
+pub use logs::{log_filter, log_filter_from};
 
 /// The generated bindings, one module per interface file.
 ///
@@ -95,6 +103,9 @@ pub mod bindings {
         pub use super::all::*;
     }
     pub mod driver {
+        pub use super::all::*;
+    }
+    pub mod closer {
         pub use super::all::*;
     }
 }

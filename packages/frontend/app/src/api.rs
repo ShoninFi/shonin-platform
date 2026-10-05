@@ -77,7 +77,27 @@ pub struct UsageTotal {
 /// before taking money out of the tank.
 #[cfg(target_arch = "wasm32")]
 pub async fn usage(chain: shared::Chain, vault: &str) -> Result<UsageTotal, String> {
-    fetch::<UsageTotal>(&format!("{chain}/usage/{vault}")).await
+    let reply = gloo_net::http::Request::get(&format!("{BASE}/{chain}/usage/{vault}"))
+        .send()
+        .await
+        .map_err(|error| format!("the API did not answer: {error}"))?;
+    if !reply.ok() {
+        return Err(no_usage_total(reply.status()));
+    }
+    reply
+        .json()
+        .await
+        .map_err(|error| format!("the API said something unexpected: {error}"))
+}
+
+/// Why there is no signed total to settle with, from the API's status: the
+/// executor serves none for the vault, or it can't be reached just now.
+pub fn no_usage_total(status: u16) -> String {
+    match status {
+        404 => "the executor has no total for this vault yet".to_string(),
+        502..=504 => "the executor is unavailable just now; try again in a minute".to_string(),
+        other => format!("the API answered {other}"),
+    }
 }
 
 /// What one address holds on one vault chain, read when a page needs it.
@@ -149,4 +169,18 @@ fn blocking<T: serde::de::DeserializeOwned>(api: &str, path: &str) -> Result<T, 
     reply
         .json()
         .map_err(|error| format!("{url} said something unexpected: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_executor_that_is_unavailable_is_not_said_to_have_no_total() {
+        for status in [502, 503] {
+            let said = no_usage_total(status);
+            assert!(said.contains("unavailable"), "{status}: {said}");
+        }
+        assert!(no_usage_total(404).contains("no total"));
+    }
 }

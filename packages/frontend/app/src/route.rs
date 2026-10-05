@@ -171,8 +171,9 @@ impl Route {
                 Some(tab) => Self::strategy(slug, tab),
                 None => Self::NotFound,
             },
-            ["authors", handle] => Self::Author {
-                handle: (*handle).to_string(),
+            ["authors", handle] => match decode_segment(handle) {
+                Some(handle) => Self::Author { handle },
+                None => Self::NotFound,
             },
             ["portfolio"] => Self::Portfolio,
             ["queue"] => Self::Queue,
@@ -203,7 +204,7 @@ impl Route {
                 Some(segment) => format!("/agents/{slug}/{segment}"),
                 None => format!("/agents/{slug}"),
             },
-            Self::Author { handle } => format!("/authors/{handle}"),
+            Self::Author { handle } => author_path(handle),
             Self::Portfolio => "/portfolio".to_string(),
             Self::Queue => "/queue".to_string(),
             Self::Job { id } => format!("/queue/{id}"),
@@ -213,6 +214,40 @@ impl Route {
             Self::About => "/about".to_string(),
             Self::NotFound => return None,
         })
+    }
+
+    /// The file the build writes this route's page to, relative to the output
+    /// directory: `index.html` for the home page, `404.html` for a page that
+    /// isn't there, and the path with `.html` added for the rest.
+    ///
+    /// A static host decodes the request path before it looks for the file,
+    /// so the file is named after the decoded path: `/authors/bob%20b` is
+    /// `authors/bob b.html`. A route whose decoded path would leave its own
+    /// directory (a name that is empty, `.` or `..`, or that holds a slash)
+    /// has no file, and `None` says so: no request could reach it anyway, and
+    /// writing it would put a file somewhere it doesn't belong.
+    pub fn file(&self) -> Option<String> {
+        let Some(path) = self.path() else {
+            return Some("404.html".to_string());
+        };
+        if path == "/" {
+            return Some("index.html".to_string());
+        }
+        let segments = path
+            .trim_start_matches('/')
+            .split('/')
+            .map(decode_segment)
+            .collect::<Option<Vec<String>>>()?;
+        let stays_put = |segment: &String| {
+            !segment.is_empty()
+                && segment != "."
+                && segment != ".."
+                && !segment.contains(['/', '\\', '\0'])
+        };
+        segments
+            .iter()
+            .all(stays_put)
+            .then(|| format!("{}.html", segments.join("/")))
     }
 
     /// Where this route sits in the navigation, if anywhere. A strategy page
@@ -391,6 +426,49 @@ impl Route {
     }
 }
 
+/// The path of an author's page. The name is whatever the author is shown
+/// as, spaces, brackets and all, so it goes into the URL encoded.
+pub fn author_path(handle: &str) -> String {
+    format!("/authors/{}", encode_segment(handle))
+}
+
+/// Text as one URL path segment: everything outside the characters RFC 3986
+/// leaves unreserved (letters, digits, `-`, `.`, `_`, `~`) is percent-encoded,
+/// so a `/`, `?`, `#` or `%` in it can't end the segment or start another.
+pub fn encode_segment(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// A URL path segment as the text it encodes, or `None` if it is not a valid
+/// encoding of UTF-8 text.
+pub fn decode_segment(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(index + 1..index + 3)?).ok()?;
+            if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// The first sentence or two of a description, for a meta tag.
 fn summarise(description: &str) -> String {
     const LIMIT: usize = 240;
@@ -531,6 +609,116 @@ mod tests {
                     assert!(href.starts_with("https://"), "{href} is not a URL");
                 }
             }
+        }
+    }
+
+    /// An author's name is whatever they are shown as, so it can hold anything
+    /// a URL treats specially. It goes into the path as one segment and comes
+    /// back out unchanged.
+    #[test]
+    fn an_awkward_author_name_round_trips_its_path() {
+        let route = Route::Author {
+            handle: crate::fixture::AWKWARD_NAME.to_string(),
+        };
+        let path = route.path().unwrap();
+        assert_eq!(
+            path,
+            "/authors/zo%C3%AB%2Fal%20%280x12ab%E2%80%A6%29%20100%25%20%231%3F%20on%20Base"
+        );
+        assert_eq!(Route::from_path(&path), route);
+        assert_eq!(Route::from_path(&format!("{path}/")), route);
+
+        // A browser leaves some characters as they are rather than encoding
+        // them; those read back the same.
+        assert_eq!(
+            Route::from_path("/authors/bob%20(0x12)"),
+            Route::Author {
+                handle: "bob (0x12)".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_bad_encoding_is_not_found() {
+        for path in [
+            "/authors/bob%",
+            "/authors/bob%2",
+            "/authors/bob%zz",
+            "/authors/%FF%FE",
+            "/authors/%C3",
+        ] {
+            assert_eq!(Route::from_path(path), Route::NotFound, "{path}");
+        }
+    }
+
+    #[test]
+    fn segments_encode_only_what_they_must() {
+        assert_eq!(encode_segment("Az09-._~"), "Az09-._~");
+        assert_eq!(encode_segment("a b/c?d#e%f+g"), "a%20b%2Fc%3Fd%23e%25f%2Bg");
+        assert_eq!(decode_segment("a%20b%2fc").as_deref(), Some("a b/c"));
+        assert_eq!(decode_segment("%"), None);
+    }
+
+    /// A static host decodes a request before it looks for the file, so the
+    /// file is written under the decoded name.
+    #[test]
+    fn a_page_is_written_where_its_url_is_looked_for() {
+        assert_eq!(Route::Home.file().as_deref(), Some("index.html"));
+        assert_eq!(Route::NotFound.file().as_deref(), Some("404.html"));
+        assert_eq!(
+            Route::Strategy {
+                slug: "funding-basis-v3".to_string(),
+                tab: Tab::Record
+            }
+            .file()
+            .as_deref(),
+            Some("agents/funding-basis-v3/record.html")
+        );
+        assert_eq!(
+            Route::Author {
+                handle: "bob (0x12ab…) on Base".to_string()
+            }
+            .file()
+            .as_deref(),
+            Some("authors/bob (0x12ab…) on Base.html")
+        );
+    }
+
+    /// A name that would put its page outside its own directory gets no file.
+    #[test]
+    fn a_name_cannot_write_outside_its_directory() {
+        for handle in ["..", ".", "", "a/b", "../../etc/passwd", "a\\b", "a\0b"] {
+            let route = Route::Author {
+                handle: handle.to_string(),
+            };
+            assert_eq!(route.file(), None, "{handle:?}");
+        }
+    }
+
+    /// Authors named awkwardly are still listed, and their paths lead back to
+    /// them. A name holding a slash has no file of its own: decoded, it
+    /// would be a directory.
+    #[test]
+    fn awkward_names_are_listed_and_resolve() {
+        let names = crate::fixture::install_awkward_names();
+        for name in &names {
+            let route = Route::Author {
+                handle: name.clone(),
+            };
+            assert!(Route::indexable().contains(&route), "{name} isn't listed");
+            assert_eq!(route.file(), None, "{name} would be written as a directory");
+
+            let without_slash = Route::Author {
+                handle: name.replace('/', " "),
+            };
+            assert_eq!(
+                without_slash.file(),
+                Some(format!("authors/{}.html", name.replace('/', " "))),
+            );
+        }
+        for route in Route::indexable() {
+            let path = route.path().unwrap();
+            assert_eq!(Route::from_path(&path), route, "{path}");
         }
     }
 

@@ -71,6 +71,22 @@ impl ChainKey {
         }
     }
 
+    /// Whether two keys name one chain: an EVM key by its number, so
+    /// `evm:31337` and a hand-built `evm:031337` are the same chain, any
+    /// other key by its name.
+    pub fn same_chain(&self, other: &ChainKey) -> bool {
+        self.canonical() == other.canonical()
+    }
+
+    /// The key as the chain it names, whatever the spelling: what services
+    /// dedupe their chains by.
+    pub fn canonical(&self) -> String {
+        match self.evm_chain_id() {
+            Some(id) => format!("{}:{id}", self.kind.name()),
+            None => self.to_string(),
+        }
+    }
+
     /// The key as a file name: `evm-31337`, `solana-localnet`.
     pub fn file_stem(&self) -> String {
         format!("{}-{}", self.kind.name(), self.id)
@@ -112,8 +128,25 @@ impl FromStr for ChainKey {
                 "{text:?} has no id after the kind"
             )));
         }
-        Ok(Self::new(kind.parse()?, id))
+        let kind: ChainKind = kind.parse()?;
+        // An EVM key is the number the node answers as, written plainly: a
+        // name could never be checked against the node, and a second
+        // spelling of one number (`031337`, `+31337`) would let one chain be
+        // served under two keys.
+        if kind == ChainKind::Evm && !is_plain_decimal_u64(id) {
+            return Err(ConfigError::new(format!(
+                "{text:?}: an EVM chain's id is its chain id in plain decimal, with no sign or leading zero"
+            )));
+        }
+        Ok(Self::new(kind, id))
     }
+}
+
+/// Digits only, no leading zero (bar `0` itself), and within a u64.
+fn is_plain_decimal_u64(id: &str) -> bool {
+    id.bytes().all(|b| b.is_ascii_digit())
+        && (id == "0" || !id.starts_with('0'))
+        && id.parse::<u64>().is_ok()
 }
 
 impl Serialize for ChainKey {
@@ -130,7 +163,7 @@ impl<'de> Deserialize<'de> for ChainKey {
 }
 
 /// Where a chain answers, and what it is called.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainConfig {
     pub label: String,
@@ -139,6 +172,22 @@ pub struct ChainConfig {
     pub ws: Option<String>,
     /// The dollar a vault on this chain settles in.
     pub dollar: String,
+    /// What the chain's native coin is taken to be worth in dollars, for
+    /// turning the gas an executor spends into the author's bill. A chain
+    /// without one bills no gas at all: an author never pays for gas nobody
+    /// priced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_usd: Option<f64>,
+    /// How many blocks deep a log must be before it is acted on, so one in a
+    /// block a reorg replaces, or one a node behind the head has not got
+    /// yet, is not read past. Unset, the reader's own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmations: Option<u64>,
+    /// The `rpc` the file gives, before any override from the environment:
+    /// the one that may be handed to a browser. An override is usually a
+    /// paid URL, which carries its key.
+    #[serde(skip)]
+    pub public_rpc: String,
 }
 
 /// Which set of chains: the ones `task dev` starts, the public testnets, or
@@ -201,7 +250,7 @@ impl Network {
 }
 
 /// Every chain the platform knows, and every network.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ChainConfigs {
     chains: BTreeMap<ChainKey, ChainConfig>,
     networks: BTreeMap<NetworkName, Network>,
@@ -227,10 +276,26 @@ impl ChainConfigs {
         let file: File = toml::from_str(text)
             .map_err(|error| ConfigError::new(format!("chains.toml: {error}")))?;
 
-        let mut chains = BTreeMap::new();
+        let mut chains: BTreeMap<ChainKey, ChainConfig> = BTreeMap::new();
         for (key, mut config) in file.chains {
             let key: ChainKey = key.parse()?;
+            if let Some(other) = chains.keys().find(|known| known.same_chain(&key)) {
+                return Err(ConfigError::new(format!(
+                    "chains.toml lists one chain as both {other} and {key}"
+                )));
+            }
+            // The executor turns gas into the author's bill at this price:
+            // anything but a finite number at or above zero would bill
+            // nonsense (a NaN slips past every cap compared against it).
+            if let Some(price) = config.native_usd
+                && !(price.is_finite() && price >= 0.0)
+            {
+                return Err(ConfigError::new(format!(
+                    "chains.toml: {key}'s native_usd is {price}; it must be a finite number of dollars, at least zero"
+                )));
+            }
             let suffix = key.env_suffix();
+            config.public_rpc = config.rpc.clone();
             if let Some(rpc) = env(&format!("SHONIN_RPC_{suffix}")).filter(|v| !v.is_empty()) {
                 config.rpc = rpc;
             }
@@ -243,13 +308,20 @@ impl ChainConfigs {
         let mut networks = BTreeMap::new();
         for (name, entries) in file.networks {
             let name: NetworkName = name.parse()?;
-            let mut map = BTreeMap::new();
+            let mut map: BTreeMap<Chain, ChainKey> = BTreeMap::new();
             for (vault_chain, key) in entries {
                 let vault_chain: Chain = vault_chain.parse().map_err(ConfigError::new)?;
                 let key: ChainKey = key.parse()?;
                 if !chains.contains_key(&key) {
                     return Err(ConfigError::new(format!(
                         "network {name} names {key} for {vault_chain}, and no chain has that key"
+                    )));
+                }
+                // A chain named for two vault chains would be served twice:
+                // two sweeps, two keys at one nonce, two meters for a vault.
+                if let Some((other, _)) = map.iter().find(|(_, named)| named.same_chain(&key)) {
+                    return Err(ConfigError::new(format!(
+                        "network {name} names {key} for both {other} and {vault_chain}; each vault chain needs a chain of its own"
                     )));
                 }
                 map.insert(vault_chain, key);
@@ -373,6 +445,18 @@ mod tests {
         assert!("8453".parse::<ChainKey>().is_err());
         assert!("evm:".parse::<ChainKey>().is_err());
         assert!("cosmos:hub".parse::<ChainKey>().is_err());
+        for id in [
+            "local",
+            "031337",
+            "+31337",
+            "-1",
+            " 1",
+            "18446744073709551616",
+        ] {
+            assert!(format!("evm:{id}").parse::<ChainKey>().is_err(), "{id}");
+        }
+        assert!("evm:0".parse::<ChainKey>().is_ok());
+        assert!("evm:18446744073709551615".parse::<ChainKey>().is_ok());
     }
 
     #[test]
@@ -408,6 +492,8 @@ mod tests {
         let base = configs.get(&"evm:8453".parse().unwrap()).unwrap();
         assert_eq!(base.rpc, "https://paid.example/key");
         assert_eq!(base.ws.as_deref(), Some("wss://paid.example/key"));
+        // What may be shown to anyone is still the file's own.
+        assert_eq!(base.public_rpc, "https://mainnet.base.org");
         // An empty variable is the same as an unset one.
         let local = configs.get(&"evm:31337".parse().unwrap()).unwrap();
         assert_eq!(local.rpc, "http://127.0.0.1:19100");
@@ -427,6 +513,27 @@ mod tests {
         assert!(ChainConfigs::from_toml(text, no_env).is_err());
         let text = text.replace("base = \"evm:2\"", "polygon = \"evm:1\"");
         assert!(ChainConfigs::from_toml(&text, no_env).is_err());
+    }
+
+    #[test]
+    fn a_network_naming_one_chain_for_two_vault_chains_is_refused() {
+        let text = r#"
+            [chains."evm:1"]
+            label = "One"
+            rpc = "http://one"
+            dollar = "USDC"
+
+            [networks.local]
+            base = "evm:1"
+            robinhood = "evm:1"
+        "#;
+        let error = ChainConfigs::from_toml(text, no_env)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("evm:1") && error.contains("base") && error.contains("robinhood"),
+            "{error}"
+        );
     }
 
     #[test]

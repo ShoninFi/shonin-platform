@@ -33,6 +33,11 @@ pub struct Deployments {
     /// the registry under `local` and `local-bridge`.
     pub driver: Address,
     pub bridge: Address,
+    /// Stops, empties, values and closes a halted vault in one transaction.
+    /// Holds nothing and answers to nobody, so it is at the same address on
+    /// every chain. A deployment from before it existed has none.
+    #[serde(default)]
+    pub closer: Address,
     pub roles: Roles,
 }
 

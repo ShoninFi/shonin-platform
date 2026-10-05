@@ -89,6 +89,10 @@ pub enum Signing {
 
 /// The first accounts a mnemonic derives (`m/44'/60'/0'/0/i`), one per role
 /// index, the same way a development chain derives its own.
+///
+/// The library's own error for a phrase it can't use quotes the phrase, and
+/// a service prints the error it fails with, so it is never passed on: the
+/// error says only that the phrase is not a valid one.
 pub fn keys_from_mnemonic(phrase: &str, count: usize) -> Result<Vec<PrivateKeySigner>> {
     use alloy::signers::local::MnemonicBuilder;
     use alloy::signers::local::coins_bip39::English;
@@ -96,9 +100,14 @@ pub fn keys_from_mnemonic(phrase: &str, count: usize) -> Result<Vec<PrivateKeySi
         .map(|index| {
             MnemonicBuilder::<English>::default()
                 .phrase(phrase.trim())
-                .index(index)?
-                .build()
-                .context("deriving an account from the mnemonic")
+                .index(index)
+                .ok()
+                .and_then(|builder| builder.build().ok())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "the mnemonic is not a valid BIP-39 phrase (its words, or its checksum)"
+                    )
+                })
         })
         .collect()
 }
@@ -115,6 +124,11 @@ pub struct Client {
     pub accounts: Vec<Address>,
     /// The keys this client signs with itself, when the node doesn't.
     keys: Option<Arc<HashMap<Address, PrivateKeySigner>>>,
+    /// One send at a time from each account this client signs for, shared by
+    /// every clone. The nonce is asked of the node when a transaction is
+    /// filled in, so two sends from one account at once would both take the
+    /// same one and the node would keep only one of them.
+    turns: Arc<std::sync::Mutex<HashMap<Address, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 /// The fillers a signing client runs: gas, then the nonce, then the chain id.
@@ -129,15 +143,319 @@ type SigningFillers = alloy::providers::fillers::JoinFill<
     alloy::providers::fillers::ChainIdFiller,
 >;
 
+/// A provider that fills a transaction in and signs it with one key.
+type SigningProvider = alloy::providers::fillers::FillProvider<
+    alloy::providers::fillers::JoinFill<
+        SigningFillers,
+        alloy::providers::fillers::WalletFiller<EthereumWallet>,
+    >,
+    alloy::providers::RootProvider,
+>;
+
 /// How a client that signs for itself fills a transaction in. The nonce is
 /// asked of the chain each time rather than counted here, so a send that
 /// fails before it is broadcast leaves no gap that strands every later one.
-fn signing_builder()
--> ProviderBuilder<alloy::providers::Identity, SigningFillers, alloy::network::Ethereum> {
+/// The chain id is `chain_id`, the one checked against the chain config and
+/// the deployment file when the client connected, never one a node names at
+/// send time: a key signs for the chain it was checked on, and a node that
+/// answers another id afterwards gets nothing valid on that other chain.
+fn signing_builder(
+    chain_id: u64,
+) -> ProviderBuilder<alloy::providers::Identity, SigningFillers, alloy::network::Ethereum> {
     ProviderBuilder::default()
         .with_gas_estimation()
         .with_simple_nonce_management()
-        .fetch_chain_id()
+        .with_chain_id(chain_id)
+}
+
+/// A paid RPC URL carries its key, in its path or its query, and an error
+/// can name it: the HTTP client's own errors name the URL it was sending to,
+/// and a gateway's error page or refusal often names the path it was asked
+/// for. Every request goes through this layer, which takes the URL, and any
+/// part after the host that could be a key, out of whatever comes back, so no
+/// error a service logs or returns can hand the key on.
+#[derive(Clone)]
+struct KeepUrlOut {
+    /// The URL as configured and as the HTTP client writes it, everything
+    /// after its host, and each part of that long enough to be a key.
+    spellings: Arc<[String]>,
+}
+
+/// How long a path segment or query value must be before it is taken for a
+/// key. Shorter ones are words such as `v2` or `rpc`, and replacing those
+/// would only garble the errors they appear in.
+const KEY_LENGTH: usize = 8;
+
+impl KeepUrlOut {
+    fn new(configured: &str, parsed: &alloy::transports::http::reqwest::Url) -> Self {
+        let mut spellings = vec![configured.to_string(), parsed.as_str().to_string()];
+        // Everything after the host, as it was asked for.
+        let mut after_host = parsed.path().to_string();
+        if let Some(query) = parsed.query() {
+            after_host.push('?');
+            after_host.push_str(query);
+        }
+        spellings.push(after_host);
+        // A key can ride in the user part as well as the password.
+        if !parsed.username().is_empty() {
+            spellings.push(parsed.username().to_string());
+        }
+        if let Some(password) = parsed.password() {
+            spellings.push(password.to_string());
+        }
+        for segment in parsed.path().split('/') {
+            spellings.push(segment.to_string());
+        }
+        for part in parsed.query().unwrap_or_default().split('&') {
+            spellings.push(part.to_string());
+            if let Some((_, value)) = part.split_once('=') {
+                spellings.push(value.to_string());
+            }
+        }
+        if let Some(fragment) = parsed.fragment() {
+            spellings.push(fragment.to_string());
+        }
+        // Each spelling also as the HTTP client may have escaped it, or a
+        // gateway unescaped it.
+        let unescaped: Vec<String> = spellings
+            .iter()
+            .filter_map(|spelling| unescape(spelling))
+            .collect();
+        spellings.extend(unescaped);
+        spellings.retain(|spelling| spelling.len() >= KEY_LENGTH);
+        // Longest first, so a spelling that contains another goes whole.
+        spellings.sort_by_key(|spelling| std::cmp::Reverse(spelling.len()));
+        spellings.dedup();
+        Self {
+            spellings: spellings.into(),
+        }
+    }
+
+    fn scrub(&self, text: &str) -> String {
+        self.spellings.iter().fold(text.to_string(), |text, url| {
+            text.replace(url.as_str(), "<rpc>")
+        })
+    }
+
+    /// An error from the transport, with the URL taken out of whatever text
+    /// it carries. It stays the same kind of error, so a caller tells an
+    /// unanswered send from a refused one the same way.
+    fn scrub_error(
+        &self,
+        error: alloy::transports::TransportError,
+    ) -> alloy::transports::TransportError {
+        use alloy::transports::{RpcError, TransportErrorKind};
+        match error {
+            RpcError::Transport(TransportErrorKind::Custom(inner)) => {
+                TransportErrorKind::custom_str(&self.scrub(&inner.to_string()))
+            }
+            RpcError::Transport(TransportErrorKind::HttpError(mut http)) => {
+                http.body = self.scrub(&http.body);
+                RpcError::Transport(TransportErrorKind::HttpError(http))
+            }
+            RpcError::Transport(TransportErrorKind::HttpErrorWithRetryAfter {
+                mut error,
+                retry_after,
+            }) => {
+                error.body = self.scrub(&error.body);
+                RpcError::Transport(TransportErrorKind::HttpErrorWithRetryAfter {
+                    error,
+                    retry_after,
+                })
+            }
+            // A reply that didn't parse: both the text and the parser's
+            // message, which quotes what it could not read.
+            RpcError::DeserError { err, text } => {
+                let message = err.to_string();
+                let scrubbed = self.scrub(&message);
+                RpcError::DeserError {
+                    err: if scrubbed == message {
+                        err
+                    } else {
+                        <serde_json::Error as serde::de::Error>::custom(scrubbed)
+                    },
+                    text: self.scrub(&text),
+                }
+            }
+            // A refusal the transport read out of a reply that wasn't a
+            // JSON-RPC response, as a gateway's bare error object is.
+            RpcError::ErrorResp(mut refusal) => {
+                self.scrub_refusal(&mut refusal);
+                RpcError::ErrorResp(refusal)
+            }
+            other => other,
+        }
+    }
+
+    /// A node's refusal, with the URL taken out of its message and its data.
+    fn scrub_refusal(&self, refusal: &mut alloy::rpc::json_rpc::ErrorPayload) {
+        let message = self.scrub(&refusal.message);
+        if message != refusal.message {
+            refusal.message = message.into();
+        }
+        if let Some(data) = &refusal.data {
+            let scrubbed = self.scrub(data.get());
+            if scrubbed != data.get() {
+                // Data that is no longer JSON once scrubbed is carried as a
+                // string.
+                refusal.data = serde_json::value::RawValue::from_string(scrubbed.clone())
+                    .or_else(|_| serde_json::value::to_raw_value(&scrubbed))
+                    .ok();
+            }
+        }
+    }
+
+    /// A node's answer, with the URL taken out of any refusal in it.
+    fn scrub_answer(
+        &self,
+        mut answer: alloy::rpc::json_rpc::ResponsePacket,
+    ) -> alloy::rpc::json_rpc::ResponsePacket {
+        use alloy::rpc::json_rpc::{ResponsePacket, ResponsePayload};
+        let responses = match &mut answer {
+            ResponsePacket::Single(one) => std::slice::from_mut(one),
+            ResponsePacket::Batch(all) => all.as_mut_slice(),
+        };
+        for response in responses {
+            if let ResponsePayload::Failure(refusal) = &mut response.payload {
+                self.scrub_refusal(refusal);
+            }
+        }
+        answer
+    }
+}
+
+/// A URL part with its percent-escapes decoded, when it has any.
+fn unescape(text: &str) -> Option<String> {
+    if !text.contains('%') {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%'
+            && let Some(hex) = text.get(at + 1..at + 3)
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            decoded.push(byte);
+            at += 3;
+        } else {
+            decoded.push(bytes[at]);
+            at += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+impl<S> tower::Layer<S> for KeepUrlOut {
+    type Service = UrlKeptOut<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        UrlKeptOut {
+            inner,
+            keep: self.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct UrlKeptOut<S> {
+    inner: S,
+    keep: KeepUrlOut,
+}
+
+impl<S> tower::Service<alloy::rpc::json_rpc::RequestPacket> for UrlKeptOut<S>
+where
+    S: tower::Service<
+            alloy::rpc::json_rpc::RequestPacket,
+            Response = alloy::rpc::json_rpc::ResponsePacket,
+            Error = alloy::transports::TransportError,
+            Future = alloy::transports::TransportFut<'static>,
+        > + Send
+        + Sync
+        + Clone
+        + 'static,
+{
+    type Response = alloy::rpc::json_rpc::ResponsePacket;
+    type Error = alloy::transports::TransportError;
+    type Future = alloy::transports::TransportFut<'static>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: alloy::rpc::json_rpc::RequestPacket) -> Self::Future {
+        let answer = self.inner.call(request);
+        let keep = self.keep.clone();
+        Box::pin(async move {
+            answer
+                .await
+                .map(|answer| keep.scrub_answer(answer))
+                .map_err(|error| keep.scrub_error(error))
+        })
+    }
+}
+
+/// How long any one request to a node may take. A node or gateway that
+/// takes a request and never answers would otherwise hold whatever waits on
+/// it for good: a key's turn to send, a round of the keeper, a vault being
+/// taken on.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The connection to a node, with the URL kept out of its errors and every
+/// request bounded in time.
+fn rpc_client(rpc_url: &str) -> Result<alloy::rpc::client::RpcClient> {
+    let url: alloy::transports::http::reqwest::Url = rpc_url
+        .parse()
+        .map_err(|_| anyhow!("the chain's rpc in the chain config is not a URL"))?;
+    let http = alloy::transports::http::reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .context("making the HTTP client")?;
+    Ok(alloy::rpc::client::ClientBuilder::default()
+        .layer(KeepUrlOut::new(rpc_url, &url))
+        .http_with_client(http, url))
+}
+
+/// Wait for a sent transaction's receipt, for at most `within`. A receipt
+/// that never comes (the transaction dropped, the node restarted) is an
+/// unanswered send rather than a wait that never ends.
+async fn receipt_within(
+    provider: &DynProvider,
+    hash: B256,
+    within: Duration,
+    what: &str,
+) -> Result<TransactionReceipt> {
+    receipt_by(provider, hash, tokio::time::Instant::now() + within)
+        .await
+        .with_context(|| what.to_string())
+}
+
+/// Look for a transaction's receipt by its hash until `deadline`. A read that
+/// fails (a gateway's rate limit, a node restarting) is the node's trouble,
+/// not the transaction's: it says nothing about whether the transaction will
+/// land, so it is asked again rather than taken for a failed send, which its
+/// sender would send again.
+async fn receipt_by(
+    provider: &DynProvider,
+    hash: B256,
+    deadline: tokio::time::Instant,
+) -> Result<TransactionReceipt> {
+    let every = provider.client().poll_interval();
+    loop {
+        if let Ok(Ok(Some(receipt))) =
+            tokio::time::timeout(POLL_TIMEOUT, provider.get_transaction_receipt(hash)).await
+        {
+            return Ok(receipt);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow::Error::new(NeverLanded));
+        }
+        tokio::time::sleep(every).await;
+    }
 }
 
 impl Client {
@@ -145,32 +463,44 @@ impl Client {
     /// at once, so a service usually arrives before the chain does.
     pub async fn connect(config: &ChainConfig, signing: Signing) -> Result<Self> {
         let rpc_url = config.rpc.as_str();
-        let url = rpc_url.parse().context("the chain's address")?;
+        let rpc = rpc_client(rpc_url)?;
+        // The chain id is asked for first, on a provider that signs nothing,
+        // so a provider that signs is made for that id alone.
+        let asking = ProviderBuilder::default()
+            .connect_client(rpc.clone())
+            .erased();
+
+        // Measured by the clock, not by the pauses between tries: a node
+        // that takes each request and never answers spends a request's whole
+        // timeout on every try.
+        let started = tokio::time::Instant::now();
+        let chain_id = loop {
+            match asking.get_chain_id().await {
+                Ok(id) => break id,
+                Err(error) => {
+                    // The URL is left out: a paid one carries its key.
+                    if started.elapsed() > Duration::from_secs(120) {
+                        return Err(anyhow!("{} never answered: {error}", config.label));
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        };
+
         let provider = match &signing {
             Signing::Keys(keys) if !keys.is_empty() => {
                 let mut wallet = EthereumWallet::from(keys[0].clone());
                 for key in &keys[1..] {
                     wallet.register_signer(key.clone());
                 }
-                signing_builder().wallet(wallet).connect_http(url).erased()
+                signing_builder(chain_id)
+                    .wallet(wallet)
+                    .connect_client(rpc)
+                    .erased()
             }
             // The node holds unlocked accounts' keys and numbers their
             // transactions itself.
-            _ => ProviderBuilder::default().connect_http(url).erased(),
-        };
-
-        let mut waited = Duration::ZERO;
-        let chain_id = loop {
-            match provider.get_chain_id().await {
-                Ok(id) => break id,
-                Err(error) => {
-                    if waited > Duration::from_secs(120) {
-                        return Err(anyhow!("the chain never answered at {rpc_url}: {error}"));
-                    }
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    waited += Duration::from_millis(500);
-                }
-            }
+            _ => asking,
         };
 
         let (accounts, keys) = match signing {
@@ -195,6 +525,7 @@ impl Client {
             chain_id,
             accounts,
             keys,
+            turns: Default::default(),
         })
     }
 
@@ -211,20 +542,36 @@ impl Client {
         to: Address,
         value: alloy::primitives::U256,
     ) -> Result<TransactionReceipt> {
+        self.transfer_noting(from, to, value, |_| {}).await
+    }
+
+    /// Send the chain's own coin, and hand the transfer's hash to `sent_as`
+    /// as soon as the node has taken it, before waiting for it to land. A
+    /// caller whose wait runs out can still look for it by that hash rather
+    /// than send it again.
+    pub async fn transfer_noting(
+        &self,
+        from: Address,
+        to: Address,
+        value: alloy::primitives::U256,
+        sent_as: impl FnOnce(B256) + Send,
+    ) -> Result<TransactionReceipt> {
         let request = TransactionRequest::default()
             .with_from(from)
             .with_to(to)
             .with_value(value);
         let receipt = self
-            .provider
-            .send_transaction(request)
-            .await
-            .context("sending gas money")?
-            .get_receipt()
-            .await
-            .context("waiting for a transfer")?;
+            .sent(
+                request,
+                RECEIPT_TIMEOUT,
+                "sending gas money",
+                "a transfer",
+                sent_as,
+            )
+            .await?;
         if !receipt.status() {
-            bail!("the transfer to {to} was reverted by the chain");
+            return Err(anyhow::Error::new(Reverted)
+                .context(format!("the transfer to {to} was reverted by the chain")));
         }
         Ok(receipt)
     }
@@ -307,26 +654,52 @@ impl Client {
         to: Address,
         call: C,
     ) -> Result<TransactionReceipt> {
-        let request = TransactionRequest::default()
+        self.send_with(from, to, call, None).await
+    }
+
+    /// Send a call as `from` with the gas limit given rather than the node's
+    /// estimate, and wait for it to land: for a call whose estimate leaves
+    /// too little for what it tries inside and may let fail.
+    pub async fn send_with_gas_limit<C: SolCall>(
+        &self,
+        from: Address,
+        to: Address,
+        call: C,
+        gas_limit: u64,
+    ) -> Result<TransactionReceipt> {
+        self.send_with(from, to, call, Some(gas_limit)).await
+    }
+
+    async fn send_with<C: SolCall>(
+        &self,
+        from: Address,
+        to: Address,
+        call: C,
+        gas_limit: Option<u64>,
+    ) -> Result<TransactionReceipt> {
+        let mut request = TransactionRequest::default()
             .with_from(from)
             .with_to(to)
             .with_input(call.abi_encode());
-        let pending = self
-            .provider
-            .send_transaction(request)
-            .await
-            .with_context(|| format!("sending {}", C::SIGNATURE))?;
-        let receipt = tokio::time::timeout(RECEIPT_TIMEOUT, pending.get_receipt())
-            .await
-            .map_err(|_| anyhow!("{} never landed", C::SIGNATURE))?
-            .with_context(|| format!("waiting for {}", C::SIGNATURE))?;
+        if let Some(gas_limit) = gas_limit {
+            request = request.with_gas_limit(gas_limit);
+        }
+        let receipt = self
+            .sent(
+                request,
+                RECEIPT_TIMEOUT,
+                &format!("sending {}", C::SIGNATURE),
+                C::SIGNATURE,
+                |_| {},
+            )
+            .await?;
         if !receipt.status() {
-            bail!("{} was reverted by the chain", C::SIGNATURE);
+            return Err(anyhow::Error::new(Reverted)
+                .context(format!("{} was reverted by the chain", C::SIGNATURE)));
         }
         Ok(receipt)
     }
 
-    /// Deploy a contract from its bytecode and constructor arguments.
     /// Send bytes that are not a call of ours, such as a creation through the
     /// deterministic deployer.
     pub async fn send_raw(
@@ -340,34 +713,75 @@ impl Client {
             .with_to(to)
             .with_input(data);
         let receipt = self
-            .provider
-            .send_transaction(request)
-            .await
-            .context("sending")?
-            .get_receipt()
-            .await
-            .context("waiting for a receipt")?;
+            .sent(request, RECEIPT_TIMEOUT, "sending", "a transaction", |_| {})
+            .await?;
         if !receipt.status() {
-            bail!("the transaction reverted");
+            return Err(anyhow::Error::new(Reverted).context("the transaction reverted"));
         }
         Ok(receipt)
     }
 
+    /// Deploy a contract from its bytecode and constructor arguments. A
+    /// creation the chain reverted is an error: its receipt still names the
+    /// address the contract would have had, with nothing there.
     pub async fn deploy(&self, from: Address, bytecode: Vec<u8>) -> Result<Address> {
         let request = TransactionRequest::default()
             .with_from(from)
             .with_deploy_code(bytecode);
         let receipt = self
-            .provider
-            .send_transaction(request)
-            .await
-            .context("deploying")?
-            .get_receipt()
-            .await
-            .context("waiting for a deployment")?;
+            .sent(request, DEPLOY_TIMEOUT, "deploying", "a deployment", |_| {})
+            .await?;
+        if !receipt.status() {
+            return Err(
+                anyhow::Error::new(Reverted).context("the deployment was reverted by the chain")
+            );
+        }
         receipt
             .contract_address
             .ok_or_else(|| anyhow!("the chain accepted a deployment without giving it an address"))
+    }
+
+    /// Send a transaction and wait, for at most `within`, for its receipt,
+    /// telling `sent_as` its hash once the node has it.
+    ///
+    /// A send from an account this client signs for waits for that
+    /// account's turn and holds it until the receipt comes or the wait runs
+    /// out. A node that signs for the account numbers its transactions
+    /// itself, so those need no turn.
+    async fn sent(
+        &self,
+        request: TransactionRequest,
+        within: Duration,
+        sending: &str,
+        what: &str,
+        sent_as: impl FnOnce(B256) + Send,
+    ) -> Result<TransactionReceipt> {
+        let _turn = match request.from {
+            Some(from)
+                if self
+                    .keys
+                    .as_ref()
+                    .is_some_and(|keys| keys.contains_key(&from)) =>
+            {
+                let turn = self
+                    .turns
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .entry(from)
+                    .or_default()
+                    .clone();
+                Some(turn.lock_owned().await)
+            }
+            _ => None,
+        };
+        let pending = self
+            .provider
+            .send_transaction(request)
+            .await
+            .with_context(|| sending.to_string())?;
+        let hash = *pending.tx_hash();
+        sent_as(hash);
+        receipt_within(&self.provider, hash, within, what).await
     }
 
     /// Have the node sign a digest as `who`, the way a wallet would: the
@@ -444,6 +858,18 @@ impl Client {
         Ok(block.header.timestamp)
     }
 
+    /// The head and its time, from one read of the head block: two reads
+    /// could land either side of a new block.
+    pub async fn head_and_time(&self) -> Result<(u64, u64)> {
+        let block = self
+            .provider
+            .get_block(alloy::eips::BlockId::latest())
+            .await
+            .context("the head block")?
+            .ok_or_else(|| anyhow!("the chain has no blocks yet"))?;
+        Ok((block.header.number, block.header.timestamp))
+    }
+
     /// Whether anything is deployed at an address: how a deploy knows the
     /// file it found is describing a chain that still exists.
     pub async fn has_code(&self, at: Address) -> Result<bool> {
@@ -463,16 +889,17 @@ impl Client {
     /// enclave ever holds them.
     pub fn with_key(&self, signer: PrivateKeySigner) -> Result<KeyClient> {
         let address = signer.address();
-        let url = self.rpc_url.parse().context("the chain's address")?;
-        let provider = signing_builder()
+        let signing = signing_builder(self.chain_id)
             .wallet(EthereumWallet::from(signer.clone()))
-            .connect_http(url)
-            .erased();
+            .connect_client(rpc_client(&self.rpc_url)?);
         Ok(KeyClient {
-            provider,
+            provider: signing.clone().erased(),
+            signing,
             signer,
             address,
             sending: Default::default(),
+            spent: Default::default(),
+            noting: None,
         })
     }
 
@@ -493,7 +920,8 @@ impl Client {
 
     /// Wait until a deploy has written the file and its contracts are there.
     pub async fn wait_for_deployments(&self, path: &std::path::Path) -> Result<Deployments> {
-        let mut waited = Duration::ZERO;
+        // By the clock: each look can itself take a request's timeout.
+        let started = tokio::time::Instant::now();
         loop {
             if path.exists()
                 && let Ok(deployments) = self.deployments(path).await
@@ -501,11 +929,10 @@ impl Client {
             {
                 return Ok(deployments);
             }
-            if waited > Duration::from_secs(180) {
+            if started.elapsed() > Duration::from_secs(180) {
                 bail!("no deployment appeared at {}", path.display());
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
-            waited += Duration::from_millis(500);
         }
     }
 }
@@ -514,37 +941,431 @@ impl Client {
 #[derive(Clone)]
 pub struct KeyClient {
     provider: DynProvider,
+    /// The same connection, filling transactions in and signing them here,
+    /// so a transaction's hash is known before it is sent.
+    signing: SigningProvider,
     signer: PrivateKeySigner,
     pub address: Address,
     /// One transaction at a time from this key. Several tasks act with the
     /// same key, and two sends at once would take the same nonce, leaving one
-    /// of them waiting for a receipt that never comes.
+    /// of them waiting for a receipt that never comes. The turn is held by
+    /// the task that sends, not by the caller, so it ends when the send does.
     sending: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// What this key has paid for gas, counted from the receipt of every
+    /// transaction it sent, reverted ones included, whenever the receipt
+    /// arrives.
+    spent: Arc<std::sync::Mutex<Spent>>,
+    /// Where each of this client's broadcasts is noted as one that may still
+    /// land, from the moment it is broadcast until its receipt is found or
+    /// no longer looked for (see [`KeyClient::noting`]).
+    noting: Option<Unanswered>,
+}
+
+/// What a key has paid for gas, in the native coin's smallest unit, and the
+/// transactions already counted in it.
+///
+/// A key signs deterministically, so a send filled in exactly as an earlier
+/// one was is the same transaction, with the same hash, and both sends watch
+/// for its one receipt. Its gas is counted by whichever watch finds it first
+/// and never again. A hash is remembered for twice the landing window, past
+/// the end of any watch that could still find it, and then forgotten, so the
+/// set stays small.
+#[derive(Default)]
+struct Spent {
+    total: u128,
+    counted: HashMap<B256, std::time::Instant>,
+    /// Sends whose gas may still be added: started, and not yet landed or
+    /// given up on.
+    in_flight: usize,
+    /// When the last of them landed or was given up on.
+    last_settled: Option<std::time::Instant>,
+}
+
+/// Counts a send as in flight from when it starts until its watch ends,
+/// however it ends.
+struct InFlight(Arc<std::sync::Mutex<Spent>>);
+
+impl InFlight {
+    fn start(spent: Arc<std::sync::Mutex<Spent>>) -> Self {
+        if let Ok(mut spent) = spent.lock() {
+            spent.in_flight += 1;
+        }
+        Self(spent)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Ok(mut spent) = self.0.lock() {
+            spent.in_flight = spent.in_flight.saturating_sub(1);
+            spent.last_settled = Some(std::time::Instant::now());
+        }
+    }
+}
+
+impl Spent {
+    const REMEMBERED_FOR: Duration = Duration::from_secs(2 * LANDING_TIMEOUT.as_secs());
+
+    fn count(&mut self, hash: B256, cost: u128, now: std::time::Instant) {
+        self.counted
+            .retain(|_, at| now.duration_since(*at) < Self::REMEMBERED_FOR);
+        if self.counted.insert(hash, now).is_none() {
+            self.total = self.total.saturating_add(cost);
+        }
+    }
+}
+
+/// A transaction that was sent and never came back with a receipt.
+#[derive(Debug)]
+pub struct NeverLanded;
+
+impl std::fmt::Display for NeverLanded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("it never landed")
+    }
+}
+
+impl std::error::Error for NeverLanded {}
+
+/// A transaction the node never said it had taken, within the time a key's
+/// turn to send is held. It may or may not have been broadcast.
+#[derive(Debug)]
+pub struct NeverAcknowledged;
+
+impl std::fmt::Display for NeverAcknowledged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the node never said it had it")
+    }
+}
+
+impl std::error::Error for NeverAcknowledged {}
+
+/// A send that failed before anything was broadcast: filling it in (the gas
+/// estimate, the fee or the nonce), or the check it was sent on, failed. The
+/// node never had it, so it can't land, however unanswered the failure was.
+#[derive(Debug)]
+pub struct NeverSent(anyhow::Error);
+
+impl NeverSent {
+    pub(crate) fn wrap(error: anyhow::Error) -> anyhow::Error {
+        anyhow::Error::new(NeverSent(error))
+    }
+}
+
+impl std::fmt::Display for NeverSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("nothing was sent")
+    }
+}
+
+impl std::error::Error for NeverSent {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+/// A transaction that was mined and reverted: the chain looked at it and
+/// refused it, after it had been paid for.
+#[derive(Debug)]
+pub struct Reverted;
+
+impl std::fmt::Display for Reverted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("it was reverted by the chain")
+    }
+}
+
+impl std::error::Error for Reverted {}
+
+/// Whether a send failed because the chain could not be reached, or never
+/// answered, rather than because it looked at the transaction and refused
+/// it. A refusal is an answer; this is the absence of one.
+pub fn unanswered(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<NeverLanded>()
+            || cause.is::<NeverAcknowledged>()
+            || cause
+                .downcast_ref::<alloy::transports::TransportError>()
+                .is_some_and(|error| error.is_transport_error())
+            || cause.is::<alloy::providers::PendingTransactionError>()
+    })
+}
+
+/// Whether a failed send may still land: it went unanswered after it was
+/// broadcast, or may have been. One that failed before anything was sent
+/// can't, so it is no reason to hold the next send back.
+pub fn may_still_land(error: &anyhow::Error) -> bool {
+    unanswered(error) && !error.chain().any(|cause| cause.is::<NeverSent>())
+}
+
+/// A key's last send of one kind (an approval, a blessing) that may still
+/// land, kept where every sender of that kind for the key sees it, however
+/// often the sender itself is started again. While it may, another sent
+/// meanwhile could land as well and both be paid for.
+///
+/// A send made through a [`KeyClient::noting`] this is noted by the send
+/// itself, at the moment it is broadcast, and the note is taken off when its
+/// receipt is found or no longer looked for. The send carries on whatever
+/// becomes of its caller, so a caller stopped halfway still leaves the note.
+/// A send made any other way is noted by its caller, with
+/// [`Unanswered::failed`].
+#[derive(Clone, Default)]
+pub struct Unanswered(Arc<std::sync::Mutex<Option<Note>>>);
+
+/// One send that may still land: whose, which one, and when it no longer may.
+#[derive(Clone, Copy)]
+struct Note {
+    key: Address,
+    id: u64,
+    until: tokio::time::Instant,
+}
+
+impl Unanswered {
+    /// Take note of a failed send of `key`'s that its caller saw fail: one
+    /// that may still land holds the next back until it no longer may. A
+    /// send already noted when it was broadcast is left as noted while that
+    /// note holds; a note that has run out is replaced, or this send would
+    /// hold nothing back.
+    pub fn failed(&self, key: Address, error: &anyhow::Error) {
+        if !may_still_land(error) {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        if let Ok(mut note) = self.0.lock()
+            && !note.is_some_and(|note| note.key == key && now < note.until)
+        {
+            *note = Some(Note {
+                key,
+                id: next_note(),
+                until: now + LANDING_TIMEOUT,
+            });
+        }
+    }
+
+    /// What the send was for is seen done: nothing is waited on any more.
+    pub fn settled(&self) {
+        if let Ok(mut note) = self.0.lock() {
+            *note = None;
+        }
+    }
+
+    /// Whether a send of `key`'s may still land.
+    pub fn may_still_land(&self, key: Address) -> bool {
+        self.0.lock().map_or(true, |note| {
+            note.is_some_and(|note| note.key == key && tokio::time::Instant::now() < note.until)
+        })
+    }
+
+    /// Note a send of `key`'s as broadcast. It may land for as long as it is
+    /// watched for, which is never longer than this.
+    fn broadcast(&self, key: Address) -> u64 {
+        let id = next_note();
+        if let Ok(mut note) = self.0.lock() {
+            *note = Some(Note {
+                key,
+                id,
+                until: tokio::time::Instant::now() + RECEIPT_TIMEOUT + LANDING_TIMEOUT,
+            });
+        }
+        id
+    }
+
+    /// The send noted as `id` is no longer watched for: take its note off,
+    /// unless a later send has been noted since.
+    fn watched(&self, id: u64) {
+        if let Ok(mut note) = self.0.lock()
+            && note.is_some_and(|note| note.id == id)
+        {
+            *note = None;
+        }
+    }
+}
+
+fn next_note() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Keeps a broadcast noted in an [`Unanswered`] for as long as it is
+/// watched for, and takes the note off when the watch ends, however it ends.
+struct Noted {
+    unanswered: Unanswered,
+    id: u64,
+}
+
+impl Noted {
+    fn start(unanswered: Unanswered, key: Address) -> Self {
+        let id = unanswered.broadcast(key);
+        Self { unanswered, id }
+    }
+}
+
+impl Drop for Noted {
+    fn drop(&mut self) {
+        self.unanswered.watched(self.id);
+    }
 }
 
 /// How long to wait for a transaction to land before giving up on it, so a
 /// dropped one is an error rather than a task that never wakes.
 const RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long to wait for a deployment to land. A contract's creation is
+/// larger than a call and can sit longer before a block takes it.
+const DEPLOY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How often a [`KeyClient::send_if`] held back by a noted send that may
+/// still land looks again.
+const NOTED_LOOK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long a transaction's receipt is still looked for after the sender has
+/// stopped waiting, so that its gas is counted when it lands late.
+pub const LANDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The most one look for a receipt may take, so a node that stops answering
+/// can't stretch the landing past its deadline.
+const POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl KeyClient {
+    /// Send a call, and wait for it to land.
+    ///
+    /// Once a transaction has been written to the node its gas may be spent
+    /// whatever becomes of this call, and the node can take its time to say
+    /// it has it. So everything from the broadcast on runs on a task of its
+    /// own: a caller that stops waiting, or is itself stopped, even halfway
+    /// through the broadcast, doesn't lose the count. The caller is free to
+    /// stop while it waits for its turn, since nothing has been sent then.
     pub async fn send<C: SolCall>(&self, to: Address, call: C) -> Result<TransactionReceipt> {
-        let _turn = self.sending.lock().await;
+        let turn = self.sending.clone().lock_owned().await;
+        self.send_holding(turn, to, call).await
+    }
+
+    /// Send a call only if `check`, run once this key's turn to send is
+    /// taken and before anything is signed, says to; `None` if it said not
+    /// to. A check made before the turn may be stale by the time the turn
+    /// comes (another of this key's sends may have changed what it read, or
+    /// anyone else meanwhile). A check that fails sends nothing.
+    ///
+    /// Inside the turn, no send of this key's is being filled in or waited
+    /// on, but one given up on may still be in the node's pool: its turn
+    /// ends at its deadline, and it can land long after. The chain can't
+    /// show the check that one, so a client [`KeyClient::noting`] its sends
+    /// doesn't check while a send noted there may still land: it gives the
+    /// turn back and waits, and checks once that one has landed or no longer
+    /// can. A client that notes nothing can't know of such a send, and its
+    /// check is all there is.
+    pub async fn send_if<C: SolCall>(
+        &self,
+        check: impl std::future::Future<Output = Result<bool>>,
+        to: Address,
+        call: C,
+    ) -> Result<Option<TransactionReceipt>> {
+        let turn = loop {
+            let turn = self.sending.clone().lock_owned().await;
+            match &self.noting {
+                Some(noted) if noted.may_still_land(self.address) => {
+                    drop(turn);
+                    tokio::time::sleep(NOTED_LOOK).await;
+                }
+                _ => break turn,
+            }
+        };
+        if !check.await.map_err(NeverSent::wrap)? {
+            return Ok(None);
+        }
+        self.send_holding(turn, to, call).await.map(Some)
+    }
+
+    async fn send_holding<C: SolCall>(
+        &self,
+        turn: tokio::sync::OwnedMutexGuard<()>,
+        to: Address,
+        call: C,
+    ) -> Result<TransactionReceipt> {
         let request = TransactionRequest::default()
             .with_to(to)
             .with_input(call.abi_encode());
-        let pending = self
-            .provider
-            .send_transaction(request)
+        let in_flight = InFlight::start(self.spent.clone());
+        // One deadline for the caller and the broadcast alike, measured from
+        // here rather than from whenever the broadcast task first runs.
+        let deadline = tokio::time::Instant::now() + RECEIPT_TIMEOUT;
+        let stage = Arc::new(Stage::default());
+        let sending = tokio::spawn(broadcast(
+            self.signing.clone(),
+            self.provider.clone(),
+            request,
+            turn,
+            self.spent.clone(),
+            in_flight,
+            stage.clone(),
+            deadline,
+            self.noting.clone().map(|noting| (noting, self.address)),
+            C::SIGNATURE,
+        ));
+        // Giving up claims the send's stage: a broadcast that hasn't begun by
+        // then never will, so the send was never sent. One that has begun may
+        // still land.
+        let never_landed = || {
+            let error = anyhow::Error::new(NeverLanded).context(C::SIGNATURE);
+            if stage.give_up() {
+                NeverSent::wrap(error)
+            } else {
+                error
+            }
+        };
+        let receipt = tokio::time::timeout_at(deadline, sending)
             .await
-            .with_context(|| format!("sending {}", C::SIGNATURE))?;
-        let receipt = tokio::time::timeout(RECEIPT_TIMEOUT, pending.get_receipt())
-            .await
-            .map_err(|_| anyhow!("{} never landed", C::SIGNATURE))?
-            .with_context(|| format!("waiting for {}", C::SIGNATURE))?;
+            .map_err(|_| never_landed())?
+            .map_err(|_| never_landed())??;
         if !receipt.status() {
-            bail!("{} was reverted by the chain", C::SIGNATURE);
+            return Err(anyhow::Error::new(Reverted)
+                .context(format!("{} was reverted by the chain", C::SIGNATURE)));
         }
         Ok(receipt)
+    }
+
+    /// The same key with a gas counter of its own, for transactions sent on
+    /// the platform's behalf rather than the agent's, such as its blessing:
+    /// those are not the author's to pay. It shares the key's turn to send,
+    /// so the two never reach for the same nonce.
+    pub fn unmetered(&self) -> KeyClient {
+        KeyClient {
+            spent: Default::default(),
+            ..self.clone()
+        }
+    }
+
+    /// The same key, noting each of its broadcasts in `unanswered` as one
+    /// that may still land, from the moment it is broadcast until its
+    /// receipt is found or no longer looked for. The note is made and taken
+    /// off by the send itself, which runs on whatever becomes of its caller.
+    pub fn noting(&self, unanswered: &Unanswered) -> KeyClient {
+        KeyClient {
+            noting: Some(unanswered.clone()),
+            ..self.clone()
+        }
+    }
+
+    /// What this key has paid for gas so far, in the native coin's smallest
+    /// unit.
+    pub fn gas_spent(&self) -> u128 {
+        self.spent
+            .lock()
+            .map(|spent| spent.total)
+            .unwrap_or_default()
+    }
+
+    /// Whether a send this key's gas count covers may still land, so its gas
+    /// may still be added to [`KeyClient::gas_spent`]: it has started and
+    /// its watch for the receipt hasn't ended.
+    pub fn sends_in_flight(&self) -> bool {
+        self.spent.lock().map_or(true, |spent| spent.in_flight > 0)
+    }
+
+    /// When the last of this key's sends landed or was given up on, if any
+    /// has.
+    pub fn last_settled(&self) -> Option<std::time::Instant> {
+        self.spent.lock().ok().and_then(|spent| spent.last_settled)
     }
 
     /// Sign a digest the way a contract expects to recover it.
@@ -557,9 +1378,296 @@ impl KeyClient {
     }
 }
 
+/// How far a send has got, claimed by whichever of its broadcast and its
+/// caller giving up on it comes first: a send is either broadcast before it
+/// is given up on, so it may still land, or never broadcast at all.
+#[derive(Default)]
+struct Stage(std::sync::atomic::AtomicU8);
+
+impl Stage {
+    const FILLING: u8 = 0;
+    const BROADCAST: u8 = 1;
+    const GIVEN_UP: u8 = 2;
+
+    /// Claim the broadcast; false if the send was given up on first.
+    fn broadcast(&self) -> bool {
+        self.claim(Self::BROADCAST)
+    }
+
+    /// Claim giving up; false if the broadcast began first.
+    fn give_up(&self) -> bool {
+        self.claim(Self::GIVEN_UP)
+    }
+
+    fn claim(&self, to: u8) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        match self.0.compare_exchange(Self::FILLING, to, SeqCst, SeqCst) {
+            Ok(_) => true,
+            Err(now) => now == to,
+        }
+    }
+}
+
+/// Send a transaction and wait for it to land, holding the key's turn until
+/// it does or until its sender would have stopped waiting, whichever is
+/// first.
+///
+/// The transaction is filled in (nonce, gas, fees) and signed here, so its
+/// hash is known before it is sent. Once it has been sent its receipt is
+/// looked for by that hash whatever the node's reply: a reply lost or too
+/// slow says nothing about whether the node took the transaction, and if it
+/// lands its gas is counted all the same. Only a refusal (the node answered
+/// and said no) means it was not taken. Everything up to the receipt runs
+/// under one deadline, so a node that never answers can't keep the turn:
+/// past it the turn is given up and the send is unanswered, while the
+/// receipt is still looked for afterwards without holding the key's next
+/// transaction up.
+#[allow(clippy::too_many_arguments)]
+async fn broadcast(
+    signing: SigningProvider,
+    provider: DynProvider,
+    request: TransactionRequest,
+    turn: tokio::sync::OwnedMutexGuard<()>,
+    spent: Arc<std::sync::Mutex<Spent>>,
+    _in_flight: InFlight,
+    stage: Arc<Stage>,
+    deadline: tokio::time::Instant,
+    noting: Option<(Unanswered, Address)>,
+    signature: &'static str,
+) -> Result<TransactionReceipt> {
+    use alloy::eips::eip2718::Encodable2718;
+    use alloy::rpc::json_rpc::RpcError;
+
+    // Nothing has been sent while this runs: only the node's reads are
+    // asked for. So whatever fails here, nothing can land.
+    let filled = match tokio::time::timeout_at(deadline, signing.fill(request)).await {
+        Ok(filled) => filled
+            .with_context(|| format!("sending {signature}"))
+            .map_err(NeverSent::wrap)?,
+        Err(_) => {
+            return Err(NeverSent::wrap(
+                anyhow::Error::new(NeverAcknowledged).context(signature),
+            ));
+        }
+    };
+    let Some(signed) = filled.as_envelope() else {
+        return Err(NeverSent::wrap(anyhow!(
+            "{signature} was filled in but not signed"
+        )));
+    };
+    let hash = *signed.tx_hash();
+    let raw = signed.encoded_2718();
+
+    // The caller may have given up while this was filled in, and been told
+    // nothing was sent: then nothing is. Nor is anything once the deadline
+    // has passed: the send couldn't go out before the caller gives up, and
+    // must not be taken as one that may still land.
+    if tokio::time::Instant::now() >= deadline || !stage.broadcast() {
+        return Err(NeverSent::wrap(
+            anyhow::Error::new(NeverAcknowledged).context(signature),
+        ));
+    }
+    // From here it may land: noted as such, in the send itself, until the
+    // watch for its receipt ends.
+    let _noted = noting.map(|(unanswered, key)| Noted::start(unanswered, key));
+    let reply = tokio::time::timeout_at(deadline, provider.send_raw_transaction(&raw)).await;
+    if let Ok(Err(refusal @ RpcError::ErrorResp(_))) = reply
+        && !already_held(&refusal)
+    {
+        drop(turn);
+        return Err(anyhow::Error::new(refusal).context(format!("sending {signature}")));
+    }
+    // Taken, already held, or no reply came back: whichever, it may land.
+    let landing = land(provider, hash, spent);
+    tokio::pin!(landing);
+    let landed = match tokio::time::timeout_at(deadline, &mut landing).await {
+        Ok(landed) => landed,
+        Err(_) => {
+            drop(turn);
+            landing.await
+        }
+    };
+    landed.with_context(|| format!("waiting for {signature}"))
+}
+
+/// Whether a node's refusal of a send says it already holds that very
+/// transaction. That is no refusal: the node has it, and it may land, so it
+/// is watched for like any other send. Nodes word it differently ("already
+/// known", "known transaction", "transaction already imported"); an "unknown
+/// transaction" is not one of them.
+fn already_held(refusal: &alloy::transports::TransportError) -> bool {
+    let alloy::rpc::json_rpc::RpcError::ErrorResp(payload) = refusal else {
+        return false;
+    };
+    let message = payload.message.to_lowercase();
+    message.contains("already known")
+        || message.contains("alreadyknown")
+        || message.contains("already imported")
+        || message.starts_with("known transaction")
+}
+
+/// Wait for a sent transaction's receipt, and add what it cost to the key's
+/// count when it arrives, unless another watch of the same transaction
+/// already has.
+async fn land(
+    provider: DynProvider,
+    hash: B256,
+    spent: Arc<std::sync::Mutex<Spent>>,
+) -> Result<TransactionReceipt> {
+    let receipt = receipt_by(
+        &provider,
+        hash,
+        tokio::time::Instant::now() + LANDING_TIMEOUT,
+    )
+    .await?;
+    if let Ok(mut spent) = spent.lock() {
+        spent.count(
+            hash,
+            (receipt.gas_used as u128).saturating_mul(receipt.effective_gas_price),
+            std::time::Instant::now(),
+        );
+    }
+    Ok(receipt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_send_that_was_broadcast_may_still_land() {
+        let lost = anyhow::Error::new(NeverLanded).context("approveKey");
+        assert!(unanswered(&lost) && may_still_land(&lost));
+        // Unanswered all the same, but nothing was sent.
+        let unsent = NeverSent::wrap(anyhow::Error::new(NeverAcknowledged)).context("approveKey");
+        assert!(unanswered(&unsent));
+        assert!(!may_still_land(&unsent));
+        // A refusal is an answer either way.
+        assert!(!may_still_land(&anyhow::Error::new(Reverted)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_send_unanswered_after_an_earlier_note_lapsed_still_holds_the_next_back() {
+        let key = Address::repeat_byte(1);
+        let lost = || anyhow::Error::new(NeverLanded).context("bless");
+        let unanswered = Unanswered::default();
+
+        // A first send goes unanswered: it may land for the landing window.
+        unanswered.failed(key, &lost());
+        assert!(unanswered.may_still_land(key));
+
+        // The window passes: that one no longer may.
+        tokio::time::advance(LANDING_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        assert!(!unanswered.may_still_land(key));
+
+        // The next goes unanswered too, and may land just as the first might
+        // have: its note replaces the lapsed one.
+        unanswered.failed(key, &lost());
+        assert!(unanswered.may_still_land(key));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_note_still_running_is_kept_when_its_send_is_seen_to_fail() {
+        let key = Address::repeat_byte(1);
+        let unanswered = Unanswered::default();
+        // Noted at its broadcast, for as long as its receipt is watched for.
+        let _watching = Noted::start(unanswered.clone(), key);
+        // Its caller sees it go unanswered: the note it already has stands,
+        // rather than being cut back to the caller's own window.
+        unanswered.failed(key, &anyhow::Error::new(NeverLanded).context("bless"));
+        tokio::time::advance(LANDING_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        assert!(unanswered.may_still_land(key));
+    }
+
+    #[test]
+    fn every_part_of_a_paid_url_that_could_be_a_key_is_scrubbed() {
+        // Made-up keys, built here so they don't read as real ones.
+        let path_key = "abcdef01".repeat(2);
+        let query_key = "fedcba98".repeat(2);
+        let user = "user0123456789";
+        let configured = format!("https://{user}@eth.example.com/v2/{path_key}?apikey={query_key}");
+        let keep = KeepUrlOut::new(&configured, &configured.parse().unwrap());
+        for leak in [
+            format!("Cannot POST /v2/{path_key}"),
+            format!("unknown key {path_key}"),
+            format!("bad apikey={query_key}"),
+            format!("bad key {query_key}"),
+            format!(
+                "error sending request for url (https://eth.example.com/v2/{path_key}?apikey={query_key})"
+            ),
+            format!("no account {user} at this gateway"),
+        ] {
+            let scrubbed = keep.scrub(&leak);
+            assert!(
+                !scrubbed.contains(&path_key)
+                    && !scrubbed.contains(&query_key)
+                    && !scrubbed.contains(user),
+                "{scrubbed}"
+            );
+        }
+        // Short words in the path are not taken for keys.
+        assert_eq!(keep.scrub("v2 rpc"), "v2 rpc");
+    }
+
+    #[test]
+    fn a_transaction_s_gas_is_counted_once_and_its_hash_forgotten_after_the_window() {
+        let start = std::time::Instant::now();
+        let mut spent = Spent::default();
+        let one = B256::repeat_byte(1);
+        spent.count(one, 100, start);
+        spent.count(one, 100, start + Duration::from_secs(5));
+        assert_eq!(spent.total, 100);
+        // Remembered from the last watch that found it.
+        spent.count(
+            B256::repeat_byte(2),
+            7,
+            start + Duration::from_secs(5) + Spent::REMEMBERED_FOR,
+        );
+        assert_eq!(spent.total, 107);
+        assert!(!spent.counted.contains_key(&one), "kept past the window");
+    }
+
+    #[test]
+    fn only_a_node_that_holds_the_transaction_is_taken_as_holding_it() {
+        let refusal = |message: &str| {
+            alloy::rpc::json_rpc::RpcError::ErrorResp(alloy::rpc::json_rpc::ErrorPayload {
+                code: -32000,
+                message: message.to_string().into(),
+                data: None,
+            })
+        };
+        for held in [
+            "already known",
+            "AlreadyKnown",
+            "known transaction: 0xabc",
+            "Transaction with the same hash was already imported.",
+        ] {
+            assert!(already_held(&refusal(held)), "{held}");
+        }
+        for refused in [
+            "nonce too low",
+            "insufficient funds for gas * price + value",
+            "unknown transaction",
+            "replacement transaction underpriced",
+        ] {
+            assert!(!already_held(&refusal(refused)), "{refused}");
+        }
+    }
+
+    #[test]
+    fn a_mnemonic_that_fails_its_checksum_is_not_quoted_in_the_error() {
+        // A development chain's public mnemonic with its last word changed
+        // to another real word: the checksum no longer holds.
+        let phrase = "test test test test test test test test test test test zoo";
+        let Err(error) = keys_from_mnemonic(phrase, 1) else {
+            panic!("the checksum should fail");
+        };
+        let text = format!("{error:#} / {error:?}");
+        assert!(
+            !text.contains("test test"),
+            "the error quotes the mnemonic: {text}"
+        );
+    }
 
     #[test]
     fn a_mnemonic_derives_the_accounts_a_development_chain_would() {

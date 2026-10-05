@@ -220,6 +220,7 @@ async fn deploy(
         (admin,).abi_encode_params(),
     )
     .await?;
+    let closer = put_everywhere(client, artifacts, admin, "Closer", Vec::new()).await?;
 
     // The vault is too large for one contract: its logic is in four
     // libraries linked into it.
@@ -332,6 +333,7 @@ async fn deploy(
         station_factory,
         driver,
         bridge,
+        closer,
         roles,
     };
 
