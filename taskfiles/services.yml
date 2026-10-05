@@ -4,7 +4,8 @@
 #
 # Each takes the network (NETWORK, from SHONIN_NETWORK; `local` by default)
 # and serves every EVM vault chain of it, or only VAULT_CHAIN when it is set.
-# The seed publishes to VAULT_CHAIN, or base.
+# The seed publishes to VAULT_CHAIN, or base; VAULT_CHAIN=solana seeds the
+# local Solana cluster.
 #
 # Commands `cd` explicitly rather than using `dir:`, so absolute templated
 # paths behave the same in included taskfiles.
@@ -26,12 +27,13 @@ vars:
 
 tasks:
   devnet:
-    desc: "The ops dashboard; on the local network it also deploys the contracts and drives every EVM chain"
+    desc: "The ops dashboard; on the local network it also deploys the contracts and programs and drives every chain"
     cmds:
       - >-
         cargo run -q -p shonin-devnet --
         {{.SERVICE_ARGS}}
         --artifacts "{{.PATH_ARTIFACTS}}"
+        --solana-programs "{{.PATH_SOLANA_PROGRAMS}}"
         --port {{.PORT_DEVNET}}
         --seconds-per-block {{.CHAIN_SECONDS_PER_BLOCK}}
         --service "app=http://127.0.0.1:{{.PORT_APP_DEV}}/"

@@ -237,7 +237,7 @@ const HOUR: Duration = Duration::from_secs(3_600);
 
 /// The counts a report gives "an hour".
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct Hourly {
+pub(crate) struct Hourly {
     restarts: u64,
     venue_errors: u64,
 }
@@ -246,7 +246,7 @@ struct Hourly {
 /// at least an hour old, or the oldest there is. Readings older than that one
 /// are forgotten; it is kept, so that after a gap in the readings the count
 /// still starts from the last one before it rather than from nothing.
-fn last_hour(
+pub(crate) fn last_hour(
     window: &mut VecDeque<(Instant, Counters)>,
     now: Instant,
     counters: Counters,
@@ -434,57 +434,16 @@ impl Reporter {
         let holds = self.chain.balance(self.key.address).await?;
         let send = worst_send(&self.chain).await?;
 
-        let now = OffsetDateTime::now_utc();
-        let at = time::PrimitiveDateTime::new(now.date(), now.time());
-
-        let report = Health {
-            signals: vec![
-                Signal {
-                    name: "Restarts".to_string(),
-                    value: hourly.restarts as f64,
-                    unit: "an hour".to_string(),
-                    warn_at: 3.0,
-                    error_at: 10.0,
-                    lower_is_worse: false,
-                    window: "the last hour".to_string(),
-                    note: None,
-                },
-                Signal {
-                    name: "Rejected submissions".to_string(),
-                    value: rejection_rate,
-                    unit: "% of submissions".to_string(),
-                    warn_at: 5.0,
-                    error_at: 25.0,
-                    lower_is_worse: false,
-                    window: "since it started".to_string(),
-                    note: None,
-                },
-                Signal {
-                    name: "Venue errors".to_string(),
-                    value: hourly.venue_errors as f64,
-                    unit: "an hour".to_string(),
-                    warn_at: 1.0,
-                    error_at: 5.0,
-                    lower_is_worse: false,
-                    window: "the last hour".to_string(),
-                    note: None,
-                },
-                Signal {
-                    name: "Tank".to_string(),
-                    value: runway,
-                    unit: "days".to_string(),
-                    warn_at: 7.0,
-                    error_at: 0.0,
-                    lower_is_worse: true,
-                    window: "at today's charges".to_string(),
-                    note: None,
-                },
-                key_gas(holds, stake_at(gas_stake(&self.chain), send), send),
-            ],
-            entries: entries(at, counters, dry, &held_below),
-            updated: at,
-            signed_by: format!("{:?}", self.key.address),
-        };
+        let report = report(
+            counters,
+            hourly,
+            runway,
+            rejection_rate,
+            key_gas(holds, stake_at(gas_stake(&self.chain), send), send),
+            dry,
+            &held_below,
+            format!("{:?}", self.key.address),
+        );
 
         // Signed with the key the registry blessed for this vault, so a
         // reader can tell a report from this instance apart from anybody
@@ -500,14 +459,82 @@ impl Reporter {
             vault,
             report,
             signature: alloy::hex::encode_prefixed(signature),
+            // Recovered from the signature.
+            signer: None,
         })
+    }
+}
+
+/// A report of what this instance has seen: the counts, the tank's runway
+/// in days, the share of submissions refused, and the key's gas.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn report(
+    counters: Counters,
+    hourly: Hourly,
+    runway: f64,
+    rejection_rate: f64,
+    gas: Signal,
+    dry: bool,
+    held_below: &[String],
+    signed_by: String,
+) -> Health {
+    let now = OffsetDateTime::now_utc();
+    let at = time::PrimitiveDateTime::new(now.date(), now.time());
+
+    Health {
+        signals: vec![
+            Signal {
+                name: "Restarts".to_string(),
+                value: hourly.restarts as f64,
+                unit: "an hour".to_string(),
+                warn_at: 3.0,
+                error_at: 10.0,
+                lower_is_worse: false,
+                window: "the last hour".to_string(),
+                note: None,
+            },
+            Signal {
+                name: "Rejected submissions".to_string(),
+                value: rejection_rate,
+                unit: "% of submissions".to_string(),
+                warn_at: 5.0,
+                error_at: 25.0,
+                lower_is_worse: false,
+                window: "since it started".to_string(),
+                note: None,
+            },
+            Signal {
+                name: "Venue errors".to_string(),
+                value: hourly.venue_errors as f64,
+                unit: "an hour".to_string(),
+                warn_at: 1.0,
+                error_at: 5.0,
+                lower_is_worse: false,
+                window: "the last hour".to_string(),
+                note: None,
+            },
+            Signal {
+                name: "Tank".to_string(),
+                value: runway,
+                unit: "days".to_string(),
+                warn_at: 7.0,
+                error_at: 0.0,
+                lower_is_worse: true,
+                window: "at today's charges".to_string(),
+                note: None,
+            },
+            gas,
+        ],
+        entries: entries(at, counters, dry, held_below),
+        updated: at,
+        signed_by,
     }
 }
 
 /// How many days the tank lasts at what the allowances cost a day, counting
 /// only what is left once the usage owed but not yet collected is paid. A dry
 /// tank lasts no time at all: the strategy is stopped.
-fn runway(balance: U256, unpaid: U256, daily: f64, dry: bool) -> Result<f64> {
+pub(crate) fn runway(balance: U256, unpaid: U256, daily: f64, dry: bool) -> Result<f64> {
     if dry {
         return Ok(0.0);
     }

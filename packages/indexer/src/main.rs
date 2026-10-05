@@ -39,16 +39,13 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     // Each chain is read from the moment it connects: one out of reach
     // holds up none of the others.
-    let expected = args
-        .chain_args
-        .targets()?
-        .iter()
-        .map(|target| target.vault_chain)
-        .collect();
-    let connected = args.chain_args.connect_each()?;
-    let indexer = Arc::new(Indexer::new(expected, args.store, args.builder_url));
-    let adding = indexer.clone();
-    tokio::spawn(async move { adding.add_each(connected).await });
+    let connections = indexer::connections(&args.chain_args)?;
+    let indexer = Arc::new(Indexer::new(
+        connections.expected.clone(),
+        args.store,
+        args.builder_url,
+    ));
+    indexer.take(connections);
 
     if args.port != 0 {
         let app = axum::Router::new()

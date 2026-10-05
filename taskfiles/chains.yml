@@ -1,5 +1,5 @@
 # The local chains: three anvils standing in for the EVM vault chains (base,
-# hyperliquid, robinhood) and one Solana validator. Their ids and ports match
+# hyperliquid, robinhood) and one Solana cluster (Surfpool). Their ids and ports match
 # the `local` network in config/chains.toml.
 #
 # Commands `cd` explicitly rather than using `dir:`, so absolute templated
@@ -21,7 +21,7 @@ vars:
 
 tasks:
   default:
-    desc: "Every local chain: three anvils and a Solana validator"
+    desc: "Every local chain: three anvils and a Solana cluster"
     deps: [evm, solana]
 
   evm:
@@ -45,17 +45,23 @@ tasks:
           --accounts 10 --balance 10000 --host 127.0.0.1 --silent
 
   solana:
-    desc: "A Solana validator, with a fresh ledger each time"
+    desc: "A Solana cluster (Surfpool, offline), fresh each time; the devnet deploys to it and drives its clock"
     cmds:
+      # Offline: nothing is fetched from a public cluster, so every account
+      # on it is one the devnet put there. Surfpool's clock can be moved,
+      # which is how the devnet runs it an hour a second as it runs the
+      # anvils'.
       - |
         {{.ONLY_LOCAL}}
+        rm -rf "{{.PATH_SOLANA_LEDGER}}"
         mkdir -p "{{.PATH_SOLANA_LEDGER}}"
-        exec solana-test-validator --rpc-port {{.PORT_SOLANA_RPC}} \
-          --faucet-port {{.PORT_SOLANA_FAUCET}} --ledger "{{.PATH_SOLANA_LEDGER}}" \
-          --reset --quiet
+        cd "{{.PATH_SOLANA_LEDGER}}"
+        exec "{{.SURFPOOL}}" start --offline --no-tui --no-studio --no-deploy -y \
+          --host 127.0.0.1 --port {{.PORT_SOLANA_RPC}} --ws-port {{.PORT_SOLANA_WS}} \
+          --log-path ./logs --log-level warn
 
   deploy:
-    desc: "Deploy the EVM contracts to every EVM chain of the network (local, or NETWORK=testnet; mainnet refuses)"
+    desc: "Deploy the EVM contracts to every EVM chain of the network, and locally the Solana programs (local, or NETWORK=testnet; mainnet refuses)"
     cmds:
       - task: :contracts:build
       - "{{.DEVNET}} deploy"

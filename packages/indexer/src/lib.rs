@@ -10,6 +10,7 @@
 
 mod logs;
 pub mod read;
+pub mod solana;
 pub mod store;
 
 use std::collections::{HashMap, HashSet};
@@ -19,12 +20,12 @@ use std::time::{Duration, Instant};
 
 use alloy::primitives::Address;
 use anyhow::Result;
-use chain::Served;
 use chain::bindings::attestation::{IAttestationRegistry, ImageKind};
 use chain::bindings::vault::IVault;
-use shared::Chain;
+use chain::{ChainKey, Served, SolanaServed};
 use shared::model::health::Health;
 use shared::model::registry::{Author, FeedEvent, Job, JobState};
+use shared::{Chain, ChainAddress};
 use shared::{ChainInfo, HealthPost, Snapshot, Totals};
 use tokio::sync::RwLock;
 
@@ -90,10 +91,90 @@ fn recover(chain: Chain, post: &HealthPost) -> Result<Address> {
     Ok(signature.recover_address_from_msg(digest.as_slice())?)
 }
 
+/// Who signed a report on the Solana cluster `cluster` stands for (the value
+/// the vault program binds its digests to there): the key the post names, if
+/// the signature over the report's digest for that cluster is that key's.
+/// ed25519 has no recovery, so the post carries its key and the signature is
+/// checked against it. None when the signature or the key is malformed, or
+/// the signature is not the key's.
+fn ed25519_signer(cluster: &[u8; 32], post: &HealthPost) -> Option<Option<[u8; 32]>> {
+    let key = post.signer.as_deref()?;
+    let key: [u8; 32] = bs58::decode(key).into_vec().ok()?.try_into().ok()?;
+    let signature = match post.signature.strip_prefix("0x") {
+        Some(hex) => alloy::hex::decode(hex).ok()?,
+        None => bs58::decode(&post.signature).into_vec().ok()?,
+    };
+    let signature = ed25519_dalek::Signature::from_slice(&signature).ok()?;
+    let verifying = ed25519_dalek::VerifyingKey::from_bytes(&key).ok()?;
+    let digest = HealthPost::solana_digest(cluster, &post.vault, &post.report);
+    Some(
+        verifying
+            .verify_strict(&digest, &signature)
+            .is_ok()
+            .then_some(key),
+    )
+}
+
+/// Whether `signer` is blessed for `vault` and the bundle it runs, and as an
+/// executor, at the cluster's clock: the registry's blessing for the vault,
+/// the key's record, and its image's and project's, read and judged as the
+/// programs judge them.
+async fn solana_blessed_executor(
+    served: &SolanaServed,
+    vault: &chain::solana::Pubkey,
+    signer: &chain::solana::Pubkey,
+) -> Result<bool> {
+    use chain::solana::programs::registry::{read as at, state};
+
+    let client = &served.client;
+    let Some(account) = client
+        .load::<chain::solana::programs::vault::state::Vault>(vault)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let now = client.now().await?;
+    let config: state::Config = served.platform.registry_config(client).await?;
+    let Some(blessing) = client
+        .load::<state::Blessing>(&at::blessing_address(
+            signer,
+            &served.platform.cluster,
+            &vault.to_bytes(),
+            &account.bundle_hash,
+        ))
+        .await?
+    else {
+        return Ok(false);
+    };
+    let Some(key) = client
+        .load::<state::KeyInfo>(&at::key_address(signer))
+        .await?
+    else {
+        return Ok(false);
+    };
+    let image = client
+        .load::<state::ImageRecord>(&at::image_address(&key.image_digest))
+        .await?;
+    let project = client
+        .load::<state::ProjectRecord>(&at::project_address(&key.project_id))
+        .await?;
+    Ok(blessing.signer == *signer
+        && state::is_blessed_for(&config, &blessing, image.as_ref(), project.as_ref(), now)
+        && state::is_blessed_as(
+            &config,
+            &key,
+            image.as_ref(),
+            project.as_ref(),
+            state::ImageKind::Executor,
+            now,
+        ))
+}
+
 /// One vault chain, as the indexer reads it.
 pub struct Reader {
-    pub served: Served,
-    history: RwLock<History>,
+    pub vault_chain: Chain,
+    pub key: ChainKey,
+    source: Source,
     /// When it connected, and when it was last read whole: what its health
     /// is judged by.
     connected: Instant,
@@ -102,6 +183,48 @@ pub struct Reader {
     /// last read whole, none read whole now. Such a read is not a read of
     /// the chain, and moves `read_at` on no further.
     every_vault_stale: std::sync::atomic::AtomicBool,
+}
+
+/// What a chain is read through: an EVM client and what has been made of its
+/// logs, or a Solana client and what has been made of each vault's history.
+enum Source {
+    Evm {
+        served: Box<Served>,
+        history: Box<RwLock<History>>,
+    },
+    Solana {
+        served: Box<SolanaServed>,
+        history: Box<RwLock<solana::History>>,
+    },
+}
+
+impl Reader {
+    /// The EVM chain this reads, if it is one.
+    pub fn evm(&self) -> Option<&Served> {
+        match &self.source {
+            Source::Evm { served, .. } => Some(served),
+            Source::Solana { .. } => None,
+        }
+    }
+
+    /// The Solana chain this reads, if it is one.
+    pub fn solana(&self) -> Option<&SolanaServed> {
+        match &self.source {
+            Source::Solana { served, .. } => Some(served),
+            Source::Evm { .. } => None,
+        }
+    }
+
+    /// The chain as a snapshot names it before it is first read.
+    fn unread_info(&self) -> ChainInfo {
+        ChainInfo {
+            chain: self.vault_chain,
+            key: self.key.to_string(),
+            chain_id: self.evm().map(|served| served.client.chain_id),
+            block: 0,
+            as_of: None,
+        }
+    }
 }
 
 /// What one chain read came to: that chain's part of the snapshot.
@@ -113,7 +236,7 @@ struct Read {
     /// Every trade its vaults' stations have made, not only those shown.
     trades: u32,
     /// Everyone who has published on it, by address.
-    authors: Vec<(Address, Author)>,
+    authors: Vec<(ChainAddress, Author)>,
     feed: Vec<FeedEvent>,
 }
 
@@ -124,7 +247,7 @@ struct Queue {
     jobs: Vec<Job>,
     /// The wallet each job names, by chain and job id, as the build service
     /// gave it: who the job's author is, whatever they are called.
-    wallets: HashMap<(Chain, String), Address>,
+    wallets: HashMap<(Chain, String), ChainAddress>,
     as_of: Option<time::PrimitiveDateTime>,
     stale: bool,
 }
@@ -140,10 +263,45 @@ struct Completion {
 pub enum Lookup {
     /// Connected, and read.
     Served(Box<Served>),
+    /// A Solana chain, connected and read.
+    Solana(Box<SolanaServed>),
     /// To be read here, and not connected yet.
     NotConnected,
     /// Not read here at all.
     NotServed,
+}
+
+/// Every vault chain a service's arguments name, EVM and Solana, and each
+/// one as it connects: one out of reach holds up none of the others.
+pub struct Connections {
+    pub expected: Vec<Chain>,
+    pub evm: tokio::sync::mpsc::UnboundedReceiver<Served>,
+    pub solana: tokio::sync::mpsc::UnboundedReceiver<SolanaServed>,
+}
+
+/// Start connecting to every vault chain `args` name. A service told to
+/// serve one Solana chain serves no EVM chain.
+pub fn connections(args: &chain::ChainArgs) -> Result<Connections> {
+    let solana = args.solana_targets()?;
+    let only_solana = args.vault_chain.is_some() && !solana.is_empty();
+    let (evm_chains, evm) = if only_solana {
+        let (_, none) = tokio::sync::mpsc::unbounded_channel();
+        (Vec::new(), none)
+    } else {
+        let chains: Vec<Chain> = args
+            .targets()?
+            .iter()
+            .map(|target| target.vault_chain)
+            .collect();
+        (chains, args.connect_each()?)
+    };
+    let mut expected = evm_chains;
+    expected.extend(solana.iter().map(|target| target.vault_chain));
+    Ok(Connections {
+        expected,
+        evm,
+        solana: args.connect_each_solana()?,
+    })
 }
 
 /// The record, as read from every vault chain, and what it needs to keep
@@ -172,10 +330,10 @@ pub struct Indexer {
     pub snapshot: RwLock<Snapshot>,
     /// Health reports, as executors post them, by vault chain and vault: the
     /// same address can be a different vault on another chain.
-    pub health: RwLock<HashMap<(Chain, Address), Health>>,
+    pub health: RwLock<HashMap<(Chain, ChainAddress), Health>>,
     /// What each author is shown as, by vault chain and address, as the last
     /// snapshot had it (see [`shown_names`]).
-    names: std::sync::RwLock<HashMap<(Chain, Address), String>>,
+    names: std::sync::RwLock<HashMap<(Chain, ChainAddress), String>>,
 }
 
 impl Indexer {
@@ -199,28 +357,49 @@ impl Indexer {
 
     /// Start reading a chain that has connected.
     pub async fn add(&self, served: Served) {
-        tracing::info!(chain = %served.key, "the indexer is reading");
-        let info = ChainInfo {
-            chain: served.vault_chain,
-            chain_id: served.client.chain_id,
-            block: 0,
-            as_of: None,
+        let (vault_chain, key) = (served.vault_chain, served.key.clone());
+        self.add_reader(
+            vault_chain,
+            key,
+            Source::Evm {
+                served: Box::new(served),
+                history: Box::new(RwLock::new(History::default())),
+            },
+        )
+        .await;
+    }
+
+    /// Start reading a Solana chain that has connected.
+    pub async fn add_solana(&self, served: SolanaServed) {
+        let (vault_chain, key) = (served.vault_chain, served.key.clone());
+        self.add_reader(
+            vault_chain,
+            key,
+            Source::Solana {
+                served: Box::new(served),
+                history: Box::new(RwLock::new(solana::History::default())),
+            },
+        )
+        .await;
+    }
+
+    async fn add_reader(&self, vault_chain: Chain, key: ChainKey, source: Source) {
+        tracing::info!(chain = %key, "the indexer is reading");
+        let reader = Reader {
+            vault_chain,
+            key,
+            source,
+            connected: Instant::now(),
+            read_at: std::sync::Mutex::new(None),
+            every_vault_stale: std::sync::atomic::AtomicBool::new(false),
         };
+        let info = reader.unread_info();
         {
             let mut readers = self.readers.write().unwrap_or_else(|e| e.into_inner());
-            if readers
-                .iter()
-                .any(|reader| reader.served.vault_chain == served.vault_chain)
-            {
+            if readers.iter().any(|known| known.vault_chain == vault_chain) {
                 return;
             }
-            readers.push(Arc::new(Reader {
-                served,
-                history: RwLock::new(History::default()),
-                connected: Instant::now(),
-                read_at: std::sync::Mutex::new(None),
-                every_vault_stale: std::sync::atomic::AtomicBool::new(false),
-            }));
+            readers.push(Arc::new(reader));
         }
         let mut snapshot = self.snapshot.write().await;
         if snapshot.chain(info.chain).is_none() {
@@ -236,6 +415,24 @@ impl Indexer {
         }
     }
 
+    /// Read every chain of `connections` from the moment each connects.
+    pub fn take(self: &Arc<Self>, connections: Connections) {
+        let evm = self.clone();
+        tokio::spawn(async move { evm.add_each(connections.evm).await });
+        let solana = self.clone();
+        tokio::spawn(async move { solana.add_each_solana(connections.solana).await });
+    }
+
+    /// Read each Solana chain from the moment it is handed over.
+    pub async fn add_each_solana(
+        &self,
+        mut connected: tokio::sync::mpsc::UnboundedReceiver<SolanaServed>,
+    ) {
+        while let Some(served) = connected.recv().await {
+            self.add_solana(served).await;
+        }
+    }
+
     /// Every chain read so far.
     pub fn readers(&self) -> Vec<Arc<Reader>> {
         self.readers
@@ -244,25 +441,47 @@ impl Indexer {
             .clone()
     }
 
-    /// The chain a vault chain is read from, once it has connected.
+    /// The chain a vault chain is read from, once it has connected, if it
+    /// is an EVM one.
     pub fn on(&self, chain: Chain) -> Option<Served> {
+        self.reader(chain).and_then(|reader| reader.evm().cloned())
+    }
+
+    fn reader(&self, chain: Chain) -> Option<Arc<Reader>> {
         self.readers
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .map(|reader| &reader.served)
-            .find(|served| served.vault_chain == chain)
+            .find(|reader| reader.vault_chain == chain)
             .cloned()
     }
 
     /// Whether a vault chain is read here, not connected yet, or not read
     /// here at all.
     pub fn lookup(&self, chain: Chain) -> Lookup {
-        match self.on(chain) {
-            Some(served) => Lookup::Served(Box::new(served)),
+        match self.reader(chain) {
+            Some(reader) => match &reader.source {
+                Source::Evm { served, .. } => Lookup::Served(served.clone()),
+                Source::Solana { served, .. } => Lookup::Solana(served.clone()),
+            },
             None if self.expected.contains(&chain) => Lookup::NotConnected,
             None => Lookup::NotServed,
         }
+    }
+
+    /// What `owner` paid for what they hold in a Solana vault, as the vault's
+    /// history has been read so far. None until it has been read.
+    pub async fn solana_cost(
+        &self,
+        chain: Chain,
+        vault: &chain::solana::Pubkey,
+        owner: &chain::solana::Pubkey,
+    ) -> Option<f64> {
+        let reader = self.reader(chain)?;
+        let Source::Solana { history, .. } = &reader.source else {
+            return None;
+        };
+        solana::cost(&*history.read().await, vault, owner)
     }
 
     /// Take a health report if the key that signed it is blessed for the
@@ -270,6 +489,31 @@ impl Indexer {
     /// the instance running a strategy can write about it, and nobody can
     /// put an older report back.
     pub async fn take_health(&self, chain: Chain, post: HealthPost) -> HealthVerdict {
+        // A post that names its key is an ed25519 one, as a Solana executor
+        // signs; one that doesn't is recovered, as an EVM executor's is.
+        // Either is checked whole before the chain is asked anything. An
+        // ed25519 one is checked against the cluster this service connected
+        // to, which its digest binds.
+        if post.signer.is_some() {
+            if post.vault.parse::<chain::solana::Pubkey>().is_err() {
+                return HealthVerdict::Malformed;
+            }
+            let served = match self.lookup(chain) {
+                Lookup::Solana(served) => served,
+                // An ed25519 post about an EVM chain's vault: no key it could
+                // name is blessed there.
+                Lookup::Served(_) => return HealthVerdict::Malformed,
+                Lookup::NotConnected => return HealthVerdict::NotConnected,
+                Lookup::NotServed => return HealthVerdict::UnknownChain,
+            };
+            let Some(signer) = ed25519_signer(&served.client.cluster_value(), &post) else {
+                return HealthVerdict::Malformed;
+            };
+            if from_the_future(post.report.updated, time::OffsetDateTime::now_utc()) {
+                return HealthVerdict::FromTheFuture;
+            }
+            return self.take_solana_health(chain, *served, post, signer).await;
+        }
         let Ok(vault) = post.vault.parse::<Address>() else {
             return HealthVerdict::Malformed;
         };
@@ -281,6 +525,9 @@ impl Indexer {
         }
         let served = match self.lookup(chain) {
             Lookup::Served(served) => *served,
+            // A Solana vault's report names its key; one that doesn't can't
+            // be checked.
+            Lookup::Solana(_) => return HealthVerdict::Malformed,
             Lookup::NotConnected => return HealthVerdict::NotConnected,
             Lookup::NotServed => return HealthVerdict::UnknownChain,
         };
@@ -330,15 +577,60 @@ impl Indexer {
             tracing::warn!(%vault, %signer, "a health report from a key this vault has not blessed as its executor");
             return HealthVerdict::NotBlessed;
         }
+        self.keep_health(chain, ChainAddress::Evm(vault.0.0), post.report)
+            .await
+    }
 
+    /// A report about a Solana vault: signed with ed25519 by the key the post
+    /// names, and taken only if that key is blessed for the vault and its
+    /// bundle as the vault's executor, at the cluster's own clock.
+    async fn take_solana_health(
+        &self,
+        chain: Chain,
+        served: SolanaServed,
+        post: HealthPost,
+        signer: Option<[u8; 32]>,
+    ) -> HealthVerdict {
+        use chain::solana::Pubkey;
+
+        let Ok(vault) = post.vault.parse::<Pubkey>() else {
+            return HealthVerdict::Malformed;
+        };
+        let Some(signer) = signer.map(Pubkey::new_from_array) else {
+            tracing::warn!(%vault, "a health report whose signature is not its key's");
+            return HealthVerdict::NotBlessed;
+        };
+        match solana_blessed_executor(&served, &vault, &signer).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(%vault, %signer, "a health report from a key this vault has not blessed as its executor");
+                return HealthVerdict::NotBlessed;
+            }
+            Err(error) => {
+                tracing::warn!(%vault, error = format!("{error:#}"), "could not read the cluster for a health report");
+                return HealthVerdict::Unavailable;
+            }
+        }
+        self.keep_health(chain, ChainAddress::Solana(vault.to_bytes()), post.report)
+            .await
+    }
+
+    /// Keep a report checked as its vault's executor's, unless one at least
+    /// as new is held.
+    async fn keep_health(
+        &self,
+        chain: Chain,
+        vault: ChainAddress,
+        report: Health,
+    ) -> HealthVerdict {
         let mut health = self.health.write().await;
         if health
             .get(&(chain, vault))
-            .is_some_and(|held| held.updated >= post.report.updated)
+            .is_some_and(|held| held.updated >= report.updated)
         {
             return HealthVerdict::Stale;
         }
-        health.insert((chain, vault), post.report);
+        health.insert((chain, vault), report);
         HealthVerdict::Taken
     }
 
@@ -359,7 +651,7 @@ impl Indexer {
         let mut started = std::collections::HashSet::new();
         loop {
             for reader in self.readers() {
-                if started.insert(reader.served.vault_chain) {
+                if started.insert(reader.vault_chain) {
                     running.push(Box::pin(async move {
                         loop {
                             self.refresh_chain(&reader).await;
@@ -405,10 +697,7 @@ impl Indexer {
                 reader
                     .every_vault_stale
                     .store(every_vault_stale, std::sync::atomic::Ordering::SeqCst);
-                self.parts
-                    .write()
-                    .await
-                    .insert(reader.served.vault_chain, read);
+                self.parts.write().await.insert(reader.vault_chain, read);
                 if !every_vault_stale {
                     *reader.read_at.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some(Instant::now());
@@ -416,7 +705,7 @@ impl Indexer {
                 self.compose().await;
             }
             Err(error) => {
-                tracing::warn!(chain = %reader.served.key, %error, "could not read this chain");
+                tracing::warn!(chain = %reader.key, error = format!("{error:#}"), "could not read this chain");
             }
         }
     }
@@ -456,18 +745,13 @@ impl Indexer {
         let mut infos = Vec::new();
         let mut latest = 0;
         let mut strategies: Vec<shared::Strategy> = Vec::new();
-        let mut authors: Vec<((Chain, Address), Author)> = Vec::new();
+        let mut authors: Vec<((Chain, ChainAddress), Author)> = Vec::new();
         let mut feed = Vec::new();
         let mut trades = 0;
         for reader in &readers {
-            let Some(read) = parts.get(&reader.served.vault_chain) else {
+            let Some(read) = parts.get(&reader.vault_chain) else {
                 // Connected, and not read yet.
-                infos.push(ChainInfo {
-                    chain: reader.served.vault_chain,
-                    chain_id: reader.served.client.chain_id,
-                    block: 0,
-                    as_of: None,
-                });
+                infos.push(reader.unread_info());
                 continue;
             };
             infos.push(read.info.clone());
@@ -478,7 +762,7 @@ impl Indexer {
             // An author is an address on a chain: two who share a handle are
             // never one.
             for (address, author) in &read.authors {
-                let key = (reader.served.vault_chain, *address);
+                let key = (reader.vault_chain, *address);
                 if !authors.iter().any(|(known, _)| *known == key) {
                     authors.push((key, author.clone()));
                 }
@@ -490,12 +774,12 @@ impl Indexer {
         // What each author is called, the handle they set (or their address)
         // as each place read it: their profile first, then their vaults, then
         // their jobs.
-        let mut handles: Vec<((Chain, Address), String)> = authors
+        let mut handles: Vec<((Chain, ChainAddress), String)> = authors
             .iter()
             .map(|(key, author)| (*key, author.handle.clone()))
             .collect();
         for strategy in &strategies {
-            if let Ok(address) = strategy.author_address.parse::<Address>() {
+            if let Ok(address) = strategy.author_address.parse::<ChainAddress>() {
                 handles.push(((strategy.vault.chain, address), strategy.author.clone()));
             }
         }
@@ -508,7 +792,7 @@ impl Indexer {
         for strategy in &mut strategies {
             if let Some(name) = strategy
                 .author_address
-                .parse::<Address>()
+                .parse::<ChainAddress>()
                 .ok()
                 .and_then(|address| names.get(&(strategy.vault.chain, address)))
             {
@@ -574,10 +858,7 @@ impl Indexer {
         let mut wrong = Vec::new();
         let mut lines = Vec::new();
         for chain in &self.expected {
-            let Some(reader) = readers
-                .iter()
-                .find(|reader| reader.served.vault_chain == *chain)
-            else {
+            let Some(reader) = readers.iter().find(|reader| reader.vault_chain == *chain) else {
                 wrong.push(format!("{chain} not connected"));
                 lines.push(format!("{chain}: not connected"));
                 continue;
@@ -631,18 +912,23 @@ impl Indexer {
     async fn read_one(
         &self,
         reader: &Reader,
-        health: &HashMap<(Chain, Address), Health>,
+        health: &HashMap<(Chain, ChainAddress), Health>,
     ) -> Result<Read> {
-        let served = &reader.served;
+        let (served, history) = match &reader.source {
+            Source::Evm { served, history } => (served, history),
+            Source::Solana { served, history } => {
+                return self.read_solana(reader, served, history, health).await;
+            }
+        };
         let chain = &served.client;
         let (head, now) = chain.head_and_time().await?;
         let health: HashMap<Address, Health> = health
             .iter()
             .filter(|((on, _), _)| *on == served.vault_chain)
-            .map(|((_, vault), report)| (*vault, report.clone()))
+            .filter_map(|((_, vault), report)| Some((Address::from(vault.evm()?), report.clone())))
             .collect();
 
-        let mut history = reader.history.write().await;
+        let mut history = history.write().await;
         let strategies = read::strategies(
             chain,
             served.vault_chain,
@@ -657,7 +943,10 @@ impl Indexer {
         // Authors that can't be read leave the authors as last read, and hold
         // up nothing else of the chain's.
         let authors = match read::authors(chain, &served.deployments).await {
-            Ok(authors) => authors,
+            Ok(authors) => authors
+                .into_iter()
+                .map(|(address, author)| (ChainAddress::Evm(address.0.0), author))
+                .collect(),
             Err(error) => {
                 tracing::warn!(chain = %served.key, %error, "could not read the authors; kept them as last read");
                 self.parts
@@ -685,7 +974,8 @@ impl Indexer {
         Ok(Read {
             info: ChainInfo {
                 chain: served.vault_chain,
-                chain_id: chain.chain_id,
+                key: reader.key.to_string(),
+                chain_id: Some(chain.chain_id),
                 block: head,
                 as_of: Some(read::moment(now)),
             },
@@ -697,9 +987,51 @@ impl Indexer {
         })
     }
 
+    /// One Solana chain's part: its vaults as they are now, each one's
+    /// record from its own history.
+    async fn read_solana(
+        &self,
+        reader: &Reader,
+        served: &SolanaServed,
+        history: &RwLock<solana::History>,
+        health: &HashMap<(Chain, ChainAddress), Health>,
+    ) -> Result<Read> {
+        let client = &served.client;
+        let slot = client.rpc.slot().await?;
+        let now = client.now().await?;
+        let health: HashMap<chain::solana::Pubkey, Health> = health
+            .iter()
+            .filter(|((on, _), _)| *on == served.vault_chain)
+            .filter_map(|((_, vault), report)| {
+                Some((
+                    chain::solana::Pubkey::new_from_array(vault.solana()?),
+                    report.clone(),
+                ))
+            })
+            .collect();
+        let mut history = history.write().await;
+        let read = solana::read(served, &self.store, &mut history, &health, now).await?;
+        drop(history);
+        let feed = solana::feed(served.vault_chain, &read.strategies);
+        Ok(Read {
+            info: ChainInfo {
+                chain: served.vault_chain,
+                key: reader.key.to_string(),
+                chain_id: None,
+                block: slot,
+                as_of: Some(read::moment(now)),
+            },
+            now,
+            strategies: read.strategies,
+            trades: 0,
+            authors: read.authors,
+            feed,
+        })
+    }
+
     /// The builder's queue, with what the chain adds to each job, and the
     /// wallet each job names, by chain and job id.
-    async fn jobs(&self) -> Result<(Vec<Job>, HashMap<(Chain, String), Address>)> {
+    async fn jobs(&self) -> Result<(Vec<Job>, HashMap<(Chain, String), ChainAddress>)> {
         let Some(builder) = &self.builder else {
             return Ok(Default::default());
         };
@@ -751,7 +1083,7 @@ impl Indexer {
     /// It is called as the snapshot calls its author (see [`shown_names`]).
     pub async fn complete(&self, job: Job) -> Job {
         let chain = job.chain;
-        let wallet = job.author.parse::<Address>().ok();
+        let wallet = job.author.parse::<ChainAddress>().ok();
         let fallback = job.clone();
         let mut job = self
             .complete_on(chain, vec![job])
@@ -833,10 +1165,10 @@ impl Indexer {
 
 /// The wallet each job names, by chain and job id, as the build service gives
 /// it (before a chain puts the author's handle in its place).
-fn wallets(jobs: &[Job]) -> HashMap<(Chain, String), Address> {
+fn wallets(jobs: &[Job]) -> HashMap<(Chain, String), ChainAddress> {
     jobs.iter()
         .filter_map(|job| {
-            let wallet = job.author.parse::<Address>().ok()?;
+            let wallet = job.author.parse::<ChainAddress>().ok()?;
             Some(((job.chain, job.id.clone()), wallet))
         })
         .collect()
@@ -860,8 +1192,10 @@ fn wallets(jobs: &[Job]) -> HashMap<(Chain, String), Address> {
 /// - a handle two authors share is shown so for each of them, never merged;
 /// - an author at the same address on two chains, shown the same on each, is
 ///   shown with the chain's name too.
-pub fn shown_names(called: &[((Chain, Address), String)]) -> HashMap<(Chain, Address), String> {
-    let mut authors: Vec<((Chain, Address), &str, String)> = Vec::new();
+pub fn shown_names(
+    called: &[((Chain, ChainAddress), String)],
+) -> HashMap<(Chain, ChainAddress), String> {
+    let mut authors: Vec<((Chain, ChainAddress), &str, String)> = Vec::new();
     for ((chain, address), handle) in called {
         if authors.iter().any(|(key, _, _)| *key == (*chain, *address)) {
             continue;
@@ -873,7 +1207,7 @@ pub fn shown_names(called: &[((Chain, Address), String)]) -> HashMap<(Chain, Add
         ));
     }
 
-    let shared = |authors: &[((Chain, Address), &str, String)]| -> Vec<bool> {
+    let shared = |authors: &[((Chain, ChainAddress), &str, String)]| -> Vec<bool> {
         let mut counts: HashMap<String, usize> = HashMap::new();
         for (_, _, name) in authors {
             *counts.entry(compared(name)).or_default() += 1;
@@ -886,7 +1220,7 @@ pub fn shown_names(called: &[((Chain, Address), String)]) -> HashMap<(Chain, Add
     let twice = shared(&authors);
     for ((key, handle, name), twice) in authors.iter_mut().zip(twice) {
         if twice && set(handle, key.1) {
-            *name = format!("{handle} ({})", read::address_of(key.1));
+            *name = format!("{handle} ({})", shown_address(&key.1));
         }
     }
     let twice = shared(&authors);
@@ -905,8 +1239,8 @@ pub fn shown_names(called: &[((Chain, Address), String)]) -> HashMap<(Chain, Add
 /// `address` is shown as before anyone else's name is looked at: the handle,
 /// or their address if they set none, with their address alongside a handle
 /// that names an address.
-fn first_name(handle: &str, address: Address) -> String {
-    let own = read::address_of(address);
+fn first_name(handle: &str, address: ChainAddress) -> String {
+    let own = shown_address(&address);
     if !set(handle, address) {
         own
     } else if names_an_address(handle) {
@@ -918,9 +1252,22 @@ fn first_name(handle: &str, address: Address) -> String {
 
 /// Whether `handle` is one the author at `address` set, rather than their
 /// address standing in for one.
-fn set(handle: &str, address: Address) -> bool {
+fn set(handle: &str, address: ChainAddress) -> bool {
     let handle = handle.trim();
-    !handle.is_empty() && !handle.eq_ignore_ascii_case(&read::address_of(address))
+    !handle.is_empty()
+        && match address {
+            ChainAddress::Evm(_) => !handle.eq_ignore_ascii_case(&shown_address(&address)),
+            ChainAddress::Solana(_) => handle != shown_address(&address),
+        }
+}
+
+/// An address as the record shows it: an EVM one checksummed, a Solana key
+/// in base58.
+pub fn shown_address(address: &ChainAddress) -> String {
+    match address {
+        ChainAddress::Evm(bytes) => read::address_of(Address::from(*bytes)),
+        ChainAddress::Solana(_) => address.to_string(),
+    }
 }
 
 /// Whether `text` has an address in it, or the start of one: `0x` and four
@@ -1047,19 +1394,17 @@ mod tests {
     /// on two chains with the chain too.
     #[test]
     fn every_author_is_shown_by_a_name_of_their_own() {
-        let alice: Address = "0xA11cE00000000000000000000000000000000001"
+        let evm = |address: Address| ChainAddress::Evm(address.0.0);
+        let alice = evm("0xA11cE00000000000000000000000000000000001"
             .parse()
-            .unwrap();
-        let mallory: Address = "0x3a110700000000000000000000000000000000a2"
+            .unwrap());
+        let mallory = evm("0x3a110700000000000000000000000000000000a2"
             .parse()
-            .unwrap();
-        let carol = Address::repeat_byte(0xc0);
+            .unwrap());
+        let carol = evm(Address::repeat_byte(0xc0));
         let names = shown_names(&[
-            ((Chain::Base, alice), read::address_of(alice)),
-            (
-                (Chain::Base, mallory),
-                read::address_of(alice).to_lowercase(),
-            ),
+            ((Chain::Base, alice), shown_address(&alice)),
+            ((Chain::Base, mallory), shown_address(&alice).to_lowercase()),
             ((Chain::Base, carol), "carol".to_string()),
             ((Chain::Robinhood, alice), "Carol ".to_string()),
             ((Chain::Robinhood, carol), String::new()),
@@ -1069,24 +1414,24 @@ mod tests {
             ),
         ]);
         assert_eq!(names.len(), 5);
-        assert_eq!(names[&(Chain::Base, alice)], read::address_of(alice));
+        assert_eq!(names[&(Chain::Base, alice)], shown_address(&alice));
         assert_eq!(
             names[&(Chain::Base, mallory)],
             format!(
                 "{} ({})",
-                read::address_of(alice).to_lowercase(),
-                read::address_of(mallory)
+                shown_address(&alice).to_lowercase(),
+                shown_address(&mallory)
             )
         );
         assert_eq!(
             names[&(Chain::Base, carol)],
-            format!("carol ({})", read::address_of(carol))
+            format!("carol ({})", shown_address(&carol))
         );
         assert_eq!(
             names[&(Chain::Robinhood, alice)],
-            format!("Carol  ({})", read::address_of(alice))
+            format!("Carol  ({})", shown_address(&alice))
         );
-        assert_eq!(names[&(Chain::Robinhood, carol)], read::address_of(carol));
+        assert_eq!(names[&(Chain::Robinhood, carol)], shown_address(&carol));
         let mut compared: Vec<String> = names.values().map(|name| compared(name)).collect();
         compared.sort();
         compared.dedup();
@@ -1101,7 +1446,7 @@ mod tests {
             names[&(Chain::Base, carol)],
             format!(
                 "carol ({}) on {}",
-                read::address_of(carol),
+                shown_address(&carol),
                 Chain::Base.label()
             )
         );
@@ -1113,6 +1458,96 @@ mod tests {
         // A handle of one's own, in no one else's way, is shown as it is.
         let names = shown_names(&[((Chain::Base, carol), "carol".to_string())]);
         assert_eq!(names[&(Chain::Base, carol)], "carol");
+    }
+
+    /// A Solana author is shown by their key as written: base58 is
+    /// case-sensitive, so a handle that is their key in another case is a
+    /// handle of its own, and their key stands for no handle.
+    #[test]
+    fn a_solana_author_with_no_handle_is_shown_by_their_key() {
+        let key = ChainAddress::Solana([9; 32]);
+        let names = shown_names(&[((Chain::Solana, key), key.to_string())]);
+        assert_eq!(names[&(Chain::Solana, key)], key.to_string());
+        let names = shown_names(&[((Chain::Solana, key), "dana".to_string())]);
+        assert_eq!(names[&(Chain::Solana, key)], "dana");
+    }
+
+    /// A Solana report names its key, and is that key's only if the
+    /// signature over its digest verifies against it: a report signed by one
+    /// key and naming another, or signed for another vault, is not taken.
+    #[test]
+    fn a_solana_report_is_its_named_key_s_only_if_the_signature_verifies() {
+        use ed25519_dalek::Signer as _;
+
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+        let other = ed25519_dalek::SigningKey::from_bytes(&[4; 32]);
+        let key = signing.verifying_key().to_bytes();
+        let vault = bs58::encode([8u8; 32]).into_string();
+        let report = Health {
+            signals: vec![],
+            entries: vec![],
+            updated: read::moment(1_800_000_000),
+            signed_by: bs58::encode(key).into_string(),
+        };
+        let localnet = chain::solana::programs::common::digest::cluster_value("localnet");
+        let post = |by: &ed25519_dalek::SigningKey, about: &str, named: [u8; 32]| HealthPost {
+            vault: vault.clone(),
+            signature: bs58::encode(
+                by.sign(&HealthPost::solana_digest(&localnet, about, &report))
+                    .to_bytes(),
+            )
+            .into_string(),
+            report: report.clone(),
+            signer: Some(bs58::encode(named).into_string()),
+        };
+        assert_eq!(
+            ed25519_signer(&localnet, &post(&signing, &vault, key)),
+            Some(Some(key))
+        );
+        assert_eq!(
+            ed25519_signer(&localnet, &post(&other, &vault, key)),
+            Some(None)
+        );
+        let elsewhere = bs58::encode([9u8; 32]).into_string();
+        assert_eq!(
+            ed25519_signer(&localnet, &post(&signing, &elsewhere, key)),
+            Some(None)
+        );
+        let mut garbled = post(&signing, &vault, key);
+        garbled.signature = "not a signature".to_string();
+        assert_eq!(ed25519_signer(&localnet, &garbled), None);
+    }
+
+    /// A vault has the same address on every cluster: a report signed for
+    /// it on one cluster is not taken on another.
+    #[test]
+    fn a_solana_report_signed_for_one_cluster_is_refused_on_another() {
+        use ed25519_dalek::Signer as _;
+
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+        let key = signing.verifying_key().to_bytes();
+        let vault = bs58::encode([8u8; 32]).into_string();
+        let report = Health {
+            signals: vec![],
+            entries: vec![],
+            updated: read::moment(1_800_000_000),
+            signed_by: bs58::encode(key).into_string(),
+        };
+        let devnet = chain::solana::programs::common::digest::cluster_value("devnet");
+        let mainnet = chain::solana::programs::common::digest::cluster_value("mainnet-beta");
+        let post = HealthPost {
+            vault: vault.clone(),
+            signature: bs58::encode(
+                signing
+                    .sign(&HealthPost::solana_digest(&devnet, &vault, &report))
+                    .to_bytes(),
+            )
+            .into_string(),
+            report: report.clone(),
+            signer: Some(bs58::encode(key).into_string()),
+        };
+        assert_eq!(ed25519_signer(&devnet, &post), Some(Some(key)));
+        assert_eq!(ed25519_signer(&mainnet, &post), Some(None));
     }
 
     #[test]

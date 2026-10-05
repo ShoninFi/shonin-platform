@@ -78,11 +78,10 @@ tasks:
         done
 
   solana:deploy:
-    desc: "Deploy the Solana programs: to the local validator, or with NETWORK=testnet to devnet (mainnet refuses)"
+    desc: "Deploy the Solana programs: to the local cluster, set up as the devnet sets it up, or with NETWORK=testnet the registry to devnet (mainnet refuses)"
     vars:
       PROGRAM_KEYPAIR: '{{joinPath .PATH_CONTRACTS_SOLANA "target" "deploy" "shonin_registry-keypair.json"}}'
       DEPLOYER_KEYPAIR: '{{joinPath .PATH_ROOT ".shonin" .NETWORK "solana-deployer.json"}}'
-      PROGRAMS: "shonin_registry shonin_dev_verifier shonin_publishing shonin_prices shonin_profiles"
     cmds:
       - |
         set -e
@@ -94,12 +93,11 @@ tasks:
         mkdir -p "$(dirname "$program")" "$(dirname "$deployer")"
         case "{{.NETWORK}}" in
           local)
-            # Throwaway keys, and coin from the validator's own faucet: enough
-            # for every program's rent and a deploy buffer.
-            [ -f "$program" ] || solana-keygen new --no-bip39-passphrase --silent -o "$program"
-            [ -f "$deployer" ] || solana-keygen new --no-bip39-passphrase --silent -o "$deployer"
-            solana airdrop 100 "$(solana-keygen pubkey "$deployer")" --url "$rpc"
-            deploying="{{.PROGRAMS}}" ;;
+            # The devnet deploys every program, sets the platform up and
+            # writes the deployment file, as `task dev` does.
+            cd "{{.PATH_CONTRACTS_SOLANA}}" && anchor build && cd "{{.PATH_ROOT}}"
+            {{.DEVNET}} --vault-chain solana deploy
+            exit 0 ;;
           testnet)
             # Both from SHONIN_TESTNET_SOLANA_MNEMONIC, so everyone deploying
             # from it deploys the same program id. Fund the deployer first.

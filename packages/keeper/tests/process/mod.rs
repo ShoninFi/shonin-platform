@@ -455,7 +455,7 @@ pub fn start_keeper_serving_none_for(
 /// Start the keeper serving each of `chains` (a vault chain, its chain id,
 /// its node), asking `executor` for totals, with its health on a port of its
 /// own. Serving more than one, it serves every vault chain of the network:
-/// those not given have a node out of reach, and Solana isn't served.
+/// those not given, Solana's among them, have a node out of reach.
 pub fn start_keeper_on(test: &str, chains: &[(&str, u64, &str)], executor: &str) -> Keeper {
     start(test, chains, executor, &[])
 }

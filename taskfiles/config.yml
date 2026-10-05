@@ -72,8 +72,16 @@ vars:
   # committed under config/deployments/mainnet; local and testnet ones never
   # are, and stay under .shonin/<network> (gitignored).
   PATH_DEPLOYMENTS_DIR: '{{if eq .NETWORK "mainnet"}}{{joinPath .PATH_ROOT "config" "deployments" "mainnet"}}{{else}}{{joinPath .PATH_ROOT ".shonin" .NETWORK "deployments"}}{{end}}'
-  # The local Solana validator's ledger, wiped on every start.
+  # Where the local Solana cluster (Surfpool) runs and logs, wiped on every
+  # start.
   PATH_SOLANA_LEDGER: '{{joinPath .PATH_LOCAL_STATE "solana"}}'
+  # The built Solana programs and their keypairs, as `anchor build` leaves
+  # them: what the devnet deploys to the local cluster.
+  PATH_SOLANA_PROGRAMS: '{{joinPath .PATH_CONTRACTS_SOLANA "target" "deploy"}}'
+  # The Surfpool to run (1.2.0 or later: earlier ones have no Ed25519
+  # program offline). Override with SURFPOOL=/path/to/surfpool.
+  SURFPOOL:
+    sh: echo "${SURFPOOL:-surfpool}"
   # What a run on the chosen network writes, beside its deployments:
   # .shonin/local, .shonin/testnet (gitignored either way).
   PATH_NETWORK_STATE: '{{joinPath .PATH_ROOT ".shonin" .NETWORK}}'
@@ -97,6 +105,7 @@ vars:
     --deployments-dir "{{.PATH_DEPLOYMENTS_DIR}}"
     --store "{{.PATH_STORE}}"
     --artifacts "{{.PATH_ARTIFACTS}}"
+    --solana-programs "{{.PATH_SOLANA_PROGRAMS}}"
 
   # Cargo: crates that run as wasm are also checked for wasm32-unknown-unknown.
   # The app builds natively too (its seo tool runs at build time). The

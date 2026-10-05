@@ -11,6 +11,7 @@ publish.workspace = true
 name = "shared"
 
 [dependencies]
+bs58.workspace = true
 ciborium.workspace = true
 hex.workspace = true
 serde.workspace = true

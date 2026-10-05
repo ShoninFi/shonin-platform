@@ -6,6 +6,7 @@
 //! it is plain data and plain arithmetic, so the browser and the services
 //! compute the same figures from the same inputs.
 
+pub mod address;
 pub mod api;
 pub mod archive;
 pub mod base64;
@@ -15,9 +16,11 @@ pub mod manifest;
 pub mod model;
 pub mod record;
 
+pub use address::ChainAddress;
 pub use api::{
-    Addresses, ApiError, ChainInfo, Config, DevMode, HealthPost, HeldClaim, Holding, Portfolio,
-    ReviewAnswer, ReviewRequest, Snapshot, Terms, Totals, Upload, UploadAccepted,
+    Addresses, ApiError, ChainInfo, Config, DevMode, EvmAddresses, HealthPost, HeldClaim, Holding,
+    Portfolio, ReviewAnswer, ReviewRequest, Snapshot, SolanaAddresses, Terms, Totals, Upload,
+    UploadAccepted,
 };
 pub use catalogue::Catalogue;
 pub use manifest::{Allowances, Canonical, ChainNeed, Manifest, Prices};

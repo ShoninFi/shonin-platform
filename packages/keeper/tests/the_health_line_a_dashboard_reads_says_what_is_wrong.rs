@@ -109,7 +109,7 @@ async fn the_health_line_a_dashboard_reads_says_what_is_wrong() {
         first.len()
     );
     assert_eq!(
-        first, "keeper: 2 chains not kept; +2 more",
+        first, "keeper: 3 chains not kept; +2 more",
         "the first line does not name the most serious trouble and count the rest: {said:?}"
     );
 }

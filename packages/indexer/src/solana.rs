@@ -1,0 +1,1258 @@
+//! Reading a Solana vault chain into the record.
+//!
+//! Every vault is an account of the vault program, so the vaults are listed
+//! by asking for the program's vault accounts, and each one's state is its
+//! account as it is now. A cluster keeps no past state to read a vault at, so
+//! its record is rebuilt from its own history instead: every transaction that
+//! touched it, read once and in order, and every valuation's figures taken
+//! from the event the vault emitted through its own instruction data (which
+//! a node can't truncate, as it does logs) under the vault instruction that
+//! named it. The same pass keeps the vault's events for the page and what
+//! each holder has paid in and taken out.
+
+use std::collections::{HashMap, VecDeque};
+
+use alloy::primitives::B256;
+use anyhow::{Context, Result, anyhow};
+use base64::Engine as _;
+use chain::SolanaServed;
+use chain::solana::programs::anchor_lang::{AccountDeserialize, AnchorDeserialize, Discriminator};
+use chain::solana::programs::{profiles, publishing, vault as sv};
+use chain::solana::{Pubkey, SolanaClient, TransactionRecord};
+use shared::ChainAddress;
+use shared::model::activity::{EventKind, Kill, VaultEvent};
+use shared::model::common::Chain;
+use shared::model::health::Health;
+use shared::model::registry::{Author, FeedEvent, FeedKind};
+use shared::model::review::{Rating, Review};
+use shared::model::strategy::{Standing, Strategy};
+use shared::model::vault::{
+    Claim, ClaimState, Fees, Halt, PendingFloor, Request, RequestKind, Tank, Vault, VaultState,
+};
+use shared::model::venue::{Custody, ExitClass, ExitPath, Leg, Valuation, VenueStatus};
+use sv::events as ev;
+use sv::state::{
+    ClaimState as ChainClaimState, HaltReason, RequestKind as ChainRequestKind,
+    VaultState as ChainVaultState,
+};
+
+use crate::read::{self, Sample, day, hash_of, moment, name_of};
+use crate::store::Store;
+
+/// What the indexer remembers between reads of a Solana chain.
+#[derive(Default)]
+pub struct History {
+    vaults: HashMap<Pubkey, VaultLog>,
+    /// Each vault as last read whole, and the chain time it was.
+    last_whole: HashMap<Pubkey, (Strategy, u64)>,
+}
+
+/// What a vault's history has come to so far, and where reading it stands.
+#[derive(Default)]
+struct VaultLog {
+    /// Transactions listed and not read yet, oldest first.
+    queue: VecDeque<String>,
+    /// The newest transaction listed: the next listing stops there.
+    listed_until: Option<String>,
+    /// One reading per valuation, kept hourly then daily as the EVM record.
+    samples: Vec<Sample>,
+    /// The newest valuation read, by its index.
+    last_valuation: Option<u64>,
+    /// The newest of what the page shows, oldest first.
+    events: VecDeque<VaultEvent>,
+    /// The newest time the vault was stopped.
+    killed: Option<VaultEvent>,
+    /// What each holder has paid in, less what they have taken out.
+    paid: HashMap<Pubkey, f64>,
+    /// Who booked each claim, by its id: a claim the closed vault pays says
+    /// only its id.
+    claim_owners: HashMap<u64, Pubkey>,
+}
+
+/// How many of a vault's transactions are listed per request.
+const SIGNATURE_PAGE: usize = 1_000;
+
+/// The most of one vault's transactions read in one refresh: a vault whose
+/// history is being rebuilt catches up a page at a time, and the rest of
+/// the record isn't held up meanwhile.
+const TRANSACTIONS_PER_REFRESH: usize = 64;
+
+/// How many of a vault's events the page shows.
+const SHOWN: usize = 60;
+
+const HOUR: u64 = 3_600;
+
+/// Share units per share, and dollar units per dollar.
+const SHARE: f64 = 1e18;
+const DOLLAR: f64 = 1e6;
+
+/// One Solana chain's part of the record.
+pub struct ChainRead {
+    pub strategies: Vec<Strategy>,
+    pub authors: Vec<(ChainAddress, Author)>,
+}
+
+/// Every vault on the chain, as the site shows it, and their authors.
+pub async fn read(
+    served: &SolanaServed,
+    store: &Store,
+    history: &mut History,
+    health: &HashMap<Pubkey, Health>,
+    now: u64,
+) -> Result<ChainRead> {
+    let client = &served.client;
+    let vaults = vaults(client).await?;
+
+    let mut strategies = Vec::new();
+    let mut authors: Vec<(ChainAddress, Author)> = Vec::new();
+    for (address, vault) in &vaults {
+        match one(served, store, history, health, *address, vault, now).await {
+            Ok(strategy) => {
+                history.last_whole.insert(*address, (strategy.clone(), now));
+                strategies.push(strategy);
+            }
+            Err(error) => match history.last_whole.get(address) {
+                Some((strategy, read_at)) => {
+                    tracing::warn!(vault = %address, error = format!("{error:#}"), "could not read a vault; kept it as last read");
+                    strategies.push(Strategy {
+                        stale_as_of: Some(moment(*read_at)),
+                        ..strategy.clone()
+                    });
+                }
+                None => {
+                    tracing::warn!(vault = %address, error = format!("{error:#}"), "could not read a vault never read whole; shown as not read yet");
+                    strategies.push(read::placeholder(
+                        served.vault_chain,
+                        vault.strategy_id,
+                        vault.author.to_string(),
+                        vault.author.to_string(),
+                        address.to_string(),
+                    ));
+                }
+            },
+        }
+        let author = ChainAddress::Solana(vault.author.to_bytes());
+        if !authors.iter().any(|(known, _)| *known == author) {
+            // A profile that can't be read leaves the author shown by their
+            // key, and holds up nothing else.
+            let profile = served
+                .platform
+                .profile(client, &vault.author)
+                .await
+                .ok()
+                .flatten();
+            authors.push((author, author_of(&vault.author, profile)));
+        }
+    }
+    Ok(ChainRead {
+        strategies,
+        authors,
+    })
+}
+
+/// Every vault the vault program holds, by strategy id.
+pub async fn vaults(client: &SolanaClient) -> Result<Vec<(Pubkey, sv::state::Vault)>> {
+    let accounts = client
+        .rpc
+        .program_accounts(&sv::ID, &[(0, sv::state::Vault::DISCRIMINATOR.to_vec())])
+        .await
+        .context("listing the vaults")?;
+    let mut vaults = Vec::new();
+    for (address, account) in accounts {
+        let vault = sv::state::Vault::try_deserialize(&mut &account.data[..])
+            .map_err(|error| anyhow!("the vault at {address} does not read as one: {error}"))?;
+        vaults.push((address, vault));
+    }
+    vaults.sort_by_key(|(_, vault)| vault.strategy_id);
+    Ok(vaults)
+}
+
+fn author_of(key: &Pubkey, profile: Option<profiles::Profile>) -> Author {
+    let profile = profile.filter(|profile| !profile.handle.is_empty());
+    Author {
+        handle: profile
+            .as_ref()
+            .map_or_else(|| key.to_string(), |profile| profile.handle.clone()),
+        joined: day(profile.as_ref().map_or(0, |profile| profile.joined_at)),
+        blurb: profile
+            .as_ref()
+            .map(|profile| profile.blurb.clone())
+            .filter(|blurb| !blurb.is_empty())
+            .unwrap_or_else(|| "This author has not said anything about themselves.".to_string()),
+        links: profile
+            .map(|profile| {
+                profile
+                    .link_labels
+                    .into_iter()
+                    .zip(profile.link_urls)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+async fn one(
+    served: &SolanaServed,
+    store: &Store,
+    history: &mut History,
+    health: &HashMap<Pubkey, Health>,
+    address: Pubkey,
+    vault: &sv::state::Vault,
+    now: u64,
+) -> Result<Strategy> {
+    let client = &served.client;
+    let platform = &served.platform;
+    let id = vault.strategy_id;
+    let registered = platform.strategy(client, id).await?;
+    let review = platform.review(client, id).await?;
+    let author = match platform.profile(client, &vault.author).await? {
+        Some(profile) if !profile.handle.is_empty() => profile.handle,
+        _ => vault.author.to_string(),
+    };
+
+    let log = history.vaults.entry(address).or_default();
+    read_history(client, &address, log).await?;
+
+    let claims = claims(client, &address, vault).await?;
+    let requests = requests(client, &address).await?;
+    let restricted: Vec<String> = client
+        .load::<sv::state::Restricted>(&sv::state::restricted_address(&address).0)
+        .await?
+        .map(|list| {
+            list.codes
+                .iter()
+                .map(|code| name_of(B256::from(*code)))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let figures = Figures::of(vault);
+    let days_live = now.saturating_sub(vault.created_at) / 86_400;
+    let shown = shown_vault(
+        served.vault_chain,
+        &address,
+        vault,
+        &figures,
+        claims,
+        requests,
+        restricted,
+    );
+    let record = read::record_from(&log.samples, &shown, now, 0);
+
+    let kill = log.killed.as_ref().map(|event| Kill {
+        at: event.at,
+        reason: "the admin key stopped it".to_string(),
+        outcome: if vault.state == ChainVaultState::Closed {
+            "every position was closed and the cash brought home; holders are paid from it"
+                .to_string()
+        } else {
+            "its positions are being closed and the cash brought home".to_string()
+        },
+        reference: event.reference.clone(),
+    });
+    let standing = match standing(vault.state, days_live) {
+        Standing::Closed if kill.is_some() => Standing::Killed,
+        other => other,
+    };
+
+    let manifest = registered
+        .as_ref()
+        .and_then(|registered| store.manifest(&hash_of(B256::from(registered.manifest_hash))))
+        .map(|canonical| canonical.manifest);
+    let bundle = read::bundle_from(
+        store,
+        B256::from(registered.as_ref().map_or([0; 32], |r| r.manifest_hash)),
+        B256::from(registered.as_ref().map_or([0; 32], |r| r.source_hash)),
+        B256::from(vault.bundle_hash),
+    );
+    let legs = vec![leg(&shown, vault, &figures)];
+    let events: Vec<VaultEvent> = log.events.iter().rev().cloned().collect();
+
+    Ok(Strategy {
+        id,
+        slug: Strategy::slug_for(served.vault_chain, id),
+        title: manifest
+            .as_ref()
+            .map(|manifest| manifest.description.title.clone())
+            .unwrap_or_else(|| format!("Agent {id}")),
+        description: manifest
+            .as_ref()
+            .map(|manifest| manifest.description.text.clone())
+            .unwrap_or_else(|| "Its manifest is not in the store.".to_string()),
+        claims: manifest
+            .as_ref()
+            .map(|manifest| manifest.description.claims.clone())
+            .unwrap_or_default(),
+        author,
+        author_address: vault.author.to_string(),
+        standing,
+        registered: day(registered
+            .as_ref()
+            .map_or(vault.created_at, |r| r.registered_at)),
+        days_live: days_live as u32,
+        bundle,
+        vault: shown,
+        legs,
+        review: review
+            .filter(|review| review.is_review())
+            .map(|review| review_of(store, &review)),
+        health: health.get(&address).cloned(),
+        attestation: None,
+        record,
+        trades: Vec::new(),
+        events,
+        kill,
+        restricted: registered
+            .as_ref()
+            .map(|r| {
+                r.lists
+                    .restricted
+                    .iter()
+                    .map(|code| name_of(B256::from(*code)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        drivers: vault
+            .drivers
+            .iter()
+            .map(|driver| name_of(B256::from(*driver)))
+            .collect(),
+        bridges: registered
+            .as_ref()
+            .map(|r| {
+                r.lists
+                    .bridges
+                    .iter()
+                    .map(|b| name_of(B256::from(*b)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        stale_as_of: None,
+    })
+}
+
+/// A vault's worth and price per share, from its last priced valuation: the
+/// price every request it settles is priced at. Its worth is every share
+/// counted now at that price, so a deposit or withdrawal settled since the
+/// valuation (at exactly that price) is in it, as the shares it made or
+/// burnt. A vault never priced is at a dollar a share; a closed one is worth
+/// its cash.
+struct Figures {
+    value: f64,
+    share_price: f64,
+    /// What the station held at the valuation, at mark.
+    at_station: f64,
+}
+
+impl Figures {
+    fn of(vault: &sv::state::Vault) -> Self {
+        let latest = &vault.latest;
+        let shares = vault.total_supply as f64 / SHARE;
+        if vault.state == ChainVaultState::Closed {
+            let supply = vault.total_supply.saturating_add(sv::state::OFFSET) as f64;
+            let cash = vault.cash as f64;
+            return Self {
+                value: cash / DOLLAR,
+                share_price: ((cash + 1.0) / DOLLAR) / (supply / SHARE),
+                at_station: 0.0,
+            };
+        }
+        if !vault.priced || latest.supply == 0 {
+            return Self {
+                value: shares,
+                share_price: 1.0,
+                at_station: 0.0,
+            };
+        }
+        let (share_price, _) = valued(latest.gross, latest.fee, latest.supply);
+        Self {
+            value: shares * share_price,
+            share_price,
+            at_station: latest
+                .gross
+                .saturating_sub(1)
+                .saturating_sub(latest.cash as u128) as f64
+                / DOLLAR,
+        }
+    }
+}
+
+/// A valuation's price per share after the fee it owes, and what the vault
+/// was worth at mark: its gross carries one virtual unit, its supply the
+/// virtual shares, so a vault with nothing in it is at a dollar a share.
+fn valued(gross: u128, fee: u128, supply: u128) -> (f64, f64) {
+    let net = gross.saturating_sub(fee) as f64 / DOLLAR;
+    let shares = supply as f64 / SHARE;
+    let per_share = if shares > 0.0 { net / shares } else { 1.0 };
+    (per_share, gross.saturating_sub(1) as f64 / DOLLAR)
+}
+
+fn shown_vault(
+    vault_chain: Chain,
+    address: &Pubkey,
+    vault: &sv::state::Vault,
+    figures: &Figures,
+    claims: Vec<Claim>,
+    requests: Vec<Request>,
+    restricted: Vec<String>,
+) -> Vault {
+    let allowances = shared::Allowances {
+        fuel_per_sec: vault.allowances.fuel_per_sec,
+        memory_mib: vault.allowances.memory_mib,
+        requests_per_min: vault.allowances.requests_per_min,
+        bytes_per_day: vault.allowances.bytes_per_day,
+        streams: vault.allowances.streams,
+        inference_ms_per_min: vault.allowances.inference_ms_per_min,
+        gas_per_day: vault.allowances.gas_per_day as f64 / 1_000_000.0,
+    };
+    let daily = shared::Prices::published().daily_cap(&allowances);
+    Vault {
+        address: address.to_string(),
+        chain: vault_chain,
+        asset: vault_chain.dollar().to_string(),
+        state: match vault.state {
+            ChainVaultState::None => VaultState::Activating,
+            ChainVaultState::Open => VaultState::Open,
+            ChainVaultState::WindingDown => VaultState::WindingDown,
+            ChainVaultState::Frozen => VaultState::Frozen,
+            ChainVaultState::Killed => VaultState::Killed,
+            ChainVaultState::Closed => VaultState::Closed,
+        },
+        created: day(vault.created_at),
+        station: vault.station.to_string(),
+        value: figures.value,
+        idle: vault.cash as f64 / DOLLAR,
+        escrow: vault.escrow as f64 / DOLLAR,
+        shares: vault.total_supply as f64 / SHARE,
+        share_price: figures.share_price,
+        // `1e18` is $1.00 a share.
+        high_water_mark: vault.mark as f64 / SHARE,
+        last_crystallised: day(vault.last_payment),
+        idle_floor_bps: vault.floor_bps as u32,
+        pending_floor: (vault.pending_floor_at != 0).then(|| PendingFloor {
+            bps: vault.pending_floor_bps as u32,
+            from: moment(vault.pending_floor_at),
+        }),
+        allowances,
+        requests,
+        restricted,
+        halt: (vault.halted_at != 0).then(|| Halt {
+            at: moment(vault.halted_at),
+            reason: halt_reason(vault.halt_reason),
+        }),
+        fees: Fees {
+            holding_bps: vault.fees.holding_bps as u32,
+            author_bps: vault.fees.author_bps as u32,
+            platform_bps: vault.fees.platform_bps as u32,
+            transaction_bps: vault.fees.transaction_bps as u32,
+        },
+        exit_band_bps: vault.exit_band_bps as u32,
+        tank: Tank {
+            balance: vault.tank.balance as f64 / DOLLAR,
+            daily_charge: daily,
+            keep_at: vault.tank.keep_at as f64 / DOLLAR,
+            usage_settled: vault.tank.usage_settled as f64 / DOLLAR,
+        },
+        // A Solana vault trades on its own chain only: its station serves
+        // every claim itself.
+        exit_class: ExitClass::Direct,
+        freeze_after_days: (vault.timers.freeze_after / 86_400) as u32,
+        claims,
+        in_transit: None,
+    }
+}
+
+fn halt_reason(reason: HaltReason) -> String {
+    match reason {
+        HaltReason::Killed => "the admin key stopped it",
+        HaltReason::Frozen => "a claim went unpaid for its whole freeze period",
+        HaltReason::Retired => "its author retired it and the wind-down ended",
+        HaltReason::Sealed => "it is being wound down",
+        HaltReason::None => "",
+    }
+    .to_string()
+}
+
+fn standing(state: ChainVaultState, days_live: u64) -> Standing {
+    match state {
+        ChainVaultState::Killed => Standing::Killed,
+        ChainVaultState::Frozen => Standing::Frozen,
+        ChainVaultState::Closed => Standing::Closed,
+        ChainVaultState::WindingDown => Standing::Retiring,
+        _ if days_live >= Strategy::DAYS_NEW as u64 => Standing::Listed,
+        _ => Standing::New,
+    }
+}
+
+/// The vault's one leg: its station, at the stand-in venue through the
+/// drivers it pinned.
+fn leg(shown: &Vault, vault: &sv::state::Vault, figures: &Figures) -> Leg {
+    Leg {
+        venue: "Local venue".to_string(),
+        chain: shown.chain,
+        custody: Custody::VenueEnforced,
+        exit_path: ExitPath::Contract,
+        last_resort: None,
+        share_of_value: if figures.value > 0.0 {
+            (figures.at_station / figures.value).clamp(0.0, 1.0)
+        } else {
+            0.0
+        },
+        valuation: Valuation::OnChain {
+            source: "the pinned driver's reads of the venue's accounts".to_string(),
+        },
+        account: vault.station.to_string(),
+        key: "the executor's blessed key, through the station's guard".to_string(),
+        can: vec!["send the venue instructions the station's allowlist names".to_string()],
+        cannot: vec![
+            "withdraw anything".to_string(),
+            "call a program the station did not pin".to_string(),
+            "send a dollar anywhere but the vault's own accounts".to_string(),
+        ],
+        status: VenueStatus::Ok,
+        note: None,
+    }
+}
+
+fn review_of(store: &Store, review: &publishing::state::Review) -> Review {
+    let report = store.report(&hash_of(B256::from(review.report_hash)));
+    let missing = || "The report is not in the store.".to_string();
+    Review {
+        ratings: review
+            .ratings
+            .map(|code| Rating::from_code(code).unwrap_or(Rating::CouldntTell)),
+        findings: report
+            .as_ref()
+            .map(|report| report.findings.clone())
+            .unwrap_or_default(),
+        summary: report
+            .as_ref()
+            .map(|report| report.summary.clone())
+            .unwrap_or_else(missing),
+        reviewed: day(review.reviewed_at),
+        refused: review.refused,
+        sealed: report.as_ref().is_some_and(|report| report.sealed),
+        reviewer_image: hash_of(B256::from(review.reviewer_image)),
+        model_id_hash: hash_of(B256::from(review.model_id_hash)),
+        prompt_hash: hash_of(B256::from(review.prompt_hash)),
+        report_hash: hash_of(B256::from(review.report_hash)),
+        limits: report
+            .map(|report| report.limits)
+            .unwrap_or_else(|| vec![missing()]),
+    }
+}
+
+/// Every claim the vault has booked, each at the address its id derives.
+async fn claims(
+    client: &SolanaClient,
+    address: &Pubkey,
+    vault: &sv::state::Vault,
+) -> Result<Vec<Claim>> {
+    let ids: Vec<u64> = (1..=vault.claim_count).collect();
+    let mut out = Vec::new();
+    for ids in ids.chunks(100) {
+        let addresses: Vec<Pubkey> = ids
+            .iter()
+            .map(|id| sv::state::claim_address(address, *id).0)
+            .collect();
+        let accounts = client.rpc.accounts(&addresses).await?;
+        for (id, account) in ids.iter().zip(accounts) {
+            // A claim closed once it was paid and its rent taken back is
+            // gone from the cluster: what it was is in the vault's history.
+            let Some(account) = account.filter(|account| !account.data.is_empty()) else {
+                continue;
+            };
+            let claim = sv::state::Claim::try_deserialize(&mut &account.data[..])
+                .map_err(|error| anyhow!("claim {id} does not read as one: {error}"))?;
+            let paid = claim.state == ChainClaimState::Paid;
+            // A paid claim's shares are burnt, so the supply no longer counts
+            // them: its share is measured with them put back.
+            let supply = if paid {
+                vault.total_supply.saturating_add(claim.shares)
+            } else {
+                vault.total_supply
+            };
+            out.push(Claim {
+                id: claim.id as u32,
+                owner: claim.owner.to_string(),
+                shares: claim.shares as f64 / SHARE,
+                fraction_closed: if supply == 0 {
+                    0.0
+                } else {
+                    claim.shares as f64 / supply as f64
+                },
+                booked: day(claim.booked_at),
+                state: match claim.state {
+                    ChainClaimState::Paid => ClaimState::Paid,
+                    ChainClaimState::Waiting => ClaimState::Waiting,
+                    ChainClaimState::Queued => ClaimState::Queued,
+                    ChainClaimState::Fallback => ClaimState::Fallback,
+                    ChainClaimState::Pending | ChainClaimState::None => ClaimState::Pending,
+                },
+                settled_for: (claim.paid > 0).then(|| claim.paid as f64 / DOLLAR),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Every request still waiting to be priced, oldest first: the vault's
+/// request accounts not yet done. A request is at its maker's address, so
+/// they are found by the vault they name.
+async fn requests(client: &SolanaClient, address: &Pubkey) -> Result<Vec<Request>> {
+    let accounts = client
+        .rpc
+        .program_accounts(
+            &sv::ID,
+            &[
+                (0, sv::state::Request::DISCRIMINATOR.to_vec()),
+                (8, address.to_bytes().to_vec()),
+            ],
+        )
+        .await
+        .context("listing the vault's requests")?;
+    let mut waiting = Vec::new();
+    for (at, account) in accounts {
+        let request = sv::state::Request::try_deserialize(&mut &account.data[..])
+            .map_err(|error| anyhow!("the request at {at} does not read as one: {error}"))?;
+        if request.done || request.vault != *address {
+            continue;
+        }
+        let kind = match request.kind {
+            ChainRequestKind::Deposit => RequestKind::Deposit,
+            ChainRequestKind::Redeem => RequestKind::Withdrawal,
+            ChainRequestKind::Claim => RequestKind::Claim,
+            ChainRequestKind::TankFill => RequestKind::TankFill,
+        };
+        let in_dollars = kind == RequestKind::Deposit
+            || (kind == RequestKind::TankFill && request.reference == 1);
+        waiting.push(Request {
+            id: request.id,
+            owner: request.owner.to_string(),
+            kind,
+            amount: request.amount as f64 / if in_dollars { DOLLAR } else { SHARE },
+            earliest: moment(request.earliest),
+        });
+    }
+    waiting.sort_by_key(|request| request.id);
+    Ok(waiting)
+}
+
+/// Read whatever is new in the vault's history: list the transactions that
+/// touched it since the last listing, then read them oldest first, at most
+/// [`TRANSACTIONS_PER_REFRESH`] a refresh. A transaction that can't be read
+/// is read again next time, so nothing is passed over; one the node no
+/// longer holds is passed over, as there is nothing else to read it from.
+async fn read_history(client: &SolanaClient, vault: &Pubkey, log: &mut VaultLog) -> Result<()> {
+    let mut newest_first = Vec::new();
+    let mut before: Option<String> = None;
+    loop {
+        let page = client
+            .rpc
+            .signatures_for(
+                vault,
+                SIGNATURE_PAGE,
+                before.as_deref(),
+                log.listed_until.as_deref(),
+            )
+            .await
+            .context("listing the vault's transactions")?;
+        let full = page.len() == SIGNATURE_PAGE;
+        before = page.last().map(|info| info.signature.clone());
+        newest_first.extend(page);
+        if !full {
+            break;
+        }
+    }
+    if let Some(newest) = newest_first.first() {
+        log.listed_until = Some(newest.signature.clone());
+    }
+    for info in newest_first.into_iter().rev() {
+        if info.err.is_none() {
+            log.queue.push_back(info.signature);
+        }
+    }
+
+    let mut read = 0;
+    while read < TRANSACTIONS_PER_REFRESH {
+        let Some(signature) = log.queue.front().cloned() else {
+            break;
+        };
+        read += 1;
+        let record = client
+            .transaction(&signature)
+            .await
+            .with_context(|| format!("reading the vault's transaction {signature}"))?;
+        if let Some(record) = record {
+            fold(log, vault, &record);
+        } else {
+            tracing::warn!(%vault, %signature, "a transaction the node no longer holds was passed over");
+        }
+        log.queue.pop_front();
+    }
+    if !log.queue.is_empty() {
+        tracing::debug!(%vault, left = log.queue.len(), "read part of a vault's history; the rest next time");
+    }
+    Ok(())
+}
+
+/// What the vault program said in a transaction about `vault`: the events it
+/// emitted through its own instruction data under an instruction naming the
+/// vault, then those it wrote to the logs while it was the program running.
+pub fn said_about(record: &TransactionRecord, vault: &Pubkey) -> Vec<Vec<u8>> {
+    let ours = |index: usize| {
+        record
+            .instructions
+            .get(index)
+            .is_some_and(|ix| ix.accounts.contains(vault))
+    };
+    let mut out = Vec::new();
+    for (index, calls) in &record.inner {
+        if !ours(*index) {
+            continue;
+        }
+        for call in calls {
+            if call.program != sv::ID {
+                continue;
+            }
+            if let Some(event) = call
+                .data
+                .strip_prefix(chain::solana::programs::anchor_lang::event::EVENT_IX_TAG_LE)
+            {
+                out.push(event.to_vec());
+            }
+        }
+    }
+    out.extend(logged_by(&record.logs, &sv::ID));
+    out
+}
+
+/// The data `program` wrote to the logs (`Program data:`) while it was the
+/// one running, so another program's event of the same name is never taken
+/// for one of its own.
+pub fn logged_by(logs: &[String], program: &Pubkey) -> Vec<Vec<u8>> {
+    let program = program.to_string();
+    let mut running: Vec<&str> = Vec::new();
+    let mut out = Vec::new();
+    for line in logs {
+        if let Some(rest) = line.strip_prefix("Program ") {
+            if let Some(data) = rest.strip_prefix("data: ") {
+                if running.last() == Some(&program.as_str())
+                    && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data.trim())
+                {
+                    out.push(bytes);
+                }
+                continue;
+            }
+            let mut words = rest.split_whitespace();
+            let (Some(id), Some(what)) = (words.next(), words.next()) else {
+                continue;
+            };
+            match what {
+                "invoke" => running.push(id),
+                "success" | "failed:" | "failed" => {
+                    running.pop();
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// One event of kind `E`, from its discriminator and its body.
+fn decoded<E: Discriminator + AnchorDeserialize>(data: &[u8]) -> Option<E> {
+    let mut body = data.strip_prefix(E::DISCRIMINATOR)?;
+    E::deserialize(&mut body).ok()
+}
+
+/// Fold one transaction into what is known of the vault.
+fn fold(log: &mut VaultLog, vault: &Pubkey, record: &TransactionRecord) {
+    let at = record.block_time.unwrap_or(0).max(0) as u64;
+    let reference = record.signature.clone();
+    // The withdrawal said just before, if the event before was one: a claim
+    // paid while the vault ran follows its own withdrawal, which already
+    // took it off the owner's cost; one the closed vault paid says nothing
+    // before it, and is taken off the cost of whoever booked it.
+    let mut withdrawn_just_before: Option<u64> = None;
+    for data in said_about(record, vault) {
+        let withdrawn_before = withdrawn_just_before.take();
+        if let Some(valued) = decoded::<ev::Valued>(&data) {
+            if log.last_valuation.is_none_or(|last| valued.index > last) {
+                log.last_valuation = Some(valued.index);
+                let (value_per_share, aum) = valued_sample(&valued);
+                keep_sample(
+                    &mut log.samples,
+                    Sample {
+                        at: valued.time,
+                        value_per_share,
+                        aum,
+                    },
+                );
+            }
+            continue;
+        }
+        if let Some(deposited) = decoded::<ev::Deposited>(&data) {
+            *log.paid.entry(deposited.owner).or_default() += deposited.assets as f64 / DOLLAR;
+        } else if let Some(withdrawn) = decoded::<ev::Withdrawn>(&data) {
+            *log.paid.entry(withdrawn.owner).or_default() -= withdrawn.assets as f64 / DOLLAR;
+            withdrawn_just_before = Some(withdrawn.assets);
+        } else if let Some(taken) = decoded::<ev::ProRataTaken>(&data) {
+            *log.paid.entry(taken.owner).or_default() -= taken.assets as f64 / DOLLAR;
+        } else if let Some(paid) = decoded::<ev::UnitsPaid>(&data) {
+            *log.paid.entry(paid.owner).or_default() -= paid.assets as f64 / DOLLAR;
+        } else if let Some(booked) = decoded::<ev::ClaimBooked>(&data) {
+            log.claim_owners.insert(booked.claim_id, booked.owner);
+        } else if let Some(paid) = decoded::<ev::ClaimPaid>(&data)
+            && withdrawn_before != Some(paid.assets)
+            && let Some(owner) = log.claim_owners.get(&paid.claim_id).copied()
+        {
+            *log.paid.entry(owner).or_default() -= paid.assets as f64 / DOLLAR;
+        }
+        if let Some((kind, summary, amount)) = event_of(&data) {
+            let event = VaultEvent {
+                at: moment(at),
+                kind,
+                summary,
+                amount,
+                reference: reference.clone(),
+            };
+            if kind == EventKind::Killed {
+                log.killed = Some(event.clone());
+            }
+            log.events.push_back(event);
+            if log.events.len() > SHOWN {
+                log.events.pop_front();
+            }
+        }
+    }
+}
+
+fn valued_sample(event: &ev::Valued) -> (f64, f64) {
+    valued(event.gross, event.fee, event.supply)
+}
+
+/// Keep one reading an hour, the last of each, and prune as the EVM record
+/// does: a vault valued every few seconds of chain time keeps no more than
+/// the record shows.
+fn keep_sample(samples: &mut Vec<Sample>, sample: Sample) {
+    match samples.last_mut() {
+        Some(last) if last.at / HOUR == sample.at / HOUR => *last = sample,
+        Some(last) if last.at > sample.at => {}
+        _ => samples.push(sample),
+    }
+    read::prune(samples, sample.at);
+}
+
+/// A vault event as the page tells of it, if it tells of it at all.
+fn event_of(data: &[u8]) -> Option<(EventKind, String, Option<f64>)> {
+    let dollars = |units: u64| Some(units as f64 / DOLLAR);
+    Some(if let Some(e) = decoded::<ev::Requested>(data) {
+        match e.kind {
+            ChainRequestKind::Deposit => (
+                EventKind::Requested,
+                "a deposit was asked for, to be priced at a later valuation".to_string(),
+                Some(e.amount as f64 / DOLLAR),
+            ),
+            ChainRequestKind::Redeem => (
+                EventKind::Requested,
+                "a withdrawal was asked for, to be priced at a later valuation".to_string(),
+                None,
+            ),
+            ChainRequestKind::Claim => (
+                EventKind::Requested,
+                "a claim the cash covers was queued, to be priced at the next valuation"
+                    .to_string(),
+                None,
+            ),
+            ChainRequestKind::TankFill => (
+                EventKind::Requested,
+                "the tank asked to be topped up from the author's shares".to_string(),
+                None,
+            ),
+        }
+    } else if let Some(e) = decoded::<ev::ClaimTried>(data) {
+        (
+            EventKind::ClaimTried,
+            if e.blocked {
+                format!(
+                    "claim {} was tried; a market outside the exit band held its close",
+                    e.claim_id
+                )
+            } else {
+                format!("claim {} was tried", e.claim_id)
+            },
+            None,
+        )
+    } else if let Some(e) = decoded::<ev::ProRataTaken>(data) {
+        (
+            EventKind::FallbackTaken,
+            "a holder nothing could price took the pro-rata fallback".to_string(),
+            dollars(e.assets),
+        )
+    } else if let Some(e) = decoded::<ev::UnitsPaid>(data) {
+        (
+            EventKind::FallbackTaken,
+            "a fallback holder was paid for their units".to_string(),
+            dollars(e.assets),
+        )
+    } else if let Some(e) = decoded::<ev::StateChanged>(data) {
+        match e.state {
+            ChainVaultState::Closed => (
+                EventKind::Closed,
+                "the vault closed; its holders are paid from its cash".to_string(),
+                None,
+            ),
+            _ => return None,
+        }
+    } else if let Some(e) = decoded::<ev::Deposited>(data) {
+        (
+            EventKind::Deposited,
+            "a deposit was priced".to_string(),
+            dollars(e.assets),
+        )
+    } else if let Some(e) = decoded::<ev::Withdrawn>(data) {
+        (
+            EventKind::Withdrawn,
+            "a withdrawal was priced and paid".to_string(),
+            dollars(e.assets),
+        )
+    } else if let Some(e) = decoded::<ev::Refunded>(data) {
+        (
+            EventKind::Refunded,
+            "a deposit the vault could no longer take went back".to_string(),
+            dollars(e.assets),
+        )
+    } else if let Some(e) = decoded::<ev::ClaimBooked>(data) {
+        (
+            EventKind::ClaimBooked,
+            format!(
+                "a withdrawal the cash could not cover: claim {}",
+                e.claim_id
+            ),
+            None,
+        )
+    } else if let Some(e) = decoded::<ev::ClaimPaid>(data) {
+        (
+            EventKind::ClaimSettled,
+            format!("claim {} paid", e.claim_id),
+            dollars(e.assets),
+        )
+    } else if decoded::<ev::FeesPaid>(data).is_some() {
+        (
+            EventKind::Crystallised,
+            "the week's fees were paid as new shares".to_string(),
+            None,
+        )
+    } else if let Some(e) = decoded::<ev::ToStation>(data) {
+        (
+            EventKind::CapitalMoved,
+            "cash to the station".to_string(),
+            dollars(e.assets),
+        )
+    } else if let Some(e) = decoded::<ev::FromStation>(data) {
+        (
+            EventKind::CapitalMoved,
+            "the station to cash".to_string(),
+            dollars(e.assets),
+        )
+    } else if let Some(e) = decoded::<ev::TankFunded>(data) {
+        (
+            EventKind::TankFunded,
+            "the tank was topped up".to_string(),
+            dollars(e.assets),
+        )
+    } else if let Some(e) = decoded::<ev::TankFilled>(data) {
+        (
+            EventKind::TankFunded,
+            "the tank was topped up from the author's shares".to_string(),
+            dollars(e.assets),
+        )
+    } else if let Some(e) = decoded::<ev::TankCharged>(data) {
+        (
+            EventKind::TankCharged,
+            "the tank paid for running the agent".to_string(),
+            dollars(e.charged),
+        )
+    } else {
+        let e = decoded::<ev::Halted>(data)?;
+        match e.reason {
+            HaltReason::Frozen => (
+                EventKind::Frozen,
+                "a claim went untried and the vault froze".to_string(),
+                None,
+            ),
+            HaltReason::Retired => (
+                EventKind::Retired,
+                "the author's wind-down ended".to_string(),
+                None,
+            ),
+            HaltReason::Sealed => (
+                EventKind::Killed,
+                "the vault is being wound down".to_string(),
+                None,
+            ),
+            _ => (EventKind::Killed, "the vault was stopped".to_string(), None),
+        }
+    })
+}
+
+/// What `owner` has paid for what they still hold in `vault`, as its history
+/// has been read so far: everything they put in, less everything they took
+/// out. None while the vault's history has not been read.
+pub fn cost(history: &History, vault: &Pubkey, owner: &Pubkey) -> Option<f64> {
+    let log = history.vaults.get(vault)?;
+    Some(log.paid.get(owner).copied().unwrap_or(0.0).max(0.0))
+}
+
+/// What is worth announcing on a Solana chain, newest first.
+pub fn feed(vault_chain: Chain, strategies: &[Strategy]) -> Vec<FeedEvent> {
+    let mut out = Vec::new();
+    for strategy in strategies {
+        if read::never_read(strategy) {
+            continue;
+        }
+        out.push(FeedEvent {
+            at: strategy.registered.midnight(),
+            kind: FeedKind::StrategyRegistered,
+            title: format!("Agent {} on {} was registered", strategy.id, vault_chain.label()),
+            detail: "The reviewer read it first, then an allowlisted build service compiled it and signed what it made."
+                .to_string(),
+            link: Some(format!("/agents/{}", strategy.slug)),
+            reference: strategy.bundle.bundle_hash.clone(),
+        });
+        if let Some(kill) = &strategy.kill {
+            out.push(FeedEvent {
+                at: kill.at,
+                kind: FeedKind::Kill,
+                title: format!("{} was stopped", strategy.title),
+                detail: kill.outcome.clone(),
+                link: Some(format!("/agents/{}", strategy.slug)),
+                reference: kill.reference.clone(),
+            });
+        }
+        if strategy.vault.state == VaultState::Frozen {
+            out.push(FeedEvent {
+                at: moment(0),
+                kind: FeedKind::VaultFrozen,
+                title: format!("{} froze", strategy.title),
+                detail: "A claim went unserved, so no new deposits and only unwinding is left."
+                    .to_string(),
+                link: Some(format!("/agents/{}", strategy.slug)),
+                reference: strategy.vault.address.clone(),
+            });
+        }
+        if let Some(review) = &strategy.review {
+            out.push(FeedEvent {
+                at: review.reviewed.midnight(),
+                kind: FeedKind::ReviewPublished,
+                title: format!("{} was reviewed", strategy.title),
+                detail: if review.is_alarming() {
+                    "Its report card has serious concerns.".to_string()
+                } else {
+                    "Its report card is published.".to_string()
+                },
+                link: Some(format!("/agents/{}/review", strategy.slug)),
+                reference: review.report_hash.clone(),
+            });
+        }
+    }
+    out.sort_by_key(|event| std::cmp::Reverse(event.at));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chain::solana::Called;
+    use chain::solana::programs::anchor_lang::Event;
+
+    fn a_record(
+        instructions: Vec<Called>,
+        inner: Vec<(usize, Vec<Called>)>,
+        logs: Vec<String>,
+    ) -> TransactionRecord {
+        TransactionRecord {
+            signature: "sig".to_string(),
+            slot: 1,
+            block_time: Some(1_800_000_000),
+            err: None,
+            fee: 5_000,
+            account_keys: Vec::new(),
+            pre_balances: Vec::new(),
+            post_balances: Vec::new(),
+            instructions,
+            inner,
+            logs,
+            units: None,
+        }
+    }
+
+    fn a_valuation(index: u64, gross: u128) -> ev::Valued {
+        ev::Valued {
+            index,
+            time: 1_800_000_000 + index * HOUR,
+            gross,
+            gross_exit: gross,
+            supply: sv::state::OFFSET + 100 * 1_000_000_000_000_000_000,
+            fee: 0,
+        }
+    }
+
+    fn emitted(event: &impl Event) -> Called {
+        Called {
+            program: sv::ID,
+            accounts: vec![],
+            data: [
+                chain::solana::programs::anchor_lang::event::EVENT_IX_TAG_LE,
+                &event.data(),
+            ]
+            .concat(),
+        }
+    }
+
+    /// A transaction that values two vaults, one instruction each: each
+    /// vault's record takes only the valuation made under the instruction
+    /// that named it.
+    #[test]
+    fn a_valuation_is_taken_only_under_the_instruction_that_named_its_vault() {
+        let ours = Pubkey::new_unique();
+        let theirs = Pubkey::new_unique();
+        let call = |vault: Pubkey| Called {
+            program: sv::ID,
+            accounts: vec![Pubkey::new_unique(), vault],
+            data: vec![],
+        };
+        let record = a_record(
+            vec![call(theirs), call(ours)],
+            vec![
+                (0, vec![emitted(&a_valuation(1, 500_000_001))]),
+                (1, vec![emitted(&a_valuation(1, 120_000_001))]),
+            ],
+            vec![],
+        );
+        let mut log = VaultLog::default();
+        fold(&mut log, &ours, &record);
+        assert_eq!(log.samples.len(), 1);
+        assert!(
+            (log.samples[0].aum - 120.0).abs() < 1e-9,
+            "{}",
+            log.samples[0].aum
+        );
+        assert!((log.samples[0].value_per_share - 1.2).abs() < 1e-6);
+
+        // The same valuation read twice is kept once.
+        fold(&mut log, &ours, &record);
+        assert_eq!(log.samples.len(), 1);
+    }
+
+    /// The venue has events named as the vault's are; only what the vault
+    /// program itself logged is read as the vault's.
+    #[test]
+    fn only_what_the_vault_program_logged_is_read_as_its_event() {
+        let vault = Pubkey::new_unique();
+        let venue = Pubkey::new_unique();
+        let deposited = ev::Deposited {
+            request_id: 1,
+            owner: Pubkey::new_unique(),
+            assets: 25_000_000,
+            shares: 25,
+        };
+        let line = format!(
+            "Program data: {}",
+            base64::engine::general_purpose::STANDARD.encode(deposited.data())
+        );
+        let logs = vec![
+            format!("Program {} invoke [1]", sv::ID),
+            format!("Program {venue} invoke [2]"),
+            line.clone(),
+            format!("Program {venue} success"),
+            line,
+            format!("Program {} success", sv::ID),
+        ];
+        let mut log = VaultLog::default();
+        fold(&mut log, &vault, &a_record(vec![], vec![], logs));
+        assert_eq!(log.paid.get(&deposited.owner).copied(), Some(25.0));
+        assert_eq!(log.events.len(), 1);
+        assert_eq!(log.events[0].kind, EventKind::Deposited);
+    }
+
+    /// A claim the closed vault pays says only its id: it comes off the cost
+    /// of whoever booked it. One paid while the vault ran follows its own
+    /// withdrawal, and comes off once.
+    #[test]
+    fn a_claim_the_closed_vault_pays_comes_off_its_owner_s_cost_once() {
+        let vault = Pubkey::new_unique();
+        let (owner, other) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let under_vault = |events: Vec<Called>| {
+            let named = Called {
+                program: sv::ID,
+                accounts: vec![vault],
+                data: vec![],
+            };
+            a_record(vec![named], vec![(0, events)], vec![])
+        };
+        let mut log = VaultLog::default();
+        for (who, assets) in [(owner, 100_000_000), (other, 50_000_000)] {
+            fold(
+                &mut log,
+                &vault,
+                &under_vault(vec![emitted(&ev::Deposited {
+                    request_id: 1,
+                    owner: who,
+                    assets,
+                    shares: 1,
+                })]),
+            );
+        }
+        for (claim_id, who) in [(7, owner), (8, other)] {
+            fold(
+                &mut log,
+                &vault,
+                &under_vault(vec![emitted(&ev::ClaimBooked {
+                    claim_id,
+                    owner: who,
+                    shares: 1,
+                })]),
+            );
+        }
+        // Claim 8, paid while the vault ran: its withdrawal, then the claim.
+        fold(
+            &mut log,
+            &vault,
+            &under_vault(vec![
+                emitted(&ev::Withdrawn {
+                    request_id: 0,
+                    owner: other,
+                    shares: 1,
+                    assets: 20_000_000,
+                    fee_shares: 0,
+                }),
+                emitted(&ev::ClaimPaid {
+                    claim_id: 8,
+                    assets: 20_000_000,
+                }),
+            ]),
+        );
+        // Claim 7, paid by the closed vault: the claim alone.
+        fold(
+            &mut log,
+            &vault,
+            &under_vault(vec![emitted(&ev::ClaimPaid {
+                claim_id: 7,
+                assets: 60_000_000,
+            })]),
+        );
+        let mut history = History::default();
+        history.vaults.insert(vault, log);
+        assert_eq!(cost(&history, &vault, &owner), Some(40.0));
+        assert_eq!(cost(&history, &vault, &other), Some(30.0));
+    }
+
+    #[test]
+    fn a_vault_with_nothing_in_it_is_at_a_dollar_a_share() {
+        let (per_share, worth) = valued(1, 0, sv::state::OFFSET);
+        assert!((per_share - 1.0).abs() < 1e-12);
+        assert_eq!(worth, 0.0);
+    }
+}

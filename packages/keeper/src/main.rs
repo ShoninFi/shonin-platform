@@ -169,10 +169,35 @@ async fn main() -> Result<()> {
     let _ = SERVING_NONE_FOR.set(Duration::from_secs(args.serving_none_for));
     // Every chain to be kept is in the keeper's health from the start: one
     // that never connects is not kept, and is said to be.
-    for target in args.chain_args.targets()? {
+    // A keeper asked for the Solana vault chain alone keeps no EVM chain.
+    let evm = args.chain_args.vault_chain != Some(Chain::Solana);
+    if evm {
+        for target in args.chain_args.targets()? {
+            chain_kept(target.vault_chain, |_| {});
+        }
+    }
+    let solana_targets = args.chain_args.solana_targets()?;
+    for target in &solana_targets {
         chain_kept(target.vault_chain, |_| {});
     }
-    let mut connecting = args.chain_args.connect_each()?;
+    let mut connecting = if evm {
+        args.chain_args.connect_each()?
+    } else {
+        tokio::sync::mpsc::unbounded_channel().1
+    };
+    // Each Solana vault chain is kept on its own, as it connects.
+    let mut chains = tokio::task::JoinSet::new();
+    if !solana_targets.is_empty() {
+        let mut clusters = args.chain_args.connect_each_solana()?;
+        let executor = args.executor_url.clone();
+        chains.spawn(async move {
+            let mut kept = tokio::task::JoinSet::new();
+            while let Some(served) = clusters.recv().await {
+                kept.spawn(solana::keep_chain(served, executor.clone()));
+            }
+            while kept.join_next().await.is_some() {}
+        });
+    }
 
     if args.port != 0 {
         tokio::spawn(serve_status(SocketAddr::from(([127, 0, 0, 1], args.port))));
@@ -180,7 +205,6 @@ async fn main() -> Result<()> {
 
     // Every vault chain turns on its own, from the moment it is connected,
     // so a slow chain, or one out of reach, holds up no other.
-    let mut chains = tokio::task::JoinSet::new();
     while let Some(served) = connecting.recv().await {
         let chain = served.vault_chain;
         // A chain with no keeper account is not kept, and the others still
@@ -4268,6 +4292,9 @@ struct Troubles<'a> {
     /// Whether an executor has answered 404 for every vault it was asked
     /// about, and served none, for [`SERVING_NONE_FOR`].
     serving_none: bool,
+    /// What is wrong on the Solana vault chains, each as a short phrase and
+    /// in full (see [`solana::troubles`]).
+    solana: &'a [(String, String)],
 }
 
 /// The keeper's health: whether all is well, and what to say. The first line
@@ -4412,6 +4439,10 @@ fn health(troubles: &Troubles, now: std::time::Instant) -> (bool, String) {
             "the executor answers 404 for every vault it is asked about: check its URL".to_string(),
         );
     }
+    for (phrase, detail) in troubles.solana {
+        first.push(format!("solana: {phrase}"));
+        details.push(format!("solana: {detail}"));
+    }
     let Some(worst) = first.first() else {
         return (true, "keeper".to_string());
     };
@@ -4538,6 +4569,7 @@ async fn serve_status(address: SocketAddr) {
             // Read before the rest is locked: the asks lock their own.
             let unanswered = unanswered_asks(now);
             let serving_none = executors_serving_none(now);
+            let solana = solana::troubles(now);
             let (
                 Ok(mut not_sent),
                 Ok(chains),
@@ -4572,6 +4604,7 @@ async fn serve_status(address: SocketAddr) {
                 calls_refused: &calls_refused,
                 tanks_unread: &tanks_unread,
                 serving_none,
+                solana: &solana,
             };
             // Anything failing is not "up": a dashboard or a supervisor that
             // reads only the status still hears of it.
@@ -4585,6 +4618,8 @@ async fn serve_status(address: SocketAddr) {
         let _ = axum::serve(listener, app).await;
     }
 }
+
+mod solana;
 
 #[cfg(test)]
 mod stand_in;
@@ -4643,6 +4678,7 @@ mod tests {
                 calls_refused: &HashMap::new(),
                 tanks_unread: &HashMap::new(),
                 serving_none: false,
+                solana: &[],
             },
             now,
         )
@@ -5066,6 +5102,7 @@ mod tests {
                 calls_refused: &calls_refused,
                 tanks_unread: &HashMap::new(),
                 serving_none: false,
+                solana: &[],
             },
             now,
         );

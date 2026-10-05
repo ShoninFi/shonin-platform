@@ -83,7 +83,7 @@ pub struct Tank {
 pub struct SignedThrough(Arc<Mutex<Option<Instant>>>);
 
 impl SignedThrough {
-    fn signed(&self, through: Instant) {
+    pub(crate) fn signed(&self, through: Instant) {
         if let Ok(mut at) = self.0.lock() {
             *at = Some(through);
         }
@@ -107,12 +107,12 @@ impl SignedThrough {
 
 /// How often the running flag is looked at, and how many looks make a tick:
 /// a total is signed once a tick.
-const SAMPLE: Duration = if cfg!(test) {
+pub(crate) const SAMPLE: Duration = if cfg!(test) {
     Duration::from_millis(100)
 } else {
     Duration::from_secs(1)
 };
-const SAMPLES_PER_TICK: u32 = 5;
+pub(crate) const SAMPLES_PER_TICK: u32 = 5;
 
 /// Meter one vault, keep its signed total current, and say when its tank is
 /// dry. `running` is whether the agent is running at this moment: capacity is
@@ -267,7 +267,7 @@ struct Elapsed {
 
 /// What one vault has run up since this instance took it on, in the asset's
 /// smallest unit, and the total it carries on from.
-struct Meter {
+pub(crate) struct Meter {
     /// What the total counts on from: what the vault had collected when the
     /// meter started, or the total an earlier meter in this process signed
     /// for the vault, or a larger total another instance signed and the vault
@@ -293,7 +293,7 @@ struct Meter {
 }
 
 impl Meter {
-    fn new(native_usd: Option<f64>, gas_seen: u128) -> Self {
+    pub(crate) fn new(native_usd: Option<f64>, gas_seen: u128) -> Self {
         Self {
             base: U256::ZERO,
             signed: U256::ZERO,
@@ -308,7 +308,7 @@ impl Meter {
 
     /// Carry on from a total an earlier meter for the vault signed, so a
     /// vault let go and taken on again never serves a smaller total.
-    fn carrying_on(mut self, signed: U256) -> Self {
+    pub(crate) fn carrying_on(mut self, signed: U256) -> Self {
         self.base = signed;
         self.signed = signed;
         self
@@ -316,7 +316,13 @@ impl Meter {
 
     /// Add `seconds` at these allowances, `running` of which the agent was
     /// running for, and whatever gas the key has paid since the last reading.
-    fn add(&mut self, seconds: f64, running: f64, allowances: &Allowances, gas_now: u128) {
+    pub(crate) fn add(
+        &mut self,
+        seconds: f64,
+        running: f64,
+        allowances: &Allowances,
+        gas_now: u128,
+    ) {
         let unit = 10f64.powi(ASSET_DECIMALS as i32);
         self.capacity += cost(running.min(seconds), allowances);
         let day = allowances.gas_per_day * unit;
@@ -361,7 +367,7 @@ impl Meter {
     /// signing below it would have every collection refused as stale, the
     /// agent never billed and never stopped. The vault's own cap bounds what
     /// any total, however it was reached, can take from the tank.
-    fn agreed(&mut self, settled: U256, block: u64, apart: u64, now: Instant) -> bool {
+    pub(crate) fn agreed(&mut self, settled: U256, block: u64, apart: u64, now: Instant) -> bool {
         if settled <= self.signed {
             self.unconfirmed = None;
             return false;
@@ -379,13 +385,13 @@ impl Meter {
     }
 
     /// Carry on from an agreed collected figure.
-    fn carry_on_from(&mut self, settled: U256) {
+    pub(crate) fn carry_on_from(&mut self, settled: U256) {
         self.unconfirmed = None;
         self.base = self.base.max(settled);
     }
 
     /// The total to sign: what it carries on from, and what has accrued.
-    fn total(&mut self) -> U256 {
+    pub(crate) fn total(&mut self) -> U256 {
         let total = self.base + self.accrued();
         self.signed = self.signed.max(total);
         total
@@ -395,7 +401,7 @@ impl Meter {
 /// How many blocks apart two reads of the vault's collected figure must be,
 /// agreeing, before the meter carries on from it, on a chain read at its
 /// head (no confirmations). Read deeper, a later block is enough.
-const AGREE_BLOCKS: u64 = 3;
+pub(crate) const AGREE_BLOCKS: u64 = 3;
 
 /// How far apart two agreeing reads of the collected figure may be in time,
 /// rather than in blocks, for a chain whose head doesn't move.

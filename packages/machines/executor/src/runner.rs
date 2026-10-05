@@ -10,15 +10,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use alloy::primitives::Address;
 use anyhow::{Result, anyhow};
-use chain::{Client, KeyClient};
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::feed::Reader;
-use crate::host::{Agent, Allowance, Counters, Ctx};
+use crate::host::{Agent, Allowance, Counters, Ctx, Place};
 use crate::watch::VaultEvent;
 
 /// The least fuel a second any strategy gets, whatever its manifest says. A
@@ -52,13 +50,8 @@ pub const SAID_AT_MOST: usize = 1_024;
 pub const INSTANTIATE_WITHIN: Duration = Duration::from_secs(30);
 
 pub struct Runner {
-    pub chain: Client,
-    pub key: KeyClient,
-    pub vault: Address,
-    pub station: Address,
-    pub venue: Address,
-    pub usd: Address,
-    pub factory: Address,
+    /// Where the vault is, and how its agent's requests reach it.
+    pub place: Place,
     pub home_chain: String,
     /// The driver this agent's manifest named.
     pub driver: String,
@@ -131,13 +124,7 @@ impl Runner {
                     .inherit_stderr()
                     .build(),
                 table: handle_table(),
-                chain: self.chain.clone(),
-                key: self.key.clone(),
-                vault: self.vault,
-                station: self.station,
-                venue: self.venue,
-                usd: self.usd,
-                factory: self.factory,
+                place: self.place.clone(),
                 home_chain: self.home_chain.clone(),
                 driver: self.driver.clone(),
                 cache: Default::default(),
@@ -161,12 +148,13 @@ impl Runner {
         store.set_epoch_deadline(1);
         store.epoch_deadline_async_yield_and_update(1);
 
+        let vault = self.place.vault();
         let fault = |why: String| {
             if let Ok(mut counters) = counters.lock() {
                 counters.faults += 1;
             }
             let why = at_most(&why, SAID_AT_MOST).into_owned();
-            tracing::warn!(vault = %self.vault, why, "the strategy stopped");
+            tracing::warn!(vault, why, "the strategy stopped");
         };
 
         // Instantiating runs the strategy's own code (every module's start
@@ -201,7 +189,7 @@ impl Runner {
             .await;
         match outcome {
             Ok(Ok(Ok(()))) => {
-                tracing::info!(vault = %self.vault, "the strategy finished");
+                tracing::info!(vault, "the strategy finished");
                 return Ok(Stopped::Finished);
             }
             Ok(Ok(Err(reason))) => fault(reason),

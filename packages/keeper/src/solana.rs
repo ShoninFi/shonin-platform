@@ -1,0 +1,1638 @@
+//! The keeper on a Solana vault chain: every vault action anyone may send,
+//! as on the EVM chains, through the vault program's own instructions.
+//!
+//! Each round, for each vault the vault program holds:
+//!
+//! - its bill collected from the tank with the executor's latest signed
+//!   total, one `keep` per newer total, the executor asked once a day for an
+//!   open vault, at the halt and once its grace is over for a halted one, and
+//!   once a minute for a closed one in its last bill's window; a `keep`
+//!   without a total once a day when the author keeps the tank above what it
+//!   holds and it could be filled;
+//! - a halted vault, once its grace is over, wound up: its station stopped,
+//!   then closed in one transaction (stop, unwind, value, close) when that
+//!   would go through, or else unwound only when a simulation shows the
+//!   unwind brings money home, so the valuation after it finds the station
+//!   empty; the close is held for the vault's last bill exactly as on the EVM
+//!   (see [`collect_before_close`]);
+//! - settlement of whatever the last priced valuation owes, in batches,
+//!   before and after this slot's valuation, which is sent only when it
+//!   lands in the slot's window and a simulation shows it would not be void;
+//! - every claim that is waiting tried, at most once a slot and less often
+//!   the longer it keeps waiting; a vault whose claim is still unpaid after
+//!   its try past the freeze period frozen; a retired vault evicted once its
+//!   wind-down is over;
+//! - finished requests and claims closed, their rent going back to whoever
+//!   paid it; a closed vault's waiting requests and claims paid through its
+//!   own doors, its station stopped and emptied, its last bill collected.
+//!
+//! Every send is run by the node before it goes out (its preflight), so a
+//! call the vault would refuse costs nothing; what must land inside a window,
+//! or is only worth sending when it moves money, is simulated first as well.
+//! What the keeper remembers having done is remembered only once it landed
+//! and went through.
+
+use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use chain::SolanaServed;
+use chain::solana::platform::VaultAccounts;
+use chain::solana::programs::anchor_lang::AccountDeserialize;
+use chain::solana::programs::{station, vault as vp};
+use chain::solana::upkeep::SignedUsage;
+use chain::solana::{
+    Instruction, Keypair, Platform, Pubkey, Signer, SolanaClient, TransactionFailed,
+};
+use serde::Deserialize;
+use vp::state::{Claim, ClaimState, Request, Vault, VaultState};
+
+use crate::{DAY, MINUTE, Said, chain_kept, waited};
+
+/// How long the keeper waits between one round of a cluster and the next.
+const ROUND_PAUSE: Duration = Duration::from_secs(2);
+/// The most rounds a vault's requests go unread for their rent: they are
+/// read again sooner whenever settlement has moved.
+const RENT_EVERY: u64 = 30;
+/// The most records closed in one transaction.
+const CLOSES_AT_ONCE: usize = 8;
+/// The least an unwind must bring home to be paid for: a cent.
+const UNWIND_WORTH_AT_LEAST: u128 = 10_000;
+/// The longest wait, in chain time, between simulations of an unwind found
+/// not worth sending.
+const MOST_SECONDS_BETWEEN_CHECKS: u64 = 5 * MINUTE;
+/// The longest wait, in slots, between tries of a claim that keeps waiting.
+const MOST_SLOTS_BETWEEN_TRIES: u64 = 64;
+/// The longest wait, in chain time, after a `keep` that landed and failed.
+const MOST_SECONDS_BETWEEN_REVERTS: u64 = 60 * MINUTE;
+/// Rounds in a row a vault may fail before it is in the keeper's health.
+const MOST_VAULT_ROUNDS_FAILING: u64 = 3;
+/// How long the executor may answer no ask before the health says so.
+const UNANSWERED_FOR: Duration = Duration::from_secs(15 * 60);
+/// How long one ask of the executor may take, and how long a `close` waits
+/// for an answer.
+const ASK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Keep one Solana vault chain, round after round, for good.
+pub async fn keep_chain(served: SolanaServed, executor: String) {
+    let chain = served.vault_chain;
+    let keeper = match served.client.role(chain::Role::Keeper) {
+        Ok(keeper) => keeper.insecure_clone(),
+        Err(error) => {
+            tracing::warn!(chain = %served.key, error = format!("{error:#}"), "no keeper key on this cluster; it is not kept");
+            chain_kept(chain, |kept| kept.no_keeper = true);
+            return;
+        }
+    };
+    tracing::info!(chain = %served.key, keeper = %keeper.pubkey(), "the keeper is up");
+    chain_kept(chain, |kept| kept.connected = Some(Instant::now()));
+    let keeping = Keeping {
+        client: served.client.clone(),
+        platform: served.platform.clone(),
+        keeper,
+        executor,
+    };
+    let mut memory: HashMap<Pubkey, Memory> = HashMap::new();
+    let mut said = Said::default();
+    loop {
+        let started = Instant::now();
+        let done = keeping.round(&mut memory).await;
+        let now = Instant::now();
+        match done {
+            Ok(()) => {
+                chain_kept(chain, |kept| {
+                    kept.finished = Some(now);
+                    kept.took = now.duration_since(started);
+                    kept.failing = 0;
+                });
+                if said.over() {
+                    tracing::info!(chain = %served.key, "the rounds finish again");
+                }
+            }
+            Err(error) => {
+                chain_kept(chain, |kept| kept.failing += 1);
+                if let Some(times) = said.due(now) {
+                    tracing::warn!(chain = %served.key, times, error = format!("{error:#}"), "the round did not finish");
+                }
+            }
+        }
+        tokio::time::sleep(ROUND_PAUSE).await;
+    }
+}
+
+/// One cluster as the keeper keeps it.
+struct Keeping {
+    client: SolanaClient,
+    platform: Platform,
+    keeper: Keypair,
+    executor: String,
+}
+
+/// What the keeper remembers about one vault between rounds.
+#[derive(Default)]
+struct Memory {
+    /// The keeper's rounds this vault has been in.
+    rounds: u64,
+    /// The chain time of the last daily round.
+    daily_at: Option<u64>,
+    /// The `as_of` of the last total a `keep` went through with, or that was
+    /// counted settled while the vault refused it: each total is collected
+    /// at most once.
+    bill_sent_as_of: u64,
+    /// The `as_of` of the last total the vault refused.
+    bill_refused_as_of: u64,
+    /// When a `keep` carrying a total is next sent after one that landed and
+    /// failed: the wait in seconds, and the chain time.
+    keep_again: Option<(u64, u64)>,
+    /// Rounds in a row the vault refused its bill, and the round last
+    /// counted.
+    bill_refused: u64,
+    bill_refused_in: Option<u64>,
+    bill_refused_said: Said,
+    /// Whether the executor has been asked since the halt was seen, and
+    /// since its grace was over.
+    asked_at_halt: bool,
+    asked_after_grace: bool,
+    /// When the executor was last asked for a closed vault's last bill, in
+    /// chain time and on the keeper's clock: a minute must pass on both.
+    bill_asked_at: Option<(u64, Instant)>,
+    /// When an ask that got no answer is made again: the wait, and the chain
+    /// time and the keeper's own clock it must pass on both, so a fast chain
+    /// clock can't have a silent executor asked every round.
+    ask_again: Option<(u64, u64, Instant)>,
+    /// When the close was first held for its bill, and the hold's last try
+    /// first made, in chain time and on the keeper's clock; the grace end of
+    /// the halt whose bill was written off.
+    close_held_since: Option<(u64, Instant)>,
+    last_try_since: Option<(u64, Instant)>,
+    written_off_for: Option<u64>,
+    /// When the vault was first seen closed; the first ask sent once its last
+    /// bill's window was over, and whether its last try was made.
+    closed_seen_at: Option<(u64, Instant)>,
+    asked_past_window: Option<Instant>,
+    tried_past_window: bool,
+    /// The chain time a closed vault was last found with nothing to do.
+    quiet_since: Option<u64>,
+    /// Each waiting claim's next try: the slot, and the wait in slots.
+    claims_tried: HashMap<u64, (u64, u64)>,
+    /// The slot the station was last unwound in, and when an unwind found
+    /// not worth sending is next simulated: the chain time, and the wait.
+    unwound_in: Option<u64>,
+    unwind_checks: Option<(u64, u64)>,
+    /// Whether the last simulation found the unwind not worth sending.
+    unwind_idle: bool,
+    /// The settlement cursor the records were last read for their rent at,
+    /// and the round.
+    rent_read: Option<(u64, u64)>,
+    /// The vault's rounds in a row that did not finish, and their warning.
+    rounds_failing: u64,
+    round_said: Said,
+}
+
+/// What became of a send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    /// It landed and went through.
+    Done,
+    /// The node ran it first and the vault refused it: it cost nothing.
+    Refused,
+    /// The vault refused it as `Stale`, which a node behind the cluster also
+    /// says.
+    Stale,
+    /// It landed and failed: it paid its fee.
+    Reverted,
+    /// It didn't go out, or nobody can say whether it landed.
+    NotSent,
+}
+
+impl Outcome {
+    fn of(result: &Result<chain::solana::Landed>) -> Self {
+        let Err(error) = result else {
+            return Outcome::Done;
+        };
+        if let Some(failed) = error
+            .chain()
+            .find_map(|c| c.downcast_ref::<TransactionFailed>())
+        {
+            if failed.custom == Some(vault_error(vp::error::VaultError::Stale)) {
+                return Outcome::Stale;
+            }
+            return match failed.signature {
+                Some(_) => Outcome::Reverted,
+                None => Outcome::Refused,
+            };
+        }
+        // It never landed, the node turned it away for its own reasons, or
+        // nobody can say: nothing the vault said.
+        Outcome::NotSent
+    }
+}
+
+/// A vault program error as the node reports its code.
+fn vault_error(error: vp::error::VaultError) -> u32 {
+    error as u32 + chain::solana::programs::anchor_lang::error::ERROR_CODE_OFFSET
+}
+
+/// What became of collecting the bill with the executor's latest answer, as
+/// on the EVM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Billing {
+    NoAnswer,
+    NotServed,
+    UpToDate,
+    Collected,
+    Refused,
+    NotCollected,
+    EmptyTank,
+    Capped,
+}
+
+impl Billing {
+    /// Whether nothing is left to collect with the latest answer in hand.
+    fn settled(self) -> bool {
+        !matches!(self, Billing::Refused | Billing::NotCollected)
+    }
+}
+
+/// Whether a `keep` with a total could only charge nothing: an empty tank,
+/// or a collection that has reached the halt's grace end with no cap
+/// carried. Either would only write the total off.
+fn nothing_to_charge(tank: &vp::state::Tank, grace_end: Option<u64>) -> Option<Billing> {
+    if tank.balance == 0 {
+        Some(Billing::EmptyTank)
+    } else if grace_end.is_some_and(|end| tank.last_collection >= end) && tank.cap_carried == 0 {
+        Some(Billing::Capped)
+    } else {
+        None
+    }
+}
+
+/// Whether a signed total bills anything the vault hasn't collected, and is
+/// newer than the last one sent.
+fn owes(signed: &SignedUsage, tank: &vp::state::Tank, sent_as_of: u64) -> bool {
+    signed.total > tank.usage_settled
+        && signed.as_of > tank.usage_as_of
+        && signed.as_of > sent_as_of
+}
+
+/// Whether a valuation sent now lands inside this slot's window and the
+/// vault hasn't been valued in it: the vault's own rule, with a second's
+/// room for the transaction to land.
+fn valuation_due(vault: &Vault, now: u64) -> bool {
+    let interval = vault.timers.slot_interval.max(1);
+    let start = now - now % interval;
+    now - start < vault.timers.slot_window
+        && (vault.valuation_count == 0 || vault.last_valued_at < start)
+}
+
+/// The slot `now` falls in.
+fn slot_of(now: u64, interval: u64) -> u64 {
+    now / interval.max(1)
+}
+
+/// The next try of a claim, after one at `slot` left it `state`: a claim
+/// the market kept waiting is tried ever less often, up to
+/// [`MOST_SLOTS_BETWEEN_TRIES`] slots apart; any other next slot.
+fn next_try(before: Option<(u64, u64)>, state: ClaimState, slot: u64) -> (u64, u64) {
+    let wait = match (state, before) {
+        (ClaimState::Waiting, Some((_, wait))) => (wait * 2).clamp(1, MOST_SLOTS_BETWEEN_TRIES),
+        _ => 1,
+    };
+    (slot + wait, wait)
+}
+
+/// The next simulation of an unwind found not worth sending: a slot on,
+/// doubling up to [`MOST_SECONDS_BETWEEN_CHECKS`].
+fn next_check(before: Option<(u64, u64)>, now: u64, interval: u64) -> (u64, u64) {
+    let wait = before
+        .map(|(_, wait)| wait * 2)
+        .unwrap_or(interval)
+        .clamp(interval.max(1), MOST_SECONDS_BETWEEN_CHECKS.max(interval));
+    (now + wait, wait)
+}
+
+/// Whether an unwind that brings home `brought` is worth paying for: a cent,
+/// or the vault's dust, whichever is larger.
+fn worth_an_unwind(brought: u128, dust: u128) -> bool {
+    brought >= UNWIND_WORTH_AT_LEAST.max(dust)
+}
+
+impl Keeping {
+    fn keeper(&self) -> Pubkey {
+        self.keeper.pubkey()
+    }
+
+    /// Send `ixs` as the keeper, and say what became of it. A send the
+    /// cluster never took is said at warn and in the health until the same
+    /// call goes through.
+    async fn send(&self, vault: &Pubkey, ixs: Vec<Instruction>, what: &'static str) -> Outcome {
+        let result = self.client.send(ixs, &[&self.keeper]).await;
+        let outcome = Outcome::of(&result);
+        let key = (*vault, what);
+        match (&result, outcome) {
+            (_, Outcome::NotSent) => {
+                let error = result
+                    .as_ref()
+                    .err()
+                    .map(|e| format!("{e:#}"))
+                    .unwrap_or_default();
+                let due = TROUBLES.lock().ok().and_then(|mut troubles| {
+                    troubles
+                        .not_sent
+                        .entry(key)
+                        .or_insert_with(|| (Instant::now(), Said::default()))
+                        .1
+                        .due(Instant::now())
+                });
+                if let Some(times) = due {
+                    tracing::warn!(%vault, what, times, error, "the keeper's send did not go out");
+                }
+            }
+            (Err(error), _) => {
+                went_out(&key);
+                tracing::debug!(%vault, what, error = format!("{error:#}"), "not yet");
+            }
+            (Ok(landed), _) => {
+                went_out(&key);
+                tracing::info!(%vault, what, signature = landed.signature(), "done");
+            }
+        }
+        outcome
+    }
+
+    async fn round(&self, memory: &mut HashMap<Pubkey, Memory>) -> Result<()> {
+        let vaults = self.platform.vaults(&self.client).await?;
+        let addresses: Vec<Pubkey> = vaults.iter().map(|(address, _)| *address).collect();
+        // Every claim of every vault, read once a round.
+        let mut claims: BTreeMap<Pubkey, Vec<Claim>> = BTreeMap::new();
+        for (vault, _, claim) in self.platform.claims_of(&self.client, &addresses).await? {
+            claims.entry(vault).or_default().push(claim);
+        }
+        for (address, vault) in &vaults {
+            let remembered = memory.entry(*address).or_default();
+            let theirs = claims.remove(address).unwrap_or_default();
+            let done = self.keep_one(address, vault, &theirs, remembered).await;
+            match done {
+                Ok(()) => {
+                    remembered.rounds_failing = 0;
+                    if remembered.round_said.over() {
+                        tracing::info!(vault = %address, "the vault's rounds finish again");
+                    }
+                    if let Ok(mut troubles) = TROUBLES.lock() {
+                        troubles.unkept.remove(address);
+                    }
+                }
+                Err(error) => {
+                    remembered.rounds_failing += 1;
+                    if let Some(times) = remembered.round_said.due(Instant::now()) {
+                        tracing::warn!(vault = %address, times, error = format!("{error:#}"), "the vault's round did not finish");
+                    }
+                    if let Ok(mut troubles) = TROUBLES.lock() {
+                        troubles.unkept.insert(*address, remembered.rounds_failing);
+                    }
+                }
+            }
+        }
+        if let Ok(mut troubles) = TROUBLES.lock() {
+            troubles.unkept.retain(|vault, _| addresses.contains(vault));
+            troubles
+                .bills_refused
+                .retain(|vault, _| addresses.contains(vault));
+            troubles
+                .not_sent
+                .retain(|(vault, _), _| addresses.contains(vault));
+        }
+        Ok(())
+    }
+
+    /// Everything one vault might need this round.
+    async fn keep_one(
+        &self,
+        address: &Pubkey,
+        vault: &Vault,
+        claims: &[Claim],
+        memory: &mut Memory,
+    ) -> Result<()> {
+        memory.rounds += 1;
+        let now = self.client.now().await?;
+        let v = self.platform.vault_accounts(vault.strategy_id);
+        if vault.state == VaultState::Closed {
+            if memory
+                .quiet_since
+                .is_some_and(|at| now < at.saturating_add(DAY))
+            {
+                return Ok(());
+            }
+            return self.closed_round(&v, vault, claims, now, memory).await;
+        }
+        let grace_end = vault
+            .halted()
+            .then(|| vault.halted_at.saturating_add(vault.timers.halt_grace));
+
+        // The bill: whatever newer total the executor has answered with is
+        // collected, once; the executor is asked off the round.
+        let billing = self
+            .collect_answered(&v, vault, grace_end, now, false, memory)
+            .await;
+        let due = memory.daily_at.is_none_or(|at| now >= at + DAY);
+        if due {
+            memory.daily_at = Some(now);
+            if !vault.halted() && nothing_to_charge(&vault.tank, None).is_none() {
+                ask(&self.client.cluster, &self.executor, &v.vault);
+            }
+            if !vault.halted() && billing != Billing::Collected && self.fill_wanted(&v, vault).await
+            {
+                carry_on(
+                    address,
+                    "queue a tank fill",
+                    async {
+                        let ixs = self
+                            .platform
+                            .ix_keep(&self.client, &v, vault, &self.keeper(), None)
+                            .await?;
+                        self.send(address, ixs, "keep").await;
+                        Ok(())
+                    }
+                    .await,
+                );
+            }
+        }
+        if let Some(grace_end) = grace_end {
+            self.ask_halted(&v, vault, now, grace_end, memory);
+        }
+        self.ask_again(&v.vault, now, memory);
+
+        // A halted vault's station is stopped and emptied before the slot's
+        // valuation, so the valuation finds it empty and the vault can close.
+        let mut closed = false;
+        if let Some(grace_end) = grace_end
+            && now >= grace_end
+        {
+            match self
+                .stop_and_unwind(&v, address, grace_end, now, memory)
+                .await
+            {
+                Ok(done) => closed = done,
+                Err(error) => carry_on(address, "stop and unwind the station", Err(error)),
+            }
+        }
+        if closed {
+            return Ok(());
+        }
+
+        carry_on(address, "settle", self.settle(&v).await);
+        carry_on(address, "value", self.value(&v, address).await);
+        carry_on(address, "settle", self.settle(&v).await);
+        carry_on(
+            address,
+            "claims",
+            self.claims(&v, address, claims, memory).await,
+        );
+
+        if vault.state == VaultState::WindingDown
+            && !vault.halted()
+            && now >= vault.retired_at.saturating_add(vault.timers.wind_down)
+        {
+            self.send(address, vec![self.platform.ix_evict(address)], "evict")
+                .await;
+        }
+
+        // `close` has no window: it goes whenever a valuation after the halt
+        // found the station empty and nothing priced is owed. The bill is
+        // collected first; a bill that didn't go through holds the close.
+        let vault = self.platform.vault(&self.client, address).await?;
+        if let Some(grace_end) = grace_end
+            && vault.ready_to_close()
+            && !vault.owed()
+            && self.would_close(&v, &vault).await
+            && self
+                .collect_before_close(&v, &vault, grace_end, now, memory)
+                .await
+        {
+            self.send(
+                address,
+                vec![self.platform.ix_close_vault(&v, &vault)],
+                "close",
+            )
+            .await;
+        }
+        carry_on(address, "take back rent", self.rent(address, memory).await);
+        Ok(())
+    }
+
+    /// Whether a fill could be queued and paid: the author keeps the tank
+    /// above what it holds, none is queued, the author holds shares and the
+    /// vault holds cash.
+    async fn fill_wanted(&self, v: &VaultAccounts, vault: &Vault) -> bool {
+        if vault.tank.keep_at <= vault.tank.balance || vault.tank.fill_pending || vault.cash == 0 {
+            return false;
+        }
+        self.platform
+            .shares(&self.client, &v.vault, &vault.author)
+            .await
+            .is_ok_and(|shares| shares > 0)
+    }
+
+    /// Whether the vault's `close` would go through now.
+    async fn would_close(&self, v: &VaultAccounts, vault: &Vault) -> bool {
+        self.client
+            .simulate(vec![self.platform.ix_close_vault(v, vault)], &self.keeper())
+            .await
+            .is_ok()
+    }
+
+    /// Settle everything the last priced valuation owes.
+    async fn settle(&self, v: &VaultAccounts) -> Result<()> {
+        let sent = self
+            .platform
+            .settle_all(&self.client, &self.keeper, v)
+            .await?;
+        if sent > 0 {
+            tracing::info!(vault = %v.vault, batches = sent, "settled");
+        }
+        Ok(())
+    }
+
+    /// This slot's valuation, when it lands inside the window and a
+    /// simulation shows it would price: a void one is not paid for.
+    async fn value(&self, v: &VaultAccounts, address: &Pubkey) -> Result<()> {
+        let vault = self.platform.vault(&self.client, address).await?;
+        let now = self.client.now().await?;
+        if !valuation_due(&vault, now) || vault.owed() {
+            return Ok(());
+        }
+        let ix = self.platform.ix_record_valuation(&self.client, v).await?;
+        let simulated = match self
+            .client
+            .simulate_reading(vec![ix.clone()], &self.keeper(), &[*address])
+            .await
+        {
+            Ok(simulated) => simulated,
+            // Outside the window, or valued already: next slot.
+            Err(error) => {
+                tracing::debug!(vault = %address, error = format!("{error:#}"), "no valuation this slot");
+                return Ok(());
+            }
+        };
+        let after = simulated
+            .accounts
+            .first()
+            .cloned()
+            .flatten()
+            .and_then(|account| Vault::try_deserialize(&mut &account.data[..]).ok());
+        let priced =
+            after.is_some_and(|after| after.priced && after.latest.index == vault.valuation_count);
+        if !priced {
+            tracing::debug!(vault = %address, "this slot's valuation would be void; not sent");
+            return Ok(());
+        }
+        self.send(address, vec![ix], "value").await;
+        Ok(())
+    }
+
+    /// Try every claim that is waiting, at most once a slot and less often
+    /// the longer it keeps waiting; freeze the vault for one still unpaid
+    /// after its try past the freeze period.
+    async fn claims(
+        &self,
+        v: &VaultAccounts,
+        address: &Pubkey,
+        claims: &[Claim],
+        memory: &mut Memory,
+    ) -> Result<()> {
+        memory
+            .claims_tried
+            .retain(|id, _| claims.iter().any(|claim| claim.id == *id));
+        for claim in claims {
+            if !matches!(claim.state, ClaimState::Pending | ClaimState::Waiting) {
+                continue;
+            }
+            let now = self.client.now().await?;
+            let vault = self.platform.vault(&self.client, address).await?;
+            let slot = slot_of(now, vault.timers.slot_interval);
+            let before = memory.claims_tried.get(&claim.id).copied();
+            if before.is_some_and(|(next, _)| slot < next) {
+                continue;
+            }
+            let ix = self
+                .platform
+                .ix_settle_claim(&self.client, v, &self.keeper(), claim.id)
+                .await?;
+            let outcome = self.send(address, vec![ix], "settle a claim").await;
+            let after = self.platform.claim(&self.client, address, claim.id).await?;
+            let state = after.as_ref().map_or(ClaimState::Paid, |claim| claim.state);
+            match outcome {
+                // Refused before it went out cost nothing: next slot.
+                Outcome::Refused | Outcome::NotSent | Outcome::Stale => {
+                    memory.claims_tried.insert(claim.id, (slot + 1, 1));
+                }
+                _ => {
+                    memory
+                        .claims_tried
+                        .insert(claim.id, next_try(before, state, slot));
+                }
+            }
+            if state == ClaimState::Paid {
+                tracing::info!(vault = %address, claim = claim.id, "the claim is paid");
+            }
+            // Tried and still unpaid past the freeze period: the vault is
+            // frozen, never while a valuation's settlement is owed.
+            if matches!(
+                state,
+                ClaimState::Pending | ClaimState::Waiting | ClaimState::Queued
+            ) && now >= claim.booked_at.saturating_add(vault.timers.freeze_after)
+                && vault.live()
+                && !vault.halted()
+                && !vault.owed()
+            {
+                self.send(
+                    address,
+                    vec![self.platform.ix_freeze(address, claim.id)],
+                    "freeze",
+                )
+                .await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Finished requests and claims closed, their rent going back to whoever
+    /// paid it, read again whenever settlement has moved.
+    async fn rent(&self, address: &Pubkey, memory: &mut Memory) -> Result<()> {
+        let vault = self.platform.vault(&self.client, address).await?;
+        let read_at = (vault.request_cursor, memory.rounds);
+        if memory.rent_read.is_some_and(|(cursor, round)| {
+            cursor == vault.request_cursor && memory.rounds < round + RENT_EVERY
+        }) {
+            return Ok(());
+        }
+        let mut closes = Vec::new();
+        for (record, request) in self.platform.requests_of(&self.client, address).await? {
+            if Platform::request_closable(&vault, &request) {
+                closes.push(self.platform.ix_close_request(address, &record, &request));
+            }
+        }
+        let claims = self.platform.claims_of(&self.client, &[*address]).await?;
+        for (_, _, claim) in &claims {
+            if Platform::claim_closable(&vault, claim) {
+                closes.push(self.platform.ix_close_claim(address, claim));
+            }
+        }
+        let mut all_done = true;
+        for batch in closes.chunks(CLOSES_AT_ONCE) {
+            if self.send(address, batch.to_vec(), "take back rent").await != Outcome::Done {
+                all_done = false;
+            }
+        }
+        if all_done {
+            memory.rent_read = Some(read_at);
+        }
+        Ok(())
+    }
+
+    // The halt -------------------------------------------------------------------------------
+
+    /// An ask that got no answer is made again a chain-minute later, then
+    /// after two, four and so on up to an hour, until one is answered.
+    fn ask_again(&self, vault: &Pubkey, now: u64, memory: &mut Memory) {
+        let unanswered = ASKS
+            .lock()
+            .is_ok_and(|asks| asks.unanswered.contains(vault));
+        if !unanswered {
+            memory.ask_again = None;
+            return;
+        }
+        let later = |wait: u64| {
+            Some((
+                wait,
+                now.saturating_add(wait),
+                Instant::now() + Duration::from_secs(wait),
+            ))
+        };
+        match memory.ask_again {
+            None => memory.ask_again = later(MINUTE),
+            Some((wait, next, next_here)) if now >= next && Instant::now() >= next_here => {
+                if ask(&self.client.cluster, &self.executor, vault).is_some() {
+                    memory.ask_again = later((wait * 2).min(60 * MINUTE));
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Ask for a halted vault's total when the halt is first seen and again
+    /// once its grace is over.
+    fn ask_halted(
+        &self,
+        v: &VaultAccounts,
+        vault: &Vault,
+        now: u64,
+        grace_end: u64,
+        memory: &mut Memory,
+    ) {
+        if nothing_to_charge(&vault.tank, Some(grace_end)).is_some() {
+            return;
+        }
+        let asked = if now < grace_end {
+            &mut memory.asked_at_halt
+        } else {
+            &mut memory.asked_after_grace
+        };
+        if !*asked && ask(&self.client.cluster, &self.executor, &v.vault).is_some() {
+            *asked = true;
+        }
+    }
+
+    /// A halted vault past its grace: its station stopped, then closed in one
+    /// transaction when that would go through, the bill collected first;
+    /// otherwise its station unwound when a simulation shows the unwind
+    /// brings money home. Whether the vault closed.
+    async fn stop_and_unwind(
+        &self,
+        v: &VaultAccounts,
+        address: &Pubkey,
+        grace_end: u64,
+        now: u64,
+        memory: &mut Memory,
+    ) -> Result<bool> {
+        let station = self.platform.station(&self.client, &v.station).await?;
+        // Whatever was priced before the stop is settled first, so the
+        // close in one transaction can follow.
+        self.settle(v).await?;
+        let vault = self.platform.vault(&self.client, address).await?;
+        let slot = slot_of(now, vault.timers.slot_interval);
+
+        // The close in one transaction, which nobody can get between, when
+        // it lands in this slot's window and would go through.
+        if !vault.owed() && valuation_due(&vault, now) {
+            let ixs = self
+                .platform
+                .ixs_close_in_one(&self.client, v, &vault, &self.keeper(), station.stopped)
+                .await?;
+            let fits = self
+                .client
+                .wire_size(ixs.clone(), &self.keeper())
+                .is_ok_and(|size| size <= chain::solana::client::PACKET_DATA_SIZE);
+            if fits
+                && self
+                    .client
+                    .simulate(ixs.clone(), &self.keeper())
+                    .await
+                    .is_ok()
+            {
+                if !self
+                    .collect_before_close(v, &vault, grace_end, now, memory)
+                    .await
+                {
+                    return Ok(false);
+                }
+                // The bill may have taken a while: judged again on the clock.
+                let vault = self.platform.vault(&self.client, address).await?;
+                if !valuation_due(&vault, self.client.now().await?) {
+                    return Ok(false);
+                }
+                let ixs = self
+                    .platform
+                    .ixs_close_in_one(&self.client, v, &vault, &self.keeper(), station.stopped)
+                    .await?;
+                if self.send(address, ixs, "close in one transaction").await == Outcome::Done {
+                    tracing::info!(vault = %address, "the halted vault is closed");
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
+        }
+
+        if !station.stopped {
+            self.send(address, vec![self.platform.ix_stop(v)], "stop the station")
+                .await;
+        }
+        self.unwind(v, address, &vault, now, slot, memory).await?;
+        Ok(false)
+    }
+
+    /// The stopped station unwound in full, at most once a slot, only when a
+    /// simulation shows it brings home a cent or the vault's dust, whichever
+    /// is larger. One found not worth it is simulated again ever less often.
+    async fn unwind(
+        &self,
+        v: &VaultAccounts,
+        address: &Pubkey,
+        vault: &Vault,
+        now: u64,
+        slot: u64,
+        memory: &mut Memory,
+    ) -> Result<()> {
+        if memory.unwound_in == Some(slot)
+            || memory.unwind_checks.is_some_and(|(next, _)| now < next)
+        {
+            return Ok(());
+        }
+        let station = self.platform.station(&self.client, &v.station).await?;
+        if !station.stopped {
+            return Ok(());
+        }
+        let ix = self
+            .platform
+            .ix_unwind(
+                &self.client,
+                v,
+                &self.keeper(),
+                chain::solana::programs::driver::WAD,
+            )
+            .await?;
+        let simulated = self
+            .client
+            .simulate_reading(vec![ix.clone()], &self.keeper(), &[v.station])
+            .await;
+        let brought = match simulated {
+            Ok(simulated) => simulated
+                .accounts
+                .first()
+                .cloned()
+                .flatten()
+                .and_then(|account| {
+                    station::state::Station::try_deserialize(&mut &account.data[..]).ok()
+                })
+                .map_or(0, |after| after.sent_home.saturating_sub(station.sent_home)),
+            Err(error) => {
+                tracing::debug!(vault = %address, error = format!("{error:#}"), "the unwind would not go through");
+                0
+            }
+        };
+        if !worth_an_unwind(brought, vault.dust()) {
+            memory.unwind_checks = Some(next_check(
+                memory.unwind_checks,
+                now,
+                vault.timers.slot_interval,
+            ));
+            memory.unwind_idle = true;
+            return Ok(());
+        }
+        memory.unwind_checks = None;
+        memory.unwind_idle = false;
+        if self.send(address, vec![ix], "unwind the station").await == Outcome::Done {
+            memory.unwound_in = Some(slot);
+            tracing::info!(vault = %address, brought, "the stopped station was unwound");
+        }
+        Ok(())
+    }
+
+    // The bill --------------------------------------------------------------------------------
+
+    /// Collect the bill with the latest answer the executor has given, when
+    /// it bills anything the vault could charge. Each total goes through in
+    /// one `keep` at most; one that landed and failed is tried again after a
+    /// wait, unless this is the last try (see [`collect_before_close`]).
+    async fn collect_answered(
+        &self,
+        v: &VaultAccounts,
+        vault: &Vault,
+        grace_end: Option<u64>,
+        now: u64,
+        last_try: bool,
+        memory: &mut Memory,
+    ) -> Billing {
+        let (billing, _) = self
+            .collect_latest(v, vault, grace_end, now, last_try, memory)
+            .await;
+        match billing {
+            Billing::NoAnswer | Billing::NotCollected => {}
+            Billing::Refused => {
+                if memory.bill_refused_in != Some(memory.rounds) {
+                    memory.bill_refused_in = Some(memory.rounds);
+                    memory.bill_refused += 1;
+                    if let Ok(mut troubles) = TROUBLES.lock() {
+                        troubles.bills_refused.insert(v.vault, memory.bill_refused);
+                    }
+                    if let Some(times) = memory.bill_refused_said.due(Instant::now()) {
+                        tracing::warn!(vault = %v.vault, times, "the vault refuses the keep carrying its bill; it is tried again");
+                    }
+                }
+            }
+            _ => {
+                if bill_settled(&v.vault, memory) {
+                    tracing::info!(vault = %v.vault, "the vault's bill no longer waits on a refused keep");
+                }
+            }
+        }
+        billing
+    }
+
+    /// [`Keeping::collect_answered`] before what became of it is noted; also
+    /// when the ask the answer is for was sent.
+    async fn collect_latest(
+        &self,
+        v: &VaultAccounts,
+        vault: &Vault,
+        grace_end: Option<u64>,
+        now: u64,
+        last_try: bool,
+        memory: &mut Memory,
+    ) -> (Billing, Option<Instant>) {
+        if let Some(nothing) = nothing_to_charge(&vault.tank, grace_end) {
+            total_not_wanted(&v.vault);
+            return (nothing, None);
+        }
+        let Some((answer, asked)) = latest_answer(&v.vault) else {
+            return (Billing::NoAnswer, None);
+        };
+        let Asked::Total(signed) = answer else {
+            return (Billing::NotServed, Some(asked));
+        };
+        if !owes(&signed, &vault.tank, memory.bill_sent_as_of) {
+            return (Billing::UpToDate, Some(asked));
+        }
+        if memory.keep_again.is_some_and(|(_, next)| now < next)
+            && (!last_try || memory.bill_refused_as_of == signed.as_of)
+        {
+            return (Billing::Refused, Some(asked));
+        }
+        let ixs = match self
+            .platform
+            .ix_keep(&self.client, v, vault, &self.keeper(), Some(&signed))
+            .await
+        {
+            Ok(ixs) => ixs,
+            Err(error) => {
+                carry_on(&v.vault, "build the keep", Err(error));
+                return (Billing::NotCollected, Some(asked));
+            }
+        };
+        let billing = match self.send(&v.vault, ixs, "keep").await {
+            Outcome::Done => Billing::Collected,
+            Outcome::Reverted => {
+                let wait = memory
+                    .keep_again
+                    .map_or(vault.timers.slot_interval, |(wait, _)| wait * 2)
+                    .clamp(
+                        vault.timers.slot_interval.max(1),
+                        MOST_SECONDS_BETWEEN_REVERTS,
+                    );
+                memory.keep_again = Some((wait, now + wait));
+                memory.bill_refused_as_of = signed.as_of;
+                return (Billing::Refused, Some(asked));
+            }
+            Outcome::Refused => {
+                memory.bill_refused_as_of = signed.as_of;
+                return (Billing::Refused, Some(asked));
+            }
+            Outcome::NotSent | Outcome::Stale => return (Billing::NotCollected, Some(asked)),
+        };
+        tracing::info!(vault = %v.vault, total = signed.total, as_of = signed.as_of, "the bill was collected");
+        memory.keep_again = None;
+        memory.bill_sent_as_of = signed.as_of;
+        (billing, Some(asked))
+    }
+
+    /// Before a send that may close a halted vault, whose author may take
+    /// the tank the moment it closes: the executor is asked, its answer
+    /// waited for up to [`ASK_TIMEOUT`], and whatever newer total it gives
+    /// collected. Whether the close may go, by the EVM's rules: once nothing
+    /// is left to collect; a refused or unsent `keep` holds the close for at
+    /// most fifteen minutes on both clocks, then gets one last try, after
+    /// which the bill is written off and the close goes, depositors first.
+    async fn collect_before_close(
+        &self,
+        v: &VaultAccounts,
+        vault: &Vault,
+        grace_end: u64,
+        now: u64,
+        memory: &mut Memory,
+    ) -> bool {
+        let written_off = memory.written_off_for == Some(grace_end);
+        let last_try = !written_off
+            && memory
+                .close_held_since
+                .is_some_and(|since| waited(since, now));
+        if nothing_to_charge(&vault.tank, Some(grace_end)).is_none() {
+            ask(&self.client.cluster, &self.executor, &v.vault);
+            answer_in_flight(&v.vault, ASK_TIMEOUT).await;
+        }
+        let billing = self
+            .collect_answered(v, vault, Some(grace_end), now, last_try, memory)
+            .await;
+        if written_off {
+            return true;
+        }
+        if billing.settled() {
+            bill_settled(&v.vault, memory);
+            return true;
+        }
+        if last_try {
+            let refused = billing == Billing::Refused;
+            let tried_out = memory
+                .last_try_since
+                .is_some_and(|since| waited(since, now));
+            if refused || tried_out {
+                tracing::warn!(vault = %v.vault, refused, "the bill has held the vault's close as long as it may; the vault is closed with it uncollected");
+                memory.bill_sent_as_of = memory.bill_sent_as_of.max(memory.bill_refused_as_of);
+                bill_settled(&v.vault, memory);
+                memory.written_off_for = Some(grace_end);
+                return true;
+            }
+            memory.last_try_since.get_or_insert((now, Instant::now()));
+        }
+        memory.close_held_since.get_or_insert((now, Instant::now()));
+        tracing::debug!(vault = %v.vault, "the bill did not go through; the close waits for it");
+        false
+    }
+
+    // A closed vault --------------------------------------------------------------------------
+
+    /// A closed vault: its station stopped once the grace is over and asked
+    /// to send home what it still holds, what was waiting when it closed paid
+    /// through its own doors, its last bill collected, its records closed for
+    /// their rent. One with nothing left to do is looked at once a day.
+    async fn closed_round(
+        &self,
+        v: &VaultAccounts,
+        vault: &Vault,
+        claims: &[Claim],
+        now: u64,
+        memory: &mut Memory,
+    ) -> Result<()> {
+        let address = v.vault;
+        let grace_end = vault.halted_at.saturating_add(vault.timers.halt_grace);
+        let station = self.platform.station(&self.client, &v.station).await?;
+        let mut station_left = !station.stopped;
+        if !station.stopped && now >= grace_end {
+            self.send(
+                &address,
+                vec![self.platform.ix_stop(v)],
+                "stop the closed vault's station",
+            )
+            .await;
+        }
+        if station.stopped {
+            let slot = slot_of(now, vault.timers.slot_interval);
+            carry_on(
+                &address,
+                "empty the closed vault's station",
+                self.unwind(v, &address, vault, now, slot, memory).await,
+            );
+            station_left = !memory.unwind_idle;
+        }
+
+        // What was waiting when it closed, paid out.
+        let mut waiting = false;
+        for claim in claims {
+            if matches!(
+                claim.state,
+                ClaimState::Pending | ClaimState::Waiting | ClaimState::Queued
+            ) {
+                waiting = true;
+                self.send(
+                    &address,
+                    vec![self.platform.ix_claim_closed(v, claim)],
+                    "pay a claim of the closed vault",
+                )
+                .await;
+            }
+        }
+        let requests: Vec<(Pubkey, Request)> =
+            self.platform.requests_of(&self.client, &address).await?;
+        for (record, request) in &requests {
+            if !request.done && request.kind != vp::state::RequestKind::Claim {
+                waiting = true;
+                self.send(
+                    &address,
+                    vec![self.platform.ix_settle_closed(v, vault, record, request)],
+                    "settle a request of the closed vault",
+                )
+                .await;
+            }
+        }
+
+        let closed_at = *memory.closed_seen_at.get_or_insert((now, Instant::now()));
+        let billed = self
+            .last_bill(v, vault, closed_at, grace_end, now, memory)
+            .await;
+        carry_on(
+            &address,
+            "take back rent",
+            self.rent(&address, memory).await,
+        );
+        if !station_left && !waiting && billed {
+            memory.quiet_since = Some(now);
+        }
+        Ok(())
+    }
+
+    /// A closed vault's last bill, and whether it is settled: the executor is
+    /// asked once a minute and each newer total collected; for fifteen
+    /// minutes (both clocks) past the later of the close and the grace's end
+    /// it is never settled; after that, once an answer to an ask sent since
+    /// says there is nothing more, or the vault can charge nothing.
+    async fn last_bill(
+        &self,
+        v: &VaultAccounts,
+        vault: &Vault,
+        closed_at: (u64, Instant),
+        grace_end: u64,
+        now: u64,
+        memory: &mut Memory,
+    ) -> bool {
+        let over = waited((closed_at.0.max(grace_end), closed_at.1), now);
+        let past_window = over
+            && latest_answer(&v.vault)
+                .zip(memory.asked_past_window)
+                .is_some_and(|((_, answered), past)| answered >= past);
+        let last_try = past_window && !memory.tried_past_window;
+        let (billing, answered) = self
+            .collect_latest(v, vault, Some(grace_end), now, last_try, memory)
+            .await;
+        if matches!(billing, Billing::EmptyTank | Billing::Capped) {
+            return over;
+        }
+        if memory.bill_asked_at.is_none_or(|(at, here)| {
+            now >= at.saturating_add(MINUTE) && here.elapsed() >= Duration::from_secs(MINUTE)
+        }) && let Some(sent) = ask(&self.client.cluster, &self.executor, &v.vault)
+        {
+            memory.bill_asked_at = Some((now, Instant::now()));
+            if over && memory.asked_past_window.is_none() {
+                memory.asked_past_window = Some(sent);
+            }
+        }
+        let settled = past_window
+            && answered
+                .zip(memory.asked_past_window)
+                .is_some_and(|(answered, past)| answered >= past)
+            && matches!(
+                billing,
+                Billing::NotServed | Billing::UpToDate | Billing::Collected | Billing::Refused
+            );
+        if settled {
+            memory.tried_past_window = true;
+            total_not_wanted(&v.vault);
+            memory.bill_sent_as_of = memory.bill_sent_as_of.max(memory.bill_refused_as_of);
+            bill_settled(&v.vault, memory);
+        }
+        settled
+    }
+}
+
+/// A step that failed is said at debug and the round carries on: one that
+/// can't go through this round mustn't hold up the steps after it.
+fn carry_on(vault: &Pubkey, step: &'static str, done: Result<()>) {
+    if let Err(error) = done {
+        tracing::debug!(%vault, step, error = format!("{error:#}"), "a step did not go through");
+    }
+}
+
+/// The vault's bill is settled: the vault is no longer said to refuse it,
+/// and a close held for it is held no longer. Whether it had been said.
+fn bill_settled(vault: &Pubkey, memory: &mut Memory) -> bool {
+    memory.close_held_since = None;
+    memory.last_try_since = None;
+    memory.bill_refused = 0;
+    if let Ok(mut troubles) = TROUBLES.lock() {
+        troubles.bills_refused.remove(vault);
+    }
+    memory.bill_refused_said.over()
+}
+
+/// A call went out (whatever the vault made of it): it is no longer said
+/// not to go out.
+fn went_out(key: &(Pubkey, &'static str)) {
+    if let Ok(mut troubles) = TROUBLES.lock()
+        && troubles.not_sent.remove(key).is_some()
+    {
+        tracing::info!(vault = %key.0, what = key.1, "the keeper's send goes out again");
+    }
+}
+
+// Asking the executor -----------------------------------------------------------------------------
+
+/// What the executor answered for a vault's total.
+#[derive(Clone)]
+enum Asked {
+    Total(SignedUsage),
+    NotServed,
+}
+
+/// The executor's asks, by vault: the latest answer and when the ask it
+/// answers was sent, the ask in flight, and since when no ask has been
+/// answered while some go unanswered.
+#[derive(Default)]
+struct Asks {
+    latest: HashMap<Pubkey, (Asked, Instant)>,
+    in_flight: HashMap<Pubkey, Instant>,
+    unanswered: std::collections::BTreeSet<Pubkey>,
+    failing_since: Option<Instant>,
+    said: Said,
+}
+
+static ASKS: std::sync::LazyLock<std::sync::Mutex<Asks>> =
+    std::sync::LazyLock::new(Default::default);
+
+static HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(ASK_TIMEOUT)
+        .build()
+        .unwrap_or_default()
+});
+
+/// Ask the executor for a vault's total, off the round; its answer is kept
+/// whenever it comes back. Not while an ask for the vault is in flight. When
+/// the ask was sent, if it was.
+fn ask(cluster: &str, url: &str, vault: &Pubkey) -> Option<Instant> {
+    let mut asks = ASKS.lock().ok()?;
+    if asks.in_flight.contains_key(vault) {
+        return None;
+    }
+    let sent = Instant::now();
+    asks.in_flight.insert(*vault, sent);
+    let (cluster, url, vault) = (cluster.to_string(), url.to_string(), *vault);
+    tokio::spawn(async move {
+        let answer = fetch_total(&cluster, &url, &vault).await;
+        let Ok(mut asks) = ASKS.lock() else {
+            return;
+        };
+        if asks.in_flight.get(&vault) == Some(&sent) {
+            asks.in_flight.remove(&vault);
+        }
+        match answer {
+            Ok(asked) => {
+                asks.unanswered.remove(&vault);
+                asks.failing_since = None;
+                if asks.said.over() {
+                    tracing::info!("the executor answers again");
+                }
+                if matches!(asked, Asked::NotServed) && !asks.latest.contains_key(&vault) {
+                    tracing::warn!(%vault, "the executor serves no total for this vault; if it should, check the executor's URL");
+                }
+                if asks.latest.get(&vault).is_none_or(|(_, at)| *at < sent) {
+                    asks.latest.insert(vault, (asked, sent));
+                }
+            }
+            Err(error) => {
+                asks.unanswered.insert(vault);
+                let now = Instant::now();
+                asks.failing_since.get_or_insert(now);
+                if let Some(times) = asks.said.due(now) {
+                    tracing::warn!(%vault, times, error, "the executor could not be asked for the vault's total; its bill waits for the next ask");
+                }
+            }
+        }
+    });
+    Some(sent)
+}
+
+fn latest_answer(vault: &Pubkey) -> Option<(Asked, Instant)> {
+    ASKS.lock().ok()?.latest.get(vault).cloned()
+}
+
+/// Wait for the vault's ask in flight to come back, for at most `limit`.
+async fn answer_in_flight(vault: &Pubkey, limit: Duration) {
+    let started = Instant::now();
+    while started.elapsed() < limit
+        && ASKS
+            .lock()
+            .is_ok_and(|asks| asks.in_flight.contains_key(vault))
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The keeper no longer wants a total for the vault: it no longer counts
+/// against the executor in the health.
+fn total_not_wanted(vault: &Pubkey) {
+    if let Ok(mut asks) = ASKS.lock() {
+        asks.unanswered.remove(vault);
+        if asks.unanswered.is_empty() {
+            asks.failing_since = None;
+        }
+    }
+}
+
+/// A running total as the executor serves it for a Solana vault.
+#[derive(Deserialize)]
+struct Served {
+    total: serde_json::Value,
+    as_of: u64,
+    signature: String,
+    signer: String,
+}
+
+/// Read what the executor served: the total as a decimal string or a
+/// number, the signature in base58 or `0x` hex, the signer in base58.
+fn read_served(served: Served) -> Result<SignedUsage, String> {
+    let total = match &served.total {
+        serde_json::Value::String(text) => text
+            .parse::<u64>()
+            .map_err(|e| format!("a total that is no number: {e}"))?,
+        serde_json::Value::Number(number) => number.as_u64().ok_or("a total that is no u64")?,
+        _ => return Err("a total that is no number".to_string()),
+    };
+    let bytes = match served.signature.strip_prefix("0x") {
+        Some(hex) => {
+            alloy::hex::decode(hex).map_err(|e| format!("a signature that is not hex: {e}"))?
+        }
+        None => bs58::decode(&served.signature)
+            .into_vec()
+            .map_err(|e| format!("a signature that is not base58: {e}"))?,
+    };
+    let signature: [u8; 64] = bytes
+        .try_into()
+        .map_err(|_| "a signature that is not 64 bytes".to_string())?;
+    let signer: Pubkey = served
+        .signer
+        .parse()
+        .map_err(|_| "a signer that is not an address".to_string())?;
+    Ok(SignedUsage {
+        total,
+        as_of: served.as_of,
+        signer,
+        signature,
+    })
+}
+
+async fn fetch_total(cluster: &str, executor: &str, vault: &Pubkey) -> Result<Asked, String> {
+    let reply = HTTP
+        .get(format!("{executor}/usage/{cluster}/{vault}"))
+        .send()
+        .await
+        .map_err(|error| error.without_url().to_string())?;
+    if reply.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(Asked::NotServed);
+    }
+    if !reply.status().is_success() {
+        return Err(format!("answered {}", reply.status()));
+    }
+    let served: Served = reply
+        .json()
+        .await
+        .map_err(|error| format!("not a total: {}", error.without_url()))?;
+    read_served(served).map(Asked::Total)
+}
+
+// Health ---------------------------------------------------------------------------------------------
+
+/// What the keeper's health hears of its Solana vaults.
+#[derive(Default)]
+struct Troubles {
+    /// Vaults whose rounds haven't finished, and how many in a row.
+    unkept: HashMap<Pubkey, u64>,
+    /// Vaults that refuse the `keep` carrying their bill, and for how many
+    /// rounds.
+    bills_refused: HashMap<Pubkey, u64>,
+    /// Sends that didn't go out, by vault and what they were for, since
+    /// when, and their warning.
+    not_sent: HashMap<(Pubkey, &'static str), (Instant, Said)>,
+}
+
+static TROUBLES: std::sync::LazyLock<std::sync::Mutex<Troubles>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The keeper's Solana troubles, as the health says them: a short phrase for
+/// the first line, and the whole of it.
+pub fn troubles(now: Instant) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Ok(troubles) = TROUBLES.lock() {
+        let mut unkept: Vec<String> = troubles
+            .unkept
+            .iter()
+            .filter(|(_, failing)| **failing >= MOST_VAULT_ROUNDS_FAILING)
+            .map(|(vault, failing)| format!("solana/{vault} ({failing} rounds in a row)"))
+            .collect();
+        if !unkept.is_empty() {
+            unkept.sort_unstable();
+            out.push((
+                format!("{} vaults not kept", unkept.len()),
+                format!("vault rounds not finishing: {}", unkept.join(", ")),
+            ));
+        }
+        if !troubles.not_sent.is_empty() {
+            let mut whats: Vec<String> = troubles
+                .not_sent
+                .keys()
+                .map(|(vault, what)| format!("{what} solana/{vault}"))
+                .collect();
+            whats.sort_unstable();
+            out.push((
+                format!("{} sends not going out", whats.len()),
+                format!("not going out: {}", whats.join(", ")),
+            ));
+        }
+        let mut refused: Vec<String> = troubles
+            .bills_refused
+            .iter()
+            .map(|(vault, rounds)| format!("solana/{vault} ({rounds} rounds in a row)"))
+            .collect();
+        if !refused.is_empty() {
+            refused.sort_unstable();
+            out.push((
+                format!("{} bills refused", refused.len()),
+                format!("bills the vault refuses to collect: {}", refused.join(", ")),
+            ));
+        }
+    }
+    if let Ok(asks) = ASKS.lock()
+        && asks
+            .failing_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= UNANSWERED_FOR)
+        && !asks.unanswered.is_empty()
+    {
+        let vaults: Vec<String> = asks
+            .unanswered
+            .iter()
+            .map(|vault| format!("solana/{vault}"))
+            .collect();
+        out.push((
+            "executor not answering".to_string(),
+            format!("no total from the executor for: {}", vaults.join(", ")),
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn a_tank(
+        balance: u64,
+        settled: u64,
+        as_of: u64,
+        last_collection: u64,
+        carried: u128,
+    ) -> vp::state::Tank {
+        vp::state::Tank {
+            balance,
+            keep_at: 0,
+            usage_settled: settled,
+            usage_as_of: as_of,
+            last_collection,
+            escape_requested_at: 0,
+            cap_carried: carried,
+            fill_pending: false,
+            fill_request: 0,
+        }
+    }
+
+    fn signed(total: u64, as_of: u64) -> SignedUsage {
+        SignedUsage {
+            total,
+            as_of,
+            signer: Pubkey::new_unique(),
+            signature: [7; 64],
+        }
+    }
+
+    #[test]
+    fn a_signed_total_bills_only_what_the_vault_has_not_collected_and_was_not_sent() {
+        let tank = a_tank(1_000, 50, 100, 100, 0);
+        assert!(owes(&signed(60, 101), &tank, 0));
+        assert!(
+            !owes(&signed(50, 101), &tank, 0),
+            "nothing more than collected"
+        );
+        assert!(
+            !owes(&signed(60, 100), &tank, 0),
+            "signed no later than collected"
+        );
+        assert!(!owes(&signed(60, 101), &tank, 101), "already sent");
+    }
+
+    #[test]
+    fn a_keep_is_known_to_charge_nothing_from_an_empty_tank_or_past_the_grace() {
+        assert_eq!(
+            nothing_to_charge(&a_tank(0, 0, 0, 0, 0), None),
+            Some(Billing::EmptyTank)
+        );
+        assert_eq!(
+            nothing_to_charge(&a_tank(5, 0, 0, 500, 0), Some(500)),
+            Some(Billing::Capped)
+        );
+        assert_eq!(
+            nothing_to_charge(&a_tank(5, 0, 0, 500, 1), Some(500)),
+            None,
+            "cap carried past the grace"
+        );
+        assert_eq!(nothing_to_charge(&a_tank(5, 0, 0, 499, 0), Some(500)), None);
+        assert_eq!(nothing_to_charge(&a_tank(5, 0, 0, 499, 0), None), None);
+    }
+
+    #[test]
+    fn a_claim_left_waiting_is_tried_ever_less_often_and_any_other_next_slot() {
+        let mut tried = None;
+        let mut waits = Vec::new();
+        for slot in [10, 11, 13, 17] {
+            let next = next_try(tried, ClaimState::Waiting, slot);
+            waits.push(next.1);
+            tried = Some(next);
+        }
+        assert_eq!(waits, [1, 2, 4, 8]);
+        assert_eq!(next_try(tried, ClaimState::Pending, 30), (31, 1));
+        let mut tried = Some((0, MOST_SLOTS_BETWEEN_TRIES));
+        tried = Some(next_try(tried, ClaimState::Waiting, 100));
+        assert_eq!(tried.unwrap().1, MOST_SLOTS_BETWEEN_TRIES);
+    }
+
+    #[test]
+    fn an_unwind_not_worth_sending_is_simulated_again_ever_less_often_up_to_five_minutes() {
+        let mut check = None;
+        let mut waits = Vec::new();
+        for _ in 0..8 {
+            let next = next_check(check, 1_000, 10);
+            waits.push(next.1);
+            check = Some(next);
+        }
+        assert_eq!(waits, [10, 20, 40, 80, 160, 300, 300, 300]);
+        assert!(!worth_an_unwind(9_999, 0));
+        assert!(worth_an_unwind(10_000, 82));
+        assert!(
+            !worth_an_unwind(20_000, 30_000),
+            "less than the vault's dust"
+        );
+    }
+
+    #[test]
+    fn a_total_is_read_with_its_signature_in_base58_or_hex() {
+        let signer = Pubkey::new_unique();
+        let served = |total: serde_json::Value, signature: String| Served {
+            total,
+            as_of: 9,
+            signature,
+            signer: signer.to_string(),
+        };
+        let base58 = bs58::encode([3u8; 64]).into_string();
+        let read = read_served(served(serde_json::json!("12"), base58)).unwrap();
+        assert_eq!(
+            (read.total, read.as_of, read.signer, read.signature),
+            (12, 9, signer, [3; 64])
+        );
+        let hex = format!("0x{}", alloy::hex::encode([4u8; 64]));
+        let read = read_served(served(serde_json::json!(13), hex)).unwrap();
+        assert_eq!((read.total, read.signature), (13, [4; 64]));
+        assert!(read_served(served(serde_json::json!("x"), "0x00".into())).is_err());
+        assert!(
+            read_served(served(serde_json::json!(1), "0x00".into())).is_err(),
+            "a short signature"
+        );
+    }
+
+    #[test]
+    fn a_vault_whose_rounds_keep_failing_or_whose_send_does_not_go_out_is_in_the_health() {
+        let vault = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        {
+            let mut troubles = TROUBLES.lock().unwrap();
+            troubles.unkept.insert(vault, MOST_VAULT_ROUNDS_FAILING);
+            troubles.unkept.insert(other, 1);
+            troubles
+                .not_sent
+                .insert((vault, "keep"), (Instant::now(), Said::default()));
+        }
+        let said = troubles(Instant::now());
+        let line = |phrase: &str| {
+            said.iter()
+                .find(|(first, _)| first.contains(phrase))
+                .cloned()
+        };
+        let (_, unkept) = line("vaults not kept").expect("the vault not kept is not said");
+        assert!(
+            unkept.contains(&vault.to_string()) && !unkept.contains(&other.to_string()),
+            "{unkept}"
+        );
+        let (_, not_sent) = line("sends not going out").expect("the send is not said");
+        assert!(not_sent.contains("keep"), "{not_sent}");
+        // Once the same call goes out, it is no longer said.
+        went_out(&(vault, "keep"));
+        assert!(
+            troubles(Instant::now())
+                .iter()
+                .all(|(_, detail)| !detail.contains(&format!("keep solana/{vault}")))
+        );
+        TROUBLES.lock().unwrap().unkept.clear();
+    }
+
+    #[test]
+    fn a_program_error_is_read_as_the_vault_refusing_or_as_stale() {
+        let failed =
+            |custom: Option<u32>, signature: Option<String>| -> Result<chain::solana::Landed> {
+                Err(TransactionFailed {
+                    signature,
+                    err: serde_json::Value::Null,
+                    custom,
+                    logs: vec![],
+                }
+                .into())
+            };
+        let stale = vault_error(vp::error::VaultError::Stale);
+        assert_eq!(Outcome::of(&failed(Some(stale), None)), Outcome::Stale);
+        assert_eq!(
+            Outcome::of(&failed(Some(stale + 1), None)),
+            Outcome::Refused
+        );
+        assert_eq!(
+            Outcome::of(&failed(Some(stale + 1), Some("s".into()))),
+            Outcome::Reverted
+        );
+        assert_eq!(
+            Outcome::of(&Err(anyhow::anyhow!("the node is down"))),
+            Outcome::NotSent
+        );
+    }
+}
