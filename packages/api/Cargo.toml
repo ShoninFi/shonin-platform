@@ -19,11 +19,15 @@ alloy.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
+futures.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

@@ -12,9 +12,10 @@ cargo build --release --locked --target wasm32-wasip2
 ```
 
 - **Commit your `Cargo.lock`.** The builder builds with `--locked`, so it uses exactly the dependency versions you tested with, and your archive only carries what you committed. The template already commits it; just don't add it to your `.gitignore`.
+- **Depend only on reviewed crates.** Besides the SDK and crates inside your own project, your agent may depend only on the crates.io crates the platform has reviewed itself, each at an exact version, listed in [`config/dependency-allowlist.toml`](https://github.com/ShoninFi/shonin-platform/blob/main/config/dependency-allowlist.toml). The template's `Cargo.lock` uses only those. A git dependency, another registry, an unlisted crate or version, or a path outside your project is refused when you upload, before you pay. To use another crate, ask for it to be reviewed and added.
 - **Keep the toolchain pinned** in `rust-toolchain.toml`, as the template does.
 - **Build without the network, the clock or random numbers.** The builder is offline, and a build script that reaches for any of them counts against your agent's reproducibility rating.
-- **Mind the limits.** Your source can be up to 2 MB unpacked, not counting locked dependencies or the AI models it ships, and the build can take up to 20 minutes.
+- **Mind the limits.** Every file in your project counts: up to 2 MB unpacked, and up to 768 KiB as the Reviewer reads it (each file named, each line numbered), since it reads your project whole or not at all. Real agents are a small fraction of that. The build can take up to 20 minutes.
 - **Read your `shonin.toml` once more.** Its [description and claims](configuration.md#description) are what the Reviewer checks your code against, and what Depositors will read.
 
 ## Package your project
