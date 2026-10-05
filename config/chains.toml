@@ -54,14 +54,14 @@ rpc = "https://sepolia.base.org"
 dollar = "USDC"
 native_usd = 0.0
 
-# Hyperliquid's own testnet endpoint (https://rpc.hyperliquid-testnet.xyz/evm)
-# rate-limits a whole stack polling from one address within minutes, so the
-# testnet reads through Chainlink's public endpoint for HyperEVM. It is a
-# proxy over several nodes, some a few blocks behind; the chain client asks a
-# lagging node again.
+# Every free public endpoint for HyperEVM's testnet limits how fast one
+# address may ask, and a whole stack on one machine passes any one of their
+# limits within minutes, so the testnet names three: the client sends each
+# request to whichever has answered best lately and moves off one that starts
+# refusing. A browser is handed the first, Hyperliquid's own.
 [chains."evm:998"]
 label = "Hyperliquid testnet"
-rpc = "https://rpcs.chain.link/hyperevm/testnet"
+rpc = "https://rpc.hyperliquid-testnet.xyz/evm https://hyperliquid-testnet.drpc.org https://rpcs.chain.link/hyperevm/testnet"
 dollar = "USDC"
 native_usd = 0.0
 

@@ -201,7 +201,7 @@ async fn fund_chain(
     let client = chain::connect_to(network, key, config).await?;
     let provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(funder.clone()))
-        .connect_http(config.rpc.parse().context("the chain's RPC URL")?);
+        .connect_http(config.first_rpc().parse().context("the chain's RPC URL")?);
     let from = funder.address();
     println!("{} ({key}), funder {from:?}", config.label);
 

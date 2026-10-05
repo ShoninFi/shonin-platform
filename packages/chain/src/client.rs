@@ -407,17 +407,100 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The connection to a node, with the URL kept out of its errors and every
 /// request bounded in time.
-fn rpc_client(rpc_url: &str) -> Result<alloy::rpc::client::RpcClient> {
-    let url: alloy::transports::http::reqwest::Url = rpc_url
-        .parse()
-        .map_err(|_| anyhow!("the chain's rpc in the chain config is not a URL"))?;
+///
+/// `rpc` may name several endpoints, separated by spaces: free public
+/// endpoints each limit how fast one address may ask, and a whole stack on
+/// one machine passes any one of their limits. Each request then goes to the
+/// endpoint ranked best by how often and how fast it has answered lately, and
+/// one that refuses (a rate limit included, however it is worded) falls in
+/// the ranking, so the next requests go elsewhere.
+fn rpc_client(rpc: &str) -> Result<alloy::rpc::client::RpcClient> {
     let http = alloy::transports::http::reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()
         .context("making the HTTP client")?;
-    Ok(alloy::rpc::client::ClientBuilder::default()
-        .layer(KeepUrlOut::new(rpc_url, &url))
-        .http_with_client(http, url))
+    let urls: Vec<&str> = rpc.split_whitespace().collect();
+    let parse = |url: &str| -> Result<alloy::transports::http::reqwest::Url> {
+        url.parse()
+            .map_err(|_| anyhow!("the chain's rpc in the chain config is not a URL"))
+    };
+    if urls.len() <= 1 {
+        let url = parse(rpc.trim())?;
+        return Ok(alloy::rpc::client::ClientBuilder::default()
+            .layer(KeepUrlOut::new(rpc.trim(), &url))
+            .http_with_client(http, url));
+    }
+    let mut transports = Vec::with_capacity(urls.len());
+    for configured in urls {
+        let url = parse(configured)?;
+        let keep = KeepUrlOut::new(configured, &url);
+        let inner = alloy::transports::http::Http::with_client(http.clone(), url);
+        transports.push(tower::Layer::layer(&keep, RateLimitIsAFailure { inner }));
+    }
+    let fallback = tower::Layer::layer(
+        &alloy::transports::layers::FallbackLayer::default()
+            .with_active_transport_count(std::num::NonZeroUsize::MIN),
+        transports,
+    );
+    Ok(alloy::rpc::client::ClientBuilder::default().transport(fallback, false))
+}
+
+/// An answer that is a rate limit, whether as an HTTP status or inside a
+/// JSON-RPC error, taken as the endpoint failing, so a ranking of endpoints
+/// moves away from it.
+#[derive(Clone)]
+struct RateLimitIsAFailure<S> {
+    inner: S,
+}
+
+impl<S> tower::Service<alloy::rpc::json_rpc::RequestPacket> for RateLimitIsAFailure<S>
+where
+    S: tower::Service<
+            alloy::rpc::json_rpc::RequestPacket,
+            Response = alloy::rpc::json_rpc::ResponsePacket,
+            Error = alloy::transports::TransportError,
+            Future = alloy::transports::TransportFut<'static>,
+        > + Send
+        + Clone
+        + 'static,
+{
+    type Response = alloy::rpc::json_rpc::ResponsePacket;
+    type Error = alloy::transports::TransportError;
+    type Future = alloy::transports::TransportFut<'static>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: alloy::rpc::json_rpc::RequestPacket) -> Self::Future {
+        let answer = self.inner.call(request);
+        Box::pin(async move {
+            let answer = answer.await?;
+            let limited = answer
+                .responses()
+                .iter()
+                .filter_map(|response| response.payload.as_error())
+                .any(|error| is_rate_limit(error.code, &error.message));
+            if limited {
+                return Err(alloy::transports::TransportErrorKind::custom_str(
+                    "the endpoint is limiting the rate of requests",
+                ));
+            }
+            Ok(answer)
+        })
+    }
+}
+
+/// Whether a JSON-RPC error is an endpoint limiting the rate of requests.
+fn is_rate_limit(code: i64, message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    code == 429
+        || message.contains("rate limit")
+        || message.contains("too many requests")
+        || (code == -32005 && !message.contains("range") && !message.contains("results"))
 }
 
 /// Wait for a sent transaction's receipt, for at most `within`. A receipt
@@ -1791,5 +1874,18 @@ mod tests {
         }
         assert!(!refused_as_too_wide("execution reverted"));
         assert!(!refused_as_not_there_yet("rate limited"));
+    }
+
+    #[test]
+    fn a_rate_limit_is_told_from_a_refusal_of_the_request_itself() {
+        assert!(is_rate_limit(-32005, "rate limited"));
+        assert!(is_rate_limit(-32000, "Too Many Requests"));
+        assert!(is_rate_limit(429, "slow down"));
+        assert!(!is_rate_limit(
+            -32005,
+            "query returned more than 10000 results"
+        ));
+        assert!(!is_rate_limit(3, "execution reverted"));
+        assert!(!is_rate_limit(-32000, "nonce too low"));
     }
 }

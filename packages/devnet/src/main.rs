@@ -247,7 +247,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::Chain) => {
-            println!("{}", target.config.rpc);
+            println!("{}", target.config.first_rpc());
             println!("{}", target.deployments_file().display());
             Ok(())
         }

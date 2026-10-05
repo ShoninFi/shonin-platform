@@ -176,8 +176,8 @@ async fn chain_row(
     config: &ChainConfig,
 ) -> String {
     let probe = match key.kind {
-        ChainKind::Evm => probe_evm(dashboard, &config.rpc).await,
-        ChainKind::Solana => probe_solana(dashboard, &config.rpc).await,
+        ChainKind::Evm => probe_evm(dashboard, config.first_rpc()).await,
+        ChainKind::Solana => probe_solana(dashboard, config.first_rpc()).await,
     };
     let (identity, head, time, class) = match probe {
         Ok(probe) => {
@@ -206,7 +206,7 @@ async fn chain_row(
         esc(vault_chain.name()),
         esc(&key.to_string()),
         esc(&config.label),
-        esc(&config.rpc),
+        esc(config.first_rpc()),
         esc(&identity),
         esc(&head),
         esc(&time),
