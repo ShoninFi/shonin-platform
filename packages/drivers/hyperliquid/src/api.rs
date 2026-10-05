@@ -5,6 +5,7 @@
 //! `error` per order, never an HTTP failure, so every answer is read and a
 //! refusal returned as an error.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256};
@@ -16,6 +17,10 @@ use serde_json::{Value, json};
 use crate::signing::{
     Field, Network, SIGNATURE_CHAIN_ID, l1_action_digest, user_action_digest, wire_decimal,
 };
+
+/// How an error from HyperCore's own refusal begins, so a caller can tell
+/// it from a request that got no answer.
+pub const REFUSED: &str = "HyperCore refused the action";
 
 /// Where HyperCore answers, and which network it is.
 #[derive(Clone)]
@@ -223,6 +228,7 @@ impl Api {
 pub struct HyperCore {
     pub api: Api,
     signer: PrivateKeySigner,
+    last_nonce: AtomicU64,
 }
 
 #[derive(Serialize)]
@@ -270,7 +276,11 @@ pub struct Fill {
 
 impl HyperCore {
     pub fn new(api: Api, signer: PrivateKeySigner) -> Self {
-        Self { api, signer }
+        Self {
+            api,
+            signer,
+            last_nonce: AtomicU64::new(0),
+        }
     }
 
     pub fn address(&self) -> Address {
@@ -304,13 +314,36 @@ impl HyperCore {
             )
             .await?;
         if answer["status"] != "ok" {
-            bail!("HyperCore refused the action: {}", answer["response"]);
+            bail!("{REFUSED}: {}", answer["response"]);
         }
         Ok(answer["response"].clone())
     }
 
+    /// A nonce for this signer: the time in milliseconds, and always more
+    /// than the last one it used, so two actions in one millisecond both
+    /// go through.
+    pub fn next_nonce(&self) -> u64 {
+        let now = Self::nonce();
+        let mut last = self.last_nonce.load(Ordering::Relaxed);
+        loop {
+            let next = now.max(last + 1);
+            match self
+                .last_nonce
+                .compare_exchange(last, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return next,
+                Err(seen) => last = seen,
+            }
+        }
+    }
+
     async fn l1<A: Serialize>(&self, action: &A) -> Result<Value> {
-        let nonce = Self::nonce();
+        self.l1_at(action, self.next_nonce()).await
+    }
+
+    /// Sign and send an L1 action with `nonce`, for an action that names its
+    /// own nonce too.
+    pub async fn l1_at<A: Serialize>(&self, action: &A, nonce: u64) -> Result<Value> {
         let digest = l1_action_digest(self.api.network, action, nonce)?;
         let signature = self.sign(digest).await?;
         self.submit(serde_json::to_value(action)?, nonce, signature)

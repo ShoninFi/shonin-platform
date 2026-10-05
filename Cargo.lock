@@ -7110,12 +7110,16 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "anyhow",
+ "ciborium",
+ "fastnum",
+ "futures",
  "hex",
  "reqwest",
  "rmp-serde",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite 0.30.0",
  "tracing",
 ]
 

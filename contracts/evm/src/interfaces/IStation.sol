@@ -9,6 +9,21 @@ struct Send {
     uint64 sentAt;
 }
 
+/// A close through a delayed driver, in progress: placed, then proved and
+/// swept, then delivered home.
+struct Stage {
+    /// The fraction of every position being closed (1e18 is all).
+    uint256 fraction;
+    /// What goes home once it has all landed: the fraction's worth at exit
+    /// prices from each delayed venue, what other venues brought home at the
+    /// stage, and the fraction of the idle dollars.
+    uint256 owed;
+    uint64 stagedAt;
+    uint64 stagedBlock;
+    uint64 sweptAt;
+    uint64 sweptBlock;
+}
+
 /// What a station is told about itself when it is created.
 struct StationSpec {
     /// The chain its vault lives on, by chain id.
@@ -50,6 +65,17 @@ interface IStation {
     /// A driver failed during a stopped station's full unwind; the others
     /// went ahead.
     event DriverFailed(bytes32 indexed driver);
+    /// A close through a delayed driver was placed; it is proved, swept and
+    /// delivered by `settleClose` in later blocks.
+    event CloseStaged(uint256 fraction, uint256 owed);
+    event CloseSwept(uint256 fraction);
+    /// A staged close not proved in time: nothing was swept, and whatever it
+    /// sold stays in the account.
+    event CloseLapsed(uint256 fraction);
+    event CloseDelivered(uint256 fraction, uint256 amount);
+    /// Money in one of the venue's own vaults is counted, and brought back
+    /// when its lock allows; trading through the driver has ended.
+    event Reclaimed(bytes32 indexed driver, address indexed venueVault, uint256 equity);
 
     /// A close inside the band that couldn't bring its worth home: margin a
     /// position was bought on still holds the proceeds at the venue. The
@@ -82,10 +108,21 @@ interface IStation {
     /// one that fails, and sends everything idle home. `blocked` is true, and nothing
     /// is closed, when a market is outside the band. It reverts with
     /// `ShortSweep` when what a venue sends home falls short of the closed
-    /// fraction's worth by more than the band.
+    /// fraction's worth by more than the band. On a station with a delayed
+    /// driver a partial close is staged instead: nothing goes home now, and
+    /// `blocked` is true until `settleClose` has delivered it.
     function unwind(uint256 fraction) external returns (uint256 sentHome, bool blocked);
     /// What the station holds, at mark and at exit-side prices.
     function value() external view returns (uint256 mark, uint256 exit);
+    /// Move a close staged through a delayed driver on: prove and sweep it,
+    /// then deliver it home. Anyone may call it.
+    function settleClose() external;
+    function stage() external view returns (Stage memory);
+    /// Count, bring back, and end trading over, money the station's account
+    /// put into one of a venue's own vaults. Anyone may call it.
+    function reclaim(bytes32 driver, address venueVault) external;
+    function heldIn(bytes32 driver) external view returns (address[] memory);
+    function reclaimed(bytes32 driver) external view returns (bool);
     /// Whether any market a driver holds is further from the venue's own
     /// price than the exit band: a close of it would be refused.
     function outsideBand() external view returns (bool);
