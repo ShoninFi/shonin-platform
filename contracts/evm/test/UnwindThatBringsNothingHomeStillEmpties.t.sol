@@ -48,7 +48,7 @@ contract UnwindThatBringsNothingHomeStillEmptiesTest is ClaimBase {
 
     function test_an_unwind_that_brings_nothing_home_empties_the_station() public {
         (uint256 markBefore, uint256 exitBefore) = station.value();
-        assertEq(markBefore, 6_000e6, "worth something at the mark");
+        assertEq(markBefore, 6000e6, "worth something at the mark");
         assertEq(exitBefore, 0, "nothing at the bid");
         assertFalse(station.outsideBand(), "the market is inside the band");
 
