@@ -135,6 +135,10 @@ enum Command {
         /// instead of the full set of examples the site needs.
         #[arg(long)]
         agent: Option<String>,
+        /// With `--agent`, then use its vault as the full seed's live vault
+        /// is used: a deposit priced and a claim booked and paid.
+        #[arg(long)]
+        live: bool,
     },
 }
 
@@ -278,7 +282,12 @@ async fn main() -> Result<()> {
             let served = target.serve_solana().await?;
             solana_seed::run(&served).await
         }
-        Some(Command::Seed { api, agents, agent }) => {
+        Some(Command::Seed {
+            api,
+            agents,
+            agent,
+            live,
+        }) => {
             let client = target.connect().await?;
             let deployments = target.wait_for_deployments(&client).await?;
             match agent {
@@ -290,6 +299,7 @@ async fn main() -> Result<()> {
                         &api,
                         agents.as_deref(),
                         &name,
+                        live,
                     )
                     .await
                 }

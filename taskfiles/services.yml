@@ -50,9 +50,9 @@ tasks:
         --gcp-region "{{.GCP_REGION}}"
 
   seed:
-    desc: "Publish the reference work to the local chain, through the real flows (AGENT=name for just one)"
+    desc: "Publish the reference work through the real flows (AGENT=name for just one; LIVE=1 then deposits and books and pays a claim on its vault)"
     vars:
-      AGENT_ARG: '{{if .AGENT}}--agent "{{.AGENT}}"{{end}}'
+      AGENT_ARG: '{{if .AGENT}}--agent "{{.AGENT}}"{{end}}{{if .LIVE}} --live{{end}}'
     cmds:
       - >-
         cargo run -q -p shonin-devnet --
