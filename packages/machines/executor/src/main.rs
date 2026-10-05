@@ -16,6 +16,7 @@ mod health;
 mod host;
 mod runner;
 mod scale;
+mod solana;
 mod usage;
 mod watch;
 
@@ -72,19 +73,37 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    // The EVM chains and the Solana clusters to serve. A Solana vault chain
+    // named alone is served alone.
+    let solana_targets = args.chain_args.solana_targets()?;
+    let evm_targets = if args.chain_args.vault_chain.is_some() && !solana_targets.is_empty() {
+        Vec::new()
+    } else {
+        args.chain_args.targets()?
+    };
     // Each chain is served as soon as it connects: one out of reach (its node
     // down, its deployment missing) is tried again in the background, and
     // doesn't keep the executor from the vaults on the others.
-    let mut connecting = args.chain_args.connect_each()?;
+    let connecting = if evm_targets.is_empty() {
+        None
+    } else {
+        Some(args.chain_args.connect_each()?)
+    };
+    let mut connecting_solana = if solana_targets.is_empty() {
+        None
+    } else {
+        Some(args.chain_args.connect_each_solana()?)
+    };
     tracing::info!(image = %chain::attest::image_digest("executor"), "the executor is up");
 
     let totals: usage::Totals = Default::default();
+    let solana_totals: solana::Totals = Default::default();
     // Every vault chain to be served, each said connected as it connects: the
     // status port's health is unavailable until all of them have.
     let served_chains = health::Chains::new(
-        args.chain_args
-            .targets()?
-            .into_iter()
+        evm_targets
+            .iter()
+            .chain(&solana_targets)
             .map(|target| target.vault_chain)
             .collect(),
     );
@@ -97,6 +116,7 @@ async fn main() -> Result<()> {
         tokio::spawn(serve_status(
             listener,
             totals.clone(),
+            solana_totals.clone(),
             served_chains.clone(),
         ));
     }
@@ -107,17 +127,44 @@ async fn main() -> Result<()> {
     // Each vault chain is swept on its own, with its own vaults: the same
     // address can be a different vault on another chain.
     // How deep each chain's vaults are read for what they have collected.
-    let confirmations: HashMap<shared::Chain, u64> = args
-        .chain_args
-        .targets()?
-        .into_iter()
+    let confirmations: HashMap<shared::Chain, u64> = evm_targets
+        .iter()
         .map(|target| {
             let deep = target.config.confirmations.unwrap_or(CONFIRMATIONS);
             (target.vault_chain, deep)
         })
         .collect();
+    // The price of each Solana cluster's coin, from its config.
+    let native_usd: HashMap<shared::Chain, Option<f64>> = solana_targets
+        .iter()
+        .map(|target| (target.vault_chain, target.config.native_usd))
+        .collect();
     let args = Arc::new(args);
     let mut chains = tokio::task::JoinSet::new();
+    if let Some(mut connecting_solana) = connecting_solana.take() {
+        let engine = engine.clone();
+        let args = args.clone();
+        let served_chains = served_chains.clone();
+        chains.spawn(async move {
+            let mut clusters = tokio::task::JoinSet::new();
+            while let Some(served) = connecting_solana.recv().await {
+                served_chains.connected(served.vault_chain);
+                let native_usd = native_usd.get(&served.vault_chain).copied().flatten();
+                clusters.spawn(solana::run(
+                    served,
+                    native_usd,
+                    engine.clone(),
+                    args.clone(),
+                    solana_totals.clone(),
+                ));
+            }
+            while clusters.join_next().await.is_some() {}
+        });
+    }
+    let Some(mut connecting) = connecting else {
+        while chains.join_next().await.is_some() {}
+        return Ok(());
+    };
     while let Some(served) = connecting.recv().await {
         served_chains.connected(served.vault_chain);
         let engine = engine.clone();
@@ -1104,13 +1151,15 @@ async fn serve(
         let started = tokio::time::Instant::now();
         let instantiated = Arc::new(std::sync::OnceLock::new());
         let runner = runner::Runner {
-            chain: chain.clone(),
-            key: key.clone(),
-            vault,
-            station,
-            venue: deployments.venue,
-            usd: deployments.usd,
-            factory: deployments.factory,
+            place: host::Place::Evm(host::Evm {
+                chain: chain.clone(),
+                key: key.clone(),
+                vault,
+                station,
+                venue: deployments.venue,
+                usd: deployments.usd,
+                factory: deployments.factory,
+            }),
             home_chain: vault_chain.name().to_string(),
             driver: recorded.driver.clone(),
             allowances,
@@ -2029,12 +2078,29 @@ fn recorded_for(
     bundle: B256,
     network: &str,
 ) -> Result<Recorded> {
+    recorded_in(
+        store,
+        registered.bundleHash,
+        registered.manifestHash,
+        bundle,
+        network,
+    )
+}
+
+/// The same, from the bundle and manifest hashes the registry recorded,
+/// whatever chain recorded them.
+fn recorded_in(
+    store: &std::path::Path,
+    registered_bundle: B256,
+    manifest_hash: B256,
+    bundle: B256,
+    network: &str,
+) -> Result<Recorded> {
     anyhow::ensure!(
-        registered.bundleHash == bundle,
-        "the registry records bundle {} for this strategy, and the vault runs {bundle}",
-        registered.bundleHash
+        registered_bundle == bundle,
+        "the registry records bundle {registered_bundle} for this strategy, and the vault runs {bundle}"
     );
-    let hash = format!("sha256:{}", alloy::hex::encode(registered.manifestHash));
+    let hash = format!("sha256:{}", alloy::hex::encode(manifest_hash));
     let path = store.join(hash.replace(':', "-")).join("manifest.json");
     let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let canonical: shared::Canonical =
@@ -2148,6 +2214,7 @@ async fn bind_status(address: SocketAddr) -> Result<tokio::net::TcpListener> {
 async fn serve_status(
     listener: tokio::net::TcpListener,
     totals: usage::Totals,
+    solana_totals: solana::Totals,
     chains: health::Chains,
 ) {
     let app = axum::Router::new()
@@ -2160,18 +2227,32 @@ async fn serve_status(
         )
         .route(
             "/usage/{chain}/{vault}",
+            // An EVM chain by its id and a vault by its 0x address; a Solana
+            // cluster by its name and a vault by its base58 address.
             axum::routing::get(
-                move |axum::extract::Path((chain, vault)): axum::extract::Path<(u64, Address)>| {
+                move |axum::extract::Path((chain, vault)): axum::extract::Path<(
+                    String,
+                    String,
+                )>| {
                     let totals = totals.clone();
+                    let solana_totals = solana_totals.clone();
                     async move {
-                        let found = totals
-                            .lock()
-                            .ok()
-                            .and_then(|totals| totals.get(&(chain, vault)).cloned());
-                        match found {
-                            Some(signed) => axum::Json(signed).into_response(),
-                            None => axum::http::StatusCode::NOT_FOUND.into_response(),
-                        }
+                        let found = match (chain.parse::<u64>(), vault.parse::<Address>()) {
+                            (Ok(chain), Ok(vault)) => totals
+                                .lock()
+                                .ok()
+                                .and_then(|totals| totals.get(&(chain, vault)).cloned())
+                                .map(|signed| axum::Json(signed).into_response()),
+                            (Ok(_), Err(_)) => {
+                                return axum::http::StatusCode::BAD_REQUEST.into_response();
+                            }
+                            (Err(_), _) => solana_totals
+                                .lock()
+                                .ok()
+                                .and_then(|totals| totals.get(&(chain, vault)).cloned())
+                                .map(|signed| axum::Json(signed).into_response()),
+                        };
+                        found.unwrap_or_else(|| axum::http::StatusCode::NOT_FOUND.into_response())
                     }
                 },
             ),
@@ -3220,13 +3301,15 @@ mod tests {
             a_killed_vault(false, SPINS_AT_INSTANTIATION.as_bytes()).await;
         let running = shared.running.clone();
         let runner = runner::Runner {
-            chain: client,
-            key: shared.key.clone(),
-            vault: Address::repeat_byte(0x11),
-            station: Address::repeat_byte(0x55),
-            venue: Address::ZERO,
-            usd: Address::ZERO,
-            factory: Address::ZERO,
+            place: host::Place::Evm(host::Evm {
+                chain: client,
+                key: shared.key.clone(),
+                vault: Address::repeat_byte(0x11),
+                station: Address::repeat_byte(0x55),
+                venue: Address::ZERO,
+                usd: Address::ZERO,
+                factory: Address::ZERO,
+            }),
             home_chain: "base".to_string(),
             driver: "local".to_string(),
             allowances: shared::Allowances::modest(),

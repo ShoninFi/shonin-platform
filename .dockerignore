@@ -17,6 +17,7 @@ cloudflare/
 contracts/evm/lib/
 contracts/evm/out/
 contracts/evm/cache/
-contracts/solana/
+# The Solana programs' sources are the services' interface to them; their
+# build output (target/, with the local keypairs) stays out.
 packages/frontend/app/tests/
 **/.DS_Store

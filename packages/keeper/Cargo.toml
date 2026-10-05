@@ -17,6 +17,7 @@ chain = { workspace = true, features = ["args"] }
 alloy.workspace = true
 anyhow.workspace = true
 axum.workspace = true
+bs58.workspace = true
 clap.workspace = true
 reqwest.workspace = true
 serde.workspace = true

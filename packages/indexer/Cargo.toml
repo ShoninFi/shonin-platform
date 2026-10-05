@@ -20,7 +20,10 @@ chain = { workspace = true, features = ["args"] }
 alloy.workspace = true
 anyhow.workspace = true
 axum.workspace = true
+base64 = "0.22"
+bs58.workspace = true
 clap.workspace = true
+ed25519-dalek.workspace = true
 futures.workspace = true
 reqwest.workspace = true
 serde.workspace = true

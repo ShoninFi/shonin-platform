@@ -48,8 +48,15 @@ pub struct Snapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChainInfo {
     pub chain: Chain,
-    pub chain_id: u64,
-    /// The block the snapshot was built from.
+    /// The chain as the chain config names it, whatever kind it is:
+    /// `evm:31337`, `solana:localnet`.
+    #[serde(default)]
+    pub key: String,
+    /// An EVM chain's id, what a wallet is asked to switch to and what typed
+    /// data names. None on a chain that isn't an EVM one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_id: Option<u64>,
+    /// The block the snapshot was built from: on Solana, the slot.
     pub block: u64,
     /// That block's time, on the chain's own clock: each chain's part of the
     /// snapshot is read on its own, so each says how fresh it is. None until
@@ -115,10 +122,35 @@ pub struct Terms {
     pub terms_hash: String,
 }
 
+/// Where the platform lives on one vault chain, in the shape that kind of
+/// chain has. Untagged, so an EVM chain's reads exactly as it always has.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Addresses {
+    Evm(EvmAddresses),
+    Solana(SolanaAddresses),
+}
+
+impl Addresses {
+    pub fn evm(&self) -> Option<&EvmAddresses> {
+        match self {
+            Self::Evm(addresses) => Some(addresses),
+            Self::Solana(_) => None,
+        }
+    }
+
+    pub fn solana(&self) -> Option<&SolanaAddresses> {
+        match self {
+            Self::Solana(addresses) => Some(addresses),
+            Self::Evm(_) => None,
+        }
+    }
+}
+
 /// Where each contract lives, as hex strings, because that is what a
 /// transaction carries and what a browser hands to a wallet.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Addresses {
+pub struct EvmAddresses {
     pub usd: String,
     pub publishing: String,
     pub prices: String,
@@ -129,6 +161,23 @@ pub struct Addresses {
     pub profiles: String,
     pub factory: String,
     pub station_factory: String,
+}
+
+/// Where the platform lives on a Solana cluster, each key in base58: every
+/// program by its library name (`shonin_vault`), the dollar's mint and the
+/// token program that owns it, and the accounts a client starts from.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SolanaAddresses {
+    /// The cluster's name: `localnet`, `devnet`, `mainnet-beta`.
+    pub cluster: String,
+    pub programs: std::collections::BTreeMap<String, String>,
+    pub mint: String,
+    pub token_program: String,
+    /// The vault program's factory account: the terms, and the vault count.
+    pub vault_factory: String,
+    /// The publishing program's config account: the fee, and the count of
+    /// strategies submitted.
+    pub publishing_config: String,
 }
 
 /// The development chain's offer: an account it already holds the key for, so
@@ -230,16 +279,34 @@ pub struct ReviewAnswer {
 }
 
 /// A health report, as the executor signs and posts it.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
 /// Posted to `/api/{chain}/health`: the same address can be a different vault
 /// on another chain.
+///
+/// - on an EVM chain, `signature` is the 65-byte secp256k1 signature of
+///   [`HealthPost::digest`] as an Ethereum signed message (`0x` hex), and the
+///   signer is recovered from it; `signer` is absent.
+/// - on Solana, `signature` is the 64-byte ed25519 signature of the 32-byte
+///   [`HealthPost::solana_digest`] itself, in base58, which binds the
+///   cluster, and `signer` is the key that made it, in base58: ed25519 has
+///   no recovery, so the post names its key and the reader checks the
+///   signature against it.
+///
+/// Either way the reader then takes the report only if that key is blessed as
+/// the vault's executor.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HealthPost {
     /// The vault it is about.
     pub vault: String,
     pub report: Health,
-    /// A signature over [`HealthPost::digest`] by a key blessed for that
-    /// vault, so a report can only come from whoever holds the vault's keys.
+    /// A signature over [`HealthPost::digest`] (on Solana,
+    /// [`HealthPost::solana_digest`]) by a key blessed for that vault, so a
+    /// report can only come from whoever holds the vault's keys.
     pub signature: String,
+    /// The signing key, where it can't be recovered from the signature: an
+    /// ed25519 key, in base58.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<String>,
 }
 
 impl HealthPost {
@@ -247,8 +314,29 @@ impl HealthPost {
     /// and the report, canonically encoded, so two encodings of one report
     /// cannot differ. The chain is in it because one key can be blessed for
     /// the same address on two chains, and a report about one must not pass
-    /// for a report about the other.
+    /// for a report about the other. An EVM address is taken in lower case,
+    /// whatever case it came in; a Solana key is taken as written, since
+    /// base58 is case-sensitive.
     pub fn digest(chain: Chain, vault: &str, report: &Health) -> [u8; 32] {
+        let vault = if vault.starts_with("0x") || vault.starts_with("0X") {
+            vault.to_ascii_lowercase()
+        } else {
+            vault.to_string()
+        };
+        Self::digest_bound(b"shonin-health/2", chain.name().as_bytes(), &vault, report)
+    }
+
+    /// What a Solana executor signs and a reader checks: as
+    /// [`HealthPost::digest`], but bound to the cluster rather than the
+    /// chain's name, by the 32-byte value the vault program binds its own
+    /// digests to on that cluster. A vault has the same address on every
+    /// cluster, so a report about it on one cluster must not pass for a
+    /// report on another. The vault is taken as written.
+    pub fn solana_digest(cluster: &[u8; 32], vault: &str, report: &Health) -> [u8; 32] {
+        Self::digest_bound(b"shonin-health-solana/1", cluster, vault, report)
+    }
+
+    fn digest_bound(tag: &[u8], bound: &[u8], vault: &str, report: &Health) -> [u8; 32] {
         use sha2::{Digest, Sha256};
 
         let mut body = Vec::new();
@@ -257,10 +345,10 @@ impl HealthPost {
         ciborium::into_writer(report, &mut body).expect("a report encodes");
 
         let mut hasher = Sha256::new();
-        hasher.update(b"shonin-health/2");
-        hasher.update(chain.name().as_bytes());
+        hasher.update(tag);
+        hasher.update(bound);
         hasher.update(b"/");
-        hasher.update(vault.to_ascii_lowercase().as_bytes());
+        hasher.update(vault.as_bytes());
         hasher.update(&body);
         hasher.finalize().into()
     }
@@ -325,5 +413,92 @@ mod tests {
             HealthPost::digest(Chain::Base, "0xA", &report),
             HealthPost::digest(Chain::Hyperliquid, "0xA", &report)
         );
+    }
+
+    fn a_report() -> Health {
+        Health {
+            signals: vec![],
+            entries: vec![],
+            updated: time::PrimitiveDateTime::new(
+                time::Date::from_ordinal_date(2026, 274).unwrap(),
+                time::Time::MIDNIGHT,
+            ),
+            signed_by: "0x0".into(),
+        }
+    }
+
+    #[test]
+    fn an_evm_vault_is_digested_in_any_case_and_a_solana_vault_only_as_written() {
+        let report = a_report();
+        assert_eq!(
+            HealthPost::digest(Chain::Base, "0xABCDEF", &report),
+            HealthPost::digest(Chain::Base, "0xabcdef", &report)
+        );
+        let key = "So11111111111111111111111111111111111111112";
+        assert_ne!(
+            HealthPost::solana_digest(&[1; 32], key, &report),
+            HealthPost::solana_digest(&[1; 32], &key.to_lowercase(), &report)
+        );
+    }
+
+    #[test]
+    fn a_solana_report_about_one_cluster_is_not_a_report_about_another() {
+        let report = a_report();
+        let key = "So11111111111111111111111111111111111111112";
+        assert_ne!(
+            HealthPost::solana_digest(&[1; 32], key, &report),
+            HealthPost::solana_digest(&[2; 32], key, &report)
+        );
+    }
+
+    /// The EVM digest is what EVM executors already sign: its layout stays.
+    #[test]
+    fn an_evm_report_digests_as_it_always_has() {
+        use sha2::{Digest, Sha256};
+        let report = a_report();
+        let mut body = Vec::new();
+        ciborium::into_writer(&report, &mut body).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(b"shonin-health/2");
+        hasher.update(Chain::Base.name().as_bytes());
+        hasher.update(b"/");
+        hasher.update(b"0xabc");
+        hasher.update(&body);
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(HealthPost::digest(Chain::Base, "0xABC", &report), expected);
+    }
+
+    #[test]
+    fn an_evm_chain_s_addresses_and_chain_read_as_they_always_have() {
+        let json = r#"{"usd":"0x1","publishing":"0x2","prices":"0x3","venue":"0x4",
+            "attestation":"0x5","strategies":"0x6","reviews":"0x7","profiles":"0x8",
+            "factory":"0x9","station_factory":"0xa"}"#;
+        let addresses: Addresses = serde_json::from_str(json).unwrap();
+        assert_eq!(addresses.evm().unwrap().factory, "0x9");
+        let back = serde_json::to_value(&addresses).unwrap();
+        assert_eq!(back["usd"], "0x1");
+
+        let solana = Addresses::Solana(SolanaAddresses {
+            cluster: "localnet".into(),
+            programs: [("shonin_vault".to_string(), "V".to_string())].into(),
+            mint: "M".into(),
+            token_program: "T".into(),
+            vault_factory: "F".into(),
+            publishing_config: "P".into(),
+        });
+        let read: Addresses =
+            serde_json::from_str(&serde_json::to_string(&solana).unwrap()).unwrap();
+        assert_eq!(read.solana().unwrap().mint, "M");
+
+        // A chain written before it had a key still reads, and an EVM
+        // chain's id is where it always was.
+        let info: ChainInfo =
+            serde_json::from_str(r#"{"chain":"base","chain_id":31337,"block":5}"#).unwrap();
+        assert_eq!(info.chain_id, Some(31337));
+        let solana: ChainInfo =
+            serde_json::from_str(r#"{"chain":"solana","key":"solana:localnet","block":5}"#)
+                .unwrap();
+        assert_eq!(solana.chain_id, None);
+        assert!(!serde_json::to_string(&solana).unwrap().contains("chain_id"));
     }
 }

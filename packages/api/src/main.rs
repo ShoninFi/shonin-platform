@@ -6,6 +6,8 @@
 //! the store's files by hash. Submissions pass through to the build service
 //! and health reports are taken only from a key blessed for their vault.
 
+mod solana;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,14 +24,14 @@ use chain::bindings::attestation::IAttestationRegistry;
 use chain::bindings::erc20::IERC20;
 use chain::bindings::factory::IVaultFactory;
 use chain::bindings::publishing::IPublishing;
-use chain::{Client, Role, Served};
+use chain::{Client, Role, Served, SolanaServed};
 use clap::Parser;
 use futures::{StreamExt, TryStreamExt};
 use indexer::{Indexer, Lookup};
 use shared::model::registry::Job;
 use shared::{
-    Addresses, Chain, ChainInfo, Config, DevMode, HealthPost, HeldClaim, Holding, Portfolio,
-    Snapshot, Terms, Upload, UploadAccepted,
+    Addresses, Chain, ChainInfo, Config, DevMode, EvmAddresses, HealthPost, HeldClaim, Holding,
+    Portfolio, Snapshot, Terms, Upload, UploadAccepted,
 };
 
 #[derive(Parser)]
@@ -71,20 +73,13 @@ async fn main() -> Result<()> {
     // The port is bound at once, and each chain is served from the moment
     // it connects: one chain out of reach holds up none of the others, and
     // is answered for as not connected yet.
-    let expected = args
-        .chain_args
-        .targets()?
-        .iter()
-        .map(|target| target.vault_chain)
-        .collect();
-    let connected = args.chain_args.connect_each()?;
+    let connections = indexer::connections(&args.chain_args)?;
     let indexer = Arc::new(Indexer::new(
-        expected,
+        connections.expected.clone(),
         args.store.clone(),
         Some(args.builder_url.clone()),
     ));
-    let adding = indexer.clone();
-    tokio::spawn(async move { adding.add_each(connected).await });
+    indexer.take(connections);
     let reader = indexer.clone();
     tokio::spawn(async move { reader.run().await });
 
@@ -136,13 +131,20 @@ async fn snapshot(State(service): State<Arc<Service>>) -> Json<Snapshot> {
     Json(service.indexer.snapshot.read().await.clone())
 }
 
+/// A vault chain the API serves, whichever kind it is.
+enum On {
+    Evm(Box<Served>),
+    Solana(Box<SolanaServed>),
+}
+
 /// The vault chain a path names, if this API serves it and it has
 /// connected. One not connected yet is unavailable (503), not unknown.
-fn served(service: &Service, chain: Chain) -> Result<Served, (StatusCode, Json<shared::ApiError>)> {
+fn served(service: &Service, chain: Chain) -> Result<On, (StatusCode, Json<shared::ApiError>)> {
     let refused =
         |status: StatusCode, message: String| (status, Json(shared::ApiError { message }));
     match service.indexer.lookup(chain) {
-        Lookup::Served(served) => Ok(*served),
+        Lookup::Served(served) => Ok(On::Evm(served)),
+        Lookup::Solana(served) => Ok(On::Solana(served)),
         Lookup::NotConnected => Err(refused(
             StatusCode::SERVICE_UNAVAILABLE,
             format!("{} is not connected yet", chain.label()),
@@ -158,7 +160,10 @@ async fn config(
     State(service): State<Arc<Service>>,
     UrlPath(chain): UrlPath<Chain>,
 ) -> Result<Json<Config>, (StatusCode, Json<shared::ApiError>)> {
-    let served = served(&service, chain)?;
+    let served = match served(&service, chain)? {
+        On::Evm(served) => served,
+        On::Solana(served) => return solana::config(&service, chain, &served).await.map(Json),
+    };
     let terms = terms(chain, &served.client, &served.deployments)
         .await
         .map_err(|error| {
@@ -181,7 +186,8 @@ async fn config(
         .cloned()
         .unwrap_or(ChainInfo {
             chain,
-            chain_id: served.client.chain_id,
+            key: served.key.to_string(),
+            chain_id: Some(served.client.chain_id),
             block: 0,
             as_of: None,
         });
@@ -197,7 +203,7 @@ async fn config(
         chain: info,
         // The file's own URL, never an override: a paid one carries its key.
         rpc_url: served.public_rpc.clone(),
-        addresses: Addresses {
+        addresses: Addresses::Evm(EvmAddresses {
             usd: format!("{:?}", deployments.usd),
             publishing: format!("{:?}", deployments.publishing),
             prices: format!("{:?}", deployments.prices),
@@ -208,7 +214,7 @@ async fn config(
             profiles: format!("{:?}", deployments.profiles),
             factory: format!("{:?}", deployments.factory),
             station_factory: format!("{:?}", deployments.station_factory),
-        },
+        }),
         asset_symbol: chain.dollar().to_string(),
         asset_decimals: 6,
         terms,
@@ -249,7 +255,10 @@ async fn read_portfolio(
     chain: Chain,
     address: String,
 ) -> Result<Json<Portfolio>, (StatusCode, Json<shared::ApiError>)> {
-    let served = served(service, chain)?;
+    let served = match served(service, chain)? {
+        On::Evm(served) => served,
+        On::Solana(served) => return solana::portfolio(service, chain, &served, address).await,
+    };
     let who: Address = address.parse().map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
@@ -704,16 +713,31 @@ async fn post_health(
 /// is asked of the executor is only ever a path of its own.
 async fn usage(
     State(service): State<Arc<Service>>,
-    UrlPath((chain, vault)): UrlPath<(Chain, alloy::primitives::Address)>,
+    UrlPath((chain, vault)): UrlPath<(Chain, String)>,
 ) -> impl IntoResponse {
-    let served = match served(&service, chain) {
-        Ok(served) => served,
+    let on = match served(&service, chain) {
+        Ok(on) => on,
         Err(refused) => return refused.into_response(),
     };
-    let url = format!(
-        "{}/usage/{}/{}",
-        service.executor, served.deployments.chain_id, vault
-    );
+    // The vault is read as an address of its chain's kind and written back
+    // as one, so what is asked of the executor is only ever a path of its
+    // own.
+    let url = match on {
+        On::Evm(served) => match vault.parse::<Address>() {
+            Ok(vault) => format!(
+                "{}/usage/{}/{}",
+                service.executor, served.deployments.chain_id, vault
+            ),
+            Err(_) => return (StatusCode::BAD_REQUEST, "that is not an address").into_response(),
+        },
+        On::Solana(served) => match vault.parse::<chain::solana::Pubkey>() {
+            Ok(vault) => format!(
+                "{}/usage/{}/{}",
+                service.executor, served.client.cluster, vault
+            ),
+            Err(_) => return (StatusCode::BAD_REQUEST, "that is not an address").into_response(),
+        },
+    };
     ask_executor(&service.http, &url).await
 }
 

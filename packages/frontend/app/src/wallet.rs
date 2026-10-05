@@ -691,7 +691,7 @@ mod send {
     ) -> Result<String, String> {
         let from = signer()?;
         let setup = setup(chain)?;
-        let publishing = address_of(&setup.addresses.publishing)?;
+        let publishing = address_of(&evm(&setup)?.publishing)?;
         let usd = asset_address(chain)?;
 
         working("Uploading the source");
@@ -750,7 +750,7 @@ mod send {
     ) -> Result<String, String> {
         let from = signer()?;
         let config = setup(chain)?;
-        let factory = address_of(&config.addresses.factory)?;
+        let factory = address_of(&evm(&config)?.factory)?;
         let usd = asset_address(chain)?;
         let funding = units(tank);
         let strategy_id = U256::from(id);
@@ -842,7 +842,7 @@ mod send {
             "domain": {
                 "name": "Shonin Vault",
                 "version": "1",
-                "chainId": config.chain.chain_id,
+                "chainId": evm_chain_id(&config)?,
                 "verifyingContract": format!("{vault:?}"),
             },
             "message": {
@@ -929,7 +929,29 @@ mod send {
     }
 
     fn asset_address(chain: shared::Chain) -> Result<Address, String> {
-        address_of(&setup(chain)?.addresses.usd)
+        let config = setup(chain)?;
+        address_of(&evm(&config)?.usd)
+    }
+
+    /// The contracts of an EVM vault chain: the wallet signs only for EVM
+    /// chains, so a chain of another kind is refused here.
+    fn evm(config: &shared::Config) -> Result<&shared::EvmAddresses, String> {
+        config.addresses.evm().ok_or_else(|| {
+            format!(
+                "the app's wallet does not sign for {} yet",
+                config.chain.chain.label()
+            )
+        })
+    }
+
+    /// The EVM chain id typed data names.
+    fn evm_chain_id(config: &shared::Config) -> Result<u64, String> {
+        config.chain.chain_id.ok_or_else(|| {
+            format!(
+                "the app's wallet does not sign for {} yet",
+                config.chain.chain.label()
+            )
+        })
     }
 
     fn address_of(text: &str) -> Result<Address, String> {

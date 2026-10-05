@@ -32,9 +32,17 @@ tasks:
       # Commit guard: every commit runs .githooks/commit-msg (see CLAUDE.md).
       - git config core.hooksPath .githooks
       - |
-        for bin in trunk anvil forge solana-test-validator anchor gitleaks claude jq; do
+        for bin in trunk anvil forge solana anchor surfpool gitleaks claude jq; do
           command -v "$bin" >/dev/null || echo "missing: $bin (see README.md)"
         done
+        # Surfpool before 1.2.0 has no Ed25519 program offline, which every
+        # signature the Solana programs check needs.
+        if command -v surfpool >/dev/null; then
+          version=$(surfpool --version | awk '{print $2}')
+          case "$version" in
+            0.*|1.0.*|1.1.*) echo "surfpool $version is too old: install 1.2.0 or later (see README.md)" ;;
+          esac
+        fi
         for f in .private/terms.txt .private/review.md; do
           [ -f "$f" ] || echo "missing: $f (commit guard input; commits are blocked until it exists)"
         done

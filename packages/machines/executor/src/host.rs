@@ -44,17 +44,8 @@ use shonin::agent::websocket::Connection;
 pub struct Ctx {
     pub wasi: WasiCtx,
     pub table: ResourceTable,
-    /// Reading the chain.
-    pub chain: Client,
-    /// Acting on it, as the key blessed for this vault.
-    pub key: KeyClient,
-    pub vault: Address,
-    /// The vault's station on this chain: the master of its venue account,
-    /// and the only thing that moves its money.
-    pub station: Address,
-    pub venue: Address,
-    pub usd: Address,
-    pub factory: Address,
+    /// Where the vault is, and how to act for it there.
+    pub place: Place,
     /// The vault's own chain, as `shonin.toml` names it.
     pub home_chain: String,
     /// The driver this agent's manifest named. The executor refuses a
@@ -80,6 +71,41 @@ pub struct Ctx {
     /// topped up.
     /// The most memory the strategy's instance may hold, from its manifest.
     pub memory: Allowance,
+}
+
+/// Where a vault is, and how its agent's requests reach it. One is held for
+/// each agent running, so its size doesn't matter.
+#[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum Place {
+    Evm(Evm),
+    Solana(Arc<crate::solana::Trading>),
+}
+
+/// A vault on an EVM chain.
+#[derive(Clone)]
+pub struct Evm {
+    /// Reading the chain.
+    pub chain: Client,
+    /// Acting on it, as the key blessed for this vault.
+    pub key: KeyClient,
+    pub vault: Address,
+    /// The vault's station on this chain: the master of its venue account,
+    /// and the only thing that moves its money.
+    pub station: Address,
+    pub venue: Address,
+    pub usd: Address,
+    pub factory: Address,
+}
+
+impl Place {
+    /// The vault, as its chain writes its address.
+    pub fn vault(&self) -> String {
+        match self {
+            Place::Evm(evm) => evm.vault.to_string(),
+            Place::Solana(trading) => trading.vault.to_string(),
+        }
+    }
 }
 
 impl Ctx {
@@ -306,10 +332,10 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
         driver: String,
         actions: Vec<Vec<u8>>,
     ) -> HostResult<Vec<Verdict>> {
-        let (key, station, venue_address, expected) = accessor.with(|mut access| {
+        let (place, expected) = accessor.with(|mut access| {
             refuel(&mut access);
             let ctx = access.get();
-            (ctx.key.clone(), ctx.station, ctx.venue, ctx.driver.clone())
+            (ctx.place.clone(), ctx.driver.clone())
         });
 
         if driver != expected {
@@ -324,7 +350,10 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
         let mut tallies = Vec::with_capacity(actions.len());
         for bytes in &actions {
             let (verdict, tally) = match strategy_sdk::from_payload::<Action>(bytes) {
-                Ok(action) => act(&key, station, venue_address, action).await,
+                Ok(action) => match &place {
+                    Place::Evm(evm) => act(&evm.key, evm.station, evm.venue, action).await,
+                    Place::Solana(trading) => answer(trading.act(action).await),
+                },
                 Err(error) => (
                     Verdict::Rejected(format!("that is not an action: {error}")),
                     Tally::Refused,
@@ -351,23 +380,22 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
         driver: String,
         _query: Vec<u8>,
     ) -> HostResult<Result<Vec<u8>, String>> {
-        let (chain, vault, station, venue_address, usd, expected) = accessor.with(|mut access| {
+        let (place, expected) = accessor.with(|mut access| {
             let ctx = access.get();
-            (
-                ctx.chain.clone(),
-                ctx.vault,
-                ctx.station,
-                ctx.venue,
-                ctx.usd,
-                ctx.driver.clone(),
-            )
+            (ctx.place.clone(), ctx.driver.clone())
         });
         if driver != expected {
             return Ok(Err(format!(
                 "this agent trades through {expected}, not {driver}"
             )));
         }
-        match read_account_state(&chain, vault, station, venue_address, usd).await {
+        let state = match &place {
+            Place::Evm(evm) => {
+                read_account_state(&evm.chain, evm.vault, evm.station, evm.venue, evm.usd).await
+            }
+            Place::Solana(trading) => trading.account_state().await,
+        };
+        match state {
             Ok(state) => Ok(Ok(strategy_sdk::to_payload(&state))),
             Err(error) => {
                 accessor.with(|mut access| access.get().count(|c| c.venue_errors += 1));
@@ -389,7 +417,7 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
 // Transfers --------------------------------------------------------------------
 
 /// One call a move is made of, sent to the station as the vault's key.
-enum Step {
+pub enum Step {
     Pull,
     Push,
     Deposit,
@@ -455,12 +483,11 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
         destination: Account,
         amount: u64,
     ) -> HostResult<Result<(), String>> {
-        let (key, station, home, driver) = accessor.with(|mut access| {
+        let (place, home, driver) = accessor.with(|mut access| {
             refuel(&mut access);
             let ctx = access.get();
             (
-                ctx.key.clone(),
-                ctx.station,
+                ctx.place.clone(),
                 ctx.home_chain.clone(),
                 ctx.driver.clone(),
             )
@@ -468,6 +495,19 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
         let steps = match route(&home, &driver, &source, &destination) {
             Ok(steps) => steps,
             Err(why) => return Ok(Err(why)),
+        };
+        let (key, station) = match place {
+            Place::Evm(evm) => (evm.key, evm.station),
+            Place::Solana(trading) => {
+                // Counted once however many sends it takes, as below.
+                let moved = trading.carry(&steps, amount).await;
+                let tally = match &moved {
+                    Ok(()) => Tally::Done,
+                    Err(error) => crate::solana::tally_of(error),
+                };
+                accessor.with(|mut access| access.get().count(|c| c.submitted(tally)));
+                return Ok(moved.map_err(|error| format!("{error:#}")));
+            }
         };
         let amount = U256::from(amount);
         let name = chain::names::name(driver.as_bytes());
@@ -515,22 +555,28 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
         destination_chain: String,
         amount: u64,
     ) -> HostResult<Result<(), String>> {
-        let (chain, key, station, factory, home) = accessor.with(|mut access| {
+        let (place, home) = accessor.with(|mut access| {
             refuel(&mut access);
             let ctx = access.get();
-            (
-                ctx.chain.clone(),
-                ctx.key.clone(),
-                ctx.station,
-                ctx.factory,
-                ctx.home_chain.clone(),
-            )
+            (ctx.place.clone(), ctx.home_chain.clone())
         });
         if source_chain != home {
             return Ok(Err(format!(
                 "this executor serves the vault's station on {home} only, not on {source_chain}"
             )));
         }
+        let Place::Evm(Evm {
+            chain,
+            key,
+            station,
+            factory,
+            ..
+        }) = place
+        else {
+            // No bridge is offered from a Solana vault yet: the agent's
+            // mistake, refused here and counted as nothing.
+            return Ok(Err(format!("no bridge is offered from {home}")));
+        };
         let to_chain = match chain_id_of(&chain, factory, &destination_chain).await {
             Ok(id) => id,
             Err(error) => {
@@ -565,19 +611,51 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
     }
 
     async fn balances(accessor: &Accessor<Ctx, Self>) -> HostResult<Vec<Balance>> {
-        let (chain, vault, station, venue, usd, home, driver) = accessor.with(|mut access| {
+        let (place, home, driver) = accessor.with(|mut access| {
             refuel(&mut access);
             let ctx = access.get();
             (
-                ctx.chain.clone(),
-                ctx.vault,
-                ctx.station,
-                ctx.venue,
-                ctx.usd,
+                ctx.place.clone(),
                 ctx.home_chain.clone(),
                 ctx.driver.clone(),
             )
         });
+        let Evm {
+            chain,
+            vault,
+            station,
+            venue,
+            usd,
+            ..
+        } = match place {
+            Place::Evm(evm) => evm,
+            Place::Solana(trading) => {
+                let (vault, station, venue) = trading.balances().await;
+                let mut out = Vec::new();
+                if let Some(amount) = vault {
+                    out.push(Balance {
+                        account: Account::Vault,
+                        amount,
+                    });
+                }
+                if let Some(amount) = station {
+                    out.push(Balance {
+                        account: Account::Station(home.clone()),
+                        amount,
+                    });
+                }
+                if let Some(amount) = venue {
+                    out.push(Balance {
+                        account: Account::Venue(VenueAccount {
+                            chain: home,
+                            driver,
+                        }),
+                        amount,
+                    });
+                }
+                return Ok(out);
+            }
+        };
         let units = |value: U256| u64::try_from(value).unwrap_or(u64::MAX);
         let mut out = Vec::new();
         if let Ok(cash) = chain.read(vault, IVault::cashCall {}).await {
@@ -677,11 +755,15 @@ impl shonin::agent::data::HostWithStore<Ctx> for HasSelf<Ctx> {
                 "this executor knows no source called {source}"
             )));
         }
-        let (chain, venue) = accessor.with(|mut access| {
+        let place = accessor.with(|mut access| {
             refuel(&mut access);
-            (access.get().chain.clone(), access.get().venue)
+            access.get().place.clone()
         });
-        match read_markets(&chain, venue).await {
+        let markets = match &place {
+            Place::Evm(evm) => read_markets(&evm.chain, evm.venue).await,
+            Place::Solana(trading) => trading.markets().await,
+        };
+        match markets {
             Ok(markets) => Ok(Ok(strategy_sdk::to_payload(&markets))),
             Err(error) => Ok(Err(error.to_string())),
         }
@@ -796,7 +878,7 @@ impl shonin::agent::inference::HostWithStore<Ctx> for HasSelf<Ctx> {
 
 /// How an action counts in the health report.
 #[derive(Clone, Copy)]
-enum Tally {
+pub enum Tally {
     Done,
     /// The venue looked at it and said no.
     Refused,
@@ -807,7 +889,7 @@ enum Tally {
 impl Tally {
     /// How a send that failed counts: a refusal if the chain looked at it and
     /// said no, otherwise a venue that never answered.
-    fn of_failure(error: &anyhow::Error) -> Self {
+    pub fn of_failure(error: &anyhow::Error) -> Self {
         if chain::unanswered(error) {
             Tally::Unanswered
         } else {
@@ -836,6 +918,11 @@ async fn act(
     let done = match action {
         Action::Place(order) => place(key, station, venue, &order).await,
     };
+    answer(done)
+}
+
+/// What the agent is told of an action, and how it counts.
+pub fn answer(done: std::result::Result<Receipt, Refusal>) -> (Verdict, Tally) {
     match done {
         Ok(receipt) => (
             Verdict::Accepted(strategy_sdk::to_payload(&receipt)),
@@ -850,10 +937,10 @@ async fn act(
 }
 
 /// What the venue says when an order found no fill.
-const NO_FILL: &str = "no fill at that price";
+pub const NO_FILL: &str = "no fill at that price";
 
 /// Why an action produced no receipt.
-enum Refusal {
+pub enum Refusal {
     /// The venue would have taken the order; nobody was there at that price.
     NoFill,
     /// The venue would not take it, and said why.

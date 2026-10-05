@@ -128,10 +128,10 @@ struct Mark {
 
 /// One reading of a vault, dated by its block's time.
 #[derive(Clone, Copy)]
-struct Sample {
-    at: u64,
-    value_per_share: f64,
-    aum: f64,
+pub(crate) struct Sample {
+    pub(crate) at: u64,
+    pub(crate) value_per_share: f64,
+    pub(crate) aum: f64,
 }
 
 /// A registration, as the feed tells of it.
@@ -212,7 +212,7 @@ pub fn day(timestamp: u64) -> Date {
 }
 
 /// Dollars, as the asset counts them.
-fn dollars(value: U256) -> f64 {
+pub(crate) fn dollars(value: U256) -> f64 {
     value.to_string().parse::<f64>().unwrap_or(0.0) / 1e6
 }
 
@@ -220,12 +220,12 @@ fn shares(value: U256) -> f64 {
     value.to_string().parse::<f64>().unwrap_or(0.0) / 1e18
 }
 
-fn name_of(id: B256) -> String {
+pub(crate) fn name_of(id: B256) -> String {
     let end = id.0.iter().position(|byte| *byte == 0).unwrap_or(32);
     String::from_utf8_lossy(&id.0[..end]).to_string()
 }
 
-fn hash_of(value: B256) -> String {
+pub(crate) fn hash_of(value: B256) -> String {
     format!("sha256:{}", alloy::hex::encode(value))
 }
 
@@ -359,13 +359,25 @@ async fn unread(
         ),
         Err(_) => (String::new(), String::new()),
     };
+    placeholder(vault_chain, id, author, author_address, address_of(address))
+}
+
+/// A vault never read whole, as the record shows it: who it is as far as
+/// that could be read, and no figures (see [`unread`]).
+pub(crate) fn placeholder(
+    vault_chain: Chain,
+    id: u64,
+    author: String,
+    author_address: String,
+    address: String,
+) -> Strategy {
     let unknown = || "not read yet".to_string();
     let epoch = NEVER_READ.date();
     Strategy {
         id,
         slug: Strategy::slug_for(vault_chain, id),
         title: if id == 0 {
-            format!("A vault at {}", address_of(address))
+            format!("A vault at {address}")
         } else {
             format!("Agent {id}")
         },
@@ -390,7 +402,7 @@ async fn unread(
             built_in_seconds: 0,
         },
         vault: Vault {
-            address: address_of(address),
+            address,
             chain: vault_chain,
             asset: vault_chain.dollar().to_string(),
             state: VaultState::Activating,
@@ -1061,7 +1073,7 @@ async fn take(chain: &Client, history: &mut History, address: Address, at: Mark)
 }
 
 /// Keep readings older than [`HOURLY_FOR`] one a day, the last of each day.
-fn prune(samples: &mut Vec<Sample>, now: u64) {
+pub(crate) fn prune(samples: &mut Vec<Sample>, now: u64) {
     let hourly_from = now.saturating_sub(HOURLY_FOR);
     let mut kept: Vec<Sample> = Vec::with_capacity(samples.len());
     for sample in samples.drain(..) {
@@ -1089,6 +1101,17 @@ fn build_record(
         .get(&address)
         .map(Vec::as_slice)
         .unwrap_or_default();
+    record_from(samples, vault, now, trades)
+}
+
+/// The record from a vault's readings, oldest first, with today's from the
+/// vault as just read.
+pub(crate) fn record_from(
+    samples: &[Sample],
+    vault: &Vault,
+    now: u64,
+    trades: u32,
+) -> Option<Record> {
     let mut value_per_share: Vec<Point> = samples
         .iter()
         .map(|sample| Point {
@@ -1713,15 +1736,30 @@ fn read_bundle(
     registered: &chain::bindings::strategies::Strategy,
     bundle_hash: B256,
 ) -> Bundle {
+    bundle_from(
+        store,
+        registered.manifestHash,
+        registered.sourceHash,
+        bundle_hash,
+    )
+}
+
+/// A bundle as its registration names it, with what the store holds of it.
+pub(crate) fn bundle_from(
+    store: &Store,
+    manifest_hash: B256,
+    source_hash: B256,
+    bundle_hash: B256,
+) -> Bundle {
     let hash = hash_of(bundle_hash);
-    let canonical = store.manifest(&hash_of(registered.manifestHash));
+    let canonical = store.manifest(&hash_of(manifest_hash));
     Bundle {
         bundle_hash: hash.clone(),
         component_hash: store
             .component_hash(&hash)
             .unwrap_or_else(|| "not in the store".to_string()),
-        source_hash: hash_of(registered.sourceHash),
-        manifest_hash: hash_of(registered.manifestHash),
+        source_hash: hash_of(source_hash),
+        manifest_hash: hash_of(manifest_hash),
         world: canonical
             .as_ref()
             .map(|canonical| canonical.world.clone())
@@ -1733,8 +1771,8 @@ fn read_bundle(
             .map(|canonical| canonical.builder_image)
             .unwrap_or_else(|| hash_of(alloy::primitives::keccak256("shonin-dev-image:builder"))),
         models: Vec::<ModelFile>::new(),
-        source: store.source(&hash_of(registered.sourceHash)),
-        source_files: store.source_files(&hash_of(registered.sourceHash)),
+        source: store.source(&hash_of(source_hash)),
+        source_files: store.source_files(&hash_of(source_hash)),
         built_in_seconds: store.built_in_seconds(&hash),
     }
 }
