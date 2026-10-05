@@ -45,6 +45,31 @@ solana = [
     "dep:bincode",
     "dep:solana-message",
     "dep:solana-hash",
+    "dep:solana-address-lookup-table-interface",
+]
+# Which network's program ids the programs' crates compile in (see
+# contracts/solana/crates/shonin-program-id): with neither, the local deploy
+# keypairs'; with one, the ids committed for that network. Set at most one,
+# for a whole image. The stand-ins are never built for mainnet, so there they
+# keep their local ids, which no mainnet deployment names.
+mainnet = [
+    "shonin-registry?/mainnet",
+    "shonin-publishing?/mainnet",
+    "shonin-prices?/mainnet",
+    "shonin-profiles?/mainnet",
+    "shonin-station?/mainnet",
+    "shonin-vault?/mainnet",
+]
+devnet = [
+    "shonin-registry?/devnet",
+    "shonin-dev-verifier?/devnet",
+    "shonin-publishing?/devnet",
+    "shonin-prices?/devnet",
+    "shonin-profiles?/devnet",
+    "shonin-station?/devnet",
+    "shonin-vault?/devnet",
+    "shonin-local-venue?/devnet",
+    "shonin-local-driver?/devnet",
 ]
 
 [dependencies]
@@ -83,6 +108,7 @@ solana-keypair = { version = "2.2", optional = true }
 solana-signer = { version = "2.2", optional = true }
 solana-message = { version = "2.4", optional = true }
 solana-hash = { version = "2.2", optional = true }
+solana-address-lookup-table-interface = { version = "2.2", optional = true, features = ["bincode", "bytemuck"] }
 solana-compute-budget-interface = { version = "2.2", optional = true, features = ["borsh"] }
 solana-ed25519-program = { version = "2.2", optional = true }
 reqwest = { workspace = true, optional = true }

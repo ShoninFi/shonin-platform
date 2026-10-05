@@ -1,49 +1,72 @@
-# Check, lint and test: the same `task check`, `task lint` and `task test` a
-# change has to pass locally before it is opened as a pull request, plus a
-# check that every contract fits the chain's contract-size limit.
+# Check, lint and test, split into jobs that run side by side: the EVM
+# contracts, the Solana programs, the Rust workspace's lints (native and
+# wasm) and its tests. A pull request runs only the jobs its changes can
+# affect (.github/scripts/changes.sh says which); a push to main runs all of
+# them. `ci-ok` is the one status to require: it passes when every job either
+# passed or was not needed.
+#
+# The keeper's and the executor's process suites (tests that run the service
+# binaries against scripted nodes, most of the test time) are left to the
+# nightly run, which calls this workflow and adds them; their unit tests run
+# here.
 name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  ci:
+  changes:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-    env:
-      CARGO_TERM_COLOR: always
+    timeout-minutes: 5
+    outputs:
+      evm: ${{ steps.changes.outputs.evm }}
+      solana: ${{ steps.changes.outputs.solana }}
+      rust: ${{ steps.changes.outputs.rust }}
+    steps:
+      # Two commits deep: a pull request's merge commit and the base it is
+      # merged onto, which is all the diff needs.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - id: changes
+        run: bash .github/scripts/changes.sh
+
+  evm:
+    name: EVM contracts
+    needs: changes
+    if: needs.changes.outputs.evm == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: contracts/evm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
 
-      # rust-toolchain.toml pins the compiler, its components and targets;
-      # the first cargo call installs them.
-      - name: Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          workspaces: |
-            .
-            contracts/solana
-
       - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
         with:
           version: v1.2.3
 
-      # Compiling the contracts and their tests is most of the contract
-      # steps' time; forge only rebuilds what changed since the cached run.
+      # Compiling the contracts and their tests is most of this job's time;
+      # forge only rebuilds what changed since the cached run.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           # Not the saved fuzz and invariant counterexamples: a later run
@@ -57,43 +80,12 @@ jobs:
           restore-keys: |
             forge-${{ runner.os }}-
 
-      # The Solana programs build with Anza's toolchain and Anchor, at the
-      # versions Anchor.toml pins. Both are release binaries; they and the
-      # platform tools cargo-build-sbf fetches on first use are cached.
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        id: solana-tools
-        with:
-          path: |
-            ~/.local/share/solana-release
-            ~/.local/bin/anchor
-            ~/.cache/solana
-          key: solana-tools-${{ runner.os }}-agave-3.1.13-anchor-0.32.1
-
-      - name: Solana and Anchor
-        if: steps.solana-tools.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p ~/.local/share ~/.local/bin
-          curl -sSfL https://github.com/anza-xyz/agave/releases/download/v3.1.13/solana-release-x86_64-unknown-linux-gnu.tar.bz2 \
-            | tar -xj -C ~/.local/share
-          curl -sSfL -o ~/.local/bin/anchor \
-            https://github.com/solana-foundation/anchor/releases/download/v0.32.1/anchor-0.32.1-x86_64-unknown-linux-gnu
-          chmod +x ~/.local/bin/anchor
-
-      - name: Solana and Anchor on the path
-        run: |
-          echo "$HOME/.local/share/solana-release/bin" >> "$GITHUB_PATH"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - uses: arduino/setup-task@c0bc642852239c2689f73f4ea6459c29405f3c52 # v3.0.0
-        with:
-          version: 3.x
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
       # Compiling every contract and test through the IR pipeline at once
       # peaks at about 13 GB, more than the runner's memory. The runner image
       # carries toolchains this build never uses; removing them leaves disk
       # for swap that carries the peak.
       - name: Room and swap for the contract build
+        working-directory: .
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift
@@ -109,14 +101,230 @@ jobs:
           fi
           free -h
 
-      - name: Check
-        run: task check
+      # The same commands as `task contracts:lint`, `contracts:build`,
+      # `contracts:sizes` and the EVM half of `contracts:test`.
+      - name: Format
+        run: forge fmt --check
+
+      - name: Build
+        run: forge build
 
       - name: Contract sizes
-        run: task contracts:sizes
-
-      - name: Lint
-        run: task lint
+        run: forge build --sizes --skip test --skip script
 
       - name: Test
-        run: task test
+        run: forge test
+
+  solana:
+    name: Solana programs
+    needs: changes
+    if: needs.changes.outputs.solana == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: contracts/solana
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # rust-toolchain.toml pins the compiler, its components and targets;
+      # the first cargo call installs them.
+      - name: Rust toolchain
+        working-directory: .
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # Compiled dependencies only. The build step below clears
+      # target/deploy, so no program binary or keypair from an earlier run
+      # is ever used.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: solana
+          workspaces: contracts/solana -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The Solana programs build with Anza's toolchain and Anchor, at the
+      # versions Anchor.toml pins. Both are release binaries; they and the
+      # platform tools cargo-build-sbf fetches on first use are cached.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: solana-tools
+        with:
+          path: |
+            ~/.local/share/solana-release
+            ~/.local/bin/anchor
+            ~/.cache/solana
+          key: solana-tools-${{ runner.os }}-agave-3.1.13-anchor-0.32.1
+
+      - name: Solana and Anchor
+        if: steps.solana-tools.outputs.cache-hit != 'true'
+        working-directory: .
+        run: |
+          mkdir -p ~/.local/share ~/.local/bin
+          curl -sSfL https://github.com/anza-xyz/agave/releases/download/v3.1.13/solana-release-x86_64-unknown-linux-gnu.tar.bz2 \
+            | tar -xj -C ~/.local/share
+          curl -sSfL -o ~/.local/bin/anchor \
+            https://github.com/solana-foundation/anchor/releases/download/v0.32.1/anchor-0.32.1-x86_64-unknown-linux-gnu
+          chmod +x ~/.local/bin/anchor
+
+      - name: Solana and Anchor on the path
+        working-directory: .
+        run: |
+          echo "$HOME/.local/share/solana-release/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # Every run builds the programs under fresh program ids, never cached
+      # ones: a program's id is its keypair's under target/deploy, and code
+      # that only works at one particular address fails under new ones.
+      # Anchor makes every keypair that is missing before it compiles, so
+      # the directory is cleared first. The ids are printed so a failure can
+      # be reproduced at the same addresses.
+      - name: Build, under fresh program ids
+        run: |
+          rm -rf target/deploy
+          anchor build
+          for keypair in target/deploy/*-keypair.json; do
+            echo "$(basename "$keypair" -keypair.json): $(solana-keygen pubkey "$keypair")"
+          done
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The programs' tests run in-process (LiteSVM) against the programs
+      # just built, as `task contracts:solana:test` runs them.
+      - name: Test
+        run: cargo test --workspace
+
+  rust-lint:
+    name: Rust format and clippy
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: rust-lint
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # Clippy type-checks every target as `cargo check --workspace
+      # --all-targets` (in `task check`) does, so it stands in for both.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  rust-wasm:
+    name: Rust clippy for wasm
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: rust-wasm
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: arduino/setup-task@c0bc642852239c2689f73f4ea6459c29405f3c52 # v3.0.0
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The web app's crates for wasm32-unknown-unknown and the strategy SDK
+      # for wasm32-wasip2; this also covers the wasm half of `task check`.
+      - name: Clippy for wasm
+        run: task lint:wasm
+
+  rust-test:
+    name: Rust tests
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Line tables keep backtraces readable and the test binaries small
+      # enough to link quickly and fit the runner's disk.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Every test binary of the workspace is large; the runner image's
+      # unused toolchains make room for them.
+      - name: Room for the test build
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift
+          df -h /
+
+      - name: Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: rust-test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # nextest runs every test as its own process, all binaries at once, so
+      # the many one-test files that wait on a running service overlap
+      # instead of running one binary after another.
+      - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
+        with:
+          tool: cargo-nextest@0.9.146
+
+      # The workspace compiles the Solana programs' crates, and with them
+      # each program's id from its keypair under contracts/solana/target/
+      # deploy. Fresh ones every run, as the Solana job's build makes.
+      - name: Fresh program ids
+        run: bash .github/scripts/fresh-program-keypairs.sh
+
+      # Everything but the keeper's and the executor's integration tests,
+      # which run the service binaries for minutes each (the nightly run has
+      # them); their unit tests are in their binaries and run here.
+      - name: Test
+        run: |
+          cargo nextest run --workspace --no-fail-fast \
+            -E 'not (package(shonin-keeper) | package(shonin-executor)) | kind(bin)'
+
+      # nextest does not run doctests.
+      - name: Doctests
+        run: cargo test --workspace --doc
+
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [changes, evm, solana, rust-lint, rust-wasm, rust-test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every needed job passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          for result in $RESULTS; do
+            case "$result" in
+              success | skipped) ;;
+              *) exit 1 ;;
+            esac
+          done

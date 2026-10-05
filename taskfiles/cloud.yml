@@ -32,16 +32,23 @@ vars:
 
 tasks:
   build:
-    desc: "Build an image locally (NAME=reviewer|builder|executor|unwinder|api|indexer|keeper), tagged NAME:GIT_SHA"
+    desc: "Build an image locally for a network (NAME=reviewer|builder|executor|unwinder|api|indexer|keeper, NETWORK=testnet|mainnet), tagged NAME:GIT_SHA"
     requires:
-      vars: [NAME]
+      vars: [NAME, NETWORK]
     preconditions:
       - sh: 'for n in {{.MACHINES}} {{.SERVICES}}; do [ "$n" = "{{.NAME}}" ] && exit 0; done; exit 1'
         msg: "No image is called {{.NAME}}: {{.MACHINES}} {{.SERVICES}}"
+      - sh: '[ "{{.NETWORK}}" = "testnet" ] || [ "{{.NETWORK}}" = "mainnet" ]'
+        msg: "Name the chains: NETWORK=testnet or NETWORK=mainnet. An image is built for one network, and the cloud never runs against local chains (NETWORK={{.NETWORK}})."
+    vars:
+      # The Solana program ids an image compiles in: a testnet image the
+      # committed devnet ids, a mainnet one the committed mainnet ids.
+      NETWORK_FEATURE: '{{if eq .NETWORK "mainnet"}}mainnet{{else}}devnet{{end}}'
     cmds:
       # Confidential Space and Cloud Run both run linux/amd64.
       - >-
         docker build --platform linux/amd64
+        --build-arg NETWORK_FEATURE={{.NETWORK_FEATURE}}
         -f "{{.PATH_ROOT}}/deploy/gcp/Dockerfile.{{.NAME}}"
         -t "{{.NAME}}:{{.GIT_SHA}}"
         "{{.PATH_ROOT}}"
@@ -58,7 +65,7 @@ tasks:
         msg: "No Google Cloud project for {{.NETWORK}}: set GCP_PROJECT_{{upper .NETWORK}} in taskfiles/config.yml. The gcloud default project is never used."
     cmds:
       - task: build
-        vars: { NAME: "{{.NAME}}" }
+        vars: { NAME: "{{.NAME}}", NETWORK: "{{.NETWORK}}" }
       - gcloud auth configure-docker "{{.GCP_REGION}}-docker.pkg.dev" --project="{{.GCP_PROJECT}}" --quiet
       - docker tag "{{.NAME}}:{{.GIT_SHA}}" "{{.GCP_REGISTRY}}/{{.NAME}}:{{.GIT_SHA}}"
       - docker push "{{.GCP_REGISTRY}}/{{.NAME}}:{{.GIT_SHA}}"

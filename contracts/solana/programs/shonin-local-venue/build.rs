@@ -1,5 +1,5 @@
 //! The program's address, decided at build time (see `shonin-program-id`).
-//! The stand-in venue serves local chains and tests and is never built for mainnet.
+//! The stand-in venue serves local chains, devnet and tests, and is never built for mainnet.
 
 fn main() {
     assert!(

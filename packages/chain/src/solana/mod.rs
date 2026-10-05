@@ -16,6 +16,8 @@
 //!
 //! - [`rpc`]: the node's JSON-RPC.
 //! - [`client`]: connecting, reading, and sending until a transaction lands.
+//! - [`tables`]: address lookup tables, for a transaction too large for the
+//!   wire by address.
 //! - [`events`]: a landed transaction, and the events in it.
 //! - [`keys`]: the role keys, and keypair files.
 //! - [`platform`]: every instruction the platform sends, built from the
@@ -29,12 +31,14 @@ pub mod events;
 pub mod executor;
 pub mod keys;
 pub mod platform;
+pub mod pro_rata;
 pub mod rpc;
+pub mod tables;
 pub mod upkeep;
 
 pub use anchor_lang::prelude::{AccountMeta, Pubkey};
 pub use anchor_lang::solana_program::instruction::Instruction;
-pub use client::{Landed, NeverLanded, SolanaClient, TransactionFailed};
+pub use client::{Landed, MayStillLand, NeverLanded, SolanaClient, TransactionFailed};
 pub use events::{Called, TransactionRecord};
 pub use platform::Platform;
 pub use solana_keypair::Keypair;

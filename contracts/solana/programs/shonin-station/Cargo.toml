@@ -29,6 +29,14 @@ mainnet = [
     "shonin-prices/mainnet",
     "shonin-profiles/mainnet",
 ]
+# Build with the committed devnet ids (devnet-id), derived from the team's mnemonic.
+devnet = [
+    "shonin-registry/devnet",
+    "shonin-publishing/devnet",
+    "shonin-prices/devnet",
+    "shonin-profiles/devnet",
+    "shonin-dev-verifier/devnet",
+]
 
 [dependencies]
 anchor-lang = { workspace = true }

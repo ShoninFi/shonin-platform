@@ -9,9 +9,9 @@
 //! upgradeable by the deployer locally, which is the key that sets each of
 //! them up.
 //!
-//! On testnets only the registry is deployed, by `task
-//! contracts:solana:deploy`, from keys of the team's mnemonic; nothing here
-//! touches a public cluster.
+//! On testnets the same programs are deployed by `task
+//! contracts:solana:deploy`, at keys of the team's mnemonic
+//! ([`crate::devnet_keys`]); nothing here touches a public cluster.
 
 use std::path::Path;
 use std::time::Duration;
@@ -71,6 +71,11 @@ const PROGRAMS: [(&str, bool); 9] = [
     ("shonin_vault", false),
     ("shonin_local_venue", false),
 ];
+
+/// Whether `program` is deployed final, on any cluster.
+pub fn deployed_final(program: &str) -> bool {
+    PROGRAMS.contains(&(program, true))
+}
 
 /// The terms every local vault is created with: the EVM factory's.
 pub fn terms() -> vault::state::Terms {

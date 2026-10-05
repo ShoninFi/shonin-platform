@@ -1,14 +1,20 @@
 # syntax=docker/dockerfile:1
 # The executor: runs strategies and trades for their vaults.
 # Runs on a Confidential Space VM, which attests to this image by its digest.
-# Built from the repository root: task cloud:build NAME=executor
-#   (docker build -f deploy/gcp/Dockerfile.executor .)
+# Built from the repository root: task cloud:build NAME=executor NETWORK=testnet
+#   (docker build --build-arg NETWORK_FEATURE=devnet -f deploy/gcp/Dockerfile.executor .)
 
 FROM rust:1.98.1-slim-bookworm AS build
 WORKDIR /src
 COPY . .
+# The network whose Solana program ids are compiled in: devnet for a testnet
+# image, mainnet for a mainnet one (task cloud:build passes it). The local
+# keypairs never reach the build, so an image without it could reach no
+# cluster.
+ARG NETWORK_FEATURE
 # rust-toolchain.toml pins the same compiler; --locked builds exactly Cargo.lock.
-RUN cargo build --release --locked -p shonin-executor --bin executor
+RUN : "${NETWORK_FEATURE:?pass --build-arg NETWORK_FEATURE=devnet or mainnet}" && \
+    cargo build --release --locked -p shonin-executor --bin executor --features "$NETWORK_FEATURE"
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /src/target/release/executor /usr/local/bin/executor

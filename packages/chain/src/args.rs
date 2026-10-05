@@ -71,9 +71,10 @@ impl ChainArgs {
         self.target(&configs, self.vault_chain.unwrap_or(Chain::Base))
     }
 
-    /// Every vault chain this service serves: the one named, or every one of
-    /// the network whose chain the services speak to. Solana is listed and
-    /// skipped, because no service speaks to it yet.
+    /// Every EVM vault chain this service serves: the one named, if it is an
+    /// EVM one, or every EVM vault chain of the network. A Solana vault chain
+    /// named alone leaves none, so the service serves that cluster alone; the
+    /// Solana clusters are [`ChainArgs::solana_targets`]'s.
     pub fn targets(&self) -> Result<Vec<Target>> {
         let configs = ChainConfigs::load(&self.chains)?;
         let wanted: Vec<Chain> = match self.vault_chain {
@@ -94,15 +95,23 @@ impl ChainArgs {
             }
             if target.key.kind == ChainKind::Evm {
                 targets.push(target);
-            } else if self.vault_chain.is_some() {
-                bail!(
-                    "{} is a {} chain, and the services only speak to EVM chains",
-                    target.key,
-                    target.key.kind.name()
-                );
-            } else {
-                tracing::info!(chain = %target.key, "not served: the services only speak to EVM chains");
             }
+        }
+        Ok(targets)
+    }
+
+    /// The EVM vault chains to connect to, for a service that speaks to them:
+    /// refused when there are none, as when a Solana vault chain is named
+    /// alone to a service that serves only EVM chains.
+    fn evm_targets_to_serve(&self) -> Result<Vec<Target>> {
+        let targets = self.targets()?;
+        if targets.is_empty() {
+            bail!(
+                "no EVM vault chain to serve{}: this service speaks only to EVM chains",
+                self.vault_chain
+                    .map(|chain| format!(" ({chain} is not one)"))
+                    .unwrap_or_default()
+            );
         }
         Ok(targets)
     }
@@ -132,12 +141,18 @@ impl ChainArgs {
 
     /// Connect to every Solana cluster this service serves, each on its own,
     /// handing each one over once it is connected and its deployment found,
-    /// as [`ChainArgs::connect_each`] does for the EVM chains.
+    /// as [`ChainArgs::connect_each`] does for the EVM chains. Refused when a
+    /// cluster is to be served by a build whose program ids are not the
+    /// network's (see [`BuiltFor`]).
     pub fn connect_each_solana(
         &self,
     ) -> Result<tokio::sync::mpsc::UnboundedReceiver<SolanaServed>> {
+        let targets = self.solana_targets()?;
+        if !targets.is_empty() {
+            BuiltFor::THIS.serves(self.network)?;
+        }
         Ok(each_until_connected(
-            self.solana_targets()?,
+            targets,
             |target| target.key.canonical(),
             |target| async move { target.serve_solana().await },
             CONNECT_RETRY_FIRST,
@@ -148,7 +163,7 @@ impl ChainArgs {
     /// deployment, all at once.
     pub async fn connect_all(&self) -> Result<Vec<Served>> {
         let mut pending = tokio::task::JoinSet::new();
-        for (order, target) in self.targets()?.into_iter().enumerate() {
+        for (order, target) in self.evm_targets_to_serve()?.into_iter().enumerate() {
             pending.spawn(async move { Ok::<_, anyhow::Error>((order, target.serve().await?)) });
         }
         let mut served = Vec::new();
@@ -167,7 +182,7 @@ impl ChainArgs {
     /// The receiver ends once every chain has been handed over.
     pub fn connect_each(&self) -> Result<tokio::sync::mpsc::UnboundedReceiver<Served>> {
         Ok(each_until_connected(
-            self.targets()?,
+            self.evm_targets_to_serve()?,
             |target| target.key.canonical(),
             |target| async move { target.serve().await },
             CONNECT_RETRY_FIRST,
@@ -184,6 +199,54 @@ impl ChainArgs {
             deployments_dir: self.deployments_dir.clone(),
             configs: configs.clone(),
         })
+    }
+}
+
+/// The network whose Solana program ids this build compiled in, by the
+/// chain crate's `mainnet` and `devnet` features (a testnet build uses
+/// `devnet`); with neither, the local ones. A Solana cluster is served only by
+/// a build for its network, since a program id is not read from the
+/// deployment file but compiled in. The EVM chains' addresses come from their
+/// deployment files, so an EVM-only service runs on any build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuiltFor {
+    Local,
+    Devnet,
+    Mainnet,
+}
+
+impl BuiltFor {
+    /// What this build is for.
+    const THIS: BuiltFor = if cfg!(feature = "mainnet") {
+        BuiltFor::Mainnet
+    } else if cfg!(feature = "devnet") {
+        BuiltFor::Devnet
+    } else {
+        BuiltFor::Local
+    };
+
+    /// Whether a build for this serves `network`'s Solana clusters, and if
+    /// not, which build does.
+    fn serves(self, network: NetworkName) -> Result<()> {
+        let needed = match network {
+            NetworkName::Local => BuiltFor::Local,
+            NetworkName::Testnet => BuiltFor::Devnet,
+            NetworkName::Mainnet => BuiltFor::Mainnet,
+        };
+        if self == needed {
+            return Ok(());
+        }
+        let build = match needed {
+            BuiltFor::Local => "without the mainnet and devnet features".to_string(),
+            BuiltFor::Devnet => "with the devnet feature".to_string(),
+            BuiltFor::Mainnet => "with the mainnet feature".to_string(),
+        };
+        let this = match self {
+            BuiltFor::Local => "the local program ids",
+            BuiltFor::Devnet => "the devnet program ids",
+            BuiltFor::Mainnet => "the mainnet program ids",
+        };
+        bail!("this build carries {this}, and the {network} Solana cluster needs a build {build}")
     }
 }
 
@@ -445,6 +508,141 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    /// Chain args over a network of two EVM vault chains and a Solana one.
+    fn args_naming(vault_chain: Option<Chain>) -> (ChainArgs, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "shonin-chain-args-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let chains = dir.join("chains.toml");
+        std::fs::write(
+            &chains,
+            r#"
+            [chains."evm:31337"]
+            label = "Base (local)"
+            rpc = "http://127.0.0.1:19100"
+            dollar = "USDC"
+
+            [chains."evm:31338"]
+            label = "Hyperliquid (local)"
+            rpc = "http://127.0.0.1:19101"
+            dollar = "USDC"
+
+            [chains."evm:31339"]
+            label = "Robinhood (local)"
+            rpc = "http://127.0.0.1:19102"
+            dollar = "USDC"
+
+            [chains."solana:localnet"]
+            label = "Solana (local)"
+            rpc = "http://127.0.0.1:19110"
+            dollar = "USDC"
+
+            [networks.local]
+            base = "evm:31337"
+            hyperliquid = "evm:31338"
+            robinhood = "evm:31339"
+            solana = "solana:localnet"
+            "#,
+        )
+        .unwrap();
+        let args = ChainArgs {
+            network: NetworkName::Local,
+            chains,
+            deployments_dir: dir.join("deployments"),
+            vault_chain,
+        };
+        (args, dir)
+    }
+
+    #[test]
+    fn a_solana_vault_chain_named_alone_is_served_with_no_evm_chain() {
+        let (args, dir) = args_naming(Some(Chain::Solana));
+        assert!(args.targets().unwrap().is_empty());
+        let solana = args.solana_targets().unwrap();
+        assert_eq!(solana.len(), 1);
+        assert_eq!(solana[0].vault_chain, Chain::Solana);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_evm_vault_chain_is_served_when_none_is_named_and_solana_only_as_a_cluster() {
+        let (args, dir) = args_naming(None);
+        let evm: Vec<Chain> = args
+            .targets()
+            .unwrap()
+            .iter()
+            .map(|target| target.vault_chain)
+            .collect();
+        assert!(!evm.is_empty());
+        assert!(!evm.contains(&Chain::Solana));
+        let solana: Vec<Chain> = args
+            .solana_targets()
+            .unwrap()
+            .iter()
+            .map(|target| target.vault_chain)
+            .collect();
+        assert_eq!(solana, vec![Chain::Solana]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_service_speaking_only_to_evm_chains_refuses_a_solana_vault_chain_named_alone() {
+        let (args, dir) = args_naming(Some(Chain::Solana));
+        let error = format!("{:#}", args.connect_each().err().unwrap());
+        assert!(error.contains("solana"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_solana_cluster_is_served_only_by_a_build_for_its_network() {
+        use BuiltFor::*;
+        for (built, network, serves) in [
+            (Local, NetworkName::Local, true),
+            (Local, NetworkName::Testnet, false),
+            (Local, NetworkName::Mainnet, false),
+            (Devnet, NetworkName::Local, false),
+            (Devnet, NetworkName::Testnet, true),
+            (Devnet, NetworkName::Mainnet, false),
+            (Mainnet, NetworkName::Local, false),
+            (Mainnet, NetworkName::Testnet, false),
+            (Mainnet, NetworkName::Mainnet, true),
+        ] {
+            assert_eq!(
+                built.serves(network).is_ok(),
+                serves,
+                "{built:?} on {network}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_build_is_told_which_feature_to_build_with() {
+        let testnet = format!(
+            "{}",
+            BuiltFor::Local.serves(NetworkName::Testnet).unwrap_err()
+        );
+        assert!(testnet.contains("devnet feature"), "{testnet}");
+        let mainnet = format!(
+            "{}",
+            BuiltFor::Devnet.serves(NetworkName::Mainnet).unwrap_err()
+        );
+        assert!(mainnet.contains("mainnet feature"), "{mainnet}");
+        let local = format!(
+            "{}",
+            BuiltFor::Devnet.serves(NetworkName::Local).unwrap_err()
+        );
+        assert!(
+            local.contains("without the mainnet and devnet features"),
+            "{local}"
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn a_chain_out_of_reach_holds_up_none_of_the_others_and_is_tried_until_it_connects() {

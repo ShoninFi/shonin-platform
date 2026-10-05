@@ -1,9 +1,14 @@
 //! A connection to a Solana cluster: which cluster it is, the platform's
 //! programs on it, reading accounts, and sending transactions signed by a
 //! role's key or any other (a vault's own executor key) until they land.
+//!
+//! Every send and simulation goes through one place, which names every
+//! account by address when that fits the wire and otherwise finds them
+//! through the paying key's own lookup table ([`super::tables`]).
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anchor_lang::AccountDeserialize;
@@ -12,12 +17,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_hash::Hash;
-use solana_message::Message;
-use solana_transaction::Transaction;
+use solana_message::VersionedMessage;
+use solana_transaction::versioned::VersionedTransaction;
 
 use super::events::TransactionRecord;
 use super::keys::{RoleKeys, mnemonic_for};
 use super::rpc::{Account, Rpc, RpcError, Simulated};
+use super::tables::{self, Table};
 use super::{Keypair, Pubkey, Signer, programs};
 use crate::client::Role;
 use crate::config::{ChainConfig, ChainKey, ChainKind, NetworkName};
@@ -37,6 +43,12 @@ const POLL: Duration = Duration::from_millis(400);
 const RESEND: Duration = Duration::from_secs(2);
 /// How long to wait for a cluster to answer at all before giving up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a lookup table just grown is waited on to be usable.
+const WARM_UP_TIMEOUT: Duration = Duration::from_secs(60);
+/// How many times a known lookup table the node answers nothing for is read
+/// before the key's tables are searched for again: a node behind the
+/// cluster answers nothing for an account that is there.
+const TABLE_READS: usize = 5;
 
 /// The public clusters' genesis hashes: a key naming one of them must be
 /// answered by it, and a key naming a local cluster must not be answered by
@@ -107,6 +119,23 @@ impl std::fmt::Display for NeverLanded {
 
 impl std::error::Error for NeverLanded {}
 
+/// A send the node stopped answering about before it landed or its
+/// blockhash expired: it may still land, and its fee be paid, later.
+#[derive(Clone, Debug)]
+pub struct MayStillLand {
+    pub signature: String,
+}
+
+impl std::fmt::Display for MayStillLand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "transaction {} may still land: the node stopped answering",
+            self.signature
+        )
+    }
+}
+
 enum Watch {
     Landed,
     Waiting,
@@ -118,6 +147,9 @@ enum Watch {
 pub struct Landed {
     pub record: TransactionRecord,
     pub payer: Pubkey,
+    /// The transactions that made or grew the payer's lookup table for it
+    /// first, if it needed one: part of what it cost.
+    pub setup: Vec<TransactionRecord>,
 }
 
 impl Landed {
@@ -125,15 +157,21 @@ impl Landed {
         &self.record.signature
     }
 
-    /// The fee, in lamports.
+    /// The fees, in lamports: its own and its table set-up's.
     pub fn fee(&self) -> u64 {
-        self.record.fee
+        self.record.fee + self.setup.iter().map(|record| record.fee).sum::<u64>()
     }
 
-    /// Everything the payer's lamports fell by: the fee and the rent of every
-    /// account it paid for, less rent refunded to it.
+    /// Everything the payer's lamports fell by: the fees and the rent of
+    /// every account it paid for (a lookup table among them), less rent
+    /// refunded to it.
     pub fn payer_spent(&self) -> i128 {
         self.record.spent_by(&self.payer)
+            + self
+                .setup
+                .iter()
+                .map(|record| record.spent_by(&self.payer))
+                .sum::<i128>()
     }
 
     /// The rent the payer put into accounts (negative: took back).
@@ -151,7 +189,13 @@ pub struct SolanaClient {
     pub cluster: String,
     pub genesis_hash: String,
     keys: Option<Arc<RoleKeys>>,
+    /// Each paying key's lookup tables, as last read: `None` until they have
+    /// been looked for on the cluster. One key's tables are set up one send
+    /// at a time.
+    tables: Arc<Mutex<HashMap<Pubkey, KeyTables>>>,
 }
+
+type KeyTables = Arc<tokio::sync::Mutex<Option<Vec<Table>>>>;
 
 impl SolanaClient {
     /// Connect, waiting for the cluster to answer, and check it is the
@@ -199,6 +243,7 @@ impl SolanaClient {
             cluster: key.id.clone(),
             genesis_hash,
             keys,
+            tables: Arc::default(),
         })
     }
 
@@ -356,41 +401,36 @@ impl SolanaClient {
 
     // Sending -----------------------------------------------------------------
 
-    /// `ixs` as one transaction, behind the compute (and, for a call into a
-    /// vault or station, the heap) they may need, signed by `signers`, the
-    /// first of whom pays.
-    pub fn transaction_for(
-        &self,
-        ixs: Vec<Instruction>,
-        signers: &[&Keypair],
-        blockhash: Hash,
-    ) -> Result<Transaction> {
-        let payer = signers
-            .first()
-            .ok_or_else(|| anyhow!("a transaction needs someone to pay for it"))?
-            .pubkey();
-        let message = Message::new(&with_budget(ixs), Some(&payer));
-        let mut unique: Vec<&Keypair> = Vec::new();
-        for signer in signers {
-            if !unique.iter().any(|seen| seen.pubkey() == signer.pubkey()) {
-                unique.push(signer);
-            }
-        }
-        let mut tx = Transaction::new_unsigned(message);
-        tx.try_sign(&unique, blockhash)
-            .map_err(|error| anyhow!("signing the transaction: {error}"))?;
-        Ok(tx)
-    }
-
     /// Send `ixs` and wait until they land, the first signer paying. A
     /// transaction the cluster refuses or that fails comes back as
-    /// [`TransactionFailed`], with its logs.
+    /// [`TransactionFailed`], with its logs. One too large for the wire by
+    /// address goes through the payer's lookup table, made or grown first
+    /// (and paid for by the payer) when it doesn't hold the accounts yet.
     pub async fn send(&self, ixs: Vec<Instruction>, signers: &[&Keypair]) -> Result<Landed> {
+        let payer = *signers
+            .first()
+            .ok_or_else(|| anyhow!("a transaction needs someone to pay for it"))?;
+        let ixs = with_budget(ixs);
+        let (table, setup) = self.table_for(&ixs, &payer.pubkey(), Some(payer)).await?;
+        let (blockhash, last_valid) = self.blockhash().await?;
+        let message = tables::compile(&ixs, &payer.pubkey(), table.as_ref(), blockhash)?;
+        let mut landed = self.land(signed(message, signers)?, last_valid).await?;
+        landed.setup = setup;
+        Ok(landed)
+    }
+
+    async fn blockhash(&self) -> Result<(Hash, u64)> {
         let (blockhash, last_valid) = self.rpc.latest_blockhash().await?;
         let blockhash: Hash = blockhash
             .parse()
             .map_err(|_| anyhow!("the node's blockhash is not a hash"))?;
-        let tx = self.transaction_for(ixs, signers, blockhash)?;
+        Ok((blockhash, last_valid))
+    }
+
+    /// Hand a signed transaction to the node and watch it until it lands,
+    /// its blockhash (valid until block `last_valid`) expires, or the node
+    /// stops answering for too long.
+    async fn land(&self, tx: VersionedTransaction, last_valid: u64) -> Result<Landed> {
         let wire = bincode::serialize(&tx).context("encoding the transaction")?;
         if wire.len() > PACKET_DATA_SIZE {
             bail!(
@@ -398,7 +438,7 @@ impl SolanaClient {
                 wire.len()
             );
         }
-        let payer = tx.message.account_keys[0];
+        let payer = tx.message.static_account_keys()[0];
         let signature = tx.signatures[0].to_string();
         self.submit(&wire).await?;
         let started = Instant::now();
@@ -413,7 +453,11 @@ impl SolanaClient {
                             TransactionFailed::from_err(Some(signature), err, record.logs).into(),
                         );
                     }
-                    return Ok(Landed { record, payer });
+                    return Ok(Landed {
+                        record,
+                        payer,
+                        setup: Vec::new(),
+                    });
                 }
                 Ok(Watch::Expired) => return Err(NeverLanded { signature }.into()),
                 Ok(Watch::Waiting) => {}
@@ -421,9 +465,7 @@ impl SolanaClient {
                 // watched until it does, its blockhash expires, or the
                 // node stays silent too long to say.
                 Err(error) if started.elapsed() > LANDING_TIMEOUT => {
-                    return Err(error.context(format!(
-                        "transaction {signature} may still land: the node stopped answering"
-                    )));
+                    return Err(error.context(MayStillLand { signature }));
                 }
                 Err(_) => {}
             }
@@ -503,14 +545,11 @@ impl SolanaClient {
     }
 
     /// How many bytes `ixs` take on the wire as one transaction `payer`
-    /// pays for, with its signatures: over [`PACKET_DATA_SIZE`] it can't be
-    /// sent.
+    /// pays for, with its signatures, as it would go: by address, or through
+    /// a lookup table when that doesn't fit. Over [`PACKET_DATA_SIZE`] it
+    /// can't be sent.
     pub fn wire_size(&self, ixs: Vec<Instruction>, payer: &Pubkey) -> Result<usize> {
-        let message = Message::new(&with_budget(ixs), Some(payer));
-        let tx = Transaction::new_unsigned(message);
-        Ok(bincode::serialize(&tx)
-            .context("encoding the transaction")?
-            .len())
+        tables::sent_size(&with_budget(ixs), payer)
     }
 
     /// Run `ixs` without keeping anything, for what they return and log.
@@ -519,20 +558,283 @@ impl SolanaClient {
     }
 
     /// The same, with `addresses` as the transaction would leave them.
+    ///
+    /// It is compiled as the send would be: through the payer's lookup table
+    /// when it doesn't fit by address. Where this client holds the payer's
+    /// key (a role's), a table it needs is made or grown first, as the send
+    /// would; for any other payer it must already hold the accounts.
     pub async fn simulate_reading(
         &self,
         ixs: Vec<Instruction>,
         payer: &Pubkey,
         addresses: &[Pubkey],
     ) -> Result<Simulated> {
-        let message = Message::new(&with_budget(ixs), Some(payer));
-        let tx = Transaction::new_unsigned(message);
-        let wire = bincode::serialize(&tx).context("encoding the transaction")?;
+        let ixs = with_budget(ixs);
+        let own = self.own_key(payer);
+        let (table, _) = self.table_for(&ixs, payer, own).await?;
+        let message = tables::compile(&ixs, payer, table.as_ref(), Hash::default())?;
+        let unsigned = VersionedTransaction {
+            signatures: vec![Default::default(); message.header().num_required_signatures as usize],
+            message,
+        };
+        let wire = bincode::serialize(&unsigned).context("encoding the transaction")?;
         let simulated = self.rpc.simulate_reading(&wire, addresses).await?;
         if let Some(err) = simulated.err.clone() {
             return Err(TransactionFailed::from_err(None, err, simulated.logs).into());
         }
         Ok(simulated)
+    }
+
+    /// The role key at `address`, if this client holds it.
+    fn own_key(&self, address: &Pubkey) -> Option<&Keypair> {
+        self.keys.as_deref()?.find(address)
+    }
+
+    // Lookup tables -------------------------------------------------------------
+
+    /// The table `payer`'s transaction of `ixs` goes through, if it doesn't
+    /// fit by address, read and checked just now and ready to use; and the
+    /// transactions that made or grew it, if `builder` (the payer's key) had
+    /// to. Without the key, a table not ready is an error.
+    async fn table_for(
+        &self,
+        ixs: &[Instruction],
+        payer: &Pubkey,
+        builder: Option<&Keypair>,
+    ) -> Result<(Option<Table>, Vec<TransactionRecord>)> {
+        if tables::fits(&tables::by_address(ixs, payer, Hash::default())) {
+            return Ok((None, Vec::new()));
+        }
+        let wanted = tables::tableable(ixs, payer);
+        if wanted.len() > tables::MOST_ADDRESSES {
+            bail!(
+                "a transaction naming {} accounts is more than one lookup table holds",
+                wanted.len()
+            );
+        }
+        let held = {
+            let mut all = self.tables.lock().map_err(|_| anyhow!("a poisoned lock"))?;
+            all.entry(*payer).or_default().clone()
+        };
+        let mut held = held.lock().await;
+        if held.is_none() {
+            *held = Some(self.find_tables(payer).await);
+        }
+        let known = held.get_or_insert_with(Vec::new);
+        let (readable, unread) = self.read_tables(payer, known).await?;
+        *known = readable.iter().chain(&unread).cloned().collect();
+
+        if let Some(table) = readable.iter().find(|table| table.ready_for(&wanted)) {
+            return Ok((Some(table.clone()), Vec::new()));
+        }
+        if let Some(table) = readable.iter().find(|table| table.holds(&wanted)).cloned() {
+            let table = self.warmed_up(payer, &table, table.extended_in).await?;
+            replace(known, &table);
+            return Ok((Some(table), Vec::new()));
+        }
+        if !unread.is_empty() {
+            let unread: Vec<String> = unread
+                .iter()
+                .map(|table| table.address.to_string())
+                .collect();
+            bail!(
+                "{payer}'s lookup tables {} could not be read just now: no new one is made while they may still be there",
+                unread.join(", ")
+            );
+        }
+        let Some(builder) = builder else {
+            bail!("the transaction needs a lookup table {payer} has not made yet");
+        };
+
+        let mut setup = Vec::new();
+        let (address, before, adding) = match tables::to_extend(&readable, &wanted) {
+            Some(table) => (
+                table.address,
+                table.addresses.clone(),
+                table.missing(&wanted),
+            ),
+            None => {
+                let recent = self.rpc.slot().await?;
+                let (create, address) = tables::create_lookup_table(*payer, *payer, recent);
+                let first: Vec<Pubkey> =
+                    wanted.iter().take(tables::ADDED_AT_ONCE).copied().collect();
+                let extend = tables::extend_lookup_table(address, *payer, Some(*payer), first);
+                setup.push(self.set_up(vec![create, extend], builder).await?);
+                (
+                    address,
+                    Vec::new(),
+                    wanted[wanted.len().min(tables::ADDED_AT_ONCE)..].to_vec(),
+                )
+            }
+        };
+        for chunk in adding.chunks(tables::ADDED_AT_ONCE) {
+            let extend = tables::extend_lookup_table(address, *payer, Some(*payer), chunk.to_vec());
+            setup.push(self.set_up(vec![extend], builder).await?);
+        }
+        let last = setup.iter().map(|record| record.slot).max().unwrap_or(0);
+        let mut expected = before;
+        expected.extend(
+            wanted
+                .iter()
+                .filter(|key| !expected.contains(key))
+                .copied()
+                .collect::<Vec<_>>(),
+        );
+        // Known before it is waited on, so a wait that ends without reading
+        // it leaves the next send to read it rather than make another.
+        let grown = Table {
+            address,
+            addresses: expected,
+            usable: 0,
+            extended_in: last,
+        };
+        replace(known, &grown);
+        let table = self.warmed_up(payer, &grown, last).await?;
+        if !table.ready_for(&wanted) {
+            bail!(
+                "the lookup table {address} was grown and does not hold the transaction's accounts"
+            );
+        }
+        replace(known, &table);
+        tracing::info!(%payer, table = %address, addresses = table.addresses.len(), "a lookup table grown");
+        Ok((Some(table), setup))
+    }
+
+    /// Send a lookup table's set-up, `payer` paying.
+    async fn set_up(&self, ixs: Vec<Instruction>, payer: &Keypair) -> Result<TransactionRecord> {
+        let (blockhash, last_valid) = self.blockhash().await?;
+        let message = tables::by_address(&ixs, &payer.pubkey(), blockhash);
+        let landed = self
+            .land(signed(message, &[payer])?, last_valid)
+            .await
+            .context("setting up a lookup table")?;
+        Ok(landed.record)
+    }
+
+    /// `payer`'s tables on the cluster, found by their authority: none if
+    /// the node won't search (some won't), and the first send that needs
+    /// one makes a new one.
+    async fn find_tables(&self, payer: &Pubkey) -> Vec<Table> {
+        let found = match self
+            .rpc
+            .program_accounts(&tables::PROGRAM, &tables::owned_by(payer))
+            .await
+        {
+            Ok(found) => found,
+            Err(error) => {
+                tracing::warn!(%payer, error = format!("{error:#}"), "the node would not find the key's lookup tables: a new one will be made");
+                return Vec::new();
+            }
+        };
+        let slot = self.rpc.slot().await.unwrap_or(0);
+        found
+            .into_iter()
+            .filter_map(|(address, account)| Table::read(address, &account, payer, slot).ok())
+            .collect()
+    }
+
+    /// `known` as the cluster holds each table now, with every address it
+    /// held before still at its index; and those that could not be read,
+    /// as they were. One that is not `payer`'s, deactivated or changed is
+    /// dropped and never used again. One the node answers nothing for is
+    /// read again a few times, and then looked for among `payer`'s tables:
+    /// it is dropped only if that search finds it gone, and kept unread if
+    /// the node won't search.
+    async fn read_tables(
+        &self,
+        payer: &Pubkey,
+        known: &[Table],
+    ) -> Result<(Vec<Table>, Vec<Table>)> {
+        if known.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let addresses: Vec<Pubkey> = known.iter().map(|table| table.address).collect();
+        let mut accounts = self.rpc.accounts(&addresses).await?;
+        for _ in 1..TABLE_READS {
+            let missing: Vec<usize> = (0..accounts.len())
+                .filter(|at| accounts[*at].is_none())
+                .collect();
+            if missing.is_empty() {
+                break;
+            }
+            tokio::time::sleep(POLL).await;
+            let again: Vec<Pubkey> = missing.iter().map(|at| addresses[*at]).collect();
+            for (at, account) in missing.into_iter().zip(self.rpc.accounts(&again).await?) {
+                accounts[at] = account;
+            }
+        }
+        let mut searched = false;
+        if accounts.iter().any(Option::is_none) {
+            match self
+                .rpc
+                .program_accounts(&tables::PROGRAM, &tables::owned_by(payer))
+                .await
+            {
+                Ok(found) => {
+                    searched = true;
+                    for (address, account) in found {
+                        if let Some(at) = addresses.iter().position(|known| *known == address)
+                            && accounts[at].is_none()
+                        {
+                            accounts[at] = Some(account);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%payer, error = format!("{error:#}"), "the node would not find the key's lookup tables")
+                }
+            }
+        }
+        let slot = self.rpc.slot().await?;
+        let (mut readable, mut unread) = (Vec::new(), Vec::new());
+        for (was, account) in known.iter().zip(accounts) {
+            let Some(account) = account else {
+                if searched {
+                    tracing::warn!(%payer, table = %was.address, "a lookup table is gone: neither read nor found");
+                } else {
+                    tracing::warn!(%payer, table = %was.address, "a lookup table could not be read: kept");
+                    unread.push(was.clone());
+                }
+                continue;
+            };
+            let read = Table::read(was.address, &account, payer, slot)
+                .and_then(|table| table.agrees_with(&was.addresses).map(|()| table));
+            match read {
+                Ok(table) => readable.push(table),
+                Err(error) => {
+                    tracing::warn!(%payer, error = format!("{error:#}"), "a lookup table refused")
+                }
+            }
+        }
+        Ok((readable, unread))
+    }
+
+    /// `table` read again once the cluster is past `slot`, the slot it was
+    /// last grown in, so everything in it can be looked up; checked to hold
+    /// what it held.
+    async fn warmed_up(&self, payer: &Pubkey, table: &Table, slot: u64) -> Result<Table> {
+        let started = Instant::now();
+        loop {
+            let now = self.rpc.slot().await?;
+            // A node behind the cluster answers nothing for a table that
+            // is there: it is asked again until the wait is over.
+            if now > slot
+                && let Some(account) = self.rpc.account(&table.address).await?
+            {
+                let read = Table::read(table.address, &account, payer, now)?;
+                read.agrees_with(&table.addresses)?;
+                if read.usable >= table.addresses.len() {
+                    return Ok(read);
+                }
+            }
+            if started.elapsed() > WARM_UP_TIMEOUT {
+                bail!(
+                    "the lookup table {} never became usable: the cluster stayed at slot {now}, or the node never read it",
+                    table.address
+                );
+            }
+            tokio::time::sleep(POLL).await;
+        }
     }
 
     /// Coin from the cluster's own faucet, waited for: development clusters
@@ -552,6 +854,26 @@ impl SolanaClient {
             tokio::time::sleep(POLL).await;
         }
         bail!("an airdrop to {to} never landed")
+    }
+}
+
+/// `message` signed by `signers`, each once, the payer first among them.
+fn signed(message: VersionedMessage, signers: &[&Keypair]) -> Result<VersionedTransaction> {
+    let mut unique: Vec<&Keypair> = Vec::new();
+    for signer in signers {
+        if !unique.iter().any(|seen| seen.pubkey() == signer.pubkey()) {
+            unique.push(signer);
+        }
+    }
+    VersionedTransaction::try_new(message, &unique)
+        .map_err(|error| anyhow!("signing the transaction: {error}"))
+}
+
+/// `table` in place of the one of the same address in `known`.
+fn replace(known: &mut Vec<Table>, table: &Table) {
+    match known.iter_mut().find(|held| held.address == table.address) {
+        Some(held) => *held = table.clone(),
+        None => known.push(table.clone()),
     }
 }
 

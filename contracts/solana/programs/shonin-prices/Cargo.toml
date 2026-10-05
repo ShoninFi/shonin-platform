@@ -22,6 +22,8 @@ custom-heap = []
 custom-panic = []
 # Build with the committed mainnet id (mainnet-id) instead of the local keypair's.
 mainnet = []
+# Build with the committed devnet id (devnet-id), derived from the team's mnemonic.
+devnet = []
 
 [dependencies]
 anchor-lang = { workspace = true }

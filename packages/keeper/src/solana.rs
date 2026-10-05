@@ -22,13 +22,22 @@
 //!   the longer it keeps waiting; a vault whose claim is still unpaid after
 //!   its try past the freeze period frozen; a retired vault evicted once its
 //!   wind-down is over;
+//! - each holder's units the pro-rata fallback left served (`serve_pro_rata`)
+//!   at most once a slot, less often after one that landed and failed, never
+//!   while a valuation's settlement is owed; a vault whose holder's units have
+//!   waited unserved as long as a claim may frozen (`freeze_units`); a closed
+//!   vault's units still served;
+//! - once a day for an open vault that hasn't halted, after the slot's
+//!   settlement, its restricted list read again (`refresh_restricted`) from
+//!   each driver whose read alone would lengthen it, and only then;
 //! - finished requests and claims closed, their rent going back to whoever
 //!   paid it; a closed vault's waiting requests and claims paid through its
 //!   own doors, its station stopped and emptied, its last bill collected.
 //!
 //! Every send is run by the node before it goes out (its preflight), so a
 //! call the vault would refuse costs nothing; what must land inside a window,
-//! or is only worth sending when it moves money, is simulated first as well.
+//! or is only worth sending when it moves money, is simulated first as well,
+//! as is every serve, freeze for units and refresh.
 //! What the keeper remembers having done is remembered only once it landed
 //! and went through.
 
@@ -45,7 +54,7 @@ use chain::solana::{
     Instruction, Keypair, Platform, Pubkey, Signer, SolanaClient, TransactionFailed,
 };
 use serde::Deserialize;
-use vp::state::{Claim, ClaimState, Request, Vault, VaultState};
+use vp::state::{Claim, ClaimState, Holder, Request, Vault, VaultState};
 
 use crate::{DAY, MINUTE, Said, chain_kept, waited};
 
@@ -175,6 +184,8 @@ struct Memory {
     quiet_since: Option<u64>,
     /// Each waiting claim's next try: the slot, and the wait in slots.
     claims_tried: HashMap<u64, (u64, u64)>,
+    /// Each unit holder's next serve, by owner (see [`next_units_try`]).
+    units_tried: HashMap<Pubkey, UnitsTry>,
     /// The slot the station was last unwound in, and when an unwind found
     /// not worth sending is next simulated: the chain time, and the wait.
     unwound_in: Option<u64>,
@@ -317,6 +328,82 @@ fn worth_an_unwind(brought: u128, dust: u128) -> bool {
     brought >= UNWIND_WORTH_AT_LEAST.max(dust)
 }
 
+/// When a holder's units are next tried.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct UnitsTry {
+    /// The first slot they may be tried in.
+    next: u64,
+    /// How many slots the last send that landed and failed was told to wait.
+    wait: u64,
+    /// The first of the keeper's rounds (see [`Memory::rounds`]) they may be
+    /// tried in: a cluster whose clock runs fast passes many slots in a
+    /// round, and the wait is whichever of the two is longer.
+    next_round: u64,
+}
+
+/// Whether a holder's units are tried in `slot` and the keeper's round
+/// `round`, after the try `before`.
+fn units_due(before: Option<UnitsTry>, slot: u64, round: u64) -> bool {
+    before.is_none_or(|before| slot >= before.next && round >= before.next_round)
+}
+
+/// The next try of a holder's units, after one at `slot` in the keeper's
+/// round `round` that came to `outcome` (none when nothing was sent), the
+/// vault's slots `interval` apart: a send that landed and failed paid its fee
+/// and served nothing, so the wait doubles, up to
+/// [`MOST_SECONDS_BETWEEN_REVERTS`], and is as many of the keeper's rounds
+/// too; anything else is tried again next slot, the wait kept, as a refusal
+/// costs nothing.
+fn next_units_try(
+    before: Option<UnitsTry>,
+    outcome: Option<Outcome>,
+    slot: u64,
+    interval: u64,
+    round: u64,
+) -> UnitsTry {
+    let kept = before.map_or(1, |before| before.wait);
+    match outcome {
+        Some(Outcome::Reverted) => {
+            let most = (MOST_SECONDS_BETWEEN_REVERTS / interval.max(1)).max(1);
+            let wait = before.map_or(1, |before| (before.wait * 2).clamp(1, most));
+            UnitsTry {
+                next: slot + wait,
+                wait,
+                next_round: round + wait,
+            }
+        }
+        _ => UnitsTry {
+            next: slot + 1,
+            wait: kept,
+            next_round: round,
+        },
+    }
+}
+
+/// Whether a vault may be frozen for `holder`'s units: they have waited
+/// unserved as long as a claim may, the vault is live and hasn't halted, and
+/// no valuation's settlement is owed, which the serve waits for and may pay
+/// them from.
+fn freeze_for_units_due(holder: &Holder, vault: &Vault, now: u64) -> bool {
+    holder.units != 0
+        && now >= holder.units_since.saturating_add(vault.timers.freeze_after)
+        && vault.live()
+        && !vault.halted()
+        && !vault.owed()
+}
+
+/// Whether a vault's restricted list is read again in its daily round: while
+/// it is open and hasn't halted, as on the EVM.
+fn refresh_wanted(vault: &Vault) -> bool {
+    vault.state == VaultState::Open && !vault.halted()
+}
+
+/// Whether a refresh left the vault, as simulated, with a longer list than
+/// the one whose hash it holds: one that adds nothing is not paid for.
+fn lengthens(before: &Vault, after: Option<&Vault>) -> bool {
+    after.is_some_and(|after| after.restricted_hash != before.restricted_hash)
+}
+
 impl Keeping {
     fn keeper(&self) -> Pubkey {
         self.keeper.pubkey()
@@ -360,6 +447,24 @@ impl Keeping {
         outcome
     }
 
+    /// Simulate `ixs` as the keeper's, and send them only when the node
+    /// accepts them: one the node refuses cost nothing and is counted
+    /// refused (or stale, or not sent when the node itself failed).
+    async fn send_simulated(
+        &self,
+        vault: &Pubkey,
+        ixs: Vec<Instruction>,
+        what: &'static str,
+    ) -> Outcome {
+        match self.client.simulate(ixs.clone(), &self.keeper()).await {
+            Ok(_) => self.send(vault, ixs, what).await,
+            Err(error) => {
+                tracing::debug!(%vault, what, error = format!("{error:#}"), "the simulation turns it down; not sent");
+                Outcome::of(&Err(error))
+            }
+        }
+    }
+
     async fn round(&self, memory: &mut HashMap<Pubkey, Memory>) -> Result<()> {
         let vaults = self.platform.vaults(&self.client).await?;
         let addresses: Vec<Pubkey> = vaults.iter().map(|(address, _)| *address).collect();
@@ -372,6 +477,7 @@ impl Keeping {
             let remembered = memory.entry(*address).or_default();
             let theirs = claims.remove(address).unwrap_or_default();
             let done = self.keep_one(address, vault, &theirs, remembered).await;
+            steps_worked(address, done.is_ok());
             match done {
                 Ok(()) => {
                     remembered.rounds_failing = 0;
@@ -402,6 +508,16 @@ impl Keeping {
                 .not_sent
                 .retain(|(vault, _), _| addresses.contains(vault));
         }
+        if let Ok(mut failed) = STEPS_FAILED.lock() {
+            failed.retain(|(vault, _), _| addresses.contains(vault));
+        }
+        if let Ok(mut asks) = ASKS.lock() {
+            asks.unanswered.retain(|vault| addresses.contains(vault));
+            asks.not_wanted.retain(|vault, _| addresses.contains(vault));
+            asks.latest.retain(|vault, _| addresses.contains(vault));
+            asks.note_serving();
+        }
+        say_serving_none();
         Ok(())
     }
 
@@ -435,6 +551,8 @@ impl Keeping {
             .collect_answered(&v, vault, grace_end, now, false, memory)
             .await;
         let due = memory.daily_at.is_none_or(|at| now >= at + DAY);
+        // The restricted list is the day's too, read after the settle.
+        let refresh = due && refresh_wanted(vault);
         if due {
             memory.daily_at = Some(now);
             if !vault.halted() && nothing_to_charge(&vault.tank, None).is_none() {
@@ -483,10 +601,24 @@ impl Keeping {
         carry_on(address, "settle", self.settle(&v).await);
         carry_on(address, "value", self.value(&v, address).await);
         carry_on(address, "settle", self.settle(&v).await);
+        // After the round's settle, so the list is read against what was
+        // priced.
+        if refresh {
+            carry_on(
+                address,
+                "refresh the restricted list",
+                self.refresh_restricted(address).await,
+            );
+        }
         carry_on(
             address,
             "claims",
             self.claims(&v, address, claims, memory).await,
+        );
+        carry_on(
+            address,
+            "units",
+            self.units(&v, address, true, memory).await.map(|_| ()),
         );
 
         if vault.state == VaultState::WindingDown
@@ -686,6 +818,169 @@ impl Keeping {
         }
         if all_done {
             memory.rent_read = Some(read_at);
+        }
+        Ok(())
+    }
+
+    // The pro-rata fallback and the restricted list ------------------------------------------
+
+    /// Serve every holder's units the pro-rata fallback left, each at most
+    /// once a slot and less often after a serve that landed and failed; and,
+    /// if `freezable`, freeze the vault for units left unserved as long as a
+    /// claim may wait. Holders are read only while the vault counts units.
+    /// Whether every holder is served.
+    async fn units(
+        &self,
+        v: &VaultAccounts,
+        address: &Pubkey,
+        freezable: bool,
+        memory: &mut Memory,
+    ) -> Result<bool> {
+        let vault = self.platform.vault(&self.client, address).await?;
+        if vault.units == 0 {
+            memory.units_tried.clear();
+            return Ok(true);
+        }
+        let holders = self.platform.unit_holders(&self.client, address).await?;
+        memory
+            .units_tried
+            .retain(|owner, _| holders.iter().any(|holder| holder.owner == *owner));
+        let mut all_served = true;
+        for holder in &holders {
+            // One holder whose serve can't be built or read holds up no
+            // other.
+            match self
+                .serve_holder(v, address, &holder.owner, freezable, memory)
+                .await
+            {
+                Ok(served) => all_served &= served,
+                Err(error) => {
+                    all_served = false;
+                    carry_on(address, "serve a holder's units", Err(error));
+                }
+            }
+        }
+        Ok(all_served)
+    }
+
+    /// One holder's units served, when their try is due; the vault frozen
+    /// for them if they are still unserved and have waited as long as a claim
+    /// may. Whether they are served.
+    async fn serve_holder(
+        &self,
+        v: &VaultAccounts,
+        address: &Pubkey,
+        owner: &Pubkey,
+        freezable: bool,
+        memory: &mut Memory,
+    ) -> Result<bool> {
+        let now = self.client.now().await?;
+        let vault = self.platform.vault(&self.client, address).await?;
+        let slot = slot_of(now, vault.timers.slot_interval);
+        let before = memory.units_tried.get(owner).copied();
+        if !units_due(before, slot, memory.rounds) {
+            return Ok(false);
+        }
+        // Refused while a valuation's settlement is owed: not sent.
+        let mut outcome = None;
+        if !vault.owed() {
+            let ix = self
+                .platform
+                .ix_serve_pro_rata(&self.client, v, &vault, &self.keeper(), owner)
+                .await?;
+            outcome = Some(
+                self.send_simulated(address, vec![ix], "serve a holder's units")
+                    .await,
+            );
+        }
+        let left = self
+            .platform
+            .holder(&self.client, address, owner)
+            .await?
+            .filter(|holder| holder.units != 0);
+        let Some(holder) = left else {
+            memory.units_tried.remove(owner);
+            tracing::info!(vault = %address, %owner, "the holder's units are served");
+            return Ok(true);
+        };
+        if freezable {
+            let vault = self.platform.vault(&self.client, address).await?;
+            if freeze_for_units_due(&holder, &vault, now) {
+                let ix = self.platform.ix_freeze_units(address, owner);
+                let frozen = self
+                    .send_simulated(address, vec![ix], "freeze for units left unserved")
+                    .await;
+                if frozen == Outcome::Reverted {
+                    outcome = Some(Outcome::Reverted);
+                }
+            }
+        }
+        memory.units_tried.insert(
+            *owner,
+            next_units_try(
+                before,
+                outcome,
+                slot,
+                vault.timers.slot_interval,
+                memory.rounds,
+            ),
+        );
+        Ok(false)
+    }
+
+    /// The vault's restricted list read again from its drivers: each driver
+    /// is simulated alone, so one whose read fails (which fails the whole
+    /// call) is left out, and only those that would lengthen the list are
+    /// sent, together, once the node accepts them.
+    async fn refresh_restricted(&self, address: &Pubkey) -> Result<()> {
+        let vault = self.platform.vault(&self.client, address).await?;
+        if !refresh_wanted(&vault) {
+            return Ok(());
+        }
+        let now = self.client.now().await?;
+        let mut adding = Vec::new();
+        for (index, name) in vault.drivers.iter().enumerate() {
+            let index = u8::try_from(index)?;
+            let reading = self
+                .platform
+                .driver_reading(&self.client, name, now)
+                .await?;
+            let ix =
+                self.platform
+                    .ix_refresh_restricted(address, &self.keeper(), &[(index, reading)]);
+            let after = match self
+                .client
+                .simulate_reading(vec![ix], &self.keeper(), &[*address])
+                .await
+            {
+                Ok(simulated) => simulated
+                    .accounts
+                    .first()
+                    .cloned()
+                    .flatten()
+                    .and_then(|account| Vault::try_deserialize(&mut &account.data[..]).ok()),
+                Err(error) => {
+                    tracing::debug!(vault = %address, driver = index, error = format!("{error:#}"), "the driver's list can't be read again; left out");
+                    None
+                }
+            };
+            if lengthens(&vault, after.as_ref()) {
+                adding.push((index, reading));
+            }
+        }
+        if adding.is_empty() {
+            tracing::debug!(vault = %address, "the restricted list is current");
+            return Ok(());
+        }
+        let ix = self
+            .platform
+            .ix_refresh_restricted(address, &self.keeper(), &adding);
+        if self
+            .send_simulated(address, vec![ix], "refresh the restricted list")
+            .await
+            == Outcome::Done
+        {
+            tracing::info!(vault = %address, drivers = adding.len(), "the restricted list was read again from the drivers");
         }
         Ok(())
     }
@@ -1104,6 +1399,15 @@ impl Keeping {
             }
         }
 
+        // A closed vault is past freezing; its units are still served.
+        match self.units(v, &address, false, memory).await {
+            Ok(served) => waiting |= !served,
+            Err(error) => {
+                waiting = true;
+                carry_on(&address, "units", Err(error));
+            }
+        }
+
         let closed_at = *memory.closed_seen_at.get_or_insert((now, Instant::now()));
         let billed = self
             .last_bill(v, vault, closed_at, grace_end, now, memory)
@@ -1172,13 +1476,49 @@ impl Keeping {
     }
 }
 
-/// A step that failed is said at debug and the round carries on: one that
-/// can't go through this round mustn't hold up the steps after it.
+/// A step that failed is said at warn (at once, then at most every ten
+/// minutes with a count, for each vault and step) and the round carries on:
+/// one that can't go through this round mustn't hold up the steps after it.
+/// A round of the vault that finishes without it failing ends it (see
+/// [`steps_worked`]): its next failure is said at once.
 fn carry_on(vault: &Pubkey, step: &'static str, done: Result<()>) {
     if let Err(error) = done {
-        tracing::debug!(%vault, step, error = format!("{error:#}"), "a step did not go through");
+        let due = STEPS_FAILED.lock().ok().and_then(|mut failed| {
+            let failed = failed.entry((*vault, step)).or_default();
+            failed.this_round = true;
+            failed.said.due(Instant::now())
+        });
+        if let Some(times) = due {
+            tracing::warn!(%vault, step, times, error = format!("{error:#}"), "a step did not go through");
+        }
     }
 }
+
+/// The vault's round is over: if it `finished`, the steps that failed before
+/// and not in it go through again. Either way the next round starts afresh.
+fn steps_worked(vault: &Pubkey, finished: bool) {
+    let Ok(mut failed) = STEPS_FAILED.lock() else {
+        return;
+    };
+    failed.retain(|(at, step), failed| {
+        if at != vault {
+            return true;
+        }
+        if finished && !failed.this_round {
+            if failed.said.over() {
+                tracing::info!(vault = %at, step, "the step goes through again");
+            }
+            return false;
+        }
+        failed.this_round = false;
+        true
+    });
+}
+
+/// The steps that failed, by vault and step (see [`carry_on`]).
+static STEPS_FAILED: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<(Pubkey, &'static str), crate::StepFailed>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// The vault's bill is settled: the vault is no longer said to refuse it,
 /// and a close held for it is held no longer. Whether it had been said.
@@ -1219,8 +1559,73 @@ struct Asks {
     latest: HashMap<Pubkey, (Asked, Instant)>,
     in_flight: HashMap<Pubkey, Instant>,
     unanswered: std::collections::BTreeSet<Pubkey>,
+    /// When the keeper last said it no longer wants a vault's total: an
+    /// answer to an ask sent before then doesn't count (see
+    /// [`total_not_wanted`]).
+    not_wanted: HashMap<Pubkey, Instant>,
     failing_since: Option<Instant>,
     said: Said,
+    /// Since when its latest answer for every vault the keeper still wants a
+    /// total for has been a 404, while it is (see [`serving_none`]), and
+    /// that warning.
+    serving_none_since: Option<Instant>,
+    serving_none_said: Said,
+}
+
+impl Asks {
+    /// Whether the keeper still wants a total for the vault, as of an ask
+    /// sent at `sent`.
+    fn wanted(&self, vault: &Pubkey, sent: Instant) -> bool {
+        self.not_wanted.get(vault).is_none_or(|since| sent > *since)
+    }
+
+    /// Start or stop the time the executor has served no vault (see
+    /// [`serving_none`]), counting only the vaults the keeper still wants a
+    /// total for: it serves none while every such vault's latest answer is a
+    /// 404, and not once any gets a total or none is wanted.
+    fn note_serving(&mut self) {
+        let mut wanted = self
+            .latest
+            .iter()
+            .filter(|(vault, (_, sent))| self.wanted(vault, *sent))
+            .peekable();
+        let none = wanted.peek().is_some()
+            && wanted.all(|(_, (asked, _))| matches!(asked, Asked::NotServed));
+        if none {
+            self.serving_none_since.get_or_insert_with(Instant::now);
+        } else {
+            self.serving_none_since = None;
+        }
+    }
+}
+
+/// Whether the executor's latest answer for every Solana vault the keeper
+/// still wants a total for has been a 404, with none served a total, for as
+/// long as the EVM's executors may (see [`crate::serving_none_for`]): a URL
+/// that is wrong answers so, and no bill is collected.
+fn serving_none(asks: &Asks, now: Instant) -> bool {
+    asks.serving_none_since
+        .is_some_and(|since| now.saturating_duration_since(since) >= crate::serving_none_for())
+}
+
+/// Say at warn that the executor serves no Solana vault (see
+/// [`serving_none`]), at once, then at most every ten minutes with a count,
+/// while it doesn't.
+fn say_serving_none() {
+    let Ok(mut asks) = ASKS.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    if serving_none(&asks, now) {
+        if let Some(times) = asks.serving_none_said.due(now) {
+            tracing::warn!(
+                times,
+                "the executor has answered 404 for every Solana vault it was asked about, and served none; check the executor's URL"
+            );
+        }
+    } else if asks.serving_none_said.over() {
+        tracing::info!("the executor serves a Solana vault again");
+    }
 }
 
 static ASKS: std::sync::LazyLock<std::sync::Mutex<Asks>> =
@@ -1265,8 +1670,16 @@ fn ask(cluster: &str, url: &str, vault: &Pubkey) -> Option<Instant> {
                 if asks.latest.get(&vault).is_none_or(|(_, at)| *at < sent) {
                     asks.latest.insert(vault, (asked, sent));
                 }
+                asks.note_serving();
             }
             Err(error) => {
+                if asks
+                    .not_wanted
+                    .get(&vault)
+                    .is_some_and(|since| sent <= *since)
+                {
+                    return;
+                }
                 asks.unanswered.insert(vault);
                 let now = Instant::now();
                 asks.failing_since.get_or_insert(now);
@@ -1296,13 +1709,16 @@ async fn answer_in_flight(vault: &Pubkey, limit: Duration) {
 }
 
 /// The keeper no longer wants a total for the vault: it no longer counts
-/// against the executor in the health.
+/// against the executor in the health, and an ask already sent that comes
+/// back with no answer doesn't put it back.
 fn total_not_wanted(vault: &Pubkey) {
     if let Ok(mut asks) = ASKS.lock() {
         asks.unanswered.remove(vault);
+        asks.not_wanted.insert(*vault, Instant::now());
         if asks.unanswered.is_empty() {
             asks.failing_since = None;
         }
+        asks.note_serving();
     }
 }
 
@@ -1442,6 +1858,13 @@ pub fn troubles(now: Instant) -> Vec<(String, String)> {
         out.push((
             "executor not answering".to_string(),
             format!("no total from the executor for: {}", vaults.join(", ")),
+        ));
+    }
+    if ASKS.lock().is_ok_and(|asks| serving_none(&asks, now)) {
+        out.push((
+            "executor serves no vault".to_string(),
+            "the executor answers 404 for every Solana vault it is asked about: check its URL"
+                .to_string(),
         ));
     }
     out
@@ -1606,6 +2029,235 @@ mod tests {
                 .all(|(_, detail)| !detail.contains(&format!("keep solana/{vault}")))
         );
         TROUBLES.lock().unwrap().unkept.clear();
+    }
+
+    fn a_vault() -> Vault {
+        let mut vault = Vault::try_deserialize_unchecked(&mut &[0u8; 8192][..]).unwrap();
+        vault.state = VaultState::Open;
+        vault.timers.freeze_after = 1_000;
+        vault.timers.slot_interval = 10;
+        vault
+    }
+
+    fn a_holder(units: u128, units_since: u64) -> Holder {
+        Holder {
+            vault: Pubkey::new_unique(),
+            owner: Pubkey::new_unique(),
+            shares: 0,
+            statement: [0; 32],
+            units,
+            unit_debt: 0,
+            unit_credit: 0,
+            units_since,
+            pending: 0,
+            payer: Pubkey::new_unique(),
+            bump: 0,
+        }
+    }
+
+    #[test]
+    fn a_holder_s_units_are_tried_once_a_slot_and_ever_less_often_in_slots_and_rounds_after_serves_that_landed_and_failed()
+     {
+        // Slots a minute apart: an hour is sixty of them.
+        let interval = 60;
+        assert!(units_due(None, 5, 0));
+        let mut tried = None;
+        let mut waits = Vec::new();
+        let (mut slot, mut round) = (10, 3);
+        for _ in 0..9 {
+            assert!(units_due(tried, slot, round));
+            let next = next_units_try(tried, Some(Outcome::Reverted), slot, interval, round);
+            assert!(
+                !units_due(Some(next), slot, round),
+                "tried again in the same slot"
+            );
+            // A clock that runs fast passes the wait in slots within a round:
+            // the rounds hold the try back as long.
+            assert!(
+                !units_due(Some(next), next.next + 1_000, round + next.wait - 1),
+                "tried again before as many rounds passed"
+            );
+            assert!(
+                !units_due(Some(next), next.next - 1, round + 1_000),
+                "tried again before as many slots passed"
+            );
+            assert!(units_due(Some(next), next.next, round + next.wait));
+            waits.push(next.wait);
+            slot = next.next;
+            round = next.next_round;
+            tried = Some(next);
+        }
+        assert_eq!(waits, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+        // A refusal costs nothing: next slot and any round, the wait kept
+        // for the next that lands and fails.
+        let refused = next_units_try(tried, Some(Outcome::Refused), 500, interval, 9);
+        assert_eq!(
+            refused,
+            UnitsTry {
+                next: 501,
+                wait: 60,
+                next_round: 9
+            }
+        );
+        assert!(units_due(Some(refused), 501, 9));
+        assert_eq!(
+            next_units_try(None, Some(Outcome::NotSent), 7, interval, 2),
+            UnitsTry {
+                next: 8,
+                wait: 1,
+                next_round: 2
+            }
+        );
+        let waited = UnitsTry {
+            next: 0,
+            wait: 4,
+            next_round: 0,
+        };
+        assert_eq!(
+            next_units_try(Some(waited), None, 7, interval, 2),
+            UnitsTry {
+                next: 8,
+                wait: 4,
+                next_round: 2
+            }
+        );
+        assert_eq!(
+            next_units_try(Some(waited), Some(Outcome::Reverted), 7, interval, 2),
+            UnitsTry {
+                next: 15,
+                wait: 8,
+                next_round: 10
+            }
+        );
+        // Slots longer than an hour still wait one.
+        assert_eq!(
+            next_units_try(Some(waited), Some(Outcome::Reverted), 7, 2 * 60 * MINUTE, 2).wait,
+            1
+        );
+    }
+
+    #[test]
+    fn a_vault_is_frozen_for_units_only_once_they_waited_a_freeze_period_on_a_live_vault_owing_nothing()
+     {
+        let vault = a_vault();
+        let holder = a_holder(5, 100);
+        assert!(!freeze_for_units_due(&holder, &vault, 1_099), "too early");
+        assert!(freeze_for_units_due(&holder, &vault, 1_100));
+        assert!(
+            !freeze_for_units_due(&a_holder(0, 100), &vault, 5_000),
+            "no units left"
+        );
+        let mut halted = a_vault();
+        halted.halted_at = 50;
+        assert!(!freeze_for_units_due(&holder, &halted, 5_000), "halted");
+        let mut closed = a_vault();
+        closed.state = VaultState::Closed;
+        assert!(!freeze_for_units_due(&holder, &closed, 5_000), "closed");
+        let mut winding = a_vault();
+        winding.state = VaultState::WindingDown;
+        assert!(freeze_for_units_due(&holder, &winding, 5_000));
+        let mut owed = a_vault();
+        owed.priced = true;
+        owed.priced_through = 3;
+        owed.request_cursor = 1;
+        assert!(
+            !freeze_for_units_due(&holder, &owed, 5_000),
+            "a valuation's settlement is owed"
+        );
+    }
+
+    #[test]
+    fn the_restricted_list_is_read_again_only_for_an_open_vault_not_halted_and_sent_only_if_it_lengthens()
+     {
+        let vault = a_vault();
+        assert!(refresh_wanted(&vault));
+        for state in [
+            VaultState::WindingDown,
+            VaultState::Frozen,
+            VaultState::Closed,
+        ] {
+            let mut other = a_vault();
+            other.state = state;
+            assert!(!refresh_wanted(&other), "{state:?}");
+        }
+        let mut halted = a_vault();
+        halted.halted_at = 1;
+        assert!(!refresh_wanted(&halted));
+
+        let mut longer = a_vault();
+        longer.restricted_hash = [9; 32];
+        assert!(lengthens(&vault, Some(&longer)));
+        assert!(!lengthens(&vault, Some(&a_vault())), "the same list");
+        assert!(!lengthens(&vault, None), "nothing read back");
+    }
+
+    #[test]
+    fn an_executor_answering_404_for_every_wanted_vault_is_said_to_serve_none_until_one_is_served_or_none_is_wanted()
+     {
+        let (first, second) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let later = || Instant::now() + crate::serving_none_for();
+        let mut asks = Asks::default();
+        asks.note_serving();
+        assert!(!serving_none(&asks, later()), "asked about no vault");
+
+        let sent = Instant::now();
+        asks.latest.insert(first, (Asked::NotServed, sent));
+        asks.latest.insert(second, (Asked::NotServed, sent));
+        asks.note_serving();
+        assert!(!serving_none(&asks, Instant::now()), "said at once");
+        assert!(serving_none(&asks, later()));
+
+        asks.latest
+            .insert(second, (Asked::Total(signed(1, 1)), Instant::now()));
+        asks.note_serving();
+        assert!(
+            !serving_none(&asks, later()),
+            "a vault is served, yet the executor is said to serve none"
+        );
+
+        // A vault no longer wanting a total doesn't count: the other's 404
+        // is then every wanted vault's.
+        asks.latest.insert(second, (Asked::NotServed, sent));
+        asks.not_wanted.insert(second, Instant::now());
+        asks.note_serving();
+        assert!(serving_none(&asks, later()));
+        asks.not_wanted.insert(first, Instant::now());
+        asks.note_serving();
+        assert!(
+            !serving_none(&asks, later()),
+            "no vault wants a total, yet the executor is said to serve none"
+        );
+    }
+
+    #[test]
+    fn an_executor_serving_no_vault_is_in_the_health() {
+        ASKS.lock().unwrap().serving_none_since = Some(Instant::now());
+        let said = troubles(Instant::now() + crate::serving_none_for());
+        ASKS.lock().unwrap().serving_none_since = None;
+        assert!(
+            said.iter()
+                .any(|(first, _)| first == "executor serves no vault"),
+            "{said:?}"
+        );
+        assert!(
+            troubles(Instant::now() + crate::serving_none_for())
+                .iter()
+                .all(|(first, _)| first != "executor serves no vault")
+        );
+    }
+
+    #[test]
+    fn a_failed_step_is_kept_until_a_round_of_its_vault_finishes_without_it() {
+        let vault = Pubkey::new_unique();
+        let kept = || STEPS_FAILED.lock().unwrap().contains_key(&(vault, "units"));
+        carry_on(&vault, "units", Err(anyhow::anyhow!("the node is down")));
+        assert!(kept());
+        steps_worked(&vault, true);
+        assert!(kept(), "it failed in the round that just finished");
+        steps_worked(&vault, false);
+        assert!(kept(), "a round that did not finish ends nothing");
+        steps_worked(&vault, true);
+        assert!(!kept(), "a round finished without it, yet it is kept");
     }
 
     #[test]

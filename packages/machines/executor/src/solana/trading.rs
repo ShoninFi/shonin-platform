@@ -141,28 +141,36 @@ impl Trading {
     /// Send for the agent, the key paying, and bill what it cost: a send
     /// that landed and failed was paid for too. The send is watched, and
     /// its cost counted, in a task of its own, which carries on if the agent
-    /// is stopped while it waits.
+    /// is stopped while it waits. One the node stopped answering about is
+    /// watched on in a task of its own, still in flight, and billed if it
+    /// lands (see [`landed_late`]); the agent is answered meanwhile.
     async fn send(&self, ixs: Vec<Instruction>) -> Result<Landed> {
         let _turn = self.sending.lock().await;
         let (client, key, spent) = (self.client.clone(), self.key.clone(), self.spent.clone());
+        let flights = self.flights.clone();
         let watched = self.flights.watched(async move {
             let sent = client.send(ixs, &[&key]).await;
             let cost = match &sent {
                 Ok(landed) => landed.payer_spent(),
-                Err(error) => match failed_signature(error) {
-                    Some(signature) => client
+                Err(error) => match to_bill(error) {
+                    ToBill::Failed(signature) => client
                         .transaction(&signature)
                         .await
                         .ok()
                         .flatten()
                         .map_or(0, |record| record.spent_by(&key.pubkey())),
-                    None => 0,
+                    ToBill::IfItLands(signature) => {
+                        let (client, key, spent) = (client.clone(), key.clone(), spent.clone());
+                        drop(flights.watched(async move {
+                            let cost = landed_late(&client, &signature, &key.pubkey()).await;
+                            add_spent(&spent, cost);
+                        }));
+                        0
+                    }
+                    ToBill::Nothing => 0,
                 },
             };
-            spent.fetch_add(
-                cost.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
-                Ordering::SeqCst,
-            );
+            add_spent(&spent, cost);
             sent
         });
         watched
@@ -392,12 +400,59 @@ impl Trading {
     }
 }
 
-/// The signature of a send that landed and failed: its fee was paid.
-fn failed_signature(error: &anyhow::Error) -> Option<String> {
-    error
+/// How long a send the node stopped answering about is watched on for, and
+/// how often it is looked for: well past its blockhash's life.
+const LATE_WATCH: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const LATE_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What a send that ended in `error` may have cost the key.
+#[derive(Debug, PartialEq)]
+enum ToBill {
+    /// It landed and failed: its fee was paid.
+    Failed(String),
+    /// The node stopped answering about it: it is paid for if it lands.
+    IfItLands(String),
+    /// It never landed, or never went out.
+    Nothing,
+}
+
+fn to_bill(error: &anyhow::Error) -> ToBill {
+    let failed = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<chain::solana::TransactionFailed>())
-        .and_then(|failed| failed.signature.clone())
+        .and_then(|failed| failed.signature.clone());
+    if let Some(signature) = failed {
+        return ToBill::Failed(signature);
+    }
+    match error.downcast_ref::<chain::solana::MayStillLand>() {
+        Some(late) => ToBill::IfItLands(late.signature.clone()),
+        None => ToBill::Nothing,
+    }
+}
+
+/// What the send `signature` cost `payer` once it is found landed, looked for
+/// every [`LATE_POLL`] for [`LATE_WATCH`]; nothing if it never is.
+async fn landed_late(client: &SolanaClient, signature: &str, payer: &Pubkey) -> i128 {
+    let started = std::time::Instant::now();
+    loop {
+        if let Ok(Some(record)) = client.transaction(signature).await {
+            tracing::info!(%signature, "a send the node stopped answering about landed: billed");
+            return record.spent_by(payer);
+        }
+        if started.elapsed() > LATE_WATCH {
+            tracing::warn!(%signature, "a send the node stopped answering about was never found landed");
+            return 0;
+        }
+        tokio::time::sleep(LATE_POLL).await;
+    }
+}
+
+/// `cost` added to what the agent's sends have cost the key.
+fn add_spent(spent: &AtomicI64, cost: i128) {
+    spent.fetch_add(
+        cost.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+        Ordering::SeqCst,
+    );
 }
 
 /// How a send that failed counts against the agent's health: refused if the
@@ -567,6 +622,37 @@ mod tests {
             tally_of(&anyhow!("the node did not answer")),
             crate::host::Tally::Unanswered
         ));
+    }
+
+    #[test]
+    fn a_send_that_landed_and_failed_is_billed_and_one_that_may_still_land_is_billed_if_it_lands() {
+        let failed: anyhow::Error = chain::solana::TransactionFailed {
+            signature: Some("failed".into()),
+            err: serde_json::json!({"InstructionError": [0, {"Custom": 6000}]}),
+            custom: Some(6000),
+            logs: vec![],
+        }
+        .into();
+        assert_eq!(
+            to_bill(&failed.context("buying spot")),
+            ToBill::Failed("failed".into())
+        );
+        // However deep the client's own context put it.
+        let late = anyhow!("the node did not answer")
+            .context(chain::solana::MayStillLand {
+                signature: "late".into(),
+            })
+            .context("setting up a lookup table");
+        assert_eq!(to_bill(&late), ToBill::IfItLands("late".into()));
+        let never: anyhow::Error = chain::solana::NeverLanded {
+            signature: "never".into(),
+        }
+        .into();
+        assert_eq!(to_bill(&never), ToBill::Nothing);
+        assert_eq!(
+            to_bill(&anyhow!("refused before it went out")),
+            ToBill::Nothing
+        );
     }
 
     #[test]

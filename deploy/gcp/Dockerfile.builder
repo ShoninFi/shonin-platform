@@ -1,14 +1,20 @@
 # syntax=docker/dockerfile:1
 # The builder: compiles submitted source into a signed bundle.
 # Runs on a Confidential Space VM, which attests to this image by its digest.
-# Built from the repository root: task cloud:build NAME=builder
-#   (docker build -f deploy/gcp/Dockerfile.builder .)
+# Built from the repository root: task cloud:build NAME=builder NETWORK=testnet
+#   (docker build --build-arg NETWORK_FEATURE=devnet -f deploy/gcp/Dockerfile.builder .)
 
 FROM rust:1.98.1-slim-bookworm AS build
 WORKDIR /src
 COPY . .
+# The network whose Solana program ids are compiled in: devnet for a testnet
+# image, mainnet for a mainnet one (task cloud:build passes it). The local
+# keypairs never reach the build, so an image without it could reach no
+# cluster.
+ARG NETWORK_FEATURE
 # rust-toolchain.toml pins the same compiler; --locked builds exactly Cargo.lock.
-RUN cargo build --release --locked -p shonin-builder --bin builder
+RUN : "${NETWORK_FEATURE:?pass --build-arg NETWORK_FEATURE=devnet or mainnet}" && \
+    cargo build --release --locked -p shonin-builder --bin builder --features "$NETWORK_FEATURE"
 # The reviewed crates of config/dependency-allowlist.toml (compiled into the
 # builder), fetched from crates.io and checked against their checksums: the
 # only crates.io crates a strategy build can reach, offline.

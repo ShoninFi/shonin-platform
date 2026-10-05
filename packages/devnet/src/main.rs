@@ -14,6 +14,7 @@
 
 mod dashboard;
 mod deploy;
+mod devnet_keys;
 mod market;
 mod publish;
 mod seed;
@@ -94,9 +95,16 @@ enum Command {
     },
     /// Write a Solana keypair derived from the testnet Solana mnemonic.
     SolanaKeypair {
-        /// Which: the deployer, or the program's own address.
+        /// Which: the deployer, or the registry's own address.
         #[arg(long, value_parser = ["deployer", "program"])]
         role: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Write every program's devnet keypair, derived from the testnet Solana
+    /// mnemonic, into a directory as `<name>-keypair.json`, and print each
+    /// program as `<name> <address> <final|upgradeable>`.
+    SolanaProgramKeypairs {
         #[arg(long)]
         out: PathBuf,
     },
@@ -215,6 +223,18 @@ async fn main() -> Result<()> {
             let pair = solana::keypair_from_mnemonic(&solana::testnet_mnemonic()?, index)?;
             chain::solana::keys::write_keypair(&pair, &out)?;
             println!("{}", chain::solana::Signer::pubkey(&pair));
+            Ok(())
+        }
+        Some(Command::SolanaProgramKeypairs { out }) => {
+            let written = devnet_keys::write_program_keypairs(&solana::testnet_mnemonic()?, &out)?;
+            for (name, address) in written {
+                let kind = if solana::deployed_final(name) {
+                    "final"
+                } else {
+                    "upgradeable"
+                };
+                println!("{name} {address} {kind}");
+            }
             Ok(())
         }
         Some(Command::Seed { .. }) if target.key.kind == ChainKind::Solana => {
@@ -357,12 +377,18 @@ async fn accounts(target: &Target) -> Result<()> {
         }
     }
     if target.network == NetworkName::Testnet {
-        let deployer =
-            solana::keypair_from_mnemonic(&solana::testnet_mnemonic()?, solana::DEPLOYER)?;
-        let program = solana::keypair_from_mnemonic(&solana::testnet_mnemonic()?, solana::PROGRAM)?;
+        let phrase = solana::testnet_mnemonic()?;
+        let deployer = solana::keypair_from_mnemonic(&phrase, solana::DEPLOYER)?;
         println!("Solana devnet");
-        println!("  deployer  {}", chain::solana::Signer::pubkey(&deployer));
-        println!("  program   {}", chain::solana::Signer::pubkey(&program));
+        println!(
+            "  {:<20} {}",
+            "deployer",
+            chain::solana::Signer::pubkey(&deployer)
+        );
+        for (name, index) in devnet_keys::PROGRAM_KEYS {
+            let program = solana::keypair_from_mnemonic(&phrase, index)?;
+            println!("  {name:<20} {}", chain::solana::Signer::pubkey(&program));
+        }
     }
     Ok(())
 }

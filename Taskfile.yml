@@ -102,6 +102,11 @@ tasks:
       - task: contracts:lint
       - cargo fmt --all --check
       - cargo clippy --workspace --all-targets -- -D warnings
+      - task: lint:wasm
+
+  lint:wasm:
+    desc: "clippy -D warnings for the crates built for wasm: the web app and the crates it uses, and the strategy SDK"
+    cmds:
       - cargo clippy {{.CARGO_WASM_PACKAGES}} --target wasm32-unknown-unknown -- -D warnings
       - cargo clippy {{.CARGO_WASIP2_PACKAGES}} --target wasm32-wasip2 -- -D warnings
 
