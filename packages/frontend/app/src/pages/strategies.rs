@@ -94,6 +94,19 @@ fn header() -> Dom {
                  money in its vault, read from its own contract. Sort by whichever matters to you."
             )
         }))
+        .child(match data::unread() {
+            0 => html!("span"),
+            1 => html!("p", {
+                .class(["small", "faint"])
+                .text("One more vault is not read yet; it is listed here once it has been read whole.")
+            }),
+            many => html!("p", {
+                .class(["small", "faint"])
+                .text(&format!(
+                    "{many} more vaults are not read yet; each is listed here once it has been read whole."
+                ))
+            }),
+        })
     })
 }
 

@@ -1,0 +1,37 @@
+[package]
+name = "shonin-local-driver-2"
+version = "0.1.0"
+description = "For tests only: the stand-in driver for the second copy of the stand-in venue"
+edition = "2021"
+license = "BUSL-1.1"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "shonin_local_driver_2"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build", "shonin-driver/idl-build"]
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+# Never set for this program: it is refused for mainnet at build time.
+mainnet = []
+
+[dependencies]
+anchor-lang = { workspace = true }
+anchor-spl = { workspace = true }
+shonin-driver = { path = "../../crates/shonin-driver" }
+shonin-local-driver = { path = "../shonin-local-driver", features = ["no-entrypoint"] }
+shonin-local-venue-2 = { path = "../shonin-local-venue-2", features = ["no-entrypoint"] }
+
+[build-dependencies]
+shonin-program-id = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

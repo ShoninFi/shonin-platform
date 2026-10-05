@@ -4,6 +4,9 @@
 //! that concern this vault into the payloads its streams carry. It is the only
 //! thing in the executor that polls: the strategy itself never does.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use alloy::primitives::{Address, U256};
 use alloy::rpc::types::Filter;
 use anyhow::Result;
@@ -20,26 +23,41 @@ use crate::scale::{ASSET_DECIMALS, SIZE_DECIMALS, signed_to_decimal, to_decimal}
 pub use crate::host::shonin::agent::vault::VaultEvent;
 
 /// Follow one vault: what the venue does to its station's account, and what
-/// the vault says about itself.
+/// the vault says about itself. It reads on from the block `next` holds and
+/// keeps it at the block after the last it has passed on, so a watcher
+/// started after this one carries on where it stopped.
 pub async fn run(
     chain: Client,
     vault: Address,
     station: Address,
     venue: Address,
-    from_block: u64,
+    next_block: Arc<AtomicU64>,
     account: UnboundedSender<Vec<u8>>,
     vault_events: UnboundedSender<VaultEvent>,
 ) {
-    let mut next = from_block;
+    let mut next = next_block.load(Ordering::SeqCst);
     // The shortfall last reported, so an agent hears about a new one rather
     // than the same one every block.
     let mut reported = U256::ZERO;
+    // Whether the last look failed, so a failure is said once at `warn` when
+    // it starts rather than at every block.
+    let mut chain_down = false;
+    let mut cash_unread = false;
+    // Blocks that can't be read are tried again every look, and said about
+    // once a minute.
+    let mut unread = crate::Throttle::default();
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         let head = match chain.block_number().await {
-            Ok(head) => head,
+            Ok(head) => {
+                chain_down = false;
+                head
+            }
             Err(error) => {
-                tracing::debug!(%error, "the chain did not answer");
+                if !chain_down {
+                    tracing::warn!(%vault, error = format!("{error:#}"), "the chain did not answer; the agent hears nothing new until it does");
+                }
+                chain_down = true;
                 continue;
             }
         };
@@ -47,7 +65,14 @@ pub async fn run(
             continue;
         }
 
-        match shortfall(&chain, vault).await {
+        let short = shortfall(&chain, vault).await;
+        if let Err(error) = &short
+            && !cash_unread
+        {
+            tracing::warn!(%vault, error = format!("{error:#}"), "could not read the vault's cash; the agent is not told of a shortfall until it can");
+        }
+        cash_unread = short.is_err();
+        match short {
             Ok(short) if short > reported => {
                 reported = short;
                 let short = u64::try_from(short).unwrap_or(u64::MAX);
@@ -56,27 +81,46 @@ pub async fn run(
                 }
             }
             Ok(short) if short.is_zero() => reported = U256::ZERO,
-            Ok(_) => {}
-            Err(error) => tracing::debug!(%error, "could not read the vault's cash"),
+            Ok(_) | Err(_) => {}
         }
 
-        match read(&chain, vault, station, venue, next, head).await {
-            Ok((account_events, vault_news)) => {
-                for event in account_events {
-                    if account.send(strategy_sdk::to_payload(&event)).is_err() {
-                        return;
+        // A node limits how many blocks one log query may span, so a gap
+        // that has grown (a slow node, a long pause) is read a chunk at a
+        // time, and each chunk read is never read again.
+        while let Some((from, to)) = chunk(next, head) {
+            match read(&chain, vault, station, venue, from, to).await {
+                Ok((account_events, vault_news)) => {
+                    for event in account_events {
+                        if account.send(strategy_sdk::to_payload(&event)).is_err() {
+                            return;
+                        }
                     }
-                }
-                for event in vault_news {
-                    if vault_events.send(event).is_err() {
-                        return;
+                    for event in vault_news {
+                        if vault_events.send(event).is_err() {
+                            return;
+                        }
                     }
+                    next = to + 1;
+                    next_block.store(next, Ordering::SeqCst);
                 }
-                next = head + 1;
+                Err(error) => {
+                    if unread.due(std::time::Instant::now()) {
+                        tracing::warn!(%vault, from, to, error = format!("{error:#}"), "could not read these blocks; trying again");
+                    }
+                    break;
+                }
             }
-            Err(error) => tracing::debug!(%error, "could not read a block"),
         }
     }
+}
+
+/// The most blocks one log query spans: within what public nodes allow.
+const MOST_BLOCKS: u64 = 2_000;
+
+/// The next blocks to read, from `next` up to `head` but never more than
+/// [`MOST_BLOCKS`] of them, or nothing once `next` has passed the head.
+fn chunk(next: u64, head: u64) -> Option<(u64, u64)> {
+    (next <= head).then(|| (next, head.min(next.saturating_add(MOST_BLOCKS - 1))))
 }
 
 async fn read(
@@ -138,18 +182,110 @@ async fn read(
                 },
             )));
         } else if let Ok(halted) = log.log_decode::<IVault::Halted>() {
-            let reason = chain::names::text(halted.inner.data.reason);
-            news.push(VaultEvent::Halting(match reason.as_str() {
-                "killed" => "the vault was stopped".to_string(),
-                "frozen" => "a claim went unserved and the vault froze".to_string(),
-                "retired" => "the author retired the vault and its wind-down is over".to_string(),
-                "sealed" => "the vault is being wound down".to_string(),
-                other => other.to_string(),
-            }));
+            news.push(halting(halted.inner.data.reason));
         }
     }
 
     Ok((account, news))
+}
+
+/// What an agent is told when its vault halts, for the reason the vault gave.
+fn halting(reason: alloy::primitives::B256) -> VaultEvent {
+    let reason = chain::names::text(reason);
+    VaultEvent::Halting(match reason.as_str() {
+        "killed" => "the vault was stopped".to_string(),
+        "frozen" => "a claim went unserved and the vault froze".to_string(),
+        "retired" => "the author retired the vault and its wind-down is over".to_string(),
+        "sealed" => "the vault is being wound down".to_string(),
+        other => other.to_string(),
+    })
+}
+
+/// The halting notice owed to an agent that starts on a vault that has
+/// already halted, or nothing if it hasn't. A watcher reads on from where
+/// the last one stopped, or from the head, so it never passes the halt
+/// again: the agent would otherwise run out its grace without being told.
+/// The reason comes from the vault's `Halted` log, looked for back through
+/// as many blocks as the chain has made since the halt, newest first, a
+/// query's span at a time (a fast chain makes thousands in a grace); a halt
+/// whose log isn't found there is still a halt, said without its reason.
+pub async fn halting_notice(chain: &Client, vault: Address) -> Result<Option<VaultEvent>> {
+    let halted = chain
+        .read(
+            vault,
+            chain::bindings::station::IStationVault::haltedAtCall {},
+        )
+        .await?;
+    if halted == 0 {
+        return Ok(None);
+    }
+    let head = chain.block_number().await?;
+    let back = match since_the_halt(chain, head, halted).await {
+        Ok(back) => back,
+        Err(_) => MOST_BLOCKS,
+    };
+    let oldest = head.saturating_sub(back.saturating_sub(1));
+    let filter = Filter::new()
+        .address(vault)
+        .event_signature(<IVault::Halted as alloy::sol_types::SolEvent>::SIGNATURE_HASH);
+    let mut to = head;
+    let reason = loop {
+        let from = to.saturating_sub(MOST_BLOCKS - 1).max(oldest);
+        let logs = chain
+            .logs(&filter.clone().from_block(from).to_block(to))
+            .await
+            .unwrap_or_default();
+        let found = logs
+            .iter()
+            .rev()
+            .find_map(|log| log.log_decode::<IVault::Halted>().ok())
+            .map(|halted| halted.inner.data.reason);
+        if found.is_some() || from <= oldest {
+            break found;
+        }
+        to = from - 1;
+    };
+    Ok(Some(match reason {
+        Some(reason) => halting(reason),
+        None => VaultEvent::Halting("the vault has halted".to_string()),
+    }))
+}
+
+/// The most blocks looked back through for a halt's log: a hundred queries.
+const MOST_HALT_BLOCKS: u64 = 100 * MOST_BLOCKS;
+
+/// The blocks a block interval is measured over.
+const SAMPLED_BLOCKS: u64 = 100;
+
+/// How many blocks back a halt at `halted` may be, from the chain's block
+/// interval measured over its latest blocks.
+async fn since_the_halt(chain: &Client, head: u64, halted: u64) -> Result<u64> {
+    let sampled = head.min(SAMPLED_BLOCKS);
+    let now = chain.block_timestamp_at(head).await?;
+    let then = chain.block_timestamp_at(head - sampled).await?;
+    Ok(blocks_back(
+        now.saturating_sub(halted),
+        sampled,
+        now.saturating_sub(then),
+    ))
+}
+
+/// How many blocks a chain that made `sampled_blocks` in `sampled_secs` has
+/// made in `elapsed` seconds, with a query's span to spare, and never more
+/// than [`MOST_HALT_BLOCKS`]. Blocks too fast to tell apart by their whole
+/// seconds are taken as the most.
+fn blocks_back(elapsed: u64, sampled_blocks: u64, sampled_secs: u64) -> u64 {
+    if elapsed == 0 {
+        return MOST_BLOCKS;
+    }
+    if sampled_secs == 0 {
+        return MOST_HALT_BLOCKS;
+    }
+    elapsed
+        .saturating_mul(sampled_blocks)
+        .div_ceil(sampled_secs)
+        .saturating_add(MOST_BLOCKS)
+        .min(MOST_HALT_BLOCKS)
 }
 
 /// How far the vault's cash falls short of what leavers are waiting for
@@ -196,4 +332,151 @@ async fn shortfall(chain: &Client, vault: Address) -> Result<U256> {
     }
     let needed = waiting + value * U256::from(floor.bps) / U256::from(10_000u64);
     Ok(needed.saturating_sub(cash))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::stand_in;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_watcher_carries_on_from_the_block_after_the_last_one_read() {
+        let state = stand_in::chain(1_000_000_000, 0);
+        state.lock().unwrap().head = 20;
+        let client = stand_in::client(&stand_in::start(state.clone()).await).await;
+        let next = Arc::new(AtomicU64::new(12));
+        let (account, _account_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (vault_events, _vault_rx) = tokio::sync::mpsc::unbounded_channel();
+        let address = Address::repeat_byte(0x11);
+        let watching = tokio::spawn(run(
+            client,
+            address,
+            address,
+            address,
+            next.clone(),
+            account,
+            vault_events,
+        ));
+        for _ in 0..100 {
+            if next.load(Ordering::SeqCst) == 21 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        watching.abort();
+        assert_eq!(next.load(Ordering::SeqCst), 21, "it read up to the head");
+        let reads = state.lock().unwrap().log_reads.clone();
+        assert_eq!(
+            reads.first(),
+            Some(&(12, 20)),
+            "it started where the last watcher stopped"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_event_an_agent_never_read_reaches_the_agent_started_after_it() {
+        // The vault halted at block 15, which the agent is owed well before
+        // its positions are closed.
+        let vault = Address::repeat_byte(0x11);
+        let state = stand_in::chain(1_000_000_000, 0);
+        state.lock().unwrap().head = 20;
+        state.lock().unwrap().halted = Some((vault, 15));
+        let client = stand_in::client(&stand_in::start(state.clone()).await).await;
+        let watched_to = Arc::new(AtomicU64::new(10));
+        let account = crate::feed::Feed::<Vec<u8>>::default();
+        let vault_events = crate::feed::Feed::<VaultEvent>::default();
+        let watcher = || {
+            tokio::spawn(run(
+                client.clone(),
+                vault,
+                Address::repeat_byte(0x22),
+                Address::repeat_byte(0x33),
+                watched_to.clone(),
+                account.sender(),
+                vault_events.sender(),
+            ))
+        };
+
+        // The first agent has its stream, and stops before reading it, once
+        // its watcher has read past the halt.
+        let first = watcher();
+        let unread = vault_events.reader();
+        for _ in 0..100 {
+            if watched_to.load(Ordering::SeqCst) > 15 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            watched_to.load(Ordering::SeqCst) > 15,
+            "the first watcher read past block 15"
+        );
+        drop(unread);
+        first.abort();
+
+        // The next agent and its watcher, which carries on after block 15.
+        let second = watcher();
+        let reader = vault_events.reader();
+        let heard = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            std::future::poll_fn(|cx| reader.lock().unwrap().poll_recv(cx)),
+        )
+        .await;
+        second.abort();
+        assert!(
+            matches!(heard, Ok(Some(VaultEvent::Halting(_)))),
+            "the agent started next never hears that the vault is halting"
+        );
+    }
+
+    #[test]
+    fn a_halt_is_looked_for_as_far_back_as_the_chain_has_made_blocks_since() {
+        // Ten minutes into the grace on a chain of quarter-second blocks:
+        // 2,400 blocks, more than one query spans.
+        assert_eq!(blocks_back(600, 100, 25), 2_400 + MOST_BLOCKS);
+        // On a chain of twelve-second blocks, one query's span is plenty.
+        assert_eq!(blocks_back(600, 100, 1_200), 50 + MOST_BLOCKS);
+        // A long grace on a fast chain is capped.
+        assert_eq!(blocks_back(30 * 86_400, 100, 25), MOST_HALT_BLOCKS);
+        // Blocks too fast to tell apart: the most.
+        assert_eq!(blocks_back(600, 100, 0), MOST_HALT_BLOCKS);
+    }
+
+    #[tokio::test]
+    async fn a_halt_older_than_one_query_spans_is_still_found_with_its_reason() {
+        let vault = Address::repeat_byte(0x11);
+        let state = stand_in::chain(1_000_000_000, 0);
+        state.lock().unwrap().head = 10_000;
+        state.lock().unwrap().halted = Some((vault, 3_000));
+        // Blocks too fast to tell apart, and a halt a minute ago.
+        state.lock().unwrap().halted_secs_ago = 60;
+        let client = stand_in::client(&stand_in::start(state.clone()).await).await;
+
+        let notice = halting_notice(&client, vault).await.unwrap();
+        assert!(
+            matches!(&notice, Some(VaultEvent::Halting(why)) if why == "the vault was stopped"),
+            "the halt's reason was not found: {notice:?}"
+        );
+        let reads = state.lock().unwrap().log_reads.clone();
+        assert_eq!(
+            reads.first(),
+            Some(&(8_001, 10_000)),
+            "the newest blocks are read first"
+        );
+    }
+
+    #[test]
+    fn a_wide_gap_is_read_in_chunks_of_at_most_two_thousand_blocks() {
+        let mut next = 100;
+        let head = 4_500;
+        let mut chunks = Vec::new();
+        while let Some((from, to)) = chunk(next, head) {
+            chunks.push((from, to));
+            next = to + 1;
+        }
+        assert_eq!(chunks, [(100, 2_099), (2_100, 4_099), (4_100, 4_500)]);
+        assert_eq!(chunk(7, 7), Some((7, 7)), "one new block is one chunk");
+        assert_eq!(chunk(8, 7), None, "nothing new, nothing to read");
+    }
 }

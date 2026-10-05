@@ -41,6 +41,11 @@ pub struct Served {
     pub key: ChainKey,
     pub client: Client,
     pub deployments: Deployments,
+    /// The native coin's price in dollars, where the chain's config gives one.
+    pub native_usd: Option<f64>,
+    /// The chain's RPC as the chain config file gives it, which may be shown
+    /// to anyone; the one the client uses may be a paid URL carrying a key.
+    pub public_rpc: String,
 }
 
 /// What the arguments came to: the chain to talk to, and where its
@@ -76,6 +81,15 @@ impl ChainArgs {
         let mut targets = Vec::new();
         for chain in wanted {
             let target = self.target(&configs, chain)?;
+            // The config refuses a chain named twice; should one get through,
+            // it is still served once, under the first vault chain naming it.
+            if let Some(first) = targets
+                .iter()
+                .find(|served: &&Target| served.key.same_chain(&target.key))
+            {
+                tracing::warn!(chain = %target.key, first = %first.vault_chain, also = %target.vault_chain, "a chain named for two vault chains is served once");
+                continue;
+            }
             if target.key.kind == ChainKind::Evm {
                 targets.push(target);
             } else if self.vault_chain.is_some() {
@@ -96,19 +110,7 @@ impl ChainArgs {
     pub async fn connect_all(&self) -> Result<Vec<Served>> {
         let mut pending = tokio::task::JoinSet::new();
         for (order, target) in self.targets()?.into_iter().enumerate() {
-            pending.spawn(async move {
-                let client = target.connect().await?;
-                let deployments = target.wait_for_deployments(&client).await?;
-                Ok::<_, anyhow::Error>((
-                    order,
-                    Served {
-                        vault_chain: target.vault_chain,
-                        key: target.key,
-                        client,
-                        deployments,
-                    },
-                ))
-            });
+            pending.spawn(async move { Ok::<_, anyhow::Error>((order, target.serve().await?)) });
         }
         let mut served = Vec::new();
         while let Some(done) = pending.join_next().await {
@@ -116,6 +118,21 @@ impl ChainArgs {
         }
         served.sort_by_key(|(order, _)| *order);
         Ok(served.into_iter().map(|(_, served)| served).collect())
+    }
+
+    /// Connect to every chain this service serves, each on its own, and
+    /// hand each one over as soon as it is connected and its deployment
+    /// found. A chain that can't be (its node down, its deployment missing)
+    /// is said at warn and tried again, waiting longer each time, until it
+    /// is: one chain out of reach doesn't keep the service from the others.
+    /// The receiver ends once every chain has been handed over.
+    pub fn connect_each(&self) -> Result<tokio::sync::mpsc::UnboundedReceiver<Served>> {
+        Ok(each_until_connected(
+            self.targets()?,
+            |target| target.key.canonical(),
+            |target| async move { target.serve().await },
+            CONNECT_RETRY_FIRST,
+        ))
     }
 
     fn target(&self, configs: &ChainConfigs, vault_chain: Chain) -> Result<Target> {
@@ -131,7 +148,76 @@ impl ChainArgs {
     }
 }
 
+/// How long a chain that could not be connected to is first waited on
+/// before it is tried again. Each try after waits twice as long as the last,
+/// up to [`CONNECT_RETRY_MOST`].
+const CONNECT_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(5);
+const CONNECT_RETRY_MOST: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Try `connect` on every target at once, each until it succeeds, and send
+/// each success on as it comes. A failure is said at warn, with how long
+/// until the next try. A target named twice is connected once.
+fn each_until_connected<T, S, F, Fut>(
+    targets: Vec<T>,
+    name: impl Fn(&T) -> String,
+    connect: F,
+    first_wait: std::time::Duration,
+) -> tokio::sync::mpsc::UnboundedReceiver<S>
+where
+    T: Clone + Send + 'static,
+    S: Send + 'static,
+    F: Fn(T) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<S>> + Send,
+{
+    let (send, receive) = tokio::sync::mpsc::unbounded_channel();
+    let mut named = std::collections::HashSet::new();
+    for target in targets {
+        let chain = name(&target);
+        if !named.insert(chain.clone()) {
+            continue;
+        }
+        let connect = connect.clone();
+        let send = send.clone();
+        tokio::spawn(async move {
+            let mut wait = first_wait;
+            loop {
+                match connect(target.clone()).await {
+                    Ok(served) => {
+                        let _ = send.send(served);
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            chain,
+                            error = format!("{error:#}"),
+                            retry_in_secs = wait.as_secs(),
+                            "could not serve this chain; the others are served meanwhile"
+                        );
+                        tokio::time::sleep(wait).await;
+                        wait = (wait * 2).min(CONNECT_RETRY_MOST.max(first_wait));
+                    }
+                }
+            }
+        });
+    }
+    receive
+}
+
 impl Target {
+    /// Connect to this chain and wait for its deployment.
+    pub async fn serve(&self) -> Result<Served> {
+        let client = self.connect().await?;
+        let deployments = self.wait_for_deployments(&client).await?;
+        Ok(Served {
+            vault_chain: self.vault_chain,
+            key: self.key.clone(),
+            client,
+            deployments,
+            native_usd: self.config.native_usd,
+            public_rpc: self.config.public_rpc.clone(),
+        })
+    }
+
     /// The deployment file for this chain.
     pub fn deployments_file(&self) -> PathBuf {
         Deployments::file_in(&self.deployments_dir, &self.key)
@@ -214,16 +300,82 @@ pub async fn connect_to(
             key.kind.name()
         );
     }
+    // A key read from the chain config is always a number; one built by
+    // hand is held to the same rule, so no node goes unchecked.
+    let expected = key
+        .evm_chain_id()
+        .ok_or_else(|| anyhow!("{key} names no EVM chain id"))?;
     let client = Client::connect(config, signing_for(network)?).await?;
-    if let Some(expected) = key.evm_chain_id()
-        && expected != client.chain_id
-    {
+    if expected != client.chain_id {
+        // Named by its label: the URL may be a paid one, carrying its key.
         bail!(
             "{} answers as chain {}, not {expected}: check its rpc in the chain config",
-            config.rpc,
+            config.label,
             client.chain_id
         );
     }
     tracing::info!(%network, chain = %key, label = config.label, "connected");
     Ok(client)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_chain_out_of_reach_holds_up_none_of_the_others_and_is_tried_until_it_connects() {
+        // "down" fails its first three tries; "up" connects at once.
+        let tries = Arc::new(Mutex::new(0));
+        let counted = tries.clone();
+        let mut connected = each_until_connected(
+            vec!["down", "up"],
+            |name| name.to_string(),
+            move |name: &'static str| {
+                let tries = counted.clone();
+                async move {
+                    if name == "down" {
+                        let mut tries = tries.lock().unwrap();
+                        *tries += 1;
+                        if *tries <= 3 {
+                            bail!("no answer");
+                        }
+                    }
+                    Ok(name)
+                }
+            },
+            Duration::from_secs(5),
+        );
+        let started = tokio::time::Instant::now();
+        assert_eq!(connected.recv().await, Some("up"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // Tried again after 5, 10 and 20 seconds.
+        assert_eq!(connected.recv().await, Some("down"));
+        assert_eq!(*tries.lock().unwrap(), 4);
+        assert_eq!(started.elapsed(), Duration::from_secs(35));
+        // Every chain handed over: nothing more comes.
+        assert_eq!(connected.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn a_chain_named_twice_is_connected_and_handed_over_once() {
+        let tries = Arc::new(Mutex::new(0));
+        let counted = tries.clone();
+        let mut connected = each_until_connected(
+            vec!["one", "one"],
+            |name| name.to_string(),
+            move |name: &'static str| {
+                let tries = counted.clone();
+                async move {
+                    *tries.lock().unwrap() += 1;
+                    Ok(name)
+                }
+            },
+            Duration::from_secs(5),
+        );
+        assert_eq!(connected.recv().await, Some("one"));
+        assert_eq!(connected.recv().await, None);
+        assert_eq!(*tries.lock().unwrap(), 1);
+    }
 }

@@ -1,0 +1,52 @@
+[package]
+name = "shonin-station"
+version = "0.1.0"
+description = "A vault's station on Solana: the address that holds its money at the venues, and the guard over every call made from it"
+edition = "2021"
+license = "BUSL-1.1"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "shonin_station"
+
+[features]
+# The station brings its own allocator (see `heap`), which takes the default's
+# place only when this is set.
+default = ["custom-heap"]
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build", "shonin-driver/idl-build"]
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+# Build with the committed mainnet ids (mainnet-id) instead of the local keypairs'.
+mainnet = [
+    "shonin-registry/mainnet",
+    "shonin-publishing/mainnet",
+    "shonin-prices/mainnet",
+    "shonin-profiles/mainnet",
+]
+
+[dependencies]
+anchor-lang = { workspace = true }
+anchor-spl = { workspace = true }
+shonin-common = { workspace = true }
+shonin-driver = { path = "../../crates/shonin-driver" }
+shonin-registry = { path = "../shonin-registry", features = ["no-entrypoint"] }
+# Shonin's other programs, only for their addresses: no allowlist may name
+# one. The development checker is never on mainnet, so a mainnet build leaves
+# it out of that list.
+shonin-publishing = { path = "../shonin-publishing", features = ["no-entrypoint"] }
+shonin-prices = { path = "../shonin-prices", features = ["no-entrypoint"] }
+shonin-profiles = { path = "../shonin-profiles", features = ["no-entrypoint"] }
+shonin-dev-verifier = { path = "../shonin-dev-verifier", features = ["no-entrypoint"] }
+solana-sdk-ids = { workspace = true }
+
+[build-dependencies]
+shonin-program-id = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

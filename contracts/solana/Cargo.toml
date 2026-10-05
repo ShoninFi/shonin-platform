@@ -1,8 +1,17 @@
 # The Solana programs are their own Cargo workspace: they build for Solana's
 # own target with Anchor's toolchain, and the root workspace excludes them.
 [workspace]
-members = ["programs/*"]
+members = ["programs/*", "crates/*", "tests"]
 resolver = "2"
+
+[workspace.dependencies]
+anchor-lang = { version = "0.32.1", features = ["init-if-needed"] }
+anchor-spl = { version = "0.32.1", default-features = false, features = ["token", "token_2022", "associated_token"] }
+solana-keccak-hasher = "2.2"
+solana-sdk-ids = "2.2"
+uint = { version = "0.9", default-features = false }
+shonin-common = { path = "crates/shonin-common" }
+shonin-program-id = { path = "crates/shonin-program-id" }
 
 [profile.release]
 overflow-checks = true

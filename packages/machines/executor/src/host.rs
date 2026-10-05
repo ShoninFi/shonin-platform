@@ -18,13 +18,12 @@ use chain::bindings::vault::IVault;
 use chain::bindings::venue::{ILocalVenue, OrderRequest};
 use chain::{Client, KeyClient};
 use strategy_sdk::{Action, MarketState, PositionState, Receipt, Side};
-use tokio::sync::mpsc::UnboundedReceiver;
 use wasmtime::AsContextMut;
 use wasmtime::Result as HostResult;
 use wasmtime::component::{Access, Accessor, HasSelf, Resource, ResourceTable, StreamReader};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
-use crate::feed::ChannelProducer;
+use crate::feed::{ChannelProducer, Reader};
 use crate::scale::{ASSET_DECIMALS, SIZE_DECIMALS, signed_to_decimal, to_decimal, to_units};
 
 wasmtime::component::bindgen!({
@@ -66,17 +65,21 @@ pub struct Ctx {
     /// from the venue.
     pub cache: HashMap<String, Vec<u8>>,
     /// Filled by the watcher, drained by the strategy. Taken when the strategy
-    /// first asks for the stream.
-    pub account_events: Option<UnboundedReceiver<Vec<u8>>>,
-    pub vault_events: Option<UnboundedReceiver<VaultEvent>>,
+    /// first asks for the stream. They are the vault's, so whatever an agent
+    /// before this one left unread is read here first.
+    pub account_events: Option<Reader<Vec<u8>>>,
+    pub vault_events: Option<Reader<VaultEvent>>,
     /// What the health report is made of. Shared, so a report can be sent
     /// while the strategy is still running: a strategy's `run` is meant never
     /// to return.
     pub counters: Arc<Mutex<Counters>>,
+    /// Raised once the vault's halting notice has been handed to the
+    /// strategy, so an agent that then ends is known to have been told.
+    pub halting_heard: Arc<std::sync::atomic::AtomicBool>,
     /// How much fuel a second of running is worth, and when it was last
     /// topped up.
     /// The most memory the strategy's instance may hold, from its manifest.
-    pub memory_bytes: usize,
+    pub memory: Allowance,
 }
 
 impl Ctx {
@@ -117,28 +120,158 @@ pub struct Counters {
     pub venue_errors: u64,
     pub faults: u64,
     pub restarts: u64,
+    /// How many times the component in the store was found not to be the
+    /// vault's bundle, and was not run.
+    pub not_the_bundle: u64,
+}
+
+impl Counters {
+    /// Count one thing the agent asked to have done, and how it was
+    /// answered. A refusal or an unanswered request is always one of the
+    /// submissions too, so the share refused can never pass the whole.
+    fn submitted(&mut self, tally: Tally) {
+        self.submissions += 1;
+        match tally {
+            Tally::Done => {}
+            Tally::Refused => self.rejections += 1,
+            Tally::Unanswered => self.venue_errors += 1,
+        }
+    }
+
+    /// The share of submissions refused, as a percentage.
+    pub fn rejection_rate(&self) -> f64 {
+        if self.submissions == 0 {
+            0.0
+        } else {
+            self.rejections as f64 / self.submissions as f64 * 100.0
+        }
+    }
 }
 
 /// The memory allowance, enforced. A strategy that asks for more than it
 /// declared is refused the growth, which it sees as an allocation failure and
 /// the host counts as a fault if it cannot carry on.
-impl wasmtime::ResourceLimiter for Ctx {
+///
+/// Its tables are held to the same allowance as its linear memory: each entry
+/// is kept in the host's memory, so a table of millions of entries is memory
+/// the strategy holds whether or not it is linear. Every memory and table the
+/// instance makes, at instantiation and after, is counted together.
+///
+/// Only growth that happens is counted. Wasmtime asks before it checks the
+/// memory's or table's own maximum, so a growth past that maximum is refused
+/// here, uncounted, as wasmtime would refuse it after. What is left to fail
+/// once a growth is let through is the host's own allocation, which is
+/// counted as held: wasmtime also reports failures it never asked about, so
+/// an undo could take back a growth that did happen.
+///
+/// A strategy is also held to a few instances, memories and tables, so it
+/// can't reserve address space by making many.
+#[derive(Debug)]
+pub struct Allowance {
+    bytes: usize,
+    held: usize,
+}
+
+impl Allowance {
+    /// What one table entry is counted as holding: a reference, the size of
+    /// a pointer.
+    pub const TABLE_ENTRY_BYTES: usize = std::mem::size_of::<usize>();
+
+    /// The most core instances a strategy's component may make. A built
+    /// strategy makes three or so.
+    pub const INSTANCES: usize = 16;
+
+    /// The most linear memories a strategy may make. Each one reserves
+    /// gigabytes of address space whatever it holds.
+    pub const MEMORIES: usize = 4;
+
+    /// The most tables a strategy may make.
+    pub const TABLES: usize = 16;
+
+    pub fn new(bytes: usize) -> Self {
+        Self { bytes, held: 0 }
+    }
+
+    fn grow(&mut self, current: usize, desired: usize, maximum: Option<usize>) -> bool {
+        if maximum.is_some_and(|maximum| desired > maximum) {
+            return false;
+        }
+        let more = desired.saturating_sub(current);
+        match self.held.checked_add(more) {
+            Some(held) if held <= self.bytes => {
+                self.held = held;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl wasmtime::ResourceLimiter for Allowance {
     fn memory_growing(
         &mut self,
-        _current: usize,
+        current: usize,
         desired: usize,
-        _maximum: Option<usize>,
+        maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        Ok(desired <= self.memory_bytes)
+        Ok(self.grow(current, desired, maximum))
     }
 
     fn table_growing(
         &mut self,
-        _current: usize,
-        _desired: usize,
-        _maximum: Option<usize>,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        Ok(true)
+        Ok(self.grow(
+            current.saturating_mul(Self::TABLE_ENTRY_BYTES),
+            desired.saturating_mul(Self::TABLE_ENTRY_BYTES),
+            maximum.map(|entries| entries.saturating_mul(Self::TABLE_ENTRY_BYTES)),
+        ))
+    }
+
+    fn instances(&self) -> usize {
+        Self::INSTANCES
+    }
+
+    fn memories(&self) -> usize {
+        Self::MEMORIES
+    }
+
+    fn tables(&self) -> usize {
+        Self::TABLES
+    }
+}
+
+impl wasmtime::ResourceLimiter for Ctx {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        self.memory.memory_growing(current, desired, maximum)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        self.memory.table_growing(current, desired, maximum)
+    }
+
+    fn instances(&self) -> usize {
+        self.memory.instances()
+    }
+
+    fn memories(&self) -> usize {
+        self.memory.memories()
+    }
+
+    fn tables(&self) -> usize {
+        self.memory.tables()
     }
 }
 
@@ -188,25 +321,24 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
         }
 
         let mut verdicts = Vec::with_capacity(actions.len());
-        let mut refused = 0;
+        let mut tallies = Vec::with_capacity(actions.len());
         for bytes in &actions {
-            let (verdict, counts) = match strategy_sdk::from_payload::<Action>(bytes) {
+            let (verdict, tally) = match strategy_sdk::from_payload::<Action>(bytes) {
                 Ok(action) => act(&key, station, venue_address, action).await,
                 Err(error) => (
                     Verdict::Rejected(format!("that is not an action: {error}")),
-                    true,
+                    Tally::Refused,
                 ),
             };
-            if counts {
-                refused += 1;
-            }
+            tallies.push(tally);
             verdicts.push(verdict);
         }
         accessor.with(|mut access| {
             refuel(&mut access);
             access.get().count(|counters| {
-                counters.submissions += actions.len() as u64;
-                counters.rejections += refused;
+                for tally in tallies {
+                    counters.submitted(tally);
+                }
             });
         });
         Ok(verdicts)
@@ -237,7 +369,10 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
         }
         match read_account_state(&chain, vault, station, venue_address, usd).await {
             Ok(state) => Ok(Ok(strategy_sdk::to_payload(&state))),
-            Err(error) => Ok(Err(error.to_string())),
+            Err(error) => {
+                accessor.with(|mut access| access.get().count(|c| c.venue_errors += 1));
+                Ok(Err(error.to_string()))
+            }
         }
     }
 
@@ -336,6 +471,8 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
         };
         let amount = U256::from(amount);
         let name = chain::names::name(driver.as_bytes());
+        // A move the station is asked to make is a submission like an order,
+        // and counted once however many calls it takes.
         for step in steps {
             let sent = match step {
                 Step::Pull => key.send(station, IStation::pullCall { amount }).await,
@@ -362,10 +499,12 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
                 }
             };
             if let Err(error) = sent {
-                accessor.with(|mut access| access.get().count(|c| c.rejections += 1));
+                let tally = Tally::of_failure(&error);
+                accessor.with(|mut access| access.get().count(|c| c.submitted(tally)));
                 return Ok(Err(format!("{error:#}")));
             }
         }
+        accessor.with(|mut access| access.get().count(|c| c.submitted(Tally::Done)));
         Ok(Ok(()))
     }
 
@@ -394,7 +533,15 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
         }
         let to_chain = match chain_id_of(&chain, factory, &destination_chain).await {
             Ok(id) => id,
-            Err(error) => return Ok(Err(format!("{error:#}"))),
+            Err(error) => {
+                // A chain that never answered the lookup is a venue that
+                // never answered; a name nobody knows is the agent's mistake
+                // and counts as nothing.
+                if let Some(tally) = Tally::of_lookup_failure(&error) {
+                    accessor.with(|mut access| access.get().count(|c| c.submitted(tally)));
+                }
+                return Ok(Err(format!("{error:#}")));
+            }
         };
         let sent = key
             .send(
@@ -407,6 +554,13 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
                 },
             )
             .await;
+        // A bridge the station is asked to make is a submission like a move,
+        // and its refusal or a venue that never answered is counted the same.
+        let tally = match &sent {
+            Ok(_) => Tally::Done,
+            Err(error) => Tally::of_failure(error),
+        };
+        accessor.with(|mut access| access.get().count(|c| c.submitted(tally)));
         Ok(sent.map(|_| ()).map_err(|error| format!("{error:#}")))
     }
 
@@ -474,7 +628,18 @@ impl shonin::agent::vault::HostWithStore<Ctx> for HasSelf<Ctx> {
     async fn events(mut access: Access<'_, Ctx, Self>) -> HostResult<StreamReader<VaultEvent>> {
         refuel(&mut access);
         let events = access.get().vault_events.take();
-        stream_of(&mut access, events)
+        let heard = access.get().halting_heard.clone();
+        match events {
+            Some(events) => {
+                let producer = ChannelProducer::new(events).noting(move |event| {
+                    if matches!(event, VaultEvent::Halting(_)) {
+                        heard.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+                Ok(StreamReader::new(&mut access, producer)?)
+            }
+            None => stream_of(&mut access, None),
+        }
     }
 }
 
@@ -483,7 +648,7 @@ impl shonin::agent::vault::HostWithStore<Ctx> for HasSelf<Ctx> {
 /// to stop it.
 fn stream_of<T, S>(
     access: &mut Access<'_, Ctx, S>,
-    events: Option<UnboundedReceiver<T>>,
+    events: Option<Reader<T>>,
 ) -> HostResult<StreamReader<T>>
 where
     T: wasmtime::component::Lower + wasmtime::component::Lift + Send + Sync + Unpin + 'static,
@@ -498,8 +663,10 @@ where
 // The shared data layer ------------------------------------------------------
 
 impl shonin::agent::data::HostWithStore<Ctx> for HasSelf<Ctx> {
-    /// One source: the venue's own markets, cached and shared, so ten
-    /// strategies watching the same book cost the executor one read.
+    /// One source: the venue's own markets, read from the chain's RPC on
+    /// every call. Nothing is cached or shared between strategies yet, and
+    /// no quota holds a strategy's reads down: the shared data layer and its
+    /// quotas are still to be built.
     async fn query(
         accessor: &Accessor<Ctx, Self>,
         source: String,
@@ -627,20 +794,58 @@ impl shonin::agent::inference::HostWithStore<Ctx> for HasSelf<Ctx> {
 
 // Doing what a strategy asked ------------------------------------------------
 
+/// How an action counts in the health report.
+#[derive(Clone, Copy)]
+enum Tally {
+    Done,
+    /// The venue looked at it and said no.
+    Refused,
+    /// The venue never answered.
+    Unanswered,
+}
+
+impl Tally {
+    /// How a send that failed counts: a refusal if the chain looked at it and
+    /// said no, otherwise a venue that never answered.
+    fn of_failure(error: &anyhow::Error) -> Self {
+        if chain::unanswered(error) {
+            Tally::Unanswered
+        } else {
+            Tally::Refused
+        }
+    }
+
+    /// How a lookup the host makes before sending counts when it fails: as a
+    /// venue that never answered if the chain didn't, and not at all if it
+    /// answered and the agent asked for something that isn't there.
+    fn of_lookup_failure(error: &anyhow::Error) -> Option<Self> {
+        chain::unanswered(error).then_some(Tally::Unanswered)
+    }
+}
+
 /// Do one action, and say whether the answer counts against the strategy's
 /// health. An order that found nobody at its price is the market's answer, not
 /// the venue's: a strategy whose orders are not crossing is trading, and one
 /// whose orders are being refused is not.
-async fn act(key: &KeyClient, station: Address, venue: Address, action: Action) -> (Verdict, bool) {
+async fn act(
+    key: &KeyClient,
+    station: Address,
+    venue: Address,
+    action: Action,
+) -> (Verdict, Tally) {
     let done = match action {
         Action::Place(order) => place(key, station, venue, &order).await,
     };
     match done {
-        Ok(receipt) => (Verdict::Accepted(strategy_sdk::to_payload(&receipt)), false),
-        Err(Refusal::NoFill) => (Verdict::Rejected(NO_FILL.to_string()), false),
+        Ok(receipt) => (
+            Verdict::Accepted(strategy_sdk::to_payload(&receipt)),
+            Tally::Done,
+        ),
+        Err(Refusal::NoFill) => (Verdict::Rejected(NO_FILL.to_string()), Tally::Done),
         // A refusal is the venue's answer, not a fault: the strategy is told
         // why and decides what to do about it.
-        Err(Refusal::Refused(why)) => (Verdict::Rejected(why), true),
+        Err(Refusal::Refused(why)) => (Verdict::Rejected(why), Tally::Refused),
+        Err(Refusal::Unanswered(why)) => (Verdict::Rejected(why), Tally::Unanswered),
     }
 }
 
@@ -653,11 +858,17 @@ enum Refusal {
     NoFill,
     /// The venue would not take it, and said why.
     Refused(String),
+    /// The venue could not be reached, or never answered.
+    Unanswered(String),
 }
 
 impl From<anyhow::Error> for Refusal {
     fn from(error: anyhow::Error) -> Self {
-        Refusal::Refused(format!("{error}"))
+        if chain::unanswered(&error) {
+            Refusal::Unanswered(format!("{error}"))
+        } else {
+            Refusal::Refused(format!("{error}"))
+        }
     }
 }
 
@@ -801,4 +1012,193 @@ pub fn market_id(name: &str) -> alloy::primitives::FixedBytes<32> {
 pub fn market_name(id: alloy::primitives::FixedBytes<32>) -> String {
     let end = id.0.iter().position(|byte| *byte == 0).unwrap_or(32);
     String::from_utf8_lossy(&id.0[..end]).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A core module's instance in a store held to `mib` of allowance, as the
+    /// runner holds a strategy's.
+    fn instantiate(
+        mib: usize,
+        wat: &str,
+    ) -> (wasmtime::Store<Allowance>, HostResult<wasmtime::Instance>) {
+        let engine = wasmtime::Engine::default();
+        let mut store = wasmtime::Store::new(&engine, Allowance::new(mib * 1024 * 1024));
+        store.limiter(|allowance| allowance);
+        let module = wasmtime::Module::new(&engine, wat).unwrap();
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]);
+        (store, instance)
+    }
+
+    #[test]
+    fn a_table_declared_past_the_memory_allowance_is_refused_at_instantiation() {
+        // 2^27 entries: a GiB of host memory against a 64 MiB allowance.
+        let (_, refused) = instantiate(64, "(module (table 134217728 funcref))");
+        assert!(refused.is_err(), "a table past the allowance was made");
+        // A table that fits is made.
+        let (_, made) = instantiate(64, "(module (table 1024 funcref))");
+        made.unwrap();
+    }
+
+    #[test]
+    fn a_table_cannot_grow_past_the_memory_allowance() {
+        let wat = r#"(module
+            (table $t 0 funcref)
+            (func (export "grow") (param i32) (result i32)
+                (table.grow $t (ref.null func) (local.get 0))))"#;
+        let (mut store, instance) = instantiate(64, wat);
+        let instance = instance.unwrap();
+        let grow = instance
+            .get_typed_func::<i32, i32>(&mut store, "grow")
+            .unwrap();
+        // 2^28 entries is two GiB at 8 bytes an entry: refused, which the
+        // strategy sees as -1.
+        assert_eq!(grow.call(&mut store, 1 << 28).unwrap(), -1);
+        // What fits in the allowance is still given.
+        assert_eq!(grow.call(&mut store, 1024).unwrap(), 0);
+    }
+
+    #[test]
+    fn tables_and_linear_memory_share_one_allowance() {
+        // 32 MiB of linear memory (512 pages) against a 64 MiB allowance
+        // leaves room for 32 MiB of table, and no more.
+        let wat = r#"(module
+            (memory (export "memory") 512)
+            (table $t 0 funcref)
+            (func (export "grow") (param i32) (result i32)
+                (table.grow $t (ref.null func) (local.get 0))))"#;
+        let (mut store, instance) = instantiate(64, wat);
+        let instance = instance.unwrap();
+        let grow = instance
+            .get_typed_func::<i32, i32>(&mut store, "grow")
+            .unwrap();
+        let fits = (32 * 1024 * 1024 / Allowance::TABLE_ENTRY_BYTES) as i32;
+        assert_eq!(grow.call(&mut store, fits + 1).unwrap(), -1);
+        assert_eq!(grow.call(&mut store, fits).unwrap(), 0);
+        // Nothing is left for the memory to grow into.
+        let memory = instance.get_memory(&mut store, "memory").unwrap();
+        assert!(memory.grow(&mut store, 1).is_err());
+        assert_eq!(grow.call(&mut store, 1).unwrap(), -1);
+    }
+
+    /// A growth past a table's own maximum never happens, so it uses up none
+    /// of the allowance: a memory growth well inside it is still given.
+    #[test]
+    fn a_table_growth_past_its_own_maximum_does_not_use_up_the_allowance() {
+        let wat = r#"(module
+            (memory (export "memory") 1)
+            (table $t 0 1 funcref)
+            (func (export "grow_table") (param i32) (result i32)
+                (table.grow $t (ref.null func) (local.get 0)))
+            (func (export "grow_memory") (param i32) (result i32)
+                (memory.grow (local.get 0))))"#;
+        let (mut store, instance) = instantiate(2, wat);
+        let instance = instance.unwrap();
+        let grow_table = instance
+            .get_typed_func::<i32, i32>(&mut store, "grow_table")
+            .unwrap();
+        let grow_memory = instance
+            .get_typed_func::<i32, i32>(&mut store, "grow_memory")
+            .unwrap();
+        // 1.92 MB of entries fits the allowance, but not the table.
+        assert_eq!(grow_table.call(&mut store, 240_000).unwrap(), -1);
+        // 64 KiB held; two more pages make 192 KiB of 2 MiB.
+        assert_eq!(grow_memory.call(&mut store, 2).unwrap(), 1);
+    }
+
+    /// The same for a memory grown past its own maximum, however often.
+    #[test]
+    fn a_memory_growth_past_its_own_maximum_does_not_use_up_the_allowance() {
+        let wat = r#"(module
+            (memory $capped 1 2)
+            (memory $free (export "memory") 1)
+            (func (export "grow_capped") (param i32) (result i32)
+                (memory.grow $capped (local.get 0)))
+            (func (export "grow_free") (param i32) (result i32)
+                (memory.grow $free (local.get 0))))"#;
+        let (mut store, instance) = instantiate(4, wat);
+        let instance = instance.unwrap();
+        let grow_capped = instance
+            .get_typed_func::<i32, i32>(&mut store, "grow_capped")
+            .unwrap();
+        let grow_free = instance
+            .get_typed_func::<i32, i32>(&mut store, "grow_free")
+            .unwrap();
+        for _ in 0..12 {
+            assert_eq!(grow_capped.call(&mut store, 4).unwrap(), -1);
+        }
+        // 128 KiB held; another MiB fits 4 MiB easily.
+        assert_eq!(grow_free.call(&mut store, 16).unwrap(), 1);
+        // A growth inside the capped memory's maximum is still given.
+        assert_eq!(grow_capped.call(&mut store, 1).unwrap(), 1);
+    }
+
+    /// Each memory reserves address space whatever it holds, so a strategy
+    /// may make only a few, and only a few tables and instances.
+    #[test]
+    fn a_strategy_may_make_only_a_few_memories_tables_and_instances() {
+        let memories = |count: usize| format!("(module {})", "(memory 0)".repeat(count));
+        instantiate(64, &memories(Allowance::MEMORIES)).1.unwrap();
+        assert!(
+            instantiate(64, &memories(Allowance::MEMORIES + 1))
+                .1
+                .is_err(),
+            "more memories than allowed were made"
+        );
+
+        let tables = |count: usize| format!("(module {})", "(table 0 funcref)".repeat(count));
+        instantiate(64, &tables(Allowance::TABLES)).1.unwrap();
+        assert!(
+            instantiate(64, &tables(Allowance::TABLES + 1)).1.is_err(),
+            "more tables than allowed were made"
+        );
+
+        let engine = wasmtime::Engine::default();
+        let mut store = wasmtime::Store::new(&engine, Allowance::new(64 * 1024 * 1024));
+        store.limiter(|allowance| allowance);
+        let module = wasmtime::Module::new(&engine, "(module)").unwrap();
+        for _ in 0..Allowance::INSTANCES {
+            wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+        }
+        assert!(
+            wasmtime::Instance::new(&mut store, &module, &[]).is_err(),
+            "more instances than allowed were made"
+        );
+    }
+
+    #[test]
+    fn a_bridge_whose_chain_lookup_goes_unanswered_counts_as_a_venue_error() {
+        let unanswered = anyhow::Error::new(chain::NeverLanded).context("reading the chains");
+        let mut counters = Counters::default();
+        if let Some(tally) = Tally::of_lookup_failure(&unanswered) {
+            counters.submitted(tally);
+        }
+        assert_eq!(counters.venue_errors, 1);
+        assert_eq!(counters.submissions, 1);
+        // A chain nobody here knows is the agent's mistake, not the venue's.
+        let unknown = anyhow!("no chain called nowhere here");
+        assert!(Tally::of_lookup_failure(&unknown).is_none());
+    }
+
+    #[test]
+    fn the_rejection_rate_counts_refused_transfers_as_submissions() {
+        // One order the venue took, and three transfers the station refused.
+        let mut counters = Counters::default();
+        counters.submitted(Tally::Done);
+        for _ in 0..3 {
+            counters.submitted(Tally::Refused);
+        }
+        assert_eq!(counters.submissions, 4);
+        assert_eq!(counters.rejection_rate(), 75.0);
+
+        // Whatever is refused, the share never passes the whole.
+        let mut counters = Counters::default();
+        for _ in 0..5 {
+            counters.submitted(Tally::Refused);
+            counters.submitted(Tally::Unanswered);
+            assert!(counters.rejection_rate() <= 100.0);
+        }
+    }
 }

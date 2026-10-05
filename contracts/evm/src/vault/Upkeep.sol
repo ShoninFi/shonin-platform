@@ -203,7 +203,12 @@ library Upkeep {
 
     /// Charge the running total signed by the vault's executor, believing it
     /// only up to the author's allowances at published prices for the time it
-    /// covers. What isn't charged is written off: the tank never owes.
+    /// covers. What isn't charged is written off: the tank never owes. What a
+    /// collection leaves of the cap is kept for the next, up to a day's cost
+    /// at the allowances in force: a burst inside a day, or gas landing after
+    /// a halt, is charged whenever anyone collects, while allowance left
+    /// unused for longer can't be saved up, so a wrong total takes at most
+    /// about a day beyond what the time since the last collection allowed.
     function _collect(Layout storage s, uint256 total, uint64 asOf, bytes calldata signature) private {
         bytes32 digest = MessageHashUtils.toEthSignedMessageHash(usageDigest(total, asOf));
         (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, signature);
@@ -230,7 +235,9 @@ library Upkeep {
         s.tank.usageSettled = total;
         s.tank.usageAsOf = asOf;
         s.tank.lastCollection = end;
-        s.tank.capCarried = 0;
+        uint256 left = cap - charge;
+        uint256 day = IPrices(s.prices).dailyCost(s.allowances);
+        s.tank.capCarried = left < day ? left : day;
         s.tank.balance -= charge;
         IERC20(s.asset).safeTransfer(s.platform, charge);
         emit IVault.TankCharged(billed, charge, total);
@@ -317,6 +324,8 @@ library Upkeep {
     }
 
     /// Close the cap's interval at the old allowances, then run on the new.
+    /// Only the time since the last collection is added to what it carried,
+    /// so this carries no more than a collection then would have allowed.
     function setAllowances(Allowances calldata allowances) external {
         Layout storage s = VaultStorage.layout();
         _authorOnly(s);

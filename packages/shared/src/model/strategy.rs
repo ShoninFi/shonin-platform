@@ -1,7 +1,7 @@
 //! An agent: one frozen bundle, its vault, and everything shown beside it.
 
 use serde::{Deserialize, Serialize};
-use time::Date;
+use time::{Date, PrimitiveDateTime};
 
 use super::activity::{Kill, Trade, VaultEvent};
 use super::attestation::Attestation;
@@ -106,6 +106,11 @@ pub struct Strategy {
     /// The drivers it trades through and the bridges it uses, by name.
     pub drivers: Vec<String>,
     pub bridges: Vec<String>,
+    /// Set when the latest read of its vault failed part-way: everything
+    /// above is then what was last read whole, as of this moment on its
+    /// chain's clock. None while it is as fresh as its chain's part.
+    #[serde(default)]
+    pub stale_as_of: Option<PrimitiveDateTime>,
 }
 
 impl Strategy {

@@ -1,12 +1,19 @@
-# The Solana programs, built with Anchor. A skeleton for now: the toolchain
-# and the local validator are wired in, and the program does nothing yet.
+# The Solana programs, built with Anchor: the attestation registry, the
+# development attestation checker, publishing (submissions, strategies and
+# reviews), prices and author profiles. The tests run them in-process.
+
+# The toolchain every machine and CI builds with.
+[toolchain]
+anchor_version = "0.32.1"
+solana_version = "3.1.13"
+
 [features]
 resolution = true
 skip-lint = false
 
 # Program ids are not written here. A program's address is its keypair's
 # (target/deploy, never committed), or, built with `--features mainnet`, the
-# committed id in programs/<name>/mainnet-id; see its build.rs.
+# committed id in programs/<name>/mainnet-id; see crates/shonin-program-id.
 
 # The local validator `task dev` starts (see taskfiles/config.yml for ports).
 [provider]
@@ -14,4 +21,4 @@ cluster = "http://127.0.0.1:19110"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
-test = "cargo test"
+test = "cargo test -p shonin-solana-tests"

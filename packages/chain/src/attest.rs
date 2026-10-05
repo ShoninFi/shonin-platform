@@ -15,7 +15,7 @@ use alloy::sol_types::SolValue;
 use anyhow::{Context, Result, bail};
 
 use crate::bindings::attestation::{IAttestationRegistry, ImageKind, KeyInfo};
-use crate::client::{Client, KeyClient};
+use crate::client::{Client, KeyClient, NeverSent, Unanswered};
 use crate::deployments::Deployments;
 
 /// Who puts a blessing on the chain. Anyone may — the proof is what the
@@ -30,15 +30,12 @@ pub enum Sender {
 }
 
 impl Sender {
-    async fn send<C: alloy::sol_types::SolCall>(
-        &self,
-        chain: &Client,
-        to: Address,
-        call: C,
-    ) -> Result<()> {
+    /// The same sender, a key's own noting each blessing it broadcasts in
+    /// `unanswered` (see [`KeyClient::noting`]).
+    fn noting(self, unanswered: &Unanswered) -> Sender {
         match self {
-            Sender::Unlocked(from) => chain.send(*from, to, call).await.map(|_| ()),
-            Sender::Own(key) => key.send(to, call).await.map(|_| ()),
+            Sender::Own(key) => Sender::Own(Box::new(key.noting(unanswered))),
+            unlocked => unlocked,
         }
     }
 }
@@ -110,11 +107,7 @@ async fn bless(
     // commit to a root over many and prove one of them here.
     // The vault is on this chain: a vault on another chain is served by its
     // station here, which is blessed against the vault chain's id.
-    let vault_chain = if vault == Address::ZERO {
-        U256::ZERO
-    } else {
-        U256::from(deployments.chain_id)
-    };
+    let vault_chain = vault_chain(deployments, vault);
     // The one leaf this instance holds a key for: a vault and its bundle, or
     // for a builder or a reviewer, no vault, on this chain. A larger instance
     // would commit to a root over many and prove one of them here.
@@ -124,21 +117,27 @@ async fn bless(
     ));
     // A blessing runs a TTL from when the instance attested, by the chain's
     // own clock.
+    // Nothing is sent until the registry is asked to bless: a failure before
+    // that can't land.
     let issued_at = chain
         .block_timestamp()
         .await
-        .context("reading the chain's clock")?;
+        .context("reading the chain's clock")
+        .map_err(NeverSent::wrap)?;
     let journal: Journal = (image, project_id(), key, root, issued_at);
     let encoded = journal.abi_encode_params();
     let seal = chain
         .sign(deployments.roles.attestor, keccak256(&encoded))
         .await
-        .context("the attestation was not sealed")?;
+        .context("the attestation was not sealed")
+        .map_err(NeverSent::wrap)?;
 
     // An image waits out its timelock before it can hold a key. A service
     // that starts the moment the chain does is simply early, so it waits
-    // rather than gives up.
-    let mut waited = Duration::ZERO;
+    // rather than gives up. The wait is measured by the clock: each look
+    // can itself take a request's timeout.
+    let started = tokio::time::Instant::now();
+    let mut said_so = false;
     loop {
         let allowed = chain
             .read(
@@ -149,32 +148,50 @@ async fn bless(
             .unwrap_or(false);
 
         if allowed {
-            sender
-                .send(
-                    chain,
-                    deployments.attestation,
-                    IAttestationRegistry::blessCall {
-                        seal: seal.clone(),
-                        journal: encoded.clone().into(),
-                        vaultChain: vault_chain,
-                        vault,
-                        strategyHash: bundle,
-                        merkleProof: Vec::new(),
-                    },
-                )
-                .await
-                .context("the registry would not bless the key")?;
+            let call = IAttestationRegistry::blessCall {
+                seal: seal.clone(),
+                journal: encoded.clone().into(),
+                vaultChain: vault_chain,
+                vault,
+                strategyHash: bundle,
+                merkleProof: Vec::new(),
+            };
+            match &sender {
+                Sender::Unlocked(from) => {
+                    chain
+                        .send(*from, deployments.attestation, call)
+                        .await
+                        .context("the registry would not bless the key")?;
+                }
+                // Looked at again once the key's turn to send has come: a
+                // blessing of this key's sent before (by a serve since
+                // stopped, say) may have landed while this one waited, and
+                // a second would be paid for nothing.
+                Sender::Own(own) => {
+                    own.send_if(
+                        async {
+                            blessed_for_a_while(chain, deployments, service, key, vault, bundle)
+                                .await
+                                .map(|blessed| !blessed)
+                        },
+                        deployments.attestation,
+                        call,
+                    )
+                    .await
+                    .context("the registry would not bless the key")?;
+                }
+            }
             break;
         }
 
-        if waited > Duration::from_secs(300) {
+        if started.elapsed() > Duration::from_secs(300) {
             bail!("the {service} image is still not allowlisted");
         }
-        if waited.is_zero() {
+        if !said_so {
             tracing::info!(service, "waiting out the image's timelock");
+            said_so = true;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
-        waited += Duration::from_secs(2);
     }
 
     chain
@@ -186,12 +203,106 @@ async fn bless(
         .context("reading back what was blessed")
 }
 
+/// Which chain the vault a key is blessed for is on: none for a key that
+/// serves no particular vault.
+fn vault_chain(deployments: &Deployments, vault: Address) -> U256 {
+    if vault == Address::ZERO {
+        U256::ZERO
+    } else {
+        U256::from(deployments.chain_id)
+    }
+}
+
+/// Whether the registry counts `key` as blessed for this vault and bundle
+/// (or, with no vault, as this service's kind) right now. The key's record
+/// alone can't say: a blessing also ends when the checker that gave it is
+/// retired, until an allowed checker vouches for the key again.
+async fn blessed_now(
+    chain: &Client,
+    deployments: &Deployments,
+    service: &str,
+    key: Address,
+    vault: Address,
+    bundle: B256,
+) -> Result<bool> {
+    if vault == Address::ZERO {
+        chain
+            .read(
+                deployments.attestation,
+                IAttestationRegistry::isBlessedAsCall {
+                    signer: key,
+                    kind: kind_of(service),
+                },
+            )
+            .await
+    } else {
+        chain
+            .read(
+                deployments.attestation,
+                IAttestationRegistry::isBlessedForCall {
+                    signer: key,
+                    vaultChain: vault_chain(deployments, vault),
+                    vault,
+                    strategyHash: bundle,
+                },
+            )
+            .await
+    }
+}
+
+/// Whether `key` is blessed for this vault and bundle with more than half
+/// its blessing left by the chain's clock, so blessing it again now would
+/// pay for nothing.
+async fn blessed_for_a_while(
+    chain: &Client,
+    deployments: &Deployments,
+    service: &str,
+    key: Address,
+    vault: Address,
+    bundle: B256,
+) -> Result<bool> {
+    let info = chain
+        .read(
+            deployments.attestation,
+            IAttestationRegistry::keyInfoCall { signer: key },
+        )
+        .await?;
+    if info.vaultChain != vault_chain(deployments, vault)
+        || info.vault != vault
+        || info.strategyHash != bundle
+    {
+        return Ok(false);
+    }
+    if !blessed_now(chain, deployments, service, key, vault, bundle).await? {
+        return Ok(false);
+    }
+    let ttl = chain
+        .read(
+            deployments.attestation,
+            IAttestationRegistry::blessingTtlCall {},
+        )
+        .await?;
+    let now = chain.block_timestamp().await?;
+    Ok(info.blessedUntil.saturating_sub(now).saturating_mul(2) > ttl)
+}
+
 /// Keep a key blessed for as long as this service runs.
 ///
 /// A blessing expires, and an expired key is exactly as useless as a revoked
 /// one — which is the point: an instance that stops attesting stops being
 /// able to act. So an instance that is still running attests again well
 /// before its blessing runs out.
+///
+/// `on_renewal` runs whenever the key's blessing is seen to have moved, not
+/// only when a renewal reports success: a renewal can land on the chain and
+/// still fail afterwards (its receipt or the read-back lost), and whatever
+/// follows the blessing has to follow it all the same.
+///
+/// A renewal that has been broadcast may land, for as long as the chain
+/// client watches for its receipt. While it may, no other is sent: the
+/// blessing's end is read again at every look, and a renewal that lands is
+/// seen there. Renewals start with a third of the blessing left, which is far
+/// longer than that wait.
 #[allow(clippy::too_many_arguments)]
 pub fn keep_blessed(
     chain: Client,
@@ -201,33 +312,75 @@ pub fn keep_blessed(
     sender: Sender,
     vault: Address,
     bundle: B256,
+    on_renewal: impl FnMut() + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    keep_blessed_sharing(
+        chain,
+        deployments,
+        service,
+        key,
+        sender,
+        vault,
+        bundle,
+        Unanswered::default(),
+        on_renewal,
+    )
+}
+
+/// [`keep_blessed`], holding its renewals back while any blessing of the
+/// key's noted in `unanswered` may still land, and noting there each of its
+/// own: one sent by an earlier keeper of the same key (a serve started
+/// again) holds this one back as its own would. A key's own renewal is noted
+/// by its send the moment it is broadcast, so a keeper stopped halfway
+/// through the send still leaves it noted; a renewal sent by an unlocked
+/// account is noted when it is seen to go unanswered.
+#[allow(clippy::too_many_arguments)]
+pub fn keep_blessed_sharing(
+    chain: Client,
+    deployments: Deployments,
+    service: &'static str,
+    key: Address,
+    sender: Sender,
+    vault: Address,
+    bundle: B256,
+    unanswered: Unanswered,
     mut on_renewal: impl FnMut() + Send + 'static,
 ) -> tokio::task::JoinHandle<()> {
+    let sender = sender.noting(&unanswered);
     tokio::spawn(async move {
+        let mut unread = false;
+        // The blessing's end as last seen, so a move is noticed however it
+        // came about.
+        let mut seen_until: Option<u64> = None;
         loop {
-            let ttl = chain
-                .read(
-                    deployments.attestation,
-                    IAttestationRegistry::blessingTtlCall {},
-                )
-                .await
-                .unwrap_or(72 * 3_600);
+            // A read that failed says nothing about the blessing, so it is
+            // looked at again shortly rather than renewed on a guess: a
+            // renewal on every failed read would pay for blessings that
+            // still have days to run.
+            let due = match renewal_due(&chain, &deployments, service, key, vault, bundle).await {
+                Ok((due, until)) => {
+                    unread = false;
+                    if seen_until.is_some_and(|seen| seen != until) {
+                        unanswered.settled();
+                        on_renewal();
+                    }
+                    seen_until = Some(until);
+                    due
+                }
+                Err(error) => {
+                    if !unread {
+                        tracing::warn!(
+                            service,
+                            error = format!("{error:#}"),
+                            "could not tell how long a blessing has left; looking again shortly"
+                        );
+                    }
+                    unread = true;
+                    false
+                }
+            };
 
-            // Renew with a third of the blessing left, so a slow chain or a
-            // busy moment never leaves a gap.
-            let info = chain
-                .read(
-                    deployments.attestation,
-                    IAttestationRegistry::keyInfoCall { signer: key },
-                )
-                .await
-                .ok();
-            let now = chain.block_timestamp().await.unwrap_or_default();
-            let left = info
-                .map(|info| info.blessedUntil.saturating_sub(now))
-                .unwrap_or(0);
-
-            if left * 3 <= ttl {
+            if due && !unanswered.may_still_land(key) {
                 match bless(
                     &chain,
                     &deployments,
@@ -239,10 +392,18 @@ pub fn keep_blessed(
                 )
                 .await
                 {
-                    Ok(_) => on_renewal(),
+                    Ok(info) => {
+                        unanswered.settled();
+                        on_renewal();
+                        seen_until = Some(info.blessedUntil);
+                    }
                     // A key that stops being blessed stops being able to act,
-                    // so this is never a quiet failure.
-                    Err(error) => tracing::warn!(service, %error, "could not renew a blessing"),
+                    // so this is never a quiet failure. A renewal that landed
+                    // regardless is noticed at the next look.
+                    Err(error) => {
+                        unanswered.failed(key, &error);
+                        tracing::warn!(service, %error, "could not renew a blessing");
+                    }
                 }
             }
 
@@ -252,6 +413,36 @@ pub fn keep_blessed(
     })
 }
 
+/// Whether a key's blessing is down to a third of its length, so it is
+/// renewed with time to spare for a slow chain or a busy moment, and when it
+/// ends. A key the registry no longer counts as blessed (its checker
+/// retired, say) is due at once, however long its record says is left.
+async fn renewal_due(
+    chain: &Client,
+    deployments: &Deployments,
+    service: &str,
+    key: Address,
+    vault: Address,
+    bundle: B256,
+) -> Result<(bool, u64)> {
+    let ttl = chain
+        .read(
+            deployments.attestation,
+            IAttestationRegistry::blessingTtlCall {},
+        )
+        .await?;
+    let info = chain
+        .read(
+            deployments.attestation,
+            IAttestationRegistry::keyInfoCall { signer: key },
+        )
+        .await?;
+    let blessed = blessed_now(chain, deployments, service, key, vault, bundle).await?;
+    let now = chain.block_timestamp().await?;
+    let due = !blessed || info.blessedUntil.saturating_sub(now).saturating_mul(3) <= ttl;
+    Ok((due, info.blessedUntil))
+}
+
 /// Which kind of image a service runs as, for the pages that say so.
 pub fn kind_of(service: &str) -> ImageKind {
     match service {
@@ -259,5 +450,33 @@ pub fn kind_of(service: &str) -> ImageKind {
         "reviewer" => ImageKind::Reviewer,
         "unwinder" => ImageKind::Unwinder,
         _ => ImageKind::Executor,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::NeverLanded;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_renewal_is_not_sent_again_while_an_unanswered_one_may_still_land() {
+        let key = Address::repeat_byte(1);
+        let unanswered = Unanswered::default();
+        // Nothing went unanswered: renewed when due.
+        assert!(!unanswered.may_still_land(key));
+        // One that was never sent can't land.
+        unanswered.failed(
+            key,
+            &NeverSent::wrap(anyhow::Error::new(NeverLanded)).context("bless"),
+        );
+        assert!(!unanswered.may_still_land(key));
+        // One went unanswered a minute ago: it may still land, for this key.
+        unanswered.failed(key, &anyhow::Error::new(NeverLanded).context("bless"));
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(unanswered.may_still_land(key));
+        assert!(!unanswered.may_still_land(Address::repeat_byte(2)));
+        // Once the client has stopped watching for it, it won't.
+        tokio::time::advance(crate::client::LANDING_TIMEOUT).await;
+        assert!(!unanswered.may_still_land(key));
     }
 }

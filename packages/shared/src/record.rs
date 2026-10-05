@@ -48,6 +48,12 @@ pub fn drawdown(series: &[Point]) -> Vec<Point> {
         .collect()
 }
 
+/// The change from one level to another, or none from a level of nothing
+/// (a vault that has lost everything has no return to show, not an infinite one).
+fn change(from: f64, to: f64) -> f64 {
+    if from > 0.0 { to / from - 1.0 } else { 0.0 }
+}
+
 /// Return in each calendar month the series covers, dated to the month's end.
 pub fn monthly(series: &[Point]) -> Vec<Point> {
     let mut out: Vec<Point> = Vec::new();
@@ -64,7 +70,7 @@ pub fn monthly(series: &[Point]) -> Vec<Point> {
             Some(previous) if previous != key => {
                 out.push(Point {
                     date: point.date,
-                    value: point.value / month_start - 1.0,
+                    value: change(month_start, point.value),
                 });
                 month_start = point.value;
                 current = Some(key);
@@ -76,7 +82,7 @@ pub fn monthly(series: &[Point]) -> Vec<Point> {
     if let Some(last) = series.last() {
         out.push(Point {
             date: last.date,
-            value: last.value / month_start - 1.0,
+            value: change(month_start, last.value),
         });
     }
     out

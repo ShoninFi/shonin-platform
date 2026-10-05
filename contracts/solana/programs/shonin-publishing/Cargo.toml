@@ -1,0 +1,36 @@
+[package]
+name = "shonin-publishing"
+version = "0.1.0"
+description = "Publishing on Solana: the paid submission, every strategy, and every strategy's one review"
+edition = "2021"
+license = "BUSL-1.1"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "shonin_publishing"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+# Build with the committed mainnet ids (mainnet-id) instead of the local keypairs'.
+mainnet = ["shonin-registry/mainnet"]
+
+[dependencies]
+anchor-lang = { workspace = true }
+anchor-spl = { workspace = true }
+shonin-common = { workspace = true }
+shonin-registry = { path = "../shonin-registry", features = ["no-entrypoint"] }
+
+[build-dependencies]
+shonin-program-id = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

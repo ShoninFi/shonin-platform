@@ -27,7 +27,9 @@
 //!
 //! Files are flat (`about.html`, not `about/index.html`): Workers static
 //! assets serve them at `/about` with no trailing-slash redirect, which is
-//! also why a nested route becomes `agents/<slug>/record.html`.
+//! also why a nested route becomes `agents/<slug>/record.html`. A name in a
+//! path is percent-encoded in links and decoded in the file name, since the
+//! host decodes a request before it looks for the file (see `Route::file`).
 
 use std::{error::Error, fs, path::PathBuf};
 
@@ -78,22 +80,52 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let pages = Route::all_pages();
-    for route in pages.iter().chain([&Route::NotFound]) {
-        let html = render(&shell, base, route);
-        let file = match route.path().as_deref() {
-            Some("/") => "index.html".to_string(),
-            Some(path) => format!("{}.html", path.trim_start_matches('/')),
-            None => "404.html".to_string(),
-        };
-        let target = dist.join(&file);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
+    // A route with no file of its own (a name that would leave its
+    // directory, or too long for a file name) is skipped, and kept out of
+    // the sitemap with it.
+    let mut pages = Route::all_pages();
+    pages.retain(|route| {
+        let written = route.file().is_some();
+        if !written {
+            println!(
+                "skipping {:?}: its path has no safe file name",
+                route.path()
+            );
         }
-        fs::write(&target, html)?;
+        written
+    });
+    // A page whose file can't be written is skipped, said so and kept out of
+    // the sitemap: one route the filesystem refuses holds up no other page.
+    let mut unwritten = Vec::new();
+    for route in pages.iter().chain([&Route::NotFound]) {
+        let Some(file) = route.file() else {
+            continue;
+        };
+        let html = render(&shell, base, route);
+        let target = dist.join(&file);
+        let written = match target.parent() {
+            Some(parent) => fs::create_dir_all(parent),
+            None => Ok(()),
+        }
+        .and_then(|()| fs::write(&target, html));
+        if let Err(error) = written {
+            if *route == Route::NotFound {
+                return Err(format!("writing {}: {error}", target.display()).into());
+            }
+            println!(
+                "skipping {:?}: {file} could not be written: {error}",
+                route.path()
+            );
+            unwritten.push(route.clone());
+        }
     }
+    pages.retain(|route| !unwritten.contains(route));
 
-    let urls: String = Route::indexable()
+    let listed: Vec<Route> = Route::indexable()
+        .into_iter()
+        .filter(|route| pages.contains(route))
+        .collect();
+    let urls: String = listed
         .iter()
         .filter_map(Route::path)
         .map(|path| {
@@ -119,7 +151,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "pre-rendered {} pages ({} of them listed), 404.html, sitemap.xml, robots.txt",
         pages.len(),
-        Route::indexable().len()
+        listed.len()
     );
     Ok(())
 }

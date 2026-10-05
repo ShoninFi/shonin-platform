@@ -9,7 +9,7 @@
 use crate::copy;
 use crate::data;
 use crate::format as fmt;
-use crate::route::{HANDBOOK, Route, Tab};
+use crate::route::{HANDBOOK, Route, Tab, author_path};
 
 // ------------------------------------------------------------- html helpers
 
@@ -294,7 +294,7 @@ fn strategies() -> String {
         let performance = performance(strategy);
         vec![
             link(&format!("/agents/{}", strategy.slug), strategy.name()),
-            link(&format!("/authors/{}", strategy.author), &strategy.author),
+            link(&author_path(&strategy.author), &strategy.author),
             esc(&fmt::days(strategy.days_live)),
             esc(&thirty_days(&performance)),
             esc(&fmt::percent_signed(performance.return_since_open, 1)),
@@ -323,7 +323,7 @@ fn strategies() -> String {
         .map(|strategy| {
             vec![
                 link(&format!("/agents/{}", strategy.slug), strategy.name()),
-                link(&format!("/authors/{}", strategy.author), &strategy.author),
+                link(&author_path(&strategy.author), &strategy.author),
                 esc(strategy.standing.label()),
                 esc(&fmt::days(strategy.days_live)),
             ]
@@ -1524,6 +1524,47 @@ mod tests {
             assert!(html.contains("colophon"), "{:?}", route.path());
             assert!(html.contains("skip-link"), "{:?}", route.path());
         }
+    }
+
+    /// Every link to an author the pre-render writes leads back to that same
+    /// author, however awkward their name.
+    #[test]
+    fn author_links_lead_back_to_the_author() {
+        let names = crate::fixture::install_awkward_names();
+        let unescape = |text: &str| {
+            text.replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'")
+                .replace("&amp;", "&")
+        };
+
+        let mut routes = vec![Route::Home, Route::Strategies];
+        routes.extend(data::vaults().iter().map(|strategy| Route::Strategy {
+            slug: strategy.slug.clone(),
+            tab: Tab::Overview,
+        }));
+        let mut seen = 0;
+        for route in routes {
+            let html = body(&route);
+            for rest in html.split("href=\"").skip(1) {
+                let href = unescape(rest.split('"').next().unwrap_or_default());
+                if !href.starts_with("/authors/") {
+                    continue;
+                }
+                seen += 1;
+                let Route::Author { handle } = Route::from_path(&href) else {
+                    panic!("{href} on {:?} isn't an author's page", route.path());
+                };
+                assert!(names.contains(&handle), "{href} names {handle:?}");
+                assert!(data::author(&handle).is_some(), "{handle:?} isn't found");
+                assert!(
+                    html.contains(&format!("{}\">{}</a>", esc(&href), esc(&handle))),
+                    "{href} isn't the link for {handle:?}"
+                );
+            }
+        }
+        assert!(seen > 0, "no author links were rendered");
     }
 
     #[test]

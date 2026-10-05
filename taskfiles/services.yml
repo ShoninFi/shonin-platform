@@ -81,11 +81,15 @@ tasks:
     desc: "The build service"
     cmds:
       - >-
+        test -d "{{.PATH_VENDOR}}" ||
+        cargo run -q -p shonin-builder -- --vendor-into "{{.PATH_VENDOR}}"
+      - >-
         cargo run -q -p shonin-builder --
         {{.SERVICE_ARGS}}
         --port {{.PORT_BUILDER}}
         --builds "{{.PATH_BUILDS}}"
         --sdk "{{.PATH_PACKAGE_SDK}}"
+        --vendor "{{.PATH_VENDOR}}"
         --reviewer-url "{{.URL_REVIEWER_DEV}}"
 
   reviewer:

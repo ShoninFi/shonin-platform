@@ -8,6 +8,7 @@ use shared::{
 
 use crate::data;
 use crate::format as fmt;
+use crate::route;
 use crate::ui::chart;
 use crate::ui::primitives as ui;
 use crate::ui::primitives::Tone;
@@ -131,7 +132,7 @@ pub fn byline(strategy: &Strategy) -> Dom {
     html!("p", {
         .class("muted")
         .child(text(&format!("{} · by ", strategy.title)))
-        .child(link!(format!("/authors/{}", strategy.author), {
+        .child(link!(route::author_path(&strategy.author), {
             .text(&strategy.author)
         }))
         .child(text(&format!(" · {} live", fmt::days(strategy.days_live))))

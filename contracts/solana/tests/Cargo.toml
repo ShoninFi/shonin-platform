@@ -1,0 +1,50 @@
+[package]
+name = "shonin-solana-tests"
+version = "0.1.0"
+edition = "2021"
+license = "BUSL-1.1"
+publish = false
+
+# The platform as the development chain deploys it, in-process: the built
+# programs from target/deploy, run by LiteSVM. `src` is the fixture; `tests`
+# holds one file per program or concern, each named for what it proves.
+[dependencies]
+anchor-lang = { workspace = true }
+anchor-spl = { workspace = true }
+litesvm = "0.7"
+shonin-common = { workspace = true }
+shonin-registry = { path = "../programs/shonin-registry", features = ["no-entrypoint"] }
+shonin-dev-verifier = { path = "../programs/shonin-dev-verifier", features = ["no-entrypoint"] }
+shonin-publishing = { path = "../programs/shonin-publishing", features = ["no-entrypoint"] }
+shonin-prices = { path = "../programs/shonin-prices", features = ["no-entrypoint"] }
+shonin-profiles = { path = "../programs/shonin-profiles", features = ["no-entrypoint"] }
+shonin-station = { path = "../programs/shonin-station", features = ["no-entrypoint"] }
+shonin-local-venue = { path = "../programs/shonin-local-venue", features = ["no-entrypoint"] }
+shonin-local-driver = { path = "../programs/shonin-local-driver", features = ["no-entrypoint"] }
+shonin-local-venue-2 = { path = "../programs/shonin-local-venue-2", features = ["no-entrypoint"] }
+shonin-local-venue-3 = { path = "../programs/shonin-local-venue-3", features = ["no-entrypoint"] }
+shonin-local-driver-2 = { path = "../programs/shonin-local-driver-2", features = ["no-entrypoint"] }
+shonin-local-driver-3 = { path = "../programs/shonin-local-driver-3", features = ["no-entrypoint"] }
+shonin-test-driver = { path = "../programs/shonin-test-driver", features = ["no-entrypoint"] }
+shonin-test-hostile-venue = { path = "../programs/shonin-test-hostile-venue", features = ["no-entrypoint"] }
+shonin-test-vault = { path = "../programs/shonin-test-vault", features = ["no-entrypoint"] }
+shonin-vault = { path = "../programs/shonin-vault", features = ["no-entrypoint"] }
+shonin-driver = { path = "../crates/shonin-driver" }
+solana-account = "2.2"
+solana-address-lookup-table-interface = { version = "2.2", features = ["bincode", "bytemuck"] }
+solana-clock = "2.2"
+solana-compute-budget-interface = "2.2"
+solana-ed25519-program = "2.2"
+solana-instruction = "2.3"
+solana-keypair = "2.2"
+solana-message = "2.4"
+solana-sdk-ids = { workspace = true }
+solana-signer = "2.2"
+solana-transaction = "2.2"
+solana-transaction-error = "2.2"
+bincode = "1.3"
+base64 = "0.22"
+
+# A failed transaction carries its logs, which is the point of returning it.
+[lints.clippy]
+result_large_err = "allow"

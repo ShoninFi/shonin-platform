@@ -1,13 +1,16 @@
-//! The reference indexer, on its own: it reads the chain into the record and
-//! answers "are you up?". The web app's API runs the same indexer in-process.
+//! The reference indexer, on its own: it reads the chain into the record,
+//! takes the health reports executors sign, and answers "are you up?". The
+//! web app's API runs the same indexer in-process.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::extract::State;
-use axum::routing::get;
+use axum::Json;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::routing::{get, post};
 use clap::Parser;
 use indexer::Indexer;
 
@@ -29,22 +32,28 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(chain::log_filter())
         .with_target(false)
         .init();
 
     let args = Args::parse();
-    let served = args.chain_args.connect_all().await?;
-    let indexer = Arc::new(Indexer::new(served, args.store, args.builder_url));
-    for reader in &indexer.readers {
-        tracing::info!(chain = %reader.served.key, "the indexer is reading");
-    }
+    // Each chain is read from the moment it connects: one out of reach
+    // holds up none of the others.
+    let expected = args
+        .chain_args
+        .targets()?
+        .iter()
+        .map(|target| target.vault_chain)
+        .collect();
+    let connected = args.chain_args.connect_each()?;
+    let indexer = Arc::new(Indexer::new(expected, args.store, args.builder_url));
+    let adding = indexer.clone();
+    tokio::spawn(async move { adding.add_each(connected).await });
 
     if args.port != 0 {
         let app = axum::Router::new()
             .route("/health", get(health))
+            .route("/api/{chain}/health", post(post_health))
             .with_state(indexer.clone());
         let address = SocketAddr::from(([127, 0, 0, 1], args.port));
         let listener = tokio::net::TcpListener::bind(address).await?;
@@ -57,13 +66,18 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Up, and how far it has read on each chain.
-async fn health(State(indexer): State<Arc<Indexer>>) -> String {
-    let snapshot = indexer.snapshot.read().await;
-    let blocks: Vec<String> = snapshot
-        .chains
-        .iter()
-        .map(|info| format!("{} block {}", info.chain, info.block))
-        .collect();
-    format!("indexer: {}", blocks.join(", "))
+/// A health report from the instance running a vault's strategy, checked
+/// the same way the web app's API checks it.
+async fn post_health(
+    State(indexer): State<Arc<Indexer>>,
+    Path(chain): Path<shared::Chain>,
+    Json(post): Json<shared::HealthPost>,
+) -> StatusCode {
+    indexer.take_health(chain, post).await.status()
+}
+
+/// Up, and how far it has read on each chain: 503 while a chain it is to
+/// read is not connected, or has not been read lately.
+async fn health(State(indexer): State<Arc<Indexer>>) -> (StatusCode, String) {
+    indexer.health_answer("indexer")
 }

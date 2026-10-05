@@ -28,6 +28,40 @@ pub fn install() {
     }
 }
 
+/// A name with everything in it a URL path treats specially: spaces,
+/// brackets, a slash, a percent sign, a hash, a question mark and text
+/// outside ASCII.
+pub const AWKWARD_NAME: &str = "zoë/al (0x12ab…) 100% #1? on Base";
+
+/// The captured snapshot with every author renamed to [`AWKWARD_NAME`] and a
+/// number, everywhere the name appears, and made what the app is showing.
+/// Returns the new names.
+pub fn install_awkward_names() -> Vec<String> {
+    let mut snapshot = snapshot();
+    let renamed: Vec<(String, String)> = snapshot
+        .authors
+        .iter()
+        .enumerate()
+        .map(|(index, author)| (author.handle.clone(), format!("{AWKWARD_NAME} {index}")))
+        .collect();
+    let rename = |name: &mut String| {
+        if let Some((_, new)) = renamed.iter().find(|(old, _)| old == name) {
+            *name = new.clone();
+        }
+    };
+    for author in &mut snapshot.authors {
+        rename(&mut author.handle);
+    }
+    for strategy in &mut snapshot.strategies {
+        rename(&mut strategy.author);
+    }
+    for job in &mut snapshot.jobs {
+        rename(&mut job.author);
+    }
+    crate::data::set(snapshot);
+    renamed.into_iter().map(|(_, new)| new).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

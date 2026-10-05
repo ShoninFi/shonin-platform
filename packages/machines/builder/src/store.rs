@@ -13,6 +13,15 @@ pub fn directory(store: &Path, hash: &str) -> PathBuf {
     store.join(hash.replace(':', "-"))
 }
 
+/// Whether the store holds a bundle's files, those a page reads for a build:
+/// a job reads ready with a bundle only if it does.
+pub fn holds_bundle(store: &Path, bundle_hash: &str) -> bool {
+    let directory = directory(store, bundle_hash);
+    ["component.wasm", "bundle.tar", "hashes.json"]
+        .iter()
+        .all(|name| directory.join(name).is_file())
+}
+
 pub fn put(store: &Path, hash: &str, name: &str, bytes: &[u8]) -> Result<PathBuf> {
     let directory = directory(store, hash);
     std::fs::create_dir_all(&directory)

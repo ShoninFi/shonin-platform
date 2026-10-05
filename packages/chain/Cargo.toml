@@ -13,9 +13,9 @@ name = "chain"
 [features]
 # Talking to a node. Native only: the web app encodes calls with this crate
 # and sends them through the browser's own wallet.
-rpc = ["dep:alloy", "dep:anyhow", "dep:tokio", "dep:tracing"]
+rpc = ["dep:alloy", "dep:anyhow", "dep:tokio", "dep:tower", "dep:tracing"]
 # The arguments every service takes to choose its network and chain.
-args = ["rpc", "dep:clap"]
+args = ["rpc", "dep:clap", "dep:tracing-subscriber"]
 
 [dependencies]
 alloy-primitives = { workspace = true, features = ["serde"] }
@@ -25,11 +25,17 @@ serde_json.workspace = true
 shared.workspace = true
 toml.workspace = true
 
-alloy = { workspace = true, optional = true }
+alloy = { workspace = true, optional = true, features = ["json-rpc"] }
 anyhow = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+[dev-dependencies]
+# A paused clock, so a test can wait out a receipt timeout without waiting.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

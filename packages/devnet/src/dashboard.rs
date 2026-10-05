@@ -287,18 +287,18 @@ async fn service_row(dashboard: &Dashboard, name: &str, url: &str) -> String {
         .map(|port| port.to_string())
         .unwrap_or_default();
     let (status, class) = match dashboard.http.get(url).send().await {
+        // A health route says who it is; a page just says it is there.
         Ok(reply) if reply.status().is_success() => {
             let text = reply.text().await.unwrap_or_default();
-            let first = text.lines().next().unwrap_or_default().trim().to_string();
-            // A health route says who it is; a page just says it is there.
-            let said = if first.len() > 60 || first.starts_with('<') {
-                "up".to_string()
-            } else {
-                format!("up: {first}")
-            };
-            (said, "ok")
+            (said_with("up".to_string(), &text), "ok")
         }
-        Ok(reply) => (format!("answered {}", reply.status()), "bad"),
+        // A health route that answers it is not well says what is wrong on
+        // its first line.
+        Ok(reply) => {
+            let status = reply.status();
+            let text = reply.text().await.unwrap_or_default();
+            (said_with(format!("answered {status}"), &text), "bad")
+        }
         Err(error) => (format!("down ({})", short(&error)), "bad"),
     };
     format!(
@@ -308,6 +308,24 @@ async fn service_row(dashboard: &Dashboard, name: &str, url: &str) -> String {
         esc(&status),
         url = esc(url),
     )
+}
+
+/// The most of a health route's first line a service's row shows.
+const HEALTH_LINE: usize = 60;
+
+/// What a service's row says: `status`, then the first line of what its
+/// health route answered, cut to [`HEALTH_LINE`] characters if it runs
+/// longer. A page (or nothing) adds nothing.
+fn said_with(status: String, text: &str) -> String {
+    let first = text.lines().next().unwrap_or_default().trim();
+    if first.is_empty() || first.starts_with('<') {
+        return status;
+    }
+    if first.chars().count() <= HEALTH_LINE {
+        return format!("{status}: {first}");
+    }
+    let cut: String = first.chars().take(HEALTH_LINE - 1).collect();
+    format!("{status}: {}…", cut.trim_end())
 }
 
 fn deployment_section(dashboard: &Dashboard, key: &ChainKey, config: &ChainConfig) -> String {
@@ -519,3 +537,33 @@ code, pre { font: 12px ui-monospace, monospace; } pre { overflow-x: auto; paddin
 .columns { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }
 section { overflow-x: auto; }
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A service with much wrong says the most on its first line: a row
+    /// shows that line cut to fit rather than dropping it.
+    #[test]
+    fn a_health_line_too_long_for_its_row_is_cut_not_dropped() {
+        let long = format!("keeper: {}", "x".repeat(80));
+        let said = said_with("answered 503".to_string(), &format!("{long}\ndetails"));
+        let shown = said.strip_prefix("answered 503: ").expect(&said);
+        assert_eq!(shown.chars().count(), HEALTH_LINE);
+        assert!(
+            shown.starts_with("keeper: xxx") && shown.ends_with('…'),
+            "{said}"
+        );
+        assert_eq!(said_with("up".to_string(), &long), format!("up: {shown}"));
+
+        assert_eq!(
+            said_with(
+                "answered 503".to_string(),
+                "keeper: 2 chains not kept; +2 more\nmore"
+            ),
+            "answered 503: keeper: 2 chains not kept; +2 more"
+        );
+        assert_eq!(said_with("up".to_string(), "<!doctype html>"), "up");
+        assert_eq!(said_with("answered 502".to_string(), ""), "answered 502");
+    }
+}
