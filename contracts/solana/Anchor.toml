@@ -12,8 +12,9 @@ resolution = true
 skip-lint = false
 
 # Program ids are not written here. A program's address is its keypair's
-# (target/deploy, never committed), or, built with `--features mainnet`, the
-# committed id in programs/<name>/mainnet-id; see crates/shonin-program-id.
+# (target/deploy, never committed), or, built with `--features mainnet` or
+# `--features devnet`, the committed id in programs/<name>/mainnet-id or
+# devnet-id; see crates/shonin-program-id.
 
 # The local validator `task dev` starts (see taskfiles/config.yml for ports).
 [provider]

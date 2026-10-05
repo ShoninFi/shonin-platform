@@ -22,6 +22,8 @@ custom-heap = []
 custom-panic = []
 # Never set for this program: it is refused for mainnet at build time.
 mainnet = []
+# Build with the committed devnet id (devnet-id): the stand-in stack runs on devnet.
+devnet = []
 
 [dependencies]
 anchor-lang = { workspace = true }

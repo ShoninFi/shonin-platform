@@ -6091,6 +6091,7 @@ dependencies = [
  "shonin-shared",
  "shonin-station",
  "shonin-vault",
+ "solana-address-lookup-table-interface",
  "solana-compute-budget-interface",
  "solana-ed25519-program",
  "solana-hash",

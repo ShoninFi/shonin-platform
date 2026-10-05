@@ -88,6 +88,14 @@ impl RoleKeys {
     pub fn address(&self, role: Role) -> Pubkey {
         self.get(role).pubkey()
     }
+
+    /// The key at `address`, the deployer's or a role's, if it is one of
+    /// these.
+    pub fn find(&self, address: &Pubkey) -> Option<&Keypair> {
+        std::iter::once(&self.deployer)
+            .chain(&self.roles)
+            .find(|key| key.pubkey() == *address)
+    }
 }
 
 /// Read a keypair file the Solana tools wrote.

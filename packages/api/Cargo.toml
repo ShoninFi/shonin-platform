@@ -11,6 +11,12 @@ publish.workspace = true
 name = "api"
 path = "src/main.rs"
 
+[features]
+# The network whose Solana program ids are compiled in; neither is local (see
+# the chain crate's features).
+mainnet = ["chain/mainnet"]
+devnet = ["chain/devnet"]
+
 [dependencies]
 shared.workspace = true
 chain = { workspace = true, features = ["args"] }

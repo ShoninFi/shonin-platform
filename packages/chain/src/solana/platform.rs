@@ -350,7 +350,17 @@ impl Platform {
     }
 
     pub fn ix_initialize_venue(&self, deployer: &Pubkey, margin_bps: u64) -> Instruction {
-        let venue = shonin_local_venue::ID;
+        self.ix_initialize_venue_at(&shonin_local_venue::ID, deployer, margin_bps)
+    }
+
+    /// The same for `venue`, the stand-in venue or one of its copies.
+    pub fn ix_initialize_venue_at(
+        &self,
+        venue: &Pubkey,
+        deployer: &Pubkey,
+        margin_bps: u64,
+    ) -> Instruction {
+        let venue = *venue;
         Instruction {
             program_id: venue,
             accounts: shonin_local_venue::accounts::Initialize {
@@ -402,7 +412,18 @@ impl Platform {
     // The stand-in venue ------------------------------------------------------
 
     pub fn ix_list_market(&self, id: [u8; 32], is_perp: bool, price: u64) -> Instruction {
-        let venue = shonin_local_venue::ID;
+        self.ix_list_market_at(&shonin_local_venue::ID, id, is_perp, price)
+    }
+
+    /// The same at `venue`.
+    pub fn ix_list_market_at(
+        &self,
+        venue: &Pubkey,
+        id: [u8; 32],
+        is_perp: bool,
+        price: u64,
+    ) -> Instruction {
+        let venue = *venue;
         Instruction {
             program_id: venue,
             accounts: shonin_local_venue::accounts::ListMarket {
@@ -478,8 +499,19 @@ impl Platform {
         client: &SolanaClient,
         master: &Pubkey,
     ) -> Result<Option<shonin_local_venue::MarginAccount>> {
+        self.margin_account_at(client, &shonin_local_venue::ID, master)
+            .await
+    }
+
+    /// The same at `venue`, the stand-in venue or one of its copies.
+    pub async fn margin_account_at(
+        &self,
+        client: &SolanaClient,
+        venue: &Pubkey,
+        master: &Pubkey,
+    ) -> Result<Option<shonin_local_venue::MarginAccount>> {
         client
-            .load(&shonin_local_venue::account_address(master))
+            .load(&shonin_local_venue::account_address_of(venue, master))
             .await
     }
 
@@ -489,14 +521,25 @@ impl Platform {
         client: &SolanaClient,
         master: &Pubkey,
     ) -> Result<Vec<Pubkey>> {
+        self.held_markets_at(client, &shonin_local_venue::ID, master)
+            .await
+    }
+
+    /// The same at `venue`.
+    pub async fn held_markets_at(
+        &self,
+        client: &SolanaClient,
+        venue: &Pubkey,
+        master: &Pubkey,
+    ) -> Result<Vec<Pubkey>> {
         Ok(self
-            .margin_account(client, master)
+            .margin_account_at(client, venue, master)
             .await?
             .map(|account| {
                 account
                     .positions
                     .iter()
-                    .map(|position| shonin_local_venue::market_address(&position.market))
+                    .map(|position| shonin_local_venue::market_address_of(venue, &position.market))
                     .collect()
             })
             .unwrap_or_default())
@@ -1135,6 +1178,27 @@ impl Platform {
         Ok((list, hash))
     }
 
+    /// The venue `driver` trades at, as its allowlist says: where a station
+    /// created with it gets its authority.
+    pub async fn venue_of(
+        &self,
+        client: &SolanaClient,
+        payer: &Pubkey,
+        driver: &Pubkey,
+    ) -> Result<Pubkey> {
+        let ask = Instruction {
+            program_id: *driver,
+            accounts: vec![],
+            data: shonin_driver::discriminator::ALLOWLIST.to_vec(),
+        };
+        let (_, data) = client
+            .simulate(vec![ask], payer)
+            .await?
+            .return_data
+            .ok_or_else(|| anyhow!("the driver {driver} answered no allowlist"))?;
+        Ok(shonin_driver::Allowlist::try_from_slice(&data)?.venue)
+    }
+
     // Vaults: the author -----------------------------------------------------------------
 
     /// The author's `activate` of strategy `id`, its station pinning
@@ -1194,7 +1258,8 @@ impl Platform {
                 );
             }
             let revoked = registry::revoked_address(ApprovalKind::Driver, &driver.name, &effective);
-            let authority = authority_of(&v.station, &driver.program);
+            let venue = self.venue_of(client, author, &driver.program).await?;
+            let authority = venue_authority(&v.station, &venue);
             let group = [
                 AccountMeta::new_readonly(driver.program, false),
                 AccountMeta::new_readonly(program_data_address(&driver.program), false),
@@ -1372,21 +1437,42 @@ impl Platform {
         station: &Pubkey,
         program: &Pubkey,
     ) -> Result<Vec<AccountMeta>> {
-        let venue = shonin_local_venue::ID;
-        let authority = authority_of(station, program);
+        let record = self.station(client, station).await?;
+        let pinned = record
+            .drivers
+            .iter()
+            .find(|driver| driver.program == *program)
+            .ok_or_else(|| anyhow!("the station {station} pins no driver {program}"))?;
+        self.pinned_group(client, pinned).await
+    }
+
+    /// The accounts a pinned driver is given: the program, the station's
+    /// authority at its venue and that authority's dollar account, then the
+    /// stand-in venue's layout at that venue (its own or a copy's), with
+    /// every market the authority holds there.
+    async fn pinned_group(
+        &self,
+        client: &SolanaClient,
+        pinned: &shonin_station::state::Pinned,
+    ) -> Result<Vec<AccountMeta>> {
+        let venue = pinned.venue;
+        let authority = pinned.authority;
         let mut group = vec![
-            AccountMeta::new_readonly(*program, false),
+            AccountMeta::new_readonly(pinned.program, false),
             AccountMeta::new_readonly(authority, false),
-            AccountMeta::new(self.dollars(&authority), false),
+            AccountMeta::new(pinned.dollars, false),
             AccountMeta::new_readonly(venue, false),
-            AccountMeta::new_readonly(shonin_local_venue::venue_address(), false),
-            AccountMeta::new(shonin_local_venue::vault_address(), false),
+            AccountMeta::new_readonly(shonin_local_venue::venue_address_of(&venue), false),
+            AccountMeta::new(shonin_local_venue::vault_address_of(&venue), false),
             AccountMeta::new_readonly(self.mint, false),
             AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new(shonin_local_venue::account_address(&authority), false),
+            AccountMeta::new(
+                shonin_local_venue::account_address_of(&venue, &authority),
+                false,
+            ),
         ];
         group.extend(
-            self.held_markets(client, &authority)
+            self.held_markets_at(client, &venue, &authority)
                 .await?
                 .into_iter()
                 .map(|market| AccountMeta::new_readonly(market, false)),
@@ -1404,7 +1490,7 @@ impl Platform {
         let mut accounts = Vec::new();
         let mut sizes = Vec::new();
         for driver in &record.drivers {
-            let group = self.driver_group(client, station, &driver.program).await?;
+            let group = self.pinned_group(client, driver).await?;
             sizes.push(group.len() as u8);
             accounts.extend(group);
         }
@@ -1883,12 +1969,18 @@ impl Platform {
     // Stand-in venue calls, made through a station ----------------------------------------
 
     pub fn venue_open(&self, payer: &Pubkey, master: &Pubkey) -> Instruction {
+        self.venue_open_at(&shonin_local_venue::ID, payer, master)
+    }
+
+    /// The same at `venue`, the stand-in venue or one of its copies, as
+    /// each `_at` call below.
+    pub fn venue_open_at(&self, venue: &Pubkey, payer: &Pubkey, master: &Pubkey) -> Instruction {
         Instruction {
-            program_id: shonin_local_venue::ID,
+            program_id: *venue,
             accounts: shonin_local_venue::accounts::OpenAccount {
                 payer: *payer,
                 master: *master,
-                account: shonin_local_venue::account_address(master),
+                account: shonin_local_venue::account_address_of(venue, master),
                 system_program: SYSTEM,
             }
             .to_account_metas(None),
@@ -1897,14 +1989,18 @@ impl Platform {
     }
 
     pub fn venue_deposit(&self, master: &Pubkey, amount: u64) -> Instruction {
+        self.venue_deposit_at(&shonin_local_venue::ID, master, amount)
+    }
+
+    pub fn venue_deposit_at(&self, venue: &Pubkey, master: &Pubkey, amount: u64) -> Instruction {
         Instruction {
-            program_id: shonin_local_venue::ID,
+            program_id: *venue,
             accounts: shonin_local_venue::accounts::Deposit {
                 master: *master,
-                account: shonin_local_venue::account_address(master),
+                account: shonin_local_venue::account_address_of(venue, master),
                 master_dollars: self.dollars(master),
-                venue: shonin_local_venue::venue_address(),
-                vault: shonin_local_venue::vault_address(),
+                venue: shonin_local_venue::venue_address_of(venue),
+                vault: shonin_local_venue::vault_address_of(venue),
                 mint: self.mint,
                 token_program: spl_token::ID,
             }
@@ -1919,15 +2015,26 @@ impl Platform {
         master: &Pubkey,
         orders: Vec<shonin_local_venue::OrderRequest>,
     ) -> Result<Instruction> {
+        self.venue_place_at(client, &shonin_local_venue::ID, master, orders)
+            .await
+    }
+
+    pub async fn venue_place_at(
+        &self,
+        client: &SolanaClient,
+        venue: &Pubkey,
+        master: &Pubkey,
+        orders: Vec<shonin_local_venue::OrderRequest>,
+    ) -> Result<Instruction> {
         let mut accounts = shonin_local_venue::accounts::Place {
             master: *master,
-            account: shonin_local_venue::account_address(master),
-            venue: shonin_local_venue::venue_address(),
+            account: shonin_local_venue::account_address_of(venue, master),
+            venue: shonin_local_venue::venue_address_of(venue),
         }
         .to_account_metas(None);
-        let mut markets = self.held_markets(client, master).await?;
+        let mut markets = self.held_markets_at(client, venue, master).await?;
         for order in &orders {
-            let market = shonin_local_venue::market_address(&order.market);
+            let market = shonin_local_venue::market_address_of(venue, &order.market);
             if !markets.contains(&market) {
                 markets.push(market);
             }
@@ -1938,17 +2045,16 @@ impl Platform {
                 .map(|market| AccountMeta::new_readonly(market, false)),
         );
         Ok(Instruction {
-            program_id: shonin_local_venue::ID,
+            program_id: *venue,
             accounts,
             data: shonin_local_venue::instruction::Place { orders }.data(),
         })
     }
 }
 
-/// The station's signing authority at the venue `driver` trades at. Every
-/// driver the platform deploys trades at the stand-in venue.
-pub fn authority_of(station: &Pubkey, _driver: &Pubkey) -> Pubkey {
-    shonin_station::venue_authority(station, &shonin_local_venue::ID).0
+/// The station's signing authority at `venue`.
+pub fn venue_authority(station: &Pubkey, venue: &Pubkey) -> Pubkey {
+    shonin_station::venue_authority(station, venue).0
 }
 
 /// An Ed25519 instruction verifying `signer`'s signature over `message`: how

@@ -16,6 +16,8 @@
 //!
 //! - [`rpc`]: the node's JSON-RPC.
 //! - [`client`]: connecting, reading, and sending until a transaction lands.
+//! - [`tables`]: address lookup tables, for a transaction too large for the
+//!   wire by address.
 //! - [`events`]: a landed transaction, and the events in it.
 //! - [`keys`]: the role keys, and keypair files.
 //! - [`platform`]: every instruction the platform sends, built from the
@@ -30,6 +32,7 @@ pub mod executor;
 pub mod keys;
 pub mod platform;
 pub mod rpc;
+pub mod tables;
 pub mod upkeep;
 
 pub use anchor_lang::prelude::{AccountMeta, Pubkey};

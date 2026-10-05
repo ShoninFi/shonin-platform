@@ -1,14 +1,20 @@
 # syntax=docker/dockerfile:1
 # The API: the web app's server, running the indexer in-process.
 # Runs on Cloud Run.
-# Built from the repository root: task cloud:build NAME=api
-#   (docker build -f deploy/gcp/Dockerfile.api .)
+# Built from the repository root: task cloud:build NAME=api NETWORK=testnet
+#   (docker build --build-arg NETWORK_FEATURE=devnet -f deploy/gcp/Dockerfile.api .)
 
 FROM rust:1.98.1-slim-bookworm AS build
 WORKDIR /src
 COPY . .
+# The network whose Solana program ids are compiled in: devnet for a testnet
+# image, mainnet for a mainnet one (task cloud:build passes it). The local
+# keypairs never reach the build, so an image without it could reach no
+# cluster.
+ARG NETWORK_FEATURE
 # rust-toolchain.toml pins the same compiler; --locked builds exactly Cargo.lock.
-RUN cargo build --release --locked -p shonin-api --bin api
+RUN : "${NETWORK_FEATURE:?pass --build-arg NETWORK_FEATURE=devnet or mainnet}" && \
+    cargo build --release --locked -p shonin-api --bin api --features "$NETWORK_FEATURE"
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /src/target/release/api /usr/local/bin/api

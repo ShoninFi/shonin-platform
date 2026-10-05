@@ -1,0 +1,115 @@
+//! The Solana programs' addresses on devnet. Each program that goes on
+//! devnet is deployed at a key of the team's mnemonic
+//! (`SHONIN_TESTNET_SOLANA_MNEMONIC`), along `m/44'/501'/<index>'/0'` at the
+//! index this table gives it, so everyone deploying from the mnemonic deploys
+//! the same ids, and each program's committed `devnet-id` is its key's
+//! address.
+//!
+//! An index is never reused or renumbered: a program's devnet address is its
+//! index's key, so moving it moves the program. A new program takes the next
+//! index after the last one here, and a retired program's entry stays, so its
+//! index is never handed out again. Below 100, index 0 is the deployer and 1
+//! the registry; the role keys are at 10 and up. Programs that serve tests
+//! only have no index: they never leave a test.
+
+use std::path::Path;
+
+use anyhow::Result;
+use chain::solana::Signer;
+use chain::solana::keys::{self, PROGRAM};
+
+/// Every program deployed to devnet, by its library name, and its index.
+pub const PROGRAM_KEYS: [(&str, u32); 9] = [
+    ("shonin_registry", PROGRAM),
+    ("shonin_publishing", 100),
+    ("shonin_prices", 101),
+    ("shonin_profiles", 102),
+    ("shonin_station", 103),
+    ("shonin_vault", 104),
+    ("shonin_dev_verifier", 105),
+    ("shonin_local_venue", 106),
+    ("shonin_local_driver", 107),
+];
+
+/// Write each program's keypair, from `phrase`, into `dir` as
+/// `<name>-keypair.json`, and return each name with its address.
+pub fn write_program_keypairs(phrase: &str, dir: &Path) -> Result<Vec<(&'static str, String)>> {
+    let mut written = Vec::new();
+    for (name, index) in PROGRAM_KEYS {
+        let pair = keys::keypair_from_mnemonic(phrase, index)?;
+        keys::write_keypair(&pair, &dir.join(format!("{name}-keypair.json")))?;
+        written.push((name, pair.pubkey().to_string()));
+    }
+    Ok(written)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use chain::solana::keys::DEPLOYER;
+
+    /// The first index a program other than the registry takes.
+    const FIRST_PROGRAM_INDEX: u32 = 100;
+
+    #[test]
+    fn every_index_is_used_once() {
+        let indices: BTreeSet<u32> = PROGRAM_KEYS.iter().map(|(_, index)| *index).collect();
+        assert_eq!(indices.len(), PROGRAM_KEYS.len());
+        let names: BTreeSet<&str> = PROGRAM_KEYS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names.len(), PROGRAM_KEYS.len());
+    }
+
+    #[test]
+    fn the_deployer_is_at_0_and_the_registry_at_1() {
+        assert_eq!(DEPLOYER, 0);
+        assert!(PROGRAM_KEYS.iter().all(|(_, index)| *index != DEPLOYER));
+        assert_eq!(
+            PROGRAM_KEYS
+                .iter()
+                .find(|(name, _)| *name == "shonin_registry"),
+            Some(&("shonin_registry", 1))
+        );
+    }
+
+    #[test]
+    fn every_other_program_is_at_100_or_above() {
+        for (name, index) in PROGRAM_KEYS {
+            if name != "shonin_registry" {
+                assert!(index >= FIRST_PROGRAM_INDEX, "{name} is at {index}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_role_keys_stay_below_the_programs() {
+        let last_role = keys::ROLE_BASE + chain::client::ROLE_COUNT as u32 - 1;
+        assert!(last_role < FIRST_PROGRAM_INDEX);
+        let roles = keys::ROLE_BASE..=last_role;
+        assert!(PROGRAM_KEYS.iter().all(|(_, index)| !roles.contains(index)));
+    }
+
+    #[test]
+    fn every_program_the_platform_deploys_has_an_index() {
+        let deployed: BTreeSet<&str> = chain::solana::programs::compiled()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        let indexed: BTreeSet<&str> = PROGRAM_KEYS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(deployed, indexed);
+    }
+
+    #[test]
+    fn each_program_s_keypair_file_holds_its_derived_address() {
+        let dir = std::env::temp_dir().join(format!("devnet-keys-{}", std::process::id()));
+        let written = write_program_keypairs(keys::DEVELOPMENT_MNEMONIC, &dir).unwrap();
+        for (name, address) in &written {
+            let pair = keys::read_keypair(&dir.join(format!("{name}-keypair.json"))).unwrap();
+            assert_eq!(pair.pubkey().to_string(), *address);
+        }
+        let addresses: BTreeSet<&String> = written.iter().map(|(_, address)| address).collect();
+        assert_eq!(addresses.len(), PROGRAM_KEYS.len());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
