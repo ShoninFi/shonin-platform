@@ -16,6 +16,10 @@ members = [
     "packages/devnet",
     "packages/strategy-sdk",
     "packages/drivers/hyperliquid",
+    "packages/attestation/core",
+    "packages/attestation/methods",
+    "packages/attestation/host",
+    "packages/attestation/deploy",
 ]
 # The Solana programs are their own workspace, built with Anchor.
 exclude = ["contracts/solana"]

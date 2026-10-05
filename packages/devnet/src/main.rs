@@ -12,6 +12,7 @@
 //! On any network it serves the ops dashboard on its port: what is running,
 //! locally and in the cloud.
 
+mod checker;
 mod dashboard;
 mod deploy;
 mod devnet_keys;
@@ -86,6 +87,10 @@ enum Command {
     /// Solana deployer, roles and programs: what to fund before a testnet
     /// deploy.
     Accounts,
+    /// Deploy the Confidential Space checker on every EVM chain of the
+    /// network and propose it to the registry beside the development
+    /// checker. Already proposed is done.
+    ProposeChecker,
     /// Top every role up on every EVM testnet from the funder, to the amounts
     /// in the funding file; buys HYPE on HyperCore for HyperEVM. Safe to run
     /// again; testnet only.
@@ -148,7 +153,13 @@ async fn main() -> Result<()> {
     let one = args.chain_args.vault_chain.is_some();
     let changes_chains = matches!(
         args.command,
-        Some(Command::Deploy | Command::Seed { .. } | Command::Accounts | Command::Fund)
+        Some(
+            Command::Deploy
+                | Command::Seed { .. }
+                | Command::Accounts
+                | Command::Fund
+                | Command::ProposeChecker
+        )
     );
     if target.network == NetworkName::Mainnet && changes_chains {
         bail!("{MAINNET_MISSING}");
@@ -181,6 +192,15 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::Accounts) => accounts(&target, &args.funding).await,
+        Some(Command::ProposeChecker) => {
+            checker::run(
+                target.network,
+                only(&target, one, evm_chains(&target)),
+                &target.deployments_dir,
+                &args.artifacts,
+            )
+            .await
+        }
         Some(Command::Fund) => {
             fund::run(
                 target.network,

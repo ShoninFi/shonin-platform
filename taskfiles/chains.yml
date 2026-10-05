@@ -71,6 +71,12 @@ tasks:
     cmds:
       - "{{.DEVNET}} accounts"
 
+  checker:
+    desc: "Deploy the Confidential Space checker and propose it beside the development checker on every EVM chain of the network (local or NETWORK=testnet)"
+    cmds:
+      - task: :contracts:build
+      - "{{.DEVNET}} propose-checker"
+
   fund:
     desc: "Top every role up on every EVM testnet from the funder, buying HYPE on HyperCore for HyperEVM; safe to run again (NETWORK=testnet only)"
     cmds:
