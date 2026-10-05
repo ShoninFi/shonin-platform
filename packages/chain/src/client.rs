@@ -838,8 +838,52 @@ impl Client {
             .with_context(|| format!("asking the chain for {method}"))
     }
 
+    /// The logs a filter matches, through whatever the provider allows.
+    ///
+    /// Public providers refuse ranges wider than they like, each in its own
+    /// words, so a numbered range one refuses as too wide is read in halves
+    /// (and those in halves, as far as one block). Several nodes often
+    /// answer behind one name, and one behind the others may not have the
+    /// range's newest block yet, so a range it says it doesn't have is asked
+    /// again a few times, a second or two apart, before the error is
+    /// returned. A filter with no numbered range is asked once.
     pub async fn logs(&self, filter: &Filter) -> Result<Vec<Log>> {
-        self.provider.get_logs(filter).await.context("reading logs")
+        let range = filter.get_from_block().zip(filter.get_to_block());
+        let Some((from, to)) = range.filter(|(from, to)| from <= to) else {
+            return self.provider.get_logs(filter).await.context("reading logs");
+        };
+        let mut found = Vec::new();
+        let mut pending = vec![(from, to)];
+        while let Some((from, to)) = pending.pop() {
+            let part = filter.clone().from_block(from).to_block(to);
+            let mut tries = 0;
+            loop {
+                match self.provider.get_logs(&part).await {
+                    Ok(logs) => {
+                        found.extend(logs);
+                        break;
+                    }
+                    Err(error) => {
+                        let text = error.to_string();
+                        if to > from && refused_as_too_wide(&text) {
+                            let middle = from + (to - from) / 2;
+                            // Popped last-in first-out: the earlier half first.
+                            pending.push((middle + 1, to));
+                            pending.push((from, middle));
+                            break;
+                        }
+                        if refused_as_not_there_yet(&text) && tries < LOGS_BEHIND_TRIES {
+                            tries += 1;
+                            tokio::time::sleep(Duration::from_millis(1_500)).await;
+                            continue;
+                        }
+                        return Err(anyhow::Error::new(error)
+                            .context(format!("reading logs from block {from} to {to}")));
+                    }
+                }
+            }
+        }
+        Ok(found)
     }
 
     pub async fn block_number(&self) -> Result<u64> {
@@ -1530,6 +1574,44 @@ async fn land(
     Ok(receipt)
 }
 
+/// How many times a range a node says it hasn't reached yet is asked again.
+const LOGS_BEHIND_TRIES: u32 = 4;
+
+/// Whether a provider refused a log range for its width, in any of the ways
+/// providers say so.
+fn refused_as_too_wide(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "range",
+        "too many",
+        "too large",
+        "limit exceeded",
+        "exceeds the limit",
+        "response size",
+        "query returned more than",
+        "block span",
+        "blocks are not supported",
+    ]
+    .iter()
+    .any(|phrase| error.contains(phrase))
+        && !refused_as_not_there_yet(&error)
+}
+
+/// Whether a node refused a log range because it hasn't reached its end yet.
+fn refused_as_not_there_yet(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "block not found",
+        "not available on the upstream",
+        "unknown block",
+        "header not found",
+        "beyond current head",
+        "after last accepted block",
+    ]
+    .iter()
+    .any(|phrase| error.contains(phrase))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1685,5 +1767,29 @@ mod tests {
             format!("{:?}", keys[1].address()),
             "0x70997970c51812dc3a010c7d01b50e0d17dc79c8"
         );
+    }
+
+    #[test]
+    fn a_range_refused_for_its_width_is_told_apart_from_one_not_reached_yet() {
+        for wide in [
+            "error code 35: ranges over 10000 blocks are not supported on free plan",
+            "query returned more than 10000 results",
+            "eth_getLogs block range too large, max is 2000",
+            "error code -32005: limit exceeded",
+            "block range is too wide",
+        ] {
+            assert!(refused_as_too_wide(wide), "{wide}");
+            assert!(!refused_as_not_there_yet(wide), "{wide}");
+        }
+        for behind in [
+            "error code -32603: block not found, because requested block (toBlock 66130301) is not available on the upstream node",
+            "header not found",
+            "unknown block",
+        ] {
+            assert!(refused_as_not_there_yet(behind), "{behind}");
+            assert!(!refused_as_too_wide(behind), "{behind}");
+        }
+        assert!(!refused_as_too_wide("execution reverted"));
+        assert!(!refused_as_not_there_yet("rate limited"));
     }
 }
