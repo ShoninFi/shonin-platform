@@ -34,5 +34,9 @@ tracing-subscriber.workspace = true
 wasmtime.workspace = true
 wasmtime-wasi.workspace = true
 
+[dev-dependencies]
+# A paused clock, so a test can wait out a receipt timeout without waiting.
+tokio = { workspace = true, features = ["test-util"] }
+
 [lints]
 workspace = true
