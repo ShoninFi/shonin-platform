@@ -9,7 +9,7 @@ You choose drivers by name in `shonin.toml`, one `[drivers.<name>]` table each. 
 | Driver | Name in `shonin.toml` | What it trades | Chain |
 | --- | --- | --- | --- |
 | Hyperliquid | `hyperliquid` | Perpetuals and spot | Hyperliquid |
-| Robinhood Chain stock tokens | `robinhood-stocks` | Tokenised stocks, through approved exchanges on the chain | Robinhood Chain |
+| Robinhood Chain stock tokens | `robinhood` | Tokenised stocks, through approved exchanges on the chain | Robinhood Chain |
 | Lighter | `lighter` | Stock and crypto perpetuals | Robinhood Chain |
 | Orca | `orca` | Liquidity in concentrated-liquidity pools, and swaps | Solana |
 
