@@ -16,10 +16,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use alloy::network::{EthereumWallet, TransactionBuilder};
+use alloy::network::TransactionBuilder;
 use alloy::primitives::utils::{format_ether, parse_ether};
 use alloy::primitives::{Address, U256};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result, anyhow, bail};
@@ -212,9 +212,9 @@ async fn fund_chain(
         return Ok(());
     };
     let client = chain::connect_to(network, key, config).await?;
-    let provider = ProviderBuilder::new()
-        .wallet(EthereumWallet::from(funder.clone()))
-        .connect_http(config.first_rpc().parse().context("the chain's RPC URL")?);
+    // Through the client's own connection: an endpoint's URL may carry a
+    // key, and an error must never name it.
+    let provider = client.signing_provider(funder.clone())?;
     let from = funder.address();
     println!("{} ({key}), funder {from:?}", config.label);
 

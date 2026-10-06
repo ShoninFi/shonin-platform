@@ -179,42 +179,50 @@ pub async fn account_state(api: &Api, markets: &Markets, account: Address) -> Re
     let orders = api
         .info(json!({"type": "openOrders", "user": account}))
         .await?;
-    Ok(state_from(markets, &perp, &spot, &orders))
+    state_from(markets, &perp, &spot, &orders)
 }
 
-/// The same, from the venue's three answers.
-pub fn state_from(markets: &Markets, perp: &Value, spot: &Value, orders: &Value) -> AccountState {
-    let positions = perp["assetPositions"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| {
-            let position = &entry["position"];
-            Some(Position {
-                market: market(markets, &position["coin"]),
-                size: decimal(&position["szi"])?,
-                entry_price: decimal(&position["entryPx"]),
-                leverage: position["leverage"]["value"].as_u64().unwrap_or(0) as u32,
-            })
+/// The same, from the venue's three answers. An answer that isn't the list
+/// or the figure it should be, or an entry in it that can't be read, is an
+/// error: never an account with less in it than the venue holds.
+pub fn state_from(
+    markets: &Markets,
+    perp: &Value,
+    spot: &Value,
+    orders: &Value,
+) -> Result<AccountState> {
+    let list = |answer: &Value, what: &str| -> Result<Vec<Value>> {
+        answer.as_array().cloned().ok_or_else(|| {
+            anyhow!("the venue's answer for the account's {what} can't be read: {answer}")
         })
-        .collect();
-    let balances = spot["balances"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|balance| {
-            Some(SpotBalance {
-                token: balance["coin"].as_str()?.to_string(),
-                total: decimal(&balance["total"])?,
-                hold: decimal(&balance["hold"]).unwrap_or(Decimal::ZERO),
-            })
-        })
-        .collect();
-    let open_orders = orders
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|order| {
+    };
+    let unreadable =
+        |what: &str, entry: &Value| anyhow!("one of the account's {what} can't be read: {entry}");
+    let mut positions = Vec::new();
+    for entry in list(&perp["assetPositions"], "positions")? {
+        let position = &entry["position"];
+        positions.push(Position {
+            market: market(markets, &position["coin"]),
+            size: decimal(&position["szi"]).ok_or_else(|| unreadable("positions", &entry))?,
+            entry_price: decimal(&position["entryPx"]),
+            leverage: position["leverage"]["value"].as_u64().unwrap_or(0) as u32,
+        });
+    }
+    let mut balances = Vec::new();
+    for balance in list(&spot["balances"], "spot balances")? {
+        balances.push(SpotBalance {
+            token: balance["coin"]
+                .as_str()
+                .ok_or_else(|| unreadable("spot balances", &balance))?
+                .to_string(),
+            total: decimal(&balance["total"])
+                .ok_or_else(|| unreadable("spot balances", &balance))?,
+            hold: decimal(&balance["hold"]).unwrap_or(Decimal::ZERO),
+        });
+    }
+    let mut open_orders = Vec::new();
+    for order in list(orders, "open orders")? {
+        let read = || {
             Some(OpenOrder {
                 market: market(markets, &order["coin"]),
                 order_id: order["oid"].as_u64()?,
@@ -222,17 +230,21 @@ pub fn state_from(markets: &Markets, perp: &Value, spot: &Value, orders: &Value)
                 size: decimal(&order["sz"])?,
                 limit_price: decimal(&order["limitPx"])?,
             })
-        })
-        .collect();
-    AccountState {
+        };
+        open_orders.push(read().ok_or_else(|| unreadable("open orders", &order))?);
+    }
+    let figure = |value: &Value, what: &str| {
+        decimal(value).ok_or_else(|| anyhow!("the account's {what} can't be read: {value}"))
+    };
+    Ok(AccountState {
         vault_value: Decimal::ZERO,
         idle: Decimal::ZERO,
-        account_value: decimal(&perp["marginSummary"]["accountValue"]).unwrap_or(Decimal::ZERO),
-        withdrawable: decimal(&perp["withdrawable"]).unwrap_or(Decimal::ZERO),
+        account_value: figure(&perp["marginSummary"]["accountValue"], "value")?,
+        withdrawable: figure(&perp["withdrawable"], "withdrawable dollars")?,
         positions,
         spot: balances,
         open_orders,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -301,7 +313,7 @@ mod tests {
         let spot = json!({"balances": [{"coin": "USDC", "total": "5", "hold": "1"}]});
         let orders =
             json!([{"coin": "ETH", "oid": 1, "side": "A", "sz": "0.1", "limitPx": "2800"}]);
-        let state = state_from(&markets, &perp, &spot, &orders);
+        let state = state_from(&markets, &perp, &spot, &orders).unwrap();
         assert_eq!(state.positions[0].size, "-0.1".parse().unwrap());
         assert_eq!(state.positions[0].leverage, 3);
         assert_eq!(state.spot[0].hold, "1".parse().unwrap());

@@ -76,10 +76,16 @@ native_usd = 0.0
 # address may ask, and a whole stack on one machine passes any one of their
 # limits within minutes, so the testnet names three: the client sends each
 # request to whichever has answered best lately and moves off one that starts
-# refusing. A browser is handed the first, Hyperliquid's own.
+# refusing. A browser is handed the first.
+#
+# drpc's is first: asked an account's nonce at a past block, it answers as of
+# that block, while Hyperliquid's own and Chainlink's answer any block with
+# the head's state (measured October 2026). The client sends no read pinned to
+# a past block to an endpoint it finds doing that, and asks one it couldn't
+# check only after those it found honouring the block.
 [chains."evm:998"]
 label = "Hyperliquid testnet"
-rpc = "https://rpc.hyperliquid-testnet.xyz/evm https://hyperliquid-testnet.drpc.org https://rpcs.chain.link/hyperevm/testnet"
+rpc = "https://hyperliquid-testnet.drpc.org https://rpc.hyperliquid-testnet.xyz/evm https://rpcs.chain.link/hyperevm/testnet"
 dollar = "USDC"
 native_usd = 0.0
 

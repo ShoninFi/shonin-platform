@@ -311,9 +311,12 @@ contract LighterDriver is IDriver, IDelayedDriver {
 
     /// Take the key out of every account the station owns, and cancel its
     /// resting orders there: an executor replaced must not keep trading.
-    function revokeKey(address station, address) external view returns (Call[] memory) {
+    /// The accounts have one executor slot, so that is done only for the key
+    /// the station has in place: any other key was already replaced, and
+    /// naming it withdraws nothing.
+    function revokeKey(address station, address key) external view returns (Call[] memory) {
         (, bool exists) = masterOf(station);
-        if (!exists) return new Call[](0);
+        if (!exists || key != IStation(station).approvedKey(_name(station))) return new Call[](0);
         return _keyCalls(station, NOBODY, true);
     }
 

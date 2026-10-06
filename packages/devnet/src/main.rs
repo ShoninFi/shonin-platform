@@ -223,6 +223,9 @@ async fn main() -> Result<()> {
             }
             let generation = deploy::settle_generation(args.generation, &kept, &args.artifacts)?;
             tracing::info!(generation, "the deployment generation");
+            if chains.iter().any(|(_, _, _, keeps)| !keeps) {
+                deploy::refuse_another_build(&kept, &args.artifacts, generation)?;
+            }
             for (_, client, file, keeps) in &chains {
                 if !keeps {
                     deploy::refuse_a_used_station_factory(

@@ -45,6 +45,15 @@ library StationCloses {
     /// holding more than dust stages the close instead.
     function close(uint256 fraction, bool forVault) external returns (uint256 sentHome, bool blocked, bool) {
         StationLayout storage s = StationStorage.layout();
+        // Money parked in a venue's own vaults counts in the station's value,
+        // and no close can sell it: while more than a dollar of it is parked,
+        // nothing is closed, and whoever the close is for waits until it is
+        // home. A dollar is the most a leaver could lose to it. A stopped
+        // station's full unwind, which every holder shares, isn't held.
+        if (_parked(s) > s.oneDollar()) {
+            emit IStation.Unwound(fraction, 0, true);
+            return (0, true, false);
+        }
         uint256 count = s.spec.drivers.length;
         IDriver[] memory drivers = new IDriver[](count);
         Call[][] memory closes = new Call[][](count);
@@ -103,6 +112,15 @@ library StationCloses {
         if (sentHome != 0) s.home(sentHome);
         emit IStation.Unwound(fraction, sentHome, false);
         return (sentHome, false, false);
+    }
+
+    /// What the station's money parked in its venues' own vaults is worth.
+    function _parked(StationLayout storage s) private view returns (uint256 parked) {
+        for (uint256 i = 0; i < s.spec.drivers.length; i++) {
+            bytes32 name = s.spec.drivers[i];
+            address[] storage held = s.held[name];
+            if (held.length != 0) parked += IDelayedDriver(s.pinned(name)).heldValue(address(this), held);
+        }
     }
 
     /// Close and sweep one venue whose closes settle in the transaction, and

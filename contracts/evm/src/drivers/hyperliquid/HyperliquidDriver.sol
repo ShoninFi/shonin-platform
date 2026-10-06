@@ -265,8 +265,13 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
     }
 
     /// Hand the agent's name to an address nobody holds a key for, which
-    /// withdraws whichever wallet held it.
-    function revokeKey(address station, address) external view returns (Call[] memory calls) {
+    /// withdraws whichever wallet held it. The account has one agent name,
+    /// so that is done only for the key the station has in place: any other
+    /// key was already replaced, and naming it withdraws nothing.
+    function revokeKey(address station, address key) external view returns (Call[] memory calls) {
+        if (key != IStation(station).approvedKey(DelayedVenue.nameIn(station, address(this)))) {
+            return new Call[](0);
+        }
         calls = new Call[](1);
         calls[0] = _write(HyperCore.addApiWallet(burnAgent(station), AGENT_NAME));
     }

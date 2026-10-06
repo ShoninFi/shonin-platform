@@ -18,6 +18,8 @@
 //! out of order stops the read, so nothing is ever counted as zero for want
 //! of a figure.
 
+use std::collections::HashSet;
+
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 
@@ -214,11 +216,14 @@ pub fn utc_micros(text: &str) -> Option<u64> {
 /// to the account at or before its read (`read_at_us`, the account's own
 /// `transaction_time` as read). The first withdrawal at or before
 /// `credited_through` ends the tally: every older one was credited before it.
+/// A withdrawal listed again (the list read in pages shifts as it grows, and
+/// one transaction may carry more than one withdrawal log) is taken once.
 #[derive(Clone, Debug)]
 pub struct OnTheirWay {
     read_at_us: u64,
     credited_through: u64,
     last_height: Option<u64>,
+    taken: HashSet<String>,
     total: u128,
     done: bool,
 }
@@ -229,6 +234,7 @@ impl OnTheirWay {
             read_at_us,
             credited_through,
             last_height: None,
+            taken: HashSet::new(),
             total: 0,
             done: false,
         }
@@ -236,7 +242,7 @@ impl OnTheirWay {
 
     /// Take the next withdrawal, newest first.
     pub fn take(&mut self, withdrawal: &Withdrawal) -> Result<()> {
-        if self.done {
+        if self.done || !self.taken.insert(withdrawal.hash.clone()) {
             return Ok(());
         }
         if self

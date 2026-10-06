@@ -332,8 +332,14 @@ pub fn pace(before: Option<&Pace>, seen: B256, now: u64, slot_interval: u64) -> 
     }
 }
 
-/// Read what a stopped delayed station's unwind would do.
-pub async fn work(client: &Client, station: Address, drivers: &[DelayedDriver]) -> Result<Work> {
+/// Read what a stopped delayed station's unwind would do at chain time
+/// `now`.
+pub async fn work(
+    client: &Client,
+    station: Address,
+    drivers: &[DelayedDriver],
+    now: u64,
+) -> Result<Work> {
     let band = client.read(station, IStation::stoppedBandCall {}).await?;
     let simulated = client
         .read(
@@ -350,6 +356,15 @@ pub async fn work(client: &Client, station: Address, drivers: &[DelayedDriver]) 
     };
     let mut seen = Vec::new();
     for driver in drivers {
+        // The unwind places no order and sweeps nothing through a driver
+        // before it may be moved through again, or whose close is blocked.
+        let movable_at = client
+            .read(
+                driver.implementation,
+                IDelayedDriver::movableAtCall { station },
+            )
+            .await?;
+        let movable = movable_at <= U256::from(now);
         let closing = client
             .read(
                 driver.implementation,
@@ -362,7 +377,7 @@ pub async fn work(client: &Client, station: Address, drivers: &[DelayedDriver]) 
             .await?;
         if closing.blocked {
             work.outside = true;
-        } else if !closing.calls.is_empty() {
+        } else if movable && !closing.calls.is_empty() {
             work.orders = true;
         }
         // The orders themselves: a band that has widened since names new
@@ -377,7 +392,7 @@ pub async fn work(client: &Client, station: Address, drivers: &[DelayedDriver]) 
                 },
             )
             .await?;
-        if !sweeping.is_empty() {
+        if movable && !closing.blocked && !sweeping.is_empty() {
             work.sweep = true;
         }
         let exposure = client
@@ -426,7 +441,7 @@ pub async fn unwind_stopped(
         return Ok(());
     }
     collect_withdrawals(client, keeper, station, drivers).await?;
-    let work = work(client, station, drivers).await?;
+    let work = work(client, station, drivers, now).await?;
     if !unwind_wanted(&work, worth(work.sent_home)) {
         if work.outside {
             tracing::debug!(%vault, "the stopped station's markets are outside its band; waiting");
@@ -436,7 +451,6 @@ pub async fn unwind_stopped(
     let Some(next) = pace(memory.unwinds.as_ref(), work.seen, now, slot_interval) else {
         return Ok(());
     };
-    memory.unwinds = Some(next);
     let outcome = send_roomy_outcome(
         client,
         keeper,
@@ -447,6 +461,11 @@ pub async fn unwind_stopped(
         "unwind the delayed station",
     )
     .await;
+    // One that never reached the chain tried nothing: it doesn't set the
+    // pace.
+    if outcome.mined() {
+        memory.unwinds = Some(next);
+    }
     if outcome == Outcome::Done {
         tracing::info!(%vault, orders = work.orders, sweep = work.sweep, "unwound the stopped station a step");
     }

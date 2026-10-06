@@ -489,7 +489,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// `setting` names the setting the list came from, for an error that can't
 /// name the URL.
-fn rpc_client(rpc: &str, setting: &str) -> Result<alloy::rpc::client::RpcClient> {
+fn rpc_client(
+    rpc: &str,
+    setting: &str,
+    chain_id: Option<u64>,
+) -> Result<alloy::rpc::client::RpcClient> {
     let http = http_client()?;
     let urls: Vec<&str> = rpc.split_whitespace().collect();
     if urls.len() <= 1 {
@@ -506,7 +510,7 @@ fn rpc_client(rpc: &str, setting: &str) -> Result<alloy::rpc::client::RpcClient>
     }
     let mut transports = Vec::with_capacity(urls.len());
     for configured in urls {
-        transports.push(endpoint_transport(configured, setting, &http)?);
+        transports.push(endpoint_transport(configured, setting, &http, chain_id)?);
     }
     // Every method the services use goes to one endpoint at a time, best
     // first, and on to the next when one refuses, so a request fails only
@@ -544,21 +548,118 @@ fn parse_endpoint(url: &str, setting: &str) -> Result<alloy::transports::http::r
 }
 
 /// The connection to one endpoint of a list: its URL kept out of its
-/// errors, and its own trouble (a rate limit, missing history) an error
-/// rather than an answer.
+/// errors, its own trouble (a rate limit, missing history) an error rather
+/// than an answer, and, once the chain's id is known, held to that chain.
 fn endpoint_transport(
     configured: &str,
     setting: &str,
     http: &alloy::transports::http::reqwest::Client,
+    chain_id: Option<u64>,
 ) -> Result<
-    UrlKeptOut<
-        TroubleIsAFailure<alloy::transports::http::Http<alloy::transports::http::reqwest::Client>>,
+    HeldToChain<
+        UrlKeptOut<
+            TroubleIsAFailure<
+                alloy::transports::http::Http<alloy::transports::http::reqwest::Client>,
+            >,
+        >,
     >,
 > {
     let url = parse_endpoint(configured, setting)?;
     let keep = KeepUrlOut::new(configured, &url);
     let inner = alloy::transports::http::Http::with_client(http.clone(), url);
-    Ok(tower::Layer::layer(&keep, TroubleIsAFailure { inner }))
+    Ok(HeldToChain {
+        inner: tower::Layer::layer(&keep, TroubleIsAFailure { inner }),
+        chain_id,
+        on_it: Default::default(),
+    })
+}
+
+/// One endpoint of a list, held to chain `chain_id`: before it answers
+/// anything, it is asked its chain id, once, and an endpoint on another
+/// chain is refused every request from then on. An endpoint that doesn't
+/// answer that is asked again on its next request, and fails this one, so a
+/// list moves on to the next endpoint. A list's endpoints are each asked
+/// when the client connects, but one that didn't answer then (limiting the
+/// rate while a whole stack starts) would otherwise answer for another
+/// chain as this one, and stations share one address on every chain.
+/// Without `chain_id` (the connection the id itself is first asked over)
+/// requests pass as they are, and so does a request for the chain id.
+#[derive(Clone)]
+struct HeldToChain<S> {
+    inner: S,
+    chain_id: Option<u64>,
+    /// Whether the endpoint said it is on the chain, once it has answered.
+    on_it: Arc<tokio::sync::OnceCell<bool>>,
+}
+
+impl<S> tower::Service<alloy::rpc::json_rpc::RequestPacket> for HeldToChain<S>
+where
+    S: tower::Service<
+            alloy::rpc::json_rpc::RequestPacket,
+            Response = alloy::rpc::json_rpc::ResponsePacket,
+            Error = alloy::transports::TransportError,
+            Future = alloy::transports::TransportFut<'static>,
+        > + Send
+        + Clone
+        + 'static,
+{
+    type Response = alloy::rpc::json_rpc::ResponsePacket;
+    type Error = alloy::transports::TransportError;
+    type Future = alloy::transports::TransportFut<'static>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: alloy::rpc::json_rpc::RequestPacket) -> Self::Future {
+        let Some(chain_id) = self.chain_id else {
+            return self.inner.call(request);
+        };
+        if self.on_it.get() == Some(&true)
+            || request.method_names().all(|method| method == "eth_chainId")
+        {
+            return self.inner.call(request);
+        }
+        let mut inner = self.inner.clone();
+        let on_it = self.on_it.clone();
+        Box::pin(async move {
+            use alloy::transports::TransportErrorKind;
+            let answered = on_it
+                .get_or_try_init(|| async {
+                    let asking = alloy::rpc::json_rpc::Request::new(
+                        "eth_chainId",
+                        alloy::rpc::json_rpc::Id::Number(0),
+                        (),
+                    )
+                    .serialize()
+                    .map_err(TransportErrorKind::custom)?;
+                    let answer = inner
+                        .call(alloy::rpc::json_rpc::RequestPacket::Single(asking))
+                        .await?;
+                    let id = answer
+                        .responses()
+                        .first()
+                        .and_then(|response| response.payload.as_success())
+                        .and_then(|raw| {
+                            serde_json::from_str::<alloy::primitives::U64>(raw.get()).ok()
+                        })
+                        .ok_or_else(|| {
+                            TransportErrorKind::custom_str("the endpoint did not give its chain id")
+                        })?;
+                    Ok::<_, alloy::transports::TransportError>(id.to::<u64>() == chain_id)
+                })
+                .await?;
+            if !*answered {
+                return Err(TransportErrorKind::custom_str(&format!(
+                    "the endpoint is not on chain {chain_id}"
+                )));
+            }
+            inner.call(request).await
+        })
+    }
 }
 
 /// One endpoint of a list, asked on its own rather than through the
@@ -570,8 +671,49 @@ struct Endpoint {
     provider: DynProvider,
     /// Whether it answers a read pinned to a past block as of that block:
     /// `Some(false)` if it answers with the head's state whatever block is
-    /// asked, `None` if that could not be found out ([`honours_blocks`]).
-    honours_blocks: Option<bool>,
+    /// asked, `None` if that could not be found out ([`honours_blocks`]);
+    /// and when it was last asked.
+    honours_blocks: Arc<std::sync::Mutex<(Option<bool>, tokio::time::Instant)>>,
+}
+
+/// How long an endpoint not known to honour a past block goes before it
+/// is asked again, when a past read would use it.
+const PROBE_AGAIN_AFTER: Duration = Duration::from_secs(60);
+
+impl Endpoint {
+    fn honours(&self) -> Option<bool> {
+        self.honours_blocks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0
+    }
+
+    /// Whether it honours a past block, asking it again first ([`honours_blocks`])
+    /// if that isn't known and it wasn't asked in the last
+    /// [`PROBE_AGAIN_AFTER`].
+    async fn honours_now(&self) -> Option<bool> {
+        {
+            let mut probed = self
+                .honours_blocks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if probed.0.is_some() || probed.1.elapsed() < PROBE_AGAIN_AFTER {
+                return probed.0;
+            }
+            // Marked now, so reads at once don't all ask it.
+            probed.1 = tokio::time::Instant::now();
+        }
+        let found = tokio::time::timeout(CHECK_TIMEOUT, honours_blocks(&self.provider))
+            .await
+            .ok()
+            .flatten();
+        let mut probed = self
+            .honours_blocks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        probed.0 = probed.0.or(found);
+        probed.0
+    }
 }
 
 /// The endpoints of one list, each on its own, and which one answered last.
@@ -582,16 +724,23 @@ struct Endpoints {
 }
 
 impl Endpoints {
-    fn new(list: &str, setting: &str) -> Result<Self> {
+    /// Each endpoint held to chain `chain_id` when there is one
+    /// ([`HeldToChain`]).
+    fn new(list: &str, setting: &str, chain_id: Option<u64>) -> Result<Self> {
         let http = http_client()?;
         let each = list
             .split_whitespace()
             .map(|configured| {
-                let client = alloy::rpc::client::ClientBuilder::default()
-                    .transport(endpoint_transport(configured, setting, &http)?, false);
+                let client = alloy::rpc::client::ClientBuilder::default().transport(
+                    endpoint_transport(configured, setting, &http, chain_id)?,
+                    false,
+                );
                 Ok(Endpoint {
                     provider: ProviderBuilder::default().connect_client(client).erased(),
-                    honours_blocks: None,
+                    honours_blocks: Arc::new(std::sync::Mutex::new((
+                        None,
+                        tokio::time::Instant::now(),
+                    ))),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -618,8 +767,8 @@ impl Endpoints {
     }
 
     /// Check that every endpoint that answers is on chain `chain_id` (one
-    /// that doesn't answer now is left to the failover, as any endpoint
-    /// is), unless `id_known` says the list is the one endpoint the id was
+    /// that doesn't answer now is held to it when next asked anything:
+    /// [`HeldToChain`]), unless `id_known` says the list is the one endpoint the id was
     /// just asked of; and, with `probe`, find out which of them answer a
     /// read pinned to a past block as of that block. The endpoints are asked at once,
     /// each for at most [`CHECK_TIMEOUT`].
@@ -661,7 +810,6 @@ impl Endpoints {
                 (at, id, honours)
             });
         }
-        let mut each = self.each.to_vec();
         while let Some(joined) = asked.join_next().await {
             let (at, id, honours) =
                 joined.map_err(|_| anyhow!("checking an endpoint stopped before it ended"))?;
@@ -674,7 +822,11 @@ impl Endpoints {
                     at + 1
                 );
             }
-            each[at].honours_blocks = honours;
+            *self.each[at]
+                .honours_blocks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                (honours, tokio::time::Instant::now());
             match honours {
                 Some(false) => tracing::warn!(
                     chain = %label,
@@ -686,15 +838,12 @@ impl Endpoints {
                     chain = %label,
                     endpoint = at + 1,
                     "could not find out whether this endpoint answers a read at a past block \
-                     as of that block; past reads may be sent to it"
+                     as of that block; it is asked again before a past read is sent to it"
                 ),
                 _ => {}
             }
         }
-        Ok(Self {
-            each: each.into(),
-            preferred: self.preferred,
-        })
+        Ok(self)
     }
 }
 
@@ -724,14 +873,19 @@ const PROBE_SCAN: u64 = 32;
 /// for `S`'s nonce as of block `b - 1`: exactly `n` honours the block, more
 /// than `n` ignores it, and a refusal for missing history counts as
 /// honouring (the read then moves on from it, as from any endpoint that
-/// lacks the state). `None` when it couldn't be found out: the endpoint
+/// lacks the state). Past those blocks it looks, on a quiet chain, at one
+/// block every power of two further down (2 × [`PROBE_SCAN`], 4 ×, …, to
+/// the first block). `None` when it couldn't be found out: the endpoint
 /// didn't answer or answered something else, or the chain is too young or
 /// too quiet to have such a transaction in reach.
 async fn honours_blocks(provider: &DynProvider) -> Option<bool> {
     let head = provider.get_block_number().await.ok()?;
     let newest = head.checked_sub(PROBE_DEPTH).filter(|block| *block >= 1)?;
     let oldest = newest.saturating_sub(PROBE_SCAN).max(1);
-    for block in (oldest..=newest).rev() {
+    let deeper =
+        std::iter::successors(Some(PROBE_SCAN.saturating_mul(2)), |gap| gap.checked_mul(2))
+            .map_while(|gap| newest.checked_sub(gap).filter(|block| *block >= 1));
+    for block in (oldest..=newest).rev().chain(deeper) {
         let Some((sender, nonce)) = probe_transaction(provider, block).await? else {
             continue;
         };
@@ -994,7 +1148,9 @@ enum Handed {
 /// then says its nonce is too low or the transaction is already known,
 /// because this very transaction used it. So once an endpoint may have taken
 /// it, no later refusal is taken as one: whether it landed is found out by
-/// its hash. A refusal from the first endpoint that answers at all stays a
+/// its hash. An error that is no judgement of the transaction itself
+/// ([`judges_the_transaction`]) is no answer either, however it arrives. A
+/// clear refusal from the first endpoint that answers at all stays a
 /// refusal, except a "nonce too low" from an endpoint that holds this very
 /// transaction's receipt (a gateway that retried it behind one name) or
 /// can't be asked for it. A rate limit is no answer either way and moves on. The bytes are
@@ -1019,6 +1175,13 @@ async fn hand_over(endpoints: &Endpoints, raw: &[u8], deadline: tokio::time::Ins
             Err(refusal @ RpcError::ErrorResp(_)) => {
                 if may_have_taken || already_held(&refusal) {
                     return Handed::MayLand;
+                }
+                // An error of the endpoint's own (an internal error, a
+                // timeout upstream) says nothing of the transaction, which
+                // its node may have: like a gateway's 502.
+                if !judges_the_transaction(&refusal) {
+                    may_have_taken = true;
+                    continue;
                 }
                 // A gateway that retries a send behind one name can take it
                 // and then call its own retry's nonce too low: this very
@@ -1250,11 +1413,10 @@ impl Client {
     /// at once, so a service usually arrives before the chain does.
     pub async fn connect(config: &ChainConfig, signing: Signing) -> Result<Self> {
         let rpc_url = config.rpc.as_str();
-        let rpc = rpc_client(rpc_url, "rpc")?;
         // The chain id is asked for first, on a provider that signs nothing,
         // so a provider that signs is made for that id alone.
-        let asking = ProviderBuilder::default()
-            .connect_client(rpc.clone())
+        let asking: DynProvider = ProviderBuilder::default()
+            .connect_client(rpc_client(rpc_url, "rpc", None)?)
             .erased();
 
         // Measured by the clock, not by the pauses between tries: a node
@@ -1277,10 +1439,18 @@ impl Client {
         // Every endpoint of the list is on this chain: one on another would
         // answer for that chain as this one, and stations share one address
         // on every chain.
-        let endpoints = Endpoints::new(rpc_url, "rpc")?
+        // A lone endpoint is the one that just answered the chain id.
+        let several = rpc_url.split_whitespace().count() > 1;
+        let endpoints = Endpoints::new(rpc_url, "rpc", several.then_some(chain_id))?
             .checked(chain_id, &config.label, "rpc", true, true)
             .await?;
 
+        // From here every endpoint of the list is held to this chain,
+        // whether or not it answered just now.
+        let rpc = rpc_client(rpc_url, "rpc", Some(chain_id))?;
+        let asking: DynProvider = ProviderBuilder::default()
+            .connect_client(rpc.clone())
+            .erased();
         let reading = asking.clone();
         let (provider, signing_provider) = match &signing {
             Signing::Keys(keys) if !keys.is_empty() => {
@@ -1319,9 +1489,9 @@ impl Client {
         {
             Some(list) => (
                 ProviderBuilder::default()
-                    .connect_client(rpc_client(list, "logs_rpc")?)
+                    .connect_client(rpc_client(list, "logs_rpc", Some(chain_id))?)
                     .erased(),
-                Endpoints::new(list, "logs_rpc")?
+                Endpoints::new(list, "logs_rpc", Some(chain_id))?
                     .checked(chain_id, &config.label, "logs_rpc", false, false)
                     .await?,
             ),
@@ -1442,8 +1612,10 @@ impl Client {
     /// `pending`) goes only to the endpoints that answer as of the block
     /// asked: some answer with the head's state whatever block is asked,
     /// without an error. Which do was found out when the client connected
-    /// ([`honours_blocks`]); one that couldn't be found out is asked like
-    /// one that honours the block. The read moves on from an endpoint that
+    /// ([`honours_blocks`]). Those known to honour the block are asked
+    /// first; one that couldn't be found out is checked again (at most once
+    /// a [`PROBE_AGAIN_AFTER`]) before it is asked, and asked unchecked only
+    /// while no endpoint is known to honour the block, which is logged. The read moves on from an endpoint that
     /// doesn't answer, limits the rate or no longer has the state asked for,
     /// and fails, naming the chain, when only endpoints that ignore the block
     /// are left.
@@ -1498,10 +1670,27 @@ impl Client {
         loop {
             let mut behind = false;
             let mut round = RateLimits::round();
-            for at in self.endpoints.order() {
+            // Those known to honour the block first. One not known is asked
+            // again first, and asked unchecked only while none is known to.
+            let any_known = self
+                .endpoints
+                .each
+                .iter()
+                .any(|endpoint| endpoint.honours() == Some(true));
+            let mut order = self.endpoints.order();
+            order.sort_by_key(|at| self.endpoints.each[*at].honours() != Some(true));
+            for at in order {
                 let endpoint = &self.endpoints.each[at];
-                if endpoint.honours_blocks == Some(false) {
-                    continue;
+                match endpoint.honours_now().await {
+                    Some(false) => continue,
+                    Some(true) => {}
+                    None if any_known => continue,
+                    None => tracing::warn!(
+                        chain = %self.label,
+                        endpoint = at + 1,
+                        "no endpoint is known to answer a read at a past block as of that block, \
+                         and this one could not be checked again: the read is sent to it unchecked"
+                    ),
                 }
                 asked_any = true;
                 match endpoint.provider.call(request.clone()).block(block).await {
@@ -1653,6 +1842,48 @@ impl Client {
             return Err(anyhow::Error::new(Reverted).context("the transaction reverted"));
         }
         Ok(receipt)
+    }
+
+    /// Send bytes as [`Client::send_raw`] does, and hand the transaction's
+    /// hash to `sent_as` as soon as the node has it, before waiting for it
+    /// to land: a caller whose wait runs out can look for it by that hash
+    /// rather than send it again.
+    pub async fn send_raw_noting(
+        &self,
+        from: Address,
+        to: Address,
+        data: alloy_primitives::Bytes,
+        sent_as: impl FnOnce(B256) + Send,
+    ) -> Result<TransactionReceipt> {
+        let request = TransactionRequest::default()
+            .with_from(from)
+            .with_to(to)
+            .with_input(data);
+        let receipt = self
+            .sent(
+                request,
+                RECEIPT_TIMEOUT,
+                "sending",
+                "a transaction",
+                sent_as,
+            )
+            .await?;
+        if !receipt.status() {
+            return Err(anyhow::Error::new(Reverted).context("the transaction reverted"));
+        }
+        Ok(receipt)
+    }
+
+    /// A provider that signs as `signer` itself, over this client's
+    /// endpoints, each held to the chain and with its URL kept out of every
+    /// error: for a tool that sends from a key that plays no role. The
+    /// transaction is signed once, so whichever endpoint takes it, the same
+    /// bytes go to each.
+    pub fn signing_provider(&self, signer: PrivateKeySigner) -> Result<DynProvider> {
+        Ok(ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer))
+            .connect_client(rpc_client(&self.rpc_url, "rpc", Some(self.chain_id))?)
+            .erased())
     }
 
     /// Deploy a contract from its bytecode and constructor arguments. A
@@ -1978,7 +2209,7 @@ impl Client {
         let address = signer.address();
         let signing = signing_builder(self.chain_id)
             .wallet(EthereumWallet::from(signer.clone()))
-            .connect_client(rpc_client(&self.rpc_url, "rpc")?);
+            .connect_client(rpc_client(&self.rpc_url, "rpc", Some(self.chain_id))?);
         // The key's turn to send is the one every client made from this
         // one takes for this key, as its nonce floor is.
         let sending = self
@@ -2646,6 +2877,62 @@ fn nonce_too_low(refusal: &alloy::transports::TransportError) -> bool {
     message.contains("nonce too low") || message.contains("nonce has already been used")
 }
 
+/// Whether an endpoint's error to a send is a clear refusal of the
+/// transaction: "this transaction is invalid, and here is why". Only these
+/// count as clear:
+///
+/// - its nonce: "nonce too low", "nonce too high", "invalid nonce", "nonce
+///   has already been used";
+/// - its sender's funds: "insufficient funds";
+/// - its gas and fees: "intrinsic gas too low", "exceeds block gas limit",
+///   "gas limit", "underpriced", "fee cap", "base fee", "gas price",
+///   "configured cap";
+/// - its bytes: "invalid sender", "invalid signature", "chain id",
+///   "transaction type not supported", "tx type not supported", "oversized
+///   data", "initcode", "rlp", "invalid transaction";
+/// - a revert the node found running it (code 3, "execution reverted");
+/// - the request itself refused as malformed or unknown (codes -32601,
+///   -32602).
+///
+/// Anything else (an internal error, a server error, a timeout, a gateway's
+/// own failure) is unclear: the endpoint may have taken it.
+fn judges_the_transaction(refusal: &alloy::transports::TransportError) -> bool {
+    let alloy::rpc::json_rpc::RpcError::ErrorResp(payload) = refusal else {
+        return false;
+    };
+    if matches!(payload.code, 3 | -32601 | -32602) {
+        return true;
+    }
+    let message = payload.message.to_lowercase();
+    [
+        "nonce too low",
+        "nonce too high",
+        "invalid nonce",
+        "nonce has already been used",
+        "insufficient funds",
+        "intrinsic gas too low",
+        "exceeds block gas limit",
+        "gas limit",
+        "underpriced",
+        "fee cap",
+        "base fee",
+        "gas price",
+        "configured cap",
+        "invalid sender",
+        "invalid signature",
+        "chain id",
+        "transaction type not supported",
+        "tx type not supported",
+        "oversized data",
+        "initcode",
+        "rlp",
+        "invalid transaction",
+        "execution reverted",
+    ]
+    .iter()
+    .any(|clear| message.contains(clear))
+}
+
 fn already_held(refusal: &alloy::transports::TransportError) -> bool {
     let alloy::rpc::json_rpc::RpcError::ErrorResp(payload) = refusal else {
         return false;
@@ -3099,6 +3386,47 @@ mod tests {
             "replacement transaction underpriced",
         ] {
             assert!(!already_held(&refusal(refused)), "{refused}");
+        }
+    }
+
+    #[test]
+    fn only_a_judgement_of_the_transaction_itself_is_a_refusal_of_a_send() {
+        let refusal = |code: i64, message: &str| {
+            alloy::rpc::json_rpc::RpcError::ErrorResp(alloy::rpc::json_rpc::ErrorPayload {
+                code,
+                message: message.to_string().into(),
+                data: None,
+            })
+        };
+        for clear in [
+            (-32000, "nonce too low"),
+            (-32000, "insufficient funds for gas * price + value"),
+            (-32000, "replacement transaction underpriced"),
+            (-32000, "max fee per gas less than block base fee"),
+            (-32000, "intrinsic gas too low"),
+            (-32000, "invalid sender"),
+            (3, "execution reverted: NotBlessed()"),
+            (-32602, "invalid params"),
+        ] {
+            assert!(
+                judges_the_transaction(&refusal(clear.0, clear.1)),
+                "{clear:?}"
+            );
+        }
+        for unclear in [
+            (-32603, "Internal error"),
+            (-32000, "upstream request timeout"),
+            (
+                30,
+                "Request timeout on the free tier, please upgrade your tier to the paid one",
+            ),
+            (-32000, "server error"),
+            (-32002, "resource unavailable"),
+        ] {
+            assert!(
+                !judges_the_transaction(&refusal(unclear.0, unclear.1)),
+                "{unclear:?}"
+            );
         }
     }
 

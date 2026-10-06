@@ -48,6 +48,15 @@ fn name_of(driver: &str) -> B256 {
     B256::from(name)
 }
 
+/// The dollar on HyperCore, by the venue's number for it, as the driver
+/// contract numbers it.
+const USDC_TOKEN: u64 = 0;
+/// The name of the token sends home are paid in.
+const GAS_TOKEN_NAME: &str = "HYPE";
+/// How often markets the pinned driver lists and the venue doesn't list for
+/// trading are looked for again.
+const MISSING_LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// One vault's Hyperliquid account, and the key that trades it.
 pub struct Half {
     pub trader: Trader,
@@ -55,6 +64,14 @@ pub struct Half {
     chain: Client,
     vault: Address,
     station: Address,
+    /// The venue's numbers for the perps and spot pairs the pinned driver
+    /// lists.
+    perps: Vec<u32>,
+    spots: Vec<u32>,
+    /// The pinned spot pair of the token sends home are paid in, and the
+    /// venue's number for that token, as the driver contract picks it: the
+    /// last of its pairs whose token the venue names HYPE.
+    gas: Option<(u32, u64)>,
 }
 
 impl Half {
@@ -97,21 +114,75 @@ impl Half {
             .into_iter()
             .map(|perp| perp.index)
             .collect();
-        let spots: Vec<u32> = chain
-            .read(driver, IHyperliquidDriver::spotsCall {})
-            .await?
-            .into_iter()
-            .map(|spot| spot.pair)
-            .collect();
+        let pinned = chain.read(driver, IHyperliquidDriver::spotsCall {}).await?;
+        let spots: Vec<u32> = pinned.iter().map(|spot| spot.pair).collect();
         let markets = Markets::read(&api).await?;
+        let gas = pinned
+            .iter()
+            .rev()
+            .find(|spot| markets.token_name(spot.token) == Some(GAS_TOKEN_NAME))
+            .map(|spot| (spot.pair, spot.token));
         let allowlist = Allowlist::from_driver(station, markets, &perps, &spots)?;
+        for (market, why) in &allowlist.missing {
+            tracing::warn!(
+                %station,
+                market,
+                why,
+                "a market the station's driver lists is not traded: the venue doesn't list it for trading now, and it is looked for again"
+            );
+        }
         Ok(Arc::new(Self {
             trader: Trader::new(api.clone(), agent, allowlist),
             api,
             chain: chain.clone(),
             vault,
             station,
+            perps,
+            spots,
+            gas,
         }))
+    }
+
+    /// While a market the pinned driver lists is missing from the venue's
+    /// markets for trading, look for it again every [`MISSING_LOOK_EVERY`],
+    /// and hold the agent key to the venue's markets as they are listed then
+    /// once what is missing has changed. Ends when none is missing.
+    pub fn missing_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let half = self.clone();
+        tokio::spawn(async move {
+            while !half.trader.allowlist().missing.is_empty() {
+                tokio::time::sleep(MISSING_LOOK_EVERY).await;
+                let markets = match Markets::read(&half.api).await {
+                    Ok(markets) => markets,
+                    Err(error) => {
+                        tracing::warn!(
+                            station = %half.station,
+                            error = %format!("{error:#}"),
+                            "the venue's markets couldn't be read to look for the missing ones"
+                        );
+                        continue;
+                    }
+                };
+                let Ok(allowlist) =
+                    Allowlist::from_driver(half.station, markets, &half.perps, &half.spots)
+                else {
+                    continue;
+                };
+                let was = half.trader.allowlist();
+                if allowlist.missing != was.missing {
+                    for market in was.missing.keys() {
+                        if !allowlist.missing.contains_key(market) {
+                            tracing::info!(
+                                station = %half.station,
+                                market,
+                                "a market the station's driver lists is listed for trading again, and traded"
+                            );
+                        }
+                    }
+                    half.trader.hold_to(allowlist);
+                }
+            }
+        })
     }
 
     pub async fn submit(&self, payload: &[u8]) -> Outcome<Vec<u8>> {
@@ -122,7 +193,7 @@ impl Half {
     pub async fn state(&self) -> Result<Vec<u8>> {
         let mut state = hyperliquid::events::account_state(
             &self.api,
-            &self.trader.allowlist.markets,
+            &self.trader.allowlist().markets,
             self.station,
         )
         .await?;
@@ -158,7 +229,7 @@ impl Half {
         let mut events = hyperliquid::events::account_events(
             self.api.network,
             self.station,
-            self.trader.allowlist.markets.clone(),
+            self.trader.allowlist().markets.clone(),
         );
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
@@ -438,15 +509,30 @@ pub enum TopUp {
 }
 
 impl Half {
-    /// The pinned HYPE/USDC market, if the station's driver lists it: the
-    /// only market a top-up may trade.
+    /// The pinned spot pair of the token sends home are paid in, if the
+    /// venue lists it for trading now: the only market a top-up may trade.
     fn hype_market(&self) -> Option<hyperliquid::Market> {
+        let (pair, token) = self.gas?;
         self.trader
-            .allowlist
+            .allowlist()
             .markets
-            .get("HYPE/USDC")
-            .filter(|market| market.is_spot())
+            .spot_pair(pair)
+            .filter(|market| {
+                market.kind
+                    == hyperliquid::markets::Kind::Spot {
+                        pair,
+                        base_token: token,
+                    }
+            })
             .cloned()
+    }
+
+    /// The account's holding of the token sends home are paid in.
+    async fn hype_holding(&self) -> Result<hyperliquid::api::SpotHolding> {
+        let (_, token) = self.gas.ok_or_else(|| {
+            anyhow!("the station's driver lists no pair of the token sends home are paid in")
+        })?;
+        self.api.spot_holding(self.station, token).await
     }
 
     /// Look at the account's HYPE every minute and top it up when its free
@@ -496,7 +582,7 @@ impl Half {
                     }
                 }
                 // Said at every look (once a minute) while it lasts.
-                if let Ok(hype) = half.api.spot_holding(half.station, "HYPE").await
+                if let Ok(hype) = half.hype_holding().await
                     && blocked(&hype)
                 {
                     tracing::error!(
@@ -519,7 +605,7 @@ impl Half {
     /// the venue's fills; a buy sent now is added to it.
     pub async fn top_up_hype(&self, attempts: &mut Vec<(u128, u64)>) -> Result<TopUp> {
         use hyperliquid::payload::{Action, Balance, Decimal, Order, Side, Tif};
-        let hype = self.api.spot_holding(self.station, "HYPE").await?;
+        let hype = self.hype_holding().await?;
         if hype.free() >= HYPE_FLOOR.parse().unwrap_or(Decimal::ZERO) {
             return Ok(TopUp::Enough);
         }
@@ -527,7 +613,7 @@ impl Half {
             return Ok(TopUp::Staged);
         }
         let market = self.hype_market().ok_or_else(|| {
-            anyhow!("the station's driver doesn't list the HYPE/USDC pair, the only market a top-up may use")
+            anyhow!("the venue doesn't list the HYPE pair the station's driver lists for trading now, the only market a top-up may use")
         })?;
         let now = now_ms();
         let fills = self
@@ -541,7 +627,7 @@ impl Half {
         }
         let (_, ask) = self.api.best_bid_ask(&market.coin).await?;
         let spot = self.api.spot_price(&market.coin).await?;
-        let usdc = self.api.spot_holding(self.station, "USDC").await?;
+        let usdc = self.api.spot_holding(self.station, USDC_TOKEN).await?;
         let perp_free = decimal_of(self.api.perp_withdrawable(self.station).await?);
         let buy = plan_hype_buy(&HypeBook {
             free: hype.free(),

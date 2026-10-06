@@ -2379,8 +2379,12 @@ async fn claims(
         {
             memory.last_staged = None;
         }
+        // Only past claims paid in id order: the turn may put an unpaid
+        // claim after paid ones that come later.
         if settled_prefix {
-            if matches!(claim.state, ClaimState::Paid | ClaimState::Fallback) {
+            if matches!(claim.state, ClaimState::Paid | ClaimState::Fallback)
+                && id == memory.claims_from.max(1)
+            {
                 memory.claims_from = id + 1;
                 continue;
             }
@@ -2458,6 +2462,9 @@ async fn claims(
                         memory.claims_tried.insert(id, next);
                         if matches!(after, ClaimState::Closing) {
                             memory.last_staged = Some(id);
+                            // This try staged a close: it holds off every
+                            // claim after it this round.
+                            staged = Some(true);
                         }
                         state = after;
                     }

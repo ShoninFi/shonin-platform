@@ -11,7 +11,8 @@
 //! spot balances, and a scheduled cancel. Every wire action it can produce is
 //! one of [`SIGNABLE`]; there is no way to ask it for anything else.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use alloy::primitives::Address;
 use alloy::signers::local::PrivateKeySigner;
@@ -178,12 +179,17 @@ pub struct Allowlist {
     pub markets: Markets,
     /// The markets the vault's driver lists, by the agent's names.
     pub allowed: BTreeSet<String>,
+    /// The markets the vault's driver lists that the venue doesn't list for
+    /// trading now: by the agent's name for them where the venue still gives
+    /// one (else the venue's number), and why.
+    pub missing: BTreeMap<String, String>,
 }
 
 impl Allowlist {
     /// The markets a deployed driver lists, by the venue's numbers (its
-    /// `perps()` and `spots()`), named as an agent names them. A number the
-    /// venue doesn't list is refused.
+    /// `perps()` and `spots()`), named as an agent names them. One the venue
+    /// doesn't list for trading now is held in [`Self::missing`], and an
+    /// action naming it is refused with the reason; the others are traded.
     pub fn from_driver(
         master: Address,
         markets: Markets,
@@ -191,26 +197,50 @@ impl Allowlist {
         spot_pairs: &[u32],
     ) -> Result<Self> {
         let mut allowed = BTreeSet::new();
+        let mut missing = BTreeMap::new();
         for index in perps {
-            let market = markets
-                .perp(*index)
-                .ok_or_else(|| anyhow!("the venue lists no tradable perp {index}"))?;
-            allowed.insert(market.name.clone());
+            match (markets.perp(*index), markets.untradable_perp(*index)) {
+                (Some(market), _) => {
+                    allowed.insert(market.name.clone());
+                }
+                (None, Some((name, why))) => {
+                    missing.insert(name.clone(), why.to_string());
+                }
+                (None, None) => {
+                    missing.insert(
+                        format!("perp {index}"),
+                        "the venue doesn't list it".to_string(),
+                    );
+                }
+            }
         }
         for pair in spot_pairs {
-            let market = markets
-                .spot_pair(*pair)
-                .ok_or_else(|| anyhow!("the venue lists no spot pair {pair} against the dollar"))?;
-            allowed.insert(market.name.clone());
+            match markets.spot_pair(*pair) {
+                Some(market) => {
+                    allowed.insert(market.name.clone());
+                }
+                None => {
+                    missing.insert(
+                        format!("spot pair {pair}"),
+                        "the venue doesn't list it against the dollar".to_string(),
+                    );
+                }
+            }
         }
         Ok(Self {
             master,
             markets,
             allowed,
+            missing,
         })
     }
 
     fn market(&self, name: &str) -> Result<&Market> {
+        if let Some(why) = self.missing.get(name) {
+            bail!(
+                "{name} is a market this vault's driver lists, and {why}: it is not traded while the venue doesn't list it for trading"
+            );
+        }
         if !self.allowed.contains(name) {
             bail!("{name} is not a market this vault's driver lists");
         }
@@ -398,15 +428,32 @@ pub fn is_upkeep_cloid(text: &str) -> bool {
 /// The agent key at work for one vault's account.
 pub struct Trader {
     core: HyperCore,
-    pub allowlist: Allowlist,
+    allowlist: RwLock<Arc<Allowlist>>,
 }
 
 impl Trader {
     pub fn new(api: Api, agent: PrivateKeySigner, allowlist: Allowlist) -> Self {
         Self {
             core: HyperCore::new(api, agent),
-            allowlist,
+            allowlist: RwLock::new(Arc::new(allowlist)),
         }
+    }
+
+    /// What the agent key may sign now.
+    pub fn allowlist(&self) -> Arc<Allowlist> {
+        self.allowlist
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Hold the agent key to `allowlist` from now on: the same driver's
+    /// markets, as the venue lists them now.
+    pub fn hold_to(&self, allowlist: Allowlist) {
+        *self
+            .allowlist
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::new(allowlist);
     }
 
     /// The agent key's address: what the station approves.
@@ -449,7 +496,7 @@ impl Trader {
 
     async fn outcome_nonce(&self, action: &Action, upkeep: bool) -> (Outcome, u64) {
         let nonce = self.core.next_nonce();
-        let wire = match self.allowlist.check_as(action, nonce, upkeep) {
+        let wire = match self.allowlist().check_as(action, nonce, upkeep) {
             Ok(wire) => wire,
             Err(why) => return (Outcome::Refused(why.to_string()), nonce),
         };
@@ -505,7 +552,8 @@ impl Trader {
         why: String,
     ) -> Outcome {
         let unknown = |found: &str| Outcome::Unknown(format!("{why}; {found}"));
-        let master = self.allowlist.master;
+        let allowlist = self.allowlist();
+        let master = allowlist.master;
         let api = &self.core.api;
         match (action, wire) {
             (Action::Place(order), Wire::Order(placed)) => {
@@ -531,7 +579,7 @@ impl Trader {
                         return unknown(&format!("its order couldn't be looked up: {error:#}"));
                     }
                 };
-                let market = match self.allowlist.markets.get(&order.market) {
+                let market = match allowlist.markets.get(&order.market) {
                     Some(market) => market,
                     None => return unknown("its market is no longer listed"),
                 };
@@ -715,6 +763,15 @@ enum Read {
 fn receipt(wire: &Wire, response: &Value) -> Read {
     match wire {
         Wire::Order(_) | Wire::Modify(_) => {
+            // The venue answers a single modification it took with a plain
+            // ok that carries no status at all: done. An answer that carries
+            // statuses, and an order's answer, are read as below.
+            if matches!(wire, Wire::Modify(_))
+                && response["type"] == "default"
+                && response["data"].is_null()
+            {
+                return Read::Receipt(Receipt::Done);
+            }
             let status = &response["data"]["statuses"][0];
             if let Some(error) = status["error"].as_str() {
                 return Read::Refused(format!("the venue refused the order: {error}"));

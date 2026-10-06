@@ -633,6 +633,39 @@ fn left_for_the_venue(why: String) -> Moved {
     ))
 }
 
+/// The station's idle dollars, if they can be read.
+async fn station_holds(chain: &Client, usd: Address, station: Address) -> Option<U256> {
+    chain
+        .read(usd, IERC20::balanceOfCall { account: station })
+        .await
+        .ok()
+}
+
+/// How far the station's idle dollars have risen over `before`, looking
+/// every two seconds for at most `wait` until they have risen by `units`;
+/// `None` when that can't be read. A fall (the station paying out meanwhile)
+/// counts as no rise, so a rise is never more than what came in.
+async fn risen_by(
+    chain: &Client,
+    usd: Address,
+    station: Address,
+    before: Option<U256>,
+    units: U256,
+    wait: std::time::Duration,
+) -> Option<U256> {
+    let before = before?;
+    let until = tokio::time::Instant::now() + wait;
+    loop {
+        let risen = station_holds(chain, usd, station)
+            .await
+            .map(|held| held.saturating_sub(before));
+        if risen.is_some_and(|risen| risen >= units) || tokio::time::Instant::now() >= until {
+            return risen;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
 /// The calls that take money from one account to another on the vault's own
 /// chain. Anything else is refused here, and the station would refuse it too.
 fn route(
@@ -720,8 +753,9 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
         let mut reached = None;
         for step in steps {
             // Set when a deposit left the station and the venue hasn't
-            // credited it: the money is in neither, so the agent hears
-            // where it really is, on its way.
+            // credited it, or a withdrawal was asked of the venue and hasn't
+            // all reached the station: the money is not where it was going,
+            // so the agent hears it may be on its way.
             let mut in_flight = false;
             let (failed, may_still_land) = match &place {
                 Place::Evm(evm) => {
@@ -793,14 +827,52 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
                             }
                         }
                         Step::Withdraw => {
-                            key.send(
-                                station,
-                                IStation::withdrawCall {
-                                    driver: name,
-                                    amount: units,
-                                },
-                            )
-                            .await
+                            // A delayed venue pays a withdrawal out after the
+                            // call that asks for it, and may pay less or
+                            // nothing; so it is done only once the station's
+                            // own balance shows it.
+                            let before = station_holds(&evm.chain, evm.usd, station).await;
+                            let sent = key
+                                .send(
+                                    station,
+                                    IStation::withdrawCall {
+                                        driver: name,
+                                        amount: units,
+                                    },
+                                )
+                                .await;
+                            match sent {
+                                Ok(receipt) => {
+                                    // HyperCore pays out a block or so later.
+                                    let wait = if driver == crate::hyperliquid::DRIVER {
+                                        crate::hyperliquid::DEPOSIT_CONFIRM_WAIT
+                                    } else {
+                                        std::time::Duration::ZERO
+                                    };
+                                    let risen =
+                                        risen_by(&evm.chain, evm.usd, station, before, units, wait)
+                                            .await;
+                                    if risen.is_some_and(|risen| risen >= units) {
+                                        Ok(receipt)
+                                    } else {
+                                        in_flight = true;
+                                        let found = match risen {
+                                            Some(risen) => format!("the station's balance rose by {risen} millionths"),
+                                            None => "the station's balance can't be read, so what reached it can't be told".to_string(),
+                                        };
+                                        tracing::warn!(
+                                            station = %station,
+                                            amount,
+                                            "a withdrawal was asked of the venue and hasn't all reached the station"
+                                        );
+                                        Err(anyhow::Error::new(chain::NeverLanded).context(format!(
+                                            "the withdrawal of {amount} millionths was asked of the venue, and {found} within {} s: the rest may still arrive, or still be at the venue",
+                                            wait.as_secs()
+                                        )))
+                                    }
+                                }
+                                Err(error) => Err(error),
+                            }
                         }
                     };
                     match sent {
@@ -841,7 +913,10 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
             if let Some((tally, error)) = failed {
                 accessor.with(|mut access| access.get().count(|c| c.submitted(tally)));
                 if in_flight {
-                    return Ok(left_for_the_venue(format!("{error:#}")));
+                    return Ok(match step {
+                        Step::Withdraw => Moved::Unknown(format!("{error:#}")),
+                        _ => left_for_the_venue(format!("{error:#}")),
+                    });
                 }
                 return Ok(stopped(reached, format!("{error:#}"), may_still_land));
             }

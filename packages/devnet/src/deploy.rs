@@ -155,9 +155,23 @@ pub async fn refuse_a_used_station_factory(
         return Ok(());
     };
     // An earlier try of this very deploy, stopped after initialising it:
-    // carried on, not refused.
-    if Landed::load(file, generation).initialised(&set) {
-        return Ok(());
+    // carried on, not refused, if this is the build it was made from. From
+    // another build, its contracts would be deployed again and the station
+    // factory could serve none of them: refused here, before anything is.
+    let earlier = Landed::load(file, generation);
+    if earlier.initialised(&set) {
+        if earlier.build == Some(build_of(artifacts)?) {
+            return Ok(());
+        }
+        bail!(
+            "the station factory generation {generation} puts at {} on chain {} was initialised by \
+             an earlier try of this deploy, from another build of the contracts: carried on, it \
+             would deploy them again, and the station factory could serve none of them. Nothing \
+             was sent. Deploy every chain of the network under a new generation: \
+             `task chains:deploy NETWORK=<network> GENERATION=<n>`, the same on every chain.",
+            at.station_factory,
+            client.chain_id,
+        );
     }
     let mut free = None;
     for later in generation + 1..=generation + FREE_GENERATION_SEARCH {
@@ -206,6 +220,9 @@ pub struct Kept {
     pub generation: Option<u64>,
     pub admin: Address,
     pub station_factory: Address,
+    /// The station implementation its station factory was initialised
+    /// with; `None` for a file written before files recorded it.
+    pub station_implementation: Option<Address>,
 }
 
 impl Kept {
@@ -218,8 +235,54 @@ impl Kept {
             generation: recorded_generation(&text),
             admin: deployments.roles.admin,
             station_factory: deployments.station_factory,
+            station_implementation: serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get(STATION_IMPLEMENTATION_KEY)?
+                        .as_str()?
+                        .parse()
+                        .ok()
+                }),
         })
     }
+}
+
+/// What a deployment file records the station implementation under: with
+/// the station factory's address, it fixes where a vault's stations are.
+pub const STATION_IMPLEMENTATION_KEY: &str = "station_implementation";
+
+/// Refuse a deploy whose build would put a vault's stations elsewhere than
+/// a chain kept under the same generation does. A station's address follows
+/// from the station factory's address and the station implementation, and
+/// both follow from the build as well as the generation: two chains under
+/// one generation from builds whose station differs would give one vault's
+/// stations two addresses, and a bridge send to the vault's own station on
+/// the other chain would go where no station is. Called before anything is
+/// sent, when some chain is to be deployed.
+pub fn refuse_another_build(kept: &[Kept], artifacts: &Path, generation: u64) -> Result<()> {
+    for kept in kept {
+        let expected = everywhere_addresses(artifacts, kept.admin, generation)?;
+        if kept.station_factory == expected.station_factory
+            && kept.station_implementation == Some(expected.station_implementation)
+        {
+            continue;
+        }
+        bail!(
+            "{} is kept under generation {generation} with station factory {} and station \
+             implementation {}, and this build puts them at {} and {} under it: a vault's stations \
+             would not share one address across the network's chains. Nothing was sent. Deploy \
+             every chain of the network afresh under a new generation: \
+             `task chains:deploy NETWORK=<network> GENERATION=<n>`, the same on every chain.",
+            kept.key,
+            kept.station_factory,
+            kept.station_implementation
+                .map_or_else(|| "unrecorded".to_string(), |at| at.to_string()),
+            expected.station_factory,
+            expected.station_implementation
+        );
+    }
+    Ok(())
 }
 
 /// The generation a deployment file's text records, if any.
@@ -340,19 +403,13 @@ pub async fn ensure(
             );
         }
         // A deploy that stopped part-way through its setup carries on.
-        if let Some(done) = std::fs::read_to_string(file)
+        if let Some(setup) = std::fs::read_to_string(file)
             .ok()
             .and_then(|text| recorded_setup(&text))
         {
-            tracing::info!(file = %file.display(), done = done.len(), "the contracts are on this chain; finishing their setup");
-            set_up(
-                client,
-                &existing,
-                file,
-                recorded.unwrap_or(generation),
-                done,
-            )
-            .await?;
+            tracing::info!(file = %file.display(), done = setup.done.len(), "the contracts are on this chain; finishing their setup");
+            let written = Written::read(client, &existing, recorded.unwrap_or(generation)).await?;
+            set_up(client, &existing, file, &written, setup).await?;
             return Ok(existing);
         }
         tracing::info!(file = %file.display(), "the contracts are already on this chain");
@@ -364,11 +421,37 @@ pub async fn ensure(
     // stops in its setup is carried on rather than deployed again (which
     // would need a new generation).
     let deployments = deploy(client, network, key, artifacts, chains, generation, file).await?;
-    write_file(file, &deployments, generation, Some(&[]))?;
+    let written = Written::read(client, &deployments, generation).await?;
+    write_file(file, &deployments, &written, Some(&Setup::default()))?;
     Landed::finished(file);
     tracing::info!(file = %file.display(), generation, "the addresses are written");
-    set_up(client, &deployments, file, generation, Vec::new()).await?;
+    set_up(client, &deployments, file, &written, Setup::default()).await?;
     Ok(deployments)
+}
+
+/// What a deployment file records beside the addresses: the generation,
+/// and the station implementation its station factory was initialised
+/// with, read back from the chain.
+struct Written {
+    generation: u64,
+    station_implementation: Address,
+}
+
+impl Written {
+    async fn read(client: &Client, deployments: &Deployments, generation: u64) -> Result<Self> {
+        let set = station_factory_set(client, deployments.station_factory)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "the station factory at {} is not initialised",
+                    deployments.station_factory
+                )
+            })?;
+        Ok(Self {
+            generation,
+            station_implementation: set.implementation,
+        })
+    }
 }
 
 async fn deploy(
@@ -404,9 +487,12 @@ async fn deploy(
     // Before anything is sent: a station factory this generation already
     // gave another deployment can never serve this one.
     refuse_a_used_station_factory(client, artifacts, admin, generation, file).await?;
-    // What an earlier try of this deploy landed before it stopped.
+    // What an earlier try of this deploy landed before it stopped, and the
+    // build this try is made from, recorded before anything is sent.
     let mut landed = Landed::load(file, generation);
     let from_block = landed.first_block(client.block_number().await?);
+    landed.build = Some(build_of(artifacts)?);
+    landed.save()?;
 
     let usd = put(
         &mut landed,
@@ -644,7 +730,9 @@ async fn deploy(
     let deployments = Deployments {
         chain_key: key.to_string(),
         chain_id: client.chain_id,
-        rpc_url: client.rpc_url.clone(),
+        // Never the client's endpoints: one set from the environment is
+        // usually a paid URL, which carries its key. Nothing reads it.
+        rpc_url: String::new(),
         deployed_block: from_block,
         usd,
         venue,
@@ -830,7 +918,54 @@ struct Landed {
     path: std::path::PathBuf,
     generation: u64,
     from_block: Option<u64>,
+    /// The build the last try was made from ([`build_of`]).
+    build: Option<B256>,
     contracts: std::collections::BTreeMap<String, (Address, B256)>,
+}
+
+/// Every contract a deploy puts on a chain.
+const DEPLOYED: [&str; 21] = [
+    "LocalUsd",
+    "LocalVenue",
+    "DevAttestationVerifier",
+    "AttestationRegistry",
+    "Publishing",
+    "Prices",
+    "StrategyRegistry",
+    "ReviewRegistry",
+    "AuthorProfiles",
+    "LocalDriver",
+    "LocalBridge",
+    "StationCloses",
+    "Station",
+    "StationFactory",
+    "Closer",
+    "Valuations",
+    "Claims",
+    "Posts",
+    "Upkeep",
+    "Vault",
+    "VaultFactory",
+];
+
+/// Which build of the contracts `artifacts` holds: the hash of every
+/// deployed contract's creation code, as the build left it.
+fn build_of(artifacts: &Path) -> Result<B256> {
+    let mut codes = Vec::new();
+    for name in DEPLOYED {
+        let path = artifacts
+            .join(format!("{name}.sol"))
+            .join(format!("{name}.json"));
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let artifact: serde_json::Value =
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let code = artifact["bytecode"]["object"]
+            .as_str()
+            .ok_or_else(|| anyhow!("{name} has no bytecode"))?;
+        codes.extend_from_slice(keccak256(code.as_bytes()).as_slice());
+    }
+    Ok(keccak256(&codes))
 }
 
 impl Landed {
@@ -846,6 +981,7 @@ impl Landed {
             path: path.clone(),
             generation,
             from_block: None,
+            build: None,
             contracts: Default::default(),
         };
         let Some(value) = std::fs::read_to_string(&path)
@@ -858,6 +994,9 @@ impl Landed {
             return landed;
         }
         landed.from_block = value.get("from_block").and_then(|block| block.as_u64());
+        landed.build = value
+            .get("build")
+            .and_then(|build| build.as_str()?.parse().ok());
         for (name, entry) in value
             .get("contracts")
             .and_then(|contracts| contracts.as_object())
@@ -898,6 +1037,10 @@ impl Landed {
 
     fn record(&mut self, name: &str, address: Address, init: B256) -> Result<()> {
         self.contracts.insert(name.to_string(), (address, init));
+        self.save()
+    }
+
+    fn save(&self) -> Result<()> {
         let contracts: serde_json::Map<String, serde_json::Value> = self
             .contracts
             .iter()
@@ -916,6 +1059,7 @@ impl Landed {
             serde_json::to_string_pretty(&serde_json::json!({
                 GENERATION_KEY: self.generation,
                 "from_block": self.from_block,
+                "build": self.build,
                 "contracts": contracts,
             }))?,
         )
@@ -1023,6 +1167,13 @@ fn creation_code(artifacts: &Path, name: &str, libraries: &[(&str, Address)]) ->
 /// What a deployment file records of the setup still to finish: the steps
 /// already done. Present only until every step is done.
 pub const SETUP_DONE_KEY: &str = "setup_done";
+/// What it records of the steps sent and not yet seen to land: each
+/// step's transaction hash.
+pub const SETUP_SENT_KEY: &str = "setup_sent";
+
+/// How long a deploy waits for a step's earlier send, still known to the
+/// chain by its hash, to land before it stops and asks to be run again.
+const SENT_STEP_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// One send of a deployment's setup, after its contracts are on the chain
 /// and the file is written: named, so a deploy that stopped part-way picks
@@ -1032,6 +1183,26 @@ struct Step {
     from: Address,
     to: Address,
     call: Vec<u8>,
+    /// What on the chain shows it done.
+    shows: Shows,
+}
+
+/// What on the chain shows a setup step done.
+enum Shows {
+    /// The venue lists the market.
+    Market(&'static str),
+    /// The registry holds the service's image, proposed.
+    Image(&'static str),
+    /// The registry refuses the project's proposal again: it has no view of
+    /// one still in its timelock.
+    Project,
+    /// The registry names the stand-in driver, or bridge, under its name:
+    /// one still in its timelock is not shown.
+    Driver,
+    Bridge,
+    /// The account holds its starting money of the deployment's dollar,
+    /// which nobody but the setup has handed out before.
+    Money(Address),
 }
 
 /// Every setup step, in order: the venue's markets, the images the
@@ -1053,6 +1224,7 @@ fn setup_steps(deployments: &Deployments) -> Vec<Step> {
                 price: U256::from(STARTING_PRICE),
             }
             .abi_encode(),
+            shows: Shows::Market(id),
         });
     }
     for (service, kind) in [
@@ -1070,6 +1242,7 @@ fn setup_steps(deployments: &Deployments) -> Vec<Step> {
                 kind,
             }
             .abi_encode(),
+            shows: Shows::Image(service),
         });
     }
     steps.push(Step {
@@ -1080,6 +1253,7 @@ fn setup_steps(deployments: &Deployments) -> Vec<Step> {
             projectId: project_id(),
         }
         .abi_encode(),
+        shows: Shows::Project,
     });
     steps.push(Step {
         name: "driver local".to_string(),
@@ -1090,6 +1264,7 @@ fn setup_steps(deployments: &Deployments) -> Vec<Step> {
             implementation: deployments.driver,
         }
         .abi_encode(),
+        shows: Shows::Driver,
     });
     steps.push(Step {
         name: "bridge local-bridge".to_string(),
@@ -1100,6 +1275,7 @@ fn setup_steps(deployments: &Deployments) -> Vec<Step> {
             implementation: deployments.bridge,
         }
         .abi_encode(),
+        shows: Shows::Bridge,
     });
     for who in [roles.author, roles.viewer, roles.keeper, roles.admin] {
         steps.push(Step {
@@ -1111,35 +1287,181 @@ fn setup_steps(deployments: &Deployments) -> Vec<Step> {
                 amount: U256::from(STARTING_BALANCE),
             }
             .abi_encode(),
+            shows: Shows::Money(who),
         });
     }
     steps
 }
 
-/// The setup steps a deployment file records as done, or `None` if its
-/// setup is finished (or it is from before files recorded it).
-pub fn recorded_setup(text: &str) -> Option<Vec<String>> {
-    let value: serde_json::Value = serde_json::from_str(text).ok()?;
-    let done = value.get(SETUP_DONE_KEY)?.as_array()?;
-    Some(
-        done.iter()
-            .filter_map(|name| name.as_str().map(str::to_string))
-            .collect(),
-    )
+alloy::sol! {
+    /// The registry's refusal of a proposal it already holds.
+    error AlreadyProposed();
 }
 
-/// Write a deployment's file: its addresses, its generation, and while its
-/// setup is unfinished the steps done.
+/// Whether the chain shows `step` done. A read that fails is an error,
+/// never "not done": the step would be sent again.
+async fn shown_done(client: &Client, deployments: &Deployments, step: &Step) -> Result<bool> {
+    use alloy::sol_types::SolError;
+    let registry = deployments.attestation;
+    Ok(match step.shows {
+        Shows::Market(id) => {
+            client
+                .read(
+                    deployments.venue,
+                    ILocalVenue::marketOfCall {
+                        market: market_id(id),
+                    },
+                )
+                .await?
+                .id
+                != B256::ZERO
+        }
+        Shows::Image(service) => {
+            client
+                .read(
+                    registry,
+                    IAttestationRegistry::imageOfCall {
+                        imageDigest: image_digest(service),
+                    },
+                )
+                .await?
+                .allowedAt
+                != 0
+        }
+        Shows::Project => {
+            let proposing = alloy::rpc::types::TransactionRequest::default()
+                .from(step.from)
+                .to(step.to)
+                .input(Bytes::from(step.call.clone()).into());
+            match alloy::providers::Provider::call(client.provider(), proposing).await {
+                Ok(_) => false,
+                Err(error)
+                    if error
+                        .as_error_resp()
+                        .and_then(|refusal| refusal.as_revert_data())
+                        .is_some_and(|data| data.starts_with(&AlreadyProposed::SELECTOR)) =>
+                {
+                    true
+                }
+                Err(error) => {
+                    return Err(
+                        anyhow::Error::new(error).context("asking whether the project is proposed")
+                    );
+                }
+            }
+        }
+        Shows::Driver => {
+            client
+                .read(
+                    registry,
+                    IAttestationRegistry::tradingDriverCall {
+                        name: market_id("local"),
+                    },
+                )
+                .await?
+                == deployments.driver
+        }
+        Shows::Bridge => {
+            client
+                .read(
+                    registry,
+                    IAttestationRegistry::bridgeOfCall {
+                        name: market_id("local-bridge"),
+                    },
+                )
+                .await?
+                == deployments.bridge
+        }
+        Shows::Money(who) => {
+            client
+                .read(
+                    deployments.usd,
+                    chain::bindings::erc20::IERC20::balanceOfCall { account: who },
+                )
+                .await?
+                >= U256::from(STARTING_BALANCE)
+        }
+    })
+}
+
+/// Whether a step's earlier send, known by its hash, landed: its receipt
+/// says so, or it is waited for while the chain still knows the
+/// transaction. A transaction the chain no longer knows never landed.
+async fn landed_by_hash(client: &Client, hash: B256) -> Result<bool> {
+    use alloy::providers::Provider;
+    let provider = client.provider();
+    let deadline = tokio::time::Instant::now() + SENT_STEP_WAIT;
+    loop {
+        if let Some(receipt) = provider
+            .get_transaction_receipt(hash)
+            .await
+            .context("looking for a step's earlier send")?
+        {
+            return Ok(receipt.status());
+        }
+        if provider
+            .get_transaction_by_hash(hash)
+            .await
+            .context("looking for a step's earlier send")?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "its earlier send {hash} is still waiting to land: run the deploy again once it has"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// What a deployment file records of its unfinished setup.
+#[derive(Clone, Debug, Default)]
+pub struct Setup {
+    /// The steps done, in order.
+    pub done: Vec<String>,
+    /// Each step sent and not seen to land, by its transaction's hash.
+    pub sent: std::collections::BTreeMap<String, B256>,
+}
+
+/// What a deployment file records of its setup, or `None` if its setup is
+/// finished (or it is from before files recorded it).
+pub fn recorded_setup(text: &str) -> Option<Setup> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let done = value.get(SETUP_DONE_KEY)?.as_array()?;
+    Some(Setup {
+        done: done
+            .iter()
+            .filter_map(|name| name.as_str().map(str::to_string))
+            .collect(),
+        sent: value
+            .get(SETUP_SENT_KEY)
+            .and_then(|sent| serde_json::from_value(sent.clone()).ok())
+            .unwrap_or_default(),
+    })
+}
+
+/// Write a deployment's file: its addresses, its generation and station
+/// implementation, and while its setup is unfinished the steps done and
+/// sent.
 fn write_file(
     file: &Path,
     deployments: &Deployments,
-    generation: u64,
-    setup_done: Option<&[String]>,
+    written: &Written,
+    setup: Option<&Setup>,
 ) -> Result<()> {
     let mut value: serde_json::Value =
-        serde_json::from_str(&deployment_json(deployments, generation)?)?;
-    if let (Some(done), Some(object)) = (setup_done, value.as_object_mut()) {
-        object.insert(SETUP_DONE_KEY.to_string(), serde_json::json!(done));
+        serde_json::from_str(&deployment_json(deployments, written.generation)?)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            STATION_IMPLEMENTATION_KEY.to_string(),
+            serde_json::json!(written.station_implementation),
+        );
+        if let Some(setup) = setup {
+            object.insert(SETUP_DONE_KEY.to_string(), serde_json::json!(setup.done));
+            object.insert(SETUP_SENT_KEY.to_string(), serde_json::json!(setup.sent));
+        }
     }
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("making {}", parent.display()))?;
@@ -1148,35 +1470,62 @@ fn write_file(
         .with_context(|| format!("writing {}", file.display()))
 }
 
-/// Run the setup steps not yet done, recording each in the file as it
-/// lands; the file is complete once they all have. A step whose send failed
-/// stops the deploy: run it again to carry on from that step.
+/// Run the setup steps not yet done, recording each in the file once it
+/// lands; the file is complete once they all have. Each step is looked for
+/// on the chain before it is sent, and its earlier send by its hash, so a
+/// step that landed unseen (its receipt not read in time, or the deploy
+/// stopped between the send and the record) is recorded, never sent again.
+/// A step whose send failed stops the deploy: run it again to carry on.
 async fn set_up(
     client: &Client,
     deployments: &Deployments,
     file: &Path,
-    generation: u64,
-    mut done: Vec<String>,
+    written: &Written,
+    mut setup: Setup,
 ) -> Result<()> {
     for step in setup_steps(deployments) {
-        if done.contains(&step.name) {
+        if setup.done.contains(&step.name) {
             continue;
         }
-        client
-            .send_raw(step.from, step.to, Bytes::from(step.call))
+        let context = || {
+            format!(
+                "the deployment's setup step \"{}\"; the addresses are written, so run the deploy \
+                 again to carry on from this step",
+                step.name
+            )
+        };
+        let mut done = shown_done(client, deployments, &step)
             .await
-            .with_context(|| {
-                format!(
-                    "the deployment's setup step \"{}\"; the addresses are written, so run the \
-                     deploy again to carry on from this step",
-                    step.name
-                )
-            })?;
-        tracing::info!(step = step.name, "set up");
-        done.push(step.name);
-        write_file(file, deployments, generation, Some(&done))?;
+            .with_context(context)?;
+        if !done && let Some(hash) = setup.sent.get(&step.name) {
+            done = landed_by_hash(client, *hash).await.with_context(context)?;
+        }
+        if done {
+            tracing::info!(step = step.name, "already done on the chain");
+        } else {
+            // Its hash is in the file as soon as the node has it, before its
+            // receipt is waited for.
+            let mut noted = setup.clone();
+            let name = step.name.clone();
+            client
+                .send_raw_noting(step.from, step.to, Bytes::from(step.call.clone()), |hash| {
+                    noted.sent.insert(name, hash);
+                    if let Err(error) = write_file(file, deployments, written, Some(&noted)) {
+                        tracing::warn!(
+                            error = format!("{error:#}"),
+                            "a setup send's hash could not be recorded"
+                        );
+                    }
+                })
+                .await
+                .with_context(context)?;
+            tracing::info!(step = step.name, "set up");
+        }
+        setup.sent.remove(&step.name);
+        setup.done.push(step.name);
+        write_file(file, deployments, written, Some(&setup))?;
     }
-    write_file(file, deployments, generation, None)?;
+    write_file(file, deployments, written, None)?;
     tracing::info!(
         "the deployment is set up: markets listed, images and drivers proposed, accounts funded"
     );
@@ -1228,6 +1577,7 @@ mod tests {
             generation,
             admin: Address::repeat_byte(0xad),
             station_factory,
+            station_implementation: None,
         }
     }
 
@@ -1539,9 +1889,8 @@ mod tests {
         assert_eq!(finished.usd, deployed.usd, "deployed again");
         assert!(!Landed::path_for(&file).exists(), "the record is kept");
         let text = std::fs::read_to_string(&file).unwrap();
-        assert_eq!(
-            recorded_setup(&text),
-            None,
+        assert!(
+            recorded_setup(&text).is_none(),
             "the setup is not recorded as done"
         );
         assert_eq!(recorded_generation(&text), Some(0));
@@ -1574,6 +1923,72 @@ mod tests {
                 .unwrap(),
             sent
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deploy_stopped_part_way_and_carried_on_from_another_build_is_refused_before_anything_is_sent()
+     {
+        let Some(built) = artifacts() else {
+            eprintln!("the contracts are not built: skipping");
+            return;
+        };
+        let Some((_anvil, client)) = anvil().await else {
+            eprintln!("anvil is not installed: skipping");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("shonin-rebuilt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A copy of the build, which then changes as a later build would.
+        let artifacts = dir.join("out");
+        for name in DEPLOYED {
+            let into = artifacts.join(format!("{name}.sol"));
+            std::fs::create_dir_all(&into).unwrap();
+            std::fs::copy(
+                built
+                    .join(format!("{name}.sol"))
+                    .join(format!("{name}.json")),
+                into.join(format!("{name}.json")),
+            )
+            .unwrap();
+        }
+        let file = dir.join("evm-31337.json");
+        let key = key(31337);
+        let names = [("base".to_string(), 31337u64)];
+        let network = NetworkName::Testnet;
+
+        // Stopped after the station factory was initialised, before the
+        // deployment file was written.
+        deploy(&client, network, &key, &artifacts, &names, 0, &file)
+            .await
+            .unwrap();
+        let driver = artifacts.join("LocalDriver.sol").join("LocalDriver.json");
+        let mut artifact: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&driver).unwrap()).unwrap();
+        let code = artifact["bytecode"]["object"].as_str().unwrap().to_string();
+        artifact["bytecode"]["object"] = serde_json::json!(format!("{code}00"));
+        std::fs::write(&driver, artifact.to_string()).unwrap();
+
+        let admin = client.account(Role::Admin).unwrap();
+        let sent = client
+            .provider()
+            .get_transaction_count(admin)
+            .await
+            .unwrap();
+        let error = ensure(&client, network, &key, &artifacts, &file, &names, 0)
+            .await
+            .expect_err("carried on from another build");
+        assert!(format!("{error:#}").contains("another build"), "{error:#}");
+        assert_eq!(
+            client
+                .provider()
+                .get_transaction_count(admin)
+                .await
+                .unwrap(),
+            sent,
+            "something was sent before the refusal"
+        );
+        assert!(!file.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

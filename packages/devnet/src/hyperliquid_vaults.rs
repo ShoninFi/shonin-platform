@@ -36,9 +36,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, U256};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::{SolCall, SolValue};
 use anyhow::{Context, Result, anyhow, bail};
@@ -379,7 +378,6 @@ pub struct Funder {
     core: HyperCore,
     api: Api,
     signer: PrivateKeySigner,
-    rpc: String,
 }
 
 impl Funder {
@@ -390,13 +388,6 @@ impl Funder {
             core: HyperCore::new(api.clone(), signer.clone()),
             api,
             signer,
-            // A chain may name several endpoints, one after another.
-            rpc: client
-                .rpc_url
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .to_string(),
         })
     }
 
@@ -410,9 +401,9 @@ impl Funder {
         dollars: f64,
     ) -> Result<()> {
         let me = self.signer.address();
-        let provider = ProviderBuilder::new()
-            .wallet(EthereumWallet::from(self.signer.clone()))
-            .connect_http(self.rpc.parse()?);
+        // Through the client's own connection: an endpoint's URL may carry
+        // a key, and an error must never name it.
+        let provider = client.signing_provider(self.signer.clone())?;
         let wanted = U256::from((dollars * 1e6).round() as u64);
         // Someone who already holds it is given nothing more.
         if client
@@ -477,7 +468,9 @@ impl Funder {
     /// make. The funder buys the HYPE first if it holds too little. Safe to
     /// run again: what is there is not sent twice.
     pub async fn station_account(&self, station: Address, dollars: f64, hype: f64) -> Result<()> {
-        let worth = account_value(&self.api, station).await.unwrap_or(0.0);
+        // A read that fails stops here: taken for an empty account, the
+        // station would be sent its dollars and HYPE again.
+        let worth = account_value(&self.api, station).await?;
         if worth < dollars * 0.9 {
             self.core
                 .usd_send(station, dollars)
@@ -487,7 +480,7 @@ impl Funder {
         } else {
             tracing::info!(%station, worth, "the station's HyperCore account already holds its dollars");
         }
-        let held = self.api.spot_balance(station, SPOT).await.unwrap_or(0.0);
+        let held = spot_total(&self.api, station, SPOT).await?;
         let short = hype - held;
         if short > 0.0 {
             let token = self.api.spot_token(SPOT).await?;
@@ -561,10 +554,30 @@ async fn account_value(api: &Api, user: Address) -> Result<f64> {
     let state = api
         .info(json!({"type": "clearinghouseState", "user": user}))
         .await?;
-    Ok(state["marginSummary"]["accountValue"]
+    state["marginSummary"]["accountValue"]
         .as_str()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(0.0))
+        .ok_or_else(|| anyhow!("HyperCore's account value for {user} can't be read: {state}"))
+}
+
+/// What `user` holds of spot token `token` on HyperCore: zero if the answer
+/// lists none, an error if the answer can't be read.
+async fn spot_total(api: &Api, user: Address, token: &str) -> Result<f64> {
+    let state = api
+        .info(json!({"type": "spotClearinghouseState", "user": user}))
+        .await?;
+    let balances = state["balances"]
+        .as_array()
+        .ok_or_else(|| anyhow!("HyperCore's spot balances for {user} can't be read: {state}"))?;
+    match balances.iter().find(|balance| balance["coin"] == token) {
+        None => Ok(0.0),
+        Some(balance) => balance["total"]
+            .as_str()
+            .and_then(|total| total.parse().ok())
+            .ok_or_else(|| {
+                anyhow!("HyperCore's {token} balance for {user} can't be read: {balance}")
+            }),
+    }
 }
 
 /// Activate a published, reviewed strategy at the Hyperliquid factory: the

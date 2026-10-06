@@ -333,10 +333,12 @@ impl Api {
     }
 
     /// An account's spot balance of a token as the driver reads it: the
-    /// total, and how much of it open orders hold. A token the account has
-    /// never held is not in the answer, and is zero; a balance whose figures
-    /// can't be read is an error, never zero.
-    pub async fn spot_holding(&self, user: Address, token: &str) -> Result<SpotHolding> {
+    /// total, and how much of it open orders hold. The token is the venue's
+    /// number for it (as the driver contract names it), never its name, which
+    /// another token may share. A token the account has never held is not in
+    /// the answer, and is zero; a balance whose figures can't be read is an
+    /// error, never zero.
+    pub async fn spot_holding(&self, user: Address, token: u64) -> Result<SpotHolding> {
         let state = self
             .info(json!({"type": "spotClearinghouseState", "user": user}))
             .await?;
@@ -792,14 +794,22 @@ impl SpotHolding {
 }
 
 /// [`Api::spot_holding`], from the venue's `spotClearinghouseState` answer.
-pub fn spot_holding_of(state: &Value, token: &str) -> Result<SpotHolding> {
+pub fn spot_holding_of(state: &Value, token: u64) -> Result<SpotHolding> {
     let balances = state["balances"].as_array().ok_or_else(|| {
         anyhow!(
             "HyperCore's spot balances can't be read: {}",
             cut(&state.to_string())
         )
     })?;
-    let mut found = balances.iter().filter(|balance| balance["coin"] == token);
+    if let Some(balance) = balances
+        .iter()
+        .find(|balance| balance["token"].as_u64().is_none())
+    {
+        bail!("a spot balance names no token number: {balance}");
+    }
+    let mut found = balances
+        .iter()
+        .filter(|balance| balance["token"].as_u64() == Some(token));
     let Some(balance) = found.next() else {
         return Ok(SpotHolding {
             total: crate::payload::Decimal::ZERO,
@@ -807,23 +817,23 @@ pub fn spot_holding_of(state: &Value, token: &str) -> Result<SpotHolding> {
         });
     };
     if found.next().is_some() {
-        bail!("HyperCore gives two spot balances of {token}");
+        bail!("HyperCore gives two spot balances of token {token}");
     }
     let figure = |field: &str| -> Result<crate::payload::Decimal> {
         let value: crate::payload::Decimal = balance[field]
             .as_str()
             .and_then(|text| text.parse().ok())
             .ok_or_else(|| {
-                anyhow!("the spot balance of {token} has no readable {field}: {balance}")
+                anyhow!("the spot balance of token {token} has no readable {field}: {balance}")
             })?;
         if value.is_sign_negative() {
-            bail!("the spot balance of {token} has a negative {field}: {balance}");
+            bail!("the spot balance of token {token} has a negative {field}: {balance}");
         }
         Ok(value)
     };
     let (total, hold) = (figure("total")?, figure("hold")?);
     if hold > total {
-        bail!("the spot balance of {token} holds more than it has: {balance}");
+        bail!("the spot balance of token {token} holds more than it has: {balance}");
     }
     Ok(SpotHolding { total, hold })
 }
@@ -969,24 +979,28 @@ mod tests {
     fn a_spot_balance_is_its_total_less_what_orders_hold_and_never_read_as_zero_by_default() {
         let state = json!({"balances": [
             {"coin": "USDC", "token": 0, "total": "14.6", "hold": "0.0"},
-            {"coin": "HYPE", "token": 150, "total": "0.30", "hold": "0.30"}
+            {"coin": "HYPE", "token": 150, "total": "0.30", "hold": "0.30"},
+            {"coin": "HYPE", "token": 4242, "total": "900", "hold": "0"}
         ]});
-        let hype = spot_holding_of(&state, "HYPE").unwrap();
+        // A token is read by the venue's number for it: another token of the
+        // same name is not it.
+        let hype = spot_holding_of(&state, 150).unwrap();
         assert_eq!(hype.free(), "0".parse().unwrap());
         assert_eq!(hype.total, "0.3".parse().unwrap());
         // Never held: none.
         assert_eq!(
-            spot_holding_of(&state, "PURR").unwrap().total,
+            spot_holding_of(&state, 7).unwrap().total,
             "0".parse().unwrap()
         );
         // A figure that can't be read is an error, not zero.
         for broken in [
-            json!({"balances": [{"coin": "HYPE", "total": 0.3, "hold": "0"}]}),
-            json!({"balances": [{"coin": "HYPE", "total": "0.3"}]}),
-            json!({"balances": [{"coin": "HYPE", "total": "0.3", "hold": "0.4"}]}),
+            json!({"balances": [{"coin": "HYPE", "token": 150, "total": 0.3, "hold": "0"}]}),
+            json!({"balances": [{"coin": "HYPE", "token": 150, "total": "0.3"}]}),
+            json!({"balances": [{"coin": "HYPE", "token": 150, "total": "0.3", "hold": "0.4"}]}),
+            json!({"balances": [{"coin": "HYPE", "total": "0.3", "hold": "0"}]}),
             json!({"error": "x"}),
         ] {
-            assert!(spot_holding_of(&broken, "HYPE").is_err(), "{broken}");
+            assert!(spot_holding_of(&broken, 150).is_err(), "{broken}");
         }
     }
 

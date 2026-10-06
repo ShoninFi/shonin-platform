@@ -91,6 +91,7 @@ async fn main() -> Result<()> {
                 master: station,
                 markets,
                 allowed: BTreeSet::from([market.clone()]),
+                missing: Default::default(),
             };
             let trader = Trader::new(api, agent, allowlist);
             let receipt = trader
@@ -119,6 +120,7 @@ async fn main() -> Result<()> {
                 master: station,
                 markets: Markets::read(&api).await?,
                 allowed: BTreeSet::new(),
+                missing: Default::default(),
             };
             let receipt = Trader::new(api, agent, allowlist)
                 .submit(&Action::MoveDollars { from, amount })

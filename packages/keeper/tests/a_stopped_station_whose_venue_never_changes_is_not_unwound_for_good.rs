@@ -166,6 +166,13 @@ async fn a_stopped_station_whose_venue_never_changes_is_not_unwound_for_good() {
         },
         vec![],
     );
+    // Money may be moved through the driver at once.
+    answers(
+        &node,
+        DRIVER,
+        IDelayedDriver::movableAtCall { station: STATION },
+        U256::ZERO,
+    );
     answers(
         &node,
         DRIVER,
