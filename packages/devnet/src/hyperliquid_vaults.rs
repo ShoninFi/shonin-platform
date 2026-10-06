@@ -1149,9 +1149,18 @@ pub async fn run(
     // vault. The driver stages no close for a fraction so near all of the
     // station that what would be left couldn't cover the close's worst
     // slippage, and while the agent holds a position such a leaver's claim
-    // would wait for it to be flat.
+    // would wait for it to be flat. They put in the least a deposit may be:
+    // the leaver's claim reaches the venue only while the stayer's cash is
+    // less than what the station holds there, or the cash pays it all.
     if !progress.stayed {
-        let units = (deposit_units / 10).max(least);
+        let units = least;
+        if units as f64 / 1e6 >= options.station_dollars {
+            tracing::warn!(
+                stays_units = units,
+                station_dollars = options.station_dollars,
+                "the second depositor's cash covers what the station holds at the venue: the leaver will be paid from cash, with no close staged"
+            );
+        }
         funder
             .dollars_on_hyperevm(client, author, units as f64 / 1e6)
             .await?;
