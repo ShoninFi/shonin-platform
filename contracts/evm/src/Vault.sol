@@ -170,6 +170,14 @@ contract Vault is IVault, ReentrancyGuardTransient {
         Valuations.fromStation(amount);
     }
 
+    function delivered(uint256 amount) external nonReentrant {
+        Claims.delivered(amount);
+    }
+
+    function unstaged() external nonReentrant {
+        Claims.unstaged();
+    }
+
     function haltedAt() external view returns (uint64) {
         return VaultStorage.layout().haltedAt;
     }

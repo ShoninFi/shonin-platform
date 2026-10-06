@@ -42,6 +42,9 @@ contract MockZkLighter {
     Withdrawal[] public withdrawals;
     uint256 public cancels;
     uint256 public priorityRequests;
+    /// Whether a withdrawal larger than the account can give is refused
+    /// whole, rather than trimmed to what it can.
+    bool public refuseOversized;
 
     error NotRegistered();
     error NotOwner();
@@ -53,6 +56,10 @@ contract MockZkLighter {
     function listMarket(uint16 market, uint8 sizeDecimals, uint8 priceDecimals, uint32 mark) external {
         unit[market] = 10 ** (uint256(sizeDecimals) + priceDecimals);
         markOf[market] = mark;
+    }
+
+    function setRefuseOversized(bool refuse) external {
+        refuseOversized = refuse;
     }
 
     function setMark(uint16 market, uint32 mark) external {
@@ -158,6 +165,7 @@ contract MockZkLighter {
             Withdrawal memory w = withdrawals[i];
             int256 free = cash[w.account] - _margin(w.account);
             uint256 amount = free <= 0 ? 0 : (uint256(free) < w.amount ? uint256(free) : w.amount);
+            if (refuseOversized && amount < w.amount) amount = 0;
             cash[w.account] -= int256(amount);
             _pending[ownerOf[w.account]] += uint128(amount);
         }

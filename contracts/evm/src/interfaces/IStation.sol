@@ -9,19 +9,34 @@ struct Send {
     uint64 sentAt;
 }
 
-/// A close through a delayed driver, in progress: placed, then proved and
-/// swept, then delivered home.
+/// A close through a delayed driver, in progress: placed, then proved,
+/// measured and swept, then delivered home once its dollars have landed.
 struct Stage {
     /// The fraction of every position being closed (1e18 is all).
     uint256 fraction;
-    /// What goes home once it has all landed: the fraction's worth at exit
-    /// prices from each delayed venue, what other venues brought home at the
-    /// stage, and the fraction of the idle dollars.
+    /// What goes home at delivery: the fraction of the idle dollars and what
+    /// other venues brought home at the stage, and, once proved, what the
+    /// delayed venues' part was measured to have fetched.
     uint256 owed;
+    /// The most the delayed venues' part can be measured at: the fraction's
+    /// worth there at exit-side prices when it was placed.
+    uint256 estimate;
+    /// What the delayed venues' part was measured to have fetched, once
+    /// proved: it must all have reached the station before delivery.
+    uint256 fetched;
+    /// The station's `arrivals` when it was placed.
+    uint256 arrivedAt;
     uint64 stagedAt;
     uint64 stagedBlock;
+    /// When it was proved and swept, or last swept again.
     uint64 sweptAt;
     uint64 sweptBlock;
+    /// How long it may wait to be proved, and for its dollars before they
+    /// are asked for again: the longest delivery window of its drivers.
+    uint64 window;
+    /// Placed by the vault for one of its claims or one holder's units, and
+    /// delivered through the vault's own door for them.
+    bool forVault;
 }
 
 /// What a station is told about itself when it is created.
@@ -65,12 +80,15 @@ interface IStation {
     /// A driver failed during a stopped station's full unwind; the others
     /// went ahead.
     event DriverFailed(bytes32 indexed driver);
-    /// A close through a delayed driver was placed; it is proved, swept and
-    /// delivered by `settleClose` in later blocks.
-    event CloseStaged(uint256 fraction, uint256 owed);
-    event CloseSwept(uint256 fraction);
-    /// A staged close not proved in time: nothing was swept, and whatever it
-    /// sold stays in the account.
+    /// A close through a delayed driver was placed; it is proved, measured,
+    /// swept and delivered by `settleClose` in later blocks.
+    event CloseStaged(uint256 fraction, uint256 owed, uint256 estimate);
+    /// Proved and measured at `fetched`, and `asked` of it asked for from
+    /// the venue; or, a delivery window on, asked for again.
+    event CloseSwept(uint256 fraction, uint256 fetched, uint256 asked);
+    /// A staged close not proved in time, or one a stopped station's full
+    /// unwind took the place of: whatever it sold stays at the station,
+    /// everyone's.
     event CloseLapsed(uint256 fraction);
     event CloseDelivered(uint256 fraction, uint256 amount);
     /// Money in one of the venue's own vaults is counted, and brought back
@@ -110,14 +128,30 @@ interface IStation {
     /// `ShortSweep` when what a venue sends home falls short of the closed
     /// fraction's worth by more than the band. On a station with a delayed
     /// driver a partial close is staged instead: nothing goes home now, and
-    /// `blocked` is true until `settleClose` has delivered it.
+    /// `blocked` is true until `settleClose` has delivered it. On the home
+    /// station only the vault stages one, through `stageClose`.
     function unwind(uint256 fraction) external returns (uint256 sentHome, bool blocked);
+    /// Home station, the vault only: close `fraction` for one of its claims
+    /// or one holder's units. Where a delayed driver holds anything worth
+    /// closing, the close is staged (`staged`), one at a time, and delivered
+    /// to the vault through `delivered` once its dollars have landed, or
+    /// handed back through `unstaged`; otherwise it is `unwind`'s close.
+    function stageClose(uint256 fraction) external returns (uint256 sentHome, bool blocked, bool staged);
     /// What the station holds, at mark and at exit-side prices.
     function value() external view returns (uint256 mark, uint256 exit);
-    /// Move a close staged through a delayed driver on: prove and sweep it,
-    /// then deliver it home. Anyone may call it.
+    /// Move a close staged through a delayed driver on: prove, measure and
+    /// sweep it, ask again for dollars a delivery window late, deliver it
+    /// home once they have landed, or let an unproved one lapse. Anyone may
+    /// call it.
     function settleClose() external;
     function stage() external view returns (Stage memory);
+    /// Every dollar that has reached the station other than through its own
+    /// calls (a venue's send or a pending withdrawal paid out, a bridge, a
+    /// gift), counted up for good.
+    function arrivals() external view returns (uint256);
+    /// What the station has put into a venue through `deposit`, counted up
+    /// for good, and when it last did.
+    function venueFlows(bytes32 driver) external view returns (uint256 sent, uint64 depositedAt);
     /// Count, bring back, and end trading over, money the station's account
     /// put into one of a venue's own vaults. Anyone may call it.
     function reclaim(bytes32 driver, address venueVault) external;
@@ -202,6 +236,14 @@ interface IStationVault {
     function toStation(uint256 amount) external;
     /// Take `amount` from the home station into cash.
     function fromStation(uint256 amount) external;
+    /// Take `amount` from the home station: what the close it staged for the
+    /// vault fetched, with the fraction of the station's idle dollars, paid
+    /// to the claim or the holder the vault staged it for and no one else.
+    function delivered(uint256 amount) external;
+    /// The close the home station staged for the vault ended without a
+    /// delivery: not proved in time, or taken over by a stopped station's
+    /// full unwind.
+    function unstaged() external;
     /// When the vault halted; zero while it runs.
     function haltedAt() external view returns (uint64);
     function haltGrace() external view returns (uint64);

@@ -101,7 +101,11 @@ library Valuations {
 
         syncHolding(s);
         (uint256 markValue, uint256 exitValue) = IStation(s.homeStation).value();
-        if (IStation(s.homeStation).outsideBand()) s.wide[count] = true;
+        // A close in progress at the home station has sold part of what it
+        // holds for one leaver, not yet home: such a valuation prices
+        // nothing, as one at a market outside the band.
+        if (IStation(s.homeStation).outsideBand() || s.staging()) s.wide[count] = true;
+        s.valueFirst = false;
         // An exit side above the mark is what the holdings could be sold
         // for: a deposit pays it on top, net of the profit fee a sale there
         // would owe, so it can't buy below the pool's realisable worth; but
@@ -506,7 +510,7 @@ library Valuations {
         }
         // Nor while a priced valuation waits to settle: its withdrawals are
         // paid from the cash first.
-        if (block.timestamp < r.earliest + s.timers.fallbackAfter || s.valuing() || owed(s)) {
+        if (block.timestamp < r.earliest + s.timers.fallbackAfter || s.valuing() || owed(s) || s.staging()) {
             revert IVault.NotYet();
         }
         // A closing vault pays its holders through its own door.
@@ -576,7 +580,7 @@ library Valuations {
         s.cash -= assets - kept;
         assets -= kept;
         if (raw != 0) {
-            _accrue(s, owner);
+            s.accrue(owner);
             if (s.unitsOf[owner] == 0) s.unitsSince[owner] = uint64(block.timestamp);
             s.unitsOf[owner] += raw;
             s.units += raw;
@@ -586,20 +590,9 @@ library Valuations {
         emit IVault.ProRataTaken(owner, shares, assets, fraction);
     }
 
-    /// What a holder's units have earned since they last looked: measured
-    /// down, from a starting point measured up, so no holder is ever credited
-    /// more than came home for them, whatever the rounding of the others.
-    function _accrue(Layout storage s, address holder) private {
-        uint256 units = s.unitsOf[holder];
-        uint256 earned = units.mulDiv(s.perUnit, UNIT_SCALE);
-        uint256 debt = s.unitDebt[holder];
-        if (earned > debt) s.unitCredit[holder] += earned - debt;
-        s.unitDebt[holder] = units.mulDiv(s.perUnit, UNIT_SCALE, Math.Rounding.Ceil);
-    }
-
     function collectUnits() external returns (uint256 assets) {
         Layout storage s = VaultStorage.layout();
-        _accrue(s, msg.sender);
+        s.accrue(msg.sender);
         assets = s.unitCredit[msg.sender];
         if (assets == 0) revert IVault.Nothing();
         s.unitCredit[msg.sender] = 0;
@@ -615,8 +608,9 @@ library Valuations {
         Layout storage s = VaultStorage.layout();
         uint256 raw = s.unitsOf[holder];
         if (raw == 0) revert IVault.Nothing();
-        // Not between a valuation's pricing and its settlement, as claims.
-        if (s.valuing() || owed(s)) revert IVault.NotYet();
+        // Not between a valuation's pricing and its settlement, as claims;
+        // not while a close is staged, nor before a valuation since one was.
+        if (s.valuing() || owed(s) || s.staging() || s.valueFirst) revert IVault.NotYet();
         // On a vault that trades on other chains a serve here reaches only
         // this chain's station, and nothing on this chain can say what the
         // others hold: only the holder may accept it.
@@ -631,10 +625,18 @@ library Valuations {
         // leaves them waiting is judged below.
         uint256 home;
         bool blocked;
-        try IStation(s.homeStation).unwind(fraction) returns (uint256 sent, bool outside) {
-            (home, blocked) = (sent, outside);
+        bool staged;
+        try IStation(s.homeStation).stageClose(fraction) returns (uint256 sent, bool outside, bool placed) {
+            (home, blocked, staged) = (sent, outside, placed);
         } catch {}
         s.serving = address(0);
+        // A close that settles after the block is staged for this holder:
+        // what it fetches is theirs alone, credited when it is delivered.
+        if (staged) {
+            s.stagedHolder = holder;
+            s.stagedFraction = fraction;
+            return;
+        }
         // Units are only burned for what came home for them: nothing home
         // from a station that held something, or from a vault whose stations
         // are elsewhere too, is not a serve. Units of an empty station are
@@ -660,18 +662,7 @@ library Valuations {
         if (blocked || (home == 0 && worthSomething)) {
             revert IVault.NotYet();
         }
-        _accrue(s, holder);
-        s.units -= raw;
-        s.unitsOf[holder] = 0;
-        s.unitsSince[holder] = 0;
-        // What is left at the stations is everyone else's, in the same
-        // proportions as before: every remaining fraction grows to match.
-        if (s.units == 0) {
-            s.unitScale = 0;
-        } else if (fraction < WAD) {
-            s.unitScale = s.scale().mulDiv(WAD, WAD - fraction);
-        }
-        s.unitDebt[holder] = 0;
+        s.retireUnits(holder, fraction);
     }
 
     // The home station ------------------------------------------------------
@@ -685,7 +676,10 @@ library Valuations {
         // out would leave the claim unpaid.
         // Nor between a valuation and its settlement: cash its withdrawals
         // were priced to be paid from stays home until they are.
-        if (!s.live() || s.halted() || s.units != 0 || s.queuedClaims != 0 || s.valuing() || owed(s)) {
+        if (
+            !s.live() || s.halted() || s.units != 0 || s.queuedClaims != 0 || s.valuing() || owed(s)
+                || s.staging()
+        ) {
             revert IVault.WrongState();
         }
         // The stations as last valued, the cash as it is now, and what was

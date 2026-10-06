@@ -28,6 +28,20 @@ contract StationDouble {
         s.exitBandBps = band;
     }
 
+    /// It never stops, and its counters stay at nothing: a driver valuing it
+    /// from a reading sees nothing moved since.
+    function stopped() external pure returns (bool) {
+        return false;
+    }
+
+    function arrivals() external pure returns (uint256) {
+        return 0;
+    }
+
+    function venueFlows(bytes32) external pure returns (uint256, uint64) {
+        return (0, 0);
+    }
+
     function setApprovedKey(bytes32 driver, address key) external {
         approvedKey[driver] = key;
     }

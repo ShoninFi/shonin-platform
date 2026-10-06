@@ -2,111 +2,16 @@
 pragma solidity ^0.8.30;
 
 import {Station} from "../../src/Station.sol";
-import {Vault} from "../../src/Vault.sol";
-import {HyperCore, ICoreDepositWallet} from "../../src/drivers/hyperliquid/HyperCore.sol";
+import {HyperCore} from "../../src/drivers/hyperliquid/HyperCore.sol";
 import {HyperliquidDriver} from "../../src/drivers/hyperliquid/HyperliquidDriver.sol";
 import {Call} from "../../src/interfaces/IDriver.sol";
 import {Stage} from "../../src/interfaces/IStation.sol";
-import {ChainNeed} from "../../src/interfaces/IStrategyRegistry.sol";
 import {ClaimState} from "../../src/interfaces/IVault.sol";
-import {Fixture} from "../Fixture.sol";
-import {MockDepositWallet, MockHyperCore} from "./MockHyperCore.sol";
-import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
+import {HyperliquidVault} from "./HyperliquidVault.sol";
 
 /// A vault whose station trades on Hyperliquid, against a HyperCore that
 /// acts on CoreWriter's queue only after the block, as the venue does.
-contract HyperliquidStationTest is Fixture {
-    bytes32 internal constant HL = "hyperliquid";
-    uint32 internal constant ETH = 4;
-    uint8 internal constant ETH_SZ = 4;
-    /// $2,700, as a perp price with four size decimals.
-    uint64 internal constant ETH_PX = 270_000;
-    uint32 internal constant HYPE_PAIR = 5;
-    uint64 internal constant HYPE_TOKEN = 7;
-
-    MockHyperCore internal core;
-    MockDepositWallet internal wallet;
-    HyperliquidDriver internal hl;
-    Vault internal vault;
-    Station internal station;
-
-    function setUp() public override {
-        super.setUp();
-        core = new MockHyperCore(usd);
-        core.listPerp(ETH, ETH_SZ, ETH_PX);
-        // HYPE at $20: two size decimals, eight wei decimals.
-        core.listSpot(HYPE_PAIR, HYPE_TOKEN, 2, 8, 20_000_000);
-        wallet = new MockDepositWallet(core, usd);
-        uint32[] memory perps = new uint32[](1);
-        perps[0] = ETH;
-        uint32[] memory pairs = new uint32[](1);
-        pairs[0] = HYPE_PAIR;
-        hl = new HyperliquidDriver(IERC20(address(usd)), ICoreDepositWallet(address(wallet)), perps, pairs);
-        vm.prank(admin);
-        attestation.proposeDriver(HL, address(hl));
-        skip(TIMELOCK);
-
-        uint256 id = submitAs(author);
-        bytes32 bundle = keccak256(abi.encode("bundle", id));
-        _register(id, bundle);
-        vm.prank(reviewer);
-        reviews.submitReview(id, reviewFor(bundle, 1));
-        vault = activate(id, allowancesCosting(2e6), MINIMUM_TANK);
-        blessExecutorKey(executor, address(vault), bundle);
-        station = stationOf(vault);
-    }
-
-    function _register(uint256 id, bytes32 bundleHash) internal {
-        ChainNeed[] memory chains = new ChainNeed[](1);
-        chains[0].chain = "base";
-        chains[0].drivers = new bytes32[](1);
-        chains[0].drivers[0] = HL;
-        bytes32[] memory none = new bytes32[](0);
-        bytes32[] memory restricted = new bytes32[](2);
-        restricted[0] = "SANCTIONED";
-        restricted[1] = "US";
-        bytes32 digest = strategies.registrationDigest(
-            id, author, keccak256("source"), bundleHash, keccak256("manifest"), chains, none, restricted
-        );
-        strategies.register(
-            id,
-            author,
-            keccak256("source"),
-            bundleHash,
-            keccak256("manifest"),
-            chains,
-            none,
-            restricted,
-            signed(BUILDER_KEY, digest),
-            signed(REVIEWER_KEY, strategies.clearanceDigest(id, keccak256("source")))
-        );
-    }
-
-    /// Alice and Bob each put in 100k; the executor moves 190k to HyperCore
-    /// and goes long about 180k of ETH on the account.
-    function _fundAndTrade() internal returns (uint256 aliceShares) {
-        aliceShares = depositAs(vault, alice, 100_000e6);
-        depositAs(vault, bob, 100_000e6);
-        vm.startPrank(executor);
-        station.pull(190_000e6);
-        station.deposit(HL, 190_000e6);
-        vm.stopPrank();
-        // 66.6667 ETH at $2,700.
-        core.trade(address(station), ETH, 666_667, ETH_PX);
-        _spread(ETH_PX, 10);
-    }
-
-    function _spread(uint64 px, uint64 halfTicks) internal {
-        core.setPerp(ETH, px, px, px - halfTicks, px + halfTicks);
-    }
-
-    /// The venue acts on what was queued, after the block.
-    function _nextBlock() internal {
-        vm.roll(block.number + 1);
-        skip(1);
-        core.process();
-    }
-
+contract HyperliquidStationTest is HyperliquidVault {
     // Valuing ---------------------------------------------------------------
 
     function test_the_account_is_valued_at_mark_and_at_the_bid_from_the_precompiles() public {
@@ -156,6 +61,28 @@ contract HyperliquidStationTest is Fixture {
         assertTrue(blocked);
     }
 
+    function test_hype_kept_for_sends_home_is_never_sold_never_blocks_and_still_counts() public {
+        _fundAndTrade();
+        // $12 of HYPE, more than the smallest order, on a book far wider
+        // than the band: still the cost of sending home, under the reserve.
+        core.creditSpot(address(station), HYPE_TOKEN, 0.6e8);
+        core.setSpot(HYPE_PAIR, 20_000_000, 15_000_000, 30_000_000);
+        (Call[] memory calls, bool blocked) = hl.close(address(station), 0.5e18, 100);
+        assertFalse(blocked, "the reserve never blocks");
+        assertEq(calls.length, 1, "only the perp is closed");
+        (uint256 mark,) = hl.valueOf(address(station));
+        (int256 accountValue,) = core.accountValue(address(station));
+        assertEq(mark, uint256(accountValue) + 12e6, "and it is counted at its price");
+        // Nor is it asked of a proof: the perp shrinking is enough.
+        int256[] memory before = hl.exposure(address(station));
+        core.trade(address(station), ETH, -333_334, ETH_PX);
+        assertTrue(hl.closed(address(station), before, 0.5e18));
+        // Above the reserve, HYPE is a holding like any other.
+        core.creditSpot(address(station), HYPE_TOKEN, 2e8);
+        (, blocked) = hl.close(address(station), 0.5e18, 100);
+        assertTrue(blocked, "1.6 HYPE above the reserve, on that book, is outside the band");
+    }
+
     function test_a_mark_off_the_oracle_by_more_than_the_band_blocks_the_close() public {
         _fundAndTrade();
         core.setPerp(ETH, ETH_PX * 103 / 100, ETH_PX, ETH_PX - 10, ETH_PX + 10);
@@ -165,6 +92,7 @@ contract HyperliquidStationTest is Fixture {
 
     function test_close_orders_are_reduce_only_ioc_limited_to_the_band_in_five_significant_figures() public {
         _fundAndTrade();
+        _stockGas();
         (bytes memory raw) = _onlyCall(hl, 0.5e18);
         (uint32 asset, bool isBuy, uint64 limitPx, uint64 sz, bool reduceOnly, uint8 tif,) =
             abi.decode(_fields(raw), (uint32, bool, uint64, uint64, bool, uint8, uint128));
@@ -180,17 +108,18 @@ contract HyperliquidStationTest is Fixture {
 
     // A claim's close -------------------------------------------------------
 
-    function test_a_claim_is_closed_proved_swept_delivered_and_then_paid_from_cash() public {
+    function test_a_claim_is_closed_proved_measured_swept_and_paid_when_delivered() public {
         uint256 aliceShares = _fundAndTrade();
-        vm.prank(alice);
-        vault.requestRedeem(aliceShares, alice);
-        value(vault);
-        assertEq(vault.claimCount(), 1);
+        _stockGas();
+        _aliceClaims(aliceShares);
 
+        uint256 cashBefore = vault.cash();
         vault.settleClaim(1);
-        assertTrue(vault.claimAt(1).state == ClaimState.Waiting, "the claim waits for its cash");
+        assertTrue(vault.claimAt(1).state == ClaimState.Closing, "the claim waits for its own close");
+        assertLt(vault.cash(), cashBefore, "its part of the cash is set aside");
         Stage memory s = station.stage();
         assertGt(s.fraction, 0.45e18);
+        assertTrue(s.forVault);
         assertEq(core.queued(), 1, "one closing order is queued");
         // Nothing can be proved in the block it was placed in.
         vm.expectRevert(Station.NotYet.selector);
@@ -198,38 +127,48 @@ contract HyperliquidStationTest is Fixture {
 
         _nextBlock();
         station.settleClose();
-        assertGt(station.stage().sweptBlock, 0, "proved and swept");
-        uint256 cashBefore = vault.cash();
+        s = station.stage();
+        assertGt(s.sweptBlock, 0, "proved and swept");
+        assertApproxEqRel(s.fetched, 95_000e6, 0.01e18, "the fraction's worth, measured");
+        assertLe(s.fetched, s.estimate);
         _nextBlock();
         station.settleClose();
-        uint256 delivered = vault.cash() - cashBefore;
-        assertApproxEqRel(delivered, 95_000e6, 0.01e18, "the fraction's worth came home");
-        assertEq(station.stage().stagedAt, 0);
-
-        vault.settleClaim(1);
-        assertTrue(vault.claimAt(1).state == ClaimState.Queued, "the cash now covers it");
-        value(vault);
-        assertTrue(vault.claimAt(1).state == ClaimState.Paid);
+        assertEq(station.stage().stagedAt, 0, "delivered");
+        assertTrue(vault.claimAt(1).state == ClaimState.Paid, "paid at delivery, no valuation needed");
         assertApproxEqRel(usd.balanceOf(alice), 100_000e6, 0.01e18);
         // Bob still owns half of a long the size of his share.
         assertApproxEqRel(uint256(int256(core.szi(address(station), ETH))), 333_333, 0.001e18);
     }
 
-    function test_a_second_try_while_a_close_is_staged_closes_nothing_more() public {
+    function test_without_hype_to_send_home_a_claims_close_is_blocked_before_anything_is_sold() public {
         uint256 aliceShares = _fundAndTrade();
-        vm.prank(alice);
-        vault.requestRedeem(aliceShares, alice);
+        _aliceClaims(aliceShares);
+        vault.settleClaim(1);
+        assertTrue(vault.claimAt(1).state == ClaimState.Waiting, "blocked: nothing staged");
+        assertEq(core.queued(), 0, "nothing ordered");
+        assertFalse(station.outsideBand(), "valuations are not voided for it");
+        // Once the executor has stocked HYPE, the close goes ahead.
+        _stockGas();
         value(vault);
         vault.settleClaim(1);
+        assertTrue(vault.claimAt(1).state == ClaimState.Closing);
+    }
+
+    function test_a_second_try_while_a_close_is_staged_closes_nothing_more() public {
+        uint256 aliceShares = _fundAndTrade();
+        _stockGas();
+        _aliceClaims(aliceShares);
+        vault.settleClaim(1);
+        vm.expectRevert();
         vault.settleClaim(1);
         assertEq(core.queued(), 1, "still one order");
     }
 
     function test_a_close_the_venue_did_not_fill_moves_nothing_and_lapses() public {
         uint256 aliceShares = _fundAndTrade();
-        vm.prank(alice);
-        vault.requestRedeem(aliceShares, alice);
-        value(vault);
+        _stockGas();
+        _aliceClaims(aliceShares);
+        uint256 cashBefore = vault.cash();
         vault.settleClaim(1);
         // The book runs away before the venue acts: the IOC fills nothing.
         core.setPerp(ETH, ETH_PX, ETH_PX, ETH_PX * 98 / 100, ETH_PX + 10);
@@ -237,9 +176,11 @@ contract HyperliquidStationTest is Fixture {
         (uint256 markBefore,) = station.value();
         vm.expectRevert(Station.NotYet.selector);
         station.settleClose();
-        skip(station.STAGE_TIMEOUT());
+        skip(station.stage().window);
         station.settleClose();
         assertEq(station.stage().stagedAt, 0, "lapsed");
+        assertTrue(vault.claimAt(1).state == ClaimState.Waiting, "the claim waits again");
+        assertEq(vault.cash(), cashBefore, "its part of the cash is back");
         assertEq(core.queued(), 0, "nothing was swept");
         (uint256 markAfter,) = station.value();
         assertEq(markAfter, markBefore);
@@ -248,9 +189,8 @@ contract HyperliquidStationTest is Fixture {
 
     function test_a_partly_filled_close_is_not_proved_and_sweeps_nothing() public {
         uint256 aliceShares = _fundAndTrade();
-        vm.prank(alice);
-        vault.requestRedeem(aliceShares, alice);
-        value(vault);
+        _stockGas();
+        _aliceClaims(aliceShares);
         vault.settleClaim(1);
         core.setDepth(100_000);
         _nextBlock();
@@ -268,6 +208,7 @@ contract HyperliquidStationTest is Fixture {
     /// nothing and a further unwind sends nothing.
     function test_a_stopped_station_is_emptied_by_repeated_unwinds_placed_swept_then_sent_home() public {
         _fundAndTrade();
+        _stockGas();
         vm.prank(admin);
         vault.kill();
         skip(HALT_GRACE);
@@ -299,7 +240,8 @@ contract HyperliquidStationTest is Fixture {
         assertGt(sentHome, 185_000e6, "the account's worth came home, less the venue's costs");
 
         (uint256 mark,) = station.value();
-        assertEq(mark, 0, "the station holds nothing");
+        // Only the HYPE kept to pay for sends home, which is never sold.
+        assertLe(mark, 2e6, "the station holds nothing but its HYPE");
         (home, blocked) = station.unwind(1e18);
         assertEq(home, 0);
         assertFalse(blocked);

@@ -343,7 +343,12 @@ library Upkeep {
         Layout storage s = VaultStorage.layout();
         Claim storage claim = s.claims[claimId - 1];
         ClaimState state = claim.state;
-        if (state != ClaimState.Pending && state != ClaimState.Waiting && state != ClaimState.Queued) {
+        // A claim whose close is staged counts too: a close whose dollars
+        // never come must not keep the leaver out for good.
+        if (
+            state != ClaimState.Pending && state != ClaimState.Waiting && state != ClaimState.Queued
+                && state != ClaimState.Closing
+        ) {
             revert IVault.NotAllowed();
         }
         // Counted from when it was booked, whatever was tried since: a leaver

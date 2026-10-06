@@ -25,9 +25,9 @@ enum ExitPath {
     Unwinder,
     /// The station, but the venue acts on its calls after the transaction
     /// (a venue that executes queued actions after the block): a close is
-    /// placed in one transaction, proved and swept in a later one, and its
-    /// dollars delivered home once they land. The driver also implements
-    /// `IDelayedDriver`.
+    /// placed in one transaction, proved, measured and swept in a later
+    /// one, and its dollars delivered home once they land. The driver also
+    /// implements `IDelayedDriver`.
     Delayed
 }
 
@@ -104,11 +104,17 @@ interface IBridge {
 
 /// What a station needs from a driver whose venue acts after the
 /// transaction: a close can't be checked by what it brought home in the same
-/// transaction, so it is checked against the positions instead.
+/// transaction, so it is checked against the positions instead, and what it
+/// fetched is measured against what the account held when it was placed.
 interface IDelayedDriver {
     /// What the station holds in each market the driver knows, in the
-    /// venue's own units, in a fixed order: what `closed` compares against.
+    /// venue's own units, in a fixed order: what `closed` compares against
+    /// and `measure` reprices. A driver may add to it what it needs to read
+    /// it again (when it was read, the prices it was read at).
     function exposure(address station) external view returns (int256[] memory);
+    /// The station's dollars through the driver, signed (a perp ledger can
+    /// be negative): with `exposure`, everything the account is worth.
+    function ledger(address station) external view returns (int256);
     /// Whether a close of `fraction` placed when the station held `before`
     /// has happened: every position it would have ordered is at least that
     /// much smaller now, on the same side.
@@ -117,6 +123,24 @@ interface IDelayedDriver {
         int256[] calldata before,
         uint256 fraction
     ) external view returns (bool);
+    /// What a close of `fraction`, placed when the account held `dollars`
+    /// (its `ledger`) and `before` (its `exposure`), fetched, by the venue's
+    /// prices now: what the account is worth now, less what the part it was
+    /// to keep (1 - `fraction`) of the account as it was would be worth now,
+    /// that part rounded up. A market move since then cancels out, and so
+    /// does a trade made since at the price now. It may be negative; the
+    /// station adds what reached it from the venue meanwhile and holds the
+    /// sum between nothing and the stage's estimate.
+    function measure(
+        address station,
+        int256 dollars,
+        int256[] calldata before,
+        uint256 fraction
+    ) external view returns (int256);
+    /// How long a close through the driver may take to be proved, and its
+    /// dollars to reach the station before they are asked for again; a move
+    /// of dollars between the station and the venue lands within it too.
+    function deliveryWindow() external view returns (uint64);
     /// What the station's money parked in the venue's own vaults (`held`) is
     /// worth.
     function heldValue(address station, address[] calldata held) external view returns (uint256);

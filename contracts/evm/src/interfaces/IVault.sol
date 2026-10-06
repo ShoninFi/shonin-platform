@@ -91,7 +91,12 @@ enum ClaimState {
     Queued,
     Paid,
     /// Taken through the pro-rata fallback.
-    Fallback
+    Fallback,
+    /// A close staged for it at a venue whose closes settle after the block
+    /// is in progress: it is paid when the close is delivered, from what the
+    /// close fetched and its part of the cash fixed and set aside at the
+    /// stage, or waits again if the close lapses.
+    Closing
 }
 
 /// Money a station sent over a bridge that has not landed yet.
@@ -310,7 +315,9 @@ interface IVault is IStationVault {
     ) external view returns (bytes32);
     function settle(uint256 max) external returns (uint256 settled);
     /// Close the leaver's fraction of every position and pay them in the same
-    /// transaction, or queue the claim if the cash already covers it.
+    /// transaction, or queue the claim if the cash already covers it. Where
+    /// the home station's close settles after the block, the close is staged
+    /// for this claim and the claim is paid when it is delivered.
     function settleClaim(uint256 claimId) external;
     function freeze(uint256 claimId) external;
     /// Anyone, once a holder's units have waited `freezeAfter` unserved, on a

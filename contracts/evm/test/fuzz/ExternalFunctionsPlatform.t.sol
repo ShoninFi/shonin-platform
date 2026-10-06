@@ -636,6 +636,24 @@ contract StationExternalFunctionsTest is ClaimBase, Calls {
         nothingLeft(b);
     }
 
+    /// A close for the vault: only the vault may ask, and on a station with
+    /// no delayed driver it is the one-transaction close, never a stage.
+    function testFuzz_stageClose(uint8 stage, uint8 pick, address random, uint256 fraction) public {
+        stage = arrange(stage);
+        address caller = pickCaller(pick, random);
+        fraction = bound(fraction, 0, 1.1e18);
+        Books memory b = books(caller);
+        uint256 cash = vault.cash();
+        bytes4 want;
+        if (fraction == 0 || fraction > 1e18 || caller != address(vault)) want = Station.NotAllowed.selector;
+        (bool ok, bytes4 err) =
+            callAs(caller, address(station), abi.encodeCall(Station.stageClose, (fraction)));
+        expectOutcome(ok, err, want, "stageClose");
+        if (ok) assertGe(vault.cash(), cash, "a close took cash from the vault");
+        assertEq(station.stage().stagedAt, 0, "nothing is staged without a delayed driver");
+        nothingLeft(b);
+    }
+
     /// A stopped station's unwind by name: anyone, once stopped; it never
     /// takes cash from the vault.
     function testFuzz_unwindStopped(uint8 stage, uint8 pick, address random, uint8 which) public {

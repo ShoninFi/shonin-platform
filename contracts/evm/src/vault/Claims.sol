@@ -7,6 +7,8 @@ import {
 } from "../interfaces/IVault.sol";
 import {Valuations} from "./Valuations.sol";
 import {Layout, VaultStorage} from "./VaultStorage.sol";
+import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
+import {SafeERC20} from "openzeppelin/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "openzeppelin/utils/math/Math.sol";
 
 /// Withdrawals the cash couldn't pay.
@@ -18,7 +20,14 @@ import {Math} from "openzeppelin/utils/math/Math.sol";
 /// there and then, so nothing else in the vault ever has to account for a
 /// leaver who is half gone. A claim the cash already covers needs no close:
 /// it becomes an ordinary request, priced at the next valuation.
+///
+/// Where the home station's close settles after the block, the close is
+/// staged for the claim, which is closing until it is delivered: it is paid
+/// then, from what its own close fetched and its part of the cash fixed and
+/// set aside at the stage, its shares burned then. Nothing is priced or
+/// divided meanwhile, and no other claim or serve is tried.
 library Claims {
+    using SafeERC20 for IERC20;
     using VaultStorage for Layout;
     using Math for uint256;
 
@@ -39,6 +48,8 @@ library Claims {
         if (
             s.state == VaultState.Closed || s.state == VaultState.Cancelled || s.readyToClose() || s.valuing()
         ) revert IVault.WrongState();
+        // One close at a time, and a valuation between two of them.
+        if (s.staging() || s.valueFirst) revert IVault.NotYet();
         uint256 shares = claim.shares;
 
         // Cash at home that already covers it: an ordinary request, priced at
@@ -90,7 +101,19 @@ library Claims {
                 if (counted > stationsBefore) stationsBefore = counted;
             }
         } catch {}
-        (uint256 home, bool blocked, bool failed) = _close(s, fraction);
+        (uint256 home, bool blocked, bool failed, bool staged) = _close(s, fraction);
+        if (staged) {
+            // Paid when its close is delivered: its part of the cash is fixed
+            // now and set aside, so nothing else can take it.
+            claim.state = ClaimState.Closing;
+            claim.lastAttemptAt = uint64(block.timestamp);
+            s.stagedClaim = claimId;
+            s.stagedFraction = fraction;
+            s.stagedCash = cashShare;
+            s.cash -= cashShare;
+            emit IVault.ClaimTried(claimId, false);
+            return;
+        }
         // A claim worth fewer dollar-units at the stations than they have
         // parts brings nothing home however often it is closed: it is dust,
         // paid its cash share and done, so it can't hold a vault open or
@@ -130,14 +153,62 @@ library Claims {
     function _close(
         Layout storage s,
         uint256 fraction
-    ) private returns (uint256 home, bool blocked, bool failed) {
+    ) private returns (uint256 home, bool blocked, bool failed, bool staged) {
         s.closing = true;
-        try IStation(s.homeStation).unwind(fraction) returns (uint256 sent, bool outside) {
-            (home, blocked) = (sent, outside);
+        try IStation(s.homeStation).stageClose(fraction) returns (uint256 sent, bool outside, bool placed) {
+            (home, blocked, staged) = (sent, outside, placed);
         } catch {
             failed = true;
         }
         s.closing = false;
+    }
+
+    /// The home station delivers the close it staged: what it fetched with
+    /// the fraction of the station's idle dollars. A claim is paid that and
+    /// its part of the cash set aside at the stage; a holder is credited it.
+    /// Nobody else takes any of it.
+    function delivered(uint256 amount) external {
+        Layout storage s = VaultStorage.layout();
+        if (msg.sender != s.homeStation || !s.staging()) revert IVault.NotAllowed();
+        IERC20(s.asset).safeTransferFrom(msg.sender, address(this), amount);
+        uint256 claimId = s.stagedClaim;
+        uint256 fraction = s.stagedFraction;
+        address holder = s.stagedHolder;
+        uint256 cashShare = s.stagedCash;
+        _unstage(s);
+        if (claimId != 0) {
+            s.cash += amount + cashShare;
+            // The close came from the shares' part alone: the unit holders
+            // own the same as before, now a larger fraction of what is left.
+            if (s.units != 0 && fraction < WAD) s.unitScale = s.scale().mulDiv(WAD, WAD - fraction);
+            _pay(s, s.claims[claimId - 1], claimId, amount + cashShare);
+        } else {
+            s.retireUnits(holder, fraction);
+            s.unitCredit[holder] += amount;
+            s.unitReserve += amount;
+            emit IVault.FromStation(amount, amount);
+        }
+    }
+
+    /// The staged close ended without a delivery: the claim waits again,
+    /// with its part of the cash back in the cash; units wait as they were.
+    function unstaged() external {
+        Layout storage s = VaultStorage.layout();
+        if (msg.sender != s.homeStation || !s.staging()) revert IVault.NotAllowed();
+        uint256 claimId = s.stagedClaim;
+        if (claimId != 0) {
+            s.claims[claimId - 1].state = ClaimState.Waiting;
+            s.cash += s.stagedCash;
+        }
+        _unstage(s);
+    }
+
+    function _unstage(Layout storage s) private {
+        s.stagedClaim = 0;
+        s.stagedHolder = address(0);
+        s.stagedFraction = 0;
+        s.stagedCash = 0;
+        s.valueFirst = true;
     }
 
     /// Pay a claim what its shares own, less its own profit fee, paid in
@@ -180,7 +251,10 @@ library Claims {
         if (s.state == VaultState.Closed || s.state == VaultState.Cancelled || s.readyToClose()) {
             revert IVault.WrongState();
         }
-        if (block.timestamp < r.earliest + s.timers.fallbackAfter || s.valuing() || Valuations.owed(s)) {
+        if (
+            block.timestamp < r.earliest + s.timers.fallbackAfter || s.valuing() || Valuations.owed(s)
+                || s.staging()
+        ) {
             revert IVault.NotYet();
         }
         if (s.lastPriced != 0 && s.latest().time >= r.earliest) revert IVault.NotAllowed();
@@ -220,7 +294,9 @@ library Claims {
         // (a market outside the band, a close that can't come home) takes
         // its share of the cash and units for the rest, whether or not
         // valuations kept being priced meanwhile.
-        if (block.timestamp < claim.bookedAt + s.timers.fallbackAfter || s.valuing()) revert IVault.NotYet();
+        if (block.timestamp < claim.bookedAt + s.timers.fallbackAfter || s.valuing() || s.staging()) {
+            revert IVault.NotYet();
+        }
         // Not while a priced valuation waits to settle, and not for a claim
         // the cash covers: that one can be served now, at a price.
         if (Valuations.owed(s)) revert IVault.NotYet();

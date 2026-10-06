@@ -32,11 +32,17 @@ import {Math} from "openzeppelin/utils/math/Math.sol";
 ///
 /// A venue that acts on the station's calls only after the transaction (a
 /// `Delayed` driver) can't be closed and checked in one transaction. There a
-/// claim's close is staged: the closing orders are placed and the claim
-/// waits; in a later block anyone proves the positions shrank and sweeps the
-/// fraction's worth home; once it lands, anyone delivers it to the vault as
-/// cash, which then covers the claim at the next valuation, as a claim on a
-/// vault that trades on other chains waits for its cash.
+/// claim's close is staged for that claim (or one holder's units): the
+/// closing orders are placed and what the account held is recorded; in a
+/// later block anyone proves the positions shrank, and what the close
+/// fetched is measured against the record at the prices then, so a market
+/// move or a trade since cancels out, never more than the fraction's worth
+/// at exit-side prices when it was placed; that much is asked for from the
+/// venue, and once it has reached the station, anyone delivers it with the
+/// fraction of the idle dollars to the vault, which pays whom it was for.
+/// Nothing moves between the station and its venues meanwhile but the
+/// close's own sweep, so the station can tell what came home for it: every
+/// dollar that reaches it outside its own calls is counted (`arrivals`).
 contract Station is IStation, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
     using Math for uint256;
@@ -73,11 +79,27 @@ contract Station is IStation, ReentrancyGuardTransient {
     /// A driver whose key parked money where the station had to reclaim it
     /// trades no more; closing and valuing through it still work.
     mapping(bytes32 => bool) public reclaimed;
+    /// What each delayed driver's account held in dollars when the stage was
+    /// placed, beside its exposure: what the close is measured against.
+    mapping(bytes32 => int256) private _stagedLedger;
+    /// Dollars that reached the station outside its own calls, counted up to
+    /// the start of its current or last call, and its balance at the end of
+    /// that call. Its balance only falls inside its own calls, so whatever it
+    /// gained between them arrived from outside.
+    uint256 private _arrived;
+    uint256 private _seen;
+    bool private transient _inCall;
 
-    /// How long a staged close has to be proved, and its sweep to land,
-    /// before it lapses: whatever it sold stays in the account, counted as
-    /// before, and a later try places a new one.
-    uint64 public constant STAGE_TIMEOUT = 5 minutes;
+    /// What the station has put into one venue, and when it last moved
+    /// dollars to or from it.
+    struct Flow {
+        uint256 sent;
+        uint64 depositedAt;
+        uint64 movedAt;
+    }
+
+    mapping(bytes32 => Flow) private _flows;
+
     /// The most venue vaults one driver may have reclaimed from.
     uint256 private constant MAX_HELD = 8;
 
@@ -180,33 +202,42 @@ contract Station is IStation, ReentrancyGuardTransient {
 
     // Moving money ----------------------------------------------------------
 
-    function pull(uint256 amount) external nonReentrant {
+    function pull(uint256 amount) external nonReentrant tracked {
         _executorOnly();
         if (!isHome()) revert NotHome();
         IStationVault(_spec.vault).toStation(amount);
         emit Pulled(amount);
     }
 
-    function push(uint256 amount) external nonReentrant {
+    function push(uint256 amount) external nonReentrant tracked {
         _executorOnly();
         if (!isHome()) revert NotHome();
         _sendHome(amount);
         emit Pushed(amount);
     }
 
-    function deposit(bytes32 driver, uint256 amount) external nonReentrant {
+    function deposit(bytes32 driver, uint256 amount) external nonReentrant tracked {
         _executorOnly();
         address implementation = _tradable(driver);
+        uint256 before = _balance();
         _run(IDriver(implementation).deposit(address(this), amount), IDriver(implementation).targets());
+        // What left for the venue, counted for good: a venue valued from a
+        // reading made elsewhere counts what was sent after the reading.
+        uint256 left = _balance();
+        Flow storage flow = _flows[driver];
+        if (left < before) flow.sent += before - left;
+        flow.depositedAt = uint64(block.timestamp);
+        flow.movedAt = uint64(block.timestamp);
         emit Deposited(driver, amount);
     }
 
-    function withdraw(bytes32 driver, uint256 amount) external nonReentrant {
+    function withdraw(bytes32 driver, uint256 amount) external nonReentrant tracked {
         _executorOnly();
         // Bringing money out never depends on the driver still being
         // approved to trade.
         address implementation = _pinned(driver);
         _run(IDriver(implementation).withdraw(address(this), amount), IDriver(implementation).targets());
+        _flows[driver].movedAt = uint64(block.timestamp);
         emit Withdrawn(driver, amount);
     }
 
@@ -215,7 +246,7 @@ contract Station is IStation, ReentrancyGuardTransient {
         uint256 toChain,
         uint256 amount,
         bytes calldata extra
-    ) external nonReentrant {
+    ) external nonReentrant tracked {
         _executorOnly();
         if (toChain == block.chainid) revert NoRoute();
         // Nothing leaves the home station while a valuation waits for the
@@ -245,7 +276,12 @@ contract Station is IStation, ReentrancyGuardTransient {
         _stop(reason, haltedAt);
     }
 
-    function unwind(uint256 fraction) external nonReentrant returns (uint256 sentHome, bool blocked) {
+    function unwind(uint256 fraction)
+        external
+        nonReentrant
+        tracked
+        returns (uint256 sentHome, bool blocked)
+    {
         if (fraction == 0 || fraction > WAD) revert NotAllowed();
         // Once stopped, a fraction is closed only for the vault's own claims
         // and serves, which wait for settlement themselves; the rest is a
@@ -255,17 +291,31 @@ contract Station is IStation, ReentrancyGuardTransient {
             || (stopped && fraction == WAD);
         if (!permitted) revert NotAllowed();
         if (stopped && fraction == WAD) return _unwindStopped(_spec.drivers);
-        if (_anyDelayed()) return _stageClose(fraction);
+        (sentHome, blocked,) = _close(fraction, false);
+    }
 
-        // Every driver's close is prepared before any is made, so a market
-        // outside the band on one venue closes nothing anywhere: a leaver is
-        // never half-sold.
+    function stageClose(uint256 fraction)
+        external
+        nonReentrant
+        tracked
+        returns (uint256 sentHome, bool blocked, bool staged)
+    {
+        if (fraction == 0 || fraction > WAD || !isHome() || msg.sender != _spec.vault) revert NotAllowed();
+        return _close(fraction, true);
+    }
+
+    /// Close `fraction` of every position. Every driver's close is prepared
+    /// before any is made, so a market outside the band on one venue closes
+    /// nothing anywhere: a leaver is never half-sold. A delayed driver
+    /// holding more than dust stages the close instead (`_stageClose`).
+    function _close(uint256 fraction, bool forVault) private returns (uint256 sentHome, bool blocked, bool) {
         uint256 count = _spec.drivers.length;
         IDriver[] memory drivers = new IDriver[](count);
         Call[][] memory closes = new Call[][](count);
         uint256[] memory freed = new uint256[](count);
         uint256[] memory before = new uint256[](count);
         bool[] memory skipped = new bool[](count);
+        bool delayed;
         for (uint256 i = 0; i < count; i++) {
             drivers[i] = IDriver(_pinned(_spec.drivers[i]));
             // What the fraction is worth at exit prices before the close:
@@ -278,7 +328,7 @@ contract Station is IStation, ReentrancyGuardTransient {
             (closes[i], outside) = drivers[i].close(address(this), fraction, _spec.exitBandBps);
             if (outside) {
                 emit Unwound(fraction, 0, true);
-                return (0, true);
+                return (0, true, false);
             }
             // An account worth no more than a few dollar-units is dust: a
             // fraction of it is left where it is rather than let its rounding
@@ -299,60 +349,83 @@ contract Station is IStation, ReentrancyGuardTransient {
             ) {
                 revert ShortSweep();
             }
+            if (drivers[i].exitPath() == ExitPath.Delayed) delayed = true;
+        }
+        if (delayed) {
+            // On the home station only the vault stages a close, for whom it
+            // asks, and it is delivered through the vault's own door.
+            if (isHome() && !forVault) revert NotAllowed();
+            return (0, true, _stageClose(fraction, drivers, closes, freed, before, skipped));
         }
 
-        IERC20 dollar = _asset();
-        uint256 idleBefore = dollar.balanceOf(address(this));
+        uint256 idleBefore = _balance();
         uint256 brought;
         for (uint256 i = 0; i < count; i++) {
-            if (skipped[i]) continue;
-            address[] memory targets = drivers[i].targets();
-            uint256 held = dollar.balanceOf(address(this));
-            _run(closes[i], targets);
-            _run(drivers[i].sweep(address(this), freed[i]), targets);
-            // Selling the fraction is only a serve if its worth comes home:
-            // proceeds left at the venue would still belong to everyone.
-            uint256 swept = dollar.balanceOf(address(this)) - held;
-            // Nothing home for a fraction worth something is never a fill.
-            if (swept < freed[i].mulDiv(BPS - _spec.exitBandBps, BPS) || (swept == 0 && freed[i] != 0)) {
-                revert ShortSweep();
-            }
-            // A shortfall is the leaver's own fill, never the stayers' gain:
-            // proceeds that went to repay the account's margin debt, so the
-            // account is left worth more than the stayers' share, still
-            // belong to the leaver, and the close is undone.
-            if (swept < freed[i]) {
-                (, uint256 exitAfter) = drivers[i].valueOf(address(this));
-                if (exitAfter > before[i] - freed[i] + 1) revert ShortSweep();
-            }
-            // Never more than the fraction's worth: anything a venue sends
-            // beyond it stays here, everyone's.
-            brought += swept < freed[i] ? swept : freed[i];
+            if (!skipped[i]) brought += _closeOne(drivers[i], closes[i], freed[i], before[i]);
         }
         sentHome = brought + idleBefore.mulDiv(fraction, WAD, Math.Rounding.Floor);
-
-        if (sentHome != 0) {
-            if (isHome()) {
-                _sendHome(sentHome);
-            } else if (_spec.bridges.length != 0) {
-                _send(_spec.bridges[0], _spec.vaultChain, sentHome, "");
-            } else {
-                revert NoRoute();
-            }
-        }
+        if (sentHome != 0) _home(sentHome);
         emit Unwound(fraction, sentHome, false);
+        return (sentHome, false, false);
+    }
+
+    /// Close and sweep one venue whose closes settle in the transaction, and
+    /// what of it counts as the fraction's: never more than its worth.
+    function _closeOne(
+        IDriver driver,
+        Call[] memory calls,
+        uint256 freed,
+        uint256 exitBefore
+    ) private returns (uint256) {
+        address[] memory targets = driver.targets();
+        uint256 held = _balance();
+        _run(calls, targets);
+        _run(driver.sweep(address(this), freed), targets);
+        // Selling the fraction is only a serve if its worth comes home:
+        // proceeds left at the venue would still belong to everyone.
+        uint256 swept = _balance() - held;
+        // Nothing home for a fraction worth something is never a fill.
+        if (swept < freed.mulDiv(BPS - _spec.exitBandBps, BPS) || (swept == 0 && freed != 0)) {
+            revert ShortSweep();
+        }
+        // A shortfall is the leaver's own fill, never the stayers' gain:
+        // proceeds that went to repay the account's margin debt, so the
+        // account is left worth more than the stayers' share, still belong
+        // to the leaver, and the close is undone.
+        if (swept < freed) {
+            (, uint256 exitAfter) = driver.valueOf(address(this));
+            if (exitAfter > exitBefore - freed + 1) revert ShortSweep();
+            return swept;
+        }
+        // Never more than the fraction's worth: anything a venue sends
+        // beyond it stays here, everyone's.
+        return freed;
+    }
+
+    /// Send `amount` of idle dollars to the vault's chain.
+    function _home(uint256 amount) private {
+        if (isHome()) {
+            _sendHome(amount);
+        } else if (_spec.bridges.length != 0) {
+            _send(_spec.bridges[0], _spec.vaultChain, amount, "");
+        } else {
+            revert NoRoute();
+        }
     }
 
     /// A stopped station's full unwind, which every holder shares: each
     /// driver closes on its own, inside the band as it has widened since the
     /// stop, so a venue that refuses or a market still outside the band
-    /// leaves only its own money behind. Everything idle then goes home.
+    /// leaves only its own money behind. Everything idle then goes home. It
+    /// takes the place of a staged close: whatever that sold or brought home
+    /// is everyone's again.
     function _unwindStopped(bytes32[] memory drivers) private returns (uint256 sentHome, bool blocked) {
         // Not between a valuation's pricing and its settlement: what this
         // sale brings home must not pay withdrawals priced before it.
         if (isHome() && (IStationVault(_spec.vault).valuing() || IStationVault(_spec.vault).unsettled())) {
             revert NotAllowed();
         }
+        if (_stage.stagedAt != 0) _endStage();
         uint16 band = stoppedBand();
         for (uint256 i = 0; i < drivers.length; i++) {
             _pinned(drivers[i]);
@@ -363,16 +436,8 @@ contract Station is IStation, ReentrancyGuardTransient {
                 emit DriverFailed(drivers[i]);
             }
         }
-        sentHome = _asset().balanceOf(address(this));
-        if (sentHome != 0) {
-            if (isHome()) {
-                _sendHome(sentHome);
-            } else if (_spec.bridges.length != 0) {
-                _send(_spec.bridges[0], _spec.vaultChain, sentHome, "");
-            } else {
-                revert NoRoute();
-            }
-        }
+        sentHome = _balance();
+        if (sentHome != 0) _home(sentHome);
         emit Unwound(WAD, sentHome, blocked);
     }
 
@@ -383,6 +448,7 @@ contract Station is IStation, ReentrancyGuardTransient {
     function unwindStopped(bytes32[] calldata drivers)
         external
         nonReentrant
+        tracked
         returns (uint256 sentHome, bool blocked)
     {
         if (!stopped) revert NotHalted();
@@ -409,150 +475,182 @@ contract Station is IStation, ReentrancyGuardTransient {
             _run(driver.sweep(address(this), type(uint256).max), targets);
             return calls.length != 0;
         }
-        IERC20 dollar = _asset();
-        uint256 before = dollar.balanceOf(address(this));
+        uint256 before = _balance();
         _run(calls, targets);
         _run(driver.sweep(address(this), exitBefore), targets);
-        uint256 swept = dollar.balanceOf(address(this)) - before;
+        uint256 swept = _balance() - before;
         if (swept < exitBefore.mulDiv(BPS - band, BPS)) revert ShortSweep();
     }
 
     // Delayed venues --------------------------------------------------------
 
-    /// A close through a delayed driver: every driver's band is checked
-    /// first, as for any close; then a delayed driver's closing orders are
-    /// placed and what its account held is recorded, and any other driver is
-    /// closed and swept as usual, its dollars kept here. Nothing goes home in
-    /// this transaction, and the caller is told the close is not done
-    /// (`blocked`), so a claim waits for the cash.
-    function _stageClose(uint256 fraction) private returns (uint256, bool) {
-        // One at a time: a second try while one is in progress closes
-        // nothing more.
-        if (_stage.stagedAt != 0) {
+    /// Stage a close whose band every driver has passed: record what each
+    /// delayed account holds, then place its closing orders; close and sweep
+    /// any other venue at once, its dollars kept here for the stage. Nothing
+    /// goes home in this transaction. One stage at a time, none once
+    /// stopped, and none while dollars the executor moved to or from a
+    /// delayed venue may still be landing: the record would miss them.
+    function _stageClose(
+        uint256 fraction,
+        IDriver[] memory drivers,
+        Call[][] memory closes,
+        uint256[] memory freed,
+        uint256[] memory before,
+        bool[] memory skipped
+    ) private returns (bool) {
+        if (_stage.stagedAt != 0 || stopped) {
             emit Unwound(fraction, 0, true);
-            return (0, true);
+            return false;
         }
-        uint256 count = _spec.drivers.length;
-        IDriver[] memory drivers = new IDriver[](count);
-        Call[][] memory closes = new Call[][](count);
-        for (uint256 i = 0; i < count; i++) {
-            drivers[i] = IDriver(_pinned(_spec.drivers[i]));
-            bool outside;
-            (closes[i], outside) = drivers[i].close(address(this), fraction, _spec.exitBandBps);
-            if (outside) {
-                emit Unwound(fraction, 0, true);
-                return (0, true);
-            }
-        }
-        IERC20 dollar = _asset();
-        uint256 owed = dollar.balanceOf(address(this)).mulDiv(fraction, WAD, Math.Rounding.Floor);
-        for (uint256 i = 0; i < count; i++) {
+        uint64 window;
+        uint256 estimate;
+        for (uint256 i = 0; i < drivers.length; i++) {
+            if (skipped[i] || drivers[i].exitPath() != ExitPath.Delayed) continue;
             bytes32 name = _spec.drivers[i];
-            (uint256 markBefore, uint256 exitBefore) = drivers[i].valueOf(address(this));
-            if (fraction < WAD && markBefore <= count + 1) continue;
-            uint256 freed = exitBefore.mulDiv(fraction, WAD, Math.Rounding.Floor);
-            // Under water at the exit side: only a full unwind may sell it.
-            if (freed == 0 && markBefore.mulDiv(fraction, WAD) > (count + 1) * (count + 1) && fraction < WAD)
-            {
-                revert ShortSweep();
+            IDelayedDriver delayed = IDelayedDriver(address(drivers[i]));
+            uint64 w = delayed.deliveryWindow();
+            if (block.timestamp < uint256(_flows[name].movedAt) + w) {
+                emit Unwound(fraction, 0, true);
+                return false;
             }
-            address[] memory targets = drivers[i].targets();
+            if (w > window) window = w;
+            _stagedExposure[name] = delayed.exposure(address(this));
+            _stagedLedger[name] = delayed.ledger(address(this));
+            _stagedFreed[name] = freed[i];
+            estimate += freed[i];
+        }
+        uint256 owed = _balance().mulDiv(fraction, WAD, Math.Rounding.Floor);
+        for (uint256 i = 0; i < drivers.length; i++) {
+            if (skipped[i]) continue;
             if (drivers[i].exitPath() == ExitPath.Delayed) {
-                _stagedExposure[name] = IDelayedDriver(address(drivers[i])).exposure(address(this));
-                _stagedFreed[name] = freed;
-                _run(closes[i], targets);
-                owed += freed;
+                _run(closes[i], drivers[i].targets());
             } else {
-                uint256 held = dollar.balanceOf(address(this));
-                _run(closes[i], targets);
-                _run(drivers[i].sweep(address(this), freed), targets);
-                uint256 swept = dollar.balanceOf(address(this)) - held;
-                if (swept < freed.mulDiv(BPS - _spec.exitBandBps, BPS) || (swept == 0 && freed != 0)) {
-                    revert ShortSweep();
-                }
-                owed += swept < freed ? swept : freed;
+                owed += _closeOne(drivers[i], closes[i], freed[i], before[i]);
             }
         }
         _stage = Stage({
             fraction: fraction,
             owed: owed,
+            estimate: estimate,
+            fetched: 0,
+            arrivedAt: _arrived,
             stagedAt: uint64(block.timestamp),
             stagedBlock: uint64(block.number),
             sweptAt: 0,
-            sweptBlock: 0
+            sweptBlock: 0,
+            window: window,
+            forVault: isHome()
         });
-        emit CloseStaged(fraction, owed);
+        emit CloseStaged(fraction, owed, estimate);
         emit Unwound(fraction, 0, true);
-        return (0, true);
+        return true;
     }
 
     /// Move a staged close on; anyone may call it. In a block after the
-    /// stage: prove every delayed driver's close happened and sweep the
-    /// fraction's worth home (a close not proved in `STAGE_TIMEOUT` lapses,
-    /// moving nothing). In a block after the sweep: deliver what is owed to
-    /// the vault, once it has all landed or the timeout has passed.
-    function settleClose() external nonReentrant {
+    /// stage: prove every delayed driver's close happened, measure what it
+    /// fetched, and ask the venue for that, less whatever has reached the
+    /// station since the stage (a close not proved within its window lapses,
+    /// moving nothing). Once all it fetched has reached the station: deliver
+    /// it, with the fraction of the idle dollars, to the vault. A proved
+    /// close is never placed again: if its dollars are a window late, they
+    /// are asked for again, and it waits.
+    function settleClose() external nonReentrant tracked {
         Stage memory current = _stage;
         if (current.stagedAt == 0) revert NotAllowed();
+        uint256 arrived = _arrived - current.arrivedAt;
         if (current.sweptBlock == 0) {
             if (block.number <= current.stagedBlock) revert NotYet();
-            bool proved = true;
-            for (uint256 i = 0; i < _spec.drivers.length && proved; i++) {
-                bytes32 name = _spec.drivers[i];
-                address implementation = _pinned(name);
-                if (IDriver(implementation).exitPath() != ExitPath.Delayed) continue;
-                if (_stagedExposure[name].length == 0) continue;
-                proved = IDelayedDriver(implementation).closed(
-                    address(this), _stagedExposure[name], current.fraction
-                );
-            }
-            if (!proved) {
-                if (block.timestamp < current.stagedAt + STAGE_TIMEOUT) revert NotYet();
-                // Whatever it sold stays in the account, everyone's.
-                _clearStage();
-                emit CloseLapsed(current.fraction);
-                return;
-            }
+            int256 measured = int256(arrived);
             for (uint256 i = 0; i < _spec.drivers.length; i++) {
                 bytes32 name = _spec.drivers[i];
-                if (_stagedFreed[name] == 0) continue;
-                IDriver implementation = IDriver(_pinned(name));
-                _run(implementation.sweep(address(this), _stagedFreed[name]), implementation.targets());
+                if (_stagedExposure[name].length == 0) continue;
+                IDelayedDriver delayed = IDelayedDriver(_pinned(name));
+                if (!delayed.closed(address(this), _stagedExposure[name], current.fraction)) {
+                    if (block.timestamp < uint256(current.stagedAt) + current.window) revert NotYet();
+                    // Whatever it sold stays in the account, everyone's.
+                    _endStage();
+                    return;
+                }
+                int256 part = delayed.measure(
+                    address(this), _stagedLedger[name], _stagedExposure[name], current.fraction
+                );
+                measured += part;
+                // What to ask this venue for: its own part, as measured.
+                _stagedFreed[name] = part > 0 ? uint256(part) : 0;
             }
+            // Never below nothing (a shortfall is the leaver's own), never
+            // above the fraction's worth at exit prices when it was placed.
+            current.fetched = measured <= 0 ? 0 : Math.min(uint256(measured), current.estimate);
+            current.owed += current.fetched;
+            _stage.fetched = current.fetched;
+            _stage.owed = current.owed;
+        } else if (arrived < current.fetched && block.timestamp < uint256(current.sweptAt) + current.window) {
+            revert NotYet();
+        }
+        if (arrived < current.fetched) {
+            uint256 asked = _sweepStaged(current.fetched - arrived);
             _stage.sweptAt = uint64(block.timestamp);
             _stage.sweptBlock = uint64(block.number);
-            emit CloseSwept(current.fraction);
+            emit CloseSwept(current.fraction, current.fetched, asked);
             return;
         }
-        if (block.number <= current.sweptBlock) revert NotYet();
-        uint256 idle = _asset().balanceOf(address(this));
-        uint256 amount = idle < current.owed ? idle : current.owed;
-        // Wait for the sweep to land, but not for good: a send the venue
-        // dropped leaves the dollars in the account, counted there.
-        if (amount < current.owed && block.timestamp < current.sweptAt + STAGE_TIMEOUT) revert NotYet();
+        // Everything it fetched is here, beside the fraction of the idle
+        // dollars it kept: deliver it.
         _clearStage();
-        if (amount != 0) {
-            if (isHome()) {
-                _sendHome(amount);
-            } else if (_spec.bridges.length != 0) {
-                _send(_spec.bridges[0], _spec.vaultChain, amount, "");
-            } else {
-                revert NoRoute();
-            }
+        uint256 amount = Math.min(current.owed, _balance());
+        if (current.forVault) {
+            _asset().forceApprove(_spec.vault, amount);
+            IStationVault(_spec.vault).delivered(amount);
+        } else if (amount != 0) {
+            _home(amount);
         }
         emit CloseDelivered(current.fraction, amount);
+    }
+
+    /// Ask each delayed venue for its measured part of `need`, in order.
+    function _sweepStaged(uint256 need) private returns (uint256 asked) {
+        for (uint256 i = 0; i < _spec.drivers.length && asked < need; i++) {
+            bytes32 name = _spec.drivers[i];
+            uint256 ask = Math.min(_stagedFreed[name], need - asked);
+            if (ask == 0 || _stagedExposure[name].length == 0) continue;
+            IDriver implementation = IDriver(_pinned(name));
+            _run(implementation.sweep(address(this), ask), implementation.targets());
+            asked += ask;
+        }
+    }
+
+    /// End a stage without a delivery, and tell the vault if it was its.
+    function _endStage() private {
+        Stage memory current = _stage;
+        _clearStage();
+        emit CloseLapsed(current.fraction);
+        if (current.forVault) IStationVault(_spec.vault).unstaged();
     }
 
     function stage() external view returns (Stage memory) {
         return _stage;
     }
 
+    function arrivals() public view returns (uint256) {
+        // Inside its own call, only what arrived before it began.
+        if (_inCall) return _arrived;
+        uint256 held = _balance();
+        return held > _seen ? _arrived + held - _seen : _arrived;
+    }
+
+    function venueFlows(bytes32 driver) external view returns (uint256 sent, uint64 depositedAt) {
+        Flow storage flow = _flows[driver];
+        return (flow.sent, flow.depositedAt);
+    }
+
     /// Money the station's account put into one of the venue's own vaults
     /// (which only its trading key could have done): count it from now on,
     /// bring it back as soon as the vault's lock allows, and end trading
     /// through that driver, withdrawing its key. Anyone may call it, and
-    /// again to bring the money back once the lock ends.
-    function reclaim(bytes32 driver, address venueVault) external nonReentrant {
+    /// again to bring the money back once the lock ends; not while a close is
+    /// staged, whose measure it would change.
+    function reclaim(bytes32 driver, address venueVault) external nonReentrant tracked {
+        if (_stage.stagedAt != 0) revert NotYet();
         address implementation = _pinned(driver);
         (Call[] memory calls, uint256 equity) =
             IDelayedDriver(implementation).reclaim(address(this), venueVault);
@@ -588,17 +686,12 @@ contract Station is IStation, ReentrancyGuardTransient {
 
     function _clearStage() private {
         for (uint256 i = 0; i < _spec.drivers.length; i++) {
-            delete _stagedExposure[_spec.drivers[i]];
-            delete _stagedFreed[_spec.drivers[i]];
+            bytes32 name = _spec.drivers[i];
+            delete _stagedExposure[name];
+            delete _stagedFreed[name];
+            delete _stagedLedger[name];
         }
         delete _stage;
-    }
-
-    function _anyDelayed() private view returns (bool) {
-        for (uint256 i = 0; i < _spec.drivers.length; i++) {
-            if (IDriver(_pinned(_spec.drivers[i])).exitPath() == ExitPath.Delayed) return true;
-        }
-        return false;
     }
 
     // What it holds ---------------------------------------------------------
@@ -772,8 +865,15 @@ contract Station is IStation, ReentrancyGuardTransient {
             bool allowed;
             if (c.target == dollar) {
                 if (c.data.length == 68 && bytes4(c.data) == APPROVE) {
-                    (address spender,) = abi.decode(_args(c.data), (address, uint256));
-                    allowed = _includes(targets, spender) && !_ours(spender);
+                    // The spender: the first argument, after the selector.
+                    bytes memory data = c.data;
+                    uint256 word;
+                    assembly ("memory-safe") {
+                        word := mload(add(data, 36))
+                    }
+                    // Not an address in its word: no approval anyone checked.
+                    address spender = address(uint160(word));
+                    allowed = word >> 160 == 0 && _includes(targets, spender) && !_ours(spender);
                 }
             } else {
                 allowed = _includes(targets, c.target) && !_ours(c.target);
@@ -793,15 +893,11 @@ contract Station is IStation, ReentrancyGuardTransient {
             || target == address(_registry());
     }
 
-    function _args(bytes memory data) private pure returns (bytes memory args) {
-        args = new bytes(data.length - 4);
-        for (uint256 i = 0; i < args.length; i++) {
-            args[i] = data[i + 4];
-        }
-    }
-
+    /// The executor's own moves; none while a close is staged, so nothing
+    /// moves between the station and its venues but the close's sweep.
     function _executorOnly() private view {
         if (stopped) revert AlreadyStopped();
+        if (_stage.stagedAt != 0) revert NotYet();
         if (!_isKey(msg.sender, ImageKind.Executor)) revert NotBlessed();
     }
 
@@ -835,6 +931,30 @@ contract Station is IStation, ReentrancyGuardTransient {
 
     function _asset() private view returns (IERC20) {
         return IERC20(factory.asset());
+    }
+
+    function _balance() private view returns (uint256) {
+        return _asset().balanceOf(address(this));
+    }
+
+    /// Count what arrived since the last call before this one moves
+    /// anything, and note the balance it leaves. Every call that can move
+    /// the station's dollars is tracked; a key's approval or revoke and a
+    /// stop move none.
+    modifier tracked() {
+        _enter();
+        _;
+        _leave();
+    }
+
+    function _enter() private {
+        _arrived = arrivals();
+        _inCall = true;
+    }
+
+    function _leave() private {
+        _seen = _balance();
+        _inCall = false;
     }
 
     function _listed(uint256[] storage list, uint256 item) private view returns (bool) {

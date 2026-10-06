@@ -35,8 +35,12 @@ contract DemoVault is IStationVault {
     }
 
     /// What a claim does: close `fraction` of every position.
-    function claim(uint256 fraction) external onlyOwner returns (uint256 sentHome, bool blocked) {
-        return IStation(station).unwind(fraction);
+    function claim(uint256 fraction)
+        external
+        onlyOwner
+        returns (uint256 sentHome, bool blocked, bool staged)
+    {
+        return IStation(station).stageClose(fraction);
     }
 
     function toStation(uint256 amount) external {
@@ -50,6 +54,18 @@ contract DemoVault is IStationVault {
         asset.transferFrom(station, address(this), amount);
         cash += amount;
         emit Home(amount);
+    }
+
+    /// A staged close's delivery: what it fetched, as cash.
+    function delivered(uint256 amount) external {
+        require(msg.sender == station, "station only");
+        asset.transferFrom(station, address(this), amount);
+        cash += amount;
+        emit Home(amount);
+    }
+
+    function unstaged() external view {
+        require(msg.sender == station, "station only");
     }
 
     function haltedAt() external pure returns (uint64) {

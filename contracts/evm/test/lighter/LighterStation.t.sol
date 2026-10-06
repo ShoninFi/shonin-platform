@@ -2,144 +2,16 @@
 pragma solidity ^0.8.30;
 
 import {Station} from "../../src/Station.sol";
-import {Vault} from "../../src/Vault.sol";
-import {
-    LighterBoard,
-    LighterPosition,
-    LighterPrice,
-    LighterReport,
-    LighterShares
-} from "../../src/drivers/lighter/LighterBoard.sol";
+import {LighterBoard, LighterReport} from "../../src/drivers/lighter/LighterBoard.sol";
 import {LighterDriver} from "../../src/drivers/lighter/LighterDriver.sol";
-import {IZkLighter} from "../../src/drivers/lighter/ZkLighter.sol";
 import {Call} from "../../src/interfaces/IDriver.sol";
-import {ChainNeed} from "../../src/interfaces/IStrategyRegistry.sol";
 import {ClaimState} from "../../src/interfaces/IVault.sol";
-import {Fixture} from "../Fixture.sol";
-import {MockZkLighter} from "./MockZkLighter.sol";
-import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
+import {LighterVault} from "./LighterVault.sol";
 
 /// A vault whose station trades on Lighter: the station owns the account,
 /// registers the executor's key, and closes and withdraws by priority
 /// request; its value is what a blessed key posts on the board.
-contract LighterStationTest is Fixture {
-    bytes32 internal constant LIGHTER = "lighter";
-    uint16 internal constant ETH = 0;
-    /// $2,700.00: two price decimals; four size decimals.
-    uint32 internal constant ETH_PX = 270_000;
-    bytes internal constant EXECUTOR_PUBKEY =
-        hex"0a000000000000000b000000000000000c000000000000000d000000000000000e00000000000000";
-
-    MockZkLighter internal exchange;
-    LighterBoard internal board;
-    LighterDriver internal lighter;
-    Vault internal vault;
-    Station internal station;
-    uint32 internal spread = 50;
-
-    function setUp() public override {
-        super.setUp();
-        exchange = new MockZkLighter(IERC20(address(usd)));
-        exchange.listMarket(ETH, 4, 2, ETH_PX);
-        board = new LighterBoard();
-        LighterDriver.Market[] memory markets = new LighterDriver.Market[](1);
-        markets[0] = LighterDriver.Market({index: ETH, sizeDecimals: 4, priceDecimals: 2});
-        lighter =
-            new LighterDriver(IZkLighter(address(exchange)), IERC20(address(usd)), board, 1 hours, 6, markets);
-        vm.prank(admin);
-        attestation.proposeDriver(LIGHTER, address(lighter));
-        skip(TIMELOCK);
-
-        uint256 id = submitAs(author);
-        bytes32 bundle = keccak256(abi.encode("bundle", id));
-        _register(id, bundle);
-        vm.prank(reviewer);
-        reviews.submitReview(id, reviewFor(bundle, 1));
-        vault = activate(id, allowancesCosting(2e6), MINIMUM_TANK);
-        blessExecutorKey(executor, address(vault), bundle);
-        station = stationOf(vault);
-        vm.prank(executor);
-        board.setPubKey(EXECUTOR_PUBKEY);
-    }
-
-    function _register(uint256 id, bytes32 bundleHash) internal {
-        ChainNeed[] memory chains = new ChainNeed[](1);
-        chains[0].chain = "base";
-        chains[0].drivers = new bytes32[](1);
-        chains[0].drivers[0] = LIGHTER;
-        bytes32[] memory none = new bytes32[](0);
-        bytes32[] memory restricted = new bytes32[](2);
-        restricted[0] = "SANCTIONED";
-        restricted[1] = "US";
-        bytes32 digest = strategies.registrationDigest(
-            id, author, keccak256("source"), bundleHash, keccak256("manifest"), chains, none, restricted
-        );
-        strategies.register(
-            id,
-            author,
-            keccak256("source"),
-            bundleHash,
-            keccak256("manifest"),
-            chains,
-            none,
-            restricted,
-            signed(BUILDER_KEY, digest),
-            signed(REVIEWER_KEY, strategies.clearanceDigest(id, keccak256("source")))
-        );
-    }
-
-    function _master() internal view returns (uint48 account) {
-        (account,) = lighter.masterOf(address(station));
-    }
-
-    /// What the executor's attested image reads from the exchange, posted.
-    function _post() internal {
-        uint48 account = _master();
-        uint16[] memory markets = new uint16[](1);
-        markets[0] = ETH;
-        LighterReport memory r;
-        r.asOf = uint64(block.timestamp);
-        r.accounts = new uint48[](1);
-        r.accounts[0] = account;
-        int256 equity = exchange.equity(account, markets);
-        r.equity = equity > 0 ? uint256(equity) : 0;
-        r.pending = exchange.getPendingBalance(address(station), 3);
-        r.available = new uint256[](1);
-        int256 cash = exchange.cash(account);
-        r.available[0] = cash > 0 ? uint256(cash) : 0;
-        int64 held = exchange.size(account, ETH);
-        if (held != 0) {
-            r.positions = new LighterPosition[](1);
-            r.positions[0] = LighterPosition({account: account, market: ETH, size: held});
-        }
-        uint32 mark = exchange.markOf(ETH);
-        r.prices = new LighterPrice[](1);
-        r.prices[0] =
-            LighterPrice({market: ETH, mark: mark, index: mark, bid: mark - spread, ask: mark + spread});
-        vm.prank(executor);
-        board.post(address(station), r);
-    }
-
-    function _nextBlock() internal {
-        vm.roll(block.number + 1);
-        skip(1);
-    }
-
-    /// Alice and Bob each put in 100k; the executor moves 150k to Lighter and
-    /// goes long 40 ETH ($108k).
-    function _fundAndTrade() internal returns (uint256 aliceShares) {
-        aliceShares = depositAs(vault, alice, 100_000e6);
-        depositAs(vault, bob, 100_000e6);
-        vm.startPrank(executor);
-        station.approveKey(LIGHTER, executor);
-        station.pull(150_000e6);
-        station.deposit(LIGHTER, 150_000e6);
-        station.approveKey(LIGHTER, executor);
-        vm.stopPrank();
-        exchange.trade(_master(), ETH, 400_000);
-        _post();
-    }
-
+contract LighterStationTest is LighterVault {
     // The account and the key -------------------------------------------------
 
     function test_the_first_deposit_makes_the_station_an_account_owner_and_a_second_approval_registers_the_key(
@@ -254,14 +126,10 @@ contract LighterStationTest is Fixture {
 
     function test_a_claim_is_closed_by_priority_request_proved_by_a_newer_post_withdrawn_and_paid() public {
         uint256 aliceShares = _fundAndTrade();
-        vm.prank(alice);
-        vault.requestRedeem(aliceShares, alice);
-        value(vault);
-        _post();
-        assertEq(vault.claimCount(), 1, "the cash can't pay it");
+        _aliceClaims(aliceShares);
 
         vault.settleClaim(1);
-        assertTrue(vault.claimAt(1).state == ClaimState.Waiting, "the claim waits for its cash");
+        assertTrue(vault.claimAt(1).state == ClaimState.Closing, "the claim waits for its own close");
         assertEq(exchange.orderCount(), 1, "one reduce-only order queued");
         (uint48 account, uint16 market, uint48 base, uint32 price, bool isAsk) = exchange.orders(0);
         assertEq(account, _master());
@@ -278,19 +146,17 @@ contract LighterStationTest is Fixture {
         exchange.process();
         _post();
         station.settleClose();
-        assertEq(exchange.withdrawalCount(), 1, "proved: the freed dollars are asked for");
+        assertEq(exchange.withdrawalCount(), 1, "proved: what it fetched is asked for");
+        assertApproxEqRel(station.stage().fetched, 75_000e6, 0.01e18, "her half of the account, measured");
 
-        exchange.process();
-        exchange.withdrawPendingBalance(address(station), 3, exchange.getPendingBalance(address(station), 3));
-        uint256 cashBefore = vault.cash();
+        // Not delivered until the dollars have reached the station.
         _nextBlock();
+        vm.expectRevert(Station.NotYet.selector);
         station.settleClose();
-        assertApproxEqRel(vault.cash() - cashBefore, 75_000e6, 0.01e18, "her half of the station came home");
-
-        _post();
-        vault.settleClaim(1);
-        value(vault);
-        assertTrue(vault.claimAt(1).state == ClaimState.Paid);
+        exchange.process();
+        _collect();
+        station.settleClose();
+        assertTrue(vault.claimAt(1).state == ClaimState.Paid, "paid at delivery");
         assertApproxEqRel(usd.balanceOf(alice), 100_000e6, 0.01e18);
         assertApproxEqRel(
             uint256(int256(exchange.size(_master(), ETH))), 200_000, 0.01e18, "Bob's half stays"

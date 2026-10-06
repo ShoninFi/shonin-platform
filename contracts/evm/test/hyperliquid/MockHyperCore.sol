@@ -39,6 +39,7 @@ contract MockHyperCore {
     struct Token {
         uint8 szDecimals;
         uint8 weiDecimals;
+        string name;
     }
 
     struct Queued {
@@ -70,10 +71,14 @@ contract MockHyperCore {
 
     Queued[] private _queue;
     uint256 public dropped;
+    /// What a send to HyperEVM costs, in the gas token's wei: the venue
+    /// drops a send the account can't pay for.
+    uint64 public gasToken;
+    uint64 public sendFee;
 
     constructor(LocalUsd usd_) {
         usd = usd_;
-        token[0] = Token({szDecimals: 8, weiDecimals: 8});
+        token[0] = Token({szDecimals: 8, weiDecimals: 8, name: "USDC"});
         PrecompileStub stub = new PrecompileStub(this);
         address[13] memory precompiles = [
             HyperCore.POSITION,
@@ -111,12 +116,19 @@ contract MockHyperCore {
     function listSpot(
         uint32 index,
         uint64 base,
+        string calldata name,
         uint8 szDecimals,
         uint8 weiDecimals,
         uint64 price
     ) external {
         pair[index] = SpotPair(base, price, price, price);
-        token[base] = Token(szDecimals, weiDecimals);
+        token[base] = Token(szDecimals, weiDecimals, name);
+    }
+
+    /// Sends to HyperEVM cost `fee` of `tokenIndex`, as the venue charges
+    /// them in HYPE.
+    function setSendFee(uint64 tokenIndex, uint64 fee) external {
+        (gasToken, sendFee) = (tokenIndex, fee);
     }
 
     function setSpot(uint32 index, uint64 px, uint64 bid, uint64 ask) external {
@@ -206,7 +218,7 @@ contract MockHyperCore {
             Token memory t = token[abi.decode(input, (uint64))];
             return abi.encode(
                 HyperCore.TokenInfo(
-                    "TOKEN", new uint64[](0), 0, address(0), address(0), t.szDecimals, t.weiDecimals, 0
+                    t.name, new uint64[](0), 0, address(0), address(0), t.szDecimals, t.weiDecimals, 0
                 )
             );
         }
@@ -272,6 +284,10 @@ contract MockHyperCore {
         if (id == HyperCore.SPOT_SEND) {
             (address destination, uint64 t, uint64 amount) = abi.decode(fields, (address, uint64, uint64));
             if (spotTotal[sender][t] - spotHold[sender][t] < amount) return false;
+            if (destination == USDC_SYSTEM && sendFee != 0) {
+                if (spotTotal[sender][gasToken] - spotHold[sender][gasToken] < sendFee) return false;
+                spotTotal[sender][gasToken] -= sendFee;
+            }
             spotTotal[sender][t] -= amount;
             if (destination == USDC_SYSTEM && t == 0) {
                 usd.mint(sender, amount / 100);

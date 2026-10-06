@@ -2,6 +2,7 @@
 pragma solidity ^0.8.30;
 
 import {Call, Custody, ExitPath, IDelayedDriver, IDriver, ValuationKind} from "../../interfaces/IDriver.sol";
+import {IStation} from "../../interfaces/IStation.sol";
 import {LighterBoard, LighterPosition, LighterPrice, LighterReport, LighterShares} from "./LighterBoard.sol";
 import {IZkLighter} from "./ZkLighter.sol";
 import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
@@ -23,12 +24,24 @@ import {Math} from "openzeppelin/utils/math/Math.sol";
 /// What the accounts are worth exists only in the exchange's API, so their
 /// value is an attested read: the newest post on the board. A post older
 /// than `maxReportAge` voids a valuation, as does any held market whose mark
-/// or book sits further from the exchange's index than the band.
+/// or book sits further from the exchange's index than the band, and any
+/// post made before a deposit could have been credited.
+///
+/// Dollars move between the accounts and the station after a post: a
+/// withdrawal is carried out into a pending balance, which anyone may pay
+/// out to the station, and a deposit leaves the station at once. The post
+/// carries the station's own counters as of its reading (every dollar that
+/// had reached it from outside its calls, every dollar it had sent the
+/// exchange), so whatever has moved since is counted exactly once: the
+/// exchange's side is the post's equity and pending balance, plus what was
+/// sent since, less what arrived since. Payouts are never made inside a
+/// station call, so every one of them shows in the counter.
 ///
 /// The exchange carries out the station's requests after the transaction, so
 /// a claim's close is staged (`ExitPath.Delayed`): reduce-only orders are
-/// placed, a later post proves the positions shrank, then a withdrawal is
-/// requested and, minutes later, paid to the station.
+/// placed, a later post proves the positions shrank and measures what the
+/// close fetched, then that is withdrawn and, minutes later, paid to the
+/// station.
 ///
 /// It is immutable and has no owner. Its markets are fixed at deployment,
 /// with their decimals as the exchange lists them.
@@ -45,6 +58,14 @@ contract LighterDriver is IDriver, IDelayedDriver {
     /// The key slot the executor's key goes in. Slots 0 and 1 are the
     /// exchange's own apps'.
     uint8 public constant KEY_SLOT = 2;
+    /// A withdrawal is paid out six to nine minutes after it is asked for;
+    /// half an hour holds a staged close's proof and its dollars with room.
+    uint64 public constant DELIVERY_WINDOW = 30 minutes;
+    /// How long a deposit may take to be credited to the account: a post
+    /// read sooner after one may not show it, so it prices nothing.
+    uint64 public constant DEPOSIT_CREDIT = 10 minutes;
+    /// The name stations know the driver by.
+    bytes32 private constant NAME = "lighter";
     /// What a withdrawn key is replaced with: five field elements nobody
     /// holds the secret for (each below the field's modulus, not all zero).
     bytes public constant NOBODY =
@@ -93,7 +114,7 @@ contract LighterDriver is IDriver, IDelayedDriver {
     // What it is ------------------------------------------------------------
 
     function name() external pure returns (bytes32) {
-        return "lighter";
+        return NAME;
     }
 
     function targets() external view returns (address[] memory list) {
@@ -120,6 +141,10 @@ contract LighterDriver is IDriver, IDelayedDriver {
 
     function exitPath() external pure returns (ExitPath) {
         return ExitPath.Delayed;
+    }
+
+    function deliveryWindow() external pure returns (uint64) {
+        return DELIVERY_WINDOW;
     }
 
     function valuation() external pure returns (ValuationKind) {
@@ -171,14 +196,19 @@ contract LighterDriver is IDriver, IDelayedDriver {
         );
     }
 
-    /// Ask for `amount` from the accounts (the master's first), and pay out
-    /// whatever earlier requests left pending.
+    /// Ask for `amount` from the accounts, never more of one than the
+    /// newest post says it can give. What the exchange carries out lands as
+    /// a pending balance minutes later, which anyone may then pay out to the
+    /// station; never inside a station call, so the payout is counted.
     function withdraw(address station, uint256 amount) external view returns (Call[] memory) {
         return _withdrawCalls(station, amount);
     }
 
-    /// The same: after a close, the freed dollars are asked for, and land as
-    /// a pending balance minutes later, which anyone may then pay out.
+    /// The same; asked for everything (a stopped station's unwind), it asks
+    /// for what the accounts can hold in descending halves, each its own
+    /// request, so the requests the exchange can carry out take all but the
+    /// last dollar whether it refuses or trims a request larger than the
+    /// account (which of the two it does is not known here).
     function sweep(address station, uint256 amount) external view returns (Call[] memory) {
         return _withdrawCalls(station, amount);
     }
@@ -190,7 +220,10 @@ contract LighterDriver is IDriver, IDelayedDriver {
     /// is too old or any held market is outside the band. At the full band,
     /// every listed market of every account is closed whole at any price,
     /// needing no post: a reduce-only order of zero size is the whole
-    /// position, and the side that holds nothing does nothing.
+    /// position, and the side that holds nothing does nothing. A stopped
+    /// station whose newest post is stale (nobody can post once its keys
+    /// are gone) closes everything whole too, each order no worse than the
+    /// band from that post's index, as the band widens with time.
     function close(
         address station,
         uint256 fraction,
@@ -199,8 +232,11 @@ contract LighterDriver is IDriver, IDelayedDriver {
         (uint48 master, bool exists) = masterOf(station);
         if (!exists) return (new Call[](0), false);
         (LighterReport memory report, bool reported) = board.reportOf(station);
-        if (bandBps >= BPS) return (_closeEverything(master, report), false);
-        if (!reported || !_fresh(report)) return (new Call[](0), true);
+        if (bandBps >= BPS) return (_closeEverything(master, report, 0), false);
+        if (reported && !_fresh(report) && fraction == WAD && IStation(station).stopped()) {
+            return (_closeEverything(master, report, bandBps), false);
+        }
+        if (!reported || !_fresh(report) || !_credited(station, report)) return (new Call[](0), true);
         if (_outsideBand(report, bandBps)) return (new Call[](0), true);
 
         calls = new Call[](report.positions.length);
@@ -213,47 +249,30 @@ contract LighterDriver is IDriver, IDelayedDriver {
             uint256 size = open.mulDiv(fraction, WAD, Math.Rounding.Ceil);
             if (size > open) size = open;
             if (size == 0) continue;
-            LighterPrice memory price = _priceOf(report, position.market);
-            uint256 limit = long
-                ? uint256(price.index).mulDiv(BPS - bandBps, BPS, Math.Rounding.Ceil)
-                : uint256(price.index).mulDiv(BPS + bandBps, BPS);
-            if (limit == 0) limit = 1;
-            if (limit > MAX_PRICE) limit = MAX_PRICE;
-            calls[made++] = Call(
-                address(exchange),
-                0,
-                abi.encodeCall(
-                    IZkLighter.createOrder,
-                    (
-                        position.account,
-                        position.market,
-                        uint48(size),
-                        uint32(limit),
-                        long ? 1 : 0,
-                        MARKET_ORDER
-                    )
-                )
-            );
+            uint256 limit = _limit(_priceOf(report, position.market).index, long, bandBps);
+            calls[made++] = _order(position.account, position.market, size, limit, long);
         }
         assembly ("memory-safe") {
             mstore(calls, made)
         }
     }
 
-    /// The accounts' worth from the newest post (however old: a stale post
-    /// voids the valuation through `close`), plus what withdrawals have left
-    /// pending for the station on-chain. The exit side takes each position
-    /// at the book's closing side where that is worse than the mark.
-    ///
-    /// The pending balance counts at the lower of what the post saw and what
-    /// is pending now: a withdrawal carried out since the post is still in
-    /// the post's equity, and a balance paid out since the post is in the
-    /// station's own dollars, so neither is counted twice.
+    /// The exchange's side from the newest post (however old: a stale post
+    /// voids the valuation through `close`): its equity and the pending
+    /// balance it saw, plus what the station has sent the exchange since,
+    /// less what has reached the station since. A withdrawal carried out
+    /// since the post is still in its equity, and once paid out it is in the
+    /// station's own dollars and taken off here, so nothing counts twice;
+    /// a deposit since counts at once. The exit side takes each position at
+    /// the book's closing side where that is worse than the mark.
     function valueOf(address station) external view returns (uint256 mark, uint256 exit) {
-        uint256 pending = exchange.getPendingBalance(station, DOLLAR_ASSET);
         (LighterReport memory report, bool reported) = board.reportOf(station);
-        if (!reported) return (pending, pending);
-        if (report.pending < pending) pending = report.pending;
+        if (!reported) {
+            uint256 pending = exchange.getPendingBalance(station, DOLLAR_ASSET);
+            return (pending, pending);
+        }
+        int256 worth = _worth(station, report);
+        mark = worth > 0 ? uint256(worth) : 0;
         uint256 haircut;
         for (uint256 i = 0; i < report.positions.length; i++) {
             LighterPosition memory position = report.positions[i];
@@ -269,24 +288,91 @@ contract LighterDriver is IDriver, IDelayedDriver {
             haircut +=
                 open.mulDiv(worse * _dollarUnit, 10 ** (uint256(market.sizeDecimals) + market.priceDecimals));
         }
-        mark = report.equity + pending;
-        exit = (report.equity > haircut ? report.equity - haircut : 0) + pending;
+        exit = mark > haircut ? mark - haircut : 0;
+    }
+
+    /// The exchange's side, signed: the post's equity and pending balance,
+    /// plus what was sent since it, less what arrived since it.
+    function _worth(address station, LighterReport memory report) private view returns (int256) {
+        (uint256 sent,) = IStation(station).venueFlows(NAME);
+        uint256 arrived = IStation(station).arrivals();
+        int256 worth = int256(report.equity + report.pending);
+        if (sent > report.sent) worth += int256(sent - report.sent);
+        if (arrived > report.arrived) worth -= int256(arrived - report.arrived);
+        return worth;
+    }
+
+    /// Whether a post was read long enough after the last deposit for the
+    /// exchange to have credited it.
+    function _credited(address station, LighterReport memory report) private view returns (bool) {
+        (, uint64 depositedAt) = IStation(station).venueFlows(NAME);
+        return depositedAt == 0 || report.asOf >= uint256(depositedAt) + DEPOSIT_CREDIT;
     }
 
     // Delayed closes --------------------------------------------------------
 
     /// Each listed market's net position over all the station's accounts, in
-    /// the driver's market order, then the post's time: what `closed`
-    /// compares a later post against.
-    function exposure(address station) external view returns (int256[] memory held) {
+    /// the driver's market order, then the post's time, then each market's
+    /// mark in the post: what `closed` compares a later post against, and
+    /// what `measure` reprices.
+    function exposure(address station) public view returns (int256[] memory held) {
         (LighterReport memory report,) = board.reportOf(station);
-        held = new int256[](_markets.length + 1);
+        return _exposure(report);
+    }
+
+    function _exposure(LighterReport memory report) private view returns (int256[] memory held) {
+        uint256 n = _markets.length;
+        held = new int256[](2 * n + 1);
         for (uint256 i = 0; i < report.positions.length; i++) {
-            for (uint256 m = 0; m < _markets.length; m++) {
+            for (uint256 m = 0; m < n; m++) {
                 if (_markets[m].index == report.positions[i].market) held[m] += report.positions[i].size;
             }
         }
-        held[_markets.length] = int256(uint256(report.asOf));
+        held[n] = int256(uint256(report.asOf));
+        for (uint256 m = 0; m < n; m++) {
+            held[n + 1 + m] = int256(uint256(_priceOf(report, _markets[m].index).mark));
+        }
+    }
+
+    /// The exchange's side (`valueOf`'s, signed) less its positions at their
+    /// marks: the accounts' dollars, by the newest post.
+    function ledger(address station) external view returns (int256 dollars) {
+        (LighterReport memory report,) = board.reportOf(station);
+        dollars = _worth(station, report);
+        int256[] memory held = _exposure(report);
+        for (uint256 m = 0; m < _markets.length; m++) {
+            dollars -= _notional(m, held[m], held[_markets.length + 1 + m]);
+        }
+    }
+
+    /// By the newest post (newer than `before`'s, as `closed` asks): the
+    /// exchange's side now, less the kept part of `dollars` and `before`'s
+    /// positions repriced at the marks now. A market the newest post has no
+    /// price for keeps the mark it had.
+    function measure(
+        address station,
+        int256 dollars,
+        int256[] calldata before,
+        uint256 fraction
+    ) external view returns (int256) {
+        (LighterReport memory report,) = board.reportOf(station);
+        uint256 n = _markets.length;
+        int256 then = dollars;
+        for (uint256 m = 0; m < n; m++) {
+            int256 mark = int256(uint256(_priceOf(report, _markets[m].index).mark));
+            if (mark == 0) mark = before[n + 1 + m];
+            then += _notional(m, before[m], mark);
+        }
+        uint256 size = uint256(then < 0 ? -then : then);
+        uint256 kept = size.mulDiv(WAD - fraction, WAD, then < 0 ? Math.Rounding.Floor : Math.Rounding.Ceil);
+        return _worth(station, report) - (then < 0 ? -int256(kept) : int256(kept));
+    }
+
+    /// `size` base units of market `m` at `price` ticks, in dollar units.
+    function _notional(uint256 m, int256 size, int256 price) private view returns (int256) {
+        Market memory market = _markets[m];
+        return size * price * int256(_dollarUnit)
+            / int256(10 ** (uint256(market.sizeDecimals) + market.priceDecimals));
     }
 
     /// Whether a post newer than the one `before` came from shows every
@@ -296,8 +382,8 @@ contract LighterDriver is IDriver, IDelayedDriver {
         int256[] calldata before,
         uint256 fraction
     ) external view returns (bool) {
-        if (before.length != _markets.length + 1) return false;
-        int256[] memory now_ = this.exposure(station);
+        if (before.length != 2 * _markets.length + 1) return false;
+        int256[] memory now_ = exposure(station);
         if (now_[_markets.length] <= before[_markets.length]) return false;
         for (uint256 m = 0; m < _markets.length; m++) {
             int256 was = before[m];
@@ -376,36 +462,24 @@ contract LighterDriver is IDriver, IDelayedDriver {
 
     function _withdrawCalls(address station, uint256 amount) private view returns (Call[] memory calls) {
         (uint48 master, bool exists) = masterOf(station);
-        uint256 pending = exchange.getPendingBalance(station, DOLLAR_ASSET);
         if (!exists) return new Call[](0);
         (LighterReport memory report, bool reported) = board.reportOf(station);
-        uint48[] memory accounts = _accounts(master, report);
-        calls = new Call[](accounts.length + 1);
-        uint256 made;
-        if (pending != 0) {
-            calls[made++] = Call(
-                address(exchange),
-                0,
-                abi.encodeCall(IZkLighter.withdrawPendingBalance, (station, DOLLAR_ASSET, uint128(pending)))
-            );
+        if (!reported) {
+            // Nothing is known of the account: only the executor's own ask.
+            if (amount == type(uint256).max || amount == 0) return new Call[](0);
+            calls = new Call[](1);
+            calls[0] = _withdrawCall(master, amount);
+            return calls;
         }
+        uint48[] memory accounts = _accounts(master, report);
+        if (amount == type(uint256).max) return _halves(station, report, accounts);
+        calls = new Call[](accounts.length);
+        uint256 made;
         uint256 left = amount;
         for (uint256 i = 0; i < accounts.length && left != 0; i++) {
-            uint256 take = left;
-            // What each account can give, where a post says; the master is
-            // asked for the rest when nothing is known.
-            if (reported) {
-                uint256 available = _availableOf(report, accounts[i]);
-                if (take > available) take = available;
-                if (i == accounts.length - 1 && accounts[i] == master) take = left;
-            }
+            uint256 take = Math.min(left, _availableOf(report, accounts[i]));
             if (take == 0) continue;
-            if (take > type(uint64).max) take = type(uint64).max;
-            calls[made++] = Call(
-                address(exchange),
-                0,
-                abi.encodeCall(IZkLighter.withdraw, (accounts[i], DOLLAR_ASSET, PERPS, uint64(take)))
-            );
+            calls[made++] = _withdrawCall(accounts[i], take);
             left -= take;
         }
         assembly ("memory-safe") {
@@ -413,34 +487,101 @@ contract LighterDriver is IDriver, IDelayedDriver {
         }
     }
 
-    /// Every listed market of every account, both sides, whole, at any
-    /// price: reduce-only, so only the side that closes something acts.
+    /// Everything still in the accounts, asked for without knowing what each
+    /// holds now: by the newest post, the exchange's side less what is
+    /// pending now is what is left in them, and each account is asked for
+    /// that rounded up to a power of two, then each half below it down to a
+    /// dollar. Carried out in order, each request at most what the account
+    /// still holds goes through, so the account is emptied to under a dollar
+    /// of whatever it holds up to twice the estimate, and no request ever
+    /// relies on the exchange trimming one too large.
+    function _halves(
+        address station,
+        LighterReport memory report,
+        uint48[] memory accounts
+    ) private view returns (Call[] memory calls) {
+        int256 worth =
+            _worth(station, report) - int256(uint256(exchange.getPendingBalance(station, DOLLAR_ASSET)));
+        if (worth < int256(_dollarUnit)) return new Call[](0);
+        uint256 top = _dollarUnit;
+        uint256 pieces = 1;
+        while (top < uint256(worth) && top < type(uint64).max / 2) {
+            top <<= 1;
+            pieces++;
+        }
+        calls = new Call[](accounts.length * pieces);
+        uint256 made;
+        for (uint256 a = 0; a < accounts.length; a++) {
+            for (uint256 piece = top; piece >= _dollarUnit; piece >>= 1) {
+                calls[made++] = _withdrawCall(accounts[a], piece);
+            }
+        }
+    }
+
+    function _withdrawCall(uint48 account, uint256 amount) private view returns (Call memory) {
+        if (amount > type(uint64).max) amount = type(uint64).max;
+        return Call(
+            address(exchange),
+            0,
+            abi.encodeCall(IZkLighter.withdraw, (account, DOLLAR_ASSET, PERPS, uint64(amount)))
+        );
+    }
+
+    /// Every listed market of every account, both sides, whole:
+    /// reduce-only, so only the side that closes something acts. With no
+    /// band (zero), at any price; with one, no worse than it from the post's
+    /// index, and a market the post has no price for is left to the full
+    /// band.
     function _closeEverything(
         uint48 master,
-        LighterReport memory report
+        LighterReport memory report,
+        uint16 bandBps
     ) private view returns (Call[] memory calls) {
         uint48[] memory accounts = _accounts(master, report);
         calls = new Call[](accounts.length * _markets.length * 2);
         uint256 made;
         for (uint256 a = 0; a < accounts.length; a++) {
             for (uint256 m = 0; m < _markets.length; m++) {
-                calls[made++] = Call(
-                    address(exchange),
-                    0,
-                    abi.encodeCall(
-                        IZkLighter.createOrder, (accounts[a], _markets[m].index, 0, 1, 1, MARKET_ORDER)
-                    )
-                );
-                calls[made++] = Call(
-                    address(exchange),
-                    0,
-                    abi.encodeCall(
-                        IZkLighter.createOrder,
-                        (accounts[a], _markets[m].index, 0, MAX_PRICE, 0, MARKET_ORDER)
-                    )
-                );
+                uint256 sellAt = 1;
+                uint256 buyAt = MAX_PRICE;
+                if (bandBps != 0) {
+                    uint32 index = _priceOf(report, _markets[m].index).index;
+                    if (index == 0) continue;
+                    sellAt = _limit(index, true, bandBps);
+                    buyAt = _limit(index, false, bandBps);
+                }
+                calls[made++] = _order(accounts[a], _markets[m].index, 0, sellAt, true);
+                calls[made++] = _order(accounts[a], _markets[m].index, 0, buyAt, false);
             }
         }
+        assembly ("memory-safe") {
+            mstore(calls, made)
+        }
+    }
+
+    /// The worst price a closing order may take: `bandBps` from `index`,
+    /// below it to close a long, above it to close a short.
+    function _limit(uint256 index, bool long, uint16 bandBps) private pure returns (uint256 limit) {
+        limit = long ? index.mulDiv(BPS - bandBps, BPS, Math.Rounding.Ceil) : index.mulDiv(BPS + bandBps, BPS);
+        if (limit == 0) limit = 1;
+        if (limit > MAX_PRICE) limit = MAX_PRICE;
+    }
+
+    function _order(
+        uint48 account,
+        uint16 market,
+        uint256 size,
+        uint256 limit,
+        bool ask
+    ) private view returns (Call memory) {
+        return Call(
+            address(exchange),
+            0,
+            abi.encodeCall(
+                IZkLighter.createOrder,
+                (account, market, uint48(size), uint32(limit), ask ? 1 : 0, MARKET_ORDER)
+            )
+        );
     }
 
     /// The master, then every other account the post names, once each.
