@@ -21,7 +21,7 @@ vars:
   # name, since Task hands .env only to commands, not to variables.)
   NETWORK:
     sh: |
-      from_env_file=$(awk '/^[[:space:]]*(export[[:space:]]+)?SHONIN_NETWORK=/ { v = substr($0, index($0, "=") + 1) } END { gsub(/["'"'"' \r]/, "", v); print v }' "{{.ROOT_DIR}}/.env" 2>/dev/null)
+      from_env_file=$(awk '/^[[:space:]]*(export[[:space:]]+)?SHONIN_NETWORK=/ { v = substr($0, index($0, "=") + 1) } END { gsub(/["'"'"' \r]/, "", v); print v }' "{{.ROOT_DIR}}/.env" 2>/dev/null || true)
       named="${NETWORK:-}"
       shonin="${SHONIN_NETWORK:-$from_env_file}"
       if [ -n "$named" ] && [ -n "$shonin" ] && [ "$named" != "$shonin" ]; then
