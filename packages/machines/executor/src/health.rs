@@ -58,6 +58,7 @@ fn stake_at(base: u128, worst_send: u128) -> u128 {
 }
 
 /// The stake a key is given at today's fee, as [`fund_gas`] sees to it.
+#[cfg(test)]
 pub async fn stake_today(chain: &Client) -> Result<u128> {
     Ok(stake_at(gas_stake(chain), worst_send(chain).await?))
 }
