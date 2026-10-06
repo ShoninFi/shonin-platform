@@ -767,6 +767,19 @@ pub async fn claim_all(
     minutes: u64,
     noted: impl Fn(u64) -> Result<()>,
 ) -> Result<U256> {
+    // A claim booked by an earlier run that stopped before it noted the
+    // claim is followed, not asked for again.
+    let known = match known {
+        Some(id) => Some(id),
+        None => {
+            let found = newest_claim(client, vault, who, 0, false).await?;
+            if let Some(id) = found {
+                tracing::info!(%vault, claim = id, "a claim is already booked");
+                noted(id)?;
+            }
+            found
+        }
+    };
     let claim_id = match known {
         Some(id) => id,
         None => {
@@ -793,26 +806,15 @@ pub async fn claim_all(
                 .context("the withdrawal")?;
             let request = client.read(vault, IVault::requestCountCall {}).await?;
             tracing::info!(%vault, shares_units = %shares, request = %request, tx = %receipt.transaction_hash, "withdrawal requested");
-            // Booked at the next valuation, if the cash can't pay it.
+            // Booked at the next valuation, if the cash can't pay it. The
+            // request can be read as done a moment before the claim it
+            // booked (two reads either side of the valuation, or on two
+            // endpoints a block apart), so it is taken as paid from cash
+            // only once the claim still isn't there a little later.
             let mut booked = None;
+            let mut done_since: Option<tokio::time::Instant> = None;
             for _ in 0..minutes * 12 {
-                let count = client
-                    .read(vault, IVault::claimCountCall {})
-                    .await?
-                    .to::<u64>();
-                for id in claims_before + 1..=count {
-                    let claim = client
-                        .read(
-                            vault,
-                            IVault::claimAtCall {
-                                claimId: U256::from(id),
-                            },
-                        )
-                        .await?;
-                    if claim.owner == who {
-                        booked = Some(id);
-                    }
-                }
+                booked = newest_claim(client, vault, who, claims_before, true).await?;
                 if booked.is_some() {
                     break;
                 }
@@ -821,7 +823,10 @@ pub async fn claim_all(
                     .await?
                     .done
                 {
-                    bail!("the withdrawal was paid from the vault's cash: no claim was booked");
+                    let since = *done_since.get_or_insert_with(tokio::time::Instant::now);
+                    if since.elapsed() >= CLAIM_SEEN_WITHIN {
+                        bail!("the withdrawal was paid from the vault's cash: no claim was booked");
+                    }
                 }
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
@@ -875,6 +880,41 @@ pub async fn claim_all(
     bail!("claim {claim_id} was not paid in {minutes} minutes")
 }
 
+/// How long after a withdrawal is read as done its claim is still looked
+/// for, before the withdrawal is taken as paid from cash.
+const CLAIM_SEEN_WITHIN: Duration = Duration::from_secs(30);
+
+/// The newest claim of `who`'s numbered above `after`: any of them, or with
+/// `settled` false only one still waiting to be paid.
+async fn newest_claim(
+    client: &Client,
+    vault: Address,
+    who: Address,
+    after: u64,
+    settled: bool,
+) -> Result<Option<u64>> {
+    let count = client
+        .read(vault, IVault::claimCountCall {})
+        .await?
+        .to::<u64>();
+    let mut found = None;
+    for id in after + 1..=count {
+        let claim = client
+            .read(
+                vault,
+                IVault::claimAtCall {
+                    claimId: U256::from(id),
+                },
+            )
+            .await?;
+        let waiting = !matches!(claim.state, ClaimState::Paid | ClaimState::Fallback);
+        if claim.owner == who && (settled || waiting) {
+            found = Some(id);
+        }
+    }
+    Ok(found)
+}
+
 /// A claim state's name, by its number in the vault's `ClaimState`.
 fn claim_state_name(state: u8) -> &'static str {
     const NAMES: [&str; 7] = [
@@ -896,6 +936,9 @@ pub struct Progress {
     pub deposited: Option<u64>,
     pub priced: bool,
     pub station_funded: bool,
+    /// A second depositor's deposit is priced.
+    #[serde(default)]
+    pub stayed: bool,
     pub claim: Option<u64>,
     pub paid: Option<String>,
 }
@@ -1102,6 +1145,23 @@ pub async fn run(
         log_valuation(client, vault).await?;
     }
 
+    // A second depositor, who stays, so the leaver isn't nearly the whole
+    // vault. The driver stages no close for a fraction so near all of the
+    // station that what would be left couldn't cover the close's worst
+    // slippage, and while the agent holds a position such a leaver's claim
+    // would wait for it to be flat.
+    if !progress.stayed {
+        let units = (deposit_units / 10).max(least);
+        funder
+            .dollars_on_hyperevm(client, author, units as f64 / 1e6)
+            .await?;
+        deposit(client, &vaults, vault, author, units).await?;
+        let shares = shares_of(client, vault, author, 15).await?;
+        tracing::info!(%vault, deposit_units = units, shares_units = %shares, "a second depositor's deposit is priced, and they stay");
+        progress.stayed = true;
+        progress.write(&progress_file)?;
+    }
+
     let paid = claim_all(
         client,
         vault,
@@ -1165,6 +1225,7 @@ mod tests {
             deposited: Some(650_000_000),
             priced: true,
             station_funded: true,
+            stayed: true,
             claim: Some(1),
             paid: None,
         };
