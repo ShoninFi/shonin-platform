@@ -55,7 +55,7 @@ contract VerifierRotationTest is Fixture {
     function test_a_proof_the_new_checker_accepts_can_be_re_blessed_after_the_old_one_retires() public {
         address vault = makeAddr("vault");
         bytes32 bundle = keccak256("bundle");
-        bytes memory journal = journalFor(EXECUTOR_IMAGE, executor, leafFor(vault, bundle));
+        bytes memory journal = journalFor(EXECUTOR_IMAGE, executor, leafFor(vault, bundle, executor));
         bytes memory seal = sealOf(journal);
         // The service keys were blessed in setUp, before the new checker was
         // ready, so through the old one: they drop at its retirement.
@@ -66,7 +66,7 @@ contract VerifierRotationTest is Fixture {
         // The fixed checker accepts this very proof, and it is well within
         // its TTL.
         assertTrue(fixedChecker.verify(seal, journal));
-        attestation.bless(seal, journal, block.chainid, vault, bundle, new bytes32[](0));
+        attestation.bless(seal, journal, block.chainid, vault, bundle, executor, new bytes32[](0));
         assertTrue(
             attestation.isBlessedFor(executor, block.chainid, vault, bundle),
             "an allowed checker vouches for the proof, but the blessing stays dead"

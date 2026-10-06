@@ -17,8 +17,8 @@ contract KeyInfoRepointingTest is Fixture {
     }
 
     function test_a_stranger_cannot_change_what_a_key_is_reported_as_serving() public {
-        bytes32 leafA = leafFor(vaultA, bundle);
-        bytes32 leafB = leafFor(vaultB, bundle);
+        bytes32 leafA = leafFor(vaultA, bundle, executor);
+        bytes32 leafB = leafFor(vaultB, bundle, executor);
         bytes memory journal = journalFor(EXECUTOR_IMAGE, executor, pair(leafA, leafB));
         bytes memory seal = sealOf(journal);
         bytes32[] memory proofA = new bytes32[](1);
@@ -26,12 +26,12 @@ contract KeyInfoRepointingTest is Fixture {
         bytes32[] memory proofB = new bytes32[](1);
         proofB[0] = leafA;
 
-        attestation.bless(seal, journal, block.chainid, vaultA, bundle, proofA);
+        attestation.bless(seal, journal, block.chainid, vaultA, bundle, executor, proofA);
         KeyInfo memory before = attestation.keyInfo(executor);
         assertEq(before.vault, vaultA);
 
         vm.prank(alice);
-        attestation.bless(seal, journal, block.chainid, vaultB, bundle, proofB);
+        attestation.bless(seal, journal, block.chainid, vaultB, bundle, executor, proofB);
         KeyInfo memory after_ = attestation.keyInfo(executor);
         // The blessing for A stands ...
         assertTrue(attestation.isBlessedFor(executor, block.chainid, vaultA, bundle));

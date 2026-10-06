@@ -719,10 +719,13 @@ contract RemoteStationExternalFunctionsTest is Fixture, Calls {
     }
 
     function blessFor(bytes32 image, address signer) internal {
-        bytes32 leaf =
-            keccak256(bytes.concat(keccak256(abi.encode(VAULT_CHAIN, remoteVault, BUNDLE, block.chainid))));
+        bytes32 leaf = keccak256(
+            bytes.concat(keccak256(abi.encode(VAULT_CHAIN, remoteVault, BUNDLE, block.chainid, signer)))
+        );
         bytes memory journal = journalFor(image, signer, leaf);
-        attestation.bless(sealOf(journal), journal, VAULT_CHAIN, remoteVault, BUNDLE, new bytes32[](0));
+        attestation.bless(
+            sealOf(journal), journal, VAULT_CHAIN, remoteVault, BUNDLE, signer, new bytes32[](0)
+        );
     }
 
     function names(bytes32 a) internal pure returns (bytes32[] memory list) {
@@ -1015,8 +1018,9 @@ contract RegistryExternalFunctionsTest is Fixture, Calls {
         p.target = target % 3;
         if (p.target != 0) (p.vaultChain, p.hash) = (block.chainid, keccak256("a bundle"));
         if (p.target == 1) p.forVault = alice;
-        bytes32 leaf =
-            keccak256(bytes.concat(keccak256(abi.encode(p.vaultChain, p.forVault, p.hash, block.chainid))));
+        bytes32 leaf = keccak256(
+            bytes.concat(keccak256(abi.encode(p.vaultChain, p.forVault, p.hash, block.chainid, p.signer)))
+        );
         p.issuedAt =
             uint64(int64(int256(vm.getBlockTimestamp())) + int64(bound(int256(issued), -100 hours, 1 hours)));
         p.journal = abi.encode(
@@ -1079,7 +1083,7 @@ contract RegistryExternalFunctionsTest is Fixture, Calls {
             address(attestation),
             abi.encodeCall(
                 AttestationRegistry.bless,
-                (p.seal, p.journal, p.vaultChain, p.forVault, p.hash, new bytes32[](0))
+                (p.seal, p.journal, p.vaultChain, p.forVault, p.hash, p.signer, new bytes32[](0))
             )
         );
         expectOutcome(ok, err, want, "bless");

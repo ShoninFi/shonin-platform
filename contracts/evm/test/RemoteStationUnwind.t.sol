@@ -50,10 +50,11 @@ contract RemoteStationUnwindTest is Fixture {
     }
 
     function blessFor(bytes32 image, address signer) internal {
-        bytes32 leaf =
-            keccak256(bytes.concat(keccak256(abi.encode(VAULT_CHAIN, vaultAddr, BUNDLE, block.chainid))));
+        bytes32 leaf = keccak256(
+            bytes.concat(keccak256(abi.encode(VAULT_CHAIN, vaultAddr, BUNDLE, block.chainid, signer)))
+        );
         bytes memory journal = journalFor(image, signer, leaf);
-        attestation.bless(sealOf(journal), journal, VAULT_CHAIN, vaultAddr, BUNDLE, new bytes32[](0));
+        attestation.bless(sealOf(journal), journal, VAULT_CHAIN, vaultAddr, BUNDLE, signer, new bytes32[](0));
     }
 
     function remoteSpec() internal view returns (StationSpec memory spec) {

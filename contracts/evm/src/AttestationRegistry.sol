@@ -26,11 +26,13 @@ contract AttestationRegistry is IAttestationRegistry {
     struct Journal {
         bytes32 imageDigest;
         bytes32 projectId;
-        /// The key generated inside the instance.
+        /// The instance's own key, generated inside it. It names the
+        /// instance; the keys it holds for its work are in the leaves.
         address signer;
-        /// The root of the (vault chain, vault, bundle, chain) leaves this
-        /// instance holds keys for. A builder or a reviewer commits to the
-        /// leaf with no vault, for each chain it serves.
+        /// The root of the (vault chain, vault, bundle, chain, key) leaves
+        /// this instance holds keys for: each leaf names the key it holds
+        /// for that vault. A builder or a reviewer commits to the leaf with
+        /// no vault and its own key, for each chain it serves.
         bytes32 vaultsRoot;
         /// When the instance attested. A blessing lasts a TTL from here.
         uint64 issuedAt;
@@ -379,6 +381,7 @@ contract AttestationRegistry is IAttestationRegistry {
         uint256 vaultChain,
         address vault,
         bytes32 strategyHash,
+        address key,
         bytes32[] calldata merkleProof
     ) external {
         IAttestationVerifier verifier = _verifierFor(seal, journalBytes);
@@ -388,7 +391,8 @@ contract AttestationRegistry is IAttestationRegistry {
         if (!isProjectAllowed(journal.projectId)) revert ProjectNotAllowed();
         ImageKind kind = _image[journal.imageDigest].kind;
 
-        if (journal.signer == address(0)) revert NoSigner();
+        // The instance has to name itself, and the key has to be a key.
+        if (journal.signer == address(0) || key == address(0)) revert NoSigner();
         bool servesOneVault = kind == ImageKind.Executor || kind == ImageKind.Unwinder;
         if (
             servesOneVault
@@ -398,10 +402,12 @@ contract AttestationRegistry is IAttestationRegistry {
             revert WrongKindForVault();
         }
         // The key may act for this vault and this bundle only, on this chain
-        // only, and the instance had to have said so before it saw this
-        // transaction. A builder or a reviewer proves the leaf with no vault.
-        bytes32 leaf =
-            keccak256(bytes.concat(keccak256(abi.encode(vaultChain, vault, strategyHash, block.chainid))));
+        // only, and the instance had to have said so, naming the key, before
+        // it saw this transaction. A builder or a reviewer proves the leaf
+        // with no vault and its own key.
+        bytes32 leaf = keccak256(
+            bytes.concat(keccak256(abi.encode(vaultChain, vault, strategyHash, block.chainid, key)))
+        );
         if (!MerkleProof.verify(merkleProof, journal.vaultsRoot, leaf)) revert NotAmongTheVaults();
 
         // A blessing runs from the attestation, so replaying an old one can
@@ -409,17 +415,17 @@ contract AttestationRegistry is IAttestationRegistry {
         uint64 until = journal.issuedAt + blessingTtl;
         if (journal.issuedAt > block.timestamp || until <= block.timestamp) revert Stale();
 
-        KeyInfo storage key = _key[journal.signer];
+        KeyInfo storage info = _key[key];
         if (
-            key.kind != ImageKind.None
-                && (key.imageDigest != journal.imageDigest || key.projectId != journal.projectId)
+            info.kind != ImageKind.None
+                && (info.imageDigest != journal.imageDigest || info.projectId != journal.projectId)
         ) {
             revert NotThisInstance();
         }
         // A blessing only ever moves later, and remembers the checker that
         // gave it, so retiring that checker retires it.
         bytes32 target = _target(vaultChain, vault, strategyHash);
-        Blessing storage blessing = _blessing[journal.signer][target];
+        Blessing storage blessing = _blessing[key][target];
         // Also when the checker it was recorded against has since been
         // retired: an allowed checker vouching for it again revives it.
         if (until > blessing.until || !isVerifierAllowed(blessing.verifier)) {
@@ -427,20 +433,20 @@ contract AttestationRegistry is IAttestationRegistry {
             blessing.verifier = address(verifier);
         }
 
-        key.imageDigest = journal.imageDigest;
-        key.projectId = journal.projectId;
-        key.kind = kind;
+        info.imageDigest = journal.imageDigest;
+        info.projectId = journal.projectId;
+        info.kind = kind;
         // What the key is reported as serving moves only with a later
         // blessing, so replaying a public seal can't change it.
-        if (until > key.blessedUntil || !isVerifierAllowed(key.verifier)) {
-            key.strategyHash = strategyHash;
-            key.vaultChain = vaultChain;
-            key.vault = vault;
-            key.blessedUntil = until;
-            key.trustRoot = verifier.trustRoot();
-            key.verifier = address(verifier);
+        if (until > info.blessedUntil || !isVerifierAllowed(info.verifier)) {
+            info.strategyHash = strategyHash;
+            info.vaultChain = vaultChain;
+            info.vault = vault;
+            info.blessedUntil = until;
+            info.trustRoot = verifier.trustRoot();
+            info.verifier = address(verifier);
         }
-        emit Blessed(journal.signer, vaultChain, vault, strategyHash, journal.imageDigest, blessing.until);
+        emit Blessed(key, vaultChain, vault, strategyHash, journal.imageDigest, blessing.until);
     }
 
     function _target(

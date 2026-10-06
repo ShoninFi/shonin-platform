@@ -111,7 +111,7 @@ async fn pay(
 
 /// Wait for the review to be posted, then activate with the minimum tank and
 /// the modest allowances.
-async fn activate_it(
+pub async fn activate_it(
     chain: &Client,
     deployments: &Deployments,
     author: Address,

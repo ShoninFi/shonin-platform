@@ -23,9 +23,9 @@ contract RegistrySoundnessTest is Fixture {
         address vault = makeAddr("vault on base");
         bytes32 bundle = keccak256("bundle");
         bytes32 leaf =
-            keccak256(bytes.concat(keccak256(abi.encode(vaultChain, vault, bundle, block.chainid))));
+            keccak256(bytes.concat(keccak256(abi.encode(vaultChain, vault, bundle, block.chainid, executor))));
         bytes memory journal = journalFor(EXECUTOR_IMAGE, executor, leaf);
-        attestation.bless(sealOf(journal), journal, vaultChain, vault, bundle, new bytes32[](0));
+        attestation.bless(sealOf(journal), journal, vaultChain, vault, bundle, executor, new bytes32[](0));
 
         assertTrue(attestation.isBlessedFor(executor, vaultChain, vault, bundle));
         assertFalse(attestation.isBlessedFor(executor, block.chainid, vault, bundle));
@@ -35,7 +35,7 @@ contract RegistrySoundnessTest is Fixture {
         bytes memory seal = sealOf(journal);
         vm.chainId(block.chainid + 1);
         vm.expectRevert(AttestationRegistry.NotAmongTheVaults.selector);
-        attestation.bless(seal, journal, vaultChain, vault, bundle, new bytes32[](0));
+        attestation.bless(seal, journal, vaultChain, vault, bundle, executor, new bytes32[](0));
     }
 
     /// Two lowerings in a row: the second discards the first and waits the
@@ -69,13 +69,13 @@ contract RegistrySoundnessTest is Fixture {
                 imageDigest: BUILDER_IMAGE,
                 projectId: otherProject,
                 signer: builder,
-                vaultsRoot: serviceLeaf(),
+                vaultsRoot: serviceLeaf(builder),
                 issuedAt: uint64(vm.getBlockTimestamp())
             })
         );
         bytes memory seal = sealOf(journal);
         vm.expectRevert(AttestationRegistry.NotThisInstance.selector);
-        attestation.bless(seal, journal, 0, address(0), bytes32(0), new bytes32[](0));
+        attestation.bless(seal, journal, 0, address(0), bytes32(0), builder, new bytes32[](0));
     }
 
     // StrategyRegistry --------------------------------------------------------

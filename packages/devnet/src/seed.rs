@@ -110,10 +110,11 @@ const PLAN: &[Plan] = &[
 const WAIT_SECONDS: u64 = 600;
 
 /// How long, in seconds of the clock, the executor has to take a new vault
-/// on (stake its key with gas and have the key approved at the station)
-/// before the seed stops and says so, rather than waiting on an agent that
-/// never starts.
-const TAKE_ON_SECONDS: u64 = 180;
+/// on (its key blessed, stocked with gas by the keeper, and approved at the
+/// station) before the seed stops and says so, rather than waiting on an
+/// agent that never starts: the default of `--take-on-seconds`. Where a
+/// proof of the attestation is in the path, allow far longer.
+pub const TAKE_ON_SECONDS: u64 = 180;
 
 /// When a wait of `seconds` begun now ends, by the clock: a step's reads take
 /// their own time on a slow or rate-limited endpoint, so turns of a loop are
@@ -134,8 +135,14 @@ const STAYING_DEPOSIT: u64 = 5_000_000_000;
 /// With `live`, the vault is then used as the full seed's live vault is: a
 /// depositor's request priced at a later valuation, and all of it asked back
 /// once the agent has put part of it to work, booking a claim the keeper
-/// serves; then a little of the author's, so it keeps a depositor. On a testnet that is the proof the vault runs on a real
-/// chain, so each wait is long enough for a real chain's blocks.
+/// serves; then a little of the author's, so it keeps a depositor. On a
+/// testnet that is the proof the vault runs on a real chain, so each wait is
+/// long enough for a real chain's blocks.
+///
+/// With `publish_only`, it is published and nothing more: no vault is
+/// activated, and [`on_strategy`] runs the live part later (on a testnet
+/// whose development checker is retired in between, say).
+#[allow(clippy::too_many_arguments)]
 pub async fn one(
     client: &Client,
     vault_chain: shared::Chain,
@@ -144,6 +151,8 @@ pub async fn one(
     agents: Option<&Path>,
     name: &str,
     live: bool,
+    publish_only: bool,
+    take_on: u64,
 ) -> Result<()> {
     let agents = agents
         .map(Path::to_path_buf)
@@ -169,10 +178,21 @@ pub async fn one(
         project,
         author,
         false,
-        true,
+        !publish_only,
     )
     .await?;
     match published.outcome {
+        JobState::Ready if publish_only => {
+            let id = published.strategy_id.context("a ready job has an id")?;
+            tracing::info!(
+                slug = published.slug(vault_chain),
+                job = published.job_id,
+                "published; no vault activated"
+            );
+            // For the task that runs the live part later.
+            println!("strategy {id}");
+            Ok(())
+        }
         JobState::Ready => {
             tracing::info!(slug = published.slug(vault_chain), vault = ?published.vault, job = published.job_id, "published and activated");
             if live {
@@ -180,15 +200,66 @@ pub async fn one(
                     .vault
                     .context("the strategy was published but no vault was activated")?;
                 let slug = published.slug(vault_chain).unwrap_or_default();
-                let viewer = client.account(Role::Viewer)?;
-                deposit(client, deployments, vault, viewer, DEPOSIT).await?;
-                tracing::info!(slug, "a depositor asked to put money in");
-                claim(client, deployments, vault, &slug).await?;
+                used_live(client, deployments, vault, &slug, take_on).await?;
             }
             Ok(())
         }
         other => bail!("job {} ended {}", published.job_id, other.label()),
     }
+}
+
+/// The live part of [`one`] on a strategy already published: its vault
+/// activated if it has none yet, then a depositor in, a claim booked and
+/// paid, and a little of the author's left in. Nothing is published, so no
+/// build or review service is needed, and no checker but the one that
+/// blesses the executor.
+pub async fn on_strategy(
+    client: &Client,
+    vault_chain: shared::Chain,
+    deployments: &Deployments,
+    strategy: u64,
+    take_on: u64,
+) -> Result<()> {
+    use chain::bindings::strategies::IStrategyRegistry;
+    let id = U256::from(strategy);
+    let registered = client
+        .read(
+            deployments.strategies,
+            IStrategyRegistry::isRegisteredCall { strategyId: id },
+        )
+        .await?;
+    if !registered {
+        bail!("strategy {strategy} is not registered on this chain");
+    }
+    let slug = shared::Strategy::slug_for(vault_chain, strategy);
+    let mut vault = client
+        .read(
+            deployments.factory,
+            IVaultFactory::vaultOfCall { strategyId: id },
+        )
+        .await?;
+    if vault.is_zero() {
+        let author = client.account(Role::Author)?;
+        vault = crate::publish::activate_it(client, deployments, author, strategy).await?;
+        tracing::info!(slug, %vault, "activated");
+    } else {
+        tracing::info!(slug, %vault, "its vault is already activated");
+    }
+    used_live(client, deployments, vault, &slug, take_on).await
+}
+
+/// A depositor in, then the claim flow ([`claim`]).
+async fn used_live(
+    client: &Client,
+    deployments: &Deployments,
+    vault: alloy::primitives::Address,
+    slug: &str,
+    take_on: u64,
+) -> Result<()> {
+    let viewer = client.account(Role::Viewer)?;
+    deposit(client, deployments, vault, viewer, DEPOSIT).await?;
+    tracing::info!(slug, "a depositor asked to put money in");
+    claim(client, deployments, vault, slug, take_on).await
 }
 
 pub async fn run(
@@ -197,6 +268,7 @@ pub async fn run(
     deployments: &Deployments,
     api: &str,
     agents: Option<&Path>,
+    take_on: u64,
 ) -> Result<()> {
     let agents = agents
         .map(Path::to_path_buf)
@@ -249,7 +321,7 @@ pub async fn run(
             tracing::info!(slug, "and a depositor asked to put money in");
         }
         if plan.claim {
-            claim(client, deployments, vault, &slug).await?;
+            claim(client, deployments, vault, &slug, take_on).await?;
         }
         if plan.retired {
             wait_for_shares(client, vault, client.account(Role::Viewer)?).await?;
@@ -260,7 +332,7 @@ pub async fn run(
             tracing::info!(slug, "and then its author retired it");
         }
         if plan.killed {
-            killed(client, deployments, vault, &slug).await?;
+            killed(client, deployments, vault, &slug, take_on).await?;
         }
     }
 
@@ -327,7 +399,7 @@ async fn wait_for_shares(
     bail!("a deposit was never priced within {WAIT_SECONDS} s: is the keeper running?")
 }
 
-/// Wait, by the clock and for at most [`TAKE_ON_SECONDS`], until the
+/// Wait, by the clock and for at most `take_on` seconds, until the
 /// executor has taken the vault on: a key approved at its station for the
 /// strategy's first driver. If it hasn't, say so with the likeliest reason
 /// rather than wait on an agent that never starts.
@@ -336,13 +408,14 @@ async fn wait_taken_on(
     deployments: &Deployments,
     vault: alloy::primitives::Address,
     slug: &str,
+    take_on: u64,
 ) -> Result<()> {
     let station = client.read(vault, IVault::homeStationCall {}).await?;
     let spec = client.read(station, IStation::specCall {}).await?;
     let Some(driver) = spec.drivers.first().copied() else {
         return Ok(());
     };
-    let until = deadline(TAKE_ON_SECONDS);
+    let until = deadline(take_on);
     while tokio::time::Instant::now() < until {
         let key = client
             .read(station, IStation::approvedKeyCall { driver })
@@ -353,15 +426,18 @@ async fn wait_taken_on(
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
-    let executor = deployments.roles.executor;
-    let holds = client.balance(executor).await.unwrap_or_default();
+    let keeper = deployments.roles.keeper;
+    let holds = client.balance(keeper).await.unwrap_or_default();
     bail!(
-        "the executor has not taken {slug} ({vault}) on within {TAKE_ON_SECONDS} s: no key is \
-         approved at its station, so its agent never starts. The executor's log says why (\"could \
-         not take on this vault\"). Most often its account cannot stake the vault's key: it holds \
-         {} of the chain's coin, and on a public chain each vault's key is staked 0.0005 of it. \
-         Raise the executor's amount in config/funding.toml and run `task chains:fund \
-         NETWORK=testnet`.",
+        "the executor has not taken {slug} ({vault}) on within {take_on} s: no key is approved at \
+         its station, so its agent never starts. The vault's key is made by the executor, blessed \
+         by a bless the keeper relays once the executor publishes a seal for it (in an enclave, \
+         once the prover has proved its token), stocked with gas by the keeper once blessed, and \
+         then approved at the station by the key itself. The executor's /attestation and log and \
+         the keeper's log say which step is missing. The keeper holds {} of the chain's coin, and \
+         stocks each vault key with three worst-case sends: if it is short, raise its amount in \
+         config/funding.toml and run `task chains:fund NETWORK=testnet`. With a proof in the \
+         path, allow longer with --take-on-seconds.",
         alloy::primitives::utils::format_ether(holds)
     )
 }
@@ -407,10 +483,11 @@ async fn claim(
     deployments: &Deployments,
     vault: alloy::primitives::Address,
     slug: &str,
+    take_on: u64,
 ) -> Result<()> {
     use chain::bindings::venue::ILocalVenue;
     let leaver = client.account(Role::Viewer)?;
-    wait_taken_on(client, deployments, vault, slug).await?;
+    wait_taken_on(client, deployments, vault, slug, take_on).await?;
     let shares = wait_for_shares(client, vault, leaver).await?;
     tracing::info!(slug, %shares, "the deposit was priced at a later valuation");
     let station = client.read(vault, IVault::homeStationCall {}).await?;
@@ -596,9 +673,10 @@ async fn killed(
     deployments: &Deployments,
     vault: alloy::primitives::Address,
     slug: &str,
+    take_on: u64,
 ) -> Result<()> {
     let viewer = client.account(Role::Viewer)?;
-    wait_taken_on(client, deployments, vault, slug).await?;
+    wait_taken_on(client, deployments, vault, slug, take_on).await?;
     let shares = wait_for_shares(client, vault, viewer).await?;
     let until = deadline(WAIT_SECONDS);
     while tokio::time::Instant::now() < until {

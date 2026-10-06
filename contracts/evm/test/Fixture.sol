@@ -241,27 +241,42 @@ contract Fixture is Test {
 
     /// A builder or a reviewer key: it serves every strategy and no vault.
     function blessServiceKey(bytes32 image, address signer) internal {
-        bytes memory journal = journalFor(image, signer, serviceLeaf());
-        attestation.bless(sealOf(journal), journal, 0, address(0), bytes32(0), new bytes32[](0));
+        bytes memory journal = journalFor(image, signer, serviceLeaf(signer));
+        attestation.bless(sealOf(journal), journal, 0, address(0), bytes32(0), signer, new bytes32[](0));
     }
 
-    /// The leaf a builder or a reviewer commits to: no vault, on this chain.
-    function serviceLeaf() internal view returns (bytes32) {
-        return
-            keccak256(bytes.concat(keccak256(abi.encode(uint256(0), address(0), bytes32(0), block.chainid))));
+    /// The leaf a builder or a reviewer commits to for its key: no vault, on
+    /// this chain.
+    function serviceLeaf(address key) internal view returns (bytes32) {
+        return keyLeaf(0, address(0), bytes32(0), key);
     }
 
-    /// The leaf an instance commits to for one vault and one bundle, on this
-    /// chain.
-    function leafFor(address vault, bytes32 strategyHash) internal view returns (bytes32) {
-        return
-            keccak256(bytes.concat(keccak256(abi.encode(block.chainid, vault, strategyHash, block.chainid))));
+    /// The leaf an instance commits to for the key it holds for one vault and
+    /// one bundle, on this chain.
+    function leafFor(address vault, bytes32 strategyHash, address key) internal view returns (bytes32) {
+        return keyLeaf(block.chainid, vault, strategyHash, key);
     }
 
-    /// An executor key: it may act for one vault running one bundle.
+    /// The leaf the registry checks: the vault, the bundle, the chain the
+    /// blessing is sent on, and the key.
+    function keyLeaf(
+        uint256 vaultChain,
+        address vault,
+        bytes32 strategyHash,
+        address key
+    ) internal view returns (bytes32) {
+        return keccak256(
+            bytes.concat(keccak256(abi.encode(vaultChain, vault, strategyHash, block.chainid, key)))
+        );
+    }
+
+    /// An executor key: it may act for one vault running one bundle. The
+    /// instance's own key is the one blessed here.
     function blessExecutorKey(address signer, address vault, bytes32 strategyHash) internal {
-        bytes memory journal = journalFor(EXECUTOR_IMAGE, signer, leafFor(vault, strategyHash));
-        attestation.bless(sealOf(journal), journal, block.chainid, vault, strategyHash, new bytes32[](0));
+        bytes memory journal = journalFor(EXECUTOR_IMAGE, signer, leafFor(vault, strategyHash, signer));
+        attestation.bless(
+            sealOf(journal), journal, block.chainid, vault, strategyHash, signer, new bytes32[](0)
+        );
     }
 
     /// The prices the Rust side publishes: $0.15 a core-hour, $0.01 a

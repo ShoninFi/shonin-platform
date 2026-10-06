@@ -80,7 +80,9 @@ contract OnlyTheKeyInPlaceIsWithdrawnOnLighterTest is LighterVault {
         skip(TIMELOCK);
         fresh = vm.addr(0xF4E5);
         bytes32 bundle = station.spec().bundleHash;
-        bytes memory journal = journalFor(freshImage, fresh, leafFor(address(vault), bundle));
-        attestation.bless(sealOf(journal), journal, block.chainid, address(vault), bundle, new bytes32[](0));
+        bytes memory journal = journalFor(freshImage, fresh, leafFor(address(vault), bundle, fresh));
+        attestation.bless(
+            sealOf(journal), journal, block.chainid, address(vault), bundle, fresh, new bytes32[](0)
+        );
     }
 }

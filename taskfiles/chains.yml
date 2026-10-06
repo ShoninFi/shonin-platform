@@ -72,10 +72,35 @@ tasks:
       - "{{.DEVNET}} accounts"
 
   checker:
-    desc: "Deploy the Confidential Space checker and propose it beside the development checker on every EVM chain of the network (local or NETWORK=testnet)"
+    desc: "Propose the Confidential Space checker beside the development checker on every EVM chain of the network: the one named in the deployments directory's attestation-<chain>.json if it is on the chain, else a new one (local or NETWORK=testnet)"
     cmds:
       - task: :contracts:build
       - "{{.DEVNET}} propose-checker"
+
+  image:
+    desc: "Propose a real image digest on every EVM chain's registry, as the admin (DIGEST=sha256:<hex> KIND=executor|builder|reviewer|unwinder; NETWORK=testnet); already proposed is done"
+    requires:
+      vars: [DIGEST, KIND]
+    cmds:
+      - "{{.DEVNET}} propose-image --digest {{.DIGEST}} --kind {{.KIND}}"
+
+  project:
+    desc: "Propose an operator's Google Cloud project (its keccak256) on every EVM chain's registry, as the admin (PROJECT=<project id>; NETWORK=testnet); already proposed is done"
+    requires:
+      vars: [PROJECT]
+    cmds:
+      - "{{.DEVNET}} propose-project {{.PROJECT}}"
+
+  retire-dev-checker:
+    desc: "Retire the development checker on every EVM chain, as the admin; refused where no other checker is allowed (NETWORK=testnet)"
+    cmds:
+      - "{{.DEVNET}} retire-checker --dev"
+
+  allow-dev-checker:
+    desc: "Deploy and propose a fresh development checker on every EVM chain, for a publish only it can bless; retire it again after (NETWORK=testnet)"
+    cmds:
+      - task: :contracts:build
+      - "{{.DEVNET}} allow-dev-checker"
 
   fund:
     desc: "Top every role up on every EVM testnet from the funder, buying HYPE on HyperCore for HyperEVM; safe to run again (NETWORK=testnet only)"

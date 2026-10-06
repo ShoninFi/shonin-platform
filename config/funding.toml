@@ -6,34 +6,41 @@
 # The funder keeps `reserve` for itself and funds nothing past it: a role it
 # can't fully top up is reported, not half-funded.
 #
-# The executor stakes each vault's key with gas before it takes the vault on:
-# 0.0005 of the chain's coin a vault on a public chain (more if three of the
-# key's sends cost more). Its amount must cover a stake for every vault a run
-# makes (the full seed activates four) and its own sends, or a vault is taken
-# on by nobody and its agent never starts.
+# The executor holds no role account: the keeper relays every blessing the
+# executor publishes and, once the chain shows a vault's key blessed, stakes
+# that key with gas: 0.0005 of the chain's coin on a public chain, or three
+# of the key's worst-case sends if that is more. So the keeper's amount
+# covers a stake for every vault key a run makes (the full seed activates
+# four; a handover makes one more), the blessings it relays (a Groth16 check
+# is a few hundred thousand gas, renewed every day or so) and its own sends,
+# or a vault is taken on by nobody and its agent never starts. The executor
+# role is given nothing.
 
 [testnet."evm:84532"] # Base Sepolia, ETH
 reserve = 0.01
 default = 0.004
 admin = 0.03
-executor = 0.01
-keeper = 0.01
+executor = 0
+keeper = 0.02
 author = 0.008
 
 [testnet."evm:998"] # Hyperliquid testnet's HyperEVM, HYPE
 reserve = 0.05
 default = 0.03
 admin = 0.4
-executor = 0.1
-keeper = 0.1
+executor = 0
+keeper = 0.2
 author = 0.06
 
+# The funder here is thin (a few thousandths of an ETH), so only what one
+# live vault needs: two vault-key stakes (one for a handover), the blessings
+# and the keeper's own sends.
 [testnet."evm:46630"] # Robinhood Chain testnet, ETH
 reserve = 0.0015
 default = 0.0003
 admin = 0.004
-executor = 0.004
-keeper = 0.001
+executor = 0
+keeper = 0.002
 author = 0.001
 
 # On Hyperliquid testnet the funder holds dollars on HyperCore and no HYPE on

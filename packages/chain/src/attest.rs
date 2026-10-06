@@ -106,18 +106,16 @@ async fn bless(
     bundle: B256,
 ) -> Result<KeyInfo> {
     let image = image_digest(service);
-    // The one pair this instance holds a key for. A larger instance would
-    // commit to a root over many and prove one of them here.
     // The vault is on this chain: a vault on another chain is served by its
     // station here, which is blessed against the vault chain's id.
     let vault_chain = vault_chain(deployments, vault);
     // The one leaf this instance holds a key for: a vault and its bundle, or
-    // for a builder or a reviewer, no vault, on this chain. A larger instance
-    // would commit to a root over many and prove one of them here.
+    // for a builder or a reviewer, no vault, on this chain, naming the key.
+    // Here the instance's own key is the one blessed; an instance holding
+    // several keys commits to a root over all their leaves (see
+    // [`merkle_root`]) and proves each with [`merkle_proof`].
     let this_chain = U256::from(deployments.chain_id);
-    let root = keccak256(keccak256(
-        (vault_chain, vault, bundle, this_chain).abi_encode(),
-    ));
+    let root = key_leaf(vault_chain, vault, bundle, this_chain, key);
     // A blessing runs a TTL from when the instance attested, by the chain's
     // own clock, dated a little back: a public RPC is often several nodes
     // behind one name, and the registry refuses an attestation from after
@@ -162,6 +160,7 @@ async fn bless(
                 vaultChain: vault_chain,
                 vault,
                 strategyHash: bundle,
+                key,
                 merkleProof: Vec::new(),
             };
             match &sender {
@@ -209,6 +208,87 @@ async fn bless(
         )
         .await
         .context("reading back what was blessed")
+}
+
+/// The leaf an instance commits to for one key: the vault and bundle the key
+/// acts for (zero for a builder's or a reviewer's), the chain the blessing is
+/// sent on, and the key. It matches `AttestationRegistry.bless`:
+/// `keccak256(bytes.concat(keccak256(abi.encode(vaultChain, vault,
+/// strategyHash, block.chainid, key))))`.
+pub fn key_leaf(
+    vault_chain: U256,
+    vault: Address,
+    strategy_hash: B256,
+    this_chain: U256,
+    key: Address,
+) -> B256 {
+    keccak256(keccak256(
+        (vault_chain, vault, strategy_hash, this_chain, key).abi_encode(),
+    ))
+}
+
+/// One level up the tree: the pair hashed in sorted order, as OpenZeppelin's
+/// `MerkleProof` does.
+fn hash_pair(a: B256, b: B256) -> B256 {
+    let (low, high) = if a <= b { (a, b) } else { (b, a) };
+    let mut both = [0u8; 64];
+    both[..32].copy_from_slice(low.as_slice());
+    both[32..].copy_from_slice(high.as_slice());
+    keccak256(both)
+}
+
+/// Each level of the tree over `leaves`, the leaves first and the root last.
+/// Leaves are paired in the order given; a node left without a partner is
+/// carried up as it is.
+fn levels(leaves: &[B256]) -> Vec<Vec<B256>> {
+    let mut levels = vec![leaves.to_vec()];
+    while levels.last().is_some_and(|level| level.len() > 1) {
+        let below = levels.last().expect("a level");
+        let above = below
+            .chunks(2)
+            .map(|pair| match pair {
+                [a, b] => hash_pair(*a, *b),
+                [lone] => *lone,
+                _ => unreachable!("chunks of two"),
+            })
+            .collect();
+        levels.push(above);
+    }
+    levels
+}
+
+/// The root over `leaves`, as the registry checks it: zero for none, the leaf
+/// itself for one.
+pub fn merkle_root(leaves: &[B256]) -> B256 {
+    levels(leaves)
+        .last()
+        .and_then(|top| top.first().copied())
+        .unwrap_or(B256::ZERO)
+}
+
+/// The proof that `leaves[index]` is under [`merkle_root`]`(leaves)`, as
+/// OpenZeppelin's `MerkleProof.verify` takes it: the sibling at each level,
+/// bottom up, a level where the node has no sibling contributing nothing.
+/// Empty for one leaf.
+///
+/// # Panics
+///
+/// If `index` is not a leaf's.
+pub fn merkle_proof(leaves: &[B256], index: usize) -> Vec<B256> {
+    assert!(
+        index < leaves.len(),
+        "no leaf {index} among {}",
+        leaves.len()
+    );
+    let mut proof = Vec::new();
+    let mut at = index;
+    for level in levels(leaves).iter().take_while(|level| level.len() > 1) {
+        if let Some(sibling) = level.get(at ^ 1) {
+            proof.push(*sibling);
+        }
+        at /= 2;
+    }
+    proof
 }
 
 /// Which chain the vault a key is blessed for is on: none for a key that
@@ -465,6 +545,104 @@ pub fn kind_of(service: &str) -> ImageKind {
 mod tests {
     use super::*;
     use crate::client::NeverLanded;
+
+    /// OpenZeppelin's `MerkleProof.processProof` and `verify`, word for word.
+    fn oz_verify(proof: &[B256], root: B256, leaf: B256) -> bool {
+        proof
+            .iter()
+            .fold(leaf, |computed, sibling| hash_pair(computed, *sibling))
+            == root
+    }
+
+    fn leaves(count: usize) -> Vec<B256> {
+        (0..count)
+            .map(|i| {
+                key_leaf(
+                    U256::from(46_630),
+                    Address::repeat_byte(i as u8 + 1),
+                    B256::repeat_byte(0x5b),
+                    U256::from(46_630),
+                    Address::repeat_byte(0xa0 + i as u8),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_leaf_s_proof_verifies_under_the_root_by_openzeppelin_s_rule() {
+        for count in 1..=9 {
+            let leaves = leaves(count);
+            let root = merkle_root(&leaves);
+            for (index, leaf) in leaves.iter().enumerate() {
+                let proof = merkle_proof(&leaves, index);
+                assert!(oz_verify(&proof, root, *leaf), "leaf {index} of {count}");
+                // And no other leaf passes with this leaf's proof.
+                for (other, wrong) in leaves.iter().enumerate() {
+                    if other != index && count > 1 {
+                        assert!(
+                            !oz_verify(&proof, root, *wrong),
+                            "leaf {other} with {index}'s proof"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_leaf_is_its_own_root_and_none_is_zero() {
+        let one = leaves(1);
+        assert_eq!(merkle_root(&one), one[0]);
+        assert!(merkle_proof(&one, 0).is_empty());
+        assert_eq!(merkle_root(&[]), B256::ZERO);
+    }
+
+    /// The vector `KeysInTheLeaves.t.sol` checks on the contract side: the
+    /// registry's own leaf and OpenZeppelin's `verify`, over three leaves.
+    #[test]
+    fn the_leaf_and_the_proof_match_the_contract_s_vector() {
+        let key = |byte| Address::repeat_byte(byte);
+        let leaves = [
+            key_leaf(
+                U256::from(31_337),
+                key(0x0a),
+                B256::repeat_byte(0x5b),
+                U256::from(31_337),
+                key(0xe1),
+            ),
+            key_leaf(
+                U256::from(31_337),
+                key(0x0b),
+                B256::repeat_byte(0x5b),
+                U256::from(31_337),
+                key(0xe2),
+            ),
+            key_leaf(
+                U256::ZERO,
+                Address::ZERO,
+                B256::ZERO,
+                U256::from(31_337),
+                key(0xe3),
+            ),
+        ];
+        assert_eq!(
+            leaves[0],
+            "0x13bff5568b694d0a5bcff54736167b4950f3e40d1e91348b917fe483c6af5fb3"
+                .parse::<B256>()
+                .unwrap()
+        );
+        let root = merkle_root(&leaves);
+        assert_eq!(
+            root,
+            "0x84ab51bbb5eef0d7b04749b37284b518840833bdee69bad44be90f861b3c40cd"
+                .parse::<B256>()
+                .unwrap()
+        );
+        assert_eq!(
+            merkle_proof(&leaves, 2),
+            vec![hash_pair(leaves[0], leaves[1])]
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn a_renewal_is_not_sent_again_while_an_unanswered_one_may_still_land() {

@@ -1125,7 +1125,11 @@ async fn put_everywhere(
 }
 
 /// A contract's creation code, with `libraries` linked in where it calls them.
-fn creation_code(artifacts: &Path, name: &str, libraries: &[(&str, Address)]) -> Result<Vec<u8>> {
+pub(crate) fn creation_code(
+    artifacts: &Path,
+    name: &str,
+    libraries: &[(&str, Address)],
+) -> Result<Vec<u8>> {
     let path = artifacts
         .join(format!("{name}.sol"))
         .join(format!("{name}.json"));

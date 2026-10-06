@@ -78,22 +78,27 @@ interface IAttestationRegistry {
         uint64 blessedUntil
     );
 
-    /// Bless the key the attested instance generated.
+    /// Bless `key`, a key the attested instance generated, for one vault
+    /// and bundle (or, for a builder or a reviewer, for none).
     ///
     /// `journal` is what the instance attested to: the image it is, the
-    /// project it runs in, the key it generated, the root of the
-    /// (vault chain, vault, bundle, chain) leaves it holds keys for, and when
-    /// it attested. `seal` is the proof over that journal. `merkleProof` shows
-    /// that this vault and this bundle, on this chain, are among them; a
-    /// builder or a reviewer proves the leaf with no vault, on this chain.
-    /// Anyone may send it, and sending it again changes nothing: a blessing
-    /// lasts a TTL from the attestation, not from the transaction.
+    /// project it runs in, its own key (which names the instance and is not
+    /// blessed by this call), the root of the
+    /// (vault chain, vault, bundle, chain, key) leaves it holds keys for, and
+    /// when it attested. `seal` is the proof over that journal. `merkleProof`
+    /// shows that this vault and this bundle, on this chain, with `key`,
+    /// are among them; a builder or a reviewer proves the leaf with no vault
+    /// and its own key, on this chain. One proof so blesses every key the
+    /// instance holds, each for its own vault only. Anyone may send it, and
+    /// sending it again changes nothing: a blessing lasts a TTL from the
+    /// attestation, not from the transaction.
     function bless(
         bytes calldata seal,
         bytes calldata journal,
         uint256 vaultChain,
         address vault,
         bytes32 strategyHash,
+        address key,
         bytes32[] calldata merkleProof
     ) external;
 
