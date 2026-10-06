@@ -2,10 +2,11 @@
 //!
 //! Testnet and mainnet number perps, spot pairs and tokens differently, and
 //! testnet lists look-alike tokens under the same names, so nothing here is a
-//! table: every number is read from the venue, and a spot name that two
-//! tokens share is refused.
+//! table: every number is read from the venue. A token is told apart by the
+//! venue's number for it, never its name: a pair whose token shares its name
+//! with another is named by the venue's own name for the pair (`@<index>`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -13,6 +14,8 @@ use serde_json::{Value, json};
 use crate::api::Api;
 use crate::payload::Decimal;
 
+/// The dollar on HyperCore, by the venue's number for it.
+const USDC_TOKEN: u64 = 0;
 /// Spot order assets are the pair's index plus this.
 pub const SPOT_ASSET_OFFSET: u32 = 10_000;
 /// Decimals a perp price may carry, less the market's size decimals.
@@ -112,6 +115,13 @@ pub fn plain(value: Decimal) -> Result<String> {
 pub struct Markets {
     by_name: BTreeMap<String, Market>,
     by_coin: BTreeMap<String, String>,
+    /// Each spot token's name, by the venue's number for it.
+    tokens: BTreeMap<u64, String>,
+    /// Each name more than one spot token is listed under.
+    shared: BTreeSet<String>,
+    /// Each perp the venue lists and no agent may open, by its number: its
+    /// name, and why.
+    untradable: BTreeMap<u32, (String, &'static str)>,
     /// The dollar on the spot market: its wire name for a send.
     pub usdc_wire: String,
 }
@@ -136,9 +146,17 @@ impl Markets {
             };
             // A delisted perp, or one that trades only isolated, is not one
             // a station's agent may open.
-            if perp["isDelisted"].as_bool() == Some(true)
-                || perp["onlyIsolated"].as_bool() == Some(true)
-            {
+            let why = if perp["isDelisted"].as_bool() == Some(true) {
+                Some("the venue has delisted it")
+            } else if perp["onlyIsolated"].as_bool() == Some(true) {
+                Some("the venue trades it isolated only")
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                markets
+                    .untradable
+                    .insert(index as u32, (name.to_string(), why));
                 continue;
             }
             markets.insert(Market {
@@ -155,7 +173,10 @@ impl Markets {
         let tokens = spot["tokens"]
             .as_array()
             .ok_or_else(|| anyhow!("spotMeta has no tokens"))?;
-        let usdc = unique_token(tokens, "USDC")?;
+        let usdc = tokens
+            .iter()
+            .find(|t| t["index"].as_u64() == Some(USDC_TOKEN))
+            .ok_or_else(|| anyhow!("the venue lists no token numbered {USDC_TOKEN}"))?;
         markets.usdc_wire = format!(
             "USDC:{}",
             usdc["tokenId"]
@@ -171,11 +192,11 @@ impl Markets {
             else {
                 continue;
             };
-            if Some(index) == usdc_index {
-                continue;
-            }
-            // A name two tokens share names neither.
+            markets.tokens.insert(index, name.to_string());
             if tokens.iter().filter(|t| t["name"] == name).count() != 1 {
+                markets.shared.insert(name.to_string());
+            }
+            if Some(index) == usdc_index {
                 continue;
             }
             let Some(pair) = pairs.iter().find(|pair| {
@@ -187,13 +208,21 @@ impl Markets {
             let Some(pair_index) = pair["index"].as_u64() else {
                 continue;
             };
+            let coin = pair["name"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("@{pair_index}"));
+            // A name two tokens share names neither's pair: each is named by
+            // the venue's own name for it, which no other pair has.
+            let shared = markets.shared.contains(name);
             markets.insert(Market {
-                name: format!("{name}/USDC"),
+                name: if shared {
+                    coin.clone()
+                } else {
+                    format!("{name}/USDC")
+                },
                 asset: SPOT_ASSET_OFFSET + pair_index as u32,
-                coin: pair["name"]
-                    .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("@{pair_index}")),
+                coin,
                 sz_decimals: token["szDecimals"].as_u64().unwrap_or(0) as u32,
                 kind: Kind::Spot {
                     pair: pair_index as u32,
@@ -228,6 +257,29 @@ impl Markets {
             .find(|m| !m.is_spot() && m.asset == index)
     }
 
+    /// The name and why of a perp the venue lists as `index` and no agent
+    /// may open.
+    pub fn untradable_perp(&self, index: u32) -> Option<&(String, &'static str)> {
+        self.untradable.get(&index)
+    }
+
+    /// The name of the spot token the venue numbers `index`.
+    pub fn token_name(&self, index: u64) -> Option<&str> {
+        self.tokens.get(&index).map(String::as_str)
+    }
+
+    /// The name a balance of the token the venue numbers `index`, and calls
+    /// `coin`, is reported under, which no other token's balance has: the
+    /// dollar's and any other token's own name when no other token is
+    /// listed under it, and otherwise (or when the token was listed after
+    /// these markets were read) `<coin>:<index>`.
+    pub fn balance_name(&self, index: u64, coin: &str) -> String {
+        match self.tokens.get(&index) {
+            Some(name) if index == USDC_TOKEN || !self.shared.contains(name) => name.clone(),
+            _ => format!("{coin}:{index}"),
+        }
+    }
+
     /// The spot pair the venue numbers `pair`.
     pub fn spot_pair(&self, pair: u32) -> Option<&Market> {
         self.by_name
@@ -241,15 +293,6 @@ impl Markets {
 
     pub fn is_empty(&self) -> bool {
         self.by_name.is_empty()
-    }
-}
-
-fn unique_token<'a>(tokens: &'a [Value], name: &str) -> Result<&'a Value> {
-    let mut found = tokens.iter().filter(|t| t["name"] == name);
-    match (found.next(), found.next()) {
-        (Some(token), None) => Ok(token),
-        (None, _) => bail!("the venue lists no token named {name}"),
-        _ => bail!("the venue lists more than one token named {name}"),
     }
 }
 
@@ -296,11 +339,28 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn delisted_isolated_only_and_look_alike_markets_are_not_listed() {
+    fn delisted_and_isolated_only_perps_are_not_listed_and_look_alike_tokens_are_told_apart() {
         let markets = sample();
         assert!(markets.get("OLD").is_none());
         assert!(markets.get("ISO").is_none());
+        assert_eq!(
+            markets.untradable_perp(1),
+            Some(&("OLD".to_string(), "the venue has delisted it"))
+        );
+        assert!(markets.untradable_perp(3).is_some());
+        // Two tokens named FAKE: neither is FAKE/USDC, and the one with a
+        // pair is named by the venue's own name for it.
         assert!(markets.get("FAKE/USDC").is_none());
+        let fake = markets.get("@3").unwrap();
+        assert_eq!(fake.asset, 10_003);
+        assert_eq!(
+            fake.kind,
+            Kind::Spot {
+                pair: 3,
+                base_token: 7
+            }
+        );
+        assert_eq!(markets.token_name(1105), Some("HYPE"));
     }
 
     #[test]

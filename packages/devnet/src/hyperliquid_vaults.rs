@@ -36,16 +36,14 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, U256};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::{SolCall, SolValue};
 use anyhow::{Context, Result, anyhow, bail};
 use chain::bindings::attestation::IAttestationRegistry;
 use chain::bindings::erc20::IERC20;
 use chain::bindings::factory::IVaultFactory;
-use chain::bindings::station::IStationFactory;
 use chain::bindings::vault::{ClaimState, IVault};
 use chain::{Client, Deployments, Role};
 use hyperliquid::{Api, HyperCore};
@@ -91,6 +89,12 @@ pub struct HyperliquidVaults {
     pub factory: Address,
     /// The deployment's own factory, which this one replaces.
     pub previous_factory: Address,
+    /// The generation of the deployment this stack was deployed beside, as
+    /// its file records it; `None` for a stack or a deployment from before
+    /// deployments recorded one. A stack is only kept beside a deployment of
+    /// its own generation.
+    #[serde(default)]
+    pub generation: Option<u64>,
 }
 
 impl HyperliquidVaults {
@@ -117,6 +121,7 @@ pub async fn ensure(
     client: &Client,
     artifacts: &Path,
     deployments: &Deployments,
+    generation: Option<u64>,
     file: &Path,
 ) -> Result<HyperliquidVaults> {
     if client.chain_id != CHAIN_ID {
@@ -128,7 +133,11 @@ pub async fn ensure(
     if let Ok(text) = std::fs::read_to_string(file) {
         let vaults: HyperliquidVaults =
             serde_json::from_str(&text).with_context(|| format!("reading {}", file.display()))?;
-        let mut all_there = vaults.previous_factory == deployments.factory;
+        // The deployment as deployed, or as adopted with this factory in
+        // place.
+        let mut all_there = (vaults.previous_factory == deployments.factory
+            || vaults.factory == deployments.factory)
+            && vaults.generation == generation;
         for address in [
             vaults.driver,
             vaults.station_implementation,
@@ -142,11 +151,11 @@ pub async fn ensure(
             return Ok(vaults);
         }
         tracing::warn!(
-            "{} names contracts that aren't there, or another deployment's factory: deploying again",
+            "{} names contracts that aren't there, or another deployment's factory or generation: deploying again",
             file.display()
         );
     }
-    let vaults = deploy(client, artifacts, deployments).await?;
+    let vaults = deploy(client, artifacts, deployments, generation).await?;
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -154,19 +163,29 @@ pub async fn ensure(
     // The deployment as the services would read it with this factory in
     // place, ready to be put where they read it once they run code that
     // knows the driver.
+    // It carries the deployment's generation, as the chain's own file does.
     let adopted_file = file.with_extension("deployment.json");
-    std::fs::write(
-        &adopted_file,
-        serde_json::to_string_pretty(&adopted(deployments, &vaults))? + "\n",
-    )?;
+    let adopted = adopted(deployments, &vaults);
+    let adopted_text = match generation {
+        Some(generation) => crate::deploy::deployment_json(&adopted, generation)?,
+        None => serde_json::to_string_pretty(&adopted)?,
+    };
+    std::fs::write(&adopted_file, adopted_text + "\n")?;
     tracing::info!(file = %file.display(), deployment = %adopted_file.display(), "the Hyperliquid vault stack is written");
     Ok(vaults)
 }
 
+/// Deploy the stack. Its station factory is deployed afresh (not at an
+/// address shared across chains: a Hyperliquid vault's station is on
+/// HyperEVM alone), so no earlier stack's can be met; it is still read back
+/// once initialised and refused, naming what differs, if it names anything
+/// but this stack's vault factory, USDC, the registry and this stack's
+/// station implementation.
 async fn deploy(
     client: &Client,
     artifacts: &Path,
     deployments: &Deployments,
+    generation: Option<u64>,
 ) -> Result<HyperliquidVaults> {
     let admin = deployments.roles.admin;
     let api = Api::for_chain(client.chain_id).ok_or_else(|| anyhow!("not HyperEVM"))?;
@@ -196,7 +215,9 @@ async fn deploy(
         (USDC, CORE_DEPOSIT_WALLET, vec![perp], vec![spot_pair]).abi_encode_params(),
     )
     .await?;
-    let station_implementation = put(client, artifacts, admin, "Station", Vec::new()).await?;
+    // The station's closes run in a library linked into it.
+    let closes = put(client, artifacts, admin, "StationCloses", Vec::new()).await?;
+    let station_implementation = put_with(client, artifacts, admin, "Station", closes).await?;
     let station_factory = put(
         client,
         artifacts,
@@ -237,19 +258,18 @@ async fn deploy(
             .abi_encode_params(),
     )
     .await?;
-    client
-        .send(
-            admin,
-            station_factory,
-            IStationFactory::initializeCall {
-                attestation_: deployments.attestation,
-                asset_: USDC,
-                vaultFactory_: factory,
-                implementation_: station_implementation,
-            },
-        )
-        .await
-        .context("initialising the station factory")?;
+    crate::deploy::initialise_station_factory(
+        client,
+        admin,
+        station_factory,
+        crate::deploy::StationFactorySet {
+            attestation: deployments.attestation,
+            asset: USDC,
+            vault_factory: factory,
+            implementation: station_implementation,
+        },
+    )
+    .await?;
     client
         .send(
             admin,
@@ -273,6 +293,7 @@ async fn deploy(
         station_factory,
         factory,
         previous_factory: previous,
+        generation,
     })
 }
 
@@ -297,6 +318,28 @@ async fn put(
     name: &str,
     arguments: Vec<u8>,
 ) -> Result<Address> {
+    put_linking(client, artifacts, from, name, arguments, None).await
+}
+
+/// A contract that links one library, at `library`.
+async fn put_with(
+    client: &Client,
+    artifacts: &Path,
+    from: Address,
+    name: &str,
+    library: Address,
+) -> Result<Address> {
+    put_linking(client, artifacts, from, name, Vec::new(), Some(library)).await
+}
+
+async fn put_linking(
+    client: &Client,
+    artifacts: &Path,
+    from: Address,
+    name: &str,
+    arguments: Vec<u8>,
+    library: Option<Address>,
+) -> Result<Address> {
     let path = artifacts
         .join(format!("{name}.sol"))
         .join(format!("{name}.json"));
@@ -307,13 +350,23 @@ async fn put(
         )
     })?;
     let artifact: serde_json::Value = serde_json::from_str(&text)?;
-    let hex = artifact["bytecode"]["object"]
+    let mut hex = artifact["bytecode"]["object"]
         .as_str()
-        .ok_or_else(|| anyhow!("{name} has no bytecode"))?;
+        .ok_or_else(|| anyhow!("{name} has no bytecode"))?
+        .to_string();
+    // Each place the library is called holds a 40-character placeholder.
+    if let Some(library) = library {
+        while let Some(start) = hex.find("__$") {
+            hex.replace_range(start..start + 40, &alloy::hex::encode(library));
+        }
+    }
     let mut bytecode = alloy::hex::decode(hex.trim_start_matches("0x"))
         .with_context(|| format!("{name}'s bytecode (it links no libraries)"))?;
     bytecode.extend_from_slice(&arguments);
-    let address = client.deploy(from, bytecode).await?;
+    // A fixed gas limit on HyperEVM rather than an endpoint's estimate.
+    let address = client
+        .deploy_with_gas_limit(from, bytecode, crate::deploy::creation_gas(client))
+        .await?;
     tracing::info!(%address, contract = name, "deployed");
     Ok(address)
 }
@@ -325,7 +378,6 @@ pub struct Funder {
     core: HyperCore,
     api: Api,
     signer: PrivateKeySigner,
-    rpc: String,
 }
 
 impl Funder {
@@ -336,13 +388,6 @@ impl Funder {
             core: HyperCore::new(api.clone(), signer.clone()),
             api,
             signer,
-            // A chain may name several endpoints, one after another.
-            rpc: client
-                .rpc_url
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .to_string(),
         })
     }
 
@@ -356,9 +401,9 @@ impl Funder {
         dollars: f64,
     ) -> Result<()> {
         let me = self.signer.address();
-        let provider = ProviderBuilder::new()
-            .wallet(EthereumWallet::from(self.signer.clone()))
-            .connect_http(self.rpc.parse()?);
+        // Through the client's own connection: an endpoint's URL may carry
+        // a key, and an error must never name it.
+        let provider = client.signing_provider(self.signer.clone())?;
         let wanted = U256::from((dollars * 1e6).round() as u64);
         // Someone who already holds it is given nothing more.
         if client
@@ -416,27 +461,128 @@ impl Funder {
         Ok(())
     }
 
-    /// Fund a station's HyperCore account directly: `dollars` to its perp
-    /// balance (which brings the account into being, for the venue's $1),
-    /// and a little HYPE on its spot side for the sends home its closes
-    /// make.
+    /// Fund a station's HyperCore account directly, as far as it isn't
+    /// already: `dollars` to its perp balance (which brings the account into
+    /// being, for the venue's $1) unless its account is already worth that,
+    /// and HYPE on its spot side up to `hype`, for the sends home its closes
+    /// make. The funder buys the HYPE first if it holds too little. Safe to
+    /// run again: what is there is not sent twice.
     pub async fn station_account(&self, station: Address, dollars: f64, hype: f64) -> Result<()> {
-        self.core
-            .usd_send(station, dollars)
-            .await
-            .context("sending the station's account its dollars")?;
-        let token = self.api.spot_token(SPOT).await?;
-        self.core
-            .spot_send(station, &token, hype)
-            .await
-            .context("sending the station's account HYPE for its sends")?;
-        tracing::info!(%station, dollars, hype, "the station's HyperCore account is funded");
+        // A read that fails stops here: taken for an empty account, the
+        // station would be sent its dollars and HYPE again.
+        let worth = account_value(&self.api, station).await?;
+        if worth < dollars * 0.9 {
+            self.core
+                .usd_send(station, dollars)
+                .await
+                .context("sending the station's account its dollars")?;
+            tracing::info!(%station, millionths = (dollars * 1e6).round() as u64, "the station's HyperCore account was sent dollars");
+        } else {
+            tracing::info!(%station, worth, "the station's HyperCore account already holds its dollars");
+        }
+        let held = spot_total(&self.api, station, SPOT).await?;
+        let short = hype - held;
+        if short > 0.0 {
+            let token = self.api.spot_token(SPOT).await?;
+            let send = round_up(short, 8);
+            self.hype_on_hand(&token, send).await?;
+            self.core
+                .spot_send(station, &token, send)
+                .await
+                .context("sending the station's account HYPE for its sends")?;
+            tracing::info!(%station, hype = send, "the station's HyperCore account was sent HYPE");
+        }
+        Ok(())
+    }
+
+    /// Make sure the funder holds `amount` HYPE on HyperCore's spot side,
+    /// buying what it lacks (at least the venue's $10 minimum, at no more
+    /// than [`HYPE_CEILING`] a HYPE).
+    async fn hype_on_hand(&self, token: &hyperliquid::SpotToken, amount: f64) -> Result<()> {
+        let me = self.signer.address();
+        let held = self.api.spot_balance(me, SPOT).await?;
+        if held >= amount {
+            return Ok(());
+        }
+        let pair = token
+            .usdc_pair
+            .ok_or_else(|| anyhow!("{SPOT} has no pair against USDC"))?;
+        let (_, ask) = self.api.best_bid_ask(&format!("@{pair}")).await?;
+        let ask = ask.ok_or_else(|| anyhow!("nobody is selling {SPOT} on HyperCore"))?;
+        if ask > HYPE_CEILING {
+            bail!("{SPOT}'s best ask is ${ask}, over the ${HYPE_CEILING} this run pays");
+        }
+        let size = round_up((amount - held).max(12.0 / ask), token.sz_decimals);
+        let limit = (ask * 1.03).min(HYPE_CEILING);
+        let limit = (limit * 100.0).ceil() / 100.0;
+        let cost = size * limit * 1.01;
+        let spot_usdc = self.api.spot_balance(me, "USDC").await?;
+        if spot_usdc < cost {
+            self.core
+                .usd_class_transfer((cost - spot_usdc).ceil() + 1.0, false)
+                .await
+                .context("moving the funder's perp dollars to spot")?;
+        }
+        let fill = self.core.spot_ioc(pair, true, size, limit).await?;
+        tracing::info!(
+            size = fill.size,
+            price = fill.average_price,
+            "the funder bought {SPOT}"
+        );
         Ok(())
     }
 }
 
+/// How long a run follows its claim: a close is staged, the venue acts, and
+/// it is delivered within the driver's five-minute window, perhaps in parts,
+/// each staged after a valuation.
+const CLAIM_MINUTES: u64 = 60;
+
+/// The most the funder pays for a HYPE when it buys some for a station.
+const HYPE_CEILING: f64 = 100.0;
+/// The HYPE a station's account is given for its sends home: above the
+/// executor's own floor, so it doesn't start by buying.
+pub const STATION_HYPE: f64 = 0.06;
+
+fn round_up(value: f64, decimals: u32) -> f64 {
+    let scale = 10f64.powi(decimals as i32);
+    (value * scale).ceil() / scale
+}
+
+/// An account's perp side at mark, in dollars.
+async fn account_value(api: &Api, user: Address) -> Result<f64> {
+    let state = api
+        .info(json!({"type": "clearinghouseState", "user": user}))
+        .await?;
+    state["marginSummary"]["accountValue"]
+        .as_str()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| anyhow!("HyperCore's account value for {user} can't be read: {state}"))
+}
+
+/// What `user` holds of spot token `token` on HyperCore: zero if the answer
+/// lists none, an error if the answer can't be read.
+async fn spot_total(api: &Api, user: Address, token: &str) -> Result<f64> {
+    let state = api
+        .info(json!({"type": "spotClearinghouseState", "user": user}))
+        .await?;
+    let balances = state["balances"]
+        .as_array()
+        .ok_or_else(|| anyhow!("HyperCore's spot balances for {user} can't be read: {state}"))?;
+    match balances.iter().find(|balance| balance["coin"] == token) {
+        None => Ok(0.0),
+        Some(balance) => balance["total"]
+            .as_str()
+            .and_then(|total| total.parse().ok())
+            .ok_or_else(|| {
+                anyhow!("HyperCore's {token} balance for {user} can't be read: {balance}")
+            }),
+    }
+}
+
 /// Activate a published, reviewed strategy at the Hyperliquid factory: the
-/// tank in USDC, the modest allowances, the author's statement signed.
+/// tank in USDC, the modest allowances, the author's statement signed. A
+/// vault already activated for it is returned as it is.
 pub async fn activate(
     client: &Client,
     vaults: &HyperliquidVaults,
@@ -445,6 +591,13 @@ pub async fn activate(
 ) -> Result<Address> {
     let id = U256::from(strategy_id);
     let factory = vaults.factory;
+    let vault = client
+        .read(factory, IVaultFactory::predictVaultCall { strategyId: id })
+        .await?;
+    if client.has_code(vault).await? {
+        tracing::info!(%vault, "already activated");
+        return Ok(vault);
+    }
     let tank = client
         .read(factory, IVaultFactory::configCall {})
         .await?
@@ -460,9 +613,6 @@ pub async fn activate(
         )
         .await
         .context("approving the tank")?;
-    let vault = client
-        .read(factory, IVaultFactory::predictVaultCall { strategyId: id })
-        .await?;
     let restricted = client
         .read(factory, IVaultFactory::restrictedForCall { strategyId: id })
         .await?
@@ -485,7 +635,7 @@ pub async fn activate(
         )
         .await
         .context("activating the vault")?;
-    tracing::info!(%vault, tx = %receipt.transaction_hash, "activated");
+    tracing::info!(%vault, tank_units = %tank, tx = %receipt.transaction_hash, "activated");
     Ok(vault)
 }
 
@@ -522,7 +672,7 @@ pub async fn deposit(
         )
         .await
         .context("the deposit")?;
-    tracing::info!(%vault, %who, %amount, tx = %receipt.transaction_hash, "deposit requested");
+    tracing::info!(%vault, %who, units = %amount, tx = %receipt.transaction_hash, "deposit requested");
     Ok(())
 }
 
@@ -546,132 +696,431 @@ pub async fn shares_of(
     bail!("the deposit was never priced: is the keeper keeping the Hyperliquid factory?")
 }
 
-/// Ask for all of `who`'s shares back and follow the claim it books until
-/// it is paid (staged at the station, proved, swept, delivered, then paid at
-/// a valuation), for up to `minutes`.
-pub async fn claim_all(client: &Client, vault: Address, who: Address, minutes: u64) -> Result<()> {
-    let shares = client
-        .read(vault, IVault::balanceOfCall { owner: who })
-        .await?;
-    let claims_before = client.read(vault, IVault::claimCountCall {}).await?;
-    let receipt = client
-        .send(
-            who,
+/// The vault's latest valuation, read back and logged in base units.
+pub async fn log_valuation(client: &Client, vault: Address) -> Result<u64> {
+    let count = client
+        .read(vault, IVault::valuationCountCall {})
+        .await?
+        .to::<u64>();
+    if count == 0 {
+        bail!("the vault has no valuation yet");
+    }
+    let valuation = client
+        .read(
             vault,
-            IVault::requestRedeemCall {
-                shares,
-                receiver: who,
+            IVault::valuationAtCall {
+                index: U256::from(count - 1),
             },
         )
-        .await
-        .context("the withdrawal")?;
-    tracing::info!(%vault, %shares, tx = %receipt.transaction_hash, "withdrawal requested");
-    let claim_id = claims_before + U256::from(1u64);
-    for _ in 0..minutes * 12 {
-        if client.read(vault, IVault::claimCountCall {}).await? >= claim_id {
-            let claim = client
-                .read(vault, IVault::claimAtCall { claimId: claim_id })
+        .await?;
+    tracing::info!(
+        %vault,
+        index = count - 1,
+        time = valuation.time,
+        status = valuation.status as u8,
+        gross_units = %valuation.gross,
+        gross_exit_units = %valuation.grossExit,
+        supply_units = %valuation.supply,
+        cash_units = %valuation.cash,
+        "a valuation"
+    );
+    Ok(count)
+}
+
+/// The station's fills on HyperCore since `since_ms`, as the venue records
+/// them, each logged once (by its trade id) as the venue writes its price
+/// and size.
+async fn log_fills(api: &Api, station: Address, since_ms: u64, seen: &mut Vec<u64>) -> Result<()> {
+    let fills = api
+        .info(json!({"type": "userFillsByTime", "user": station, "startTime": since_ms}))
+        .await?;
+    for fill in fills.as_array().into_iter().flatten() {
+        let id = fill["tid"].as_u64().unwrap_or_default();
+        if seen.contains(&id) {
+            continue;
+        }
+        seen.push(id);
+        tracing::info!(
+            %station,
+            coin = %fill["coin"],
+            side = %fill["side"],
+            price = %fill["px"],
+            size = %fill["sz"],
+            fee = %fill["fee"],
+            order = %fill["oid"],
+            "a fill on HyperCore, through the executor's key"
+        );
+    }
+    Ok(())
+}
+
+/// Ask for all of `who`'s shares back, unless a claim of theirs is already
+/// booked, and follow that claim until it is paid: staged at the station,
+/// delivered from HyperCore, and paid from its own delivery. Each change of
+/// state is logged with what was paid, in base units. Fails loudly if the
+/// withdrawal is paid from cash instead of booking a claim.
+pub async fn claim_all(
+    client: &Client,
+    vault: Address,
+    who: Address,
+    known: Option<u64>,
+    minutes: u64,
+    noted: impl Fn(u64) -> Result<()>,
+) -> Result<U256> {
+    let claim_id = match known {
+        Some(id) => id,
+        None => {
+            let shares = client
+                .read(vault, IVault::balanceOfCall { owner: who })
                 .await?;
-            if matches!(claim.state, ClaimState::Paid) {
-                tracing::info!(%vault, paid = %claim.paid, "the claim is paid");
-                return Ok(());
+            if shares.is_zero() {
+                bail!("{who} holds no shares to ask back");
             }
+            let claims_before = client
+                .read(vault, IVault::claimCountCall {})
+                .await?
+                .to::<u64>();
+            let receipt = client
+                .send(
+                    who,
+                    vault,
+                    IVault::requestRedeemCall {
+                        shares,
+                        receiver: who,
+                    },
+                )
+                .await
+                .context("the withdrawal")?;
+            let request = client.read(vault, IVault::requestCountCall {}).await?;
+            tracing::info!(%vault, shares_units = %shares, request = %request, tx = %receipt.transaction_hash, "withdrawal requested");
+            // Booked at the next valuation, if the cash can't pay it.
+            let mut booked = None;
+            for _ in 0..minutes * 12 {
+                let count = client
+                    .read(vault, IVault::claimCountCall {})
+                    .await?
+                    .to::<u64>();
+                for id in claims_before + 1..=count {
+                    let claim = client
+                        .read(
+                            vault,
+                            IVault::claimAtCall {
+                                claimId: U256::from(id),
+                            },
+                        )
+                        .await?;
+                    if claim.owner == who {
+                        booked = Some(id);
+                    }
+                }
+                if booked.is_some() {
+                    break;
+                }
+                if client
+                    .read(vault, IVault::requestAtCall { requestId: request })
+                    .await?
+                    .done
+                {
+                    bail!("the withdrawal was paid from the vault's cash: no claim was booked");
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            let id = booked.ok_or_else(|| anyhow!("no claim was booked in {minutes} minutes"))?;
+            tracing::info!(%vault, claim = id, "a claim is booked");
+            noted(id)?;
+            id
+        }
+    };
+    // Each change is logged: a state (`Waiting`, `Closing` while the close
+    // staged for it runs, `Paid`), and each part paid, which sends a claim
+    // back to `Waiting` with fewer shares and more paid.
+    let mut last = None;
+    for _ in 0..minutes * 12 {
+        let claim = client
+            .read(
+                vault,
+                IVault::claimAtCall {
+                    claimId: U256::from(claim_id),
+                },
+            )
+            .await?;
+        let seen = (claim.state as u8, claim.shares, claim.paid);
+        if last != Some(seen) {
+            let part_paid = last.is_some_and(|(_, _, paid)| claim.paid > paid)
+                && !matches!(claim.state, ClaimState::Paid);
+            tracing::info!(
+                %vault,
+                claim = claim_id,
+                state = claim_state_name(claim.state as u8),
+                shares_units = %claim.shares,
+                paid_units = %claim.paid,
+                "{}",
+                if part_paid {
+                    "a part of the claim is paid"
+                } else {
+                    "the claim"
+                }
+            );
+            last = Some(seen);
+        }
+        if matches!(claim.state, ClaimState::Paid) {
+            let held = client
+                .read(USDC, IERC20::balanceOfCall { account: who })
+                .await?;
+            tracing::info!(%vault, claim = claim_id, paid_units = %claim.paid, depositor_usdc_units = %held, "the claim is paid");
+            return Ok(claim.paid);
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
-    bail!("the claim was not paid in {minutes} minutes")
+    bail!("claim {claim_id} was not paid in {minutes} minutes")
+}
+
+/// A claim state's name, by its number in the vault's `ClaimState`.
+fn claim_state_name(state: u8) -> &'static str {
+    const NAMES: [&str; 7] = [
+        "None", "Pending", "Waiting", "Queued", "Paid", "Fallback", "Closing",
+    ];
+    NAMES.get(usize::from(state)).copied().unwrap_or("unknown")
+}
+
+/// How far a run has got, kept beside the deployment so a run stopped
+/// part-way picks up where it stopped rather than spending its testnet
+/// dollars again (on testnet, money sent toward HyperCore from HyperEVM can't
+/// always be got back).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Progress {
+    pub agent: String,
+    pub strategy_id: Option<u64>,
+    pub vault: Option<Address>,
+    /// The deposit, in USDC millionths, once it was sent.
+    pub deposited: Option<u64>,
+    pub priced: bool,
+    pub station_funded: bool,
+    pub claim: Option<u64>,
+    pub paid: Option<String>,
+}
+
+impl Progress {
+    pub fn file_in(deployments_dir: &Path, agent: &str) -> PathBuf {
+        deployments_dir.join(format!("hyperliquid-{CHAIN_ID}.run-{agent}.json"))
+    }
+
+    fn read(path: &Path, agent: &str) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Ok(serde_json::from_str(&text)
+                .with_context(|| format!("reading {}", path.display()))?),
+            Err(_) => Ok(Self {
+                agent: agent.to_string(),
+                ..Self::default()
+            }),
+        }
+    }
+
+    fn write(&self, path: &Path) -> Result<()> {
+        std::fs::write(path, serde_json::to_string_pretty(self)? + "\n")
+            .with_context(|| format!("writing {}", path.display()))
+    }
+}
+
+/// What a run is given.
+pub struct RunOptions<'a> {
+    pub api: &'a str,
+    pub agent: &'a Path,
+    /// The depositor's deposit, in dollars: at least the factory's minimum.
+    pub deposit_dollars: Option<f64>,
+    /// What the funder sends the station's HyperCore account.
+    pub station_dollars: f64,
+    /// How long the agent trades before the claim, at least.
+    pub trade_minutes: u64,
 }
 
 /// The whole run on a testnet whose services read [`adopted`]: deploy (or
-/// find) the stack; publish `agent` through the API on `api`; activate it at
-/// the Hyperliquid factory; a depositor's USDC in; once it is priced, the
-/// station's HyperCore account funded with `station_dollars` so the agent
-/// has a venue balance to trade; then, after `trade_minutes`, all of the
-/// depositor's shares asked back and the claim followed until it is paid.
+/// find) the stack; publish the agent through the API; activate it at the
+/// Hyperliquid factory; the depositor's USDC in and priced; the station's
+/// HyperCore account funded so the agent has a venue balance to trade; the
+/// agent's fills through the executor read back from the venue; a valuation
+/// read back; then all of the depositor's shares asked back and the claim
+/// followed until it is paid. Each step is read back and logged in base
+/// units, and each is recorded in [`Progress`] as it is done, so a run
+/// stopped part-way can be started again with the same arguments.
 ///
 /// What an agent can do depends on the vault's size: `mm-quoter` quotes 2%
-/// of the vault's value a side and posts nothing under $12, so it quotes
-/// only once the vault is worth $600 or more.
-#[allow(clippy::too_many_arguments)]
+/// of the vault's value a side and posts nothing under $12, so it needs a
+/// vault of about $650 (`--deposit 650`).
 pub async fn run(
     client: &Client,
     artifacts: &Path,
     deployments: &Deployments,
+    generation: Option<u64>,
     deployments_dir: &Path,
-    api: &str,
-    agent: &Path,
-    station_dollars: f64,
-    trade_minutes: u64,
+    options: RunOptions<'_>,
 ) -> Result<()> {
     let file = HyperliquidVaults::file_in(deployments_dir);
-    let vaults = ensure(client, artifacts, deployments, &file).await?;
+    let vaults = ensure(client, artifacts, deployments, generation, &file).await?;
+    if deployments.factory != vaults.factory {
+        bail!(
+            "the services don't read the Hyperliquid factory yet, so nothing would price this vault's deposit or serve its claim: put {} in place of the chain's deployment file (keep the original), start the services again, and run this again",
+            file.with_extension("deployment.json").display()
+        );
+    }
+    let agent_name = options
+        .agent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("agent")
+        .to_string();
+    let progress_file = Progress::file_in(deployments_dir, &agent_name);
+    let mut progress = Progress::read(&progress_file, &agent_name)?;
     let author = client.account(Role::Author)?;
     let depositor = client.account(Role::Viewer)?;
     let funder = Funder::new(client)?;
+    let api = Api::for_chain(client.chain_id).ok_or_else(|| anyhow!("not HyperEVM"))?;
 
-    let published = crate::publish::publish(
-        client,
-        shared::Chain::Hyperliquid,
-        deployments,
-        api,
-        agent,
-        author,
-        false,
-        false,
-    )
-    .await?;
-    let strategy_id = published
-        .strategy_id
-        .ok_or_else(|| anyhow!("the agent was not registered: {:?}", published.outcome))?;
-    tracing::info!(strategy_id, outcome = ?published.outcome, "published");
+    let strategy_id = match progress.strategy_id {
+        Some(id) => id,
+        None => {
+            let published = crate::publish::publish(
+                client,
+                shared::Chain::Hyperliquid,
+                deployments,
+                options.api,
+                options.agent,
+                author,
+                false,
+                false,
+            )
+            .await?;
+            let id = published
+                .strategy_id
+                .ok_or_else(|| anyhow!("the agent was not registered: {:?}", published.outcome))?;
+            tracing::info!(strategy_id = id, outcome = ?published.outcome, "published");
+            progress.strategy_id = Some(id);
+            progress.write(&progress_file)?;
+            id
+        }
+    };
 
-    let minimum_tank = client
+    let config = client
         .read(vaults.factory, IVaultFactory::configCall {})
         .await?;
-    let tank_dollars = minimum_tank.minimumTank.to::<u64>() as f64 / 1e6;
-    let deposit_units = minimum_tank.minimumDeposit.to::<u64>().max(20_000_000);
-    funder
-        .dollars_on_hyperevm(client, author, tank_dollars)
-        .await?;
-    funder
-        .dollars_on_hyperevm(client, depositor, deposit_units as f64 / 1e6)
-        .await?;
+    let tank_dollars = config.minimumTank.to::<u64>() as f64 / 1e6;
+    let least = config.minimumDeposit.to::<u64>().max(20_000_000);
+    let deposit_units = match options.deposit_dollars {
+        Some(dollars) => {
+            let units = (dollars * 1e6).round() as u64;
+            if units < config.minimumDeposit.to::<u64>() {
+                bail!("a deposit of ${dollars} is under the factory's minimum");
+            }
+            units
+        }
+        None => least,
+    };
 
-    // The review is posted by the reviewer service; activation waits for it.
-    for attempt in 0.. {
-        if client
-            .read(
-                deployments.reviews,
-                chain::bindings::reviews::IReviewRegistry::hasReviewCall {
-                    strategyId: U256::from(strategy_id),
-                },
-            )
-            .await?
-        {
-            break;
+    let vault = match progress.vault {
+        Some(vault) => vault,
+        None => {
+            funder
+                .dollars_on_hyperevm(client, author, tank_dollars)
+                .await?;
+            // The review is posted by the reviewer service; activation waits
+            // for it.
+            for attempt in 0.. {
+                if client
+                    .read(
+                        deployments.reviews,
+                        chain::bindings::reviews::IReviewRegistry::hasReviewCall {
+                            strategyId: U256::from(strategy_id),
+                        },
+                    )
+                    .await?
+                {
+                    break;
+                }
+                if attempt == 120 {
+                    bail!("the review of {strategy_id} was never posted");
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            let vault = activate(client, &vaults, author, strategy_id).await?;
+            progress.vault = Some(vault);
+            progress.write(&progress_file)?;
+            vault
         }
-        if attempt == 120 {
-            bail!("the review of {strategy_id} was never posted");
-        }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+    };
+
+    if progress.deposited.is_none() {
+        funder
+            .dollars_on_hyperevm(client, depositor, deposit_units as f64 / 1e6)
+            .await?;
+        deposit(client, &vaults, vault, depositor, deposit_units).await?;
+        progress.deposited = Some(deposit_units);
+        progress.write(&progress_file)?;
     }
-    let vault = activate(client, &vaults, author, strategy_id).await?;
-    deposit(client, &vaults, vault, depositor, deposit_units).await?;
-    let shares = shares_of(client, vault, depositor, 15).await?;
-    tracing::info!(%vault, %shares, "the deposit is priced");
+    if !progress.priced {
+        let shares = shares_of(client, vault, depositor, 15).await?;
+        tracing::info!(%vault, deposit_units = progress.deposited.unwrap_or(deposit_units), shares_units = %shares, "the deposit is priced");
+        log_valuation(client, vault).await?;
+        progress.priced = true;
+        progress.write(&progress_file)?;
+    }
 
     // Funded once the depositor holds the shares, so what the account
     // brings is theirs rather than the dead shares'. The executor's agent
     // approval is queued at the venue and dropped while the account doesn't
     // exist; it approves again within a minute once it reads it missing.
     let station = client.read(vault, IVault::homeStationCall {}).await?;
-    // HYPE for the account's sends home: a send costs a tiny fraction of
-    // this, and the funder's own spot HYPE is what `chains:fund` left.
-    funder
-        .station_account(station, station_dollars, 0.001)
-        .await?;
-    tokio::time::sleep(Duration::from_secs(trade_minutes * 60)).await;
-    claim_all(client, vault, depositor, 30).await
+    if !progress.station_funded {
+        funder
+            .station_account(station, options.station_dollars, STATION_HYPE)
+            .await?;
+        progress.station_funded = true;
+        progress.write(&progress_file)?;
+    }
+
+    if progress.claim.is_none() {
+        // The agent trades; its fills are read back from the venue as they
+        // come.
+        let since_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as u64
+            - options.trade_minutes * 60_000
+            - 60_000;
+        let mut seen = Vec::new();
+        let until = tokio::time::Instant::now() + Duration::from_secs(options.trade_minutes * 60);
+        while tokio::time::Instant::now() < until {
+            if let Err(error) = log_fills(&api, station, since_ms, &mut seen).await {
+                tracing::warn!(error = %format!("{error:#}"), "the venue's fills couldn't be read");
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+        log_fills(&api, station, since_ms, &mut seen).await?;
+        if seen.is_empty() {
+            tracing::warn!(%station, "no fill through the executor yet: the agent placed nothing that traded");
+        }
+        let worth = account_value(&api, station).await.unwrap_or(0.0);
+        tracing::info!(%station, account_value_millionths = (worth * 1e6).round() as u64, "the station's HyperCore account");
+        log_valuation(client, vault).await?;
+    }
+
+    let paid = claim_all(
+        client,
+        vault,
+        depositor,
+        progress.claim,
+        CLAIM_MINUTES,
+        |id| {
+            let mut noted = progress.clone();
+            noted.claim = Some(id);
+            noted.write(&progress_file)
+        },
+    )
+    .await?;
+    progress = Progress::read(&progress_file, &agent_name)?;
+    progress.paid = Some(paid.to_string());
+    progress.write(&progress_file)?;
+    log_valuation(client, vault).await?;
+    tracing::info!(%vault, "the run is done: fills, a valuation, a deposit priced and a claim paid");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -690,6 +1139,7 @@ mod tests {
             station_factory: Address::repeat_byte(3),
             factory: Address::repeat_byte(4),
             previous_factory: Address::repeat_byte(5),
+            generation: Some(2),
         };
         let text = serde_json::to_string(&vaults).unwrap();
         assert_eq!(
@@ -697,6 +1147,30 @@ mod tests {
             vaults
         );
         assert!(HyperliquidVaults::file_in(Path::new("/x")).ends_with("hyperliquid-998.json"));
+    }
+
+    #[test]
+    fn a_run_s_progress_reads_back_as_written_and_starts_empty() {
+        let dir = std::env::temp_dir().join(format!("shonin-hl-progress-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = Progress::file_in(&dir, "mm-quoter");
+        assert!(file.ends_with("hyperliquid-998.run-mm-quoter.json"));
+        let fresh = Progress::read(&file, "mm-quoter").unwrap();
+        assert_eq!(fresh.agent, "mm-quoter");
+        assert_eq!(fresh.vault, None);
+        let progress = Progress {
+            agent: "mm-quoter".to_string(),
+            strategy_id: Some(3),
+            vault: Some(Address::repeat_byte(7)),
+            deposited: Some(650_000_000),
+            priced: true,
+            station_funded: true,
+            claim: Some(1),
+            paid: None,
+        };
+        progress.write(&file).unwrap();
+        assert_eq!(Progress::read(&file, "mm-quoter").unwrap(), progress);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -744,6 +1218,7 @@ mod tests {
             station_factory: Address::repeat_byte(3),
             factory: Address::repeat_byte(4),
             previous_factory: Address::repeat_byte(5),
+            generation: Some(2),
         };
         let adopted = adopted(&deployments, &vaults);
         assert_eq!(adopted.factory, vaults.factory);

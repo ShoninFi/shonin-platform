@@ -27,30 +27,87 @@ use tokio::sync::Mutex;
 pub const ROBINHOOD: &str = "robinhood";
 pub const LIGHTER: &str = "lighter";
 
-/// How often the attested read of a station's Lighter accounts is posted.
-const REPORT_EVERY: Duration = Duration::from_secs(120);
+/// How often the attested read of a station's Lighter accounts is posted:
+/// the driver stages a claim's close only on a post at most three minutes
+/// old, so a post every minute leaves room for two to fail.
+pub const REPORT_EVERY: Duration = Duration::from_secs(60);
+/// How often the post's loop looks at whether a staged close is waiting for
+/// a post read after its settle delay, which it then makes at once.
+const STAGE_LOOK_EVERY: Duration = Duration::from_secs(5);
+/// How long after a post that failed the next is tried.
+const RETRY_AFTER: Duration = Duration::from_secs(15);
+/// The most one post may take, reads and send: past it, the round is given
+/// up and the next one made on time.
+const POST_TIMEOUT: Duration = Duration::from_secs(90);
+/// The most time between the start of a post's reads of the exchange's API
+/// and its read of the chain (the pending balance and the station's
+/// counters): the post says both were true together, so it is not made when
+/// they are further apart, nor when the chain's newest block is older than
+/// the API reads by more than this.
+pub const POST_READ_SPAN: Duration = Duration::from_secs(30);
 
 alloy::sol! {
     interface IStationRh {
         function pinnedDriver(bytes32 driver) external view returns (address);
         function approveKey(bytes32 driver, address key) external;
         function approvedKey(bytes32 driver) external view returns (address);
+        function arrivals() external view returns (uint256);
+        function venueFlows(bytes32 driver) external view returns (uint256 sent, uint64 depositedAt);
+        function movedAt(bytes32 driver) external view returns (uint64);
     }
     interface ILighterDriver {
+        struct Market { uint16 index; uint8 sizeDecimals; uint8 priceDecimals; }
         function exchange() external view returns (address);
         function board() external view returns (address);
+        function markets() external view returns (Market[] memory);
+        function DEPOSIT_CREDIT() external view returns (uint64);
+        function settleDelay() external view returns (uint64);
     }
     interface IExchange {
         function addressToAccountIndex(address owner) external view returns (uint48);
         function getPendingBalance(address owner, uint16 assetIndex) external view returns (uint128);
+        function executedBatchesCount() external view returns (uint64);
     }
 }
+
+/// How far past an account's own read the explorer's newest block must be
+/// before its list of the account's withdrawals is taken as complete up to
+/// that read, and how long it is waited for within one post.
+const EXPLORER_CAUGHT_UP_BY: Duration = Duration::from_secs(3);
+const EXPLORER_WAIT: Duration = Duration::from_secs(10);
+const EXPLORER_LOOK_EVERY: Duration = Duration::from_secs(1);
+/// The most pages of one account's withdrawals read in one post: more on
+/// their way at once than this can't be told, and nothing is posted.
+const WITHDRAWAL_PAGES: u64 = 5;
 
 /// A driver's name as a station keys it: the name, zero-padded.
 fn name(driver: &str) -> B256 {
     let mut bytes = [0u8; 32];
     bytes[..driver.len()].copy_from_slice(driver.as_bytes());
     B256::from(bytes)
+}
+
+/// The name, as a station keys it, of a driver the vault's recorded
+/// manifest names: the station must have pinned a driver under it, so every
+/// read and call of the half is under the name the station pinned it under.
+async fn pinned_under(chain: &Client, station: Address, driver: &str) -> Result<(B256, Address)> {
+    use chain::bindings::station::IStation;
+    let key = name(driver);
+    let spec = chain
+        .read(station, IStation::specCall {})
+        .await
+        .context("reading the station's drivers")?;
+    if !spec.drivers.contains(&key) {
+        bail!("the station doesn't list the {driver} driver the vault's manifest names");
+    }
+    let pinned = chain
+        .read(station, IStationRh::pinnedDriverCall { driver: key })
+        .await
+        .with_context(|| format!("reading the driver the station pinned as {driver}"))?;
+    if pinned == Address::ZERO {
+        bail!("the station has no driver pinned as {driver}");
+    }
+    Ok((key, pinned))
 }
 
 fn now_ms() -> i64 {
@@ -79,16 +136,14 @@ pub struct StockHalf {
 }
 
 impl StockHalf {
-    pub async fn connect(chain: &Client, key: KeyClient, station: Address) -> Result<Arc<Self>> {
-        let driver = chain
-            .read(
-                station,
-                IStationRh::pinnedDriverCall {
-                    driver: name(ROBINHOOD),
-                },
-            )
-            .await
-            .context("reading the station's pinned Robinhood driver")?;
+    /// The half for the driver the station pinned under `driver`.
+    pub async fn connect(
+        chain: &Client,
+        key: KeyClient,
+        station: Address,
+        driver: &str,
+    ) -> Result<Arc<Self>> {
+        let (_, driver) = pinned_under(chain, station, driver).await?;
         let trader = robinhood::Trader::load(chain.provider(), driver, station).await?;
         Ok(Arc::new(Self {
             trader,
@@ -230,7 +285,23 @@ pub struct LighterHalf {
     station: Address,
     exchange: Address,
     board: Address,
+    /// The name the station pinned the driver under, which its counters
+    /// and the key it registers are kept under.
+    pinned_as: B256,
+    /// The station's pinned Lighter driver, whose markets are the only ones
+    /// the key signs in.
+    driver: Address,
+    /// How long after a deposit, and after any move of dollars through the
+    /// driver (a withdrawal request among them), the driver prices the
+    /// station again only on a post read since, where the driver says.
+    deposit_credit: Option<u64>,
+    settle_delay: Option<u64>,
     api: lighter::Api,
+    explorer: lighter::Explorer,
+    /// What is known for good: each withdrawal read by its hash, and the
+    /// last L2 block of the newest executed batch read.
+    withdrawals: Mutex<std::collections::HashMap<String, lighter::withdrawals::Withdrawal>>,
+    batch_end: Mutex<Option<(u64, u64)>>,
     chain_id: u32,
     lighter_key: lighter::Key,
     /// Built once the station has an account and has registered this key.
@@ -240,27 +311,42 @@ pub struct LighterHalf {
 impl LighterHalf {
     /// Make a Lighter key, name it on the board as this vault's key, and
     /// have the station register it if the account already exists.
-    pub async fn connect(chain: &Client, key: KeyClient, station: Address) -> Result<Arc<Self>> {
-        let (api, chain_id) = match chain.chain_id {
+    pub async fn connect(
+        chain: &Client,
+        key: KeyClient,
+        station: Address,
+        driver: &str,
+    ) -> Result<Arc<Self>> {
+        let (api, explorer, chain_id) = match chain.chain_id {
             robinhood::listings::MAINNET => (
                 lighter::Api::new(lighter::api::MAINNET),
+                lighter::Explorer::new(lighter::api::MAINNET_EXPLORER),
                 lighter::api::MAINNET_CHAIN_ID,
             ),
             other => bail!(
                 "Lighter has no exchange on chain {other} (its testnet settles on Ethereum Sepolia)"
             ),
         };
-        let driver = chain
-            .read(
-                station,
-                IStationRh::pinnedDriverCall {
-                    driver: name(LIGHTER),
-                },
-            )
-            .await
-            .context("reading the station's pinned Lighter driver")?;
+        let (pinned_as, driver) = pinned_under(chain, station, driver).await?;
         let exchange = chain.read(driver, ILighterDriver::exchangeCall {}).await?;
         let board = chain.read(driver, ILighterDriver::boardCall {}).await?;
+        let deposit_credit = match chain
+            .read(driver, ILighterDriver::DEPOSIT_CREDITCall {})
+            .await
+        {
+            Ok(credit) => Some(credit),
+            Err(error) => {
+                tracing::warn!(%station, error = %format!("{error:#}"), "the Lighter driver's deposit credit time wasn't read: posts are made on their schedule only after a deposit");
+                None
+            }
+        };
+        let settle_delay = match chain.read(driver, ILighterDriver::settleDelayCall {}).await {
+            Ok(delay) => Some(delay),
+            Err(error) => {
+                tracing::warn!(%station, error = %format!("{error:#}"), "the Lighter driver's settle delay wasn't read: posts are made on their schedule only after a withdrawal");
+                None
+            }
+        };
         let lighter_key = lighter::Key::generate();
         key.send(
             board,
@@ -276,7 +362,14 @@ impl LighterHalf {
             station,
             exchange,
             board,
+            pinned_as,
+            driver,
+            deposit_credit,
+            settle_delay,
             api,
+            explorer,
+            withdrawals: Mutex::default(),
+            batch_end: Mutex::default(),
             chain_id,
             lighter_key,
             trader: Mutex::new(None),
@@ -310,19 +403,41 @@ impl LighterHalf {
                 .send(
                     self.station,
                     IStationRh::approveKeyCall {
-                        driver: name(LIGHTER),
+                        driver: self.pinned_as,
                         key: self.key.address,
                     },
                 )
                 .await
                 .context("having the station register this start's Lighter key")?;
-            let markets = self.api.markets().await?;
+            let markets = self.driver_markets().await?;
             let trader = lighter::Trader::new(&self.lighter_key, account, self.chain_id, markets)?;
             *held = Some((account, trader));
         }
         Ok(tokio::sync::MutexGuard::map(held, |held| {
             held.as_mut().expect("just made")
         }))
+    }
+
+    /// The markets the station's pinned driver lists, read from the chain,
+    /// as the exchange writes them: the only markets this key signs in.
+    async fn driver_markets(&self) -> Result<lighter::Markets> {
+        let listed: Vec<(u16, u8, u8)> = self
+            .chain
+            .read(self.driver, ILighterDriver::marketsCall {})
+            .await
+            .context("reading the markets the station's Lighter driver lists")?
+            .into_iter()
+            .map(|market| (market.index, market.sizeDecimals, market.priceDecimals))
+            .collect();
+        let markets = self.api.markets().await?.listed_by_driver(&listed)?;
+        if markets.iter().count() < listed.len() {
+            tracing::warn!(
+                station = %self.station,
+                listed = ?listed,
+                "the station's Lighter driver lists markets the exchange doesn't trade; nothing is signed in them"
+            );
+        }
+        Ok(markets)
     }
 
     pub async fn submit(&self, payload: &[u8]) -> Outcome<Vec<u8>> {
@@ -355,10 +470,10 @@ impl LighterHalf {
                     tx_hash,
                 }))
             }
+            // Refused by the exchange, or turned away before it: nothing
+            // was done.
+            Err(error) if lighter::api::not_taken(&error) => Outcome::Refused(format!("{error:#}")),
             // The exchange may have taken it before the answer was lost.
-            Err(error) if error.to_string().contains("refused") => {
-                Outcome::Refused(format!("{error:#}"))
-            }
             Err(error) => Outcome::Unknown(format!("{error:#}")),
         }
     }
@@ -402,23 +517,266 @@ impl LighterHalf {
         }))
     }
 
-    /// Read the station's accounts and post them on the board, every
-    /// `REPORT_EVERY`, until the task is dropped.
+    /// What the post reads on-chain, all at the chain's newest block: that
+    /// block's time, which stamps the post, the station's pending balance at
+    /// the exchange, and its own counters, so the driver can tell what moved
+    /// after the reading; and how many of the exchange's batches had been
+    /// executed there, which says which withdrawals that pending balance
+    /// holds. The withdrawals on their way are left at zero, for
+    /// [`Self::in_flight`].
+    async fn on_chain(&self) -> Result<(lighter::report::OnChain, u64)> {
+        let (head, as_of) = self.chain.head_and_time().await?;
+        let at = alloy::eips::BlockId::number(head);
+        let pending = self
+            .chain
+            .read_at(
+                self.exchange,
+                IExchange::getPendingBalanceCall {
+                    owner: self.station,
+                    assetIndex: lighter::withdrawals::DOLLAR_ASSET,
+                },
+                at,
+            )
+            .await?;
+        let executed = self
+            .chain
+            .read_at(self.exchange, IExchange::executedBatchesCountCall {}, at)
+            .await?;
+        let arrived = self
+            .chain
+            .read_at(self.station, IStationRh::arrivalsCall {}, at)
+            .await?;
+        let flows = self
+            .chain
+            .read_at(
+                self.station,
+                IStationRh::venueFlowsCall {
+                    driver: self.pinned_as,
+                },
+                at,
+            )
+            .await?;
+        Ok((
+            lighter::report::OnChain {
+                as_of,
+                pending: U256::from(pending),
+                in_flight: U256::ZERO,
+                arrived,
+                sent: flows.sent,
+            },
+            executed,
+        ))
+    }
+
+    /// The dollars the exchange has taken out of the station's `accounts`
+    /// (each as read from the API, with its own `transaction_time`) for
+    /// withdrawals not yet in the pending balance at the block where
+    /// `executed` batches had been executed. See
+    /// [`lighter::withdrawals`]. Anything that can't be told is an error.
+    async fn in_flight(&self, accounts: &[serde_json::Value], executed: u64) -> Result<U256> {
+        use lighter::withdrawals::{
+            OnTheirWay, batch_end, listed_hash, newest_block_us, withdrawal,
+        };
+        let credited_through = if executed == 0 {
+            0
+        } else {
+            let known = *self.batch_end.lock().await;
+            match known {
+                Some((batch, end)) if batch == executed => end,
+                _ => {
+                    let end = batch_end(&self.explorer.batch(executed).await?, executed)?;
+                    *self.batch_end.lock().await = Some((executed, end));
+                    end
+                }
+            }
+        };
+        let mut reads = Vec::new();
+        for account in accounts {
+            let index = account["index"]
+                .as_u64()
+                .ok_or_else(|| anyhow!("an account without an index: {}", account["index"]))?;
+            let read_at = account["transaction_time"].as_u64().ok_or_else(|| {
+                anyhow!(
+                    "account {index}'s time of its last transaction can't be read: {}",
+                    account["transaction_time"]
+                )
+            })?;
+            reads.push((index, read_at));
+        }
+        // The explorer's list holds every withdrawal up to an account's read
+        // only once its newest block is past that read.
+        let latest = reads.iter().map(|(_, at)| *at).max().unwrap_or_default();
+        let needed = latest.saturating_add(EXPLORER_CAUGHT_UP_BY.as_micros() as u64);
+        let waited = tokio::time::Instant::now();
+        loop {
+            let newest = newest_block_us(&self.explorer.newest_blocks().await?)?;
+            if newest >= needed {
+                break;
+            }
+            if waited.elapsed() >= EXPLORER_WAIT {
+                bail!(
+                    "Lighter's explorer is {} ms behind the accounts as read: their withdrawals can't be told",
+                    (needed - newest) / 1_000
+                );
+            }
+            tokio::time::sleep(EXPLORER_LOOK_EVERY).await;
+        }
+        let mut known = self.withdrawals.lock().await;
+        let mut seen = std::collections::HashMap::new();
+        let mut total = U256::ZERO;
+        for (index, read_at) in reads {
+            let mut tally = OnTheirWay::new(read_at, credited_through);
+            let mut page = 0;
+            'pages: loop {
+                if page == WITHDRAWAL_PAGES {
+                    bail!(
+                        "account {index} has more withdrawals on their way than {} can be read",
+                        WITHDRAWAL_PAGES * lighter::api::EXPLORER_PAGE
+                    );
+                }
+                let logs = self
+                    .explorer
+                    .withdrawals(index, page * lighter::api::EXPLORER_PAGE)
+                    .await?;
+                for log in &logs {
+                    let hash = listed_hash(log)?;
+                    let read = match known.get(&hash) {
+                        Some(read) => read.clone(),
+                        None => withdrawal(&self.api.tx(&hash).await?, index)?,
+                    };
+                    tally.take(&read)?;
+                    seen.insert(hash, read);
+                    if tally.done() {
+                        break 'pages;
+                    }
+                }
+                if (logs.len() as u64) < lighter::api::EXPLORER_PAGE {
+                    break;
+                }
+                page += 1;
+            }
+            total += U256::from(tally.total());
+        }
+        // Only what the next post may meet again is kept.
+        *known = seen;
+        Ok(total)
+    }
+
+    /// Read the station's accounts and post them on the board every
+    /// [`REPORT_EVERY`], and at once when the driver has just begun to wait
+    /// for a post read after some time (see [`Self::a_post_is_due`]) and no
+    /// post read since then has been made, until the task is dropped. A post
+    /// that fails is tried again after [`RETRY_AFTER`]; no post waits on
+    /// one before it for longer than [`POST_TIMEOUT`].
     pub fn report_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let half = self.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(REPORT_EVERY);
+            let mut tick = tokio::time::interval(STAGE_LOOK_EVERY);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // When the last post was made or tried, and the chain time it
+            // was read at.
+            let mut last_try: Option<tokio::time::Instant> = None;
+            let mut last_failed = false;
+            let mut posted_as_of = 0u64;
+            let mut warned = crate::Throttle::default();
             loop {
                 tick.tick().await;
-                if let Err(error) = half.post().await {
-                    tracing::warn!(station = %half.station, error = %format!("{error:#}"), "the Lighter read wasn't posted");
+                let since = last_try.map(|at| at.elapsed());
+                let scheduled = match since {
+                    None => true,
+                    Some(since) if last_failed => since >= RETRY_AFTER,
+                    Some(since) => since >= REPORT_EVERY,
+                };
+                let proving = !scheduled
+                    && !(last_failed && since.is_some_and(|since| since < RETRY_AFTER))
+                    && half.a_post_is_due(posted_as_of).await;
+                if !scheduled && !proving {
+                    continue;
+                }
+                last_try = Some(tokio::time::Instant::now());
+                match tokio::time::timeout(POST_TIMEOUT, half.post()).await {
+                    Ok(Ok(Some(as_of))) => {
+                        posted_as_of = as_of;
+                        last_failed = false;
+                    }
+                    Ok(Ok(None)) => last_failed = false,
+                    Ok(Err(error)) => {
+                        last_failed = true;
+                        if warned.due(std::time::Instant::now()) {
+                            tracing::warn!(station = %half.station, error = %format!("{error:#}"), "the Lighter read wasn't posted");
+                        }
+                    }
+                    Err(_) => {
+                        last_failed = true;
+                        if warned.due(std::time::Instant::now()) {
+                            tracing::warn!(station = %half.station, "the Lighter read wasn't posted: it took more than {} s", POST_TIMEOUT.as_secs());
+                        }
+                    }
                 }
             }
         })
     }
 
-    /// One attested read of every account the station owns, posted.
-    pub async fn post(&self) -> Result<()> {
+    /// Whether the driver waits for a post read after a time that has
+    /// passed by the chain's clock, and the newest post (read at
+    /// `posted_as_of`) was read before it: a close staged at the station
+    /// past its settle delay (only such a post can prove it), a deposit past
+    /// its credit time, or a move of dollars through the driver (a
+    /// withdrawal request, a deposit) past the driver's settle delay (only
+    /// such posts price the station again), so the post is made at once
+    /// rather than on its schedule, and a priced valuation fits before the
+    /// next move is allowed. A time that can't be read is left to the
+    /// schedule.
+    async fn a_post_is_due(&self, posted_as_of: u64) -> bool {
+        use chain::bindings::station::IStation;
+        let mut due = Vec::new();
+        if let Ok(stage) = self.chain.read(self.station, IStation::stageCall {}).await
+            && stage.stagedAt != 0
+        {
+            due.push(stage.stagedAt.saturating_add(stage.delay));
+        }
+        if let Some(credit) = self.deposit_credit
+            && let Ok(flows) = self
+                .chain
+                .read(
+                    self.station,
+                    IStationRh::venueFlowsCall {
+                        driver: self.pinned_as,
+                    },
+                )
+                .await
+            && flows.depositedAt != 0
+        {
+            due.push(flows.depositedAt.saturating_add(credit));
+        }
+        if let Some(delay) = self.settle_delay
+            && let Ok(moved) = self
+                .chain
+                .read(
+                    self.station,
+                    IStationRh::movedAtCall {
+                        driver: self.pinned_as,
+                    },
+                )
+                .await
+            && moved != 0
+        {
+            due.push(moved.saturating_add(delay));
+        }
+        if due.iter().all(|due| posted_as_of >= *due) {
+            return false;
+        }
+        match self.chain.head_and_time().await {
+            Ok((_, now)) => post_due(&due, posted_as_of, now),
+            Err(_) => false,
+        }
+    }
+
+    /// One attested read of every account the station owns, posted: the
+    /// chain time it was read at, or `None` when the station has no account
+    /// to read. Any figure that can't be read, or reads too far apart in
+    /// time, and nothing is posted.
+    pub async fn post(&self) -> Result<Option<u64>> {
         let account = self
             .chain
             .read(
@@ -430,20 +788,31 @@ impl LighterHalf {
             .await?
             .to::<u64>();
         if account == 0 {
-            return Ok(());
+            return Ok(None);
         }
+        let started = tokio::time::Instant::now();
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or_default();
+        // Every market the exchange trades, not only the driver's: a
+        // position in one the driver doesn't list must be posted, so the
+        // driver sees it.
         let markets = self.api.markets().await?;
         let owned = self.api.accounts_of(&self.station.to_string()).await?;
         let mut accounts: Vec<serde_json::Value> = Vec::new();
-        for summary in owned["sub_accounts"]
+        let listed = owned["sub_accounts"]
             .as_array()
-            .into_iter()
-            .flatten()
-            .chain(std::iter::once(&serde_json::json!({ "index": account })))
-        {
-            let Some(index) = summary["index"].as_u64() else {
-                continue;
-            };
+            .ok_or_else(|| anyhow!("the station's accounts can't be read: {owned}"))?;
+        let mut indices = Vec::new();
+        for summary in listed {
+            let index = summary["index"]
+                .as_u64()
+                .ok_or_else(|| anyhow!("one of the station's accounts has no index: {summary}"))?;
+            indices.push(index);
+        }
+        indices.push(account);
+        for index in indices {
             if accounts
                 .iter()
                 .any(|known| known["index"].as_u64() == Some(index))
@@ -455,11 +824,16 @@ impl LighterHalf {
         let mut held = std::collections::BTreeSet::new();
         for account in &accounts {
             for position in account["positions"].as_array().into_iter().flatten() {
-                let open = position["position"]
+                // Anything but a size that reads as nothing is held: one
+                // that can't be read stops the post when it is built.
+                let flat = position["position"]
                     .as_str()
-                    .is_some_and(|size| size.parse::<f64>().unwrap_or(0.0) != 0.0);
-                if let (true, Some(market)) = (open, position["market_id"].as_u64()) {
-                    held.insert(market as u16);
+                    .and_then(|size| size.parse::<lighter::payload::Decimal>().ok())
+                    .is_some_and(|size| size.is_zero());
+                if let (false, Some(market)) = (flat, position["market_id"].as_u64())
+                    && let Ok(market) = u16::try_from(market)
+                {
+                    held.insert(market);
                 }
             }
         }
@@ -469,19 +843,14 @@ impl LighterHalf {
             let book = self.api.book_orders(market, 1).await?;
             prices.push(lighter::report::prices(market, &details, &book, &markets)?);
         }
-        let pending = self
-            .chain
-            .read(
-                self.exchange,
-                IExchange::getPendingBalanceCall {
-                    owner: self.station,
-                    assetIndex: 3,
-                },
-            )
-            .await?;
-        let as_of = (now_ms() / 1000) as u64;
-        let report =
-            lighter::report::build(as_of, &accounts, U256::from(pending), &prices, &markets)?;
+        let mut pools = Vec::new();
+        for pool in lighter::report::pools_held(&accounts) {
+            pools.push(self.api.account(pool).await?);
+        }
+        let (mut on_chain, executed) = self.on_chain().await?;
+        read_together(started.elapsed(), started_at, on_chain.as_of)?;
+        on_chain.in_flight = self.in_flight(&accounts, executed).await?;
+        let report = lighter::report::build(on_chain, &accounts, &prices, &markets, &pools)?;
         tracing::info!(report = %lighter::report::describe(self.station, &report), "posting the Lighter read");
         self.key
             .send(
@@ -492,7 +861,66 @@ impl LighterHalf {
                 },
             )
             .await
-            .map(|_| ())
+            .map(|_| Some(on_chain.as_of))
             .map_err(|error| anyhow!("{error:#}"))
+    }
+}
+
+/// Whether a post is due at once: one of the times the driver waits for a
+/// post read after (`due`) has passed by the chain's clock (`now`), and the
+/// newest post was read before it.
+pub fn post_due(due: &[u64], posted_as_of: u64, now: u64) -> bool {
+    due.iter().any(|due| posted_as_of < *due && now >= *due)
+}
+
+/// Whether a post's API reads (begun `started_at`, by the machine's clock,
+/// and taking `took` up to the end of the chain read) and its chain read (at
+/// a block of time `as_of`) are close enough to be posted as one reading.
+pub fn read_together(took: Duration, started_at: u64, as_of: u64) -> Result<()> {
+    if took > POST_READ_SPAN {
+        bail!(
+            "the exchange's API and the chain were read {} s apart, more than {} s: nothing is posted",
+            took.as_secs(),
+            POST_READ_SPAN.as_secs()
+        );
+    }
+    if as_of.saturating_add(POST_READ_SPAN.as_secs()) < started_at {
+        bail!(
+            "the chain's newest block is {} s older than the exchange's API read, more than {} s: nothing is posted",
+            started_at - as_of,
+            POST_READ_SPAN.as_secs()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_post_is_made_at_once_when_the_driver_waits_for_one_read_after_a_time_now_past() {
+        // A staged close's settle delay ends at 100, a deposit's credit at
+        // 300; the newest post was read at 50.
+        assert!(!post_due(&[100, 300], 50, 99));
+        assert!(post_due(&[100, 300], 50, 100));
+        // A post read at 100 or later proves the close; the deposit's
+        // credit time is still to come.
+        assert!(!post_due(&[100, 300], 100, 250));
+        assert!(post_due(&[100, 300], 100, 300));
+        assert!(!post_due(&[100, 300], 300, 400));
+        assert!(!post_due(&[], 0, 400));
+    }
+
+    #[test]
+    fn a_post_is_made_only_of_reads_close_together_in_time() {
+        let span = POST_READ_SPAN.as_secs();
+        assert!(read_together(Duration::from_secs(3), 1_000, 1_002).is_ok());
+        assert!(read_together(POST_READ_SPAN, 1_000, 1_000).is_ok());
+        // The reads took too long from the first API read to the chain's.
+        assert!(read_together(POST_READ_SPAN + Duration::from_secs(1), 1_000, 1_000).is_err());
+        // The chain's newest block predates the API read by too much.
+        assert!(read_together(Duration::from_secs(1), 1_000 + span + 1, 1_000).is_err());
+        assert!(read_together(Duration::from_secs(1), 1_000 + span, 1_000).is_ok());
     }
 }

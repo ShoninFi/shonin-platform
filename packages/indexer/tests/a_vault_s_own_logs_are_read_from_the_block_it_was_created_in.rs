@@ -271,6 +271,8 @@ async fn read_through(name: &str) -> (Arc<Indexer>, Vec<u64>) {
         dollar: "USDC".to_string(),
         native_usd: None,
         public_rpc: node,
+        logs_rpc: None,
+        log_range: None,
         confirmations: None,
     };
     let client = Client::connect(&config, Signing::ReadOnly).await.unwrap();

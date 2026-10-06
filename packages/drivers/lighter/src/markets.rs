@@ -105,10 +105,18 @@ impl Markets {
                 .unwrap_or("0")
                 .parse()
                 .map_err(|_| anyhow!("bad min_base_amount for {symbol}"))?;
+            let index = u16::try_from(book["market_id"].as_u64().unwrap_or(u64::MAX))
+                .map_err(|_| anyhow!("bad market id for {symbol}"))?;
+            if by_symbol.contains_key(&symbol)
+                || by_symbol
+                    .values()
+                    .any(|known: &Market| known.index == index)
+            {
+                bail!("the exchange lists market {symbol} ({index}) twice");
+            }
             let market = Market {
                 symbol: symbol.clone(),
-                index: u16::try_from(book["market_id"].as_u64().unwrap_or(u64::MAX))
-                    .map_err(|_| anyhow!("bad market id for {symbol}"))?,
+                index,
                 size_decimals,
                 price_decimals: small(&book["supported_price_decimals"])?,
                 min_base: integer((min * pow10(size_decimals)).ceil())?,
@@ -118,10 +126,36 @@ impl Markets {
         Ok(Self { by_symbol })
     }
 
+    /// Only the markets a station's pinned driver lists (`listed`: each
+    /// market's number, size decimals and price decimals, as its `markets()`
+    /// gives them), as the exchange lists them. A listed market whose
+    /// decimals the exchange writes differently from the driver is refused:
+    /// the driver would read every size and price in it wrong. A listed
+    /// market the exchange no longer trades is left out: nothing can be
+    /// ordered in it.
+    pub fn listed_by_driver(&self, listed: &[(u16, u8, u8)]) -> Result<Self> {
+        let mut by_symbol = BTreeMap::new();
+        for &(index, size_decimals, price_decimals) in listed {
+            let Some(market) = self.by_index(index) else {
+                continue;
+            };
+            if (market.size_decimals, market.price_decimals) != (size_decimals, price_decimals) {
+                bail!(
+                    "the driver writes market {index} ({}) with {size_decimals} size and {price_decimals} price decimals, the exchange with {} and {}",
+                    market.symbol,
+                    market.size_decimals,
+                    market.price_decimals
+                );
+            }
+            by_symbol.insert(market.symbol.clone(), market.clone());
+        }
+        Ok(Self { by_symbol })
+    }
+
     pub fn get(&self, symbol: &str) -> Result<&Market> {
         self.by_symbol
             .get(symbol)
-            .ok_or_else(|| anyhow!("{symbol} is not an active perp on this exchange"))
+            .ok_or_else(|| anyhow!("{symbol} is not a market this station's driver lists"))
     }
 
     pub fn by_index(&self, index: u16) -> Option<&Market> {
@@ -186,6 +220,37 @@ mod tests {
         );
         assert_eq!(spy().price_ticks(d("775.555"), Round::Up).unwrap(), 77_556);
         assert!(spy().price_ticks(d("0"), Round::Up).is_err());
+    }
+
+    fn exchange() -> Markets {
+        Markets::from_order_books(&serde_json::json!({"order_books": [
+            {"symbol": "SPY", "market_id": 26, "market_type": "perp", "status": "active",
+             "supported_size_decimals": 4, "supported_price_decimals": 2, "min_base_amount": "0.0100"},
+            {"symbol": "TSLA", "market_id": 27, "market_type": "perp", "status": "active",
+             "supported_size_decimals": 3, "supported_price_decimals": 2, "min_base_amount": "0.010"}
+        ]}))
+        .unwrap()
+    }
+
+    #[test]
+    fn only_the_markets_the_driver_lists_are_kept() {
+        let kept = exchange().listed_by_driver(&[(26, 4, 2)]).unwrap();
+        assert_eq!(kept.get("SPY").unwrap(), &spy());
+        assert!(kept.get("TSLA").is_err());
+        assert!(kept.by_index(27).is_none());
+        // A market the driver lists and the exchange no longer trades: none.
+        let kept = exchange()
+            .listed_by_driver(&[(26, 4, 2), (99, 2, 2)])
+            .unwrap();
+        assert_eq!(kept.iter().count(), 1);
+        // Nothing listed, nothing kept.
+        assert_eq!(exchange().listed_by_driver(&[]).unwrap().iter().count(), 0);
+    }
+
+    #[test]
+    fn a_market_the_driver_writes_with_other_decimals_than_the_exchange_is_refused() {
+        assert!(exchange().listed_by_driver(&[(26, 2, 2)]).is_err());
+        assert!(exchange().listed_by_driver(&[(26, 4, 3)]).is_err());
     }
 
     #[test]

@@ -5,6 +5,12 @@
 #
 # The funder keeps `reserve` for itself and funds nothing past it: a role it
 # can't fully top up is reported, not half-funded.
+#
+# The executor stakes each vault's key with gas before it takes the vault on:
+# 0.0005 of the chain's coin a vault on a public chain (more if three of the
+# key's sends cost more). Its amount must cover a stake for every vault a run
+# makes (the full seed activates four) and its own sends, or a vault is taken
+# on by nobody and its agent never starts.
 
 [testnet."evm:84532"] # Base Sepolia, ETH
 reserve = 0.01
@@ -26,7 +32,7 @@ author = 0.06
 reserve = 0.0015
 default = 0.0003
 admin = 0.004
-executor = 0.001
+executor = 0.004
 keeper = 0.001
 author = 0.001
 
@@ -37,6 +43,6 @@ author = 0.001
 # is given `activation_usd` on HyperCore so it exists there, and switched to
 # big blocks, since some contracts are larger than a small block's 2M gas.
 [hyperliquid]
-max_price = 35.0
+max_price = 60.0
 max_per_run = 3.0
 activation_usd = 2.0

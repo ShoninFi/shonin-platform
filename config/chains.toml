@@ -6,6 +6,21 @@
 # digits turned into "_" (SHONIN_RPC_EVM_8453, SHONIN_RPC_SOLANA_MAINNET_BETA).
 # Paid RPC URLs carry keys, so they only ever go there.
 #
+# `logs_rpc` (optional, space-separated like `rpc`) names endpoints for log
+# queries alone: every eth_getLogs goes through a failover over them, and
+# nothing else does. `log_range` (optional, a positive whole number) is the
+# most blocks one log query may span, both ends included; a range is read in
+# windows of at most that many. The width belongs to the list log queries go
+# to (`logs_rpc`, or `rpc` without it), not to one endpoint, since the
+# failover picks the endpoint beneath each query: it must suit every endpoint
+# in that list. Without them, logs use `rpc` and a range is asked for whole,
+# halved when an endpoint refuses it as too wide. Both are overridden from
+# .env as SHONIN_LOGS_RPC_<KIND>_<ID> and SHONIN_LOG_RANGE_<KIND>_<ID>.
+#
+# An endpoint that answers a read by saying it no longer keeps the state asked
+# for (pruned, "historical state ... is not available") counts as failing, and
+# the read goes on to the next endpoint in the list.
+#
 # `dollar` is the stablecoin a vault on that chain settles in.
 #
 # `native_usd` is what the chain's coin is taken to be worth, for billing an
@@ -61,10 +76,16 @@ native_usd = 0.0
 # address may ask, and a whole stack on one machine passes any one of their
 # limits within minutes, so the testnet names three: the client sends each
 # request to whichever has answered best lately and moves off one that starts
-# refusing. A browser is handed the first, Hyperliquid's own.
+# refusing. A browser is handed the first.
+#
+# drpc's is first: asked an account's nonce at a past block, it answers as of
+# that block, while Hyperliquid's own and Chainlink's answer any block with
+# the head's state (measured October 2026). The client sends no read pinned to
+# a past block to an endpoint it finds doing that, and asks one it couldn't
+# check only after those it found honouring the block.
 [chains."evm:998"]
 label = "Hyperliquid testnet"
-rpc = "https://rpc.hyperliquid-testnet.xyz/evm https://hyperliquid-testnet.drpc.org https://rpcs.chain.link/hyperevm/testnet"
+rpc = "https://hyperliquid-testnet.drpc.org https://rpc.hyperliquid-testnet.xyz/evm https://rpcs.chain.link/hyperevm/testnet"
 dollar = "USDC"
 native_usd = 0.0
 

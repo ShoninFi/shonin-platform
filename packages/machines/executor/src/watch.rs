@@ -329,7 +329,9 @@ async fn shortfall(chain: &Client, vault: Address) -> Result<U256> {
         id -= U256::from(1u64);
     }
     // And the claims not yet paid: each is paid from what comes home for it,
-    // or from cash the next valuation finds.
+    // or from cash the next valuation finds. A claim whose close is staged
+    // (closing) is paid from that close's own delivery and its part of the
+    // cash already set aside, so it needs nothing brought home.
     let claims = chain.read(vault, IVault::claimCountCall {}).await?;
     let first = claims.saturating_sub(U256::from(50u64));
     let mut id = claims;

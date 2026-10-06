@@ -153,6 +153,8 @@ async fn a_reading_the_vault_does_not_answer_is_asked_again() {
         dollar: "USDC".to_string(),
         native_usd: None,
         public_rpc: node,
+        logs_rpc: None,
+        log_range: None,
         confirmations: None,
     };
     let client = Client::connect(&config, Signing::ReadOnly).await.unwrap();

@@ -37,6 +37,7 @@ pragma solidity ^0.8.30;
 //   collectHeld              VaultExternalFunctionsTest.testFuzz_collectHeld
 //   toStation                VaultExternalFunctionsTest.testFuzz_toStation
 //   fromStation              VaultExternalFunctionsTest.testFuzz_fromStation
+//   delivered, unstaged      VaultExternalFunctionsTest.testFuzz_staged_doors_are_the_stations_alone
 //   fundTank                 VaultExternalFunctionsTest.testFuzz_fundTank
 //   keep                     VaultExternalFunctionsTest.testFuzz_keep
 //   withdrawTank             VaultExternalFunctionsTest.testFuzz_withdrawTank
@@ -81,6 +82,7 @@ pragma solidity ^0.8.30;
 //   Station.stop(bytes32,uint64,bytes)    RemoteStationExternalFunctionsTest.testFuzz_carried_stop,
 //                                         StationExternalFunctionsTest.testFuzz_stop (refused at home)
 //   Station.unwind                        StationExternalFunctionsTest.testFuzz_unwind
+//   Station.stageClose                    StationExternalFunctionsTest.testFuzz_stageClose
 //   Station.closeAll                      StationExternalFunctionsTest.testFuzz_closeAll
 //   Station.unwindStopped                 StationExternalFunctionsTest.testFuzz_unwindStopped
 //   AttestationRegistry.setTimelock       RegistryExternalFunctionsTest.testFuzz_setTimelock
@@ -959,6 +961,30 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
         );
         if (ok) assertEq(amount, 0, "the vault took money the station didn't send");
         if (ok) assertEq(vault.cash(), cash);
+        consistent(b, nobody());
+    }
+
+    /// The doors a staged close is delivered or handed back through: only
+    /// the home station, and only while a close it staged for the vault is in
+    /// progress (never on a vault whose station has no delayed driver).
+    function testFuzz_staged_doors_are_the_stations_alone(
+        uint8 stage,
+        uint8 pick,
+        address random,
+        uint256 amount,
+        bool deliver
+    ) public {
+        arrange(stage);
+        address caller = pickCaller(pick, random);
+        amount = bound(amount, 0, 1_000_000e6);
+        World memory b = look(caller, address(0));
+        uint256 cash = vault.cash();
+        bytes memory call = deliver
+            ? abi.encodeCall(Vault.delivered, (amount, 1e18, 0, amount))
+            : abi.encodeCall(Vault.unstaged, ());
+        (bool ok, bytes4 err) = callAs(caller, address(vault), call);
+        expectOutcome(ok, err, IVault.NotAllowed.selector, deliver ? "delivered" : "unstaged");
+        assertEq(vault.cash(), cash);
         consistent(b, nobody());
     }
 

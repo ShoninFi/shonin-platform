@@ -25,9 +25,9 @@ enum ExitPath {
     Unwinder,
     /// The station, but the venue acts on its calls after the transaction
     /// (a venue that executes queued actions after the block): a close is
-    /// placed in one transaction, proved and swept in a later one, and its
-    /// dollars delivered home once they land. The driver also implements
-    /// `IDelayedDriver`.
+    /// placed in one transaction, proved, measured and swept in a later
+    /// one, and its dollars delivered home once they land. The driver also
+    /// implements `IDelayedDriver`.
     Delayed
 }
 
@@ -104,19 +104,67 @@ interface IBridge {
 
 /// What a station needs from a driver whose venue acts after the
 /// transaction: a close can't be checked by what it brought home in the same
-/// transaction, so it is checked against the positions instead.
+/// transaction, so it is checked against the positions instead, and what it
+/// fetched is measured against what the account held when it was placed.
 interface IDelayedDriver {
     /// What the station holds in each market the driver knows, in the
-    /// venue's own units, in a fixed order: what `closed` compares against.
+    /// venue's own units, in a fixed order: what `closed` compares against
+    /// and `measure` reprices. A driver may add to it what it needs to read
+    /// it again (when it was read, the prices it was read at).
     function exposure(address station) external view returns (int256[] memory);
-    /// Whether a close of `fraction` placed when the station held `before`
-    /// has happened: every position it would have ordered is at least that
-    /// much smaller now, on the same side.
-    function closed(
+    /// The station's dollars through the driver, signed (a perp ledger can
+    /// be negative): with `exposure`, everything the account is worth.
+    function ledger(address station) external view returns (int256);
+    /// What part of a close of `fraction`, placed when the station held
+    /// `before`, has happened (1e18 is all of it): for each market it would
+    /// have ordered, how much of what it ordered the position is smaller
+    /// now, on the same side; the smallest of those, and 1e18 where nothing
+    /// needed ordering. `known` is false while the driver can't yet tell
+    /// from what the venue did after `since` (the stage plus its settle
+    /// delay): a reading made before then says nothing about the close.
+    function closedPart(
         address station,
         int256[] calldata before,
-        uint256 fraction
-    ) external view returns (bool);
+        uint256 fraction,
+        uint64 since
+    ) external view returns (uint256 part, bool known);
+    /// What a close of `fraction` placed when the account held `dollars`
+    /// (its `ledger`) and `before` (its `exposure`) fetched for `part` of
+    /// it (1e18 is all), by the venue's prices now: what the account is
+    /// worth now, less what the rest of the account as it was
+    /// (1 - `fraction` x `part`) would be worth now, rounded against the
+    /// leaver. A market move since cancels out, and so does a trade made
+    /// since at the price now; every dollar of slippage of what the close
+    /// sold falls on it. Never below what the close's own orders could have
+    /// lost at their limits (`bandBps` of what they ordered, at the prices
+    /// now), so a loss nobody's close could have made isn't the leaver's.
+    /// It may be negative; the station adds what reached it from the venue
+    /// meanwhile.
+    function measure(
+        address station,
+        int256 dollars,
+        int256[] calldata before,
+        uint256 fraction,
+        uint256 part,
+        uint16 bandBps
+    ) external view returns (int256);
+    /// How long a close through the driver may take to be proved, and its
+    /// dollars to reach the station once asked for.
+    function deliveryWindow() external view returns (uint64);
+    /// How long the venue may take to act on a call queued in a
+    /// transaction: a close is proved no sooner than this after it was
+    /// placed.
+    function settleDelay() external view returns (uint64);
+    /// Whether what `valueOf` says can be trusted now: false while dollars
+    /// moved between the station and the venue may be counted in neither,
+    /// or while the venue's state is known only from a stale reading.
+    function priced(address station) external view returns (bool);
+    /// The earliest time the next move of dollars through the driver may be
+    /// made (the executor's deposit or withdrawal, or a stopped station's
+    /// unwind): a whole slot after the last move stops voiding valuations,
+    /// so a priced valuation always fits between two moves, whoever makes
+    /// them. Zero: at once.
+    function movableAt(address station) external view returns (uint256);
     /// What the station's money parked in the venue's own vaults (`held`) is
     /// worth.
     function heldValue(address station, address[] calldata held) external view returns (uint256);

@@ -183,6 +183,8 @@ async fn a_refusal_completed_before_its_review_is_readable_is_read_again() {
         dollar: "USDC".to_string(),
         native_usd: None,
         public_rpc: node,
+        logs_rpc: None,
+        log_range: None,
         confirmations: None,
     };
     let client = Client::connect(&config, Signing::ReadOnly).await.unwrap();

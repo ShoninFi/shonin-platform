@@ -85,6 +85,9 @@ fn answer(node: &Mutex<Node>, path: &str, request: &Value) -> (Reply, Option<Dur
             "reward": [["0x3b9aca00"]],
         }),
         "eth_estimateGas" => json!("0x5208"),
+        // Its head is too young for the client's connect-time check of past
+        // blocks to ask about anything below it, so nothing reads state here
+        // but the sender's own nonce.
         "eth_getTransactionCount" => json!(format!("0x{:x}", node.sent.len())),
         "eth_sendRawTransaction" => {
             let raw = request["params"][0].as_str().unwrap();
@@ -231,6 +234,8 @@ pub fn config(url: &str) -> ChainConfig {
         native_usd: Some(2_500.0),
         confirmations: None,
         public_rpc: url.to_string(),
+        logs_rpc: None,
+        log_range: None,
     }
 }
 
@@ -247,6 +252,69 @@ pub enum Said {
 /// How a programmable node answers a request, given its method and the
 /// whole request.
 pub type Answer = Arc<dyn Fn(&str, &Value) -> Said + Send + Sync>;
+
+/// The sender of the transaction the client's connect-time check of past
+/// blocks finds in a block below the head, and the nonce it used there.
+pub const CHECKED_SENDER: Address = Address::repeat_byte(0x5e);
+pub const CHECKED_NONCE: u64 = 5;
+
+/// How an endpoint answers a read of state at a past block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Past {
+    /// As of that block.
+    Honours,
+    /// With the head's state, whatever block is asked.
+    Ignores,
+    /// By saying it no longer keeps that block's state.
+    Pruned,
+}
+
+/// The answer to the client's connect-time check of whether an endpoint
+/// answers a read at a past block as of that block, or `None` for any other
+/// request. Every block below the head holds a chain's own system
+/// transaction (a type of its own, whose sender's nonce never moves) and then
+/// an ordinary one from [`CHECKED_SENDER`] at [`CHECKED_NONCE`], whose nonce
+/// at the head is four more.
+pub fn past_block_check(method: &str, request: &Value, past: Past) -> Option<Said> {
+    let params = &request["params"];
+    match method {
+        "eth_getBlockByNumber" if params[1] == json!(true) => Some(Said::Result(json!({
+            "number": params[0].clone(),
+            "transactions": [
+                {"type": "0x6a", "from": Address::repeat_byte(0x0a), "nonce": "0x0"},
+                {"type": "0x2", "from": CHECKED_SENDER, "nonce": format!("0x{CHECKED_NONCE:x}")},
+            ],
+        }))),
+        "eth_getTransactionCount" => {
+            let at_head = matches!(params[1].as_str(), None | Some("latest" | "pending"));
+            let from: Address = params[0].as_str()?.parse().ok()?;
+            if from != CHECKED_SENDER {
+                return Some(Said::Result(json!("0x0")));
+            }
+            Some(match (at_head, past) {
+                (true, _) | (false, Past::Ignores) => {
+                    Said::Result(json!(format!("0x{:x}", CHECKED_NONCE + 4)))
+                }
+                (false, Past::Honours) => Said::Result(json!(format!("0x{CHECKED_NONCE:x}"))),
+                (false, Past::Pruned) => Said::Raw(200, missing_trie_node(request)),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A node's refusal of a read whose block's state it no longer keeps.
+pub fn missing_trie_node(request: &Value) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request["id"].clone(),
+        "error": {
+            "code": -32000,
+            "message": "missing trie node 0xab (path ) state 0xcd is not available",
+        },
+    })
+    .to_string()
+}
 
 /// A refusal of a method the node doesn't know, as a node would give it.
 pub fn unknown_method() -> Said {

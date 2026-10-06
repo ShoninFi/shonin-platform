@@ -16,9 +16,11 @@ pub mod markets;
 pub mod report;
 #[cfg(feature = "venue")]
 pub mod trader;
+#[cfg(feature = "venue")]
+pub mod withdrawals;
 
 #[cfg(feature = "venue")]
-pub use api::Api;
+pub use api::{Api, Explorer};
 #[cfg(feature = "venue")]
 pub use markets::{Market, Markets};
 #[cfg(feature = "venue")]

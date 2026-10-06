@@ -589,6 +589,88 @@ fn stopped(reached: Option<Account>, why: String, may_still_land: bool) -> Moved
     }
 }
 
+/// Why the station may be holding money back from moving through driver
+/// `name`, if one of its rules does now: a close staged there (none of the
+/// executor's moves until it ends), or, for a move through the venue
+/// (`through_venue`), a move through that driver lately (they are spaced, so
+/// a valuation can be priced between two). Nothing when neither can be read
+/// or neither holds.
+async fn held_back(
+    chain: &chain::Client,
+    station: Address,
+    name: alloy::primitives::FixedBytes<32>,
+    through_venue: bool,
+) -> Option<String> {
+    if let Ok(stage) = chain.read(station, IStation::stageCall {}).await
+        && stage.stagedAt != 0
+    {
+        return Some(format!(
+            "refused: a close is staged at the station (since {}), and the executor's money moves wait until it ends",
+            stage.stagedAt
+        ));
+    }
+    if !through_venue {
+        return None;
+    }
+    let moved = chain
+        .read(station, IStation::movedAtCall { driver: name })
+        .await
+        .ok()?;
+    (moved != 0).then(|| {
+        format!(
+            "refused, maybe for being too soon: the station spaces money moves through a venue, and the last through this one was at {moved} (chain time), so wait for a valuation before moving again"
+        )
+    })
+}
+
+/// What the agent is told of a deposit that left the station and that the
+/// venue hasn't credited: whatever steps came before it, the money is in
+/// none of the vault's accounts now but on its way to the venue, where it
+/// may still arrive. Read the balances before moving it again.
+fn left_for_the_venue(why: String) -> Moved {
+    Moved::Unknown(format!(
+        "the money left the station for the venue and hasn't been credited there: {why}"
+    ))
+}
+
+/// The station's idle dollars, if they can be read.
+async fn station_holds(chain: &Client, usd: Address, station: Address) -> Option<U256> {
+    chain
+        .read(usd, IERC20::balanceOfCall { account: station })
+        .await
+        .ok()
+}
+
+/// How long a withdrawal through a venue other than Hyperliquid is looked
+/// for in the station's balance after its receipt: enough for an endpoint a
+/// block or two behind to catch up.
+const WITHDRAWAL_SEEN_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// How far the station's idle dollars have risen over `before`, looking
+/// every two seconds for at most `wait` until they have risen by `units`;
+/// `None` when that can't be read. A fall (the station paying out meanwhile)
+/// counts as no rise, so a rise is never more than what came in.
+async fn risen_by(
+    chain: &Client,
+    usd: Address,
+    station: Address,
+    before: Option<U256>,
+    units: U256,
+    wait: std::time::Duration,
+) -> Option<U256> {
+    let before = before?;
+    let until = tokio::time::Instant::now() + wait;
+    loop {
+        let risen = station_holds(chain, usd, station)
+            .await
+            .map(|held| held.saturating_sub(before));
+        if risen.is_some_and(|risen| risen >= units) || tokio::time::Instant::now() >= until {
+            return risen;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
 /// The calls that take money from one account to another on the vault's own
 /// chain. Anything else is refused here, and the station would refuse it too.
 fn route(
@@ -675,6 +757,11 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
         // known to have got as far as the last step that landed.
         let mut reached = None;
         for step in steps {
+            // Set when a deposit left the station and the venue hasn't
+            // credited it, or a withdrawal was asked of the venue and hasn't
+            // all reached the station: the money is not where it was going,
+            // so the agent hears it may be on its way.
+            let mut in_flight = false;
             let (failed, may_still_land) = match &place {
                 Place::Evm(evm) => {
                     let (key, station) = (&evm.key, evm.station);
@@ -688,31 +775,134 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
                                 .await
                         }
                         Step::Deposit => {
-                            key.send(
-                                station,
-                                IStation::depositCall {
-                                    driver: name,
-                                    amount: units,
+                            // A deposit into HyperCore lands on HyperEVM
+                            // whether or not HyperCore credits it (on
+                            // testnet it silently doesn't for an address
+                            // without mainnet history), so it is done only
+                            // once HyperCore's ledger shows it.
+                            let half = evm
+                                .hyperliquid
+                                .as_ref()
+                                .filter(|_| driver == crate::hyperliquid::DRIVER);
+                            let watch = match half {
+                                Some(half) => match half.deposit_watch(amount).await {
+                                    Ok(watch) => Some((half, watch)),
+                                    Err(error) => {
+                                        let error = error.context(
+                                            "HyperCore's ledger can't be read, so the deposit couldn't be confirmed; nothing was sent",
+                                        );
+                                        let tally = Tally::of_lookup_failure(&error);
+                                        accessor.with(|mut access| {
+                                            access.get().count(|c| {
+                                                c.submitted(tally.unwrap_or(Tally::Unanswered))
+                                            })
+                                        });
+                                        return Ok(stopped(reached, format!("{error:#}"), false));
+                                    }
                                 },
-                            )
-                            .await
+                                None => None,
+                            };
+                            let sent = key
+                                .send(
+                                    station,
+                                    IStation::depositCall {
+                                        driver: name,
+                                        amount: units,
+                                    },
+                                )
+                                .await;
+                            match (sent, watch) {
+                                (Ok(receipt), Some((half, watch))) => {
+                                    if half.deposit_credited(&watch).await {
+                                        Ok(receipt)
+                                    } else {
+                                        in_flight = true;
+                                        tracing::warn!(
+                                            station = %station,
+                                            amount,
+                                            "a deposit left the station for HyperCore and HyperCore hasn't credited it"
+                                        );
+                                        Err(anyhow::Error::new(chain::NeverLanded).context(format!(
+                                            "the deposit of {amount} millionths left the station for HyperCore, which hasn't credited it within {} s: it may still arrive, or be held by the deposit contract",
+                                            crate::hyperliquid::DEPOSIT_CONFIRM_WAIT.as_secs()
+                                        )))
+                                    }
+                                }
+                                (sent, _) => sent,
+                            }
                         }
                         Step::Withdraw => {
-                            key.send(
-                                station,
-                                IStation::withdrawCall {
-                                    driver: name,
-                                    amount: units,
-                                },
-                            )
-                            .await
+                            // A delayed venue pays a withdrawal out after the
+                            // call that asks for it, and may pay less or
+                            // nothing; so it is done only once the station's
+                            // own balance shows it.
+                            let before = station_holds(&evm.chain, evm.usd, station).await;
+                            let sent = key
+                                .send(
+                                    station,
+                                    IStation::withdrawCall {
+                                        driver: name,
+                                        amount: units,
+                                    },
+                                )
+                                .await;
+                            match sent {
+                                Ok(receipt) => {
+                                    // HyperCore pays out a block or so later;
+                                    // any other venue's payout is read again
+                                    // for a few seconds, in case the first
+                                    // read comes from an endpoint a block
+                                    // behind the receipt.
+                                    let wait = if driver == crate::hyperliquid::DRIVER {
+                                        crate::hyperliquid::DEPOSIT_CONFIRM_WAIT
+                                    } else {
+                                        WITHDRAWAL_SEEN_WAIT
+                                    };
+                                    let risen =
+                                        risen_by(&evm.chain, evm.usd, station, before, units, wait)
+                                            .await;
+                                    if risen.is_some_and(|risen| risen >= units) {
+                                        Ok(receipt)
+                                    } else {
+                                        in_flight = true;
+                                        let found = match risen {
+                                            Some(risen) => format!("the station's balance rose by {risen} millionths"),
+                                            None => "the station's balance can't be read, so what reached it can't be told".to_string(),
+                                        };
+                                        tracing::warn!(
+                                            station = %station,
+                                            amount,
+                                            "a withdrawal was asked of the venue and hasn't all reached the station"
+                                        );
+                                        Err(anyhow::Error::new(chain::NeverLanded).context(format!(
+                                            "the withdrawal of {amount} millionths was asked of the venue, and {found} within {} s: the rest may still arrive, or still be at the venue",
+                                            wait.as_secs()
+                                        )))
+                                    }
+                                }
+                                Err(error) => Err(error),
+                            }
                         }
                     };
                     match sent {
                         Ok(_) => (None, false),
                         Err(error) => {
                             let may = chain::may_still_land(&error);
-                            (Some((Tally::of_failure(&error), error)), may)
+                            let tally = Tally::of_failure(&error);
+                            // A refusal the station's own rules explain is
+                            // told with them, so the agent waits rather than
+                            // asking again into the same refusal.
+                            let held = if may || in_flight {
+                                None
+                            } else {
+                                let venue = matches!(step, Step::Deposit | Step::Withdraw);
+                                held_back(&evm.chain, station, name, venue).await
+                            };
+                            let error = match held {
+                                Some(why) => error.context(why),
+                                None => error,
+                            };
+                            (Some((tally, error)), may)
                         }
                     }
                 }
@@ -731,6 +921,12 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
             };
             if let Some((tally, error)) = failed {
                 accessor.with(|mut access| access.get().count(|c| c.submitted(tally)));
+                if in_flight {
+                    return Ok(match step {
+                        Step::Withdraw => Moved::Unknown(format!("{error:#}")),
+                        _ => left_for_the_venue(format!("{error:#}")),
+                    });
+                }
                 return Ok(stopped(reached, format!("{error:#}"), may_still_land));
             }
             reached = Some(step.lands_in(&home, &driver));
@@ -1817,6 +2013,17 @@ mod tests {
             Step::Deposit.lands_in(home, driver),
             Account::Venue(VenueAccount { chain, driver: d }) if chain == home && d == driver
         ));
+    }
+
+    #[test]
+    fn a_deposit_the_venue_has_not_credited_is_never_said_to_be_at_the_station() {
+        // Whether it was the move's first step or came after a pull from the
+        // vault, the money left the station: it may still arrive.
+        let moved = left_for_the_venue("not credited within 60 s".to_string());
+        assert!(
+            matches!(&moved, Moved::Unknown(why) if why.contains("left the station")),
+            "{moved:?}"
+        );
     }
 
     #[test]

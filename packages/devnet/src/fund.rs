@@ -16,10 +16,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use alloy::network::{EthereumWallet, TransactionBuilder};
+use alloy::network::TransactionBuilder;
 use alloy::primitives::utils::{format_ether, parse_ether};
 use alloy::primitives::{Address, U256};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result, anyhow, bail};
@@ -174,11 +174,24 @@ pub async fn run(
     }
     let funding = Funding::read(funding_file)?;
     let funder = funder()?;
-    let mut failed = Vec::new();
+    // Every chain is funded and reported, whatever became of the others.
+    let mut outcomes = Vec::new();
     for (key, config) in chains {
-        if let Err(error) = fund_chain(&funding, &funder, network, &key, &config).await {
+        let outcome = fund_chain(&funding, &funder, network, &key, &config).await;
+        if let Err(error) = &outcome {
             tracing::error!(chain = %key, error = format!("{error:#}"), "funding stopped");
-            failed.push(key.to_string());
+        }
+        outcomes.push((key, config.label, outcome));
+    }
+    println!("Funding:");
+    let mut failed = Vec::new();
+    for (key, label, outcome) in outcomes {
+        match outcome {
+            Ok(()) => println!("  {label} ({key}): done"),
+            Err(error) => {
+                println!("  {label} ({key}): failed: {error:#}");
+                failed.push(key.to_string());
+            }
         }
     }
     if !failed.is_empty() {
@@ -199,15 +212,21 @@ async fn fund_chain(
         return Ok(());
     };
     let client = chain::connect_to(network, key, config).await?;
-    let provider = ProviderBuilder::new()
-        .wallet(EthereumWallet::from(funder.clone()))
-        .connect_http(config.first_rpc().parse().context("the chain's RPC URL")?);
+    // Through the client's own connection: an endpoint's URL may carry a
+    // key, and an error must never name it.
+    let provider = client.signing_provider(funder.clone())?;
     let from = funder.address();
     println!("{} ({key}), funder {from:?}", config.label);
 
-    let hypercore = Api::for_chain(client.chain_id);
-    if let Some(api) = &hypercore {
-        prepare_hyperevm(funding, funder, api, &client, &provider, key, reserve).await?;
+    // On HyperEVM, HYPE is bought on HyperCore first. If that fails, the
+    // roles are still topped up from what the funder already holds here,
+    // and the failure is the chain's outcome.
+    let mut prepared = Ok(());
+    if let Some(api) = &Api::for_chain(client.chain_id) {
+        prepared = prepare_hyperevm(funding, funder, api, &client, &provider, key, reserve).await;
+        if let Err(error) = &prepared {
+            println!("  HyperCore: {error:#}; topping up from what the funder holds here");
+        }
     }
 
     let short = shortfalls(funding, &client, key).await?;
@@ -238,7 +257,7 @@ async fn fund_chain(
             format_ether(need)
         );
     }
-    Ok(())
+    prepared
 }
 
 /// Send the chain's coin from the funder at a legacy gas price (HyperEVM's
@@ -309,25 +328,27 @@ async fn prepare_hyperevm<P: Provider>(
     println!("  admin     {admin:?} on big blocks, for contracts over 2M gas");
 
     let held = provider.get_balance(from).await?;
-    let wanted = shortfalls(funding, client, key).await?.total + reserve;
+    let short = shortfalls(funding, client, key).await?;
+    let wanted = short.total + reserve;
     if held >= wanted {
         return Ok(());
     }
     let missing = to_tokens(wanted - held);
+    // Whether a role is short more than dust of its amount: only then is a
+    // purchase under the venue's smallest order rounded up to it.
+    let needed = short.rows.iter().any(|(role, _, _, need)| {
+        let target = funding.target(key, *role).unwrap_or(U256::ZERO);
+        is_more_than_dust(*need, target)
+    });
     let hype = api.spot_token("HYPE").await?;
     let pair = hype
         .usdc_pair
         .ok_or_else(|| anyhow!("HYPE has no USDC pair on HyperCore"))?;
     let on_core = api.spot_balance(from, "HYPE").await?;
     let step = 10f64.powi(-(hype.sz_decimals as i32));
-    let to_buy = round_up((missing - on_core).max(0.0) * 1.01, hype.sz_decimals);
-    if to_buy > settings.max_per_run {
-        bail!(
-            "the roles need {to_buy} HYPE, over the {} a run may buy: raise max_per_run in the funding file, or run it again",
-            settings.max_per_run
-        );
-    }
-    if to_buy >= step {
+    let wanted_on_core = round_up((missing - on_core).max(0.0) * 1.01, hype.sz_decimals);
+    let mut to_buy = 0.0;
+    if wanted_on_core >= step {
         let (_, ask) = api.best_bid_ask(&format!("@{pair}")).await?;
         let ask = ask.ok_or_else(|| anyhow!("nobody is selling HYPE on HyperCore"))?;
         if ask > settings.max_price {
@@ -336,6 +357,20 @@ async fn prepare_hyperevm<P: Provider>(
                 settings.max_price
             );
         }
+        match hype_purchase(wanted_on_core, ask, hype.sz_decimals, needed) {
+            Purchase::Size(size) => to_buy = size,
+            Purchase::Dust { worth } => println!(
+                "  funder: the roles are short only dust (${worth:.2} of HYPE, under the venue's ${MIN_ORDER_USD} smallest order): left as it is"
+            ),
+        }
+    }
+    if to_buy > settings.max_per_run {
+        bail!(
+            "the roles need {to_buy} HYPE, over the {} a run may buy: raise max_per_run in the funding file, or run it again",
+            settings.max_per_run
+        );
+    }
+    if to_buy >= step {
         // The order may sweep the book up to the ceiling: testnet books are
         // thin, and a fill only at the best ask often covers a fraction.
         let limit = round_price(settings.max_price);
@@ -357,6 +392,10 @@ async fn prepare_hyperevm<P: Provider>(
     let on_core = api.spot_balance(from, "HYPE").await?;
     let send = round_down(on_core.min(missing * 1.01), 8);
     if send <= 0.0 {
+        if to_buy < step {
+            // Nothing bought (dust), and nothing on HyperCore to send.
+            return Ok(());
+        }
         bail!("no HYPE on HyperCore to send to HyperEVM");
     }
     core.spot_send(hyperliquid::api::system_address(&hype), &hype, send)
@@ -386,6 +425,47 @@ where
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     bail!("not seen within two minutes")
+}
+
+/// The venue's smallest order, in dollars: it refuses an order worth less
+/// ("Order must have minimum value of 10 USDC").
+const MIN_ORDER_USD: f64 = 10.0;
+/// How far over the smallest order a purchase rounded up to it goes, so a
+/// price moving before it is placed does not take it under.
+const MIN_ORDER_MARGIN: f64 = 1.05;
+
+/// Whether a role short `need` of its amount `target` is short more than
+/// dust: more than a quarter of its amount. A role short less holds nearly
+/// its amount.
+fn is_more_than_dust(need: U256, target: U256) -> bool {
+    need.saturating_mul(U256::from(4u8)) > target
+}
+
+/// What to buy on HyperCore, in HYPE.
+#[derive(Debug, PartialEq)]
+enum Purchase {
+    /// This many, never worth less than the venue's smallest order.
+    Size(f64),
+    /// Nothing: what is missing is worth less than the smallest order and
+    /// no role is short more than dust, so it is left.
+    Dust { worth: f64 },
+}
+
+/// A purchase of `wanted` HYPE (already rounded to the token's size
+/// decimals) at about `ask` dollars a HYPE, as the venue will take it: at
+/// least [`MIN_ORDER_USD`] × [`MIN_ORDER_MARGIN`] at the ask. Under that, it
+/// is rounded up to it if `needed` (a role is short more than dust; the
+/// extra stays with the funder for later runs), and otherwise left.
+fn hype_purchase(wanted: f64, ask: f64, sz_decimals: u32, needed: bool) -> Purchase {
+    let least = MIN_ORDER_USD * MIN_ORDER_MARGIN;
+    let worth = wanted * ask;
+    if worth >= least {
+        Purchase::Size(wanted)
+    } else if needed {
+        Purchase::Size(round_up(least / ask, sz_decimals))
+    } else {
+        Purchase::Dust { worth }
+    }
 }
 
 fn to_tokens(amount: U256) -> f64 {
@@ -450,6 +530,41 @@ activation_usd = 2.0
         assert_eq!(round_price(0.0287114), 0.028711);
         assert_eq!(round_up(1.001, 2), 1.01);
         assert_eq!(round_down(1.009, 2), 1.0);
+    }
+
+    #[test]
+    fn a_purchase_is_never_under_the_venue_s_smallest_order() {
+        // Enough on its own.
+        assert_eq!(hype_purchase(1.0, 35.0, 2, false), Purchase::Size(1.0));
+        // Dust the roles can do without: left.
+        assert!(matches!(
+            hype_purchase(0.01, 35.0, 2, false),
+            Purchase::Dust { worth } if (worth - 0.35).abs() < 1e-9
+        ));
+        // Short more than dust: rounded up to the smallest order and a
+        // margin, at the token's size decimals.
+        let Purchase::Size(size) = hype_purchase(0.01, 35.0, 2, true) else {
+            panic!("a needed purchase is made");
+        };
+        assert_eq!(size, 0.3);
+        assert!(size * 35.0 >= MIN_ORDER_USD);
+        for ask in [0.5, 3.0, 12.6, 35.0, 59.9] {
+            for wanted in [0.0001, 0.01, 0.2, 5.0] {
+                if let Purchase::Size(size) = hype_purchase(wanted, ask, 2, true) {
+                    assert!(size * ask >= MIN_ORDER_USD, "{size} at {ask}");
+                    assert!(size >= wanted);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_role_short_a_quarter_of_its_amount_or_less_holds_nearly_its_amount() {
+        let target = parse_ether("0.4").unwrap();
+        assert!(!is_more_than_dust(parse_ether("0.1").unwrap(), target));
+        assert!(!is_more_than_dust(U256::ZERO, target));
+        assert!(is_more_than_dust(parse_ether("0.11").unwrap(), target));
+        assert!(is_more_than_dust(parse_ether("0.01").unwrap(), U256::ZERO));
     }
 
     #[test]

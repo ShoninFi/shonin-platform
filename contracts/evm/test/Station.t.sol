@@ -51,6 +51,16 @@ contract FakeVault is IStationVault {
         dollar.transferFrom(station, address(this), amount);
         cash += amount;
     }
+
+    function delivered(uint256 amount, uint256, uint256, uint256) external {
+        require(msg.sender == station, "not the station");
+        dollar.transferFrom(station, address(this), amount);
+        cash += amount;
+    }
+
+    function unstaged() external view {
+        require(msg.sender == station, "not the station");
+    }
 }
 
 /// A driver whose calls try to take the station's dollars.

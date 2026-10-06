@@ -141,6 +141,8 @@ async fn a_vault_is_sampled_hourly_not_at_every_refresh() {
         dollar: "USDC".to_string(),
         native_usd: None,
         public_rpc: node,
+        logs_rpc: None,
+        log_range: None,
         confirmations: None,
     };
     let client = Client::connect(&config, Signing::ReadOnly).await.unwrap();

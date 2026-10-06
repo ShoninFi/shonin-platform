@@ -130,10 +130,76 @@ pub struct Client {
     /// same one and the node would keep only one of them.
     turns: Arc<std::sync::Mutex<HashMap<Address, Arc<tokio::sync::Mutex<()>>>>>,
     /// The nonce after each account's last send whose receipt was seen,
-    /// shared by every clone. A public RPC is often several nodes behind one
-    /// name, and one a block behind would number the next send as the last
-    /// again; a send is never numbered below this.
-    nonces: Arc<std::sync::Mutex<HashMap<Address, u64>>>,
+    /// shared by every clone and every [`KeyClient`] made from it.
+    nonces: NonceFloor,
+    /// Where a log query with no numbered range goes: the endpoints
+    /// `logs_rpc` names, or the same connection as everything else when it
+    /// names none.
+    logs: DynProvider,
+    /// The same endpoints, each on its own, for log queries over a numbered
+    /// range, each checked against its own head.
+    log_endpoints: Endpoints,
+    /// The most blocks one log query may span, both ends included.
+    log_range: Option<u64>,
+    /// The `rpc` endpoints, each on its own: for sends, and for reads pinned
+    /// to a past block, which only an endpoint that honours the block
+    /// answers.
+    endpoints: Endpoints,
+    /// The provider that fills transactions in and signs them here, when
+    /// the client holds the role accounts' keys.
+    signing: Option<SigningProvider>,
+    /// The chain's name, for errors and logs that can't name an endpoint.
+    label: String,
+}
+
+/// The nonce after each account's last send this client saw land.
+///
+/// A public RPC is often several nodes behind one name, and one a block
+/// behind counts the account's sends without the last one: numbered from its
+/// count alone, the next send would take the last one's nonce again, and be
+/// refused or, worse, replace a send still waiting in the pool. So a send is
+/// numbered at the node's count of the account's sends (pending ones
+/// included) but never below this. It starts empty: a client that starts
+/// again takes the node's count until it has seen a send of its own land.
+#[derive(Clone, Default)]
+struct NonceFloor(Arc<std::sync::Mutex<HashMap<Address, u64>>>);
+
+impl NonceFloor {
+    /// The nonce for `from`'s next send, given the node's count of its sends.
+    fn number(&self, from: Address, counted: u64) -> u64 {
+        let floor = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&from)
+            .copied()
+            .unwrap_or(0);
+        counted.max(floor)
+    }
+
+    /// A send of `from`'s numbered `nonce` landed (reverted or not: either
+    /// way the nonce is used).
+    fn landed(&self, from: Address, nonce: u64) {
+        let mut floors = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let next = floors.entry(from).or_default();
+        *next = (*next).max(nonce.saturating_add(1));
+    }
+
+    /// Ask the node for `from`'s count of sends, pending ones included, and
+    /// number the next send from it and the floor. A count the node won't
+    /// give is a send that can't be numbered safely, so nothing is sent.
+    async fn next(&self, provider: &DynProvider, from: Address) -> Result<u64> {
+        let counted = provider
+            .get_transaction_count(from)
+            .pending()
+            .await
+            .context("counting the account's sends")
+            .map_err(NeverSent::wrap)?;
+        Ok(self.number(from, counted))
+    }
 }
 
 /// The fillers a signing client runs: gas, then the nonce, then the chain id.
@@ -418,29 +484,33 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// one machine passes any one of their limits. Each request then goes to the
 /// endpoint ranked best by how often and how fast it has answered lately, and
 /// to the next when one refuses (a rate limit included, however it is
-/// worded), which also falls in the ranking.
-fn rpc_client(rpc: &str) -> Result<alloy::rpc::client::RpcClient> {
-    let http = alloy::transports::http::reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .context("making the HTTP client")?;
+/// worded, and an endpoint saying it no longer has the past state a read
+/// asked for), which also falls in the ranking.
+///
+/// `setting` names the setting the list came from, for an error that can't
+/// name the URL.
+fn rpc_client(
+    rpc: &str,
+    setting: &str,
+    chain_id: Option<u64>,
+) -> Result<alloy::rpc::client::RpcClient> {
+    let http = http_client()?;
     let urls: Vec<&str> = rpc.split_whitespace().collect();
-    let parse = |url: &str| -> Result<alloy::transports::http::reqwest::Url> {
-        url.parse()
-            .map_err(|_| anyhow!("the chain's rpc in the chain config is not a URL"))
-    };
     if urls.len() <= 1 {
-        let url = parse(rpc.trim())?;
-        return Ok(alloy::rpc::client::ClientBuilder::default()
-            .layer(KeepUrlOut::new(rpc.trim(), &url))
-            .http_with_client(http, url));
+        let url = parse_endpoint(rpc.trim(), setting)?;
+        let is_local = alloy::transports::utils::guess_local_url(&url);
+        let keep = KeepUrlOut::new(rpc.trim(), &url);
+        let http = alloy::transports::http::Http::with_client(http, url);
+        return Ok(alloy::rpc::client::ClientBuilder::default().transport(
+            AskAgainWhenRateLimited {
+                inner: tower::Layer::layer(&keep, http),
+            },
+            is_local,
+        ));
     }
     let mut transports = Vec::with_capacity(urls.len());
     for configured in urls {
-        let url = parse(configured)?;
-        let keep = KeepUrlOut::new(configured, &url);
-        let inner = alloy::transports::http::Http::with_client(http.clone(), url);
-        transports.push(tower::Layer::layer(&keep, RateLimitIsAFailure { inner }));
+        transports.push(endpoint_transport(configured, setting, &http, chain_id)?);
     }
     // Every method the services use goes to one endpoint at a time, best
     // first, and on to the next when one refuses, so a request fails only
@@ -459,7 +529,712 @@ fn rpc_client(rpc: &str) -> Result<alloy::rpc::client::RpcClient> {
             ),
         transports,
     );
-    Ok(alloy::rpc::client::ClientBuilder::default().transport(fallback, false))
+    Ok(alloy::rpc::client::ClientBuilder::default()
+        .transport(AskAgainWhenRateLimited { inner: fallback }, false))
+}
+
+/// The HTTP client every endpoint is asked through, each request bounded in
+/// time.
+fn http_client() -> Result<alloy::transports::http::reqwest::Client> {
+    alloy::transports::http::reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .context("making the HTTP client")
+}
+
+fn parse_endpoint(url: &str, setting: &str) -> Result<alloy::transports::http::reqwest::Url> {
+    url.parse()
+        .map_err(|_| anyhow!("an endpoint in the chain's {setting} is not a URL"))
+}
+
+/// The connection to one endpoint of a list: its URL kept out of its
+/// errors, its own trouble (a rate limit, missing history) an error rather
+/// than an answer, and, once the chain's id is known, held to that chain.
+fn endpoint_transport(
+    configured: &str,
+    setting: &str,
+    http: &alloy::transports::http::reqwest::Client,
+    chain_id: Option<u64>,
+) -> Result<
+    HeldToChain<
+        UrlKeptOut<
+            TroubleIsAFailure<
+                alloy::transports::http::Http<alloy::transports::http::reqwest::Client>,
+            >,
+        >,
+    >,
+> {
+    let url = parse_endpoint(configured, setting)?;
+    let keep = KeepUrlOut::new(configured, &url);
+    let inner = alloy::transports::http::Http::with_client(http.clone(), url);
+    Ok(HeldToChain {
+        inner: tower::Layer::layer(&keep, TroubleIsAFailure { inner }),
+        chain_id,
+        on_it: Default::default(),
+        failed_at: Default::default(),
+    })
+}
+
+/// How long an endpoint is given to say its chain id before a request.
+const CHAIN_ID_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long after an endpoint failed to say its chain id its requests fail
+/// at once, so a list moves each of them on rather than each asking again.
+const CHAIN_ID_PROBE_REST: Duration = Duration::from_secs(10);
+
+/// One endpoint of a list, held to chain `chain_id`: before it answers
+/// anything, it is asked its chain id, once, and an endpoint on another
+/// chain is refused every request from then on. An endpoint that doesn't
+/// answer that within [`CHAIN_ID_PROBE_TIMEOUT`] fails this request, and
+/// every request waiting on or arriving within [`CHAIN_ID_PROBE_REST`] of
+/// that answer, at once, so a list moves each on to the next endpoint; it is
+/// asked again after that. A list's endpoints are each asked
+/// when the client connects, but one that didn't answer then (limiting the
+/// rate while a whole stack starts) would otherwise answer for another
+/// chain as this one, and stations share one address on every chain.
+/// Without `chain_id` (the connection the id itself is first asked over)
+/// requests pass as they are, and so does a request for the chain id.
+#[derive(Clone)]
+struct HeldToChain<S> {
+    inner: S,
+    chain_id: Option<u64>,
+    /// Whether the endpoint said it is on the chain, once it has answered.
+    on_it: Arc<tokio::sync::OnceCell<bool>>,
+    /// When the endpoint last failed to say its chain id.
+    failed_at: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+}
+
+impl<S> tower::Service<alloy::rpc::json_rpc::RequestPacket> for HeldToChain<S>
+where
+    S: tower::Service<
+            alloy::rpc::json_rpc::RequestPacket,
+            Response = alloy::rpc::json_rpc::ResponsePacket,
+            Error = alloy::transports::TransportError,
+            Future = alloy::transports::TransportFut<'static>,
+        > + Send
+        + Clone
+        + 'static,
+{
+    type Response = alloy::rpc::json_rpc::ResponsePacket;
+    type Error = alloy::transports::TransportError;
+    type Future = alloy::transports::TransportFut<'static>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: alloy::rpc::json_rpc::RequestPacket) -> Self::Future {
+        let Some(chain_id) = self.chain_id else {
+            return self.inner.call(request);
+        };
+        if self.on_it.get() == Some(&true)
+            || request.method_names().all(|method| method == "eth_chainId")
+        {
+            return self.inner.call(request);
+        }
+        let mut inner = self.inner.clone();
+        let on_it = self.on_it.clone();
+        let failed_at = self.failed_at.clone();
+        Box::pin(async move {
+            use alloy::transports::TransportErrorKind;
+            let answered = on_it
+                .get_or_try_init(|| async {
+                    let failed = || failed_at.lock().unwrap_or_else(|p| p.into_inner());
+                    if failed().is_some_and(|at| at.elapsed() < CHAIN_ID_PROBE_REST) {
+                        return Err(TransportErrorKind::custom_str(
+                            "the endpoint did not give its chain id",
+                        ));
+                    }
+                    let asking = alloy::rpc::json_rpc::Request::new(
+                        "eth_chainId",
+                        alloy::rpc::json_rpc::Id::Number(0),
+                        (),
+                    )
+                    .serialize()
+                    .map_err(TransportErrorKind::custom)?;
+                    let answer = tokio::time::timeout(
+                        CHAIN_ID_PROBE_TIMEOUT,
+                        inner.call(alloy::rpc::json_rpc::RequestPacket::Single(asking)),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(TransportErrorKind::custom_str(
+                            "the endpoint did not give its chain id in time",
+                        ))
+                    })
+                    .inspect_err(|_| *failed() = Some(tokio::time::Instant::now()))?;
+                    let id = answer
+                        .responses()
+                        .first()
+                        .and_then(|response| response.payload.as_success())
+                        .and_then(|raw| {
+                            serde_json::from_str::<alloy::primitives::U64>(raw.get()).ok()
+                        })
+                        .ok_or_else(|| {
+                            *failed() = Some(tokio::time::Instant::now());
+                            TransportErrorKind::custom_str("the endpoint did not give its chain id")
+                        })?;
+                    Ok::<_, alloy::transports::TransportError>(id.to::<u64>() == chain_id)
+                })
+                .await?;
+            if !*answered {
+                return Err(TransportErrorKind::custom_str(&format!(
+                    "the endpoint is not on chain {chain_id}"
+                )));
+            }
+            inner.call(request).await
+        })
+    }
+}
+
+/// One endpoint of a list, asked on its own rather than through the
+/// failover, for the requests whose answer depends on which endpoint gave
+/// it: a send, a read pinned to a past block, a log query and the head it is
+/// checked against.
+#[derive(Clone)]
+struct Endpoint {
+    provider: DynProvider,
+    /// Whether it answers a read pinned to a past block as of that block:
+    /// `Some(false)` if it answers with the head's state whatever block is
+    /// asked, `None` if that could not be found out ([`honours_blocks`]);
+    /// and when it was last asked.
+    honours_blocks: Arc<std::sync::Mutex<(Option<bool>, tokio::time::Instant)>>,
+}
+
+/// How long an endpoint not known to honour a past block goes before it
+/// is asked again, when a past read would use it.
+const PROBE_AGAIN_AFTER: Duration = Duration::from_secs(60);
+
+impl Endpoint {
+    fn honours(&self) -> Option<bool> {
+        self.honours_blocks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0
+    }
+
+    /// Whether it honours a past block, asking it again first ([`honours_blocks`])
+    /// if that isn't known and it wasn't asked in the last
+    /// [`PROBE_AGAIN_AFTER`].
+    async fn honours_now(&self) -> Option<bool> {
+        {
+            let mut probed = self
+                .honours_blocks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if probed.0.is_some() || probed.1.elapsed() < PROBE_AGAIN_AFTER {
+                return probed.0;
+            }
+            // Marked now, so reads at once don't all ask it.
+            probed.1 = tokio::time::Instant::now();
+        }
+        let found = tokio::time::timeout(CHECK_TIMEOUT, honours_blocks(&self.provider))
+            .await
+            .ok()
+            .flatten();
+        let mut probed = self
+            .honours_blocks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        probed.0 = probed.0.or(found);
+        probed.0
+    }
+}
+
+/// The endpoints of one list, each on its own, and which one answered last.
+#[derive(Clone)]
+struct Endpoints {
+    each: Arc<[Endpoint]>,
+    preferred: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Endpoints {
+    /// Each endpoint held to chain `chain_id` when there is one
+    /// ([`HeldToChain`]).
+    fn new(list: &str, setting: &str, chain_id: Option<u64>) -> Result<Self> {
+        let http = http_client()?;
+        let each = list
+            .split_whitespace()
+            .map(|configured| {
+                let client = alloy::rpc::client::ClientBuilder::default().transport(
+                    endpoint_transport(configured, setting, &http, chain_id)?,
+                    false,
+                );
+                Ok(Endpoint {
+                    provider: ProviderBuilder::default().connect_client(client).erased(),
+                    honours_blocks: Arc::new(std::sync::Mutex::new((
+                        None,
+                        tokio::time::Instant::now(),
+                    ))),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if each.is_empty() {
+            bail!("the chain's {setting} names no endpoint");
+        }
+        Ok(Self {
+            each: each.into(),
+            preferred: Default::default(),
+        })
+    }
+
+    /// The order to ask them in: the one that answered last, then the rest
+    /// in the list's order.
+    fn order(&self) -> Vec<usize> {
+        let count = self.each.len();
+        let start = self.preferred.load(std::sync::atomic::Ordering::Relaxed) % count;
+        (0..count).map(|step| (start + step) % count).collect()
+    }
+
+    fn answered(&self, at: usize) {
+        self.preferred
+            .store(at, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Check that every endpoint that answers is on chain `chain_id` (one
+    /// that doesn't answer now is held to it when next asked anything:
+    /// [`HeldToChain`]), unless `id_known` says the list is the one endpoint the id was
+    /// just asked of; and, with `probe`, find out which of them answer a
+    /// read pinned to a past block as of that block. The endpoints are asked at once,
+    /// each for at most [`CHECK_TIMEOUT`].
+    async fn checked(
+        self,
+        chain_id: u64,
+        label: &str,
+        setting: &str,
+        id_known: bool,
+        probe: bool,
+    ) -> Result<Self> {
+        let ask_ids = !(id_known && self.each.len() == 1);
+        let mut asked = tokio::task::JoinSet::new();
+        for (at, endpoint) in self.each.iter().enumerate() {
+            let provider = endpoint.provider.clone();
+            asked.spawn(async move {
+                let (id, honours) = tokio::join!(
+                    async {
+                        if ask_ids {
+                            tokio::time::timeout(CHECK_TIMEOUT, provider.get_chain_id())
+                                .await
+                                .ok()
+                                .and_then(Result::ok)
+                        } else {
+                            None
+                        }
+                    },
+                    async {
+                        if probe {
+                            tokio::time::timeout(CHECK_TIMEOUT, honours_blocks(&provider))
+                                .await
+                                .ok()
+                                .flatten()
+                        } else {
+                            None
+                        }
+                    }
+                );
+                (at, id, honours)
+            });
+        }
+        while let Some(joined) = asked.join_next().await {
+            let (at, id, honours) =
+                joined.map_err(|_| anyhow!("checking an endpoint stopped before it ended"))?;
+            // Named by its place in the list: the URL may carry a key.
+            if let Some(id) = id
+                && id != chain_id
+            {
+                bail!(
+                    "endpoint {} of {label}'s {setting} is on chain {id}, not {chain_id}",
+                    at + 1
+                );
+            }
+            *self.each[at]
+                .honours_blocks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                (honours, tokio::time::Instant::now());
+            match honours {
+                Some(false) => tracing::warn!(
+                    chain = %label,
+                    endpoint = at + 1,
+                    "this endpoint answers a read at a past block with the head's state; \
+                     past reads are never sent to it"
+                ),
+                None if probe => tracing::info!(
+                    chain = %label,
+                    endpoint = at + 1,
+                    "could not find out whether this endpoint answers a read at a past block \
+                     as of that block; it is asked again before a past read is sent to it"
+                ),
+                _ => {}
+            }
+        }
+        Ok(self)
+    }
+}
+
+/// How long each check of an endpoint at connect may take.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How far below its head an endpoint is asked about in [`honours_blocks`]:
+/// deep enough that a node a few blocks behind the others behind one name
+/// has the block, shallow enough that one keeping little history still does.
+const PROBE_DEPTH: u64 = 16;
+
+/// How many blocks below [`PROBE_DEPTH`] [`honours_blocks`] looks through
+/// for a transaction to ask about, on a quiet chain.
+const PROBE_SCAN: u64 = 32;
+
+/// Whether an endpoint answers a read pinned to a past block as of that
+/// block. Some answer it with the head's state whatever block is asked, with
+/// no error, so no wording can catch it.
+///
+/// It is asked about state, which is what a pinned read reads (the block's
+/// own number or environment is not: an Arbitrum-stack chain's `NUMBER` is
+/// the parent chain's, and some nodes run a call in the next block's
+/// environment while reading the asked block's state). It finds a
+/// transaction of an ordinary type in a block `b` from [`PROBE_DEPTH`] to
+/// [`PROBE_DEPTH`] + [`PROBE_SCAN`] below its head whose sender `S` has a
+/// nonce at the head above `n`, the lowest nonce `S` used in `b`, and asks
+/// for `S`'s nonce as of block `b - 1`: exactly `n` honours the block, more
+/// than `n` ignores it, and a refusal for missing history counts as
+/// honouring (the read then moves on from it, as from any endpoint that
+/// lacks the state). Past those blocks it looks, on a quiet chain, at one
+/// block every power of two further down (2 × [`PROBE_SCAN`], 4 ×, …, to
+/// the first block). `None` when it couldn't be found out: the endpoint
+/// didn't answer or answered something else, or the chain is too young or
+/// too quiet to have such a transaction in reach.
+async fn honours_blocks(provider: &DynProvider) -> Option<bool> {
+    let head = provider.get_block_number().await.ok()?;
+    let newest = head.checked_sub(PROBE_DEPTH).filter(|block| *block >= 1)?;
+    let oldest = newest.saturating_sub(PROBE_SCAN).max(1);
+    let deeper =
+        std::iter::successors(Some(PROBE_SCAN.saturating_mul(2)), |gap| gap.checked_mul(2))
+            .map_while(|gap| newest.checked_sub(gap).filter(|block| *block >= 1));
+    for block in (oldest..=newest).rev().chain(deeper) {
+        let Some((sender, nonce)) = probe_transaction(provider, block).await? else {
+            continue;
+        };
+        let now = provider.get_transaction_count(sender).await.ok()?;
+        // A sender whose nonce the transaction didn't move (a chain's own
+        // system transaction) says nothing either way.
+        if now <= nonce {
+            continue;
+        }
+        return match provider
+            .get_transaction_count(sender)
+            .block_id(alloy::eips::BlockId::number(block - 1))
+            .await
+        {
+            Ok(before) if before == nonce => Some(true),
+            Ok(before) if before > nonce => Some(false),
+            Ok(_) => None,
+            Err(error) if error.to_string().contains(MISSING_STATE) => Some(true),
+            Err(_) => None,
+        };
+    }
+    None
+}
+
+/// A transaction of an ordinary type (0 to 4) in `block`, as its sender and
+/// the lowest nonce that sender used in the block; `Some(None)` when the
+/// block has none, `None` when the block couldn't be read. The block is read
+/// as plain JSON: a chain's own transaction types are not Ethereum's.
+async fn probe_transaction(provider: &DynProvider, block: u64) -> Option<Option<(Address, u64)>> {
+    let read: serde_json::Value = provider
+        .raw_request(
+            "eth_getBlockByNumber".into(),
+            (format!("0x{block:x}"), true),
+        )
+        .await
+        .ok()?;
+    let quantity = |value: &serde_json::Value| {
+        u64::from_str_radix(value.as_str()?.strip_prefix("0x")?, 16).ok()
+    };
+    let ordinary: Vec<(Address, u64)> = read
+        .get("transactions")?
+        .as_array()?
+        .iter()
+        .filter(|tx| quantity(&tx["type"]).unwrap_or(0) <= 4)
+        .filter_map(|tx| Some((tx["from"].as_str()?.parse().ok()?, quantity(&tx["nonce"])?)))
+        .collect();
+    let Some((sender, _)) = ordinary.first().copied() else {
+        return Some(None);
+    };
+    let lowest = ordinary
+        .iter()
+        .filter(|(from, _)| *from == sender)
+        .map(|(_, nonce)| *nonce)
+        .min()?;
+    Some(Some((sender, lowest)))
+}
+
+/// How many times a read is asked again when every endpoint asked limited
+/// the rate of requests (and nothing else went wrong).
+const RATE_LIMIT_RETRIES: u32 = 3;
+/// The pause before the first time it is asked again; each next pause is
+/// twice the last.
+const RATE_LIMIT_PAUSE: Duration = Duration::from_millis(500);
+/// The longest pause, whatever an endpoint's Retry-After asks.
+const RATE_LIMIT_PAUSE_MOST: Duration = Duration::from_secs(10);
+
+/// The pause before asking again for the `retry`th time (from 0): 0.5 s,
+/// 1 s, 2 s, or longer if an endpoint's Retry-After asked for longer, and never
+/// over [`RATE_LIMIT_PAUSE_MOST`].
+fn rate_limit_pause(retry: u32, retry_after: Option<Duration>) -> Duration {
+    let grown = RATE_LIMIT_PAUSE.saturating_mul(2u32.saturating_pow(retry));
+    retry_after
+        .map_or(grown, |asked| asked.max(grown))
+        .min(RATE_LIMIT_PAUSE_MOST)
+}
+
+/// The wait an endpoint asked for with a Retry-After, if it did.
+fn retry_after(error: &alloy::transports::TransportError) -> Option<Duration> {
+    match error {
+        alloy::transports::RpcError::Transport(
+            alloy::transports::TransportErrorKind::HttpErrorWithRetryAfter { retry_after, .. },
+        ) => Some(*retry_after),
+        _ => None,
+    }
+}
+
+/// A read's rounds over a list's endpoints, for asking again when every
+/// endpoint asked limited the rate. A read whose endpoints all limited the
+/// rate once is not a read the chain refused: the endpoints are asked again
+/// a few times, with growing pauses, before it fails. A send is never asked
+/// again this way.
+#[derive(Default)]
+struct RateLimits {
+    retries: u32,
+}
+
+/// What the endpoints of one round said that was not an answer.
+struct Round {
+    limited: bool,
+    other: bool,
+    retry_after: Option<Duration>,
+}
+
+impl Round {
+    /// An endpoint's failure.
+    fn saw(&mut self, error: &alloy::transports::TransportError) {
+        if rate_limited(error) {
+            self.limited = true;
+            self.retry_after = self.retry_after.max(retry_after(error));
+        } else {
+            self.other = true;
+        }
+    }
+
+    /// Anything else that went wrong.
+    fn other(&mut self) {
+        self.other = true;
+    }
+}
+
+impl RateLimits {
+    fn round() -> Round {
+        Round {
+            limited: false,
+            other: false,
+            retry_after: None,
+        }
+    }
+
+    /// After a round with no answer: if every endpoint asked limited the
+    /// rate and the read may be asked again, wait and say so.
+    async fn wait_after(&mut self, round: Round) -> bool {
+        if !round.limited || round.other || self.retries >= RATE_LIMIT_RETRIES {
+            return false;
+        }
+        tokio::time::sleep(rate_limit_pause(self.retries, round.retry_after)).await;
+        self.retries += 1;
+        true
+    }
+}
+
+/// Whether a request is made of reads alone, which may be asked again when
+/// rate limited: no send, no signature, nothing a list doesn't name.
+fn retried_when_rate_limited(request: &alloy::rpc::json_rpc::RequestPacket) -> bool {
+    request.method_names().all(|method| {
+        ONE_ENDPOINT_AT_A_TIME.contains(&method)
+            && !method.starts_with("eth_send")
+            && !method.starts_with("eth_sign")
+    })
+}
+
+/// Asks a read again, as [`RateLimits`] says, when its whole list of
+/// endpoints refused it for the rate: the outermost layer of a client.
+#[derive(Clone)]
+struct AskAgainWhenRateLimited<S> {
+    inner: S,
+}
+
+impl<S> tower::Service<alloy::rpc::json_rpc::RequestPacket> for AskAgainWhenRateLimited<S>
+where
+    S: tower::Service<
+            alloy::rpc::json_rpc::RequestPacket,
+            Response = alloy::rpc::json_rpc::ResponsePacket,
+            Error = alloy::transports::TransportError,
+            Future = alloy::transports::TransportFut<'static>,
+        > + Send
+        + Sync
+        + Clone
+        + 'static,
+{
+    type Response = alloy::rpc::json_rpc::ResponsePacket;
+    type Error = alloy::transports::TransportError;
+    type Future = alloy::transports::TransportFut<'static>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: alloy::rpc::json_rpc::RequestPacket) -> Self::Future {
+        if !retried_when_rate_limited(&request) {
+            return self.inner.call(request);
+        }
+        let mut inner = self.inner.clone();
+        let first = self.inner.call(request.clone());
+        Box::pin(async move {
+            let mut limits = RateLimits::default();
+            let mut answer = first.await;
+            loop {
+                let mut round = RateLimits::round();
+                match &answer {
+                    Err(error) => round.saw(error),
+                    // A rate limit inside a JSON-RPC answer, from a lone
+                    // endpoint (a list's endpoints turn it into a failure).
+                    Ok(packet)
+                        if packet
+                            .responses()
+                            .iter()
+                            .filter_map(|response| response.payload.as_error())
+                            .any(|error| is_rate_limit(error.code, &error.message)) =>
+                    {
+                        round.limited = true;
+                    }
+                    Ok(_) => return answer,
+                }
+                if !limits.wait_after(round).await {
+                    return answer;
+                }
+                answer = inner.call(request.clone()).await;
+            }
+        })
+    }
+}
+
+/// What [`TroubleIsAFailure`] says of an endpoint limiting the rate of
+/// requests.
+const RATE_LIMITED: &str = "the endpoint is limiting the rate of requests";
+
+/// What [`TroubleIsAFailure`] says of an endpoint that no longer has the
+/// state a read asked for.
+const MISSING_STATE: &str = "the endpoint does not have the state asked for";
+
+/// Whether a request's failure is an endpoint limiting the rate of
+/// requests, however it arrived: an HTTP 429, a rate limit inside a
+/// JSON-RPC error, or one an endpoint's transport already turned into a
+/// failure. An endpoint that limited the rate did nothing with the request.
+fn rate_limited(error: &alloy::transports::TransportError) -> bool {
+    use alloy::transports::{RpcError, TransportErrorKind};
+    match error {
+        RpcError::Transport(TransportErrorKind::HttpError(http))
+        | RpcError::Transport(TransportErrorKind::HttpErrorWithRetryAfter {
+            error: http, ..
+        }) => http.status == 429 || is_rate_limit(0, &http.body),
+        RpcError::ErrorResp(refusal) => is_rate_limit(refusal.code, &refusal.message),
+        other => {
+            let text = other.to_string();
+            text.contains(RATE_LIMITED) || is_rate_limit(0, &text)
+        }
+    }
+}
+
+/// What became of a transaction handed to a list's endpoints.
+enum Handed {
+    /// Taken, or it may have been: watched for by its hash.
+    MayLand,
+    /// Refused, and no endpoint can have taken it.
+    Refused(alloy::transports::TransportError),
+    /// Every endpoint limited the rate of requests: none took it.
+    NotTaken(alloy::transports::TransportError),
+}
+
+/// Hand a signed transaction's bytes to a list's endpoints, one at a time,
+/// until one takes it or refuses it.
+///
+/// An endpoint whose answer is lost or unreadable (a gateway error, a
+/// timeout, a dropped connection) may have taken it, and on a chain with
+/// fast blocks it may be mined before the next endpoint is asked. That one
+/// then says its nonce is too low or the transaction is already known,
+/// because this very transaction used it. So once an endpoint may have taken
+/// it, no later refusal is taken as one: whether it landed is found out by
+/// its hash. An error that is no judgement of the transaction itself
+/// ([`judges_the_transaction`]) is no answer either, however it arrives. A
+/// clear refusal from the first endpoint that answers at all stays a
+/// refusal, except a "nonce too low" from an endpoint that holds this very
+/// transaction's receipt (a gateway that retried it behind one name) or
+/// can't be asked for it. A rate limit is no answer either way and moves on. The bytes are
+/// the same at every endpoint, so the transaction is never sent under a
+/// second nonce.
+async fn hand_over(endpoints: &Endpoints, raw: &[u8], deadline: tokio::time::Instant) -> Handed {
+    use alloy::rpc::json_rpc::RpcError;
+    let mut may_have_taken = false;
+    let mut limited = None;
+    for at in endpoints.order() {
+        let send = endpoints.each[at].provider.send_raw_transaction(raw);
+        let Ok(reply) = tokio::time::timeout_at(deadline, send).await else {
+            // Out of time with the bytes on their way: it may be taken.
+            return Handed::MayLand;
+        };
+        match reply {
+            Ok(_) => {
+                endpoints.answered(at);
+                return Handed::MayLand;
+            }
+            Err(error) if rate_limited(&error) => limited = Some(error),
+            Err(refusal @ RpcError::ErrorResp(_)) => {
+                if may_have_taken || already_held(&refusal) {
+                    return Handed::MayLand;
+                }
+                // An error of the endpoint's own (an internal error, a
+                // timeout upstream) says nothing of the transaction, which
+                // its node may have: like a gateway's 502.
+                if !judges_the_transaction(&refusal) {
+                    may_have_taken = true;
+                    continue;
+                }
+                // A gateway that retries a send behind one name can take it
+                // and then call its own retry's nonce too low: this very
+                // transaction is then mined. Asked by its hash, the endpoint
+                // says so; one that can't be asked is no proof of a refusal.
+                if nonce_too_low(&refusal) {
+                    let hash = alloy::primitives::keccak256(raw);
+                    let provider = &endpoints.each[at].provider;
+                    match tokio::time::timeout_at(deadline, provider.get_transaction_receipt(hash))
+                        .await
+                    {
+                        Ok(Ok(None)) => {}
+                        _ => return Handed::MayLand,
+                    }
+                }
+                return Handed::Refused(refusal);
+            }
+            Err(_) => may_have_taken = true,
+        }
+    }
+    match limited {
+        Some(error) if !may_have_taken => Handed::NotTaken(error),
+        // No endpoint said yes or no, and one may have taken it.
+        _ => Handed::MayLand,
+    }
 }
 
 /// The methods sent to one endpoint at a time: every one the services use.
@@ -489,15 +1264,36 @@ const ONE_ENDPOINT_AT_A_TIME: [&str; 22] = [
     "eth_signTypedData_v4",
 ];
 
-/// An answer that is a rate limit, whether as an HTTP status or inside a
-/// JSON-RPC error, taken as the endpoint failing, so a ranking of endpoints
-/// moves away from it.
+/// An answer that is the endpoint's own trouble rather than an answer to
+/// what was asked, taken as the endpoint failing, so the request goes on to
+/// the next endpoint and the ranking moves away from this one:
+///
+/// - a rate limit, whether as an HTTP status or inside a JSON-RPC error;
+/// - to a read of the chain's state or logs, an endpoint saying it no longer
+///   has (or never kept) the state asked for. Another endpoint in the list
+///   may keep the past, so a list mixing endpoints that do and don't is
+///   safe: the read fails only when none has it. A send is never moved on
+///   for this, and a refusal about the request itself (a revert, a bad
+///   argument) stays the answer it is.
 #[derive(Clone)]
-struct RateLimitIsAFailure<S> {
+struct TroubleIsAFailure<S> {
     inner: S,
 }
 
-impl<S> tower::Service<alloy::rpc::json_rpc::RequestPacket> for RateLimitIsAFailure<S>
+/// The reads an endpoint may answer by saying it no longer has the state
+/// they ask about. No send is among them.
+const READS_OF_THE_PAST: [&str; 8] = [
+    "eth_call",
+    "eth_estimateGas",
+    "eth_getBalance",
+    "eth_getCode",
+    "eth_getStorageAt",
+    "eth_getTransactionCount",
+    "eth_getProof",
+    "eth_getLogs",
+];
+
+impl<S> tower::Service<alloy::rpc::json_rpc::RequestPacket> for TroubleIsAFailure<S>
 where
     S: tower::Service<
             alloy::rpc::json_rpc::RequestPacket,
@@ -520,27 +1316,81 @@ where
     }
 
     fn call(&mut self, request: alloy::rpc::json_rpc::RequestPacket) -> Self::Future {
+        // Only a request made of reads alone may be moved on for missing
+        // history: a batch carrying a send is answered as it is.
+        let reads_only = request
+            .method_names()
+            .all(|method| READS_OF_THE_PAST.contains(&method));
         let answer = self.inner.call(request);
         Box::pin(async move {
             let answer = answer.await?;
-            let limited = answer
-                .responses()
-                .iter()
-                .filter_map(|response| response.payload.as_error())
-                .any(|error| is_rate_limit(error.code, &error.message));
-            if limited {
+            let refusals = || {
+                answer
+                    .responses()
+                    .iter()
+                    .filter_map(|response| response.payload.as_error())
+            };
+            if refusals().any(|error| is_rate_limit(error.code, &error.message)) {
                 return Err(alloy::transports::TransportErrorKind::custom_str(
-                    "the endpoint is limiting the rate of requests",
+                    RATE_LIMITED,
                 ));
+            }
+            if reads_only
+                && let Some(error) =
+                    refusals().find(|error| is_missing_history(error.code, &error.message))
+            {
+                return Err(alloy::transports::TransportErrorKind::custom_str(&format!(
+                    "{MISSING_STATE}: {}",
+                    error.message
+                )));
             }
             Ok(answer)
         })
     }
 }
 
-/// Whether a JSON-RPC error is an endpoint limiting the rate of requests.
+/// Whether a JSON-RPC error is an endpoint saying it doesn't have the past
+/// state (or the past blocks' logs) asked for: pruned, never kept, or behind
+/// what an upstream it relies on keeps. Each wording here is one a public
+/// endpoint gives. A revert, whatever its reason says, is the chain's
+/// answer, never this.
+fn is_missing_history(code: i64, message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    if code == 3 || message.contains("revert") {
+        return false;
+    }
+    [
+        // Nitro (Robinhood Chain): "historical state <root> is not available",
+        // "missing trie node <hash> (path ) state <root> is not available".
+        "historical state",
+        "missing trie node",
+        // "state at block #N is pruned"; geth's "pruned history unavailable".
+        "pruned",
+        // "Unknown state. First available state is N".
+        "unknown state",
+        "first available state",
+        // A gateway with no upstream keeping that block's state: "Upstream
+        // lower height N of type STATE is greater than M".
+        "upstream lower height",
+        "state not available",
+        "state is not available",
+        "state unavailable",
+        "state history",
+        "archive",
+        // "no state found for block 0x…".
+        "no state found",
+    ]
+    .iter()
+    .any(|phrase| message.contains(phrase))
+}
+
+/// Whether a JSON-RPC error is an endpoint limiting the rate of requests. A
+/// revert, whatever its reason says, is the chain's answer, never this.
 fn is_rate_limit(code: i64, message: &str) -> bool {
     let message = message.to_ascii_lowercase();
+    if code == 3 || message.contains("revert") {
+        return false;
+    }
     code == 429
         || message.contains("rate limit")
         || message.contains("too many requests")
@@ -591,11 +1441,10 @@ impl Client {
     /// at once, so a service usually arrives before the chain does.
     pub async fn connect(config: &ChainConfig, signing: Signing) -> Result<Self> {
         let rpc_url = config.rpc.as_str();
-        let rpc = rpc_client(rpc_url)?;
         // The chain id is asked for first, on a provider that signs nothing,
         // so a provider that signs is made for that id alone.
-        let asking = ProviderBuilder::default()
-            .connect_client(rpc.clone())
+        let asking: DynProvider = ProviderBuilder::default()
+            .connect_client(rpc_client(rpc_url, "rpc", None)?)
             .erased();
 
         // Measured by the clock, not by the pauses between tries: a node
@@ -615,20 +1464,34 @@ impl Client {
             }
         };
 
-        let provider = match &signing {
+        // Every endpoint of the list is on this chain: one on another would
+        // answer for that chain as this one, and stations share one address
+        // on every chain.
+        // A lone endpoint is the one that just answered the chain id.
+        let several = rpc_url.split_whitespace().count() > 1;
+        let endpoints = Endpoints::new(rpc_url, "rpc", several.then_some(chain_id))?
+            .checked(chain_id, &config.label, "rpc", true, true)
+            .await?;
+
+        // From here every endpoint of the list is held to this chain,
+        // whether or not it answered just now.
+        let rpc = rpc_client(rpc_url, "rpc", Some(chain_id))?;
+        let asking: DynProvider = ProviderBuilder::default()
+            .connect_client(rpc.clone())
+            .erased();
+        let reading = asking.clone();
+        let (provider, signing_provider) = match &signing {
             Signing::Keys(keys) if !keys.is_empty() => {
                 let mut wallet = EthereumWallet::from(keys[0].clone());
                 for key in &keys[1..] {
                     wallet.register_signer(key.clone());
                 }
-                signing_builder(chain_id)
-                    .wallet(wallet)
-                    .connect_client(rpc)
-                    .erased()
+                let signs = signing_builder(chain_id).wallet(wallet).connect_client(rpc);
+                (signs.clone().erased(), Some(signs))
             }
             // The node holds unlocked accounts' keys and numbers their
             // transactions itself.
-            _ => asking,
+            _ => (asking, None),
         };
 
         let (accounts, keys) = match signing {
@@ -647,6 +1510,21 @@ impl Client {
             ),
             Signing::ReadOnly => (Vec::new(), None),
         };
+        let (logs, log_endpoints) = match config
+            .logs_rpc
+            .as_deref()
+            .filter(|list| !list.trim().is_empty())
+        {
+            Some(list) => (
+                ProviderBuilder::default()
+                    .connect_client(rpc_client(list, "logs_rpc", Some(chain_id))?)
+                    .erased(),
+                Endpoints::new(list, "logs_rpc", Some(chain_id))?
+                    .checked(chain_id, &config.label, "logs_rpc", false, false)
+                    .await?,
+            ),
+            None => (reading, endpoints.clone()),
+        };
         Ok(Self {
             provider,
             rpc_url: rpc_url.to_string(),
@@ -655,7 +1533,18 @@ impl Client {
             keys,
             turns: Default::default(),
             nonces: Default::default(),
+            logs,
+            log_endpoints,
+            log_range: config.log_range,
+            endpoints,
+            signing: signing_provider,
+            label: config.label.clone(),
         })
+    }
+
+    /// The most blocks one of this client's log queries spans, if capped.
+    pub fn log_range(&self) -> Option<u64> {
+        self.log_range
     }
 
     /// Whether the node itself holds the accounts' keys, which is what makes
@@ -746,23 +1635,140 @@ impl Client {
 
     /// Read a contract as it was at a past block. A chain that keeps its
     /// history is a record nobody has to be trusted to have kept.
+    ///
+    /// A read pinned to a block (any but the head's tags `latest` and
+    /// `pending`) goes only to the endpoints that answer as of the block
+    /// asked: some answer with the head's state whatever block is asked,
+    /// without an error. Which do was found out when the client connected
+    /// ([`honours_blocks`]). Those known to honour the block are asked
+    /// first; one that couldn't be found out is checked again (at most once
+    /// a [`PROBE_AGAIN_AFTER`]) before it is asked, and asked unchecked only
+    /// while no endpoint is known to honour the block, which is logged. The read moves on from an endpoint that
+    /// doesn't answer, limits the rate or no longer has the state asked for,
+    /// and fails, naming the chain, when only endpoints that ignore the block
+    /// are left.
     pub async fn read_at<C: SolCall>(
         &self,
         to: Address,
         call: C,
         block: alloy::eips::BlockId,
     ) -> Result<C::Return> {
+        use alloy::eips::{BlockId, BlockNumberOrTag};
         let request = TransactionRequest::default()
             .with_to(to)
             .with_input(call.abi_encode());
-        let returned = self
-            .provider
-            .call(request)
-            .block(block)
-            .await
-            .with_context(|| format!("reading {} at block {block:?}", C::SIGNATURE))?;
+        let at_the_head = matches!(
+            block,
+            BlockId::Number(BlockNumberOrTag::Latest | BlockNumberOrTag::Pending)
+        );
+        let returned = if at_the_head {
+            self.provider
+                .call(request)
+                .block(block)
+                .await
+                .map_err(anyhow::Error::new)
+        } else {
+            self.call_pinned(request, block).await
+        }
+        .with_context(|| format!("reading {} at block {block:?}", C::SIGNATURE))?;
         C::abi_decode_returns(&returned)
             .with_context(|| format!("decoding what {} returned", C::SIGNATURE))
+    }
+
+    /// A call pinned to `block`, through the endpoints that honour it.
+    ///
+    /// An endpoint that says it hasn't reached the block ("header not
+    /// found", "unknown block" and their kin) is behind, which is its own
+    /// state, not the chain's answer: the read goes on to the next, and only
+    /// an endpoint that answered becomes the one asked first next time. When
+    /// no endpoint has reached the block, they are all asked again a few
+    /// times, a moment apart, as for a log window no endpoint has reached;
+    /// and when every endpoint asked limited the rate, as for any read
+    /// ([`RateLimits`]). A revert, or any other refusal of the call itself,
+    /// is the answer.
+    async fn call_pinned(
+        &self,
+        request: TransactionRequest,
+        block: alloy::eips::BlockId,
+    ) -> Result<Bytes> {
+        let mut last: Option<anyhow::Error> = None;
+        let mut asked_any = false;
+        let mut behind_tries = 0;
+        let mut limits = RateLimits::default();
+        loop {
+            let mut behind = false;
+            let mut round = RateLimits::round();
+            // Those known to honour the block first. One not known is asked
+            // again first, and asked unchecked only while none is known to.
+            let any_known = self
+                .endpoints
+                .each
+                .iter()
+                .any(|endpoint| endpoint.honours() == Some(true));
+            let mut order = self.endpoints.order();
+            order.sort_by_key(|at| self.endpoints.each[*at].honours() != Some(true));
+            for at in order {
+                let endpoint = &self.endpoints.each[at];
+                match endpoint.honours_now().await {
+                    Some(false) => continue,
+                    Some(true) => {}
+                    None if any_known => continue,
+                    None => tracing::warn!(
+                        chain = %self.label,
+                        endpoint = at + 1,
+                        "no endpoint is known to answer a read at a past block as of that block, \
+                         and this one could not be checked again: the read is sent to it unchecked"
+                    ),
+                }
+                asked_any = true;
+                match endpoint.provider.call(request.clone()).block(block).await {
+                    Ok(returned) => {
+                        self.endpoints.answered(at);
+                        return Ok(returned);
+                    }
+                    Err(alloy::rpc::json_rpc::RpcError::ErrorResp(refusal))
+                        if not_reached_yet(refusal.code, &refusal.message) =>
+                    {
+                        behind = true;
+                        round.other();
+                        last = Some(anyhow!(
+                            "endpoint {} of {}'s rpc has not reached the block yet: {}",
+                            at + 1,
+                            self.label,
+                            refusal.message
+                        ));
+                    }
+                    // The chain's answer about the call itself (a revert, a
+                    // bad argument) is the answer.
+                    Err(refusal @ alloy::rpc::json_rpc::RpcError::ErrorResp(_)) => {
+                        return Err(refusal.into());
+                    }
+                    // The endpoint's own trouble: on to the next.
+                    Err(error) => {
+                        round.saw(&error);
+                        last = Some(error.into());
+                    }
+                }
+            }
+            if behind && behind_tries < PINNED_BEHIND_TRIES {
+                behind_tries += 1;
+                tokio::time::sleep(PINNED_BEHIND_PAUSE).await;
+                continue;
+            }
+            if limits.wait_after(round).await {
+                continue;
+            }
+            break;
+        }
+        match last {
+            Some(error) => Err(error),
+            None if !asked_any => bail!(
+                "no endpoint of {}'s rpc answers a read at a past block as of that block \
+                 (each answers with the head's state), so it is not read",
+                self.label
+            ),
+            None => bail!("no endpoint of {}'s rpc answered", self.label),
+        }
     }
 
     /// When a past block was mined, in the chain's own time.
@@ -837,10 +1843,26 @@ impl Client {
         to: Address,
         data: alloy_primitives::Bytes,
     ) -> Result<TransactionReceipt> {
-        let request = TransactionRequest::default()
+        self.send_raw_with_gas_limit(from, to, data, None).await
+    }
+
+    /// The same, with the gas limit given (when there is one) rather than
+    /// the node's estimate: some endpoints estimate against a smaller block
+    /// than the sender's transactions go into.
+    pub async fn send_raw_with_gas_limit(
+        &self,
+        from: Address,
+        to: Address,
+        data: alloy_primitives::Bytes,
+        gas_limit: Option<u64>,
+    ) -> Result<TransactionReceipt> {
+        let mut request = TransactionRequest::default()
             .with_from(from)
             .with_to(to)
             .with_input(data);
+        if let Some(gas_limit) = gas_limit {
+            request = request.with_gas_limit(gas_limit);
+        }
         let receipt = self
             .sent(request, RECEIPT_TIMEOUT, "sending", "a transaction", |_| {})
             .await?;
@@ -850,13 +1872,69 @@ impl Client {
         Ok(receipt)
     }
 
+    /// Send bytes as [`Client::send_raw`] does, and hand the transaction's
+    /// hash to `sent_as` as soon as the node has it, before waiting for it
+    /// to land: a caller whose wait runs out can look for it by that hash
+    /// rather than send it again.
+    pub async fn send_raw_noting(
+        &self,
+        from: Address,
+        to: Address,
+        data: alloy_primitives::Bytes,
+        sent_as: impl FnOnce(B256) + Send,
+    ) -> Result<TransactionReceipt> {
+        let request = TransactionRequest::default()
+            .with_from(from)
+            .with_to(to)
+            .with_input(data);
+        let receipt = self
+            .sent(
+                request,
+                RECEIPT_TIMEOUT,
+                "sending",
+                "a transaction",
+                sent_as,
+            )
+            .await?;
+        if !receipt.status() {
+            return Err(anyhow::Error::new(Reverted).context("the transaction reverted"));
+        }
+        Ok(receipt)
+    }
+
+    /// A provider that signs as `signer` itself, over this client's
+    /// endpoints, each held to the chain and with its URL kept out of every
+    /// error: for a tool that sends from a key that plays no role. The
+    /// transaction is signed once, so whichever endpoint takes it, the same
+    /// bytes go to each.
+    pub fn signing_provider(&self, signer: PrivateKeySigner) -> Result<DynProvider> {
+        Ok(ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer))
+            .connect_client(rpc_client(&self.rpc_url, "rpc", Some(self.chain_id))?)
+            .erased())
+    }
+
     /// Deploy a contract from its bytecode and constructor arguments. A
     /// creation the chain reverted is an error: its receipt still names the
     /// address the contract would have had, with nothing there.
     pub async fn deploy(&self, from: Address, bytecode: Vec<u8>) -> Result<Address> {
-        let request = TransactionRequest::default()
+        self.deploy_with_gas_limit(from, bytecode, None).await
+    }
+
+    /// The same, with the gas limit given (when there is one) rather than
+    /// the node's estimate.
+    pub async fn deploy_with_gas_limit(
+        &self,
+        from: Address,
+        bytecode: Vec<u8>,
+        gas_limit: Option<u64>,
+    ) -> Result<Address> {
+        let mut request = TransactionRequest::default()
             .with_from(from)
             .with_deploy_code(bytecode);
+        if let Some(gas_limit) = gas_limit {
+            request = request.with_gas_limit(gas_limit);
+        }
         let receipt = self
             .sent(request, DEPLOY_TIMEOUT, "deploying", "a deployment", |_| {})
             .await?;
@@ -905,39 +1983,59 @@ impl Client {
         };
         // Numbered here, while the account's turn is held: the node's count
         // of the account's sends, pending ones included, but never below the
-        // one after the last send this client saw land. A count the node
-        // won't give leaves the numbering to the send itself, as before.
+        // one after the last send this client saw land ([`NonceFloor`]).
         let mut request = request;
         let mut numbered = None;
-        if let (Some(_), Some(from), None) = (&_turn, request.from, request.nonce)
-            && let Ok(counted) = self.provider.get_transaction_count(from).pending().await
-        {
-            let floor = self
+        if let (Some(_), Some(from), None) = (&_turn, request.from, request.nonce) {
+            let nonce = self
                 .nonces
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get(&from)
-                .copied()
-                .unwrap_or(0);
-            let nonce = counted.max(floor);
+                .next(&self.provider, from)
+                .await
+                .with_context(|| sending.to_string())?;
             request = request.with_nonce(nonce);
             numbered = Some((from, nonce));
         }
-        let pending = self
-            .provider
-            .send_transaction(request)
-            .await
-            .with_context(|| sending.to_string())?;
-        let hash = *pending.tx_hash();
+        let hash = match (&_turn, &self.signing) {
+            // Signed here: handed to the endpoints one at a time, so a send
+            // one endpoint may have taken is never reported refused by the
+            // next ([`hand_over`]).
+            (Some(_), Some(signing)) => {
+                use alloy::eips::eip2718::Encodable2718;
+                let filled = signing
+                    .fill(request)
+                    .await
+                    .with_context(|| sending.to_string())
+                    .map_err(NeverSent::wrap)?;
+                let Some(signed) = filled.as_envelope() else {
+                    return Err(NeverSent::wrap(anyhow!(
+                        "{what} was filled in but not signed"
+                    )));
+                };
+                let hash = *signed.tx_hash();
+                let deadline = tokio::time::Instant::now() + within;
+                match hand_over(&self.endpoints, &signed.encoded_2718(), deadline).await {
+                    Handed::MayLand => hash,
+                    Handed::Refused(refusal) => {
+                        return Err(anyhow::Error::new(refusal).context(sending.to_string()));
+                    }
+                    Handed::NotTaken(limited) => {
+                        return Err(NeverSent::wrap(
+                            anyhow::Error::new(limited).context(sending.to_string()),
+                        ));
+                    }
+                }
+            }
+            _ => *self
+                .provider
+                .send_transaction(request)
+                .await
+                .with_context(|| sending.to_string())?
+                .tx_hash(),
+        };
         sent_as(hash);
         let receipt = receipt_within(&self.provider, hash, within, what).await?;
         if let Some((from, nonce)) = numbered {
-            let mut nonces = self
-                .nonces
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let next = nonces.entry(from).or_default();
-            *next = (*next).max(nonce + 1);
+            self.nonces.landed(from, nonce);
         }
         Ok(receipt)
     }
@@ -996,49 +2094,95 @@ impl Client {
             .with_context(|| format!("asking the chain for {method}"))
     }
 
-    /// The logs a filter matches, through whatever the provider allows.
+    /// The logs a filter matches, in block order, through whatever the
+    /// endpoints allow.
     ///
-    /// Public providers refuse ranges wider than they like, each in its own
-    /// words, so a numbered range one refuses as too wide is read in halves
-    /// (and those in halves, as far as one block). Several nodes often
-    /// answer behind one name, and one behind the others may not have the
-    /// range's newest block yet, so a range it says it doesn't have is asked
-    /// again a few times, a second or two apart, before the error is
-    /// returned. A filter with no numbered range is asked once.
+    /// Log queries go to the chain's `logs_rpc` endpoints when it names
+    /// any, and to its `rpc` endpoints otherwise. With a width cap
+    /// (`log_range`), a numbered range is read in consecutive windows of at
+    /// most that many blocks, each block in exactly one, a few at a time
+    /// ([`LOG_WINDOWS_IN_FLIGHT`]), and a range from a numbered block to the
+    /// head is read up to the head's number, as the first of those
+    /// endpoints to answer gives it. Without one, a numbered range is one
+    /// window, and a range to the head is asked once, its end being
+    /// whatever the endpoint answering has reached.
+    ///
+    /// A read is returned only when every block of the range was read by an
+    /// endpoint that had reached it. A node behind the range's newest block
+    /// may answer with the logs it has and no error, so each window goes to
+    /// one endpoint at a time, and only to one whose own head, asked just
+    /// before (once per endpoint and read, and again only when a window ends
+    /// past what it last said), is at or past the window's end. An endpoint
+    /// that is behind, says it hasn't reached the window, limits the rate,
+    /// doesn't answer, or no longer has the logs, is passed over for the
+    /// next; when every endpoint has been passed over and one of them was
+    /// behind, the window is asked again a few times
+    /// ([`LOGS_BEHIND_TRIES`]), a second and a half apart, and then the read
+    /// fails. A window an endpoint refuses as too wide is read there in
+    /// halves (and those in halves, as far as one block). A filter with no
+    /// numbered range is asked once, through the failover.
+    ///
+    /// Behind one endpoint's name several nodes may answer, and its head
+    /// and its logs may come from different ones: the check is exact per
+    /// endpoint, not per node behind it.
     pub async fn logs(&self, filter: &Filter) -> Result<Vec<Log>> {
-        let range = filter.get_from_block().zip(filter.get_to_block());
-        let Some((from, to)) = range.filter(|(from, to)| from <= to) else {
-            return self.provider.get_logs(filter).await.context("reading logs");
+        use alloy::eips::BlockNumberOrTag;
+        use alloy::rpc::types::FilterBlockOption;
+        let from = filter.get_from_block();
+        let mut to = filter.get_to_block();
+        let to_the_head = matches!(
+            filter.block_option,
+            FilterBlockOption::Range {
+                to_block: None | Some(BlockNumberOrTag::Latest),
+                ..
+            }
+        );
+        let heads = Heads::new(self.log_endpoints.each.len());
+        if self.log_range.is_some() && from.is_some() && to_the_head {
+            to = Some(
+                logs_head(&self.log_endpoints, &heads)
+                    .await
+                    .context("the head, to read logs up to")?,
+            );
+        }
+        let Some((from, to)) = from.zip(to).filter(|(from, to)| from <= to) else {
+            return self.logs.get_logs(filter).await.context("reading logs");
         };
+
+        let mut windows = LogWindows::new(from, to, self.log_range);
+        let mut running = tokio::task::JoinSet::new();
+        // Windows read but not yet handed on, because an earlier one hasn't
+        // come back yet: at most the number in flight.
+        let mut read: std::collections::BTreeMap<usize, Vec<Log>> = Default::default();
+        let (mut started, mut handed_on) = (0usize, 0usize);
         let mut found = Vec::new();
-        let mut pending = vec![(from, to)];
-        while let Some((from, to)) = pending.pop() {
-            let part = filter.clone().from_block(from).to_block(to);
-            let mut tries = 0;
-            loop {
-                match self.provider.get_logs(&part).await {
-                    Ok(logs) => {
-                        found.extend(logs);
-                        break;
-                    }
-                    Err(error) => {
-                        let text = error.to_string();
-                        if to > from && refused_as_too_wide(&text) {
-                            let middle = from + (to - from) / 2;
-                            // Popped last-in first-out: the earlier half first.
-                            pending.push((middle + 1, to));
-                            pending.push((from, middle));
-                            break;
-                        }
-                        if refused_as_not_there_yet(&text) && tries < LOGS_BEHIND_TRIES {
-                            tries += 1;
-                            tokio::time::sleep(Duration::from_millis(1_500)).await;
-                            continue;
-                        }
-                        return Err(anyhow::Error::new(error)
-                            .context(format!("reading logs from block {from} to {to}")));
-                    }
-                }
+        loop {
+            while started - handed_on < LOG_WINDOWS_IN_FLIGHT
+                && let Some((from, to)) = windows.next()
+            {
+                let endpoints = self.log_endpoints.clone();
+                let heads = heads.clone();
+                let window = filter.clone();
+                let index = started;
+                running.spawn(async move {
+                    (
+                        index,
+                        read_window(&endpoints, &heads, &window, from, to).await,
+                    )
+                });
+                started += 1;
+            }
+            let Some(joined) = running.join_next().await else {
+                break;
+            };
+            let (index, logs) =
+                joined.map_err(|_| anyhow!("a log read stopped before it ended"))?;
+            // A window that failed fails the whole read; the rest are
+            // stopped as the set is dropped.
+            read.insert(index, logs?);
+            while let Some(logs) = read.remove(&handed_on) {
+                found.extend(logs);
+                handed_on += 1;
             }
         }
         Ok(found)
@@ -1093,15 +2237,26 @@ impl Client {
         let address = signer.address();
         let signing = signing_builder(self.chain_id)
             .wallet(EthereumWallet::from(signer.clone()))
-            .connect_client(rpc_client(&self.rpc_url)?);
+            .connect_client(rpc_client(&self.rpc_url, "rpc", Some(self.chain_id))?);
+        // The key's turn to send is the one every client made from this
+        // one takes for this key, as its nonce floor is.
+        let sending = self
+            .turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(address)
+            .or_default()
+            .clone();
         Ok(KeyClient {
             provider: signing.clone().erased(),
             signing,
             signer,
             address,
-            sending: Default::default(),
+            sending,
             spent: Default::default(),
             noting: None,
+            nonces: self.nonces.clone(),
+            endpoints: self.endpoints.clone(),
         })
     }
 
@@ -1161,6 +2316,11 @@ pub struct KeyClient {
     /// land, from the moment it is broadcast until its receipt is found or
     /// no longer looked for (see [`KeyClient::noting`]).
     noting: Option<Unanswered>,
+    /// The nonce after this key's last send seen to land, shared with the
+    /// client it was made from and every other key client made from it.
+    nonces: NonceFloor,
+    /// The chain's endpoints, each on its own, that a send is handed to.
+    endpoints: Endpoints,
 }
 
 /// What a key has paid for gas, in the native coin's smallest unit, and the
@@ -1500,6 +2660,7 @@ impl KeyClient {
         call: C,
     ) -> Result<TransactionReceipt> {
         let request = TransactionRequest::default()
+            .with_from(self.address)
             .with_to(to)
             .with_input(call.abi_encode());
         let in_flight = InFlight::start(self.spent.clone());
@@ -1517,6 +2678,8 @@ impl KeyClient {
             stage.clone(),
             deadline,
             self.noting.clone().map(|noting| (noting, self.address)),
+            (self.nonces.clone(), self.address),
+            self.endpoints.clone(),
             C::SIGNATURE,
         ));
         // Giving up claims the send's stage: a broadcast that hasn't begun by
@@ -1633,8 +2796,10 @@ impl Stage {
 /// hash is known before it is sent. Once it has been sent its receipt is
 /// looked for by that hash whatever the node's reply: a reply lost or too
 /// slow says nothing about whether the node took the transaction, and if it
-/// lands its gas is counted all the same. Only a refusal (the node answered
-/// and said no) means it was not taken. Everything up to the receipt runs
+/// lands its gas is counted all the same. Only a refusal from an endpoint
+/// asked before any could have taken it, or every endpoint limiting the
+/// rate, means it was not taken ([`hand_over`]). Everything up to the
+/// receipt runs
 /// under one deadline, so a node that never answers can't keep the turn:
 /// past it the turn is given up and the send is unanswered, while the
 /// receipt is still looked for afterwards without holding the key's next
@@ -1650,13 +2815,27 @@ async fn broadcast(
     stage: Arc<Stage>,
     deadline: tokio::time::Instant,
     noting: Option<(Unanswered, Address)>,
+    (nonces, from): (NonceFloor, Address),
+    endpoints: Endpoints,
     signature: &'static str,
 ) -> Result<TransactionReceipt> {
     use alloy::eips::eip2718::Encodable2718;
-    use alloy::rpc::json_rpc::RpcError;
 
     // Nothing has been sent while this runs: only the node's reads are
-    // asked for. So whatever fails here, nothing can land.
+    // asked for. So whatever fails here, nothing can land. The nonce is the
+    // node's count of the key's sends, but never below the one after the
+    // last send of the key's this client saw land ([`NonceFloor`]): a node
+    // lagging behind the one that took that send would number this one the
+    // same.
+    let nonce = match tokio::time::timeout_at(deadline, nonces.next(&provider, from)).await {
+        Ok(nonce) => nonce.with_context(|| format!("sending {signature}"))?,
+        Err(_) => {
+            return Err(NeverSent::wrap(
+                anyhow::Error::new(NeverAcknowledged).context(signature),
+            ));
+        }
+    };
+    let request = request.with_nonce(nonce);
     let filled = match tokio::time::timeout_at(deadline, signing.fill(request)).await {
         Ok(filled) => filled
             .with_context(|| format!("sending {signature}"))
@@ -1687,15 +2866,21 @@ async fn broadcast(
     // From here it may land: noted as such, in the send itself, until the
     // watch for its receipt ends.
     let _noted = noting.map(|(unanswered, key)| Noted::start(unanswered, key));
-    let reply = tokio::time::timeout_at(deadline, provider.send_raw_transaction(&raw)).await;
-    if let Ok(Err(refusal @ RpcError::ErrorResp(_))) = reply
-        && !already_held(&refusal)
-    {
-        drop(turn);
-        return Err(anyhow::Error::new(refusal).context(format!("sending {signature}")));
+    match hand_over(&endpoints, &raw, deadline).await {
+        Handed::MayLand => {}
+        Handed::Refused(refusal) => {
+            drop(turn);
+            return Err(anyhow::Error::new(refusal).context(format!("sending {signature}")));
+        }
+        Handed::NotTaken(limited) => {
+            drop(turn);
+            return Err(NeverSent::wrap(
+                anyhow::Error::new(limited).context(format!("sending {signature}")),
+            ));
+        }
     }
     // Taken, already held, or no reply came back: whichever, it may land.
-    let landing = land(provider, hash, spent);
+    let landing = land(provider, hash, spent, (nonces, from, nonce));
     tokio::pin!(landing);
     let landed = match tokio::time::timeout_at(deadline, &mut landing).await {
         Ok(landed) => landed,
@@ -1712,6 +2897,70 @@ async fn broadcast(
 /// is watched for like any other send. Nodes word it differently ("already
 /// known", "known transaction", "transaction already imported"); an "unknown
 /// transaction" is not one of them.
+fn nonce_too_low(refusal: &alloy::transports::TransportError) -> bool {
+    let alloy::rpc::json_rpc::RpcError::ErrorResp(payload) = refusal else {
+        return false;
+    };
+    let message = payload.message.to_lowercase();
+    message.contains("nonce too low") || message.contains("nonce has already been used")
+}
+
+/// Whether an endpoint's error to a send is a clear refusal of the
+/// transaction: "this transaction is invalid, and here is why". Only these
+/// count as clear:
+///
+/// - its nonce: "nonce too low", "nonce too high", "invalid nonce", "nonce
+///   has already been used";
+/// - its sender's funds: "insufficient funds";
+/// - its gas and fees: "intrinsic gas too low", "exceeds block gas limit",
+///   "gas limit", "underpriced", "fee cap", "base fee", "gas price",
+///   "configured cap";
+/// - its bytes: "invalid sender", "invalid signature", "chain id",
+///   "transaction type not supported", "tx type not supported", "oversized
+///   data", "initcode", "rlp", "invalid transaction";
+/// - a revert the node found running it (code 3, "execution reverted");
+/// - the request itself refused as malformed or unknown (codes -32601,
+///   -32602).
+///
+/// Anything else (an internal error, a server error, a timeout, a gateway's
+/// own failure) is unclear: the endpoint may have taken it.
+fn judges_the_transaction(refusal: &alloy::transports::TransportError) -> bool {
+    let alloy::rpc::json_rpc::RpcError::ErrorResp(payload) = refusal else {
+        return false;
+    };
+    if matches!(payload.code, 3 | -32601 | -32602) {
+        return true;
+    }
+    let message = payload.message.to_lowercase();
+    [
+        "nonce too low",
+        "nonce too high",
+        "invalid nonce",
+        "nonce has already been used",
+        "insufficient funds",
+        "intrinsic gas too low",
+        "exceeds block gas limit",
+        "gas limit",
+        "underpriced",
+        "fee cap",
+        "base fee",
+        "gas price",
+        "configured cap",
+        "invalid sender",
+        "invalid signature",
+        "chain id",
+        "transaction type not supported",
+        "tx type not supported",
+        "oversized data",
+        "initcode",
+        "rlp",
+        "invalid transaction",
+        "execution reverted",
+    ]
+    .iter()
+    .any(|clear| message.contains(clear))
+}
+
 fn already_held(refusal: &alloy::transports::TransportError) -> bool {
     let alloy::rpc::json_rpc::RpcError::ErrorResp(payload) = refusal else {
         return false;
@@ -1725,11 +2974,12 @@ fn already_held(refusal: &alloy::transports::TransportError) -> bool {
 
 /// Wait for a sent transaction's receipt, and add what it cost to the key's
 /// count when it arrives, unless another watch of the same transaction
-/// already has.
+/// already has; and raise the key's nonce floor past it.
 async fn land(
     provider: DynProvider,
     hash: B256,
     spent: Arc<std::sync::Mutex<Spent>>,
+    (nonces, from, nonce): (NonceFloor, Address, u64),
 ) -> Result<TransactionReceipt> {
     let receipt = receipt_by(
         &provider,
@@ -1737,6 +2987,9 @@ async fn land(
         tokio::time::Instant::now() + LANDING_TIMEOUT,
     )
     .await?;
+    // Landed, reverted or not: its nonce is used, and the next send of the
+    // key's is never numbered at or below it.
+    nonces.landed(from, nonce);
     if let Ok(mut spent) = spent.lock() {
         spent.count(
             hash,
@@ -1747,8 +3000,245 @@ async fn land(
     Ok(receipt)
 }
 
-/// How many times a range a node says it hasn't reached yet is asked again.
+/// How many windows of one log read may be asked for at once. Their logs
+/// are still handed back in block order. Four keeps one read well inside a
+/// free endpoint's per-second limit (Base's own allows 25 requests a second)
+/// while the rest of the services ask too, and covers the indexer's
+/// 2,000-block page at the narrowest cap the testnets use (500 blocks) in
+/// one round trip. A rate limit on any window still moves that window to
+/// the next endpoint, as every read does.
+pub const LOG_WINDOWS_IN_FLIGHT: usize = 4;
+
+/// Consecutive block windows covering `from..=to`, each at most `cap`
+/// blocks wide, each block in exactly one; the whole range at once without
+/// a cap.
+#[derive(Clone, Debug)]
+struct LogWindows {
+    next: Option<u64>,
+    to: u64,
+    cap: Option<u64>,
+}
+
+impl LogWindows {
+    fn new(from: u64, to: u64, cap: Option<u64>) -> Self {
+        Self {
+            next: (from <= to).then_some(from),
+            to,
+            // A zero cap never passes the config; taken as one block if it
+            // somehow did, rather than reading nothing.
+            cap: cap.map(|cap| cap.max(1)),
+        }
+    }
+}
+
+impl Iterator for LogWindows {
+    type Item = (u64, u64);
+
+    fn next(&mut self) -> Option<(u64, u64)> {
+        let from = self.next?;
+        let to = match self.cap {
+            Some(cap) => from.saturating_add(cap - 1).min(self.to),
+            None => self.to,
+        };
+        self.next = if to >= self.to { None } else { Some(to + 1) };
+        Some((from, to))
+    }
+}
+
+/// The highest head each endpoint of a list said it had reached, during
+/// one log read.
+#[derive(Clone)]
+struct Heads(Arc<std::sync::Mutex<Vec<Option<u64>>>>);
+
+impl Heads {
+    fn new(count: usize) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(vec![None; count])))
+    }
+
+    fn of(&self, at: usize) -> Option<u64> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(at)
+            .copied()
+            .flatten()
+    }
+
+    fn saw(&self, at: usize, head: u64) {
+        if let Some(known) = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(at)
+        {
+            *known = Some(known.map_or(head, |known| known.max(head)));
+        }
+    }
+}
+
+/// The head, as the first endpoint of the list to answer gives it.
+async fn logs_head(endpoints: &Endpoints, heads: &Heads) -> Result<u64> {
+    let mut limits = RateLimits::default();
+    loop {
+        let mut last = None;
+        let mut round = RateLimits::round();
+        for at in endpoints.order() {
+            match endpoints.each[at].provider.get_block_number().await {
+                Ok(head) => {
+                    heads.saw(at, head);
+                    return Ok(head);
+                }
+                Err(error) => {
+                    round.saw(&error);
+                    last = Some(error);
+                }
+            }
+        }
+        if !limits.wait_after(round).await {
+            return Err(last.map_or_else(|| anyhow!("no endpoint answered"), anyhow::Error::new));
+        }
+    }
+}
+
+/// Why one endpoint didn't give a window's logs.
+enum Passed {
+    /// It hasn't reached the window's end yet: it may later.
+    Behind(anyhow::Error),
+    /// It limited the rate of requests.
+    Limited(anyhow::Error, Option<Duration>),
+    /// Anything else.
+    Over(anyhow::Error),
+}
+
+/// The logs `filter` matches from `from` to `to`, read whole by an endpoint
+/// that had reached `to` ([`Client::logs`]).
+async fn read_window(
+    endpoints: &Endpoints,
+    heads: &Heads,
+    filter: &Filter,
+    from: u64,
+    to: u64,
+) -> Result<Vec<Log>> {
+    let mut last = None;
+    let mut behind_tries = 0;
+    let mut limits = RateLimits::default();
+    loop {
+        let mut behind = false;
+        let mut round = RateLimits::round();
+        for at in endpoints.order() {
+            let provider = &endpoints.each[at].provider;
+            // Its head, asked again only when the last it gave falls short.
+            let head = match heads.of(at).filter(|head| *head >= to) {
+                Some(head) => head,
+                None => match provider.get_block_number().await {
+                    Ok(head) => {
+                        heads.saw(at, head);
+                        head
+                    }
+                    Err(error) => {
+                        round.saw(&error);
+                        last = Some(
+                            anyhow::Error::new(error)
+                                .context(format!("the head of log endpoint {}", at + 1)),
+                        );
+                        continue;
+                    }
+                },
+            };
+            if head < to {
+                behind = true;
+                round.other();
+                last = Some(anyhow!(
+                    "log endpoint {} has reached block {head}, not yet {to}",
+                    at + 1
+                ));
+                continue;
+            }
+            match read_range(provider, filter, from, to).await {
+                Ok(logs) => {
+                    endpoints.answered(at);
+                    return Ok(logs);
+                }
+                Err(Passed::Behind(error)) => {
+                    behind = true;
+                    round.other();
+                    last = Some(error);
+                }
+                Err(Passed::Limited(error, asked)) => {
+                    round.limited = true;
+                    round.retry_after = round.retry_after.max(asked);
+                    last = Some(error);
+                }
+                Err(Passed::Over(error)) => {
+                    round.other();
+                    last = Some(error);
+                }
+            }
+        }
+        if behind && behind_tries < LOGS_BEHIND_TRIES {
+            behind_tries += 1;
+            tokio::time::sleep(LOGS_BEHIND_PAUSE).await;
+            continue;
+        }
+        if limits.wait_after(round).await {
+            continue;
+        }
+        break;
+    }
+    Err(last
+        .unwrap_or_else(|| anyhow!("no log endpoint answered"))
+        .context(format!("reading logs from block {from} to {to}")))
+}
+
+/// The logs `filter` matches from `from` to `to` at one endpoint, halving a
+/// range it refuses as too wide.
+async fn read_range(
+    provider: &DynProvider,
+    filter: &Filter,
+    from: u64,
+    to: u64,
+) -> Result<Vec<Log>, Passed> {
+    let mut found = Vec::new();
+    let mut pending = vec![(from, to)];
+    while let Some((from, to)) = pending.pop() {
+        let part = filter.clone().from_block(from).to_block(to);
+        match provider.get_logs(&part).await {
+            Ok(logs) => found.extend(logs),
+            Err(error) => {
+                let text = error.to_string();
+                // A rate limit, or missing logs, is the endpoint's trouble,
+                // whatever else its words say.
+                let trouble = rate_limited(&error) || text.contains(MISSING_STATE);
+                if !trouble && to > from && refused_as_too_wide(&text) {
+                    let middle = from + (to - from) / 2;
+                    // Popped last-in first-out: the earlier half first.
+                    pending.push((middle + 1, to));
+                    pending.push((from, middle));
+                    continue;
+                }
+                let limited = rate_limited(&error);
+                let asked = retry_after(&error);
+                let error = anyhow::Error::new(error)
+                    .context(format!("reading logs from block {from} to {to}"));
+                return Err(if limited {
+                    Passed::Limited(error, asked)
+                } else if !trouble && refused_as_not_there_yet(&text) {
+                    Passed::Behind(error)
+                } else {
+                    Passed::Over(error)
+                });
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// How many times a window no endpoint has reached yet is asked again.
 const LOGS_BEHIND_TRIES: u32 = 4;
+
+/// How long to wait before asking again for a window no endpoint had
+/// reached: a few of the testnets' blocks.
+const LOGS_BEHIND_PAUSE: Duration = Duration::from_millis(1_500);
 
 /// Whether a provider refused a log range for its width, in any of the ways
 /// providers say so.
@@ -1768,6 +3258,24 @@ fn refused_as_too_wide(error: &str) -> bool {
     .iter()
     .any(|phrase| error.contains(phrase))
         && !refused_as_not_there_yet(&error)
+        && !is_rate_limit(0, &error)
+}
+
+/// How many times a pinned read no endpoint has reached the block of is
+/// asked again: a read pinned to the head's block one endpoint just gave.
+const PINNED_BEHIND_TRIES: u32 = 3;
+
+/// How long to wait before asking again for a pinned read at a block no
+/// endpoint had reached: about one of the slower testnets' blocks.
+const PINNED_BEHIND_PAUSE: Duration = Duration::from_millis(1_000);
+
+/// Whether a JSON-RPC refusal of a pinned read is the endpoint saying it
+/// hasn't reached the block yet. A revert, whatever its reason says, is the
+/// chain's answer, never this.
+fn not_reached_yet(code: i64, message: &str) -> bool {
+    code != 3
+        && !message.to_ascii_lowercase().contains("revert")
+        && refused_as_not_there_yet(message)
 }
 
 /// Whether a node refused a log range because it hasn't reached its end yet.
@@ -1910,6 +3418,47 @@ mod tests {
     }
 
     #[test]
+    fn only_a_judgement_of_the_transaction_itself_is_a_refusal_of_a_send() {
+        let refusal = |code: i64, message: &str| {
+            alloy::rpc::json_rpc::RpcError::ErrorResp(alloy::rpc::json_rpc::ErrorPayload {
+                code,
+                message: message.to_string().into(),
+                data: None,
+            })
+        };
+        for clear in [
+            (-32000, "nonce too low"),
+            (-32000, "insufficient funds for gas * price + value"),
+            (-32000, "replacement transaction underpriced"),
+            (-32000, "max fee per gas less than block base fee"),
+            (-32000, "intrinsic gas too low"),
+            (-32000, "invalid sender"),
+            (3, "execution reverted: NotBlessed()"),
+            (-32602, "invalid params"),
+        ] {
+            assert!(
+                judges_the_transaction(&refusal(clear.0, clear.1)),
+                "{clear:?}"
+            );
+        }
+        for unclear in [
+            (-32603, "Internal error"),
+            (-32000, "upstream request timeout"),
+            (
+                30,
+                "Request timeout on the free tier, please upgrade your tier to the paid one",
+            ),
+            (-32000, "server error"),
+            (-32002, "resource unavailable"),
+        ] {
+            assert!(
+                !judges_the_transaction(&refusal(unclear.0, unclear.1)),
+                "{unclear:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_mnemonic_that_fails_its_checksum_is_not_quoted_in_the_error() {
         // A development chain's public mnemonic with its last word changed
         // to another real word: the checksum no longer holds.
@@ -1966,6 +3515,158 @@ mod tests {
         assert!(!refused_as_not_there_yet("rate limited"));
     }
 
+    /// Every block of `from..=to` in exactly one window, in order, none
+    /// wider than the cap.
+    #[test]
+    fn a_rate_limited_read_waits_longer_each_time_and_honours_a_retry_after_within_a_bound() {
+        assert_eq!(rate_limit_pause(0, None), Duration::from_millis(500));
+        assert_eq!(rate_limit_pause(1, None), Duration::from_secs(1));
+        assert_eq!(rate_limit_pause(2, None), Duration::from_secs(2));
+        assert_eq!(
+            rate_limit_pause(0, Some(Duration::from_secs(3))),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            rate_limit_pause(2, Some(Duration::from_secs(1))),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            rate_limit_pause(0, Some(Duration::from_secs(600))),
+            RATE_LIMIT_PAUSE_MOST
+        );
+        assert_eq!(rate_limit_pause(30, None), RATE_LIMIT_PAUSE_MOST);
+    }
+
+    #[test]
+    fn only_reads_are_asked_again_for_a_rate_limit() {
+        use alloy::rpc::json_rpc::{Request, RequestPacket, SerializedRequest};
+        let packet = |method: &'static str| -> RequestPacket {
+            let request: SerializedRequest =
+                Request::new(method, 1u64.into(), ()).try_into().unwrap();
+            request.into()
+        };
+        assert!(retried_when_rate_limited(&packet("eth_call")));
+        assert!(retried_when_rate_limited(&packet("eth_blockNumber")));
+        assert!(!retried_when_rate_limited(&packet(
+            "eth_sendRawTransaction"
+        )));
+        assert!(!retried_when_rate_limited(&packet(
+            "eth_sendRawTransactionSync"
+        )));
+        assert!(!retried_when_rate_limited(&packet("eth_signTypedData_v4")));
+        assert!(!retried_when_rate_limited(&packet("debug_traceCall")));
+    }
+
+    #[test]
+    fn a_block_not_reached_yet_is_told_from_a_revert() {
+        for behind in [
+            "header not found",
+            "unknown block",
+            "block not found",
+            "Block 0x3e8 not found... unknown block",
+        ] {
+            assert!(not_reached_yet(-32000, behind), "{behind}");
+        }
+        assert!(!not_reached_yet(3, "header not found"));
+        assert!(!not_reached_yet(
+            -32000,
+            "execution reverted: unknown block"
+        ));
+        assert!(!not_reached_yet(-32000, "insufficient funds"));
+    }
+
+    fn covers_once(from: u64, to: u64, cap: Option<u64>) -> Vec<(u64, u64)> {
+        let windows: Vec<_> = LogWindows::new(from, to, cap).collect();
+        let mut next = from;
+        for &(start, end) in &windows {
+            assert_eq!(start, next, "a gap or an overlap: {windows:?}");
+            assert!(start <= end, "{windows:?}");
+            if let Some(cap) = cap {
+                assert!(end - start < cap, "wider than {cap}: {windows:?}");
+            }
+            next = end.wrapping_add(1);
+        }
+        assert_eq!(
+            next,
+            to.wrapping_add(1),
+            "the range's end was not reached: {windows:?}"
+        );
+        windows
+    }
+
+    #[test]
+    fn log_windows_cover_a_range_once_with_no_gap_or_overlap() {
+        // Smaller than the cap: one window.
+        assert_eq!(covers_once(100, 150, Some(500)), vec![(100, 150)]);
+        // An exact multiple.
+        assert_eq!(
+            covers_once(1, 30, Some(10)),
+            vec![(1, 10), (11, 20), (21, 30)]
+        );
+        // One block.
+        assert_eq!(covers_once(7, 7, Some(10)), vec![(7, 7)]);
+        assert_eq!(covers_once(7, 7, Some(1)), vec![(7, 7)]);
+        // A remainder.
+        assert_eq!(
+            covers_once(0, 24, Some(10)),
+            vec![(0, 9), (10, 19), (20, 24)]
+        );
+        // A cap of one block.
+        assert_eq!(covers_once(5, 8, Some(1)).len(), 4);
+        // No cap: the whole range at once.
+        assert_eq!(covers_once(0, 1_000_000, None), vec![(0, 1_000_000)]);
+        // The top of the number range doesn't wrap.
+        covers_once(u64::MAX - 25, u64::MAX, Some(10));
+        // A backwards range has none.
+        assert_eq!(LogWindows::new(9, 8, Some(10)).count(), 0);
+    }
+
+    #[test]
+    fn missing_history_is_told_from_a_revert_and_from_a_refusal_of_the_request() {
+        // The wordings the testnets' public endpoints give.
+        for pruned in [
+            "historical state 0c1857f57b3ecc4ebf8d1889d12e66d39d324e81518720fb83598755297c268b is not available",
+            "missing trie node 0c1857 (path ) state 0x0c1857 is not available, not found",
+            "state at block #45748311 is pruned",
+            "Unknown state. First available state is 1",
+            "no available upstreams to process a request. Cause - x - Upstream lower height 34112653 of type STATE is greater than 4000000",
+            "pruned history unavailable",
+            "no state found for block 0x1e8480",
+        ] {
+            assert!(is_missing_history(-32000, pruned), "{pruned}");
+        }
+        for answer in [
+            "execution reverted",
+            "execution reverted: state is pruned",
+            "execution reverted: no state found for block",
+            "invalid argument 0: hex string without 0x prefix",
+            "nonce too low",
+            "block range too large",
+        ] {
+            assert!(!is_missing_history(-32000, answer), "{answer}");
+        }
+        assert!(!is_missing_history(3, "historical state is not available"));
+    }
+
+    #[test]
+    fn a_send_is_never_numbered_below_the_last_one_seen_to_land() {
+        let floor = NonceFloor::default();
+        let (one, two) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        // Nothing seen yet: the node's count.
+        assert_eq!(floor.number(one, 4), 4);
+        floor.landed(one, 4);
+        // A node a block behind still counts four.
+        assert_eq!(floor.number(one, 4), 5);
+        // One ahead (a send still pending) is taken as it is.
+        assert_eq!(floor.number(one, 7), 7);
+        // Another key has a floor of its own.
+        assert_eq!(floor.number(two, 0), 0);
+        // A send that lands late never lowers the floor.
+        floor.landed(one, 9);
+        floor.landed(one, 6);
+        assert_eq!(floor.number(one, 3), 10);
+    }
+
     #[test]
     fn a_rate_limit_is_told_from_a_refusal_of_the_request_itself() {
         assert!(is_rate_limit(-32005, "rate limited"));
@@ -1977,6 +3678,23 @@ mod tests {
         ));
         assert!(!is_rate_limit(3, "execution reverted"));
         assert!(!is_rate_limit(-32000, "nonce too low"));
+        // A revert whose reason reads like a rate limit is the chain's
+        // answer.
+        assert!(!is_rate_limit(3, "Too many requests"));
+        assert!(!is_rate_limit(-32000, "execution reverted: rate limit"));
+        assert!(!is_rate_limit(429, "execution reverted"));
+    }
+
+    #[test]
+    fn a_rate_limit_on_a_log_query_is_never_taken_as_too_wide() {
+        for limited in [
+            "HTTP error 429 with body: Too Many Requests",
+            "too many requests, request limit exceeded for this range",
+            "rate limit exceeded",
+        ] {
+            assert!(!refused_as_too_wide(limited), "{limited}");
+        }
+        assert!(refused_as_too_wide("block range too large"));
     }
 
     #[test]

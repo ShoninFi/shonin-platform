@@ -165,6 +165,21 @@ struct Layout {
     mapping(uint256 => address) payerOf;
     // Since when each holder's units have been waiting to be served ---------
     mapping(address => uint64) unitsSince;
+    // A close staged at the home station ------------------------------------
+    /// Whom the close staged at the home station is for: one claim, or one
+    /// holder's units. Nothing is priced, divided or tried meanwhile, and
+    /// what it delivers is theirs alone.
+    uint256 stagedClaim;
+    address stagedHolder;
+    /// The fraction of the stations staged.
+    uint256 stagedFraction;
+    /// The claim's part of the cash, fixed at the stage and set aside from
+    /// it, so nothing else can take it.
+    uint256 stagedCash;
+    /// A staged close has ended since the last valuation was recorded: the
+    /// next stage waits for one, so a run of closes always leaves room to
+    /// price everyone else's requests.
+    bool valueFirst;
 }
 
 /// The vault's storage, and the bookkeeping every part of it shares.
@@ -272,6 +287,50 @@ library VaultStorage {
 
     function scale(Layout storage s) internal view returns (uint256) {
         return s.unitScale == 0 ? WAD : s.unitScale;
+    }
+
+    /// A close is staged at the home station for a claim or a holder.
+    function staging(Layout storage s) internal view returns (bool) {
+        return s.stagedClaim != 0 || s.stagedHolder != address(0);
+    }
+
+    /// What a holder's units have earned since they last looked: measured
+    /// down, from a starting point measured up, so no holder is ever credited
+    /// more than came home for them, whatever the rounding of the others.
+    function accrue(Layout storage s, address holder) internal {
+        uint256 units = s.unitsOf[holder];
+        uint256 earned = units.mulDiv(s.perUnit, UNIT_SCALE);
+        uint256 debt = s.unitDebt[holder];
+        if (earned > debt) s.unitCredit[holder] += earned - debt;
+        s.unitDebt[holder] = units.mulDiv(s.perUnit, UNIT_SCALE, Math.Rounding.Ceil);
+    }
+
+    /// A holder's units are served: `fraction` of the stations came home for
+    /// them. What is left is everyone else's in the same proportions, so
+    /// every remaining fraction grows to match.
+    function retireUnits(Layout storage s, address holder, uint256 fraction) internal {
+        retireUnits(s, holder, fraction, s.unitsOf[holder]);
+    }
+
+    /// The same for `gone` of a holder's units (all, or a part served and
+    /// any taken for a cost); the stations paid out `fraction` for them.
+    function retireUnits(Layout storage s, address holder, uint256 fraction, uint256 gone) internal {
+        accrue(s, holder);
+        uint256 held = s.unitsOf[holder];
+        if (gone > held) gone = held;
+        s.units -= gone;
+        s.unitsOf[holder] = held - gone;
+        if (held == gone) {
+            s.unitsSince[holder] = 0;
+            s.unitDebt[holder] = 0;
+        } else {
+            s.unitDebt[holder] = (held - gone).mulDiv(s.perUnit, UNIT_SCALE, Math.Rounding.Ceil);
+        }
+        if (s.units == 0) {
+            s.unitScale = 0;
+        } else if (fraction != 0 && fraction < WAD) {
+            s.unitScale = scale(s).mulDiv(WAD, WAD - fraction);
+        }
     }
 
     /// Cash nothing has set aside: what withdrawals, fills and the station

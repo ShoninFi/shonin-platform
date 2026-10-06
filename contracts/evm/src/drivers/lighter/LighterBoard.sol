@@ -36,7 +36,8 @@ struct LighterShares {
 }
 
 /// What an attested machine read from Lighter's API about every account a
-/// station owns, at `asOf`.
+/// station owns, at `asOf`: the time of the chain block its on-chain figures
+/// were read at.
 struct LighterReport {
     uint64 asOf;
     /// Every account index the station owns: its master and the
@@ -49,6 +50,19 @@ struct LighterReport {
     /// carried out, not yet paid out) as read on-chain beside the API, at
     /// `asOf`.
     uint256 pending;
+    /// The dollars the exchange had taken out of the accounts for
+    /// withdrawals that were not yet in `pending` at `asOf`: carried out,
+    /// and not yet credited on-chain. A withdrawal is in exactly one of
+    /// `equity`, `inFlight` and `pending` at the post's moment, or paid out
+    /// (in `arrived`).
+    uint256 inFlight;
+    /// The station's own counters, read on-chain at the same block as
+    /// `pending`: every dollar that had reached it outside its own calls (a
+    /// pending withdrawal paid out among them) and every dollar it had put
+    /// into the exchange. What has changed in them since is what a payout or
+    /// a deposit since the reading moved, so it is counted once.
+    uint256 arrived;
+    uint256 sent;
     /// The dollars the accounts could withdraw now, per account, in the
     /// order of `accounts`.
     uint256[] available;

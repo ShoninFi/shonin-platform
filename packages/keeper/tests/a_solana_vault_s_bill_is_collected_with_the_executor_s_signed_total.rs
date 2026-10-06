@@ -35,6 +35,8 @@ async fn a_solana_vault_s_bill_is_collected_with_the_executor_s_signed_total() {
         native_usd: None,
         confirmations: None,
         public_rpc: rpc,
+        logs_rpc: None,
+        log_range: None,
     };
     let keys = Arc::new(RoleKeys::from_mnemonic(DEVELOPMENT_MNEMONIC).unwrap());
     let client = SolanaClient::connect_with(

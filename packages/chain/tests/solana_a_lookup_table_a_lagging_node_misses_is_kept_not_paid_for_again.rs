@@ -322,6 +322,8 @@ async fn send_through_the_keeper_s_table(
         native_usd: None,
         confirmations: None,
         public_rpc: url,
+        logs_rpc: None,
+        log_range: None,
     };
     let client = SolanaClient::connect_with(
         &ChainKey::new(ChainKind::Solana, "localnet"),

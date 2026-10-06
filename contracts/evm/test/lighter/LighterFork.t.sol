@@ -42,7 +42,13 @@ contract LighterForkTest is Test {
         markets[0] = LighterDriver.Market({index: 0, sizeDecimals: 4, priceDecimals: 2});
         markets[1] = LighterDriver.Market({index: 26, sizeDecimals: 4, priceDecimals: 2});
         markets[2] = LighterDriver.Market({index: 25, sizeDecimals: 4, priceDecimals: 2});
-        lighter = new LighterDriver(IZkLighter(ZK_LIGHTER), IERC20(USDG), board, 1 hours, 6, markets);
+        // Their smallest orders: 0.0020 ETH and 0.0075 of a share, and $10.
+        LighterDriver.Minimum[] memory minimums = new LighterDriver.Minimum[](3);
+        minimums[0] = LighterDriver.Minimum({base: 20, quote: 10e6});
+        minimums[1] = LighterDriver.Minimum({base: 75, quote: 10e6});
+        minimums[2] = LighterDriver.Minimum({base: 75, quote: 10e6});
+        lighter =
+            new LighterDriver(IZkLighter(ZK_LIGHTER), IERC20(USDG), board, 1 hours, 6, markets, minimums);
         station = new StationDouble(USDG, 100);
         deal(USDG, address(station), 100e6);
         vm.prank(executor);

@@ -110,6 +110,8 @@ async fn served(chain: shared::Chain, chain_id: u64, hangs: bool) -> Served {
         dollar: "USDC".to_string(),
         native_usd: None,
         public_rpc: node,
+        logs_rpc: None,
+        log_range: None,
         confirmations: None,
     };
     let client = Client::connect(&config, Signing::ReadOnly).await.unwrap();

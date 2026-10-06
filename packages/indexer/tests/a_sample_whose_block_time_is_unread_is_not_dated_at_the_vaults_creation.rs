@@ -142,6 +142,8 @@ async fn a_sample_whose_block_time_is_unread_is_not_dated_at_the_vaults_creation
         dollar: "USDC".to_string(),
         native_usd: None,
         public_rpc: node,
+        logs_rpc: None,
+        log_range: None,
         confirmations: None,
     };
     let client = Client::connect(&config, Signing::ReadOnly).await.unwrap();

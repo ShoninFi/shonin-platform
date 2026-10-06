@@ -183,6 +183,21 @@ pub struct ChainConfig {
     /// yet, is not read past. Unset, the reader's own default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmations: Option<u64>,
+    /// Endpoints for log queries alone, space-separated like `rpc`: every
+    /// `eth_getLogs` goes through a failover over these, and nothing else
+    /// does. Unset or empty, log queries use `rpc`. A provider that keeps
+    /// the chain's past state may answer only narrow log queries, and one
+    /// that answers wide ones may not keep the past, so the two can differ.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs_rpc: Option<String>,
+    /// The most blocks one log query may span, both ends included. A range
+    /// is read in consecutive windows of at most this many blocks. It
+    /// belongs to the list log queries go to (`logs_rpc`, or `rpc` when that
+    /// is unset), not to one endpoint, since the failover picks the endpoint
+    /// beneath each query: it must suit every endpoint in that list. Unset,
+    /// a range is asked for whole and halved only when refused as too wide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_range: Option<u64>,
     /// The `rpc` the file gives, before any override from the environment:
     /// the one that may be handed to a browser. An override is usually a
     /// paid URL, which carries its key.
@@ -196,6 +211,26 @@ impl ChainConfig {
     /// takes one URL, or a browser, is given the first.
     pub fn first_rpc(&self) -> &str {
         self.rpc.split_whitespace().next().unwrap_or_default()
+    }
+
+    /// The endpoints log queries go to: `logs_rpc` when it names any,
+    /// otherwise `rpc`.
+    pub fn logs_endpoints(&self) -> &str {
+        self.logs_rpc
+            .as_deref()
+            .filter(|list| !list.trim().is_empty())
+            .unwrap_or(&self.rpc)
+    }
+}
+
+/// A log query's width cap, as the environment gives it: a positive whole
+/// number of blocks, or a refusal naming the variable.
+fn log_range_from(name: &str, value: &str) -> Result<u64, ConfigError> {
+    match value.trim().parse::<u64>() {
+        Ok(blocks) if blocks > 0 => Ok(blocks),
+        _ => Err(ConfigError::new(format!(
+            "{name} is {value:?}; it must be a positive whole number of blocks"
+        ))),
     }
 }
 
@@ -310,6 +345,27 @@ impl ChainConfigs {
             }
             if let Some(ws) = env(&format!("SHONIN_WS_{suffix}")).filter(|v| !v.is_empty()) {
                 config.ws = Some(ws);
+            }
+            if let Some(logs) =
+                env(&format!("SHONIN_LOGS_RPC_{suffix}")).filter(|v| !v.trim().is_empty())
+            {
+                config.logs_rpc = Some(logs);
+            }
+            if config
+                .logs_rpc
+                .as_deref()
+                .is_some_and(|list| list.trim().is_empty())
+            {
+                config.logs_rpc = None;
+            }
+            if config.log_range == Some(0) {
+                return Err(ConfigError::new(format!(
+                    "chains.toml: {key}'s log_range is 0; it must be a positive whole number of blocks"
+                )));
+            }
+            let range_name = format!("SHONIN_LOG_RANGE_{suffix}");
+            if let Some(range) = env(&range_name).filter(|v| !v.trim().is_empty()) {
+                config.log_range = Some(log_range_from(&range_name, &range)?);
             }
             chains.insert(key, config);
         }
@@ -506,6 +562,63 @@ mod tests {
         // An empty variable is the same as an unset one.
         let local = configs.get(&"evm:31337".parse().unwrap()).unwrap();
         assert_eq!(local.rpc, "http://127.0.0.1:19100");
+    }
+
+    #[test]
+    fn the_environment_overrides_the_file_s_log_endpoints_and_width() {
+        let text = TOML.replace(
+            "rpc = \"https://mainnet.base.org\"",
+            "rpc = \"https://mainnet.base.org\"\nlogs_rpc = \"https://logs.example\"\nlog_range = 2000",
+        );
+        let configs = ChainConfigs::from_toml(&text, no_env).unwrap();
+        let base = configs.get(&"evm:8453".parse().unwrap()).unwrap();
+        assert_eq!(base.logs_endpoints(), "https://logs.example");
+        assert_eq!(base.log_range, Some(2000));
+        // A chain that names neither reads logs from its own endpoints, whole.
+        let local = configs.get(&"evm:31337".parse().unwrap()).unwrap();
+        assert_eq!(local.logs_endpoints(), local.rpc);
+        assert_eq!(local.log_range, None);
+
+        let env = |name: &str| match name {
+            "SHONIN_LOGS_RPC_EVM_8453" => Some("https://a.example https://b.example".to_string()),
+            "SHONIN_LOG_RANGE_EVM_8453" => Some("500".to_string()),
+            "SHONIN_LOGS_RPC_EVM_31337" => Some("  ".to_string()),
+            "SHONIN_LOG_RANGE_EVM_31337" => Some(String::new()),
+            _ => None,
+        };
+        let configs = ChainConfigs::from_toml(&text, env).unwrap();
+        let base = configs.get(&"evm:8453".parse().unwrap()).unwrap();
+        assert_eq!(base.logs_endpoints(), "https://a.example https://b.example");
+        assert_eq!(base.log_range, Some(500));
+        // Empty variables are the same as unset ones.
+        let local = configs.get(&"evm:31337".parse().unwrap()).unwrap();
+        assert_eq!(local.logs_rpc, None);
+        assert_eq!(local.log_range, None);
+    }
+
+    #[test]
+    fn a_log_width_that_is_not_a_positive_whole_number_is_refused_by_name() {
+        for bad in ["0", "-5", "ten", "1.5", "500 blocks"] {
+            let env = |name: &str| (name == "SHONIN_LOG_RANGE_EVM_8453").then(|| bad.to_string());
+            let error = ChainConfigs::from_toml(TOML, env).unwrap_err().to_string();
+            assert!(
+                error.contains("SHONIN_LOG_RANGE_EVM_8453"),
+                "{bad}: {error}"
+            );
+        }
+        let text = TOML.replace(
+            "rpc = \"https://mainnet.base.org\"",
+            "rpc = \"https://mainnet.base.org\"\nlog_range = 0",
+        );
+        let error = ChainConfigs::from_toml(&text, no_env)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("log_range"), "{error}");
+        let text = text.replace("log_range = 0", "log_range = -3");
+        let error = ChainConfigs::from_toml(&text, no_env)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("log_range"), "{error}");
     }
 
     #[test]

@@ -95,6 +95,8 @@ async fn connect(cluster: &Cluster) -> SolanaClient {
         native_usd: None,
         confirmations: None,
         public_rpc: cluster.rpc.clone(),
+        logs_rpc: None,
+        log_range: None,
     };
     let keys = Arc::new(RoleKeys::from_mnemonic(DEVELOPMENT_MNEMONIC).unwrap());
     SolanaClient::connect_with(

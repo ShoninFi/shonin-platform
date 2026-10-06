@@ -29,8 +29,9 @@ struct Plan {
     activate: bool,
     /// A depositor puts money in once it is open.
     deposit: bool,
-    /// Its author deposits too, then asks it all back while the agent has
-    /// the money at the venue, so a claim is booked and served.
+    /// The depositor asks it all back while the agent has part of the money
+    /// at the venue, so a claim is booked and served; the author then puts
+    /// a little in, so the vault keeps a depositor.
     claim: bool,
     /// Its author retires it once a depositor is in.
     retired: bool,
@@ -103,23 +104,37 @@ const PLAN: &[Plan] = &[
     },
 ];
 
-/// How long, in seconds, the seed waits for the keeper or the agent to take
-/// each step: long enough for a real chain's blocks and a public endpoint's
-/// pace, not only the local chains'.
-const WAIT_SECONDS: u32 = 600;
+/// How long, in seconds of the clock, the seed waits for the keeper or the
+/// agent to take each step: long enough for a real chain's blocks and a
+/// public endpoint's pace, not only the local chains'.
+const WAIT_SECONDS: u64 = 600;
+
+/// How long, in seconds of the clock, the executor has to take a new vault
+/// on (stake its key with gas and have the key approved at the station)
+/// before the seed stops and says so, rather than waiting on an agent that
+/// never starts.
+const TAKE_ON_SECONDS: u64 = 180;
+
+/// When a wait of `seconds` begun now ends, by the clock: a step's reads take
+/// their own time on a slow or rate-limited endpoint, so turns of a loop are
+/// no measure.
+fn deadline(seconds: u64) -> tokio::time::Instant {
+    tokio::time::Instant::now() + std::time::Duration::from_secs(seconds)
+}
 
 /// What the seeded depositor puts into the live vault.
 const DEPOSIT: u64 = 25_000_000_000;
-/// What the author puts in and asks back, to book a claim.
-const CLAIM_DEPOSIT: u64 = 20_000_000_000;
+/// What the author puts into the live vault once the depositor's claim is
+/// paid, so it keeps a depositor.
+const STAYING_DEPOSIT: u64 = 5_000_000_000;
 
 /// Publish one project as it stands: what an author does from the web app,
 /// run from a checkout of their work. It is activated once it is ready.
 ///
 /// With `live`, the vault is then used as the full seed's live vault is: a
-/// depositor's request priced at a later valuation, and the author's own
-/// deposit asked back once the agent has put it to work, booking a claim the
-/// keeper serves. On a testnet that is the proof the vault runs on a real
+/// depositor's request priced at a later valuation, and all of it asked back
+/// once the agent has put part of it to work, booking a claim the keeper
+/// serves; then a little of the author's, so it keeps a depositor. On a testnet that is the proof the vault runs on a real
 /// chain, so each wait is long enough for a real chain's blocks.
 pub async fn one(
     client: &Client,
@@ -168,9 +183,7 @@ pub async fn one(
                 let viewer = client.account(Role::Viewer)?;
                 deposit(client, deployments, vault, viewer, DEPOSIT).await?;
                 tracing::info!(slug, "a depositor asked to put money in");
-                let shares = wait_for_shares(client, vault, viewer).await?;
-                tracing::info!(slug, %shares, "and the deposit was priced at a later valuation");
-                claim(client, deployments, vault, author, &slug).await?;
+                claim(client, deployments, vault, &slug).await?;
             }
             Ok(())
         }
@@ -236,7 +249,7 @@ pub async fn run(
             tracing::info!(slug, "and a depositor asked to put money in");
         }
         if plan.claim {
-            claim(client, deployments, vault, author, &slug).await?;
+            claim(client, deployments, vault, &slug).await?;
         }
         if plan.retired {
             wait_for_shares(client, vault, client.account(Role::Viewer)?).await?;
@@ -301,7 +314,8 @@ async fn wait_for_shares(
     vault: alloy::primitives::Address,
     who: alloy::primitives::Address,
 ) -> Result<U256> {
-    for _ in 0..WAIT_SECONDS {
+    let until = deadline(WAIT_SECONDS);
+    while tokio::time::Instant::now() < until {
         let held = client
             .read(vault, IVault::balanceOfCall { owner: who })
             .await?;
@@ -310,77 +324,256 @@ async fn wait_for_shares(
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    bail!("a deposit was never priced: is the keeper running?")
+    bail!("a deposit was never priced within {WAIT_SECONDS} s: is the keeper running?")
 }
 
-/// The author deposits, waits for the agent to put the money to work, then
-/// asks for all of it back: more than the vault's cash, so a claim is booked
-/// and the keeper serves it.
+/// Wait, by the clock and for at most [`TAKE_ON_SECONDS`], until the
+/// executor has taken the vault on: a key approved at its station for the
+/// strategy's first driver. If it hasn't, say so with the likeliest reason
+/// rather than wait on an agent that never starts.
+async fn wait_taken_on(
+    client: &Client,
+    deployments: &Deployments,
+    vault: alloy::primitives::Address,
+    slug: &str,
+) -> Result<()> {
+    let station = client.read(vault, IVault::homeStationCall {}).await?;
+    let spec = client.read(station, IStation::specCall {}).await?;
+    let Some(driver) = spec.drivers.first().copied() else {
+        return Ok(());
+    };
+    let until = deadline(TAKE_ON_SECONDS);
+    while tokio::time::Instant::now() < until {
+        let key = client
+            .read(station, IStation::approvedKeyCall { driver })
+            .await?;
+        if !key.is_zero() {
+            tracing::info!(slug, %key, "the executor has taken the vault on");
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    let executor = deployments.roles.executor;
+    let holds = client.balance(executor).await.unwrap_or_default();
+    bail!(
+        "the executor has not taken {slug} ({vault}) on within {TAKE_ON_SECONDS} s: no key is \
+         approved at its station, so its agent never starts. The executor's log says why (\"could \
+         not take on this vault\"). Most often its account cannot stake the vault's key: it holds \
+         {} of the chain's coin, and on a public chain each vault's key is staked 0.0005 of it. \
+         Raise the executor's amount in config/funding.toml and run `task chains:fund \
+         NETWORK=testnet`.",
+        alloy::primitives::utils::format_ether(holds)
+    )
+}
+
+/// How often, while the seed waits for the agent to put money to work, it
+/// posts the stand-in venue's prices and funding again: each post is an
+/// event the agent wakes to.
+const NUDGE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The funding rate the seed posts for the stand-in venue's perpetual while
+/// it waits, as a fraction of the mark a day: five times what
+/// `funding-basis` needs to start carrying (0.0002), and about what the local
+/// market's own walk averages.
+const NUDGED_FUNDING: (u64, u64) = (1, 1_000);
+
+/// The depositor, once the agent has put part of the vault to work, asks for
+/// all of it back: more than the vault's cash, so a claim is booked and the
+/// keeper serves it. Fails if no claim is booked. Then the author puts a
+/// little in, so the live vault keeps a depositor.
+///
+/// The leaver is the depositor, who holds nearly the whole vault, so their
+/// withdrawal is more than the cash as soon as the agent has more than a
+/// tenth of the vault at the venue, whatever share it aims for. (A leaver
+/// who put money in after the agent moved would find it all in cash, since
+/// an agent need not move again.)
+///
+/// Nothing moves the stand-in venue on a testnet, and `funding-basis` puts
+/// money to work only when the venue's funding pays for it and the venue
+/// tells it something happened. So while it waits the seed plays the market
+/// operator for the run, as the local chain's market does every block:
+/// it posts the venue's prices as they stand with a funding rate the agent
+/// acts on. The withdrawal is asked for only once the station holds
+/// positions at the venue and the vault's cash is under nine tenths of what
+/// the depositor's shares are worth; a position isn't money the agent can
+/// bring home before the next valuation, so the cash can't cover it and a
+/// claim is booked.
 async fn claim(
     client: &Client,
     deployments: &Deployments,
     vault: alloy::primitives::Address,
-    author: alloy::primitives::Address,
     slug: &str,
 ) -> Result<()> {
-    deposit(client, deployments, vault, author, CLAIM_DEPOSIT).await?;
-    let shares = wait_for_shares(client, vault, author).await?;
-    // The agent keeps a buffer at home and puts the rest to work.
-    for _ in 0..WAIT_SECONDS {
+    use chain::bindings::venue::ILocalVenue;
+    let leaver = client.account(Role::Viewer)?;
+    wait_taken_on(client, deployments, vault, slug).await?;
+    let shares = wait_for_shares(client, vault, leaver).await?;
+    tracing::info!(slug, %shares, "the deposit was priced at a later valuation");
+    let station = client.read(vault, IVault::homeStationCall {}).await?;
+    let mut at_work = false;
+    let mut nudged: Option<tokio::time::Instant> = None;
+    let until = deadline(WAIT_SECONDS);
+    while tokio::time::Instant::now() < until {
+        if nudged.is_none_or(|at| at.elapsed() >= NUDGE_EVERY) {
+            if let Err(error) = nudge_the_market(client, deployments).await {
+                tracing::warn!(error = %format!("{error:#}"), "the stand-in venue's prices weren't posted");
+            } else if nudged.is_none() {
+                tracing::info!(
+                    slug,
+                    "the seed posts the stand-in venue's prices and a funding rate the agent acts on, as its market operator"
+                );
+            }
+            nudged = Some(tokio::time::Instant::now());
+        }
+        let held = client
+            .read(
+                deployments.venue,
+                ILocalVenue::marketsHeldByCall { master: station },
+            )
+            .await?;
         let cash = client.read(vault, IVault::cashCall {}).await?;
-        if cash < U256::from(CLAIM_DEPOSIT) {
+        let price = client.read(vault, IVault::sharePriceCall {}).await?;
+        let worth = shares * price / U256::from(10u64).pow(U256::from(18u64));
+        if !held.is_empty() && cash * U256::from(10u64) < worth * U256::from(9u64) {
+            at_work = true;
+            tracing::info!(slug, %cash, %worth, markets = held.len(), "the agent has put the money to work");
             break;
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
+    if !at_work {
+        bail!(
+            "the agent never put a tenth of the vault to work within {WAIT_SECONDS} s, so a withdrawal would be paid from cash and no claim booked"
+        );
+    }
+    let claims_before = client
+        .read(vault, IVault::claimCountCall {})
+        .await?
+        .to::<u64>();
     client
         .send(
-            author,
+            leaver,
             vault,
             IVault::requestRedeemCall {
                 shares,
-                receiver: author,
+                receiver: leaver,
             },
         )
         .await
         .context("the seeded withdrawal")?;
-    let mut booked = false;
-    for _ in 0..WAIT_SECONDS {
-        if !client
+    let request = client.read(vault, IVault::requestCountCall {}).await?;
+    let mut booked = None;
+    let until = deadline(WAIT_SECONDS);
+    while tokio::time::Instant::now() < until {
+        let count = client
             .read(vault, IVault::claimCountCall {})
             .await?
-            .is_zero()
-        {
-            booked = true;
-            tracing::info!(slug, "and a withdrawal larger than the cash booked a claim");
+            .to::<u64>();
+        for id in claims_before + 1..=count {
+            let claim = client
+                .read(
+                    vault,
+                    IVault::claimAtCall {
+                        claimId: U256::from(id),
+                    },
+                )
+                .await?;
+            if claim.owner == leaver {
+                booked = Some(id);
+            }
+        }
+        if booked.is_some() {
             break;
+        }
+        if client
+            .read(vault, IVault::requestAtCall { requestId: request })
+            .await?
+            .done
+        {
+            bail!("the seeded withdrawal was paid from cash, so no claim was booked");
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    if !booked {
-        tracing::warn!(
-            slug,
-            "the withdrawal was paid from cash, so no claim was booked"
+    let Some(claim_id) = booked else {
+        bail!(
+            "the seeded withdrawal booked no claim within {WAIT_SECONDS} s: is the keeper running?"
         );
-        return Ok(());
-    }
-    // The keeper serves it: the leaver's fraction is closed and paid at once.
-    for _ in 0..WAIT_SECONDS {
+    };
+    tracing::info!(
+        slug,
+        claim = claim_id,
+        "and a withdrawal larger than the cash booked a claim"
+    );
+    // The keeper serves it: the leaver's fraction is closed and they are
+    // paid.
+    let until = deadline(WAIT_SECONDS);
+    let mut paid = None;
+    while tokio::time::Instant::now() < until {
         let claim = client
             .read(
                 vault,
                 IVault::claimAtCall {
-                    claimId: U256::from(1u64),
+                    claimId: U256::from(claim_id),
                 },
             )
             .await?;
         if matches!(claim.state, ClaimState::Paid) {
-            tracing::info!(slug, paid = %claim.paid, "and the claim was paid");
-            return Ok(());
+            paid = Some(claim.paid);
+            break;
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    bail!("a claim was booked but never paid: is the keeper running?")
+    let Some(paid) = paid else {
+        bail!("a claim was booked but never paid within {WAIT_SECONDS} s: is the keeper running?");
+    };
+    tracing::info!(slug, %paid, "and the claim was paid");
+    let author = client.account(Role::Author)?;
+    deposit(client, deployments, vault, author, STAYING_DEPOSIT).await?;
+    wait_for_shares(client, vault, author).await?;
+    tracing::info!(
+        slug,
+        "and its author put a little in, so the vault keeps a depositor"
+    );
+    Ok(())
+}
+
+/// Post the stand-in venue's prices as they stand, with a funding rate on its
+/// perpetual of [`NUDGED_FUNDING`] of the mark a day, as its market operator.
+async fn nudge_the_market(client: &Client, deployments: &Deployments) -> Result<()> {
+    use chain::bindings::venue::{Funding, ILocalVenue, Quote};
+    let operator = client.account(Role::Operator)?;
+    let mut quotes = Vec::new();
+    let mut funding = Vec::new();
+    for name in [crate::deploy::SPOT, crate::deploy::PERP] {
+        let id = crate::deploy::market_id(name);
+        let market = client
+            .read(deployments.venue, ILocalVenue::marketOfCall { market: id })
+            .await?;
+        quotes.push(Quote {
+            market: id,
+            mark: market.mark,
+            oracle: market.oracle,
+            bid: market.bid,
+            ask: market.ask,
+        });
+        if market.isPerp {
+            let rate = market.mark * U256::from(NUDGED_FUNDING.0) / U256::from(NUDGED_FUNDING.1);
+            funding.push(Funding {
+                market: id,
+                ratePerDay: alloy::primitives::I256::try_from(rate)?,
+                paidPerUnit: alloy::primitives::I256::ZERO,
+            });
+        }
+    }
+    client
+        .send(
+            operator,
+            deployments.venue,
+            ILocalVenue::postCall { quotes, funding },
+        )
+        .await
+        .context("posting the stand-in venue's prices")?;
+    Ok(())
 }
 
 /// The depositor's money goes to work; the admin stops the vault; the keeper
@@ -393,8 +586,10 @@ async fn killed(
     slug: &str,
 ) -> Result<()> {
     let viewer = client.account(Role::Viewer)?;
+    wait_taken_on(client, deployments, vault, slug).await?;
     let shares = wait_for_shares(client, vault, viewer).await?;
-    for _ in 0..WAIT_SECONDS {
+    let until = deadline(WAIT_SECONDS);
+    while tokio::time::Instant::now() < until {
         let cash = client.read(vault, IVault::cashCall {}).await?;
         if cash < U256::from(DEPOSIT) {
             break;
@@ -409,7 +604,8 @@ async fn killed(
     tracing::info!(slug, "and then stopped with a depositor's money at work");
 
     let mut closed = false;
-    for _ in 0..300 {
+    let until = deadline(WAIT_SECONDS);
+    while tokio::time::Instant::now() < until {
         if matches!(
             client.read(vault, IVault::stateCall {}).await?,
             VaultState::Closed

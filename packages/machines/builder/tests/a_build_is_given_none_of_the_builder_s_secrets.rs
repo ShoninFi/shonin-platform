@@ -3,8 +3,8 @@
 //! testnet the build service's environment carries
 //! `SHONIN_TESTNET_EVM_MNEMONIC`, from which every role account is derived
 //! (the admin, the attestor that stands in for the attestation hardware, the
-//! builder and the reviewer), and any RPC override (`SHONIN_RPC_*`, which may
-//! carry a provider's API key). Handed to a build, a reviewed-looking
+//! builder and the reviewer), and any RPC override (`SHONIN_RPC_*` and
+//! `SHONIN_LOGS_RPC_*`, which may carry a provider's API key). Handed to a build, a reviewed-looking
 //! `option_env!(...)` would bake them into the component, which the builder
 //! writes to the public store.
 //!
@@ -28,6 +28,7 @@ use alloy::primitives::Address;
 
 const MNEMONIC: &str = "secret words that must never reach a strategy build";
 const RPC: &str = "https://base.example.invalid/v2/provider-api-key-0123456789";
+const LOGS_RPC: &str = "https://logs.example.invalid/v2/logs-provider-key-9876543210";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_build_is_given_none_of_the_builder_s_secrets() {
@@ -55,6 +56,7 @@ async fn a_build_is_given_none_of_the_builder_s_secrets() {
         std::env::set_var("PATH", path);
         std::env::set_var("SHONIN_TESTNET_EVM_MNEMONIC", MNEMONIC);
         std::env::set_var("SHONIN_RPC_BASE_SEPOLIA", RPC);
+        std::env::set_var("SHONIN_LOGS_RPC_EVM_84532", LOGS_RPC);
     }
     black_box::CLEARS.store(true, Ordering::SeqCst);
 
@@ -78,7 +80,7 @@ async fn a_build_is_given_none_of_the_builder_s_secrets() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let environment = std::fs::read_to_string(&seen).unwrap();
-    let leaked: Vec<&str> = [MNEMONIC, RPC]
+    let leaked: Vec<&str> = [MNEMONIC, RPC, LOGS_RPC]
         .into_iter()
         .filter(|secret| environment.contains(secret))
         .collect();
