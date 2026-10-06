@@ -73,6 +73,13 @@ struct Args {
     /// Seconds of chain time each block advances.
     #[arg(long, default_value_t = 3_600)]
     seconds_per_block: u64,
+    /// The deployment generation: the salt of the contracts at one address
+    /// on every chain (the station factory among them), the same on every
+    /// chain of the network and recorded in each deployment file. A clean
+    /// redeploy beside an older deployment needs a new one. Without it, a
+    /// deploy takes the generation of the chains it keeps, or 0.
+    #[arg(long, env = "SHONIN_GENERATION")]
+    generation: Option<u64>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -193,16 +200,50 @@ async fn main() -> Result<()> {
     match args.command {
         Some(Command::Deploy) => {
             let names = chain_names(&target);
-            for (key, config) in only(&target, one, evm_chains(&target)) {
-                let client = connect_to(target.network, &key, &config).await?;
+            let chosen = only(&target, one, evm_chains(&target));
+            // Every chain is looked at before anything is sent to any: which
+            // are kept as they are, the generation they all go under, and
+            // whether that generation's station factory is free on each of
+            // the others.
+            let mut chains = Vec::new();
+            let mut kept = Vec::new();
+            for (key, config) in evm_chains(&target) {
                 let file = Deployments::file_in(&target.deployments_dir, &key);
+                if !chosen.iter().any(|(chosen, _)| *chosen == key) {
+                    // Not deployed to this time; its file still counts.
+                    kept.extend(deploy::Kept::read(&key, &file));
+                    continue;
+                }
+                let client = connect_to(target.network, &key, &config).await?;
+                let keeps = deploy::still_there(&client, &file).await.is_some();
+                if keeps {
+                    kept.extend(deploy::Kept::read(&key, &file));
+                }
+                chains.push((key, client, file, keeps));
+            }
+            let generation = deploy::settle_generation(args.generation, &kept, &args.artifacts)?;
+            tracing::info!(generation, "the deployment generation");
+            for (_, client, file, keeps) in &chains {
+                if !keeps {
+                    deploy::refuse_a_used_station_factory(
+                        client,
+                        &args.artifacts,
+                        client.account(chain::Role::Admin)?,
+                        generation,
+                        file,
+                    )
+                    .await?;
+                }
+            }
+            for (key, client, file, _) in &chains {
                 deploy::ensure(
-                    &client,
+                    client,
                     target.network,
-                    &key,
+                    key,
                     &args.artifacts,
-                    &file,
+                    file,
                     &names,
+                    generation,
                 )
                 .await?;
             }
@@ -308,12 +349,26 @@ async fn main() -> Result<()> {
         }) => {
             let client = target.connect().await?;
             let deployments = target.wait_for_deployments(&client).await?;
+            // The stack goes with the deployment's generation, as its file
+            // records it.
+            let generation = std::fs::read_to_string(target.deployments_file())
+                .ok()
+                .and_then(|text| deploy::recorded_generation(&text));
+            if let (Some(asked), Some(recorded)) = (args.generation, generation)
+                && asked != recorded
+            {
+                bail!(
+                    "the deployment on this chain is under generation {recorded}, not {asked}: \
+                     the Hyperliquid stack goes beside the deployment as it is"
+                );
+            }
             match (api, agent) {
                 (Some(api), Some(agent)) => {
                     hyperliquid_vaults::run(
                         &client,
                         &args.artifacts,
                         &deployments,
+                        generation,
                         &target.deployments_dir,
                         hyperliquid_vaults::RunOptions {
                             api: &api,
@@ -328,9 +383,14 @@ async fn main() -> Result<()> {
                 _ => {
                     let file =
                         hyperliquid_vaults::HyperliquidVaults::file_in(&target.deployments_dir);
-                    let vaults =
-                        hyperliquid_vaults::ensure(&client, &args.artifacts, &deployments, &file)
-                            .await?;
+                    let vaults = hyperliquid_vaults::ensure(
+                        &client,
+                        &args.artifacts,
+                        &deployments,
+                        generation,
+                        &file,
+                    )
+                    .await?;
                     println!("{}", serde_json::to_string_pretty(&vaults)?);
                     Ok(())
                 }
@@ -402,11 +462,13 @@ async fn main() -> Result<()> {
                     let file = Deployments::file_in(&target.deployments_dir, &key);
                     let seconds_per_block = args.seconds_per_block;
                     let network = target.network;
+                    let generation = args.generation.unwrap_or(0);
                     running.spawn(async move {
                         let client = connect_to(network, &key, &config).await?;
-                        let deployments =
-                            deploy::ensure(&client, network, &key, &artifacts, &file, &names)
-                                .await?;
+                        let deployments = deploy::ensure(
+                            &client, network, &key, &artifacts, &file, &names, generation,
+                        )
+                        .await?;
                         tracing::info!(chain = %key, label = config.label, "the chain is up");
                         market::run(&client, &deployments, seconds_per_block)
                             .await

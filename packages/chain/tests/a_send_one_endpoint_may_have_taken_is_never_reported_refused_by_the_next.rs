@@ -13,7 +13,9 @@
 //!
 //! So once an endpoint may have taken the bytes, no later endpoint's
 //! refusal is taken as one: whether it landed is found out by its hash. A
-//! refusal from the first endpoint that answers stays a refusal.
+//! refusal from the first endpoint that answers stays a refusal, unless it
+//! calls the nonce too low and holds this very transaction's receipt: a
+//! gateway that retries a send behind one name reproduces two endpoints.
 //!
 //! Needs the `args` feature.
 
@@ -234,4 +236,44 @@ async fn a_refusal_from_the_first_endpoint_asked_stays_a_refusal() {
         !*asked_second.lock().unwrap(),
         "a refused send was handed to a second endpoint"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gateway_that_retried_a_send_it_took_is_not_taken_to_have_refused_it() {
+    // One name, and behind it a gateway that hands the send to its node,
+    // loses the reply, retries, and answers the retry's "nonce too low".
+    let mined: Arc<Mutex<Option<B256>>> = Default::default();
+    let gateway: stand_in::Answer = {
+        let inner = endpoint(mined.clone());
+        let mined = mined.clone();
+        Arc::new(move |method, request| {
+            if method == "eth_sendRawTransaction" {
+                let raw = alloy::hex::decode(request["params"][0].as_str().unwrap()).unwrap();
+                *mined.lock().unwrap() = Some(keccak256(&raw));
+                return Said::Raw(
+                    200,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"].clone(),
+                        "error": {"code": -32000, "message": "nonce too low"},
+                    })
+                    .to_string(),
+                );
+            }
+            inner(method, request)
+        })
+    };
+    let only = stand_in::answering(Some(31337), gateway).await;
+    let client = chain::Client::connect(&stand_in::config(&only), Signing::ReadOnly)
+        .await
+        .unwrap();
+    let key = client.with_key(PrivateKeySigner::random()).unwrap();
+    let outcome = key.send(Address::repeat_byte(0x22), approve()).await;
+    assert!(mined.lock().unwrap().is_some());
+    if let Err(error) = &outcome {
+        assert!(
+            chain::may_still_land(error),
+            "the transaction is mined, and its sender was told it was refused: {error:#}"
+        );
+    }
 }

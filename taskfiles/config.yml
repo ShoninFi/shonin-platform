@@ -9,11 +9,37 @@
 version: "3"
 
 vars:
-  # Which chains: local (what `task dev` starts), testnet or mainnet. Set
-  # SHONIN_NETWORK in .env, or pass NETWORK=testnet to a task. The chains each
-  # one means are in config/chains.toml.
+  # Which chains: local (what `task dev` starts), testnet or mainnet. The
+  # chains each one means are in config/chains.toml. Any of these says which,
+  # the first that is set winning:
+  #   task dev:services NETWORK=testnet      (the task's own argument)
+  #   NETWORK=testnet task dev:services      (the environment)
+  #   SHONIN_NETWORK=testnet, in the environment or in .env
+  # and NETWORK and SHONIN_NETWORK set to different networks are refused,
+  # rather than one of them quietly ignored. Unset, it is local. (A task's
+  # argument replaces this whole computation; .env is read here for that one
+  # name, since Task hands .env only to commands, not to variables.)
   NETWORK:
-    sh: echo "${SHONIN_NETWORK:-local}"
+    sh: |
+      from_env_file=$(awk '/^[[:space:]]*(export[[:space:]]+)?SHONIN_NETWORK=/ { v = substr($0, index($0, "=") + 1) } END { gsub(/["'"'"' \r]/, "", v); print v }' "{{.ROOT_DIR}}/.env" 2>/dev/null)
+      named="${NETWORK:-}"
+      shonin="${SHONIN_NETWORK:-$from_env_file}"
+      if [ -n "$named" ] && [ -n "$shonin" ] && [ "$named" != "$shonin" ]; then
+        echo "NETWORK=$named and SHONIN_NETWORK=$shonin name different networks: unset one, or pass NETWORK=<network> to the task" >&2
+        exit 1
+      fi
+      echo "${named:-${shonin:-local}}"
+  # The deployment generation a deploy goes under: the salt of the contracts
+  # at one address on every chain, the station factory among them. A clean
+  # redeploy beside an older deployment needs a new one, the same for every
+  # chain of the network (`task chains:deploy NETWORK=testnet GENERATION=2`);
+  # each deployment file records its own. Unset, a deploy takes the
+  # generation of the chains it keeps, or 0. Also read from GENERATION in the
+  # environment, or SHONIN_GENERATION in the environment or .env (which the
+  # devnet reads itself).
+  GENERATION:
+    sh: echo "${GENERATION:-}"
+  GENERATION_ARG: '{{if .GENERATION}}--generation "{{.GENERATION}}"{{end}}'
   # The services serve every vault chain of the network. Set VAULT_CHAIN=base
   # (or hyperliquid, robinhood) on a task to serve, or seed, just one.
   VAULT_CHAIN: ""
@@ -108,6 +134,7 @@ vars:
     --store "{{.PATH_STORE}}"
     --artifacts "{{.PATH_ARTIFACTS}}"
     --solana-programs "{{.PATH_SOLANA_PROGRAMS}}"
+    {{.GENERATION_ARG}}
 
   # Cargo: crates that run as wasm are also checked for wasm32-unknown-unknown.
   # The app builds natively too (its seo tool runs at build time). The

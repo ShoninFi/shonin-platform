@@ -415,8 +415,9 @@ async fn a_rate_limit_on_a_log_query_moves_to_the_next_endpoint_and_is_never_hal
     assert_eq!(limited.lock().unwrap().ranges, vec![(1, 100)], "halved");
     assert_eq!(open.lock().unwrap().ranges, vec![(1, 100)]);
 
-    // With only the limiting endpoint, the read fails as the endpoint's
-    // trouble, and still unhalved.
+    // With only the limiting endpoint, the read is asked again a few times
+    // (every endpoint of the list limited the rate), then fails as the
+    // endpoint's trouble, and still unhalved.
     let alone: Arc<Mutex<Seen>> = Default::default();
     let only = stand_in::answering(Some(31337), limiting_node(alone.clone())).await;
     let client = client_with(&main_url, Some(&only), None).await;
@@ -425,5 +426,5 @@ async fn a_rate_limit_on_a_log_query_moves_to_the_next_endpoint_and_is_never_hal
         .await
         .expect_err("the only endpoint limits the rate");
     assert!(chain::node_trouble(&error), "{error:#}");
-    assert_eq!(alone.lock().unwrap().ranges, vec![(1, 100)], "halved");
+    assert_eq!(alone.lock().unwrap().ranges, vec![(1, 100); 4], "halved");
 }

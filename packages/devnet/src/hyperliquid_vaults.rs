@@ -45,7 +45,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use chain::bindings::attestation::IAttestationRegistry;
 use chain::bindings::erc20::IERC20;
 use chain::bindings::factory::IVaultFactory;
-use chain::bindings::station::IStationFactory;
 use chain::bindings::vault::{ClaimState, IVault};
 use chain::{Client, Deployments, Role};
 use hyperliquid::{Api, HyperCore};
@@ -91,6 +90,12 @@ pub struct HyperliquidVaults {
     pub factory: Address,
     /// The deployment's own factory, which this one replaces.
     pub previous_factory: Address,
+    /// The generation of the deployment this stack was deployed beside, as
+    /// its file records it; `None` for a stack or a deployment from before
+    /// deployments recorded one. A stack is only kept beside a deployment of
+    /// its own generation.
+    #[serde(default)]
+    pub generation: Option<u64>,
 }
 
 impl HyperliquidVaults {
@@ -117,6 +122,7 @@ pub async fn ensure(
     client: &Client,
     artifacts: &Path,
     deployments: &Deployments,
+    generation: Option<u64>,
     file: &Path,
 ) -> Result<HyperliquidVaults> {
     if client.chain_id != CHAIN_ID {
@@ -130,8 +136,9 @@ pub async fn ensure(
             serde_json::from_str(&text).with_context(|| format!("reading {}", file.display()))?;
         // The deployment as deployed, or as adopted with this factory in
         // place.
-        let mut all_there =
-            vaults.previous_factory == deployments.factory || vaults.factory == deployments.factory;
+        let mut all_there = (vaults.previous_factory == deployments.factory
+            || vaults.factory == deployments.factory)
+            && vaults.generation == generation;
         for address in [
             vaults.driver,
             vaults.station_implementation,
@@ -145,11 +152,11 @@ pub async fn ensure(
             return Ok(vaults);
         }
         tracing::warn!(
-            "{} names contracts that aren't there, or another deployment's factory: deploying again",
+            "{} names contracts that aren't there, or another deployment's factory or generation: deploying again",
             file.display()
         );
     }
-    let vaults = deploy(client, artifacts, deployments).await?;
+    let vaults = deploy(client, artifacts, deployments, generation).await?;
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -157,19 +164,29 @@ pub async fn ensure(
     // The deployment as the services would read it with this factory in
     // place, ready to be put where they read it once they run code that
     // knows the driver.
+    // It carries the deployment's generation, as the chain's own file does.
     let adopted_file = file.with_extension("deployment.json");
-    std::fs::write(
-        &adopted_file,
-        serde_json::to_string_pretty(&adopted(deployments, &vaults))? + "\n",
-    )?;
+    let adopted = adopted(deployments, &vaults);
+    let adopted_text = match generation {
+        Some(generation) => crate::deploy::deployment_json(&adopted, generation)?,
+        None => serde_json::to_string_pretty(&adopted)?,
+    };
+    std::fs::write(&adopted_file, adopted_text + "\n")?;
     tracing::info!(file = %file.display(), deployment = %adopted_file.display(), "the Hyperliquid vault stack is written");
     Ok(vaults)
 }
 
+/// Deploy the stack. Its station factory is deployed afresh (not at an
+/// address shared across chains: a Hyperliquid vault's station is on
+/// HyperEVM alone), so no earlier stack's can be met; it is still read back
+/// once initialised and refused, naming what differs, if it names anything
+/// but this stack's vault factory, USDC, the registry and this stack's
+/// station implementation.
 async fn deploy(
     client: &Client,
     artifacts: &Path,
     deployments: &Deployments,
+    generation: Option<u64>,
 ) -> Result<HyperliquidVaults> {
     let admin = deployments.roles.admin;
     let api = Api::for_chain(client.chain_id).ok_or_else(|| anyhow!("not HyperEVM"))?;
@@ -242,19 +259,18 @@ async fn deploy(
             .abi_encode_params(),
     )
     .await?;
-    client
-        .send(
-            admin,
-            station_factory,
-            IStationFactory::initializeCall {
-                attestation_: deployments.attestation,
-                asset_: USDC,
-                vaultFactory_: factory,
-                implementation_: station_implementation,
-            },
-        )
-        .await
-        .context("initialising the station factory")?;
+    crate::deploy::initialise_station_factory(
+        client,
+        admin,
+        station_factory,
+        crate::deploy::StationFactorySet {
+            attestation: deployments.attestation,
+            asset: USDC,
+            vault_factory: factory,
+            implementation: station_implementation,
+        },
+    )
+    .await?;
     client
         .send(
             admin,
@@ -278,6 +294,7 @@ async fn deploy(
         station_factory,
         factory,
         previous_factory: previous,
+        generation,
     })
 }
 
@@ -347,7 +364,10 @@ async fn put_linking(
     let mut bytecode = alloy::hex::decode(hex.trim_start_matches("0x"))
         .with_context(|| format!("{name}'s bytecode (it links no libraries)"))?;
     bytecode.extend_from_slice(&arguments);
-    let address = client.deploy(from, bytecode).await?;
+    // A fixed gas limit on HyperEVM rather than an endpoint's estimate.
+    let address = client
+        .deploy_with_gas_limit(from, bytecode, crate::deploy::creation_gas(client))
+        .await?;
     tracing::info!(%address, contract = name, "deployed");
     Ok(address)
 }
@@ -519,6 +539,11 @@ impl Funder {
         Ok(())
     }
 }
+
+/// How long a run follows its claim: a close is staged, the venue acts, and
+/// it is delivered within the driver's five-minute window, perhaps in parts,
+/// each staged after a valuation.
+const CLAIM_MINUTES: u64 = 60;
 
 /// The most the funder pays for a HYPE when it buys some for a station.
 const HYPE_CEILING: f64 = 100.0;
@@ -793,6 +818,9 @@ pub async fn claim_all(
             id
         }
     };
+    // Each change is logged: a state (`Waiting`, `Closing` while the close
+    // staged for it runs, `Paid`), and each part paid, which sends a claim
+    // back to `Waiting` with fewer shares and more paid.
     let mut last = None;
     for _ in 0..minutes * 12 {
         let claim = client
@@ -803,11 +831,24 @@ pub async fn claim_all(
                 },
             )
             .await?;
-        // The state by its number in the vault's `ClaimState`.
-        let state = claim.state as u8;
-        if last != Some(state) {
-            tracing::info!(%vault, claim = claim_id, state, shares_units = %claim.shares, paid_units = %claim.paid, "the claim");
-            last = Some(state);
+        let seen = (claim.state as u8, claim.shares, claim.paid);
+        if last != Some(seen) {
+            let part_paid = last.is_some_and(|(_, _, paid)| claim.paid > paid)
+                && !matches!(claim.state, ClaimState::Paid);
+            tracing::info!(
+                %vault,
+                claim = claim_id,
+                state = claim_state_name(claim.state as u8),
+                shares_units = %claim.shares,
+                paid_units = %claim.paid,
+                "{}",
+                if part_paid {
+                    "a part of the claim is paid"
+                } else {
+                    "the claim"
+                }
+            );
+            last = Some(seen);
         }
         if matches!(claim.state, ClaimState::Paid) {
             let held = client
@@ -819,6 +860,14 @@ pub async fn claim_all(
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
     bail!("claim {claim_id} was not paid in {minutes} minutes")
+}
+
+/// A claim state's name, by its number in the vault's `ClaimState`.
+fn claim_state_name(state: u8) -> &'static str {
+    const NAMES: [&str; 7] = [
+        "None", "Pending", "Waiting", "Queued", "Paid", "Fallback", "Closing",
+    ];
+    NAMES.get(usize::from(state)).copied().unwrap_or("unknown")
 }
 
 /// How far a run has got, kept beside the deployment so a run stopped
@@ -889,11 +938,12 @@ pub async fn run(
     client: &Client,
     artifacts: &Path,
     deployments: &Deployments,
+    generation: Option<u64>,
     deployments_dir: &Path,
     options: RunOptions<'_>,
 ) -> Result<()> {
     let file = HyperliquidVaults::file_in(deployments_dir);
-    let vaults = ensure(client, artifacts, deployments, &file).await?;
+    let vaults = ensure(client, artifacts, deployments, generation, &file).await?;
     if deployments.factory != vaults.factory {
         bail!(
             "the services don't read the Hyperliquid factory yet, so nothing would price this vault's deposit or serve its claim: put {} in place of the chain's deployment file (keep the original), start the services again, and run this again",
@@ -1039,11 +1089,18 @@ pub async fn run(
         log_valuation(client, vault).await?;
     }
 
-    let paid = claim_all(client, vault, depositor, progress.claim, 30, |id| {
-        let mut noted = progress.clone();
-        noted.claim = Some(id);
-        noted.write(&progress_file)
-    })
+    let paid = claim_all(
+        client,
+        vault,
+        depositor,
+        progress.claim,
+        CLAIM_MINUTES,
+        |id| {
+            let mut noted = progress.clone();
+            noted.claim = Some(id);
+            noted.write(&progress_file)
+        },
+    )
     .await?;
     progress = Progress::read(&progress_file, &agent_name)?;
     progress.paid = Some(paid.to_string());
@@ -1069,6 +1126,7 @@ mod tests {
             station_factory: Address::repeat_byte(3),
             factory: Address::repeat_byte(4),
             previous_factory: Address::repeat_byte(5),
+            generation: Some(2),
         };
         let text = serde_json::to_string(&vaults).unwrap();
         assert_eq!(
@@ -1147,6 +1205,7 @@ mod tests {
             station_factory: Address::repeat_byte(3),
             factory: Address::repeat_byte(4),
             previous_factory: Address::repeat_byte(5),
+            generation: Some(2),
         };
         let adopted = adopted(&deployments, &vaults);
         assert_eq!(adopted.factory, vaults.factory);
