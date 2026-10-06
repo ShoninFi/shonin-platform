@@ -6,6 +6,7 @@
 //! per account, reconnecting after a failure. A strategy reads them as
 //! [`AccountEvent`] payloads.
 
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use alloy::primitives::Address;
@@ -24,6 +25,29 @@ pub const MAINNET_SOCKET: &str = "wss://api.hyperliquid.xyz/ws";
 
 /// How many events wait for a slow reader before the newest are dropped.
 const WAITING_MOST: usize = 1024;
+
+/// The TLS the socket is opened with: the roots compiled in, and a crypto
+/// provider named here. Left to the process default, the connection panics
+/// in a build where another crate has turned a second provider on and
+/// nothing has chosen between them.
+fn tls() -> tokio_tungstenite::Connector {
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    let config = CONFIG.get_or_init(|| {
+        let roots = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("the default protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        )
+    });
+    tokio_tungstenite::Connector::Rustls(config.clone())
+}
 
 fn decimal(value: &Value) -> Option<Decimal> {
     value.as_str().and_then(|text| text.parse().ok())
@@ -133,7 +157,8 @@ async fn follow(
     markets: &Markets,
     sender: &mpsc::Sender<AccountEvent>,
 ) -> Result<()> {
-    let (mut socket, _) = tokio_tungstenite::connect_async(url).await?;
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async_tls_with_config(url, None, false, Some(tls())).await?;
     let user = format!("{account:#x}");
     for kind in ["userEvents", "orderUpdates"] {
         let subscribe =
@@ -320,5 +345,26 @@ mod tests {
         assert_eq!(state.spot[0].hold, "1".parse().unwrap());
         assert_eq!(state.open_orders[0].side, Side::Sell);
         assert_eq!(state.withdrawable, "80".parse().unwrap());
+    }
+
+    /// The stream's connection names its own crypto provider: reaching the
+    /// TLS handshake ends in an error from a peer that isn't the venue, never
+    /// in a panic over a process default nobody set.
+    #[tokio::test]
+    async fn a_connection_reaches_its_tls_handshake_without_a_process_wide_provider() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let (sender, _receiver) = mpsc::channel(1);
+        let followed = follow(
+            &format!("wss://localhost:{port}/ws"),
+            Address::ZERO,
+            &Markets::default(),
+            &sender,
+        )
+        .await;
+        assert!(followed.is_err());
     }
 }
