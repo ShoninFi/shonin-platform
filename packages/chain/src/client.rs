@@ -129,6 +129,11 @@ pub struct Client {
     /// filled in, so two sends from one account at once would both take the
     /// same one and the node would keep only one of them.
     turns: Arc<std::sync::Mutex<HashMap<Address, Arc<tokio::sync::Mutex<()>>>>>,
+    /// The nonce after each account's last send whose receipt was seen,
+    /// shared by every clone. A public RPC is often several nodes behind one
+    /// name, and one a block behind would number the next send as the last
+    /// again; a send is never numbered below this.
+    nonces: Arc<std::sync::Mutex<HashMap<Address, u64>>>,
 }
 
 /// The fillers a signing client runs: gas, then the nonce, then the chain id.
@@ -649,6 +654,7 @@ impl Client {
             accounts,
             keys,
             turns: Default::default(),
+            nonces: Default::default(),
         })
     }
 
@@ -897,6 +903,26 @@ impl Client {
             }
             _ => None,
         };
+        // Numbered here, while the account's turn is held: the node's count
+        // of the account's sends, pending ones included, but never below the
+        // one after the last send this client saw land. A count the node
+        // won't give leaves the numbering to the send itself, as before.
+        let mut request = request;
+        let mut numbered = None;
+        if let (Some(_), Some(from), None) = (&_turn, request.from, request.nonce)
+            && let Ok(counted) = self.provider.get_transaction_count(from).pending().await
+        {
+            let floor = self
+                .nonces
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&from)
+                .copied()
+                .unwrap_or(0);
+            let nonce = counted.max(floor);
+            request = request.with_nonce(nonce);
+            numbered = Some((from, nonce));
+        }
         let pending = self
             .provider
             .send_transaction(request)
@@ -904,7 +930,16 @@ impl Client {
             .with_context(|| sending.to_string())?;
         let hash = *pending.tx_hash();
         sent_as(hash);
-        receipt_within(&self.provider, hash, within, what).await
+        let receipt = receipt_within(&self.provider, hash, within, what).await?;
+        if let Some((from, nonce)) = numbered {
+            let mut nonces = self
+                .nonces
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let next = nonces.entry(from).or_default();
+            *next = (*next).max(nonce + 1);
+        }
+        Ok(receipt)
     }
 
     /// Have the node sign a digest as `who`, the way a wallet would: the

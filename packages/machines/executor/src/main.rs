@@ -2684,7 +2684,7 @@ mod tests {
     async fn a_served_key_that_has_spent_its_gas_is_given_more() {
         let state = stand_in::chain(1_000_000_000, 0);
         let client = stand_in::client(&stand_in::start(state.clone()).await).await;
-        let stake = alloy::primitives::U256::from(health::gas_stake(&client));
+        let stake = alloy::primitives::U256::from(health::stake_today(&client).await.unwrap());
         // The key already holds a full stake, so taking the vault on sends
         // none.
         state.lock().unwrap().sent.push(stake);
@@ -4157,7 +4157,7 @@ mod tests {
         state.lock().unwrap().head = 16;
         let client = stand_in::client(&stand_in::start(state.clone()).await).await;
         // The key already holds a full stake, so none is sent.
-        let stake = alloy::primitives::U256::from(health::gas_stake(&client));
+        let stake = alloy::primitives::U256::from(health::stake_today(&client).await.unwrap());
         state.lock().unwrap().sent.push(stake);
         let store = std::env::temp_dir().join(format!("executor-watched-{}", std::process::id()));
         let served = staked_and_taken_on(&client, &store).await;

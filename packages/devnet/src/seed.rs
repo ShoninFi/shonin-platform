@@ -139,6 +139,10 @@ pub async fn one(
     if !project.join("shonin.toml").exists() {
         bail!("no agent at {}", project.display());
     }
+    // A manifest names one vault chain, and the build service refuses it on
+    // any other: to publish the agent on another, a copy names this one.
+    let moved = on_vault_chain(&agents, project, vault_chain)?;
+    let project = moved.as_deref().unwrap_or(project);
     let author = client.account(Role::Author)?;
     say_who_the_author_is(client, deployments, author).await?;
     tracing::info!(project = %project.display(), "publishing");
@@ -447,6 +451,48 @@ async fn killed(
 }
 
 /// Copy the agent into a scratch tree, under the title a plan asks for.
+/// A copy of the agents with `project`'s manifest naming `vault_chain` as its
+/// vault's chain, when it names another; none when it already names it.
+fn on_vault_chain(
+    agents: &Path,
+    project: &Path,
+    vault_chain: shared::Chain,
+) -> Result<Option<PathBuf>> {
+    let manifest = std::fs::read_to_string(project.join("shonin.toml"))?;
+    let wanted = format!("chain = \"{}\"", vault_chain.name());
+    let mut in_vault = false;
+    let mut changed = false;
+    let rewritten: Vec<String> = manifest
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_vault = trimmed == "[vault]";
+            }
+            if in_vault && trimmed.starts_with("chain = ") && trimmed != wanted {
+                changed = true;
+                wanted.clone()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    if !changed {
+        return Ok(None);
+    }
+    let into = std::env::temp_dir().join(format!("shonin-seed-{}", vault_chain.name()));
+    let _ = std::fs::remove_dir_all(&into);
+    copy_tree(agents, &into)?;
+    let relative = project.strip_prefix(agents).unwrap_or(project);
+    let moved = into.join(relative);
+    std::fs::write(moved.join("shonin.toml"), rewritten.join("\n") + "\n")?;
+    tracing::info!(
+        chain = vault_chain.name(),
+        "the manifest names another vault chain: publishing a copy that names this one"
+    );
+    Ok(Some(moved))
+}
+
 fn prepare(agents: &Path, agent: &Path, into: &Path, plan: &Plan) -> Result<PathBuf> {
     copy_tree(agents, into)?;
     let relative = agent

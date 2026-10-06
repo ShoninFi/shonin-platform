@@ -57,6 +57,11 @@ fn stake_at(base: u128, worst_send: u128) -> u128 {
     base.max(worst_send.saturating_mul(3))
 }
 
+/// The stake a key is given at today's fee, as [`fund_gas`] sees to it.
+pub async fn stake_today(chain: &Client) -> Result<u128> {
+    Ok(stake_at(gas_stake(chain), worst_send(chain).await?))
+}
+
 /// Below what a key is topped up: the stake less one worst-case send, so the
 /// key is brought back up after every few sends rather than left to fall to
 /// the warning at half a stake. Never below two worst-case sends, so a key is
