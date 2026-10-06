@@ -180,7 +180,9 @@ pub fn hub() -> &'static Hub {
             .get()
             .cloned()
             .unwrap_or_else(|| HYPERLIQUID_TESTNET.to_string());
-        Hub::new(vec![Arc::new(Hyperliquid { url: hyperliquid })])
+        let mut venues: Vec<Arc<dyn Venue>> = vec![Arc::new(Hyperliquid { url: hyperliquid })];
+        venues.extend(crate::streams_rh::venues());
+        Hub::new(venues)
     })
 }
 

@@ -469,7 +469,8 @@ impl Cluster {
             let runner = crate::runner::Runner {
                 place: Place::Solana(shared.trading.clone()),
                 home_chain: shared::Chain::Solana.name().to_string(),
-                driver: recorded.driver.clone(),
+                drivers: recorded.drivers.clone(),
+                models: None,
                 network: recorded.network,
                 allowances,
                 halting_heard: halting_heard.clone(),

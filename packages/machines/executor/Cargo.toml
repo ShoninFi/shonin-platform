@@ -22,6 +22,10 @@ shared.workspace = true
 strategy-sdk.workspace = true
 chain = { workspace = true, features = ["args"] }
 alloy.workspace = true
+hyperliquid.workspace = true
+robinhood.workspace = true
+lighter.workspace = true
+ort.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 ciborium.workspace = true

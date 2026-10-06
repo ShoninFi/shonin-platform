@@ -15,11 +15,15 @@ mod data;
 mod feed;
 mod health;
 mod host;
+mod hyperliquid;
+mod inference;
 mod net;
+mod robinhood;
 mod runner;
 mod scale;
 mod solana;
 mod state;
+mod streams_rh;
 mod usage;
 mod watch;
 
@@ -1112,6 +1116,33 @@ async fn serve(
         )
         .await?;
     let recorded = recorded_for(&store, &registered, bundle, &network)?;
+    // A Hyperliquid vault's account is traded by this vault's own key as the
+    // station's agent; its events go to the vault's feed for as long as it
+    // is served.
+    let names = |name: &str| recorded.drivers.iter().any(|driver| driver == name);
+    let (hyperliquid, _hyperliquid_events) = if names(hyperliquid::DRIVER) {
+        let half = hyperliquid::Half::connect(&chain, vault, station, key_for(vault)).await?;
+        let events = AbortOnDrop(half.forward_events(account_events.sender()));
+        (Some(half), Some(events))
+    } else {
+        (None, None)
+    };
+    // A Robinhood Chain vault's Safe is traded by this vault's key through
+    // the Safe's role; its Lighter account by a Lighter key made now, which
+    // the station registers, and whose accounts this executor posts on the
+    // board for as long as it serves the vault.
+    let stocks = if names(robinhood::ROBINHOOD) {
+        Some(robinhood::StockHalf::connect(&chain, key.clone(), station).await?)
+    } else {
+        None
+    };
+    let (lighter, _lighter_posts) = if names(robinhood::LIGHTER) {
+        let half = robinhood::LighterHalf::connect(&chain, key.clone(), station).await?;
+        let posts = AbortOnDrop(half.report_loop());
+        (Some(half), Some(posts))
+    } else {
+        (None, None)
+    };
 
     // Until the vault's halt is known (see [`Shared::halt_known`]), a halted
     // vault starts a faulting agent again at once, however long ago it
@@ -1178,9 +1209,17 @@ async fn serve(
                 venue: deployments.venue,
                 usd: deployments.usd,
                 factory: deployments.factory,
+                hyperliquid: hyperliquid.clone(),
+                stocks: stocks.clone(),
+                lighter: lighter.clone(),
             }),
             home_chain: vault_chain.name().to_string(),
-            driver: recorded.driver.clone(),
+            drivers: recorded.drivers.clone(),
+            models: Some(
+                store
+                    .join(format!("sha256-{}", alloy::hex::encode(bundle)))
+                    .join("models"),
+            ),
             network: recorded.network,
             allowances,
             halting_heard: halting_heard.clone(),
@@ -2081,8 +2120,8 @@ async fn finished(chain: &Client, vault: Address) -> Result<bool> {
 
 /// What the builder recorded for a vault's bundle, as far as running it goes.
 struct Recorded {
-    /// The driver the agent trades through.
-    driver: String,
+    /// The drivers the agent trades through.
+    drivers: Vec<String>,
     /// Whether the manifest declares `network`.
     network: bool,
     /// The hash of the component the bundle was built to: the only bytes
@@ -2142,16 +2181,21 @@ fn recorded_in(
         .manifest
         .check(&catalogue, network)
         .map_err(|why| anyhow::anyhow!("this image won't run it: {why}"))?;
-    // This image carries one driver's executor half: the stand-in venue's.
-    let drivers: Vec<&String> = canonical.manifest.drivers.keys().collect();
-    let driver = match drivers.as_slice() {
-        [only] if only.as_str() == "local" => (*only).clone(),
-        _ => anyhow::bail!(
-            "this image carries the local driver only, and the manifest names {drivers:?}"
-        ),
+    // This image carries four drivers' executor halves: the stand-in
+    // venue's, Hyperliquid's, and Robinhood Chain's two (its stock tokens
+    // and Lighter), which an agent may use together.
+    let drivers: Vec<String> = canonical.manifest.drivers.keys().cloned().collect();
+    let robinhood_chain = |name: &str| name == robinhood::ROBINHOOD || name == robinhood::LIGHTER;
+    let carried = match drivers.as_slice() {
+        [only] if only.as_str() == host::LOCAL || only.as_str() == hyperliquid::DRIVER => true,
+        some => !some.is_empty() && some.iter().all(|name| robinhood_chain(name)),
     };
+    anyhow::ensure!(
+        carried,
+        "this image carries the local or hyperliquid driver alone, or robinhood and lighter together, and the manifest names {drivers:?}"
+    );
     Ok(Recorded {
-        driver,
+        drivers,
         network: canonical
             .manifest
             .capabilities
@@ -3337,9 +3381,13 @@ mod tests {
                 venue: Address::ZERO,
                 usd: Address::ZERO,
                 factory: Address::ZERO,
+                hyperliquid: None,
+                stocks: None,
+                lighter: None,
             }),
             home_chain: "base".to_string(),
-            driver: "local".to_string(),
+            drivers: vec!["local".to_string()],
+            models: None,
             network: false,
             allowances: shared::Allowances::modest(),
             halting_heard: Default::default(),
