@@ -16,6 +16,8 @@ members = [
     "packages/devnet",
     "packages/strategy-sdk",
     "packages/drivers/hyperliquid",
+    "packages/drivers/robinhood",
+    "packages/drivers/lighter",
     "packages/attestation/core",
     "packages/attestation/methods",
     "packages/attestation/host",
@@ -37,6 +39,8 @@ publish = false
 # Local crates
 shared = { path = "packages/shared", package = "shonin-shared" }
 hyperliquid = { path = "packages/drivers/hyperliquid", package = "shonin-hyperliquid" }
+robinhood = { path = "packages/drivers/robinhood", package = "shonin-robinhood" }
+lighter = { path = "packages/drivers/lighter", package = "shonin-lighter" }
 chain = { path = "packages/chain", package = "shonin-chain" }
 strategy-sdk = { path = "packages/strategy-sdk", package = "shonin-strategy-sdk" }
 indexer = { path = "packages/indexer", package = "shonin-indexer" }
@@ -105,6 +109,12 @@ alloy = { version = "2.4.2", features = ["full", "signer-mnemonic"] }
 alloy-primitives = "1.7.3"
 alloy-sol-types = "1.7.3"
 k256 = "0.14.0"
+# Lighter's transaction signing (Poseidon2 over Goldilocks, Schnorr on
+# ECgFp5), offline only: no client, no network.
+lighters = { version = "0.1.1", default-features = false }
+# The inference host: ONNX Runtime on the CPU, its prebuilt library fetched
+# at build time and pinned with the crate.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-rustls", "copy-dylibs"] }
 ed25519-dalek = "3.0.0"
 bs58 = "0.5.1"
 
