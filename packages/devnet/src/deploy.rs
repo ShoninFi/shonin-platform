@@ -210,17 +210,29 @@ async fn deploy(
     // The station factory and its implementation carry nothing chain-specific
     // in their creation code, so they land at the same addresses on every
     // chain, and so does every vault's station.
-    let station_implementation =
-        put_everywhere(client, artifacts, admin, "Station", Vec::new()).await?;
+    // The station's closes run in a library linked into it, itself at the
+    // same address everywhere, so the station's creation code is too.
+    let station_closes =
+        put_everywhere(client, artifacts, admin, "StationCloses", Vec::new(), &[]).await?;
+    let station_implementation = put_everywhere(
+        client,
+        artifacts,
+        admin,
+        "Station",
+        Vec::new(),
+        &[("StationCloses", station_closes)],
+    )
+    .await?;
     let station_factory = put_everywhere(
         client,
         artifacts,
         admin,
         "StationFactory",
         (admin,).abi_encode_params(),
+        &[],
     )
     .await?;
-    let closer = put_everywhere(client, artifacts, admin, "Closer", Vec::new()).await?;
+    let closer = put_everywhere(client, artifacts, admin, "Closer", Vec::new(), &[]).await?;
 
     // The vault is too large for one contract: its logic is in four
     // libraries linked into it.
@@ -429,8 +441,9 @@ async fn put_everywhere(
     from: Address,
     name: &str,
     arguments: Vec<u8>,
+    libraries: &[(&str, Address)],
 ) -> Result<Address> {
-    let mut init = creation_code(artifacts, name, &[])?;
+    let mut init = creation_code(artifacts, name, libraries)?;
     init.extend_from_slice(&arguments);
     let address = CREATE2_DEPLOYER.create2(STATION_SALT, keccak256(&init));
     if client.has_code(address).await? {

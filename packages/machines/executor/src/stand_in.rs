@@ -83,6 +83,23 @@ pub fn chain(balance: u64, settled: u64) -> Shared {
     }))
 }
 
+/// An `eth_call` that runs code of its own rather than calling a contract
+/// (no `to`): a client asking which block a read pinned to a block runs at.
+/// Answered as a node that honours the block does: with that block's number.
+pub(crate) fn code_run(request: &Value) -> Option<Value> {
+    let tx = &request["params"][0];
+    if !tx["to"].is_null() {
+        return None;
+    }
+    let block = request["params"][1]
+        .as_str()
+        .and_then(|block| u64::from_str_radix(block.trim_start_matches("0x"), 16).ok())
+        .unwrap_or_default();
+    Some(json!(alloy::hex::encode_prefixed(
+        U256::from(block).to_be_bytes::<32>()
+    )))
+}
+
 /// Answer one `eth_call` by its selector, as the contracts would.
 fn answer_call(state: &Chain, input: &[u8]) -> Vec<u8> {
     let selector: [u8; 4] = input[..4].try_into().unwrap();
@@ -205,6 +222,9 @@ async fn rpc(State(state): State<Shared>, Json(request): Json<Value>) -> Respons
             }
             "eth_getTransactionReceipt" => {
                 return (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response();
+            }
+            "eth_call" if crate::stand_in::code_run(&request).is_some() => {
+                crate::stand_in::code_run(&request).unwrap()
             }
             "eth_call" => {
                 let tx = &request["params"][0];
@@ -655,6 +675,9 @@ pub mod serving {
                     Value::Null
                 }
             }
+            "eth_call" if crate::stand_in::code_run(&request).is_some() => {
+                crate::stand_in::code_run(&request).unwrap()
+            }
             "eth_call" => {
                 let tx = &request["params"][0];
                 let data = tx["input"]
@@ -773,6 +796,9 @@ pub mod public {
                     "status": "0x1",
                     "type": "0x2",
                 })
+            }
+            "eth_call" if crate::stand_in::code_run(&request).is_some() => {
+                crate::stand_in::code_run(&request).unwrap()
             }
             "eth_call" => {
                 let tx = &request["params"][0];
@@ -962,6 +988,9 @@ pub mod killed {
                 block.header.inner.number = 16;
                 block.header.inner.timestamp = NOW;
                 serde_json::to_value(block).unwrap()
+            }
+            "eth_call" if crate::stand_in::code_run(&request).is_some() => {
+                crate::stand_in::code_run(&request).unwrap()
             }
             "eth_call" => {
                 let tx = &request["params"][0];

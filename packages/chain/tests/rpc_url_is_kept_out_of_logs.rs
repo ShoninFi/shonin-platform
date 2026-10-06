@@ -85,6 +85,8 @@ async fn the_rpc_key_never_reaches_the_log_whatever_level_is_asked_for() {
         Some(31337),
         Arc::new(|method, _| match method {
             "eth_getLogs" => stand_in::Said::Result(serde_json::json!([])),
+            // A log read checks the endpoint's head first.
+            "eth_blockNumber" => stand_in::Said::Result(serde_json::json!("0x10")),
             _ => stand_in::unknown_method(),
         }),
     )

@@ -292,4 +292,38 @@ mod tests {
         }
         assert!(trader.sign(&tiny, 1, 0).is_err());
     }
+
+    #[test]
+    fn a_trader_built_from_the_driver_s_markets_refuses_every_other_market_before_signing() {
+        let exchange = Markets::from_order_books(&serde_json::json!({"order_books": [
+            {"symbol": "SPY", "market_id": 26, "market_type": "perp", "status": "active",
+             "supported_size_decimals": 4, "supported_price_decimals": 2, "min_base_amount": "0.0100"},
+            {"symbol": "TSLA", "market_id": 27, "market_type": "perp", "status": "active",
+             "supported_size_decimals": 4, "supported_price_decimals": 2, "min_base_amount": "0.0100"}
+        ]}))
+        .unwrap();
+        let listed = exchange.listed_by_driver(&[(26, 4, 2)]).unwrap();
+        let trader = Trader::new(&Key::generate(), 1, 300, listed).unwrap();
+        assert!(trader.sign(&order(Side::Buy, Tif::Ioc), 1, 0).is_ok());
+        let mut elsewhere = order(Side::Buy, Tif::Ioc);
+        if let Action::Place(order) = &mut elsewhere {
+            order.market = "TSLA".into();
+        }
+        let refused = trader.sign(&elsewhere, 1, 0).unwrap_err();
+        assert!(refused.to_string().contains("driver lists"), "{refused}");
+        for action in [
+            Action::Cancel {
+                market: "TSLA".into(),
+                order: OrderRef::Venue(1),
+            },
+            Action::Modify {
+                market: "TSLA".into(),
+                order: OrderRef::Venue(1),
+                size: d("1"),
+                limit_price: d("1"),
+            },
+        ] {
+            assert!(trader.sign(&action, 1, 0).is_err());
+        }
+    }
 }

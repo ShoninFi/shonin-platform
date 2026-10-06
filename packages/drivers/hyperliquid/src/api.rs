@@ -22,6 +22,39 @@ use crate::signing::{
 /// it from a request that got no answer.
 pub const REFUSED: &str = "HyperCore refused the action";
 
+/// How an error begins for an action that reached HyperCore and whose answer
+/// was lost: it may have done what it asked.
+pub const ARRIVED: &str = "the action reached HyperCore and its answer was lost";
+
+/// How many times in all one signed action is sent to the exchange endpoint
+/// while no answer comes back: the same bytes each time, so at most one of
+/// them is ever taken.
+pub const EXCHANGE_SENDS: usize = 3;
+
+/// What came of sending one signed action to the exchange endpoint.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Delivery {
+    /// The venue's answer to it: `status` is `ok` or `err`.
+    Answered(Value),
+    /// A later send of the same bytes was refused as a duplicate nonce: the
+    /// action arrived, and the answer to it was lost.
+    Arrived,
+    /// No answer came back to any send: it may or may not have arrived.
+    Unanswered(String),
+}
+
+/// Whether the venue's answer refuses a nonce it has already taken.
+fn duplicate_nonce(answer: &Value) -> bool {
+    if answer["status"] != "err" {
+        return false;
+    }
+    let text = match &answer["response"] {
+        Value::String(text) => text.to_ascii_lowercase(),
+        other => other.to_string().to_ascii_lowercase(),
+    };
+    text.contains("nonce") && (text.contains("duplicate") || text.contains("already used"))
+}
+
 /// Where HyperCore answers, and which network it is.
 #[derive(Clone)]
 pub struct Api {
@@ -101,10 +134,75 @@ impl Api {
     /// One read, retried with a growing pause when the venue limits the
     /// rate.
     pub async fn info(&self, request: Value) -> Result<Value> {
-        self.post("info", &request).await
+        self.read("info", &request).await
     }
 
-    async fn post(&self, path: &str, body: &Value) -> Result<Value> {
+    /// Send one signed action to the exchange endpoint, and find out whether
+    /// it arrived when its answer is lost.
+    ///
+    /// The action is sent once. Only when no answer comes back (the
+    /// connection failed, the answer was cut off or unreadable, a gateway
+    /// answered for the venue, or the venue turned it away for its rate) are
+    /// the very same bytes sent again, at most [`EXCHANGE_SENDS`] times in
+    /// all. The venue takes an action's nonce once, so a second send can
+    /// never act a second time: it is either the action's first arrival,
+    /// answered as such, or refused as a duplicate nonce, which says the
+    /// first arrived.
+    pub async fn deliver(&self, body: &Value) -> Delivery {
+        let url = format!("{}/exchange", self.base);
+        let mut pause = Duration::from_millis(1_000);
+        let mut why = String::new();
+        for send in 0..EXCHANGE_SENDS {
+            if send > 0 {
+                tokio::time::sleep(pause).await;
+                pause *= 2;
+            }
+            let response = match self.http.post(&url).json(body).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    why = format!("asking HyperCore: {error}");
+                    continue;
+                }
+            };
+            let status = response.status();
+            let text = match response.text().await {
+                Ok(text) => text,
+                Err(error) => {
+                    why = format!("reading HyperCore's answer: {error}");
+                    continue;
+                }
+            };
+            if status.as_u16() == 429 || status.is_server_error() {
+                why = format!("HyperCore answered {status}: {}", cut(&text));
+                continue;
+            }
+            if !status.is_success() {
+                // The venue turned the request itself away (a body it can't
+                // read): nothing was done.
+                return Delivery::Answered(json!({
+                    "status": "err",
+                    "response": format!("HyperCore answered {status}: {}", cut(&text)),
+                }));
+            }
+            let Ok(answer) = serde_json::from_str::<Value>(&text) else {
+                why = format!("HyperCore's answer can't be read: {}", cut(&text));
+                continue;
+            };
+            if answer["status"] != "ok" && answer["status"] != "err" {
+                why = format!("HyperCore's answer can't be read: {}", cut(&text));
+                continue;
+            }
+            if send > 0 && duplicate_nonce(&answer) {
+                return Delivery::Arrived;
+            }
+            return Delivery::Answered(answer);
+        }
+        Delivery::Unanswered(why)
+    }
+
+    /// A read: asked again on a failed connection or a rate limit, which no
+    /// read can do harm by.
+    async fn read(&self, path: &str, body: &Value) -> Result<Value> {
         let url = format!("{}/{path}", self.base);
         let mut pause = Duration::from_millis(500);
         for attempt in 0.. {
@@ -213,6 +311,85 @@ impl Api {
             .unwrap_or(0.0))
     }
 
+    /// An account's spot balance of a token as the driver reads it: the
+    /// total, and how much of it open orders hold. A token the account has
+    /// never held is not in the answer, and is zero; a balance whose figures
+    /// can't be read is an error, never zero.
+    pub async fn spot_holding(&self, user: Address, token: &str) -> Result<SpotHolding> {
+        let state = self
+            .info(json!({"type": "spotClearinghouseState", "user": user}))
+            .await?;
+        spot_holding_of(&state, token)
+    }
+
+    /// The venue's own price of a spot pair (`markPx`, the price HyperEVM's
+    /// spot price precompile gives the driver), by the pair's coin name.
+    pub async fn spot_price(&self, coin: &str) -> Result<crate::payload::Decimal> {
+        let answer = self.info(json!({"type": "spotMetaAndAssetCtxs"})).await?;
+        spot_price_of(&answer, coin)
+    }
+
+    /// What the venue records of one of `user`'s orders, by the venue's id
+    /// or the client id it was placed with (`0x` and 32 hex digits): the
+    /// record's `order` and `status`, or `None` when it knows no such order.
+    pub async fn order_status(&self, user: Address, id: Value) -> Result<Option<Value>> {
+        let answer = self
+            .info(json!({"type": "orderStatus", "user": user, "oid": id}))
+            .await?;
+        match answer["status"].as_str() {
+            Some("order") if answer["order"].is_object() => Ok(Some(answer["order"].clone())),
+            Some("unknownOid") => Ok(None),
+            _ => bail!(
+                "HyperCore's order status can't be read: {}",
+                cut(&answer.to_string())
+            ),
+        }
+    }
+
+    /// Every fill of `user`'s since `since_ms` (the venue's clock), oldest
+    /// first, read in the venue's pages; at most `pages` pages, past which
+    /// it is an error rather than a list cut short.
+    pub async fn fills_since(
+        &self,
+        user: Address,
+        since_ms: u64,
+        pages: usize,
+    ) -> Result<Vec<Value>> {
+        let mut fills: Vec<Value> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut start = since_ms;
+        for _ in 0..pages {
+            let page = self
+                .info(json!({"type": "userFillsByTime", "user": user, "startTime": start}))
+                .await?;
+            let page = page.as_array().ok_or_else(|| {
+                anyhow!(
+                    "HyperCore's fills can't be read: {}",
+                    cut(&page.to_string())
+                )
+            })?;
+            let mut last = None;
+            for fill in page {
+                let time = fill["time"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("a fill without a time: {fill}"))?;
+                last = Some(last.map_or(time, |at: u64| at.max(time)));
+                // A fill on the page boundary is on both pages: kept once.
+                if seen.insert((fill["tid"].to_string(), time)) {
+                    fills.push(fill.clone());
+                }
+            }
+            match last {
+                Some(last) if page.len() >= FILLS_PAGE => start = last,
+                _ => {
+                    fills.sort_by_key(|fill| fill["time"].as_u64().unwrap_or_default());
+                    return Ok(fills);
+                }
+            }
+        }
+        bail!("the account has more fills since {since_ms} than {pages} pages of them")
+    }
+
     /// What an account's perp side could withdraw, in dollars.
     pub async fn perp_withdrawable(&self, user: Address) -> Result<f64> {
         let state = self
@@ -241,6 +418,31 @@ impl Api {
             .await
             .context("reading the account's ledger on HyperCore")?;
         Ok(deposits_matching(&ledger, user, millionths))
+    }
+
+    /// [`Api::deposits_of`], as the entries themselves (see
+    /// [`deposit_entries`]).
+    pub async fn deposit_entries_of(
+        &self,
+        user: Address,
+        since_ms: u64,
+        millionths: u64,
+    ) -> Result<Vec<String>> {
+        let ledger = self
+            .info(json!({
+                "type": "userNonFundingLedgerUpdates",
+                "user": user,
+                "startTime": since_ms,
+            }))
+            .await
+            .context("reading the account's ledger on HyperCore")?;
+        if !ledger.is_array() {
+            bail!(
+                "HyperCore's ledger can't be read: {}",
+                cut(&ledger.to_string())
+            );
+        }
+        Ok(deposit_entries(&ledger, user, millionths))
     }
 
     /// Whether HyperCore knows the account at all: an address it has never
@@ -332,18 +534,36 @@ impl HyperCore {
         }))
     }
 
+    /// Send a signed action; its answer, or an error that begins with
+    /// [`REFUSED`] only when the venue said it refused it. Any other error is
+    /// an action that may have been done.
     async fn submit(&self, action: Value, nonce: u64, signature: Value) -> Result<Value> {
-        let answer = self
-            .api
-            .post(
-                "exchange",
-                &json!({"action": action, "nonce": nonce, "signature": signature, "vaultAddress": null}),
-            )
-            .await?;
-        if answer["status"] != "ok" {
-            bail!("{REFUSED}: {}", answer["response"]);
+        let body =
+            json!({"action": action, "nonce": nonce, "signature": signature, "vaultAddress": null});
+        match self.api.deliver(&body).await {
+            Delivery::Answered(answer) if answer["status"] == "ok" => {
+                Ok(answer["response"].clone())
+            }
+            Delivery::Answered(answer) => bail!("{REFUSED}: {}", answer["response"]),
+            Delivery::Arrived => bail!("{ARRIVED}"),
+            Delivery::Unanswered(why) => {
+                bail!("HyperCore never answered the action, which may still have been done: {why}")
+            }
         }
-        Ok(answer["response"].clone())
+    }
+
+    /// Sign an L1 action with `nonce` and send it; what came of it. An error
+    /// means it couldn't be signed, and nothing was sent.
+    pub async fn deliver_l1<A: Serialize>(&self, action: &A, nonce: u64) -> Result<Delivery> {
+        let digest = l1_action_digest(self.api.network, action, nonce)?;
+        let signature = self.sign(digest).await?;
+        let body = json!({
+            "action": serde_json::to_value(action)?,
+            "nonce": nonce,
+            "signature": signature,
+            "vaultAddress": null,
+        });
+        Ok(self.api.deliver(&body).await)
     }
 
     /// A nonce for this signer: the time in milliseconds, and always more
@@ -530,6 +750,81 @@ impl HyperCore {
     }
 }
 
+/// How many fills the venue gives in one page of `userFillsByTime`.
+pub const FILLS_PAGE: usize = 2_000;
+
+/// A spot balance: the total, and how much of it open orders hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpotHolding {
+    pub total: crate::payload::Decimal,
+    pub hold: crate::payload::Decimal,
+}
+
+impl SpotHolding {
+    /// What open orders don't hold: what the account can send or sell now.
+    pub fn free(&self) -> crate::payload::Decimal {
+        self.total - self.hold
+    }
+}
+
+/// [`Api::spot_holding`], from the venue's `spotClearinghouseState` answer.
+pub fn spot_holding_of(state: &Value, token: &str) -> Result<SpotHolding> {
+    let balances = state["balances"].as_array().ok_or_else(|| {
+        anyhow!(
+            "HyperCore's spot balances can't be read: {}",
+            cut(&state.to_string())
+        )
+    })?;
+    let mut found = balances.iter().filter(|balance| balance["coin"] == token);
+    let Some(balance) = found.next() else {
+        return Ok(SpotHolding {
+            total: crate::payload::Decimal::ZERO,
+            hold: crate::payload::Decimal::ZERO,
+        });
+    };
+    if found.next().is_some() {
+        bail!("HyperCore gives two spot balances of {token}");
+    }
+    let figure = |field: &str| -> Result<crate::payload::Decimal> {
+        let value: crate::payload::Decimal = balance[field]
+            .as_str()
+            .and_then(|text| text.parse().ok())
+            .ok_or_else(|| {
+                anyhow!("the spot balance of {token} has no readable {field}: {balance}")
+            })?;
+        if value.is_sign_negative() {
+            bail!("the spot balance of {token} has a negative {field}: {balance}");
+        }
+        Ok(value)
+    };
+    let (total, hold) = (figure("total")?, figure("hold")?);
+    if hold > total {
+        bail!("the spot balance of {token} holds more than it has: {balance}");
+    }
+    Ok(SpotHolding { total, hold })
+}
+
+/// [`Api::spot_price`], from the venue's `spotMetaAndAssetCtxs` answer.
+pub fn spot_price_of(answer: &Value, coin: &str) -> Result<crate::payload::Decimal> {
+    let contexts = answer[1]
+        .as_array()
+        .ok_or_else(|| anyhow!("HyperCore's spot prices can't be read"))?;
+    let mut found = contexts.iter().filter(|context| context["coin"] == coin);
+    let context = match (found.next(), found.next()) {
+        (Some(context), None) => context,
+        (None, _) => bail!("HyperCore gives no spot price for {coin}"),
+        _ => bail!("HyperCore gives two spot prices for {coin}"),
+    };
+    let price: crate::payload::Decimal = context["markPx"]
+        .as_str()
+        .and_then(|text| text.parse().ok())
+        .ok_or_else(|| anyhow!("the spot price of {coin} can't be read: {context}"))?;
+    if price <= crate::payload::Decimal::ZERO {
+        bail!("the spot price of {coin} is not positive: {context}");
+    }
+    Ok(price)
+}
+
 fn cut(text: &str) -> &str {
     let end = text
         .char_indices()
@@ -546,6 +841,14 @@ fn cut(text: &str) -> &str {
 /// own moves between perp and spot, sends out, withdrawals and trades are
 /// not.
 pub fn deposits_matching(ledger: &Value, user: Address, millionths: u64) -> usize {
+    deposit_entries(ledger, user, millionths).len()
+}
+
+/// The entries [`deposits_matching`] counts, each as one string that tells
+/// it from every other entry of the ledger (its hash and time when the venue
+/// gives them, else the whole entry): so one credit is taken for one deposit
+/// only.
+pub fn deposit_entries(ledger: &Value, user: Address, millionths: u64) -> Vec<String> {
     let me = format!("{user:#x}");
     ledger
         .as_array()
@@ -574,7 +877,13 @@ pub fn deposits_matching(ledger: &Value, user: Address, millionths: u64) -> usiz
             });
             dollars.and_then(millionths_of) == Some(millionths)
         })
-        .count()
+        .map(
+            |entry| match (entry["hash"].as_str(), entry["time"].as_u64()) {
+                (Some(hash), Some(time)) => format!("{hash}@{time}"),
+                _ => entry.to_string(),
+            },
+        )
+        .collect()
 }
 
 /// A decimal number of dollars as millionths, when it is a whole number of
@@ -630,6 +939,59 @@ mod tests {
         assert_eq!(millionths_of("0.0000001"), None);
         assert_eq!(millionths_of("-1"), None);
         assert_eq!(millionths_of("x"), None);
+    }
+
+    #[test]
+    fn a_spot_balance_is_its_total_less_what_orders_hold_and_never_read_as_zero_by_default() {
+        let state = json!({"balances": [
+            {"coin": "USDC", "token": 0, "total": "14.6", "hold": "0.0"},
+            {"coin": "HYPE", "token": 150, "total": "0.30", "hold": "0.30"}
+        ]});
+        let hype = spot_holding_of(&state, "HYPE").unwrap();
+        assert_eq!(hype.free(), "0".parse().unwrap());
+        assert_eq!(hype.total, "0.3".parse().unwrap());
+        // Never held: none.
+        assert_eq!(
+            spot_holding_of(&state, "PURR").unwrap().total,
+            "0".parse().unwrap()
+        );
+        // A figure that can't be read is an error, not zero.
+        for broken in [
+            json!({"balances": [{"coin": "HYPE", "total": 0.3, "hold": "0"}]}),
+            json!({"balances": [{"coin": "HYPE", "total": "0.3"}]}),
+            json!({"balances": [{"coin": "HYPE", "total": "0.3", "hold": "0.4"}]}),
+            json!({"error": "x"}),
+        ] {
+            assert!(spot_holding_of(&broken, "HYPE").is_err(), "{broken}");
+        }
+    }
+
+    #[test]
+    fn a_spot_price_is_the_venue_s_own_for_the_pair_s_coin() {
+        let answer = json!([{}, [
+            {"coin": "PURR/USDC", "markPx": "4.5795", "midPx": "4.6"},
+            {"coin": "@1035", "markPx": "40.705", "midPx": "43.5745"}
+        ]]);
+        assert_eq!(
+            spot_price_of(&answer, "@1035").unwrap(),
+            "40.705".parse().unwrap()
+        );
+        assert!(spot_price_of(&answer, "@1").is_err());
+        assert!(spot_price_of(&json!([{}, [{"coin": "@1", "markPx": 3.0}]]), "@1").is_err());
+        assert!(spot_price_of(&json!([{}, [{"coin": "@1", "markPx": "0"}]]), "@1").is_err());
+    }
+
+    #[test]
+    fn only_a_duplicate_nonce_answer_says_an_earlier_send_arrived() {
+        assert!(duplicate_nonce(
+            &json!({"status": "err", "response": "Invalid nonce: duplicate nonce"})
+        ));
+        assert!(!duplicate_nonce(
+            &json!({"status": "err", "response": "Insufficient margin"})
+        ));
+        assert!(!duplicate_nonce(
+            &json!({"status": "ok", "response": "duplicate nonce"})
+        ));
     }
 
     fn token(name: &str, index: u64) -> SpotToken {

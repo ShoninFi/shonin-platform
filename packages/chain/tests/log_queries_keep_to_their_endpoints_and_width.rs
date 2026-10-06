@@ -125,12 +125,13 @@ async fn without_a_cap_a_range_is_asked_for_once() {
     let seen: Arc<Mutex<Seen>> = Default::default();
     let url = stand_in::answering(Some(31337), logs_node(seen.clone(), None)).await;
     let client = client_with(&url, None, None).await;
+    // The head is block 1,000.
     let logs = client
-        .logs(&Filter::new().from_block(1u64).to_block(2_000u64))
+        .logs(&Filter::new().from_block(1u64).to_block(1_000u64))
         .await
         .unwrap();
-    assert_eq!(logs.len(), 2_000);
-    assert_eq!(seen.lock().unwrap().ranges, vec![(1, 2_000)]);
+    assert_eq!(logs.len(), 1_000);
+    assert_eq!(seen.lock().unwrap().ranges, vec![(1, 1_000)]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -173,9 +174,12 @@ async fn with_a_logs_list_log_queries_and_everything_else_keep_to_their_own_endp
         main.methods
     );
     assert!(
-        logs.methods
-            .iter()
-            .all(|method| method == "eth_getLogs" || method == "eth_chainId"),
+        // A log query, the head it is checked against, and the chain id
+        // checked at connect.
+        logs.methods.iter().all(|method| matches!(
+            method.as_str(),
+            "eth_getLogs" | "eth_blockNumber" | "eth_chainId"
+        )),
         "something but a log query reached the logs endpoints: {:?}",
         logs.methods
     );
@@ -255,6 +259,7 @@ async fn a_read_an_endpoint_has_pruned_moves_on_to_one_that_keeps_it() {
         "missing trie node 0c18 (path ) state 0x0c18 is not available, not found",
         "state at block #45748311 is pruned",
         "Unknown state. First available state is 1",
+        "no state found for block 0x5",
     ] {
         let pruned: Arc<Mutex<Seen>> = Default::default();
         let archive: Arc<Mutex<Seen>> = Default::default();
@@ -371,4 +376,54 @@ async fn a_read_no_endpoint_has_fails_rather_than_answering() {
         .await
         .expect_err("no endpoint keeps block 5");
     assert!(chain::node_trouble(&error), "{error:#}");
+}
+
+/// A node that answers every log query with an HTTP 429 and a body in
+/// words a width refusal might also use.
+fn limiting_node(seen: Arc<Mutex<Seen>>) -> stand_in::Answer {
+    Arc::new(move |method, request| {
+        seen.lock().unwrap().methods.push(method.to_string());
+        match method {
+            "eth_getLogs" => {
+                let from = number(&request["params"][0]["fromBlock"]);
+                let to = number(&request["params"][0]["toBlock"]);
+                seen.lock().unwrap().ranges.push((from, to));
+                Said::Raw(
+                    429,
+                    "Too many requests in this range, slow down".to_string(),
+                )
+            }
+            "eth_blockNumber" => Said::Result(json!("0x3e8")),
+            _ => stand_in::unknown_method(),
+        }
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rate_limit_on_a_log_query_moves_to_the_next_endpoint_and_is_never_halved() {
+    let (limited, open): (Arc<Mutex<Seen>>, Arc<Mutex<Seen>>) = Default::default();
+    let main_url = stand_in::answering(Some(31337), logs_node(Default::default(), None)).await;
+    let first = stand_in::answering(Some(31337), limiting_node(limited.clone())).await;
+    let second = stand_in::answering(Some(31337), logs_node(open.clone(), None)).await;
+    let client = client_with(&main_url, Some(&format!("{first} {second}")), None).await;
+
+    let logs = client
+        .logs(&Filter::new().from_block(1u64).to_block(100u64))
+        .await
+        .unwrap();
+    assert_eq!(blocks_of(&logs), (1..=100).collect::<Vec<_>>());
+    assert_eq!(limited.lock().unwrap().ranges, vec![(1, 100)], "halved");
+    assert_eq!(open.lock().unwrap().ranges, vec![(1, 100)]);
+
+    // With only the limiting endpoint, the read fails as the endpoint's
+    // trouble, and still unhalved.
+    let alone: Arc<Mutex<Seen>> = Default::default();
+    let only = stand_in::answering(Some(31337), limiting_node(alone.clone())).await;
+    let client = client_with(&main_url, Some(&only), None).await;
+    let error = client
+        .logs(&Filter::new().from_block(1u64).to_block(100u64))
+        .await
+        .expect_err("the only endpoint limits the rate");
+    assert!(chain::node_trouble(&error), "{error:#}");
+    assert_eq!(alone.lock().unwrap().ranges, vec![(1, 100)], "halved");
 }

@@ -589,6 +589,50 @@ fn stopped(reached: Option<Account>, why: String, may_still_land: bool) -> Moved
     }
 }
 
+/// Why the station may be holding money back from moving through driver
+/// `name`, if one of its rules does now: a close staged there (none of the
+/// executor's moves until it ends), or, for a move through the venue
+/// (`through_venue`), a move through that driver lately (they are spaced, so
+/// a valuation can be priced between two). Nothing when neither can be read
+/// or neither holds.
+async fn held_back(
+    chain: &chain::Client,
+    station: Address,
+    name: alloy::primitives::FixedBytes<32>,
+    through_venue: bool,
+) -> Option<String> {
+    if let Ok(stage) = chain.read(station, IStation::stageCall {}).await
+        && stage.stagedAt != 0
+    {
+        return Some(format!(
+            "refused: a close is staged at the station (since {}), and the executor's money moves wait until it ends",
+            stage.stagedAt
+        ));
+    }
+    if !through_venue {
+        return None;
+    }
+    let moved = chain
+        .read(station, IStation::movedAtCall { driver: name })
+        .await
+        .ok()?;
+    (moved != 0).then(|| {
+        format!(
+            "refused, maybe for being too soon: the station spaces money moves through a venue, and the last through this one was at {moved} (chain time), so wait for a valuation before moving again"
+        )
+    })
+}
+
+/// What the agent is told of a deposit that left the station and that the
+/// venue hasn't credited: whatever steps came before it, the money is in
+/// none of the vault's accounts now but on its way to the venue, where it
+/// may still arrive. Read the balances before moving it again.
+fn left_for_the_venue(why: String) -> Moved {
+    Moved::Unknown(format!(
+        "the money left the station for the venue and hasn't been credited there: {why}"
+    ))
+}
+
 /// The calls that take money from one account to another on the vault's own
 /// chain. Anything else is refused here, and the station would refuse it too.
 fn route(
@@ -675,6 +719,10 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
         // known to have got as far as the last step that landed.
         let mut reached = None;
         for step in steps {
+            // Set when a deposit left the station and the venue hasn't
+            // credited it: the money is in neither, so the agent hears
+            // where it really is, on its way.
+            let mut in_flight = false;
             let (failed, may_still_land) = match &place {
                 Place::Evm(evm) => {
                     let (key, station) = (&evm.key, evm.station);
@@ -729,6 +777,7 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
                                     if half.deposit_credited(&watch).await {
                                         Ok(receipt)
                                     } else {
+                                        in_flight = true;
                                         tracing::warn!(
                                             station = %station,
                                             amount,
@@ -758,7 +807,21 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
                         Ok(_) => (None, false),
                         Err(error) => {
                             let may = chain::may_still_land(&error);
-                            (Some((Tally::of_failure(&error), error)), may)
+                            let tally = Tally::of_failure(&error);
+                            // A refusal the station's own rules explain is
+                            // told with them, so the agent waits rather than
+                            // asking again into the same refusal.
+                            let held = if may || in_flight {
+                                None
+                            } else {
+                                let venue = matches!(step, Step::Deposit | Step::Withdraw);
+                                held_back(&evm.chain, station, name, venue).await
+                            };
+                            let error = match held {
+                                Some(why) => error.context(why),
+                                None => error,
+                            };
+                            (Some((tally, error)), may)
                         }
                     }
                 }
@@ -777,6 +840,9 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
             };
             if let Some((tally, error)) = failed {
                 accessor.with(|mut access| access.get().count(|c| c.submitted(tally)));
+                if in_flight {
+                    return Ok(left_for_the_venue(format!("{error:#}")));
+                }
                 return Ok(stopped(reached, format!("{error:#}"), may_still_land));
             }
             reached = Some(step.lands_in(&home, &driver));
@@ -1863,6 +1929,17 @@ mod tests {
             Step::Deposit.lands_in(home, driver),
             Account::Venue(VenueAccount { chain, driver: d }) if chain == home && d == driver
         ));
+    }
+
+    #[test]
+    fn a_deposit_the_venue_has_not_credited_is_never_said_to_be_at_the_station() {
+        // Whether it was the move's first step or came after a pull from the
+        // vault, the money left the station: it may still arrive.
+        let moved = left_for_the_venue("not credited within 60 s".to_string());
+        assert!(
+            matches!(&moved, Moved::Unknown(why) if why.contains("left the station")),
+            "{moved:?}"
+        );
     }
 
     #[test]

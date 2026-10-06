@@ -199,7 +199,9 @@ async fn deploy(
         (USDC, CORE_DEPOSIT_WALLET, vec![perp], vec![spot_pair]).abi_encode_params(),
     )
     .await?;
-    let station_implementation = put(client, artifacts, admin, "Station", Vec::new()).await?;
+    // The station's closes run in a library linked into it.
+    let closes = put(client, artifacts, admin, "StationCloses", Vec::new()).await?;
+    let station_implementation = put_with(client, artifacts, admin, "Station", closes).await?;
     let station_factory = put(
         client,
         artifacts,
@@ -300,6 +302,28 @@ async fn put(
     name: &str,
     arguments: Vec<u8>,
 ) -> Result<Address> {
+    put_linking(client, artifacts, from, name, arguments, None).await
+}
+
+/// A contract that links one library, at `library`.
+async fn put_with(
+    client: &Client,
+    artifacts: &Path,
+    from: Address,
+    name: &str,
+    library: Address,
+) -> Result<Address> {
+    put_linking(client, artifacts, from, name, Vec::new(), Some(library)).await
+}
+
+async fn put_linking(
+    client: &Client,
+    artifacts: &Path,
+    from: Address,
+    name: &str,
+    arguments: Vec<u8>,
+    library: Option<Address>,
+) -> Result<Address> {
     let path = artifacts
         .join(format!("{name}.sol"))
         .join(format!("{name}.json"));
@@ -310,9 +334,16 @@ async fn put(
         )
     })?;
     let artifact: serde_json::Value = serde_json::from_str(&text)?;
-    let hex = artifact["bytecode"]["object"]
+    let mut hex = artifact["bytecode"]["object"]
         .as_str()
-        .ok_or_else(|| anyhow!("{name} has no bytecode"))?;
+        .ok_or_else(|| anyhow!("{name} has no bytecode"))?
+        .to_string();
+    // Each place the library is called holds a 40-character placeholder.
+    if let Some(library) = library {
+        while let Some(start) = hex.find("__$") {
+            hex.replace_range(start..start + 40, &alloy::hex::encode(library));
+        }
+    }
     let mut bytecode = alloy::hex::decode(hex.trim_start_matches("0x"))
         .with_context(|| format!("{name}'s bytecode (it links no libraries)"))?;
     bytecode.extend_from_slice(&arguments);

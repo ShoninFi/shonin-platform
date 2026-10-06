@@ -1455,6 +1455,12 @@ fn vault_event(log: &Log) -> Option<VaultEvent> {
             format!("claim {} paid", event.inner.data.claimId),
             Some(dollars(event.inner.data.assets)),
         )
+    } else if let Ok(event) = log.log_decode::<IVault::ClaimPartPaid>() {
+        (
+            EventKind::ClaimSettled,
+            format!("claim {} paid in part", event.inner.data.claimId),
+            Some(dollars(event.inner.data.assets)),
+        )
     } else if log.log_decode::<IVault::FeesPaid>().is_ok() {
         (
             EventKind::Crystallised,

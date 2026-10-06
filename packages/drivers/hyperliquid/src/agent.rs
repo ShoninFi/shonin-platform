@@ -19,7 +19,7 @@ use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::api::{Api, HyperCore};
+use crate::api::{Api, Delivery, HyperCore};
 use crate::markets::{Kind, Market, Markets};
 use crate::payload::{Action, Balance, Decimal, Order, OrderRef, Receipt, Side, Tif};
 
@@ -219,10 +219,33 @@ impl Allowlist {
             .ok_or_else(|| anyhow!("the venue doesn't list {name}"))
     }
 
-    fn order_wire(&self, order: &Order) -> Result<OrderWire> {
+    /// `order` as the venue's wire writes it. Every order carries a client
+    /// id, so a placement whose answer is lost can be looked up: the agent's
+    /// own, or else one made from the account and the nonce, which no other
+    /// order of the account's shares. An agent's id may not carry the tag
+    /// the executor marks its own upkeep orders with.
+    fn order_wire(&self, order: &Order, nonce: u64, upkeep: bool) -> Result<OrderWire> {
+        let client_id = match (order.client_id, upkeep) {
+            (_, true) => upkeep_client_id(nonce),
+            (Some(id), false) => id,
+            (None, false) => self.client_id_for(nonce),
+        };
+        self.wire_of(order, Some(client_id))
+    }
+
+    /// The order a modification puts in place of another: with the agent's
+    /// client id, if it gave one.
+    fn modified_wire(&self, order: &Order) -> Result<OrderWire> {
+        self.wire_of(order, order.client_id)
+    }
+
+    fn wire_of(&self, order: &Order, client_id: Option<u128>) -> Result<OrderWire> {
         let market = self.market(&order.market)?;
         if order.reduce_only && market.is_spot() {
             bail!("a spot order can't be reduce-only");
+        }
+        if order.client_id.is_some_and(is_upkeep) {
+            bail!("client ids beginning {UPKEEP_TAG:#018x} are the executor's own");
         }
         Ok(OrderWire {
             a: market.asset,
@@ -239,17 +262,35 @@ impl Allowlist {
                     },
                 },
             },
-            c: order.client_id.map(cloid),
+            c: client_id.map(cloid),
         })
+    }
+
+    /// A client id for an order the agent gave none: the account and the
+    /// nonce, hashed, never one with the upkeep tag.
+    fn client_id_for(&self, nonce: u64) -> u128 {
+        let mut seed = self.master.to_vec();
+        seed.extend_from_slice(&nonce.to_be_bytes());
+        let hash = alloy::primitives::keccak256(&seed);
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&hash[..16]);
+        let id = u128::from_be_bytes(bytes);
+        if is_upkeep(id) { id ^ (1 << 127) } else { id }
     }
 
     /// Check `action` and turn it into the one wire action it allows.
     /// `nonce` is the nonce it will be signed with, which a move names.
     pub fn check(&self, action: &Action, nonce: u64) -> Result<Wire> {
+        self.check_as(action, nonce, false)
+    }
+
+    /// The same, for the executor's own upkeep (`upkeep`): its orders carry
+    /// the upkeep tag in their client id, which an agent's may not.
+    fn check_as(&self, action: &Action, nonce: u64, upkeep: bool) -> Result<Wire> {
         Ok(match action {
             Action::Place(order) => Wire::Order(OrderAction {
                 kind: "order",
-                orders: vec![self.order_wire(order)?],
+                orders: vec![self.order_wire(order, nonce, upkeep)?],
                 grouping: "na",
             }),
             Action::Cancel {
@@ -278,7 +319,7 @@ impl Allowlist {
                     OrderRef::Venue(oid) => Oid::Venue(*oid),
                     OrderRef::Client(id) => Oid::Client(cloid(*id)),
                 },
-                order: self.order_wire(order)?,
+                order: self.modified_wire(order)?,
             }),
             Action::Leverage { market, leverage } => {
                 let market = self.market(market)?;
@@ -330,6 +371,30 @@ fn cloid(id: u128) -> String {
     format!("0x{id:032x}")
 }
 
+/// The top 64 bits of the client id of every order the executor places for
+/// its own upkeep (HYPE for sends home), and of no agent's: so the venue's
+/// own record of the account's fills tells the upkeep's buys apart, after a
+/// restart too.
+pub const UPKEEP_TAG: u64 = u64::from_be_bytes(*b"shnnUPKP");
+
+/// The client id of an upkeep order signed with `nonce`.
+pub fn upkeep_client_id(nonce: u64) -> u128 {
+    (u128::from(UPKEEP_TAG) << 64) | u128::from(nonce)
+}
+
+/// Whether a client id carries the upkeep tag.
+pub fn is_upkeep(id: u128) -> bool {
+    (id >> 64) as u64 == UPKEEP_TAG
+}
+
+/// Whether a client id as the venue writes it (`0x` and 32 hex digits)
+/// carries the upkeep tag.
+pub fn is_upkeep_cloid(text: &str) -> bool {
+    text.strip_prefix("0x")
+        .and_then(|hex| u128::from_str_radix(hex, 16).ok())
+        .is_some_and(is_upkeep)
+}
+
 /// The agent key at work for one vault's account.
 pub struct Trader {
     core: HyperCore,
@@ -365,25 +430,183 @@ impl Trader {
     /// The same, told apart as the agent must hear it: refused (nothing
     /// happened), or sent with no answer (it may still land).
     pub async fn outcome(&self, action: &Action) -> Outcome {
+        self.outcome_as(action, false).await
+    }
+
+    /// One of the executor's own upkeep orders (never an agent's): placed
+    /// with the upkeep tag in its client id, and told apart as an agent's
+    /// order is. The client id it was placed with comes back beside it.
+    pub async fn upkeep(&self, order: &Order) -> (Outcome, u128) {
+        let (outcome, nonce) = self
+            .outcome_nonce(&Action::Place(order.clone()), true)
+            .await;
+        (outcome, upkeep_client_id(nonce))
+    }
+
+    async fn outcome_as(&self, action: &Action, upkeep: bool) -> Outcome {
+        self.outcome_nonce(action, upkeep).await.0
+    }
+
+    async fn outcome_nonce(&self, action: &Action, upkeep: bool) -> (Outcome, u64) {
         let nonce = self.core.next_nonce();
-        let wire = match self.allowlist.check(action, nonce) {
+        let wire = match self.allowlist.check_as(action, nonce, upkeep) {
             Ok(wire) => wire,
-            Err(why) => return Outcome::Refused(why.to_string()),
+            Err(why) => return (Outcome::Refused(why.to_string()), nonce),
         };
         debug_assert!(SIGNABLE.contains(&wire.kind()));
-        match self.core.l1_at(&wire, nonce).await {
-            Ok(response) => match receipt(&wire, &response) {
-                Ok(receipt) => Outcome::Accepted(receipt),
-                Err(why) => Outcome::Refused(why.to_string()),
-            },
-            Err(why) => {
-                let why = format!("{why:#}");
-                if why.starts_with(crate::api::REFUSED) {
-                    Outcome::Refused(why)
-                } else {
-                    Outcome::Unknown(why)
+        let delivery = match self.core.deliver_l1(&wire, nonce).await {
+            Ok(delivery) => delivery,
+            // It couldn't be signed: nothing was sent.
+            Err(why) => return (Outcome::Refused(format!("{why:#}")), nonce),
+        };
+        let outcome = match delivery {
+            Delivery::Answered(answer) if answer["status"] == "ok" => {
+                match receipt(&wire, &answer["response"]) {
+                    Read::Receipt(receipt) => Outcome::Accepted(receipt),
+                    Read::Refused(why) => Outcome::Refused(why),
+                    // The venue took the action and its answer can't be
+                    // read: what it did is looked up like a lost answer.
+                    Read::Unreadable(why) => self.look_up(action, &wire, nonce, false, why).await,
                 }
             }
+            Delivery::Answered(answer) => {
+                Outcome::Refused(format!("{}: {}", crate::api::REFUSED, answer["response"]))
+            }
+            Delivery::Arrived => {
+                self.look_up(action, &wire, nonce, true, crate::api::ARRIVED.to_string())
+                    .await
+            }
+            Delivery::Unanswered(why) => {
+                let why =
+                    format!("HyperCore never answered, so the action may still be done: {why}");
+                self.look_up(action, &wire, nonce, false, why).await
+            }
+        };
+        (outcome, nonce)
+    }
+
+    /// What became of an action whose answer was lost (`arrived`: the venue
+    /// is known to have taken its nonce), from the venue's own record: an
+    /// order by its client id, and its fills; a cancel by the order it
+    /// cancels. Refused only when the record says nothing happened; unknown
+    /// when the record can't tell.
+    async fn look_up(
+        &self,
+        action: &Action,
+        wire: &Wire,
+        nonce: u64,
+        arrived: bool,
+        why: String,
+    ) -> Outcome {
+        let unknown = |found: &str| Outcome::Unknown(format!("{why}; {found}"));
+        let master = self.allowlist.master;
+        let api = &self.core.api;
+        match (action, wire) {
+            (Action::Place(order), Wire::Order(placed)) => {
+                let Some(sent) = placed.orders.first() else {
+                    return unknown("no order was in it");
+                };
+                let Some(client) = sent.c.clone() else {
+                    return unknown("it had no client id to look it up by");
+                };
+                let record = match api
+                    .order_status(master, Value::String(client.clone()))
+                    .await
+                {
+                    Ok(Some(record)) => record,
+                    Ok(None) => {
+                        return unknown(if arrived {
+                            "the venue has no order under its client id, and can't say what it did"
+                        } else {
+                            "the venue has no order under its client id yet"
+                        });
+                    }
+                    Err(error) => {
+                        return unknown(&format!("its order couldn't be looked up: {error:#}"));
+                    }
+                };
+                let market = match self.allowlist.markets.get(&order.market) {
+                    Some(market) => market,
+                    None => return unknown("its market is no longer listed"),
+                };
+                if !same_order(&record["order"], sent, market, nonce) {
+                    return unknown("the order under its client id is not this one");
+                }
+                let Some(oid) = record["order"]["oid"].as_u64() else {
+                    return unknown("the venue's record of the order has no id");
+                };
+                let status = record["status"].as_str().unwrap_or_default();
+                let filled = || async { filled_of(api, master, oid, nonce).await };
+                match status {
+                    "open" => Outcome::Accepted(Receipt::Resting { order_id: oid }),
+                    "filled" => match filled().await {
+                        Ok(Some((size, average_price))) => Outcome::Accepted(Receipt::Filled {
+                            order_id: oid,
+                            size,
+                            average_price,
+                        }),
+                        Ok(None) => {
+                            unknown("the venue says it filled, and shows no fill of it yet")
+                        }
+                        Err(error) => unknown(&format!(
+                            "it filled, and its fills couldn't be read: {error:#}"
+                        )),
+                    },
+                    status if status.ends_with("Rejected") || status == "rejected" => {
+                        Outcome::Refused(format!("the venue refused the order: {status}"))
+                    }
+                    status
+                        if status.ends_with("Canceled")
+                            || status == "canceled"
+                            || status == "scheduledCancel" =>
+                    {
+                        match filled().await {
+                            Ok(Some((size, average_price))) => Outcome::Accepted(Receipt::Filled {
+                                order_id: oid,
+                                size,
+                                average_price,
+                            }),
+                            // Nothing of it filled and it is off the book:
+                            // an order that never rested did nothing; one
+                            // that rested was placed, and its cancel is the
+                            // account's news.
+                            Ok(None) if order.tif == Tif::Ioc => Outcome::Refused(format!(
+                                "the venue took the order and cancelled it with nothing filled ({status})"
+                            )),
+                            Ok(None) => Outcome::Accepted(Receipt::Resting { order_id: oid }),
+                            Err(error) => unknown(&format!(
+                                "it was cancelled, and its fills couldn't be read: {error:#}"
+                            )),
+                        }
+                    }
+                    other => unknown(&format!("the venue says the order is {other}")),
+                }
+            }
+            (Action::Cancel { order, .. }, _) => {
+                let id = match order {
+                    OrderRef::Venue(oid) => Value::from(*oid),
+                    OrderRef::Client(id) => Value::String(cloid(*id)),
+                };
+                match api.order_status(master, id).await {
+                    Ok(Some(record)) => {
+                        let status = record["status"].as_str().unwrap_or_default();
+                        if status.ends_with("Canceled") || status == "canceled" {
+                            Outcome::Accepted(Receipt::Done)
+                        } else {
+                            unknown(&format!("the order it cancels is {status}"))
+                        }
+                    }
+                    Ok(None) => unknown("the venue has no record of the order it cancels"),
+                    Err(error) => unknown(&format!(
+                        "the order it cancels couldn't be looked up: {error:#}"
+                    )),
+                }
+            }
+            _ => unknown(if arrived {
+                "the venue took it, and what it did can't be read back"
+            } else {
+                "what it did can't be read back"
+            }),
         }
     }
 
@@ -399,6 +622,61 @@ impl Trader {
             Err(why) => Outcome::Refused(why.to_string()),
         }
     }
+}
+
+/// How far before an action's nonce (its signing time) the venue's record of
+/// it may be dated and still be taken for it: clocks a little apart.
+const RECORD_SLACK_MS: u64 = 60_000;
+
+/// Whether the venue's record of an order (`orderStatus`'s `order.order`) is
+/// the one sent: its market, side, size and price, placed no earlier than a
+/// little before it was signed.
+fn same_order(record: &Value, sent: &OrderWire, market: &Market, nonce: u64) -> bool {
+    let decimal = |field: &str| -> Option<Decimal> { record[field].as_str()?.parse().ok() };
+    let wire = |text: &str| -> Option<Decimal> { text.parse().ok() };
+    let side = if sent.b { "B" } else { "A" };
+    record["coin"].as_str() == Some(market.coin.as_str())
+        && record["side"].as_str() == Some(side)
+        && decimal("origSz").is_some()
+        && decimal("origSz") == wire(&sent.s)
+        && decimal("limitPx").is_some()
+        && decimal("limitPx") == wire(&sent.p)
+        && record["timestamp"]
+            .as_u64()
+            .is_some_and(|at| at + RECORD_SLACK_MS >= nonce)
+}
+
+/// What filled of order `oid`: its size and average price, from the
+/// account's fills since a little before it was signed; `None` if nothing.
+async fn filled_of(
+    api: &Api,
+    user: Address,
+    oid: u64,
+    nonce: u64,
+) -> Result<Option<(Decimal, Decimal)>> {
+    let fills = api
+        .fills_since(user, nonce.saturating_sub(RECORD_SLACK_MS), 10)
+        .await?;
+    let mut size = Decimal::ZERO;
+    let mut notional = Decimal::ZERO;
+    for fill in fills
+        .iter()
+        .filter(|fill| fill["oid"].as_u64() == Some(oid))
+    {
+        let number = |field: &str| -> Result<Decimal> {
+            fill[field]
+                .as_str()
+                .and_then(|text| text.parse().ok())
+                .ok_or_else(|| anyhow!("a fill without a readable {field}: {fill}"))
+        };
+        let (sz, px) = (number("sz")?, number("px")?);
+        size += sz;
+        notional += sz * px;
+    }
+    if size <= Decimal::ZERO {
+        return Ok(None);
+    }
+    Ok(Some((size, notional / size)))
 }
 
 /// What became of one submitted action.
@@ -418,44 +696,55 @@ pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
     bytes
 }
 
+/// What the venue's answer to an action it took says.
+enum Read {
+    Receipt(Receipt),
+    /// It refused the order or cancel inside it: nothing happened.
+    Refused(String),
+    /// It can't be read: the action was taken, and what it did is unknown.
+    Unreadable(String),
+}
+
 /// What the venue's answer to `wire` means.
-fn receipt(wire: &Wire, response: &Value) -> Result<Receipt> {
+fn receipt(wire: &Wire, response: &Value) -> Read {
     match wire {
         Wire::Order(_) | Wire::Modify(_) => {
             let status = &response["data"]["statuses"][0];
             if let Some(error) = status["error"].as_str() {
-                bail!("the venue refused the order: {error}");
+                return Read::Refused(format!("the venue refused the order: {error}"));
             }
             if let Some(oid) = status["resting"]["oid"].as_u64() {
-                return Ok(Receipt::Resting { order_id: oid });
+                return Read::Receipt(Receipt::Resting { order_id: oid });
             }
             let filled = &status["filled"];
             if let Some(oid) = filled["oid"].as_u64() {
-                let number = |field: &str| -> Result<Decimal> {
-                    filled[field]
-                        .as_str()
-                        .and_then(|text| text.parse().ok())
-                        .ok_or_else(|| anyhow!("the venue's fill has no {field}"))
+                let number = |field: &str| -> Option<Decimal> {
+                    filled[field].as_str().and_then(|text| text.parse().ok())
                 };
-                return Ok(Receipt::Filled {
-                    order_id: oid,
-                    size: number("totalSz")?,
-                    average_price: number("avgPx")?,
-                });
+                return match (number("totalSz"), number("avgPx")) {
+                    (Some(size), Some(average_price)) => Read::Receipt(Receipt::Filled {
+                        order_id: oid,
+                        size,
+                        average_price,
+                    }),
+                    _ => Read::Unreadable(format!("the venue's fill can't be read: {status}")),
+                };
             }
             if status == "success" || status.is_null() {
-                return Ok(Receipt::Done);
+                return Read::Receipt(Receipt::Done);
             }
-            bail!("the venue's answer is not one this driver reads: {status}")
+            Read::Unreadable(format!(
+                "the venue's answer is not one this driver reads: {status}"
+            ))
         }
         Wire::Cancel(_) | Wire::CancelByCloid(_) => {
             let status = &response["data"]["statuses"][0];
             if let Some(error) = status["error"].as_str() {
-                bail!("the venue refused the cancel: {error}");
+                return Read::Refused(format!("the venue refused the cancel: {error}"));
             }
-            Ok(Receipt::Done)
+            Read::Receipt(Receipt::Done)
         }
-        _ => Ok(Receipt::Done),
+        _ => Read::Receipt(Receipt::Done),
     }
 }
 
@@ -631,6 +920,52 @@ mod tests {
         assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(l1_action_digest(Network::Testnet, &wire, 1).is_ok());
         assert_eq!(to_json(&wire)["orders"][0]["c"], format!("0x{:032x}", 7));
+    }
+
+    #[test]
+    fn an_agent_may_not_use_the_client_ids_the_executor_marks_its_own_upkeep_with() {
+        let list = allowlist();
+        let mut tagged = order("ETH");
+        tagged.client_id = Some(upkeep_client_id(5));
+        assert!(list.check(&Action::Place(tagged.clone()), 1).is_err());
+        assert!(
+            list.check(
+                &Action::Modify {
+                    order_ref: OrderRef::Venue(9),
+                    order: tagged,
+                },
+                1
+            )
+            .is_err()
+        );
+        // The executor's own order carries the tag, with its nonce.
+        let mut own = order("HYPE/USDC");
+        own.limit_price = d("22.5");
+        own.client_id = None;
+        let wire = list.check_as(&Action::Place(own), 42, true).unwrap();
+        let client = to_json(&wire)["orders"][0]["c"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(is_upkeep_cloid(&client));
+        assert_eq!(client, cloid(upkeep_client_id(42)));
+    }
+
+    #[test]
+    fn an_order_the_agent_gave_no_client_id_is_sent_with_one_never_the_upkeep_s() {
+        let list = allowlist();
+        let mut plain = order("ETH");
+        plain.client_id = None;
+        let mut seen = BTreeSet::new();
+        for nonce in 0..2_000 {
+            let wire = list.check(&Action::Place(plain.clone()), nonce).unwrap();
+            let client = to_json(&wire)["orders"][0]["c"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(!is_upkeep_cloid(&client));
+            assert!(seen.insert(client), "one client id per nonce");
+        }
     }
 
     #[test]

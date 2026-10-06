@@ -461,6 +461,10 @@ struct Memory {
     /// counted in these as well as in slots, since a chain whose clock runs
     /// fast passes many slots a round.
     claim_rounds: u64,
+    /// The claim the keeper last saw a close staged for: it goes to the back
+    /// of the turn, so a claim whose close keeps ending with something left
+    /// never keeps the others from theirs.
+    last_staged: Option<u64>,
     /// The slot the stopped station was last asked to unwind in.
     unwound_in: Option<u64>,
     /// When the stopped station's unwind is next simulated, after
@@ -1342,7 +1346,7 @@ async fn delayed_steps(
 /// The client the keeper asks venues' APIs with.
 static VENUE_HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(3))
         .build()
         .expect("an HTTP client with a timeout")
 });
@@ -2353,7 +2357,7 @@ async fn claims(
     // Whether any claim is still to be tried, or might be.
     let mut wanted = false;
     let mut unread = false;
-    for id in memory.claims_from.max(1)..=count {
+    for id in turn_order(memory.claims_from.max(1), count, memory.last_staged) {
         let claim_id = U256::from(id);
         let claim = match client
             .read(vault, IVault::claimAtCall { claimId: claim_id })
@@ -2367,6 +2371,14 @@ async fn claims(
                 continue;
             }
         };
+        if matches!(claim.state, ClaimState::Closing) {
+            memory.last_staged = Some(id);
+        }
+        if matches!(claim.state, ClaimState::Paid | ClaimState::Fallback)
+            && memory.last_staged == Some(id)
+        {
+            memory.last_staged = None;
+        }
         if settled_prefix {
             if matches!(claim.state, ClaimState::Paid | ClaimState::Fallback) {
                 memory.claims_from = id + 1;
@@ -2387,6 +2399,10 @@ async fn claims(
                 // its wait: freezing halts everyone, and the cash or the
                 // market may pay it now.
                 let mut state = claim.state;
+                // Whether a close staged at the station kept this claim from
+                // its try this round: it is tried once that close has ended
+                // (within its windows), never frozen for meanwhile.
+                let mut held_off = matches!(claim.state, ClaimState::Closing);
                 if claim_tryable(claim.state)
                     && (overdue || claim_due(tried.as_ref(), claim.state, slot, round))
                 {
@@ -2398,6 +2414,7 @@ async fn claims(
                             held
                         }
                     };
+                    held_off |= held;
                     let wide = held
                         || match outside_band {
                             Some(wide) => wide,
@@ -2439,6 +2456,9 @@ async fn claims(
                             not_tried(before.as_ref(), after, slot, timers.slotInterval, round)
                         };
                         memory.claims_tried.insert(id, next);
+                        if matches!(after, ClaimState::Closing) {
+                            memory.last_staged = Some(id);
+                        }
                         state = after;
                     }
                 }
@@ -2455,7 +2475,7 @@ async fn claims(
                         | ClaimState::Closing
                 );
                 wanted |= matches!(state, ClaimState::Pending | ClaimState::Waiting);
-                if overdue && unpaid && settled(client, vault).await {
+                if overdue && unpaid && !held_off && settled(client, vault).await {
                     send(
                         client,
                         keeper,
@@ -2479,6 +2499,20 @@ async fn claims(
     let from = memory.claims_from;
     memory.claims_tried.retain(|id, _| *id >= from);
     Ok(())
+}
+
+/// The claims from `from` to `count`, in the order they are tried: by id,
+/// but the one a close was last staged for goes last, so a claim whose
+/// close keeps ending with something left takes its turn after the others.
+fn turn_order(from: u64, count: u64, last_staged: Option<u64>) -> Vec<u64> {
+    let mut ids: Vec<u64> = (from..=count).collect();
+    if let Some(last) = last_staged
+        && let Some(at) = ids.iter().position(|id| *id == last)
+    {
+        let id = ids.remove(at);
+        ids.push(id);
+    }
+    ids
 }
 
 /// Whether a claim in this state is tried: one booked or waiting. A queued
@@ -6947,6 +6981,16 @@ mod tests {
     }
 
     #[test]
+    fn the_claim_a_close_was_last_staged_for_takes_its_turn_after_the_others() {
+        assert_eq!(turn_order(1, 3, None), vec![1, 2, 3]);
+        assert_eq!(turn_order(1, 3, Some(1)), vec![2, 3, 1]);
+        assert_eq!(turn_order(1, 3, Some(2)), vec![1, 3, 2]);
+        // One already past the settled prefix changes nothing.
+        assert_eq!(turn_order(2, 3, Some(1)), vec![2, 3]);
+        assert_eq!(turn_order(1, 0, Some(1)), Vec::<u64>::new());
+    }
+
+    #[test]
     fn only_a_claim_booked_or_waiting_is_ever_tried() {
         assert!(claim_tryable(ClaimState::Pending));
         assert!(claim_tryable(ClaimState::Waiting));
@@ -6986,12 +7030,15 @@ mod tests {
                 owed: U256::ZERO,
                 estimate: U256::from(1_000u64),
                 fetched: U256::ZERO,
+                cost: U256::ZERO,
+                part: U256::ZERO,
                 arrivedAt: U256::ZERO,
                 stagedAt: now - 5,
                 stagedBlock: 1,
                 sweptAt: 0,
                 sweptBlock: 0,
                 window: 300,
+                delay: 0,
                 forVault: true,
             },
         );

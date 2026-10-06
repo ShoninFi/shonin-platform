@@ -85,6 +85,14 @@ fn answer(node: &Mutex<Node>, path: &str, request: &Value) -> (Reply, Option<Dur
             "reward": [["0x3b9aca00"]],
         }),
         "eth_estimateGas" => json!("0x5208"),
+        // Only the client's check of whether a read at a past block is
+        // answered as of that block asks this node to run code: it does, and
+        // returns the block asked, as an honest node would.
+        "eth_call" => {
+            let block = request["params"][1].as_str().unwrap_or("0x0");
+            let number = u64::from_str_radix(block.trim_start_matches("0x"), 16).unwrap_or(0);
+            json!(B256::from(alloy::primitives::U256::from(number)))
+        }
         "eth_getTransactionCount" => json!(format!("0x{:x}", node.sent.len())),
         "eth_sendRawTransaction" => {
             let raw = request["params"][0].as_str().unwrap();

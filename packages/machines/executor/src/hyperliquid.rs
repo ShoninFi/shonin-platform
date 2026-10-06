@@ -153,34 +153,49 @@ impl Half {
 
 // HYPE for sends home ------------------------------------------------------
 
-/// The HYPE the account keeps on HyperCore at the least. Every send of
-/// dollars from HyperCore to the station on HyperEVM (a sweep, a claim's
-/// delivery, a stopped station's unwind) costs the account a little HYPE,
-/// and the on-chain driver refuses to start a close without enough for one;
-/// this keeps several sends' worth, above the driver's own threshold.
+/// The free HYPE (what open orders don't hold) the account keeps on
+/// HyperCore at the least. Every send of dollars from HyperCore to the
+/// station on HyperEVM (a sweep, a claim's delivery, a stopped station's
+/// unwind) costs the account a little HYPE, and the on-chain driver refuses
+/// to start a claim's close with less than [`DRIVER_GAS_FLOOR`] free; this
+/// keeps several sends' worth above that.
 pub const HYPE_FLOOR: &str = "0.05";
-/// What a top-up aims for: the floor twice over, or the venue's smallest
-/// order, whichever buys more.
+/// The driver's own line: with less free HYPE than this, every claim's close
+/// is blocked. Said loudly whenever the account is under it.
+pub const DRIVER_GAS_FLOOR: &str = "0.01";
+/// What a top-up aims for, in free HYPE: the floor twice over, or the
+/// venue's smallest order, whichever buys more.
 pub const HYPE_TARGET: &str = "0.1";
-/// The most HYPE a top-up may leave the account holding: the reserve the
-/// on-chain driver treats as the cost of sending home rather than a holding
-/// a close must sell. A top-up that would leave more is not made (it says
-/// so in the log); at a HYPE price under $12 / (this − the floor) the
-/// venue's smallest order no longer fits under it.
+/// The most HYPE in all a top-up may leave the account holding: the reserve
+/// the on-chain driver treats as the cost of sending home rather than a
+/// holding a close must sell. A top-up that would leave more is not made (it
+/// says so in the log).
 pub const HYPE_RESERVE: &str = "1";
 /// The venue refuses an order under ten dollars: a top-up is at least this.
 pub const HYPE_BUY_LEAST_USD: &str = "12";
-/// And never more than this, at its limit price: a top-up that would cost
-/// more (a book far from where HYPE trades) is not made.
+/// The most a top-up may cost at its limit, unless twice the target's HYPE
+/// costs more at that limit: then that, so a dear HYPE is still bought, and
+/// never more than twice the target of it.
 pub const HYPE_BUY_MOST_USD: &str = "25";
 /// How far above the best ask the immediate-or-cancel buy may fill.
 pub const HYPE_BUY_REACH: &str = "0.02";
+/// How far above the venue's own spot price (the price the driver values
+/// HYPE at) a top-up may pay: a book whose ask is further off is not bought
+/// from, and the log says HYPE costs more than the top-up may pay.
+pub const HYPE_BUY_OVER_SPOT: &str = "0.05";
 /// How often the account's HYPE is looked at.
 const HYPE_LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 /// At most one top-up in this long, and at most [`HYPE_BUYS_A_DAY`] a day:
-/// a bound on what the upkeep can spend (four buys of at most $25).
-const HYPE_BUY_SPACING: std::time::Duration = std::time::Duration::from_secs(600);
+/// a bound on what the upkeep can spend. Counted from the venue's own record
+/// of the account's fills (the upkeep's orders carry their own tag), so a
+/// restart doesn't reset it, and from the executor's own record of buys
+/// whose outcome it couldn't learn.
+const HYPE_BUY_SPACING_MS: u64 = 600_000;
 const HYPE_BUYS_A_DAY: usize = 4;
+const DAY_MS: u64 = 86_400_000;
+/// How often the account's close-blocking want of HYPE is said again while
+/// it lasts.
+const BLOCKED_SAID_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// A top-up of the account's HYPE: an immediate-or-cancel buy of `size` at
 /// no more than `limit`, after moving `from_perp` dollars to spot to pay
@@ -192,50 +207,109 @@ pub struct HypeBuy {
     pub from_perp: hyperliquid::payload::Decimal,
 }
 
-/// What to buy, if the account's HYPE (`held`) is under the floor: enough to
+/// Why no top-up is planned though the account's free HYPE is under the
+/// floor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NoBuy {
+    pub why: String,
+    /// HYPE costs more than a top-up may pay.
+    pub too_dear: bool,
+}
+
+/// What the account holds and what the venue asks, for a top-up's plan.
+#[derive(Clone, Copy, Debug)]
+pub struct HypeBook {
+    /// HYPE not held by open orders, and HYPE in all.
+    pub free: hyperliquid::payload::Decimal,
+    pub total: hyperliquid::payload::Decimal,
+    /// The best ask on the pair, and the venue's own spot price of it.
+    pub ask: Option<hyperliquid::payload::Decimal>,
+    pub spot: hyperliquid::payload::Decimal,
+    /// Spot dollars not held by open orders, and what the perp side can
+    /// spare.
+    pub spot_usdc: hyperliquid::payload::Decimal,
+    pub perp_free: hyperliquid::payload::Decimal,
+    pub sz_decimals: u32,
+}
+
+/// What to buy, if the account's free HYPE is under the floor: enough to
 /// reach the target, and at least the venue's smallest order; limited to
-/// [`HYPE_BUY_REACH`] above the best ask and to [`HYPE_BUY_MOST_USD`]; paid
-/// from spot dollars first, then from what the perp side can spare. `None`
-/// when nothing is needed, there is no ask, or the account can't pay.
-pub fn plan_hype_buy(
-    held: hyperliquid::payload::Decimal,
-    ask: Option<hyperliquid::payload::Decimal>,
-    spot_usdc: hyperliquid::payload::Decimal,
-    perp_free: hyperliquid::payload::Decimal,
-    sz_decimals: u32,
-) -> Option<HypeBuy> {
+/// [`HYPE_BUY_REACH`] above the best ask and [`HYPE_BUY_OVER_SPOT`] above
+/// the venue's spot price; never leaving more than [`HYPE_RESERVE`] in all;
+/// paid from spot dollars first, then from what the perp side can spare.
+/// `Ok(None)` when nothing is needed.
+pub fn plan_hype_buy(book: &HypeBook) -> std::result::Result<Option<HypeBuy>, NoBuy> {
     use hyperliquid::payload::Decimal;
     let decimal = |text: &str| -> Decimal { text.parse().unwrap_or(Decimal::ZERO) };
     let zero = Decimal::ZERO;
-    if held >= decimal(HYPE_FLOOR) {
-        return None;
+    let no = |why: String| NoBuy {
+        why,
+        too_dear: false,
+    };
+    if book.free >= decimal(HYPE_FLOOR) {
+        return Ok(None);
     }
-    let ask = ask.filter(|ask| *ask > zero)?;
-    let limit = five_figures_up(ask * (Decimal::from(1) + decimal(HYPE_BUY_REACH)));
-    let wanted = decimal(HYPE_TARGET) - held;
+    let Some(ask) = book.ask.filter(|ask| *ask > zero) else {
+        return Err(no("the HYPE/USDC book has no ask".to_string()));
+    };
+    if book.spot <= zero {
+        return Err(no("the venue gives no spot price for HYPE".to_string()));
+    }
+    let cap = book.spot * (Decimal::from(1) + decimal(HYPE_BUY_OVER_SPOT));
+    let mut limit = five_figures_up(ask * (Decimal::from(1) + decimal(HYPE_BUY_REACH)));
+    if limit > cap {
+        limit = five_figures_down(cap);
+    }
+    if limit < ask {
+        return Err(NoBuy {
+            why: format!(
+                "HYPE costs more than a top-up may pay: the best ask is {ask}, the venue's spot price {}, and a top-up pays at most {HYPE_BUY_OVER_SPOT} over it ({limit})",
+                book.spot
+            ),
+            too_dear: true,
+        });
+    }
+    let scale = Decimal::from(10u64.pow(book.sz_decimals));
+    let wanted = decimal(HYPE_TARGET) - book.free;
     let least = decimal(HYPE_BUY_LEAST_USD) / ask;
-    let scale = Decimal::from(10u64.pow(sz_decimals));
     let size = ((if wanted > least { wanted } else { least }) * scale).ceil() / scale;
     let cost = size * limit;
-    if size <= zero || cost > decimal(HYPE_BUY_MOST_USD) || held + size > decimal(HYPE_RESERVE) {
-        return None;
+    let most = {
+        let target = Decimal::from(2) * decimal(HYPE_TARGET) * limit;
+        let fixed = decimal(HYPE_BUY_MOST_USD);
+        if target > fixed { target } else { fixed }
+    };
+    if size <= zero || cost > most {
+        return Err(NoBuy {
+            why: format!("a top-up of {size} HYPE at {limit} would cost {cost}, more than {most}"),
+            too_dear: true,
+        });
+    }
+    if book.total + size > decimal(HYPE_RESERVE) {
+        return Err(no(format!(
+            "a top-up of {size} HYPE would leave {} HYPE, more than the {HYPE_RESERVE} the driver keeps for sends home",
+            book.total + size
+        )));
     }
     // A little over the cost, for the venue's fee.
     let needed = cost * decimal("1.01");
-    let from_perp = if spot_usdc >= needed {
+    let from_perp = if book.spot_usdc >= needed {
         zero
     } else {
         // Whole cents, rounded up.
-        ((needed - spot_usdc) * Decimal::from(100)).ceil() / Decimal::from(100)
+        ((needed - book.spot_usdc) * Decimal::from(100)).ceil() / Decimal::from(100)
     };
-    if from_perp > perp_free {
-        return None;
+    if from_perp > book.perp_free {
+        return Err(no(format!(
+            "the account can't pay {needed} for HYPE: {} spot dollars free and {} to spare on the perp side",
+            book.spot_usdc, book.perp_free
+        )));
     }
-    Some(HypeBuy {
+    Ok(Some(HypeBuy {
         size,
         limit,
         from_perp,
-    })
+    }))
 }
 
 /// A number the venue's API gave, as a decimal (zero if it can't be read).
@@ -245,13 +319,9 @@ fn decimal_of(value: f64) -> hyperliquid::payload::Decimal {
         .unwrap_or(hyperliquid::payload::Decimal::ZERO)
 }
 
-/// A price to five significant figures (the most the venue takes), rounded
-/// up, so a buy's limit is never under the price asked for.
-fn five_figures_up(price: hyperliquid::payload::Decimal) -> hyperliquid::payload::Decimal {
+/// The power of ten that puts `price` between 10,000 and 100,000.
+fn five_figure_scale(price: hyperliquid::payload::Decimal) -> hyperliquid::payload::Decimal {
     use hyperliquid::payload::Decimal;
-    if price <= Decimal::ZERO {
-        return price;
-    }
     let ten = Decimal::from(10);
     let mut scale = Decimal::from(1);
     while price * scale < Decimal::from(10_000) {
@@ -260,7 +330,95 @@ fn five_figures_up(price: hyperliquid::payload::Decimal) -> hyperliquid::payload
     while price * scale >= Decimal::from(100_000) {
         scale /= ten;
     }
+    scale
+}
+
+/// A price to five significant figures (the most the venue takes), rounded
+/// up, so a buy's limit is never under the price asked for.
+fn five_figures_up(price: hyperliquid::payload::Decimal) -> hyperliquid::payload::Decimal {
+    if price <= hyperliquid::payload::Decimal::ZERO {
+        return price;
+    }
+    let scale = five_figure_scale(price);
     (price * scale).ceil() / scale
+}
+
+/// The same, rounded down, so a cap is never passed.
+fn five_figures_down(price: hyperliquid::payload::Decimal) -> hyperliquid::payload::Decimal {
+    if price <= hyperliquid::payload::Decimal::ZERO {
+        return price;
+    }
+    let scale = five_figure_scale(price);
+    (price * scale).floor() / scale
+}
+
+/// The upkeep's HYPE buys of the last day, by client id, with when each was
+/// made (milliseconds): from the venue's record of the account's fills on
+/// the pair (only the upkeep's orders carry its tag), and from `attempts`,
+/// the buys this executor sent whose outcome it couldn't learn or that the
+/// venue took.
+pub fn upkeep_buys(
+    fills: &[serde_json::Value],
+    coin: &str,
+    attempts: &[(u128, u64)],
+    now_ms: u64,
+) -> std::collections::BTreeMap<u128, u64> {
+    let since = now_ms.saturating_sub(DAY_MS);
+    let mut buys = std::collections::BTreeMap::new();
+    let mut add = |id: u128, at: u64| {
+        if at >= since {
+            let earliest = buys.entry(id).or_insert(at);
+            *earliest = (*earliest).min(at);
+        }
+    };
+    for fill in fills {
+        let tagged = fill["cloid"]
+            .as_str()
+            .filter(|cloid| hyperliquid::agent::is_upkeep_cloid(cloid))
+            .and_then(|cloid| u128::from_str_radix(cloid.trim_start_matches("0x"), 16).ok());
+        if let (Some(id), Some(at), true, true) = (
+            tagged,
+            fill["time"].as_u64(),
+            fill["coin"] == coin,
+            fill["side"] == "B",
+        ) {
+            add(id, at);
+        }
+    }
+    for (id, at) in attempts {
+        add(*id, *at);
+    }
+    buys
+}
+
+/// Whether a top-up may be made now, given the day's buys: none in the last
+/// [`HYPE_BUY_SPACING_MS`], and fewer than [`HYPE_BUYS_A_DAY`] in the day.
+pub fn may_buy(buys: &std::collections::BTreeMap<u128, u64>, now_ms: u64) -> bool {
+    buys.len() < HYPE_BUYS_A_DAY
+        && buys
+            .values()
+            .all(|at| now_ms.saturating_sub(*at) >= HYPE_BUY_SPACING_MS)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// What one look at the account's HYPE found and did.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TopUp {
+    /// Free HYPE at or over the floor.
+    Enough,
+    /// A close is staged at the station: nothing is bought until it ends
+    /// (a buy would be charged to the leaver), and the close was staged
+    /// with enough HYPE free.
+    Staged,
+    /// The day's buys are spent, or the last was too recent.
+    Spaced,
+    Bought(HypeBuy),
 }
 
 impl Half {
@@ -275,33 +433,26 @@ impl Half {
             .cloned()
     }
 
-    /// Look at the account's HYPE every minute and top it up when it falls
-    /// under the floor, until the task is dropped. Says what it did, or why
-    /// it couldn't, in the log.
+    /// Look at the account's HYPE every minute and top it up when its free
+    /// HYPE falls under the floor, until the task is dropped. Says what it
+    /// did, or why it couldn't, in the log; and says loudly, every ten
+    /// minutes while it lasts, when the account has less free HYPE than the
+    /// driver needs to start a claim's close.
     pub fn hype_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let half = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(HYPE_LOOK_EVERY);
-            let mut bought: std::collections::VecDeque<tokio::time::Instant> = Default::default();
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut attempts: Vec<(u128, u64)> = Vec::new();
             let mut warned = false;
+            let mut blocked_said: Option<tokio::time::Instant> = None;
             loop {
                 tick.tick().await;
-                let now = tokio::time::Instant::now();
-                while bought.front().is_some_and(|at| {
-                    now.duration_since(*at) > std::time::Duration::from_secs(86_400)
-                }) {
-                    bought.pop_front();
-                }
-                if bought.len() >= HYPE_BUYS_A_DAY
-                    || bought
-                        .back()
-                        .is_some_and(|at| now.duration_since(*at) < HYPE_BUY_SPACING)
-                {
-                    continue;
-                }
-                match half.top_up_hype().await {
-                    Ok(Some(buy)) => {
-                        bought.push_back(now);
+                attempts.retain(|(_, at)| now_ms().saturating_sub(*at) < DAY_MS);
+                let look = half.top_up_hype(&mut attempts).await;
+                match &look {
+                    Ok(TopUp::Bought(buy)) => {
+                        warned = false;
                         tracing::info!(
                             station = %half.station,
                             size = %buy.size,
@@ -310,9 +461,14 @@ impl Half {
                             "bought HYPE on HyperCore for the account's sends home"
                         );
                     }
-                    Ok(None) => warned = false,
+                    Ok(_) => warned = false,
                     Err(error) => {
-                        if !warned {
+                        let dear = error
+                            .downcast_ref::<NoBuyError>()
+                            .is_some_and(|no| no.0.too_dear);
+                        // HYPE dearer than a top-up may pay is said at every
+                        // look; anything else once until it changes.
+                        if dear || !warned {
                             tracing::warn!(
                                 station = %half.station,
                                 error = %format!("{error:#}"),
@@ -322,36 +478,85 @@ impl Half {
                         warned = true;
                     }
                 }
+                match half.free_hype().await {
+                    Ok(free) if free < DRIVER_GAS_FLOOR.parse().unwrap_or_default() => {
+                        if blocked_said.is_none_or(|at| at.elapsed() >= BLOCKED_SAID_EVERY) {
+                            blocked_said = Some(tokio::time::Instant::now());
+                            tracing::error!(
+                                station = %half.station,
+                                free = %free,
+                                floor = DRIVER_GAS_FLOOR,
+                                "every claim's close at this station is blocked: the account has less free HYPE than the driver needs to send dollars home (open orders may hold the rest)"
+                            );
+                        }
+                    }
+                    Ok(_) => blocked_said = None,
+                    Err(_) => {}
+                }
             }
         })
     }
 
-    /// One look at the account's HYPE, and a top-up if it is low: the buy
-    /// made, `None` if none was needed, or why one was needed and not made.
-    pub async fn top_up_hype(&self) -> Result<Option<HypeBuy>> {
+    /// The account's free HYPE (what open orders don't hold), as the driver
+    /// reads it.
+    async fn free_hype(&self) -> Result<hyperliquid::payload::Decimal> {
+        Ok(self.api.spot_holding(self.station, "HYPE").await?.free())
+    }
+
+    /// One look at the account's HYPE, and a top-up if its free HYPE is
+    /// low: what it found or did, or why a top-up was needed and not made.
+    /// `attempts` holds the buys this executor sent and could not see in
+    /// the venue's fills; a buy sent now is added to it.
+    pub async fn top_up_hype(&self, attempts: &mut Vec<(u128, u64)>) -> Result<TopUp> {
         use hyperliquid::payload::{Action, Balance, Decimal, Order, Side, Tif};
-        let held = decimal_of(self.api.spot_balance(self.station, "HYPE").await?);
-        if held >= HYPE_FLOOR.parse().unwrap_or(Decimal::ZERO) {
-            return Ok(None);
+        let hype = self.api.spot_holding(self.station, "HYPE").await?;
+        if hype.free() >= HYPE_FLOOR.parse().unwrap_or(Decimal::ZERO) {
+            return Ok(TopUp::Enough);
+        }
+        let stage = self
+            .chain
+            .read(
+                self.station,
+                chain::bindings::station::IStation::stageCall {},
+            )
+            .await
+            .context("reading whether a close is staged at the station")?;
+        if stage.stagedAt != 0 {
+            return Ok(TopUp::Staged);
         }
         let market = self.hype_market().ok_or_else(|| {
             anyhow!("the station's driver doesn't list the HYPE/USDC pair, the only market a top-up may use")
         })?;
+        let now = now_ms();
+        let fills = self
+            .api
+            .fills_since(self.station, now.saturating_sub(DAY_MS), 10)
+            .await
+            .context("reading the account's fills, which count the day's top-ups")?;
+        let buys = upkeep_buys(&fills, &market.coin, attempts, now);
+        if !may_buy(&buys, now) {
+            return Ok(TopUp::Spaced);
+        }
         let (_, ask) = self.api.best_bid_ask(&market.coin).await?;
-        let spot_usdc = decimal_of(self.api.spot_balance(self.station, "USDC").await?);
+        let spot = self.api.spot_price(&market.coin).await?;
+        let usdc = self.api.spot_holding(self.station, "USDC").await?;
         let perp_free = decimal_of(self.api.perp_withdrawable(self.station).await?);
-        let buy = plan_hype_buy(
-            held,
-            ask.map(decimal_of),
-            spot_usdc,
+        let buy = plan_hype_buy(&HypeBook {
+            free: hype.free(),
+            total: hype.total,
+            ask: ask.map(decimal_of),
+            spot,
+            spot_usdc: usdc.free(),
             perp_free,
-            market.sz_decimals,
-        )
-        .ok_or_else(|| {
-            anyhow!(
-                "HYPE is {held}, under {HYPE_FLOOR}, and no buy fits (best ask {ask:?}, spot dollars {spot_usdc}, perp free {perp_free})"
-            )
+            sz_decimals: market.sz_decimals,
+        })
+        .map_err(|no| {
+            anyhow::Error::new(NoBuyError(no))
+                .context(format!("free HYPE is {}, under {HYPE_FLOOR}", hype.free()))
         })?;
+        let Some(buy) = buy else {
+            return Ok(TopUp::Enough);
+        };
         if buy.from_perp > Decimal::ZERO {
             self.trader
                 .submit(&Action::MoveDollars {
@@ -361,8 +566,9 @@ impl Half {
                 .await
                 .context("moving dollars to spot for HYPE")?;
         }
-        self.trader
-            .submit(&Action::Place(Order {
+        let (outcome, client) = self
+            .trader
+            .upkeep(&Order {
                 market: market.name.clone(),
                 side: Side::Buy,
                 size: buy.size,
@@ -370,12 +576,36 @@ impl Half {
                 tif: Tif::Ioc,
                 reduce_only: false,
                 client_id: None,
-            }))
-            .await
-            .context("buying HYPE")?;
-        Ok(Some(buy))
+            })
+            .await;
+        match outcome {
+            hyperliquid::agent::Outcome::Accepted(_) => {
+                attempts.push((client, now));
+                Ok(TopUp::Bought(buy))
+            }
+            hyperliquid::agent::Outcome::Unknown(why) => {
+                // It may have bought: counted as a buy all the same.
+                attempts.push((client, now));
+                Err(anyhow!(
+                    "a HYPE buy got no answer, and may have been made: {why}"
+                ))
+            }
+            hyperliquid::agent::Outcome::Refused(why) => Err(anyhow!("buying HYPE: {why}")),
+        }
     }
 }
+
+/// [`NoBuy`] as an error, so the loop can tell a HYPE too dear to buy.
+#[derive(Debug)]
+pub struct NoBuyError(pub NoBuy);
+
+impl std::fmt::Display for NoBuyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.why)
+    }
+}
+
+impl std::error::Error for NoBuyError {}
 
 /// How long a deposit into HyperCore is looked for before the move is
 /// reported as not confirmed. HyperCore credits a deposit from HyperEVM in
@@ -388,14 +618,49 @@ const DEPOSIT_CONFIRM_EVERY: std::time::Duration = std::time::Duration::from_sec
 const DEPOSIT_LOOKBACK_MS: u64 = 10 * 60 * 1000;
 
 /// A deposit into the station's HyperCore account, watched for in the
-/// account's ledger: deposits of exactly its amount, counted before it was
-/// sent and looked for again after.
+/// account's ledger: the deposits of exactly its amount there before it was
+/// sent, and, after, one more that no other watch has taken.
 #[derive(Clone, Debug)]
 pub struct DepositWatch {
     account: Address,
     millionths: u64,
     since_ms: u64,
-    before: usize,
+    before: std::collections::HashSet<String>,
+}
+
+/// How long a credit taken for one deposit is kept from every other: far
+/// longer than any watch lasts, or than an entry stays in the window read.
+const CREDIT_TAKEN_FOR: std::time::Duration = std::time::Duration::from_secs(3_600);
+
+/// The ledger entries already taken as some deposit's credit, by account:
+/// one credit confirms one deposit, however many of the same amount are
+/// watched for at once.
+static CREDITS_TAKEN: std::sync::LazyLock<std::sync::Mutex<CreditsTaken>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Each account's credits taken, with when.
+type CreditsTaken = std::collections::HashMap<Address, Vec<(String, std::time::Instant)>>;
+
+/// The ledger's matching entries, each named once even when two read alike
+/// (the `n`th of a kind is `entry#n`).
+async fn credits(
+    api: &Api,
+    account: Address,
+    since_ms: u64,
+    millionths: u64,
+) -> Result<Vec<String>> {
+    let entries = api
+        .deposit_entries_of(account, since_ms, millionths)
+        .await?;
+    let mut seen: std::collections::HashMap<String, usize> = Default::default();
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let n = seen.entry(entry.clone()).or_default();
+            *n += 1;
+            format!("{entry}#{n}")
+        })
+        .collect())
 }
 
 impl DepositWatch {
@@ -405,7 +670,10 @@ impl DepositWatch {
             .map(|since| since.as_millis() as u64)
             .unwrap_or_default();
         let since_ms = now_ms.saturating_sub(DEPOSIT_LOOKBACK_MS);
-        let before = api.deposits_of(account, since_ms, millionths).await?;
+        let before = credits(api, account, since_ms, millionths)
+            .await?
+            .into_iter()
+            .collect();
         Ok(Self {
             account,
             millionths,
@@ -414,9 +682,11 @@ impl DepositWatch {
         })
     }
 
-    /// Whether the ledger shows one more such deposit than it did before,
-    /// looking every `every` for at most `within`. A read that fails is
-    /// looked at again, never taken for a deposit.
+    /// Whether the ledger shows a credit of this amount that wasn't there
+    /// when the watch started and that no other watch has taken; if so it is
+    /// taken for this deposit. Looked for every `every`, for at most
+    /// `within`. A read that fails is looked at again, never taken for a
+    /// deposit.
     pub async fn credited(
         &self,
         api: &Api,
@@ -425,10 +695,8 @@ impl DepositWatch {
     ) -> bool {
         let until = tokio::time::Instant::now() + within;
         loop {
-            if let Ok(now) = api
-                .deposits_of(self.account, self.since_ms, self.millionths)
-                .await
-                && now > self.before
+            if let Ok(now) = credits(api, self.account, self.since_ms, self.millionths).await
+                && self.take(now)
             {
                 return true;
             }
@@ -436,6 +704,26 @@ impl DepositWatch {
                 return false;
             }
             tokio::time::sleep(every).await;
+        }
+    }
+
+    /// Take the first new, untaken credit among `now` for this deposit.
+    fn take(&self, now: Vec<String>) -> bool {
+        let Ok(mut taken) = CREDITS_TAKEN.lock() else {
+            return false;
+        };
+        let clock = std::time::Instant::now();
+        let mine = taken.entry(self.account).or_default();
+        mine.retain(|(_, at)| clock.duration_since(*at) < CREDIT_TAKEN_FOR);
+        let fresh = now.into_iter().find(|credit| {
+            !self.before.contains(credit) && !mine.iter().any(|(known, _)| known == credit)
+        });
+        match fresh {
+            Some(credit) => {
+                mine.push((credit, clock));
+                true
+            }
+            None => false,
         }
     }
 }
@@ -646,37 +934,70 @@ mod tests {
         text.parse().unwrap()
     }
 
+    /// An account with `free` HYPE free (all of it, unless `total` says
+    /// more), a book asking `ask` at a spot price of 34, and dollars to pay.
+    fn book(free: &str, ask: Option<&str>) -> HypeBook {
+        HypeBook {
+            free: d(free),
+            total: d(free),
+            ask: ask.map(d),
+            spot: d("34"),
+            spot_usdc: d("100"),
+            perp_free: d("100"),
+            sz_decimals: 2,
+        }
+    }
+
     #[test]
     fn a_top_up_never_leaves_more_than_the_reserve() {
         // At $34, 0.36 HYPE: under the reserve.
-        let buy = plan_hype_buy(d("0.04"), Some(d("34")), d("100"), d("100"), 2).unwrap();
+        let buy = plan_hype_buy(&book("0.04", Some("34"))).unwrap().unwrap();
         assert!(d("0.04") + buy.size <= d(HYPE_RESERVE));
         // At $5, the venue's smallest order is 2.4 HYPE: over it, so none.
-        assert_eq!(
-            plan_hype_buy(d("0.04"), Some(d("5")), d("100"), d("100"), 2),
-            None
-        );
-        // The floor sits under the reserve.
+        let cheap = HypeBook {
+            spot: d("5"),
+            ..book("0.04", Some("5"))
+        };
+        assert!(plan_hype_buy(&cheap).is_err());
+        // HYPE the strategy holds counts toward the reserve too.
+        let held = HypeBook {
+            total: d("0.8"),
+            ..book("0", Some("34"))
+        };
+        assert!(plan_hype_buy(&held).is_err());
+        // The floor sits under the reserve, and over the driver's own line.
         assert!(d(HYPE_FLOOR) < d(HYPE_RESERVE));
+        assert!(d(DRIVER_GAS_FLOOR) < d(HYPE_FLOOR));
     }
 
     #[test]
     fn hype_over_the_floor_is_left_alone() {
-        assert_eq!(
-            plan_hype_buy(d("0.05"), Some(d("34")), d("100"), d("100"), 2),
-            None
-        );
-        assert_eq!(
-            plan_hype_buy(d("3"), Some(d("34")), d("100"), d("100"), 2),
-            None
-        );
+        assert_eq!(plan_hype_buy(&book("0.05", Some("34"))), Ok(None));
+        assert_eq!(plan_hype_buy(&book("3", Some("34"))), Ok(None));
+    }
+
+    #[test]
+    fn hype_an_open_order_holds_is_not_counted_and_is_topped_up() {
+        // A strategy resting a sell of its 0.30 HYPE: none of it is free.
+        let resting = HypeBook {
+            total: d("0.3"),
+            ..book("0", Some("34"))
+        };
+        let buy = plan_hype_buy(&resting).unwrap().unwrap();
+        assert!(buy.size >= d("0.1"));
+        assert!(d("0.3") + buy.size <= d(HYPE_RESERVE));
     }
 
     #[test]
     fn a_low_balance_buys_at_least_the_venue_s_smallest_order_within_the_bounds() {
         // 0.01 HYPE at an ask of 34: the target needs 0.09, the venue's
         // smallest order 12 / 34 = 0.353 HYPE, rounded up to 0.36.
-        let buy = plan_hype_buy(d("0.01"), Some(d("34")), d("100"), d("0"), 2).unwrap();
+        let buy = plan_hype_buy(&HypeBook {
+            perp_free: d("0"),
+            ..book("0.01", Some("34"))
+        })
+        .unwrap()
+        .unwrap();
         assert_eq!(buy.size, d("0.36"));
         // Two per cent over the ask, to five figures, rounded up.
         assert_eq!(buy.limit, d("34.68"));
@@ -687,29 +1008,99 @@ mod tests {
 
     #[test]
     fn a_top_up_is_paid_from_perp_only_for_what_spot_lacks() {
-        let buy = plan_hype_buy(d("0"), Some(d("34")), d("5"), d("100"), 2).unwrap();
+        let buy = plan_hype_buy(&HypeBook {
+            spot_usdc: d("5"),
+            ..book("0", Some("34"))
+        })
+        .unwrap()
+        .unwrap();
         // 0.36 at 34.68 is 12.4848; with 1% for the fee 12.609648; less the
         // 5 on spot, 7.61 in whole cents, rounded up.
         assert_eq!(buy.from_perp, d("7.61"));
         // An account that can't pay buys nothing.
-        assert_eq!(
-            plan_hype_buy(d("0"), Some(d("34")), d("5"), d("1"), 2),
-            None
+        assert!(
+            plan_hype_buy(&HypeBook {
+                spot_usdc: d("5"),
+                perp_free: d("1"),
+                ..book("0", Some("34"))
+            })
+            .is_err()
         );
     }
 
     #[test]
-    fn no_top_up_without_an_ask_or_past_the_most_it_may_cost() {
-        assert_eq!(plan_hype_buy(d("0"), None, d("100"), d("100"), 2), None);
-        assert_eq!(
-            plan_hype_buy(d("0"), Some(d("0")), d("100"), d("100"), 2),
-            None
-        );
-        // A HYPE so dear that one whole size step costs more than the cap.
-        assert_eq!(
-            plan_hype_buy(d("0"), Some(d("400")), d("1000"), d("1000"), 0),
-            None
-        );
+    fn no_top_up_without_an_ask() {
+        assert!(plan_hype_buy(&book("0", None)).is_err());
+        assert!(plan_hype_buy(&book("0", Some("0"))).is_err());
+    }
+
+    #[test]
+    fn a_top_up_never_pays_more_than_its_bound_over_the_venue_s_spot_price() {
+        // The ask is 4% over the spot price: the limit is held at 5% over it.
+        let buy = plan_hype_buy(&book("0", Some("35.36"))).unwrap().unwrap();
+        assert!(buy.limit <= d("34") * d("1.05"), "{}", buy.limit);
+        assert!(buy.limit >= d("35.36"));
+        // The ask is 6% over: too dear, and said so.
+        let dear = plan_hype_buy(&book("0", Some("36.04"))).unwrap_err();
+        assert!(dear.too_dear, "{}", dear.why);
+        assert!(dear.why.contains("costs more"), "{}", dear.why);
+    }
+
+    #[test]
+    fn a_dear_hype_is_still_bought_up_to_the_target() {
+        // At $400 the target's 0.1 HYPE alone costs more than the fixed cap.
+        let dear = HypeBook {
+            spot: d("400"),
+            spot_usdc: d("1000"),
+            perp_free: d("1000"),
+            ..book("0", Some("400"))
+        };
+        let buy = plan_hype_buy(&dear).unwrap().unwrap();
+        assert_eq!(buy.size, d("0.1"));
+        // A HYPE whose smallest size step is a whole HYPE: more than twice
+        // the target, so none.
+        let whole = HypeBook {
+            sz_decimals: 0,
+            ..dear
+        };
+        assert!(plan_hype_buy(&whole).is_err());
+    }
+
+    #[test]
+    fn the_day_s_top_ups_are_counted_from_the_venue_s_fills_and_the_unanswered_buys() {
+        let now = 10 * DAY_MS;
+        let tagged = |nonce: u64| format!("0x{:032x}", hyperliquid::agent::upkeep_client_id(nonce));
+        let fills = vec![
+            // Two fills of one top-up: one buy.
+            serde_json::json!({"coin": "@1035", "side": "B", "time": now - 3_600_000, "cloid": tagged(1)}),
+            serde_json::json!({"coin": "@1035", "side": "B", "time": now - 3_599_000, "cloid": tagged(1)}),
+            // The strategy's own buy, a sell, another coin, and a top-up
+            // over a day ago: none.
+            serde_json::json!({"coin": "@1035", "side": "B", "time": now - 1_000, "cloid": "0x01"}),
+            serde_json::json!({"coin": "@1035", "side": "A", "time": now - 1_000, "cloid": tagged(2)}),
+            serde_json::json!({"coin": "ETH", "side": "B", "time": now - 1_000, "cloid": tagged(3)}),
+            serde_json::json!({"coin": "@1035", "side": "B", "time": now - DAY_MS - 1, "cloid": tagged(4)}),
+        ];
+        let buys = upkeep_buys(&fills, "@1035", &[], now);
+        assert_eq!(buys.len(), 1);
+        assert!(may_buy(&buys, now));
+        // A buy sent a minute ago whose outcome is unknown: too recent.
+        let attempts = [(hyperliquid::agent::upkeep_client_id(5), now - 60_000)];
+        let buys = upkeep_buys(&fills, "@1035", &attempts, now);
+        assert_eq!(buys.len(), 2);
+        assert!(!may_buy(&buys, now));
+        // Four in the day, however far apart: no more.
+        let attempts: Vec<_> = (0..3)
+            .map(|n| {
+                (
+                    hyperliquid::agent::upkeep_client_id(10 + n),
+                    now - 7_200_000 * (n + 1),
+                )
+            })
+            .collect();
+        let buys = upkeep_buys(&fills, "@1035", &attempts, now);
+        assert_eq!(buys.len(), 4);
+        assert!(!may_buy(&buys, now));
     }
 
     #[test]

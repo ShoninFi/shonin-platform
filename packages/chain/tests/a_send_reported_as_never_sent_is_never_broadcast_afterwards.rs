@@ -58,6 +58,13 @@ fn answer(node: &Mutex<Slow>, request: &Value) -> (Value, Option<Duration>) {
             hold = node.estimate_delay;
             json!("0x5208")
         }
+        // The connect-time check of whether a read at a past block is
+        // answered as of that block: answered honestly.
+        "eth_call" => {
+            let block = request["params"][1].as_str().unwrap_or("0x0");
+            let number = u64::from_str_radix(block.trim_start_matches("0x"), 16).unwrap_or(0);
+            json!(B256::from(alloy::primitives::U256::from(number)))
+        }
         "eth_getTransactionCount" => json!(format!("0x{:x}", node.sent.len())),
         "eth_sendRawTransaction" => {
             let raw = request["params"][0].as_str().unwrap();

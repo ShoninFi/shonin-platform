@@ -27,8 +27,24 @@ use tokio::sync::Mutex;
 pub const ROBINHOOD: &str = "robinhood";
 pub const LIGHTER: &str = "lighter";
 
-/// How often the attested read of a station's Lighter accounts is posted.
-const REPORT_EVERY: Duration = Duration::from_secs(120);
+/// How often the attested read of a station's Lighter accounts is posted:
+/// the driver stages a claim's close only on a post at most three minutes
+/// old, so a post every minute leaves room for two to fail.
+pub const REPORT_EVERY: Duration = Duration::from_secs(60);
+/// How often the post's loop looks at whether a staged close is waiting for
+/// a post read after its settle delay, which it then makes at once.
+const STAGE_LOOK_EVERY: Duration = Duration::from_secs(5);
+/// How long after a post that failed the next is tried.
+const RETRY_AFTER: Duration = Duration::from_secs(15);
+/// The most one post may take, reads and send: past it, the round is given
+/// up and the next one made on time.
+const POST_TIMEOUT: Duration = Duration::from_secs(90);
+/// The most time between the start of a post's reads of the exchange's API
+/// and its read of the chain (the pending balance and the station's
+/// counters): the post says both were true together, so it is not made when
+/// they are further apart, nor when the chain's newest block is older than
+/// the API reads by more than this.
+pub const POST_READ_SPAN: Duration = Duration::from_secs(30);
 
 alloy::sol! {
     interface IStationRh {
@@ -39,8 +55,10 @@ alloy::sol! {
         function venueFlows(bytes32 driver) external view returns (uint256 sent, uint64 depositedAt);
     }
     interface ILighterDriver {
+        struct Market { uint16 index; uint8 sizeDecimals; uint8 priceDecimals; }
         function exchange() external view returns (address);
         function board() external view returns (address);
+        function markets() external view returns (Market[] memory);
     }
     interface IExchange {
         function addressToAccountIndex(address owner) external view returns (uint48);
@@ -232,6 +250,9 @@ pub struct LighterHalf {
     station: Address,
     exchange: Address,
     board: Address,
+    /// The station's pinned Lighter driver, whose markets are the only ones
+    /// the key signs in.
+    driver: Address,
     api: lighter::Api,
     chain_id: u32,
     lighter_key: lighter::Key,
@@ -278,6 +299,7 @@ impl LighterHalf {
             station,
             exchange,
             board,
+            driver,
             api,
             chain_id,
             lighter_key,
@@ -318,13 +340,35 @@ impl LighterHalf {
                 )
                 .await
                 .context("having the station register this start's Lighter key")?;
-            let markets = self.api.markets().await?;
+            let markets = self.driver_markets().await?;
             let trader = lighter::Trader::new(&self.lighter_key, account, self.chain_id, markets)?;
             *held = Some((account, trader));
         }
         Ok(tokio::sync::MutexGuard::map(held, |held| {
             held.as_mut().expect("just made")
         }))
+    }
+
+    /// The markets the station's pinned driver lists, read from the chain,
+    /// as the exchange writes them: the only markets this key signs in.
+    async fn driver_markets(&self) -> Result<lighter::Markets> {
+        let listed: Vec<(u16, u8, u8)> = self
+            .chain
+            .read(self.driver, ILighterDriver::marketsCall {})
+            .await
+            .context("reading the markets the station's Lighter driver lists")?
+            .into_iter()
+            .map(|market| (market.index, market.sizeDecimals, market.priceDecimals))
+            .collect();
+        let markets = self.api.markets().await?.listed_by_driver(&listed)?;
+        if markets.iter().count() < listed.len() {
+            tracing::warn!(
+                station = %self.station,
+                listed = ?listed,
+                "the station's Lighter driver lists markets the exchange doesn't trade; nothing is signed in them"
+            );
+        }
+        Ok(markets)
     }
 
     pub async fn submit(&self, payload: &[u8]) -> Outcome<Vec<u8>> {
@@ -357,10 +401,10 @@ impl LighterHalf {
                     tx_hash,
                 }))
             }
+            // Refused by the exchange, or turned away before it: nothing
+            // was done.
+            Err(error) if lighter::api::not_taken(&error) => Outcome::Refused(format!("{error:#}")),
             // The exchange may have taken it before the answer was lost.
-            Err(error) if error.to_string().contains("refused") => {
-                Outcome::Refused(format!("{error:#}"))
-            }
             Err(error) => Outcome::Unknown(format!("{error:#}")),
         }
     }
@@ -444,23 +488,87 @@ impl LighterHalf {
         })
     }
 
-    /// Read the station's accounts and post them on the board, every
-    /// `REPORT_EVERY`, until the task is dropped.
+    /// Read the station's accounts and post them on the board every
+    /// [`REPORT_EVERY`], and at once when a close staged at the station has
+    /// passed its settle delay and no post read since then has been made
+    /// (only such a post can prove it), until the task is dropped. A post
+    /// that fails is tried again after [`RETRY_AFTER`]; no post waits on
+    /// one before it for longer than [`POST_TIMEOUT`].
     pub fn report_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let half = self.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(REPORT_EVERY);
+            let mut tick = tokio::time::interval(STAGE_LOOK_EVERY);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // When the last post was made or tried, and the chain time it
+            // was read at.
+            let mut last_try: Option<tokio::time::Instant> = None;
+            let mut last_failed = false;
+            let mut posted_as_of = 0u64;
+            let mut warned = crate::Throttle::default();
             loop {
                 tick.tick().await;
-                if let Err(error) = half.post().await {
-                    tracing::warn!(station = %half.station, error = %format!("{error:#}"), "the Lighter read wasn't posted");
+                let since = last_try.map(|at| at.elapsed());
+                let scheduled = match since {
+                    None => true,
+                    Some(since) if last_failed => since >= RETRY_AFTER,
+                    Some(since) => since >= REPORT_EVERY,
+                };
+                let proving = !scheduled
+                    && !(last_failed && since.is_some_and(|since| since < RETRY_AFTER))
+                    && half.stage_waits_for_a_post(posted_as_of).await;
+                if !scheduled && !proving {
+                    continue;
+                }
+                last_try = Some(tokio::time::Instant::now());
+                match tokio::time::timeout(POST_TIMEOUT, half.post()).await {
+                    Ok(Ok(Some(as_of))) => {
+                        posted_as_of = as_of;
+                        last_failed = false;
+                    }
+                    Ok(Ok(None)) => last_failed = false,
+                    Ok(Err(error)) => {
+                        last_failed = true;
+                        if warned.due(std::time::Instant::now()) {
+                            tracing::warn!(station = %half.station, error = %format!("{error:#}"), "the Lighter read wasn't posted");
+                        }
+                    }
+                    Err(_) => {
+                        last_failed = true;
+                        if warned.due(std::time::Instant::now()) {
+                            tracing::warn!(station = %half.station, "the Lighter read wasn't posted: it took more than {} s", POST_TIMEOUT.as_secs());
+                        }
+                    }
                 }
             }
         })
     }
 
-    /// One attested read of every account the station owns, posted.
-    pub async fn post(&self) -> Result<()> {
+    /// Whether a close is staged at the station, its settle delay has
+    /// passed by the chain's clock, and the newest post (read at
+    /// `posted_as_of`) was read before then, so it can't prove it.
+    async fn stage_waits_for_a_post(&self, posted_as_of: u64) -> bool {
+        use chain::bindings::station::IStation;
+        let Ok(stage) = self.chain.read(self.station, IStation::stageCall {}).await else {
+            return false;
+        };
+        if stage.stagedAt == 0 {
+            return false;
+        }
+        let due = stage.stagedAt.saturating_add(stage.delay);
+        if posted_as_of >= due {
+            return false;
+        }
+        match self.chain.head_and_time().await {
+            Ok((_, now)) => now >= due,
+            Err(_) => false,
+        }
+    }
+
+    /// One attested read of every account the station owns, posted: the
+    /// chain time it was read at, or `None` when the station has no account
+    /// to read. Any figure that can't be read, or reads too far apart in
+    /// time, and nothing is posted.
+    pub async fn post(&self) -> Result<Option<u64>> {
         let account = self
             .chain
             .read(
@@ -472,20 +580,31 @@ impl LighterHalf {
             .await?
             .to::<u64>();
         if account == 0 {
-            return Ok(());
+            return Ok(None);
         }
+        let started = tokio::time::Instant::now();
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or_default();
+        // Every market the exchange trades, not only the driver's: a
+        // position in one the driver doesn't list must be posted, so the
+        // driver sees it.
         let markets = self.api.markets().await?;
         let owned = self.api.accounts_of(&self.station.to_string()).await?;
         let mut accounts: Vec<serde_json::Value> = Vec::new();
-        for summary in owned["sub_accounts"]
+        let listed = owned["sub_accounts"]
             .as_array()
-            .into_iter()
-            .flatten()
-            .chain(std::iter::once(&serde_json::json!({ "index": account })))
-        {
-            let Some(index) = summary["index"].as_u64() else {
-                continue;
-            };
+            .ok_or_else(|| anyhow!("the station's accounts can't be read: {owned}"))?;
+        let mut indices = Vec::new();
+        for summary in listed {
+            let index = summary["index"]
+                .as_u64()
+                .ok_or_else(|| anyhow!("one of the station's accounts has no index: {summary}"))?;
+            indices.push(index);
+        }
+        indices.push(account);
+        for index in indices {
             if accounts
                 .iter()
                 .any(|known| known["index"].as_u64() == Some(index))
@@ -497,11 +616,16 @@ impl LighterHalf {
         let mut held = std::collections::BTreeSet::new();
         for account in &accounts {
             for position in account["positions"].as_array().into_iter().flatten() {
-                let open = position["position"]
+                // Anything but a size that reads as nothing is held: one
+                // that can't be read stops the post when it is built.
+                let flat = position["position"]
                     .as_str()
-                    .is_some_and(|size| size.parse::<f64>().unwrap_or(0.0) != 0.0);
-                if let (true, Some(market)) = (open, position["market_id"].as_u64()) {
-                    held.insert(market as u16);
+                    .and_then(|size| size.parse::<lighter::payload::Decimal>().ok())
+                    .is_some_and(|size| size.is_zero());
+                if let (false, Some(market)) = (flat, position["market_id"].as_u64())
+                    && let Ok(market) = u16::try_from(market)
+                {
+                    held.insert(market);
                 }
             }
         }
@@ -511,8 +635,13 @@ impl LighterHalf {
             let book = self.api.book_orders(market, 1).await?;
             prices.push(lighter::report::prices(market, &details, &book, &markets)?);
         }
+        let mut pools = Vec::new();
+        for pool in lighter::report::pools_held(&accounts) {
+            pools.push(self.api.account(pool).await?);
+        }
         let on_chain = self.on_chain().await?;
-        let report = lighter::report::build(on_chain, &accounts, &prices, &markets)?;
+        read_together(started.elapsed(), started_at, on_chain.as_of)?;
+        let report = lighter::report::build(on_chain, &accounts, &prices, &markets, &pools)?;
         tracing::info!(report = %lighter::report::describe(self.station, &report), "posting the Lighter read");
         self.key
             .send(
@@ -523,7 +652,45 @@ impl LighterHalf {
                 },
             )
             .await
-            .map(|_| ())
+            .map(|_| Some(on_chain.as_of))
             .map_err(|error| anyhow!("{error:#}"))
+    }
+}
+
+/// Whether a post's API reads (begun `started_at`, by the machine's clock,
+/// and taking `took` up to the end of the chain read) and its chain read (at
+/// a block of time `as_of`) are close enough to be posted as one reading.
+pub fn read_together(took: Duration, started_at: u64, as_of: u64) -> Result<()> {
+    if took > POST_READ_SPAN {
+        bail!(
+            "the exchange's API and the chain were read {} s apart, more than {} s: nothing is posted",
+            took.as_secs(),
+            POST_READ_SPAN.as_secs()
+        );
+    }
+    if as_of.saturating_add(POST_READ_SPAN.as_secs()) < started_at {
+        bail!(
+            "the chain's newest block is {} s older than the exchange's API read, more than {} s: nothing is posted",
+            started_at - as_of,
+            POST_READ_SPAN.as_secs()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_post_is_made_only_of_reads_close_together_in_time() {
+        let span = POST_READ_SPAN.as_secs();
+        assert!(read_together(Duration::from_secs(3), 1_000, 1_002).is_ok());
+        assert!(read_together(POST_READ_SPAN, 1_000, 1_000).is_ok());
+        // The reads took too long from the first API read to the chain's.
+        assert!(read_together(POST_READ_SPAN + Duration::from_secs(1), 1_000, 1_000).is_err());
+        // The chain's newest block predates the API read by too much.
+        assert!(read_together(Duration::from_secs(1), 1_000 + span + 1, 1_000).is_err());
+        assert!(read_together(Duration::from_secs(1), 1_000 + span, 1_000).is_ok());
     }
 }

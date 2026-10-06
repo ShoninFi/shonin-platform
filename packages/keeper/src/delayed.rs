@@ -5,10 +5,11 @@
 //!
 //! - a close is staged by the station for one claim or one holder's units;
 //!   the keeper calls `settleClose` once it would go through: to prove,
-//!   measure and sweep it, to ask again for its dollars once a delivery
-//!   window has passed without them, and to deliver it to the vault, which
-//!   pays whom it was for. While one is staged no claim is tried and no
-//!   units are served (the vault would refuse them);
+//!   measure and sweep it, and to deliver it to the vault, which pays whom
+//!   it was for, in whole or in part. Every stage ends within its windows.
+//!   While one is staged no claim is tried and no units are served (the
+//!   vault would refuse them), and the claim a close was last staged for
+//!   takes its next turn after the others;
 //! - a venue whose withdrawals wait in a pending balance until someone pays
 //!   them out (Lighter) has them paid out to the station whenever any is
 //!   pending, before the staged close is moved on;
@@ -17,8 +18,9 @@
 //!   anything: the keeper repeats it until nothing is left at the venue;
 //! - money the station's account put into one of the venue's own vaults
 //!   (which only its trading key could do) is found through the venue's API
-//!   and reclaimed: counted, brought back when its lock allows, and trading
-//!   through that driver ended.
+//!   (Hyperliquid's, asked beside the rounds) or the newest post (Lighter's
+//!   pools) and reclaimed: counted, brought back when its lock allows, and
+//!   trading through that driver ended.
 //!
 //! Every one of these calls is public and simulated before it is sent.
 
@@ -41,6 +43,16 @@ const VENUE_VAULTS_EVERY: Duration = Duration::from_secs(60);
 /// The longest wait between two stopped unwinds of a delayed station that
 /// find nothing changed at the venue.
 const MOST_SECONDS_BETWEEN_UNWINDS: u64 = 5 * 60;
+
+/// How many stopped unwinds in a row may find the venue as the last one left
+/// it before the keeper stops sending them until something changes there:
+/// an unwind that changes nothing is paid for and does nothing.
+const MOST_UNWINDS_UNCHANGED: u32 = 6;
+
+/// How long the keeper waits for a venue's API before giving up on it for
+/// this look; asked off the vault's round, so a slow API never holds a
+/// valuation up.
+const VENUE_API_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// One driver of the station's whose venue acts after the transaction.
 #[derive(Clone, Debug, PartialEq)]
@@ -69,8 +81,19 @@ pub struct Pace {
     pub seen: B256,
     /// How many slots it was told to wait.
     pub wait: u64,
-    /// The first chain time the next may be sent.
+    /// The first chain time the next may be sent; `u64::MAX` once the venue
+    /// has read the same for [`MOST_UNWINDS_UNCHANGED`] unwinds in a row, when
+    /// only a change there sends another.
     pub next: u64,
+    /// The unwinds in a row that found the venue as the last one left it.
+    pub unchanged: u32,
+}
+
+impl Pace {
+    /// Whether the keeper has stopped unwinding until the venue changes.
+    pub fn ended(&self) -> bool {
+        self.next == u64::MAX
+    }
 }
 
 /// The station's delayed drivers, read once and remembered. A station built
@@ -107,11 +130,12 @@ pub async fn drivers_of(
 }
 
 /// Move a staged close on, if one is in progress and the station would take
-/// the call now (it is simulated first): in a block after the stage, to prove,
-/// measure and sweep it (or let it lapse once its window has passed
-/// unproved); once its dollars have landed, to deliver it; a window after a
-/// sweep whose dollars haven't come, to ask for them again. A call that
-/// can't go yet (`NotYet`) is simply tried next round, and nothing is sent.
+/// the call now (it is simulated first): once its settle delay has passed, to
+/// prove, measure and sweep it (wholly closed, or, its window over, for the
+/// part that closed); once its dollars have landed, or a delivery window
+/// after the ask, to deliver it, in whole or the part that landed. A call
+/// that can't go yet (`NotYet`) is simply tried next round, and nothing is
+/// sent.
 pub async fn settle_close(client: &Client, keeper: Address, station: Address) -> Result<()> {
     let stage = client.read(station, IStation::stageCall {}).await?;
     let Some(what) = close_step(stage.stagedAt, stage.sweptBlock) else {
@@ -134,15 +158,49 @@ pub async fn settle_close(client: &Client, keeper: Address, station: Address) ->
 pub fn close_step(staged_at: u64, swept_block: u64) -> Option<&'static str> {
     match (staged_at, swept_block) {
         (0, _) => None,
-        (_, 0) => Some("prove, measure and sweep the staged close, or let it lapse"),
-        _ => Some("deliver the staged close, or ask again for its dollars"),
+        (_, 0) => Some("prove, measure and sweep the staged close, or end it with its window"),
+        _ => Some("deliver the staged close, or the part of it that has landed"),
     }
 }
 
 alloy::sol! {
+    struct LighterPosition {
+        uint48 account;
+        uint16 market;
+        int64 size;
+    }
+    struct LighterPrice {
+        uint16 market;
+        uint32 mark;
+        uint32 index;
+        uint32 bid;
+        uint32 ask;
+    }
+    struct LighterShares {
+        uint48 account;
+        uint48 pool;
+        uint64 shares;
+        uint256 value;
+    }
+    struct LighterReport {
+        uint64 asOf;
+        uint48[] accounts;
+        uint256 equity;
+        uint256 pending;
+        uint256 arrived;
+        uint256 sent;
+        uint256[] available;
+        LighterPosition[] positions;
+        LighterPrice[] prices;
+        LighterShares[] pools;
+    }
     interface ILighterDriver {
         function exchange() external view returns (address);
         function DOLLAR_ASSET() external view returns (uint16);
+        function board() external view returns (address);
+    }
+    interface ILighterBoard {
+        function reportOf(address station) external view returns (LighterReport memory report, bool exists);
     }
     interface ILighterExchange {
         function getPendingBalance(address owner, uint16 assetIndex) external view returns (uint128);
@@ -231,25 +289,35 @@ pub fn unwind_wanted(work: &Work, worth_sending_home: bool) -> bool {
 /// Whether the next stopped unwind may go now, and the pace after it. One a
 /// slot while the venue keeps changing (orders filling, dollars landing);
 /// when the venue reads the same as at the last one (a sweep the venue keeps
-/// dropping, an order it keeps refusing), twice as long each time, up to
-/// [`MOST_SECONDS_BETWEEN_UNWINDS`].
+/// dropping, an order it keeps refusing, a stale post's orders), twice as
+/// long each time, up to [`MOST_SECONDS_BETWEEN_UNWINDS`], and after
+/// [`MOST_UNWINDS_UNCHANGED`] such unwinds in a row none at all until the
+/// venue reads differently.
 pub fn pace(before: Option<&Pace>, seen: B256, now: u64, slot_interval: u64) -> Option<Pace> {
     let interval = slot_interval.max(1);
     let most = (MOST_SECONDS_BETWEEN_UNWINDS / interval).max(1);
     match before {
-        Some(before) if now < before.next => None,
+        Some(before) if before.ended() && before.seen == seen => None,
+        Some(before) if !before.ended() && now < before.next => None,
         Some(before) if before.seen == seen => {
+            let unchanged = before.unchanged + 1;
             let wait = (before.wait * 2).clamp(1, most);
             Some(Pace {
                 seen,
                 wait,
-                next: now + wait * interval,
+                next: if unchanged >= MOST_UNWINDS_UNCHANGED {
+                    u64::MAX
+                } else {
+                    now + wait * interval
+                },
+                unchanged,
             })
         }
         _ => Some(Pace {
             seen,
             wait: 1,
             next: now + interval,
+            unchanged: 0,
         }),
     }
 }
@@ -287,6 +355,9 @@ pub async fn work(client: &Client, station: Address, drivers: &[DelayedDriver]) 
         } else if !closing.calls.is_empty() {
             work.orders = true;
         }
+        // The orders themselves: a band that has widened since names new
+        // limits, which is a change worth an unwind.
+        let close_data: Vec<Bytes> = closing.calls.into_iter().map(|call| call.data).collect();
         let sweeping = client
             .read(
                 driver.implementation,
@@ -306,7 +377,16 @@ pub async fn work(client: &Client, station: Address, drivers: &[DelayedDriver]) 
             )
             .await?;
         let sweep_data: Vec<Bytes> = sweeping.into_iter().map(|call| call.data).collect();
-        seen.push((driver.name, exposure, sweep_data).abi_encode());
+        seen.push(
+            (
+                driver.name,
+                exposure,
+                sweep_data,
+                close_data,
+                closing.blocked,
+            )
+                .abi_encode(),
+        );
     }
     seen.push(work.sent_home.abi_encode());
     work.seen = keccak256(seen.concat());
@@ -331,7 +411,7 @@ pub async fn unwind_stopped(
     if memory
         .unwinds
         .as_ref()
-        .is_some_and(|before| now < before.next)
+        .is_some_and(|before| !before.ended() && now < before.next)
     {
         return Ok(());
     }
@@ -418,8 +498,105 @@ pub fn reclaim_wanted(listed: bool, equity: U256, calls: usize) -> bool {
     (!listed && equity != U256::ZERO) || (listed && calls != 0)
 }
 
+/// The pools a Lighter post names the station's accounts holding shares in,
+/// each pool's index as the station and the driver name it: as an address.
+pub fn pools_from(report: &LighterReport) -> Vec<Address> {
+    let mut pools = Vec::new();
+    for shares in &report.pools {
+        if shares.shares == 0 {
+            continue;
+        }
+        let index: u64 = shares.pool.to();
+        let mut bytes = [0u8; 20];
+        bytes[12..].copy_from_slice(&index.to_be_bytes());
+        let pool = Address::from(bytes);
+        if !pools.contains(&pool) {
+            pools.push(pool);
+        }
+    }
+    pools
+}
+
+/// What a venue's API last said about a station's venue vaults, and whether
+/// a look is out now.
+#[derive(Default)]
+struct Looked {
+    at: Option<Instant>,
+    vaults: Vec<Address>,
+    asking: bool,
+}
+
+/// The venue vaults each station was last found holding money in, by API
+/// and station, filled in by looks that run beside the rounds.
+static VENUE_VAULTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(&'static str, Address), Looked>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The venue vaults the API last named for `station`, and a new look sent
+/// off beside the round if the last is older than [`VENUE_VAULTS_EVERY`].
+/// Never waits for the API: a slow or hanging one costs no vault its
+/// valuation window, only the freshness of this list.
+fn venue_vaults_known(http: &reqwest::Client, url: &'static str, station: Address) -> Vec<Address> {
+    let mut looked = VENUE_VAULTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = looked.entry((url, station)).or_default();
+    let stale = entry.at.is_none_or(|at| at.elapsed() >= VENUE_VAULTS_EVERY);
+    if stale && !entry.asking {
+        entry.asking = true;
+        let http = http.clone();
+        tokio::spawn(async move {
+            let found =
+                tokio::time::timeout(VENUE_API_TIMEOUT, ask_venue_vaults(&http, url, station))
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|found| found);
+            let mut looked = VENUE_VAULTS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entry = looked.entry((url, station)).or_default();
+            entry.asking = false;
+            entry.at = Some(Instant::now());
+            match found {
+                Ok(vaults) => entry.vaults = vaults,
+                Err(error) => {
+                    tracing::debug!(%station, error = format!("{error:#}"), "the venue's API did not say where the station's money is");
+                }
+            }
+        });
+    }
+    entry.vaults.clone()
+}
+
+async fn ask_venue_vaults(
+    http: &reqwest::Client,
+    url: &str,
+    station: Address,
+) -> Result<Vec<Address>> {
+    let answer: serde_json::Value = http
+        .post(url)
+        .timeout(VENUE_API_TIMEOUT)
+        .json(&serde_json::json!({
+            "type": "userVaultEquities",
+            "user": format!("{station:#x}"),
+        }))
+        .send()
+        .await
+        .context("asking the venue for the station's vaults")?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(venue_vaults_from(&answer)
+        .into_iter()
+        .map(|vault| vault.address)
+        .collect())
+}
+
 /// Find money the station's account put into the venue's own vaults, and
-/// reclaim it. Looked at once a minute per station.
+/// reclaim it: on Hyperliquid from what its API last said (asked beside the
+/// rounds, never waited for), on Lighter from the pools the newest post
+/// names, and in either case every vault already listed. Looked at once a
+/// minute per station.
 pub async fn reclaim(
     client: &Client,
     http: &reqwest::Client,
@@ -436,25 +613,23 @@ pub async fn reclaim(
     }
     memory.venue_vaults_at = Some(Instant::now());
     for driver in drivers {
-        let Some(url) = venue_api(driver.name, client.chain_id) else {
+        let mut candidates = if let Some(url) = venue_api(driver.name, client.chain_id) {
+            venue_vaults_known(http, url, station)
+        } else if driver.name == name_word("lighter") {
+            let board = client
+                .read(driver.implementation, ILighterDriver::boardCall {})
+                .await?;
+            let post = client
+                .read(board, ILighterBoard::reportOfCall { station })
+                .await?;
+            if post.exists {
+                pools_from(&post.report)
+            } else {
+                Vec::new()
+            }
+        } else {
             continue;
         };
-        let answer: serde_json::Value = http
-            .post(url)
-            .json(&serde_json::json!({
-                "type": "userVaultEquities",
-                "user": format!("{station:#x}"),
-            }))
-            .send()
-            .await
-            .context("asking the venue for the station's vaults")?
-            .error_for_status()?
-            .json()
-            .await?;
-        let mut candidates: Vec<Address> = venue_vaults_from(&answer)
-            .into_iter()
-            .map(|vault| vault.address)
-            .collect();
         let listed = client
             .read(
                 station,
@@ -567,20 +742,63 @@ mod tests {
     }
 
     #[test]
-    fn a_delayed_unwind_that_changes_nothing_backs_off_to_five_minutes() {
+    fn a_delayed_unwind_that_changes_nothing_backs_off_and_then_stops_until_the_venue_changes() {
         let same = B256::repeat_byte(7);
         let mut now = 0;
         let mut before = pace(None, same, now, 10).unwrap();
         let mut waits = Vec::new();
-        for _ in 0..8 {
+        while !before.ended() {
             now = before.next;
             before = pace(Some(&before), same, now, 10).unwrap();
             waits.push(before.wait);
         }
-        assert_eq!(waits, vec![2, 4, 8, 16, 30, 30, 30, 30]);
+        assert_eq!(waits, vec![2, 4, 8, 16, 30, 30]);
+        // Ended: however long after, nothing while the venue reads the same.
+        assert_eq!(pace(Some(&before), same, now + 1_000_000, 10), None);
         // A change at the venue brings it back to every slot.
-        let changed = pace(Some(&before), B256::repeat_byte(8), before.next, 10).unwrap();
+        let changed = pace(Some(&before), B256::repeat_byte(8), now + 5, 10).unwrap();
         assert_eq!(changed.wait, 1);
+        assert_eq!(changed.next, now + 15);
+        assert!(!changed.ended());
+    }
+
+    #[test]
+    fn the_pools_a_post_names_are_the_ones_reclaimed() {
+        use alloy::primitives::aliases::U48;
+        let shares = |pool: u64, shares: u64| LighterShares {
+            account: U48::from(7u64),
+            pool: U48::from(pool),
+            shares,
+            value: U256::from(1u64),
+        };
+        let report = LighterReport {
+            asOf: 0,
+            accounts: vec![],
+            equity: U256::ZERO,
+            pending: U256::ZERO,
+            arrived: U256::ZERO,
+            sent: U256::ZERO,
+            available: vec![],
+            positions: vec![],
+            prices: vec![],
+            pools: vec![
+                shares(281_474_976_710_654, 5),
+                shares(3, 0),
+                shares(281_474_976_710_654, 1),
+            ],
+        };
+        let pools = pools_from(&report);
+        assert_eq!(
+            pools.len(),
+            1,
+            "a pool with no shares is left out, and each pool named once"
+        );
+        assert_eq!(
+            pools[0],
+            "0x0000000000000000000000000000fffffffffffe"
+                .parse::<Address>()
+                .unwrap()
+        );
     }
 
     #[test]

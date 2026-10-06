@@ -37,6 +37,6 @@ author = 0.001
 # is given `activation_usd` on HyperCore so it exists there, and switched to
 # big blocks, since some contracts are larger than a small block's 2M gas.
 [hyperliquid]
-max_price = 35.0
+max_price = 60.0
 max_per_run = 3.0
 activation_usd = 2.0
