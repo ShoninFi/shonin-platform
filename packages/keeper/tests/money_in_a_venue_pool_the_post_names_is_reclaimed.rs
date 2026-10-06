@@ -51,6 +51,7 @@ alloy::sol! {
         uint48[] accounts;
         uint256 equity;
         uint256 pending;
+        uint256 inFlight;
         uint256 arrived;
         uint256 sent;
         uint256[] available;
@@ -156,6 +157,7 @@ async fn money_in_a_venue_pool_the_post_names_is_reclaimed() {
     );
 
     answers(&node, DRIVER, IDriver::exitPathCall {}, ExitPath::Delayed);
+    answers(&node, DRIVER, IDriver::nameCall {}, name("lighter"));
     answers(&node, DRIVER, ILighterDriver::exchangeCall {}, EXCHANGE);
     answers(&node, DRIVER, ILighterDriver::DOLLAR_ASSETCall {}, 3);
     answers(&node, DRIVER, ILighterDriver::boardCall {}, BOARD);
@@ -180,6 +182,7 @@ async fn money_in_a_venue_pool_the_post_names_is_reclaimed() {
                 accounts: vec![U48::from(7u64)],
                 equity: U256::from(20_000_000_000u64),
                 pending: U256::ZERO,
+                inFlight: U256::ZERO,
                 arrived: U256::ZERO,
                 sent: U256::from(25_000_000_000u64),
                 available: vec![U256::from(20_000_000_000u64)],

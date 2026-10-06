@@ -72,6 +72,7 @@ async fn a_claim_whose_close_keeps_ending_unpaid_does_not_keep_the_next_claim_fr
     answers(&node, STATION, IStation::outsideBandCall {}, false);
     answers(&node, STATION, IStation::heldInCall { driver }, vec![]);
     answers(&node, DRIVER, IDriver::exitPathCall {}, ExitPath::Delayed);
+    answers(&node, DRIVER, IDriver::nameCall {}, driver);
     {
         let mut locked = node.lock().unwrap();
         for var in [

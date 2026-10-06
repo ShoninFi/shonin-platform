@@ -39,6 +39,10 @@ pub enum Delivery {
     /// A later send of the same bytes was refused as a duplicate nonce: the
     /// action arrived, and the answer to it was lost.
     Arrived,
+    /// A later send of the same bytes was answered with an error in other
+    /// words: an earlier send may have arrived and be acting (the error may be
+    /// the venue's word for a nonce it already took), so it is not a refusal.
+    ResentAndErred(String),
     /// No answer came back to any send: it may or may not have arrived.
     Unanswered(String),
 }
@@ -147,7 +151,9 @@ impl Api {
     /// all. The venue takes an action's nonce once, so a second send can
     /// never act a second time: it is either the action's first arrival,
     /// answered as such, or refused as a duplicate nonce, which says the
-    /// first arrived.
+    /// first arrived. Any other error answering a later send can't say which
+    /// (it is [`Delivery::ResentAndErred`], never a refusal): only an error
+    /// answering the first send is the venue's refusal.
     pub async fn deliver(&self, body: &Value) -> Delivery {
         let url = format!("{}/exchange", self.base);
         let mut pause = Duration::from_millis(1_000);
@@ -176,6 +182,12 @@ impl Api {
                 why = format!("HyperCore answered {status}: {}", cut(&text));
                 continue;
             }
+            if !status.is_success() && send > 0 {
+                return Delivery::ResentAndErred(format!(
+                    "HyperCore answered a later send of it with {status}: {}",
+                    cut(&text)
+                ));
+            }
             if !status.is_success() {
                 // The venue turned the request itself away (a body it can't
                 // read): nothing was done.
@@ -194,6 +206,15 @@ impl Api {
             }
             if send > 0 && duplicate_nonce(&answer) {
                 return Delivery::Arrived;
+            }
+            // Only the answer to the first send says the venue refused it: an
+            // error answering a later one may be about that send alone, while
+            // an earlier one rests.
+            if send > 0 && answer["status"] == "err" {
+                return Delivery::ResentAndErred(format!(
+                    "HyperCore answered a later send of it with an error: {}",
+                    answer["response"]
+                ));
             }
             return Delivery::Answered(answer);
         }
@@ -546,6 +567,9 @@ impl HyperCore {
             }
             Delivery::Answered(answer) => bail!("{REFUSED}: {}", answer["response"]),
             Delivery::Arrived => bail!("{ARRIVED}"),
+            Delivery::ResentAndErred(why) => {
+                bail!("the action may still have been done: {why}")
+            }
             Delivery::Unanswered(why) => {
                 bail!("HyperCore never answered the action, which may still have been done: {why}")
             }

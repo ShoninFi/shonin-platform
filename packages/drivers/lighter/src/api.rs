@@ -139,6 +139,15 @@ impl Api {
             .await
     }
 
+    /// One transaction by its hash: what the exchange carried out, in which
+    /// of its blocks, and when.
+    pub async fn tx(&self, hash: &str) -> Result<Value> {
+        if hash.is_empty() || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!("{hash:?} is not a transaction hash");
+        }
+        self.get(&format!("/api/v1/tx?by=hash&value={hash}")).await
+    }
+
     pub async fn next_nonce(&self, account: u64, api_key: u8) -> Result<i64> {
         let answer = self
             .get(&format!(
@@ -173,6 +182,93 @@ impl Api {
             .await
             .context("reading Lighter's answer to a transaction, which it may have taken")?;
         sent(status.as_u16(), &text)
+    }
+}
+
+/// Lighter's public explorer API for each instance: the exchange's batches
+/// and blocks, and each account's logs.
+pub const MAINNET_EXPLORER: &str = "https://explorerapi.rh.lighter.xyz/api";
+pub const TESTNET_EXPLORER: &str = "https://explorerapi.rh-testnet.lighter.xyz/api";
+
+/// The most withdrawals asked of the explorer at once (its own limit).
+pub const EXPLORER_PAGE: u64 = 100;
+
+/// Lighter's explorer API. Its answers pass through a cache in front of it,
+/// so every read carries a mark of its own and asks for no cached answer:
+/// what is read is what the explorer knows now.
+#[derive(Clone, Debug)]
+pub struct Explorer {
+    base: String,
+    http: reqwest::Client,
+}
+
+impl Explorer {
+    pub fn new(base: impl Into<String>) -> Self {
+        Self {
+            base: base.into(),
+            http: reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .connect_timeout(CONNECT_TIMEOUT)
+                .build()
+                .expect("an HTTP client with a timeout"),
+        }
+    }
+
+    async fn get(&self, path: &str) -> Result<Value> {
+        let fresh = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default();
+        let joiner = if path.contains('?') { '&' } else { '?' };
+        let url = format!("{}{path}{joiner}fresh={fresh}", self.base);
+        let response = self
+            .http
+            .get(&url)
+            .header("cache-control", "no-cache")
+            .send()
+            .await
+            .with_context(|| format!("asking Lighter's explorer {path}"))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .with_context(|| format!("reading Lighter's explorer's answer to {path}"))?;
+        if !status.is_success() {
+            bail!(
+                "Lighter's explorer answered {path} with {status}: {}",
+                cut(&text)
+            );
+        }
+        serde_json::from_str(&text)
+            .with_context(|| format!("Lighter's explorer's answer to {path}: {}", cut(&text)))
+    }
+
+    /// An account's withdrawal logs, newest first, from the `offset`th:
+    /// at most [`EXPLORER_PAGE`].
+    pub async fn withdrawals(&self, account: u64, offset: u64) -> Result<Vec<Value>> {
+        let kinds = crate::withdrawals::WITHDRAW_LOGS.join(",");
+        let answer = self
+            .get(&format!(
+                "/accounts/{account}/logs?pub_data_type={kinds}&limit={EXPLORER_PAGE}&offset={offset}"
+            ))
+            .await?;
+        match answer {
+            Value::Array(logs) => Ok(logs),
+            other => bail!(
+                "Lighter's explorer's list of account {account}'s withdrawals can't be read: {}",
+                cut(&other.to_string())
+            ),
+        }
+    }
+
+    /// One batch, with every block in it.
+    pub async fn batch(&self, number: u64) -> Result<Value> {
+        self.get(&format!("/batches/{number}")).await
+    }
+
+    /// The newest blocks the explorer has.
+    pub async fn newest_blocks(&self) -> Result<Value> {
+        self.get("/blocks?limit=1").await
     }
 }
 

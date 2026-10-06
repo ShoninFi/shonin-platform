@@ -126,6 +126,7 @@ async fn a_stopped_station_whose_venue_never_changes_is_not_unwound_for_good() {
     );
 
     answers(&node, DRIVER, IDriver::exitPathCall {}, ExitPath::Delayed);
+    answers(&node, DRIVER, IDriver::nameCall {}, name("lighter"));
     answers(&node, DRIVER, IPendingDriver::exchangeCall {}, EXCHANGE);
     answers(&node, DRIVER, IPendingDriver::DOLLAR_ASSETCall {}, 3);
     answers(

@@ -2687,7 +2687,10 @@ async fn units(
         };
         // Not while a priced valuation is settling, or while that can't be
         // read: the serve is refused until it is done, and may pay them then.
-        if halted == 0 && now >= since + freeze_after && settled(client, vault).await {
+        // Nor while a staged close holds every serve off, as for claims: the
+        // serve is tried once it has ended (within its windows).
+        if units_freeze_due(halted, now, since, freeze_after, held) && settled(client, vault).await
+        {
             send(
                 client,
                 keeper,
@@ -2704,6 +2707,13 @@ async fn units(
         memory.serve_again.remove(&holder);
     }
     Ok(read_to_head && !unread && memory.holders.is_empty())
+}
+
+/// Whether a holder's units left unserved since `since` are due a freeze:
+/// a week (`freeze_after`) after, in a vault not halted, and not while a
+/// close staged at the home station holds their serve off.
+fn units_freeze_due(halted: u64, now: u64, since: u64, freeze_after: u64, held: bool) -> bool {
+    halted == 0 && !held && now >= since.saturating_add(freeze_after)
 }
 
 /// Read on through the vault's log for whoever has taken units, from where
@@ -4784,6 +4794,18 @@ mod tests {
     use alloy::sol_types::SolCall;
     use chain::bindings::station::StationSpec;
     use chain::bindings::vault::{Claim, Valuation};
+
+    #[test]
+    fn units_a_staged_close_holds_off_are_never_frozen_for_meanwhile() {
+        let week = 7 * 24 * 3600;
+        // A week unserved, nothing staged: due.
+        assert!(units_freeze_due(0, 1_000 + week, 1_000, week, false));
+        // The same while a close is staged: held off, as a claim is.
+        assert!(!units_freeze_due(0, 1_000 + week, 1_000, week, true));
+        // Not yet a week, or the vault halted: never.
+        assert!(!units_freeze_due(0, 999 + week, 1_000, week, false));
+        assert!(!units_freeze_due(5, 1_000 + week, 1_000, week, false));
+    }
 
     use crate::stand_in::{
         BETWEEN_SLOTS, Failing, Hook, KEEPER, SLOT_START, STATION, Shared, VAULT, answers, connect,

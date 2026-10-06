@@ -109,8 +109,11 @@ async fn a_probe_turned_away_now_and_then_does_not_have_the_unwind_sent_unsimula
     }
     let rpc = serve_node(node.clone()).await;
     let keeper = start_keeper("flaky-probe", &rpc, "http://127.0.0.1:1");
+    // Each turned-away probe is asked again a few times before the check
+    // gives up on it (a rate limit, as the chain client treats any read), so
+    // the rounds take longer than they would.
     assert!(
-        wait_until(Duration::from_secs(200), || {
+        wait_until(Duration::from_secs(300), || {
             node.lock().unwrap().vars["rounds"] >= 41
         })
         .await,

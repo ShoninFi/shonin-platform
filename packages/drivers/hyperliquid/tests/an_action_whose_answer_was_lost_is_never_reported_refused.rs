@@ -56,6 +56,11 @@ enum Exchange {
     /// Lose the first send on the way (it never arrives), and answer the
     /// next as a venue does.
     LoseTheFirstSend,
+    /// Take the first send of a nonce and lose its answer; answer any later
+    /// send of it with an error in words other than a duplicate nonce's.
+    TakeAndErrOnTheNextInOtherWords,
+    /// Take the order and answer with no status for it.
+    AnswerWithNoStatus,
 }
 
 /// What the stand-in's record says of an order it took.
@@ -101,8 +106,18 @@ async fn venue(exchange: Exchange, record: Record) -> (String, Arc<Mutex<Seen>>)
                         return;
                     }
                     if !seen.taken.insert(nonce) {
-                        json!({"status": "err", "response": "Invalid nonce: duplicate nonce"})
-                    } else if matches!(exchange, Exchange::TakeAndLoseTheAnswer) {
+                        if matches!(exchange, Exchange::TakeAndErrOnTheNextInOtherWords) {
+                            json!({"status": "err", "response": "Insufficient margin to place order."})
+                        } else {
+                            json!({"status": "err", "response": "Invalid nonce: duplicate nonce"})
+                        }
+                    } else if matches!(exchange, Exchange::AnswerWithNoStatus) {
+                        json!({"status": "ok", "response": {"type": "order",
+                            "data": {"statuses": []}}})
+                    } else if matches!(
+                        exchange,
+                        Exchange::TakeAndLoseTheAnswer | Exchange::TakeAndErrOnTheNextInOtherWords
+                    ) {
                         // Taken, and the answer lost.
                         return;
                     } else {
@@ -319,4 +334,52 @@ async fn every_order_is_sent_with_a_client_id_to_look_it_up_by() {
     let seen = seen.lock().unwrap();
     let client = seen.sent[0]["action"]["orders"][0]["c"].as_str().unwrap();
     assert_eq!(client.len(), 34, "0x and 32 hex digits: {client}");
+}
+
+#[tokio::test]
+async fn any_error_answering_a_later_send_leads_to_the_venue_s_record_never_to_refused() {
+    let (url, seen) = venue(
+        Exchange::TakeAndErrOnTheNextInOtherWords,
+        Record::Order("open", vec![]),
+    )
+    .await;
+
+    let outcome = trader(&url).outcome(&order(Tif::Gtc)).await;
+
+    assert!(seen.lock().unwrap().sent.len() >= 2, "it was sent again");
+    assert_eq!(
+        outcome,
+        Outcome::Accepted(Receipt::Resting { order_id: OID }),
+        "the first send rests, whatever the later one was answered"
+    );
+}
+
+#[tokio::test]
+async fn an_error_answering_a_later_send_with_no_record_to_read_is_unknown_never_refused() {
+    let (url, _) = venue(Exchange::TakeAndErrOnTheNextInOtherWords, Record::None).await;
+
+    let outcome = trader(&url).outcome(&order(Tif::Gtc)).await;
+
+    assert!(
+        matches!(outcome, Outcome::Unknown(_)),
+        "an error answering a later send says nothing of the first: {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_order_answered_with_no_status_is_looked_up_never_taken_for_done() {
+    let (url, _) = venue(Exchange::AnswerWithNoStatus, Record::Order("open", vec![])).await;
+    let outcome = trader(&url).outcome(&order(Tif::Gtc)).await;
+    assert_eq!(
+        outcome,
+        Outcome::Accepted(Receipt::Resting { order_id: OID }),
+        "what the order did is read from the venue's record"
+    );
+
+    let (url, _) = venue(Exchange::AnswerWithNoStatus, Record::None).await;
+    let outcome = trader(&url).outcome(&order(Tif::Gtc)).await;
+    assert!(
+        matches!(outcome, Outcome::Unknown(_)),
+        "no status and no record: unknown, never done: {outcome:?}"
+    );
 }

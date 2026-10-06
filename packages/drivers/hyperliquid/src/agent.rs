@@ -476,6 +476,12 @@ impl Trader {
                 self.look_up(action, &wire, nonce, true, crate::api::ARRIVED.to_string())
                     .await
             }
+            // An error answering a later send: the first may rest, so what
+            // it did is looked up, as for a lost answer.
+            Delivery::ResentAndErred(why) => {
+                let why = format!("an earlier send may have been done: {why}");
+                self.look_up(action, &wire, nonce, false, why).await
+            }
             Delivery::Unanswered(why) => {
                 let why =
                     format!("HyperCore never answered, so the action may still be done: {why}");
@@ -730,9 +736,11 @@ fn receipt(wire: &Wire, response: &Value) -> Read {
                     _ => Read::Unreadable(format!("the venue's fill can't be read: {status}")),
                 };
             }
-            if status == "success" || status.is_null() {
+            if status == "success" {
                 return Read::Receipt(Receipt::Done);
             }
+            // A missing status says nothing of what the order did: it is
+            // looked up, never taken for done.
             Read::Unreadable(format!(
                 "the venue's answer is not one this driver reads: {status}"
             ))
@@ -742,7 +750,12 @@ fn receipt(wire: &Wire, response: &Value) -> Read {
             if let Some(error) = status["error"].as_str() {
                 return Read::Refused(format!("the venue refused the cancel: {error}"));
             }
-            Read::Receipt(Receipt::Done)
+            if status == "success" {
+                return Read::Receipt(Receipt::Done);
+            }
+            Read::Unreadable(format!(
+                "the venue's answer to the cancel is not one this driver reads: {status}"
+            ))
         }
         _ => Read::Receipt(Receipt::Done),
     }

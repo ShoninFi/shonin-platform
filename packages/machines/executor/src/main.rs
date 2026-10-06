@@ -1116,6 +1116,13 @@ async fn serve(
         )
         .await?;
     let recorded = recorded_for(&store, &registered, bundle, &network)?;
+    // Which half serves a driver is told by its name in the recorded
+    // manifest: a manifest may only name drivers on the published list,
+    // which is compiled into this image and fixes what each name is, and the
+    // station pins its drivers under the manifest's names. Each half then
+    // works under the name it was pinned under, and refuses to start unless
+    // the station lists that name and pinned a driver under it.
+    //
     // A Hyperliquid vault's account is traded by this vault's own key as the
     // station's agent; its events go to the vault's feed for as long as it
     // is served.
@@ -1123,7 +1130,9 @@ async fn serve(
     // It also keeps a little HYPE on HyperCore for the account's sends home,
     // buying some on the pinned HYPE/USDC pair when it runs low.
     let (hyperliquid, _hyperliquid_events, _hyperliquid_hype) = if names(hyperliquid::DRIVER) {
-        let half = hyperliquid::Half::connect(&chain, vault, station, key_for(vault)).await?;
+        let half =
+            hyperliquid::Half::connect(&chain, vault, station, key_for(vault), hyperliquid::DRIVER)
+                .await?;
         let events = AbortOnDrop(half.forward_events(account_events.sender()));
         let hype = AbortOnDrop(half.hype_loop());
         (Some(half), Some(events), Some(hype))
@@ -1135,12 +1144,17 @@ async fn serve(
     // the station registers, and whose accounts this executor posts on the
     // board for as long as it serves the vault.
     let stocks = if names(robinhood::ROBINHOOD) {
-        Some(robinhood::StockHalf::connect(&chain, key.clone(), station).await?)
+        Some(
+            robinhood::StockHalf::connect(&chain, key.clone(), station, robinhood::ROBINHOOD)
+                .await?,
+        )
     } else {
         None
     };
     let (lighter, _lighter_posts) = if names(robinhood::LIGHTER) {
-        let half = robinhood::LighterHalf::connect(&chain, key.clone(), station).await?;
+        let half =
+            robinhood::LighterHalf::connect(&chain, key.clone(), station, robinhood::LIGHTER)
+                .await?;
         let posts = AbortOnDrop(half.report_loop());
         (Some(half), Some(posts))
     } else {
@@ -1797,7 +1811,7 @@ async fn key_driver(chain: &Client, station: Address) -> Result<B256> {
 
 /// [`key_driver`], from the station's list of drivers.
 fn key_driver_of(drivers: &[B256]) -> Option<B256> {
-    let own_key = chain::names::name(b"lighter");
+    let own_key = chain::names::name(robinhood::LIGHTER.as_bytes());
     drivers
         .iter()
         .find(|driver| **driver != own_key)

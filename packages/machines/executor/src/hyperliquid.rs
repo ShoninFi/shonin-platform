@@ -38,8 +38,13 @@ alloy::sol! {
 
 /// The driver's name as a station keys it: the name, zero-padded.
 pub fn driver_name() -> B256 {
+    name_of(DRIVER)
+}
+
+/// A driver's name as a station keys it: the name, zero-padded.
+fn name_of(driver: &str) -> B256 {
     let mut name = [0u8; 32];
-    name[..DRIVER.len()].copy_from_slice(DRIVER.as_bytes());
+    name[..driver.len()].copy_from_slice(driver.as_bytes());
     B256::from(name)
 }
 
@@ -53,25 +58,39 @@ pub struct Half {
 }
 
 impl Half {
-    /// Read what the station's pinned driver lists, and the venue's numbers
-    /// for it, and hold `agent` to them.
+    /// Read what the driver the station pinned under `pinned_as` (the name
+    /// the vault's recorded manifest gives it) lists, and the venue's
+    /// numbers for it, and hold `agent` to them.
     pub async fn connect(
         chain: &Client,
         vault: Address,
         station: Address,
         agent: PrivateKeySigner,
+        pinned_as: &str,
     ) -> Result<Arc<Self>> {
         let api = Api::for_chain(chain.chain_id)
             .ok_or_else(|| anyhow!("chain {} is not HyperEVM", chain.chain_id))?;
+        let spec = chain
+            .read(station, chain::bindings::station::IStation::specCall {})
+            .await
+            .context("reading the station's drivers")?;
+        if !spec.drivers.contains(&name_of(pinned_as)) {
+            anyhow::bail!(
+                "the station doesn't list the {pinned_as} driver the vault's manifest names"
+            );
+        }
         let driver = chain
             .read(
                 station,
                 IPinnedStation::pinnedDriverCall {
-                    driver: driver_name(),
+                    driver: name_of(pinned_as),
                 },
             )
             .await
             .context("reading the station's pinned Hyperliquid driver")?;
+        if driver == Address::ZERO {
+            anyhow::bail!("the station has no driver pinned as {pinned_as}");
+        }
         let perps: Vec<u32> = chain
             .read(driver, IHyperliquidDriver::perpsCall {})
             .await?
@@ -193,9 +212,6 @@ const HYPE_LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 const HYPE_BUY_SPACING_MS: u64 = 600_000;
 const HYPE_BUYS_A_DAY: usize = 4;
 const DAY_MS: u64 = 86_400_000;
-/// How often the account's close-blocking want of HYPE is said again while
-/// it lasts.
-const BLOCKED_SAID_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// A top-up of the account's HYPE: an immediate-or-cancel buy of `size` at
 /// no more than `limit`, after moving `from_perp` dollars to spot to pay
@@ -435,9 +451,11 @@ impl Half {
 
     /// Look at the account's HYPE every minute and top it up when its free
     /// HYPE falls under the floor, until the task is dropped. Says what it
-    /// did, or why it couldn't, in the log; and says loudly, every ten
-    /// minutes while it lasts, when the account has less free HYPE than the
-    /// driver needs to start a claim's close.
+    /// did, or why it couldn't, in the log; and says loudly, at every look
+    /// while it lasts, when the account has less free HYPE than the driver
+    /// needs to start a claim's close, and whether only the strategy's own
+    /// orders can end it. (The agent's event stream has no event for it: the
+    /// log is where it is said.)
     pub fn hype_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let half = self.clone();
         tokio::spawn(async move {
@@ -445,7 +463,6 @@ impl Half {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut attempts: Vec<(u128, u64)> = Vec::new();
             let mut warned = false;
-            let mut blocked_said: Option<tokio::time::Instant> = None;
             loop {
                 tick.tick().await;
                 attempts.retain(|(_, at)| now_ms().saturating_sub(*at) < DAY_MS);
@@ -478,29 +495,22 @@ impl Half {
                         warned = true;
                     }
                 }
-                match half.free_hype().await {
-                    Ok(free) if free < DRIVER_GAS_FLOOR.parse().unwrap_or_default() => {
-                        if blocked_said.is_none_or(|at| at.elapsed() >= BLOCKED_SAID_EVERY) {
-                            blocked_said = Some(tokio::time::Instant::now());
-                            tracing::error!(
-                                station = %half.station,
-                                free = %free,
-                                floor = DRIVER_GAS_FLOOR,
-                                "every claim's close at this station is blocked: the account has less free HYPE than the driver needs to send dollars home (open orders may hold the rest)"
-                            );
-                        }
-                    }
-                    Ok(_) => blocked_said = None,
-                    Err(_) => {}
+                // Said at every look (once a minute) while it lasts.
+                if let Ok(hype) = half.api.spot_holding(half.station, "HYPE").await
+                    && blocked(&hype)
+                {
+                    tracing::error!(
+                        station = %half.station,
+                        free = %hype.free(),
+                        held = %hype.hold,
+                        total = %hype.total,
+                        floor = DRIVER_GAS_FLOOR,
+                        "{}",
+                        blocked_why(&hype)
+                    );
                 }
             }
         })
-    }
-
-    /// The account's free HYPE (what open orders don't hold), as the driver
-    /// reads it.
-    async fn free_hype(&self) -> Result<hyperliquid::payload::Decimal> {
-        Ok(self.api.spot_holding(self.station, "HYPE").await?.free())
     }
 
     /// One look at the account's HYPE, and a top-up if its free HYPE is
@@ -513,15 +523,7 @@ impl Half {
         if hype.free() >= HYPE_FLOOR.parse().unwrap_or(Decimal::ZERO) {
             return Ok(TopUp::Enough);
         }
-        let stage = self
-            .chain
-            .read(
-                self.station,
-                chain::bindings::station::IStation::stageCall {},
-            )
-            .await
-            .context("reading whether a close is staged at the station")?;
-        if stage.stagedAt != 0 {
+        if self.close_staged().await? {
             return Ok(TopUp::Staged);
         }
         let market = self.hype_market().ok_or_else(|| {
@@ -566,6 +568,12 @@ impl Half {
                 .await
                 .context("moving dollars to spot for HYPE")?;
         }
+        // A close may have been staged since the stage was first read: the
+        // buy is sent only if the stage, read again now, is still empty (the
+        // dollars moved to spot stay the account's, worth the same).
+        if self.close_staged().await? {
+            return Ok(TopUp::Staged);
+        }
         let (outcome, client) = self
             .trader
             .upkeep(&Order {
@@ -592,6 +600,50 @@ impl Half {
             }
             hyperliquid::agent::Outcome::Refused(why) => Err(anyhow!("buying HYPE: {why}")),
         }
+    }
+}
+
+impl Half {
+    /// Whether a close is staged at the station now.
+    async fn close_staged(&self) -> Result<bool> {
+        let stage = self
+            .chain
+            .read(
+                self.station,
+                chain::bindings::station::IStation::stageCall {},
+            )
+            .await
+            .context("reading whether a close is staged at the station")?;
+        Ok(stage.stagedAt != 0)
+    }
+}
+
+/// Whether the account has less free HYPE than the driver needs to start a
+/// claim's close.
+pub fn blocked(hype: &hyperliquid::api::SpotHolding) -> bool {
+    hype.free() < DRIVER_GAS_FLOOR.parse().unwrap_or_default()
+}
+
+/// Why the account's closes are blocked, as said in the log: when open
+/// orders hold so much of the account's HYPE that no top-up can be bought
+/// under the reserve, only the strategy that rests them can free it.
+pub fn blocked_why(hype: &hyperliquid::api::SpotHolding) -> String {
+    use hyperliquid::payload::Decimal;
+    let reserve: Decimal = HYPE_RESERVE.parse().unwrap_or_default();
+    let floor: Decimal = HYPE_FLOOR.parse().unwrap_or_default();
+    if hype.total + (floor - hype.free()) > reserve {
+        format!(
+            "every claim's close at this station is blocked: the account's open orders hold {} of its {} HYPE, leaving {} free, under the {DRIVER_GAS_FLOOR} the driver needs to send dollars home; no top-up can be bought without leaving more than the {HYPE_RESERVE} HYPE reserve, so it lasts until the strategy cancels or fills some of its HYPE orders",
+            hype.hold,
+            hype.total,
+            hype.free()
+        )
+    } else {
+        format!(
+            "every claim's close at this station is blocked: the account has {} free HYPE ({} held by open orders), under the {DRIVER_GAS_FLOOR} the driver needs to send dollars home",
+            hype.free(),
+            hype.hold
+        )
     }
 }
 
@@ -968,6 +1020,25 @@ mod tests {
         // The floor sits under the reserve, and over the driver's own line.
         assert!(d(HYPE_FLOOR) < d(HYPE_RESERVE));
         assert!(d(DRIVER_GAS_FLOOR) < d(HYPE_FLOOR));
+    }
+
+    #[test]
+    fn hype_held_by_the_strategy_s_orders_over_the_reserve_is_said_to_need_the_strategy() {
+        let holding = |total: &str, hold: &str| hyperliquid::api::SpotHolding {
+            total: d(total),
+            hold: d(hold),
+        };
+        // All of 1.2 HYPE on hold: blocked, and no top-up fits under the
+        // reserve, so only the strategy can free it.
+        let held = holding("1.2", "1.2");
+        assert!(blocked(&held));
+        assert!(blocked_why(&held).contains("until the strategy cancels"));
+        // The same with a buy the reserve still has room for: blocked, and a
+        // top-up can end it.
+        let low = holding("0.3", "0.295");
+        assert!(blocked(&low));
+        assert!(!blocked_why(&low).contains("until the strategy cancels"));
+        assert!(!blocked(&holding("1.2", "1.0")));
     }
 
     #[test]

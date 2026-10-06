@@ -37,6 +37,7 @@ alloy::sol! {
         uint48[] accounts;
         uint256 equity;
         uint256 pending;
+        uint256 inFlight;
         uint256 arrived;
         uint256 sent;
         uint256[] available;
@@ -89,13 +90,17 @@ fn dollars(value: &Value, what: &str) -> Result<U256> {
 /// What the report reads on-chain, all at one block: its time, which the
 /// report is stamped with (never the machine's clock, which may run ahead of
 /// the chain's and have the board refuse it), the station's pending balance
-/// at the exchange, and the station's own counters (every dollar that had
-/// reached it from outside its calls, and every dollar it had put into the
-/// exchange), which tell the driver what moved after the reading.
+/// at the exchange, the dollars the exchange has taken out of the station's
+/// accounts for withdrawals not yet in that pending balance at that block
+/// (`in_flight`, see [`crate::withdrawals`]), and the station's own counters
+/// (every dollar that had reached it from outside its calls, and every
+/// dollar it had put into the exchange), which tell the driver what moved
+/// after the reading.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OnChain {
     pub as_of: u64,
     pub pending: U256,
+    pub in_flight: U256,
     pub arrived: U256,
     pub sent: U256,
 }
@@ -121,6 +126,7 @@ pub fn build(
         accounts: Vec::new(),
         equity: U256::ZERO,
         pending: on_chain.pending,
+        inFlight: on_chain.in_flight,
         arrived: on_chain.arrived,
         sent: on_chain.sent,
         available: Vec::new(),
@@ -308,9 +314,11 @@ pub fn prices(market: u16, details: &Value, book: &Value, markets: &Markets) -> 
 /// Which address a report is about, for logs.
 pub fn describe(station: Address, report: &LighterReport) -> String {
     format!(
-        "{station}: {} accounts, equity {}, {} positions",
+        "{station}: {} accounts, equity {}, pending {}, on their way {}, {} positions",
         report.accounts.len(),
         report.equity,
+        report.pending,
+        report.inFlight,
         report.positions.len()
     )
 }
@@ -338,6 +346,7 @@ mod tests {
         let on_chain = OnChain {
             as_of: 5,
             pending: U256::from(7u8),
+            in_flight: U256::from(5u8),
             arrived: U256::from(11u8),
             sent: U256::from(13u8),
         };
@@ -347,6 +356,7 @@ mod tests {
         assert_eq!(report.positions[0].size, -15_000);
         assert_eq!(report.asOf, 5, "stamped with the chain block's time");
         assert_eq!(report.pending, U256::from(7u8));
+        assert_eq!(report.inFlight, U256::from(5u8), "withdrawals on their way");
         assert_eq!(
             (report.arrived, report.sent),
             (U256::from(11u8), U256::from(13u8))

@@ -54,10 +54,14 @@ const MOST_UNWINDS_UNCHANGED: u32 = 6;
 /// valuation up.
 const VENUE_API_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// One driver of the station's whose venue acts after the transaction.
+/// One driver of the station's whose venue acts after the transaction: the
+/// name the station pinned it under (what its counters and calls use), and
+/// the name the implementation gives itself (which venue it is), so the
+/// keeper finds a venue whatever name a station pinned it under.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DelayedDriver {
     pub name: B256,
+    pub venue: B256,
     pub implementation: Address,
 }
 
@@ -119,8 +123,13 @@ pub async fn drivers_of(
             .await
             .with_context(|| format!("reading the exit path of {implementation}"))?;
         if matches!(exit, ExitPath::Delayed) {
+            let venue = client
+                .read(implementation, IDriver::nameCall {})
+                .await
+                .with_context(|| format!("reading the name of {implementation}"))?;
             delayed.push(DelayedDriver {
                 name,
+                venue,
                 implementation,
             });
         }
@@ -187,6 +196,7 @@ alloy::sol! {
         uint48[] accounts;
         uint256 equity;
         uint256 pending;
+        uint256 inFlight;
         uint256 arrived;
         uint256 sent;
         uint256[] available;
@@ -219,7 +229,7 @@ pub async fn collect_withdrawals(
     drivers: &[DelayedDriver],
 ) -> Result<()> {
     for driver in drivers {
-        if driver.name != name_word("lighter") {
+        if driver.venue != name_word("lighter") {
             continue;
         }
         let exchange = client
@@ -472,7 +482,8 @@ pub fn venue_vaults_from(answer: &serde_json::Value) -> Vec<VenueVault> {
         .collect()
 }
 
-/// The venue's API for a driver on a chain, if the keeper knows it.
+/// The venue's API for a driver (by the name its implementation gives
+/// itself) on a chain, if the keeper knows it.
 pub fn venue_api(driver: B256, chain_id: u64) -> Option<&'static str> {
     if driver != name_word("hyperliquid") {
         return None;
@@ -613,9 +624,9 @@ pub async fn reclaim(
     }
     memory.venue_vaults_at = Some(Instant::now());
     for driver in drivers {
-        let mut candidates = if let Some(url) = venue_api(driver.name, client.chain_id) {
+        let mut candidates = if let Some(url) = venue_api(driver.venue, client.chain_id) {
             venue_vaults_known(http, url, station)
-        } else if driver.name == name_word("lighter") {
+        } else if driver.venue == name_word("lighter") {
             let board = client
                 .read(driver.implementation, ILighterDriver::boardCall {})
                 .await?;
@@ -776,6 +787,7 @@ mod tests {
             accounts: vec![],
             equity: U256::ZERO,
             pending: U256::ZERO,
+            inFlight: U256::ZERO,
             arrived: U256::ZERO,
             sent: U256::ZERO,
             available: vec![],
