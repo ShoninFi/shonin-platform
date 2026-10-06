@@ -1,0 +1,4 @@
+# Public attestation tokens kept as test fixtures: Google-signed JWTs from a
+# Confidential Space instance. They carry no secret and grant nothing.
+packages/attestation/core/testdata/cs-token-oidc-2026-10-06.jwt:jwt:1
+packages/attestation/core/testdata/cs-token-pki-2026-10-06.jwt:jwt:1

@@ -1,0 +1,64 @@
+{
+ "aud": "https://shonin.fi/attestation",
+ "exp": 1791323811,
+ "iat": 1791320211,
+ "iss": "https://confidentialcomputing.googleapis.com",
+ "nbf": 1791320211,
+ "sub": "https://www.googleapis.com/compute/v1/projects/shonin-testnet/zones/us-central1-a/instances/shonin-smoke",
+ "eat_nonce": "80ae14a6754315be8cc692c2059d64cdb64dad6de08b009030626ccc13771a9c",
+ "eat_profile": "https://cloud.google.com/confidential-computing/confidential-space/docs/reference/token-claims",
+ "secboot": true,
+ "oemid": 11129,
+ "hwmodel": "GCP_INTEL_TDX",
+ "swname": "CONFIDENTIAL_SPACE",
+ "swversion": [
+  "260900"
+ ],
+ "attester_tcb": [
+  "INTEL"
+ ],
+ "dbgstat": "disabled-since-boot",
+ "submods": {
+  "confidential_space": {
+   "support_attributes": [
+    "LATEST",
+    "STABLE",
+    "USABLE"
+   ],
+   "monitoring_enabled": {
+    "memory": false
+   }
+  },
+  "container": {
+   "image_reference": "us-central1-docker.pkg.dev/shonin-testnet/shonin/smoke@sha256:b6192f4f8125235df12b18c764b6ecd068ccbe223cfd5dff24c6934bd3704342",
+   "image_digest": "sha256:b6192f4f8125235df12b18c764b6ecd068ccbe223cfd5dff24c6934bd3704342",
+   "restart_policy": "Never",
+   "image_id": "sha256:a997eca488e6e495e4c799c53708c9cc0d5d3c114d1bd5e5cd2a050ca721c329",
+   "env": {
+    "CURL_CA_BUNDLE": "/cacert.pem",
+    "HOSTNAME": "shonin-smoke",
+    "NONCE": "80ae14a6754315be8cc692c2059d64cdb64dad6de08b009030626ccc13771a9c",
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+   },
+   "args": [
+    "/bin/sh",
+    "/run.sh"
+   ]
+  },
+  "gce": {
+   "zone": "us-central1-a",
+   "project_id": "shonin-testnet",
+   "project_number": "889438049602",
+   "instance_name": "shonin-smoke",
+   "instance_id": "2752478585496854198"
+  }
+ },
+ "tdx": {
+  "gcp_attester_tcb_status": "UpToDate",
+  "gcp_attester_tcb_date": "2025-05-14T00:00:00Z",
+  "tcb_evaluation_data_number": 19
+ },
+ "google_service_accounts": [
+  "shonin-workload@shonin-testnet.iam.gserviceaccount.com"
+ ]
+}

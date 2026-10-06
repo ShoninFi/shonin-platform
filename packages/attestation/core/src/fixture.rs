@@ -135,20 +135,38 @@ pub const VAULT: [u8; 20] = [0x0A; 20];
 /// The sample vault's bundle.
 pub const STRATEGY_HASH: [u8; 32] = [0x5B; 32];
 
+/// An EVM registry's blessing leaf, which names the key it blesses:
+/// `keccak256(keccak256(abi.encode(vaultChain, vault, strategyHash,
+/// thisChain, key)))`, five words.
+pub fn key_leaf(
+    vault_chain: u64,
+    vault: &[u8; 20],
+    strategy_hash: &[u8; 32],
+    this_chain: u64,
+    key: &[u8; 20],
+) -> [u8; 32] {
+    use sha3::{Digest, Keccak256};
+    let mut hasher = Keccak256::new();
+    hasher.update(crate::chain_word(vault_chain));
+    hasher.update(crate::address_word(vault));
+    hasher.update(strategy_hash);
+    hasher.update(crate::chain_word(this_chain));
+    hasher.update(crate::address_word(key));
+    let inner: [u8; 32] = hasher.finalize().into();
+    Keccak256::digest(inner).into()
+}
+
+/// The sample instance's EVM key.
+pub const EVM_SIGNER: [u8; 20] = [0xE7; 20];
+
 /// A sample binding: an EVM key, a Solana key, and as the vaults root the
-/// one leaf of the sample vault on [`CHAIN_ID`] (a root over one leaf is the
-/// leaf, proved with an empty proof).
+/// one leaf blessing that EVM key for the sample vault on [`CHAIN_ID`] (a
+/// root over one leaf is the leaf, proved with an empty proof).
 pub fn binding() -> Binding {
-    let chain = crate::chain_word(CHAIN_ID);
     Binding {
-        evm_signer: [0xE7; 20],
+        evm_signer: EVM_SIGNER,
         solana_signer: [0x5A; 32],
-        vaults_root: crate::blessing_leaf(
-            &chain,
-            &crate::address_word(&VAULT),
-            &STRATEGY_HASH,
-            &chain,
-        ),
+        vaults_root: key_leaf(CHAIN_ID, &VAULT, &STRATEGY_HASH, CHAIN_ID, &EVM_SIGNER),
     }
 }
 
@@ -162,5 +180,67 @@ pub fn input(binding: &Binding, iat: u64, now: u64) -> Input {
         keys,
         now,
         binding: *binding,
+    }
+}
+
+/// A genuine token from a Confidential Space VM (Intel TDX, the hardened
+/// launcher image `260900`, project `shonin-testnet`), issued on 6 October
+/// 2026 and signed by Google's key in [`GOOGLE_JWKS_2026_10_06`]. It carries
+/// no secret: its nonce binds a key made for this fixture and a one-leaf
+/// root ([`real_binding`]). Proof that the checks accept what Confidential
+/// Space really issues, not only what its documentation describes.
+pub const REAL_TOKEN: &str = include_str!("../testdata/cs-token-oidc-2026-10-06.jwt");
+/// The same claims from the same VM in Google's PKI format (an `x5c` chain
+/// in the header, no `kid` among Google's published keys).
+pub const REAL_PKI_TOKEN: &str = include_str!("../testdata/cs-token-pki-2026-10-06.jwt");
+/// The real token's `iat`; it expires an hour later, at [`REAL_EXP`].
+pub const REAL_IAT: u64 = 1_791_320_211;
+pub const REAL_EXP: u64 = REAL_IAT + 3600;
+/// The real token's image digest and project.
+pub const REAL_IMAGE_DIGEST: &str =
+    "sha256:b6192f4f8125235df12b18c764b6ecd068ccbe223cfd5dff24c6934bd3704342";
+pub const REAL_PROJECT: &str = "shonin-testnet";
+/// The hash ([`Jwk::key_hash`]) of Google's key that signed the real token.
+pub const REAL_KEY_HASH: &str = "8c87b83d047d492d8a05ebcc84333ff23a5c03d8ebfbd0c5bd88aeca78bbf8eb";
+/// The real token's vault: one leaf, a vault on [`CHAIN_ID`] blessed there.
+pub const REAL_VAULT: [u8; 20] = [0x11; 20];
+/// `keccak256("shonin fixture strategy")`.
+pub const REAL_STRATEGY_HASH: &str =
+    "d3b76bf6803fde2a360c1efa4b1c8e2e3b79cb80509ade1c0bb70d72c155456e";
+/// The EVM key the real token's nonce binds (made for the fixture, never
+/// funded; only its address is kept).
+pub const REAL_EVM_SIGNER: &str = "e890cd248bed3547dc084cfb22c62da62f410539";
+
+fn hex_array<const N: usize>(text: &str) -> [u8; N] {
+    hex::decode(text)
+        .expect("fixture hex")
+        .try_into()
+        .expect("fixture length")
+}
+
+/// What the real token's nonce binds: the fixture's EVM key, no Solana key,
+/// and the root of the one leaf of [`REAL_VAULT`].
+pub fn real_binding() -> Binding {
+    let chain = crate::chain_word(CHAIN_ID);
+    Binding {
+        evm_signer: hex_array(REAL_EVM_SIGNER),
+        solana_signer: [0; 32],
+        vaults_root: crate::blessing_leaf(
+            &chain,
+            &crate::address_word(&REAL_VAULT),
+            &hex_array(REAL_STRATEGY_HASH),
+            &chain,
+        ),
+    }
+}
+
+/// A guest input over the real token, checked at `now` against Google's
+/// keys as published on 6 October 2026 (and nothing else).
+pub fn real_input(now: u64) -> Input {
+    Input {
+        token: REAL_TOKEN.into(),
+        keys: Jwk::from_jwks(GOOGLE_JWKS_2026_10_06).expect("Google's JWKS parses"),
+        now,
+        binding: real_binding(),
     }
 }

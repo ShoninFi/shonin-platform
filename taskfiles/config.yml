@@ -205,8 +205,8 @@ vars:
   # Google Cloud: where the machines and services run when they are not
   # running here. One project per network, never the gcloud default: every
   # gcloud call passes --project, and the cloud tasks refuse to run while the
-  # project for their network is empty. Region and zone are placeholders.
-  GCP_PROJECT_TESTNET: ""
+  # project for their network is empty.
+  GCP_PROJECT_TESTNET: "shonin-testnet"
   GCP_PROJECT_MAINNET: ""
   GCP_REGION: "us-central1"
   GCP_ZONE: "us-central1-a"
@@ -214,8 +214,26 @@ vars:
   GCP_ARTIFACT_REPO: "shonin"
   # Confidential Space VMs: Intel TDX needs a C3 machine.
   GCP_MACHINE_TYPE: "c3-standard-4"
-  # The service account the machines and services run as, in the project.
+  # The service account the attested machines run as, in the project: it may
+  # attest, pull images and write logs, and reads no secret.
   GCP_WORKLOAD_SERVICE_ACCOUNT: "shonin-workload"
+  # The service account of the plain VM running the API and the keeper: it
+  # reads the keeper's key and the tunnel token, and may start the prover.
+  GCP_SERVICES_SERVICE_ACCOUNT: "shonin-services"
+  # The service account of the prover's VM: it pulls images and writes logs.
+  GCP_PROVER_SERVICE_ACCOUNT: "shonin-prover"
+  # The VMs, one each per network: shonin-<role>-<network>.
+  GCP_SERVICES_MACHINE_TYPE: "e2-small"
+  GCP_PROVER_MACHINE_TYPE: "c3-standard-8"
+  # Public names of the testnet: the API through a Cloudflare tunnel from the
+  # services VM, and the content store (an R2 bucket, read-only to the world).
+  URL_API_TESTNET: "https://testnet-api.shonin.fi"
+  URL_STORE_TESTNET: "https://testnet-store.shonin.fi"
+  R2_BUCKET_STORE_TESTNET: "shonin-testnet-store"
   # The Secret Manager secret the testnet services read their role accounts'
   # mnemonic from (uploaded from .env by `task cloud:secrets NETWORK=testnet`).
   GCP_SECRET_TESTNET_EVM_MNEMONIC: "shonin-testnet-evm-mnemonic"
+  # The keeper's testnet key alone, and the tunnel's token: the only secrets
+  # in the cloud (read by the services VM's account).
+  GCP_SECRET_TESTNET_KEEPER_KEY: "shonin-testnet-keeper-key"
+  GCP_SECRET_TESTNET_TUNNEL_TOKEN: "shonin-testnet-tunnel-token"

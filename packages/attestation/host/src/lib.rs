@@ -183,6 +183,27 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "runs the guest in r0vm: needs RISC Zero's toolchain (`rzup`)"]
+    fn the_guest_accepts_the_real_token_and_commits_what_the_native_check_computes() {
+        let input = fixture::real_input(fixture::REAL_IAT + 60);
+        let native = shonin_attestation_core::verify(&input).unwrap();
+        let (journal, cycles) = execute(&input).unwrap();
+        assert_eq!(journal, native);
+        assert_eq!(hex::encode(journal.key_hash), fixture::REAL_KEY_HASH);
+        println!("the guest checked the real token in {cycles} cycles");
+        assert!(cycles < 20_000_000, "{cycles} cycles");
+    }
+
+    #[test]
+    #[ignore = "runs the guest in r0vm: needs RISC Zero's toolchain (`rzup`)"]
+    fn the_guest_refuses_the_real_token_after_its_hour_or_for_another_binding() {
+        assert!(execute(&fixture::real_input(fixture::REAL_EXP)).is_err());
+        let mut input = fixture::real_input(fixture::REAL_IAT + 60);
+        input.binding.vaults_root = [9; 32];
+        assert!(execute(&input).is_err());
+    }
+
+    #[test]
     fn the_image_id_is_the_guest_s() {
         assert_eq!(
             image_id(),

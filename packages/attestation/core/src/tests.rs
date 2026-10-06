@@ -365,3 +365,5 @@ fn each_chain_rebuilds_the_canonical_journal_from_its_own_journal_and_the_seal_s
     assert_eq!(Journal::from_evm(&dirty, &journal.evm_seal_tail()), None);
     assert_eq!(Journal::from_evm(&journal.evm(), &[0; 63]), None);
 }
+
+mod real_token;

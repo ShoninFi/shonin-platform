@@ -17,7 +17,7 @@ required-features = ["fixture"]
 [features]
 # Test tokens under a test key, and the binary that writes the contracts'
 # Groth16 fixture.
-fixture = ["shonin-attestation-core/fixture", "dep:sha3"]
+fixture = ["shonin-attestation-core/fixture", "dep:sha3", "dep:base64"]
 
 [dependencies]
 shonin-attestation-core = { path = "../core" }
@@ -31,6 +31,7 @@ serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
 sha3 = { version = "0.10.8", optional = true }
+base64 = { version = "0.22.1", optional = true }
 
 [dev-dependencies]
 shonin-attestation-core = { path = "../core", features = ["fixture"] }
