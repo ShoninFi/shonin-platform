@@ -2,6 +2,8 @@
 pragma solidity ^0.8.30;
 
 import {Call, Custody, ExitPath, IDelayedDriver, IDriver, ValuationKind} from "../../interfaces/IDriver.sol";
+import {IStation} from "../../interfaces/IStation.sol";
+import {DelayedVenue} from "../DelayedVenue.sol";
 import {HyperCore, ICoreDepositWallet, ICoreWriter} from "./HyperCore.sol";
 import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
 
@@ -20,12 +22,15 @@ import {Math} from "openzeppelin/utils/math/Math.sol";
 /// void and no leaver is paid at a figure nobody can check.
 ///
 /// A holding worth less than the venue's smallest order can't be closed, so
-/// it neither closes nor blocks.
+/// it neither closes nor blocks; a spot holding like that can't be sold
+/// either, so it is worth nothing here: it can't hold a halted vault open,
+/// and nobody can give the account a little of a token to do so.
 ///
 /// Sending dollars home costs the account a little HYPE on HyperCore, so it
 /// keeps some: up to `GAS_RESERVE` of it is the cost of sending home, not a
 /// holding. It is never ordered in a close, never a reason to block, never
-/// asked of a proof, and still counted in what the account is worth. With
+/// asked of a proof, and worth nothing in the account's value or a close's
+/// measure, since nothing ever sells it. With
 /// less than `GAS_FLOOR` of it free, a partial close is blocked before
 /// anything is sold, so a proved close is never stranded for want of a send.
 /// The HYPE/USDC pair must be listed, so the driver can see it.
@@ -33,7 +38,20 @@ import {Math} from "openzeppelin/utils/math/Math.sol";
 /// CoreWriter acts after the transaction and never reverts on a refusal, so
 /// a close here is placed in one transaction and checked, against the
 /// positions, in a later one (`ExitPath.Delayed`); the station sweeps and
-/// delivers only after that check.
+/// delivers only after that check, and only once `SETTLE_DELAY` has passed,
+/// so the close's own orders have run by then.
+///
+/// HyperCore credits a deposit from HyperEVM after the block it was made
+/// in, and a send home lands on HyperEVM a block after HyperCore runs it, so
+/// for `CREDIT_WINDOW` after dollars move between the station and the
+/// account they may show in neither: valuations are void and no close is
+/// staged meanwhile, and the executor's moves are spaced so that a priced
+/// valuation always fits between two of them.
+///
+/// A claim's close is refused before anything is sold when the account
+/// couldn't release the fraction's worth after it: what the account is
+/// worth less the venue's transfer requirement on what stays open, with a
+/// margin, and less what the close's orders could lose at their limits.
 contract HyperliquidDriver is IDriver, IDelayedDriver {
     using Math for uint256;
 
@@ -70,6 +88,18 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
     /// either, and a move between the station and the account lands within
     /// it too.
     uint64 public constant DELIVERY_WINDOW = 5 minutes;
+    /// CoreWriter's orders and transfers run "a few seconds" after their
+    /// block, by the venue's documentation; a minute is ample.
+    uint64 public constant SETTLE_DELAY = 1 minutes;
+    /// A deposit from HyperEVM is credited right after its EVM block, and a
+    /// send home is queued until the next EVM block: dollars moved are
+    /// in neither place for a block or two. A minute is ample.
+    uint64 public constant CREDIT_WINDOW = 1 minutes;
+    /// The venue lets dollars leave the perp side only while what stays
+    /// covers the larger of its initial margin and a tenth of what stays
+    /// open; a claim's close also leaves a tenth more than that.
+    uint256 private constant TRANSFER_BPS = 1000;
+    uint256 private constant SAFETY_BPS = 1000;
     /// The HYPE the account keeps for sends home, in hundredths of the
     /// token's wei: 1 HYPE is the cost of sending home, not a holding, and
     /// with less than 0.01 HYPE free a partial close is blocked. A send home
@@ -180,6 +210,20 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         return DELIVERY_WINDOW;
     }
 
+    function settleDelay() external pure returns (uint64) {
+        return SETTLE_DELAY;
+    }
+
+    /// Trusted except within `CREDIT_WINDOW` of a move of dollars between
+    /// the station and the account.
+    function priced(address station) public view returns (bool) {
+        return block.timestamp >= uint256(_movedAt(station)) + CREDIT_WINDOW;
+    }
+
+    function _movedAt(address station) private view returns (uint64) {
+        return IStation(station).movedAt(DelayedVenue.nameIn(station, address(this)));
+    }
+
     function valuation() external pure returns (ValuationKind) {
         return ValuationKind.OnChain;
     }
@@ -229,8 +273,10 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
 
     // Moving dollars --------------------------------------------------------
 
-    /// Into the account's perp balance through Circle's deposit contract.
-    function deposit(address, uint256 amount) external view returns (Call[] memory calls) {
+    /// Into the account's perp balance through Circle's deposit contract;
+    /// never sooner than the spacing after the last move (`DelayedVenue`).
+    function deposit(address station, uint256 amount) external view returns (Call[] memory calls) {
+        DelayedVenue.spaced(station, _movedAt(station), CREDIT_WINDOW);
         calls = new Call[](2);
         calls[0] = Call(address(usdc), 0, abi.encodeCall(IERC20.approve, (address(depositWallet), amount)));
         calls[1] = Call(
@@ -240,8 +286,10 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         );
     }
 
-    /// Back to the station on HyperEVM, as `sweep` does.
+    /// Back to the station on HyperEVM, as `sweep` does; spaced as a
+    /// deposit is.
     function withdraw(address station, uint256 amount) external view returns (Call[] memory) {
+        DelayedVenue.spaced(station, _movedAt(station), CREDIT_WINDOW);
         return _home(station, amount);
     }
 
@@ -282,9 +330,13 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         // No HYPE to send the dollars home with: nothing is sold for a
         // leaver whose close could then never come home. A full unwind,
         // which everyone shares, goes ahead and sends once there is.
+        // Nor while dollars moved may be in neither place (the record a
+        // stage keeps would miss them), nor when what the close frees
+        // couldn't leave the account.
         if (fraction < WAD) {
             HyperCore.SpotBalance memory gas = HyperCore.spotBalance(station, _spots[_gas].token);
             if (uint256(gas.total) - uint256(gas.hold) < gasFloor) return (new Call[](0), true);
+            if (!priced(station) || !_releasable(station, fraction, bandBps)) return (new Call[](0), true);
         }
         calls = new Call[](_perps.length + _spots.length);
         uint256 count;
@@ -298,6 +350,29 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         assembly ("memory-safe") {
             mstore(calls, count)
         }
+    }
+
+    /// Whether the perp side could release `fraction` of its worth after a
+    /// close of `fraction`: with `v` its worth, `n` its open notional and
+    /// `r` the venue's transfer requirement, the larger of the initial
+    /// margin used and `TRANSFER_BPS` of `n`, what stays after the close,
+    /// `v - band x f x n` (the most the orders can lose at their limits)
+    /// less `(1 - f) r` grossed up by `SAFETY_BPS`, must cover `f v`. Spot
+    /// dollars and tokens sold for them are always free.
+    function _releasable(address station, uint256 fraction, uint16 bandBps) private view returns (bool) {
+        HyperCore.MarginSummary memory summary = HyperCore.marginSummary(station);
+        uint256 ntl = summary.ntlPos;
+        if (ntl == 0) return true;
+        if (summary.accountValue <= 0) return false;
+        uint256 worth = uint256(int256(summary.accountValue));
+        uint256 required = Math.max(summary.marginUsed, ntl.mulDiv(TRANSFER_BPS, BPS, Math.Rounding.Ceil));
+        uint256 kept = required.mulDiv(WAD - fraction, WAD, Math.Rounding.Ceil).mulDiv(
+            BPS + SAFETY_BPS, BPS, Math.Rounding.Ceil
+        );
+        uint256 loss = ntl.mulDiv(fraction, WAD, Math.Rounding.Ceil).mulDiv(
+            Math.min(bandBps, BPS), BPS, Math.Rounding.Ceil
+        );
+        return worth >= kept + loss + worth.mulDiv(fraction, WAD, Math.Rounding.Ceil);
     }
 
     /// The order closing `fraction` of one perp position, if any.
@@ -433,37 +508,47 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         }
     }
 
-    function closed(
+    /// Not before `since`, when the close's own orders have run: then, for
+    /// each market it ordered (a piece too small to have been ordered for
+    /// sure asks nothing), the share of what it ordered that the position is
+    /// smaller by, on the same side, rounded down; the smallest of them.
+    function closedPart(
         address station,
         int256[] calldata before,
-        uint256 fraction
-    ) external view returns (bool) {
-        if (before.length != _perps.length + _spots.length) return false;
+        uint256 fraction,
+        uint64 since
+    ) external view returns (uint256 part, bool known) {
+        if (block.timestamp < since) return (0, false);
+        if (before.length != _perps.length + _spots.length) return (0, true);
         int256[] memory now_ = exposure(station);
+        part = WAD;
         for (uint256 i = 0; i < before.length; i++) {
             int256 was = before[i];
+            int256 is_ = now_[i];
             // HYPE up to the reserve was never a holding, never ordered.
-            if (i == _perps.length + _gas) {
-                Spot memory gas = _spots[_gas];
-                int256 kept = int256(gasReserve / 10 ** (gas.weiDecimals - gas.szDecimals));
-                was = was > kept ? was - kept : int256(0);
-                now_[i] = now_[i] > kept ? now_[i] - kept : int256(0);
-            }
+            if (i == _perps.length + _gas) (was, is_) = (_overReserve(was), _overReserve(is_));
             if (was == 0) continue;
             bool isLong = was > 0;
             uint256 open = uint256(isLong ? was : -was);
-            uint256 size = open.mulDiv(fraction, WAD, Math.Rounding.Ceil);
-            if (size > open) size = open;
-            // A piece too small to have been ordered for sure asks nothing.
+            uint256 size = _part(open, fraction);
+            // Millionths of a dollar, times a hundred.
             uint256 price = i < _perps.length
-                ? HyperCore.markPx(_perps[i].index)
-                : HyperCore.spotPx(_spots[i - _perps.length].pair) / 100;
-            if (size * price < 2 * MIN_ORDER) continue;
-            if (isLong ? now_[i] > was - int256(size) : now_[i] < was + int256(size)) {
-                return false;
-            }
+                ? uint256(HyperCore.markPx(_perps[i].index)) * 100
+                : HyperCore.spotPx(_spots[i - _perps.length].pair);
+            if (size * price < 2 * MIN_ORDER * 100) continue;
+            int256 done = isLong ? was - is_ : is_ - was;
+            if (done <= 0) return (0, true);
+            uint256 share = uint256(done) >= size ? WAD : uint256(done).mulDiv(WAD, size);
+            if (share < part) part = share;
         }
-        return true;
+        known = true;
+    }
+
+    /// Lots of HYPE above the reserve.
+    function _overReserve(int256 lots) private view returns (int256) {
+        Spot memory gas = _spots[_gas];
+        int256 kept = int256(gasReserve / 10 ** (gas.weiDecimals - gas.szDecimals));
+        return lots > kept ? lots - kept : int256(0);
     }
 
     /// The perp ledger (signed: what the perps' cash comes to after what
@@ -473,26 +558,52 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
             + int256(uint256(HyperCore.spotBalance(station, USDC_TOKEN).total) / CORE_TO_EVM);
     }
 
-    /// Each perp at its mark, each spot token at its spot price: the
-    /// account's worth now, less the kept part of its worth then repriced at
-    /// the same prices.
+    /// Each perp at its mark, each spot token at its spot price (HYPE up to
+    /// the reserve, and a holding worth less than the smallest order, at
+    /// nothing, on both sides): the account's worth now, less the rest of
+    /// its worth then (1 - `fraction` x `part`, rounded up) repriced at the
+    /// same prices, never below `bandBps` of what the close ordered. Figures
+    /// are kept in hundredths of a millionth until the end, which rounds
+    /// down.
     function measure(
         address station,
         int256 dollars,
         int256[] calldata before,
-        uint256 fraction
+        uint256 fraction,
+        uint256 part,
+        uint16 bandBps
     ) external view returns (int256) {
         int256[] memory current = exposure(station);
-        int256 then = dollars;
-        int256 now_ = ledger(station);
+        int256 then = dollars * 100;
+        int256 now_ = ledger(station) * 100;
+        uint256 ordered;
         for (uint256 i = 0; i < current.length; i++) {
-            int256 px = i < _perps.length
-                ? int256(uint256(HyperCore.markPx(_perps[i].index)))
-                : int256(uint256(HyperCore.spotPx(_spots[i - _perps.length].pair))) / 100;
-            then += before[i] * px;
-            now_ += current[i] * px;
+            int256 was = before[i];
+            int256 is_ = current[i];
+            uint256 px;
+            if (i < _perps.length) {
+                px = uint256(HyperCore.markPx(_perps[i].index)) * 100;
+            } else {
+                px = HyperCore.spotPx(_spots[i - _perps.length].pair);
+                if (i == _perps.length + _gas) (was, is_) = (_overReserve(was), _overReserve(is_));
+                was = _sellable(was, px);
+                is_ = _sellable(is_, px);
+            }
+            then += was * int256(px);
+            now_ += is_ * int256(px);
+            ordered += _part(uint256(was < 0 ? -was : was), fraction) * px;
         }
-        return now_ - _keptPart(then, fraction);
+        int256 measured = now_ - _keptPart(then, fraction.mulDiv(part, WAD));
+        int256 least = -int256(ordered.mulDiv(Math.min(bandBps, BPS), BPS, Math.Rounding.Ceil));
+        if (measured < least) measured = least;
+        // Down, toward minus infinity.
+        return measured >= 0 ? measured / 100 : -((-measured + 99) / 100);
+    }
+
+    /// Spot lots worth less than the smallest order at `px` (a hundredth of
+    /// a millionth per lot): nothing can sell them.
+    function _sellable(int256 lots, uint256 px) private pure returns (int256) {
+        return lots > 0 && uint256(lots) * px < MIN_ORDER * 100 ? int256(0) : lots;
     }
 
     /// (1 - `fraction`) of `worth`, rounded up.
@@ -527,8 +638,10 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
     /// The account at the venue's marks, and at its exit side: each long at
     /// the lower of its mark and bid, each short at the higher of its mark
     /// and ask. Spot dollars count at par, spot tokens at the spot price or
-    /// the lower of it and the bid. Money in the venue's own vaults is
-    /// counted by the station, which knows where it is.
+    /// the lower of it and the bid; HYPE up to the reserve, and a token
+    /// holding worth less than the smallest order, at nothing, since nothing
+    /// sells them. Money in the venue's own vaults is counted by the
+    /// station, which knows where it is.
     function valueOf(address station) external view returns (uint256 mark, uint256 exit) {
         HyperCore.MarginSummary memory summary = HyperCore.marginSummary(station);
         int256 perpValue = summary.accountValue;
@@ -561,11 +674,14 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         for (uint256 i = 0; i < _spots.length; i++) {
             Spot memory spot = _spots[i];
             uint256 total = HyperCore.spotBalance(station, spot.token).total;
+            if (i == _gas) total = total > gasReserve ? total - gasReserve : 0;
             if (total == 0) continue;
             uint256 px = HyperCore.spotPx(spot.pair);
-            (uint256 bid,) = HyperCore.bbo(HyperCore.SPOT_ASSET_OFFSET + spot.pair);
             uint256 scale = 10 ** (uint256(spot.weiDecimals) + 8 - spot.szDecimals);
-            mark += total.mulDiv(px * 1e6, scale);
+            uint256 worth = total.mulDiv(px * 1e6, scale);
+            if (worth < MIN_ORDER) continue;
+            (uint256 bid,) = HyperCore.bbo(HyperCore.SPOT_ASSET_OFFSET + spot.pair);
+            mark += worth;
             exit += total.mulDiv((bid < px ? bid : px) * 1e6, scale);
         }
     }

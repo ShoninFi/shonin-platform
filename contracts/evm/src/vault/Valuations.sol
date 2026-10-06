@@ -105,7 +105,6 @@ library Valuations {
         // holds for one leaver, not yet home: such a valuation prices
         // nothing, as one at a market outside the band.
         if (IStation(s.homeStation).outsideBand() || s.staging()) s.wide[count] = true;
-        s.valueFirst = false;
         // An exit side above the mark is what the holdings could be sold
         // for: a deposit pays it on top, net of the profit fee a sale there
         // would owe, so it can't buy below the pool's realisable worth; but
@@ -186,6 +185,8 @@ library Valuations {
         s.exitPaid = 0;
         v.status = ValuationStatus.Priced;
         s.lastPriced = index + 1;
+        // Only a priced valuation is one between two closes.
+        s.valueFirst = false;
         emit IVault.Valued(index, v.time, gross, v.grossExit, supply, v.fee);
     }
 

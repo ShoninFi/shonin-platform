@@ -57,7 +57,7 @@ contract DemoVault is IStationVault {
     }
 
     /// A staged close's delivery: what it fetched, as cash.
-    function delivered(uint256 amount) external {
+    function delivered(uint256 amount, uint256, uint256, uint256) external {
         require(msg.sender == station, "station only");
         asset.transferFrom(station, address(this), amount);
         cash += amount;

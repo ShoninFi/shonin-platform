@@ -124,7 +124,9 @@ contract LighterStationTest is LighterVault {
 
     // A claim's close -------------------------------------------------------
 
-    function test_a_claim_is_closed_by_priority_request_proved_by_a_newer_post_withdrawn_and_paid() public {
+    function test_a_claim_is_closed_by_priority_request_proved_by_a_post_read_after_it_withdrawn_and_paid()
+        public
+    {
         uint256 aliceShares = _fundAndTrade();
         _aliceClaims(aliceShares);
 
@@ -138,12 +140,18 @@ contract LighterStationTest is LighterVault {
         assertApproxEqRel(uint256(base), 200_000, 0.01e18, "about half");
         assertEq(price, ETH_PX * 99 / 100, "no worse than the band (1%) from the index");
 
-        // Nothing is proved until a newer post shows it.
+        // Nothing is proved until a post read after the settle delay shows
+        // it: a post read before then proves nothing, even once it shows the
+        // close.
         _nextBlock();
+        exchange.process();
+        _post();
         vm.expectRevert(Station.NotYet.selector);
         station.settleClose();
 
-        exchange.process();
+        skip(lighter.SETTLE_DELAY());
+        vm.expectRevert(Station.NotYet.selector);
+        station.settleClose();
         _post();
         station.settleClose();
         assertEq(exchange.withdrawalCount(), 1, "proved: what it fetched is asked for");

@@ -162,11 +162,13 @@ abstract contract LighterVault is Fixture {
         if (pending != 0) exchange.withdrawPendingBalance(address(station), DOLLAR_ASSET, pending);
     }
 
-    /// The staged close carried out, proved by a newer post, its dollars
+    /// The staged close carried out, proved by a post read after its settle
+    /// delay, its dollars
     /// withdrawn, paid out and delivered.
     function _settleStaged() internal {
         _nextBlock();
         exchange.process();
+        skip(lighter.SETTLE_DELAY());
         _post();
         station.settleClose();
         exchange.process();

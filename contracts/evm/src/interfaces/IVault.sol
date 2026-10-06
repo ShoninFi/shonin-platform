@@ -259,6 +259,11 @@ interface IVault is IStationVault {
     event ClaimBooked(uint256 indexed claimId, address indexed owner, uint256 shares);
     event ClaimTried(uint256 indexed claimId, bool blocked);
     event ClaimPaid(uint256 indexed claimId, uint256 assets);
+    /// A claim paid for part of its shares (its close part-filled or part
+    /// delivered, or a loss its own close made taken from them): `shares`
+    /// burned, `assets` paid; it waits again with `sharesLeft`, booked as
+    /// before. `ClaimPaid` follows when the last of it is paid.
+    event ClaimPartPaid(uint256 indexed claimId, uint256 shares, uint256 assets, uint256 sharesLeft);
     event ProRataTaken(address indexed owner, uint256 shares, uint256 assets, uint256 units);
     event UnitsPaid(address indexed owner, uint256 assets);
     event TankFunded(address indexed from, uint256 assets);

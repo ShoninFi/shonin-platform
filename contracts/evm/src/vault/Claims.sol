@@ -120,7 +120,7 @@ library Claims {
         // freeze it. Only a close that went through can show that; one that
         // failed proves nothing.
         if (!failed && !blocked && home == 0 && stationsBefore.mulDiv(fraction, WAD) <= s.dust()) {
-            _pay(s, claim, claimId, cashShare);
+            _pay(s, claim, claimId, cashShare, claim.shares);
             emit IVault.ClaimTried(claimId, false);
             return;
         }
@@ -141,7 +141,7 @@ library Claims {
             // The close came from the shares' part alone: the unit holders
             // own the same as before, now a larger fraction of what is left.
             if (s.units != 0 && fraction < WAD) s.unitScale = s.scale().mulDiv(WAD, WAD - fraction);
-            _pay(s, claim, claimId, home + cashShare);
+            _pay(s, claim, claimId, home + cashShare, claim.shares);
         }
         emit IVault.ClaimTried(claimId, blocked);
     }
@@ -163,11 +163,19 @@ library Claims {
         s.closing = false;
     }
 
-    /// The home station delivers the close it staged: what it fetched with
-    /// the fraction of the station's idle dollars. A claim is paid that and
-    /// its part of the cash set aside at the stage; a holder is credited it.
-    /// Nobody else takes any of it.
-    function delivered(uint256 amount) external {
+    /// The home station delivers the close it staged, in whole or in part
+    /// (`part`, 1e18 for all): what the delivered part fetched with that
+    /// part of the station's idle dollars. A claim is paid that and the same
+    /// part of its cash set aside at the stage, and the same part of its
+    /// shares, rounded up, is burned; the rest of its cash goes back to the
+    /// cash, and it waits with its remaining shares, booked as before. A
+    /// holder is credited it, and the same part of their units retired.
+    /// `cost`, a loss the close's own sale made, is taken first from what
+    /// is paid, the rest as more of the remaining shares or units, at the
+    /// rate their stake was worth at the stage (`stake`, plus the claim's
+    /// cash), rounded up, never more than are left. Nobody else takes any of
+    /// it.
+    function delivered(uint256 amount, uint256 part, uint256 cost, uint256 stake) external {
         Layout storage s = VaultStorage.layout();
         if (msg.sender != s.homeStation || !s.staging()) revert IVault.NotAllowed();
         IERC20(s.asset).safeTransferFrom(msg.sender, address(this), amount);
@@ -176,18 +184,59 @@ library Claims {
         address holder = s.stagedHolder;
         uint256 cashShare = s.stagedCash;
         _unstage(s);
+        if (part > WAD) part = WAD;
+        // The stations paid out `fraction` x `part` of themselves for whom it
+        // was staged alone: the unit holders own the same as before, now a
+        // larger fraction of what is left.
+        uint256 served = fraction.mulDiv(part, WAD);
         if (claimId != 0) {
             s.cash += amount + cashShare;
-            // The close came from the shares' part alone: the unit holders
-            // own the same as before, now a larger fraction of what is left.
-            if (s.units != 0 && fraction < WAD) s.unitScale = s.scale().mulDiv(WAD, WAD - fraction);
-            _pay(s, s.claims[claimId - 1], claimId, amount + cashShare);
+            if (s.units != 0 && served != 0 && served < WAD) {
+                s.unitScale = s.scale().mulDiv(WAD, WAD - served);
+            }
+            Claim storage claim = s.claims[claimId - 1];
+            uint256 shares = claim.shares;
+            uint256 owned = amount + cashShare.mulDiv(part, WAD);
+            uint256 burned = shares.mulDiv(part, WAD, Math.Rounding.Ceil);
+            (owned, burned) = _charge(owned, burned, shares, cost, stake + cashShare);
+            if (burned == 0) {
+                // Nothing of it closed or came home: it waits as it was.
+                claim.state = ClaimState.Waiting;
+                return;
+            }
+            _pay(s, claim, claimId, owned, burned);
         } else {
-            s.retireUnits(holder, fraction);
-            s.unitCredit[holder] += amount;
-            s.unitReserve += amount;
-            emit IVault.FromStation(amount, amount);
+            uint256 held = s.unitsOf[holder];
+            uint256 gone = held.mulDiv(part, WAD, Math.Rounding.Ceil);
+            uint256 credit;
+            (credit, gone) = _charge(amount, gone, held, cost, stake);
+            // What the cost took from the delivery stays with everyone else.
+            s.cash += amount - credit;
+            s.retireUnits(holder, served, gone);
+            s.unitCredit[holder] += credit;
+            s.unitReserve += credit;
+            emit IVault.FromStation(amount, credit);
         }
+    }
+
+    /// Take `cost` from `paid` first, then as more of what is left of
+    /// `whole` beyond `gone`, at `stake` for all of `whole`, rounded up.
+    function _charge(
+        uint256 paid,
+        uint256 gone,
+        uint256 whole,
+        uint256 cost,
+        uint256 stake
+    ) private pure returns (uint256, uint256) {
+        if (gone > whole) gone = whole;
+        uint256 taken = Math.min(cost, paid);
+        paid -= taken;
+        cost -= taken;
+        if (cost != 0) {
+            uint256 more = stake == 0 ? whole : cost.mulDiv(whole, stake, Math.Rounding.Ceil);
+            gone = Math.min(whole, gone + more);
+        }
+        return (paid, gone);
     }
 
     /// The staged close ended without a delivery: the claim waits again,
@@ -211,22 +260,28 @@ library Claims {
         s.valueFirst = true;
     }
 
-    /// Pay a claim what its shares own, less its own profit fee, paid in
-    /// cash to the author and the platform, and the transaction fee, which
-    /// stays in the pool. The profit fee is measured against the mark as it
-    /// is now, which is what the stayers' fee is measured against too.
-    function _pay(Layout storage s, Claim storage claim, uint256 claimId, uint256 owned) private {
+    /// Pay a claim `owned` for `burned` of its shares (all of them, or a
+    /// part), less their own profit fee, paid in cash to the author and the
+    /// platform, and the transaction fee, which stays in the pool. The
+    /// profit fee is measured against the mark as it is now, which is what
+    /// the stayers' fee is measured against too. A claim paid for part of
+    /// its shares waits again with the rest, booked as before.
+    function _pay(
+        Layout storage s,
+        Claim storage claim,
+        uint256 claimId,
+        uint256 owned,
+        uint256 burned
+    ) private {
         if (owned > s.cash) owned = s.cash;
-        uint256 shares = claim.shares;
-        uint256 fee = s.feeOf(owned, shares);
+        uint256 fee = s.feeOf(owned, burned);
         uint256 gross = owned - fee;
         uint256 kept = gross.mulDiv(s.fees.transactionBps, BPS, Math.Rounding.Ceil);
         uint256 payout = gross - kept;
 
-        s.pendingShares -= shares;
-        s.burn(address(this), shares);
+        s.pendingShares -= burned;
+        s.burn(address(this), burned);
         s.cash -= owned - kept;
-        claim.state = ClaimState.Paid;
         if (fee != 0) {
             uint256 total = uint256(s.fees.authorBps) + s.fees.platformBps;
             uint256 toAuthor = fee.mulDiv(s.fees.authorBps, total);
@@ -234,10 +289,18 @@ library Claims {
             s.pay(s.platform, fee - toAuthor);
         }
         payout -= Valuations.payExitCost(s, claimId, payout);
-        claim.paid = payout;
+        claim.paid += payout;
         s.pay(claim.owner, payout);
-        emit IVault.Withdrawn(0, claim.owner, shares, payout, 0);
-        emit IVault.ClaimPaid(claimId, payout);
+        uint256 left = claim.shares - burned;
+        emit IVault.Withdrawn(0, claim.owner, burned, payout, 0);
+        if (left == 0) {
+            claim.state = ClaimState.Paid;
+            emit IVault.ClaimPaid(claimId, payout);
+        } else {
+            claim.shares = left;
+            claim.state = ClaimState.Waiting;
+            emit IVault.ClaimPartPaid(claimId, burned, payout, left);
+        }
     }
 
     /// A withdrawal nothing has priced for `fallbackAfter` (a market outside

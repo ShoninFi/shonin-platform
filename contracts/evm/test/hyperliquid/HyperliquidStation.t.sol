@@ -26,12 +26,13 @@ contract HyperliquidStationTest is HyperliquidVault {
 
     function test_spot_dollars_count_at_par_and_spot_tokens_at_the_lower_of_price_and_bid() public {
         core.creditSpot(address(station), 0, 50e8);
-        // 10 HYPE, at $20 with the bid at $19.
+        // 10 HYPE, at $20 with the bid at $19: the 9 above the reserve kept
+        // for sends home count.
         core.creditSpot(address(station), HYPE_TOKEN, 10e8);
         core.setSpot(HYPE_PAIR, 20_000_000, 19_000_000, 21_000_000);
         (uint256 mark, uint256 exit) = hl.valueOf(address(station));
-        assertEq(mark, 50e6 + 200e6);
-        assertEq(exit, 50e6 + 190e6);
+        assertEq(mark, 50e6 + 180e6);
+        assertEq(exit, 50e6 + 171e6);
     }
 
     function test_a_perp_the_driver_does_not_list_blocks_every_close_and_counts_nothing_to_a_leaver()
@@ -61,7 +62,7 @@ contract HyperliquidStationTest is HyperliquidVault {
         assertTrue(blocked);
     }
 
-    function test_hype_kept_for_sends_home_is_never_sold_never_blocks_and_still_counts() public {
+    function test_hype_kept_for_sends_home_is_never_sold_never_blocks_and_is_worth_nothing() public {
         _fundAndTrade();
         // $12 of HYPE, more than the smallest order, on a book far wider
         // than the band: still the cost of sending home, under the reserve.
@@ -72,11 +73,13 @@ contract HyperliquidStationTest is HyperliquidVault {
         assertEq(calls.length, 1, "only the perp is closed");
         (uint256 mark,) = hl.valueOf(address(station));
         (int256 accountValue,) = core.accountValue(address(station));
-        assertEq(mark, uint256(accountValue) + 12e6, "and it is counted at its price");
+        assertEq(mark, uint256(accountValue), "nothing ever sells it, so it is worth nothing to anyone");
         // Nor is it asked of a proof: the perp shrinking is enough.
         int256[] memory before = hl.exposure(address(station));
         core.trade(address(station), ETH, -333_334, ETH_PX);
-        assertTrue(hl.closed(address(station), before, 0.5e18));
+        (uint256 part, bool known) = hl.closedPart(address(station), before, 0.5e18, uint64(block.timestamp));
+        assertTrue(known);
+        assertEq(part, 1e18);
         // Above the reserve, HYPE is a holding like any other.
         core.creditSpot(address(station), HYPE_TOKEN, 2e8);
         (, blocked) = hl.close(address(station), 0.5e18, 100);
@@ -126,6 +129,10 @@ contract HyperliquidStationTest is HyperliquidVault {
         station.settleClose();
 
         _nextBlock();
+        // Nor before the venue has surely run its orders.
+        vm.expectRevert(Station.NotYet.selector);
+        station.settleClose();
+        skip(hl.SETTLE_DELAY());
         station.settleClose();
         s = station.stage();
         assertGt(s.sweptBlock, 0, "proved and swept");
@@ -164,7 +171,7 @@ contract HyperliquidStationTest is HyperliquidVault {
         assertEq(core.queued(), 1, "still one order");
     }
 
-    function test_a_close_the_venue_did_not_fill_moves_nothing_and_lapses() public {
+    function test_a_close_the_venue_did_not_fill_ends_with_nothing_paid_and_the_claim_waits() public {
         uint256 aliceShares = _fundAndTrade();
         _stockGas();
         _aliceClaims(aliceShares);
@@ -178,8 +185,9 @@ contract HyperliquidStationTest is HyperliquidVault {
         station.settleClose();
         skip(station.stage().window);
         station.settleClose();
-        assertEq(station.stage().stagedAt, 0, "lapsed");
+        assertEq(station.stage().stagedAt, 0, "ended");
         assertTrue(vault.claimAt(1).state == ClaimState.Waiting, "the claim waits again");
+        assertEq(vault.claimAt(1).shares, aliceShares, "with all its shares");
         assertEq(vault.cash(), cashBefore, "its part of the cash is back");
         assertEq(core.queued(), 0, "nothing was swept");
         (uint256 markAfter,) = station.value();
@@ -187,15 +195,17 @@ contract HyperliquidStationTest is HyperliquidVault {
         assertEq(uint256(int256(core.szi(address(station), ETH))), 666_667, "the position is whole");
     }
 
-    function test_a_partly_filled_close_is_not_proved_and_sweeps_nothing() public {
+    function test_a_partly_filled_close_is_measured_only_once_its_window_is_over() public {
         uint256 aliceShares = _fundAndTrade();
         _stockGas();
         _aliceClaims(aliceShares);
         vault.settleClaim(1);
         core.setDepth(100_000);
         _nextBlock();
+        skip(hl.SETTLE_DELAY());
         vm.expectRevert(Station.NotYet.selector);
         station.settleClose();
+        assertEq(core.queued(), 0, "nothing asked for");
     }
 
     // A stopped station ------------------------------------------------------

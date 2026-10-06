@@ -979,8 +979,9 @@ contract VaultExternalFunctionsTest is ClaimBase, Calls {
         amount = bound(amount, 0, 1_000_000e6);
         World memory b = look(caller, address(0));
         uint256 cash = vault.cash();
-        bytes memory call =
-            deliver ? abi.encodeCall(Vault.delivered, (amount)) : abi.encodeCall(Vault.unstaged, ());
+        bytes memory call = deliver
+            ? abi.encodeCall(Vault.delivered, (amount, 1e18, 0, amount))
+            : abi.encodeCall(Vault.unstaged, ());
         (bool ok, bytes4 err) = callAs(caller, address(vault), call);
         expectOutcome(ok, err, IVault.NotAllowed.selector, deliver ? "delivered" : "unstaged");
         assertEq(vault.cash(), cash);

@@ -9,8 +9,8 @@ import {HyperliquidVault} from "./HyperliquidVault.sol";
 /// What a staged close fetched is measured at its proof: what the account is
 /// worth then, less what the part it was to keep of the account as it was
 /// at the stage is worth at the prices then, plus whatever came home from it
-/// meanwhile; never below nothing and never above the fraction's worth at
-/// exit-side prices when it was placed. And while a close is in progress
+/// meanwhile; never above the fraction's worth at exit-side prices when it
+/// was placed. And while a close is in progress
 /// nothing else is priced, divided or tried.
 contract StagedCloseIsMeasuredTest is HyperliquidVault {
     /// Staged, then filled at the bid in the next block; proved and measured
@@ -22,6 +22,7 @@ contract StagedCloseIsMeasuredTest is HyperliquidVault {
         vault.settleClaim(1);
         _nextBlock();
         between();
+        skip(hl.SETTLE_DELAY());
         station.settleClose();
         return station.stage();
     }
@@ -30,8 +31,7 @@ contract StagedCloseIsMeasuredTest is HyperliquidVault {
 
     function _agentSells() internal {
         // The agent sells 10 ETH at the mark, after the leaver's close and
-        // before its proof. (A trade that grew a position the close shrank
-        // would leave it unproved, and it would lapse.)
+        // before its proof.
         core.trade(address(station), ETH, -100_000, ETH_PX);
     }
 
@@ -72,6 +72,7 @@ contract StagedCloseIsMeasuredTest is HyperliquidVault {
         core.setPerp(ETH, ETH_PX, ETH_PX, ETH_PX * 1005 / 1000, ETH_PX * 1006 / 1000);
         _nextBlock();
         _spread(ETH_PX, 10);
+        skip(hl.SETTLE_DELAY());
         station.settleClose();
         Stage memory s = station.stage();
         assertEq(s.fetched, s.estimate, "never more than the fraction's worth at exit prices");
@@ -125,6 +126,30 @@ contract StagedCloseIsMeasuredTest is HyperliquidVault {
         assertTrue(vault.claimAt(2).state == ClaimState.Closing);
     }
 
+    function test_only_a_priced_valuation_is_one_between_two_closes() public {
+        _fundAndTrade();
+        _stockGas();
+        uint256 bobShares = vault.balanceOf(bob);
+        vm.startPrank(bob);
+        vault.requestRedeem(bobShares / 2, bob);
+        vault.requestRedeem(bobShares - bobShares / 2, bob);
+        vm.stopPrank();
+        value(vault);
+        vault.settleClaim(1);
+        _settleStaged();
+
+        // A valuation the band voids is not one.
+        core.setPerp(ETH, ETH_PX * 103 / 100, ETH_PX, ETH_PX - 10, ETH_PX + 10);
+        value(vault);
+        assertTrue(vault.valuationAt(vault.valuationCount() - 1).status == ValuationStatus.Void);
+        _spread(ETH_PX, 10);
+        vm.expectRevert(IVault.NotYet.selector);
+        vault.settleClaim(2);
+        value(vault);
+        vault.settleClaim(2);
+        assertTrue(vault.claimAt(2).state == ClaimState.Closing);
+    }
+
     function test_a_stopped_stations_full_unwind_takes_the_place_of_a_staged_close() public {
         uint256 aliceShares = _fundAndTrade();
         _stockGas();
@@ -132,6 +157,7 @@ contract StagedCloseIsMeasuredTest is HyperliquidVault {
         uint256 cashBefore = vault.cash();
         vault.settleClaim(1);
         _nextBlock();
+        skip(hl.SETTLE_DELAY());
         station.settleClose();
         assertGt(station.stage().sweptBlock, 0, "proved");
 

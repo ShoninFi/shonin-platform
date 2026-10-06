@@ -125,10 +125,11 @@ abstract contract HyperliquidVault is Fixture {
         require(vault.claimCount() == 1, "a claim");
     }
 
-    /// Prove the staged close in the next block, then deliver it once its
-    /// dollars have landed in the block after.
+    /// Prove the staged close once its settle delay has passed, then
+    /// deliver it once its dollars have landed in the block after.
     function _settleStaged() internal {
         _nextBlock();
+        skip(hl.SETTLE_DELAY());
         station.settleClose();
         _nextBlock();
         station.settleClose();

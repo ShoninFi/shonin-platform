@@ -32,6 +32,7 @@ contract StagedFillIsTheLeaversAloneTest is HyperliquidVault {
         _spread(ETH_PX, 10);
 
         // Proved and measured, swept, delivered: paid there and then.
+        skip(hl.SETTLE_DELAY());
         station.settleClose();
         _nextBlock();
         station.settleClose();

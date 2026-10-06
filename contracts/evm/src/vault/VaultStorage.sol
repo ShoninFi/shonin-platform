@@ -309,16 +309,28 @@ library VaultStorage {
     /// them. What is left is everyone else's in the same proportions, so
     /// every remaining fraction grows to match.
     function retireUnits(Layout storage s, address holder, uint256 fraction) internal {
+        retireUnits(s, holder, fraction, s.unitsOf[holder]);
+    }
+
+    /// The same for `gone` of a holder's units (all, or a part served and
+    /// any taken for a cost); the stations paid out `fraction` for them.
+    function retireUnits(Layout storage s, address holder, uint256 fraction, uint256 gone) internal {
         accrue(s, holder);
-        s.units -= s.unitsOf[holder];
-        s.unitsOf[holder] = 0;
-        s.unitsSince[holder] = 0;
+        uint256 held = s.unitsOf[holder];
+        if (gone > held) gone = held;
+        s.units -= gone;
+        s.unitsOf[holder] = held - gone;
+        if (held == gone) {
+            s.unitsSince[holder] = 0;
+            s.unitDebt[holder] = 0;
+        } else {
+            s.unitDebt[holder] = (held - gone).mulDiv(s.perUnit, UNIT_SCALE, Math.Rounding.Ceil);
+        }
         if (s.units == 0) {
             s.unitScale = 0;
-        } else if (fraction < WAD) {
+        } else if (fraction != 0 && fraction < WAD) {
             s.unitScale = scale(s).mulDiv(WAD, WAD - fraction);
         }
-        s.unitDebt[holder] = 0;
     }
 
     /// Cash nothing has set aside: what withdrawals, fills and the station
