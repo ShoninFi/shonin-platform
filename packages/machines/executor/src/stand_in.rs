@@ -97,6 +97,7 @@ fn answer_call(state: &Chain, input: &[u8]) -> Vec<u8> {
         IVault::homeStationCall::SELECTOR => {
             IVault::homeStationCall::abi_encode_returns(&Address::repeat_byte(0x55))
         }
+        chain::bindings::station::IStation::specCall::SELECTOR => local_station_spec(),
         // No key approved at the station.
         chain::bindings::station::IStation::approvedKeyCall::SELECTOR => {
             chain::bindings::station::IStation::approvedKeyCall::abi_encode_returns(&Address::ZERO)
@@ -129,6 +130,20 @@ fn answer_call(state: &Chain, input: &[u8]) -> Vec<u8> {
         }
         _ => panic!("the stand-in chain was asked something it does not answer: {selector:?}"),
     }
+}
+
+/// A station that trades through the stand-in venue alone.
+fn local_station_spec() -> Vec<u8> {
+    use chain::bindings::station::{IStation, StationSpec};
+    IStation::specCall::abi_encode_returns(&StationSpec {
+        vaultChain: U256::from(31_337u64),
+        vault: Address::ZERO,
+        bundleHash: B256::ZERO,
+        drivers: vec![chain::names::LOCAL_DRIVER],
+        bridges: Vec::new(),
+        chains: Vec::new(),
+        exitBandBps: 100,
+    })
 }
 
 async fn rpc(State(state): State<Shared>, Json(request): Json<Value>) -> Response {
@@ -472,6 +487,7 @@ pub mod serving {
             IVault::homeStationCall::SELECTOR => {
                 IVault::homeStationCall::abi_encode_returns(&node.station)
             }
+            IStation::specCall::SELECTOR => super::local_station_spec(),
             IStation::approvedKeyCall::SELECTOR => {
                 IStation::approvedKeyCall::abi_encode_returns(&node.approved_key)
             }
@@ -886,6 +902,7 @@ pub mod killed {
             | IVault::requestCountCall::SELECTOR
             | IVault::claimCountCall::SELECTOR => word(0),
             IVault::idleFloorCall::SELECTOR => [0u8; 96].to_vec(),
+            IStation::specCall::SELECTOR => super::local_station_spec(),
             IStation::approvedKeyCall::SELECTOR => IStation::approvedKeyCall::abi_encode_returns(
                 &node.approved_instead.unwrap_or(node.key),
             ),

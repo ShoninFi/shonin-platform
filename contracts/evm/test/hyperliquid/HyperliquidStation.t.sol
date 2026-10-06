@@ -258,6 +258,53 @@ contract HyperliquidStationTest is Fixture {
         station.settleClose();
     }
 
+    // A stopped station ------------------------------------------------------
+
+    /// What the keeper does with a stopped Hyperliquid station: it repeats
+    /// the full unwind. The first places the closing orders and reports
+    /// itself not done; once the venue has filled them, the next sends the
+    /// freed dollars to HyperEVM and is done at the venue; once they have
+    /// landed, the next sends them home to the vault. Then the station holds
+    /// nothing and a further unwind sends nothing.
+    function test_a_stopped_station_is_emptied_by_repeated_unwinds_placed_swept_then_sent_home() public {
+        _fundAndTrade();
+        vm.prank(admin);
+        vault.kill();
+        skip(HALT_GRACE);
+        station.stop();
+        uint256 cashBefore = vault.cash();
+
+        (uint256 home, bool blocked) = station.unwind(1e18);
+        assertTrue(blocked, "orders were placed: not done");
+        // The closing order, and the dollars the account could already spare
+        // sent home beside it.
+        assertGe(core.queued(), 1);
+
+        _nextBlock();
+        assertEq(core.szi(address(station), ETH), 0, "the venue filled the close");
+        uint256 sentHome = home;
+        (home, blocked) = station.unwind(1e18);
+        sentHome += home;
+        assertFalse(blocked, "nothing left to order closed");
+        assertGt(core.queued(), 0, "the freed dollars are sent home from the account");
+
+        _nextBlock();
+        uint256 landed = usd.balanceOf(address(station));
+        assertGt(landed, 0, "the account's dollars landed at the station");
+        (home, blocked) = station.unwind(1e18);
+        sentHome += home;
+        assertFalse(blocked);
+        assertEq(home, landed, "everything at the station went home");
+        assertEq(vault.cash(), cashBefore + sentHome);
+        assertGt(sentHome, 185_000e6, "the account's worth came home, less the venue's costs");
+
+        (uint256 mark,) = station.value();
+        assertEq(mark, 0, "the station holds nothing");
+        (home, blocked) = station.unwind(1e18);
+        assertEq(home, 0);
+        assertFalse(blocked);
+    }
+
     // Keys ------------------------------------------------------------------
 
     function test_approving_a_key_pins_the_balance_mode_then_names_the_agent_with_its_expiry() public {

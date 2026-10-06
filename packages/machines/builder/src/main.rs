@@ -1597,10 +1597,40 @@ async fn take_one(service: &Arc<Service>) -> Result<()> {
             }
             let _ = write_queue(service, &mut queue);
         }
+        // A node that didn't answer, or limited the rate of requests, is
+        // neither the job's doing nor the author's: the job goes back in the
+        // queue, its payment kept, and asks again later, as when the reviewer
+        // is away. A registration that landed meanwhile is found then.
+        Err(error) if chain::node_trouble(&error) => {
+            let mut queue = service.queue.lock().await;
+            if let Some(waiting) = queue
+                .jobs
+                .iter_mut()
+                .find(|waiting| waiting.job.id == entry.job.id)
+            {
+                waiting.job.state = JobState::Queued { position: 0 };
+                waiting.attempts = waiting.attempts.saturating_sub(1);
+                let wait = waiting_for_the_reviewer(waiting.reviewer_away);
+                waiting.reviewer_away += 1;
+                waiting.not_before = Some(now() + wait);
+                tracing::warn!(
+                    id = entry.job.id,
+                    error = format!("{error:#}"),
+                    seconds = wait.whole_seconds(),
+                    "the chain's node did not answer: the job is back in the queue, its payment \
+                     kept, and asks again later"
+                );
+            }
+            let _ = write_queue(service, &mut queue);
+        }
         Err(error) => {
             // The fee is spent all the same: a free retry is something anyone
             // could trigger.
-            tracing::warn!(id = entry.job.id, %error, "a job failed on our side");
+            tracing::warn!(
+                id = entry.job.id,
+                error = format!("{error:#}"),
+                "a job failed on our side"
+            );
             set_state(
                 service,
                 &entry.job.id,

@@ -17,6 +17,7 @@ mod dashboard;
 mod deploy;
 mod devnet_keys;
 mod fund;
+mod hyperliquid_vaults;
 mod market;
 mod publish;
 mod seed;
@@ -122,6 +123,21 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// On Hyperliquid testnet: deploy (or find) the vault stack whose
+    /// dollar is HyperEVM's USDC, with the Hyperliquid driver approved; with
+    /// `--api` and `--agent`, also publish that agent, activate it there,
+    /// deposit, fund the station's HyperCore account, and claim it all back.
+    HyperliquidVaults {
+        #[arg(long)]
+        api: Option<String>,
+        #[arg(long)]
+        agent: Option<PathBuf>,
+        /// What the funder sends the station's HyperCore account.
+        #[arg(long, default_value_t = 30.0)]
+        station_dollars: f64,
+        #[arg(long, default_value_t = 10)]
+        trade_minutes: u64,
+    },
     /// Publish the reference agents through the platform's own flows, on the
     /// vault chain.
     Seed {
@@ -135,6 +151,10 @@ enum Command {
         /// instead of the full set of examples the site needs.
         #[arg(long)]
         agent: Option<String>,
+        /// With `--agent`, then use its vault as the full seed's live vault
+        /// is used: a deposit priced and a claim booked and paid.
+        #[arg(long)]
+        live: bool,
     },
 }
 
@@ -159,6 +179,7 @@ async fn main() -> Result<()> {
                 | Command::Accounts
                 | Command::Fund
                 | Command::ProposeChecker
+                | Command::HyperliquidVaults { .. }
         )
     );
     if target.network == NetworkName::Mainnet && changes_chains {
@@ -274,11 +295,49 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Some(Command::HyperliquidVaults {
+            api,
+            agent,
+            station_dollars,
+            trade_minutes,
+        }) => {
+            let client = target.connect().await?;
+            let deployments = target.wait_for_deployments(&client).await?;
+            match (api, agent) {
+                (Some(api), Some(agent)) => {
+                    hyperliquid_vaults::run(
+                        &client,
+                        &args.artifacts,
+                        &deployments,
+                        &target.deployments_dir,
+                        &api,
+                        &agent,
+                        station_dollars,
+                        trade_minutes,
+                    )
+                    .await
+                }
+                _ => {
+                    let file =
+                        hyperliquid_vaults::HyperliquidVaults::file_in(&target.deployments_dir);
+                    let vaults =
+                        hyperliquid_vaults::ensure(&client, &args.artifacts, &deployments, &file)
+                            .await?;
+                    println!("{}", serde_json::to_string_pretty(&vaults)?);
+                    Ok(())
+                }
+            }
+        }
         Some(Command::Seed { .. }) if target.key.kind == ChainKind::Solana => {
             let served = target.serve_solana().await?;
             solana_seed::run(&served).await
         }
-        Some(Command::Seed { api, agents, agent }) => {
+        Some(Command::Seed {
+            api,
+            agents,
+            agent,
+            live,
+        }) => {
             let client = target.connect().await?;
             let deployments = target.wait_for_deployments(&client).await?;
             match agent {
@@ -290,6 +349,7 @@ async fn main() -> Result<()> {
                         &api,
                         agents.as_deref(),
                         &name,
+                        live,
                     )
                     .await
                 }

@@ -1,0 +1,30 @@
+[package]
+name = "shonin-lighter"
+description = "Lighter on Robinhood Chain: its API, how its transactions are signed, and the driver's executor half"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Everything but the payload types. An agent built to WebAssembly turns the
+# default off and uses only `payload`.
+default = ["venue"]
+venue = ["dep:alloy", "dep:anyhow", "dep:lighters", "dep:reqwest", "dep:serde_json"]
+
+[dependencies]
+fastnum.workspace = true
+serde.workspace = true
+
+alloy = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+lighters = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true, features = ["multipart"] }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+ciborium.workspace = true
+
+[lints]
+workspace = true

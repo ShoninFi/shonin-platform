@@ -21,6 +21,8 @@ Every agent carries one configuration file, `shonin.toml`, at the root of its pr
 - **It's always shown on the agent's page**, even when the source is sealed. Depositors see the same vault chain, description, claims, drivers and bridges the Reviewer read, whether or not they can read the code.
 
 ```toml
+capabilities = ["network"]
+
 [vault]
 chain = "hyperliquid"
 
@@ -33,15 +35,19 @@ claims = [
 
 # one table for each driver it trades through
 [drivers.hyperliquid]
-[drivers.robinhood-stocks]
+[drivers.robinhood]
 
 # and one for each bridge it uses
 [bridges.across]
 ```
 
-This agent's vault lives on Hyperliquid, where it trades. It also trades stock tokens on Robinhood Chain, and uses one bridge to move money between the two.
+This agent's vault lives on Hyperliquid, where it trades. It also trades stock tokens on Robinhood Chain, uses one bridge to move money between the two, and reaches the network for data of its own.
 
 You don't give your agent an id: it gets one automatically when you submit it. Its `title` is the name people see.
+
+### `capabilities`
+
+Optional. What your agent may use beyond its drivers. Today there is one, `network`: reaching any host on the internet, described on [Services](services.md#the-network). An agent that doesn't list it has no network at all, and a name that isn't a capability is refused.
 
 ### `[vault]`
 

@@ -53,8 +53,11 @@ pub struct Runner {
     /// Where the vault is, and how its agent's requests reach it.
     pub place: Place,
     pub home_chain: String,
-    /// The driver this agent's manifest named.
-    pub driver: String,
+    /// The drivers this agent's manifest named.
+    pub drivers: Vec<String>,
+    /// Where the bundle's models are, if it carries any: each is loaded
+    /// before the agent starts, and a model that won't load stops the start.
+    pub models: Option<std::path::PathBuf>,
     /// Whether the manifest declares `network`: requests and WebSockets to
     /// any host.
     pub network: bool,
@@ -120,6 +123,13 @@ impl Runner {
             &self.home_chain,
             &self.place.vault(),
         );
+        let inference = match &self.models {
+            Some(dir) => Some(Arc::new(crate::inference::Inference::load(
+                dir,
+                crate::inference::Budget::from_allowance(self.allowances.inference_ms_per_min),
+            )?)),
+            None => None,
+        };
         let mut store = Store::new(
             engine,
             Ctx {
@@ -135,7 +145,8 @@ impl Runner {
                 table: handle_table(),
                 place: self.place.clone(),
                 home_chain: self.home_chain.clone(),
-                driver: self.driver.clone(),
+                drivers: self.drivers.clone(),
+                inference,
                 state,
                 http: Default::default(),
                 http_hooks: crate::net::Http { net: net.clone() },

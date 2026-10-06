@@ -129,6 +129,11 @@ pub struct Client {
     /// filled in, so two sends from one account at once would both take the
     /// same one and the node would keep only one of them.
     turns: Arc<std::sync::Mutex<HashMap<Address, Arc<tokio::sync::Mutex<()>>>>>,
+    /// The nonce after each account's last send whose receipt was seen,
+    /// shared by every clone. A public RPC is often several nodes behind one
+    /// name, and one a block behind would number the next send as the last
+    /// again; a send is never numbered below this.
+    nonces: Arc<std::sync::Mutex<HashMap<Address, u64>>>,
 }
 
 /// The fillers a signing client runs: gas, then the nonce, then the chain id.
@@ -412,8 +417,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// endpoints each limit how fast one address may ask, and a whole stack on
 /// one machine passes any one of their limits. Each request then goes to the
 /// endpoint ranked best by how often and how fast it has answered lately, and
-/// one that refuses (a rate limit included, however it is worded) falls in
-/// the ranking, so the next requests go elsewhere.
+/// to the next when one refuses (a rate limit included, however it is
+/// worded), which also falls in the ranking.
 fn rpc_client(rpc: &str) -> Result<alloy::rpc::client::RpcClient> {
     let http = alloy::transports::http::reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
@@ -437,13 +442,52 @@ fn rpc_client(rpc: &str) -> Result<alloy::rpc::client::RpcClient> {
         let inner = alloy::transports::http::Http::with_client(http.clone(), url);
         transports.push(tower::Layer::layer(&keep, RateLimitIsAFailure { inner }));
     }
+    // Every method the services use goes to one endpoint at a time, best
+    // first, and on to the next when one refuses, so a request fails only
+    // when every endpoint has. A method not listed goes to them all at once
+    // and takes the first answer.
+    let count =
+        std::num::NonZeroUsize::new(transports.len()).unwrap_or(std::num::NonZeroUsize::MIN);
     let fallback = tower::Layer::layer(
         &alloy::transports::layers::FallbackLayer::default()
-            .with_active_transport_count(std::num::NonZeroUsize::MIN),
+            .with_active_transport_count(count)
+            .with_sequential_methods(
+                ONE_ENDPOINT_AT_A_TIME
+                    .iter()
+                    .map(|method| method.to_string())
+                    .collect(),
+            ),
         transports,
     );
     Ok(alloy::rpc::client::ClientBuilder::default().transport(fallback, false))
 }
+
+/// The methods sent to one endpoint at a time: every one the services use.
+/// A send among them must never go to two endpoints at once.
+const ONE_ENDPOINT_AT_A_TIME: [&str; 22] = [
+    "eth_blockNumber",
+    "eth_chainId",
+    "net_version",
+    "eth_call",
+    "eth_estimateGas",
+    "eth_getLogs",
+    "eth_getBalance",
+    "eth_getCode",
+    "eth_getStorageAt",
+    "eth_getTransactionCount",
+    "eth_getBlockByNumber",
+    "eth_getBlockByHash",
+    "eth_getTransactionByHash",
+    "eth_getTransactionReceipt",
+    "eth_gasPrice",
+    "eth_maxPriorityFeePerGas",
+    "eth_feeHistory",
+    "eth_sendRawTransaction",
+    "eth_sendTransaction",
+    "eth_sendRawTransactionSync",
+    "eth_sendTransactionSync",
+    "eth_signTypedData_v4",
+];
 
 /// An answer that is a rate limit, whether as an HTTP status or inside a
 /// JSON-RPC error, taken as the endpoint failing, so a ranking of endpoints
@@ -500,6 +544,7 @@ fn is_rate_limit(code: i64, message: &str) -> bool {
     code == 429
         || message.contains("rate limit")
         || message.contains("too many requests")
+        || message.contains("request limit")
         || (code == -32005 && !message.contains("range") && !message.contains("results"))
 }
 
@@ -609,6 +654,7 @@ impl Client {
             accounts,
             keys,
             turns: Default::default(),
+            nonces: Default::default(),
         })
     }
 
@@ -857,6 +903,26 @@ impl Client {
             }
             _ => None,
         };
+        // Numbered here, while the account's turn is held: the node's count
+        // of the account's sends, pending ones included, but never below the
+        // one after the last send this client saw land. A count the node
+        // won't give leaves the numbering to the send itself, as before.
+        let mut request = request;
+        let mut numbered = None;
+        if let (Some(_), Some(from), None) = (&_turn, request.from, request.nonce)
+            && let Ok(counted) = self.provider.get_transaction_count(from).pending().await
+        {
+            let floor = self
+                .nonces
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&from)
+                .copied()
+                .unwrap_or(0);
+            let nonce = counted.max(floor);
+            request = request.with_nonce(nonce);
+            numbered = Some((from, nonce));
+        }
         let pending = self
             .provider
             .send_transaction(request)
@@ -864,7 +930,16 @@ impl Client {
             .with_context(|| sending.to_string())?;
         let hash = *pending.tx_hash();
         sent_as(hash);
-        receipt_within(&self.provider, hash, within, what).await
+        let receipt = receipt_within(&self.provider, hash, within, what).await?;
+        if let Some((from, nonce)) = numbered {
+            let mut nonces = self
+                .nonces
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let next = nonces.entry(from).or_default();
+            *next = (*next).max(nonce + 1);
+        }
+        Ok(receipt)
     }
 
     /// Have the node sign a digest as `who`, the way a wallet would: the
@@ -1216,6 +1291,21 @@ pub fn unanswered(error: &anyhow::Error) -> bool {
                 .is_some_and(|error| error.is_transport_error())
             || cause.is::<alloy::providers::PendingTransactionError>()
     })
+}
+
+/// Whether a failure is the node's trouble rather than an answer about what
+/// was asked: it went unanswered, or the endpoint is limiting the rate of
+/// requests, however it words that. Work that failed this way is nobody's
+/// doing and can be tried again later.
+pub fn node_trouble(error: &anyhow::Error) -> bool {
+    unanswered(error)
+        || error.chain().any(|cause| {
+            cause
+                .downcast_ref::<alloy::transports::TransportError>()
+                .and_then(|error| error.as_error_resp())
+                .is_some_and(|response| is_rate_limit(response.code, &response.message))
+                || is_rate_limit(0, &cause.to_string())
+        })
 }
 
 /// Whether a failed send may still land: it went unanswered after it was
@@ -1887,5 +1977,22 @@ mod tests {
         ));
         assert!(!is_rate_limit(3, "execution reverted"));
         assert!(!is_rate_limit(-32000, "nonce too low"));
+    }
+
+    #[test]
+    fn a_rate_limit_however_it_arrives_is_the_node_s_trouble() {
+        let wrapped = anyhow::anyhow!("25/second request limit reached")
+            .context("reading isBlessedAs")
+            .context("the registry would not take the registration");
+        assert!(
+            node_trouble(&wrapped),
+            "a public endpoint's per-second limit"
+        );
+        let limited = anyhow::anyhow!("HTTP error 429 with body: Too Many Requests")
+            .context("the registry would not take the registration");
+        assert!(node_trouble(&limited));
+        let refused =
+            anyhow::Error::new(Reverted).context("the registry would not take the registration");
+        assert!(!node_trouble(&refused));
     }
 }

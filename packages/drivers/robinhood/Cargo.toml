@@ -1,0 +1,27 @@
+[package]
+name = "shonin-robinhood"
+description = "Robinhood Chain: stock tokens in a station's Safe, scoped by Zodiac Roles, and the driver's executor half"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Everything but the payload types. An agent built to WebAssembly turns the
+# default off and uses only `payload`.
+default = ["venue"]
+venue = ["dep:alloy", "dep:anyhow"]
+
+[dependencies]
+fastnum.workspace = true
+serde.workspace = true
+
+alloy = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+
+[dev-dependencies]
+ciborium.workspace = true
+
+[lints]
+workspace = true

@@ -11,10 +11,14 @@
 #   networks    the networks it is offered on today; empty until its driver is
 #               built and approved
 #   restricted  who its venue's terms exclude, as short codes: ISO 3166 country
-#               codes, or SANCTIONED. Every vault using it refuses deposits from
-#               them, on top of the platform's own US and SANCTIONED
+#               codes, ISO 3166-2 subdivision codes (CA-ON), or SANCTIONED.
+#               Every vault using it refuses deposits from them, on top of the
+#               platform's own US and SANCTIONED
 #   custody     venue (the venue enforces it) or station (the station does)
-#   exit        contract (the contracts close positions alone) or unwinder
+#   exit        contract (the contracts close positions alone, in the leaver's
+#               transaction), delayed (the contracts close them alone, but the
+#               venue acts after the transaction, so a close is proved and
+#               swept in a later one), or unwinder
 #   valuation   on-chain, or attested-read
 #
 # For each bridge: label, networks.
@@ -31,18 +35,22 @@ valuation = "on-chain"
 [drivers.hyperliquid]
 label = "Hyperliquid"
 chain = "hyperliquid"
-networks = []
-# Taken from Hyperliquid's terms when its driver is approved.
-restricted = []
+networks = ["testnet"]
+# What the driver contract's `restricted()` answers, from Hyperliquid's terms:
+# read them again before it is approved on mainnet.
+restricted = ["CA-ON", "SANCTIONED", "US"]
 custody = "venue"
-exit = "contract"
+# The venue acts on the station's orders after the transaction: a close is
+# placed, then proved and swept home in later blocks.
+exit = "delayed"
 valuation = "on-chain"
 
-[drivers.robinhood-stocks]
-label = "Stock tokens on Robinhood Chain"
+[drivers.robinhood]
+label = "Robinhood Chain stock tokens"
 chain = "robinhood"
+# Its listings are mainnet tokens: a testnet one would have nothing to trade.
 networks = []
-restricted = ["CA", "CH", "GB", "US"]
+restricted = ["CA", "CH", "GB", "SANCTIONED", "US"]
 custody = "station"
 exit = "contract"
 valuation = "on-chain"
@@ -50,10 +58,11 @@ valuation = "on-chain"
 [drivers.lighter]
 label = "Lighter"
 chain = "robinhood"
+# Lighter has no exchange on Robinhood Chain's testnet.
 networks = []
 restricted = ["CA", "CN", "GB", "RU", "SANCTIONED", "UA", "US"]
 custody = "venue"
-exit = "contract"
+exit = "delayed"
 valuation = "attested-read"
 
 [drivers.orca]

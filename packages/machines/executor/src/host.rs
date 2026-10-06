@@ -16,6 +16,7 @@ use chain::bindings::station::IStation;
 use chain::bindings::vault::IVault;
 use chain::bindings::venue::{ILocalVenue, OrderRequest};
 use chain::{Client, KeyClient};
+use hyperliquid::agent::Outcome;
 use strategy_sdk::{Action, MarketState, PositionState, Receipt, Side};
 use wasmtime::AsContextMut;
 use wasmtime::Result as HostResult;
@@ -68,6 +69,9 @@ pub fn link(linker: &mut wasmtime::component::Linker<Ctx>) -> Result<()> {
     Ok(())
 }
 
+/// The stand-in venue's driver, whose half is this module's own.
+pub const LOCAL: &str = "local";
+
 /// What the strategy is allowed to know about, and how to act for it.
 pub struct Ctx {
     pub wasi: WasiCtx,
@@ -76,9 +80,11 @@ pub struct Ctx {
     pub place: Place,
     /// The vault's own chain, as `shonin.toml` names it.
     pub home_chain: String,
-    /// The driver this agent's manifest named. The executor refuses a
+    /// The drivers this agent's manifest named. The executor refuses a
     /// manifest naming one this image doesn't carry.
-    pub driver: String,
+    pub drivers: Vec<String>,
+    /// The bundle's models, if it carries any.
+    pub inference: Option<Arc<crate::inference::Inference>>,
     /// The agent's state, served as `wasi:keyvalue`. It lives as long as
     /// this run of the agent, so every start begins with it empty.
     pub state: crate::state::Store,
@@ -127,6 +133,12 @@ pub struct Evm {
     pub venue: Address,
     pub usd: Address,
     pub factory: Address,
+    /// The Hyperliquid driver's half, for a vault whose agent trades there.
+    pub hyperliquid: Option<Arc<crate::hyperliquid::Half>>,
+    /// The Robinhood driver's half: the station's Safe of stock tokens.
+    pub stocks: Option<Arc<crate::robinhood::StockHalf>>,
+    /// The Lighter driver's half: the station's Lighter account.
+    pub lighter: Option<Arc<crate::robinhood::LighterHalf>>,
 }
 
 impl Place {
@@ -376,14 +388,14 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
         driver: String,
         actions: Vec<Vec<u8>>,
     ) -> HostResult<Vec<Verdict>> {
-        let (place, expected) = accessor.with(|mut access| {
+        let (place, drivers) = accessor.with(|mut access| {
             refuel(&mut access);
             let ctx = access.get();
-            (ctx.place.clone(), ctx.driver.clone())
+            (ctx.place.clone(), ctx.drivers.clone())
         });
 
-        if driver != expected {
-            let refusal = format!("this agent trades through {expected}, not {driver}");
+        if !drivers.contains(&driver) {
+            let refusal = format!("this agent trades through {drivers:?}, not {driver}");
             return Ok(actions
                 .iter()
                 .map(|_| Verdict::Rejected(refusal.clone()))
@@ -392,6 +404,53 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
 
         let mut verdicts = Vec::with_capacity(actions.len());
         let mut tallies = Vec::with_capacity(actions.len());
+        if driver != LOCAL {
+            for bytes in &actions {
+                let outcome = match (&place, driver.as_str()) {
+                    (
+                        Place::Evm(Evm {
+                            hyperliquid: Some(half),
+                            ..
+                        }),
+                        crate::hyperliquid::DRIVER,
+                    ) => Some(half.submit(bytes).await),
+                    (
+                        Place::Evm(Evm {
+                            stocks: Some(half), ..
+                        }),
+                        crate::robinhood::ROBINHOOD,
+                    ) => Some(half.submit(bytes).await),
+                    (
+                        Place::Evm(Evm {
+                            lighter: Some(half),
+                            ..
+                        }),
+                        crate::robinhood::LIGHTER,
+                    ) => Some(half.submit(bytes).await),
+                    _ => None,
+                };
+                let (verdict, tally) = match outcome {
+                    Some(Outcome::Accepted(receipt)) => (Verdict::Accepted(receipt), Tally::Done),
+                    Some(Outcome::Refused(why)) => (Verdict::Rejected(why), Tally::Refused),
+                    Some(Outcome::Unknown(why)) => (Verdict::Unknown(why), Tally::Unanswered),
+                    None => (
+                        Verdict::Rejected(format!("this vault has no {driver} account here")),
+                        Tally::Refused,
+                    ),
+                };
+                tallies.push(tally);
+                verdicts.push(verdict);
+            }
+            accessor.with(|mut access| {
+                refuel(&mut access);
+                access.get().count(|counters| {
+                    for tally in tallies {
+                        counters.submitted(tally);
+                    }
+                });
+            });
+            return Ok(verdicts);
+        }
         for bytes in &actions {
             let (verdict, tally) = match strategy_sdk::from_payload::<Action>(bytes) {
                 Ok(action) => match &place {
@@ -422,16 +481,48 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
     async fn account_state(
         accessor: &Accessor<Ctx, Self>,
         driver: String,
-        _query: Vec<u8>,
+        query: Vec<u8>,
     ) -> HostResult<Result<Vec<u8>, String>> {
-        let (place, expected) = accessor.with(|mut access| {
+        let (place, drivers) = accessor.with(|mut access| {
             let ctx = access.get();
-            (ctx.place.clone(), ctx.driver.clone())
+            (ctx.place.clone(), ctx.drivers.clone())
         });
-        if driver != expected {
+        if !drivers.contains(&driver) {
             return Ok(Err(format!(
-                "this agent trades through {expected}, not {driver}"
+                "this agent trades through {drivers:?}, not {driver}"
             )));
+        }
+        let state = match (&place, driver.as_str()) {
+            (
+                Place::Evm(Evm {
+                    hyperliquid: Some(half),
+                    ..
+                }),
+                crate::hyperliquid::DRIVER,
+            ) => Some(half.state().await),
+            (
+                Place::Evm(Evm {
+                    stocks: Some(half), ..
+                }),
+                crate::robinhood::ROBINHOOD,
+            ) => Some(half.state(&query).await),
+            (
+                Place::Evm(Evm {
+                    lighter: Some(half),
+                    ..
+                }),
+                crate::robinhood::LIGHTER,
+            ) => Some(half.state().await),
+            _ => None,
+        };
+        if let Some(state) = state {
+            return Ok(match state {
+                Ok(state) => Ok(state),
+                Err(error) => {
+                    accessor.with(|mut access| access.get().count(|c| c.venue_errors += 1));
+                    Err(error.to_string())
+                }
+            });
         }
         let state = match &place {
             Place::Evm(evm) => {
@@ -502,7 +593,7 @@ fn stopped(reached: Option<Account>, why: String, may_still_land: bool) -> Moved
 /// chain. Anything else is refused here, and the station would refuse it too.
 fn route(
     home: &str,
-    driver: &str,
+    drivers: &[String],
     source: &Account,
     destination: &Account,
 ) -> Result<Vec<Step>, String> {
@@ -517,11 +608,11 @@ fn route(
     };
     let venue = |account: &VenueAccount| {
         here(&account.chain)?;
-        if account.driver == driver {
+        if drivers.contains(&account.driver) {
             Ok(())
         } else {
             Err(format!(
-                "this agent trades through {driver}, not {}",
+                "this agent trades through {drivers:?}, not {}",
                 account.driver
             ))
         }
@@ -557,18 +648,24 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
         destination: Account,
         amount: u64,
     ) -> HostResult<Moved> {
-        let (place, home, driver) = accessor.with(|mut access| {
+        let (place, home, drivers) = accessor.with(|mut access| {
             refuel(&mut access);
             let ctx = access.get();
             (
                 ctx.place.clone(),
                 ctx.home_chain.clone(),
-                ctx.driver.clone(),
+                ctx.drivers.clone(),
             )
         });
-        let steps = match route(&home, &driver, &source, &destination) {
+        let steps = match route(&home, &drivers, &source, &destination) {
             Ok(steps) => steps,
             Err(why) => return Ok(Moved::Refused(why)),
+        };
+        // The venue account the move reaches or leaves, if any: the driver
+        // the station is asked to deposit or withdraw through.
+        let driver = match (&source, &destination) {
+            (Account::Venue(account), _) | (_, Account::Venue(account)) => account.driver.clone(),
+            _ => drivers.first().cloned().unwrap_or_default(),
         };
         let name = chain::names::name(driver.as_bytes());
         let units = U256::from(amount);
@@ -708,15 +805,16 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
     }
 
     async fn balances(accessor: &Accessor<Ctx, Self>) -> HostResult<Vec<Balance>> {
-        let (place, home, driver) = accessor.with(|mut access| {
+        let (place, home, drivers) = accessor.with(|mut access| {
             refuel(&mut access);
             let ctx = access.get();
             (
                 ctx.place.clone(),
                 ctx.home_chain.clone(),
-                ctx.driver.clone(),
+                ctx.drivers.clone(),
             )
         });
+        let driver = drivers.first().cloned().unwrap_or_default();
         let Evm {
             chain,
             vault,
@@ -770,20 +868,51 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
                 amount: units(idle),
             });
         }
-        if let Ok(value) = chain
-            .read(venue, ILocalVenue::accountValueCall { master: station })
-            .await
-        {
-            out.push(Balance {
-                account: Account::Venue(VenueAccount {
-                    chain: home,
-                    driver,
-                }),
-                amount: units(value),
-            });
+        for driver in drivers {
+            // The stand-in venue reads its own account; every other driver
+            // values the station's account through the driver it pinned.
+            let value = if driver == LOCAL {
+                chain
+                    .read(venue, ILocalVenue::accountValueCall { master: station })
+                    .await
+            } else {
+                pinned_value(&chain, station, &driver).await
+            };
+            if let Ok(value) = value {
+                out.push(Balance {
+                    account: Account::Venue(VenueAccount {
+                        chain: home.clone(),
+                        driver,
+                    }),
+                    amount: units(value),
+                });
+            }
         }
         Ok(out)
     }
+}
+
+alloy::sol! {
+    interface IPinnedDriverValue {
+        function pinnedDriver(bytes32 driver) external view returns (address);
+        function valueOf(address station) external view returns (uint256 mark, uint256 exit);
+    }
+}
+
+/// What a station holds through `driver`, at the mark, by its pinned driver.
+async fn pinned_value(chain: &Client, station: Address, driver: &str) -> Result<U256> {
+    let pinned = chain
+        .read(
+            station,
+            IPinnedDriverValue::pinnedDriverCall {
+                driver: chain::names::name(driver.as_bytes()),
+            },
+        )
+        .await?;
+    Ok(chain
+        .read(pinned, IPinnedDriverValue::valueOfCall { station })
+        .await?
+        .mark)
 }
 
 /// A chain's id from its name, as the vault factory on this chain knows it.
@@ -1137,22 +1266,62 @@ impl wasi::keyvalue::batch::HostWithStore<Ctx> for HasSelf<Ctx> {
 
 impl shonin::agent::inference::HostWithStore<Ctx> for HasSelf<Ctx> {
     async fn infer(
-        _accessor: &Accessor<Ctx, Self>,
+        accessor: &Accessor<Ctx, Self>,
         model: String,
-        _inputs: Vec<shonin::agent::inference::NamedTensor>,
+        inputs: Vec<shonin::agent::inference::NamedTensor>,
     ) -> HostResult<
         Result<
             Vec<shonin::agent::inference::NamedTensor>,
             shonin::agent::inference::InferenceError,
         >,
     > {
-        // Models are carried in a bundle and run by the executor's own
-        // runtime. This deployment loads none, so every name is unknown, and
-        // an unknown model is an error the strategy handles rather than a
-        // stall.
-        Ok(Err(shonin::agent::inference::InferenceError::UnknownModel(
-            model,
-        )))
+        use crate::inference::{Data, Named, Refusal};
+        use shonin::agent::inference::{InferenceError, NamedTensor, Tensor, TensorData};
+        let inference = accessor.with(|mut access| {
+            refuel(&mut access);
+            access.get().inference.clone()
+        });
+        // A bundle without models: every name is unknown, an error the
+        // strategy handles rather than a stall.
+        let Some(inference) = inference else {
+            return Ok(Err(InferenceError::UnknownModel(model)));
+        };
+        let inputs = inputs
+            .into_iter()
+            .map(|named| Named {
+                name: named.name,
+                shape: named.tensor.shape,
+                data: match named.tensor.data {
+                    TensorData::Float32(v) => Data::F32(v),
+                    TensorData::Float64(v) => Data::F64(v),
+                    TensorData::Int32(v) => Data::I32(v),
+                    TensorData::Int64(v) => Data::I64(v),
+                    TensorData::Uint8(v) => Data::U8(v),
+                },
+            })
+            .collect();
+        Ok(match inference.infer(&model, inputs).await {
+            Ok(outputs) => Ok(outputs
+                .into_iter()
+                .map(|named| NamedTensor {
+                    name: named.name,
+                    tensor: Tensor {
+                        shape: named.shape,
+                        data: match named.data {
+                            Data::F32(v) => TensorData::Float32(v),
+                            Data::F64(v) => TensorData::Float64(v),
+                            Data::I32(v) => TensorData::Int32(v),
+                            Data::I64(v) => TensorData::Int64(v),
+                            Data::U8(v) => TensorData::Uint8(v),
+                        },
+                    },
+                })
+                .collect()),
+            Err(Refusal::UnknownModel(why)) => Err(InferenceError::UnknownModel(why)),
+            Err(Refusal::InvalidInput(why)) => Err(InferenceError::InvalidInput(why)),
+            Err(Refusal::QuotaExceeded(why)) => Err(InferenceError::QuotaExceeded(why)),
+            Err(Refusal::Backend(why)) => Err(InferenceError::BackendError(why)),
+        })
     }
 }
 
@@ -1567,12 +1736,40 @@ mod tests {
     }
 
     #[test]
+    fn a_move_reaches_any_declared_drivers_account_and_no_other() {
+        let drivers = vec!["robinhood".to_string(), "lighter".to_string()];
+        let venue = |driver: &str| {
+            Account::Venue(VenueAccount {
+                chain: "robinhood".to_string(),
+                driver: driver.to_string(),
+            })
+        };
+        assert_eq!(
+            route("robinhood", &drivers, &Account::Vault, &venue("lighter")).unwrap(),
+            vec![Step::Pull, Step::Deposit]
+        );
+        assert_eq!(
+            route("robinhood", &drivers, &venue("robinhood"), &Account::Vault).unwrap(),
+            vec![Step::Withdraw, Step::Push]
+        );
+        assert!(
+            route(
+                "robinhood",
+                &drivers,
+                &Account::Vault,
+                &venue("hyperliquid")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn a_move_that_stops_on_the_way_says_where_the_money_is() {
         let (home, driver) = ("base", "local");
         // From the vault to the venue: pulled to the station, then deposited.
         let steps = route(
             home,
-            driver,
+            &[driver.to_string()],
             &Account::Vault,
             &Account::Venue(VenueAccount {
                 chain: home.to_string(),

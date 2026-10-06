@@ -103,6 +103,11 @@ const PLAN: &[Plan] = &[
     },
 ];
 
+/// How long, in seconds, the seed waits for the keeper or the agent to take
+/// each step: long enough for a real chain's blocks and a public endpoint's
+/// pace, not only the local chains'.
+const WAIT_SECONDS: u32 = 600;
+
 /// What the seeded depositor puts into the live vault.
 const DEPOSIT: u64 = 25_000_000_000;
 /// What the author puts in and asks back, to book a claim.
@@ -110,6 +115,12 @@ const CLAIM_DEPOSIT: u64 = 20_000_000_000;
 
 /// Publish one project as it stands: what an author does from the web app,
 /// run from a checkout of their work. It is activated once it is ready.
+///
+/// With `live`, the vault is then used as the full seed's live vault is: a
+/// depositor's request priced at a later valuation, and the author's own
+/// deposit asked back once the agent has put it to work, booking a claim the
+/// keeper serves. On a testnet that is the proof the vault runs on a real
+/// chain, so each wait is long enough for a real chain's blocks.
 pub async fn one(
     client: &Client,
     vault_chain: shared::Chain,
@@ -117,6 +128,7 @@ pub async fn one(
     api: &str,
     agents: Option<&Path>,
     name: &str,
+    live: bool,
 ) -> Result<()> {
     let agents = agents
         .map(Path::to_path_buf)
@@ -127,6 +139,10 @@ pub async fn one(
     if !project.join("shonin.toml").exists() {
         bail!("no agent at {}", project.display());
     }
+    // A manifest names one vault chain, and the build service refuses it on
+    // any other: to publish the agent on another, a copy names this one.
+    let moved = on_vault_chain(&agents, project, vault_chain)?;
+    let project = moved.as_deref().unwrap_or(project);
     let author = client.account(Role::Author)?;
     say_who_the_author_is(client, deployments, author).await?;
     tracing::info!(project = %project.display(), "publishing");
@@ -144,6 +160,18 @@ pub async fn one(
     match published.outcome {
         JobState::Ready => {
             tracing::info!(slug = published.slug(vault_chain), vault = ?published.vault, job = published.job_id, "published and activated");
+            if live {
+                let vault = published
+                    .vault
+                    .context("the strategy was published but no vault was activated")?;
+                let slug = published.slug(vault_chain).unwrap_or_default();
+                let viewer = client.account(Role::Viewer)?;
+                deposit(client, deployments, vault, viewer, DEPOSIT).await?;
+                tracing::info!(slug, "a depositor asked to put money in");
+                let shares = wait_for_shares(client, vault, viewer).await?;
+                tracing::info!(slug, %shares, "and the deposit was priced at a later valuation");
+                claim(client, deployments, vault, author, &slug).await?;
+            }
             Ok(())
         }
         other => bail!("job {} ended {}", published.job_id, other.label()),
@@ -273,7 +301,7 @@ async fn wait_for_shares(
     vault: alloy::primitives::Address,
     who: alloy::primitives::Address,
 ) -> Result<U256> {
-    for _ in 0..120 {
+    for _ in 0..WAIT_SECONDS {
         let held = client
             .read(vault, IVault::balanceOfCall { owner: who })
             .await?;
@@ -298,7 +326,7 @@ async fn claim(
     deposit(client, deployments, vault, author, CLAIM_DEPOSIT).await?;
     let shares = wait_for_shares(client, vault, author).await?;
     // The agent keeps a buffer at home and puts the rest to work.
-    for _ in 0..120 {
+    for _ in 0..WAIT_SECONDS {
         let cash = client.read(vault, IVault::cashCall {}).await?;
         if cash < U256::from(CLAIM_DEPOSIT) {
             break;
@@ -317,7 +345,7 @@ async fn claim(
         .await
         .context("the seeded withdrawal")?;
     let mut booked = false;
-    for _ in 0..120 {
+    for _ in 0..WAIT_SECONDS {
         if !client
             .read(vault, IVault::claimCountCall {})
             .await?
@@ -337,7 +365,7 @@ async fn claim(
         return Ok(());
     }
     // The keeper serves it: the leaver's fraction is closed and paid at once.
-    for _ in 0..180 {
+    for _ in 0..WAIT_SECONDS {
         let claim = client
             .read(
                 vault,
@@ -366,7 +394,7 @@ async fn killed(
 ) -> Result<()> {
     let viewer = client.account(Role::Viewer)?;
     let shares = wait_for_shares(client, vault, viewer).await?;
-    for _ in 0..120 {
+    for _ in 0..WAIT_SECONDS {
         let cash = client.read(vault, IVault::cashCall {}).await?;
         if cash < U256::from(DEPOSIT) {
             break;
@@ -423,6 +451,48 @@ async fn killed(
 }
 
 /// Copy the agent into a scratch tree, under the title a plan asks for.
+/// A copy of the agents with `project`'s manifest naming `vault_chain` as its
+/// vault's chain, when it names another; none when it already names it.
+fn on_vault_chain(
+    agents: &Path,
+    project: &Path,
+    vault_chain: shared::Chain,
+) -> Result<Option<PathBuf>> {
+    let manifest = std::fs::read_to_string(project.join("shonin.toml"))?;
+    let wanted = format!("chain = \"{}\"", vault_chain.name());
+    let mut in_vault = false;
+    let mut changed = false;
+    let rewritten: Vec<String> = manifest
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_vault = trimmed == "[vault]";
+            }
+            if in_vault && trimmed.starts_with("chain = ") && trimmed != wanted {
+                changed = true;
+                wanted.clone()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    if !changed {
+        return Ok(None);
+    }
+    let into = std::env::temp_dir().join(format!("shonin-seed-{}", vault_chain.name()));
+    let _ = std::fs::remove_dir_all(&into);
+    copy_tree(agents, &into)?;
+    let relative = project.strip_prefix(agents).unwrap_or(project);
+    let moved = into.join(relative);
+    std::fs::write(moved.join("shonin.toml"), rewritten.join("\n") + "\n")?;
+    tracing::info!(
+        chain = vault_chain.name(),
+        "the manifest names another vault chain: publishing a copy that names this one"
+    );
+    Ok(Some(moved))
+}
+
 fn prepare(agents: &Path, agent: &Path, into: &Path, plan: &Plan) -> Result<PathBuf> {
     copy_tree(agents, into)?;
     let relative = agent

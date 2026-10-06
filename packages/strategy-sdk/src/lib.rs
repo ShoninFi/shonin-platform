@@ -42,8 +42,14 @@ pub mod bindings {
     });
 }
 
+#[cfg(feature = "hyperliquid")]
+pub mod hyperliquid;
+#[cfg(feature = "lighter")]
+pub mod lighter;
 pub mod local;
 pub mod payload;
+#[cfg(feature = "robinhood")]
+pub mod robinhood;
 pub mod sizing;
 pub mod state;
 pub mod streams;
