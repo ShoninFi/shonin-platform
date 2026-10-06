@@ -230,9 +230,6 @@ vars:
   URL_API_TESTNET: "https://testnet-api.shonin.fi"
   URL_STORE_TESTNET: "https://testnet-store.shonin.fi"
   R2_BUCKET_STORE_TESTNET: "shonin-testnet-store"
-  # The Secret Manager secret the testnet services read their role accounts'
-  # mnemonic from (uploaded from .env by `task cloud:secrets NETWORK=testnet`).
-  GCP_SECRET_TESTNET_EVM_MNEMONIC: "shonin-testnet-evm-mnemonic"
   # The keeper's testnet key alone, and the tunnel's token: the only secrets
   # in the cloud (read by the services VM's account).
   GCP_SECRET_TESTNET_KEEPER_KEY: "shonin-testnet-keeper-key"

@@ -389,6 +389,7 @@ mod tests {
                 time::Time::from_hms_nano(5, 38, 52, 757_106_000).unwrap(),
             ),
             signed_by: "0x0".into(),
+            at: 0,
         };
         let arrived: Health =
             serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
@@ -408,6 +409,7 @@ mod tests {
                 time::Time::MIDNIGHT,
             ),
             signed_by: "0x0".into(),
+            at: 0,
         };
         assert_ne!(
             HealthPost::digest(Chain::Base, "0xA", &report),
@@ -424,6 +426,7 @@ mod tests {
                 time::Time::MIDNIGHT,
             ),
             signed_by: "0x0".into(),
+            at: 0,
         }
     }
 
@@ -466,6 +469,50 @@ mod tests {
         hasher.update(&body);
         let expected: [u8; 32] = hasher.finalize().into();
         assert_eq!(HealthPost::digest(Chain::Base, "0xABC", &report), expected);
+    }
+
+    /// The time a report was signed is part of what is signed, so a report
+    /// can't be re-dated without its signature failing.
+    #[test]
+    fn a_report_s_signing_time_is_inside_its_digest() {
+        let undated = a_report();
+        let dated = Health {
+            at: 1_790_000_000,
+            ..a_report()
+        };
+        let later = Health {
+            at: 1_790_000_001,
+            ..a_report()
+        };
+        assert_ne!(
+            HealthPost::digest(Chain::Base, "0xA", &undated),
+            HealthPost::digest(Chain::Base, "0xA", &dated)
+        );
+        assert_ne!(
+            HealthPost::digest(Chain::Base, "0xA", &dated),
+            HealthPost::digest(Chain::Base, "0xA", &later)
+        );
+        let arrived: Health =
+            serde_json::from_str(&serde_json::to_string(&dated).unwrap()).unwrap();
+        assert_eq!(arrived.at, 1_790_000_000);
+        assert_eq!(
+            HealthPost::digest(Chain::Base, "0xA", &dated),
+            HealthPost::digest(Chain::Base, "0xA", &arrived)
+        );
+    }
+
+    /// A report written before reports were dated still reads, as undated.
+    #[test]
+    fn a_report_written_before_it_had_a_time_reads_as_undated() {
+        let mut old = serde_json::to_value(a_report()).unwrap();
+        // What an older writer produced: the same fields, and no time.
+        old.as_object_mut().unwrap().remove("at");
+        let read: Health = serde_json::from_value(old).unwrap();
+        assert_eq!(read.at, 0);
+        assert_eq!(
+            HealthPost::digest(Chain::Base, "0xA", &read),
+            HealthPost::digest(Chain::Base, "0xA", &a_report())
+        );
     }
 
     #[test]

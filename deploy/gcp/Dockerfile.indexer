@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # The reference indexer: reads the chain into the record.
-# Runs on Cloud Run.
+# Not deployed in the cloud: the API runs the same indexer in-process.
 # Built from the repository root: task cloud:build NAME=indexer NETWORK=testnet
 #   (docker build --build-arg NETWORK_FEATURE=devnet -f deploy/gcp/Dockerfile.indexer .)
 

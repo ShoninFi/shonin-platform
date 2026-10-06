@@ -1,0 +1,58 @@
+# The content store's public copy: an R2 bucket, read by anyone at the
+# network's store URL (testnet: URL_STORE_TESTNET), which the executor and the
+# API read through to for any file they don't hold, checking each against its
+# hash.
+#
+# Only content-addressed files of strategies whose source is published go
+# there (taskfiles/scripts/store-public-files.sh lists them): never anything
+# sealed, nor the build service's queue, payments, archives or the reviewer's
+# pending reviews. Files are only ever added: a hash's bytes never change, and
+# a file already there that differs in size fails the copy.
+#
+# The R2 keys come from .env (CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_ACCESS_KEY_ID,
+# CLOUDFLARE_SECRET_ACCESS_KEY), reach rclone through its environment, and stay
+# on this machine.
+version: "3"
+
+includes:
+  config:
+    taskfile: ./config.yml
+    flatten: true
+
+tasks:
+  sync:
+    desc: "Copy the network's published strategies' files to the store's public copy in R2 (NETWORK=testnet; DRY_RUN=1 lists what would go)"
+    requires:
+      vars: [NETWORK]
+    preconditions:
+      - sh: '[ "{{.NETWORK}}" = "testnet" ]'
+        msg: "Only the testnet's store has a public copy so far (NETWORK={{.NETWORK}})."
+      - sh: 'command -v rclone >/dev/null && command -v jq >/dev/null'
+        msg: "rclone and jq are needed (brew install rclone jq)."
+      - sh: '[ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] && [ -n "${CLOUDFLARE_ACCESS_KEY_ID:-}" ] && [ -n "${CLOUDFLARE_SECRET_ACCESS_KEY:-}" ]'
+        msg: "CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_ACCESS_KEY_ID and CLOUDFLARE_SECRET_ACCESS_KEY must be set in .env."
+      - sh: '[ -d "{{.PATH_STORE}}" ]'
+        msg: "No store at {{.PATH_STORE}}."
+    vars:
+      BUCKET: "{{.R2_BUCKET_STORE_TESTNET}}"
+      DRY_RUN_ARG: '{{if .DRY_RUN}}--dry-run{{end}}'
+    cmds:
+      - |
+        set -eu
+        umask 077
+        list=$(mktemp)
+        trap 'rm -f "$list"' EXIT
+        sh "{{.PATH_ROOT}}/taskfiles/scripts/store-public-files.sh" "{{.PATH_STORE}}" >"$list"
+        echo "$(wc -l <"$list" | tr -d ' ') files of published strategies in {{.PATH_STORE}}:"
+        cat "$list"
+        # rclone's remote, from the environment alone: no config file, and
+        # no key on a command line.
+        export RCLONE_CONFIG_R2_TYPE=s3
+        export RCLONE_CONFIG_R2_PROVIDER=Cloudflare
+        export RCLONE_CONFIG_R2_ACCESS_KEY_ID="$CLOUDFLARE_ACCESS_KEY_ID"
+        export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$CLOUDFLARE_SECRET_ACCESS_KEY"
+        export RCLONE_CONFIG_R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+        export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
+        rclone copy "{{.PATH_STORE}}" "r2:{{.BUCKET}}" \
+          --files-from-raw "$list" --no-traverse --size-only --immutable \
+          {{.DRY_RUN_ARG}} --stats-one-line -v

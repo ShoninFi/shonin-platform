@@ -73,6 +73,17 @@ pub struct Health {
     pub updated: PrimitiveDateTime,
     /// The executor key that signed the report.
     pub signed_by: String,
+    /// When the report was signed, in unix seconds. It is in the signed
+    /// digest, so a reader can tell a fresh report from a replayed old one.
+    /// Zero (and then left out of the encoding, so a report written before
+    /// it existed reads and digests as it always did) means undated: a
+    /// reader that needs a time takes an undated report as no report.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub at: u64,
+}
+
+fn is_zero(at: &u64) -> bool {
+    *at == 0
 }
 
 impl Health {

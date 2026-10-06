@@ -331,6 +331,10 @@ pub struct Indexer {
     /// Health reports, as executors post them, by vault chain and vault: the
     /// same address can be a different vault on another chain.
     pub health: RwLock<HashMap<(Chain, ChainAddress), Health>>,
+    /// The same reports as they were posted, signature and all, so anyone
+    /// (a successor executor above all) can check for themselves who signed
+    /// the latest one and when.
+    signed: RwLock<HashMap<(Chain, ChainAddress), HealthPost>>,
     /// What each author is shown as, by vault chain and address, as the last
     /// snapshot had it (see [`shown_names`]).
     names: std::sync::RwLock<HashMap<(Chain, ChainAddress), String>>,
@@ -345,6 +349,7 @@ impl Indexer {
             expected,
             readers: std::sync::RwLock::new(Vec::new()),
             health: RwLock::new(HashMap::new()),
+            signed: RwLock::new(HashMap::new()),
             store: Store::new(store),
             builder,
             http: http(),
@@ -353,6 +358,13 @@ impl Indexer {
             completions: std::sync::Mutex::new(HashMap::new()),
             names: std::sync::RwLock::new(HashMap::new()),
         }
+    }
+
+    /// The same indexer, its store reading through to the public copy at
+    /// `base` for any file it doesn't hold (see [`Store::with_remote`]).
+    pub fn with_store_url(mut self, base: &str) -> Self {
+        self.store = Store::with_remote(self.store.root().to_path_buf(), base);
+        self
     }
 
     /// Start reading a chain that has connected.
@@ -577,7 +589,7 @@ impl Indexer {
             tracing::warn!(%vault, %signer, "a health report from a key this vault has not blessed as its executor");
             return HealthVerdict::NotBlessed;
         }
-        self.keep_health(chain, ChainAddress::Evm(vault.0.0), post.report)
+        self.keep_health(chain, ChainAddress::Evm(vault.0.0), post)
             .await
     }
 
@@ -611,7 +623,7 @@ impl Indexer {
                 return HealthVerdict::Unavailable;
             }
         }
-        self.keep_health(chain, ChainAddress::Solana(vault.to_bytes()), post.report)
+        self.keep_health(chain, ChainAddress::Solana(vault.to_bytes()), post)
             .await
     }
 
@@ -621,17 +633,28 @@ impl Indexer {
         &self,
         chain: Chain,
         vault: ChainAddress,
-        report: Health,
+        post: HealthPost,
     ) -> HealthVerdict {
         let mut health = self.health.write().await;
         if health
             .get(&(chain, vault))
-            .is_some_and(|held| held.updated >= report.updated)
+            .is_some_and(|held| held.updated >= post.report.updated)
         {
             return HealthVerdict::Stale;
         }
-        health.insert((chain, vault), report);
+        // Both under the report lock, so the two never disagree on which
+        // report is the latest.
+        self.signed
+            .write()
+            .await
+            .insert((chain, vault), post.clone());
+        health.insert((chain, vault), post.report);
         HealthVerdict::Taken
+    }
+
+    /// The latest report taken for a vault, as its executor posted it.
+    pub async fn signed_health(&self, chain: Chain, vault: ChainAddress) -> Option<HealthPost> {
+        self.signed.read().await.get(&(chain, vault)).cloned()
     }
 
     /// Keep reading, every couple of seconds, for as long as the process
@@ -1373,6 +1396,55 @@ fn empty_snapshot() -> Snapshot {
 mod tests {
     use super::*;
 
+    fn a_post(updated: u64, signature: &str) -> HealthPost {
+        HealthPost {
+            vault: "0x1111111111111111111111111111111111111111".to_string(),
+            report: Health {
+                signals: vec![],
+                entries: vec![],
+                updated: read::moment(updated),
+                signed_by: "0x22".to_string(),
+                at: updated,
+            },
+            signature: signature.to_string(),
+            signer: None,
+        }
+    }
+
+    /// The latest report taken is kept as it was posted, signature and all,
+    /// for anyone to check; an older one posted later replaces neither it
+    /// nor the report the record shows.
+    #[tokio::test]
+    async fn the_latest_report_taken_is_kept_as_posted_and_an_older_one_replaces_nothing() {
+        let indexer = Indexer::new(vec![Chain::Base], std::env::temp_dir(), None);
+        let vault = ChainAddress::Evm([0x11; 20]);
+        assert!(indexer.signed_health(Chain::Base, vault).await.is_none());
+
+        let taken = indexer
+            .keep_health(Chain::Base, vault, a_post(1_800_000_100, "0xnewer"))
+            .await;
+        assert!(matches!(taken, HealthVerdict::Taken));
+        let stale = indexer
+            .keep_health(Chain::Base, vault, a_post(1_800_000_000, "0xolder"))
+            .await;
+        assert!(matches!(stale, HealthVerdict::Stale));
+
+        let held = indexer.signed_health(Chain::Base, vault).await.unwrap();
+        assert_eq!(held.signature, "0xnewer");
+        assert_eq!(held.report.at, 1_800_000_100);
+        assert_eq!(
+            indexer.health.read().await[&(Chain::Base, vault)].at,
+            1_800_000_100
+        );
+        // Another chain's vault at the same address is another vault.
+        assert!(
+            indexer
+                .signed_health(Chain::Hyperliquid, vault)
+                .await
+                .is_none()
+        );
+    }
+
     #[test]
     fn a_report_dated_more_than_a_few_minutes_ahead_is_refused() {
         let now = time::OffsetDateTime::from_unix_timestamp(1_790_000_000).unwrap();
@@ -1488,6 +1560,7 @@ mod tests {
             entries: vec![],
             updated: read::moment(1_800_000_000),
             signed_by: bs58::encode(key).into_string(),
+            at: 0,
         };
         let localnet = chain::solana::programs::common::digest::cluster_value("localnet");
         let post = |by: &ed25519_dalek::SigningKey, about: &str, named: [u8; 32]| HealthPost {
@@ -1532,6 +1605,7 @@ mod tests {
             entries: vec![],
             updated: read::moment(1_800_000_000),
             signed_by: bs58::encode(key).into_string(),
+            at: 0,
         };
         let devnet = chain::solana::programs::common::digest::cluster_value("devnet");
         let mainnet = chain::solana::programs::common::digest::cluster_value("mainnet-beta");

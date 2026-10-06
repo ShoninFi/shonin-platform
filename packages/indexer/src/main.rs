@@ -21,12 +21,20 @@ struct Args {
     chain_args: chain::ChainArgs,
     #[arg(long)]
     store: PathBuf,
+    /// A public copy of the store to read through to for any file not on
+    /// disk: fetched from `<url>/sha256-<hash>/<name>`, checked against its
+    /// hash, then kept.
+    #[arg(long, env = "SHONIN_STORE_URL")]
+    store_url: Option<String>,
     /// Where the build service answers, for the queue. Optional: without it
     /// the record is the chain alone.
     #[arg(long)]
     builder_url: Option<String>,
     #[arg(long, default_value_t = 0)]
     port: u16,
+    /// The address to listen on with `--port`.
+    #[arg(long, default_value = "127.0.0.1")]
+    listen: std::net::IpAddr,
 }
 
 #[tokio::main]
@@ -40,11 +48,11 @@ async fn main() -> Result<()> {
     // Each chain is read from the moment it connects: one out of reach
     // holds up none of the others.
     let connections = indexer::connections(&args.chain_args)?;
-    let indexer = Arc::new(Indexer::new(
-        connections.expected.clone(),
-        args.store,
-        args.builder_url,
-    ));
+    let mut indexer = Indexer::new(connections.expected.clone(), args.store, args.builder_url);
+    if let Some(url) = args.store_url.as_deref().filter(|url| !url.is_empty()) {
+        indexer = indexer.with_store_url(url);
+    }
+    let indexer = Arc::new(indexer);
     indexer.take(connections);
 
     if args.port != 0 {
@@ -52,7 +60,7 @@ async fn main() -> Result<()> {
             .route("/health", get(health))
             .route("/api/{chain}/health", post(post_health))
             .with_state(indexer.clone());
-        let address = SocketAddr::from(([127, 0, 0, 1], args.port));
+        let address = SocketAddr::from((args.listen, args.port));
         let listener = tokio::net::TcpListener::bind(address).await?;
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;

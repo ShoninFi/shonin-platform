@@ -86,15 +86,24 @@ use shared::Chain;
 struct Args {
     #[command(flatten)]
     chain_args: chain::ChainArgs,
+    /// Accepted for the services' common arguments; the keeper reads no
+    /// store.
     #[arg(long)]
-    store: PathBuf,
+    store: Option<PathBuf>,
+    /// Accepted for the services' common arguments; the keeper asks the API
+    /// nothing.
     #[arg(long)]
-    api_url: String,
-    /// Where the executor serves each vault's signed running total.
-    #[arg(long)]
+    api_url: Option<String>,
+    /// Where the executor serves each vault's signed running total, and what
+    /// it publishes about its attestation: the keys it holds and the seal
+    /// that proves them, which the keeper relays to each chain's registry.
+    #[arg(long, env = "SHONIN_EXECUTOR_URL")]
     executor_url: String,
     #[arg(long, default_value_t = 0)]
     port: u16,
+    /// The address the health route listens on: 0.0.0.0 in a container.
+    #[arg(long, default_value = "127.0.0.1")]
+    listen: std::net::IpAddr,
     /// How long, in seconds of the keeper's own clock, a halted vault's
     /// close is held for its bill and a closed vault's last bill is waited
     /// for; as long in chain time is waited as well. Shortened only by tests
@@ -200,8 +209,9 @@ async fn main() -> Result<()> {
     }
 
     if args.port != 0 {
-        tokio::spawn(serve_status(SocketAddr::from(([127, 0, 0, 1], args.port))));
+        tokio::spawn(serve_status(SocketAddr::from((args.listen, args.port))));
     }
+    let attestation_http = reqwest::Client::new();
 
     // Every vault chain turns on its own, from the moment it is connected,
     // so a slow chain, or one out of reach, holds up no other.
@@ -218,6 +228,7 @@ async fn main() -> Result<()> {
             }
         };
         let executor = args.executor_url.clone();
+        let attestation_http = attestation_http.clone();
         tracing::info!(chain = %served.key, %keeper, "the keeper is up");
         // Without a Closer a halted vault is closed step by step, and anyone
         // may get between its station's unwind and the valuation that finds
@@ -238,6 +249,8 @@ async fn main() -> Result<()> {
             let mut said = Said::default();
             let mut closer = CloserAt::new(served.deployments.closer);
             let mut deployments = served.deployments.clone();
+            let mut blessings = attest::Memory::default();
+            let mut blessings_said = Said::default();
             loop {
                 deployments.closer = closer.usable(&served.client, &served.key).await;
                 let started = std::time::Instant::now();
@@ -267,6 +280,45 @@ async fn main() -> Result<()> {
                         chain_kept(chain, |kept| kept.failing += 1);
                         if let Some(times) = said.due(now) {
                             tracing::warn!(chain = %served.key, times, error = format!("{error:#}"), "the round did not finish");
+                        }
+                    }
+                }
+                // The executor's keys: their blessings relayed, and their gas
+                // kept, every so often rather than every round.
+                if blessings.due(std::time::Instant::now()) {
+                    let at = std::time::Instant::now();
+                    let looked = match attest::published(&attestation_http, &executor).await {
+                        Ok(published) => {
+                            let registry = attest::OnChain {
+                                client: &served.client,
+                                deployments: &deployments,
+                                keeper,
+                            };
+                            attest::round(
+                                &registry,
+                                served.client.chain_id,
+                                &published,
+                                &mut blessings,
+                                at,
+                            )
+                            .await
+                            .map(|_| ())
+                        }
+                        Err(error) => {
+                            blessings.looked(at);
+                            Err(error)
+                        }
+                    };
+                    match looked {
+                        Ok(()) => {
+                            if blessings_said.over() {
+                                tracing::info!(chain = %served.key, "the executor's keys are looked after again");
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(times) = blessings_said.due(std::time::Instant::now()) {
+                                tracing::warn!(chain = %served.key, times, error = format!("{error:#}"), "could not look after the executor's keys");
+                            }
                         }
                     }
                 }
@@ -4785,6 +4837,7 @@ async fn serve_status(address: SocketAddr) {
     }
 }
 
+mod attest;
 mod delayed;
 mod solana;
 
