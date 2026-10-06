@@ -29,7 +29,7 @@ pub use args::{ChainArgs, Served, SolanaServed, Target, connect_solana, connect_
 #[cfg(feature = "rpc")]
 pub use client::{
     Client, KeyClient, NeverAcknowledged, NeverLanded, NeverSent, ROLE_COUNT, Reverted, Role,
-    Signing, Unanswered, keys_from_mnemonic, may_still_land, unanswered,
+    Signing, Unanswered, keys_from_mnemonic, may_still_land, node_trouble, unanswered,
 };
 pub use config::{ChainConfig, ChainConfigs, ChainKey, ChainKind, Network, NetworkName};
 pub use deployments::{ChainDeployments, Deployments, Roles, SolanaDeployments, SolanaRoles};

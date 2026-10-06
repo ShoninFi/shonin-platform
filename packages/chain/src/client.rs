@@ -539,6 +539,7 @@ fn is_rate_limit(code: i64, message: &str) -> bool {
     code == 429
         || message.contains("rate limit")
         || message.contains("too many requests")
+        || message.contains("request limit")
         || (code == -32005 && !message.contains("range") && !message.contains("results"))
 }
 
@@ -1257,6 +1258,21 @@ pub fn unanswered(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Whether a failure is the node's trouble rather than an answer about what
+/// was asked: it went unanswered, or the endpoint is limiting the rate of
+/// requests, however it words that. Work that failed this way is nobody's
+/// doing and can be tried again later.
+pub fn node_trouble(error: &anyhow::Error) -> bool {
+    unanswered(error)
+        || error.chain().any(|cause| {
+            cause
+                .downcast_ref::<alloy::transports::TransportError>()
+                .and_then(|error| error.as_error_resp())
+                .is_some_and(|response| is_rate_limit(response.code, &response.message))
+                || is_rate_limit(0, &cause.to_string())
+        })
+}
+
 /// Whether a failed send may still land: it went unanswered after it was
 /// broadcast, or may have been. One that failed before anything was sent
 /// can't, so it is no reason to hold the next send back.
@@ -1926,5 +1942,22 @@ mod tests {
         ));
         assert!(!is_rate_limit(3, "execution reverted"));
         assert!(!is_rate_limit(-32000, "nonce too low"));
+    }
+
+    #[test]
+    fn a_rate_limit_however_it_arrives_is_the_node_s_trouble() {
+        let wrapped = anyhow::anyhow!("25/second request limit reached")
+            .context("reading isBlessedAs")
+            .context("the registry would not take the registration");
+        assert!(
+            node_trouble(&wrapped),
+            "a public endpoint's per-second limit"
+        );
+        let limited = anyhow::anyhow!("HTTP error 429 with body: Too Many Requests")
+            .context("the registry would not take the registration");
+        assert!(node_trouble(&limited));
+        let refused =
+            anyhow::Error::new(Reverted).context("the registry would not take the registration");
+        assert!(!node_trouble(&refused));
     }
 }

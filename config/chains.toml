@@ -48,9 +48,12 @@ dollar = "USDC"
 
 # --- Testnets ----------------------------------------------------------------
 
+# Base's own endpoint allows 25 requests a second from one address and log
+# ranges of 500 blocks; the services on one machine pass that, so two more
+# public endpoints share the load.
 [chains."evm:84532"]
 label = "Base Sepolia"
-rpc = "https://sepolia.base.org"
+rpc = "https://sepolia.base.org https://base-sepolia-rpc.publicnode.com https://base-sepolia.drpc.org"
 dollar = "USDC"
 native_usd = 0.0
 
