@@ -37,7 +37,7 @@ alloy::sol! {
 }
 
 /// The driver's name as a station keys it: the name, zero-padded.
-fn driver_name() -> B256 {
+pub fn driver_name() -> B256 {
     let mut name = [0u8; 32];
     name[..DRIVER.len()].copy_from_slice(DRIVER.as_bytes());
     B256::from(name)
@@ -136,6 +136,38 @@ impl Half {
     }
 }
 
+/// Until when, in seconds, the venue takes `agent` as the station's named
+/// agent: zero if it doesn't (never approved, replaced, or an approval the
+/// venue dropped because the account didn't exist yet). What the station's
+/// approval is compared with, as the stand-in venue's own record is.
+pub async fn agent_valid_until(chain_id: u64, station: Address, agent: Address) -> Result<u64> {
+    let api =
+        Api::for_chain(chain_id).ok_or_else(|| anyhow!("chain {chain_id} is not HyperEVM"))?;
+    let agents = api
+        .info(serde_json::json!({"type": "extraAgents", "user": format!("{station:#x}")}))
+        .await
+        .context("reading the station's agents from the venue")?;
+    Ok(valid_until_of(&agents, agent))
+}
+
+/// [`agent_valid_until`], from the venue's answer: milliseconds there.
+fn valid_until_of(agents: &serde_json::Value, agent: Address) -> u64 {
+    agents
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry["address"]
+                .as_str()
+                .and_then(|address| address.parse::<Address>().ok())
+                == Some(agent)
+        })
+        .filter_map(|entry| entry["validUntil"].as_u64())
+        .map(|ms| ms / 1000)
+        .max()
+        .unwrap_or(0)
+}
+
 /// Millionths of a dollar, as a decimal number of dollars.
 fn dollars(millionths: alloy::primitives::U256) -> hyperliquid::payload::Decimal {
     let units = u64::try_from(millionths).unwrap_or(u64::MAX);
@@ -151,6 +183,20 @@ mod tests {
         let name = driver_name();
         assert_eq!(&name[..11], b"hyperliquid");
         assert!(name[11..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn an_agent_s_validity_is_read_from_the_venue_in_seconds_and_zero_when_absent() {
+        let agent: Address = "0x369f7e7819454c8a5c62e8ee1f73f1b2f94844dc"
+            .parse()
+            .unwrap();
+        let answer = serde_json::json!([
+            {"name": "shonin", "address": "0x369f7e7819454c8a5c62e8ee1f73f1b2f94844dc", "validUntil": 1791498294000u64},
+            {"name": "other", "address": "0x1111111111111111111111111111111111111111", "validUntil": 1u64},
+        ]);
+        assert_eq!(valid_until_of(&answer, agent), 1_791_498_294);
+        assert_eq!(valid_until_of(&answer, Address::repeat_byte(2)), 0);
+        assert_eq!(valid_until_of(&serde_json::json!([]), agent), 0);
     }
 
     #[test]

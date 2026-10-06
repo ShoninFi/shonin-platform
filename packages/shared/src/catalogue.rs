@@ -55,7 +55,12 @@ pub enum Custody {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Exit {
+    /// In the leaver's own transaction.
     Contract,
+    /// By the contracts alone, but in later transactions: the venue acts on
+    /// the station's orders after the block, so a close is placed, then
+    /// proved and swept home.
+    Delayed,
     Unwinder,
 }
 
@@ -74,7 +79,8 @@ pub struct DriverEntry {
     pub chain: DriverChain,
     /// The networks it is offered on today.
     pub networks: Vec<String>,
-    /// Who its venue's terms exclude: country codes, or SANCTIONED.
+    /// Who its venue's terms exclude: country codes, subdivision codes
+    /// (`CA-ON`), or SANCTIONED.
     pub restricted: Vec<String>,
     pub custody: Custody,
     pub exit: Exit,
@@ -127,6 +133,57 @@ mod tests {
         assert!(catalogue.bridges.contains_key("local-bridge"));
     }
 
+    /// SANCTIONED, an ISO 3166 country code (`GB`), or an ISO 3166-2
+    /// subdivision code (`CA-ON`): what fits the contracts' 32-byte codes.
+    fn is_restricted_code(code: &str) -> bool {
+        let upper = |part: &str, least: usize, most: usize| {
+            (least..=most).contains(&part.len())
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        };
+        if code == "SANCTIONED" {
+            return true;
+        }
+        match code.split_once('-') {
+            None => code.len() == 2 && code.bytes().all(|b| b.is_ascii_uppercase()),
+            Some((country, subdivision)) => {
+                country.len() == 2
+                    && country.bytes().all(|b| b.is_ascii_uppercase())
+                    && upper(subdivision, 1, 3)
+            }
+        }
+    }
+
+    #[test]
+    fn a_restricted_code_is_a_country_a_subdivision_or_sanctioned() {
+        for good in ["SANCTIONED", "US", "CA-ON", "GB-ENG", "FR-75"] {
+            assert!(is_restricted_code(good), "{good}");
+        }
+        for bad in [
+            "us",
+            "USA",
+            "CA-",
+            "CA-ONTARIO",
+            "-ON",
+            "C-ON",
+            "Sanctioned",
+        ] {
+            assert!(!is_restricted_code(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn hyperliquid_is_offered_on_testnet_with_the_driver_contract_s_list() {
+        let catalogue = Catalogue::published();
+        let hyperliquid = &catalogue.drivers["hyperliquid"];
+        assert_eq!(hyperliquid.chain, DriverChain::On(Chain::Hyperliquid));
+        assert_eq!(hyperliquid.networks, vec!["testnet".to_string()]);
+        // The same codes, in the same order, as `HyperliquidDriver.restricted()`.
+        assert_eq!(hyperliquid.restricted, vec!["CA-ON", "SANCTIONED", "US"]);
+        assert_eq!(hyperliquid.exit, Exit::Delayed);
+    }
+
     #[test]
     fn every_restricted_list_is_sorted_codes() {
         for (name, driver) in Catalogue::published().drivers {
@@ -138,10 +195,7 @@ mod tests {
                 "{name}'s list is sorted and without repeats"
             );
             for code in driver.restricted {
-                assert!(
-                    code == "SANCTIONED"
-                        || (code.len() == 2 && code.bytes().all(|b| b.is_ascii_uppercase()))
-                );
+                assert!(is_restricted_code(&code), "{name}: {code:?}");
             }
         }
     }

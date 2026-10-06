@@ -554,6 +554,9 @@ struct Memory {
     /// went out, slot after slot.
     valuations_refused: Refusals,
     claims_refused: Refusals,
+    /// The station's drivers whose venue acts after the transaction, and
+    /// the pace of what is done for them (see [`delayed`]).
+    delayed: delayed::Memory,
 }
 
 /// The slots in a row in which the vault refused a call of one kind before
@@ -1168,6 +1171,12 @@ async fn keep_one(
     if let Some(station) = station {
         revoke_keys(client, keeper, station).await;
         revoke_skipped(client, keeper, vault, station, from_block, memory).await;
+        carry_on(
+            client.chain_id,
+            vault,
+            "move the delayed venue's steps on",
+            delayed_steps(client, keeper, station, memory).await,
+        );
     }
 
     // A halted vault's station is stopped and emptied before the slot's
@@ -1299,6 +1308,39 @@ async fn keep_one(
     }
     Ok(())
 }
+
+/// What a station with a delayed driver needs each round: its staged close
+/// moved on, and money its account put into the venue's own vaults
+/// reclaimed (see [`delayed`]). A station without one needs nothing here.
+async fn delayed_steps(
+    client: &Client,
+    keeper: Address,
+    station: Address,
+    memory: &mut Memory,
+) -> Result<()> {
+    let drivers = delayed::drivers_of(client, station, &mut memory.delayed).await?;
+    if drivers.is_empty() {
+        return Ok(());
+    }
+    delayed::settle_close(client, keeper, station, &drivers).await?;
+    delayed::reclaim(
+        client,
+        &VENUE_HTTP,
+        keeper,
+        station,
+        &drivers,
+        &mut memory.delayed,
+    )
+    .await
+}
+
+/// The client the keeper asks venues' APIs with.
+static VENUE_HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("an HTTP client with a timeout")
+});
 
 /// The round's read of an open or halted vault's tank, noted: one that fails
 /// [`MOST_VAULT_ROUNDS_FAILING`] rounds in a row is in the keeper's health
@@ -3169,6 +3211,31 @@ async fn unwind_stopped(
     // settled, so what the sale brings home never pays a withdrawal priced
     // before it; and the simulation below would fail until it has.
     settle(client, keeper, vault, U256::MAX, "settle before the unwind").await;
+    // A venue that acts after the transaction can't show in a simulation
+    // what the unwind brings home: its unwind is repeated while anything is
+    // left there (see [`delayed::unwind_stopped`]).
+    // Drivers that can't be read are taken as none: the unwind below is
+    // then simulated as for any station, and a delayed one reads as blocked
+    // there and sends nothing.
+    let delayed = delayed::drivers_of(client, station, &mut memory.delayed)
+        .await
+        .inspect_err(|error| tracing::debug!(%vault, error = format!("{error:#}"), "the station's delayed drivers were not read"))
+        .unwrap_or_default();
+    if !delayed.is_empty() {
+        memory.unwound_in = Some(slot);
+        return delayed::unwind_stopped(
+            client,
+            keeper,
+            vault,
+            station,
+            &delayed,
+            now,
+            timers.slotInterval,
+            |amount| worth_an_unwind(amount, dust),
+            &mut memory.delayed,
+        )
+        .await;
+    }
     match client.read(station, IStation::valueCall {}).await {
         Ok(value) => {
             let fraction = U256::from(WAD);
@@ -4619,6 +4686,7 @@ async fn serve_status(address: SocketAddr) {
     }
 }
 
+mod delayed;
 mod solana;
 
 #[cfg(test)]
@@ -4837,7 +4905,7 @@ mod tests {
     async fn a_node_that_refuses_even_the_narrowest_range_leaves_the_reading_where_it_was() {
         let node = node(BETWEEN_SLOTS);
         node.lock().unwrap().head = 25_004;
-        node.lock().unwrap().most_log_blocks = Some(50);
+        node.lock().unwrap().most_log_blocks = Some(0);
         let client = connect(&node).await;
         let mut memory = Memory::default();
 

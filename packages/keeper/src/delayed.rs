@@ -1,0 +1,622 @@
+//! Stations whose venue acts after the transaction: a driver whose exit path
+//! is `Delayed` (Hyperliquid, where CoreWriter's actions run after the
+//! block). Nothing there closes and comes home in one transaction, so the
+//! keeper moves each step on in later blocks:
+//!
+//! - a claim's close is staged by the station; the keeper calls
+//!   `settleClose` once it would go through, to prove and sweep it, and again
+//!   to deliver it home (on Lighter, whose withdrawals wait in a pending
+//!   balance until someone collects them, collecting them first);
+//! - a stopped station's full unwind places what is left to close and sweeps
+//!   what earlier closes freed, and reports itself blocked while it ordered
+//!   anything: the keeper repeats it until nothing is left at the venue;
+//! - money the station's account put into one of the venue's own vaults
+//!   (which only its trading key could do) is found through the venue's API
+//!   and reclaimed: counted, brought back when its lock allows, and trading
+//!   through that driver ended.
+//!
+//! Every one of these calls is public and simulated before it is sent.
+
+use std::time::{Duration, Instant};
+
+use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
+use alloy::sol_types::SolValue;
+use anyhow::{Context, Result};
+use chain::Client;
+use chain::bindings::driver::{ExitPath, IDelayedDriver, IDriver};
+use chain::bindings::station::IStation;
+
+use crate::{Outcome, WAD, send_outcome, send_roomy_outcome};
+
+/// How often a station's venue is asked whether its account put money into
+/// one of the venue's own vaults, and how long a reclaim that went out is
+/// given to land before the same vault is looked at again.
+const VENUE_VAULTS_EVERY: Duration = Duration::from_secs(60);
+
+/// The longest wait between two stopped unwinds of a delayed station that
+/// find nothing changed at the venue.
+const MOST_SECONDS_BETWEEN_UNWINDS: u64 = 5 * 60;
+
+/// One driver of the station's whose venue acts after the transaction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DelayedDriver {
+    pub name: B256,
+    pub implementation: Address,
+}
+
+/// What the keeper remembers about one vault's delayed station.
+#[derive(Default)]
+pub struct Memory {
+    /// The station's delayed drivers, read once: a station's drivers are
+    /// pinned when it is created. `None` until read.
+    drivers: Option<(Address, Vec<DelayedDriver>)>,
+    /// When the venue was last asked for the station's venue vaults.
+    venue_vaults_at: Option<Instant>,
+    /// The last stopped unwind sent, what it found at the venue, and when the
+    /// next may go.
+    unwinds: Option<Pace>,
+}
+
+/// The pace of a delayed station's stopped unwinds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pace {
+    /// What the venue held when the last one was sent.
+    pub seen: B256,
+    /// How many slots it was told to wait.
+    pub wait: u64,
+    /// The first chain time the next may be sent.
+    pub next: u64,
+}
+
+/// The station's delayed drivers, read once and remembered. A station built
+/// before delayed drivers existed has none.
+pub async fn drivers_of(
+    client: &Client,
+    station: Address,
+    memory: &mut Memory,
+) -> Result<Vec<DelayedDriver>> {
+    if let Some((at, drivers)) = &memory.drivers
+        && *at == station
+    {
+        return Ok(drivers.clone());
+    }
+    let spec = client.read(station, IStation::specCall {}).await?;
+    let mut delayed = Vec::new();
+    for name in spec.drivers {
+        let implementation = client
+            .read(station, IStation::pinnedDriverCall { driver: name })
+            .await?;
+        let exit = client
+            .read(implementation, IDriver::exitPathCall {})
+            .await
+            .with_context(|| format!("reading the exit path of {implementation}"))?;
+        if matches!(exit, ExitPath::Delayed) {
+            delayed.push(DelayedDriver {
+                name,
+                implementation,
+            });
+        }
+    }
+    memory.drivers = Some((station, delayed.clone()));
+    Ok(delayed)
+}
+
+/// Move a staged close on, if one is in progress and the station would take
+/// the call now: in a block after the stage, to prove and sweep it (or let it
+/// lapse once it has had its time); in a block after the sweep, to deliver it.
+/// A call that can't go yet (`NotYet`) is simply tried next round.
+pub async fn settle_close(
+    client: &Client,
+    keeper: Address,
+    station: Address,
+    drivers: &[DelayedDriver],
+) -> Result<()> {
+    let stage = client.read(station, IStation::stageCall {}).await?;
+    if stage.stagedAt == 0 {
+        return Ok(());
+    }
+    if client
+        .read(station, IStation::settleCloseCall {})
+        .await
+        .is_err()
+    {
+        // Swept but not landed: a venue whose withdrawals wait to be
+        // collected has them collected, so the delivery can go.
+        if stage.sweptBlock != 0 {
+            collect_withdrawals(client, keeper, station, drivers).await?;
+        }
+        return Ok(());
+    }
+    let what = if stage.sweptBlock == 0 {
+        "prove and sweep the staged close"
+    } else {
+        "deliver the staged close"
+    };
+    send_outcome(client, keeper, station, IStation::settleCloseCall {}, what).await;
+    Ok(())
+}
+
+alloy::sol! {
+    interface ILighterDriver {
+        function exchange() external view returns (address);
+        function DOLLAR_ASSET() external view returns (uint16);
+    }
+    interface ILighterExchange {
+        function getPendingBalance(address owner, uint16 assetIndex) external view returns (uint128);
+        function withdrawPendingBalance(address owner, uint16 assetIndex, uint128 baseAmount) external;
+    }
+}
+
+/// Collect what a venue has paid out to the station but holds until someone
+/// asks for it: Lighter's pending balance, which its withdrawals land in
+/// minutes after they are asked for, and which anyone may send on to its
+/// owner. Every other venue sends its withdrawals itself.
+pub async fn collect_withdrawals(
+    client: &Client,
+    keeper: Address,
+    station: Address,
+    drivers: &[DelayedDriver],
+) -> Result<()> {
+    for driver in drivers {
+        if driver.name != name_word("lighter") {
+            continue;
+        }
+        let exchange = client
+            .read(driver.implementation, ILighterDriver::exchangeCall {})
+            .await?;
+        let asset = client
+            .read(driver.implementation, ILighterDriver::DOLLAR_ASSETCall {})
+            .await?;
+        let pending = client
+            .read(
+                exchange,
+                ILighterExchange::getPendingBalanceCall {
+                    owner: station,
+                    assetIndex: asset,
+                },
+            )
+            .await?;
+        if pending == 0 {
+            continue;
+        }
+        let call = ILighterExchange::withdrawPendingBalanceCall {
+            owner: station,
+            assetIndex: asset,
+            baseAmount: pending,
+        };
+        if client.read(exchange, call.clone()).await.is_err() {
+            continue;
+        }
+        send_outcome(
+            client,
+            keeper,
+            exchange,
+            call,
+            "collect the station's pending withdrawal",
+        )
+        .await;
+    }
+    Ok(())
+}
+
+/// What a stopped delayed station's full unwind would do now, from views
+/// alone (a simulation of it can't show what the venue does after the
+/// block).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Work {
+    /// Some delayed driver has positions left to order closed, inside the
+    /// stopped station's band.
+    pub orders: bool,
+    /// Some delayed driver has dollars free at the venue to send home.
+    pub sweep: bool,
+    /// What the unwind would send home from the station itself now.
+    pub sent_home: U256,
+    /// Whether a market outside the band holds some of it back.
+    pub outside: bool,
+    /// A digest of what the venue holds, to tell an unwind that changed
+    /// nothing from one that did.
+    pub seen: B256,
+}
+
+/// Whether a stopped delayed station's unwind is worth sending: it has
+/// closing orders to place, dollars at the venue to bring home, or dollars
+/// at the station worth an unwind of their own.
+pub fn unwind_wanted(work: &Work, worth_sending_home: bool) -> bool {
+    work.orders || work.sweep || worth_sending_home
+}
+
+/// Whether the next stopped unwind may go now, and the pace after it. One a
+/// slot while the venue keeps changing (orders filling, dollars landing);
+/// when the venue reads the same as at the last one (a sweep the venue keeps
+/// dropping, an order it keeps refusing), twice as long each time, up to
+/// [`MOST_SECONDS_BETWEEN_UNWINDS`].
+pub fn pace(before: Option<&Pace>, seen: B256, now: u64, slot_interval: u64) -> Option<Pace> {
+    let interval = slot_interval.max(1);
+    let most = (MOST_SECONDS_BETWEEN_UNWINDS / interval).max(1);
+    match before {
+        Some(before) if now < before.next => None,
+        Some(before) if before.seen == seen => {
+            let wait = (before.wait * 2).clamp(1, most);
+            Some(Pace {
+                seen,
+                wait,
+                next: now + wait * interval,
+            })
+        }
+        _ => Some(Pace {
+            seen,
+            wait: 1,
+            next: now + interval,
+        }),
+    }
+}
+
+/// Read what a stopped delayed station's unwind would do.
+pub async fn work(client: &Client, station: Address, drivers: &[DelayedDriver]) -> Result<Work> {
+    let band = client.read(station, IStation::stoppedBandCall {}).await?;
+    let simulated = client
+        .read(
+            station,
+            IStation::unwindCall {
+                fraction: U256::from(WAD),
+            },
+        )
+        .await
+        .context("simulating the unwind")?;
+    let mut work = Work {
+        sent_home: simulated.sentHome,
+        ..Work::default()
+    };
+    let mut seen = Vec::new();
+    for driver in drivers {
+        let closing = client
+            .read(
+                driver.implementation,
+                IDriver::closeCall {
+                    station,
+                    fraction: U256::from(WAD),
+                    bandBps: band,
+                },
+            )
+            .await?;
+        if closing.blocked {
+            work.outside = true;
+        } else if !closing.calls.is_empty() {
+            work.orders = true;
+        }
+        let sweeping = client
+            .read(
+                driver.implementation,
+                IDriver::sweepCall {
+                    station,
+                    amount: U256::MAX,
+                },
+            )
+            .await?;
+        if !sweeping.is_empty() {
+            work.sweep = true;
+        }
+        let exposure = client
+            .read(
+                driver.implementation,
+                IDelayedDriver::exposureCall { station },
+            )
+            .await?;
+        let sweep_data: Vec<Bytes> = sweeping.into_iter().map(|call| call.data).collect();
+        seen.push((driver.name, exposure, sweep_data).abi_encode());
+    }
+    seen.push(work.sent_home.abi_encode());
+    work.seen = keccak256(seen.concat());
+    Ok(work)
+}
+
+/// A stopped delayed station's full unwind, repeated until nothing is left
+/// at the venue, at the pace [`pace`] sets. `worth` says whether an amount
+/// sent home from the station is worth an unwind of its own.
+#[allow(clippy::too_many_arguments)]
+pub async fn unwind_stopped(
+    client: &Client,
+    keeper: Address,
+    vault: Address,
+    station: Address,
+    drivers: &[DelayedDriver],
+    now: u64,
+    slot_interval: u64,
+    worth: impl Fn(U256) -> bool,
+    memory: &mut Memory,
+) -> Result<()> {
+    if memory
+        .unwinds
+        .as_ref()
+        .is_some_and(|before| now < before.next)
+    {
+        return Ok(());
+    }
+    collect_withdrawals(client, keeper, station, drivers).await?;
+    let work = work(client, station, drivers).await?;
+    if !unwind_wanted(&work, worth(work.sent_home)) {
+        if work.outside {
+            tracing::debug!(%vault, "the stopped station's markets are outside its band; waiting");
+        }
+        return Ok(());
+    }
+    let Some(next) = pace(memory.unwinds.as_ref(), work.seen, now, slot_interval) else {
+        return Ok(());
+    };
+    memory.unwinds = Some(next);
+    let outcome = send_roomy_outcome(
+        client,
+        keeper,
+        station,
+        IStation::unwindCall {
+            fraction: U256::from(WAD),
+        },
+        "unwind the delayed station",
+    )
+    .await;
+    if outcome == Outcome::Done {
+        tracing::info!(%vault, orders = work.orders, sweep = work.sweep, "unwound the stopped station a step");
+    }
+    Ok(())
+}
+
+/// One of the venue's own vaults the station's account holds money in.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VenueVault {
+    pub address: Address,
+    /// Dollars, as the venue writes them.
+    pub equity: String,
+}
+
+/// Read the venue's answer to `userVaultEquities`: each vault with money in
+/// it. Entries that don't read are left out, so a change in the answer's
+/// shape finds nothing rather than something wrong; what is reclaimed is
+/// read again on-chain before anything is sent.
+pub fn venue_vaults_from(answer: &serde_json::Value) -> Vec<VenueVault> {
+    let Some(entries) = answer.as_array() else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let address = entry.get("vaultAddress")?.as_str()?.parse().ok()?;
+            let equity = entry.get("equity")?.as_str()?.to_string();
+            let positive = equity
+                .parse::<f64>()
+                .is_ok_and(|equity| equity.is_finite() && equity > 0.0);
+            positive.then_some(VenueVault { address, equity })
+        })
+        .collect()
+}
+
+/// The venue's API for a driver on a chain, if the keeper knows it.
+pub fn venue_api(driver: B256, chain_id: u64) -> Option<&'static str> {
+    if driver != name_word("hyperliquid") {
+        return None;
+    }
+    match chain_id {
+        999 => Some("https://api.hyperliquid.xyz/info"),
+        998 => Some("https://api.hyperliquid-testnet.xyz/info"),
+        _ => None,
+    }
+}
+
+/// A driver's name as the contracts store it.
+pub fn name_word(name: &str) -> B256 {
+    let mut word = [0u8; 32];
+    word[..name.len()].copy_from_slice(name.as_bytes());
+    B256::from(word)
+}
+
+/// Whether to send `reclaim` for one venue vault: the first time the station
+/// is seen holding money there, and after that whenever the driver has calls
+/// to bring it back (its lock is over).
+pub fn reclaim_wanted(listed: bool, equity: U256, calls: usize) -> bool {
+    (!listed && equity != U256::ZERO) || (listed && calls != 0)
+}
+
+/// Find money the station's account put into the venue's own vaults, and
+/// reclaim it. Looked at once a minute per station.
+pub async fn reclaim(
+    client: &Client,
+    http: &reqwest::Client,
+    keeper: Address,
+    station: Address,
+    drivers: &[DelayedDriver],
+    memory: &mut Memory,
+) -> Result<()> {
+    if memory
+        .venue_vaults_at
+        .is_some_and(|at| at.elapsed() < VENUE_VAULTS_EVERY)
+    {
+        return Ok(());
+    }
+    memory.venue_vaults_at = Some(Instant::now());
+    for driver in drivers {
+        let Some(url) = venue_api(driver.name, client.chain_id) else {
+            continue;
+        };
+        let answer: serde_json::Value = http
+            .post(url)
+            .json(&serde_json::json!({
+                "type": "userVaultEquities",
+                "user": format!("{station:#x}"),
+            }))
+            .send()
+            .await
+            .context("asking the venue for the station's vaults")?
+            .error_for_status()?
+            .json()
+            .await?;
+        let mut candidates: Vec<Address> = venue_vaults_from(&answer)
+            .into_iter()
+            .map(|vault| vault.address)
+            .collect();
+        let listed = client
+            .read(
+                station,
+                IStation::heldInCall {
+                    driver: driver.name,
+                },
+            )
+            .await?;
+        for held in &listed {
+            if !candidates.contains(held) {
+                candidates.push(*held);
+            }
+        }
+        for venue_vault in candidates {
+            let (calls, equity) = {
+                let answer = client
+                    .read(
+                        driver.implementation,
+                        IDelayedDriver::reclaimCall {
+                            station,
+                            held: venue_vault,
+                        },
+                    )
+                    .await?;
+                (answer.calls.len(), answer.equity)
+            };
+            if !reclaim_wanted(listed.contains(&venue_vault), equity, calls) {
+                continue;
+            }
+            if client
+                .read(
+                    station,
+                    IStation::reclaimCall {
+                        driver: driver.name,
+                        venueVault: venue_vault,
+                    },
+                )
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            tracing::warn!(%station, %venue_vault, %equity, "the station's account holds money in one of the venue's vaults; reclaiming it");
+            send_outcome(
+                client,
+                keeper,
+                station,
+                IStation::reclaimCall {
+                    driver: driver.name,
+                    venueVault: venue_vault,
+                },
+                "reclaim money from a venue vault",
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stopped_delayed_station_is_unwound_while_anything_is_left_at_the_venue() {
+        let nothing = Work::default();
+        assert!(!unwind_wanted(&nothing, false));
+        // Positions left to order closed.
+        let orders = Work {
+            orders: true,
+            ..Work::default()
+        };
+        assert!(unwind_wanted(&orders, false));
+        // Dollars freed by earlier closes, still at the venue.
+        let sweep = Work {
+            sweep: true,
+            ..Work::default()
+        };
+        assert!(unwind_wanted(&sweep, false));
+        // Dollars landed at the station, worth sending home.
+        assert!(unwind_wanted(&nothing, true));
+        // A market outside the band alone is no reason to send anything.
+        let outside = Work {
+            outside: true,
+            ..Work::default()
+        };
+        assert!(!unwind_wanted(&outside, false));
+    }
+
+    #[test]
+    fn a_delayed_unwind_goes_once_a_slot_while_the_venue_changes() {
+        let a = B256::repeat_byte(1);
+        let b = B256::repeat_byte(2);
+        let first = pace(None, a, 1_000, 10).expect("the first goes at once");
+        assert_eq!(first.next, 1_010);
+        // Not again inside the slot.
+        assert_eq!(pace(Some(&first), b, 1_005, 10), None);
+        // Next slot, the venue changed: one slot's wait again.
+        let second = pace(Some(&first), b, 1_010, 10).unwrap();
+        assert_eq!(second.wait, 1);
+        assert_eq!(second.next, 1_020);
+    }
+
+    #[test]
+    fn a_delayed_unwind_that_changes_nothing_backs_off_to_five_minutes() {
+        let same = B256::repeat_byte(7);
+        let mut now = 0;
+        let mut before = pace(None, same, now, 10).unwrap();
+        let mut waits = Vec::new();
+        for _ in 0..8 {
+            now = before.next;
+            before = pace(Some(&before), same, now, 10).unwrap();
+            waits.push(before.wait);
+        }
+        assert_eq!(waits, vec![2, 4, 8, 16, 30, 30, 30, 30]);
+        // A change at the venue brings it back to every slot.
+        let changed = pace(Some(&before), B256::repeat_byte(8), before.next, 10).unwrap();
+        assert_eq!(changed.wait, 1);
+    }
+
+    #[test]
+    fn only_vaults_with_money_in_them_are_read_from_the_venue_s_answer() {
+        let answer = serde_json::json!([
+            {"vaultAddress": "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0", "equity": "12.5"},
+            {"vaultAddress": "0x1111111111111111111111111111111111111111", "equity": "0.0"},
+            {"vaultAddress": "not an address", "equity": "3"},
+            {"vaultAddress": "0x2222222222222222222222222222222222222222", "equity": "NaN"},
+            {"equity": "5"},
+        ]);
+        let vaults = venue_vaults_from(&answer);
+        assert_eq!(vaults.len(), 1);
+        assert_eq!(
+            vaults[0].address,
+            "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0"
+                .parse::<Address>()
+                .unwrap()
+        );
+        assert!(venue_vaults_from(&serde_json::json!({"error": "x"})).is_empty());
+    }
+
+    #[test]
+    fn a_venue_vault_is_reclaimed_when_first_found_and_again_once_its_lock_is_over() {
+        let some = U256::from(5_000_000u64);
+        // First found holding money: listed, counted, trading ended.
+        assert!(reclaim_wanted(false, some, 0));
+        // Found empty and never listed: nothing to do.
+        assert!(!reclaim_wanted(false, U256::ZERO, 0));
+        // Listed and still locked: nothing yet.
+        assert!(!reclaim_wanted(true, some, 0));
+        // Listed and the lock is over: bring it back.
+        assert!(reclaim_wanted(true, some, 1));
+    }
+
+    #[test]
+    fn only_hyperliquid_s_api_is_asked_and_only_on_its_own_chains() {
+        let hyperliquid = name_word("hyperliquid");
+        assert_eq!(
+            venue_api(hyperliquid, 998),
+            Some("https://api.hyperliquid-testnet.xyz/info")
+        );
+        assert_eq!(
+            venue_api(hyperliquid, 999),
+            Some("https://api.hyperliquid.xyz/info")
+        );
+        assert_eq!(venue_api(hyperliquid, 84_532), None);
+        assert_eq!(venue_api(name_word("local"), 998), None);
+    }
+}

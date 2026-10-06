@@ -27,8 +27,8 @@ venue = [
 ]
 
 [dependencies]
-fastnum.workspace = true
 serde.workspace = true
+strategy-sdk = { path = "../../strategy-sdk", package = "shonin-strategy-sdk", default-features = false, features = ["hyperliquid"] }
 
 alloy = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }

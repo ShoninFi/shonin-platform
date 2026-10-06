@@ -1503,15 +1503,13 @@ async fn look_held(
         .unwrap_or(0);
     let finished = matches!(held.state, VaultState::None)
         || (halted_at != 0 && grace_over(chain, held.vault, halted_at).await == Some(true));
-    let approved = chain
-        .read(
-            held.station,
-            IStation::approvedKeyCall {
-                driver: chain::names::LOCAL_DRIVER,
-            },
-        )
-        .await
-        .unwrap_or(Address::ZERO);
+    let approved = match key_driver(chain, held.station).await {
+        Ok(driver) => chain
+            .read(held.station, IStation::approvedKeyCall { driver })
+            .await
+            .unwrap_or(Address::ZERO),
+        Err(_) => Address::ZERO,
+    };
     let replaced = approved != Address::ZERO
         && approved != held.key
         && matches!(
@@ -1685,13 +1683,9 @@ async fn approval_of(
     vault: Address,
     bundle: B256,
 ) -> Result<Approval> {
+    let driver = key_driver(chain, station).await?;
     let approved = chain
-        .read(
-            station,
-            IStation::approvedKeyCall {
-                driver: chain::names::LOCAL_DRIVER,
-            },
-        )
+        .read(station, IStation::approvedKeyCall { driver })
         .await?;
     let vault_chain = alloy::primitives::U256::from(deployments.chain_id);
     if approved == Address::ZERO {
@@ -1738,20 +1732,74 @@ async fn approval_of(
             },
         )
         .await?;
-    let venue_until = chain
-        .read(
-            deployments.venue,
-            ILocalVenue::agentValidUntilCall {
-                master: station,
-                agent: key,
-            },
-        )
-        .await?;
+    // Where the venue keeps its own record of the approval, it is read
+    // there: an approval the venue dropped, or one that ends before the
+    // blessing, is behind. A venue whose approval has no end of its own
+    // follows the station's.
+    let venue_until = if driver == chain::names::LOCAL_DRIVER {
+        chain
+            .read(
+                deployments.venue,
+                ILocalVenue::agentValidUntilCall {
+                    master: station,
+                    agent: key,
+                },
+            )
+            .await?
+    } else if driver == hyperliquid::driver_name() {
+        hyperliquid::agent_valid_until(chain.chain_id, station, key).await?
+    } else {
+        return Ok(Approval::Follows);
+    };
     Ok(if venue_until < blessed_until {
         Approval::Behind
     } else {
         Approval::Follows
     })
+}
+
+/// The driver whose approved key at the station is the vault's own executor
+/// key: what says which executor holds the vault. The first of the
+/// station's drivers that approves that key, in the order the station lists
+/// them; a driver that registers a key of its own at the venue (Lighter's,
+/// made at every start) is never it. A station whose drivers are all of
+/// that kind falls back to the first.
+///
+/// A station's drivers never change, so each station's is read once. One
+/// whose list can't be read yet is taken as the stand-in's, as before
+/// stations had other drivers: for a station that doesn't declare it, the
+/// approval reads as behind and its approval is refused by the station,
+/// which costs a try and is made again on the next sweep.
+async fn key_driver(chain: &Client, station: Address) -> Result<B256> {
+    static KNOWN: std::sync::LazyLock<std::sync::Mutex<HashMap<(u64, Address), B256>>> =
+        std::sync::LazyLock::new(Default::default);
+    let at = (chain.chain_id, station);
+    if let Some(driver) = KNOWN.lock().ok().and_then(|known| known.get(&at).copied()) {
+        return Ok(driver);
+    }
+    match chain.read(station, IStation::specCall {}).await {
+        Ok(spec) => {
+            let driver = key_driver_of(&spec.drivers).context("the station lists no driver")?;
+            if let Ok(mut known) = KNOWN.lock() {
+                known.insert(at, driver);
+            }
+            Ok(driver)
+        }
+        Err(error) => {
+            tracing::debug!(%station, error = format!("{error:#}"), "the station's drivers were not read; taking the stand-in's");
+            Ok(chain::names::LOCAL_DRIVER)
+        }
+    }
+}
+
+/// [`key_driver`], from the station's list of drivers.
+fn key_driver_of(drivers: &[B256]) -> Option<B256> {
+    let own_key = chain::names::name(b"lighter");
+    drivers
+        .iter()
+        .find(|driver| **driver != own_key)
+        .or_else(|| drivers.first())
+        .copied()
 }
 
 /// Have the station approve the key at the venue, until its blessing ends,
@@ -1769,6 +1817,7 @@ async fn approve_if_behind(
     vault: Address,
     bundle: B256,
 ) -> Result<Approval> {
+    let driver = key_driver(chain, station).await?;
     let mut found = None;
     key.send_if(
         async {
@@ -1779,7 +1828,7 @@ async fn approve_if_behind(
         },
         station,
         IStation::approveKeyCall {
-            driver: chain::names::LOCAL_DRIVER,
+            driver,
             key: key.address,
         },
     )
@@ -1800,7 +1849,7 @@ async fn refused(
     vault: Address,
     bundle: B256,
 ) -> Result<bool> {
-    let driver = chain::names::LOCAL_DRIVER;
+    let driver = key_driver(chain, station).await?;
     let pinned = chain
         .read(station, IStation::pinnedDriverCall { driver })
         .await?;
@@ -5505,5 +5554,28 @@ mod tests {
             // A closed vault isn't taken for one another executor holds.
             assert_eq!(book.replaced.contains(&vault), !closes);
         }
+    }
+}
+
+#[cfg(test)]
+mod key_driver_tests {
+    use super::*;
+    use chain::names::name;
+
+    #[test]
+    fn the_vault_s_own_key_is_approved_through_the_station_s_first_trading_driver() {
+        assert_eq!(
+            key_driver_of(&[name(b"hyperliquid")]),
+            Some(name(b"hyperliquid"))
+        );
+        assert_eq!(key_driver_of(&[name(b"local")]), Some(name(b"local")));
+        // Lighter registers a key of its own: the Safe's driver holds the
+        // vault's key, whichever order the station lists them in.
+        assert_eq!(
+            key_driver_of(&[name(b"lighter"), name(b"robinhood")]),
+            Some(name(b"robinhood"))
+        );
+        assert_eq!(key_driver_of(&[name(b"lighter")]), Some(name(b"lighter")));
+        assert_eq!(key_driver_of(&[]), None);
     }
 }

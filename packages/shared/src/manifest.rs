@@ -86,6 +86,10 @@ impl Depositors {
     }
 }
 
+/// The capabilities a manifest may ask for, beyond the world's own imports:
+/// `network`, requests and WebSockets to any host, outbound only.
+pub const CAPABILITIES: &[&str] = &["network"];
+
 /// One chain the agent trades on, with the drivers it uses there: what the
 /// strategy registry records and the vault's stations are created from.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +152,19 @@ impl Manifest {
                 "a driver on another chain than the vault's needs a bridge, as a [bridges.<name>] table"
                     .into(),
             );
+        }
+        for capability in &self.capabilities {
+            if !CAPABILITIES.contains(&capability.as_str()) {
+                return Err(format!(
+                    "there is no capability called {capability:?}; the only one is \"network\""
+                ));
+            }
+        }
+        let mut seen = BTreeSet::new();
+        for capability in &self.capabilities {
+            if !seen.insert(capability) {
+                return Err(format!("the {capability} capability is named twice"));
+            }
         }
         for code in &self.depositors.exclude {
             let ok = code.len() == 2 && code.bytes().all(|b| b.is_ascii_uppercase());
@@ -448,6 +465,38 @@ exclude = ["GB"]
         let bad_code = example().replace("[\"GB\"]", "[\"Britain\"]");
         let bad_code = Manifest::from_toml(&bad_code).expect("it parses");
         assert!(bad_code.check(&catalogue(), "local").is_err());
+    }
+
+    #[test]
+    fn only_the_network_capability_is_accepted_and_only_once() {
+        let with = |capabilities: &str| {
+            Manifest::from_toml(&format!("capabilities = {capabilities}\n{}", example()))
+                .expect("it parses")
+                .check(&catalogue(), "local")
+        };
+        assert_eq!(with("[]"), Ok(()));
+        assert_eq!(with("[\"network\"]"), Ok(()));
+        assert!(with("[\"sockets\"]").unwrap_err().contains("sockets"));
+        assert!(with("[\"network\", \"network\"]").is_err());
+    }
+
+    #[test]
+    fn a_hyperliquid_vault_is_accepted_on_testnet_only() {
+        let manifest = Manifest::from_toml(
+            &example()
+                .replace("\"base\"", "\"hyperliquid\"")
+                .replace("[drivers.local]", "[drivers.hyperliquid]"),
+        )
+        .expect("it parses");
+        assert_eq!(manifest.check(&catalogue(), "testnet"), Ok(()));
+        assert!(manifest.check(&catalogue(), "mainnet").is_err());
+        assert!(manifest.check(&catalogue(), "local").is_err());
+        // Ontario is refused on top of the platform's own list.
+        assert!(
+            manifest
+                .restricted(&catalogue())
+                .contains(&"CA-ON".to_string())
+        );
     }
 
     #[test]
