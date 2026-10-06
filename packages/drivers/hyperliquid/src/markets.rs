@@ -6,7 +6,7 @@
 //! venue's number for it, never its name: a pair whose token shares its name
 //! with another is named by the venue's own name for the pair (`@<index>`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -14,6 +14,8 @@ use serde_json::{Value, json};
 use crate::api::Api;
 use crate::payload::Decimal;
 
+/// The dollar on HyperCore, by the venue's number for it.
+const USDC_TOKEN: u64 = 0;
 /// Spot order assets are the pair's index plus this.
 pub const SPOT_ASSET_OFFSET: u32 = 10_000;
 /// Decimals a perp price may carry, less the market's size decimals.
@@ -115,6 +117,8 @@ pub struct Markets {
     by_coin: BTreeMap<String, String>,
     /// Each spot token's name, by the venue's number for it.
     tokens: BTreeMap<u64, String>,
+    /// Each name more than one spot token is listed under.
+    shared: BTreeSet<String>,
     /// Each perp the venue lists and no agent may open, by its number: its
     /// name, and why.
     untradable: BTreeMap<u32, (String, &'static str)>,
@@ -169,7 +173,10 @@ impl Markets {
         let tokens = spot["tokens"]
             .as_array()
             .ok_or_else(|| anyhow!("spotMeta has no tokens"))?;
-        let usdc = unique_token(tokens, "USDC")?;
+        let usdc = tokens
+            .iter()
+            .find(|t| t["index"].as_u64() == Some(USDC_TOKEN))
+            .ok_or_else(|| anyhow!("the venue lists no token numbered {USDC_TOKEN}"))?;
         markets.usdc_wire = format!(
             "USDC:{}",
             usdc["tokenId"]
@@ -186,6 +193,9 @@ impl Markets {
                 continue;
             };
             markets.tokens.insert(index, name.to_string());
+            if tokens.iter().filter(|t| t["name"] == name).count() != 1 {
+                markets.shared.insert(name.to_string());
+            }
             if Some(index) == usdc_index {
                 continue;
             }
@@ -204,7 +214,7 @@ impl Markets {
                 .unwrap_or_else(|| format!("@{pair_index}"));
             // A name two tokens share names neither's pair: each is named by
             // the venue's own name for it, which no other pair has.
-            let shared = tokens.iter().filter(|t| t["name"] == name).count() != 1;
+            let shared = markets.shared.contains(name);
             markets.insert(Market {
                 name: if shared {
                     coin.clone()
@@ -258,6 +268,18 @@ impl Markets {
         self.tokens.get(&index).map(String::as_str)
     }
 
+    /// The name a balance of the token the venue numbers `index`, and calls
+    /// `coin`, is reported under, which no other token's balance has: the
+    /// dollar's and any other token's own name when no other token is
+    /// listed under it, and otherwise (or when the token was listed after
+    /// these markets were read) `<coin>:<index>`.
+    pub fn balance_name(&self, index: u64, coin: &str) -> String {
+        match self.tokens.get(&index) {
+            Some(name) if index == USDC_TOKEN || !self.shared.contains(name) => name.clone(),
+            _ => format!("{coin}:{index}"),
+        }
+    }
+
     /// The spot pair the venue numbers `pair`.
     pub fn spot_pair(&self, pair: u32) -> Option<&Market> {
         self.by_name
@@ -271,15 +293,6 @@ impl Markets {
 
     pub fn is_empty(&self) -> bool {
         self.by_name.is_empty()
-    }
-}
-
-fn unique_token<'a>(tokens: &'a [Value], name: &str) -> Result<&'a Value> {
-    let mut found = tokens.iter().filter(|t| t["name"] == name);
-    match (found.next(), found.next()) {
-        (Some(token), None) => Ok(token),
-        (None, _) => bail!("the venue lists no token named {name}"),
-        _ => bail!("the venue lists more than one token named {name}"),
     }
 }
 

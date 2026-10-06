@@ -2462,9 +2462,10 @@ async fn claims(
                         memory.claims_tried.insert(id, next);
                         if matches!(after, ClaimState::Closing) {
                             memory.last_staged = Some(id);
-                            // This try staged a close: it holds off every
-                            // claim after it this round.
+                            // This try staged a close: it holds off this
+                            // claim and every claim after it this round.
                             staged = Some(true);
+                            held_off = true;
                         }
                         state = after;
                     }

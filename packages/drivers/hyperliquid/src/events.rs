@@ -210,11 +210,12 @@ pub fn state_from(
     }
     let mut balances = Vec::new();
     for balance in list(&spot["balances"], "spot balances")? {
+        let (Some(coin), Some(token)) = (balance["coin"].as_str(), balance["token"].as_u64())
+        else {
+            return Err(unreadable("spot balances", &balance));
+        };
         balances.push(SpotBalance {
-            token: balance["coin"]
-                .as_str()
-                .ok_or_else(|| unreadable("spot balances", &balance))?
-                .to_string(),
+            token: markets.balance_name(token, coin),
             total: decimal(&balance["total"])
                 .ok_or_else(|| unreadable("spot balances", &balance))?,
             hold: decimal(&balance["hold"]).unwrap_or(Decimal::ZERO),
@@ -310,7 +311,7 @@ mod tests {
             "withdrawable": "80",
             "assetPositions": [{"position": {"coin": "ETH", "szi": "-0.1", "entryPx": "2700", "leverage": {"type": "cross", "value": 3}}}]
         });
-        let spot = json!({"balances": [{"coin": "USDC", "total": "5", "hold": "1"}]});
+        let spot = json!({"balances": [{"coin": "USDC", "token": 0, "total": "5", "hold": "1"}]});
         let orders =
             json!([{"coin": "ETH", "oid": 1, "side": "A", "sz": "0.1", "limitPx": "2800"}]);
         let state = state_from(&markets, &perp, &spot, &orders).unwrap();

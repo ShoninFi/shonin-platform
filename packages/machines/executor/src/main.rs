@@ -1128,8 +1128,8 @@ async fn serve(
     // is served.
     let names = |name: &str| recorded.drivers.iter().any(|driver| driver == name);
     // It also keeps a little HYPE on HyperCore for the account's sends home,
-    // buying some on the pinned HYPE/USDC pair when it runs low, and looks
-    // again for any market the driver lists that the venue doesn't list for
+    // buying some on the pinned HYPE/USDC pair when it runs low, and keeps
+    // looking for which markets the driver lists the venue doesn't list for
     // trading.
     let (hyperliquid, _hyperliquid_events, _hyperliquid_hype, _hyperliquid_missing) =
         if names(hyperliquid::DRIVER) {

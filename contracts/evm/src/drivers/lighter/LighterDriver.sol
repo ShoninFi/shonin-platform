@@ -647,10 +647,13 @@ contract LighterDriver is IDriver, IDelayedDriver {
     }
 
     /// What the shares in the public pools named (each pool index as an
-    /// address) are worth, by the newest post.
+    /// address) are worth, by the newest post. An address with any bit set
+    /// above the index's 48 names no pool and holds nothing, so one pool has
+    /// exactly one name and is counted once.
     function heldValue(address station, address[] calldata held) external view returns (uint256 value) {
         (LighterReport memory report,) = board.reportOf(station);
         for (uint256 h = 0; h < held.length; h++) {
+            if (uint160(held[h]) > type(uint48).max) continue;
             uint48 pool = uint48(uint160(held[h]));
             for (uint256 i = 0; i < report.pools.length; i++) {
                 if (report.pools[i].pool == pool) value += report.pools[i].value;
@@ -659,11 +662,13 @@ contract LighterDriver is IDriver, IDelayedDriver {
     }
 
     /// Burn every share the station's accounts hold in pool `held` (the
-    /// pool's index as an address), and say what they are worth.
+    /// pool's index as an address), and say what they are worth. An address
+    /// that is not exactly a pool index holds nothing.
     function reclaim(
         address station,
         address held
     ) external view returns (Call[] memory calls, uint256 equity) {
+        if (uint160(held) > type(uint48).max) return (calls, 0);
         (LighterReport memory report,) = board.reportOf(station);
         uint48 pool = uint48(uint160(held));
         calls = new Call[](report.pools.length);

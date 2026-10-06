@@ -206,7 +206,7 @@ async fn chain_row(
         esc(vault_chain.name()),
         esc(&key.to_string()),
         esc(&config.label),
-        esc(config.first_rpc()),
+        esc(&config.public_rpc),
         esc(&identity),
         esc(&head),
         esc(&time),

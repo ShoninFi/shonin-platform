@@ -571,14 +571,24 @@ fn endpoint_transport(
         inner: tower::Layer::layer(&keep, TroubleIsAFailure { inner }),
         chain_id,
         on_it: Default::default(),
+        failed_at: Default::default(),
     })
 }
+
+/// How long an endpoint is given to say its chain id before a request.
+const CHAIN_ID_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long after an endpoint failed to say its chain id its requests fail
+/// at once, so a list moves each of them on rather than each asking again.
+const CHAIN_ID_PROBE_REST: Duration = Duration::from_secs(10);
 
 /// One endpoint of a list, held to chain `chain_id`: before it answers
 /// anything, it is asked its chain id, once, and an endpoint on another
 /// chain is refused every request from then on. An endpoint that doesn't
-/// answer that is asked again on its next request, and fails this one, so a
-/// list moves on to the next endpoint. A list's endpoints are each asked
+/// answer that within [`CHAIN_ID_PROBE_TIMEOUT`] fails this request, and
+/// every request waiting on or arriving within [`CHAIN_ID_PROBE_REST`] of
+/// that answer, at once, so a list moves each on to the next endpoint; it is
+/// asked again after that. A list's endpoints are each asked
 /// when the client connects, but one that didn't answer then (limiting the
 /// rate while a whole stack starts) would otherwise answer for another
 /// chain as this one, and stations share one address on every chain.
@@ -590,6 +600,8 @@ struct HeldToChain<S> {
     chain_id: Option<u64>,
     /// Whether the endpoint said it is on the chain, once it has answered.
     on_it: Arc<tokio::sync::OnceCell<bool>>,
+    /// When the endpoint last failed to say its chain id.
+    failed_at: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
 }
 
 impl<S> tower::Service<alloy::rpc::json_rpc::RequestPacket> for HeldToChain<S>
@@ -625,10 +637,17 @@ where
         }
         let mut inner = self.inner.clone();
         let on_it = self.on_it.clone();
+        let failed_at = self.failed_at.clone();
         Box::pin(async move {
             use alloy::transports::TransportErrorKind;
             let answered = on_it
                 .get_or_try_init(|| async {
+                    let failed = || failed_at.lock().unwrap_or_else(|p| p.into_inner());
+                    if failed().is_some_and(|at| at.elapsed() < CHAIN_ID_PROBE_REST) {
+                        return Err(TransportErrorKind::custom_str(
+                            "the endpoint did not give its chain id",
+                        ));
+                    }
                     let asking = alloy::rpc::json_rpc::Request::new(
                         "eth_chainId",
                         alloy::rpc::json_rpc::Id::Number(0),
@@ -636,9 +655,17 @@ where
                     )
                     .serialize()
                     .map_err(TransportErrorKind::custom)?;
-                    let answer = inner
-                        .call(alloy::rpc::json_rpc::RequestPacket::Single(asking))
-                        .await?;
+                    let answer = tokio::time::timeout(
+                        CHAIN_ID_PROBE_TIMEOUT,
+                        inner.call(alloy::rpc::json_rpc::RequestPacket::Single(asking)),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(TransportErrorKind::custom_str(
+                            "the endpoint did not give its chain id in time",
+                        ))
+                    })
+                    .inspect_err(|_| *failed() = Some(tokio::time::Instant::now()))?;
                     let id = answer
                         .responses()
                         .first()
@@ -647,6 +674,7 @@ where
                             serde_json::from_str::<alloy::primitives::U64>(raw.get()).ok()
                         })
                         .ok_or_else(|| {
+                            *failed() = Some(tokio::time::Instant::now());
                             TransportErrorKind::custom_str("the endpoint did not give its chain id")
                         })?;
                     Ok::<_, alloy::transports::TransportError>(id.to::<u64>() == chain_id)

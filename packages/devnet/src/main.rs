@@ -103,8 +103,9 @@ enum Command {
     /// in the funding file; buys HYPE on HyperCore for HyperEVM. Safe to run
     /// again; testnet only.
     Fund,
-    /// Print the vault chain's RPC (overrides applied) and its deployment
-    /// file, one per line, for the tasks that shell out to other tools.
+    /// Print the vault chain's public RPC (the file's, never an override,
+    /// which may carry a key) and its deployment file, one per line, for
+    /// the tasks that shell out to other tools.
     Chain,
     /// Print every served chain's deployment as
     /// `~<prefix>SHONIN_DEPLOYMENTS_JSON=[...]`, to append to a "^~^"-delimited
@@ -316,7 +317,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::Chain) => {
-            println!("{}", target.config.first_rpc());
+            println!("{}", target.config.public_rpc);
             println!("{}", target.deployments_file().display());
             Ok(())
         }

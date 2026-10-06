@@ -884,7 +884,7 @@ async fn put_linked(
     let mut bytecode = creation_code(artifacts, name, libraries)?;
     bytecode.extend_from_slice(&arguments);
     let init = keccak256(&bytecode);
-    if let Some(address) = landed.reusable(client, name, init).await {
+    if let Some(address) = landed.reusable(client, name, init).await? {
         tracing::info!(%address, contract = name, "landed in an earlier try: kept");
         return Ok(address);
     }
@@ -1027,12 +1027,14 @@ impl Landed {
             && at("AttestationRegistry") == Some(set.attestation)
     }
 
-    async fn reusable(&self, client: &Client, name: &str, init: B256) -> Option<Address> {
-        let (address, recorded) = self.contracts.get(name)?;
-        if *recorded != init || !client.has_code(*address).await.ok()? {
-            return None;
+    async fn reusable(&self, client: &Client, name: &str, init: B256) -> Result<Option<Address>> {
+        let Some((address, recorded)) = self.contracts.get(name) else {
+            return Ok(None);
+        };
+        if *recorded != init || !client.has_code(*address).await? {
+            return Ok(None);
         }
-        Some(*address)
+        Ok(Some(*address))
     }
 
     fn record(&mut self, name: &str, address: Address, init: B256) -> Result<()> {
@@ -1303,14 +1305,18 @@ alloy::sol! {
 async fn shown_done(client: &Client, deployments: &Deployments, step: &Step) -> Result<bool> {
     use alloy::sol_types::SolError;
     let registry = deployments.attestation;
+    // At the latest block, never the node's pending state: a send still
+    // waiting in its pool has not landed.
+    let latest = alloy::eips::BlockId::latest();
     Ok(match step.shows {
         Shows::Market(id) => {
             client
-                .read(
+                .read_at(
                     deployments.venue,
                     ILocalVenue::marketOfCall {
                         market: market_id(id),
                     },
+                    latest,
                 )
                 .await?
                 .id
@@ -1318,11 +1324,12 @@ async fn shown_done(client: &Client, deployments: &Deployments, step: &Step) -> 
         }
         Shows::Image(service) => {
             client
-                .read(
+                .read_at(
                     registry,
                     IAttestationRegistry::imageOfCall {
                         imageDigest: image_digest(service),
                     },
+                    latest,
                 )
                 .await?
                 .allowedAt
@@ -1333,7 +1340,10 @@ async fn shown_done(client: &Client, deployments: &Deployments, step: &Step) -> 
                 .from(step.from)
                 .to(step.to)
                 .input(Bytes::from(step.call.clone()).into());
-            match alloy::providers::Provider::call(client.provider(), proposing).await {
+            match alloy::providers::Provider::call(client.provider(), proposing)
+                .block(latest)
+                .await
+            {
                 Ok(_) => false,
                 Err(error)
                     if error
@@ -1352,31 +1362,34 @@ async fn shown_done(client: &Client, deployments: &Deployments, step: &Step) -> 
         }
         Shows::Driver => {
             client
-                .read(
+                .read_at(
                     registry,
                     IAttestationRegistry::tradingDriverCall {
                         name: market_id("local"),
                     },
+                    latest,
                 )
                 .await?
                 == deployments.driver
         }
         Shows::Bridge => {
             client
-                .read(
+                .read_at(
                     registry,
                     IAttestationRegistry::bridgeOfCall {
                         name: market_id("local-bridge"),
                     },
+                    latest,
                 )
                 .await?
                 == deployments.bridge
         }
         Shows::Money(who) => {
             client
-                .read(
+                .read_at(
                     deployments.usd,
                     chain::bindings::erc20::IERC20::balanceOfCall { account: who },
+                    latest,
                 )
                 .await?
                 >= U256::from(STARTING_BALANCE)
@@ -1386,8 +1399,11 @@ async fn shown_done(client: &Client, deployments: &Deployments, step: &Step) -> 
 
 /// Whether a step's earlier send, known by its hash, landed: its receipt
 /// says so, or it is waited for while the chain still knows the
-/// transaction. A transaction the chain no longer knows never landed.
-async fn landed_by_hash(client: &Client, hash: B256) -> Result<bool> {
+/// transaction. A transaction the chain no longer knows never landed, unless
+/// its sender `from` still has a send waiting: an endpoint may not see a
+/// pool another holds it in, so that stops the step rather than sending it
+/// again.
+async fn landed_by_hash(client: &Client, hash: B256, from: Address) -> Result<bool> {
     use alloy::providers::Provider;
     let provider = client.provider();
     let deadline = tokio::time::Instant::now() + SENT_STEP_WAIT;
@@ -1405,6 +1421,16 @@ async fn landed_by_hash(client: &Client, hash: B256) -> Result<bool> {
             .context("looking for a step's earlier send")?
             .is_none()
         {
+            let pending = provider.get_transaction_count(from).pending().await;
+            let latest = provider.get_transaction_count(from).latest().await;
+            if pending.context("reading the sender's waiting sends")?
+                > latest.context("reading the sender's landed sends")?
+            {
+                bail!(
+                    "its earlier send {hash} is not found, but its sender has a send waiting: \
+                     run the deploy again once that has landed or been dropped"
+                );
+            }
             return Ok(false);
         }
         if tokio::time::Instant::now() >= deadline {
@@ -1498,7 +1524,9 @@ async fn set_up(
             .await
             .with_context(context)?;
         if !done && let Some(hash) = setup.sent.get(&step.name) {
-            done = landed_by_hash(client, *hash).await.with_context(context)?;
+            done = landed_by_hash(client, *hash, step.from)
+                .await
+                .with_context(context)?;
         }
         if done {
             tracing::info!(step = step.name, "already done on the chain");

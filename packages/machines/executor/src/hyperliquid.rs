@@ -53,8 +53,8 @@ fn name_of(driver: &str) -> B256 {
 const USDC_TOKEN: u64 = 0;
 /// The name of the token sends home are paid in.
 const GAS_TOKEN_NAME: &str = "HYPE";
-/// How often markets the pinned driver lists and the venue doesn't list for
-/// trading are looked for again.
+/// How often the venue's markets are read again to find which of the
+/// pinned driver's markets it doesn't list for trading.
 const MISSING_LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// One vault's Hyperliquid account, and the key that trades it.
@@ -143,14 +143,14 @@ impl Half {
         }))
     }
 
-    /// While a market the pinned driver lists is missing from the venue's
-    /// markets for trading, look for it again every [`MISSING_LOOK_EVERY`],
-    /// and hold the agent key to the venue's markets as they are listed then
-    /// once what is missing has changed. Ends when none is missing.
+    /// For the life of the half, read the venue's markets again every
+    /// [`MISSING_LOOK_EVERY`], and hold the agent key to the venue's markets
+    /// as they are listed then whenever the set of the pinned driver's
+    /// markets missing from them has changed, either way.
     pub fn missing_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let half = self.clone();
         tokio::spawn(async move {
-            while !half.trader.allowlist().missing.is_empty() {
+            loop {
                 tokio::time::sleep(MISSING_LOOK_EVERY).await;
                 let markets = match Markets::read(&half.api).await {
                     Ok(markets) => markets,
@@ -176,6 +176,16 @@ impl Half {
                                 station = %half.station,
                                 market,
                                 "a market the station's driver lists is listed for trading again, and traded"
+                            );
+                        }
+                    }
+                    for (market, why) in &allowlist.missing {
+                        if !was.missing.contains_key(market) {
+                            tracing::warn!(
+                                station = %half.station,
+                                market,
+                                why,
+                                "a market the station's driver lists is no longer listed for trading, and is not traded"
                             );
                         }
                     }

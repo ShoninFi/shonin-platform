@@ -641,6 +641,11 @@ async fn station_holds(chain: &Client, usd: Address, station: Address) -> Option
         .ok()
 }
 
+/// How long a withdrawal through a venue other than Hyperliquid is looked
+/// for in the station's balance after its receipt: enough for an endpoint a
+/// block or two behind to catch up.
+const WITHDRAWAL_SEEN_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
+
 /// How far the station's idle dollars have risen over `before`, looking
 /// every two seconds for at most `wait` until they have risen by `units`;
 /// `None` when that can't be read. A fall (the station paying out meanwhile)
@@ -843,11 +848,15 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
                                 .await;
                             match sent {
                                 Ok(receipt) => {
-                                    // HyperCore pays out a block or so later.
+                                    // HyperCore pays out a block or so later;
+                                    // any other venue's payout is read again
+                                    // for a few seconds, in case the first
+                                    // read comes from an endpoint a block
+                                    // behind the receipt.
                                     let wait = if driver == crate::hyperliquid::DRIVER {
                                         crate::hyperliquid::DEPOSIT_CONFIRM_WAIT
                                     } else {
-                                        std::time::Duration::ZERO
+                                        WITHDRAWAL_SEEN_WAIT
                                     };
                                     let risen =
                                         risen_by(&evm.chain, evm.usd, station, before, units, wait)
