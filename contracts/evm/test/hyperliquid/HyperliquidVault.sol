@@ -117,6 +117,13 @@ abstract contract HyperliquidVault is Fixture {
         core.process();
     }
 
+    /// Wait until the driver allows the next move: a stopped unwind sooner
+    /// does nothing through the venue.
+    function _whenMovable() internal {
+        uint256 at = hl.movableAt(address(station));
+        if (vm.getBlockTimestamp() < at) vm.warp(at);
+    }
+
     /// Alice asks for all her shares back and the cash can't pay it: a claim.
     function _aliceClaims(uint256 aliceShares) internal {
         vm.prank(alice);

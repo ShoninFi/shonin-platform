@@ -42,6 +42,14 @@ contract StationDouble {
         return (0, 0);
     }
 
+    function movedAt(bytes32) external pure returns (uint64) {
+        return 0;
+    }
+
+    function fullUnwindAt(bytes32) external pure returns (uint64) {
+        return 0;
+    }
+
     function setApprovedKey(bytes32 driver, address key) external {
         approvedKey[driver] = key;
     }

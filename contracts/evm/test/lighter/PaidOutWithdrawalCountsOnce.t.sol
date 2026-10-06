@@ -45,6 +45,11 @@ contract PaidOutWithdrawalCountsOnceTest is LighterVault {
         station.withdraw(LIGHTER, 50_000e6);
         exchange.process();
         exchange.withdrawPendingBalance(address(station), DOLLAR_ASSET, 50_000e6);
+        // The post from before the ask prices nothing; the executor's next
+        // one, read a settle delay after it, does.
+        assertTrue(station.outsideBand(), "a post from before the ask prices nothing");
+        skip(lighter.SETTLE_DELAY());
+        _post();
 
         // The vault is worth 200k (50k of cash, 150k at the station). Alice
         // takes a tenth of her shares out, which the cash can pay, priced at

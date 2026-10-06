@@ -37,6 +37,10 @@ contract MockZkLighter {
     /// 10^(size decimals + price decimals) per market.
     mapping(uint16 => uint256) public unit;
     mapping(address => uint128) private _pending;
+    /// Dollars carried out of an account and not yet credited to its
+    /// owner's pending balance, while credits wait for `credit`.
+    mapping(address => uint128) public inFlightOf;
+    address[] private _owed;
 
     Order[] public orders;
     Withdrawal[] public withdrawals;
@@ -45,6 +49,10 @@ contract MockZkLighter {
     /// Whether a withdrawal larger than the account can give is refused
     /// whole, rather than trimmed to what it can.
     bool public refuseOversized;
+    /// Whether a withdrawal carried out reaches the pending balance only at
+    /// `credit` (the batch executed on-chain, minutes later, as the real
+    /// exchange does), rather than at once.
+    bool public creditLater;
 
     error NotRegistered();
     error NotOwner();
@@ -60,6 +68,10 @@ contract MockZkLighter {
 
     function setRefuseOversized(bool refuse) external {
         refuseOversized = refuse;
+    }
+
+    function setCreditLater(bool later) external {
+        creditLater = later;
     }
 
     function setMark(uint16 market, uint32 mark) external {
@@ -167,9 +179,26 @@ contract MockZkLighter {
             uint256 amount = free <= 0 ? 0 : (uint256(free) < w.amount ? uint256(free) : w.amount);
             if (refuseOversized && amount < w.amount) amount = 0;
             cash[w.account] -= int256(amount);
-            _pending[ownerOf[w.account]] += uint128(amount);
+            address owner = ownerOf[w.account];
+            if (creditLater) {
+                if (inFlightOf[owner] == 0 && amount != 0) _owed.push(owner);
+                inFlightOf[owner] += uint128(amount);
+            } else {
+                _pending[owner] += uint128(amount);
+            }
         }
         delete withdrawals;
+    }
+
+    /// The batch executed on-chain: what was carried out reaches the
+    /// owners' pending balances.
+    function credit() external {
+        for (uint256 i = 0; i < _owed.length; i++) {
+            address owner = _owed[i];
+            _pending[owner] += inFlightOf[owner];
+            inFlightOf[owner] = 0;
+        }
+        delete _owed;
     }
 
     /// The account's worth at the mark, in dollar units.

@@ -321,6 +321,10 @@ contract Station is IStation, ReentrancyGuardTransient {
         return StationStorage.layout().flows[driver].movedAt;
     }
 
+    function fullUnwindAt(bytes32 driver) external view returns (uint64) {
+        return StationStorage.layout().flows[driver].fullUnwindAt;
+    }
+
     /// Money the station's account put into one of the venue's own vaults
     /// (which only its trading key could have done): count it from now on,
     /// bring it back as soon as the vault's lock allows, and end trading

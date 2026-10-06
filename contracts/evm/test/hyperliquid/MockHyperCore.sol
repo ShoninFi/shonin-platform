@@ -151,6 +151,20 @@ contract MockHyperCore {
         spotTotal[user][tokenIndex] += amount;
     }
 
+    /// What the account's own resting orders hold of a spot token.
+    function setSpotHold(address user, uint64 tokenIndex, uint64 amount) external {
+        spotHold[user][tokenIndex] = amount;
+    }
+
+    /// The account's agent buying `lots` of a spot pair's token at `px` (in
+    /// the pair's price units), paid from its spot dollars.
+    function buySpot(address user, uint32 index, uint256 lots, uint64 px) external {
+        SpotPair memory p = pair[index];
+        Token memory t = token[p.base];
+        spotTotal[user][0] -= uint64(lots * px);
+        spotTotal[user][p.base] += uint64(lots * 10 ** (t.weiDecimals - t.szDecimals));
+    }
+
     /// The account's agent trading: a fill at `px`.
     function trade(address user, uint32 index, int64 lots, uint64 px) external {
         szi[user][index] += lots;

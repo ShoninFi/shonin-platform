@@ -159,6 +159,12 @@ interface IDelayedDriver {
     /// moved between the station and the venue may be counted in neither,
     /// or while the venue's state is known only from a stale reading.
     function priced(address station) external view returns (bool);
+    /// The earliest time the next move of dollars through the driver may be
+    /// made (the executor's deposit or withdrawal, or a stopped station's
+    /// unwind): a whole slot after the last move stops voiding valuations,
+    /// so a priced valuation always fits between two moves, whoever makes
+    /// them. Zero: at once.
+    function movableAt(address station) external view returns (uint256);
     /// What the station's money parked in the venue's own vaults (`held`) is
     /// worth.
     function heldValue(address station, address[] calldata held) external view returns (uint256);

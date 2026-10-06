@@ -212,7 +212,8 @@ contract HyperliquidStationTest is HyperliquidVault {
 
     /// What the keeper does with a stopped Hyperliquid station: it repeats
     /// the full unwind. The first places the closing orders and reports
-    /// itself not done; once the venue has filled them, the next sends the
+    /// itself not done; once the venue has filled them, the next (no sooner
+    /// than the driver's spacing after the last move) sends the
     /// freed dollars to HyperEVM and is done at the venue; once they have
     /// landed, the next sends them home to the vault. Then the station holds
     /// nothing and a further unwind sends nothing.
@@ -234,6 +235,7 @@ contract HyperliquidStationTest is HyperliquidVault {
         _nextBlock();
         assertEq(core.szi(address(station), ETH), 0, "the venue filled the close");
         uint256 sentHome = home;
+        _whenMovable();
         (home, blocked) = station.unwind(1e18);
         sentHome += home;
         assertFalse(blocked, "nothing left to order closed");
@@ -242,6 +244,7 @@ contract HyperliquidStationTest is HyperliquidVault {
         _nextBlock();
         uint256 landed = usd.balanceOf(address(station));
         assertGt(landed, 0, "the account's dollars landed at the station");
+        _whenMovable();
         (home, blocked) = station.unwind(1e18);
         sentHome += home;
         assertFalse(blocked);
@@ -252,6 +255,7 @@ contract HyperliquidStationTest is HyperliquidVault {
         (uint256 mark,) = station.value();
         // Only the HYPE kept to pay for sends home, which is never sold.
         assertLe(mark, 2e6, "the station holds nothing but its HYPE");
+        _whenMovable();
         (home, blocked) = station.unwind(1e18);
         assertEq(home, 0);
         assertFalse(blocked);

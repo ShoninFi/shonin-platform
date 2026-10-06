@@ -25,18 +25,40 @@ import {Math} from "openzeppelin/utils/math/Math.sol";
 /// What the accounts are worth exists only in the exchange's API, so their
 /// value is an attested read: the newest post on the board. A post older
 /// than `maxReportAge` voids a valuation, as does any held market whose mark
-/// or book sits further from the exchange's index than the band, and any
-/// post made before a deposit could have been credited.
+/// or book sits further from the exchange's index than the band, any post
+/// made before a deposit could have been credited, and any post read
+/// sooner than `SETTLE_DELAY` after dollars were last asked for.
 ///
-/// Dollars move between the accounts and the station after a post: a
-/// withdrawal is carried out into a pending balance, which anyone may pay
-/// out to the station, and a deposit leaves the station at once. The post
-/// carries the station's own counters as of its reading (every dollar that
-/// had reached it from outside its calls, every dollar it had sent the
-/// exchange), so whatever has moved since is counted exactly once: the
-/// exchange's side is the post's equity and pending balance, plus what was
-/// sent since, less what arrived since. Payouts are never made inside a
-/// station call, so every one of them shows in the counter.
+/// Dollars move between the accounts and the station after a post. A
+/// deposit leaves the station at once. A withdrawal is asked for, carried
+/// out by the exchange (out of the account's equity), credited to the
+/// station's pending balance on-chain minutes later, and paid out to the
+/// station by anyone. The post carries, at one block, the accounts' equity,
+/// the dollars carried out and not yet credited (`inFlight`), the pending
+/// balance, and the station's own counters (every dollar that had reached
+/// it from outside its calls, every dollar it had sent the exchange), so a
+/// dollar is counted exactly once whatever order the post, the deposit and
+/// each step of a withdrawal come in: the exchange's side is the post's
+/// equity, in-flight and pending dollars, plus what was sent since, less
+/// what arrived since. For a withdrawal of W and a post P:
+///
+/// - P before the ask, or between the ask and the carrying out: W is in
+///   P's equity; once paid out it is in the station's dollars and in the
+///   arrivals since P, taken off here: once.
+/// - P between the carrying out and the credit: W is in P's in-flight
+///   dollars, and the same after the payout: once.
+/// - P between the credit and the payout: W is in P's pending balance, and
+///   the same after the payout: once.
+/// - P after the payout: W is in the station's dollars and in P's own
+///   arrivals counter, not in the arrivals since: once.
+///
+/// Payouts are never made inside a station call, so every one of them shows
+/// in the counter. A post read before a withdrawal was asked for counts it
+/// correctly too, but nothing it said can show whether the exchange carried
+/// the request out or refused it, so after any move (the executor's
+/// deposit or withdrawal, a stopped unwind's) only a post read
+/// `SETTLE_DELAY` later prices anything. A staged close's own sweep voids
+/// valuations until it is delivered, which waits for its dollars.
 ///
 /// The exchange carries out the station's requests after the transaction, so
 /// a claim's close is staged (`ExitPath.Delayed`): reduce-only orders are
@@ -87,6 +109,18 @@ contract LighterDriver is IDriver, IDelayedDriver {
     /// close more of a position than the fraction, if the strategy has
     /// traded since.
     uint64 public constant STAGE_POST_AGE = 3 minutes;
+    /// How long after pricing could resume a post showing it is sure to
+    /// have been made: the executor posts every minute, and posts at once
+    /// when a credit time or a settle delay has passed; a failed post is
+    /// tried again fifteen seconds later. Two minutes holds a missed post and
+    /// its retry. Moves are spaced by it, so the post that prices again
+    /// comes before the next move is allowed, with a whole slot to spare.
+    uint64 public constant POST_MARGIN = 2 minutes;
+    /// How long a withdrawal asked for may take to reach the station's
+    /// pending balance on-chain (six to nine minutes, with room): what a
+    /// stopped station nobody posts for waits after its last ask before it
+    /// counts only that balance.
+    uint64 public constant WITHDRAWAL_CREDIT = 15 minutes;
     /// What the freed margin is counted at when judging whether a claim's
     /// close could come home: nine tenths.
     uint256 private constant SAFETY_BPS = 1000;
@@ -103,6 +137,13 @@ contract LighterDriver is IDriver, IDelayedDriver {
         uint8 priceDecimals;
     }
 
+    /// The smallest order the exchange takes in a market: in base units (its
+    /// size decimals), and in dollar units of notional.
+    struct Minimum {
+        uint64 base;
+        uint64 quote;
+    }
+
     IZkLighter public immutable exchange;
     IERC20 public immutable dollar;
     LighterBoard public immutable board;
@@ -112,9 +153,12 @@ contract LighterDriver is IDriver, IDelayedDriver {
     uint256 private immutable _dollarUnit;
 
     Market[] private _markets;
+    /// Each market's smallest order, in the order of `_markets`.
+    Minimum[] private _minimums;
 
     error Repeated();
     error NoPubKey();
+    error BadMinimums();
 
     constructor(
         IZkLighter exchange_,
@@ -122,18 +166,21 @@ contract LighterDriver is IDriver, IDelayedDriver {
         LighterBoard board_,
         uint256 maxReportAge_,
         uint8 dollarDecimals,
-        Market[] memory markets_
+        Market[] memory markets_,
+        Minimum[] memory minimums_
     ) {
         exchange = exchange_;
         dollar = dollar_;
         board = board_;
         maxReportAge = maxReportAge_;
         _dollarUnit = 10 ** dollarDecimals;
+        if (minimums_.length != markets_.length) revert BadMinimums();
         for (uint256 i = 0; i < markets_.length; i++) {
             for (uint256 j = 0; j < i; j++) {
                 if (markets_[j].index == markets_[i].index) revert Repeated();
             }
             _markets.push(markets_[i]);
+            _minimums.push(minimums_[i]);
         }
     }
 
@@ -178,30 +225,53 @@ contract LighterDriver is IDriver, IDelayedDriver {
     }
 
     /// Trusted when there is no account, or the newest post is fresh and
-    /// read after the last deposit was credited, or the station is stopped
-    /// and has given up what it can't count (see the contract's note).
+    /// read late enough after the last move to show it (`_current`), or the
+    /// station is stopped and has given up what it can't count (see the
+    /// contract's note).
     function priced(address station) external view returns (bool) {
         (, bool exists) = masterOf(station);
         if (!exists) return true;
         (LighterReport memory report, bool reported) = board.reportOf(station);
         if (!reported) return false;
-        if (_fresh(report)) return _credited(station, report);
+        if (_fresh(report)) return _current(station, report);
         return _givenUp(station);
     }
 
-    /// A stopped station whose post is stale, its band full, an unwind at
-    /// that band made, and a delivery window passed since it last asked for
-    /// anything.
+    /// A whole slot after the newest post that prices again is sure to have
+    /// been made: `POST_MARGIN` after the last deposit's credit time and the
+    /// last ask's settle delay. A stopped station nobody posts for prices
+    /// again only once its asks have reached the pending balance
+    /// (`_givenUp`), so there it is a slot after that.
+    function movableAt(address station) public view returns (uint256) {
+        bytes32 pinned = _name(station);
+        IStation s = IStation(station);
+        (, uint64 depositedAt) = s.venueFlows(pinned);
+        uint256 moved = s.movedAt(pinned);
+        uint256 from;
+        if (depositedAt != 0) from = uint256(depositedAt) + DEPOSIT_CREDIT + POST_MARGIN;
+        if (moved != 0) {
+            from = Math.max(from, moved + SETTLE_DELAY + POST_MARGIN);
+            if (s.stopped()) {
+                (LighterReport memory report,) = board.reportOf(station);
+                if (!_fresh(report)) from = Math.max(from, moved + WITHDRAWAL_CREDIT);
+            }
+        }
+        return DelayedVenue.slotAfter(station, from);
+    }
+
+    /// A stopped station whose post is stale and its band full: a delivery
+    /// window after its unwind first ran at that band (everything was then
+    /// closed at any price and asked for), and `WITHDRAWAL_CREDIT` after it
+    /// last asked for anything (so nothing it asked for is still on its
+    /// way). Unwinds that come later move only the second clock, and they
+    /// are spaced past it.
     function _givenUp(address station) private view returns (bool) {
         IStation s = IStation(station);
         if (!s.stopped() || s.stoppedBand() < BPS) return false;
-        uint256 band = s.spec().exitBandBps;
-        if (band == 0) band = 1;
-        uint256 doublings;
-        while (band << doublings < BPS && doublings < 14) doublings++;
-        uint256 fullAt = uint256(s.stoppedAt()) + doublings * s.WIDEN_AFTER();
-        uint256 moved = s.movedAt(_name(station));
-        return moved >= fullAt && block.timestamp >= moved + DELIVERY_WINDOW;
+        bytes32 pinned = _name(station);
+        uint256 first = s.fullUnwindAt(pinned);
+        return first != 0 && block.timestamp >= first + DELIVERY_WINDOW
+            && block.timestamp >= uint256(s.movedAt(pinned)) + WITHDRAWAL_CREDIT;
     }
 
     function _name(address station) private view returns (bytes32) {
@@ -214,6 +284,10 @@ contract LighterDriver is IDriver, IDelayedDriver {
 
     function markets() external view returns (Market[] memory) {
         return _markets;
+    }
+
+    function minimums() external view returns (Minimum[] memory) {
+        return _minimums;
     }
 
     /// The station's master account at the exchange, if it has one.
@@ -249,11 +323,10 @@ contract LighterDriver is IDriver, IDelayedDriver {
     /// first. A key approved before then is registered by approving it again
     /// once the account exists: the exchange names a new account only as the
     /// deposit lands, so no call prepared before it can address the account.
-    /// Deposits are spaced (`DelayedVenue`): each voids valuations until a
-    /// post shows it credited.
+    /// Moves are spaced (`movableAt`): each voids valuations until a post
+    /// shows it.
     function deposit(address station, uint256 amount) external view returns (Call[] memory calls) {
-        (, uint64 depositedAt) = IStation(station).venueFlows(_name(station));
-        DelayedVenue.spaced(station, depositedAt, DEPOSIT_CREDIT);
+        DelayedVenue.spaced(movableAt(station));
         calls = new Call[](2);
         calls[0] = Call(address(dollar), 0, abi.encodeCall(IERC20.approve, (address(exchange), amount)));
         calls[1] = Call(
@@ -265,7 +338,9 @@ contract LighterDriver is IDriver, IDelayedDriver {
     /// newest post says it can give. What the exchange carries out lands as
     /// a pending balance minutes later, which anyone may then pay out to the
     /// station; never inside a station call, so the payout is counted.
+    /// Spaced as a deposit is.
     function withdraw(address station, uint256 amount) external view returns (Call[] memory) {
+        DelayedVenue.spaced(movableAt(station));
         return _withdrawCalls(station, amount);
     }
 
@@ -301,7 +376,7 @@ contract LighterDriver is IDriver, IDelayedDriver {
         if (reported && !_fresh(report) && fraction == WAD && IStation(station).stopped()) {
             return (_closeEverything(master, report, bandBps), false);
         }
-        if (!reported || !_fresh(report) || !_credited(station, report)) return (new Call[](0), true);
+        if (!reported || !_fresh(report) || !_current(station, report)) return (new Call[](0), true);
         if (_outsideBand(report, bandBps)) return (new Call[](0), true);
         // A claim's close: sized only from a recent post, and only if what it
         // frees could come home.
@@ -319,7 +394,11 @@ contract LighterDriver is IDriver, IDelayedDriver {
             uint256 open = uint256(uint64(long ? position.size : -position.size));
             uint256 size = open.mulDiv(fraction, WAD, Math.Rounding.Ceil);
             if (size > open) size = open;
-            if (size == 0) continue;
+            // A piece the exchange wouldn't take an order for is not
+            // ordered, and the proof asks nothing of it (`_orderable`).
+            if (size == 0 || !_orderable(position.market, size, _priceOf(report, position.market).mark)) {
+                continue;
+            }
             uint256 limit = _limit(_priceOf(report, position.market).index, long, bandBps);
             calls[made++] = _order(position.account, position.market, size, limit, long);
         }
@@ -329,12 +408,11 @@ contract LighterDriver is IDriver, IDelayedDriver {
     }
 
     /// The exchange's side from the newest post (however old: a stale post
-    /// voids the valuation through `priced`): its equity and the pending
-    /// balance it saw, plus what the station has sent the exchange since,
-    /// less what has reached the station since. A withdrawal carried out
-    /// since the post is still in its equity, and once paid out it is in the
-    /// station's own dollars and taken off here, so nothing counts twice;
-    /// a deposit since counts at once. The exit side takes each position at
+    /// voids the valuation through `priced`): its equity, in-flight and
+    /// pending dollars, plus what the station has sent the exchange since,
+    /// less what has reached the station since (see the contract's note:
+    /// every dollar once, whatever the order); a deposit since counts at
+    /// once. The exit side takes each position at
     /// the book's closing side where that is worse than the mark.
     function valueOf(address station) external view returns (uint256 mark, uint256 exit) {
         (LighterReport memory report, bool reported) = board.reportOf(station);
@@ -362,22 +440,42 @@ contract LighterDriver is IDriver, IDelayedDriver {
         exit = mark > haircut ? mark - haircut : 0;
     }
 
-    /// The exchange's side, signed: the post's equity and pending balance,
-    /// plus what was sent since it, less what arrived since it.
+    /// The exchange's side, signed: the post's equity, in-flight and
+    /// pending dollars, plus what was sent since it, less what arrived since
+    /// it.
     function _worth(address station, LighterReport memory report) private view returns (int256) {
         (uint256 sent,) = IStation(station).venueFlows(_name(station));
         uint256 arrived = IStation(station).arrivals();
-        int256 worth = int256(report.equity + report.pending);
+        int256 worth = int256(report.equity + report.inFlight + report.pending);
         if (sent > report.sent) worth += int256(sent - report.sent);
         if (arrived > report.arrived) worth -= int256(arrived - report.arrived);
         return worth;
     }
 
     /// Whether a post was read long enough after the last deposit for the
-    /// exchange to have credited it.
-    function _credited(address station, LighterReport memory report) private view returns (bool) {
-        (, uint64 depositedAt) = IStation(station).venueFlows(_name(station));
-        return depositedAt == 0 || report.asOf >= uint256(depositedAt) + DEPOSIT_CREDIT;
+    /// exchange to have credited it, and long enough after dollars were last
+    /// asked for (`movedAt`) for the exchange to have carried the request
+    /// out or refused it: a post from before then prices nothing.
+    function _current(address station, LighterReport memory report) private view returns (bool) {
+        bytes32 pinned = _name(station);
+        (, uint64 depositedAt) = IStation(station).venueFlows(pinned);
+        if (depositedAt != 0 && report.asOf < uint256(depositedAt) + DEPOSIT_CREDIT) return false;
+        return report.asOf >= uint256(IStation(station).movedAt(pinned)) + SETTLE_DELAY;
+    }
+
+    /// Whether the exchange takes an order of `size` in `market` at about
+    /// `mark`: at least its smallest size, and at least twice its smallest
+    /// notional, so a price that moves within the band between the stage and
+    /// the order can't make it too small. A market the driver doesn't list
+    /// is never orderable.
+    function _orderable(uint16 market, uint256 size, uint256 mark) private view returns (bool) {
+        for (uint256 m = 0; m < _markets.length; m++) {
+            if (_markets[m].index != market) continue;
+            Minimum memory least = _minimums[m];
+            return size >= least.base
+                && uint256(_notional(m, int256(size), int256(mark))) >= 2 * uint256(least.quote);
+        }
+        return false;
     }
 
     // Delayed closes --------------------------------------------------------
@@ -499,9 +597,10 @@ contract LighterDriver is IDriver, IDelayedDriver {
     /// Nothing is known of the close until a post read at or after `since`
     /// (the stage plus its settle delay). By that post, for each position
     /// the stage's post named (account by account, so a long in one and a
-    /// short in another each answer for their own orders), the share of
-    /// what was ordered that it is smaller by, on the same side or flat,
-    /// rounded down; the smallest of them.
+    /// short in another each answer for their own orders) and the close
+    /// ordered (a piece under the exchange's smallest order, at the stage's
+    /// mark, was not), the share of what was ordered that it is smaller by,
+    /// on the same side or flat, rounded down; the smallest of them.
     function closedPart(
         address station,
         int256[] calldata before,
@@ -525,7 +624,7 @@ contract LighterDriver is IDriver, IDelayedDriver {
             uint256 open = uint256(was > 0 ? was : -was);
             uint256 ordered = open.mulDiv(fraction, WAD, Math.Rounding.Ceil);
             if (ordered > open) ordered = open;
-            if (ordered == 0) continue;
+            if (ordered == 0 || !_orderable(uint16(key), ordered, _markAt(before, uint16(key)))) continue;
             // Crossed to the other side: more than closed, by its own trade.
             int256 done =
                 (was > 0) == (is_ > 0) || is_ == 0 ? (was > 0 ? was - is_ : is_ - was) : was > 0 ? was : -was;
@@ -533,6 +632,15 @@ contract LighterDriver is IDriver, IDelayedDriver {
             uint256 share = uint256(done) >= ordered ? WAD : uint256(done).mulDiv(WAD, ordered);
             if (share < part) part = share;
         }
+    }
+
+    /// The mark `before` (an `exposure`) was read at for `market`.
+    function _markAt(int256[] calldata before, uint16 market) private view returns (uint256) {
+        uint256 n = _markets.length;
+        for (uint256 m = 0; m < n; m++) {
+            if (_markets[m].index == market) return uint256(before[n + 1 + m]);
+        }
+        return 0;
     }
 
     /// What the shares in the public pools named (each pool index as an
@@ -625,29 +733,26 @@ contract LighterDriver is IDriver, IDelayedDriver {
     }
 
     /// Everything still in the accounts, asked for without knowing what each
-    /// holds now: by the newest post, the exchange's side less what is
-    /// pending now is what is left in them (from a stale post, at least its
-    /// equity), and each account is asked for
-    /// that rounded up to a power of two, then each half below it down to a
-    /// dollar. Carried out in order, each request at most what the account
-    /// still holds goes through, so the account is emptied to under a dollar
-    /// of whatever it holds up to twice the estimate, and no request ever
-    /// relies on the exchange trimming one too large.
+    /// holds now: by the newest post, its equity plus what the station has
+    /// sent since is what can be left in them (what was carried out since
+    /// only makes it less), and each account is asked for that rounded up to
+    /// a power of two, then each half below it down to a dollar. Carried out
+    /// in order, each request at most what the account still holds goes
+    /// through, so the account is emptied to under a dollar of whatever it
+    /// holds up to twice the estimate, and no request ever relies on the
+    /// exchange trimming one too large. From a stale post (a stopped station
+    /// nobody posts for) every pass drains up to twice its equity again.
     function _halves(
         address station,
         LighterReport memory report,
         uint48[] memory accounts
     ) private view returns (Call[] memory calls) {
-        int256 worth =
-            _worth(station, report) - int256(uint256(exchange.getPendingBalance(station, DOLLAR_ASSET)));
-        // A stale post (a stopped station nobody posts for) may say far less
-        // than the closes since have left there: never ask for less than its
-        // equity, so every pass drains up to twice that, again and again.
-        if (!_fresh(report) && int256(report.equity) > worth) worth = int256(report.equity);
-        if (worth < int256(_dollarUnit)) return new Call[](0);
+        (uint256 sent,) = IStation(station).venueFlows(_name(station));
+        uint256 worth = report.equity + (sent > report.sent ? sent - report.sent : 0);
+        if (worth < _dollarUnit) return new Call[](0);
         uint256 top = _dollarUnit;
         uint256 pieces = 1;
-        while (top < uint256(worth) && top < type(uint64).max / 2) {
+        while (top < worth && top < type(uint64).max / 2) {
             top <<= 1;
             pieces++;
         }

@@ -170,8 +170,12 @@ interface IStation {
     /// for good, and when it last did.
     function venueFlows(bytes32 driver) external view returns (uint256 sent, uint64 depositedAt);
     /// When dollars last moved between the station and a venue through a
-    /// driver: a deposit, a withdrawal, or a sweep the station asked for.
+    /// driver: the executor's deposit or withdrawal, or a stopped unwind
+    /// through an account worth more than a dollar.
     function movedAt(bytes32 driver) external view returns (uint64);
+    /// When a stopped station's unwind first ran through a driver at the
+    /// full band (any price); zero until then.
+    function fullUnwindAt(bytes32 driver) external view returns (uint64);
     /// Count, bring back, and end trading over, money the station's account
     /// put into one of a venue's own vaults. Anyone may call it.
     function reclaim(bytes32 driver, address venueVault) external;

@@ -3,7 +3,7 @@ pragma solidity ^0.8.30;
 
 import {Call, ExitPath, IDelayedDriver, IDriver} from "../interfaces/IDriver.sol";
 import {IStation, IStationVault, Stage} from "../interfaces/IStation.sol";
-import {StationLayout, StationStorage} from "./StationStorage.sol";
+import {Flow, StationLayout, StationStorage} from "./StationStorage.sol";
 
 import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
 import {SafeERC20} from "openzeppelin/token/ERC20/utils/SafeERC20.sol";
@@ -175,21 +175,36 @@ library StationCloses {
     function closeAll(bytes32 name, uint16 band) external returns (bool outside) {
         StationLayout storage s = StationStorage.layout();
         IDriver driver = IDriver(s.pinned(name));
-        (, uint256 exitBefore) = driver.valueOf(address(this));
+        bool delayed = driver.exitPath() == ExitPath.Delayed;
+        // Through a venue that acts after the transaction, not yet: no
+        // sooner after the last move than the driver spaces the executor's
+        // moves, whoever calls, so a priced valuation always fits between
+        // two of them.
+        if (delayed && block.timestamp < IDelayedDriver(address(driver)).movableAt(address(this))) {
+            return true;
+        }
+        (uint256 markBefore, uint256 exitBefore) = driver.valueOf(address(this));
         Call[] memory calls;
         (calls, outside) = driver.close(address(this), WAD, band);
         if (outside) return true;
         address[] memory targets = driver.targets();
-        if (driver.exitPath() == ExitPath.Delayed) {
+        if (delayed) {
             // The venue acts after this transaction: place what is left to
             // close, and sweep home whatever earlier closes freed. Anyone may
             // call again until nothing is left; while anything was ordered
             // the unwind is not done. Dollars it asks for are on their way
-            // for a while: the driver's value isn't trusted meanwhile.
+            // for a while: the driver's value isn't trusted meanwhile. An
+            // account worth no more than a dollar has nothing real to close
+            // or bring home, so an unwind through it moves nothing that
+            // could go uncounted, and doesn't count as a move.
             s.run(calls, targets);
             Call[] memory sweep = driver.sweep(address(this), type(uint256).max);
             s.run(sweep, targets);
-            if (calls.length != 0 || sweep.length != 0) s.flows[name].movedAt = uint64(block.timestamp);
+            Flow storage flow = s.flows[name];
+            if ((calls.length != 0 || sweep.length != 0) && markBefore > s.oneDollar()) {
+                flow.movedAt = uint64(block.timestamp);
+            }
+            if (band >= BPS && flow.fullUnwindAt == 0) flow.fullUnwindAt = uint64(block.timestamp);
             return calls.length != 0;
         }
         uint256 held = s.balance();
@@ -373,7 +388,10 @@ library StationCloses {
     /// Ask each delayed venue for its measured part of `need`, in order.
     /// What it asks for is the stage's own: the stage voids valuations
     /// until it is delivered, and a delivery waits for it to land or its
-    /// window to pass, far longer than a send takes.
+    /// window to pass, far longer than a send takes. It is not a move: what
+    /// has not landed by the delivery is counted where the venue's reading
+    /// has it (a Lighter post names what is carried out and not yet
+    /// credited), and nothing waits on a reading made after it.
     function _sweepStaged(StationLayout storage s, uint256 need) private returns (uint256 asked) {
         for (uint256 i = 0; i < s.spec.drivers.length && asked < need; i++) {
             bytes32 name = s.spec.drivers[i];

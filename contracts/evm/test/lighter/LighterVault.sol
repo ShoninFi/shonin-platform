@@ -42,8 +42,12 @@ abstract contract LighterVault is Fixture {
         board = new LighterBoard();
         LighterDriver.Market[] memory markets = new LighterDriver.Market[](1);
         markets[0] = LighterDriver.Market({index: ETH, sizeDecimals: 4, priceDecimals: 2});
-        lighter =
-            new LighterDriver(IZkLighter(address(exchange)), IERC20(address(usd)), board, 1 hours, 6, markets);
+        // The exchange's smallest ETH order: 0.0020 ETH, and $10.
+        LighterDriver.Minimum[] memory minimums = new LighterDriver.Minimum[](1);
+        minimums[0] = LighterDriver.Minimum({base: 20, quote: 10e6});
+        lighter = new LighterDriver(
+            IZkLighter(address(exchange)), IERC20(address(usd)), board, 1 hours, 6, markets, minimums
+        );
         vm.prank(admin);
         attestation.proposeDriver(LIGHTER, address(lighter));
         skip(TIMELOCK);
@@ -109,6 +113,7 @@ abstract contract LighterVault is Fixture {
         int256 equity = exchange.equity(account, markets);
         r.equity = equity > 0 ? uint256(equity) : 0;
         r.pending = exchange.getPendingBalance(address(station), DOLLAR_ASSET);
+        r.inFlight = exchange.inFlightOf(address(station));
         r.arrived = station.arrivals();
         (r.sent,) = station.venueFlows(LIGHTER);
         r.available = new uint256[](1);

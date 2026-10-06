@@ -22,14 +22,18 @@ contract HaltedVaultClosesWithItsSendingReserveTest is HyperliquidVault {
         skip(HALT_GRACE);
         station.stop();
 
-        // The keeper's repeated unwind: place the closes, send the freed
-        // dollars to HyperEVM, send them home.
+        // The keeper's repeated unwind, each as soon as the driver allows:
+        // place the closes, send the freed dollars to HyperEVM, send them
+        // home.
         station.unwind(1e18);
         _nextBlock();
+        _whenMovable();
         station.unwind(1e18);
         _nextBlock();
+        _whenMovable();
         station.unwind(1e18);
         _nextBlock();
+        _whenMovable();
         (uint256 home, bool blocked) = station.unwind(1e18);
         assertEq(home, 0, "nothing more comes home");
         assertFalse(blocked, "and nothing is left to close");

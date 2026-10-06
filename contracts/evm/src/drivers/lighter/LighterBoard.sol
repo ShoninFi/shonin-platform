@@ -50,6 +50,12 @@ struct LighterReport {
     /// carried out, not yet paid out) as read on-chain beside the API, at
     /// `asOf`.
     uint256 pending;
+    /// The dollars the exchange had taken out of the accounts for
+    /// withdrawals that were not yet in `pending` at `asOf`: carried out,
+    /// and not yet credited on-chain. A withdrawal is in exactly one of
+    /// `equity`, `inFlight` and `pending` at the post's moment, or paid out
+    /// (in `arrived`).
+    uint256 inFlight;
     /// The station's own counters, read on-chain at the same block as
     /// `pending`: every dollar that had reached it outside its own calls (a
     /// pending withdrawal paid out among them) and every dollar it had put

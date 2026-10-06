@@ -7,14 +7,16 @@ import {
     IStation, IStationFactory, IStationVault, Send, Stage, StationSpec
 } from "../interfaces/IStation.sol";
 import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "openzeppelin/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "openzeppelin/token/ERC20/utils/SafeERC20.sol";
 
-/// What the station has put into one venue, and when dollars last moved
-/// between them.
+/// What the station has put into one venue, when dollars last moved between
+/// them, and when a stopped unwind first closed through it at any price.
 struct Flow {
     uint256 sent;
     uint64 depositedAt;
     uint64 movedAt;
+    uint64 fullUnwindAt;
 }
 
 /// Everything a station keeps, in one place, so its own code and the
@@ -87,6 +89,11 @@ library StationStorage {
 
     function asset(StationLayout storage s) internal view returns (IERC20) {
         return IERC20(s.factory.asset());
+    }
+
+    /// One dollar, in the asset's units.
+    function oneDollar(StationLayout storage s) internal view returns (uint256) {
+        return 10 ** IERC20Metadata(address(asset(s))).decimals();
     }
 
     function balance(StationLayout storage s) internal view returns (uint256) {

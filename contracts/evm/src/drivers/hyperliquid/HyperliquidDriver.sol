@@ -220,6 +220,12 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         return block.timestamp >= uint256(_movedAt(station)) + CREDIT_WINDOW;
     }
 
+    /// A whole slot after the credit window of the last move.
+    function movableAt(address station) public view returns (uint256) {
+        uint256 moved = _movedAt(station);
+        return DelayedVenue.slotAfter(station, moved == 0 ? 0 : moved + CREDIT_WINDOW);
+    }
+
     function _movedAt(address station) private view returns (uint64) {
         return IStation(station).movedAt(DelayedVenue.nameIn(station, address(this)));
     }
@@ -276,7 +282,7 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
     /// Into the account's perp balance through Circle's deposit contract;
     /// never sooner than the spacing after the last move (`DelayedVenue`).
     function deposit(address station, uint256 amount) external view returns (Call[] memory calls) {
-        DelayedVenue.spaced(station, _movedAt(station), CREDIT_WINDOW);
+        DelayedVenue.spaced(movableAt(station));
         calls = new Call[](2);
         calls[0] = Call(address(usdc), 0, abi.encodeCall(IERC20.approve, (address(depositWallet), amount)));
         calls[1] = Call(
@@ -289,7 +295,7 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
     /// Back to the station on HyperEVM, as `sweep` does; spaced as a
     /// deposit is.
     function withdraw(address station, uint256 amount) external view returns (Call[] memory) {
-        DelayedVenue.spaced(station, _movedAt(station), CREDIT_WINDOW);
+        DelayedVenue.spaced(movableAt(station));
         return _home(station, amount);
     }
 
@@ -427,7 +433,6 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         // What open orders hold can't be sold until they are cancelled.
         uint256 spare = total - uint256(balance.hold);
         uint256 free = spare > kept ? (spare - kept) / lot : 0;
-        if (size > free) size = free;
         uint256 venuePx = HyperCore.spotPx(spot.pair);
         // Dust.
         if (held * venuePx / 100 < MIN_ORDER) return ("", false);
@@ -436,7 +441,17 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
             (uint256 bid, uint256 ask) = HyperCore.bbo(HyperCore.SPOT_ASSET_OFFSET + spot.pair);
             (limit, outside) = _limit(true, venuePx, venuePx, bid, ask, bandBps);
         }
-        if (outside || size == 0 || size * venuePx / 100 < MIN_ORDER) return ("", outside);
+        if (outside) return ("", true);
+        if (size > free) {
+            // A claim's close that would order this piece, and can't order
+            // all of it, sells nothing anywhere (reported blocked): the proof
+            // would ask for the piece, and the other markets' sales would be
+            // the leaver's to pay for with nothing to show. A full unwind,
+            // which everyone shares, sells what it can.
+            if (fraction < WAD && size * venuePx / 100 >= MIN_ORDER) return ("", true);
+            size = free;
+        }
+        if (size == 0 || size * venuePx / 100 < MIN_ORDER) return ("", false);
         action = HyperCore.limitOrder(
             HyperCore.SPOT_ASSET_OFFSET + spot.pair,
             false,
@@ -560,7 +575,8 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
 
     /// Each perp at its mark, each spot token at its spot price (HYPE up to
     /// the reserve, and a holding worth less than the smallest order, at
-    /// nothing, on both sides): the account's worth now, less the rest of
+    /// nothing then, and as much of it at nothing now): the account's worth
+    /// now, less the rest of
     /// its worth then (1 - `fraction` x `part`, rounded up) repriced at the
     /// same prices, never below `bandBps` of what the close ordered. Figures
     /// are kept in hundredths of a millionth until the end, which rounds
@@ -584,10 +600,19 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
             if (i < _perps.length) {
                 px = uint256(HyperCore.markPx(_perps[i].index)) * 100;
             } else {
+                // What the account held then and didn't count (HYPE up to
+                // the reserve, a holding worth less than the smallest
+                // order) stays uncounted now, and nothing else: whatever it
+                // holds above that now counts at the price, however small
+                // (the rest of a holding the close sold part of, HYPE
+                // bought since with dollars the ledger no longer has), and
+                // whatever it holds less than that (HYPE spent on a send)
+                // is never the leaver's.
                 px = HyperCore.spotPx(_spots[i - _perps.length].pair);
-                if (i == _perps.length + _gas) (was, is_) = (_overReserve(was), _overReserve(is_));
-                was = _sellable(was, px);
-                is_ = _sellable(is_, px);
+                int256 counted = _sellable(i == _perps.length + _gas ? _overReserve(was) : was, px);
+                int256 uncounted = was - counted;
+                was = counted;
+                is_ = is_ > uncounted ? is_ - uncounted : int256(0);
             }
             then += was * int256(px);
             now_ += is_ * int256(px);
