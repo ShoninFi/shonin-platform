@@ -688,14 +688,60 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
                                 .await
                         }
                         Step::Deposit => {
-                            key.send(
-                                station,
-                                IStation::depositCall {
-                                    driver: name,
-                                    amount: units,
+                            // A deposit into HyperCore lands on HyperEVM
+                            // whether or not HyperCore credits it (on
+                            // testnet it silently doesn't for an address
+                            // without mainnet history), so it is done only
+                            // once HyperCore's ledger shows it.
+                            let half = evm
+                                .hyperliquid
+                                .as_ref()
+                                .filter(|_| driver == crate::hyperliquid::DRIVER);
+                            let watch = match half {
+                                Some(half) => match half.deposit_watch(amount).await {
+                                    Ok(watch) => Some((half, watch)),
+                                    Err(error) => {
+                                        let error = error.context(
+                                            "HyperCore's ledger can't be read, so the deposit couldn't be confirmed; nothing was sent",
+                                        );
+                                        let tally = Tally::of_lookup_failure(&error);
+                                        accessor.with(|mut access| {
+                                            access.get().count(|c| {
+                                                c.submitted(tally.unwrap_or(Tally::Unanswered))
+                                            })
+                                        });
+                                        return Ok(stopped(reached, format!("{error:#}"), false));
+                                    }
                                 },
-                            )
-                            .await
+                                None => None,
+                            };
+                            let sent = key
+                                .send(
+                                    station,
+                                    IStation::depositCall {
+                                        driver: name,
+                                        amount: units,
+                                    },
+                                )
+                                .await;
+                            match (sent, watch) {
+                                (Ok(receipt), Some((half, watch))) => {
+                                    if half.deposit_credited(&watch).await {
+                                        Ok(receipt)
+                                    } else {
+                                        tracing::warn!(
+                                            station = %station,
+                                            amount,
+                                            "a deposit left the station for HyperCore and HyperCore hasn't credited it"
+                                        );
+                                        Err(anyhow::Error::new(chain::NeverLanded).context(format!(
+                                            "the deposit of {amount} millionths left the station for HyperCore, which hasn't credited it within {} s: it may still arrive, or be held by the deposit contract",
+                                            crate::hyperliquid::DEPOSIT_CONFIRM_WAIT.as_secs()
+                                        )))
+                                    }
+                                }
+                                (sent, _) => sent,
+                            }
                         }
                         Step::Withdraw => {
                             key.send(

@@ -313,9 +313,31 @@ async fn wait_for_shares(
     bail!("a deposit was never priced: is the keeper running?")
 }
 
+/// How often, while the seed waits for the agent to put money to work, it
+/// posts the stand-in venue's prices and funding again: each post is an
+/// event the agent wakes to.
+const NUDGE_EVERY_SECONDS: u32 = 20;
+
+/// The funding rate the seed posts for the stand-in venue's perpetual while
+/// it waits, as a fraction of the mark a day: five times what
+/// `funding-basis` needs to start carrying (0.0002), and about what the local
+/// market's own walk averages.
+const NUDGED_FUNDING: (u64, u64) = (1, 1_000);
+
 /// The author deposits, waits for the agent to put the money to work, then
 /// asks for all of it back: more than the vault's cash, so a claim is booked
-/// and the keeper serves it.
+/// and the keeper serves it. Fails if no claim is booked.
+///
+/// Nothing moves the stand-in venue on a testnet, and `funding-basis` puts
+/// money to work only when the venue's funding pays for it and the venue
+/// tells it something happened. So while it waits the seed plays the market
+/// operator for the run, as the local chain's market does every block:
+/// it posts the venue's prices as they stand with a funding rate the agent
+/// acts on. The withdrawal is asked for only once the station holds
+/// positions at the venue and the vault's cash is under nine tenths of what
+/// the author asks back; a position isn't money the agent can bring home
+/// before the next valuation, so the cash can't cover it and a claim is
+/// booked.
 async fn claim(
     client: &Client,
     deployments: &Deployments,
@@ -323,16 +345,47 @@ async fn claim(
     author: alloy::primitives::Address,
     slug: &str,
 ) -> Result<()> {
+    use chain::bindings::venue::ILocalVenue;
     deposit(client, deployments, vault, author, CLAIM_DEPOSIT).await?;
     let shares = wait_for_shares(client, vault, author).await?;
-    // The agent keeps a buffer at home and puts the rest to work.
-    for _ in 0..WAIT_SECONDS {
+    let station = client.read(vault, IVault::homeStationCall {}).await?;
+    let mut at_work = false;
+    for second in 0..WAIT_SECONDS {
+        if second % NUDGE_EVERY_SECONDS == 0 {
+            if let Err(error) = nudge_the_market(client, deployments).await {
+                tracing::warn!(error = %format!("{error:#}"), "the stand-in venue's prices weren't posted");
+            } else if second == 0 {
+                tracing::info!(
+                    slug,
+                    "the seed posts the stand-in venue's prices and a funding rate the agent acts on, as its market operator"
+                );
+            }
+        }
+        let held = client
+            .read(
+                deployments.venue,
+                ILocalVenue::marketsHeldByCall { master: station },
+            )
+            .await?;
         let cash = client.read(vault, IVault::cashCall {}).await?;
-        if cash < U256::from(CLAIM_DEPOSIT) {
+        if !held.is_empty()
+            && cash * U256::from(10u64) < U256::from(CLAIM_DEPOSIT) * U256::from(9u64)
+        {
+            at_work = true;
+            tracing::info!(slug, %cash, markets = held.len(), "the agent has put the money to work");
             break;
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
+    if !at_work {
+        bail!(
+            "the agent never put the money to work within {WAIT_SECONDS} s, so a withdrawal would be paid from cash and no claim booked"
+        );
+    }
+    let claims_before = client
+        .read(vault, IVault::claimCountCall {})
+        .await?
+        .to::<u64>();
     client
         .send(
             author,
@@ -344,33 +397,56 @@ async fn claim(
         )
         .await
         .context("the seeded withdrawal")?;
-    let mut booked = false;
+    let request = client.read(vault, IVault::requestCountCall {}).await?;
+    let mut booked = None;
     for _ in 0..WAIT_SECONDS {
-        if !client
+        let count = client
             .read(vault, IVault::claimCountCall {})
             .await?
-            .is_zero()
-        {
-            booked = true;
-            tracing::info!(slug, "and a withdrawal larger than the cash booked a claim");
+            .to::<u64>();
+        for id in claims_before + 1..=count {
+            let claim = client
+                .read(
+                    vault,
+                    IVault::claimAtCall {
+                        claimId: U256::from(id),
+                    },
+                )
+                .await?;
+            if claim.owner == author {
+                booked = Some(id);
+            }
+        }
+        if booked.is_some() {
             break;
+        }
+        if client
+            .read(vault, IVault::requestAtCall { requestId: request })
+            .await?
+            .done
+        {
+            bail!("the seeded withdrawal was paid from cash, so no claim was booked");
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    if !booked {
-        tracing::warn!(
-            slug,
-            "the withdrawal was paid from cash, so no claim was booked"
+    let Some(claim_id) = booked else {
+        bail!(
+            "the seeded withdrawal booked no claim within {WAIT_SECONDS} s: is the keeper running?"
         );
-        return Ok(());
-    }
-    // The keeper serves it: the leaver's fraction is closed and paid at once.
+    };
+    tracing::info!(
+        slug,
+        claim = claim_id,
+        "and a withdrawal larger than the cash booked a claim"
+    );
+    // The keeper serves it: the leaver's fraction is closed and they are
+    // paid.
     for _ in 0..WAIT_SECONDS {
         let claim = client
             .read(
                 vault,
                 IVault::claimAtCall {
-                    claimId: U256::from(1u64),
+                    claimId: U256::from(claim_id),
                 },
             )
             .await?;
@@ -381,6 +457,45 @@ async fn claim(
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
     bail!("a claim was booked but never paid: is the keeper running?")
+}
+
+/// Post the stand-in venue's prices as they stand, with a funding rate on its
+/// perpetual of [`NUDGED_FUNDING`] of the mark a day, as its market operator.
+async fn nudge_the_market(client: &Client, deployments: &Deployments) -> Result<()> {
+    use chain::bindings::venue::{Funding, ILocalVenue, Quote};
+    let operator = client.account(Role::Operator)?;
+    let mut quotes = Vec::new();
+    let mut funding = Vec::new();
+    for name in [crate::deploy::SPOT, crate::deploy::PERP] {
+        let id = crate::deploy::market_id(name);
+        let market = client
+            .read(deployments.venue, ILocalVenue::marketOfCall { market: id })
+            .await?;
+        quotes.push(Quote {
+            market: id,
+            mark: market.mark,
+            oracle: market.oracle,
+            bid: market.bid,
+            ask: market.ask,
+        });
+        if market.isPerp {
+            let rate = market.mark * U256::from(NUDGED_FUNDING.0) / U256::from(NUDGED_FUNDING.1);
+            funding.push(Funding {
+                market: id,
+                ratePerDay: alloy::primitives::I256::try_from(rate)?,
+                paidPerUnit: alloy::primitives::I256::ZERO,
+            });
+        }
+    }
+    client
+        .send(
+            operator,
+            deployments.venue,
+            ILocalVenue::postCall { quotes, funding },
+        )
+        .await
+        .context("posting the stand-in venue's prices")?;
+    Ok(())
 }
 
 /// The depositor's money goes to work; the admin stops the vault; the keeper

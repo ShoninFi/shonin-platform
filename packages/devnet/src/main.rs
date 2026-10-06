@@ -132,6 +132,10 @@ enum Command {
         api: Option<String>,
         #[arg(long)]
         agent: Option<PathBuf>,
+        /// The depositor's deposit, in dollars (at least the factory's
+        /// minimum, the default): `mm-quoter` needs a vault of about 650.
+        #[arg(long)]
+        deposit: Option<f64>,
         /// What the funder sends the station's HyperCore account.
         #[arg(long, default_value_t = 30.0)]
         station_dollars: f64,
@@ -298,6 +302,7 @@ async fn main() -> Result<()> {
         Some(Command::HyperliquidVaults {
             api,
             agent,
+            deposit,
             station_dollars,
             trade_minutes,
         }) => {
@@ -310,10 +315,13 @@ async fn main() -> Result<()> {
                         &args.artifacts,
                         &deployments,
                         &target.deployments_dir,
-                        &api,
-                        &agent,
-                        station_dollars,
-                        trade_minutes,
+                        hyperliquid_vaults::RunOptions {
+                            api: &api,
+                            agent: &agent,
+                            deposit_dollars: deposit,
+                            station_dollars,
+                            trade_minutes,
+                        },
                     )
                     .await
                 }

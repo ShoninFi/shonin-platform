@@ -80,6 +80,14 @@ impl Api {
         }
     }
 
+    /// The API at another address, for a stand-in of the venue.
+    pub fn at(base: &str, network: Network) -> Self {
+        Self {
+            base: base.trim_end_matches('/').to_string(),
+            ..Self::new(network)
+        }
+    }
+
     /// The network HyperCore is for an EVM chain id: HyperEVM's mainnet
     /// (999) or testnet (998).
     pub fn for_chain(chain_id: u64) -> Option<Self> {
@@ -214,6 +222,25 @@ impl Api {
             .as_str()
             .and_then(|value| value.parse().ok())
             .unwrap_or(0.0))
+    }
+
+    /// How many dollar deposits of exactly `millionths` HyperCore's ledger
+    /// shows credited to `user` since `since_ms` (its own clock).
+    pub async fn deposits_of(
+        &self,
+        user: Address,
+        since_ms: u64,
+        millionths: u64,
+    ) -> Result<usize> {
+        let ledger = self
+            .info(json!({
+                "type": "userNonFundingLedgerUpdates",
+                "user": user,
+                "startTime": since_ms,
+            }))
+            .await
+            .context("reading the account's ledger on HyperCore")?;
+        Ok(deposits_matching(&ledger, user, millionths))
     }
 
     /// Whether HyperCore knows the account at all: an address it has never
@@ -512,9 +539,98 @@ fn cut(text: &str) -> &str {
     &text[..end]
 }
 
+/// How many entries of an account's ledger are dollars of exactly
+/// `millionths` coming into it from outside: a deposit (from HyperEVM or a
+/// bridge, whatever the venue calls it, as long as its type says deposit),
+/// or a send whose destination is the account and whose source isn't. Its
+/// own moves between perp and spot, sends out, withdrawals and trades are
+/// not.
+pub fn deposits_matching(ledger: &Value, user: Address, millionths: u64) -> usize {
+    let me = format!("{user:#x}");
+    ledger
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            let delta = &entry["delta"];
+            let kind = delta["type"]
+                .as_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let lower = |field: &str| delta[field].as_str().map(str::to_ascii_lowercase);
+            let incoming = kind.contains("deposit")
+                || (lower("destination").as_deref() == Some(me.as_str())
+                    && lower("user").as_deref() != Some(me.as_str())
+                    && lower("source").as_deref() != Some(me.as_str())
+                    && !kind.contains("class"));
+            if !incoming || kind.contains("withdraw") {
+                return false;
+            }
+            let dollars = delta["usdc"].as_str().or_else(|| {
+                let token = delta["token"].as_str().unwrap_or_default();
+                (token == "USDC" || token.starts_with("USDC:"))
+                    .then(|| delta["amount"].as_str())
+                    .flatten()
+            });
+            dollars.and_then(millionths_of) == Some(millionths)
+        })
+        .count()
+}
+
+/// A decimal number of dollars as millionths, when it is a whole number of
+/// them.
+fn millionths_of(text: &str) -> Option<u64> {
+    let (whole, fraction) = text.trim().split_once('.').unwrap_or((text.trim(), ""));
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.len() > 6 || whole.is_empty() && fraction.is_empty() {
+        return None;
+    }
+    let whole: u64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().ok()?
+    };
+    let fraction: u64 = format!("{fraction:0<6}").parse().ok()?;
+    whole.checked_mul(1_000_000)?.checked_add(fraction)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_dollars_coming_into_the_account_count_as_its_deposit() {
+        let me: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let other = "0x2222222222222222222222222222222222222222";
+        let mine = format!("{me:#x}");
+        let ledger = json!([
+            {"time": 1, "delta": {"type": "deposit", "usdc": "650.0"}},
+            {"time": 2, "delta": {"type": "send", "user": other, "destination": mine, "token": "USDC", "amount": "650"}},
+            // Not deposits: its own perp-to-spot move, a send out, a withdrawal.
+            {"time": 3, "delta": {"type": "accountClassTransfer", "usdc": "650.0", "toPerp": true}},
+            {"time": 4, "delta": {"type": "send", "user": mine, "destination": other, "token": "USDC", "amount": "650"}},
+            {"time": 5, "delta": {"type": "withdraw", "usdc": "650.0"}},
+            // Another amount.
+            {"time": 6, "delta": {"type": "deposit", "usdc": "649.999999"}},
+        ]);
+        assert_eq!(deposits_matching(&ledger, me, 650_000_000), 2);
+        assert_eq!(deposits_matching(&ledger, me, 649_999_999), 1);
+        assert_eq!(deposits_matching(&json!([]), me, 650_000_000), 0);
+        assert_eq!(deposits_matching(&json!({"error": "x"}), me, 1), 0);
+    }
+
+    #[test]
+    fn dollar_amounts_read_as_exact_millionths() {
+        assert_eq!(millionths_of("650"), Some(650_000_000));
+        assert_eq!(millionths_of("650.0"), Some(650_000_000));
+        assert_eq!(millionths_of("0.000001"), Some(1));
+        assert_eq!(millionths_of("20.40378700"), Some(20_403_787));
+        assert_eq!(millionths_of("0.0000001"), None);
+        assert_eq!(millionths_of("-1"), None);
+        assert_eq!(millionths_of("x"), None);
+    }
 
     fn token(name: &str, index: u64) -> SpotToken {
         SpotToken {

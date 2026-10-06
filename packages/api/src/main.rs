@@ -945,6 +945,8 @@ mod tests {
             native_usd: None,
             confirmations: None,
             public_rpc: node,
+            logs_rpc: None,
+            log_range: None,
         };
         let client = Client::connect(&config, chain::Signing::ReadOnly)
             .await
@@ -1088,6 +1090,8 @@ mod tests {
             native_usd: None,
             confirmations: None,
             public_rpc: node,
+            logs_rpc: None,
+            log_range: None,
         };
         let client = Client::connect(&config, chain::Signing::ReadOnly)
             .await
@@ -1313,6 +1317,8 @@ mod tests {
             native_usd: None,
             confirmations: None,
             public_rpc: node,
+            logs_rpc: None,
+            log_range: None,
         };
         let client = Client::connect(&config, chain::Signing::ReadOnly)
             .await

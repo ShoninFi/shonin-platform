@@ -231,6 +231,8 @@ pub fn config(url: &str) -> ChainConfig {
         native_usd: Some(2_500.0),
         confirmations: None,
         public_rpc: url.to_string(),
+        logs_rpc: None,
+        log_range: None,
     }
 }
 

@@ -45,13 +45,24 @@ impl Write for Captured {
     }
 }
 
-/// Connect with the key in the URL and make an ordinary read, as the meter
-/// and the reporter do every few seconds.
-async fn read_through(paid: &str) {
-    let client = chain::Client::connect(&stand_in::config(paid), chain::Signing::ReadOnly)
+/// Connect with the key in the URL, and in the URL of the endpoints for log
+/// queries, and make an ordinary read and a log query, as the meter, the
+/// reporter and the keeper do every few seconds.
+async fn read_through(paid: &str, logs_paid: &str) {
+    let mut config = stand_in::config(paid);
+    config.logs_rpc = Some(logs_paid.to_string());
+    let client = chain::Client::connect(&config, chain::Signing::ReadOnly)
         .await
         .unwrap();
     client.block_number().await.unwrap();
+    client
+        .logs(
+            &alloy::rpc::types::Filter::new()
+                .from_block(1u64)
+                .to_block(2u64),
+        )
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -70,8 +81,17 @@ async fn the_rpc_key_never_reaches_the_log_whatever_level_is_asked_for() {
 
     let url = stand_in::start(stand_in::node(31337)).await;
     let paid = format!("{url}/?apikey={SECRET}");
+    let logs_url = stand_in::answering(
+        Some(31337),
+        Arc::new(|method, _| match method {
+            "eth_getLogs" => stand_in::Said::Result(serde_json::json!([])),
+            _ => stand_in::unknown_method(),
+        }),
+    )
+    .await;
+    let logs_paid = format!("{logs_url}/?apikey={SECRET}");
 
-    read_through(&paid).await;
+    read_through(&paid, &logs_paid).await;
     tracing::debug!("the reads are done");
     let log = captured.take();
     assert!(
@@ -98,7 +118,7 @@ async fn the_rpc_key_never_reaches_the_log_whatever_level_is_asked_for() {
             .unwrap();
         captured.take();
         let round = tracing::info_span!(target: "keeper", "round");
-        read_through(&paid).instrument(round).await;
+        read_through(&paid, &logs_paid).instrument(round).await;
         let log = captured.take();
         if log.contains(SECRET) {
             leaked.push(format!("RUST_LOG={spec}:\n{log}"));
@@ -115,7 +135,7 @@ async fn the_rpc_key_never_reaches_the_log_whatever_level_is_asked_for() {
     reloading
         .modify(|filter| *filter = EnvFilter::new("trace"))
         .unwrap();
-    read_through(&paid).await;
+    read_through(&paid, &logs_paid).await;
     let log = captured.take();
     assert!(
         log.contains(SECRET),

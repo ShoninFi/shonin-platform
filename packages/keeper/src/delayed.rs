@@ -3,10 +3,15 @@
 //! block). Nothing there closes and comes home in one transaction, so the
 //! keeper moves each step on in later blocks:
 //!
-//! - a claim's close is staged by the station; the keeper calls
-//!   `settleClose` once it would go through, to prove and sweep it, and again
-//!   to deliver it home (on Lighter, whose withdrawals wait in a pending
-//!   balance until someone collects them, collecting them first);
+//! - a close is staged by the station for one claim or one holder's units;
+//!   the keeper calls `settleClose` once it would go through: to prove,
+//!   measure and sweep it, to ask again for its dollars once a delivery
+//!   window has passed without them, and to deliver it to the vault, which
+//!   pays whom it was for. While one is staged no claim is tried and no
+//!   units are served (the vault would refuse them);
+//! - a venue whose withdrawals wait in a pending balance until someone pays
+//!   them out (Lighter) has them paid out to the station whenever any is
+//!   pending, before the staged close is moved on;
 //! - a stopped station's full unwind places what is left to close and sweeps
 //!   what earlier closes freed, and reports itself blocked while it ordered
 //!   anything: the keeper repeats it until nothing is left at the venue;
@@ -102,38 +107,36 @@ pub async fn drivers_of(
 }
 
 /// Move a staged close on, if one is in progress and the station would take
-/// the call now: in a block after the stage, to prove and sweep it (or let it
-/// lapse once it has had its time); in a block after the sweep, to deliver it.
-/// A call that can't go yet (`NotYet`) is simply tried next round.
-pub async fn settle_close(
-    client: &Client,
-    keeper: Address,
-    station: Address,
-    drivers: &[DelayedDriver],
-) -> Result<()> {
+/// the call now (it is simulated first): in a block after the stage, to prove,
+/// measure and sweep it (or let it lapse once its window has passed
+/// unproved); once its dollars have landed, to deliver it; a window after a
+/// sweep whose dollars haven't come, to ask for them again. A call that
+/// can't go yet (`NotYet`) is simply tried next round, and nothing is sent.
+pub async fn settle_close(client: &Client, keeper: Address, station: Address) -> Result<()> {
     let stage = client.read(station, IStation::stageCall {}).await?;
-    if stage.stagedAt == 0 {
+    let Some(what) = close_step(stage.stagedAt, stage.sweptBlock) else {
         return Ok(());
-    }
+    };
     if client
         .read(station, IStation::settleCloseCall {})
         .await
         .is_err()
     {
-        // Swept but not landed: a venue whose withdrawals wait to be
-        // collected has them collected, so the delivery can go.
-        if stage.sweptBlock != 0 {
-            collect_withdrawals(client, keeper, station, drivers).await?;
-        }
         return Ok(());
     }
-    let what = if stage.sweptBlock == 0 {
-        "prove and sweep the staged close"
-    } else {
-        "deliver the staged close"
-    };
     send_outcome(client, keeper, station, IStation::settleCloseCall {}, what).await;
     Ok(())
+}
+
+/// What `settleClose` would do for a stage placed at `staged_at` and swept in
+/// `swept_block` (zero for none), as the keeper's log says it; `None` with
+/// nothing staged, when there is nothing to send.
+pub fn close_step(staged_at: u64, swept_block: u64) -> Option<&'static str> {
+    match (staged_at, swept_block) {
+        (0, _) => None,
+        (_, 0) => Some("prove, measure and sweep the staged close, or let it lapse"),
+        _ => Some("deliver the staged close, or ask again for its dollars"),
+    }
 }
 
 alloy::sol! {
@@ -514,6 +517,14 @@ pub async fn reclaim(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_staged_close_is_moved_on_only_while_one_is_staged() {
+        assert_eq!(close_step(0, 0), None, "nothing staged: nothing to send");
+        assert_eq!(close_step(0, 9), None);
+        assert!(close_step(100, 0).unwrap().starts_with("prove"));
+        assert!(close_step(100, 7).unwrap().starts_with("deliver"));
+    }
 
     #[test]
     fn a_stopped_delayed_station_is_unwound_while_anything_is_left_at_the_venue() {

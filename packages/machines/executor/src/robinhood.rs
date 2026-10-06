@@ -35,6 +35,8 @@ alloy::sol! {
         function pinnedDriver(bytes32 driver) external view returns (address);
         function approveKey(bytes32 driver, address key) external;
         function approvedKey(bytes32 driver) external view returns (address);
+        function arrivals() external view returns (uint256);
+        function venueFlows(bytes32 driver) external view returns (uint256 sent, uint64 depositedAt);
     }
     interface ILighterDriver {
         function exchange() external view returns (address);
@@ -402,6 +404,46 @@ impl LighterHalf {
         }))
     }
 
+    /// What the post reads on-chain, all at the chain's newest block: that
+    /// block's time, which stamps the post, the station's pending balance at
+    /// the exchange, and its own counters, so the driver can tell what moved
+    /// after the reading.
+    async fn on_chain(&self) -> Result<lighter::report::OnChain> {
+        let (head, as_of) = self.chain.head_and_time().await?;
+        let at = alloy::eips::BlockId::number(head);
+        let pending = self
+            .chain
+            .read_at(
+                self.exchange,
+                IExchange::getPendingBalanceCall {
+                    owner: self.station,
+                    assetIndex: 3,
+                },
+                at,
+            )
+            .await?;
+        let arrived = self
+            .chain
+            .read_at(self.station, IStationRh::arrivalsCall {}, at)
+            .await?;
+        let flows = self
+            .chain
+            .read_at(
+                self.station,
+                IStationRh::venueFlowsCall {
+                    driver: name(LIGHTER),
+                },
+                at,
+            )
+            .await?;
+        Ok(lighter::report::OnChain {
+            as_of,
+            pending: U256::from(pending),
+            arrived,
+            sent: flows.sent,
+        })
+    }
+
     /// Read the station's accounts and post them on the board, every
     /// `REPORT_EVERY`, until the task is dropped.
     pub fn report_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -469,19 +511,8 @@ impl LighterHalf {
             let book = self.api.book_orders(market, 1).await?;
             prices.push(lighter::report::prices(market, &details, &book, &markets)?);
         }
-        let pending = self
-            .chain
-            .read(
-                self.exchange,
-                IExchange::getPendingBalanceCall {
-                    owner: self.station,
-                    assetIndex: 3,
-                },
-            )
-            .await?;
-        let as_of = (now_ms() / 1000) as u64;
-        let report =
-            lighter::report::build(as_of, &accounts, U256::from(pending), &prices, &markets)?;
+        let on_chain = self.on_chain().await?;
+        let report = lighter::report::build(on_chain, &accounts, &prices, &markets)?;
         tracing::info!(report = %lighter::report::describe(self.station, &report), "posting the Lighter read");
         self.key
             .send(

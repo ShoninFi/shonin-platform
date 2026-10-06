@@ -142,6 +142,8 @@ async fn a_node_capping_log_ranges_still_has_its_chain_read() {
         dollar: "USDC".to_string(),
         native_usd: None,
         public_rpc: node,
+        logs_rpc: None,
+        log_range: None,
         confirmations: None,
     };
     let client = Client::connect(&config, Signing::ReadOnly).await.unwrap();

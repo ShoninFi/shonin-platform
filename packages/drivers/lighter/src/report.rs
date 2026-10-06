@@ -37,6 +37,8 @@ alloy::sol! {
         uint48[] accounts;
         uint256 equity;
         uint256 pending;
+        uint256 arrived;
+        uint256 sent;
         uint256[] available;
         LighterPosition[] positions;
         LighterPrice[] prices;
@@ -72,21 +74,35 @@ fn dollars(value: &Value) -> Result<U256> {
     Ok(U256::from(integer((amount * pow10(6)).floor())?))
 }
 
-/// The report for `accounts` (each the API's account object), with the
-/// station's pending balance read on-chain beside them and each held
-/// market's prices.
+/// What the report reads on-chain, all at one block: its time, which the
+/// report is stamped with (never the machine's clock, which may run ahead of
+/// the chain's and have the board refuse it), the station's pending balance
+/// at the exchange, and the station's own counters (every dollar that had
+/// reached it from outside its calls, and every dollar it had put into the
+/// exchange), which tell the driver what moved after the reading.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OnChain {
+    pub as_of: u64,
+    pub pending: U256,
+    pub arrived: U256,
+    pub sent: U256,
+}
+
+/// The report for `accounts` (each the API's account object), with what was
+/// read on-chain beside them and each held market's prices.
 pub fn build(
-    as_of: u64,
+    on_chain: OnChain,
     accounts: &[Value],
-    pending: U256,
     prices: &[Prices],
     markets: &Markets,
 ) -> Result<LighterReport> {
     let mut report = LighterReport {
-        asOf: as_of,
+        asOf: on_chain.as_of,
         accounts: Vec::new(),
         equity: U256::ZERO,
-        pending,
+        pending: on_chain.pending,
+        arrived: on_chain.arrived,
+        sent: on_chain.sent,
         available: Vec::new(),
         positions: Vec::new(),
         prices: prices
@@ -215,11 +231,22 @@ mod tests {
             "positions": [{"market_id": 26, "position": "1.5000", "sign": -1}],
             "shares": []
         });
-        let report = build(5, &[account], U256::from(7u8), &[], &markets()).unwrap();
+        let on_chain = OnChain {
+            as_of: 5,
+            pending: U256::from(7u8),
+            arrived: U256::from(11u8),
+            sent: U256::from(13u8),
+        };
+        let report = build(on_chain, &[account], &[], &markets()).unwrap();
         assert_eq!(report.equity, U256::from(1_000_500_000u64));
         assert_eq!(report.available, vec![U256::from(250_250_000u64)]);
         assert_eq!(report.positions[0].size, -15_000);
+        assert_eq!(report.asOf, 5, "stamped with the chain block's time");
         assert_eq!(report.pending, U256::from(7u8));
+        assert_eq!(
+            (report.arrived, report.sent),
+            (U256::from(11u8), U256::from(13u8))
+        );
         // It encodes as the contract's struct does.
         assert!(!report.abi_encode().is_empty());
     }
@@ -230,7 +257,7 @@ mod tests {
             "index": 1, "total_asset_value": "1", "available_balance": "1",
             "positions": [{"market_id": 99, "position": "1", "sign": 1}]
         });
-        assert!(build(5, &[account], U256::ZERO, &[], &markets()).is_err());
+        assert!(build(OnChain::default(), &[account], &[], &markets()).is_err());
     }
 
     #[test]

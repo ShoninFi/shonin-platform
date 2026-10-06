@@ -138,6 +138,8 @@ async fn a_vault_s_record_is_read_from_the_deployment_not_from_block_one() {
         dollar: "USDC".to_string(),
         native_usd: None,
         public_rpc: node,
+        logs_rpc: None,
+        log_range: None,
         confirmations: None,
     };
     let client = Client::connect(&config, Signing::ReadOnly).await.unwrap();

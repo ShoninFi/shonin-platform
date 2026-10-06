@@ -377,6 +377,8 @@ pub async fn connect(node: &Shared) -> Client {
         native_usd: None,
         confirmations: None,
         public_rpc: url,
+        logs_rpc: None,
+        log_range: None,
     };
     Client::connect(&config, Signing::ReadOnly).await.unwrap()
 }
@@ -429,6 +431,8 @@ pub async fn connect_with_blocks_of(node: &Shared, seconds: u64) -> Client {
         native_usd: None,
         confirmations: None,
         public_rpc: url,
+        logs_rpc: None,
+        log_range: None,
     };
     Client::connect(&config, Signing::ReadOnly).await.unwrap()
 }
@@ -737,6 +741,8 @@ pub async fn connect_with_logs_of(node: &Shared, address: Address, logs: Vec<Val
         native_usd: None,
         confirmations: None,
         public_rpc: url,
+        logs_rpc: None,
+        log_range: None,
     };
     Client::connect(&config, Signing::ReadOnly).await.unwrap()
 }
@@ -902,6 +908,8 @@ async fn serve_in_front(app: Router, label: &str) -> Client {
         native_usd: None,
         confirmations: None,
         public_rpc: url,
+        logs_rpc: None,
+        log_range: None,
     };
     Client::connect(&config, Signing::ReadOnly).await.unwrap()
 }

@@ -1120,12 +1120,15 @@ async fn serve(
     // station's agent; its events go to the vault's feed for as long as it
     // is served.
     let names = |name: &str| recorded.drivers.iter().any(|driver| driver == name);
-    let (hyperliquid, _hyperliquid_events) = if names(hyperliquid::DRIVER) {
+    // It also keeps a little HYPE on HyperCore for the account's sends home,
+    // buying some on the pinned HYPE/USDC pair when it runs low.
+    let (hyperliquid, _hyperliquid_events, _hyperliquid_hype) = if names(hyperliquid::DRIVER) {
         let half = hyperliquid::Half::connect(&chain, vault, station, key_for(vault)).await?;
         let events = AbortOnDrop(half.forward_events(account_events.sender()));
-        (Some(half), Some(events))
+        let hype = AbortOnDrop(half.hype_loop());
+        (Some(half), Some(events), Some(hype))
     } else {
-        (None, None)
+        (None, None, None)
     };
     // A Robinhood Chain vault's Safe is traded by this vault's key through
     // the Safe's role; its Lighter account by a Lighter key made now, which

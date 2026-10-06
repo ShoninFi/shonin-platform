@@ -310,6 +310,8 @@ pub async fn client(url: &str) -> chain::Client {
         dollar: "USDC".to_string(),
         native_usd: Some(2_500.0),
         public_rpc: url.to_string(),
+        logs_rpc: None,
+        log_range: None,
         confirmations: None,
     };
     chain::Client::connect(&config, chain::Signing::ReadOnly)

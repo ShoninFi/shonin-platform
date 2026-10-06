@@ -8,7 +8,8 @@
 //! `SHONIN_TESTNET_EVM_MNEMONIC`, from which every role account is derived
 //! (the admin, the attestor, the builder and the reviewer itself), the key
 //! for the model that answers the battery (`SHONIN_CALIBRATOR_KEY`), and any
-//! RPC override, which may carry a provider's key.
+//! RPC override or log-query endpoint override, which may carry a
+//! provider's key.
 //!
 //! So the model's program is given none of the reviewer's environment but a
 //! `PATH`, a `HOME` and the model's own credentials; no tools, so it can
@@ -25,6 +26,7 @@ use std::time::{Duration, Instant};
 const MNEMONIC: &str = "secret words that must never reach the review model";
 const CALIBRATOR_KEY: &str = "calibrator-key-0123456789abcdef";
 const RPC: &str = "https://base.example.invalid/v2/provider-api-key-0123456789";
+const LOGS_RPC: &str = "https://logs.example.invalid/v2/logs-provider-key-9876543210";
 const MODEL_KEY: &str = "the-model-s-own-key-0123456789";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -49,6 +51,7 @@ async fn the_model_is_given_none_of_the_reviewer_s_secrets() {
             ("SHONIN_TESTNET_EVM_MNEMONIC", MNEMONIC),
             ("SHONIN_CALIBRATOR_KEY", CALIBRATOR_KEY),
             ("SHONIN_RPC_BASE_SEPOLIA", RPC),
+            ("SHONIN_LOGS_RPC_EVM_84532", LOGS_RPC),
             ("ANTHROPIC_API_KEY", MODEL_KEY),
         ],
         ..Default::default()
@@ -76,7 +79,7 @@ async fn the_model_is_given_none_of_the_reviewer_s_secrets() {
     let read = |name: &str| std::fs::read_to_string(seen.join(name)).unwrap();
 
     let environment = read("environment");
-    let leaked: Vec<&str> = [MNEMONIC, CALIBRATOR_KEY, RPC]
+    let leaked: Vec<&str> = [MNEMONIC, CALIBRATOR_KEY, RPC, LOGS_RPC]
         .into_iter()
         .filter(|secret| environment.contains(secret))
         .collect();

@@ -6,6 +6,21 @@
 # digits turned into "_" (SHONIN_RPC_EVM_8453, SHONIN_RPC_SOLANA_MAINNET_BETA).
 # Paid RPC URLs carry keys, so they only ever go there.
 #
+# `logs_rpc` (optional, space-separated like `rpc`) names endpoints for log
+# queries alone: every eth_getLogs goes through a failover over them, and
+# nothing else does. `log_range` (optional, a positive whole number) is the
+# most blocks one log query may span, both ends included; a range is read in
+# windows of at most that many. The width belongs to the list log queries go
+# to (`logs_rpc`, or `rpc` without it), not to one endpoint, since the
+# failover picks the endpoint beneath each query: it must suit every endpoint
+# in that list. Without them, logs use `rpc` and a range is asked for whole,
+# halved when an endpoint refuses it as too wide. Both are overridden from
+# .env as SHONIN_LOGS_RPC_<KIND>_<ID> and SHONIN_LOG_RANGE_<KIND>_<ID>.
+#
+# An endpoint that answers a read by saying it no longer keeps the state asked
+# for (pruned, "historical state ... is not available") counts as failing, and
+# the read goes on to the next endpoint in the list.
+#
 # `dollar` is the stablecoin a vault on that chain settles in.
 #
 # `native_usd` is what the chain's coin is taken to be worth, for billing an
