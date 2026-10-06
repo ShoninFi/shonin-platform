@@ -10,20 +10,25 @@
 //!
 //! Given a genuine token instead (one a Confidential Space VM was issued,
 //! with the binding its nonce commits to), it proves that token against
-//! Google's published keys alone and writes `<dir>/RealTokenFixture.sol`,
-//! for a checker that trusts Google's keys:
+//! Google's published keys alone and writes `<dir>/<Name>.sol` (a library
+//! `<Name>`, `RealTokenFixture` by default), for a checker that trusts
+//! Google's keys:
 //!
-//! `attestation-fixture --token <token.jwt> --binding <binding.json> [--now <unix seconds>] <dir>`
+//! `attestation-fixture --token <token.jwt> --binding <binding.json> [--now <unix seconds>] [--name <Name>] <dir>`
 //!
 //! The binding file holds `evm_signer`, `solana_signer` and `vaults_root`
-//! (0x hex), and the one leaf's `vault_chain` (decimal), `vault` and
-//! `strategy_hash`. `--now` is the prover's clock (default: a minute after
-//! the token's `iat`); it must lie within the token's hour.
+//! (0x hex), and either the one leaf's `vault_chain`, `vault` and
+//! `strategy_hash`, or `leaves`: each with `vault_chain`, `vault`,
+//! `strategy_hash`, `key` and `proof` (the five-word leaves that name their
+//! key). `--now` is the prover's clock (default: a minute after the token's
+//! `iat`); it must lie within the token's hour.
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use serde_json::{Value, json};
-use shonin_attestation::{Binding, Input, Jwk, Proof, evm_seal, image_id, prove, solana_seal, verify};
+use shonin_attestation::{
+    Binding, Input, Jwk, Proof, evm_seal, image_id, prove, solana_seal, verify,
+};
 use shonin_attestation_core::{GOOGLE_JWKS_2026_10_06, fixture};
 
 /// When the fixture's token was issued; a test warps the chain to after it.
@@ -33,12 +38,13 @@ fn hex0x(bytes: impl AsRef<[u8]>) -> String {
     format!("0x{}", hex::encode(bytes))
 }
 
-const USAGE: &str = "usage: attestation-fixture [--token <token.jwt> --binding <binding.json> [--now <unix seconds>]] <dir>";
+const USAGE: &str = "usage: attestation-fixture [--token <token.jwt> --binding <binding.json> [--now <unix seconds>] [--name <Library>]] <dir>";
 
 fn main() -> Result<()> {
     let mut token = None;
     let mut binding = None;
     let mut now = None;
+    let mut name = None;
     let mut dir = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -46,14 +52,22 @@ fn main() -> Result<()> {
             "--token" => token = Some(args.next().context(USAGE)?),
             "--binding" => binding = Some(args.next().context(USAGE)?),
             "--now" => now = Some(args.next().context(USAGE)?.parse::<u64>().context(USAGE)?),
+            "--name" => name = Some(args.next().context(USAGE)?),
             _ if dir.is_none() && !arg.starts_with("--") => dir = Some(arg),
             _ => bail!(USAGE),
         }
     }
     let dir = std::path::PathBuf::from(dir.context(USAGE)?);
     match (token, binding) {
-        (None, None) if now.is_none() => test_token(&dir),
-        (Some(token), Some(binding)) => real_token(&dir, &token, &binding, now),
+        (None, None) if now.is_none() && name.is_none() => test_token(&dir),
+        (Some(token), Some(binding)) => {
+            let name = name.unwrap_or_else(|| "RealTokenFixture".into());
+            anyhow::ensure!(
+                name.chars().all(|c| c.is_ascii_alphanumeric()) && !name.is_empty(),
+                "the library name must be alphanumeric"
+            );
+            real_token(&dir, &token, &binding, now, &name)
+        }
         _ => bail!(USAGE),
     }
 }
@@ -166,23 +180,66 @@ fn checksummed(address: &[u8; 20]) -> String {
     format!("0x{mixed}")
 }
 
-/// What a genuine token's nonce binds, and the one leaf under its root.
-struct RealBinding {
-    binding: Binding,
+/// One leaf under a genuine token's root.
+struct Leaf {
     vault_chain: u64,
     vault: [u8; 20],
     strategy_hash: [u8; 32],
+    /// The key the leaf names; none for the old four-word leaf.
+    key: Option<[u8; 20]>,
+    proof: Vec<[u8; 32]>,
+}
+
+/// What a genuine token's nonce binds, and the leaves under its root.
+struct RealBinding {
+    binding: Binding,
+    leaves: Vec<Leaf>,
+}
+
+fn hex_bytes<const N: usize>(text: &str, what: &str) -> Result<[u8; N]> {
+    let bytes = hex::decode(text.trim_start_matches("0x"))
+        .with_context(|| format!("the binding's `{what}` is not hex"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("the binding's `{what}` is not {N} bytes"))
 }
 
 fn hex_field<const N: usize>(doc: &Value, name: &str) -> Result<[u8; N]> {
     let text = doc[name]
         .as_str()
         .with_context(|| format!("the binding has no `{name}`"))?;
-    let bytes = hex::decode(text.trim_start_matches("0x"))
-        .with_context(|| format!("the binding's `{name}` is not hex"))?;
-    bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("the binding's `{name}` is not {N} bytes"))
+    hex_bytes(text, name)
+}
+
+/// A number written as a JSON number or as a decimal string.
+fn number(doc: &Value, name: &str) -> Result<u64> {
+    match &doc[name] {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+    .with_context(|| format!("the binding's `{name}` is not a number"))
+}
+
+fn read_leaf(doc: &Value) -> Result<Leaf> {
+    let key = match doc.get("signer") {
+        Some(_) => Some(hex_field(doc, "signer")?),
+        None => None,
+    };
+    let proof = match doc.get("proof").and_then(Value::as_array) {
+        Some(items) => items
+            .iter()
+            .map(|item| hex_bytes(item.as_str().unwrap_or_default(), "proof"))
+            .collect::<Result<_>>()?,
+        None => Vec::new(),
+    };
+    Ok(Leaf {
+        vault_chain: number(doc, "vault_chain")?,
+        vault: hex_field(doc, "vault")?,
+        strategy_hash: hex_field(doc, "strategy_hash")?,
+        key,
+        proof,
+    })
 }
 
 fn read_binding(path: &str) -> Result<RealBinding> {
@@ -195,17 +252,11 @@ fn read_binding(path: &str) -> Result<RealBinding> {
         solana_signer: hex_field(&doc, "solana_signer")?,
         vaults_root: hex_field(&doc, "vaults_root")?,
     };
-    let vault_chain = doc["vault_chain"]
-        .as_str()
-        .context("the binding has no `vault_chain`")?
-        .parse()
-        .context("the binding's `vault_chain` is not a number")?;
-    Ok(RealBinding {
-        binding,
-        vault_chain,
-        vault: hex_field(&doc, "vault")?,
-        strategy_hash: hex_field(&doc, "strategy_hash")?,
-    })
+    let leaves = match doc.get("leaves").and_then(Value::as_array) {
+        Some(items) => items.iter().map(read_leaf).collect::<Result<_>>()?,
+        None => vec![read_leaf(&doc)?],
+    };
+    Ok(RealBinding { binding, leaves })
 }
 
 /// The token's `iat`, read without checking anything (the guest checks).
@@ -219,7 +270,50 @@ fn issued_at(token: &str) -> Result<u64> {
     claims["iat"].as_u64().context("the token has no `iat`")
 }
 
-fn real_token(dir: &std::path::Path, token: &str, binding: &str, now: Option<u64>) -> Result<()> {
+/// The leaves as Solidity: the single old leaf as constants, or every
+/// five-word leaf through `leaf(i)`.
+fn solidity_leaves(leaves: &[Leaf]) -> String {
+    let word = |value: &[u8]| format!("0x{}", hex::encode(value));
+    if let [one] = leaves
+        && one.key.is_none()
+    {
+        return format!(
+            "    uint256 internal constant VAULT_CHAIN = {};\n    address internal constant VAULT = {};\n    bytes32 internal constant STRATEGY_HASH = {};\n",
+            one.vault_chain,
+            checksummed(&one.vault),
+            word(&one.strategy_hash)
+        );
+    }
+    let mut out = format!(
+        "    uint256 internal constant LEAVES = {};\n\n    /// The `i`th leaf under the root: what `bless` takes besides the seal\n    /// and the journal.\n    function leaf(uint256 i)\n        internal\n        pure\n        returns (uint256 vaultChain, address vault, bytes32 strategyHash, address key, bytes32[] memory proof)\n    {{\n",
+        leaves.len()
+    );
+    for (i, leaf) in leaves.iter().enumerate() {
+        out += &format!("        if (i == {i}) {{\n");
+        out += &format!(
+            "            (vaultChain, vault, strategyHash, key) = ({}, {}, {}, {});\n",
+            leaf.vault_chain,
+            checksummed(&leaf.vault),
+            word(&leaf.strategy_hash),
+            checksummed(&leaf.key.unwrap_or_default())
+        );
+        out += &format!("            proof = new bytes32[]({});\n", leaf.proof.len());
+        for (j, node) in leaf.proof.iter().enumerate() {
+            out += &format!("            proof[{j}] = {};\n", word(node));
+        }
+        out += "            return (vaultChain, vault, strategyHash, key, proof);\n        }\n";
+    }
+    out += "        revert(\"no such leaf\");\n    }\n";
+    out
+}
+
+fn real_token(
+    dir: &std::path::Path,
+    token: &str,
+    binding: &str,
+    now: Option<u64>,
+    name: &str,
+) -> Result<()> {
     let token = std::fs::read_to_string(token)
         .with_context(|| format!("reading {token}"))?
         .trim()
@@ -263,7 +357,7 @@ pragma solidity ^0.8.30;
 // genuine Confidential Space token, signed by Google, checked against
 // Google's published keys alone. The guest ran in {cycles} cycles; the
 // Groth16 proof took {seconds} s. Regenerate it whenever the guest changes.
-library RealTokenFixture {{
+library {name} {{
     bytes32 internal constant IMAGE_ID = {image_id};
     /// The hash of Google's key that signed the token.
     bytes32 internal constant JWK_HASH = {key_hash};
@@ -274,10 +368,7 @@ library RealTokenFixture {{
     address internal constant SIGNER = {signer};
     bytes32 internal constant VAULTS_ROOT = {vaults_root};
     uint64 internal constant ISSUED_AT = {issued_at};
-    uint256 internal constant VAULT_CHAIN = {chain};
-    address internal constant VAULT = {vault};
-    bytes32 internal constant STRATEGY_HASH = {strategy};
-
+{leaves}
     /// Google's Confidential Space keys as published when the checker's key
     /// set was pinned, by hash.
     function googleKeys() internal pure returns (bytes32[] memory keys) {{
@@ -295,13 +386,11 @@ library RealTokenFixture {{
         signer = checksummed(&journal.evm_signer),
         vaults_root = word(&journal.vaults_root),
         issued_at = journal.issued_at,
-        chain = real.vault_chain,
-        vault = checksummed(&real.vault),
-        strategy = word(&real.strategy_hash),
+        leaves = solidity_leaves(&real.leaves),
         count = google.len(),
         keys = keys_sol.join("\n"),
     );
-    let path = dir.join("RealTokenFixture.sol");
+    let path = dir.join(format!("{name}.sol"));
     std::fs::write(&path, sol).with_context(|| format!("writing {}", path.display()))?;
     println!(
         "wrote {}: guest {cycles} cycles, Groth16 proof in {seconds}s; image id {}",

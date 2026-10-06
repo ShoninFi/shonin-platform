@@ -63,10 +63,14 @@ fn the_real_token_s_nonce_is_one_string_and_binds_the_fixture_s_keys_and_root() 
         Some(real_binding().nonce().as_str())
     );
     // The binding file written beside the token says the same.
-    let file: Value =
-        serde_json::from_str(include_str!("../../testdata/cs-token-2026-10-06.binding.json"))
-            .unwrap();
-    assert_eq!(file["nonce"].as_str(), Some(real_binding().nonce().as_str()));
+    let file: Value = serde_json::from_str(include_str!(
+        "../../testdata/cs-token-2026-10-06.binding.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        file["nonce"].as_str(),
+        Some(real_binding().nonce().as_str())
+    );
     assert_eq!(
         file["vaults_root"].as_str(),
         Some(format!("0x{}", hex::encode(real_binding().vaults_root)).as_str())
@@ -135,4 +139,68 @@ fn the_real_token_is_refused_for_another_binding() {
         input.binding = binding;
         assert_eq!(verify(&input), Err(Error::Nonce));
     }
+}
+
+/// The second genuine token: its nonce binds an instance key and a root over
+/// three leaves that each name a key (see its binding file).
+#[test]
+fn the_second_real_token_binds_an_instance_key_and_a_root_over_leaves_naming_keys() {
+    let file: Value = serde_json::from_str(include_str!(
+        "../../testdata/cs-token2-2026-10-06.binding.json"
+    ))
+    .unwrap();
+    let word = |name: &str| -> Vec<u8> {
+        hex::decode(file[name].as_str().unwrap().trim_start_matches("0x")).unwrap()
+    };
+    let binding = Binding {
+        evm_signer: word("evm_signer").try_into().unwrap(),
+        solana_signer: word("solana_signer").try_into().unwrap(),
+        vaults_root: word("vaults_root").try_into().unwrap(),
+    };
+    assert_eq!(file["nonce"].as_str(), Some(binding.nonce().as_str()));
+    // Each leaf is the five-word leaf naming its key.
+    for leaf in file["leaves"].as_array().unwrap() {
+        let hex20 = |name: &str| -> [u8; 20] {
+            hex::decode(leaf[name].as_str().unwrap().trim_start_matches("0x"))
+                .unwrap()
+                .try_into()
+                .unwrap()
+        };
+        let strategy: [u8; 32] = hex::decode(
+            leaf["strategy_hash"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        let hash = fixture::key_leaf(
+            leaf["vault_chain"].as_u64().unwrap(),
+            &hex20("vault"),
+            &strategy,
+            31337,
+            &hex20("signer"),
+        );
+        assert_eq!(
+            format!("0x{}", hex::encode(hash)),
+            leaf["leaf"].as_str().unwrap()
+        );
+    }
+    let iat = 1_791_324_747;
+    let journal = verify(&Input {
+        token: include_str!("../../testdata/cs-token2-oidc-2026-10-06.jwt")
+            .trim()
+            .into(),
+        keys: Jwk::from_jwks(GOOGLE_JWKS_2026_10_06).unwrap(),
+        now: iat + 60,
+        binding,
+    })
+    .unwrap();
+    assert_eq!(journal.issued_at, iat);
+    assert_eq!(
+        hex::encode(journal.image_digest),
+        "eead1b2f4b6ca31b07ed6a06259dacfae647c3508b9e5f616d48df7fb85f14fc"
+    );
+    assert_eq!(hex::encode(journal.key_hash), fixture::REAL_KEY_HASH);
 }

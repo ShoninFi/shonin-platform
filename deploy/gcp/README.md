@@ -24,7 +24,7 @@ They name each other by internal DNS: the executor's status port is `http://shon
 
 **How a blessing happens.** The executor makes its keys inside the enclave, asks the launcher for a token binding them, and publishes the token and its keys' leaves on its status port (`GET /attestation`), saying when a seal is wanted. The waker on the services VM sees that, and starts the prover's VM if it is off; the prover proves the token, posts the seal back to the executor, and powers off once idle. The keeper relays the seal to each chain's registry (`bless`, simulated first), then stocks each key the registry shows blessed for a live vault with gas.
 
-**Memory.** The API, the keeper, cloudflared and the waker together should take a few hundred megabytes beside the OS and Docker (not yet measured), so `e2-micro` (1 GB, free in `us-central1`) may hold them; but its CPU is a quarter of a core sustained, and the indexer reads every chain every couple of seconds. The VM starts as `e2-small` (`GCP_SERVICES_MACHINE_TYPE`); move it to `e2-micro` only after `docker stats` on the VM shows the containers' memory and CPU fit with room.
+**Size.** The services VM is `e2-small` (`GCP_SERVICES_MACHINE_TYPE` in `taskfiles/config.yml`): the API, the keeper, cloudflared and the waker run beside Container-Optimized OS and Docker, and the indexer reads every chain every couple of seconds.
 
 ## The images
 

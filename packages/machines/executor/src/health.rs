@@ -9,17 +9,17 @@
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
 use chain::bindings::vault::IVault;
-use chain::{Client, Deployments, KeyClient};
+use chain::{Client, KeyClient};
 use shared::HealthPost;
 use shared::model::health::{Entry, Health, Level, Signal};
 use time::OffsetDateTime;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use alloy::primitives::{B256, U256};
+use alloy::primitives::U256;
 use alloy::providers::Provider;
 
 use chain::bindings::attestation::IAttestationRegistry;
@@ -93,123 +93,13 @@ pub async fn worst_send(chain: &Client) -> Result<u128> {
     Ok(per_gas.saturating_mul(ONE_SEND_GAS))
 }
 
-/// The stakes sent to each key and not yet seen to land, by their hash and
-/// when they were sent. Kept by the sweep, so a vault taken on again finds
-/// the stake an earlier attempt sent.
-pub type Stakes = Arc<Mutex<HashMap<Address, (B256, Instant)>>>;
-
-/// How long a stake that was sent is waited for before it is taken for lost:
-/// as long as the chain client keeps looking for a send's receipt.
-const STAKE_LANDING: Duration = Duration::from_secs(600);
-
-/// Keep a key stocked with gas: when it holds less than a stake less one
-/// worst-case send, send it what brings it back up to one.
-///
-/// A stake that was sent and has not yet been seen to land (its receipt
-/// unread, the chain slow to mine it) is waited for rather than sent again,
-/// and is no reason to fail the caller: it is on its way. A key's balance is
-/// read in the pending state as well, so a stake still in the pool counts
-/// even when this instance never learnt its hash.
-///
-/// Says whether the key holds its gas now: whether its balance, as of the
-/// latest block, is at the top-up line. A stake still on its way is not gas
-/// the key can spend yet.
-pub async fn fund_gas(
-    chain: &Client,
-    deployments: &Deployments,
-    stakes: &Stakes,
-    key: Address,
-) -> Result<bool> {
-    let remembered = stakes
-        .lock()
-        .ok()
-        .and_then(|stakes| stakes.get(&key).copied());
-    let mut landing = false;
-    if let Some((hash, sent)) = remembered
-        && sent.elapsed() < STAKE_LANDING
-    {
-        match chain.provider().get_transaction_receipt(hash).await {
-            // Landed or failed: the balance now says what the key holds.
-            Ok(Some(_)) => {}
-            // Still on its way, or no telling yet.
-            Ok(None) | Err(_) => landing = true,
-        }
-    }
-    if !landing && let Ok(mut stakes) = stakes.lock() {
-        stakes.remove(&key);
-    }
-
+/// The least a vault's key holds before its agent starts: the line below
+/// which the keeper tops a blessed key up (the stake less one worst-case
+/// send, never below two), so a key the keeper has stocked is past it.
+pub async fn gas_line(chain: &Client) -> Result<U256> {
     let send = worst_send(chain).await.ok();
     let stake = stake_at(gas_stake(chain), send.unwrap_or(0));
-    let below = U256::from(top_up_below(stake, send));
-    let stake = U256::from(stake);
-    let latest = chain
-        .balance(key)
-        .await
-        .context("reading what gas the key holds")?;
-    if latest >= below {
-        return Ok(true);
-    }
-    if landing {
-        return Ok(false);
-    }
-    let pending = chain
-        .provider()
-        .get_balance(key)
-        .pending()
-        .await
-        .unwrap_or(latest);
-    let holds = latest.max(pending);
-    if holds >= below {
-        return Ok(false);
-    }
-    let noting = stakes.clone();
-    chain
-        .transfer_noting(
-            deployments.roles.executor,
-            key,
-            stake - holds,
-            move |hash| {
-                if let Ok(mut stakes) = noting.lock() {
-                    stakes.insert(key, (hash, Instant::now()));
-                }
-            },
-        )
-        .await
-        .context("staking the key with gas")?;
-    if let Ok(mut stakes) = stakes.lock() {
-        stakes.remove(&key);
-    }
-    Ok(true)
-}
-
-/// How often a served key's gas is looked at.
-const TOP_UP_EVERY: Duration = if cfg!(test) {
-    Duration::from_millis(200)
-} else {
-    Duration::from_secs(60)
-};
-
-/// Keep a served vault's key stocked with gas for as long as the vault is
-/// served. Shonin pays for the key's gas; the agent's share is billed to the
-/// tank as it is spent. A key left to run dry could no longer trade, nor
-/// renew the blessing that its reports and signed totals depend on.
-pub async fn keep_stocked(
-    chain: Client,
-    deployments: Deployments,
-    stakes: Stakes,
-    key: Address,
-    vault: Address,
-) {
-    let mut unstocked = crate::Throttle::default();
-    loop {
-        tokio::time::sleep(TOP_UP_EVERY).await;
-        if let Err(error) = fund_gas(&chain, &deployments, &stakes, key).await
-            && unstocked.due(Instant::now())
-        {
-            tracing::warn!(%vault, %key, error = format!("{error:#}"), "could not top the key up with gas");
-        }
-    }
+    Ok(U256::from(top_up_below(stake, send)))
 }
 
 /// Roughly what one of the key's larger sends uses, such as its blessing: a
@@ -536,6 +426,7 @@ pub(crate) fn report(
         entries: entries(at, counters, dry, held_below),
         updated: at,
         signed_by,
+        at: now.unix_timestamp().max(0) as u64,
     }
 }
 
@@ -710,44 +601,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_stake_still_in_the_pool_is_not_sent_again() {
-        // Every stake sits in the pool: the latest block shows nothing, the
-        // pending state shows it, and its receipt is never read.
-        let state = crate::stand_in::chain(1_000_000_000, 0);
-        state.lock().unwrap().in_the_pool = true;
-        let client = crate::stand_in::client(&crate::stand_in::start(state.clone()).await).await;
-        let deployments = crate::stand_in::deployments();
-        let key = Address::repeat_byte(0x55);
-        let stakes = Stakes::default();
-        let sent = || state.lock().unwrap().sent.len();
-
-        // The first take-on: the stake goes out and the wait for it runs
-        // out. The clock is paused once it is out, so that is at once.
-        let first = fund_gas(&client, &deployments, &stakes, key);
-        let staked = async {
-            while sent() == 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            tokio::time::pause();
-        };
-        let (first, ()) = tokio::join!(first, staked);
-        tokio::time::resume();
-        assert!(first.is_err(), "the stake was never seen to land");
-        assert_eq!(sent(), 1);
-
-        // Tried again: the stake is on its way, so it is neither sent again
-        // nor a reason to fail.
-        fund_gas(&client, &deployments, &stakes, key).await.unwrap();
-        assert_eq!(sent(), 1, "a second stake went out after the first");
-
-        // An instance that never learnt the stake's hash sees it pending.
-        fund_gas(&client, &deployments, &Stakes::default(), key)
-            .await
-            .unwrap();
-        assert_eq!(sent(), 1, "a stake in the pool was not counted");
-    }
-
     #[test]
     fn a_key_low_on_gas_is_a_warning_and_one_that_cannot_send_is_an_error() {
         let send = 1_000_000_000 * ONE_SEND_GAS;
@@ -795,55 +648,21 @@ mod tests {
 
     const GWEI: u128 = 1_000_000_000;
 
-    /// On a public chain at 25 gwei a send may be charged at twice the base
-    /// fee, so one of the key's larger sends can cost about 0.015 of the coin.
-    /// A key holding 0.006 can't pay for its blessing, and is topped up.
+    /// A vault's key starts its agent only once it holds the line below
+    /// which the keeper tops it up, so a key the keeper has stocked to its
+    /// stake is past it, and one a send short of the stake is too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_key_that_cannot_pay_for_one_send_is_topped_up() {
-        let holds = 6 * GAS_STAKE_PUBLIC / 10;
-        let (node, client) = crate::stand_in::public::start(25 * GWEI, holds).await;
-        let send = worst_send(&client).await.unwrap();
-        assert!(
-            holds < send,
-            "the key can't pay for one of its larger sends"
-        );
-
-        fund_gas(
-            &client,
-            &crate::stand_in::deployments(),
-            &Default::default(),
-            Address::repeat_byte(0x55),
-        )
-        .await
-        .unwrap();
-
-        let stake = stake_at(GAS_STAKE_PUBLIC, send);
-        assert_eq!(
-            node.lock().unwrap().sent,
-            [U256::from(stake - holds)],
-            "a key holding less than one send was not brought up to its stake"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_key_less_than_a_send_short_of_its_stake_is_left_as_it_is() {
-        let (node, client) = crate::stand_in::public::start(25 * GWEI, 0).await;
+    async fn a_key_stocked_to_its_stake_is_past_the_line_its_agent_waits_for() {
+        let (_node, client) = crate::stand_in::public::start(25 * GWEI, 0).await;
         let send = worst_send(&client).await.unwrap();
         let stake = stake_at(GAS_STAKE_PUBLIC, send);
-        node.lock().unwrap().key_holds = stake - send / 2;
-
-        fund_gas(
-            &client,
-            &crate::stand_in::deployments(),
-            &Default::default(),
-            Address::repeat_byte(0x55),
-        )
-        .await
-        .unwrap();
-
+        let line = gas_line(&client).await.unwrap();
+        assert_eq!(line, U256::from(top_up_below(stake, Some(send))));
+        assert!(U256::from(stake) >= line);
+        assert!(U256::from(stake - send) >= line);
         assert!(
-            node.lock().unwrap().sent.is_empty(),
-            "a well-stocked key was topped up"
+            U256::from(send) < line,
+            "one send's worth would start the agent"
         );
     }
 

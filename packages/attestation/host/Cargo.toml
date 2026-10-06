@@ -10,6 +10,10 @@ publish.workspace = true
 workspace = true
 
 [[bin]]
+name = "attestation-prover"
+path = "src/bin/prover.rs"
+
+[[bin]]
 name = "attestation-fixture"
 path = "src/bin/fixture.rs"
 required-features = ["fixture"]
@@ -31,6 +35,8 @@ serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
 sha3 = { version = "0.10.8", optional = true }
+# The prover asks the executor's status port (plain HTTP inside the network).
+ureq = { version = "3.4.2", default-features = false }
 base64 = { version = "0.22.1", optional = true }
 
 [dev-dependencies]

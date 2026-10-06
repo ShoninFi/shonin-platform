@@ -15,7 +15,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, B256, U256, keccak256};
-use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolCall;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
@@ -44,23 +43,16 @@ pub fn other_key() -> Address {
     Address::repeat_byte(0xee)
 }
 
-/// The key the executor derives for a vault (`key_for` in its `main.rs`).
-pub fn executor_key(vault: Address) -> Address {
-    let mut seed = chain::attest::image_digest("executor").to_vec();
-    seed.extend_from_slice(vault.as_slice());
-    PrivateKeySigner::from_bytes(&keccak256(seed))
-        .unwrap()
-        .address()
-}
-
 /// How the station's approval and the head move.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Script {
     /// This executor's key is approved, the head stays at 0x10.
     Approved,
-    /// Nobody is approved until the first `eth_blockNumber` (the stake's);
-    /// then another executor's blessed key is, for `replaced_for`; then this
-    /// executor's key again, with the head moved on to `later_head`.
+    /// Nobody is approved until the first `eth_blockNumber` (the take-on's);
+    /// then another executor's blessed key is, for `replaced_for`; then
+    /// nobody (that key's blessing lapsed), until this executor's key, made
+    /// after that, has asked for the approval; with the head moved on to
+    /// `later_head`.
     TakenOverThenBack {
         replaced_for: Duration,
         later_head: u64,
@@ -87,6 +79,10 @@ pub struct Node {
     /// If set, `usageDigest` answers with the digest the vault computes for
     /// this total, whatever total it is asked about: a node that lies.
     pub lying_total: Mutex<Option<U256>>,
+    /// The executor's own key for the vault, made inside it, and when it was
+    /// learnt: from its first question to the registry about that key, as
+    /// it asks before the approval.
+    pub learned: Mutex<Option<(Address, Instant)>>,
 }
 
 /// The digest the vault signs a usage total under (`Upkeep.usageDigest`).
@@ -113,6 +109,40 @@ impl Node {
                     None => 1,
                     Some(at) if at.elapsed() < replaced_for => 2,
                     Some(_) => 3,
+                }
+            }
+        }
+    }
+
+    /// The executor's own key, as last learnt (zero before it has asked).
+    pub fn executor_key(&self) -> Address {
+        self.learned
+            .lock()
+            .unwrap()
+            .map(|(key, _)| key)
+            .unwrap_or(Address::ZERO)
+    }
+
+    /// The key the station approves: as the script says, with this executor's
+    /// own key approved once it has been made (and, after a takeover, made
+    /// again since).
+    fn approved(&self) -> Address {
+        match self.phase() {
+            1 => Address::ZERO,
+            2 => other_key(),
+            _ => {
+                let learned = *self.learned.lock().unwrap();
+                let since = match self.script {
+                    Script::Approved => None,
+                    Script::TakenOverThenBack { replaced_for, .. } => self
+                        .first_head_read
+                        .lock()
+                        .unwrap()
+                        .map(|first| first + replaced_for),
+                };
+                match learned {
+                    Some((key, at)) if since.is_none_or(|since| at >= since) => key,
+                    _ => Address::ZERO,
                 }
             }
         }
@@ -174,12 +204,7 @@ fn answer_call(node: &Node, input: &[u8]) -> Option<Vec<u8>> {
         | IVault::claimCountCall::SELECTOR => word(0),
         IVault::idleFloorCall::SELECTOR => [0u8; 96].to_vec(),
         IStation::approvedKeyCall::SELECTOR => {
-            let approved = match node.phase() {
-                1 => Address::ZERO,
-                2 => other_key(),
-                _ => executor_key(vault()),
-            };
-            IStation::approvedKeyCall::abi_encode_returns(&approved)
+            IStation::approvedKeyCall::abi_encode_returns(&node.approved())
         }
         IStation::pinnedDriverCall::SELECTOR => {
             IStation::pinnedDriverCall::abi_encode_returns(&Address::repeat_byte(0x77))
@@ -188,6 +213,15 @@ fn answer_call(node: &Node, input: &[u8]) -> Option<Vec<u8>> {
             IAttestationRegistry::isDriverRevokedCall::abi_encode_returns(&false)
         }
         IAttestationRegistry::isBlessedForCall::SELECTOR => {
+            if let Ok(call) = IAttestationRegistry::isBlessedForCall::abi_decode(input)
+                && call.signer != Address::ZERO
+                && call.signer != other_key()
+            {
+                let mut learned = node.learned.lock().unwrap();
+                if learned.is_none_or(|(key, _)| key != call.signer) {
+                    *learned = Some((call.signer, Instant::now()));
+                }
+            }
             IAttestationRegistry::isBlessedForCall::abi_encode_returns(&true)
         }
         IAttestationRegistry::blessingTtlCall::SELECTOR => word(TTL),
@@ -415,6 +449,7 @@ pub async fn start_recording(
         halted_at: AtomicU64::new(0),
         raised: Default::default(),
         lying_total: Mutex::new(None),
+        learned: Mutex::new(None),
     });
     let app = Router::new().route("/", post(rpc)).with_state(node.clone());
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))

@@ -23,6 +23,67 @@ pub fn image_id() -> [u8; 32] {
     Digest::from(SHONIN_ATTESTATION_GUEST_ID).into()
 }
 
+/// The image id every checker pins (the deploy crate's `GUEST_IMAGE_ID`; a
+/// test checks the two agree). A prover proves with this guest or not at
+/// all: a seal of any other is refused by every checker.
+pub const PINNED_IMAGE_ID: &str =
+    "173f3361de2092dc0eb630570982375f05ef92fbbd19119b6860549f3c7250e0";
+
+/// [`PINNED_IMAGE_ID`] as bytes.
+pub fn pinned_image_id() -> [u8; 32] {
+    let mut id = [0u8; 32];
+    hex::decode_to_slice(PINNED_IMAGE_ID, &mut id).expect("the pinned image id is 32 bytes of hex");
+    id
+}
+
+/// A guest to prove with: the one built into this binary, or an ELF built
+/// elsewhere (reproducibly, in RISC Zero's guest-builder image) and shipped
+/// beside it, named by the image id worked out from its bytes.
+pub struct Guest {
+    elf: Vec<u8>,
+    id: Digest,
+}
+
+impl Guest {
+    /// The guest built into this binary (with `SHONIN_ATTESTATION_BUILD_GUEST`).
+    pub fn embedded() -> Result<Guest> {
+        ensure!(
+            !SHONIN_ATTESTATION_GUEST_ELF.is_empty(),
+            "this binary was built without the guest; give the guest's ELF"
+        );
+        Ok(Guest {
+            elf: SHONIN_ATTESTATION_GUEST_ELF.to_vec(),
+            id: Digest::from(SHONIN_ATTESTATION_GUEST_ID),
+        })
+    }
+
+    /// A guest from its ELF's bytes.
+    pub fn from_elf(elf: Vec<u8>) -> Result<Guest> {
+        let id = risc0_zkvm::compute_image_id(&elf).context("working out the ELF's image id")?;
+        Ok(Guest { elf, id })
+    }
+
+    pub fn image_id(&self) -> [u8; 32] {
+        self.id.into()
+    }
+
+    /// Prove the guest's run over `input`.
+    pub fn prove(&self, input: &Input, proof: Proof) -> Result<(Receipt, Journal)> {
+        prove_elf(&self.elf, input, proof)
+    }
+
+    /// Check a receipt of this guest as a chain's checker does (see
+    /// [`verify`]).
+    pub fn verify(
+        &self,
+        receipt: &Receipt,
+        trusted_keys: &[[u8; 32]],
+        allow_dev: bool,
+    ) -> Result<Journal> {
+        verify_id(self.id, receipt, trusted_keys, allow_dev)
+    }
+}
+
 /// The length of a Groth16 seal as RISC Zero's verifier contract takes it:
 /// a 4-byte selector naming the verifier parameters, then the proof.
 pub const GROTH16_SEAL_LEN: usize = 4 + 256;
@@ -54,6 +115,10 @@ pub fn execute(input: &Input) -> Result<(Journal, u64)> {
 
 /// Prove the guest's run over `input`.
 pub fn prove(input: &Input, proof: Proof) -> Result<(Receipt, Journal)> {
+    prove_elf(SHONIN_ATTESTATION_GUEST_ELF, input, proof)
+}
+
+fn prove_elf(elf: &[u8], input: &Input, proof: Proof) -> Result<(Receipt, Journal)> {
     let env = ExecutorEnv::builder()
         .write(input)
         .context("writing the guest's input")?
@@ -66,7 +131,7 @@ pub fn prove(input: &Input, proof: Proof) -> Result<(Receipt, Journal)> {
     .with_dev_mode(dev);
     let context = VerifierContext::default().with_dev_mode(dev);
     let receipt = default_prover()
-        .prove_with_ctx(env, &context, SHONIN_ATTESTATION_GUEST_ELF, &opts)
+        .prove_with_ctx(env, &context, elf, &opts)
         .context("the guest refused the token, or proving failed")?
         .receipt;
     let journal = Journal::decode(&receipt.journal.bytes)
@@ -78,9 +143,23 @@ pub fn prove(input: &Input, proof: Proof) -> Result<(Receipt, Journal)> {
 /// run, and that the Google key it names is one of `trusted_keys` (by
 /// [`Jwk::key_hash`]). A dev-mode receipt passes only with `allow_dev`.
 pub fn verify(receipt: &Receipt, trusted_keys: &[[u8; 32]], allow_dev: bool) -> Result<Journal> {
+    verify_id(
+        Digest::from(SHONIN_ATTESTATION_GUEST_ID),
+        receipt,
+        trusted_keys,
+        allow_dev,
+    )
+}
+
+fn verify_id(
+    id: Digest,
+    receipt: &Receipt,
+    trusted_keys: &[[u8; 32]],
+    allow_dev: bool,
+) -> Result<Journal> {
     let context = VerifierContext::default().with_dev_mode(allow_dev);
     receipt
-        .verify_with_context(&context, SHONIN_ATTESTATION_GUEST_ID)
+        .verify_with_context(&context, id)
         .context("the receipt does not prove the attestation guest")?;
     let journal = Journal::decode(&receipt.journal.bytes)
         .context("the receipt's journal is the wrong length")?;
@@ -209,6 +288,23 @@ mod tests {
             image_id(),
             Digest::from(SHONIN_ATTESTATION_GUEST_ID).as_bytes()
         );
+    }
+
+    #[test]
+    fn the_pinned_image_id_is_the_one_the_deploy_pins() {
+        assert_eq!(
+            pinned_image_id(),
+            shonin_attestation_deploy::GUEST_IMAGE_ID.0
+        );
+    }
+
+    #[test]
+    #[ignore = "needs the guest built (Docker); without SHONIN_ATTESTATION_BUILD_GUEST the crate has no image id"]
+    fn a_guest_read_from_its_elf_is_named_by_the_image_id_the_build_gives_it() {
+        let shipped = Guest::from_elf(SHONIN_ATTESTATION_GUEST_ELF.to_vec()).unwrap();
+        assert_eq!(shipped.image_id(), image_id());
+        assert_eq!(shipped.image_id(), pinned_image_id());
+        assert!(Guest::from_elf(b"not an elf".to_vec()).is_err());
     }
 
     #[test]

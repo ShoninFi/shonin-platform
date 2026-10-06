@@ -55,10 +55,24 @@ tokio-rustls.workspace = true
 webpki-roots.workspace = true
 tokio-stream.workspace = true
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+# Keys made inside the enclave, from the operating system's randomness, and
+# wiped from memory when dropped.
+getrandom = "0.3.4"
+zeroize = "1.9.0"
+# Reading the claims of the attestation token the launcher hands out.
+base64 = "0.22.1"
+# The nonce an attestation token binds, as the attestation guest checks it.
+shonin-attestation-core = { path = "../../attestation/core" }
 
 [dev-dependencies]
 # A paused clock, so a test can wait out a receipt timeout without waiting.
 tokio = { workspace = true, features = ["test-util"] }
+# Asking the status port's routes without binding a port.
+tower = { workspace = true, features = ["util"] }
+# The attested path end to end (an ignored test): tokens signed by the
+# fixture's test key, and the Confidential Space checker deployed.
+shonin-attestation-core = { path = "../../attestation/core", features = ["fixture"] }
+shonin-attestation-deploy = { path = "../../attestation/deploy" }
 
 [lints]
 workspace = true

@@ -1,7 +1,10 @@
 //! The attested executor.
 //!
-//! It finds the vaults that are open, gets a key blessed for each one, has the
-//! vault's station approve that key at the venue, and runs each vault's agent.
+//! It finds the vaults that are open, makes a key for each one (in memory
+//! only, from the operating system's randomness), attests to every key it
+//! holds at once (see [`attestation`]), waits for the keeper to bless each key
+//! and stock it with gas, has the vault's station approve that key at the
+//! venue, and runs each vault's agent.
 //! The key can trade and nothing else: the venue refuses a withdrawal signed by
 //! it, and the station only moves money between the vault's own accounts.
 //! Whatever an agent decides, that is the whole of what can happen.
@@ -10,35 +13,40 @@
 //! the keeper to collect from the tank. Valuing the vault is the keeper's:
 //! anyone may, and one loop doing it means no two race for the same slot.
 
+mod attestation;
 mod ceilings;
 mod data;
 mod feed;
+mod handover;
 mod health;
 mod host;
 mod hyperliquid;
 mod inference;
+mod keys;
 mod net;
 mod robinhood;
 mod runner;
 mod scale;
 mod solana;
 mod state;
+mod store;
 mod streams_rh;
 mod usage;
 mod watch;
 
 #[cfg(test)]
+mod attested_path;
+#[cfg(test)]
 mod stand_in;
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use alloy::primitives::{Address, B256, keccak256};
-use alloy::signers::local::PrivateKeySigner;
+use alloy::primitives::{Address, B256};
 use anyhow::{Context, Result};
 use axum::response::IntoResponse;
 use chain::bindings::attestation::IAttestationRegistry;
@@ -57,16 +65,38 @@ struct Args {
     #[command(flatten)]
     chain_args: chain::ChainArgs,
     /// Where bundles are, by hash.
-    #[arg(long)]
+    #[arg(long, env = "SHONIN_STORE")]
     store: PathBuf,
-    /// Where the health reports go.
-    #[arg(long)]
+    /// Where the health reports go, and where another executor's are read.
+    #[arg(long, env = "SHONIN_API_URL")]
     api_url: String,
-    /// The status port, where each vault's signed total is served. 0 has
-    /// the system pick one, said in the log as the executor starts; without
-    /// it, nothing is served. A port that can't be bound stops the executor.
+    /// The status port, where each vault's signed total and the instance's
+    /// attestation are served. 0 has the system pick one, said in the log as
+    /// the executor starts; without it, nothing is served. A port that can't
+    /// be bound stops the executor.
     #[arg(long)]
     port: Option<u16>,
+    /// The address the status port listens on: 0.0.0.0 where the keeper and
+    /// the prover reach it from other machines.
+    #[arg(long, default_value = "127.0.0.1")]
+    listen: IpAddr,
+    /// How the instance attests to its keys: `launcher` in Confidential
+    /// Space (a token from the launcher, proved by a prover), `development`
+    /// on a development chain (sealed with the attestor role).
+    #[arg(long, value_enum, default_value = "development")]
+    attestation: attestation::Mode,
+    /// The launcher's socket, where tokens are asked for.
+    #[arg(long, default_value = attestation::LAUNCHER_SOCKET)]
+    launcher_socket: PathBuf,
+    /// How long a vault's approved key, still blessed and not this
+    /// executor's, must send no health report before the vault is taken
+    /// over.
+    #[arg(long, default_value_t = handover::HANDOVER_SILENCE)]
+    handover_silence_seconds: u64,
+    /// The public copy of the store, read through for a file not on disk and
+    /// believed only for its hash.
+    #[arg(long, env = "SHONIN_STORE_URL")]
+    store_url: Option<String>,
     /// The most of each allowance one agent is given here.
     #[command(flatten)]
     ceilings: ceilings::Ceilings,
@@ -117,7 +147,20 @@ async fn main() -> Result<()> {
     } else {
         Some(args.chain_args.connect_each_solana()?)
     };
-    tracing::info!(image = %chain::attest::image_digest("executor"), "the executor is up");
+    // The instance's key and the tree of every vault key it holds. In
+    // Confidential Space the token is asked for, and the seal posted, on the
+    // status port, so there has to be one.
+    anyhow::ensure!(
+        args.attestation == attestation::Mode::Development || args.port.is_some(),
+        "attesting through the launcher needs the status port (--port)"
+    );
+    let attestation = attestation::Attestation::new(args.attestation)?;
+    tokio::spawn(attestation.clone().run(args.launcher_socket.clone()));
+    tracing::info!(
+        mode = ?args.attestation,
+        instance = %attestation.instance(),
+        "the executor is up"
+    );
 
     let totals: usage::Totals = Default::default();
     let solana_totals: solana::Totals = Default::default();
@@ -131,7 +174,7 @@ async fn main() -> Result<()> {
             .collect(),
     );
     if let Some(port) = args.port {
-        let listener = bind_status(SocketAddr::from(([127, 0, 0, 1], port))).await?;
+        let listener = bind_status(SocketAddr::new(args.listen, port)).await?;
         tracing::info!(
             port = listener.local_addr()?.port(),
             "the status port is bound"
@@ -141,6 +184,7 @@ async fn main() -> Result<()> {
             totals.clone(),
             solana_totals.clone(),
             served_chains.clone(),
+            attestation.clone(),
         ));
     }
 
@@ -190,6 +234,8 @@ async fn main() -> Result<()> {
     };
     while let Some(served) = connecting.recv().await {
         served_chains.connected(served.vault_chain);
+        attestation.serve_chain(served.client.clone(), served.deployments.clone());
+        let attestation = attestation.clone();
         let engine = engine.clone();
         let args = args.clone();
         let totals = totals.clone();
@@ -212,6 +258,7 @@ async fn main() -> Result<()> {
                     &engine,
                     &args,
                     &totals,
+                    &attestation,
                     &mut book,
                 )
                 .await
@@ -255,28 +302,21 @@ struct Book {
     stations: HashMap<Address, Address>,
     /// The vaults waiting for their bundle to reach the store.
     waiting_for_bundle: HashSet<Address>,
-    /// Vaults that could not be taken on, and when to try again. Taking a
-    /// vault on stakes its key with gas, so a vault that can't be taken on
-    /// (the chain down, a stake whose fate is unknown) is held off for
-    /// longer each time rather than tried at every sweep.
+    /// Vaults that could not be taken on, and when to try again: held off
+    /// for longer each time rather than tried at every sweep.
     taking_on: HashMap<Address, Retry>,
     /// When each vault was last warned about, so a chain that is down
     /// doesn't write the same line for every vault at every sweep.
     warned: HashMap<Address, Throttle>,
-    /// The gas stakes sent to vaults' keys and not yet seen to land, shared
-    /// by every take-on and top-up on this chain.
-    stakes: health::Stakes,
-    /// Each vault's key being given gas before the vault is taken on, in a
-    /// task of its own: a stake can take a minute to land, and the sweep
-    /// carries on with every other vault meanwhile. It ends with the block
-    /// the vault's events are read from. A stake dropped from here is
-    /// stopped where it is.
-    staking: HashMap<Address, AbortOnDrop<Result<u64>>>,
     /// Vaults let go because another executor has taken them over, or
     /// because the station refuses to approve this executor's key: not taken
     /// on again while the other executor's key, still blessed, holds the
     /// station's approval, nor while the station would refuse this key.
     replaced: HashSet<Address>,
+    /// Vaults this executor never held whose station approves another
+    /// executor's key, still blessed: watched for that key's health reports,
+    /// and taken over once it has been silent long enough (see [`handover`]).
+    watching: HashMap<Address, handover::Watch>,
 }
 
 impl Book {
@@ -316,9 +356,9 @@ struct Served {
     /// The meter and the reports, which run for as long as the vault is
     /// served: a halted vault's final bill is signed after its grace.
     _upkeep: [AbortOnDrop; 2],
-    /// The key's top-ups, which stop once a halted vault's grace is over:
-    /// nothing is left for the key to send.
-    topping_up: Option<AbortOnDrop>,
+    /// The vault's key in the instance's tree, for as long as the vault is
+    /// held: its leaf leaves the tree when the vault is let go.
+    _leaf: Leaf,
     /// When the agent stopped for good because this executor no longer holds
     /// the vault (see [`Stop::Replaced`]). The vault is let go once every
     /// send of the agent's has landed or been given up on and the meter has
@@ -326,6 +366,21 @@ struct Served {
     /// the gas of the agent's last orders included, can still be collected;
     /// never later than [`LAST_SENDS_LAND_WITHIN`] after the stop.
     letting_go: Option<Instant>,
+}
+
+/// A vault's key in the instance's tree (see [`attestation`]), let go with
+/// the vault.
+struct Leaf {
+    attestation: attestation::Attestation,
+    chain_id: u64,
+    vault: Address,
+    key: Address,
+}
+
+impl Drop for Leaf {
+    fn drop(&mut self) {
+        self.attestation.remove(self.chain_id, self.vault, self.key);
+    }
 }
 
 /// A vault let go is let go entirely: the agent it was running stops with
@@ -344,6 +399,17 @@ impl Drop for Served {
 struct Shared {
     /// The agent's key. What it spends on gas is the author's bill.
     key: chain::KeyClient,
+    /// The same key, made in the enclave for this vault alone, for the
+    /// halves that sign with it themselves.
+    vault_key: Arc<keys::Key>,
+    /// The instance's attestation, where the key's leaf is and whether it
+    /// wants blessing is noted.
+    attestation: attestation::Attestation,
+    /// Another executor's key, still blessed, that this one takes the vault
+    /// over from once its own key is blessed: the station's approval is
+    /// taken from that key, and from no other. Cleared once this key holds
+    /// the approval; one that replaces it after that ends the serve.
+    takes_over: Arc<Mutex<Option<Address>>>,
     /// Whether the tank is dry, as the meter last found it.
     dry: Arc<AtomicBool>,
     /// Whether the meter has read the tank at all yet. Until it has, nobody
@@ -370,13 +436,12 @@ struct Shared {
     wound_down: Arc<AtomicBool>,
     /// The moment the meter's latest signed total counts up to.
     signed_through: usage::SignedThrough,
-    /// The key's last approval at the venue, and its last blessing, that may
-    /// still land: noted by the send itself when it is broadcast, and kept
-    /// with the vault, so a serve started again (the last one stopped during
-    /// that very send) doesn't send another while the first may still land:
-    /// both would land, each paid for.
+    /// The key's last approval at the venue that may still land: noted by
+    /// the send itself when it is broadcast, and kept with the vault, so a
+    /// serve started again (the last one stopped during that very send)
+    /// doesn't send another while the first may still land: both would
+    /// land, each paid for.
     approvals: chain::Unanswered,
-    blessings: chain::Unanswered,
     /// The most of each allowance the agent is given here.
     ceilings: ceilings::Ceilings,
     /// Starts in a row that failed, the agent's own faults and the serves'
@@ -494,6 +559,7 @@ async fn sweep(
     engine: &Engine,
     args: &Args,
     totals: &usage::Totals,
+    attestation: &attestation::Attestation,
     book: &mut Book,
 ) -> Result<()> {
     // The factory's list of every vault it ever made is read whole, so it is
@@ -527,6 +593,7 @@ async fn sweep(
             engine,
             args,
             totals,
+            attestation,
             book,
             vault,
         )
@@ -549,6 +616,7 @@ async fn sweep_one(
     engine: &Engine,
     args: &Args,
     totals: &usage::Totals,
+    attestation: &attestation::Attestation,
     book: &mut Book,
     vault: Address,
 ) -> Result<()> {
@@ -566,7 +634,6 @@ async fn sweep_one(
                 if let Some(serving) = served.serving.take() {
                     serving.abort();
                 }
-                served.topping_up = None;
                 Instant::now()
             });
             if !last_sends_billed(served, stopped) && stopped.elapsed() < LAST_SENDS_LAND_WITHIN {
@@ -577,9 +644,9 @@ async fn sweep_one(
         }
         book.waiting_for_bundle.remove(&vault);
         book.taking_on.remove(&vault);
-        book.staking.remove(&vault);
         book.warned.remove(&vault);
         book.replaced.remove(&vault);
+        book.watching.remove(&vault);
         return Ok(());
     }
     if let Some(served) = book.running.get_mut(&vault) {
@@ -598,10 +665,10 @@ async fn sweep_one(
             if ended.replaced {
                 // Another executor has taken the vault over, or the station
                 // refuses this key. Its agent has stopped and its key is no
-                // longer renewed; nor is it kept in gas. The meter signs once
-                // more, for the time up to now and the agent's last sends.
+                // longer attested once the vault is let go. The meter signs
+                // once more, for the time up to now and the agent's last
+                // sends.
                 tracing::info!(%chain, vault = %vault, "this executor no longer holds the vault's approval; letting it go");
-                served.topping_up = None;
                 served.letting_go = Some(Instant::now());
             } else if served.retry.ended(ended, Instant::now()) {
                 if let Ok(mut counters) = served.shared.counters.lock() {
@@ -616,7 +683,6 @@ async fn sweep_one(
         if let Some(stopped) = served.letting_go {
             if last_sends_billed(served, stopped) || stopped.elapsed() >= LAST_SENDS_LAND_WITHIN {
                 book.running.remove(&vault);
-                book.staking.remove(&vault);
                 book.replaced.insert(vault);
             }
             return Ok(());
@@ -681,20 +747,29 @@ async fn sweep_one(
     }
     if finished(client, vault).await? {
         // Past its grace the vault's station is stopped and its key has
-        // nothing left to send, so it is no longer kept in gas. The meter
-        // runs on, so the final bill can still be collected.
-        if let Some(served) = book.running.get_mut(&vault)
-            && served.topping_up.take().is_some()
-        {
-            tracing::info!(%chain, vault = %vault, "the vault's grace is over; its key is no longer topped up");
-        }
+        // nothing left to send. The meter runs on, so the final bill can
+        // still be collected.
         return Ok(());
     }
     let bundle = client.read(vault, IVault::bundleHashCall {}).await?;
     if bundle == B256::ZERO {
         return Ok(());
     }
-    let component = bundle_path(&args.store, bundle);
+    let mut component = bundle_path(&args.store, bundle);
+    // A bundle not on disk is read through from the public store, if there
+    // is one, and kept only once it checks against the hashes the chain
+    // holds.
+    if !component.exists()
+        && let Some(base) = args.store_url.as_deref()
+    {
+        if let Err(error) =
+            fetch_bundle(client, deployments, &args.store, base, vault, bundle).await
+            && book.warn(vault)
+        {
+            tracing::warn!(%chain, vault = %vault, %bundle, error = format!("{error:#}"), "could not read the bundle through from the public store");
+        }
+        component = bundle_path(&args.store, bundle);
+    }
     if !component.exists() {
         // Said once, not every sweep, so an operator sees why a vault isn't
         // running without the log filling with it.
@@ -714,67 +789,94 @@ async fn sweep_one(
             return Ok(());
         }
         // One executor at a time: a vault whose station approves another
-        // executor's key, still blessed, is that executor's. Looked at again
-        // at every sweep, so the vault is taken on again once that key's
-        // blessing lapses.
+        // executor's key, still blessed, is that executor's while it is
+        // heard from. This executor holds no key for the vault yet, so where
+        // the approval stands is asked for no key of its own.
         let station = client.read(vault, IVault::homeStationCall {}).await?;
-        let key = key_for(vault).address();
-        let approval = approval_of(client, deployments, station, key, vault, bundle).await?;
-        // A stake begun for a take-on that doesn't happen now is dropped: the
-        // vault's events are read from when it is taken on, so a take-on
-        // later begins its own, and never reads from this one's head.
+        let approval =
+            approval_of(client, deployments, station, Address::ZERO, vault, bundle).await?;
+        let mut takes_over = None;
         if let Approval::Replaced(by) = approval {
-            book.staking.remove(&vault);
-            if book.replaced.insert(vault) {
-                tracing::info!(%chain, vault = %vault, %by, "another executor's key holds the approval; not taking the vault on");
+            // A vault this executor was replaced on is never taken back while
+            // the key that replaced it is blessed.
+            if book.replaced.contains(&vault) {
+                return Ok(());
             }
-            return Ok(());
+            let now = unix_now();
+            let watch = book
+                .watching
+                .entry(vault)
+                .or_insert_with(|| {
+                    tracing::info!(%chain, vault = %vault, %by, "another executor's key holds the approval; watching for its reports");
+                    handover::Watch::new(by, now)
+                });
+            if watch.by != by {
+                tracing::info!(%chain, vault = %vault, %by, "another key holds the approval now; watching for its reports");
+                *watch = handover::Watch::new(by, now);
+            }
+            if !watch.look_due(Instant::now()) {
+                return Ok(());
+            }
+            match handover::latest_report(&HTTP, &args.api_url, chain, vault).await {
+                Ok(latest) => {
+                    if watch.heard(latest, unix_now()) == handover::Heard::Report
+                        || !watch.silent_for(args.handover_silence_seconds, unix_now())
+                    {
+                        return Ok(());
+                    }
+                }
+                Err(error) => {
+                    if book.warn(vault) {
+                        tracing::warn!(%chain, vault = %vault, error = format!("{error:#}"), "could not read the vault's latest report; the watch goes on");
+                    }
+                    return Ok(());
+                }
+            }
+            tracing::info!(%chain, vault = %vault, %by, silence = args.handover_silence_seconds, "the approved key has sent no report for the whole watch; taking the vault over");
+            takes_over = Some(by);
         }
+        book.watching.remove(&vault);
         // A vault let go is taken on again only once the station would
-        // approve its key: taking it on pays for a stake and a blessing.
+        // approve a key of this executor's: taking it on asks for a blessing.
         if book.replaced.contains(&vault)
-            && refused(client, deployments, station, key, vault, bundle).await?
+            && refused(
+                client,
+                deployments,
+                attestation,
+                station,
+                Address::ZERO,
+                vault,
+                bundle,
+            )
+            .await?
         {
-            book.staking.remove(&vault);
             return Ok(());
         }
         if book.replaced.remove(&vault) {
-            tracing::info!(%chain, vault = %vault, "no other executor's key holds the approval and the station would approve this one; taking the vault on again");
+            tracing::info!(%chain, vault = %vault, "no other executor's key holds the approval and the station would approve one of this executor's; taking the vault on again");
         }
-        // The key is given gas before anything is taken on, so the agent
-        // never starts without it; one stake at a time for the vault, and
-        // waited for by a later sweep rather than this one.
-        let staking = book
-            .staking
-            .entry(vault)
-            .or_insert_with(|| stake(client, deployments, &book.stakes, vault));
-        if !staking.is_finished() {
-            return Ok(());
-        }
-        let staked = match book.staking.remove(&vault) {
-            Some(task) => task
-                .await
-                .unwrap_or_else(|error| Err(anyhow::anyhow!("staking the key: {error}"))),
-            None => return Ok(()),
-        };
-        let taken = match staked {
+        // The vault's events are read from here on: an agent held back for
+        // its blessing, its gas or its tank still hears what happened since.
+        let taken = match client.block_number().await {
             Ok(head) => take_on(
                 client,
                 chain,
                 deployments,
                 native_usd,
                 vault,
+                bundle,
                 head,
+                takes_over,
                 args,
                 totals,
-                &book.stakes,
+                attestation,
                 book.confirmations,
             ),
             Err(error) => Err(error),
         };
         match taken {
             Ok(served) => {
-                tracing::info!(%chain, vault = %vault, "taking on a vault");
+                tracing::info!(%chain, vault = %vault, key = %served.shared.key.address, "taking on a vault with a key of its own");
                 book.taking_on.remove(&vault);
                 book.running.insert(vault, served);
             }
@@ -827,44 +929,85 @@ async fn sweep_one(
     Ok(())
 }
 
-/// Give a vault's key gas, in a task of its own, and say the block it was
-/// begun at.
-///
-/// The vault's events are read from that block, not from the agent's first
-/// start: an agent held back for its tank, or one whose first serve failed,
-/// still hears what happened in between. A fresh key has no gas of its own,
-/// and it pays for its own blessing from here on: one account per vault, so
-/// two vaults never reach for the same next nonce.
-fn stake(
-    client: &Client,
-    deployments: &Deployments,
-    stakes: &health::Stakes,
-    vault: Address,
-) -> AbortOnDrop<Result<u64>> {
-    let client = client.clone();
-    let deployments = deployments.clone();
-    let stakes = stakes.clone();
-    AbortOnDrop(tokio::spawn(async move {
-        let head = client.block_number().await?;
-        // Ends only once the key holds its gas: a stake still on its way, or
-        // one whose receipt can't be read, is waited for.
-        while !health::fund_gas(&client, &deployments, &stakes, key_for(vault).address()).await? {
-            tokio::time::sleep(STAKE_LOOK).await;
-        }
-        Ok(head)
-    }))
+/// The HTTP client the sweep asks the API with.
+static HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_default()
+});
+
+/// The time in unix seconds.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
 }
 
-/// How often a key's gas is looked at while its stake is on its way.
-const STAKE_LOOK: Duration = if cfg!(test) {
+/// Read a vault's bundle through from the public store: its recorded
+/// manifest, checked against the hash the registry holds, then its
+/// component, checked against the hash that manifest records.
+async fn fetch_bundle(
+    client: &Client,
+    deployments: &Deployments,
+    store_dir: &std::path::Path,
+    base: &str,
+    vault: Address,
+    bundle: B256,
+) -> Result<()> {
+    let strategy_id = client.read(vault, IVault::strategyIdCall {}).await?;
+    let registered = client
+        .read(
+            deployments.strategies,
+            IStrategyRegistry::strategyOfCall {
+                strategyId: strategy_id,
+            },
+        )
+        .await?;
+    let manifest_hash = registered.manifestHash;
+    if !store::read_through(
+        store_dir,
+        Some(base),
+        manifest_hash,
+        "manifest.json",
+        store::manifest_check(manifest_hash),
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    let path = store::path(store_dir, manifest_hash, "manifest.json");
+    let canonical: shared::Canonical = serde_json::from_slice(
+        &std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
+    )
+    .context("the recorded manifest")?;
+    anyhow::ensure!(
+        canonical.bundle_hash == format!("sha256:{}", alloy::hex::encode(bundle)),
+        "the recorded manifest is for another bundle"
+    );
+    store::read_through(
+        store_dir,
+        Some(base),
+        bundle,
+        "component.wasm",
+        store::component_check(canonical.component_hash),
+    )
+    .await?;
+    Ok(())
+}
+
+/// How often a key waiting for its blessing or its gas is looked at.
+const GAS_LOOK: Duration = if cfg!(test) {
     Duration::from_millis(100)
 } else {
     Duration::from_secs(5)
 };
 
-/// Make a vault's key, whose gas [`stake`] has seen to, and start what runs
-/// for as long as the vault does: its meter, its reports, and its key's
-/// top-ups. Its events are read from `head` on.
+/// Make a vault's key, put it in the instance's tree, and start what runs
+/// for as long as the vault does: its meter and its reports. Its events are
+/// read from `head` on. `takes_over` is the other executor's key whose
+/// approval this one takes, once its own key is blessed.
 #[allow(clippy::too_many_arguments)]
 fn take_on(
     client: &Client,
@@ -872,23 +1015,26 @@ fn take_on(
     deployments: &Deployments,
     native_usd: Option<f64>,
     vault: Address,
+    bundle: B256,
     head: u64,
+    takes_over: Option<Address>,
     args: &Args,
     totals: &usage::Totals,
-    stakes: &health::Stakes,
+    attestation: &attestation::Attestation,
     confirmations: u64,
 ) -> Result<Served> {
-    // The key is made here and never written down. Deriving it from the image
-    // and the vault means a restart picks the same one back up, so the
-    // approval the vault already granted still stands.
-    let key = client.with_key(key_for(vault))?;
-    let topping_up = tokio::spawn(health::keep_stocked(
-        client.clone(),
-        deployments.clone(),
-        stakes.clone(),
-        key.address,
+    // The key is made here from the operating system's randomness, held in
+    // memory only and never written down: an executor that restarts makes
+    // a new one, and takes the vault over from its old self.
+    let vault_key = Arc::new(keys::Key::fresh()?);
+    let key = client.with_key(vault_key.signer())?;
+    attestation.put(deployments.chain_id, vault, bundle, key.address);
+    let leaf = Leaf {
+        attestation: attestation.clone(),
+        chain_id: deployments.chain_id,
         vault,
-    ));
+        key: key.address,
+    };
 
     // What running it costs, kept as one signed total, and whether the tank
     // can still pay for it.
@@ -943,6 +1089,9 @@ fn take_on(
     Ok(Served {
         shared: Shared {
             key,
+            vault_key,
+            attestation: attestation.clone(),
+            takes_over: Arc::new(Mutex::new(takes_over)),
             dry,
             metered,
             running,
@@ -953,7 +1102,6 @@ fn take_on(
             wound_down: Default::default(),
             signed_through,
             approvals: Default::default(),
-            blessings: Default::default(),
             ceilings: args.ceilings,
             failed_starts: failed_starts.clone(),
             halt_known: Default::default(),
@@ -964,7 +1112,7 @@ fn take_on(
             ..Retry::default()
         },
         _upkeep: [AbortOnDrop(metering), AbortOnDrop(reports)],
-        topping_up: Some(AbortOnDrop(topping_up)),
+        _leaf: leaf,
         letting_go: None,
     })
 }
@@ -985,6 +1133,9 @@ async fn serve(
 ) -> Result<Stop> {
     let Shared {
         key,
+        vault_key,
+        attestation,
+        takes_over,
         dry,
         metered,
         running,
@@ -995,55 +1146,43 @@ async fn serve(
         wound_down,
         signed_through: _,
         approvals,
-        blessings,
         ceilings,
         failed_starts,
         halt_known,
     } = shared;
-    // The blessing and the venue's approval are the platform's doing, not
-    // the agent's, so their gas is kept off the author's bill. Each send of
-    // either is noted as one that may still land from the moment it is
-    // broadcast, by the send itself, which carries on if this serve stops.
+    // The venue's approval is the platform's doing, not the agent's, so its
+    // gas is kept off the author's bill. Each send of it is noted as one that
+    // may still land from the moment it is broadcast, by the send itself,
+    // which carries on if this serve stops.
     let platform = key.unmetered();
-    let blessing = platform.noting(&blessings);
     let approving = platform.noting(&approvals);
+    let taking_over = || takes_over.lock().ok().and_then(|from| *from);
 
     // One executor at a time: a vault another executor's key has taken over,
-    // that key still blessed, is not served, nor its key blessed again.
+    // that key still blessed, is not served; unless this executor is taking
+    // the vault over from that very key, after its silence.
     let station = chain.read(vault, IVault::homeStationCall {}).await?;
     if let Approval::Replaced(by) =
         approval_of(&chain, &deployments, station, key.address, vault, bundle).await?
+        && taking_over() != Some(by)
     {
         tracing::info!(%vault, key = %key.address, %by, "another executor's key holds the approval; not serving");
         return Ok(Stop::Replaced);
     }
 
-    // A serve started again soon after the last finds the key still
-    // blessed, and doesn't pay for the blessing twice. Nor does it bless
-    // while a blessing an earlier serve sent, unanswered, may still land: it
-    // waits for that one to be seen, or for it to no longer be able to land.
-    loop {
-        if blessed_for_a_while(&chain, &deployments, key.address, vault, bundle).await? {
-            blessings.settled();
-            tracing::info!(vault = %vault, key = %key.address, "still blessed");
-            break;
-        }
-        if !blessings.may_still_land(key.address) {
-            let info = chain::attest::bless_for_vault(
-                &chain,
-                &deployments,
-                "executor",
-                key.address,
-                chain::attest::Sender::Own(Box::new(blessing.clone())),
-                vault,
-                bundle,
-            )
-            .await?;
-            tracing::info!(vault = %vault, key = %key.address, until = info.blessedUntil, "blessed");
-            break;
-        }
-        tokio::time::sleep(LANDING_LOOK).await;
-    }
+    // The key's leaf is in the instance's tree; the keeper blesses it from
+    // the instance's seal, and stocks it with gas once the chain shows it
+    // blessed. Nothing is sent until both have happened.
+    attestation.put(deployments.chain_id, vault, bundle, key.address);
+    wait_blessed_and_stocked(
+        &chain,
+        &deployments,
+        &attestation,
+        key.address,
+        vault,
+        bundle,
+    )
+    .await?;
 
     // The station is the venue account's master and approves the key there.
     // Anyone may ask; it obeys only what the registry says. The venue holds
@@ -1061,15 +1200,38 @@ async fn serve(
     {
         tokio::time::sleep(LANDING_LOOK).await;
     }
-    match approve_if_behind(&chain, &deployments, &approving, station, vault, bundle).await {
+    match approve_if_behind(
+        &chain,
+        &deployments,
+        &approving,
+        station,
+        vault,
+        bundle,
+        taking_over(),
+    )
+    .await
+    {
         Ok(Approval::Follows | Approval::Behind) => approvals.settled(),
+        Ok(Approval::Replaced(by)) if taking_over() == Some(by) => {
+            approvals.settled();
+            tracing::info!(%vault, key = %key.address, from = %by, "took the vault over");
+        }
         Ok(Approval::Replaced(by)) => {
             tracing::info!(%vault, key = %key.address, %by, "another executor's key holds the approval; not serving");
             return Ok(Stop::Replaced);
         }
         Err(error) => {
             if !chain::unanswered(&error)
-                && refused(&chain, &deployments, station, key.address, vault, bundle).await?
+                && refused(
+                    &chain,
+                    &deployments,
+                    &attestation,
+                    station,
+                    key.address,
+                    vault,
+                    bundle,
+                )
+                .await?
             {
                 tracing::warn!(%vault, key = %key.address, "the station refuses to approve the key; not serving");
                 return Ok(Stop::Replaced);
@@ -1077,17 +1239,24 @@ async fn serve(
             return Err(error.context("the station would not approve the key"));
         }
     }
+    // The approval is this key's now: a key that takes it from here on has
+    // replaced this executor, which lets the vault go.
+    if let Ok(mut from) = takes_over.lock() {
+        *from = None;
+    }
 
-    // Keep it blessed, and keep the venue's approval following the blessing:
-    // a key that stopped attesting stops being able to trade. The approval
-    // is looked at after every renewal and once a minute besides, so one
-    // missed for any reason is caught up; both stop with the serve, which
-    // ends once another executor's key is found to hold the approval.
+    // Keep the venue's approval following the blessing, and note whether the
+    // key wants blessing again, so the instance asks for a fresh token in
+    // time: a key that stopped attesting stops being able to trade. The
+    // approval is looked at after every renewal and once a minute besides,
+    // so one missed for any reason is caught up; both stop with the serve,
+    // which ends once another executor's key is found to hold the approval.
     let renewed = Arc::new(tokio::sync::Notify::new());
     let replaced = Arc::new(AtomicBool::new(false));
     let _following = AbortOnDrop(tokio::spawn(follow_blessing(
         chain.clone(),
         deployments.clone(),
+        attestation.clone(),
         approving,
         station,
         vault,
@@ -1096,17 +1265,15 @@ async fn serve(
         renewed.clone(),
         replaced.clone(),
     )));
-    let _renewing = AbortOnDrop(chain::attest::keep_blessed_sharing(
+    let _tracking = AbortOnDrop(tokio::spawn(track_blessing(
         chain.clone(),
         deployments.clone(),
-        "executor",
+        attestation.clone(),
         key.address,
-        chain::attest::Sender::Own(Box::new(blessing)),
         vault,
         bundle,
-        blessings,
         move || renewed.notify_one(),
-    ));
+    )));
 
     // The executor reads the manifest the builder recorded, and refuses one
     // naming a driver this image doesn't carry.
@@ -1141,7 +1308,7 @@ async fn serve(
                 &chain,
                 vault,
                 station,
-                key_for(vault),
+                vault_key.signer(),
                 hyperliquid::DRIVER,
             )
             .await?;
@@ -1634,33 +1801,36 @@ async fn tell_if_halted(
     Ok(())
 }
 
-/// Whether a key is blessed for this vault and bundle with more than half
-/// its blessing left, so blessing it again now would be paying for nothing.
-async fn blessed_for_a_while(
+/// Whether the registry counts `key` as this vault's executor for `bundle`,
+/// when its blessing ends, and the chain's blessing TTL and clock.
+async fn blessing_of(
     chain: &Client,
     deployments: &Deployments,
     key: Address,
     vault: Address,
     bundle: B256,
-) -> Result<bool> {
+) -> Result<(bool, u64, u64, u64)> {
+    let vault_chain = alloy::primitives::U256::from(deployments.chain_id);
     let blessed = chain
         .read(
             deployments.attestation,
             IAttestationRegistry::isBlessedForCall {
                 signer: key,
-                vaultChain: alloy::primitives::U256::from(deployments.chain_id),
+                vaultChain: vault_chain,
                 vault,
                 strategyHash: bundle,
             },
         )
         .await?;
-    if !blessed {
-        return Ok(false);
-    }
-    let info = chain
+    let until = chain
         .read(
             deployments.attestation,
-            IAttestationRegistry::keyInfoCall { signer: key },
+            IAttestationRegistry::blessedUntilCall {
+                signer: key,
+                vaultChain: vault_chain,
+                vault,
+                strategyHash: bundle,
+            },
         )
         .await?;
     let ttl = chain
@@ -1670,10 +1840,95 @@ async fn blessed_for_a_while(
         )
         .await?;
     let now = chain.block_timestamp().await?;
-    Ok(info.vault == vault
-        && info.strategyHash == bundle
-        && more_than_half_left(info.blessedUntil, now, ttl))
+    Ok((blessed, until, ttl, now))
 }
+
+/// Wait until the keeper has blessed the key for this vault and bundle and
+/// stocked it with gas, noting in the instance's tree whether it still
+/// wants blessing. What is awaited is said once, not at every look.
+async fn wait_blessed_and_stocked(
+    chain: &Client,
+    deployments: &Deployments,
+    attestation: &attestation::Attestation,
+    key: Address,
+    vault: Address,
+    bundle: B256,
+) -> Result<()> {
+    let mut said = None;
+    loop {
+        let (blessed, until, ttl, now) =
+            blessing_of(chain, deployments, key, vault, bundle).await?;
+        attestation.note(
+            deployments.chain_id,
+            vault,
+            key,
+            attestation::due(blessed, until, now, ttl),
+            ttl,
+        );
+        let waiting_for = if blessed {
+            let line = health::gas_line(chain).await?;
+            if chain.balance(key).await? >= line {
+                return Ok(());
+            }
+            "its gas"
+        } else {
+            "its blessing"
+        };
+        if said != Some(waiting_for) {
+            tracing::info!(%vault, %key, "the key waits for {waiting_for} (the keeper's)");
+            said = Some(waiting_for);
+        }
+        tokio::time::sleep(GAS_LOOK).await;
+    }
+}
+
+/// For as long as the serve runs, note whether the key wants blessing again
+/// (a third of its blessing left, or none), so the instance attests afresh
+/// in time for the keeper to renew it; and run `on_renewal` whenever its
+/// blessing is seen to move, so the venue's approval follows it. A read that
+/// fails is looked at again shortly.
+async fn track_blessing(
+    chain: Client,
+    deployments: Deployments,
+    attestation: attestation::Attestation,
+    key: Address,
+    vault: Address,
+    bundle: B256,
+    mut on_renewal: impl FnMut() + Send + 'static,
+) {
+    let mut seen_until = None;
+    let mut unread = Throttle::default();
+    loop {
+        match blessing_of(&chain, &deployments, key, vault, bundle).await {
+            Ok((blessed, until, ttl, now)) => {
+                attestation.note(
+                    deployments.chain_id,
+                    vault,
+                    key,
+                    attestation::due(blessed, until, now, ttl),
+                    ttl,
+                );
+                if seen_until.is_some_and(|seen| seen != until) {
+                    on_renewal();
+                }
+                seen_until = Some(until);
+            }
+            Err(error) => {
+                if unread.due(Instant::now()) {
+                    tracing::warn!(%vault, %key, error = format!("{error:#}"), "could not tell how long the key's blessing has left; looking again shortly");
+                }
+            }
+        }
+        tokio::time::sleep(BLESSING_LOOK).await;
+    }
+}
+
+/// How often a served key's blessing is looked at.
+const BLESSING_LOOK: Duration = if cfg!(test) {
+    Duration::from_millis(100)
+} else {
+    Duration::from_secs(15)
+};
 
 /// Where the station's approval stands for this key.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1838,7 +2093,9 @@ fn key_driver_of(drivers: &[B256]) -> Option<B256> {
 /// could be stale by the time the approval is sent: one of the agent's
 /// orders may be what holds the turn, and another executor may take the
 /// vault over meanwhile, which an approval sent on the stale look would take
-/// back (`Station.approveKey` lets a blessed key replace another).
+/// back (`Station.approveKey` lets a blessed key replace another). Only the
+/// key named in `takes_over`, whose executor has gone silent, is ever
+/// replaced on purpose.
 async fn approve_if_behind(
     chain: &Client,
     deployments: &Deployments,
@@ -1846,6 +2103,7 @@ async fn approve_if_behind(
     station: Address,
     vault: Address,
     bundle: B256,
+    takes_over: Option<Address>,
 ) -> Result<Approval> {
     let driver = key_driver(chain, station).await?;
     let mut found = None;
@@ -1854,7 +2112,11 @@ async fn approve_if_behind(
             let approval =
                 approval_of(chain, deployments, station, key.address, vault, bundle).await?;
             found = Some(approval);
-            Ok(approval == Approval::Behind)
+            Ok(match approval {
+                Approval::Behind => true,
+                Approval::Replaced(by) => takes_over == Some(by),
+                Approval::Follows => false,
+            })
         },
         station,
         IStation::approveKeyCall {
@@ -1870,10 +2132,13 @@ async fn approve_if_behind(
 /// asked: the driver it approves keys for is revoked (or not there), or the
 /// key isn't blessed as this vault's executor and can't be blessed again, its
 /// image or project no longer allowed. A key whose blessing has only lapsed
-/// is blessed again, and approved after.
+/// is blessed again, and approved after. The image and project are the ones
+/// the instance attests as; while it doesn't know them yet (no token yet),
+/// they are not held against it.
 async fn refused(
     chain: &Client,
     deployments: &Deployments,
+    attestation: &attestation::Attestation,
     station: Address,
     key: Address,
     vault: Address,
@@ -1910,11 +2175,14 @@ async fn refused(
     if blessed {
         return Ok(false);
     }
+    let Some((image_digest, project_id)) = attestation.identity() else {
+        return Ok(false);
+    };
     let image = chain
         .read(
             deployments.attestation,
             IAttestationRegistry::isImageAllowedCall {
-                imageDigest: chain::attest::image_digest("executor"),
+                imageDigest: image_digest,
             },
         )
         .await?;
@@ -1922,7 +2190,7 @@ async fn refused(
         .read(
             deployments.attestation,
             IAttestationRegistry::isProjectAllowedCall {
-                projectId: chain::attest::project_id(),
+                projectId: project_id,
             },
         )
         .await?;
@@ -1963,9 +2231,11 @@ enum Held {
 /// estimate, say) can't land, and is tried again after the usual wait. One
 /// the station refuses ends the follow. A read that fails is tried again
 /// later.
+#[allow(clippy::too_many_arguments)]
 async fn approve_until_it_lands(
     chain: &Client,
     deployments: &Deployments,
+    attestation: &attestation::Attestation,
     key: &chain::KeyClient,
     station: Address,
     vault: Address,
@@ -1990,7 +2260,8 @@ async fn approve_until_it_lands(
                 continue;
             }
             Ok(Approval::Behind) => {
-                match approve_if_behind(chain, deployments, key, station, vault, bundle).await {
+                match approve_if_behind(chain, deployments, key, station, vault, bundle, None).await
+                {
                     Ok(Approval::Follows | Approval::Behind) => {
                         unanswered.settled();
                         return Held::Kept;
@@ -1999,9 +2270,17 @@ async fn approve_until_it_lands(
                     // Noted by the send itself when it was broadcast.
                     Err(error) if chain::may_still_land(&error) => error,
                     Err(error) => {
-                        if refused(chain, deployments, station, key.address, vault, bundle)
-                            .await
-                            .unwrap_or(false)
+                        if refused(
+                            chain,
+                            deployments,
+                            attestation,
+                            station,
+                            key.address,
+                            vault,
+                            bundle,
+                        )
+                        .await
+                        .unwrap_or(false)
                         {
                             return Held::Refused;
                         }
@@ -2047,6 +2326,7 @@ const FOLLOW_EVERY: Duration = if cfg!(test) {
 async fn follow_blessing(
     chain: Client,
     deployments: Deployments,
+    attestation: attestation::Attestation,
     key: chain::KeyClient,
     station: Address,
     vault: Address,
@@ -2066,6 +2346,7 @@ async fn follow_blessing(
                     approve_until_it_lands(
                         &chain,
                         &deployments,
+                        &attestation,
                         &key,
                         station,
                         vault,
@@ -2091,12 +2372,6 @@ async fn follow_blessing(
     }
 }
 
-/// Whether a blessing that lasts until `until` has more than half of `ttl`
-/// left at `now`.
-fn more_than_half_left(until: u64, now: u64, ttl: u64) -> bool {
-    until.saturating_sub(now).saturating_mul(2) > ttl
-}
-
 /// Stops the task it holds when it is dropped: when the vault it serves is
 /// let go, or the serve that started it ends, however it ends.
 struct AbortOnDrop<T = ()>(tokio::task::JoinHandle<T>);
@@ -2104,12 +2379,6 @@ struct AbortOnDrop<T = ()>(tokio::task::JoinHandle<T>);
 impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         self.0.abort();
-    }
-}
-
-impl<T> AbortOnDrop<T> {
-    fn is_finished(&self) -> bool {
-        self.0.is_finished()
     }
 }
 
@@ -2329,25 +2598,6 @@ fn bundle_path(store: &std::path::Path, bundle: B256) -> PathBuf {
         .join("component.wasm")
 }
 
-/// A key for one vault, made where the strategy runs.
-fn key_for(vault: Address) -> PrivateKeySigner {
-    let seed = keccak256((chain::attest::image_digest("executor"), vault).abi_encode_seed());
-    PrivateKeySigner::from_bytes(&seed).expect("a key from a seed")
-}
-
-/// A small helper so the seed reads as one expression.
-trait Seed {
-    fn abi_encode_seed(&self) -> Vec<u8>;
-}
-
-impl Seed for (B256, Address) {
-    fn abi_encode_seed(&self) -> Vec<u8> {
-        let mut out = self.0.to_vec();
-        out.extend_from_slice(self.1.as_slice());
-        out
-    }
-}
-
 /// The status port. The keeper and the author's withdraw screen get a
 /// vault's signed total only there, so one that can't be bound stops the
 /// executor, rather than running on with every total uncollectable, or
@@ -2359,15 +2609,16 @@ async fn bind_status(address: SocketAddr) -> Result<tokio::net::TcpListener> {
 }
 
 /// The machine's own health (unavailable while a vault chain it serves isn't
-/// connected), and each vault's signed running total for the keeper to
-/// collect.
+/// connected), each vault's signed running total for the keeper to collect,
+/// and the instance's attestation (see [`attestation::routes`]).
 async fn serve_status(
     listener: tokio::net::TcpListener,
     totals: usage::Totals,
     solana_totals: solana::Totals,
     chains: health::Chains,
+    attestation: attestation::Attestation,
 ) {
-    let app = axum::Router::new()
+    let app = attestation::routes(attestation)
         .route(
             "/health",
             axum::routing::get(move || {
@@ -2568,14 +2819,6 @@ mod tests {
         assert!(!retry.waiting(now + Duration::from_secs(5)));
     }
 
-    #[test]
-    fn a_blessing_is_renewed_only_once_half_of_it_has_gone() {
-        let ttl = 72 * 3_600;
-        assert!(more_than_half_left(1_000 + ttl, 1_000, ttl));
-        assert!(!more_than_half_left(1_000 + ttl / 2, 1_000, ttl));
-        assert!(!more_than_half_left(500, 1_000, ttl));
-    }
-
     #[tokio::test]
     async fn a_vault_let_go_stops_its_agent() {
         let state = stand_in::chain(1_000_000_000, 0);
@@ -2585,6 +2828,12 @@ mod tests {
         let watching = agent.abort_handle();
         let served = Served {
             shared: Shared {
+                vault_key: Arc::new(keys::Key::fresh().unwrap()),
+                attestation: crate::attestation::Attestation::new(
+                    crate::attestation::Mode::Development,
+                )
+                .unwrap(),
+                takes_over: Default::default(),
                 key: stand_in::key(&client),
                 dry: Default::default(),
                 metered: Default::default(),
@@ -2596,7 +2845,6 @@ mod tests {
                 wound_down: Default::default(),
                 signed_through: Default::default(),
                 approvals: Default::default(),
-                blessings: Default::default(),
                 ceilings: Default::default(),
                 failed_starts: Default::default(),
                 halt_known: Default::default(),
@@ -2604,7 +2852,7 @@ mod tests {
             serving: Some(agent),
             retry: Retry::default(),
             _upkeep: [idle(), idle()],
-            topping_up: Some(idle()),
+            _leaf: no_leaf(),
             letting_go: None,
         };
         let mut running = HashMap::from([(Address::repeat_byte(0x11), served)]);
@@ -2612,29 +2860,6 @@ mod tests {
         running.remove(&Address::repeat_byte(0x11));
         tokio::task::yield_now().await;
         assert!(watching.is_finished(), "the agent still runs");
-    }
-
-    /// A stake dropped from the book (the vault closed, or another
-    /// executor's key holds its approval) stops where it is, rather than
-    /// waiting on for a take-on that will not happen.
-    #[tokio::test]
-    async fn a_stake_dropped_from_the_book_stops() {
-        let state = stand_in::chain(1_000_000_000, 0);
-        state.lock().unwrap().in_the_pool = true;
-        let client = stand_in::client(&stand_in::start(state.clone()).await).await;
-        let vault = Address::repeat_byte(0x11);
-        let mut book = Book::default();
-        book.staking.insert(
-            vault,
-            stake(&client, &stand_in::deployments(), &book.stakes, vault),
-        );
-        let watching = book.staking[&vault].0.abort_handle();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!watching.is_finished(), "the stake ended by itself");
-
-        book.staking.remove(&vault);
-        tokio::task::yield_now().await;
-        assert!(watching.is_finished(), "the stake still runs");
     }
 
     fn args(store: &std::path::Path) -> Args {
@@ -2648,9 +2873,57 @@ mod tests {
             store: store.to_path_buf(),
             api_url: "http://127.0.0.1:9".to_string(),
             port: None,
+            listen: IpAddr::from([127, 0, 0, 1]),
+            attestation: attestation::Mode::Development,
+            launcher_socket: attestation::LAUNCHER_SOCKET.into(),
+            handover_silence_seconds: crate::handover::HANDOVER_SILENCE,
+            store_url: None,
             ceilings: Default::default(),
             hyperliquid_stream: None,
         }
+    }
+
+    /// A leaf in a tree nobody reads.
+    fn no_leaf() -> Leaf {
+        Leaf {
+            attestation: crate::attestation::Attestation::new(
+                crate::attestation::Mode::Development,
+            )
+            .unwrap(),
+            chain_id: 0,
+            vault: Address::ZERO,
+            key: Address::ZERO,
+        }
+    }
+
+    /// One vault's part of a sweep, with an attestation of its own.
+    #[allow(clippy::too_many_arguments)]
+    async fn sweep_vault(
+        chain: shared::Chain,
+        client: &Client,
+        deployments: &Deployments,
+        native_usd: Option<f64>,
+        engine: &Engine,
+        args: &Args,
+        totals: &usage::Totals,
+        book: &mut Book,
+        vault: Address,
+    ) -> Result<()> {
+        let attestation =
+            crate::attestation::Attestation::new(crate::attestation::Mode::Development)?;
+        sweep_one(
+            chain,
+            client,
+            deployments,
+            native_usd,
+            engine,
+            args,
+            totals,
+            &attestation,
+            book,
+            vault,
+        )
+        .await
     }
 
     /// The factory's list of vaults is read whole, so it isn't read at every
@@ -2672,6 +2945,8 @@ mod tests {
                 &engine,
                 &args(&store),
                 &Default::default(),
+                &crate::attestation::Attestation::new(crate::attestation::Mode::Development)
+                    .unwrap(),
                 book,
             )
             .await
@@ -2686,57 +2961,27 @@ mod tests {
         assert_eq!(reads(), 2, "the list was never read again");
     }
 
-    /// Give vault 0x11's key gas, as a sweep does, then take the vault on.
+    /// Take vault 0x11 on, as a sweep does.
     async fn staked_and_taken_on(client: &Client, store: &std::path::Path) -> Served {
         let vault = Address::repeat_byte(0x11);
         let deployments = stand_in::deployments();
-        let stakes = health::Stakes::default();
-        let head = stake(client, &deployments, &stakes, vault)
-            .await
-            .unwrap()
-            .unwrap();
+        let head = client.block_number().await.unwrap();
+        let bundle = client.read(vault, IVault::bundleHashCall {}).await.unwrap();
         take_on(
             client,
             shared::Chain::Base,
             &deployments,
             None,
             vault,
+            bundle,
             head,
+            None,
             &args(store),
             &Default::default(),
-            &stakes,
+            &crate::attestation::Attestation::new(crate::attestation::Mode::Development).unwrap(),
             0,
         )
         .unwrap()
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_served_key_that_has_spent_its_gas_is_given_more() {
-        let state = stand_in::chain(1_000_000_000, 0);
-        let client = stand_in::client(&stand_in::start(state.clone()).await).await;
-        let stake = alloy::primitives::U256::from(health::stake_today(&client).await.unwrap());
-        // The key already holds a full stake, so taking the vault on sends
-        // none.
-        state.lock().unwrap().sent.push(stake);
-        let sent = || state.lock().unwrap().sent.clone();
-        let store = std::env::temp_dir().join(format!("executor-restock-{}", std::process::id()));
-        let served = staked_and_taken_on(&client, &store).await;
-        assert_eq!(sent(), [stake], "a key holding a full stake was staked");
-
-        // The agent spends it: the key holds nothing.
-        state.lock().unwrap().sent.clear();
-        for _ in 0..50 {
-            if !sent().is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        drop(served);
-        assert_eq!(
-            sent(),
-            [stake],
-            "the key spent its gas and was not given a stake's worth more"
-        );
     }
 
     #[tokio::test]
@@ -2778,255 +3023,6 @@ mod tests {
         assert!(heard(&events).is_empty());
     }
 
-    #[tokio::test]
-    async fn a_stake_whose_fate_is_unknown_is_not_sent_again_at_the_next_sweep() {
-        // The stand-in takes the stake and never manages to say what became
-        // of it: every read of its receipt is turned away. It lands all the
-        // same.
-        let state = stand_in::chain(1_000_000_000, 0);
-        let bundle = state.lock().unwrap().bundle;
-        let client = stand_in::client(&stand_in::start(state.clone()).await).await;
-
-        let store = std::env::temp_dir().join(format!("executor-stake-{}", std::process::id()));
-        let component = bundle_path(&store, bundle);
-        std::fs::create_dir_all(component.parent().unwrap()).unwrap();
-        std::fs::write(&component, b"").unwrap();
-        let deployments = stand_in::deployments();
-        let args = args(&store);
-        let engine = runner::engine().unwrap();
-        let totals: usage::Totals = Default::default();
-        let vault = Address::repeat_byte(0x11);
-        let mut book = Book::default();
-        let sent = || state.lock().unwrap().sent.len();
-
-        // The stake goes out and its receipt is never read: the vault is not
-        // taken on. The clock is paused once it is out, so the wait for the
-        // receipt runs out at once, and started again for the sweep that
-        // finds it ended.
-        sweep_one(
-            shared::Chain::Base,
-            &client,
-            &deployments,
-            None,
-            &engine,
-            &args,
-            &totals,
-            &mut book,
-            vault,
-        )
-        .await
-        .unwrap();
-        while sent() == 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        tokio::time::pause();
-        while !book.staking[&vault].is_finished() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        tokio::time::resume();
-        sweep_one(
-            shared::Chain::Base,
-            &client,
-            &deployments,
-            None,
-            &engine,
-            &args,
-            &totals,
-            &mut book,
-            vault,
-        )
-        .await
-        .unwrap();
-        assert_eq!(sent(), 1, "the key was staked");
-        assert!(!book.running.contains_key(&vault));
-
-        // The next sweep holds off.
-        sweep_through_the_stake(
-            shared::Chain::Base,
-            &client,
-            &deployments,
-            None,
-            &engine,
-            &args,
-            &totals,
-            &mut book,
-            vault,
-        )
-        .await
-        .unwrap();
-        assert_eq!(sent(), 1, "the key was staked again at the next sweep");
-
-        // Once the wait is over, the key holds its stake and is taken on
-        // without another.
-        book.taking_on.get_mut(&vault).unwrap().at = None;
-        sweep_through_the_stake(
-            shared::Chain::Base,
-            &client,
-            &deployments,
-            None,
-            &engine,
-            &args,
-            &totals,
-            &mut book,
-            vault,
-        )
-        .await
-        .unwrap();
-        let _ = std::fs::remove_dir_all(&store);
-        assert_eq!(sent(), 1, "a key that holds its stake was staked again");
-        assert!(book.running.contains_key(&vault), "the vault was taken on");
-    }
-
-    /// One vault's part of a sweep, and of the sweeps after it for as long
-    /// as the stake the first began for the vault's key is under way: what
-    /// the sweeps do over a few seconds.
-    #[allow(clippy::too_many_arguments)]
-    async fn sweep_through_the_stake(
-        chain: shared::Chain,
-        client: &Client,
-        deployments: &Deployments,
-        native_usd: Option<f64>,
-        engine: &Engine,
-        args: &Args,
-        totals: &usage::Totals,
-        book: &mut Book,
-        vault: Address,
-    ) -> Result<()> {
-        sweep_one(
-            chain,
-            client,
-            deployments,
-            native_usd,
-            engine,
-            args,
-            totals,
-            book,
-            vault,
-        )
-        .await?;
-        while let Some(staking) = book.staking.get(&vault) {
-            if staking.is_finished() {
-                sweep_one(
-                    chain,
-                    client,
-                    deployments,
-                    native_usd,
-                    engine,
-                    args,
-                    totals,
-                    book,
-                    vault,
-                )
-                .await?;
-            } else {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
-        Ok(())
-    }
-
-    /// A stake whose receipt is slow to come (here it never does) is waited
-    /// for in a task of its own: the sweep that sent it goes on to the next
-    /// vault at once, the vault isn't taken on (its agent never starts
-    /// without gas), and the sweeps that follow while it is under way send
-    /// no other.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_stake_slow_to_land_holds_up_no_sweep() {
-        let state = stand_in::chain(1_000_000_000, 0);
-        let bundle = state.lock().unwrap().bundle;
-        let client = stand_in::client(&stand_in::start(state.clone()).await).await;
-        let store =
-            std::env::temp_dir().join(format!("executor-slow-stake-{}", std::process::id()));
-        let component = bundle_path(&store, bundle);
-        std::fs::create_dir_all(component.parent().unwrap()).unwrap();
-        std::fs::write(&component, b"").unwrap();
-        let deployments = stand_in::deployments();
-        let args = args(&store);
-        let engine = runner::engine().unwrap();
-        let totals: usage::Totals = Default::default();
-        let vault = Address::repeat_byte(0x11);
-        let mut book = Book::default();
-        let sent = || state.lock().unwrap().sent.len();
-
-        for _ in 0..3 {
-            let started = Instant::now();
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                sweep_one(
-                    shared::Chain::Base,
-                    &client,
-                    &deployments,
-                    None,
-                    &engine,
-                    &args,
-                    &totals,
-                    &mut book,
-                    vault,
-                ),
-            )
-            .await
-            .expect("the sweep waited for the stake to land")
-            .unwrap();
-            assert!(started.elapsed() < Duration::from_secs(5));
-            turn::wait_for("the stake to be sent", || sent() > 0).await;
-        }
-        let _ = std::fs::remove_dir_all(&store);
-        assert_eq!(sent(), 1, "the key was staked more than once");
-        assert!(
-            !book.running.contains_key(&vault),
-            "the vault was taken on before its key's stake was seen"
-        );
-        assert!(
-            book.staking
-                .get(&vault)
-                .is_some_and(|task| !task.is_finished())
-        );
-    }
-
-    /// The key's stake sits in the pool: the latest block shows the key
-    /// holding nothing, and the stake's receipt can't be read. A take-on
-    /// tried again meanwhile finds the stake remembered, sends no other, and
-    /// waits: the key has no gas it can spend yet. Once the stake lands, the
-    /// vault's key is staked and the take-on goes on.
-    #[tokio::test]
-    async fn a_vault_is_not_taken_on_until_its_key_holds_its_gas() {
-        let state = stand_in::chain(1_000_000_000, 0);
-        state.lock().unwrap().in_the_pool = true;
-        let client = stand_in::client(&stand_in::start(state.clone()).await).await;
-        let deployments = stand_in::deployments();
-        let stakes = health::Stakes::default();
-        let vault = Address::repeat_byte(0x11);
-        let sent = || state.lock().unwrap().sent.len();
-
-        // The first take-on's stake goes out, and the wait for it runs out.
-        let first = stake(&client, &deployments, &stakes, vault);
-        while sent() == 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        tokio::time::pause();
-        let first = first.await.unwrap();
-        tokio::time::resume();
-        assert!(first.is_err(), "the stake was never seen to land");
-
-        // Tried again while it is still in the pool: not staked.
-        let again = stake(&client, &deployments, &stakes, vault);
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        assert!(
-            !again.is_finished(),
-            "the key was taken as staked while its stake was still in the pool"
-        );
-        assert_eq!(sent(), 1, "a second stake went out after the first");
-
-        // It lands.
-        state.lock().unwrap().in_the_pool = false;
-        let head = tokio::time::timeout(Duration::from_secs(5), again)
-            .await
-            .expect("a key whose stake landed was never taken as staked")
-            .unwrap();
-        assert!(head.is_ok());
-        assert_eq!(sent(), 1);
-    }
-
     #[test]
     fn a_warning_is_said_at_most_once_a_minute() {
         let now = Instant::now();
@@ -3040,6 +3036,12 @@ mod tests {
     /// the strategy's id, which the stand-in doesn't answer.
     async fn serve_until_the_strategy(client: Client, key: chain::KeyClient) {
         let shared = Shared {
+            vault_key: Arc::new(keys::Key::fresh().unwrap()),
+            attestation: crate::attestation::Attestation::new(
+                crate::attestation::Mode::Development,
+            )
+            .unwrap(),
+            takes_over: Default::default(),
             key,
             dry: Default::default(),
             metered: Default::default(),
@@ -3051,7 +3053,6 @@ mod tests {
             wound_down: Default::default(),
             signed_through: Default::default(),
             approvals: Default::default(),
-            blessings: Default::default(),
             ceilings: Default::default(),
             failed_starts: Default::default(),
             halt_known: Default::default(),
@@ -3076,30 +3077,107 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_key_blessed_again_at_a_restart_is_approved_again_at_the_venue() {
+    async fn a_key_the_keeper_blessed_again_is_approved_again_at_the_venue_and_never_blesses_itself()
+     {
         use stand_in::serving::{NOW, TTL};
         let node = stand_in::serving::node(VaultState::Open);
         let client = stand_in::client(&stand_in::serving::start(node.clone()).await).await;
         let key = stand_in::key(&client);
         {
-            // The last instance blessed and approved this key; a quarter of
-            // the blessing is left, so this serve blesses it again.
+            // The key was approved until its old blessing's end; the keeper
+            // has blessed it again since.
             let mut node = node.lock().unwrap();
             node.approved_key = key.address;
-            node.blessed_until = NOW + TTL / 4;
+            node.blessed_until = NOW + TTL;
             node.venue_until = NOW + TTL / 4;
         }
         serve_until_the_strategy(client, key).await;
         let node = node.lock().unwrap();
         assert_eq!(
-            node.blessed_until,
-            NOW + TTL,
-            "the key was not blessed again"
-        );
-        assert_eq!(
             node.venue_until, node.blessed_until,
             "the venue holds the key approved only until the old blessing's end"
         );
+        assert!(
+            node.sent.iter().all(|(_, selector)| *selector
+                != <IAttestationRegistry::blessCall as alloy::sol_types::SolCall>::SELECTOR),
+            "the executor sent a blessing itself"
+        );
+    }
+
+    /// A serve sends nothing until the keeper has blessed its key, and says
+    /// meanwhile, in the instance's tree, that the key wants blessing; once
+    /// the chain shows it blessed (and stocked), the key is approved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_serve_waits_for_the_keeper_s_blessing_before_it_sends_anything() {
+        use stand_in::serving::{NOW, TTL};
+        let node = stand_in::serving::node(VaultState::Open);
+        node.lock().unwrap().blessed_until = 0;
+        let client = stand_in::client(&stand_in::serving::start(node.clone()).await).await;
+        let key = stand_in::key(&client);
+        let attestation =
+            crate::attestation::Attestation::new(crate::attestation::Mode::Development).unwrap();
+        let shared = Shared {
+            vault_key: Arc::new(keys::Key::fresh().unwrap()),
+            attestation: attestation.clone(),
+            takes_over: Default::default(),
+            key: key.clone(),
+            dry: Default::default(),
+            metered: Default::default(),
+            running: Default::default(),
+            counters: Default::default(),
+            watched_to: Default::default(),
+            account_events: Default::default(),
+            vault_events: Default::default(),
+            wound_down: Default::default(),
+            signed_through: Default::default(),
+            approvals: Default::default(),
+            ceilings: Default::default(),
+            failed_starts: Default::default(),
+            halt_known: Default::default(),
+        };
+        let serving = tokio::spawn(serve(
+            client,
+            shared::Chain::Base,
+            stand_in::deployments(),
+            runner::engine().unwrap(),
+            Address::repeat_byte(0x11),
+            B256::repeat_byte(0x42),
+            std::env::temp_dir(),
+            "local".to_string(),
+            shared,
+        ));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            node.lock().unwrap().sent.is_empty(),
+            "a key not yet blessed sent something"
+        );
+        let leaf = |attestation: &crate::attestation::Attestation| {
+            attestation
+                .status()
+                .leaves
+                .into_iter()
+                .find(|leaf| leaf.key.parse::<Address>().unwrap() == key.address)
+        };
+        let held = leaf(&attestation).expect("the key is not in the instance's tree");
+        assert_eq!(
+            held.vault.parse::<Address>().unwrap(),
+            Address::repeat_byte(0x11)
+        );
+        assert_eq!(
+            held.strategy_hash.parse::<B256>().unwrap(),
+            B256::repeat_byte(0x42)
+        );
+        assert!(attestation.status().leaves.len() == 1);
+
+        // The keeper blesses it.
+        node.lock().unwrap().blessed_until = NOW + TTL;
+        let served = tokio::time::timeout(Duration::from_secs(30), serving)
+            .await
+            .expect("the serve never went on once the key was blessed")
+            .unwrap();
+        assert!(served.is_err(), "the stand-in reverts the strategy's id");
+        assert_eq!(stand_in::serving::approvals(&node), 1);
+        assert_eq!(node.lock().unwrap().approved_key, key.address);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3144,6 +3222,8 @@ mod tests {
             approve_until_it_lands(
                 &client,
                 &stand_in::deployments(),
+                &crate::attestation::Attestation::new(crate::attestation::Mode::Development)
+                    .unwrap(),
                 &key,
                 station,
                 Address::repeat_byte(0x11),
@@ -3175,7 +3255,7 @@ mod tests {
         std::fs::write(&component, b"").unwrap();
         let vault = Address::repeat_byte(0x11);
         let mut book = Book::default();
-        sweep_through_the_stake(
+        sweep_vault(
             shared::Chain::Base,
             &client,
             &stand_in::deployments(),
@@ -3225,6 +3305,7 @@ mod tests {
         let following = tokio::spawn(follow_blessing(
             client,
             stand_in::deployments(),
+            crate::attestation::Attestation::new(crate::attestation::Mode::Development).unwrap(),
             key,
             station,
             Address::repeat_byte(0x11),
@@ -3273,6 +3354,7 @@ mod tests {
         let following = tokio::spawn(follow_blessing(
             client,
             stand_in::deployments(),
+            crate::attestation::Attestation::new(crate::attestation::Mode::Development).unwrap(),
             key,
             station,
             Address::repeat_byte(0x11),
@@ -3329,6 +3411,12 @@ mod tests {
         let key = stand_in::key(&client);
         node.lock().unwrap().key = key.address;
         let shared = Shared {
+            vault_key: Arc::new(keys::Key::fresh().unwrap()),
+            attestation: crate::attestation::Attestation::new(
+                crate::attestation::Mode::Development,
+            )
+            .unwrap(),
+            takes_over: Default::default(),
             key,
             dry: Default::default(),
             metered: Arc::new(AtomicBool::new(true)),
@@ -3340,7 +3428,6 @@ mod tests {
             wound_down: Arc::new(AtomicBool::new(wound_down)),
             signed_through: Default::default(),
             approvals: Default::default(),
-            blessings: Default::default(),
             ceilings: Default::default(),
             failed_starts: Default::default(),
             halt_known: Default::default(),
@@ -3815,10 +3902,7 @@ mod tests {
         let mut book = Book::default();
         let ids = |book: &Book| {
             let served = &book.running[&vault];
-            (
-                served._upkeep.each_ref().map(|task| task.0.id()),
-                served.topping_up.as_ref().map(|task| task.0.id()),
-            )
+            served._upkeep.each_ref().map(|task| task.0.id())
         };
 
         // Each serve stops at the strategy's id, which the stand-in doesn't
@@ -3827,7 +3911,7 @@ mod tests {
         let mut first = None;
         let started = Instant::now();
         while serves.len() < 3 && started.elapsed() < Duration::from_secs(30) {
-            sweep_through_the_stake(
+            sweep_vault(
                 shared::Chain::Base,
                 &client,
                 &stand_in::deployments(),
@@ -3845,7 +3929,7 @@ mod tests {
             assert_eq!(
                 *first.get_or_insert(ids),
                 ids,
-                "the meter, the reports or the top-ups were started again"
+                "the meter or the reports were started again"
             );
             if let Some(serving) = &book.running[&vault].serving {
                 serves.insert(serving.id());
@@ -3906,6 +3990,7 @@ mod tests {
         let following = tokio::spawn(follow_blessing(
             client,
             stand_in::deployments(),
+            crate::attestation::Attestation::new(crate::attestation::Mode::Development).unwrap(),
             key.clone(),
             station,
             Address::repeat_byte(0x11),
@@ -3965,6 +4050,12 @@ mod tests {
             node.approved_key = Address::repeat_byte(0x77);
         }
         let shared = Shared {
+            vault_key: Arc::new(keys::Key::fresh().unwrap()),
+            attestation: crate::attestation::Attestation::new(
+                crate::attestation::Mode::Development,
+            )
+            .unwrap(),
+            takes_over: Default::default(),
             key,
             dry: Default::default(),
             metered: Default::default(),
@@ -3976,7 +4067,6 @@ mod tests {
             wound_down: Default::default(),
             signed_through: Default::default(),
             approvals: Default::default(),
-            blessings: Default::default(),
             ceilings: Default::default(),
             failed_starts: Default::default(),
             halt_known: Default::default(),
@@ -4031,6 +4121,8 @@ mod tests {
             approve_until_it_lands(
                 &client,
                 &stand_in::deployments(),
+                &crate::attestation::Attestation::new(crate::attestation::Mode::Development)
+                    .unwrap(),
                 &key,
                 station,
                 Address::repeat_byte(0x11),
@@ -4099,7 +4191,7 @@ mod tests {
     /// station is stopped, and the key has nothing left to send), while its
     /// meter runs on so the final bill can be collected.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_halted_vault_past_its_grace_stops_its_key_top_ups_and_keeps_its_meter() {
+    async fn a_halted_vault_past_its_grace_keeps_its_meter() {
         use stand_in::serving::NOW;
         let node = stand_in::serving::node(VaultState::Killed);
         node.lock().unwrap().halted_at = NOW - 3_600;
@@ -4124,10 +4216,15 @@ mod tests {
             (AbortOnDrop(task), flag)
         }
         let (metering, meter_runs) = flagged();
-        let (topping_up, top_ups_run) = flagged();
         let idle = || AbortOnDrop(tokio::spawn(std::future::pending()));
         let served = Served {
             shared: Shared {
+                vault_key: Arc::new(keys::Key::fresh().unwrap()),
+                attestation: crate::attestation::Attestation::new(
+                    crate::attestation::Mode::Development,
+                )
+                .unwrap(),
+                takes_over: Default::default(),
                 key: stand_in::key(&client),
                 dry: Default::default(),
                 metered: Default::default(),
@@ -4139,7 +4236,6 @@ mod tests {
                 wound_down: Default::default(),
                 signed_through: Default::default(),
                 approvals: Default::default(),
-                blessings: Default::default(),
                 ceilings: Default::default(),
                 failed_starts: Default::default(),
                 halt_known: Default::default(),
@@ -4147,13 +4243,13 @@ mod tests {
             serving: None,
             retry: Default::default(),
             _upkeep: [metering, idle()],
-            topping_up: Some(topping_up),
+            _leaf: no_leaf(),
             letting_go: None,
         };
         let mut book = Book::default();
         book.running.insert(vault, served);
 
-        sweep_through_the_stake(
+        sweep_vault(
             shared::Chain::Base,
             &client,
             &stand_in::deployments(),
@@ -4168,10 +4264,6 @@ mod tests {
         .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let _ = std::fs::remove_dir_all(&store);
-        assert!(
-            !top_ups_run.load(Ordering::SeqCst),
-            "the key of a vault an hour past its grace is still topped up"
-        );
         assert!(
             meter_runs.load(Ordering::SeqCst),
             "the meter stopped before the final bill was collected"
@@ -4256,7 +4348,7 @@ mod tests {
         std::fs::create_dir_all(component.parent().unwrap()).unwrap();
         std::fs::write(&component, b"").unwrap();
         let sweep = async |book: &mut Book| {
-            sweep_through_the_stake(
+            sweep_vault(
                 shared::Chain::Base,
                 &client,
                 &stand_in::deployments(),
@@ -4276,6 +4368,12 @@ mod tests {
         let signed_through = usage::SignedThrough::default();
         let served = Served {
             shared: Shared {
+                vault_key: Arc::new(keys::Key::fresh().unwrap()),
+                attestation: crate::attestation::Attestation::new(
+                    crate::attestation::Mode::Development,
+                )
+                .unwrap(),
+                takes_over: Default::default(),
                 key: stand_in::key(&client),
                 dry: Default::default(),
                 metered: Default::default(),
@@ -4287,7 +4385,6 @@ mod tests {
                 wound_down: Default::default(),
                 signed_through: signed_through.clone(),
                 approvals: Default::default(),
-                blessings: Default::default(),
                 ceilings: Default::default(),
                 failed_starts: Default::default(),
                 halt_known: Default::default(),
@@ -4300,7 +4397,7 @@ mod tests {
             })),
             retry: Default::default(),
             _upkeep: [idle(), idle()],
-            topping_up: Some(idle()),
+            _leaf: no_leaf(),
             letting_go: None,
         };
         let mut book = Book::default();
@@ -4308,16 +4405,12 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // The meter hasn't yet signed for the time up to the stop: the vault
-        // is kept, its top-ups stopped and no new serve started.
+        // is kept, and no new serve started.
         sweep(&mut book).await;
         let served = book
             .running
             .get(&vault)
             .expect("let go before its last bill was signed");
-        assert!(
-            served.topping_up.is_none(),
-            "the replaced key is still topped up"
-        );
         assert!(served.serving.is_none(), "a new serve was started");
 
         // Once it has, the vault is let go.
@@ -4557,6 +4650,8 @@ mod tests {
             let following = tokio::spawn(follow_blessing(
                 client,
                 stand_in::deployments(),
+                crate::attestation::Attestation::new(crate::attestation::Mode::Development)
+                    .unwrap(),
                 key.clone(),
                 Address::repeat_byte(0x55),
                 Address::repeat_byte(0x11),
@@ -4614,6 +4709,8 @@ mod tests {
                 approve_until_it_lands(
                     &client,
                     &stand_in::deployments(),
+                    &crate::attestation::Attestation::new(crate::attestation::Mode::Development)
+                        .unwrap(),
                     &key,
                     station,
                     Address::repeat_byte(0x11),
@@ -4674,6 +4771,12 @@ mod tests {
         }
         // What the vault's serves share, as the sweep keeps it.
         let shared = Shared {
+            vault_key: Arc::new(keys::Key::fresh().unwrap()),
+            attestation: crate::attestation::Attestation::new(
+                crate::attestation::Mode::Development,
+            )
+            .unwrap(),
+            takes_over: Default::default(),
             key,
             dry: Default::default(),
             metered: Default::default(),
@@ -4685,7 +4788,6 @@ mod tests {
             wound_down: Default::default(),
             signed_through: Default::default(),
             approvals: Default::default(),
-            blessings: Default::default(),
             ceilings: Default::default(),
             failed_starts: Default::default(),
             halt_known: Default::default(),
@@ -4835,6 +4937,8 @@ mod tests {
             approve_until_it_lands(
                 &client,
                 &stand_in::deployments(),
+                &crate::attestation::Attestation::new(crate::attestation::Mode::Development)
+                    .unwrap(),
                 &key,
                 station,
                 Address::repeat_byte(0x11),
@@ -4877,6 +4981,7 @@ mod tests {
         let following = tokio::spawn(follow_blessing(
             client.clone(),
             stand_in::deployments(),
+            crate::attestation::Attestation::new(crate::attestation::Mode::Development).unwrap(),
             key.clone(),
             station,
             Address::repeat_byte(0x11),
@@ -4895,6 +5000,12 @@ mod tests {
 
         // At a serve's start, the same.
         let shared = Shared {
+            vault_key: Arc::new(keys::Key::fresh().unwrap()),
+            attestation: crate::attestation::Attestation::new(
+                crate::attestation::Mode::Development,
+            )
+            .unwrap(),
+            takes_over: Default::default(),
             key,
             dry: Default::default(),
             metered: Default::default(),
@@ -4906,7 +5017,6 @@ mod tests {
             wound_down: Default::default(),
             signed_through: Default::default(),
             approvals: Default::default(),
-            blessings: Default::default(),
             ceilings: Default::default(),
             failed_starts: Default::default(),
             halt_known: Default::default(),
@@ -4955,7 +5065,7 @@ mod tests {
         std::fs::create_dir_all(component.parent().unwrap()).unwrap();
         std::fs::write(&component, b"").unwrap();
         let sweep = async |book: &mut Book| {
-            sweep_through_the_stake(
+            sweep_vault(
                 shared::Chain::Base,
                 &client,
                 &stand_in::deployments(),
@@ -5231,6 +5341,10 @@ mod tests {
                     approve_until_it_lands(
                         &client,
                         &stand_in::deployments(),
+                        &crate::attestation::Attestation::new(
+                            crate::attestation::Mode::Development,
+                        )
+                        .unwrap(),
                         &platform,
                         station,
                         vault,
@@ -5490,6 +5604,12 @@ mod tests {
             let idle = || AbortOnDrop(tokio::spawn(std::future::pending()));
             let served = Served {
                 shared: crate::Shared {
+                    vault_key: Arc::new(keys::Key::fresh().unwrap()),
+                    attestation: crate::attestation::Attestation::new(
+                        crate::attestation::Mode::Development,
+                    )
+                    .unwrap(),
+                    takes_over: Default::default(),
                     key: key.clone(),
                     dry: Default::default(),
                     metered: Default::default(),
@@ -5501,7 +5621,6 @@ mod tests {
                     wound_down: Default::default(),
                     signed_through,
                     approvals: Default::default(),
-                    blessings: Default::default(),
                     ceilings: Default::default(),
                     failed_starts: Default::default(),
                     halt_known: Default::default(),
@@ -5518,7 +5637,7 @@ mod tests {
                 })),
                 retry: Default::default(),
                 _upkeep: [AbortOnDrop(metering), idle()],
-                topping_up: Some(idle()),
+                _leaf: no_leaf(),
                 letting_go: None,
             };
             let mut book = Book::default();
@@ -5530,7 +5649,7 @@ mod tests {
                 args(&std::env::temp_dir().join(format!("executor-let-go-{}", std::process::id())));
             let engine = runner::engine().unwrap();
             let sweep = async |book: &mut Book| {
-                sweep_through_the_stake(
+                sweep_vault(
                     shared::Chain::Base,
                     &client,
                     &stand_in::deployments(),
@@ -5557,7 +5676,6 @@ mod tests {
             );
             let served = &book.running[&vault];
             assert!(served.serving.is_none(), "the agent was not stopped");
-            assert!(served.topping_up.is_none(), "the key is still kept in gas");
 
             // The order lands, as orders do, and the vault is let go once a
             // total counting it is signed.
@@ -5584,6 +5702,228 @@ mod tests {
             // A closed vault isn't taken for one another executor holds.
             assert_eq!(book.replaced.contains(&vault), !closes);
         }
+    }
+
+    /// Serve vault 0x11 against the serving stand-in with `key`, taking the
+    /// vault over from `takes_over`, until the serve ends.
+    async fn serve_taking_over(
+        client: Client,
+        key: chain::KeyClient,
+        takes_over: Option<Address>,
+    ) -> Result<Stop> {
+        let shared = Shared {
+            vault_key: Arc::new(keys::Key::fresh().unwrap()),
+            attestation: crate::attestation::Attestation::new(
+                crate::attestation::Mode::Development,
+            )
+            .unwrap(),
+            takes_over: Arc::new(Mutex::new(takes_over)),
+            key,
+            dry: Default::default(),
+            metered: Default::default(),
+            running: Default::default(),
+            counters: Default::default(),
+            watched_to: Default::default(),
+            account_events: Default::default(),
+            vault_events: Default::default(),
+            wound_down: Default::default(),
+            signed_through: Default::default(),
+            approvals: Default::default(),
+            ceilings: Default::default(),
+            failed_starts: Default::default(),
+            halt_known: Default::default(),
+        };
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            serve(
+                client,
+                shared::Chain::Base,
+                stand_in::deployments(),
+                runner::engine().unwrap(),
+                Address::repeat_byte(0x11),
+                B256::repeat_byte(0x42),
+                std::env::temp_dir(),
+                "local".to_string(),
+                shared,
+            ),
+        )
+        .await
+        .expect("the serve ended")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_takeover_approves_its_own_key_in_place_of_the_silent_key_and_of_no_other() {
+        let silent = Address::repeat_byte(0xee);
+        // The station approves the silent key: the takeover replaces it.
+        let node = stand_in::serving::node(VaultState::Open);
+        node.lock().unwrap().approved_key = silent;
+        let client = stand_in::client(&stand_in::serving::start(node.clone()).await).await;
+        let key = stand_in::key(&client);
+        let served = serve_taking_over(client, key.clone(), Some(silent)).await;
+        assert!(served.is_err(), "the stand-in reverts the strategy's id");
+        assert_eq!(node.lock().unwrap().approved_key, key.address);
+        assert_eq!(stand_in::serving::approvals(&node), 1);
+
+        // Another key holds the approval by the time the serve starts: that
+        // one is not the key whose silence was watched, so nothing is sent.
+        let node = stand_in::serving::node(VaultState::Open);
+        node.lock().unwrap().approved_key = Address::repeat_byte(0xdd);
+        let client = stand_in::client(&stand_in::serving::start(node.clone()).await).await;
+        let key = stand_in::key(&client);
+        let served = serve_taking_over(client, key, Some(silent)).await;
+        assert_eq!(served.unwrap(), Stop::Replaced);
+        assert!(node.lock().unwrap().sent.is_empty());
+    }
+
+    /// An API that holds, for every vault, the given report signed by `by`
+    /// (or none), and the URL it answers at.
+    async fn api_holding(
+        report: Option<(&alloy::signers::local::PrivateKeySigner, u64)>,
+    ) -> (String, AbortOnDrop) {
+        let post = report.map(|(by, at)| {
+            let report = shared::model::health::Health {
+                signals: vec![],
+                entries: vec![],
+                updated: time::PrimitiveDateTime::new(
+                    time::Date::from_ordinal_date(2026, 280).unwrap(),
+                    time::Time::MIDNIGHT,
+                ),
+                signed_by: by.address().to_string(),
+                at,
+            };
+            let vault = format!("{:?}", Address::repeat_byte(0x11));
+            let digest = shared::HealthPost::digest(shared::Chain::Base, &vault, &report);
+            use alloy::signers::SignerSync;
+            let signature = by.sign_message_sync(&digest).unwrap();
+            shared::HealthPost {
+                vault,
+                report,
+                signature: alloy::hex::encode_prefixed(signature.as_bytes()),
+                signer: None,
+            }
+        });
+        let app = axum::Router::new().route(
+            "/api/{chain}/health/{vault}/signed",
+            axum::routing::get(move || {
+                let post = post.clone();
+                async move {
+                    match post {
+                        Some(post) => axum::Json(post).into_response(),
+                        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        (
+            url,
+            AbortOnDrop(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            })),
+        )
+    }
+
+    /// One sweep of vault 0x11 against the serving stand-in, whose station
+    /// approves `by`'s key (blessed), with the API at `api` and the given
+    /// silence. Says the book after it.
+    async fn sweep_held_by(by: Address, api: &str, silence: u64, name: &str) -> Book {
+        let node = stand_in::serving::node(VaultState::Open);
+        node.lock().unwrap().approved_key = by;
+        let bundle = node.lock().unwrap().bundle;
+        let client = stand_in::client(&stand_in::serving::start(node.clone()).await).await;
+        let store =
+            std::env::temp_dir().join(format!("executor-handover-{name}-{}", std::process::id()));
+        let component = bundle_path(&store, bundle);
+        std::fs::create_dir_all(component.parent().unwrap()).unwrap();
+        std::fs::write(&component, b"").unwrap();
+        let mut args = args(&store);
+        args.api_url = api.to_string();
+        args.handover_silence_seconds = silence;
+        let mut book = Book::default();
+        sweep_vault(
+            shared::Chain::Base,
+            &client,
+            &stand_in::deployments(),
+            None,
+            &runner::engine().unwrap(),
+            &args,
+            &Default::default(),
+            &mut book,
+            Address::repeat_byte(0x11),
+        )
+        .await
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&store);
+        book
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_vault_whose_approved_key_still_reports_is_left_to_its_executor() {
+        let other = alloy::signers::local::PrivateKeySigner::random();
+        let (api, _api) = api_holding(Some((&other, unix_now()))).await;
+        // However short the silence, a report dated after the watch began
+        // starts it again.
+        let book = sweep_held_by(other.address(), &api, 0, "reporting").await;
+        let vault = Address::repeat_byte(0x11);
+        assert!(
+            !book.running.contains_key(&vault),
+            "a live executor's vault was taken over"
+        );
+        assert_eq!(book.watching[&vault].by, other.address());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_vault_whose_approved_key_is_silent_for_the_watch_is_taken_over_from_that_key() {
+        let other = alloy::signers::local::PrivateKeySigner::random();
+        // The API has only an old report from that key, from before the watch.
+        let (api, _api) = api_holding(Some((&other, unix_now() - 3_600))).await;
+        let book = sweep_held_by(other.address(), &api, 0, "silent").await;
+        let vault = Address::repeat_byte(0x11);
+        let served = book
+            .running
+            .get(&vault)
+            .expect("a silent executor's vault was not taken over");
+        assert_eq!(
+            *served.shared.takes_over.lock().unwrap(),
+            Some(other.address()),
+            "the takeover does not name the silent key"
+        );
+        assert_ne!(served.shared.key.address, other.address());
+        assert!(!book.watching.contains_key(&vault));
+
+        // Nor is a report signed by another key taken for the approved key's.
+        let stranger = alloy::signers::local::PrivateKeySigner::random();
+        let (api, _api) = api_holding(Some((&stranger, unix_now()))).await;
+        let book = sweep_held_by(other.address(), &api, 0, "stranger").await;
+        assert!(book.running.contains_key(&vault));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_api_out_of_reach_is_never_taken_for_a_silent_executor() {
+        let other = alloy::signers::local::PrivateKeySigner::random();
+        let book = sweep_held_by(other.address(), "http://127.0.0.1:9", 0, "unreachable").await;
+        let vault = Address::repeat_byte(0x11);
+        assert!(!book.running.contains_key(&vault));
+        assert!(book.watching.contains_key(&vault));
+    }
+
+    /// The silence is counted from when the watch began: a key with no report
+    /// at all is not taken over before the silence has passed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_with_no_report_is_taken_over_only_once_the_silence_has_passed() {
+        let other = alloy::signers::local::PrivateKeySigner::random();
+        let (api, _api) = api_holding(None).await;
+        let book = sweep_held_by(
+            other.address(),
+            &api,
+            crate::handover::HANDOVER_SILENCE,
+            "waiting",
+        )
+        .await;
+        assert!(!book.running.contains_key(&Address::repeat_byte(0x11)));
+        let book = sweep_held_by(other.address(), &api, 0, "past").await;
+        assert!(book.running.contains_key(&Address::repeat_byte(0x11)));
     }
 }
 

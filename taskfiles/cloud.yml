@@ -316,8 +316,12 @@ tasks:
           --source-ranges=10.128.0.0/9 --target-tags=shonin-services
         gcloud compute firewall-rules list --project="$project" \
           --format="table(name,direction,sourceRanges.list(),allowed[].map().firewall_rule().list(),targetTags.list())"
+        # Anything but ping open to the whole internet (filtered here: the
+        # list filter can't combine a range with a protocol's absence).
         open=$(gcloud compute firewall-rules list --project="$project" \
-          --filter="direction=INGRESS AND sourceRanges:0.0.0.0/0 AND -allowed.IPProtocol=icmp" --format="value(name)")
+          --filter="direction=INGRESS" \
+          --format="value(name,sourceRanges.list(),allowed[].map().firewall_rule().list())" \
+          | awk -F'\t' '$2 ~ /(^|,)0\.0\.0\.0\/0(,|$)/ && $3 != "icmp" { print $1 }')
         [ -z "$open" ] || { echo "open to the world: $open"; exit 1; }
 
   secrets:
