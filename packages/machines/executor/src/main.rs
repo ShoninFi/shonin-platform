@@ -82,6 +82,10 @@ async fn main() -> Result<()> {
         .with_env_filter(chain::log_filter())
         .with_target(false)
         .init();
+    // One TLS crypto provider for the process, chosen here: a dependency
+    // that leaves the choice to the process default panics when the build
+    // has turned two on.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let args = Args::parse();
     data::configure(args.hyperliquid_stream.clone().unwrap_or_else(|| {

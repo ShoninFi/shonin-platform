@@ -371,6 +371,10 @@ async fn wait_taken_on(
 /// event the agent wakes to.
 const NUDGE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How long after the seeded withdrawal is read as done its claim is still
+/// looked for, before the withdrawal is taken as paid from cash.
+const CLAIM_SEEN_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The funding rate the seed posts for the stand-in venue's perpetual while
 /// it waits, as a fraction of the mark a day: five times what
 /// `funding-basis` needs to start carrying (0.0002), and about what the local
@@ -463,6 +467,11 @@ async fn claim(
         .context("the seeded withdrawal")?;
     let request = client.read(vault, IVault::requestCountCall {}).await?;
     let mut booked = None;
+    // The request can be read as done a moment before the claim it booked:
+    // the two reads may land either side of the valuation, or on two
+    // endpoints a block apart. So a done request is taken as paid from cash
+    // only once the claim still isn't there a little later.
+    let mut done_since: Option<tokio::time::Instant> = None;
     let until = deadline(WAIT_SECONDS);
     while tokio::time::Instant::now() < until {
         let count = client
@@ -490,7 +499,10 @@ async fn claim(
             .await?
             .done
         {
-            bail!("the seeded withdrawal was paid from cash, so no claim was booked");
+            let since = *done_since.get_or_insert_with(tokio::time::Instant::now);
+            if since.elapsed() >= CLAIM_SEEN_WITHIN {
+                bail!("the seeded withdrawal was paid from cash, so no claim was booked");
+            }
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
