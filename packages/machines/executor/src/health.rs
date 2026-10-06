@@ -32,10 +32,12 @@ use crate::scale::{ASSET_DECIMALS, to_decimal};
 /// is Shonin's: what the agent's own transactions spend is billed to the tank
 /// through the meter, and what the platform sends with the key (its blessing,
 /// the venue's approval) is not billed to anyone. A development chain's coin
-/// is free; a testnet's comes from a faucet, so a key gets a hundredth of it
-/// there.
+/// is free. On a public chain the floor is small, since every vault's key
+/// holds one and the stake grows to three worst-case sends at the chain's own
+/// fees whenever that is more: on a cheap chain such as Base it is hundreds
+/// of sends, on a dear one the three sends decide.
 const GAS_STAKE_DEVELOPMENT: u128 = 1_000_000_000_000_000_000;
-const GAS_STAKE_PUBLIC: u128 = 10_000_000_000_000_000;
+const GAS_STAKE_PUBLIC: u128 = 500_000_000_000_000;
 
 /// The stake a key is given on this chain, before fees are counted.
 pub fn gas_stake(chain: &Client) -> u128 {
