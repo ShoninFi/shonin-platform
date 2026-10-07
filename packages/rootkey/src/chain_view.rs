@@ -167,15 +167,21 @@ impl RegistryView {
     }
 
     /// A read of the registry (or of a checker it lists) as of block `at`.
+    ///
+    /// A read some node answered at `at` makes `at` the newest block read
+    /// here: a head only counts once a node has served a read at it.
     async fn read_at<C: alloy::sol_types::SolCall>(
         &self,
         to: Address,
         call: C,
         at: u64,
     ) -> Result<C::Return> {
-        self.client
+        let returned = self
+            .client
             .read_at(to, call, alloy::eips::BlockId::number(at))
-            .await
+            .await?;
+        self.newest.fetch_max(at, Ordering::SeqCst);
+        Ok(returned)
     }
 
     /// Connect, read-only, to the EVM chain `chain` of `chains.toml`, with
@@ -220,6 +226,23 @@ impl RegistryView {
     }
 }
 
+/// Whether a read of a checker's Google keys failed because the checker
+/// names none: the call reverted (it has no such function), or what it
+/// returned is not a list of keys. Any other failure is the read not being
+/// answered.
+fn names_no_keys(error: &anyhow::Error) -> bool {
+    use alloy::transports::{RpcError, TransportErrorKind};
+    error.chain().any(|cause| {
+        cause.downcast_ref::<alloy::sol_types::Error>().is_some()
+            || matches!(
+                cause.downcast_ref::<RpcError<TransportErrorKind>>(),
+                Some(RpcError::ErrorResp(refusal))
+                    if refusal.code == 3
+                        || refusal.message.to_ascii_lowercase().contains("revert")
+            )
+    })
+}
+
 impl ChainView for RegistryView {
     fn chain_id(&self) -> u64 {
         self.chain_id
@@ -236,10 +259,11 @@ impl ChainView for RegistryView {
         );
         let head = self.client.block_number().await?;
         // A node behind the others answers with an older head: the decision
-        // is read at the newest block already acted on instead, which such a
-        // node hasn't reached, so it never answers it.
-        let newest = self.newest.fetch_max(head, Ordering::SeqCst);
-        Ok(head.max(newest))
+        // is read at the newest block already read at instead, which such a
+        // node hasn't reached, so it never answers it. The head said is not
+        // the floor until a read at it is answered ([`Self::read_at`]): a
+        // head no node can serve fails this decision, not every later one.
+        Ok(head.max(self.newest.load(Ordering::SeqCst)))
     }
 
     async fn trusted_google_keys(&self, at: u64) -> Result<Vec<[u8; 32]>> {
@@ -259,12 +283,15 @@ impl ChainView for RegistryView {
                 continue;
             }
             // A checker that names no Google keys (the development checker,
-            // which trusts a signature instead) adds none.
-            if let Ok(keys) = self
+            // which trusts a signature instead) adds none; a read no node
+            // answered fails the decision.
+            match self
                 .read_at(verifier, IGoogleKeys::trustedKeysCall {}, at)
                 .await
             {
-                trusted.extend(keys.into_iter().map(|key| key.0));
+                Ok(keys) => trusted.extend(keys.into_iter().map(|key| key.0)),
+                Err(error) if names_no_keys(&error) => {}
+                Err(error) => return Err(error),
             }
         }
         Ok(trusted)

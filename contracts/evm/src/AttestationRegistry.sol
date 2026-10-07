@@ -585,12 +585,13 @@ contract AttestationRegistry is IAttestationRegistry {
             if (rootSigner != record.signer || journal.issuedAt < record.issuedAt) {
                 revert RootKeyAlreadySet();
             }
-            // The same attestation again (same time, image and project) moves
-            // only to a newer checker, or off one no longer allowed, as a
-            // blessing does: replaying it changes nothing else.
+            // An attestation from the same second as the one recorded, from
+            // whatever image and project, moves the record only to a newer
+            // checker, or off one no longer allowed, as a blessing does: two
+            // attestations of one second can't be replayed in turn to bounce
+            // the record between images or back onto an older checker.
             if (
-                journal.issuedAt == record.issuedAt && journal.imageDigest == record.imageDigest
-                    && journal.projectId == record.projectId && isVerifierAllowed(record.verifier)
+                journal.issuedAt == record.issuedAt && isVerifierAllowed(record.verifier)
                     && !_isNewer(address(verifier), record.verifier)
             ) {
                 revert RootKeyAlreadySet();

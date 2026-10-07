@@ -330,7 +330,13 @@ tasks:
           --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" \
           --metadata-from-file="startup-script={{.PATH_ROOT}}/deploy/gcp/services/startup.sh,shonin-waker={{.PATH_ROOT}}/deploy/gcp/services/waker.sh" \
           --metadata="^~^shonin-api-image={{.GCP_REGISTRY}}/api@${api}~shonin-keeper-image={{.GCP_REGISTRY}}/keeper@${keeper}"
-        gcloud compute instances reset "shonin-services-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}"
+        # A stopped VM is started (it reads the new images at boot); a running
+        # one is reset, since a reset needs a running VM.
+        status=$(gcloud compute instances describe "shonin-services-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" --format='value(status)')
+        case "$status" in
+          TERMINATED|STOPPED|SUSPENDED) gcloud compute instances start "shonin-services-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" ;;
+          *) gcloud compute instances reset "shonin-services-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" ;;
+        esac
 
   deploy:prover:
     desc: "Create the prover's Spot VM (off when idle; the services VM's waker starts it) from the pushed prover image's digest, and let the services VM start it (NETWORK=testnet, TAG= the commit by default)"

@@ -537,6 +537,10 @@ impl<V: ChainView, R: Records, P: Peers> Holder<V, R, P> {
             self.empty_since = None;
             self.recorded = Some(record.signer);
             self.held_since = self.held_since.max(record.head);
+            // A cleared signer is retired for good: a block whose record names
+            // it rules out any clear at or before it, so the next search
+            // starts a few dozen blocks below it, not where the root was made.
+            self.searched_to(record.head);
             self.hold_recorded(&record);
             return Ok(if record.live {
                 Look::Serving(record.signer)
@@ -1210,6 +1214,34 @@ mod tests {
         assert_eq!(holder.look().await.unwrap(), Look::Serving(signer));
         assert!(holder.service.is_serving());
         assert!(!holder.attestation.root_leaf().unwrap().due);
+    }
+
+    /// A block whose record names the held root rules out any clear at or
+    /// before it (a cleared signer is retired for good): after a long run,
+    /// the first empty read searches the log from a few dozen blocks below
+    /// the newest such block, not from the block the root was made at.
+    #[tokio::test]
+    async fn the_clear_search_after_a_long_run_starts_near_the_newest_block_that_named_the_root() {
+        let (mut holder, stand, _) = holder();
+        let signer = make(&mut holder, &stand).await;
+        stand.set_at(40, recorded(signer));
+        assert_eq!(holder.look().await.unwrap(), Look::Serving(signer));
+        stand.set_at(200_000, recorded(signer));
+        assert_eq!(holder.look().await.unwrap(), Look::Serving(signer));
+
+        stand.set_at(200_001, Record::default());
+        assert_eq!(holder.look().await.unwrap(), Look::Unlogged(signer));
+        let searched = stand.0.lock().unwrap().searched.clone();
+        assert_eq!(
+            searched,
+            [(signer, 200_000 - SEARCH_AGAIN + 1, 200_001)],
+            "the search started where the root was made, not near the newest block that named it"
+        );
+
+        // A clear in the blocks still searched is found.
+        stand.log_clear(signer, 200_002);
+        stand.set_at(200_002, Record::default());
+        assert_eq!(holder.look().await.unwrap(), Look::Cleared(signer));
     }
 
     /// The admin's clear of the recorded root is in the chain's log: the
