@@ -208,7 +208,7 @@ contract RegistrySoundnessTest is Fixture {
     /// piece rounds down on its own, so the sum of pieces is at most the whole.
     function test_pieces_never_cost_more_than_the_whole() public view {
         Allowances memory a;
-        a.fuelPerSec = 1; // a millionth of a core, so rounding bites
+        a.fuelPerSec = 1; // the least fuel there is, so rounding bites
         a.gasPerDay = 7;
         uint64 t = uint64(vm.getBlockTimestamp());
         uint256 whole = prices.costOf(a, t, t + 1 days);

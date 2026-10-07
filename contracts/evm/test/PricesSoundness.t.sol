@@ -9,7 +9,7 @@ import {Fixture} from "./Fixture.sol";
 contract PricesSoundnessTest is Fixture {
     /// The Rust `Allowances::thinking()` shape, with no gas.
     function thinking() internal pure returns (Allowances memory a) {
-        a.fuelPerSec = 4_000_000;
+        a.fuelPerSec = 20_000_000;
         a.memoryMib = 512;
         a.requestsPerMin = 120;
         a.bytesPerDay = 500_000_000;
@@ -17,14 +17,15 @@ contract PricesSoundnessTest is Fixture {
         a.inferenceMsPerMin = 2000;
     }
 
-    /// `shared::manifest::Prices::daily_cap` for the thinking shape:
-    /// 4 × 0.15 × 24 + 0.5 × 0.01 × 24 + 0.5 × 0.15 + 2880 × 0.15/3600
-    /// = 14.4 + 0.12 + 0.075 + 0.12 = 14.715. The chain holds the inference
+    /// `shared::manifest::Prices::daily_cap` for the thinking shape, a
+    /// fiftieth of a core at a billion fuel a core-second:
+    /// 0.02 × 0.15 × 24 + 0.5 × 0.01 × 24 + 0.5 × 0.15 + 2880 × 0.15/3600
+    /// = 0.072 + 0.12 + 0.075 + 0.12 = 0.387. The chain holds the inference
     /// price truncated to 1e-18, so it lands one micro-dollar under.
     function test_a_day_at_the_thinking_shape_agrees_with_the_rust_formula() public view {
         uint256 cap = prices.dailyCost(thinking());
-        assertApproxEqAbs(cap, 14_715_000, 1);
-        assertLe(cap, 14_715_000, "rounds down, in the tank's favour");
+        assertApproxEqAbs(cap, 387_000, 1);
+        assertLe(cap, 387_000, "rounds down, in the tank's favour");
     }
 
     /// Integration across three periods equals the sum of the pieces, and
@@ -56,16 +57,16 @@ contract PricesSoundnessTest is Fixture {
         assertApproxEqAbs(whole, pieces, 3);
 
         // Each piece is a whole number of days at a known daily figure:
-        // p2 is 4 × 0.45 × 24 + 0.12 + 0.075 + 0.12 = $43.515 a day;
-        // p3 is 14.4 + 0 + 0.075 + 1.2 = $15.675 a day.
+        // p2 is 0.02 × 0.45 × 24 + 0.12 + 0.075 + 0.12 = $0.531 a day;
+        // p3 is 0.072 + 0 + 0.075 + 1.2 = $1.347 a day.
         vm.warp(c1); // p2 in force
         uint256 dayAtP2 = prices.dailyCost(a);
-        assertApproxEqAbs(dayAtP2, 43_515_000, 1);
+        assertApproxEqAbs(dayAtP2, 531_000, 1);
         assertApproxEqAbs(prices.costOf(a, c1, c2), 5 * dayAtP2, 5);
-        assertApproxEqAbs(prices.costOf(a, from, c1), 3 * 14_715_000, 3);
+        assertApproxEqAbs(prices.costOf(a, from, c1), 3 * 387_000, 3);
         vm.warp(c2); // p3 in force
-        assertApproxEqAbs(prices.dailyCost(a), 15_675_000, 1);
-        assertApproxEqAbs(prices.costOf(a, c2, to), 2 * 15_675_000, 2);
+        assertApproxEqAbs(prices.dailyCost(a), 1_347_000, 1);
+        assertApproxEqAbs(prices.costOf(a, c2, to), 2 * 1_347_000, 2);
         assertEq(prices.history().length, 3);
     }
 
@@ -85,7 +86,7 @@ contract PricesSoundnessTest is Fixture {
         skip(PRICE_NOTICE);
         assertEq(prices.current().vcpuHour, 4 * 0.15e18);
         Allowances memory a = allowancesCosting(0);
-        a.fuelPerSec = 1_000_000; // one core: $3.60 a day, $14.40 at 4×
+        a.fuelPerSec = FUEL_PER_CORE_SECOND; // one core: $3.60 a day, $14.40 at 4×
         assertEq(prices.costOf(a, change, change + 1 days), 14.4e6);
         assertEq(prices.costOf(a, change - 1 days, change), 3.6e6);
         PricePeriod[] memory h = prices.history();

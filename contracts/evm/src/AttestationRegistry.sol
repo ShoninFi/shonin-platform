@@ -6,7 +6,8 @@ import {
     IAttestationVerifier,
     Image,
     ImageKind,
-    KeyInfo
+    KeyInfo,
+    RootKeyRecord
 } from "./interfaces/IAttestationRegistry.sol";
 import {MerkleProof} from "openzeppelin/utils/cryptography/MerkleProof.sol";
 
@@ -14,7 +15,9 @@ import {MerkleProof} from "openzeppelin/utils/cryptography/MerkleProof.sol";
 ///
 /// An instance proves what it is, and gets a key blessed for exactly the work
 /// that image does: an executor or unwinder key for one vault and one bundle,
-/// a builder or a reviewer key for no vault at all. Everything downstream -- a
+/// a builder or a reviewer key for no vault at all. It also records the root
+/// key's public half, which an executor or a holder attests to the same way,
+/// so anyone can check a key derived from the root. Everything downstream -- a
 /// station approving a trading key, a registry accepting a build, a review
 /// being believed -- asks this contract and nothing else.
 ///
@@ -66,6 +69,21 @@ contract AttestationRegistry is IAttestationRegistry {
         address verifier;
     }
 
+    RootKeyRecord private _rootKey;
+    /// When the last record was cleared: only an attestation made after it
+    /// can set the next, so the cleared one can't be put back by replaying
+    /// its proof.
+    uint64 private _rootKeyClearedAt;
+    /// Every signer ever cleared. A clear is a rotation, or the root is
+    /// lost: either way that root is never trusted again, even from an
+    /// instance still allowed to run and still holding it.
+    mapping(address => bool) private _rootKeyRetired;
+
+    /// What the root leaf carries in place of a bundle, under no vault on no
+    /// vault chain. A key's leaf with no vault carries no bundle, and one
+    /// with a bundle names a vault, so no key's leaf is ever a root leaf.
+    bytes32 public constant ROOT_KEY_PURPOSE = keccak256("shonin:root-key:v1");
+
     /// The longest the timelock can be set to, so a slip of the admin's
     /// finger can't put everything out of reach for good.
     uint64 public constant MAX_TIMELOCK = 365 days;
@@ -107,6 +125,11 @@ contract AttestationRegistry is IAttestationRegistry {
     error NoKind();
     error NotThisInstance();
     error NoSigner();
+    error RootKeyAlreadySet();
+    error NoRootKey();
+    error WrongKindForRoot();
+    error RootKeyRetired();
+    error HolderBlessesNothing();
 
     constructor(
         address admin_,
@@ -389,15 +412,13 @@ contract AttestationRegistry is IAttestationRegistry {
         address key,
         bytes32[] calldata merkleProof
     ) external {
-        IAttestationVerifier verifier = _verifierFor(seal, journalBytes);
-        Journal memory journal = abi.decode(journalBytes, (Journal));
+        (IAttestationVerifier verifier, Journal memory journal, ImageKind kind) =
+            _attested(seal, journalBytes);
+        // A holder only holds the root, so no key of its is ever blessed.
+        if (kind == ImageKind.Holder) revert HolderBlessesNothing();
 
-        if (!isImageAllowed(journal.imageDigest)) revert ImageNotAllowed();
-        if (!isProjectAllowed(journal.projectId)) revert ProjectNotAllowed();
-        ImageKind kind = _image[journal.imageDigest].kind;
-
-        // The instance has to name itself, and the key has to be a key.
-        if (journal.signer == address(0) || key == address(0)) revert NoSigner();
+        // The key has to be a key.
+        if (key == address(0)) revert NoSigner();
         bool servesOneVault = kind == ImageKind.Executor || kind == ImageKind.Unwinder;
         if (
             servesOneVault
@@ -406,6 +427,9 @@ contract AttestationRegistry is IAttestationRegistry {
         ) {
             revert WrongKindForVault();
         }
+        // The root's purpose is never a bundle, so a root leaf can never
+        // bless a key, whatever the vault.
+        if (strategyHash == ROOT_KEY_PURPOSE) revert WrongKindForVault();
         // The key may act for this vault and this bundle only, on this chain
         // only, and the instance had to have said so, naming the key, before
         // it saw this transaction. A builder or a reviewer proves the leaf
@@ -417,8 +441,7 @@ contract AttestationRegistry is IAttestationRegistry {
 
         // A blessing runs from the attestation, so replaying an old one can
         // never extend it.
-        uint64 until = journal.issuedAt + blessingTtl;
-        if (journal.issuedAt > block.timestamp || until <= block.timestamp) revert Stale();
+        uint64 until = _fresh(journal);
 
         KeyInfo storage info = _key[key];
         if (
@@ -466,6 +489,29 @@ contract AttestationRegistry is IAttestationRegistry {
         emit Blessed(key, vaultChain, vault, strategyHash, journal.imageDigest, blessing.until);
     }
 
+    /// The proof accepted by an allowed checker, its journal, and the kind
+    /// its image is allowed as. The image and the project have to be
+    /// allowed, and the instance has to name itself.
+    function _attested(
+        bytes calldata seal,
+        bytes calldata journalBytes
+    ) private view returns (IAttestationVerifier verifier, Journal memory journal, ImageKind kind) {
+        verifier = _verifierFor(seal, journalBytes);
+        journal = abi.decode(journalBytes, (Journal));
+
+        if (!isImageAllowed(journal.imageDigest)) revert ImageNotAllowed();
+        if (!isProjectAllowed(journal.projectId)) revert ProjectNotAllowed();
+        kind = _image[journal.imageDigest].kind;
+        if (journal.signer == address(0)) revert NoSigner();
+    }
+
+    /// Until when an attestation counts: a TTL from when it was made. One
+    /// from the future, or one already past its TTL, counts for nothing.
+    function _fresh(Journal memory journal) private view returns (uint64 until) {
+        until = journal.issuedAt + blessingTtl;
+        if (journal.issuedAt > block.timestamp || until <= block.timestamp) revert Stale();
+    }
+
     /// Whether checker `a` was proposed after checker `b`.
     function _isNewer(address a, address b) private view returns (bool) {
         return _verifierPlace[a] > _verifierPlace[b];
@@ -500,6 +546,78 @@ contract AttestationRegistry is IAttestationRegistry {
             }
         }
         revert ProofRejected();
+    }
+
+    // The root key ----------------------------------------------------------
+
+    function setRootKey(
+        bytes calldata seal,
+        bytes calldata journalBytes,
+        address rootSigner,
+        bytes32[] calldata merkleProof
+    ) external {
+        (IAttestationVerifier verifier, Journal memory journal, ImageKind kind) =
+            _attested(seal, journalBytes);
+        // Only an executor, which holds the root today, or a holder made for
+        // it may vouch for the root.
+        if (kind != ImageKind.Executor && kind != ImageKind.Holder) revert WrongKindForRoot();
+        if (rootSigner == address(0)) revert NoSigner();
+        // The instance named the root's signer, on this chain, before it saw
+        // this transaction. The leaf is shaped like a key's leaf with no
+        // vault, but carries the root's purpose where a bundle would be.
+        bytes32 leaf = keccak256(
+            bytes.concat(
+                keccak256(abi.encode(uint256(0), address(0), ROOT_KEY_PURPOSE, block.chainid, rootSigner))
+            )
+        );
+        if (!MerkleProof.verify(merkleProof, journal.vaultsRoot, leaf)) revert NotAmongTheVaults();
+        _fresh(journal);
+        if (_rootKeyRetired[rootSigner]) revert RootKeyRetired();
+
+        RootKeyRecord storage record = _rootKey;
+        if (record.signer != address(0)) {
+            // The record moves only as a blessing does: the same signer, from
+            // an attestation no earlier than the one recorded, accepted by a
+            // newer checker, or by any allowed one once the checker it was
+            // recorded against is no longer allowed. Anything else waits for
+            // the admin to clear it.
+            if (
+                rootSigner != record.signer || journal.issuedAt < record.issuedAt
+                    || (isVerifierAllowed(record.verifier) && !_isNewer(address(verifier), record.verifier))
+            ) {
+                revert RootKeyAlreadySet();
+            }
+        } else if (journal.issuedAt <= _rootKeyClearedAt) {
+            revert Stale();
+        }
+        record.signer = rootSigner;
+        record.issuedAt = journal.issuedAt;
+        record.verifier = address(verifier);
+        record.setAt = uint64(block.timestamp);
+        record.imageDigest = journal.imageDigest;
+        record.projectId = journal.projectId;
+        emit RootKeySet(
+            rootSigner, journal.imageDigest, journal.projectId, address(verifier), journal.issuedAt
+        );
+    }
+
+    function clearRootKey() external onlyAdmin {
+        address signer = _rootKey.signer;
+        if (signer == address(0)) revert NoRootKey();
+        delete _rootKey;
+        _rootKeyRetired[signer] = true;
+        _rootKeyClearedAt = uint64(block.timestamp);
+        emit RootKeyCleared(signer);
+    }
+
+    function rootKey() external view returns (RootKeyRecord memory) {
+        return _rootKey;
+    }
+
+    function isRootKeyLive() external view returns (bool) {
+        RootKeyRecord storage root = _rootKey;
+        return root.signer != address(0) && isImageAllowed(root.imageDigest)
+            && isProjectAllowed(root.projectId) && isVerifierAllowed(root.verifier);
     }
 
     function keyInfo(address signer) external view returns (KeyInfo memory) {
