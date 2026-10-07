@@ -1144,8 +1144,10 @@ const TOGETHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600
 
 /// How many looks a second apart find a sent transaction unknown to every
 /// node before it is taken for dropped: a node behind the one that took it
-/// may not have seen it yet.
-const DROPPED_AFTER: u32 = 30;
+/// may not have seen it yet, and on HyperEVM a transaction waiting for a big
+/// block (about one a minute) is unknown to the nodes until it lands, so this
+/// spans three of them.
+const DROPPED_AFTER: u32 = 180;
 
 /// The key `from` is signed with here: the role's, derived from the
 /// testnet mnemonic, when it is set and derives `from`. `None` leaves the
