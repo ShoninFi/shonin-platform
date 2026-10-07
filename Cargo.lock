@@ -7070,6 +7070,7 @@ dependencies = [
  "serde_json",
  "shonin-chain",
  "shonin-indexer",
+ "shonin-rootkey",
  "shonin-shared",
  "tokio",
  "tower-http 0.7.1",

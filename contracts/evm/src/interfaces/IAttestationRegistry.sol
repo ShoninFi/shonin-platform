@@ -64,7 +64,8 @@ struct RootKeyRecord {
     uint64 issuedAt;
     /// The checker that accepted that proof.
     address verifier;
-    /// When it was last recorded: first set, or moved to a newer checker.
+    /// When it was last recorded: first set, or moved to a later
+    /// attestation or a newer checker.
     uint64 setAt;
     /// The image of the instance that last recorded it.
     bytes32 imageDigest;
@@ -146,16 +147,18 @@ interface IAttestationRegistry {
     /// blesses an executor's vault keys also carries its root. Anyone may
     /// send it.
     ///
-    /// It is recorded once. While a record is in place, another signer is
-    /// refused; the same signer is recorded again, from an attestation no
-    /// earlier than the recorded one, only through a checker newer than the
-    /// one that accepted it, or through any allowed checker once that one is
-    /// no longer allowed. So a checker rotation's overlap carries the record
-    /// past the old checker's retirement, and a re-attestation revives it
-    /// after its checker is retired, as each does a blessing. A
-    /// record has to be cleared before another root can be set, only an
-    /// attestation made after the clear can set it, and a cleared signer is
-    /// never recorded again.
+    /// While a record is in place, another signer is refused. The same
+    /// signer is recorded again from an attestation no earlier than the
+    /// recorded one, from any allowed executor or holder image and project,
+    /// through any allowed checker; the same attestation again (same time,
+    /// image and project) moves only to a newer checker, or off one no longer
+    /// allowed. So the record follows the root to another image that
+    /// received it by attested exchange, a checker rotation's overlap carries
+    /// it past the old checker's retirement, and a re-attestation revives it
+    /// after its image's successor or its checker takes over. A record has to
+    /// be cleared before another root can be set, only an attestation made
+    /// after the clear can set it, and a cleared signer is never recorded
+    /// again.
     function setRootKey(
         bytes calldata seal,
         bytes calldata journal,

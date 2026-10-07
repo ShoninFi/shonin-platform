@@ -55,6 +55,12 @@ const SETTLE: Duration = if cfg!(test) {
     Duration::from_secs(5)
 };
 
+/// The longest a token is held back while the root key's holder decides
+/// whether to make a root (see [`Attestation::await_root`]): two looks at
+/// the record, a later block apart, and their reads, with room to spare. A
+/// root that can't be decided holds the vault keys back no longer than this.
+pub const ROOT_DECIDED_WITHIN: Duration = Duration::from_secs(60);
+
 /// The blessing TTL assumed until a chain has said its own.
 const DEFAULT_TTL: u64 = 72 * 3600;
 
@@ -162,6 +168,9 @@ struct Inner {
     ttl: Option<u64>,
     /// When the tree last changed.
     changed: Option<Instant>,
+    /// While the root key's holder may be about to add the root's leaf:
+    /// until when no token is asked for.
+    root_pending: Option<Instant>,
 }
 
 /// The instance's attestation, shared by every chain's sweep and the status
@@ -610,6 +619,33 @@ impl Attestation {
         }
     }
 
+    /// The root key's holder may be about to make a root and add its leaf:
+    /// no token is asked for until it has decided ([`Attestation::root_decided`])
+    /// or `within` has passed, whichever is first, so a token asked for the
+    /// vault keys alone isn't superseded moments later by the tree with the
+    /// root's leaf, its proof wasted. Asked again while waiting, the first
+    /// deadline stands.
+    pub fn await_root(&self, within: Duration) {
+        let mut inner = self.inner();
+        if inner.root_pending.is_none() {
+            inner.root_pending = Some(Instant::now() + within);
+        }
+    }
+
+    /// The root key's holder has decided: the root's leaf is in the tree or
+    /// won't be added. Tokens are asked for as the tree wants them.
+    pub fn root_decided(&self) {
+        let mut inner = self.inner();
+        if inner.root_pending.take().is_some() {
+            self.changed.notify_one();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn root_pending(&self) -> bool {
+        self.inner().root_pending.is_some()
+    }
+
     /// Date no development seal earlier than `at`, by the chains' clocks: a
     /// root made after a record was cleared is recorded only from an
     /// attestation made after the clear, and a development seal is otherwise
@@ -830,6 +866,12 @@ impl Attestation {
         if inner
             .changed
             .is_some_and(|changed| changed.elapsed() < SETTLE)
+        {
+            return false;
+        }
+        if inner
+            .root_pending
+            .is_some_and(|until| Instant::now() < until)
         {
             return false;
         }
@@ -1866,6 +1908,32 @@ mod tests {
         attestation.remove_root();
         assert_eq!(attestation.binding().nonce(), without);
         assert!(attestation.status().root.is_none());
+    }
+
+    /// While the root key's holder may be about to add the root's leaf, no
+    /// token is asked for the vault keys alone, whose proof the root's leaf
+    /// would supersede moments later; once the holder has decided, or the
+    /// bound has passed, one is.
+    #[test]
+    fn no_token_is_asked_for_while_the_root_may_be_about_to_join_the_tree() {
+        let attestation = with(&[leaf(31337, 0x11, 0xa1)]);
+        std::thread::sleep(SETTLE * 2);
+        let clocks = BTreeMap::new();
+        assert!(attestation.wanted(NOW, &clocks));
+
+        attestation.await_root(Duration::from_secs(60));
+        assert!(!attestation.wanted(NOW, &clocks));
+        attestation.root_decided();
+        assert!(attestation.wanted(NOW, &clocks));
+
+        // A root that is never decided holds the vault keys back only as
+        // long as the bound.
+        attestation.await_root(Duration::from_millis(100));
+        assert!(!attestation.wanted(NOW, &clocks));
+        // Asked again while waiting, the first deadline stands.
+        attestation.await_root(Duration::from_secs(60));
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(attestation.wanted(NOW, &clocks));
     }
 
     /// A seal for a tree holding the root's signer alone is taken once a

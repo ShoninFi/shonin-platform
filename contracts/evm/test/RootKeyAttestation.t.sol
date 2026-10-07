@@ -8,8 +8,9 @@ import {Fixture} from "./Fixture.sol";
 
 /// The registry records the root key's public half once, from an attested
 /// executor or holder that committed to it among its leaves, and only the
-/// admin can clear it. The same root follows a checker rotation as a
-/// blessing does; a cleared root is never recorded again. The record is live
+/// admin can clear it. The same root follows a later attestation from any
+/// allowed executor or holder image, and a checker rotation as a blessing
+/// does; a cleared root is never recorded again. The record is live
 /// only while the image, the project and the checker that last recorded it
 /// are all still allowed.
 ///
@@ -477,7 +478,7 @@ contract RootKeyAttestationTest is Fixture {
         assertEq(record.verifier, address(verifier));
     }
 
-    function test_an_older_checker_cannot_move_the_root_back() public {
+    function test_the_same_attestation_through_an_older_checker_cannot_move_the_root_back() public {
         setRoot();
         newerChecker();
         bytes memory j = journalFor(EXECUTOR_IMAGE, instance, rootOf(leaves));
@@ -485,12 +486,18 @@ contract RootKeyAttestationTest is Fixture {
         address second = attestation.verifiers()[1];
         assertEq(attestation.rootKey().verifier, second);
 
-        // A later attestation that only the first checker accepts.
-        skip(1);
-        j = journalFor(EXECUTOR_IMAGE, instance, rootOf(leaves));
+        // The same attestation, as only the first checker accepts it.
         vm.expectRevert(AttestationRegistry.RootKeyAlreadySet.selector);
         attestation.setRootKey(sealOf(j), j, root, proofOf(leaves, 1));
         assertEq(attestation.rootKey().verifier, second);
+
+        // A later attestation of the same root is recorded through whichever
+        // allowed checker accepts it, as any later attestation is.
+        skip(1);
+        j = journalFor(EXECUTOR_IMAGE, instance, rootOf(leaves));
+        attestation.setRootKey(sealOf(j), j, root, proofOf(leaves, 1));
+        assertEq(attestation.rootKey().verifier, address(verifier));
+        assertEq(attestation.rootKey().issuedAt, uint64(block.timestamp));
     }
 
     function test_the_root_follows_a_retired_newest_checker_back_to_an_older_allowed_one_when_reattested()

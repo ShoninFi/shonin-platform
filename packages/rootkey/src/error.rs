@@ -9,6 +9,10 @@ pub enum Error {
     /// The part named is not well formed.
     #[error("the {0} is malformed")]
     Malformed(&'static str),
+    /// No image may ever be given this platform secret's key, so it is not
+    /// published.
+    #[error("no image may ever have the key for {0}, so it is not published")]
+    UnknownPlatformSecret(Purpose),
     /// The root is passed whole, between holders; it has no key pair.
     #[error("the root has no key pair of its own")]
     RootHasNoKeyPair,

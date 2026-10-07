@@ -576,14 +576,22 @@ contract AttestationRegistry is IAttestationRegistry {
 
         RootKeyRecord storage record = _rootKey;
         if (record.signer != address(0)) {
-            // The record moves only as a blessing does: the same signer, from
-            // an attestation no earlier than the one recorded, accepted by a
-            // newer checker, or by any allowed one once the checker it was
-            // recorded against is no longer allowed. Anything else waits for
-            // the admin to clear it.
+            // The record follows the root wherever it is attested: the same
+            // signer, from an attestation no earlier than the one recorded,
+            // from any allowed executor or holder image and project, through
+            // any allowed checker. So an image that received the root by
+            // attested exchange carries the record past its predecessor's
+            // revocation. Another signer waits for the admin to clear it.
+            if (rootSigner != record.signer || journal.issuedAt < record.issuedAt) {
+                revert RootKeyAlreadySet();
+            }
+            // The same attestation again (same time, image and project) moves
+            // only to a newer checker, or off one no longer allowed, as a
+            // blessing does: replaying it changes nothing else.
             if (
-                rootSigner != record.signer || journal.issuedAt < record.issuedAt
-                    || (isVerifierAllowed(record.verifier) && !_isNewer(address(verifier), record.verifier))
+                journal.issuedAt == record.issuedAt && journal.imageDigest == record.imageDigest
+                    && journal.projectId == record.projectId && isVerifierAllowed(record.verifier)
+                    && !_isNewer(address(verifier), record.verifier)
             ) {
                 revert RootKeyAlreadySet();
             }

@@ -184,6 +184,9 @@ async fn main() -> Result<()> {
             .and_then(|key| key.evm_chain_id())
     };
     let root_service = root_chain.map(|chain_id| {
+        // Until the holder has looked at the record, it may be about to make
+        // a root: the first token waits for that, a bounded while.
+        attestation.await_root(attestation::ROOT_DECIDED_WITHIN);
         let service = shonin_rootkey::Service::new(shonin_rootkey::NetworkView::new(chain_id));
         // Google's keys check a token only inside Confidential Space, where
         // there is a launcher to give one.

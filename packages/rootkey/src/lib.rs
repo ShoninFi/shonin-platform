@@ -52,7 +52,8 @@ pub mod sealed;
 pub use chain_view::{ChainView, ImageKind, NetworkView, RegistryView};
 pub use error::Error;
 pub use exchange::{
-    ExchangeRequest, Received, Release, Requester, VaultProof, authorise, exchange_nonce,
+    ExchangeRequest, Received, Release, Requester, VaultProof, authorise, authorise_at,
+    exchange_nonce,
 };
 pub use http::{Service, routes};
 pub use published::PublishedKey;

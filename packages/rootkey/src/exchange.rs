@@ -48,7 +48,7 @@ use zeroize::Zeroizing;
 
 use crate::Error;
 use crate::chain_view::{ChainView, ImageKind};
-use crate::purpose::{DUMMY, Purpose, REVIEWER_MODEL};
+use crate::purpose::{PLATFORM_SECRETS, Purpose};
 use crate::root::{KeyPair, Root};
 use crate::sealed::{Kem, PrivateKey, PublicKey, base64_bytes, hpke_open, hpke_seal};
 
@@ -335,7 +335,7 @@ pub fn permission(kind: ImageKind, purpose: &Purpose) -> Permission {
         (Executor | Unwinder, Purpose::Venue { .. }) => Permission::WithVaultProof,
         (Executor, Purpose::Bundle(_)) => Permission::WithVaultProof,
         (Builder, Purpose::Builder) => Permission::Granted,
-        (Reviewer, Purpose::Platform(name)) if name == REVIEWER_MODEL || name == DUMMY => {
+        (Reviewer, Purpose::Platform(name)) if PLATFORM_SECRETS.contains(&name.as_str()) => {
             Permission::Granted
         }
         _ => Permission::Never,
@@ -466,13 +466,29 @@ fn chain_unavailable(error: anyhow::Error) -> Error {
 ///
 /// `google_keys` are Google's signing keys as the caller last fetched them
 /// (only those an allowed checker trusts count); `now` is the holder's
-/// clock, in seconds.
+/// clock, in seconds. The canonical chain is read at one block
+/// ([`ChainView::pin`]).
 pub async fn authorise<V: ChainView>(
     root: &Root,
     google_keys: &[Jwk],
     request: &ExchangeRequest,
     now: u64,
     view: &V,
+) -> Result<Release, Error> {
+    let at = view.pin(view.chain_id()).await.map_err(chain_unavailable)?;
+    authorise_at(root, google_keys, request, now, view, at).await
+}
+
+/// [`authorise`], with every read of the canonical chain at block `at`, one
+/// [`ChainView::pin`] gave; a vault's own chain, when it is another, is
+/// pinned once for the decision too.
+pub async fn authorise_at<V: ChainView>(
+    root: &Root,
+    google_keys: &[Jwk],
+    request: &ExchangeRequest,
+    now: u64,
+    view: &V,
+    at: u64,
 ) -> Result<Release, Error> {
     let ephemeral = request.ephemeral_public.0;
     PublicKey::from_bytes(&ephemeral).map_err(|_| Error::Malformed("ephemeral key"))?;
@@ -483,18 +499,18 @@ pub async fn authorise<V: ChainView>(
 
     let nonce = exchange_nonce(&ephemeral, purpose);
     let trusted = view
-        .trusted_google_keys()
+        .trusted_google_keys(at)
         .await
         .map_err(chain_unavailable)?;
     let attested = check_token(&request.token, google_keys, &trusted, now, &nonce)?;
 
     let kind = view
-        .image_kind(attested.image_digest)
+        .image_kind(attested.image_digest, at)
         .await
         .map_err(chain_unavailable)?
         .ok_or(Error::ImageNotAllowed)?;
     if !view
-        .project_allowed(attested.project_id)
+        .project_allowed(attested.project_id, at)
         .await
         .map_err(chain_unavailable)?
     {
@@ -509,7 +525,7 @@ pub async fn authorise<V: ChainView>(
             });
         }
         Permission::Granted => {}
-        Permission::WithVaultProof => check_proof(request, &attested, view).await?,
+        Permission::WithVaultProof => check_proof(request, &attested, view, at).await?,
     }
 
     let secret: Zeroizing<Vec<u8>> = match purpose {
@@ -539,11 +555,13 @@ pub async fn authorise<V: ChainView>(
 /// (and a venue's purpose) names, so the blessing and the key's image are
 /// read from that chain's registry; a chain whose registry isn't read here
 /// is refused, never answered from another. The asker's image and project
-/// were judged on the canonical chain.
+/// were judged on the canonical chain, at block `canonical_at`; the vault's
+/// chain, when it is another, is pinned to one block for both its reads.
 async fn check_proof<V: ChainView>(
     request: &ExchangeRequest,
     attested: &Attested,
     view: &V,
+    canonical_at: u64,
 ) -> Result<(), Error> {
     let purpose = &request.purpose;
     let proof = request
@@ -564,12 +582,19 @@ async fn check_proof<V: ChainView>(
     if !view.reads_chain(proof.vault_chain) {
         return Err(Error::VaultChainNotRead(proof.vault_chain));
     }
+    let at = if proof.vault_chain == view.chain_id() {
+        canonical_at
+    } else {
+        view.pin(proof.vault_chain)
+            .await
+            .map_err(chain_unavailable)?
+    };
     let blessed = view
-        .is_blessed_for(key, proof.vault_chain, proof.vault, proof.strategy_hash)
+        .is_blessed_for(key, proof.vault_chain, proof.vault, proof.strategy_hash, at)
         .await
         .map_err(chain_unavailable)?;
     let image = view
-        .key_image(proof.vault_chain, key)
+        .key_image(proof.vault_chain, key, at)
         .await
         .map_err(chain_unavailable)?;
     if !blessed || image != Some(attested.image_digest) {

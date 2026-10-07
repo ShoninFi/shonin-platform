@@ -7,24 +7,28 @@
 //! | the record | the executor |
 //! | --- | --- |
 //! | empty, nothing held | once a later block shows it empty too, makes a root, and puts its signer's leaf in the instance's tree, so the next attestation carries it; the keeper relays `setRootKey` |
-//! | empty, a root held that was never seen recorded | waits for the keeper to relay it, unless the chain logged that signer's clear (recorded and cleared between two looks): then lets it go |
-//! | empty, a root held that was recorded | the admin cleared it: lets it go, and makes a new one as above |
+//! | empty, a root held | lets it go only once the chain's log shows that signer's clear (`RootKeyCleared`), then makes a new one as above; until then keeps it, serves nothing, and wants its leaf recorded (again) |
 //! | this instance's signer, live | serves the exchange and the published keys |
 //! | this instance's signer, not live | serves nothing derived, and says why |
-//! | another signer | lets go of any root it holds, asks its peers for the recorded one, and without one serves nothing, looking again every few minutes |
+//! | another signer, a root held | lets it go only once a block the chain treats as safe, no older than the newest that showed the held root current, records another signer; until then keeps it and serves nothing |
+//! | another signer, nothing held | asks its peers for the recorded one, and without one serves nothing, looking again every few minutes |
 //!
-//! A root is never made while a record names another signer, so two roots
-//! are never in use at once; and nothing derived from a root is served until
-//! the chain records its signer, so a root nobody can check is never used.
+//! A root is never made while a record names another signer, or while one
+//! is held, so two roots are never in use at once; and nothing derived from
+//! a root is served until the chain records its signer, so a root nobody can
+//! check is never used.
 //!
-//! The record is read whole as of one block, the head when it is read, and
-//! the holder remembers the newest block it acted on. An RPC name can front
-//! several nodes, some blocks behind the others: an answer from a block below
-//! the newest one acted on is from such a node, and is ignored. So the only
-//! copy of a recorded root is let go only when the record reads empty at a
-//! block at or past the one that showed it recorded (or when the chain
-//! logged its clear), and a root is made only when two reads, the second at
-//! a later block, both find the record empty.
+//! The only copy of a recorded root is never destroyed on the word of a read
+//! that could be undone. The record is read whole as of one block, the head
+//! when it is read, and the holder remembers the newest block it acted on:
+//! an RPC name can front several nodes, some blocks behind the others, and
+//! an answer from a block below the newest one acted on is from such a node,
+//! and is ignored. But the head itself can be reorganised, and a node can
+//! answer from a fork, at a block no older by number: a record that reads
+//! empty there, or names another signer, may be undone a few blocks later.
+//! So an empty record counts only with the clear in the chain's log, read
+//! through the log path that refuses a window no endpoint has reached; and
+//! another signer counts only once a safe block records it.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -48,6 +52,19 @@ const WAITING: Duration = Duration::from_secs(15);
 const HOLDING: Duration = Duration::from_secs(60);
 /// How often it is looked at while another signer is recorded.
 const ELSEWHERE: Duration = Duration::from_secs(180);
+/// How far below the head a clear's log is searched again at each look,
+/// once searched: a reorganisation shallower than this that brings a clear
+/// into a block already searched is still found.
+const SEARCH_AGAIN: u64 = 64;
+/// How far below the head a block is taken as safe, on a chain whose
+/// endpoints don't answer for the `safe` block. The record is read on the
+/// network's root chain, Base on the testnets, whose `safe` block is the
+/// newest one derived from batches its parent chain has included, so there
+/// this is never used. For a root chain that doesn't answer: 64 blocks is
+/// about two minutes of Base's two-second blocks and 16 seconds of an
+/// Arbitrum chain's quarter-second ones, deeper than either sequencer's
+/// head is reorganised in practice; HyperEVM's blocks are final once made.
+const SAFE_DEPTH: u64 = 64;
 /// How long Google's keys are kept before they are fetched again.
 const GOOGLE_KEYS_EVERY: Duration = Duration::from_secs(3600);
 /// The least time between two fetches of Google's keys, however often a
@@ -66,8 +83,9 @@ pub struct Record {
     pub live: bool,
     pub image_allowed: bool,
     pub project_allowed: bool,
-    /// Whether the checker it was recorded through is still allowed: if
-    /// not, a fresh attestation through another moves it.
+    /// Whether the checker it was recorded through is still allowed. While
+    /// it, the image or the project is not, a fresh attestation of the same
+    /// root moves the record.
     pub checker_allowed: bool,
     /// When the attestation it was recorded from runs out: its issue time
     /// and a blessing's TTL.
@@ -104,13 +122,17 @@ pub trait Records: Send + Sync {
     /// The record, every field read as of the head block when it is read.
     fn record(&self) -> impl Future<Output = Result<Record>> + Send;
     /// Whether the chain logged the clear of `signer` (`RootKeyCleared`) in
-    /// blocks `from` to `to`, both included.
+    /// blocks `from` to `to`, both included, read only from endpoints that
+    /// have reached `to`.
     fn cleared(
         &self,
         signer: Address,
         from: u64,
         to: u64,
     ) -> impl Future<Output = Result<bool>> + Send;
+    /// The signer the record names (zero for none) as of a block the chain
+    /// treats as safe, and that block's number.
+    fn safe_signer(&self) -> impl Future<Output = Result<(u64, Address)>> + Send;
 }
 
 /// The canonical chain's registry.
@@ -201,6 +223,33 @@ impl Records for OnChain {
             .context("looking for the root key's clear")?;
         Ok(!logs.is_empty())
     }
+
+    async fn safe_signer(&self) -> Result<(u64, Address)> {
+        use alloy::eips::{BlockId, BlockNumberOrTag};
+        use alloy::providers::Provider;
+        let named = self
+            .client
+            .provider()
+            .get_block(BlockId::Number(BlockNumberOrTag::Safe))
+            .await
+            .ok()
+            .flatten()
+            .map(|block| block.header.number);
+        let safe = match named {
+            Some(safe) => safe,
+            None => self.client.block_number().await?.saturating_sub(SAFE_DEPTH),
+        };
+        let record = self
+            .client
+            .read_at(
+                self.deployments.attestation,
+                IAttestationRegistry::rootKeyCall {},
+                BlockId::number(safe),
+            )
+            .await
+            .context("reading the root key's record at a safe block")?;
+        Ok((safe, record.signer))
+    }
 }
 
 /// Other holders, asked for the root the chain records.
@@ -285,13 +334,20 @@ pub enum Look {
     /// No record, confirmed at a later block than first seen, and nothing
     /// held: a root was made.
     Made(Address),
-    /// No record: the root held waits for the chain to record it.
+    /// No record: the root held, never seen recorded, waits for the chain to
+    /// record it.
     Waiting(Address),
-    /// The held root was cleared by the admin: its record, once seen, reads
-    /// empty at a block at or past the one that showed it, or the chain
-    /// logged its clear. It is let go, and a new root is made as from an
-    /// empty record.
+    /// The record, once seen naming the held root, reads empty, and the
+    /// chain's log shows no clear of it: a reorganisation, or a node on a
+    /// fork, may have undone the record. Kept, not served, and its leaf
+    /// wanted again in case the transaction that recorded it was lost.
+    Unlogged(Address),
+    /// The held root was cleared by the admin: the chain logged its clear.
+    /// It is let go, and a new root is made as from an empty record.
     Cleared(Address),
+    /// The record names another signer than the held root's, not yet at a
+    /// block the chain treats as safe: the held root is kept, not served.
+    Unconfirmed { held: Address, recorded: Address },
     /// The record names the held root, and is live: served.
     Serving(Address),
     /// The record names the held root, and is not live: nothing served.
@@ -312,7 +368,9 @@ impl Look {
             Look::Empty(_)
             | Look::Made(_)
             | Look::Waiting(_)
+            | Look::Unlogged(_)
             | Look::Cleared(_)
+            | Look::Unconfirmed { .. }
             | Look::Behind { .. } => WAITING,
             Look::Serving(_) | Look::NotLive(_) | Look::Received(_) => HOLDING,
             Look::Elsewhere(_) => ELSEWHERE,
@@ -329,10 +387,12 @@ pub struct Holder<V, R, P> {
     pub chain_id: u64,
     pub records: R,
     pub peers: P,
-    /// The held root's signer, once the chain has recorded it: a record
-    /// found empty after that (at a block no older, as every record acted on
-    /// is) means the root was cleared.
+    /// The held root's signer, once the chain has recorded it.
     recorded: Option<Address>,
+    /// The newest block that showed the held root current: the record empty
+    /// there when it was made, or naming it. Another signer counts only once
+    /// a safe block at or past it records one.
+    held_since: u64,
     /// The record as last acted on.
     last: Record,
     /// The newest block a record was acted on at. A record read at an older
@@ -342,8 +402,9 @@ pub struct Holder<V, R, P> {
     /// since it last named a signer: a root is made only once a later block
     /// shows it empty too.
     empty_since: Option<u64>,
-    /// While the root held waits to be recorded, the first block not yet
-    /// searched for its clear.
+    /// While a root is held, the first block to search for its clear from:
+    /// none can come before it was made or received, and each block is
+    /// searched again until it is [`SEARCH_AGAIN`] below the head.
     unsearched: u64,
 }
 
@@ -362,6 +423,7 @@ impl<V: ChainView, R: Records, P: Peers> Holder<V, R, P> {
             records,
             peers,
             recorded: None,
+            held_since: 0,
             last: Record::default(),
             newest: 0,
             empty_since: None,
@@ -377,6 +439,7 @@ impl<V: ChainView, R: Records, P: Peers> Holder<V, R, P> {
         self.service.hold(root);
         self.recorded = None;
         self.empty_since = None;
+        self.held_since = self.last.head;
         // The record was empty at this block, so anything that records this
         // root, or clears it, comes later.
         self.unsearched = self.last.head.saturating_add(1);
@@ -394,8 +457,26 @@ impl<V: ChainView, R: Records, P: Peers> Holder<V, R, P> {
 
     /// Read the record once, and act on it. A record that can't be read, or
     /// that was read at a block older than one already acted on, changes
-    /// nothing.
+    /// nothing; nor does a search of the log, or a read at a safe block, that
+    /// fails.
     pub async fn look(&mut self) -> Result<Look> {
+        let look = self.look_once().await?;
+        match look {
+            // Nothing held, the record empty: a root may be made at the next
+            // look, so the next token waits for it (a bounded while). A
+            // clear starts the same wait for the root made after it.
+            Look::Empty(_) | Look::Cleared(_) => self
+                .attestation
+                .await_root(crate::attestation::ROOT_DECIDED_WITHIN),
+            // A read from a node behind the head decides nothing.
+            Look::Behind { .. } => {}
+            _ => self.attestation.root_decided(),
+        }
+        Ok(look)
+    }
+
+    /// One look, as [`Holder::look`] says.
+    async fn look_once(&mut self) -> Result<Look> {
         let record = self.records.record().await?;
         if record.head < self.newest {
             return Ok(Look::Behind {
@@ -408,32 +489,37 @@ impl<V: ChainView, R: Records, P: Peers> Holder<V, R, P> {
             // The clear's log is searched before anything is acted on, so a
             // search that fails leaves everything as it was.
             let logged_clear = match held {
-                Some(signer) if self.recorded != Some(signer) => {
+                Some(signer) => {
                     self.records
                         .cleared(signer, self.unsearched, record.head)
                         .await?
                 }
-                _ => false,
+                None => false,
             };
             self.newest = record.head;
             self.last = record;
             self.service.set_serving(false);
             return Ok(match held {
-                // Recorded once and now gone, at a block no older than the
-                // one that showed it: cleared by the admin. Or never seen
-                // recorded, but its clear logged: recorded and cleared
-                // between two looks. That signer is refused for good, so it
-                // is let go, and a new root is made once a later block
-                // confirms the record empty.
-                Some(old) if self.recorded == Some(old) || logged_clear => {
+                // Cleared by the admin, whether or not it was seen recorded
+                // first: that signer is refused for good, so it is let go,
+                // and a new root is made once a later block confirms the
+                // record empty.
+                Some(old) if logged_clear => {
                     self.let_go();
                     self.empty_since = Some(record.head);
                     Look::Cleared(old)
                 }
+                // No clear logged: the root is kept, unserved, and no other
+                // is made. Its leaf is wanted, so the record is made again if
+                // whatever showed it was undone.
                 Some(signer) => {
-                    self.unsearched = self.unsearched.max(record.head.saturating_add(1));
+                    self.searched_to(record.head);
                     self.attestation.note_root(signer, true, 0);
-                    Look::Waiting(signer)
+                    if self.recorded == Some(signer) {
+                        Look::Unlogged(signer)
+                    } else {
+                        Look::Waiting(signer)
+                    }
                 }
                 None => match self.empty_since {
                     Some(first) if record.head > first => Look::Made(self.make()?),
@@ -445,11 +531,12 @@ impl<V: ChainView, R: Records, P: Peers> Holder<V, R, P> {
                 },
             });
         }
-        self.newest = record.head;
-        self.last = record;
-        self.empty_since = None;
         if held == Some(record.signer) {
+            self.newest = record.head;
+            self.last = record;
+            self.empty_since = None;
             self.recorded = Some(record.signer);
+            self.held_since = self.held_since.max(record.head);
             self.hold_recorded(&record);
             return Ok(if record.live {
                 Look::Serving(record.signer)
@@ -458,14 +545,37 @@ impl<V: ChainView, R: Records, P: Peers> Holder<V, R, P> {
             });
         }
         // Another signer is recorded: whatever is held here is not the root,
-        // and none is made while that record stands.
-        if held.is_some() {
+        // and none is made while that record stands. A root held is let go
+        // only once a safe block, no older than the newest that showed it
+        // current, records another signer.
+        if let Some(signer) = held {
+            let (safe, at_safe) = self.records.safe_signer().await?;
+            self.newest = record.head;
+            self.last = record;
+            self.empty_since = None;
+            let confirmed =
+                safe >= self.held_since && at_safe != Address::ZERO && at_safe != signer;
+            if !confirmed {
+                self.service.set_serving(false);
+                return Ok(Look::Unconfirmed {
+                    held: signer,
+                    recorded: record.signer,
+                });
+            }
             self.let_go();
+        } else {
+            self.newest = record.head;
+            self.last = record;
+            self.empty_since = None;
         }
         match self.peers.ask(record.signer).await {
             Some(root) if root.signer_address() == record.signer => {
                 self.service.hold(root);
                 self.recorded = Some(record.signer);
+                self.held_since = record.head;
+                // A clear of a root received comes after the block that
+                // showed it recorded, give or take a reorganisation.
+                self.unsearched = record.head.saturating_sub(SEARCH_AGAIN);
                 self.hold_recorded(&record);
                 Ok(Look::Received(record.signer))
             }
@@ -473,13 +583,27 @@ impl<V: ChainView, R: Records, P: Peers> Holder<V, R, P> {
         }
     }
 
-    /// The held root is the one recorded: its leaf stays in the tree (wanted
-    /// again only if its checker is retired), and it is served while the
-    /// record is live.
+    /// The log was searched for the held root's clear up to `head`: the next
+    /// search starts [`SEARCH_AGAIN`] blocks below it, or where it started,
+    /// whichever is later.
+    fn searched_to(&mut self, head: u64) {
+        let again = head.saturating_sub(SEARCH_AGAIN).saturating_add(1);
+        self.unsearched = self.unsearched.max(again);
+    }
+
+    /// The held root is the one recorded: its leaf stays in the tree, and it
+    /// is served while the record is live. The leaf is wanted again only
+    /// while the image, the project or the checker the record was made
+    /// through is no longer allowed: the registry moves the record to any
+    /// later attestation of the same root from an allowed image and project
+    /// through an allowed checker, so this instance's next one brings it
+    /// back. While the record is live, nothing is sent: another image
+    /// holding the same root doesn't take the record from one still allowed.
     fn hold_recorded(&self, record: &Record) {
         self.attestation.put_root(self.chain_id, record.signer);
+        let moves = !(record.image_allowed && record.project_allowed && record.checker_allowed);
         self.attestation
-            .note_root(record.signer, !record.checker_allowed, record.until);
+            .note_root(record.signer, moves, record.until);
         self.service.set_serving(record.live);
     }
 
@@ -532,9 +656,18 @@ fn say(look: Look, record: &Record) {
             %signer,
             "the root key waits for the canonical chain to record its signer"
         ),
+        Look::Unlogged(signer) => tracing::warn!(
+            %signer,
+            "the root key's record reads empty, but the chain logged no clear of it (a reorganisation, or a node on a fork, may have undone it): the root is kept, nothing derived from it is served, and its signer is offered for recording again"
+        ),
         Look::Cleared(old) => tracing::warn!(
             %old,
             "the root key's record was cleared: its root is let go, and a new one is made once a later block shows the record still empty"
+        ),
+        Look::Unconfirmed { held, recorded } => tracing::warn!(
+            %held,
+            %recorded,
+            "the root key's record names another signer, not yet at a safe block: the root held is kept until one does, and nothing derived from it is served"
         ),
         Look::Serving(signer) => tracing::info!(
             %signer,
@@ -610,6 +743,11 @@ mod tests {
         top: u64,
         /// Each clear logged: its signer and block.
         clears: Vec<(Address, u64)>,
+        /// The safe block and the signer recorded there; `None` while the
+        /// chain can't say.
+        safe: Option<(u64, Address)>,
+        /// How often the safe block was read.
+        safe_reads: usize,
         /// Each search for a clear: its signer and blocks.
         searched: Vec<(Address, u64, u64)>,
         clears_unreadable: bool,
@@ -640,6 +778,10 @@ mod tests {
         fn log_clear(&self, signer: Address, block: u64) {
             self.0.lock().unwrap().clears.push((signer, block));
         }
+        /// The chain's safe block is `block`, recording `signer` there.
+        fn safe(&self, block: u64, signer: Address) {
+            self.0.lock().unwrap().safe = Some((block, signer));
+        }
         fn top(&self) -> u64 {
             self.0.lock().unwrap().top
         }
@@ -666,6 +808,12 @@ mod tests {
                 .clears
                 .iter()
                 .any(|(cleared, at)| *cleared == signer && (from..=to).contains(at)))
+        }
+
+        async fn safe_signer(&self) -> Result<(u64, Address)> {
+            let mut chain = self.0.lock().unwrap();
+            chain.safe_reads += 1;
+            chain.safe.context("the stand-in chain names no safe block")
         }
     }
 
@@ -695,22 +843,32 @@ mod tests {
         fn reads_chain(&self, chain: u64) -> bool {
             chain == CANONICAL
         }
-        async fn trusted_google_keys(&self) -> Result<Vec<[u8; 32]>> {
+        async fn pin(&self, _: u64) -> Result<u64> {
+            Ok(self.0.top())
+        }
+        async fn trusted_google_keys(&self, _: u64) -> Result<Vec<[u8; 32]>> {
             Ok(Vec::new())
         }
-        async fn image_kind(&self, _: B256) -> Result<Option<ImageKind>> {
+        async fn image_kind(&self, _: B256, _: u64) -> Result<Option<ImageKind>> {
             Ok(None)
         }
-        async fn project_allowed(&self, _: B256) -> Result<bool> {
+        async fn project_allowed(&self, _: B256, _: u64) -> Result<bool> {
             Ok(false)
         }
-        async fn is_blessed_for(&self, _: Address, _: u64, _: Address, _: B256) -> Result<bool> {
+        async fn is_blessed_for(
+            &self,
+            _: Address,
+            _: u64,
+            _: Address,
+            _: B256,
+            _: u64,
+        ) -> Result<bool> {
             Ok(false)
         }
-        async fn key_image(&self, _: u64, _: Address) -> Result<Option<B256>> {
+        async fn key_image(&self, _: u64, _: Address, _: u64) -> Result<Option<B256>> {
             Ok(None)
         }
-        async fn live_root_signer(&self) -> Result<Option<Address>> {
+        async fn live_root_signer(&self, _: u64) -> Result<Option<Address>> {
             let record = self
                 .0
                 .peek()
@@ -777,7 +935,14 @@ mod tests {
     async fn with_no_record_a_root_is_made_and_its_signer_s_leaf_bound() {
         let (mut holder, stand, _) = holder();
         let before = holder.attestation.binding().nonce();
-        let signer = make(&mut holder, &stand).await;
+        // Until a root is made, the next token waits for it.
+        stand.set(Record::default());
+        assert!(matches!(holder.look().await.unwrap(), Look::Empty(_)));
+        assert!(holder.attestation.root_pending());
+        let Look::Made(signer) = holder.look().await.unwrap() else {
+            panic!("no root was made");
+        };
+        assert!(!holder.attestation.root_pending());
         assert_eq!(holder.service.signer(), Some(signer));
         let leaf = holder.attestation.root_leaf().expect("the root's leaf");
         assert_eq!(
@@ -949,14 +1114,130 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_root_held_is_let_go_once_another_signer_is_recorded() {
+    async fn a_root_held_is_let_go_once_a_safe_block_records_another_signer() {
         let (mut holder, stand, _) = holder();
         make(&mut holder, &stand).await;
         let other = Address::repeat_byte(0x0e);
         stand.set(recorded(other));
+        stand.safe(stand.top() + 1, other);
         assert_eq!(holder.look().await.unwrap(), Look::Elsewhere(other));
         assert!(!holder.service.holds_root());
         assert!(holder.attestation.root_leaf().is_none());
+    }
+
+    /// The head names another signer, but no safe block at or past the one
+    /// that last showed the held root current does: the head may yet be
+    /// reorganised, or the node be on a fork. The only copy of the recorded
+    /// root is kept, nothing derived from it is served, no peer is asked and
+    /// no root made, until a safe block confirms the other signer.
+    #[tokio::test]
+    async fn an_unconfirmed_other_signer_keeps_the_root() {
+        let (mut holder, stand, peers) = holder();
+        let signer = make(&mut holder, &stand).await;
+        stand.set_at(40, recorded(signer));
+        assert_eq!(holder.look().await.unwrap(), Look::Serving(signer));
+
+        let other = Address::repeat_byte(0x0e);
+        // A safe block that can't be read changes nothing.
+        stand.set_at(41, recorded(other));
+        assert!(holder.look().await.is_err());
+        assert!(holder.service.is_serving());
+        // The safe block still records the held root, or is older than the
+        // block that showed it recorded, or records nothing.
+        for (safe, at_safe) in [(41, signer), (39, other), (41, Address::ZERO)] {
+            stand.safe(safe, at_safe);
+            stand.set_at(41, recorded(other));
+            assert_eq!(
+                holder.look().await.unwrap(),
+                Look::Unconfirmed {
+                    held: signer,
+                    recorded: other
+                }
+            );
+            assert_eq!(holder.service.signer(), Some(signer));
+            assert!(!holder.service.is_serving());
+            assert!(!published_status(&holder.service).await);
+            assert_eq!(holder.attestation.root_leaf().unwrap().signer, signer);
+        }
+        assert_eq!(*peers.asked.lock().unwrap(), 0);
+
+        // The head was undone: the record names the held root again, served.
+        stand.set_at(42, recorded(signer));
+        assert_eq!(holder.look().await.unwrap(), Look::Serving(signer));
+        assert!(holder.service.is_serving());
+
+        // A safe block past that one records the other signer: let go.
+        stand.safe(43, other);
+        stand.set_at(44, recorded(other));
+        assert_eq!(holder.look().await.unwrap(), Look::Elsewhere(other));
+        assert!(!holder.service.holds_root());
+        assert_eq!(*peers.asked.lock().unwrap(), 1);
+    }
+
+    /// The record names the held root at one block and reads empty at later
+    /// ones, with no clear in the chain's log: the transaction that recorded
+    /// it was undone by a reorganisation, or the node answering is on a fork.
+    /// The root is kept, not served, offered for recording again, and no new
+    /// root is made however many empty reads follow; once the record names
+    /// it again, it is served again.
+    #[tokio::test]
+    async fn an_empty_read_after_a_reorg_keeps_the_root() {
+        let (mut holder, stand, _) = holder();
+        let signer = make(&mut holder, &stand).await;
+        stand.set_at(40, recorded(signer));
+        assert_eq!(holder.look().await.unwrap(), Look::Serving(signer));
+        assert!(!holder.attestation.root_leaf().unwrap().due);
+
+        for head in 41..45 {
+            stand.set_at(head, Record::default());
+            assert_eq!(holder.look().await.unwrap(), Look::Unlogged(signer));
+            assert_eq!(holder.service.signer(), Some(signer));
+            assert!(!holder.service.is_serving());
+            assert!(!published_status(&holder.service).await);
+            let leaf = holder.attestation.root_leaf().unwrap();
+            assert_eq!((leaf.signer, leaf.due), (signer, true));
+        }
+        // Every block from the one the root was made after was searched.
+        let searched = stand.0.lock().unwrap().searched.clone();
+        assert!(
+            searched
+                .iter()
+                .all(|(who, from, _)| *who == signer && *from <= 41)
+        );
+        assert_eq!(searched.last().unwrap().2, 44);
+
+        stand.set_at(45, recorded(signer));
+        assert_eq!(holder.look().await.unwrap(), Look::Serving(signer));
+        assert!(holder.service.is_serving());
+        assert!(!holder.attestation.root_leaf().unwrap().due);
+    }
+
+    /// The admin's clear of the recorded root is in the chain's log: the
+    /// root is let go, and a new one made once a later block shows the
+    /// record still empty.
+    #[tokio::test]
+    async fn a_logged_clear_lets_the_recorded_root_go() {
+        let (mut holder, stand, _) = holder();
+        let signer = make(&mut holder, &stand).await;
+        stand.set_at(40, recorded(signer));
+        assert_eq!(holder.look().await.unwrap(), Look::Serving(signer));
+
+        // A search of the log that fails changes nothing.
+        stand.log_clear(signer, 41);
+        stand.0.lock().unwrap().clears_unreadable = true;
+        stand.set_at(41, Record::default());
+        assert!(holder.look().await.is_err());
+        assert_eq!(holder.service.signer(), Some(signer));
+        stand.0.lock().unwrap().clears_unreadable = false;
+
+        assert_eq!(holder.look().await.unwrap(), Look::Cleared(signer));
+        assert!(!holder.service.holds_root());
+        assert!(holder.attestation.root_leaf().is_none());
+        stand.set_at(42, Record::default());
+        let Look::Made(new) = holder.look().await.unwrap() else {
+            panic!("no root was made after the clear");
+        };
+        assert_ne!(new, signer);
     }
 
     #[tokio::test]
@@ -971,6 +1252,7 @@ mod tests {
         // a later block shows the record still empty.
         stand.set(recorded(first));
         holder.look().await.unwrap();
+        stand.log_clear(first, stand.top() + 1);
         stand.set(Record {
             at: 1_700_000_500,
             ..Record::default()
@@ -1020,9 +1302,12 @@ mod tests {
         assert_eq!(holder.look().await.unwrap(), Look::Cleared(signer));
         assert!(!holder.service.holds_root());
         assert!(holder.attestation.root_leaf().is_none());
+        // Searched from the block the root was made after (blocks this near
+        // the head are searched again, in case a reorganisation moved the
+        // clear).
         let searched = stand.0.lock().unwrap().searched.clone();
         assert_eq!(searched[0], (signer, made_at + 1, waited_at));
-        assert_eq!(searched.last().unwrap().1, waited_at + 1);
+        assert_eq!(searched.last().unwrap().1, made_at + 1);
 
         stand.set(Record::default());
         let Look::Made(new) = holder.look().await.unwrap() else {

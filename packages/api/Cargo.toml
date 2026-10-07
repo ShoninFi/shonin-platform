@@ -21,6 +21,9 @@ devnet = ["chain/devnet"]
 shared.workspace = true
 chain = { workspace = true, features = ["args"] }
 indexer.workspace = true
+# A purpose's canonical spelling, and which platform secrets are ever
+# released, as the root key service decides them.
+shonin-rootkey = { path = "../rootkey" }
 alloy.workspace = true
 anyhow.workspace = true
 axum.workspace = true

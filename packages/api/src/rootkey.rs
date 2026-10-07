@@ -16,7 +16,11 @@
 //! answer is kept for [`KEEP`] and passed on again from here (a published
 //! key is public, and checked against the chain by whoever seals to it), and
 //! no more than [`MOST_AT_ONCE`] are asked of the executor at a time; one
-//! more is answered busy.
+//! more is answered busy. A purpose is asked for only in its one canonical
+//! spelling, so each is kept once; at most [`MOST_KEPT`] are kept, and a new
+//! one takes the place of the one asked for least recently, so a flood of
+//! purposes can't keep a real one from being kept. A platform secret no
+//! image is ever given is refused here, as the executor would refuse it.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -42,7 +46,7 @@ pub const KEEP: Duration = Duration::from_secs(30);
 /// The most published keys asked of the executor at once.
 pub const MOST_AT_ONCE: usize = 4;
 /// The most purposes whose answers are kept at once.
-const MOST_KEPT: usize = 1024;
+pub const MOST_KEPT: usize = 1024;
 
 /// An answer of the executor's, as it is passed on.
 #[derive(Clone)]
@@ -51,11 +55,20 @@ struct Answer {
     body: axum::body::Bytes,
 }
 
+/// A purpose's answer as kept: when the executor gave it, and when it was
+/// last asked for.
+struct Kept {
+    asked_at: Instant,
+    used_at: Instant,
+    answer: Answer,
+}
+
 /// The published keys' relays: each purpose's answer as last asked, and the
 /// relays to the executor in flight.
 pub struct Relays {
     keep: Duration,
-    kept: Mutex<HashMap<String, (Instant, Answer)>>,
+    most: usize,
+    kept: Mutex<HashMap<String, Kept>>,
     at_once: tokio::sync::Semaphore,
 }
 
@@ -68,40 +81,67 @@ impl Default for Relays {
 impl Relays {
     /// Answers kept for `keep`, and at most `at_once` asked at a time.
     pub fn new(keep: Duration, at_once: usize) -> Relays {
+        Relays::bounded(keep, at_once, MOST_KEPT)
+    }
+
+    /// As [`Relays::new`], with at most `most` purposes' answers kept.
+    pub fn bounded(keep: Duration, at_once: usize, most: usize) -> Relays {
         Relays {
             keep,
+            most: most.max(1),
             kept: Mutex::new(HashMap::new()),
             at_once: tokio::sync::Semaphore::new(at_once),
         }
     }
 
     fn kept(&self, purpose: &str, now: Instant) -> Option<Answer> {
-        let kept = self
+        let mut kept = self
             .kept
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        kept.get(purpose)
-            .filter(|(at, _)| now.duration_since(*at) < self.keep)
-            .map(|(_, answer)| answer.clone())
+        let entry = kept
+            .get_mut(purpose)
+            .filter(|entry| now.duration_since(entry.asked_at) < self.keep)?;
+        entry.used_at = now;
+        Some(entry.answer.clone())
     }
 
+    /// Keep `purpose`'s answer. With the table full, what has run out goes
+    /// first, and then the purpose asked for least recently.
     fn keep(&self, purpose: &str, now: Instant, answer: Answer) {
         let mut kept = self
             .kept
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if kept.len() >= MOST_KEPT {
-            kept.retain(|_, (at, _)| now.duration_since(*at) < self.keep);
+        if !kept.contains_key(purpose) && kept.len() >= self.most {
+            kept.retain(|_, entry| now.duration_since(entry.asked_at) < self.keep);
+            while kept.len() >= self.most {
+                let Some(oldest) = kept
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.used_at)
+                    .map(|(purpose, _)| purpose.clone())
+                else {
+                    break;
+                };
+                kept.remove(&oldest);
+            }
         }
-        if kept.len() < MOST_KEPT || kept.contains_key(purpose) {
-            kept.insert(purpose.to_string(), (now, answer));
-        }
+        kept.insert(
+            purpose.to_string(),
+            Kept {
+                asked_at: now,
+                used_at: now,
+                answer,
+            },
+        );
     }
 
     /// The executor's answer for `purpose`'s published key at
     /// `{executor}/rootkey/published/{purpose}`: as kept, if it was asked in
     /// the last [`KEEP`]; otherwise asked now, unless as many are in flight
-    /// as may be (503, to ask again in a moment).
+    /// as may be (503, to ask again in a moment). `purpose` is taken as
+    /// given: the public route passes only a canonical spelling
+    /// ([`canonical`]).
     pub async fn published(
         &self,
         http: &reqwest::Client,
@@ -143,13 +183,40 @@ pub async fn published(
     State(service): State<Arc<Service>>,
     UrlPath(purpose): UrlPath<String>,
 ) -> Response {
-    if !is_purpose(&purpose) {
-        return (StatusCode::BAD_REQUEST, "that is not a purpose").into_response();
-    }
+    let purpose = match canonical(&purpose) {
+        Ok(purpose) => purpose,
+        Err(refused) => return refused.into_response(),
+    };
     service
         .rootkey
         .published(&service.http, &service.executor, &purpose)
         .await
+}
+
+/// `text` as a purpose in its one canonical spelling, as the root key
+/// service writes it (`venue:998:0x…:hyperliquid`, never `venue:+998:…` or
+/// `venue:0998:…`), or the refusal to answer with: 400 for anything else,
+/// and 404 for a platform secret no image is ever given, whose key is never
+/// published.
+pub fn canonical(text: &str) -> Result<String, (StatusCode, String)> {
+    let not = || (StatusCode::BAD_REQUEST, "that is not a purpose".to_string());
+    if !is_purpose(text) {
+        return Err(not());
+    }
+    let purpose: shonin_rootkey::Purpose = text.parse().map_err(|_| not())?;
+    if purpose.to_string() != text {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("that is not a purpose's canonical spelling: ask for {purpose}"),
+        ));
+    }
+    if purpose.is_unknown_platform_secret() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no image may ever have the key for {purpose}, so it is not published"),
+        ));
+    }
+    Ok(purpose.to_string())
 }
 
 /// Whether `text` could be a purpose's string form (`platform:dummy`,
@@ -396,6 +463,63 @@ mod tests {
         assert_eq!(served, MOST_AT_ONCE);
         assert_eq!(busy, MOST_AT_ONCE * 2);
         assert_eq!(asked.lock().unwrap().len(), MOST_AT_ONCE);
+    }
+
+    /// The table is full of purposes asked for once: a new one takes the
+    /// place of the one asked for least recently, and one asked for since
+    /// stays kept.
+    #[tokio::test]
+    async fn a_full_table_lets_go_of_the_purpose_asked_for_least_recently() {
+        let (executor, asked) = an_executor(StatusCode::OK, KEY.into(), Duration::ZERO).await;
+        let http = reqwest::Client::new();
+        let relays = Relays::bounded(Duration::from_secs(60), MOST_AT_ONCE, 3);
+        for purpose in ["builder", "platform:dummy", "platform:reviewer-model"] {
+            relays.published(&http, &executor, purpose).await;
+        }
+        // The first is asked for again, so the second is now the least
+        // recently asked for.
+        relays.published(&http, &executor, "builder").await;
+        assert_eq!(asked.lock().unwrap().len(), 3);
+        relays.published(&http, &executor, "root").await;
+        assert_eq!(asked.lock().unwrap().len(), 4);
+        // Still kept: the first and the third, and the new one.
+        for purpose in ["builder", "platform:reviewer-model", "root"] {
+            relays.published(&http, &executor, purpose).await;
+        }
+        assert_eq!(asked.lock().unwrap().len(), 4);
+        // Let go of: the second, asked of the executor again.
+        relays.published(&http, &executor, "platform:dummy").await;
+        assert_eq!(asked.lock().unwrap().len(), 5);
+        assert_eq!(
+            asked.lock().unwrap().last().unwrap(),
+            "/rootkey/published/platform:dummy"
+        );
+    }
+
+    /// Only a purpose's canonical spelling is asked for, so one purpose is
+    /// kept once however it is spelled; a platform secret no image is ever
+    /// given is refused without asking.
+    #[test]
+    fn a_purpose_is_asked_for_only_in_its_canonical_spelling() {
+        let vault = "0x1111111111111111111111111111111111111111";
+        for good in [
+            "platform:dummy".to_string(),
+            "builder".to_string(),
+            format!("venue:998:{vault}:hyperliquid"),
+            format!("bundle:0x{}", "5b".repeat(32)),
+        ] {
+            assert_eq!(canonical(&good).ok(), Some(good.clone()), "{good}");
+        }
+        for (spelling, status) in [
+            (format!("venue:+998:{vault}:hyperliquid"), 400),
+            (format!("venue:0998:{vault}:hyperliquid"), 400),
+            ("platform:not-a-secret".to_string(), 404),
+            ("platform:..".to_string(), 400),
+            ("nonsense".to_string(), 400),
+        ] {
+            let (refused, _) = canonical(&spelling).expect_err(&spelling);
+            assert_eq!(refused.as_u16(), status, "{spelling}");
+        }
     }
 
     #[test]

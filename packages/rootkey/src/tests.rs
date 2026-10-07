@@ -124,17 +124,22 @@ impl ChainView for StandIn {
         self.chains.contains(&chain)
     }
 
-    async fn trusted_google_keys(&self) -> Result<Vec<[u8; 32]>> {
+    async fn pin(&self, chain: u64) -> Result<u64> {
+        self.read(chain)?;
+        Ok(1)
+    }
+
+    async fn trusted_google_keys(&self, _: u64) -> Result<Vec<[u8; 32]>> {
         self.up()?;
         Ok(self.trusted.clone())
     }
 
-    async fn image_kind(&self, image_digest: B256) -> Result<Option<ImageKind>> {
+    async fn image_kind(&self, image_digest: B256, _: u64) -> Result<Option<ImageKind>> {
         self.up()?;
         Ok(self.images.get(&image_digest).copied())
     }
 
-    async fn project_allowed(&self, project_id: B256) -> Result<bool> {
+    async fn project_allowed(&self, project_id: B256, _: u64) -> Result<bool> {
         self.up()?;
         Ok(self.projects.contains(&project_id))
     }
@@ -145,6 +150,7 @@ impl ChainView for StandIn {
         vault_chain: u64,
         vault: Address,
         strategy_hash: B256,
+        _: u64,
     ) -> Result<bool> {
         self.read(vault_chain)?;
         Ok(self
@@ -152,12 +158,12 @@ impl ChainView for StandIn {
             .contains(&(vault_chain, key, vault_chain, vault, strategy_hash)))
     }
 
-    async fn key_image(&self, chain: u64, key: Address) -> Result<Option<B256>> {
+    async fn key_image(&self, chain: u64, key: Address, _: u64) -> Result<Option<B256>> {
         self.read(chain)?;
         Ok(self.key_images.get(&(chain, key)).copied())
     }
 
-    async fn live_root_signer(&self) -> Result<Option<Address>> {
+    async fn live_root_signer(&self, _: u64) -> Result<Option<Address>> {
         self.up()?;
         Ok(*self.live_root.lock().unwrap())
     }
@@ -1375,4 +1381,38 @@ async fn every_request_reads_the_root_key_s_liveness_from_the_chain_uncached() {
     assert_eq!(service.published(&purpose).await, Err(Error::NotServing));
     assert_eq!(node.asked_live.load(Ordering::SeqCst), 6);
     assert_eq!(node.asked_record.load(Ordering::SeqCst), 4);
+}
+
+/// Only the platform secrets an image may ever be given have their keys
+/// published: a key for any other name would have something sealed to it
+/// that nobody can ever open.
+#[tokio::test]
+async fn only_the_platform_secrets_an_image_may_be_given_are_published() {
+    let chain = StandIn::new();
+    let service = crate::Service::new(chain.clone());
+    let root = Root::for_tests(7);
+    chain.record_root(Some(root.signer_address()));
+    service.hold(root);
+    service.set_serving(true);
+    for name in [REVIEWER_MODEL, DUMMY] {
+        let purpose = Purpose::platform(name).unwrap();
+        assert!(service.published(&purpose).await.is_ok(), "{name}");
+    }
+    let unknown = Purpose::platform("anything-else").unwrap();
+    assert_eq!(
+        service.published(&unknown).await,
+        Err(Error::UnknownPlatformSecret(unknown.clone()))
+    );
+    let app = crate::routes(service.clone());
+    let answer = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::get("/rootkey/published/platform:anything-else")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(answer.status(), 404);
+    // Every other kind of purpose is published as before.
+    assert!(service.published(&Purpose::Builder).await.is_ok());
 }

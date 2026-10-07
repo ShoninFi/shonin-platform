@@ -12,6 +12,9 @@ use crate::Error;
 pub const REVIEWER_MODEL: &str = "reviewer-model";
 /// A secret of no value, sealed to prove sealing and release end to end.
 pub const DUMMY: &str = "dummy";
+/// Every platform secret an image may ever be given: the only ones whose
+/// keys are published.
+pub const PLATFORM_SECRETS: [&str; 2] = [REVIEWER_MODEL, DUMMY];
 
 /// The longest name a venue or a platform secret may have.
 pub const MAX_NAME: usize = 64;
@@ -103,6 +106,12 @@ impl Purpose {
                 out
             }
         }
+    }
+
+    /// Whether the purpose is a platform secret no image may ever be given:
+    /// its key is never published, so nothing is sealed to it in vain.
+    pub fn is_unknown_platform_secret(&self) -> bool {
+        matches!(self, Purpose::Platform(name) if !PLATFORM_SECRETS.contains(&name.as_str()))
     }
 
     /// Whether the purpose's names are well formed: a purpose built by hand

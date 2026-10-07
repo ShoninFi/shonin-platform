@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use shonin_attestation_core::Jwk;
 
 use crate::chain_view::ChainView;
-use crate::exchange::{ExchangeRequest, Release, authorise};
+use crate::exchange::{ExchangeRequest, Release, authorise_at};
 use crate::published::PublishedKey;
 use crate::purpose::Purpose;
 use crate::root::Root;
@@ -135,14 +135,20 @@ impl<V: ChainView> Service<V> {
     }
 
     /// The root, while it is held and served, and the canonical chain, read
-    /// now, still records its signer as the live root key.
-    async fn served_root(&self) -> Result<Arc<Root>, Error> {
+    /// at a block pinned now, still records its signer as the live root key;
+    /// with that block, for the rest of the decision to read at.
+    async fn served_root(&self) -> Result<(Arc<Root>, u64), Error> {
         let root = self.root().ok_or(Error::NoRoot)?;
         if !self.is_serving() {
             return Err(Error::NotServing);
         }
-        match self.inner.view.live_root_signer().await {
-            Ok(Some(signer)) if signer == root.signer_address() => Ok(root),
+        let view = &self.inner.view;
+        let at = view
+            .pin(view.chain_id())
+            .await
+            .map_err(|_| Error::ChainUnavailable)?;
+        match view.live_root_signer(at).await {
+            Ok(Some(signer)) if signer == root.signer_address() => Ok((root, at)),
             Ok(_) => Err(Error::NotServing),
             Err(_) => Err(Error::ChainUnavailable),
         }
@@ -180,10 +186,15 @@ impl<V: ChainView> Service<V> {
     }
 
     /// The purpose's public key, signed for the canonical chain, while the
-    /// root is served.
+    /// root is served. A platform secret no image may ever be given is not
+    /// published.
     pub async fn published(&self, purpose: &Purpose) -> Result<PublishedKey, Error> {
+        if purpose.is_unknown_platform_secret() {
+            return Err(Error::UnknownPlatformSecret(purpose.clone()));
+        }
         self.served_root()
             .await?
+            .0
             .publish(purpose, self.inner.view.chain_id())
     }
 
@@ -203,14 +214,14 @@ impl<V: ChainView> Service<V> {
 
     /// Decide an exchange request at `now`, while the root is served.
     pub async fn exchange_at(&self, request: &ExchangeRequest, now: u64) -> Result<Release, Error> {
-        let root = self.served_root().await?;
+        let (root, at) = self.served_root().await?;
         let keys = self
             .inner
             .google_keys
             .read()
             .expect("the keys' lock")
             .clone();
-        let decided = authorise(&root, &keys, request, now, &self.inner.view).await;
+        let decided = authorise_at(&root, &keys, request, now, &self.inner.view, at).await;
         if matches!(
             decided,
             Err(Error::Token(shonin_attestation_core::Error::UnknownKey))
@@ -225,6 +236,7 @@ impl<V: ChainView> Service<V> {
 pub fn status_of(error: &Error) -> StatusCode {
     match error {
         Error::Malformed(_) | Error::RootHasNoKeyPair => StatusCode::BAD_REQUEST,
+        Error::UnknownPlatformSecret(_) => StatusCode::NOT_FOUND,
         Error::ChainUnavailable
         | Error::VaultChainNotRead(_)
         | Error::NoRoot
