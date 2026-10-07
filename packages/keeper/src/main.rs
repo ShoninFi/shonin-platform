@@ -341,11 +341,7 @@ async fn keep_keys(
                         deployments: &deployments,
                         keeper,
                     };
-                    let blessed =
-                        attest::round(&registry, client.chain_id, &published, &mut blessings, at)
-                            .await
-                            .map(|_| ());
-                    let recorded = attest::root_round(
+                    attest::look(
                         &registry,
                         client.chain_id,
                         canonical,
@@ -354,8 +350,6 @@ async fn keep_keys(
                         at,
                     )
                     .await
-                    .map(|_| ());
-                    blessed.and(recorded)
                 }
                 Err(error) => {
                     blessings.looked(at);

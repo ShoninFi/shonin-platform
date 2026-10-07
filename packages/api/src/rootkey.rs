@@ -10,8 +10,17 @@
 //! seals to it, against the signer the canonical chain records
 //! (`shonin-seal` does). It only passes the answer on, bounded in size and
 //! time, and asks the executor for nothing but these two paths.
+//!
+//! The executor reads the canonical chain to answer each published key, so
+//! the public route can't be let spend its chain reads: each purpose's
+//! answer is kept for [`KEEP`] and passed on again from here (a published
+//! key is public, and checked against the chain by whoever seals to it), and
+//! no more than [`MOST_AT_ONCE`] are asked of the executor at a time; one
+//! more is answered busy.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path as UrlPath, State};
 use axum::http::{StatusCode, header};
@@ -27,6 +36,97 @@ pub const MOST_BYTES: usize = 16 * 1024;
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest purpose asked for: a venue's, with its chain, vault and name.
 const MOST_PURPOSE: usize = 160;
+/// How long the executor's answer for a purpose's published key is passed
+/// on again without asking it.
+pub const KEEP: Duration = Duration::from_secs(30);
+/// The most published keys asked of the executor at once.
+pub const MOST_AT_ONCE: usize = 4;
+/// The most purposes whose answers are kept at once.
+const MOST_KEPT: usize = 1024;
+
+/// An answer of the executor's, as it is passed on.
+#[derive(Clone)]
+struct Answer {
+    status: StatusCode,
+    body: axum::body::Bytes,
+}
+
+/// The published keys' relays: each purpose's answer as last asked, and the
+/// relays to the executor in flight.
+pub struct Relays {
+    keep: Duration,
+    kept: Mutex<HashMap<String, (Instant, Answer)>>,
+    at_once: tokio::sync::Semaphore,
+}
+
+impl Default for Relays {
+    fn default() -> Relays {
+        Relays::new(KEEP, MOST_AT_ONCE)
+    }
+}
+
+impl Relays {
+    /// Answers kept for `keep`, and at most `at_once` asked at a time.
+    pub fn new(keep: Duration, at_once: usize) -> Relays {
+        Relays {
+            keep,
+            kept: Mutex::new(HashMap::new()),
+            at_once: tokio::sync::Semaphore::new(at_once),
+        }
+    }
+
+    fn kept(&self, purpose: &str, now: Instant) -> Option<Answer> {
+        let kept = self
+            .kept
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        kept.get(purpose)
+            .filter(|(at, _)| now.duration_since(*at) < self.keep)
+            .map(|(_, answer)| answer.clone())
+    }
+
+    fn keep(&self, purpose: &str, now: Instant, answer: Answer) {
+        let mut kept = self
+            .kept
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if kept.len() >= MOST_KEPT {
+            kept.retain(|_, (at, _)| now.duration_since(*at) < self.keep);
+        }
+        if kept.len() < MOST_KEPT || kept.contains_key(purpose) {
+            kept.insert(purpose.to_string(), (now, answer));
+        }
+    }
+
+    /// The executor's answer for `purpose`'s published key at
+    /// `{executor}/rootkey/published/{purpose}`: as kept, if it was asked in
+    /// the last [`KEEP`]; otherwise asked now, unless as many are in flight
+    /// as may be (503, to ask again in a moment).
+    pub async fn published(
+        &self,
+        http: &reqwest::Client,
+        executor: &str,
+        purpose: &str,
+    ) -> Response {
+        if let Some(answer) = self.kept(purpose, Instant::now()) {
+            return pass_on(answer);
+        }
+        let Ok(_asking) = self.at_once.try_acquire() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "5")],
+                "the root key service is busy: ask again in a moment",
+            )
+                .into_response();
+        };
+        let url = format!("{executor}/rootkey/published/{purpose}");
+        let Some(answer) = ask(http, &url, TIMEOUT).await else {
+            return unavailable();
+        };
+        self.keep(purpose, Instant::now(), answer.clone());
+        pass_on(answer)
+    }
+}
 
 /// `GET /api/rootkey`.
 pub async fn status(State(service): State<Arc<Service>>) -> Response {
@@ -46,12 +146,10 @@ pub async fn published(
     if !is_purpose(&purpose) {
         return (StatusCode::BAD_REQUEST, "that is not a purpose").into_response();
     }
-    relay(
-        &service.http,
-        &format!("{}/rootkey/published/{purpose}", service.executor),
-        TIMEOUT,
-    )
-    .await
+    service
+        .rootkey
+        .published(&service.http, &service.executor, &purpose)
+        .await
 }
 
 /// Whether `text` could be a purpose's string form (`platform:dummy`,
@@ -73,7 +171,19 @@ pub fn is_purpose(text: &str) -> bool {
 /// refusal (400, 403, 404, 503) with its status and reason, anything else,
 /// an answer too long or too slow, or no answer, as 502.
 pub async fn relay(http: &reqwest::Client, url: &str, timeout: Duration) -> Response {
-    let unavailable = || (StatusCode::BAD_GATEWAY, "the executor is unavailable").into_response();
+    match ask(http, url, timeout).await {
+        Some(answer) => pass_on(answer),
+        None => unavailable(),
+    }
+}
+
+fn unavailable() -> Response {
+    (StatusCode::BAD_GATEWAY, "the executor is unavailable").into_response()
+}
+
+/// The executor's answer at `url`, if it is one to pass on: a success, or a
+/// refusal (400, 403, 404, 503), within [`MOST_BYTES`] and `timeout`.
+async fn ask(http: &reqwest::Client, url: &str, timeout: Duration) -> Option<Answer> {
     let asked = async {
         let mut reply = http.get(url).send().await.ok()?;
         if reply
@@ -92,19 +202,20 @@ pub async fn relay(http: &reqwest::Client, url: &str, timeout: Duration) -> Resp
         }
         Some((status, body))
     };
-    let Ok(Some((status, body))) = tokio::time::timeout(timeout, asked).await else {
-        return unavailable();
+    let (status, body) = tokio::time::timeout(timeout, asked).await.ok()??;
+    matches!(status.as_u16(), 200 | 400 | 403 | 404 | 503).then(|| Answer {
+        status,
+        body: body.into(),
+    })
+}
+
+fn pass_on(answer: Answer) -> Response {
+    let kind = if answer.status == StatusCode::OK {
+        "application/json"
+    } else {
+        "text/plain; charset=utf-8"
     };
-    match status.as_u16() {
-        200 => ([(header::CONTENT_TYPE, "application/json")], body).into_response(),
-        code @ (400 | 403 | 404 | 503) => (
-            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            body,
-        )
-            .into_response(),
-        _ => unavailable(),
-    }
+    (answer.status, [(header::CONTENT_TYPE, kind)], answer.body).into_response()
 }
 
 #[cfg(test)]
@@ -203,6 +314,88 @@ mod tests {
         .await;
         let answer = relay(&http, &format!("{executor}/rootkey"), TIMEOUT).await;
         assert_eq!(answer.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// The public route never has the executor read the chain more than
+    /// once per purpose per [`KEEP`]: a purpose's answer is passed on again
+    /// from here while it is kept, and asked again once it has run out.
+    #[tokio::test]
+    async fn a_purpose_s_published_key_is_asked_of_the_executor_once_while_kept() {
+        let (executor, asked) = an_executor(StatusCode::OK, KEY.into(), Duration::ZERO).await;
+        let http = reqwest::Client::new();
+        let relays = Relays::new(Duration::from_millis(300), MOST_AT_ONCE);
+        for _ in 0..5 {
+            let (status, body) =
+                body_of(relays.published(&http, &executor, "platform:dummy").await).await;
+            assert_eq!((status, body.as_str()), (StatusCode::OK, KEY));
+        }
+        assert_eq!(asked.lock().unwrap().len(), 1);
+        // Another purpose is its own answer.
+        relays.published(&http, &executor, "builder").await;
+        assert_eq!(asked.lock().unwrap().len(), 2);
+        // Once it has run out, asked again.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        relays.published(&http, &executor, "platform:dummy").await;
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [
+                "/rootkey/published/platform:dummy",
+                "/rootkey/published/builder",
+                "/rootkey/published/platform:dummy"
+            ]
+        );
+
+        // A refusal is kept the same way; no answer at all is not kept.
+        let (refusing, asked) = an_executor(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not serving".into(),
+            Duration::ZERO,
+        )
+        .await;
+        for _ in 0..3 {
+            let answer = relays.published(&http, &refusing, "platform:dummy-2").await;
+            assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        assert_eq!(asked.lock().unwrap().len(), 1);
+        for _ in 0..2 {
+            let answer = relays
+                .published(&http, "http://127.0.0.1:1", "platform:dummy-3")
+                .await;
+            assert_eq!(answer.status(), StatusCode::BAD_GATEWAY);
+        }
+    }
+
+    /// However many purposes are asked at once, no more than
+    /// [`MOST_AT_ONCE`] reach the executor together; the rest are answered
+    /// busy at once.
+    #[tokio::test]
+    async fn no_more_published_keys_than_the_bound_are_asked_of_the_executor_at_once() {
+        let (executor, asked) =
+            an_executor(StatusCode::OK, KEY.into(), Duration::from_millis(500)).await;
+        let http = reqwest::Client::new();
+        let relays = Arc::new(Relays::default());
+        let mut asking = tokio::task::JoinSet::new();
+        for each in 0..(MOST_AT_ONCE * 3) {
+            let (relays, http, executor) = (relays.clone(), http.clone(), executor.clone());
+            asking.spawn(async move {
+                relays
+                    .published(&http, &executor, &format!("platform:p{each}"))
+                    .await
+                    .status()
+            });
+        }
+        let mut answered = Vec::new();
+        while let Some(status) = asking.join_next().await {
+            answered.push(status.unwrap());
+        }
+        let served = answered.iter().filter(|s| **s == StatusCode::OK).count();
+        let busy = answered
+            .iter()
+            .filter(|s| **s == StatusCode::SERVICE_UNAVAILABLE)
+            .count();
+        assert_eq!(served, MOST_AT_ONCE);
+        assert_eq!(busy, MOST_AT_ONCE * 2);
+        assert_eq!(asked.lock().unwrap().len(), MOST_AT_ONCE);
     }
 
     #[test]

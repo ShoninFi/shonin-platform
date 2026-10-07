@@ -50,14 +50,21 @@ fn image_claim(digest: B256) -> String {
     format!("sha256:{}", hex::encode(digest))
 }
 
-/// The canonical chain, as a test arranges it.
+/// The chains, as a test arranges them: the canonical chain's allowlists
+/// and root record, and each chain's own registry of blessings, read per
+/// chain as the holder reads them.
 #[derive(Clone)]
 struct StandIn {
     trusted: Vec<[u8; 32]>,
     images: HashMap<B256, ImageKind>,
     projects: HashSet<B256>,
-    blessed: HashSet<(Address, u64, Address, B256)>,
-    key_images: HashMap<Address, B256>,
+    /// The chains whose registries are read.
+    chains: HashSet<u64>,
+    /// Each chain's blessings: (the chain whose registry holds it, key,
+    /// vault chain, vault, bundle).
+    blessed: HashSet<(u64, Address, u64, Address, B256)>,
+    /// Each chain's record of the image a key was blessed from.
+    key_images: HashMap<(u64, Address), B256>,
     /// The root key's signer while its record is live, shared by every
     /// clone so a test can change it under a service.
     live_root: std::sync::Arc<std::sync::Mutex<Option<Address>>>,
@@ -73,6 +80,7 @@ impl StandIn {
                 fixture::PROJECT,
             ))]
             .into(),
+            chains: [CANONICAL, VAULT_CHAIN].into(),
             blessed: HashSet::new(),
             key_images: HashMap::new(),
             live_root: Default::default(),
@@ -80,10 +88,20 @@ impl StandIn {
         }
     }
 
-    /// Bless `key` for the sample vault and bundle, from `kind`'s image.
+    /// Bless `key` for the sample vault and bundle, from `kind`'s image, on
+    /// the vault's own chain's registry, where a vault key is blessed: the
+    /// canonical chain's never hears of it.
     fn bless(&mut self, key: Address, kind: ImageKind) {
-        self.blessed.insert((key, VAULT_CHAIN, vault(), strategy()));
-        self.key_images.insert(key, digest_of(kind));
+        self.blessed
+            .insert((VAULT_CHAIN, key, VAULT_CHAIN, vault(), strategy()));
+        self.key_images.insert((VAULT_CHAIN, key), digest_of(kind));
+    }
+
+    /// The registry on `chain`, if it is read.
+    fn read(&self, chain: u64) -> Result<()> {
+        self.up()?;
+        anyhow::ensure!(self.chains.contains(&chain), "chain {chain} is not read");
+        Ok(())
     }
 
     /// The record names `signer` as the live root key, or nothing.
@@ -100,6 +118,10 @@ impl StandIn {
 impl ChainView for StandIn {
     fn chain_id(&self) -> u64 {
         CANONICAL
+    }
+
+    fn reads_chain(&self, chain: u64) -> bool {
+        self.chains.contains(&chain)
     }
 
     async fn trusted_google_keys(&self) -> Result<Vec<[u8; 32]>> {
@@ -124,15 +146,15 @@ impl ChainView for StandIn {
         vault: Address,
         strategy_hash: B256,
     ) -> Result<bool> {
-        self.up()?;
+        self.read(vault_chain)?;
         Ok(self
             .blessed
-            .contains(&(key, vault_chain, vault, strategy_hash)))
+            .contains(&(vault_chain, key, vault_chain, vault, strategy_hash)))
     }
 
-    async fn key_image(&self, key: Address) -> Result<Option<B256>> {
-        self.up()?;
-        Ok(self.key_images.get(&key).copied())
+    async fn key_image(&self, chain: u64, key: Address) -> Result<Option<B256>> {
+        self.read(chain)?;
+        Ok(self.key_images.get(&(chain, key)).copied())
     }
 
     async fn live_root_signer(&self) -> Result<Option<Address>> {
@@ -1211,4 +1233,146 @@ fn the_routes_mount_over_the_registry(
     service: crate::Service<crate::RegistryView>,
 ) -> axum::Router {
     crate::routes(service)
+}
+
+/// The canonical chain's node, as far as the root key's record goes: it
+/// answers `isRootKeyLive()` and `rootKey()` from what a test sets, and
+/// counts how often each was asked.
+#[derive(Default)]
+struct RecordNode {
+    live: std::sync::atomic::AtomicBool,
+    signer: std::sync::Mutex<Address>,
+    asked_live: std::sync::atomic::AtomicUsize,
+    asked_record: std::sync::atomic::AtomicUsize,
+}
+
+async fn record_node(node: std::sync::Arc<RecordNode>) -> String {
+    use alloy::sol_types::SolCall;
+    use chain::bindings::attestation::{IAttestationRegistry, RootKeyRecord};
+    use std::sync::atomic::Ordering;
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::post(move |axum::Json(request): axum::Json<Value>| {
+            let node = node.clone();
+            async move {
+                let id = request["id"].clone();
+                let answer = |result: Value| json!({"jsonrpc": "2.0", "id": id, "result": result});
+                let refuse = || {
+                    json!({"jsonrpc": "2.0", "id": request["id"].clone(),
+                        "error": {"code": -32601, "message": "not answered here"}})
+                };
+                axum::Json(match request["method"].as_str().unwrap_or_default() {
+                    "eth_chainId" => answer(json!(format!("0x{CANONICAL:x}"))),
+                    "eth_blockNumber" => answer(json!("0x10")),
+                    "eth_call" => {
+                        let call = &request["params"][0];
+                        let data = call["input"]
+                            .as_str()
+                            .or_else(|| call["data"].as_str())
+                            .unwrap_or_default();
+                        let input = alloy::hex::decode(data).unwrap_or_default();
+                        let selector: [u8; 4] = input
+                            .get(..4)
+                            .and_then(|head| head.try_into().ok())
+                            .unwrap_or_default();
+                        let out = match selector {
+                            IAttestationRegistry::isRootKeyLiveCall::SELECTOR => {
+                                node.asked_live.fetch_add(1, Ordering::SeqCst);
+                                IAttestationRegistry::isRootKeyLiveCall::abi_encode_returns(
+                                    &node.live.load(Ordering::SeqCst),
+                                )
+                            }
+                            IAttestationRegistry::rootKeyCall::SELECTOR => {
+                                node.asked_record.fetch_add(1, Ordering::SeqCst);
+                                IAttestationRegistry::rootKeyCall::abi_encode_returns(
+                                    &RootKeyRecord {
+                                        signer: *node.signer.lock().unwrap(),
+                                        issuedAt: NOW,
+                                        verifier: Address::repeat_byte(0xcc),
+                                        setAt: NOW,
+                                        imageDigest: digest_of(ImageKind::Executor),
+                                        projectId: B256::repeat_byte(0x9a),
+                                    },
+                                )
+                            }
+                            _ => return axum::Json(refuse()),
+                        };
+                        answer(json!(alloy::hex::encode_prefixed(out)))
+                    }
+                    _ => refuse(),
+                })
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    url
+}
+
+/// Read through the registry reader the holder uses, every published key
+/// and every exchange asks the chain for the record's liveness and signer
+/// again: nothing is kept from one request to the next, so a root revoked or
+/// cleared on the chain releases nothing from the very next request, with
+/// no look by the holder in between.
+#[tokio::test]
+async fn every_request_reads_the_root_key_s_liveness_from_the_chain_uncached() {
+    use std::sync::atomic::Ordering;
+    let node = std::sync::Arc::new(RecordNode::default());
+    let url = record_node(node.clone()).await;
+    let config = chain::ChainConfig {
+        label: "canonical".to_string(),
+        rpc: url.clone(),
+        ws: None,
+        dollar: "USDC".to_string(),
+        native_usd: None,
+        public_rpc: url,
+        logs_rpc: None,
+        log_range: None,
+        confirmations: None,
+    };
+    let client = chain::Client::connect(&config, chain::Signing::ReadOnly)
+        .await
+        .unwrap();
+    let view = crate::RegistryView::new(client, Address::repeat_byte(0xa7), CANONICAL);
+    let service = crate::Service::new(view);
+    service.set_google_keys(google_keys());
+    let root = Root::for_tests(7);
+    *node.signer.lock().unwrap() = root.signer_address();
+    node.live.store(true, Ordering::SeqCst);
+    service.hold(root);
+    service.set_serving(true);
+    let purpose = Purpose::platform(DUMMY).unwrap();
+
+    for asked in 1..=3 {
+        assert!(service.published(&purpose).await.is_ok());
+        assert_eq!(node.asked_live.load(Ordering::SeqCst), asked);
+        assert_eq!(node.asked_record.load(Ordering::SeqCst), asked);
+    }
+
+    // Revoked on the chain: the holder still says serve, and the next
+    // request is refused, published key and exchange alike.
+    node.live.store(false, Ordering::SeqCst);
+    assert!(service.is_serving());
+    assert_eq!(service.published(&purpose).await, Err(Error::NotServing));
+    assert_eq!(node.asked_live.load(Ordering::SeqCst), 4);
+    let requester = Requester::new(purpose.clone()).unwrap();
+    let mut claims = fixture::claims(&Binding::default(), NOW - 5);
+    claims["eat_nonce"] = json!([requester.nonce()]);
+    let request = requester.request(fixture::sign(&claims), None);
+    assert_eq!(
+        service.exchange_at(&request, NOW).await.err(),
+        Some(Error::NotServing)
+    );
+    assert_eq!(node.asked_live.load(Ordering::SeqCst), 5);
+
+    // Live again but naming another signer (cleared and remade elsewhere):
+    // refused too, read afresh.
+    node.live.store(true, Ordering::SeqCst);
+    *node.signer.lock().unwrap() = Address::repeat_byte(0x0e);
+    assert_eq!(service.published(&purpose).await, Err(Error::NotServing));
+    assert_eq!(node.asked_live.load(Ordering::SeqCst), 6);
+    assert_eq!(node.asked_record.load(Ordering::SeqCst), 4);
 }

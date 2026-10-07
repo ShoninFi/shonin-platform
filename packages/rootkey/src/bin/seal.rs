@@ -24,6 +24,10 @@ use clap::Parser;
 use shonin_rootkey::{ChainView, PublishedKey, Purpose, RegistryView, seal};
 use zeroize::Zeroizing;
 
+/// The most a published key's answer may be: its JSON is a few hundred
+/// bytes.
+const MOST_PUBLISHED_BYTES: usize = 16 * 1024;
+
 #[derive(Parser)]
 #[command(about = "Seal a file to a purpose's published key, checked against the chain's root")]
 struct Args {
@@ -93,18 +97,20 @@ async fn main() -> Result<()> {
         || args.published.starts_with("https://")
     {
         // A bounded fetch: the key is checked below, so where it came from
-        // needs no trust, only an answer in reasonable time.
-        reqwest::Client::new()
+        // needs no trust, only an answer of reasonable size in reasonable
+        // time.
+        let answer = reqwest::Client::new()
             .get(&args.published)
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
             .context("fetching the published key")?
             .error_for_status()
-            .context("fetching the published key")?
-            .json()
+            .context("fetching the published key")?;
+        let body = shonin_rootkey::body::read_at_most(answer, MOST_PUBLISHED_BYTES)
             .await
-            .context("the published key is not a published key's JSON")?
+            .context("fetching the published key")?;
+        serde_json::from_slice(&body).context("the published key is not a published key's JSON")?
     } else {
         let text = std::fs::read_to_string(&args.published)
             .with_context(|| format!("reading {}", args.published))?;

@@ -1,13 +1,19 @@
-//! What the holder asks the canonical chain before releasing anything.
+//! What the holder asks the chains before releasing anything.
 //!
-//! The chain is the only authority on which images may receive which keys:
-//! adding an image, a project or a checker is timelocked and public there.
-//! [`ChainView`] is what the exchange reads; [`RegistryView`] reads it from
-//! the canonical chain's `AttestationRegistry`, and tests use a stand-in.
+//! The canonical chain is the only authority on which images may receive
+//! which keys: adding an image, a project or a checker is timelocked and
+//! public there. A vault key, though, is blessed on its vault's own chain,
+//! so whether a key is blessed for a vault, and from which image, is read
+//! from the registry on that vault's chain, and never from another.
+//! [`ChainView`] is what the exchange reads; [`RegistryView`] reads one
+//! chain's `AttestationRegistry`, [`NetworkView`] puts the canonical chain's
+//! together with each vault chain's, and tests use a stand-in.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 use alloy::primitives::{Address, B256, U256};
 use anyhow::{Context, Result};
@@ -53,8 +59,9 @@ impl ImageKind {
     }
 }
 
-/// The canonical chain, as the exchange reads it. Every answer is as of
-/// now; an error means nothing could be decided, and nothing is released.
+/// The chains, as the exchange reads them: the canonical chain for who may
+/// have what, and a vault's own chain for its blessings. Every answer is as
+/// of now; an error means nothing could be decided, and nothing is released.
 pub trait ChainView: Send + Sync {
     /// The canonical chain's id, which published keys are signed for.
     fn chain_id(&self) -> u64;
@@ -73,7 +80,13 @@ pub trait ChainView: Send + Sync {
     /// Whether the operator project is allowed now.
     fn project_allowed(&self, project_id: B256) -> impl Future<Output = Result<bool>> + Send;
 
-    /// Whether `key` is blessed for the vault and bundle now.
+    /// Whether the registry on chain `chain` is read here. A vault on a
+    /// chain that isn't has its keys refused: its blessings are never read
+    /// from another chain's registry.
+    fn reads_chain(&self, chain: u64) -> bool;
+
+    /// Whether `key` is blessed for the vault and bundle now, read from the
+    /// registry on the vault's own chain, `vault_chain`.
     fn is_blessed_for(
         &self,
         key: Address,
@@ -82,8 +95,13 @@ pub trait ChainView: Send + Sync {
         strategy_hash: B256,
     ) -> impl Future<Output = Result<bool>> + Send;
 
-    /// The image `key` was last blessed from, if it has been.
-    fn key_image(&self, key: Address) -> impl Future<Output = Result<Option<B256>>> + Send;
+    /// The image `key` was last blessed from, if it has been, read from the
+    /// registry on chain `chain`.
+    fn key_image(
+        &self,
+        chain: u64,
+        key: Address,
+    ) -> impl Future<Output = Result<Option<B256>>> + Send;
 
     /// The root key's recorded signer while the record is live
     /// (`isRootKeyLive()`), or `None`: none recorded, or cleared, or its
@@ -98,7 +116,9 @@ alloy::sol! {
     }
 }
 
-/// The canonical chain's `AttestationRegistry`, read through a client.
+/// One chain's `AttestationRegistry`, read through a client. As a
+/// [`ChainView`] it reads that chain alone: for the canonical chain's own
+/// vaults, and for anything that asks only the canonical chain.
 #[derive(Clone)]
 pub struct RegistryView {
     client: Client,
@@ -160,6 +180,10 @@ impl RegistryView {
 impl ChainView for RegistryView {
     fn chain_id(&self) -> u64 {
         self.chain_id
+    }
+
+    fn reads_chain(&self, chain: u64) -> bool {
+        chain == self.chain_id
     }
 
     async fn trusted_google_keys(&self) -> Result<Vec<[u8; 32]>> {
@@ -235,6 +259,10 @@ impl ChainView for RegistryView {
         vault: Address,
         strategy_hash: B256,
     ) -> Result<bool> {
+        anyhow::ensure!(
+            vault_chain == self.chain_id,
+            "chain {vault_chain}'s registry is not read here"
+        );
         self.client
             .read(
                 self.registry,
@@ -248,7 +276,11 @@ impl ChainView for RegistryView {
             .await
     }
 
-    async fn key_image(&self, key: Address) -> Result<Option<B256>> {
+    async fn key_image(&self, chain: u64, key: Address) -> Result<Option<B256>> {
+        anyhow::ensure!(
+            chain == self.chain_id,
+            "chain {chain}'s registry is not read here"
+        );
         let info = self
             .client
             .read(
@@ -267,5 +299,95 @@ impl ChainView for RegistryView {
         }
         let signer = self.root_key().await?.signer;
         Ok((signer != Address::ZERO).then_some(signer))
+    }
+}
+
+/// The network's registries as a holder reads them: the canonical chain's
+/// for the asker's image, project and the checkers' Google keys, and each
+/// vault chain's for the blessings of its own vaults. Each chain's registry
+/// is added as its chain is connected; until the canonical chain's is, every
+/// read fails and nothing is released, and a vault on a chain whose registry
+/// was never added has its keys refused.
+#[derive(Clone)]
+pub struct NetworkView {
+    chain_id: u64,
+    registries: Arc<RwLock<HashMap<u64, RegistryView>>>,
+}
+
+impl NetworkView {
+    /// The network whose canonical chain is `chain_id`, with no registry
+    /// connected yet.
+    pub fn new(chain_id: u64) -> NetworkView {
+        NetworkView {
+            chain_id,
+            registries: Default::default(),
+        }
+    }
+
+    /// Read `registry` for its chain from now on.
+    pub fn connect(&self, registry: RegistryView) {
+        self.registries
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(registry.chain_id, registry);
+    }
+
+    /// The registry on chain `chain`, if it is connected.
+    fn on(&self, chain: u64) -> Result<RegistryView> {
+        self.registries
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&chain)
+            .cloned()
+            .with_context(|| format!("chain {chain} is not connected"))
+    }
+
+    fn canonical(&self) -> Result<RegistryView> {
+        self.on(self.chain_id)
+    }
+}
+
+impl ChainView for NetworkView {
+    fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    fn reads_chain(&self, chain: u64) -> bool {
+        self.registries
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&chain)
+    }
+
+    async fn trusted_google_keys(&self) -> Result<Vec<[u8; 32]>> {
+        self.canonical()?.trusted_google_keys().await
+    }
+
+    async fn image_kind(&self, image_digest: B256) -> Result<Option<ImageKind>> {
+        self.canonical()?.image_kind(image_digest).await
+    }
+
+    async fn project_allowed(&self, project_id: B256) -> Result<bool> {
+        self.canonical()?.project_allowed(project_id).await
+    }
+
+    async fn is_blessed_for(
+        &self,
+        key: Address,
+        vault_chain: u64,
+        vault: Address,
+        strategy_hash: B256,
+    ) -> Result<bool> {
+        self.on(vault_chain)?
+            .is_blessed_for(key, vault_chain, vault, strategy_hash)
+            .await
+    }
+
+    async fn key_image(&self, chain: u64, key: Address) -> Result<Option<B256>> {
+        self.on(chain)?.key_image(chain, key).await
+    }
+
+    async fn live_root_signer(&self) -> Result<Option<Address>> {
+        self.canonical()?.live_root_signer().await
     }
 }

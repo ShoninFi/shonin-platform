@@ -46,9 +46,14 @@ pub enum Error {
     /// The proving key is not blessed, from the asker's image, for the vault.
     #[error("the vault key is not blessed for that vault and bundle from this image")]
     NotBlessed,
-    /// The canonical chain could not be read; nothing was decided.
-    #[error("the canonical chain could not be read")]
+    /// The canonical chain, or the vault's chain, could not be read; nothing
+    /// was decided.
+    #[error("the chain could not be read")]
     ChainUnavailable,
+    /// The vault's chain is one whose registry this holder doesn't read, so
+    /// its vault keys' blessings can't be checked.
+    #[error("this holder does not read the registry on chain {0}, the vault's chain")]
+    VaultChainNotRead(u64),
     /// This instance does not hold the root.
     #[error("this instance does not hold the root")]
     NoRoot,

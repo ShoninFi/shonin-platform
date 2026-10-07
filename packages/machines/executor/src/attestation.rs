@@ -1001,6 +1001,13 @@ impl Attestation {
                 .ok()
                 .and_then(|chains| chains.get(&chain_id).cloned());
             let Some((client, deployments)) = chain else {
+                if matches!(each, Simulate::SetRoot(..)) && blesses {
+                    tracing::warn!(
+                        chain_id,
+                        "the root key's chain is not connected, so recording the root from this seal can't be simulated; the seal is kept for the vault keys, and the root waits for a later one"
+                    );
+                    continue;
+                }
                 return Err(Refusal::Unavailable(format!(
                     "chain {chain_id} is not connected"
                 )));
@@ -1960,6 +1967,49 @@ mod tests {
         assert!(matches!(
             attestation.accept(post(nonce, &journal)).await,
             Err(Refusal::Journal(why)) if why.contains("bless")
+        ));
+        assert!(attestation.status().seal.is_none());
+    }
+
+    /// A root whose chain can't be asked at all is a root problem too: the
+    /// seal is still kept for the vault keys it blesses, and only a tree
+    /// holding the root alone is refused for it.
+    #[tokio::test]
+    async fn a_root_whose_chain_is_not_connected_never_holds_back_a_vault_key_blessing() {
+        let attestation = Attestation::new(Mode::Development).unwrap();
+        attestation.put(
+            31337,
+            Address::repeat_byte(0x0a),
+            B256::repeat_byte(0x5b),
+            Address::repeat_byte(0x0b),
+        );
+        // The root's chain is one this instance has no connection to.
+        attestation.put_root(84_532, Address::repeat_byte(0x7e));
+        let journal = Journal {
+            image_digest: chain::attest::image_digest("executor"),
+            project_id: chain::attest::project_id(),
+            ..journal_for(&attestation, NOW)
+        };
+        let nonce = attestation.binding().nonce();
+        let (node, asked) = bless_node(31337, false).await;
+        attestation.serve_chain(node, crate::stand_in::deployments());
+        attestation.accept(post(nonce, &journal)).await.unwrap();
+        assert_eq!(*asked.lock().unwrap(), 1);
+        assert!(attestation.status().seal.is_some());
+        assert!(attestation.root_leaf().unwrap().due);
+
+        // The root alone, on a chain not connected: nothing is kept.
+        let attestation = Attestation::new(Mode::Development).unwrap();
+        attestation.put_root(84_532, Address::repeat_byte(0x7e));
+        let journal = Journal {
+            image_digest: chain::attest::image_digest("executor"),
+            project_id: chain::attest::project_id(),
+            ..journal_for(&attestation, NOW)
+        };
+        let nonce = attestation.binding().nonce();
+        assert!(matches!(
+            attestation.accept(post(nonce, &journal)).await,
+            Err(Refusal::Unavailable(_))
         ));
         assert!(attestation.status().seal.is_none());
     }

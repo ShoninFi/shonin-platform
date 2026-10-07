@@ -72,6 +72,8 @@ struct Service {
     http: reqwest::Client,
     /// How long an upload may take to be taken by the build service.
     upload_timeout: std::time::Duration,
+    /// The published root keys' relays to the executor.
+    rootkey: rootkey::Relays,
 }
 
 #[tokio::main]
@@ -108,6 +110,7 @@ async fn main() -> Result<()> {
         executor: args.executor_url.clone(),
         http: indexer::http(),
         upload_timeout: UPLOAD_TIMEOUT,
+        rootkey: rootkey::Relays::default(),
     });
 
     let app = axum::Router::new()
@@ -943,6 +946,7 @@ mod tests {
             executor: "http://127.0.0.1:1".to_string(),
             http: indexer::http(),
             upload_timeout: std::time::Duration::from_secs(3),
+            rootkey: rootkey::Relays::default(),
         })
     }
 
@@ -1427,6 +1431,7 @@ mod tests {
             executor: service.executor.clone(),
             http: indexer::http(),
             upload_timeout: service.upload_timeout,
+            rootkey: rootkey::Relays::default(),
         })
     }
 

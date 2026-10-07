@@ -184,7 +184,7 @@ async fn main() -> Result<()> {
             .and_then(|key| key.evm_chain_id())
     };
     let root_service = root_chain.map(|chain_id| {
-        let service = shonin_rootkey::Service::new(root::Canonical::new(chain_id));
+        let service = shonin_rootkey::Service::new(shonin_rootkey::NetworkView::new(chain_id));
         // Google's keys check a token only inside Confidential Space, where
         // there is a launcher to give one.
         if args.attestation == attestation::Mode::Launcher {
@@ -272,14 +272,20 @@ async fn main() -> Result<()> {
     while let Some(served) = connecting.recv().await {
         served_chains.connected(served.vault_chain);
         attestation.serve_chain(served.client.clone(), served.deployments.clone());
-        if let (Some(service), Some(chain_id)) = (&root_service, root_chain)
-            && served.deployments.chain_id == chain_id
-        {
+        // Every chain served has its registry read by the root key service:
+        // a vault key is blessed on its vault's own chain, so that is where
+        // the exchange reads it. The canonical chain's also answers for the
+        // asker's image, project and checkers.
+        if let Some(service) = &root_service {
             service.view().connect(shonin_rootkey::RegistryView::new(
                 served.client.clone(),
                 served.deployments.attestation,
-                chain_id,
+                served.deployments.chain_id,
             ));
+        }
+        if let (Some(service), Some(chain_id)) = (&root_service, root_chain)
+            && served.deployments.chain_id == chain_id
+        {
             let holder = root::Holder::new(
                 service.clone(),
                 attestation.clone(),
@@ -2719,7 +2725,7 @@ async fn serve_status(
     solana_totals: solana::Totals,
     chains: health::Chains,
     attestation: attestation::Attestation,
-    root: Option<shonin_rootkey::Service<root::Canonical>>,
+    root: Option<shonin_rootkey::Service<shonin_rootkey::NetworkView>>,
 ) {
     let mut app = attestation::routes(attestation);
     if let Some(service) = root {

@@ -6,9 +6,9 @@
 //!
 //! | the record | the executor |
 //! | --- | --- |
-//! | empty, nothing held | makes a root, and puts its signer's leaf in the instance's tree, so the next attestation carries it; the keeper relays `setRootKey` |
-//! | empty, a root held that was never recorded | waits for the keeper to relay it |
-//! | empty, a root held that was recorded | the admin cleared it: lets it go, and makes a new one |
+//! | empty, nothing held | once a later block shows it empty too, makes a root, and puts its signer's leaf in the instance's tree, so the next attestation carries it; the keeper relays `setRootKey` |
+//! | empty, a root held that was never seen recorded | waits for the keeper to relay it, unless the chain logged that signer's clear (recorded and cleared between two looks): then lets it go |
+//! | empty, a root held that was recorded | the admin cleared it: lets it go, and makes a new one as above |
 //! | this instance's signer, live | serves the exchange and the published keys |
 //! | this instance's signer, not live | serves nothing derived, and says why |
 //! | another signer | lets go of any root it holds, asks its peers for the recorded one, and without one serves nothing, looking again every few minutes |
@@ -16,19 +16,26 @@
 //! A root is never made while a record names another signer, so two roots
 //! are never in use at once; and nothing derived from a root is served until
 //! the chain records its signer, so a root nobody can check is never used.
+//!
+//! The record is read whole as of one block, the head when it is read, and
+//! the holder remembers the newest block it acted on. An RPC name can front
+//! several nodes, some blocks behind the others: an answer from a block below
+//! the newest one acted on is from such a node, and is ignored. So the only
+//! copy of a recorded root is let go only when the record reads empty at a
+//! block at or past the one that showed it recorded (or when the chain
+//! logged its clear), and a root is made only when two reads, the second at
+//! a later block, both find the record empty.
 
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use alloy::primitives::{Address, B256};
+use alloy::primitives::Address;
+use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result, bail};
 use chain::bindings::attestation::IAttestationRegistry;
 use chain::{Client, Deployments};
-use shonin_rootkey::{
-    ChainView, ImageKind, Purpose, Received, RegistryView, Release, Root, Service,
-};
+use shonin_rootkey::{ChainView, Purpose, Received, Release, Root, Service};
 
 use crate::attestation::{Attestation, Mode};
 
@@ -49,73 +56,6 @@ const GOOGLE_KEYS_AT_MOST: Duration = Duration::from_secs(60);
 /// The most a peer's answer to an exchange may be.
 const MOST_RELEASE_BYTES: usize = 64 * 1024;
 
-/// The canonical chain as the root key service reads it: its id from the
-/// chain config at once, its registry once the chain is connected. Until
-/// then every read fails, and nothing is released.
-#[derive(Clone)]
-pub struct Canonical {
-    chain_id: u64,
-    view: Arc<OnceLock<RegistryView>>,
-}
-
-impl Canonical {
-    pub fn new(chain_id: u64) -> Canonical {
-        Canonical {
-            chain_id,
-            view: Default::default(),
-        }
-    }
-
-    /// The registry, now the chain is connected.
-    pub fn connect(&self, view: RegistryView) {
-        let _ = self.view.set(view);
-    }
-
-    fn view(&self) -> Result<&RegistryView> {
-        self.view
-            .get()
-            .context("the canonical chain is not connected yet")
-    }
-}
-
-impl ChainView for Canonical {
-    fn chain_id(&self) -> u64 {
-        self.chain_id
-    }
-
-    async fn trusted_google_keys(&self) -> Result<Vec<[u8; 32]>> {
-        self.view()?.trusted_google_keys().await
-    }
-
-    async fn image_kind(&self, image_digest: B256) -> Result<Option<ImageKind>> {
-        self.view()?.image_kind(image_digest).await
-    }
-
-    async fn project_allowed(&self, project_id: B256) -> Result<bool> {
-        self.view()?.project_allowed(project_id).await
-    }
-
-    async fn is_blessed_for(
-        &self,
-        key: Address,
-        vault_chain: u64,
-        vault: Address,
-        strategy_hash: B256,
-    ) -> Result<bool> {
-        self.view()?
-            .is_blessed_for(key, vault_chain, vault, strategy_hash)
-            .await
-    }
-
-    async fn key_image(&self, key: Address) -> Result<Option<B256>> {
-        self.view()?.key_image(key).await
-    }
-
-    async fn live_root_signer(&self) -> Result<Option<Address>> {
-        self.view()?.live_root_signer().await
-    }
-}
-
 /// The root key's record on the canonical chain, as the holder acts on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Record {
@@ -132,7 +72,9 @@ pub struct Record {
     /// When the attestation it was recorded from runs out: its issue time
     /// and a blessing's TTL.
     pub until: u64,
-    /// The chain's time when it was read: whatever cleared it came no later.
+    /// The block it was read at: every field above is as of this one block.
+    pub head: u64,
+    /// That block's time: whatever cleared it came no later.
     pub at: u64,
 }
 
@@ -159,7 +101,16 @@ impl Record {
 
 /// Where the record is read.
 pub trait Records: Send + Sync {
+    /// The record, every field read as of the head block when it is read.
     fn record(&self) -> impl Future<Output = Result<Record>> + Send;
+    /// Whether the chain logged the clear of `signer` (`RootKeyCleared`) in
+    /// blocks `from` to `to`, both included.
+    fn cleared(
+        &self,
+        signer: Address,
+        from: u64,
+        to: u64,
+    ) -> impl Future<Output = Result<bool>> + Send;
 }
 
 /// The canonical chain's registry.
@@ -172,45 +123,54 @@ impl Records for OnChain {
     async fn record(&self) -> Result<Record> {
         let registry = self.deployments.attestation;
         let read = &self.client;
-        let at = read.block_timestamp().await?;
+        // The head and its time from one read, and every read after it
+        // pinned to that block: a node behind the others answers as of its
+        // own block, which the holder then sees is older than one it acted
+        // on, never with a mix of blocks.
+        let (head, at) = read.head_and_time().await?;
+        let block = alloy::eips::BlockId::number(head);
         let record = read
-            .read(registry, IAttestationRegistry::rootKeyCall {})
+            .read_at(registry, IAttestationRegistry::rootKeyCall {}, block)
             .await?;
         if record.signer == Address::ZERO {
             return Ok(Record {
+                head,
                 at,
                 ..Record::default()
             });
         }
         let live = read
-            .read(registry, IAttestationRegistry::isRootKeyLiveCall {})
+            .read_at(registry, IAttestationRegistry::isRootKeyLiveCall {}, block)
             .await?;
         let image_allowed = read
-            .read(
+            .read_at(
                 registry,
                 IAttestationRegistry::isImageAllowedCall {
                     imageDigest: record.imageDigest,
                 },
+                block,
             )
             .await?;
         let project_allowed = read
-            .read(
+            .read_at(
                 registry,
                 IAttestationRegistry::isProjectAllowedCall {
                     projectId: record.projectId,
                 },
+                block,
             )
             .await?;
         let checker_allowed = read
-            .read(
+            .read_at(
                 registry,
                 IAttestationRegistry::isVerifierAllowedCall {
                     verifier: record.verifier,
                 },
+                block,
             )
             .await?;
         let ttl = read
-            .read(registry, IAttestationRegistry::blessingTtlCall {})
+            .read_at(registry, IAttestationRegistry::blessingTtlCall {}, block)
             .await?;
         Ok(Record {
             signer: record.signer,
@@ -219,8 +179,27 @@ impl Records for OnChain {
             project_allowed,
             checker_allowed,
             until: record.issuedAt.saturating_add(ttl),
+            head,
             at,
         })
+    }
+
+    async fn cleared(&self, signer: Address, from: u64, to: u64) -> Result<bool> {
+        if from > to {
+            return Ok(false);
+        }
+        let filter = alloy::rpc::types::Filter::new()
+            .address(self.deployments.attestation)
+            .event_signature(IAttestationRegistry::RootKeyCleared::SIGNATURE_HASH)
+            .topic1(signer.into_word())
+            .from_block(from)
+            .to_block(to);
+        let logs = self
+            .client
+            .logs(&filter)
+            .await
+            .context("looking for the root key's clear")?;
+        Ok(!logs.is_empty())
     }
 }
 
@@ -258,10 +237,9 @@ impl Exchange {
         if !status.is_success() {
             bail!("the peer refused ({status})");
         }
-        let body = answer.bytes().await.context("reading the peer's release")?;
-        if body.len() > MOST_RELEASE_BYTES {
-            bail!("the peer's release is too long");
-        }
+        let body = shonin_rootkey::body::read_at_most(answer, MOST_RELEASE_BYTES)
+            .await
+            .context("reading the peer's release")?;
         let release: Release =
             serde_json::from_slice(&body).context("the peer's answer is not a release")?;
         match requester.open(&request, &release)? {
@@ -301,13 +279,19 @@ impl Peers for Exchange {
 /// What one look at the record came to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Look {
-    /// No record and nothing held: a root was made.
+    /// No record and nothing held, first seen at this block: a root is made
+    /// once a later block shows the record empty too.
+    Empty(u64),
+    /// No record, confirmed at a later block than first seen, and nothing
+    /// held: a root was made.
     Made(Address),
     /// No record: the root held waits for the chain to record it.
     Waiting(Address),
-    /// The held root was recorded and the record is gone: it was cleared,
-    /// and a new root was made.
-    Cleared { old: Address, new: Address },
+    /// The held root was cleared by the admin: its record, once seen, reads
+    /// empty at a block at or past the one that showed it, or the chain
+    /// logged its clear. It is let go, and a new root is made as from an
+    /// empty record.
+    Cleared(Address),
     /// The record names the held root, and is live: served.
     Serving(Address),
     /// The record names the held root, and is not live: nothing served.
@@ -316,13 +300,20 @@ pub enum Look {
     Received(Address),
     /// The record names another signer, and no peer released it.
     Elsewhere(Address),
+    /// The record was read at a block below the newest one acted on (a node
+    /// behind the others answered): ignored, and nothing changed.
+    Behind { head: u64, newest: u64 },
 }
 
 impl Look {
     /// How long until the next look.
     fn wait(self) -> Duration {
         match self {
-            Look::Made(_) | Look::Waiting(_) | Look::Cleared { .. } => WAITING,
+            Look::Empty(_)
+            | Look::Made(_)
+            | Look::Waiting(_)
+            | Look::Cleared(_)
+            | Look::Behind { .. } => WAITING,
             Look::Serving(_) | Look::NotLive(_) | Look::Received(_) => HOLDING,
             Look::Elsewhere(_) => ELSEWHERE,
         }
@@ -339,10 +330,21 @@ pub struct Holder<V, R, P> {
     pub records: R,
     pub peers: P,
     /// The held root's signer, once the chain has recorded it: a record
-    /// found empty after that means the root was cleared.
+    /// found empty after that (at a block no older, as every record acted on
+    /// is) means the root was cleared.
     recorded: Option<Address>,
-    /// The record as last read.
+    /// The record as last acted on.
     last: Record,
+    /// The newest block a record was acted on at. A record read at an older
+    /// one came from a node behind the others, and is ignored.
+    newest: u64,
+    /// While nothing is held, the block the record was first seen empty at
+    /// since it last named a signer: a root is made only once a later block
+    /// shows it empty too.
+    empty_since: Option<u64>,
+    /// While the root held waits to be recorded, the first block not yet
+    /// searched for its clear.
+    unsearched: u64,
 }
 
 impl<V: ChainView, R: Records, P: Peers> Holder<V, R, P> {
@@ -361,6 +363,9 @@ impl<V: ChainView, R: Records, P: Peers> Holder<V, R, P> {
             peers,
             recorded: None,
             last: Record::default(),
+            newest: 0,
+            empty_since: None,
+            unsearched: 0,
         }
     }
 
@@ -371,6 +376,10 @@ impl<V: ChainView, R: Records, P: Peers> Holder<V, R, P> {
         let signer = root.signer_address();
         self.service.hold(root);
         self.recorded = None;
+        self.empty_since = None;
+        // The record was empty at this block, so anything that records this
+        // root, or clears it, comes later.
+        self.unsearched = self.last.head.saturating_add(1);
         self.attestation.date_after(self.last.at.saturating_add(1));
         self.attestation.put_root(self.chain_id, signer);
         Ok(signer)
@@ -383,31 +392,62 @@ impl<V: ChainView, R: Records, P: Peers> Holder<V, R, P> {
         self.attestation.remove_root();
     }
 
-    /// Read the record once, and act on it. A record that can't be read
-    /// changes nothing.
+    /// Read the record once, and act on it. A record that can't be read, or
+    /// that was read at a block older than one already acted on, changes
+    /// nothing.
     pub async fn look(&mut self) -> Result<Look> {
         let record = self.records.record().await?;
-        self.last = record;
+        if record.head < self.newest {
+            return Ok(Look::Behind {
+                head: record.head,
+                newest: self.newest,
+            });
+        }
         let held = self.service.signer();
         if record.signer == Address::ZERO {
+            // The clear's log is searched before anything is acted on, so a
+            // search that fails leaves everything as it was.
+            let logged_clear = match held {
+                Some(signer) if self.recorded != Some(signer) => {
+                    self.records
+                        .cleared(signer, self.unsearched, record.head)
+                        .await?
+                }
+                _ => false,
+            };
+            self.newest = record.head;
+            self.last = record;
             self.service.set_serving(false);
             return Ok(match held {
-                // Recorded once and now gone: cleared by the admin. That
-                // signer is refused for good, so a new root is made.
-                Some(old) if self.recorded == Some(old) => {
+                // Recorded once and now gone, at a block no older than the
+                // one that showed it: cleared by the admin. Or never seen
+                // recorded, but its clear logged: recorded and cleared
+                // between two looks. That signer is refused for good, so it
+                // is let go, and a new root is made once a later block
+                // confirms the record empty.
+                Some(old) if self.recorded == Some(old) || logged_clear => {
                     self.let_go();
-                    Look::Cleared {
-                        old,
-                        new: self.make()?,
-                    }
+                    self.empty_since = Some(record.head);
+                    Look::Cleared(old)
                 }
                 Some(signer) => {
+                    self.unsearched = self.unsearched.max(record.head.saturating_add(1));
                     self.attestation.note_root(signer, true, 0);
                     Look::Waiting(signer)
                 }
-                None => Look::Made(self.make()?),
+                None => match self.empty_since {
+                    Some(first) if record.head > first => Look::Made(self.make()?),
+                    Some(first) => Look::Empty(first),
+                    None => {
+                        self.empty_since = Some(record.head);
+                        Look::Empty(record.head)
+                    }
+                },
             });
         }
+        self.newest = record.head;
+        self.last = record;
+        self.empty_since = None;
         if held == Some(record.signer) {
             self.recorded = Some(record.signer);
             self.hold_recorded(&record);
@@ -450,6 +490,11 @@ impl<V: ChainView, R: Records, P: Peers> Holder<V, R, P> {
         let mut unread = crate::Throttle::default();
         loop {
             let wait = match self.look().await {
+                Ok(look @ Look::Behind { .. }) => {
+                    // Said, but not taken for what the record is.
+                    say(look, &self.last);
+                    look.wait()
+                }
                 Ok(look) => {
                     if last != Some(look) {
                         say(look, &self.last);
@@ -475,6 +520,10 @@ impl<V: ChainView, R: Records, P: Peers> Holder<V, R, P> {
 /// The log line for a look that changed something.
 fn say(look: Look, record: &Record) {
     match look {
+        Look::Empty(head) => tracing::info!(
+            block = head,
+            "the root key's record is empty: a root is made once a later block shows it empty too"
+        ),
         Look::Made(signer) => tracing::info!(
             %signer,
             "made a root key: its signer is in the instance's tree, for the canonical chain to record; nothing derived from it is served until then"
@@ -483,10 +532,9 @@ fn say(look: Look, record: &Record) {
             %signer,
             "the root key waits for the canonical chain to record its signer"
         ),
-        Look::Cleared { old, new } => tracing::warn!(
+        Look::Cleared(old) => tracing::warn!(
             %old,
-            %new,
-            "the root key's record was cleared: its root is let go and a new one is made"
+            "the root key's record was cleared: its root is let go, and a new one is made once a later block shows the record still empty"
         ),
         Look::Serving(signer) => tracing::info!(
             %signer,
@@ -504,6 +552,11 @@ fn say(look: Look, record: &Record) {
         Look::Elsewhere(signer) => tracing::warn!(
             %signer,
             "the root key is held elsewhere or lost: an admin clear starts a new one"
+        ),
+        Look::Behind { head, newest } => tracing::info!(
+            block = head,
+            newest,
+            "the root key's record was read at a block older than one already read (a node behind the others answered): ignored"
         ),
     }
 }
@@ -541,27 +594,78 @@ pub async fn keep_google_keys<V: ChainView>(service: Service<V>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use alloy::primitives::B256;
+    use shonin_rootkey::ImageKind;
+    use std::sync::{Arc, Mutex};
 
-    /// A record as the test sets it.
+    /// The canonical chain as a test sets it: the record, the blocks it is
+    /// read at, and the clears logged.
+    #[derive(Default)]
+    struct Chain {
+        /// `None` while it can't be read.
+        record: Option<Record>,
+        /// The block the next read is at, if the test names one; otherwise
+        /// one past the highest yet.
+        at: Option<u64>,
+        top: u64,
+        /// Each clear logged: its signer and block.
+        clears: Vec<(Address, u64)>,
+        /// Each search for a clear: its signer and blocks.
+        searched: Vec<(Address, u64, u64)>,
+        clears_unreadable: bool,
+    }
+
     #[derive(Clone, Default)]
-    struct Stand(Arc<Mutex<Option<Record>>>);
+    struct Stand(Arc<Mutex<Chain>>);
 
     impl Stand {
+        /// The record from the next read on, each read at a block past the
+        /// highest yet.
         fn set(&self, record: Record) {
-            *self.0.lock().unwrap() = Some(record);
+            let mut chain = self.0.lock().unwrap();
+            chain.record = Some(record);
+            chain.at = None;
+        }
+        /// The record from the next read on, read at block `head`, as a node
+        /// at that block answers.
+        fn set_at(&self, head: u64, record: Record) {
+            let mut chain = self.0.lock().unwrap();
+            chain.record = Some(record);
+            chain.at = Some(head);
         }
         fn unreadable(&self) {
-            *self.0.lock().unwrap() = None;
+            self.0.lock().unwrap().record = None;
+        }
+        /// The chain logged `signer`'s clear at `block`.
+        fn log_clear(&self, signer: Address, block: u64) {
+            self.0.lock().unwrap().clears.push((signer, block));
+        }
+        fn top(&self) -> u64 {
+            self.0.lock().unwrap().top
+        }
+        /// The record as it stands, without a read.
+        fn peek(&self) -> Option<Record> {
+            self.0.lock().unwrap().record
         }
     }
 
     impl Records for Stand {
         async fn record(&self) -> Result<Record> {
-            self.0
-                .lock()
-                .unwrap()
-                .context("the stand-in chain does not answer")
+            let mut chain = self.0.lock().unwrap();
+            let record = chain.record.context("the stand-in chain does not answer")?;
+            let head = chain.at.unwrap_or(chain.top + 1);
+            chain.top = chain.top.max(head);
+            Ok(Record { head, ..record })
+        }
+
+        async fn cleared(&self, signer: Address, from: u64, to: u64) -> Result<bool> {
+            let mut chain = self.0.lock().unwrap();
+            anyhow::ensure!(!chain.clears_unreadable, "the logs can't be read");
+            chain.searched.push((signer, from, to));
+            Ok(chain
+                .clears
+                .iter()
+                .any(|(cleared, at)| *cleared == signer && (from..=to).contains(at)))
         }
     }
 
@@ -588,6 +692,9 @@ mod tests {
         fn chain_id(&self) -> u64 {
             CANONICAL
         }
+        fn reads_chain(&self, chain: u64) -> bool {
+            chain == CANONICAL
+        }
         async fn trusted_google_keys(&self) -> Result<Vec<[u8; 32]>> {
             Ok(Vec::new())
         }
@@ -600,11 +707,14 @@ mod tests {
         async fn is_blessed_for(&self, _: Address, _: u64, _: Address, _: B256) -> Result<bool> {
             Ok(false)
         }
-        async fn key_image(&self, _: Address) -> Result<Option<B256>> {
+        async fn key_image(&self, _: u64, _: Address) -> Result<Option<B256>> {
             Ok(None)
         }
         async fn live_root_signer(&self) -> Result<Option<Address>> {
-            let record = self.0.record().await?;
+            let record = self
+                .0
+                .peek()
+                .context("the stand-in chain does not answer")?;
             Ok((record.live && record.signer != Address::ZERO).then_some(record.signer))
         }
     }
@@ -637,8 +747,23 @@ mod tests {
             project_allowed: true,
             checker_allowed: true,
             until: 1_800_000_000,
+            head: 0,
             at: 1_700_000_000,
         }
+    }
+
+    /// With the record empty, look until a root is made: the first look
+    /// only notes the block it was empty at, the next (at a later block)
+    /// makes it.
+    async fn make(holder: &mut Holder<StandView, Stand, Arc<Asked>>, stand: &Stand) -> Address {
+        stand.set(Record::default());
+        let first = holder.look().await.unwrap();
+        assert!(matches!(first, Look::Empty(_)), "{first:?}");
+        assert!(!holder.service.holds_root());
+        let Look::Made(signer) = holder.look().await.unwrap() else {
+            panic!("no root was made");
+        };
+        signer
     }
 
     async fn published_status<V: ChainView>(service: &Service<V>) -> bool {
@@ -651,11 +776,8 @@ mod tests {
     #[tokio::test]
     async fn with_no_record_a_root_is_made_and_its_signer_s_leaf_bound() {
         let (mut holder, stand, _) = holder();
-        stand.set(Record::default());
         let before = holder.attestation.binding().nonce();
-        let Look::Made(signer) = holder.look().await.unwrap() else {
-            panic!("no root was made");
-        };
+        let signer = make(&mut holder, &stand).await;
         assert_eq!(holder.service.signer(), Some(signer));
         let leaf = holder.attestation.root_leaf().expect("the root's leaf");
         assert_eq!(
@@ -673,13 +795,82 @@ mod tests {
         assert_eq!(holder.service.signer(), Some(signer));
     }
 
+    /// An empty record read at one block may be a node behind the others:
+    /// a root is made only once a later block shows it empty too, so an
+    /// empty answer at start-up, or another at the same block, makes
+    /// nothing while the chain records a root.
+    #[tokio::test]
+    async fn a_root_is_made_only_once_a_later_block_confirms_the_record_empty() {
+        let (mut holder, stand, peers) = holder();
+        // Empty at block 10, twice (a node stuck there): nothing made.
+        stand.set_at(10, Record::default());
+        assert_eq!(holder.look().await.unwrap(), Look::Empty(10));
+        assert_eq!(holder.look().await.unwrap(), Look::Empty(10));
+        assert!(!holder.service.holds_root());
+        assert!(holder.attestation.root_leaf().is_none());
+        // The chain in fact records another root: still none made.
+        let other = Address::repeat_byte(0x0e);
+        stand.set_at(12, recorded(other));
+        assert_eq!(holder.look().await.unwrap(), Look::Elsewhere(other));
+        // An older empty answer after that is ignored, and makes nothing.
+        stand.set_at(11, Record::default());
+        assert_eq!(
+            holder.look().await.unwrap(),
+            Look::Behind {
+                head: 11,
+                newest: 12
+            }
+        );
+        // Empty at block 13 starts the count again: nothing made until a
+        // block after it is empty too.
+        stand.set_at(13, Record::default());
+        assert_eq!(holder.look().await.unwrap(), Look::Empty(13));
+        assert!(!holder.service.holds_root());
+        stand.set_at(14, Record::default());
+        assert!(matches!(holder.look().await.unwrap(), Look::Made(_)));
+        assert_eq!(*peers.asked.lock().unwrap(), 1);
+    }
+
+    /// A node behind the others answers a look with an older block, at which
+    /// the record was still empty. The executor holds the only copy of the
+    /// recorded root: that answer is ignored, the root kept and served, and
+    /// the next truthful answer finds it recorded as before. An older answer
+    /// naming another signer is ignored the same way.
+    #[tokio::test]
+    async fn a_record_read_at_an_older_block_never_loses_the_recorded_root() {
+        let (mut holder, stand, _) = holder();
+        let signer = make(&mut holder, &stand).await;
+        stand.set_at(40, recorded(signer));
+        assert_eq!(holder.look().await.unwrap(), Look::Serving(signer));
+
+        for stale in [Record::default(), recorded(Address::repeat_byte(0x0e))] {
+            stand.set_at(16, stale);
+            assert_eq!(
+                holder.look().await.unwrap(),
+                Look::Behind {
+                    head: 16,
+                    newest: 40
+                }
+            );
+            assert_eq!(holder.service.signer(), Some(signer));
+            assert!(holder.service.holds_root());
+            assert!(holder.service.is_serving());
+            assert_eq!(holder.attestation.root_leaf().unwrap().signer, signer);
+        }
+
+        // The truth again, at the same block or a later one.
+        stand.set_at(40, recorded(signer));
+        assert_eq!(holder.look().await.unwrap(), Look::Serving(signer));
+        stand.set_at(41, recorded(signer));
+        assert_eq!(holder.look().await.unwrap(), Look::Serving(signer));
+        assert_eq!(holder.service.signer(), Some(signer));
+        assert!(holder.service.is_serving());
+    }
+
     #[tokio::test]
     async fn nothing_is_released_before_the_chain_records_the_signer() {
         let (mut holder, stand, _) = holder();
-        stand.set(Record::default());
-        let Look::Made(signer) = holder.look().await.unwrap() else {
-            panic!("no root was made");
-        };
+        let signer = make(&mut holder, &stand).await;
         assert!(!holder.service.is_serving());
         assert!(!published_status(&holder.service).await);
         // The chain records it: served, and the leaf no longer wanted.
@@ -693,10 +884,7 @@ mod tests {
     #[tokio::test]
     async fn with_its_own_signer_recorded_it_serves() {
         let (mut holder, stand, peers) = holder();
-        stand.set(Record::default());
-        let Look::Made(signer) = holder.look().await.unwrap() else {
-            panic!("no root was made");
-        };
+        let signer = make(&mut holder, &stand).await;
         stand.set(recorded(signer));
         for _ in 0..3 {
             assert_eq!(holder.look().await.unwrap(), Look::Serving(signer));
@@ -708,10 +896,7 @@ mod tests {
     #[tokio::test]
     async fn a_record_that_is_not_live_releases_nothing() {
         let (mut holder, stand, _) = holder();
-        stand.set(Record::default());
-        let Look::Made(signer) = holder.look().await.unwrap() else {
-            panic!("no root was made");
-        };
+        let signer = make(&mut holder, &stand).await;
         stand.set(recorded(signer));
         holder.look().await.unwrap();
         assert!(published_status(&holder.service).await);
@@ -766,10 +951,7 @@ mod tests {
     #[tokio::test]
     async fn a_root_held_is_let_go_once_another_signer_is_recorded() {
         let (mut holder, stand, _) = holder();
-        stand.set(Record::default());
-        let Look::Made(_) = holder.look().await.unwrap() else {
-            panic!("no root was made");
-        };
+        make(&mut holder, &stand).await;
         let other = Address::repeat_byte(0x0e);
         stand.set(recorded(other));
         assert_eq!(holder.look().await.unwrap(), Look::Elsewhere(other));
@@ -784,28 +966,69 @@ mod tests {
         let other = Address::repeat_byte(0x0e);
         stand.set(recorded(other));
         holder.look().await.unwrap();
-        stand.set(Record::default());
-        let Look::Made(first) = holder.look().await.unwrap() else {
-            panic!("no root was made after the clear");
-        };
-        // Recorded, then cleared: that root is let go, and another made.
+        let first = make(&mut holder, &stand).await;
+        // Recorded, then cleared: that root is let go, and another made once
+        // a later block shows the record still empty.
         stand.set(recorded(first));
         holder.look().await.unwrap();
         stand.set(Record {
             at: 1_700_000_500,
             ..Record::default()
         });
-        let Look::Cleared { old, new } = holder.look().await.unwrap() else {
-            panic!("the clear was not noticed");
+        assert_eq!(holder.look().await.unwrap(), Look::Cleared(first));
+        assert!(!holder.service.holds_root());
+        assert!(holder.attestation.root_leaf().is_none());
+        stand.set(Record {
+            at: 1_700_000_502,
+            ..Record::default()
+        });
+        let Look::Made(new) = holder.look().await.unwrap() else {
+            panic!("no root was made after the clear");
         };
         // Attested only after the record was found empty.
-        assert_eq!(holder.attestation.inner_dated_after(), 1_700_000_501);
-        assert_eq!(old, first);
+        assert_eq!(holder.attestation.inner_dated_after(), 1_700_000_503);
         assert_ne!(new, first);
         assert_eq!(holder.service.signer(), Some(new));
         assert!(!holder.service.is_serving());
         let leaf = holder.attestation.root_leaf().unwrap();
         assert_eq!((leaf.signer, leaf.due), (new, true));
+    }
+
+    /// A root recorded and cleared between two looks was never seen
+    /// recorded, and its signer is retired on the chain for good: the
+    /// chain's log of its clear lets it go, and a new root is made, rather
+    /// than waiting for a record that can never come. Each block is searched
+    /// once, from the block the root was made after.
+    #[tokio::test]
+    async fn a_root_recorded_and_cleared_before_it_was_seen_recorded_is_let_go() {
+        let (mut holder, stand, _) = holder();
+        let signer = make(&mut holder, &stand).await;
+        let made_at = stand.top();
+        stand.set(Record::default());
+        assert_eq!(holder.look().await.unwrap(), Look::Waiting(signer));
+        let waited_at = stand.top();
+        // A search that fails changes nothing.
+        stand.0.lock().unwrap().clears_unreadable = true;
+        assert!(holder.look().await.is_err());
+        assert_eq!(holder.service.signer(), Some(signer));
+        stand.0.lock().unwrap().clears_unreadable = false;
+
+        // Recorded at one block and cleared at the next, both between looks:
+        // the clear is at the block the next look reads.
+        stand.log_clear(signer, stand.top() + 1);
+        stand.set(Record::default());
+        assert_eq!(holder.look().await.unwrap(), Look::Cleared(signer));
+        assert!(!holder.service.holds_root());
+        assert!(holder.attestation.root_leaf().is_none());
+        let searched = stand.0.lock().unwrap().searched.clone();
+        assert_eq!(searched[0], (signer, made_at + 1, waited_at));
+        assert_eq!(searched.last().unwrap().1, waited_at + 1);
+
+        stand.set(Record::default());
+        let Look::Made(new) = holder.look().await.unwrap() else {
+            panic!("no root was made after the clear");
+        };
+        assert_ne!(new, signer);
     }
 
     #[tokio::test]
@@ -833,10 +1056,7 @@ mod tests {
     #[tokio::test]
     async fn a_record_that_cannot_be_read_changes_nothing() {
         let (mut holder, stand, _) = holder();
-        stand.set(Record::default());
-        let Look::Made(signer) = holder.look().await.unwrap() else {
-            panic!("no root was made");
-        };
+        let signer = make(&mut holder, &stand).await;
         stand.set(recorded(signer));
         holder.look().await.unwrap();
         stand.unreadable();
@@ -857,10 +1077,7 @@ mod tests {
                 .body(axum::body::Body::empty())
                 .unwrap()
         };
-        stand.set(Record::default());
-        let Look::Made(signer) = holder.look().await.unwrap() else {
-            panic!("no root was made");
-        };
+        let signer = make(&mut holder, &stand).await;
         stand.set(recorded(signer));
         holder.look().await.unwrap();
         assert_eq!(app.clone().oneshot(get()).await.unwrap().status(), 200);
@@ -893,10 +1110,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(app.clone().oneshot(get()).await.unwrap().status(), 503);
-        stand.set(Record::default());
-        let Look::Made(signer) = holder.look().await.unwrap() else {
-            panic!("no root was made");
-        };
+        let signer = make(&mut holder, &stand).await;
         assert_eq!(app.clone().oneshot(get()).await.unwrap().status(), 503);
         stand.set(recorded(signer));
         holder.look().await.unwrap();

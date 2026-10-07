@@ -226,6 +226,7 @@ pub fn status_of(error: &Error) -> StatusCode {
     match error {
         Error::Malformed(_) | Error::RootHasNoKeyPair => StatusCode::BAD_REQUEST,
         Error::ChainUnavailable
+        | Error::VaultChainNotRead(_)
         | Error::NoRoot
         | Error::NotServing
         | Error::Randomness

@@ -14,7 +14,8 @@
 //!   nonce binds a key it just made, and the holder checks the token as the
 //!   attestation guest does, checks the image and project against the
 //!   canonical chain ([`ChainView`]), decides what that kind of image may
-//!   have, and seals it to that key.
+//!   have (a vault's keys only with a key blessed for that vault on the
+//!   vault's own chain), and seals it to that key.
 //!
 //! # Encodings
 //!
@@ -37,6 +38,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod body;
 pub mod chain_view;
 pub mod error;
 pub mod exchange;
@@ -47,7 +49,7 @@ pub mod purpose;
 pub mod root;
 pub mod sealed;
 
-pub use chain_view::{ChainView, ImageKind, RegistryView};
+pub use chain_view::{ChainView, ImageKind, NetworkView, RegistryView};
 pub use error::Error;
 pub use exchange::{
     ExchangeRequest, Received, Release, Requester, VaultProof, authorise, exchange_nonce,

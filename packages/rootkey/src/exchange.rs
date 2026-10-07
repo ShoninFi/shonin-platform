@@ -15,7 +15,8 @@
 //!    more than [`MAX_TOKEN_AGE`] ago;
 //! 2. reads the canonical chain for the image's kind and the project;
 //! 3. decides what that kind may have ([`permission`]), and for a vault's
-//!    keys checks the vault key's proof and its blessing;
+//!    keys checks the vault key's proof and its blessing, read from the
+//!    registry on the vault's own chain, where vault keys are blessed;
 //! 4. seals the root, or the purpose's private key, to the ephemeral key,
 //!    binding the token's hash and the purpose ([`Release`]).
 //!
@@ -456,7 +457,7 @@ pub fn check_token(
 }
 
 fn chain_unavailable(error: anyhow::Error) -> Error {
-    tracing::warn!(error = format!("{error:#}"), "reading the canonical chain");
+    tracing::warn!(error = format!("{error:#}"), "reading the chain");
     Error::ChainUnavailable
 }
 
@@ -533,6 +534,12 @@ pub async fn authorise<V: ChainView>(
 
 /// A vault's keys go only to an enclave that holds a key blessed for that
 /// vault (and, for a bundle's key, that bundle), from the asker's own image.
+///
+/// A vault key is blessed on the vault's own chain, the chain the proof
+/// (and a venue's purpose) names, so the blessing and the key's image are
+/// read from that chain's registry; a chain whose registry isn't read here
+/// is refused, never answered from another. The asker's image and project
+/// were judged on the canonical chain.
 async fn check_proof<V: ChainView>(
     request: &ExchangeRequest,
     attested: &Attested,
@@ -554,11 +561,17 @@ async fn check_proof<V: ChainView>(
         return Err(Error::ProofMismatch);
     }
     let key = proof.key(&request.ephemeral_public.0, purpose)?;
+    if !view.reads_chain(proof.vault_chain) {
+        return Err(Error::VaultChainNotRead(proof.vault_chain));
+    }
     let blessed = view
         .is_blessed_for(key, proof.vault_chain, proof.vault, proof.strategy_hash)
         .await
         .map_err(chain_unavailable)?;
-    let image = view.key_image(key).await.map_err(chain_unavailable)?;
+    let image = view
+        .key_image(proof.vault_chain, key)
+        .await
+        .map_err(chain_unavailable)?;
     if !blessed || image != Some(attested.image_digest) {
         return Err(Error::NotBlessed);
     }
