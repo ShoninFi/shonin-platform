@@ -35,7 +35,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS deps
 # A service image is rebuilt on every change, and neither the API nor the
 # keeper is attested: thin LTO over 16 codegen units links in a fraction of
-# the workspace's fat, single-unit release (kept for the executor's image).
+# the workspace's fat, single-unit release (the executor's image takes the same).
 ENV CARGO_PROFILE_RELEASE_LTO=thin \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
 # The network whose Solana program ids are compiled in: devnet for a testnet

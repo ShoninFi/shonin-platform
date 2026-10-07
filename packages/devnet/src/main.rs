@@ -887,17 +887,38 @@ where
     F: Fn(chain::Client, Deployments) -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
 {
-    for (key, config) in only(target, one, evm_chains(target)) {
-        let client = connect_to(target.network, &key, &config).await?;
-        let file = Deployments::file_in(&target.deployments_dir, &key);
-        let deployments = client
-            .deployments(&file)
-            .await
-            .with_context(|| format!("no deployment on {key}: run chains:deploy first"))?;
-        let said = change(client, deployments)
-            .await
-            .with_context(|| format!("on {} ({key})", config.label))?;
-        println!("{} ({key}): {said}", config.label);
+    // Every chain at once: each registry is its own chain and its own
+    // admin nonce, so one chain's slow blocks never hold up another's.
+    // Each chain's outcome is printed; the command fails if any chain did.
+    let each = only(target, one, evm_chains(target))
+        .into_iter()
+        .map(|(key, config)| {
+            let change = &change;
+            async move {
+                let outcome = async {
+                    let client = connect_to(target.network, &key, &config).await?;
+                    let file = Deployments::file_in(&target.deployments_dir, &key);
+                    let deployments = client.deployments(&file).await.with_context(|| {
+                        format!("no deployment on {key}: run chains:deploy first")
+                    })?;
+                    change(client, deployments).await
+                }
+                .await;
+                (key, config, outcome)
+            }
+        });
+    let mut failed = Vec::new();
+    for (key, config, outcome) in futures::future::join_all(each).await {
+        match outcome {
+            Ok(said) => println!("{} ({key}): {said}", config.label),
+            Err(error) => {
+                println!("{} ({key}): failed: {error:#}", config.label);
+                failed.push(format!("{} ({key})", config.label));
+            }
+        }
+    }
+    if !failed.is_empty() {
+        bail!("not done on {}", failed.join(", "));
     }
     Ok(())
 }

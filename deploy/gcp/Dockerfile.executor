@@ -47,6 +47,12 @@ RUN mkdir -p /opt/onnxruntime && \
     ln -sf libonnxruntime.so.1 /opt/onnxruntime/lib/libonnxruntime.so
 ENV ORT_LIB_LOCATION=/opt/onnxruntime/lib \
     ORT_PREFER_DYNAMIC_LINK=1
+# Thin LTO over 16 codegen units links in a fraction of the time of the
+# workspace's fat, single-unit release. It changes only how the host binary
+# is optimised: an agent's code is compiled by the runtime at start, so what
+# it is metered in fuel is the same, and the build stays reproducible.
+ENV CARGO_PROFILE_RELEASE_LTO=thin \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
 COPY --from=recipe /src/recipe.json recipe.json
 # The Solana programs' crates the chain crate names by path: outside the
 # workspace, so the recipe carries no skeleton of them.

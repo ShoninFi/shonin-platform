@@ -37,6 +37,7 @@ use serde_json::{Value, json};
 
 /// The contracts a deploy reads from the build's output.
 const CONTRACTS: &[&str] = &[
+    "BatchCreate2",
     "LocalUsd",
     "LocalVenue",
     "DevAttestationVerifier",
@@ -347,11 +348,14 @@ fn a_setup_step_is_recorded_done_only_once_its_send_has_landed() {
     let recorded: Value = serde_json::from_str(&text).unwrap();
     let admin = recorded["roles"]["admin"].as_str().unwrap().to_string();
     let usd = recorded["usd"].as_str().unwrap().to_string();
-    assert_eq!(
-        recorded["setup_done"].as_array().map(Vec::len),
-        Some(12),
-        "the setup stopped elsewhere than at its last step: {}",
-        recorded["setup_done"]
+    // Steps are sent in waves a block can hold, so others may wait beside
+    // the held one; what matters is that the held step is not recorded.
+    let done = recorded["setup_done"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the setup was recorded as finished:\n{said}"));
+    assert!(
+        !done.iter().any(|step| step == "money admin"),
+        "the admin's money was recorded as done while its send was waiting: {done:?}"
     );
     let receipt =
         runtime.block_on(stand_in.ask_node("eth_getTransactionReceipt", json!([waiting])));
