@@ -2972,7 +2972,12 @@ async fn claims(
                             }
                         };
                     if !wide {
-                        let outcome = send_outcome(
+                        // A claim's try values the station and stages its
+                        // close inside try/catch, and counts a call that ran
+                        // out of gas as blocked: with only the node's estimate
+                        // (which finds that cheaper path) no claim the cash
+                        // can't cover would ever be closed for.
+                        let outcome = send_roomy_outcome(
                             client,
                             keeper,
                             vault,
@@ -3195,7 +3200,9 @@ async fn units(
                 .get(&holder)
                 .is_some_and(|again| now < again.next || memory.rounds < again.next_round);
         if !waiting {
-            match send_outcome(
+            // Stages a close inside try/catch, like a claim's try: roomy gas,
+            // or the estimate finds the path where nothing comes home.
+            match send_roomy_outcome(
                 client,
                 keeper,
                 vault,
@@ -7538,6 +7545,64 @@ mod tests {
             },
         );
         answers(node, VAULT, IVault::homeStationCall {}, STATION);
+    }
+
+    /// A claim's try values the home station and stages its close inside
+    /// try/catch, and counts a call that ran out of gas as blocked; the
+    /// node's estimate finds exactly that cheaper path. So a claim is tried
+    /// with half again the estimate and a margin, as an unwind is.
+    #[tokio::test]
+    async fn a_claim_is_tried_with_gas_well_above_the_estimate() {
+        // The stand-in estimates every call at 21,000.
+        let roomy = Some(21_000 + 10_500 + ROOMY_GAS_MARGIN);
+        let now = BETWEEN_SLOTS;
+        let node = node(now);
+        a_waiting_claim(&node, now, ClaimState::Pending);
+        let client = connect(&node).await;
+        let mut memory = Memory::default();
+
+        claims(&client, KEEPER, VAULT, &timers(), 0, &mut memory)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::stand_in::gas_limits_of::<IVault::settleClaimCall>(&node, VAULT),
+            vec![roomy]
+        );
+    }
+
+    /// A holder's units are served by a close staged inside try/catch, like a
+    /// claim's: sent with the same room above the estimate.
+    #[tokio::test]
+    async fn a_holders_units_are_served_with_gas_well_above_the_estimate() {
+        let roomy = Some(21_000 + 10_500 + ROOMY_GAS_MARGIN);
+        let now = BETWEEN_SLOTS;
+        let node = node(now);
+        let holder = Address::repeat_byte(0x02);
+        answers(
+            &node,
+            VAULT,
+            IVault::unitsOfCall { holder },
+            IVault::unitsOfReturn {
+                units: U256::from(5u64),
+                claimable: U256::ZERO,
+            },
+        );
+        answers(&node, VAULT, IVault::unitsSinceCall { holder }, now);
+        let client = connect(&node).await;
+        let mut memory = Memory {
+            holders: BTreeSet::from([holder]),
+            ..Memory::default()
+        };
+
+        units(&client, KEEPER, VAULT, 1, now, 7 * DAY, 10, 0, &mut memory)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::stand_in::gas_limits_of::<IVault::serveProRataCall>(&node, VAULT),
+            vec![roomy]
+        );
     }
 
     #[tokio::test]
