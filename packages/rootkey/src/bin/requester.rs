@@ -56,6 +56,18 @@ async fn attempt(args: &Args, purpose: &Purpose, sealed: &Sealed) -> Result<Stri
     let status = answer.status();
     if !status.is_success() {
         let why = answer.text().await.unwrap_or_default();
+        // The token's times beside this machine's clock: a refusal over
+        // freshness is a matter of clocks, and this says whose.
+        let times = token_times(&request.token);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs_f64())
+            .unwrap_or(0.0);
+        tracing::warn!(
+            ?times,
+            now,
+            "the refused token's iat, nbf and exp, and this machine's clock"
+        );
         bail!("the holder refused ({status}): {why}");
     }
     let release: Release = answer.json().await.context("the holder's release")?;
@@ -65,6 +77,19 @@ async fn attempt(args: &Args, purpose: &Purpose, sealed: &Sealed) -> Result<Stri
     tracing::info!("opened the release");
     let plaintext = open(&pair, sealed, args.aad.as_bytes())?;
     Ok(hex::encode(Sha256::digest(plaintext.as_slice())))
+}
+
+/// A token's `iat`, `nbf` and `exp`, read without checking it (it is our own
+/// and only logged).
+fn token_times(token: &str) -> Option<(Option<u64>, Option<u64>, Option<u64>)> {
+    use base64::Engine as _;
+    let claims = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(claims.trim_end_matches('='))
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let time = |name: &str| value.get(name).and_then(serde_json::Value::as_u64);
+    Some((time("iat"), time("nbf"), time("exp")))
 }
 
 #[tokio::main]
