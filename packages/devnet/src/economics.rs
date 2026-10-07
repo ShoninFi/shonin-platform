@@ -223,6 +223,12 @@ fn dollars(value: U256) -> f64 {
     value.to_string().parse::<f64>().unwrap_or(0.0) / DOLLAR
 }
 
+/// The high-water mark in dollars a share: the vault keeps it with `1e18`
+/// as $1.00 a share (its share price has six decimals, like the dollar).
+fn mark_per_share(mark: U256) -> f64 {
+    mark.to_string().parse::<f64>().unwrap_or(0.0) / 1e18
+}
+
 fn units(value: alloy::primitives::I256) -> f64 {
     value.to_string().parse::<f64>().unwrap_or(0.0) / 1e18
 }
@@ -324,8 +330,12 @@ pub async fn report(client: &Client, deployments: &Deployments, options: &Option
         (None, None) => (CARRY_SHARE, "the agent's aim; it holds none yet"),
     };
     let usage = dollars(daily_cost_without_gas);
-    let billed = usage + gas.key_coin_per_day * options.billed_coin_usd;
-    let mainnet_like = usage + gas.key_coin_per_day * gas.coin_usd_mainnet_like;
+    let (billed, mainnet_like) = daily_bills(
+        usage,
+        gas.key_coin_per_day,
+        options.billed_coin_usd,
+        gas.coin_usd_mainnet_like,
+    );
     let project = |funding: f64, bill: f64| {
         Projection::new(
             vault_value,
@@ -363,7 +373,7 @@ pub async fn report(client: &Client, deployments: &Deployments, options: &Option
         share_price: dollars(share_price),
         total_shares: supply.to_string().parse::<f64>().unwrap_or(0.0) / 1e18,
         cash: dollars(cash),
-        high_water_mark: dollars(mark),
+        high_water_mark: mark_per_share(mark),
         last_payday,
         fees_bps: FeesBps {
             holding: fees.holdingBps,
@@ -536,6 +546,40 @@ fn print_report(r: &Report) {
     }
 }
 
+/// The tank's bill a day, as billed on this chain and with the agent's gas
+/// at a mainnet-like price: the allowances' usage (gas allowance aside) and
+/// the coin the vault's key burns a day, at each price of the coin.
+pub fn daily_bills(
+    usage: f64,
+    key_coin_per_day: f64,
+    billed_coin_usd: f64,
+    mainnet_coin_usd: f64,
+) -> (f64, f64) {
+    (
+        usage + key_coin_per_day * billed_coin_usd,
+        usage + key_coin_per_day * mainnet_coin_usd,
+    )
+}
+
+/// What `total` over a window of `hours` comes to a day; nothing for an
+/// empty window.
+fn per_day(total: f64, hours: f64) -> f64 {
+    if hours > 0.0 {
+        total * 24.0 / hours
+    } else {
+        0.0
+    }
+}
+
+/// How many of `count` over a window of `hours` fall in an hour.
+fn per_hour(count: u64, hours: f64) -> f64 {
+    if hours > 0.0 {
+        count as f64 / hours
+    } else {
+        0.0
+    }
+}
+
 /// The gas the vault's key and the keeper spent on the vault over the
 /// window, from the receipts of every transaction that touched the vault,
 /// its home station or the station's account at the venue. A send that
@@ -637,12 +681,9 @@ async fn gas_spent(
             report.other_sends += 1;
         }
     }
-    let days = options.hours / 24.0;
-    if days > 0.0 {
-        report.key_coin_per_day = report.key_coin / days;
-        report.keeper_coin_per_day = report.keeper_coin / days;
-        report.keeper_sends_per_hour = report.keeper_sends as f64 / options.hours;
-    }
+    report.key_coin_per_day = per_day(report.key_coin, options.hours);
+    report.keeper_coin_per_day = per_day(report.keeper_coin, options.hours);
+    report.keeper_sends_per_hour = per_hour(report.keeper_sends, options.hours);
     if let Some(key) = key {
         report.key_nonce = provider.get_transaction_count(key).await.ok();
         report.key_balance = client
@@ -692,6 +733,52 @@ mod tests {
         // 0.0585 / (0.1 * (0.4 * 0.1 - 0.01) / 365): $7,117.50.
         assert!(close(p.break_even_deposit.unwrap(), 0.0585 * 365.0 / 0.003));
         assert!((p.break_even_deposit.unwrap() - 7_117.5).abs() < 0.01);
+    }
+
+    /// On a testnet the agent's gas is billed at nothing; the same coin at
+    /// a mainnet-like price is what it would cost.
+    #[test]
+    fn testnet_gas_is_billed_at_nothing_and_priced_beside_it() {
+        // 0.0004 ETH a day of the key's gas, ETH at $2,500.
+        let (billed, mainnet_like) = daily_bills(0.0585, 0.0004, 0.0, 2_500.0);
+        assert!(close(billed, 0.0585));
+        assert!(close(mainnet_like, 0.0585 + 1.0));
+        let (billed, _) = daily_bills(0.0585, 0.0004, 2_500.0, 2_500.0);
+        assert!(close(billed, 1.0585));
+    }
+
+    #[test]
+    fn a_window_s_totals_are_scaled_to_a_day_and_an_hour() {
+        assert!(close(per_day(0.001, 6.0), 0.004));
+        assert!(close(per_hour(18, 6.0), 3.0));
+        assert_eq!(per_day(1.0, 0.0), 0.0);
+        assert_eq!(per_hour(5, 0.0), 0.0);
+    }
+
+    /// The mark and the share price are kept at different scales; both
+    /// read as dollars a share.
+    #[test]
+    fn the_high_water_mark_reads_in_dollars_a_share_like_the_share_price() {
+        let mark = U256::from(1_000_823_654_562_732_788u128);
+        assert!(close(mark_per_share(mark), 1.000_823_654_562_732_8));
+        assert!(close(dollars(U256::from(1_000_749u64)), 1.000_749));
+    }
+
+    #[test]
+    fn a_vault_s_state_is_named_as_the_contract_orders_them() {
+        assert_eq!(state_name(0), "none");
+        assert_eq!(state_name(2), "open");
+        assert_eq!(state_name(6), "closed");
+        assert_eq!(state_name(7), "cancelled");
+        assert_eq!(state_name(42), "unknown");
+    }
+
+    #[test]
+    fn hyperliquid_s_coin_is_priced_as_hype_and_every_other_as_eth() {
+        assert_eq!(mainnet_coin_usd(998), 25.0);
+        assert_eq!(mainnet_coin_usd(999), 25.0);
+        assert_eq!(mainnet_coin_usd(84_532), 2_500.0);
+        assert_eq!(mainnet_coin_usd(46_630), 2_500.0);
     }
 
     #[test]

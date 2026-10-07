@@ -174,15 +174,19 @@ pub async fn run(
     }
     let funding = Funding::read(funding_file)?;
     let funder = funder()?;
-    // Every chain is funded and reported, whatever became of the others.
-    let mut outcomes = Vec::new();
-    for (key, config) in chains {
-        let outcome = fund_chain(&funding, &funder, network, &key, &config).await;
-        if let Err(error) = &outcome {
-            tracing::error!(chain = %key, error = format!("{error:#}"), "funding stopped");
+    // Every chain is funded and reported, whatever became of the others,
+    // the chains at once: the funder's sends are numbered per chain.
+    let outcomes = futures::future::join_all(chains.into_iter().map(|(key, config)| {
+        let (funding, funder) = (&funding, &funder);
+        async move {
+            let outcome = fund_chain(funding, funder, network, &key, &config).await;
+            if let Err(error) = &outcome {
+                tracing::error!(chain = %key, error = format!("{error:#}"), "funding stopped");
+            }
+            (key, config.label, outcome)
         }
-        outcomes.push((key, config.label, outcome));
-    }
+    }))
+    .await;
     println!("Funding:");
     let mut failed = Vec::new();
     for (key, label, outcome) in outcomes {

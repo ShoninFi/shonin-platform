@@ -345,6 +345,8 @@ pub async fn run(
 
 /// What the demo asks of a run.
 pub struct Demo<'a> {
+    /// The network's name, for the commands the demo ends by suggesting.
+    pub network: &'a str,
     pub api: &'a str,
     pub agents: Option<&'a Path>,
     pub agent: &'a str,
@@ -383,6 +385,19 @@ pub async fn demo(
     use chain::bindings::strategies::IStrategyRegistry;
 
     let author = client.account(Role::Author)?;
+    // The publishing fee and the smallest tank, which the author pays
+    // before the tank is filled to its figure below.
+    let fee = client
+        .read(
+            deployments.publishing,
+            chain::bindings::publishing::IPublishing::feeCall {},
+        )
+        .await?;
+    let minimum_tank = client
+        .read(deployments.factory, IVaultFactory::configCall {})
+        .await?
+        .minimumTank;
+    have(client, deployments, author, fee + minimum_tank).await?;
     let strategy = match demo.strategy {
         Some(id) => {
             let strategy_id = U256::from(id);
@@ -509,10 +524,12 @@ pub async fn demo(
         alloy::primitives::utils::format_units(keep, 6).unwrap_or_default()
     );
     println!(
-        "Keep the market operator posting (task chains:market NETWORK=testnet), and the services up. To watch it pay its way:"
+        "Keep the market operator posting (task chains:market NETWORK={}; on the local network the devnet plays it), and the services up. To watch it pay its way:",
+        demo.network
     );
     println!(
-        "  task services:economics NETWORK=testnet VAULT_CHAIN={} VAULT={vault}",
+        "  task services:economics NETWORK={} VAULT_CHAIN={} VAULT={vault}",
+        demo.network,
         vault_chain.name()
     );
     println!(
@@ -590,7 +607,7 @@ async fn at_work(
     let rate: f64 = perp.fundingRate.to_string().parse().unwrap_or(0.0);
     let mark: f64 = perp.mark.to_string().parse().unwrap_or(1.0);
     bail!(
-        "the agent of {slug} ({vault}) has not put the money to work within {} min. The venue quotes funding of {:.6} a day, last posted at {}: funding-basis enters at 0.0002. Is the market operator posting (task chains:market NETWORK=testnet)? The vault is left as it is.",
+        "the agent of {slug} ({vault}) has not put the money to work within {} min. The venue quotes funding of {:.6} a day, last posted at {}: funding-basis enters at 0.0002. Is the market operator posting (task chains:market)? The vault is left as it is.",
         within.as_secs() / 60,
         rate / mark,
         perp.fundingUpdatedAt

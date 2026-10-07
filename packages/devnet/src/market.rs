@@ -27,7 +27,7 @@ use std::time::Duration;
 use alloy::primitives::{Address, I256, U256};
 use alloy::rpc::types::Filter;
 use alloy::sol_types::SolEvent;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use chain::bindings::erc20::IERC20;
 use chain::bindings::usd::ILocalUsd;
 use chain::bindings::venue::{Funding, ILocalVenue, Quote};
@@ -370,10 +370,10 @@ pub async fn operate(
 ) -> Result<()> {
     let operator = client.account(Role::Operator)?;
     if operator != deployments.roles.operator {
-        bail!(
-            "this key's operator is {operator}, and the venue's is {}: the mnemonic is not the one this deployment was made with",
-            deployments.roles.operator
-        );
+        return Err(anyhow::Error::new(WrongOperator {
+            ours: operator,
+            venue: deployments.roles.operator,
+        }));
     }
     let venue = deployments.venue;
     let spot = read_market(client, venue, SPOT).await?;
@@ -424,6 +424,36 @@ pub async fn operate(
             }
         }
     }
+}
+
+/// The mnemonic here is not the one the deployment was made with: no retry
+/// changes that.
+#[derive(Debug)]
+pub(crate) struct WrongOperator {
+    ours: Address,
+    venue: Address,
+}
+
+impl std::fmt::Display for WrongOperator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this key's operator is {}, and the venue's is {}: the mnemonic is not the one this deployment was made with",
+            self.ours, self.venue
+        )
+    }
+}
+
+impl std::error::Error for WrongOperator {}
+
+/// How long a chain's operator waits after it stopped (its endpoint down
+/// when it started, say) before it starts again.
+pub(crate) const RESTART_AFTER: Duration = Duration::from_secs(60);
+
+/// Whether an operator that stopped with `error` is worth starting again:
+/// everything but a key that isn't the venue's operator.
+pub(crate) fn worth_restarting(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<WrongOperator>().is_none()
 }
 
 /// Where a restarted operator's basis starts: the gap between the venue's
@@ -839,5 +869,311 @@ mod tests {
             starting_basis(&params, 60_000e6, 60_000e6, I256::ZERO),
             params.basis_mean
         );
+    }
+
+    #[test]
+    fn only_a_key_that_is_not_the_venue_s_operator_stops_the_operator_for_good() {
+        let wrong = anyhow::Error::new(WrongOperator {
+            ours: Address::repeat_byte(1),
+            venue: Address::repeat_byte(2),
+        })
+        .context("the market on evm:84532");
+        assert!(!worth_restarting(&wrong));
+        assert!(worth_restarting(&anyhow::anyhow!(
+            "the node did not answer"
+        )));
+    }
+
+    // On a local chain -----------------------------------------------------
+
+    struct Anvil(std::process::Child);
+
+    impl Drop for Anvil {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A free port, never one of the development stack's own.
+    fn free_port() -> u16 {
+        loop {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            if !(19000..=19200).contains(&port) {
+                return port;
+            }
+        }
+    }
+
+    fn anvil() -> Option<(Anvil, u16)> {
+        let port = free_port();
+        let child = std::process::Command::new("anvil")
+            .args([
+                "--port",
+                &port.to_string(),
+                "--chain-id",
+                "31337",
+                "--silent",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let anvil = Anvil(child);
+        let started = std::time::Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            if started.elapsed() > Duration::from_secs(20) {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Some((anvil, port))
+    }
+
+    /// A copy of the built contracts (every file under the contracts' `src`),
+    /// so a build running beside this test changes nothing under it; none if
+    /// they are not built.
+    fn artifacts(into: &std::path::Path) -> Option<std::path::PathBuf> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts/evm");
+        let built = root.join("out");
+        if !built
+            .join("LocalVenue.sol")
+            .join("LocalVenue.json")
+            .exists()
+        {
+            return None;
+        }
+        let mut sources = vec![root.join("src")];
+        while let Some(dir) = sources.pop() {
+            for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    sources.push(path);
+                    continue;
+                }
+                let Some(file) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                let from = built.join(file);
+                if !file.ends_with(".sol") || !from.is_dir() {
+                    continue;
+                }
+                let to = into.join(file);
+                std::fs::create_dir_all(&to).unwrap();
+                for json in std::fs::read_dir(&from).unwrap().flatten() {
+                    std::fs::copy(json.path(), to.join(json.file_name())).unwrap();
+                }
+            }
+        }
+        Some(into.to_path_buf())
+    }
+
+    async fn total_owed(client: &Client, venue: Address, master: Address) -> U256 {
+        client
+            .read(venue, ILocalVenue::accountValueCall { master })
+            .await
+            .unwrap()
+    }
+
+    async fn venue_holds(client: &Client, deployments: &Deployments) -> U256 {
+        client
+            .read(
+                deployments.usd,
+                IERC20::balanceOfCall {
+                    account: deployments.venue,
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn pass_time(client: &Client, seconds: u64) {
+        client
+            .raw_request("evm_increaseTime", serde_json::json!([seconds]))
+            .await
+            .unwrap();
+        client
+            .raw_request("evm_mine", serde_json::json!([]))
+            .await
+            .unwrap();
+    }
+
+    /// On a local chain, as the operator posts on a testnet: each post
+    /// moves both markets to the tape's prices, accrues exactly the funding
+    /// the venue quoted for the time elapsed by the chain's clock, and
+    /// leaves the venue holding at least what its accounts could take out,
+    /// minting it the difference when a short is owed more than it holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_post_pays_the_quoted_rate_for_the_time_elapsed_and_keeps_the_venue_solvent() {
+        use chain::bindings::venue::OrderRequest;
+        let dir = std::env::temp_dir().join(format!("shonin-market-post-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let Some(artifacts) = artifacts(&dir.join("out")) else {
+            eprintln!("the contracts are not built: skipping");
+            return;
+        };
+        let Some((_anvil, port)) = anvil() else {
+            eprintln!("anvil is not installed: skipping");
+            return;
+        };
+        let url = format!("http://127.0.0.1:{port}");
+        let config = chain::ChainConfig {
+            label: "a local chain".to_string(),
+            rpc: url.clone(),
+            ws: None,
+            dollar: "USDC".to_string(),
+            native_usd: Some(2_500.0),
+            public_rpc: url,
+            logs_rpc: None,
+            log_range: None,
+            confirmations: Some(0),
+        };
+        let key: chain::ChainKey = "evm:31337".parse().unwrap();
+        let network = chain::NetworkName::Local;
+        let client = chain::connect_to(network, &key, &config).await.unwrap();
+        let deployments = crate::deploy::ensure(
+            &client,
+            network,
+            &key,
+            &artifacts,
+            &dir.join("evm-31337.json"),
+            &[("base".to_string(), 31337)],
+            0,
+        )
+        .await
+        .unwrap();
+        let venue = deployments.venue;
+        let operator = deployments.roles.operator;
+
+        // A trader short a tenth of a unit, with $10,000 at the venue.
+        let trader = client.account(Role::Viewer).unwrap();
+        let dollars = U256::from(10_000_000_000u64);
+        client
+            .send(
+                trader,
+                deployments.usd,
+                ILocalUsd::mintCall {
+                    to: trader,
+                    amount: dollars,
+                },
+            )
+            .await
+            .unwrap();
+        client
+            .send(
+                trader,
+                deployments.usd,
+                IERC20::approveCall {
+                    spender: venue,
+                    value: dollars,
+                },
+            )
+            .await
+            .unwrap();
+        client
+            .send(trader, venue, ILocalVenue::depositCall { amount: dollars })
+            .await
+            .unwrap();
+        client
+            .send(
+                trader,
+                venue,
+                ILocalVenue::placeCall {
+                    master: trader,
+                    orders: vec![OrderRequest {
+                        market: market_id(PERP),
+                        isBuy: false,
+                        size: U256::from(100_000_000_000_000_000u128),
+                        limitPrice: U256::from(1u64),
+                        reduceOnly: false,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        let short = client
+            .read(
+                venue,
+                ILocalVenue::positionOfCall {
+                    master: trader,
+                    market: market_id(PERP),
+                },
+            )
+            .await
+            .unwrap()
+            .size;
+        assert!(short.is_negative(), "the trader holds no short: {short}");
+
+        let mut book = Book::new(deployments.deployed_block);
+        let mut tape = Tape::with(
+            TapeParams::TESTNET,
+            7,
+            STARTING_PRICE as f64,
+            TapeParams::TESTNET.basis_mean,
+        );
+        for _ in 0..3 {
+            pass_time(&client, 600).await;
+            let before = read_market(&client, venue, PERP).await.unwrap();
+            let now = client.block_timestamp().await.unwrap();
+            let tick = tape.step_by(10.0 / 60.0);
+            let posted = post_once(&client, &deployments, operator, &mut book, &tape, &tick)
+                .await
+                .unwrap();
+            let after = read_market(&client, venue, PERP).await.unwrap();
+            let elapsed = now - before.fundingUpdatedAt;
+            assert_eq!(posted.paid, paid_per_unit(before.fundingRate, elapsed));
+            assert_eq!(after.fundingIndex - before.fundingIndex, posted.paid);
+            assert_eq!(after.fundingRate, to_signed(tick.rate_per_day));
+            assert_eq!(after.mark, tape.quote(PERP, tick.perp).mark);
+            let spot = read_market(&client, venue, SPOT).await.unwrap();
+            assert_eq!(spot.mark, tape.quote(SPOT, tick.spot).mark);
+            assert!(
+                venue_holds(&client, &deployments).await
+                    >= total_owed(&client, venue, trader).await
+            );
+        }
+        assert!(
+            !read_market(&client, venue, PERP)
+                .await
+                .unwrap()
+                .fundingRate
+                .is_zero()
+        );
+
+        // A rate of a tenth of the price a day, for a day: the short is owed
+        // far more than the trades left the venue, so it is minted the
+        // difference before the post.
+        let rate = to_signed(STARTING_PRICE as f64 / 10.0);
+        client
+            .send(
+                operator,
+                venue,
+                ILocalVenue::setFundingCall {
+                    market: market_id(PERP),
+                    ratePerDay: rate,
+                },
+            )
+            .await
+            .unwrap();
+        pass_time(&client, DAY).await;
+        let tick = tape.step_by(24.0);
+        let posted = post_once(&client, &deployments, operator, &mut book, &tape, &tick)
+            .await
+            .unwrap();
+        assert!(
+            posted.paid >= paid_per_unit(rate, DAY - 5),
+            "{}",
+            posted.paid
+        );
+        assert!(!posted.minted.is_zero(), "nothing was minted");
+        let holds = venue_holds(&client, &deployments).await;
+        let owed = total_owed(&client, venue, trader).await;
+        assert!(holds >= owed, "the venue holds {holds} and owes {owed}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

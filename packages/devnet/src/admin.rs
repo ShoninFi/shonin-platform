@@ -122,10 +122,16 @@ pub async fn revoke_image(
             },
         )
         .await?;
-    // One never proposed here is revoked all the same: it can then never
-    // be proposed on this chain.
     if image.revoked {
         return Ok(format!("the image {digest} is already revoked"));
+    }
+    // One never proposed here has nothing to revoke, and a revocation of it
+    // wouldn't last: proposing it later allows it afresh. So nothing is
+    // sent, and the digest is checked rather than a mistyped one "revoked".
+    if image.allowedAt == 0 {
+        return Ok(format!(
+            "the image {digest} was never proposed here: nothing to revoke"
+        ));
     }
     let admin = client.account(Role::Admin)?;
     client

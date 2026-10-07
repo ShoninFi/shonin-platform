@@ -23,6 +23,7 @@ mod hyperliquid_vaults;
 mod market;
 mod publish;
 mod seed;
+mod smoke;
 mod solana;
 mod solana_seed;
 
@@ -92,6 +93,18 @@ enum Command {
     /// local network the programs to its Solana cluster, and write the
     /// addresses, then stop. Local and testnet only.
     Deploy,
+    /// The smoke check a deploy ends with, read-only: each EVM chain's
+    /// deployment read back from the chain (or only `--vault-chain`'s), and
+    /// with `--api` the API's health, every one of those chains served with
+    /// a fresh reading, and a vault priced. Fails if any check does.
+    Smoke {
+        /// The API's public address, e.g. https://testnet-api.shonin.fi
+        #[arg(long)]
+        api: Option<String>,
+        /// Pass when no vault is priced yet (a fresh generation)
+        #[arg(long)]
+        allow_no_vault: bool,
+    },
     /// Show the funder and each role's account on every EVM chain of the
     /// network, with what each holds for gas and what it is short, and the
     /// Solana deployer, roles and programs: what to fund before a testnet
@@ -299,12 +312,21 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+    // A report asked for as JSON is the only thing on standard output; its
+    // log goes to standard error.
+    let json_out = matches!(args.command, Some(Command::Economics { json: true, .. }));
+    let writer = if json_out {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
+    } else {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
+    };
     tracing_subscriber::fmt()
         .with_env_filter(chain::log_filter())
         .with_target(false)
+        .with_writer(writer)
         .init();
 
-    let args = Args::parse();
     let target = args.chain_args.resolve()?;
     let local = target.network == NetworkName::Local;
     // A vault chain named on the command line: the devnet deploys to and
@@ -374,18 +396,8 @@ async fn main() -> Result<()> {
                     .await?;
                 }
             }
-            for (key, client, file, _) in &chains {
-                deploy::ensure(
-                    client,
-                    target.network,
-                    key,
-                    &args.artifacts,
-                    file,
-                    &names,
-                    generation,
-                )
+            deploy::ensure_each(&chains, target.network, &args.artifacts, &names, generation)
                 .await?;
-            }
             if local {
                 for (key, config) in only(&target, one, solana_clusters(&target)) {
                     let client = chain::connect_solana(target.network, &key, &config).await?;
@@ -395,6 +407,32 @@ async fn main() -> Result<()> {
                 }
             }
             Ok(())
+        }
+        Some(Command::Smoke {
+            api,
+            allow_no_vault,
+        }) => {
+            let chains: Vec<_> = target
+                .configs
+                .network(target.network)
+                .into_iter()
+                .flat_map(|network| network.iter())
+                .filter(|(_, key)| key.kind == ChainKind::Evm)
+                .filter(|(_, key)| !one || key.same_chain(&target.key))
+                .filter_map(|(chain, key)| {
+                    Some((chain, key.clone(), target.configs.get(key)?.clone()))
+                })
+                .collect();
+            smoke::run(
+                target.network,
+                &chains,
+                &target.deployments_dir,
+                &smoke::Options {
+                    api,
+                    allow_no_vault,
+                },
+            )
+            .await
         }
         Some(Command::Accounts) => accounts(&target, &args.funding).await,
         Some(Command::ProposeChecker) => {
@@ -657,20 +695,53 @@ async fn main() -> Result<()> {
             for (key, config) in only(&target, one, evm_chains(&target)) {
                 let network = target.network;
                 let file = Deployments::file_in(&target.deployments_dir, &key);
+                // Each chain on its own: one whose endpoint is down, or that
+                // stops, is started again after a pause, and holds up none
+                // of the others.
                 running.spawn(async move {
-                    let client = connect_to(network, &key, &config).await?;
-                    let deployments = client.deployments(&file).await.with_context(|| {
-                        format!("no deployment on {key}: run chains:deploy first")
-                    })?;
-                    market::operate(&client, &deployments, every, market::TapeParams::TESTNET)
-                        .await
-                        .map_err(|error| error.context(format!("the market on {key}")))
+                    loop {
+                        let ran = async {
+                            let client = connect_to(network, &key, &config).await?;
+                            let deployments =
+                                client.deployments(&file).await.with_context(|| {
+                                    format!("no deployment on {key}: run chains:deploy first")
+                                })?;
+                            market::operate(
+                                &client,
+                                &deployments,
+                                every,
+                                market::TapeParams::TESTNET,
+                            )
+                            .await
+                        }
+                        .await;
+                        let Err(error) = ran else { continue };
+                        let error = error.context(format!("the market on {key}"));
+                        if !market::worth_restarting(&error) {
+                            return Err::<(), _>(error);
+                        }
+                        tracing::warn!(
+                            error = format!("{error:#}"),
+                            "the market operator stopped on this chain; it starts again shortly"
+                        );
+                        tokio::time::sleep(market::RESTART_AFTER).await;
+                    }
                 });
             }
+            let mut failed = None;
             while let Some(finished) = running.join_next().await {
-                finished??;
+                let error = match finished {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(error)) => error,
+                    Err(error) => anyhow::Error::new(error),
+                };
+                tracing::error!(
+                    error = format!("{error:#}"),
+                    "a chain's market operator stopped for good"
+                );
+                failed.get_or_insert(error);
             }
-            Ok(())
+            failed.map_or(Ok(()), Err)
         }
         Some(Command::Demo {
             api,
@@ -693,6 +764,7 @@ async fn main() -> Result<()> {
                 target.vault_chain,
                 &deployments,
                 &seed::Demo {
+                    network: target.network.name(),
                     api: &api,
                     agents: agents.as_deref(),
                     agent: &agent,
