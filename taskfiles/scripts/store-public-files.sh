@@ -8,7 +8,8 @@
 # A bundle goes (component.wasm, bundle.tar, hashes.json) only where its
 # build record (hashes.json, filed under that bundle's own hash) names a
 # source whose source.tar is in the store; with it go that source.tar and the
-# manifest the record names. A review report goes only if it says it is not
+# manifest the record names, and every other unsealed manifest of that
+# bundle with its own source. A review report goes only if it says it is not
 # of sealed source. Nothing else ever goes: no sealed file however it is
 # spelt, no queue, payments, archives or pending reviews, nothing outside a
 # sha256-<hex> directory. It fails (exit 1) if anything it was about
@@ -47,6 +48,23 @@ listed=$(
     done
     echo "$source/source.tar"
     [ -n "$manifest" ] && [ -f "$manifest/manifest.json" ] && echo "$manifest/manifest.json"
+  done
+  # The same bundle published again (another vault chain's copy of the same
+  # project) has a manifest and a source of its own, which its build record
+  # doesn't name: each goes if the manifest says it is not sealed, its source
+  # is in the store, and the bundle it names is one listed above.
+  for manifest in sha256-*/manifest.json; do
+    [ -f "$manifest" ] || continue
+    [ "$(jq -r '.sealed' "$manifest")" = "false" ] || continue
+    bundle=$(directory "$(jq -r '.bundle_hash // empty' "$manifest")")
+    source=$(directory "$(jq -r '.source_hash // empty' "$manifest")")
+    [ -n "$bundle" ] && [ -f "$bundle/hashes.json" ] || continue
+    [ "$(directory "$(jq -r '.bundle // empty' "$bundle/hashes.json")")" = "$bundle" ] || continue
+    published=$(directory "$(jq -r '.source // empty' "$bundle/hashes.json")")
+    [ -n "$published" ] && [ -f "$published/source.tar" ] || continue
+    [ -n "$source" ] && [ -f "$source/source.tar" ] || continue
+    echo "$manifest"
+    echo "$source/source.tar"
   done
   for report in sha256-*/report.json; do
     [ -f "$report" ] || continue

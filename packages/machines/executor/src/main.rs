@@ -302,6 +302,9 @@ struct Book {
     stations: HashMap<Address, Address>,
     /// The vaults waiting for their bundle to reach the store.
     waiting_for_bundle: HashSet<Address>,
+    /// The vaults whose bundle and manifest have been read through from the
+    /// public store (or found on disk), so they aren't asked for again.
+    read_through: HashSet<Address>,
     /// Vaults that could not be taken on, and when to try again: held off
     /// for longer each time rather than tried at every sweep.
     taking_on: HashMap<Address, Retry>,
@@ -768,17 +771,24 @@ async fn sweep_one(
         return Ok(());
     }
     let mut component = bundle_path(&args.store, bundle);
-    // A bundle not on disk is read through from the public store, if there
-    // is one, and kept only once it checks against the hashes the chain
-    // holds.
-    if !component.exists()
+    // A vault's files not on disk are read through from the public store, if
+    // there is one, and kept only once they check against the hashes the
+    // chain holds: its bundle, and its own manifest, which a vault on another
+    // chain running the same bundle doesn't share. Once a vault's files are
+    // all on disk it isn't asked again.
+    if (!component.exists() || !book.read_through.contains(&vault))
         && let Some(base) = args.store_url.as_deref()
     {
-        if let Err(error) =
-            fetch_bundle(client, deployments, &args.store, base, vault, bundle).await
-            && book.warn(vault)
-        {
-            tracing::warn!(%chain, vault = %vault, %bundle, error = format!("{error:#}"), "could not read the bundle through from the public store");
+        match fetch_bundle(client, deployments, &args.store, base, vault, bundle).await {
+            Ok(true) => {
+                book.read_through.insert(vault);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                if book.warn(vault) {
+                    tracing::warn!(%chain, vault = %vault, %bundle, error = format!("{error:#}"), "could not read the bundle through from the public store");
+                }
+            }
         }
         component = bundle_path(&args.store, bundle);
     }
@@ -960,6 +970,7 @@ fn unix_now() -> u64 {
 /// Read a vault's bundle through from the public store: its recorded
 /// manifest, checked against the hash the registry holds, then its
 /// component, checked against the hash that manifest records.
+/// Says whether the vault's manifest and component are both on disk now.
 async fn fetch_bundle(
     client: &Client,
     deployments: &Deployments,
@@ -967,7 +978,7 @@ async fn fetch_bundle(
     base: &str,
     vault: Address,
     bundle: B256,
-) -> Result<()> {
+) -> Result<bool> {
     let strategy_id = client.read(vault, IVault::strategyIdCall {}).await?;
     let registered = client
         .read(
@@ -987,7 +998,7 @@ async fn fetch_bundle(
     )
     .await?
     {
-        return Ok(());
+        return Ok(false);
     }
     let path = store::path(store_dir, manifest_hash, "manifest.json");
     let canonical: shared::Canonical = serde_json::from_slice(
@@ -1005,8 +1016,7 @@ async fn fetch_bundle(
         "component.wasm",
         store::component_check(canonical.component_hash),
     )
-    .await?;
-    Ok(())
+    .await
 }
 
 /// How often a key waiting for its blessing or its gas is looked at: often
@@ -1883,6 +1893,7 @@ async fn wait_blessed_and_stocked(
         let waiting_for = if blessed {
             let line = health::gas_line(chain).await?;
             if chain.balance(key).await? >= line {
+                tracing::info!(%vault, %key, "the key is blessed and holds its gas");
                 return Ok(());
             }
             "its gas"
