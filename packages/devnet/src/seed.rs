@@ -343,6 +343,260 @@ pub async fn run(
     Ok(())
 }
 
+/// What the demo asks of a run.
+pub struct Demo<'a> {
+    pub api: &'a str,
+    pub agents: Option<&'a Path>,
+    pub agent: &'a str,
+    /// A strategy already published (with `--publish-only`) and never
+    /// activated, to activate instead of publishing again.
+    pub strategy: Option<u64>,
+    /// The depositor's money, in dollars.
+    pub deposit_dollars: u64,
+    /// The tank is filled, and kept by auto-fill, at this many days of the
+    /// allowances' daily cap.
+    pub tank_days: u64,
+    pub take_on: u64,
+    /// How long the agent has to put the money to work once it is priced.
+    pub work_within: std::time::Duration,
+}
+
+/// A demonstration that pays its own way: a fresh vault for one agent,
+/// activated at the modest allowances with its tank on auto-fill, a
+/// depositor's money in and at work, and then left running for nobody to top
+/// up. The market is the operator's (`market`), not the seed's: nothing here
+/// posts to the venue.
+///
+/// A vault belongs to one strategy for good, so a fresh vault is a fresh
+/// publish (or a strategy published with `--publish-only` and never
+/// activated). The tank starts at, and auto-fill keeps it at, `tank_days`
+/// of the allowances' daily cap, gas allowance included; only the
+/// depositor puts money in, so the author's only shares are fee shares, and
+/// every top-up the tank gets after activation is paid from them.
+pub async fn demo(
+    client: &Client,
+    vault_chain: shared::Chain,
+    deployments: &Deployments,
+    demo: &Demo<'_>,
+) -> Result<()> {
+    use chain::bindings::prices::IPrices;
+    use chain::bindings::strategies::IStrategyRegistry;
+
+    let author = client.account(Role::Author)?;
+    let strategy = match demo.strategy {
+        Some(id) => {
+            let strategy_id = U256::from(id);
+            let registered = client
+                .read(
+                    deployments.strategies,
+                    IStrategyRegistry::isRegisteredCall {
+                        strategyId: strategy_id,
+                    },
+                )
+                .await?;
+            if !registered {
+                bail!("strategy {id} is not registered on this chain");
+            }
+            let vault = client
+                .read(
+                    deployments.factory,
+                    IVaultFactory::vaultOfCall {
+                        strategyId: strategy_id,
+                    },
+                )
+                .await?;
+            if !vault.is_zero() {
+                bail!(
+                    "strategy {id} already has its vault ({vault}): a demo runs on a fresh one, so publish again (--agent) or pass a strategy published with --publish-only"
+                );
+            }
+            id
+        }
+        None => {
+            let agents = demo
+                .agents
+                .map(Path::to_path_buf)
+                .or_else(guess_agents)
+                .context("where the agents live: pass --agents or set SHONIN_AGENTS_DIR")?;
+            let project = agents.join("packages/agents").join(demo.agent);
+            if !project.join("shonin.toml").exists() {
+                bail!("no agent at {}", project.display());
+            }
+            let moved = on_vault_chain(&agents, &project, vault_chain)?;
+            let project = moved.as_deref().unwrap_or(&project);
+            say_who_the_author_is(client, deployments, author).await?;
+            tracing::info!(project = %project.display(), "publishing, for a fresh vault");
+            let published = crate::publish::publish(
+                client,
+                vault_chain,
+                deployments,
+                demo.api,
+                project,
+                author,
+                false,
+                false,
+            )
+            .await?;
+            match published.outcome {
+                JobState::Ready => published.strategy_id.context("a ready job has an id")?,
+                other => bail!("job {} ended {}", published.job_id, other.label()),
+            }
+        }
+    };
+    let slug = shared::Strategy::slug_for(vault_chain, strategy);
+
+    // Activated as an author would, at the modest allowances with the
+    // smallest tank; then the tank filled to its figure and auto-fill set.
+    let vault = crate::publish::activate_it(client, deployments, author, strategy).await?;
+    tracing::info!(slug, %vault, "activated at the modest allowances");
+    let allowances = client.read(vault, IVault::allowancesCall {}).await?;
+    let daily = client
+        .read(deployments.prices, IPrices::dailyCostCall { allowances })
+        .await?;
+    let keep = daily * U256::from(demo.tank_days);
+    let tank = client.read(vault, IVault::tankCall {}).await?;
+    let keep = keep.max(tank.balance);
+    let more = keep - tank.balance;
+    if !more.is_zero() {
+        have(client, deployments, author, more).await?;
+        client
+            .send(
+                author,
+                deployments.usd,
+                ILocalUsd::approveCall {
+                    spender: vault,
+                    value: more,
+                },
+            )
+            .await?;
+        client
+            .send(author, vault, IVault::fundTankCall { assets: more })
+            .await
+            .context("filling the tank")?;
+    }
+    client
+        .send(author, vault, IVault::setTankKeepCall { assets: keep })
+        .await
+        .context("turning auto-fill on")?;
+    tracing::info!(
+        slug,
+        tank = %keep,
+        daily_cap = %daily,
+        days = demo.tank_days,
+        "the tank is filled, and auto-fill keeps it there from the author's fee shares"
+    );
+
+    let viewer = client.account(Role::Viewer)?;
+    let amount = demo.deposit_dollars * 1_000_000;
+    have(client, deployments, viewer, U256::from(amount)).await?;
+    deposit(client, deployments, vault, viewer, amount).await?;
+    tracing::info!(
+        slug,
+        dollars = demo.deposit_dollars,
+        "a depositor asked to put money in"
+    );
+
+    wait_taken_on(client, deployments, vault, &slug, demo.take_on).await?;
+    let shares = wait_for_shares(client, vault, viewer).await?;
+    tracing::info!(slug, %shares, "the deposit was priced at a later valuation");
+    at_work(client, deployments, vault, &slug, shares, demo.work_within).await?;
+
+    println!("vault {vault}");
+    println!(
+        "The demo is running and is left to run: {slug} ({vault}) on {}, ${} deposited, the tank at {} (auto-fill on).",
+        vault_chain.name(),
+        demo.deposit_dollars,
+        alloy::primitives::utils::format_units(keep, 6).unwrap_or_default()
+    );
+    println!(
+        "Keep the market operator posting (task chains:market NETWORK=testnet), and the services up. To watch it pay its way:"
+    );
+    println!(
+        "  task services:economics NETWORK=testnet VAULT_CHAIN={} VAULT={vault}",
+        vault_chain.name()
+    );
+    println!(
+        "The bill is collected and auto-fill runs on the keeper's daily keep; the author's fee shares are minted at the first valuation on or after Monday 00:00 UTC."
+    );
+    Ok(())
+}
+
+/// Make sure `who` holds `amount` of the development dollar, minting what it
+/// lacks (anyone may mint it).
+async fn have(
+    client: &Client,
+    deployments: &Deployments,
+    who: alloy::primitives::Address,
+    amount: U256,
+) -> Result<()> {
+    let held = client
+        .read(deployments.usd, IERC20::balanceOfCall { account: who })
+        .await?;
+    if held < amount {
+        client
+            .send(
+                who,
+                deployments.usd,
+                ILocalUsd::mintCall {
+                    to: who,
+                    amount: amount - held,
+                },
+            )
+            .await
+            .context("minting the development dollar")?;
+    }
+    Ok(())
+}
+
+/// Wait until the agent holds positions at the venue and the vault's cash is
+/// under nine tenths of what the depositor's shares are worth. The market is
+/// left to its operator; if the agent hasn't moved within `within`, say what
+/// the venue's funding is, since `funding-basis` waits for 0.0002 a day.
+async fn at_work(
+    client: &Client,
+    deployments: &Deployments,
+    vault: alloy::primitives::Address,
+    slug: &str,
+    shares: U256,
+    within: std::time::Duration,
+) -> Result<()> {
+    use chain::bindings::venue::ILocalVenue;
+    let station = client.read(vault, IVault::homeStationCall {}).await?;
+    let until = tokio::time::Instant::now() + within;
+    while tokio::time::Instant::now() < until {
+        let held = client
+            .read(
+                deployments.venue,
+                ILocalVenue::marketsHeldByCall { master: station },
+            )
+            .await?;
+        let cash = client.read(vault, IVault::cashCall {}).await?;
+        let price = client.read(vault, IVault::sharePriceCall {}).await?;
+        let worth = shares * price / U256::from(10u64).pow(U256::from(18u64));
+        if !held.is_empty() && cash * U256::from(10u64) < worth * U256::from(9u64) {
+            tracing::info!(slug, %cash, %worth, markets = held.len(), "the agent has put the money to work");
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+    let perp = client
+        .read(
+            deployments.venue,
+            ILocalVenue::marketOfCall {
+                market: crate::deploy::market_id(crate::deploy::PERP),
+            },
+        )
+        .await?;
+    let rate: f64 = perp.fundingRate.to_string().parse().unwrap_or(0.0);
+    let mark: f64 = perp.mark.to_string().parse().unwrap_or(1.0);
+    bail!(
+        "the agent of {slug} ({vault}) has not put the money to work within {} min. The venue quotes funding of {:.6} a day, last posted at {}: funding-basis enters at 0.0002. Is the market operator posting (task chains:market NETWORK=testnet)? The vault is left as it is.",
+        within.as_secs() / 60,
+        rate / mark,
+        perp.fundingUpdatedAt
+    )
+}
+
 /// Ask to deposit, with the depositor's signed statement. The next valuation
 /// prices it.
 async fn deposit(

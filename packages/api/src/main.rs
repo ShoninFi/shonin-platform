@@ -4,8 +4,10 @@
 //! snapshot that carries everything a page renders, the platform's terms as
 //! the contracts state them, a depositor's portfolio, the build queue, and
 //! the store's files by hash. Submissions pass through to the build service
-//! and health reports are taken only from a key blessed for their vault.
+//! and health reports are taken only from a key blessed for their vault. The
+//! root key's status and its published keys are relayed from the executor.
 
+mod rootkey;
 mod solana;
 
 use std::net::SocketAddr;
@@ -127,6 +129,9 @@ async fn main() -> Result<()> {
         .route("/api/{chain}/health/{vault}/signed", get(signed_health))
         .route("/api/{chain}/usage/{vault}", get(usage))
         .route("/api/store/{hash}/{name}", get(store_file))
+        // The root key service's public reads, from the executor.
+        .route("/api/rootkey", get(rootkey::status))
+        .route("/api/rootkey/published/{purpose}", get(rootkey::published))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(service);
 

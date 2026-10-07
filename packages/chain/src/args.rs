@@ -74,6 +74,16 @@ impl ChainArgs {
         self.target(&configs, self.vault_chain.unwrap_or(Chain::Base))
     }
 
+    /// The network's canonical chain for the root key (its `root` entry in
+    /// the chain config), or `None` where the network names none.
+    pub fn root_chain(&self) -> Result<Option<ChainKey>> {
+        let configs = ChainConfigs::load(&self.chains)?;
+        Ok(configs
+            .network(self.network)
+            .and_then(|network| network.root())
+            .map(|(_, key)| key.clone()))
+    }
+
     /// Every EVM vault chain this service serves: the one named, if it is an
     /// EVM one, or every EVM vault chain of the network. A Solana vault chain
     /// named alone leaves none, so the service serves that cluster alone; the

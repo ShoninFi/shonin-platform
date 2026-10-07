@@ -554,6 +554,9 @@ async fn deploy(
         (
             admin,
             price_notice,
+            // The fuel one core runs through in a second, from the same
+            // constant the executor bills with.
+            shared::manifest::FUEL_PER_CORE_SECOND,
             // The published prices, in dollars scaled by 1e18, in the order
             // `UnitPrices` declares them: a core-hour, a GiB-hour, a GB of
             // egress, a second of inference.
@@ -1253,6 +1256,7 @@ fn setup_steps(deployments: &Deployments) -> Vec<Step> {
         ("builder", ImageKind::Builder),
         ("reviewer", ImageKind::Reviewer),
         ("unwinder", ImageKind::Unwinder),
+        ("holder", ImageKind::Holder),
     ] {
         steps.push(Step {
             name: format!("image {service}"),

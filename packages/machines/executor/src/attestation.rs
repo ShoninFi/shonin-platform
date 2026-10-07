@@ -2,10 +2,13 @@
 //! that binds that tree, and the seal that proves the token.
 //!
 //! Every vault taken on, on every EVM chain served, is one leaf naming the
-//! vault's own key (`chain::attest::key_leaf`). The instance binds its own
-//! key and the root over those leaves into the nonce of the token it asks
-//! Confidential Space for, so one proof of that token blesses every key in
-//! the tree, each with its own Merkle proof.
+//! vault's own key (`chain::attest::key_leaf`). While the instance holds the
+//! root key, one more leaf names the root's signer on the canonical chain
+//! (`chain::attest::root_leaf`), so the same attestation records the root
+//! there (`setRootKey`). The instance binds its own key and the root over
+//! those leaves into the nonce of the token it asks Confidential Space for,
+//! so one proof of that token blesses every key in the tree, each with its
+//! own Merkle proof.
 //!
 //! The executor never blesses anything itself and holds no account that
 //! could: it publishes the tree, the token and, once a prover has posted
@@ -102,6 +105,26 @@ impl Leaf {
     }
 }
 
+/// The root key's signer, as a leaf of the tree on the canonical chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootLeaf {
+    /// The canonical chain, whose registry records the root.
+    pub chain_id: u64,
+    pub signer: Address,
+    /// Whether the chain wants it recorded: it records no root, or records
+    /// this one through a checker no longer allowed.
+    pub due: bool,
+    /// When the attestation the chain recorded it from runs out (its issue
+    /// time and a TTL); zero while it records none of this signer's.
+    pub until: u64,
+}
+
+impl RootLeaf {
+    pub fn hash(&self) -> B256 {
+        chain::attest::root_leaf(self.chain_id, self.signer)
+    }
+}
+
 /// A token the launcher gave, for the nonce it binds.
 #[derive(Clone, Debug)]
 struct Held {
@@ -127,6 +150,12 @@ struct Sealed {
 struct Inner {
     /// By chain and vault, so the tree's order is the same at every look.
     leaves: BTreeMap<(u64, Address), Leaf>,
+    /// The root's signer, while the instance holds the root: the tree's last
+    /// leaf.
+    root: Option<RootLeaf>,
+    /// The earliest a development seal is dated (see
+    /// [`Attestation::date_after`]).
+    dated_after: u64,
     token: Option<Held>,
     sealed: Option<Sealed>,
     /// The shortest blessing TTL among the chains served.
@@ -157,14 +186,19 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// The tree's root over `leaves` and each leaf's proof, in order.
-fn tree(leaves: &[Leaf]) -> (B256, Vec<Vec<B256>>) {
-    let hashes: Vec<B256> = leaves.iter().map(Leaf::hash).collect();
-    let root = chain::attest::merkle_root(&hashes);
+/// The tree's root over the vault leaves and, last, the root's signer's
+/// leaf, and each leaf's proof, in that order.
+fn tree(leaves: &[Leaf], root: Option<&RootLeaf>) -> (B256, Vec<Vec<B256>>) {
+    let hashes: Vec<B256> = leaves
+        .iter()
+        .map(Leaf::hash)
+        .chain(root.map(RootLeaf::hash))
+        .collect();
+    let top = chain::attest::merkle_root(&hashes);
     let proofs = (0..hashes.len())
         .map(|index| chain::attest::merkle_proof(&hashes, index))
         .collect();
-    (root, proofs)
+    (top, proofs)
 }
 
 /// Whether a blessing that ends at `until` wants renewing at `now`: not
@@ -255,6 +289,23 @@ fn seal_wanted(
         && token_nonce == nonce
         && !sealed
             .is_some_and(|(sealed_nonce, sealed_at)| sealed_nonce == nonce && sealed_at >= iat)
+}
+
+/// When a development seal is dated, with the chains' head at `head`: a
+/// minute before it, so a node a block behind doesn't see it as from the
+/// future, but no earlier than `floor`, and never past the head.
+fn dated(head: u64, floor: u64) -> u64 {
+    head.saturating_sub(DATED_BEFORE_THE_HEAD)
+        .max(floor.min(head))
+}
+
+/// What a posted seal is simulated with before it is kept.
+#[derive(Debug)]
+enum Simulate {
+    /// A `bless` of one vault key, the first on its chain.
+    Bless(Leaf, Vec<B256>),
+    /// `setRootKey` for the root's signer, on the canonical chain.
+    SetRoot(RootLeaf, Vec<B256>),
 }
 
 /// Why a seal posted to the status port was not taken.
@@ -434,6 +485,19 @@ pub struct Status {
     pub journal: Option<String>,
     pub seal_wanted: bool,
     pub leaves: Vec<LeafView>,
+    /// The root's signer's leaf, while the instance holds the root, for the
+    /// keeper to relay `setRootKey` with.
+    #[serde(default)]
+    pub root: Option<RootLeafView>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct RootLeafView {
+    pub chain_id: u64,
+    pub signer: String,
+    pub due: bool,
+    pub leaf: String,
+    pub proof: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -526,6 +590,72 @@ impl Attestation {
         }
     }
 
+    /// Put the root's signer in the tree, for the canonical chain to record:
+    /// wanted there until the chain says otherwise. The same signer again
+    /// changes nothing.
+    pub fn put_root(&self, chain_id: u64, signer: Address) {
+        let mut inner = self.inner();
+        let same = inner
+            .root
+            .as_ref()
+            .is_some_and(|held| held.chain_id == chain_id && held.signer == signer);
+        if !same {
+            inner.root = Some(RootLeaf {
+                chain_id,
+                signer,
+                due: true,
+                until: 0,
+            });
+            self.touched(&mut inner);
+        }
+    }
+
+    /// Date no development seal earlier than `at`, by the chains' clocks: a
+    /// root made after a record was cleared is recorded only from an
+    /// attestation made after the clear, and a development seal is otherwise
+    /// dated a minute before the head. A launcher's token is dated when it is
+    /// asked for, which is after anyway.
+    pub fn date_after(&self, at: u64) {
+        let mut inner = self.inner();
+        inner.dated_after = inner.dated_after.max(at);
+    }
+
+    #[cfg(test)]
+    pub fn inner_dated_after(&self) -> u64 {
+        self.inner().dated_after
+    }
+
+    /// Take the root's signer out of the tree: the root is let go.
+    pub fn remove_root(&self) {
+        let mut inner = self.inner();
+        if inner.root.take().is_some() {
+            self.touched(&mut inner);
+        }
+    }
+
+    /// Note whether the canonical chain wants the root's signer recorded,
+    /// and until when its record's attestation runs.
+    pub fn note_root(&self, signer: Address, wants: bool, until: u64) {
+        let mut inner = self.inner();
+        if let Some(root) = inner.root.as_mut()
+            && root.signer == signer
+        {
+            root.until = until;
+            if root.due != wants {
+                root.due = wants;
+                if wants {
+                    self.changed.notify_one();
+                }
+            }
+        }
+    }
+
+    /// The root's signer's leaf, while it is in the tree.
+    #[cfg(test)]
+    pub fn root_leaf(&self) -> Option<RootLeaf> {
+        self.inner().root.clone()
+    }
+
     /// Note whether a vault's key wants blessing, when the chain says its
     /// blessing runs out, and the chain's TTL.
     pub fn note(
@@ -558,17 +688,17 @@ impl Attestation {
         inner.leaves.values().cloned().collect()
     }
 
-    fn binding_of(&self, leaves: &[Leaf]) -> Binding {
+    fn binding_of(&self, inner: &Inner) -> Binding {
         Binding {
             evm_signer: self.instance.address().into_array(),
             solana_signer: [0; 32],
-            vaults_root: tree(leaves).0.0,
+            vaults_root: tree(&Self::leaves(inner), inner.root.as_ref()).0.0,
         }
     }
 
     /// What the instance's next token binds.
     pub fn binding(&self) -> Binding {
-        self.binding_of(&Self::leaves(&self.inner()))
+        self.binding_of(&self.inner())
     }
 
     /// The image and the project this instance attests as, as far as it
@@ -590,10 +720,12 @@ impl Attestation {
     pub fn status(&self) -> Status {
         let inner = self.inner();
         let leaves = Self::leaves(&inner);
-        let binding = self.binding_of(&leaves);
+        let binding = self.binding_of(&inner);
         let nonce = binding.nonce();
-        let (_, proofs) = tree(&leaves);
-        let any_due = leaves.iter().any(|leaf| leaf.due);
+        let (_, mut proofs) = tree(&leaves, inner.root.as_ref());
+        let root_proof = inner.root.as_ref().and_then(|_| proofs.pop());
+        let any_due =
+            leaves.iter().any(|leaf| leaf.due) || inner.root.as_ref().is_some_and(|root| root.due);
         let token = inner.token.as_ref().filter(|held| held.nonce == nonce);
         let sealed = inner.sealed.as_ref().filter(|sealed| sealed.nonce == nonce);
         let hex = |bytes: &[u8]| alloy::hex::encode_prefixed(bytes);
@@ -633,16 +765,37 @@ impl Attestation {
                     proof: proof.iter().map(ToString::to_string).collect(),
                 })
                 .collect(),
+            root: inner.root.as_ref().map(|root| RootLeafView {
+                chain_id: root.chain_id,
+                signer: root.signer.to_string(),
+                due: root.due,
+                leaf: root.hash().to_string(),
+                proof: root_proof
+                    .unwrap_or_default()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            }),
         }
     }
 
-    /// The chains with a key that wants blessing.
+    /// The chains with a key that wants blessing, or the root's that wants
+    /// recording.
     fn chains_wanting(&self) -> Vec<u64> {
-        let mut chains: Vec<u64> = Self::leaves(&self.inner())
+        let inner = self.inner();
+        let mut chains: Vec<u64> = Self::leaves(&inner)
             .iter()
             .filter(|leaf| leaf.due)
             .map(|leaf| leaf.chain_id)
+            .chain(
+                inner
+                    .root
+                    .as_ref()
+                    .filter(|root| root.due)
+                    .map(|root| root.chain_id),
+            )
             .collect();
+        chains.sort_unstable();
         chains.dedup();
         chains
     }
@@ -681,13 +834,23 @@ impl Attestation {
             return false;
         }
         let leaves = Self::leaves(&inner);
-        let nonce = self.binding_of(&leaves).nonce();
+        let nonce = self.binding_of(&inner).nonce();
+        // The root's signer wants recording as a key wants blessing: a seal
+        // the chain has applied while it still wants it answers nothing.
         let wanting: Vec<Wanting> = leaves
             .iter()
             .filter(|leaf| leaf.due)
-            .map(|leaf| Wanting {
-                chain_now: clocks.get(&leaf.chain_id).copied(),
-                until: leaf.until,
+            .map(|leaf| (leaf.chain_id, leaf.until))
+            .chain(
+                inner
+                    .root
+                    .as_ref()
+                    .filter(|root| root.due)
+                    .map(|root| (root.chain_id, root.until)),
+            )
+            .map(|(chain_id, until)| Wanting {
+                chain_now: clocks.get(&chain_id).copied(),
+                until,
             })
             .collect();
         let ttl = inner.ttl.unwrap_or(DEFAULT_TTL);
@@ -714,7 +877,7 @@ impl Attestation {
             "the token is for another audience"
         );
         let mut inner = self.inner();
-        let nonce = self.binding_of(&Self::leaves(&inner)).nonce();
+        let nonce = self.binding_of(&inner).nonce();
         if !claims.nonces.contains(&nonce) {
             bail!("the token binds a tree this instance no longer holds");
         }
@@ -729,13 +892,14 @@ impl Attestation {
     }
 
     /// Check a posted seal against the current binding, without a chain:
-    /// what is left is the simulated `bless`. Says the journal, and one leaf
-    /// (with its proof) on each chain with a key, to simulate it on.
-    #[allow(clippy::type_complexity)]
-    fn check(&self, post: &SealPost) -> Result<(Sealed, Vec<(Leaf, Vec<B256>)>), Refusal> {
+    /// what is left is the simulated sends. Says the journal, one leaf (with
+    /// its proof) on each chain with a key to simulate a `bless` with, and
+    /// the root's signer's leaf, while the chain wants it recorded, to
+    /// simulate `setRootKey` with.
+    fn check(&self, post: &SealPost) -> Result<(Sealed, Vec<Simulate>), Refusal> {
         let inner = self.inner();
         let leaves = Self::leaves(&inner);
-        let binding = self.binding_of(&leaves);
+        let binding = self.binding_of(&inner);
         let nonce = binding.nonce();
         if post.nonce != nonce {
             return Err(Refusal::Nonce);
@@ -780,17 +944,24 @@ impl Attestation {
         {
             return Err(refused("the journal names another image or project"));
         }
-        let (_, proofs) = tree(&leaves);
-        let mut each_chain: Vec<(Leaf, Vec<B256>)> = Vec::new();
+        let (_, mut proofs) = tree(&leaves, inner.root.as_ref());
+        let root_proof = inner.root.as_ref().and_then(|_| proofs.pop());
+        let mut simulate: Vec<Simulate> = Vec::new();
         for (leaf, proof) in leaves.iter().zip(proofs) {
-            if each_chain
-                .last()
-                .is_none_or(|(last, _)| last.chain_id != leaf.chain_id)
-            {
-                each_chain.push((leaf.clone(), proof));
+            let new_chain = !simulate.iter().any(|done| match done {
+                Simulate::Bless(last, _) => last.chain_id == leaf.chain_id,
+                Simulate::SetRoot(..) => false,
+            });
+            if new_chain {
+                simulate.push(Simulate::Bless(leaf.clone(), proof));
             }
         }
-        if each_chain.is_empty() {
+        if let (Some(root), Some(proof)) = (inner.root.as_ref(), root_proof)
+            && root.due
+        {
+            simulate.push(Simulate::SetRoot(root.clone(), proof));
+        }
+        if leaves.is_empty() && inner.root.is_none() {
             return Err(refused("the instance holds no key"));
         }
         Ok((
@@ -800,49 +971,87 @@ impl Attestation {
                 journal: journal_bytes,
                 issued_at: journal.issued_at,
             },
-            each_chain,
+            simulate,
         ))
     }
 
     /// Take a seal a prover posts: checked against the binding, then a
     /// `bless` of one leaf simulated on each chain the instance holds keys
-    /// on; kept only if it would land on every one of them, since a chain
-    /// whose checker refuses it would otherwise never see its keys blessed
-    /// until the seal aged.
+    /// on; kept only if each would land, since a chain whose checker refuses
+    /// it would otherwise never see its keys blessed until the seal aged.
+    ///
+    /// While the canonical chain wants the root recorded, `setRootKey` is
+    /// simulated too, but only a seal for a tree holding nothing else is
+    /// refused for it: the vault keys trade depositors' money, and their
+    /// blessing never waits on the root. A seal kept although `setRootKey`
+    /// would revert leaves the root's leaf wanted, for a later seal.
     pub async fn accept(&self, post: SealPost) -> Result<(), Refusal> {
-        let (sealed, each_chain) = self.check(&post)?;
-        for (leaf, proof) in each_chain {
+        let (sealed, simulate) = self.check(&post)?;
+        let blesses = simulate
+            .iter()
+            .any(|each| matches!(each, Simulate::Bless(..)));
+        for each in simulate {
+            let chain_id = match &each {
+                Simulate::Bless(leaf, _) => leaf.chain_id,
+                Simulate::SetRoot(root, _) => root.chain_id,
+            };
             let chain = self
                 .chains
                 .lock()
                 .ok()
-                .and_then(|chains| chains.get(&leaf.chain_id).cloned());
+                .and_then(|chains| chains.get(&chain_id).cloned());
             let Some((client, deployments)) = chain else {
                 return Err(Refusal::Unavailable(format!(
-                    "chain {} is not connected",
-                    leaf.chain_id
+                    "chain {chain_id} is not connected"
                 )));
             };
-            let simulated = client
-                .read(
-                    deployments.attestation,
-                    IAttestationRegistry::blessCall {
-                        seal: sealed.seal.clone(),
-                        journal: sealed.journal.clone(),
-                        vaultChain: U256::from(leaf.vault_chain),
-                        vault: leaf.vault,
-                        strategyHash: leaf.strategy_hash,
-                        key: leaf.key,
-                        merkleProof: proof,
-                    },
-                )
-                .await;
+            let (what, simulated) = match each {
+                Simulate::Bless(leaf, proof) => (
+                    "bless",
+                    client
+                        .read(
+                            deployments.attestation,
+                            IAttestationRegistry::blessCall {
+                                seal: sealed.seal.clone(),
+                                journal: sealed.journal.clone(),
+                                vaultChain: U256::from(leaf.vault_chain),
+                                vault: leaf.vault,
+                                strategyHash: leaf.strategy_hash,
+                                key: leaf.key,
+                                merkleProof: proof,
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                ),
+                Simulate::SetRoot(root, proof) => (
+                    "setRootKey",
+                    client
+                        .read(
+                            deployments.attestation,
+                            IAttestationRegistry::setRootKeyCall {
+                                seal: sealed.seal.clone(),
+                                journal: sealed.journal.clone(),
+                                rootSigner: root.signer,
+                                merkleProof: proof,
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                ),
+            };
             if let Err(error) = simulated {
                 let why = format!("{error:#}");
+                if what == "setRootKey" && blesses {
+                    tracing::warn!(
+                        error = why,
+                        "recording the root key from this seal would not go through; the seal is kept for the vault keys, and the root waits for a later one"
+                    );
+                    continue;
+                }
                 return Err(if why.contains("revert") {
                     Refusal::Journal(format!(
-                        "a simulated bless reverts on chain {}: {why}",
-                        leaf.chain_id
+                        "a simulated {what} reverts on chain {chain_id}: {why}"
                     ))
                 } else {
                     Refusal::Unavailable(why)
@@ -855,7 +1064,7 @@ impl Attestation {
     fn keep(&self, sealed: Sealed) -> Result<(), Refusal> {
         let mut inner = self.inner();
         // The tree may have moved while the chain was asked.
-        if self.binding_of(&Self::leaves(&inner)).nonce() != sealed.nonce {
+        if self.binding_of(&inner).nonce() != sealed.nonce {
             return Err(Refusal::Nonce);
         }
         tracing::info!(
@@ -877,14 +1086,15 @@ impl Attestation {
         let Some((first, deployments)) = chains.first().cloned() else {
             bail!("no chain is connected");
         };
-        let mut issued_at = u64::MAX;
+        let mut head = u64::MAX;
         for (client, _) in &chains {
-            issued_at = issued_at.min(client.block_timestamp().await?);
+            head = head.min(client.block_timestamp().await?);
         }
-        let issued_at = issued_at.saturating_sub(DATED_BEFORE_THE_HEAD);
+        let floor = self.inner().dated_after;
+        let issued_at = dated(head, floor);
         let (nonce, root) = {
             let inner = self.inner();
-            let binding = self.binding_of(&Self::leaves(&inner));
+            let binding = self.binding_of(&inner);
             (binding.nonce(), B256::from(binding.vaults_root))
         };
         let journal = Journal {
@@ -1474,12 +1684,22 @@ mod tests {
     /// A node for one chain that answers a simulated `bless` as told: it goes
     /// through, or it reverts. Notes how many it was asked.
     async fn bless_node(chain_id: u64, reverts: bool) -> (Client, Arc<Mutex<usize>>) {
+        bless_node_reverting(chain_id, move |_| reverts).await
+    }
+
+    /// A stand-in node whose calls revert where `reverts` says, by their
+    /// calldata.
+    async fn bless_node_reverting(
+        chain_id: u64,
+        reverts: impl Fn(&str) -> bool + Clone + Send + Sync + 'static,
+    ) -> (Client, Arc<Mutex<usize>>) {
         let asked = Arc::new(Mutex::new(0usize));
         let noted = asked.clone();
         let app = axum::Router::new().route(
             "/",
             axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
                 let noted = noted.clone();
+                let reverts = reverts.clone();
                 async move {
                     let id = request["id"].clone();
                     let method = request["method"].as_str().unwrap_or_default();
@@ -1503,7 +1723,12 @@ mod tests {
                         }
                         "eth_call" => {
                             *noted.lock().unwrap() += 1;
-                            if reverts {
+                            let call = &request["params"][0];
+                            let data = call["input"]
+                                .as_str()
+                                .or_else(|| call["data"].as_str())
+                                .unwrap_or_default();
+                            if reverts(data) {
                                 serde_json::json!({"jsonrpc": "2.0", "id": id, "error": {
                                     "code": 3, "message": "execution reverted", "data": "0x5f0bc0fb"
                                 }})
@@ -1569,6 +1794,188 @@ mod tests {
         attestation.serve_chain(second, crate::stand_in::deployments());
         attestation.accept(post(nonce, &journal)).await.unwrap();
         assert!(attestation.status().seal.is_some());
+    }
+
+    /// The root's signer is the tree's last leaf, by the registry's root
+    /// leaf rule, and proves under the bound root beside the vault keys.
+    #[test]
+    fn the_root_s_signer_is_a_leaf_of_the_bound_tree() {
+        let attestation = with(&[leaf(31337, 0x11, 0xa1), leaf(84532, 0x22, 0xa2)]);
+        let without = attestation.binding().nonce();
+        let signer = Address::repeat_byte(0x7e);
+        attestation.put_root(31337, signer);
+        assert_ne!(
+            attestation.binding().nonce(),
+            without,
+            "the next token binds it"
+        );
+        let status = attestation.status();
+        let top: B256 = status.binding.vaults_root.parse().unwrap();
+        let root = status.root.expect("the root's leaf is published");
+        let expected = chain::attest::root_leaf(31337, signer);
+        assert_eq!(root.leaf.parse::<B256>().unwrap(), expected);
+        assert_eq!(root.signer.parse::<Address>().unwrap(), signer);
+        let proof: Vec<B256> = root
+            .proof
+            .iter()
+            .map(|node| node.parse().unwrap())
+            .collect();
+        assert!(verifies(&proof, top, expected));
+        // The vault keys' leaves still prove under it.
+        for view in &status.leaves {
+            let proof: Vec<B256> = view
+                .proof
+                .iter()
+                .map(|node| node.parse().unwrap())
+                .collect();
+            assert!(verifies(&proof, top, view.leaf.parse().unwrap()));
+        }
+        // Wanted until the chain records it, and then not.
+        assert!(root.due);
+        assert_eq!(attestation.chains_wanting(), [31337, 84532]);
+        attestation.note(
+            31337,
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0xa1),
+            false,
+            0,
+            TTL,
+        );
+        attestation.note(
+            84532,
+            Address::repeat_byte(0x22),
+            Address::repeat_byte(0xa2),
+            false,
+            0,
+            TTL,
+        );
+        assert_eq!(attestation.chains_wanting(), [31337]);
+        attestation.note_root(signer, false, NOW + TTL);
+        assert!(attestation.chains_wanting().is_empty());
+        // The same signer again changes nothing; letting it go does.
+        let with_root = attestation.binding().nonce();
+        attestation.put_root(31337, signer);
+        assert_eq!(attestation.binding().nonce(), with_root);
+        attestation.remove_root();
+        assert_eq!(attestation.binding().nonce(), without);
+        assert!(attestation.status().root.is_none());
+    }
+
+    /// A seal for a tree holding the root's signer alone is taken once a
+    /// `setRootKey` simulated on the canonical chain goes through, and
+    /// refused where it reverts.
+    #[tokio::test]
+    async fn a_seal_is_simulated_with_set_root_key_while_the_root_wants_recording() {
+        let attestation = Attestation::new(Mode::Development).unwrap();
+        attestation.put_root(31337, Address::repeat_byte(0x7e));
+        let journal = Journal {
+            image_digest: chain::attest::image_digest("executor"),
+            project_id: chain::attest::project_id(),
+            ..journal_for(&attestation, NOW)
+        };
+        let nonce = attestation.binding().nonce();
+
+        let (refusing, asked) = bless_node(31337, true).await;
+        attestation.serve_chain(refusing, crate::stand_in::deployments());
+        assert!(matches!(
+            attestation.accept(post(nonce.clone(), &journal)).await,
+            Err(Refusal::Journal(why)) if why.contains("setRootKey")
+        ));
+        assert_eq!(*asked.lock().unwrap(), 1);
+        assert!(attestation.status().seal.is_none());
+
+        let (taking, asked) = bless_node(31337, false).await;
+        attestation.serve_chain(taking, crate::stand_in::deployments());
+        attestation
+            .accept(post(nonce.clone(), &journal))
+            .await
+            .unwrap();
+        assert_eq!(*asked.lock().unwrap(), 1);
+        assert!(attestation.status().seal.is_some());
+
+        // Once recorded, a seal is not simulated against it again.
+        attestation.note_root(Address::repeat_byte(0x7e), false, NOW + TTL);
+        let (refusing, asked) = bless_node(31337, true).await;
+        attestation.serve_chain(refusing, crate::stand_in::deployments());
+        attestation.accept(post(nonce, &journal)).await.unwrap();
+        assert_eq!(*asked.lock().unwrap(), 0);
+    }
+
+    /// A seal whose `setRootKey` would revert is still kept for the vault
+    /// keys it blesses: the root's leaf stays wanted, and only a tree holding
+    /// the root alone is refused for it.
+    #[tokio::test]
+    async fn a_root_that_cannot_be_recorded_never_holds_back_a_vault_key_blessing() {
+        let attestation = Attestation::new(Mode::Development).unwrap();
+        attestation.put(
+            31337,
+            Address::repeat_byte(0x0a),
+            B256::repeat_byte(0x5b),
+            Address::repeat_byte(0x0b),
+        );
+        attestation.put_root(31337, Address::repeat_byte(0x7e));
+        let journal = Journal {
+            image_digest: chain::attest::image_digest("executor"),
+            project_id: chain::attest::project_id(),
+            ..journal_for(&attestation, NOW)
+        };
+        let nonce = attestation.binding().nonce();
+        let set_root = alloy::hex::encode(
+            <IAttestationRegistry::setRootKeyCall as alloy::sol_types::SolCall>::SELECTOR,
+        );
+        let (node, asked) = bless_node_reverting(31337, move |data: &str| {
+            data.trim_start_matches("0x").starts_with(&set_root)
+        })
+        .await;
+        attestation.serve_chain(node, crate::stand_in::deployments());
+        attestation.accept(post(nonce, &journal)).await.unwrap();
+        // Both were simulated; the bless alone decided.
+        assert_eq!(*asked.lock().unwrap(), 2);
+        assert!(attestation.status().seal.is_some());
+        assert!(attestation.root_leaf().unwrap().due);
+
+        // A bless that reverts still refuses it, whatever the root does.
+        let attestation = Attestation::new(Mode::Development).unwrap();
+        attestation.put(
+            31337,
+            Address::repeat_byte(0x0a),
+            B256::repeat_byte(0x5b),
+            Address::repeat_byte(0x0b),
+        );
+        attestation.put_root(31337, Address::repeat_byte(0x7e));
+        let journal = Journal {
+            image_digest: chain::attest::image_digest("executor"),
+            project_id: chain::attest::project_id(),
+            ..journal_for(&attestation, NOW)
+        };
+        let nonce = attestation.binding().nonce();
+        let set_root = alloy::hex::encode(
+            <IAttestationRegistry::setRootKeyCall as alloy::sol_types::SolCall>::SELECTOR,
+        );
+        let (node, _) = bless_node_reverting(31337, move |data: &str| {
+            !data.trim_start_matches("0x").starts_with(&set_root)
+        })
+        .await;
+        attestation.serve_chain(node, crate::stand_in::deployments());
+        assert!(matches!(
+            attestation.accept(post(nonce, &journal)).await,
+            Err(Refusal::Journal(why)) if why.contains("bless")
+        ));
+        assert!(attestation.status().seal.is_none());
+    }
+
+    /// A development seal for a root made after a clear is dated after the
+    /// record was found empty, however recent the clear, and never in the
+    /// chain's future.
+    #[test]
+    fn a_development_seal_is_dated_no_earlier_than_asked_and_never_past_the_head() {
+        assert_eq!(dated(NOW, 0), NOW - DATED_BEFORE_THE_HEAD);
+        assert_eq!(dated(NOW, NOW - 10), NOW - 10);
+        assert_eq!(dated(NOW, NOW + 10), NOW);
+        let attestation = with(&[]);
+        attestation.date_after(NOW - 5);
+        attestation.date_after(NOW - 30);
+        assert_eq!(attestation.inner().dated_after, NOW - 5);
     }
 
     #[test]

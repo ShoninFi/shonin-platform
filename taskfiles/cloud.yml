@@ -34,7 +34,9 @@ vars:
   # The tag an image is built, pushed and launched under: the commit, unless
   # TAG names another.
   IMAGE_TAG: "{{.TAG | default .GIT_SHA}}"
-  MACHINES: "reviewer builder executor unwinder"
+  # The attested machines. `requester` is the root key service's test
+  # requester, launched for a live exchange and deleted after.
+  MACHINES: "reviewer builder executor unwinder requester"
   SERVICES: "api indexer keeper"
   # B's image: the attestation's prover, run on its own Spot VM.
   PROVERS: "prover"
@@ -66,7 +68,7 @@ vars:
 
 tasks:
   build:
-    desc: "Build an image locally for a network (NAME=reviewer|builder|executor|unwinder|api|indexer|keeper|prover, NETWORK=testnet|mainnet), tagged NAME:TAG (the commit by default), with the network's deployments and settings baked in"
+    desc: "Build an image locally for a network (NAME=reviewer|builder|executor|unwinder|requester|api|indexer|keeper|prover, NETWORK=testnet|mainnet; SEALED=<dir holding sealed.json> for the requester), tagged NAME:TAG (the commit by default), with the network's deployments and settings baked in"
     requires:
       vars: [NAME, NETWORK]
     preconditions:
@@ -94,8 +96,12 @@ tasks:
           elf=$(find "${CARGO_TARGET_DIR:-{{.PATH_ROOT}}/target}/riscv-guest" -path '*docker*' -name shonin-attestation-guest.bin 2>/dev/null | head -1)
           [ -n "$elf" ] && dirname "$elf" || true
       GUEST_CONTEXT: '{{if eq .NAME "prover"}}--build-context guest="{{.GUEST_DIR}}"{{end}}'
+      # The requester's sealed message (made with shonin-seal): the
+      # directory holding its sealed.json.
+      SEALED_CONTEXT: '{{if eq .NAME "requester"}}--build-context sealed="{{.SEALED}}"{{end}}'
     cmds:
       - cmd: '[ "{{.NAME}}" != "prover" ] || [ -s "{{.GUEST_DIR}}/shonin-attestation-guest.bin" ] || { echo "no guest ELF: build it with SHONIN_ATTESTATION_BUILD_GUEST=1, or set GUEST_DIR"; exit 1; }'
+      - cmd: '[ "{{.NAME}}" != "requester" ] || [ -s "{{.SEALED}}/sealed.json" ] || { echo "no sealed message: pass SEALED=<dir holding sealed.json>, made with shonin-seal"; exit 1; }'
       # Confidential Space and Compute Engine run linux/amd64. Every image
       # is handed the same settings and takes the ones it uses: the network,
       # the deployments directory (as the build context `deployments`; the
@@ -112,6 +118,7 @@ tasks:
         --build-arg EXECUTOR_URL={{.CLOUD_URL_EXECUTOR}}
         --build-context deployments="{{.PATH_DEPLOYMENTS_DIR}}"
         {{.GUEST_CONTEXT}}
+        {{.SEALED_CONTEXT}}
         -f "{{.PATH_ROOT}}/deploy/gcp/Dockerfile.{{.NAME}}"
         -t "{{.NAME}}:{{.IMAGE_TAG}}"
         "{{.PATH_ROOT}}"
@@ -129,7 +136,7 @@ tasks:
         msg: "No Google Cloud project for {{.NETWORK}}: set GCP_PROJECT_{{upper .NETWORK}} in taskfiles/config.yml. The gcloud default project is never used."
     cmds:
       - task: build
-        vars: { NAME: "{{.NAME}}", NETWORK: "{{.NETWORK}}", TAG: "{{.IMAGE_TAG}}" }
+        vars: { NAME: "{{.NAME}}", NETWORK: "{{.NETWORK}}", TAG: "{{.IMAGE_TAG}}", SEALED: "{{.SEALED}}" }
       - gcloud auth configure-docker "{{.GCP_REGION}}-docker.pkg.dev" --project="{{.GCP_PROJECT}}" --quiet
       - docker tag "{{.NAME}}:{{.IMAGE_TAG}}" "{{.GCP_REGISTRY}}/{{.NAME}}:{{.IMAGE_TAG}}"
       - docker push "{{.GCP_REGISTRY}}/{{.NAME}}:{{.IMAGE_TAG}}"

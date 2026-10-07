@@ -1,0 +1,46 @@
+# The root key: sealing to the keys derived from it.
+#
+# The executor holds the root key and publishes each purpose's public key,
+# signed by the root's signer; the API relays it (/api/rootkey/published/
+# <purpose>). Sealing checks that signature against the signer the network's
+# canonical chain records (`root` in config/chains.toml) before anything is
+# encrypted, so the API is trusted with nothing.
+version: "3"
+
+includes:
+  config:
+    taskfile: ./config.yml
+    flatten: true
+
+vars:
+  # Where the network's API answers.
+  ROOTKEY_API: '{{if eq .NETWORK "local"}}{{.URL_API_DEV}}{{else if eq .NETWORK "testnet"}}{{.URL_API_TESTNET}}{{end}}'
+
+tasks:
+  seal:
+    desc: >-
+      Seal a file to a purpose's published key, checked first against the root key the network's canonical
+      chain records (refused unless that record is live and the key is signed by its signer):
+      NETWORK=local|testnet PURPOSE=<purpose, e.g. platform:dummy> IN=<file, or - for standard input> OUT=<sealed JSON>
+      [AAD=<associated data the opener must give again>]. The plaintext is never printed.
+      For the root key's test requester: OUT=<dir>/sealed.json with PURPOSE=platform:dummy, then
+      task cloud:push NAME=requester NETWORK=testnet SEALED=<dir>, propose its digest with
+      task chains:image NETWORK=testnet DIGEST=<digest> KIND=reviewer and wait out the timelock, then
+      task cloud:deploy:machine NAME=requester NETWORK=testnet; it logs the sha256 of what it opened.
+      A root made again after a clear (task chains:clear-root-key) needs everything sealed again.
+    requires:
+      vars: [NETWORK, PURPOSE, IN, OUT]
+    preconditions:
+      - sh: '[ -n "{{.ROOTKEY_API}}" ]'
+        msg: "The {{.NETWORK}} network has no API to fetch published keys from, or no root key: NETWORK=local or NETWORK=testnet."
+    cmds:
+      - >-
+        cargo run -q -p shonin-rootkey --bin shonin-seal --
+        --network "{{.NETWORK}}"
+        --chains "{{.PATH_CHAINS}}"
+        --deployments "{{.PATH_DEPLOYMENTS_DIR}}"
+        --published "{{.ROOTKEY_API}}/api/rootkey/published/{{.PURPOSE}}"
+        --purpose "{{.PURPOSE}}"
+        --in "{{.IN}}"
+        --out "{{.OUT}}"
+        --aad "{{.AAD}}"

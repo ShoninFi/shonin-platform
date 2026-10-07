@@ -1,0 +1,41 @@
+# syntax=docker/dockerfile:1
+# The root key service's test requester: asks the holder (the executor) for a
+# platform secret's key by attested exchange, opens a message sealed to that
+# secret's purpose, and logs only whether it worked and sha256 of what it
+# opened. Runs on a Confidential Space VM, its image allowed on the canonical
+# chain as a reviewer for the test and revoked after.
+# Built from the repository root by
+# `task cloud:build NAME=requester NETWORK=testnet SEALED=<dir>`, which passes
+# the executor's internal URL and the directory holding the sealed message
+# (sealed.json, made with shonin-seal):
+#   docker build --build-arg EXECUTOR_URL=... \
+#     --build-context sealed=<dir> -f deploy/gcp/Dockerfile.requester .
+#
+# Everything it runs with is in the image: the attestation refuses a launch
+# that overrides the image's command or environment. Nothing in it is
+# secret: the sealed message opens only with the key the exchange releases
+# to this image.
+
+FROM rust:1.98.1-slim-bookworm AS build
+WORKDIR /src
+COPY . .
+# rust-toolchain.toml pins the same compiler; --locked builds exactly Cargo.lock.
+RUN cargo build --release --locked -p shonin-rootkey --bin shonin-rootkey-requester
+
+# Root inside the container: the launcher's token socket
+# (/run/container_launcher/teeserver.sock) is the launcher's.
+FROM gcr.io/distroless/cc-debian12
+# Confidential Space's hardened image sends the container's lines to Cloud
+# Logging only where the image allows it.
+LABEL "tee.launch_policy.log_redirect"="always"
+# The holder: the executor's status port.
+ARG EXECUTOR_URL
+# The purpose asked for: the dummy secret, which a reviewer's image may have.
+ARG PURPOSE=platform:dummy
+COPY --from=build /src/target/release/shonin-rootkey-requester /usr/local/bin/shonin-rootkey-requester
+# The named build context `sealed` (a build without it fails here).
+COPY --from=sealed sealed.json /etc/shonin/rootkey/sealed.json
+ENV SHONIN_ROOTKEY_HOLDER=${EXECUTOR_URL} \
+    SHONIN_ROOTKEY_PURPOSE=${PURPOSE} \
+    SHONIN_ROOTKEY_SEALED=/etc/shonin/rootkey/sealed.json
+ENTRYPOINT ["/usr/local/bin/shonin-rootkey-requester"]

@@ -19,8 +19,8 @@ use crate::feed::Reader;
 use crate::host::{Agent, Allowance, Counters, Ctx, Place};
 use crate::watch::VaultEvent;
 
-/// The least fuel a second any strategy gets, whatever its manifest says. A
-/// strategy with no fuel would never yield.
+/// The least fuel a second any strategy is held to, whatever its manifest
+/// says.
 const FUEL_FLOOR: u64 = 100_000;
 
 /// What a strategy's fuel is kept at. It is deliberately far more than any
@@ -31,6 +31,15 @@ pub const BANK: u64 = u64::MAX / 4;
 /// How long between the host taking control back, so no strategy can hold a
 /// machine to itself.
 const YIELD_INTERVAL: Duration = Duration::from_millis(10);
+
+/// How much fuel a strategy burns between yields to the host: a hundredth of
+/// a core-second, about [`YIELD_INTERVAL`] of work, the same for every
+/// strategy whatever its rate. Fairness between strategies is the epoch's;
+/// this only bounds how long one runs between yields however the clock
+/// ticks. Tied to a strategy's own rate instead, a small rate would yield
+/// every few microseconds, and a strategy running flat out would spend most
+/// of its time yielding.
+pub const YIELD_FUEL: u64 = shared::manifest::FUEL_PER_CORE_SECOND / 100;
 
 /// The most host-side handles (WASI streams, pollables and the like) a
 /// strategy may hold at once. A strategy drops each when it is done with it,
@@ -119,7 +128,7 @@ impl Runner {
         let mut linker: Linker<Ctx> = Linker::new(engine);
         crate::host::link(&mut linker)?;
 
-        let (fuel, memory_mib) = enforced(&self.allowances);
+        let (_, memory_mib) = enforced(&self.allowances);
         let (state, net) = services(
             self.network,
             &self.allowances,
@@ -168,10 +177,11 @@ impl Runner {
         // declares are counted as well as what it grows them to.
         store.limiter(|ctx| ctx);
 
-        // Kept full; the declared rate decides how often the strategy yields
-        // to the host rather than whether it may carry on.
+        // Kept full: the declared rate is what the tank is billed for, not
+        // whether the strategy may carry on. It yields every
+        // [`YIELD_FUEL`] and at every epoch tick.
         store.set_fuel(BANK)?;
-        store.fuel_async_yield_interval(Some((fuel / 100).max(1)))?;
+        store.fuel_async_yield_interval(Some(YIELD_FUEL))?;
         store.set_epoch_deadline(1);
         store.epoch_deadline_async_yield_and_update(1);
 
@@ -379,6 +389,21 @@ pub fn engine() -> Result<Engine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A strategy yields after about the epoch's slice of a core's work,
+    /// whatever its own rate: a strategy at a small rate is not made to
+    /// yield every few microseconds, nor one at a large rate let run longer
+    /// between yields than any other.
+    #[test]
+    fn a_strategy_yields_every_hundredth_of_a_core_second_whatever_its_rate() {
+        let per_core = shared::manifest::FUEL_PER_CORE_SECOND;
+        assert_eq!(YIELD_FUEL, per_core / 100);
+        let slice = Duration::from_secs_f64(YIELD_FUEL as f64 / per_core as f64);
+        assert_eq!(slice, YIELD_INTERVAL);
+        // A yield costs microseconds: a million fuel or more between them
+        // keeps that a small share of the work.
+        const { assert!(YIELD_FUEL >= 1_000_000) };
+    }
 
     #[test]
     fn the_agent_is_billed_as_running_only_while_the_flag_is_held() {

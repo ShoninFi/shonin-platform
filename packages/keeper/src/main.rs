@@ -217,6 +217,9 @@ async fn main() -> Result<()> {
         tokio::spawn(serve_status(SocketAddr::from((args.listen, args.port))));
     }
     let attestation_http = reqwest::Client::new();
+    // The chain whose registry records the root key: the executor's
+    // `setRootKey` is relayed there alone.
+    let root_chain = args.chain_args.root_chain()?;
 
     // Every vault chain turns on its own, from the moment it is connected,
     // so a slow chain, or one out of reach, holds up no other.
@@ -234,6 +237,9 @@ async fn main() -> Result<()> {
         };
         let executor = args.executor_url.clone();
         let attestation_http = attestation_http.clone();
+        let canonical = root_chain
+            .as_ref()
+            .is_some_and(|root| served.key.same_chain(root));
         tracing::info!(chain = %served.key, %keeper, "the keeper is up");
         // Without a Closer a halted vault is closed step by step, and anyone
         // may get between its station's unwind and the valuation that finds
@@ -259,6 +265,7 @@ async fn main() -> Result<()> {
                 keeper,
                 executor.clone(),
                 attestation_http.clone(),
+                canonical,
             ));
             let mut memory = HashMap::new();
             let mut factories = Factories::default();
@@ -311,7 +318,8 @@ async fn main() -> Result<()> {
 }
 
 /// Relay the executor's blessings on one chain and keep its blessed keys in
-/// gas, every [`attest::EVERY`], for as long as the keeper runs.
+/// gas, every [`attest::EVERY`], for as long as the keeper runs; on the
+/// canonical chain, relay its root key's record too.
 async fn keep_keys(
     client: Client,
     key: chain::ChainKey,
@@ -319,6 +327,7 @@ async fn keep_keys(
     keeper: Address,
     executor: String,
     http: reqwest::Client,
+    canonical: bool,
 ) {
     let mut blessings = attest::Memory::default();
     let mut said = Said::default();
@@ -332,9 +341,21 @@ async fn keep_keys(
                         deployments: &deployments,
                         keeper,
                     };
-                    attest::round(&registry, client.chain_id, &published, &mut blessings, at)
-                        .await
-                        .map(|_| ())
+                    let blessed =
+                        attest::round(&registry, client.chain_id, &published, &mut blessings, at)
+                            .await
+                            .map(|_| ());
+                    let recorded = attest::root_round(
+                        &registry,
+                        client.chain_id,
+                        canonical,
+                        &published,
+                        &mut blessings,
+                        at,
+                    )
+                    .await
+                    .map(|_| ());
+                    blessed.and(recorded)
                 }
                 Err(error) => {
                     blessings.looked(at);
