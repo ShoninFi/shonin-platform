@@ -30,12 +30,26 @@ export DOCKER_CONFIG=/var/lib/shonin/docker
 mkdir -p "$work" "$DOCKER_CONFIG"
 
 # Pull from Artifact Registry as the instance's account: its token, on stdin.
+# The network can still be settling just after boot, so each step is tried
+# for a few minutes before the VM gives up and powers off.
 registry=${image%%/*}
-metadata service-accounts/default/token |
-  sed -n 's/.*"access_token" *: *"\([^"]*\)".*/\1/p' |
-  docker login -u oauth2accesstoken --password-stdin "https://$registry" >/dev/null ||
-  { echo "shonin-prover: could not sign in to $registry"; exit 1; }
-docker pull "$image" || { echo "shonin-prover: could not pull the prover's image"; exit 1; }
+signed_in=
+for try in 1 2 3 4 5 6 7 8 9 10; do
+  if metadata service-accounts/default/token |
+    sed -n 's/.*"access_token" *: *"\([^"]*\)".*/\1/p' |
+    docker login -u oauth2accesstoken --password-stdin "https://$registry" >/dev/null; then
+    signed_in=1
+    break
+  fi
+  sleep 15
+done
+[ -n "$signed_in" ] || { echo "shonin-prover: could not sign in to $registry"; exit 1; }
+pulled=
+for try in 1 2 3 4 5; do
+  if docker pull "$image"; then pulled=1; break; fi
+  sleep 15
+done
+[ -n "$pulled" ] || { echo "shonin-prover: could not pull the prover's image"; exit 1; }
 # RISC Zero's Groth16 prover image, pulled while the first proof's STARK
 # stages run.
 docker pull risczero/risc0-groth16-prover:v2025-04-03.1 >/dev/null 2>&1 &

@@ -28,6 +28,14 @@ metadata() {
   curl -sf --retry 5 --retry-delay 2 -H 'Metadata-Flavor: Google' "$METADATA/$1"
 }
 
+# Container-Optimized OS drops every inbound connection but SSH. The API and
+# the keeper's health answer the VPC (the executor posts its reports to the
+# API); the cloud firewall keeps the rest of the world out.
+for port in 19081 19087; do
+  iptables -C INPUT -p tcp -s 10.128.0.0/9 --dport "$port" -j ACCEPT 2>/dev/null ||
+    iptables -I INPUT -p tcp -s 10.128.0.0/9 --dport "$port" -j ACCEPT
+done
+
 attribute() { metadata "instance/attributes/$1"; }
 
 # The VM's service account's access token. Printed to a pipe only.
