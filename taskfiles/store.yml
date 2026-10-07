@@ -39,7 +39,6 @@ tasks:
     cmds:
       - |
         set -eu
-        umask 077
         list=$(mktemp)
         trap 'rm -f "$list"' EXIT
         sh "{{.PATH_ROOT}}/taskfiles/scripts/store-public-files.sh" "{{.PATH_STORE}}" >"$list"

@@ -21,6 +21,16 @@ COPY . .
 # image, mainnet for a mainnet one, or none for an image that serves no
 # Solana cluster (task cloud:build passes it, with WITHOUT_SOLANA=1 for none).
 ARG NETWORK_FEATURE
+# ONNX Runtime, the inference host's library: Microsoft's own release, pinned
+# by its hash, linked dynamically and carried into the image, rather than
+# fetched by the build from a third party's mirror.
+ADD --checksum=sha256:a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407 \
+    https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-1.28.0.tgz /tmp/onnxruntime.tgz
+RUN mkdir -p /opt/onnxruntime && \
+    tar -xzf /tmp/onnxruntime.tgz -C /opt/onnxruntime --strip-components=1 && \
+    ln -sf libonnxruntime.so.1 /opt/onnxruntime/lib/libonnxruntime.so
+ENV ORT_LIB_LOCATION=/opt/onnxruntime/lib \
+    ORT_PREFER_DYNAMIC_LINK=1
 # rust-toolchain.toml pins the same compiler; --locked builds exactly Cargo.lock.
 RUN : "${NETWORK_FEATURE:?pass --build-arg NETWORK_FEATURE=devnet, mainnet or none}" && \
     features="" && { [ "$NETWORK_FEATURE" = none ] || features="--features $NETWORK_FEATURE"; } && \
@@ -40,6 +50,7 @@ ARG WITHOUT_SOLANA=
 ARG STORE_URL
 ARG API_URL
 COPY --from=build /src/target/release/executor /usr/local/bin/executor
+COPY --from=build /opt/onnxruntime/lib/libonnxruntime.so.1 /opt/onnxruntime/lib/libonnxruntime.so.1.28.0 /usr/lib/x86_64-linux-gnu/
 COPY config/chains.toml /etc/shonin/chains.toml
 # The generation's deployment files: the named build context `deployments`
 # (a build without it fails here).
