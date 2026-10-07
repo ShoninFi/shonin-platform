@@ -64,6 +64,8 @@ pub struct Half {
     chain: Client,
     vault: Address,
     station: Address,
+    /// The dollar on HyperEVM, which the station holds idle.
+    usd: Address,
     /// The venue's numbers for the perps and spot pairs the pinned driver
     /// lists.
     perps: Vec<u32>,
@@ -82,6 +84,7 @@ impl Half {
         chain: &Client,
         vault: Address,
         station: Address,
+        usd: Address,
         agent: PrivateKeySigner,
         pinned_as: &str,
     ) -> Result<Arc<Self>> {
@@ -137,6 +140,7 @@ impl Half {
             chain: chain.clone(),
             vault,
             station,
+            usd,
             perps,
             spots,
             gas,
@@ -213,8 +217,16 @@ impl Half {
             .read(self.station, IPinnedStation::valueCall {})
             .await?
             .mark;
-        state.idle = dollars(cash);
-        state.vault_value = dollars(cash + held);
+        let station_idle = self
+            .chain
+            .read(
+                self.usd,
+                chain::bindings::erc20::IERC20::balanceOfCall {
+                    account: self.station,
+                },
+            )
+            .await?;
+        with_the_vault(&mut state, cash, held, station_idle);
         Ok(hyperliquid::agent::encode(&state))
     }
 
@@ -909,6 +921,20 @@ fn valid_until_of(agents: &serde_json::Value, agent: Address) -> u64 {
 }
 
 /// Millionths of a dollar, as a decimal number of dollars.
+/// Fill in the vault's own figures beside the account, as the local driver
+/// reports them: the vault's cash, the station's idle dollars, and the whole
+/// vault (its cash and everything the station holds, at mark).
+fn with_the_vault(
+    state: &mut hyperliquid::payload::AccountState,
+    cash: alloy::primitives::U256,
+    held: alloy::primitives::U256,
+    station_idle: alloy::primitives::U256,
+) {
+    state.idle = dollars(cash);
+    state.station_idle = dollars(station_idle);
+    state.vault_value = dollars(cash + held);
+}
+
 fn dollars(millionths: alloy::primitives::U256) -> hyperliquid::payload::Decimal {
     let units = u64::try_from(millionths).unwrap_or(u64::MAX);
     hyperliquid::payload::Decimal::from(units) / hyperliquid::payload::Decimal::from(1_000_000u32)
@@ -1268,6 +1294,34 @@ mod tests {
         let buys = upkeep_buys(&fills, "@1035", &attempts, now);
         assert_eq!(buys.len(), 4);
         assert!(!may_buy(&buys, now));
+    }
+
+    #[test]
+    fn hyperliquid_account_state_reports_station_idle() {
+        use alloy::primitives::U256;
+        let mut state = hyperliquid::payload::AccountState {
+            vault_value: d("0"),
+            idle: d("0"),
+            station_idle: d("0"),
+            account_value: d("40"),
+            withdrawable: d("40"),
+            positions: Vec::new(),
+            spot: Vec::new(),
+            open_orders: Vec::new(),
+        };
+        with_the_vault(
+            &mut state,
+            U256::from(100_000_000u64),
+            U256::from(65_000_000u64),
+            U256::from(25_000_000u64),
+        );
+        assert_eq!(state.idle, d("100"));
+        assert_eq!(state.station_idle, d("25"));
+        assert_eq!(state.vault_value, d("165"));
+        // As the agent reads it.
+        let read: strategy_sdk::hyperliquid::AccountState =
+            strategy_sdk::from_payload(&hyperliquid::agent::encode(&state)).unwrap();
+        assert_eq!(read.station_idle, d("25"));
     }
 
     #[test]

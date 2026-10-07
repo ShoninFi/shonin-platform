@@ -1332,6 +1332,7 @@ async fn serve(
                 &chain,
                 vault,
                 station,
+                deployments.usd,
                 vault_key.signer(),
                 hyperliquid::DRIVER,
             )
@@ -1408,11 +1409,21 @@ async fn serve(
         let halting_heard = Arc::new(AtomicBool::new(false));
         // Stopped with this serve however it ends, so a vault let go while
         // its agent runs leaves no watcher reading the chain for nobody.
+        // The markets this start of the agent follows, as it asks about
+        // them and trades them; nothing from the stand-in venue at all for
+        // an agent that doesn't trade there.
+        let following = watch::Following::default();
+        let local_venue = recorded
+            .drivers
+            .iter()
+            .any(|driver| driver == host::LOCAL)
+            .then_some(deployments.venue);
         let watching = AbortOnDrop(tokio::spawn(watch::run(
             chain.clone(),
             vault,
             station,
-            deployments.venue,
+            local_venue,
+            following.clone(),
             watched_to.clone(),
             account_events.sender(),
             vault_events.sender(),
@@ -1447,6 +1458,7 @@ async fn serve(
             running: running.clone(),
             instantiate_within: runner::INSTANTIATE_WITHIN,
             instantiated: instantiated.clone(),
+            following,
         };
         // Read and checked at every start, before anything is billed: a
         // component swapped while the agent ran is caught when it is next
@@ -3587,6 +3599,7 @@ mod tests {
             running: running.clone(),
             instantiate_within: Duration::from_secs(1),
             instantiated: Default::default(),
+            following: Default::default(),
         };
         let billed = Arc::new(AtomicBool::new(false));
         let watching = {

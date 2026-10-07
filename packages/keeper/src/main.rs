@@ -2,9 +2,14 @@
 //!
 //! Once a chain-day it collects each vault's bill from its tank, with the
 //! running total the executor signed, and at once when the author asks to
-//! withdraw the tank without one. Every slot it values each vault and settles
-//! what the valuation prices: it is the only one that does, so two loops
-//! never race each other for the same valuation. It tries every claim that
+//! withdraw the tank without one. It values a vault in a slot only when
+//! something waits for a valuation (a request to price, the weekly payday, a
+//! claim or units held off by a close that has ended, a halted vault's
+//! close), and otherwise once a day, and settles what the valuation prices:
+//! it is the only one that does, so two loops never race each other for the
+//! same valuation. Each valuation is simulated first at the moment it would
+//! land and a block later, and is not sent if either would revert. It tries
+//! every claim that
 //! is waiting, at most once a slot and less often the longer it keeps
 //! waiting, and not while the market is outside the band, serves units left
 //! by the pro-rata fallback,
@@ -1290,6 +1295,11 @@ async fn keep_one(
     let held = memory.close_held_since.is_some()
         && grace_end.is_some()
         && client.read(vault, IVault::closeCall {}).await.is_ok();
+    let halt = match (halted, grace_end) {
+        (Some(0), _) => Halt::Running,
+        (Some(_), Some(_)) => Halt::Halted,
+        _ => Halt::Unread,
+    };
     if !closed {
         price(
             client,
@@ -1298,6 +1308,7 @@ async fn keep_one(
             &timers,
             block_interval,
             !held,
+            halt,
             memory,
         )
         .await;
@@ -2207,7 +2218,451 @@ async fn settle(client: &Client, keeper: Address, vault: Address, max: U256, wha
 /// How many requests a round's own settle takes on at once.
 const SETTLE_BATCH: u64 = 100;
 
-/// Value the vault at the slot, if `value`, and settle what has been priced.
+/// The longest a vault goes without a priced valuation when nothing waits
+/// for one. Nothing in the vault needs valuations at any pace: a request is
+/// priced at the first valuation after it, the fees are measured on the
+/// payday's own valuation and the holding fee by the second, and every
+/// fallback counts from the request or claim, not from the last valuation.
+/// What a valuation's age does change is what the vault's page, the
+/// executor's estimate of what to bring home, and the idle floor's measure
+/// of the stations read: each is the last priced valuation's. A day bounds
+/// that, at one valuation a day for a vault nobody moves in.
+const HEARTBEAT: u64 = DAY;
+
+/// Monday 00:00 UTC of the week after the one `t` falls in, as the vault
+/// counts it for its payday.
+fn next_monday(t: u64) -> u64 {
+    // The first of January 1970 was a Thursday, three days after a Monday.
+    let since_monday = t / DAY + 3;
+    (since_monday - since_monday % 7 + 4) * DAY
+}
+
+/// The vault's halt as the round read it, for whether its close waits on a
+/// valuation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Halt {
+    /// Not halted.
+    Running,
+    /// Halted.
+    Halted,
+    /// Whether it has halted couldn't be read.
+    Unread,
+}
+
+/// Why the vault wants a valuation in `slot`, if it does. Each valuation
+/// costs the platform a transaction, so one is sent only when something
+/// waits for it, as the vault itself says:
+///
+/// - a request (a deposit, a withdrawal, a claim the cash covers, a tank
+///   fill) that a valuation in this slot would price: the vault names the
+///   oldest one no valuation has priced;
+/// - the weekly payday, due at the first priced valuation on or after the
+///   Monday after the last one, with or without anything queued;
+/// - a close staged at the home station has ended since the last priced
+///   valuation, and a claim or a unit holder waits to be served: the vault
+///   serves neither until one is priced. Whether one waits is read in the
+///   same round, not taken from the last look at the claims;
+/// - a holder's units the vault won't serve until a newer priced valuation
+///   counts their station as it is now (see [`units_wait_for_a_valuation`]);
+/// - a halted vault's close, when the vault says a valuation in this slot
+///   would find its home station empty and none since the halt has found
+///   every station so (on a vault that trades on other chains too, their
+///   posts decide);
+/// - [`HEARTBEAT`]: a day since the last priced valuation, or none ever.
+///
+/// Whatever can't be read is taken as wanting one: a valuation too many
+/// costs a transaction, one too few keeps somebody waiting.
+async fn valuation_wanted(
+    client: &Client,
+    keeper: Address,
+    vault: Address,
+    slot: u64,
+    halt: Halt,
+    memory: &Memory,
+) -> Option<&'static str> {
+    let (priced, index) = match client.read(vault, IVault::lastPricedCall {}).await {
+        Ok(last) if last.priced => (last.time, last.index),
+        Ok(_) => return Some("never priced"),
+        Err(_) => return Some("the last priced valuation could not be read"),
+    };
+    if slot >= priced.saturating_add(HEARTBEAT) {
+        return Some("a day since the last priced valuation");
+    }
+    match client.read(vault, IVault::lastPaymentCall {}).await {
+        Ok(paid) if slot < next_monday(paid) => {}
+        Ok(_) => return Some("payday"),
+        Err(_) => return Some("the last payday could not be read"),
+    }
+    match client.read(vault, IVault::nextUnpricedCall {}).await {
+        Ok(earliest) if earliest == 0 || earliest > slot => {}
+        Ok(_) => return Some("a request waits for its price"),
+        Err(_) => return Some("the requests could not be read"),
+    }
+    match client.read(vault, IVault::needsValuationFirstCall {}).await {
+        Ok(false) => {}
+        Ok(true) => {
+            if let Some(why) = claims_or_units_wait(client, vault, memory).await {
+                return Some(why);
+            }
+        }
+        Err(_) => return Some("whether a staged close ended could not be read"),
+    }
+    if let Some(why) = units_wait_for_a_valuation(client, keeper, vault, index, memory).await {
+        return Some(why);
+    }
+    match halt {
+        Halt::Running => None,
+        Halt::Unread => Some("whether it has halted could not be read"),
+        Halt::Halted => match client
+            .read(vault, IVault::closeWantsValuationCall { time: slot })
+            .await
+        {
+            Ok(false) => None,
+            Ok(true) => Some("its close"),
+            Err(_) => Some("whether its close waits for one could not be read"),
+        },
+    }
+}
+
+/// Why a staged close's end keeps somebody waiting for a valuation, if it
+/// does: a claim booked or waiting to be tried, or a holder's units, read
+/// now. What can't be read is taken as waiting.
+async fn claims_or_units_wait(
+    client: &Client,
+    vault: Address,
+    memory: &Memory,
+) -> Option<&'static str> {
+    match client.read(vault, IVault::unitsCall {}).await {
+        Ok(units) if units.total.is_zero() => {}
+        Ok(_) => return Some("a staged close ended, and units wait"),
+        Err(_) => return Some("a staged close ended, and the units could not be read"),
+    }
+    let count: u64 = match client.read(vault, IVault::claimCountCall {}).await {
+        Ok(count) => count.try_into().unwrap_or(u64::MAX),
+        Err(_) => return Some("a staged close ended, and the claims could not be read"),
+    };
+    for id in memory.claims_from.max(1)..=count {
+        match client
+            .read(
+                vault,
+                IVault::claimAtCall {
+                    claimId: U256::from(id),
+                },
+            )
+            .await
+        {
+            Ok(claim) if matches!(claim.state, ClaimState::Pending | ClaimState::Waiting) => {
+                return Some("a staged close ended, and a claim waits");
+            }
+            Ok(_) => {}
+            Err(_) => return Some("a staged close ended, and a claim could not be read"),
+        }
+    }
+    None
+}
+
+/// Why a holder's units wait for a valuation, if they do. A serve that
+/// brings nothing home clears the units only as dust, judged on what the
+/// home station holds now or what the last priced valuation (`index`)
+/// counted at the stations, whichever is more: once the station has emptied
+/// since that valuation, the vault refuses the serve (`NotYet`) until a newer
+/// one counts it as it is. So one is wanted when a known holder's serve, as
+/// the keeper sends it, is refused `NotYet`, nothing priced waits to be
+/// settled (the serve waits for that, and the round's settle sees to it),
+/// and the home station now holds less than half what that valuation counted
+/// at the stations: one that has emptied, not one whose mark has only moved
+/// with the market, which a valuation wouldn't help. Past the refusal, what
+/// can't be read is taken as wanting one.
+async fn units_wait_for_a_valuation(
+    client: &Client,
+    keeper: Address,
+    vault: Address,
+    index: U256,
+    memory: &Memory,
+) -> Option<&'static str> {
+    let mut refused = false;
+    for &holder in &memory.holders {
+        if serve_refused_not_yet(client, keeper, vault, holder).await {
+            refused = true;
+            break;
+        }
+    }
+    if !refused || !settled(client, vault).await {
+        return None;
+    }
+    let Ok(last) = client.read(vault, IVault::valuationAtCall { index }).await else {
+        return Some("units wait, and the last priced valuation could not be read");
+    };
+    let counted = last
+        .gross
+        .saturating_sub(U256::from(1u64))
+        .saturating_sub(last.cash);
+    let mark = match client.read(vault, IVault::homeStationCall {}).await {
+        Ok(station) => client.read(station, IStation::valueCall {}).await,
+        Err(error) => Err(error),
+    };
+    match mark {
+        Ok(value) if value.mark < counted / U256::from(2u64) => {
+            Some("units wait for a valuation to count their emptied station")
+        }
+        Ok(_) => None,
+        Err(_) => Some("units wait, and their station could not be read"),
+    }
+}
+
+/// Whether the vault refuses `holder`'s serve, sent by the keeper now, with
+/// `NotYet`.
+async fn serve_refused_not_yet(
+    client: &Client,
+    keeper: Address,
+    vault: Address,
+    holder: Address,
+) -> bool {
+    use alloy::network::TransactionBuilder;
+    use alloy::providers::Provider;
+    use alloy::sol_types::{SolCall, SolError};
+    let request = alloy::rpc::types::TransactionRequest::default()
+        .with_from(keeper)
+        .with_to(vault)
+        .with_input(IVault::serveProRataCall { holder }.abi_encode());
+    match client.provider().call(request).await {
+        Ok(_) => false,
+        Err(error) => {
+            let error = anyhow::Error::new(error);
+            execution_reverted(&error)
+                && reverted_with(&error, IVault::NotYet::SELECTOR, "NotYet()")
+        }
+    }
+}
+
+/// Whether a call sent now would go through landing at `time`: `endpoint`
+/// runs it as the keeper would send it, with the block's time set to `time`.
+/// The vault's answer if it reverts; an error if the endpoint couldn't say.
+/// Only an endpoint found to run a call at the time it is given is asked
+/// (see [`endpoint_for_block_time`]): one that ran it at the head's time
+/// instead would judge it by the wrong moment.
+async fn would_go_through_at<C: alloy::sol_types::SolCall>(
+    endpoint: &alloy::providers::DynProvider,
+    keeper: Address,
+    to: Address,
+    call: C,
+    time: u64,
+) -> Result<bool> {
+    use alloy::network::TransactionBuilder;
+    use alloy::providers::Provider;
+    let request = alloy::rpc::types::TransactionRequest::default()
+        .with_from(keeper)
+        .with_to(to)
+        .with_input(call.abi_encode());
+    match endpoint
+        .call(request)
+        .with_block_overrides(at_time(time))
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            let error = anyhow::Error::new(error);
+            if execution_reverted(&error) {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+/// A block whose time is `time`, for a call run at a set moment.
+fn at_time(time: u64) -> alloy::rpc::types::BlockOverrides {
+    alloy::rpc::types::BlockOverrides {
+        time: Some(time),
+        ..Default::default()
+    }
+}
+
+/// Multicall3, at the one address it has on most chains (Base Sepolia,
+/// HyperEVM's testnet and Robinhood Chain's among them): its read of the
+/// block's time says what time an endpoint runs a call at.
+const MULTICALL3: Address = Address::new([
+    0xca, 0x11, 0xbd, 0xe0, 0x59, 0x77, 0xb3, 0x63, 0x11, 0x67, 0x02, 0x88, 0x62, 0xbe, 0x2a, 0x17,
+    0x39, 0x76, 0xca, 0x11,
+]);
+
+alloy::sol! {
+    /// Multicall3's read of the block's time.
+    interface IMulticall3 {
+        function getCurrentBlockTimestamp() external view returns (uint256 timestamp);
+    }
+}
+
+/// Creation code that returns the block's time, for a chain without
+/// Multicall3: `mstore(0, timestamp())`, `return(0, 32)`.
+const BLOCK_TIME_CODE: [u8; 9] = [0x42, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+
+/// How far past the head the probe of an endpoint sets the block's time:
+/// far enough that no head it might be running at instead is mistaken for
+/// it.
+const BLOCK_TIME_PROBE_AHEAD: u64 = DAY;
+
+/// Whether each endpoint runs a call at the block time it is given, by the
+/// client's endpoint list and the endpoint's place in it, once found out.
+/// Some ignore the time and run the call at the head's, with no error, so a
+/// valuation simulated there near a slot's end would seem to revert either
+/// way.
+static RUNS_AT_BLOCK_TIME: std::sync::LazyLock<std::sync::Mutex<HashMap<(String, usize), bool>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Whether `endpoint` runs a call at the block time it is given: it is asked
+/// the time of a block set a day past `now`, through Multicall3, or through
+/// creation code where nothing lives at Multicall3's address. `None` when it
+/// couldn't be found out: it refused the time, or answered with nothing to
+/// read.
+async fn runs_at_block_time(endpoint: &alloy::providers::DynProvider, now: u64) -> Option<bool> {
+    use alloy::network::TransactionBuilder;
+    use alloy::providers::Provider;
+    use alloy::sol_types::SolCall;
+    let time = now.saturating_add(BLOCK_TIME_PROBE_AHEAD);
+    let read = |returned: Bytes| (returned.len() == 32).then(|| U256::from_be_slice(&returned));
+    let through_multicall = alloy::rpc::types::TransactionRequest::default()
+        .with_to(MULTICALL3)
+        .with_input(IMulticall3::getCurrentBlockTimestampCall {}.abi_encode());
+    let mut answered = endpoint
+        .call(through_multicall)
+        .with_block_overrides(at_time(time))
+        .await
+        .ok()
+        .and_then(read);
+    if answered.is_none() {
+        let created = alloy::rpc::types::TransactionRequest::default()
+            .with_deploy_code(BLOCK_TIME_CODE.to_vec());
+        answered = endpoint
+            .call(created)
+            .with_block_overrides(at_time(time))
+            .await
+            .ok()
+            .and_then(read);
+    }
+    answered.map(|answered| answered == U256::from(time))
+}
+
+/// The endpoint a valuation is simulated at its landing through: the first
+/// of the client's found to run a call at the block time it is given, and
+/// its place in the list. Each is asked once (see [`runs_at_block_time`]),
+/// and asked again only while that couldn't be found out, or after a
+/// simulation through it failed. None when no endpoint is known to: the
+/// simulation's verdict would then be the head's, not the landing's.
+async fn endpoint_for_block_time(
+    client: &Client,
+    now: u64,
+) -> Option<(usize, alloy::providers::DynProvider)> {
+    for (at, endpoint) in client.each_endpoint().into_iter().enumerate() {
+        let key = (client.rpc_url.clone(), at);
+        let known = RUNS_AT_BLOCK_TIME
+            .lock()
+            .ok()
+            .and_then(|known| known.get(&key).copied());
+        let runs = match known {
+            Some(runs) => runs,
+            None => {
+                let found = runs_at_block_time(&endpoint, now).await;
+                if let Some(runs) = found {
+                    if !runs {
+                        tracing::info!(
+                            chain_id = client.chain_id,
+                            endpoint = at + 1,
+                            "this endpoint runs a call at the head's time, whatever time it is \
+                             given; valuations are not simulated at their landing through it"
+                        );
+                    }
+                    if let Ok(mut known) = RUNS_AT_BLOCK_TIME.lock() {
+                        known.insert(key, runs);
+                    }
+                }
+                found.unwrap_or(false)
+            }
+        };
+        if runs {
+            return Some((at, endpoint));
+        }
+    }
+    None
+}
+
+/// Forget what was found of an endpoint, after a call through it failed: it
+/// is asked again before it is next trusted.
+fn forget_block_time(client: &Client, at: usize) {
+    if let Ok(mut known) = RUNS_AT_BLOCK_TIME.lock() {
+        known.remove(&(client.rpc_url.clone(), at));
+    }
+}
+
+/// The moments a valuation sent with the head at `now` is simulated at: when
+/// it lands, a block later, and a block after that, when the chain's blocks
+/// are close enough for both to fall inside one window. A send that misses
+/// its block, or a head read from a node a block behind, lands a block late;
+/// one judged only on the block it should land in then lands outside the
+/// window, and pays for a revert.
+fn landing_times(now: u64, window: u64, block_interval: u64) -> (u64, u64) {
+    let landing = now.saturating_add(block_interval);
+    let late = if block_interval <= window {
+        landing.saturating_add(block_interval)
+    } else {
+        landing
+    };
+    (landing, late)
+}
+
+/// Send the slot's valuation, simulated first landing as it would and a
+/// block late: one that would revert either way is the vault refusing it,
+/// and is noted as refused without being sent; one that would only revert
+/// late is left for the next slot, and nothing is noted. Neither is paid
+/// for. It is simulated only through an endpoint found to run a call at the
+/// time it is given (see [`endpoint_for_block_time`]); with none, or when
+/// the simulation fails there, it is left to its gas estimate, as any other
+/// send is. What became of it, if it was judged.
+async fn simulated_valuation(
+    client: &Client,
+    keeper: Address,
+    vault: Address,
+    timers: &chain::bindings::vault::Timers,
+    now: u64,
+    block_interval: u64,
+) -> Option<Outcome> {
+    let (on_time, late) = landing_times(now, timers.slotWindow, block_interval);
+    let call = || IVault::recordValuationCall {};
+    let Some((at, endpoint)) = endpoint_for_block_time(client, now).await else {
+        tracing::debug!(%vault, "no endpoint is known to run a call at the time it is given; the valuation's estimate judges it");
+        return Some(send_outcome(client, keeper, vault, call(), "value").await);
+    };
+    let goes = match would_go_through_at(&endpoint, keeper, vault, call(), late).await {
+        Ok(true) => true,
+        Ok(false) if late == on_time => false,
+        Ok(false) => match would_go_through_at(&endpoint, keeper, vault, call(), on_time).await {
+            Ok(false) => false,
+            Ok(true) => {
+                tracing::debug!(%vault, "this slot's valuation could land after its window; not sent");
+                return None;
+            }
+            Err(_) => {
+                forget_block_time(client, at);
+                return None;
+            }
+        },
+        Err(error) => {
+            forget_block_time(client, at);
+            tracing::debug!(%vault, error = format!("{error:#}"), "the valuation could not be simulated at its landing; its estimate judges it");
+            true
+        }
+    };
+    if !goes {
+        tracing::debug!(%vault, "the vault would refuse this slot's valuation; not sent");
+        return Some(Outcome::Refused);
+    }
+    Some(send_outcome(client, keeper, vault, call(), "value").await)
+}
+
+/// Value the vault at the slot, if `value` and something waits for a
+/// valuation (see [`valuation_wanted`]), and settle what has been priced.
+#[allow(clippy::too_many_arguments)]
 async fn price(
     client: &Client,
     keeper: Address,
@@ -2215,6 +2670,7 @@ async fn price(
     timers: &chain::bindings::vault::Timers,
     block_interval: u64,
     value: bool,
+    halt: Halt,
     memory: &mut Memory,
 ) {
     // The round's other steps take time: the window is judged on the
@@ -2254,21 +2710,26 @@ async fn price(
         )
         .await;
     }
-    let last = latest.map(|valuation| valuation.time).unwrap_or(0);
+    let last = latest.as_ref().map(|valuation| valuation.time).unwrap_or(0);
     if !value {
         memory
             .valuations_refused
             .not_wanted(Refused::Valuations, client.chain_id, vault);
     }
-    if value
-        && due_for_valuation(
-            now,
-            timers.slotInterval,
-            timers.slotWindow,
-            block_interval,
-            last,
-        )
-    {
+    let landing = landing_slot(now, timers.slotInterval, timers.slotWindow, block_interval);
+    let wanted = match landing {
+        Some(slot) if value && last < slot => {
+            valuation_wanted(client, keeper, vault, slot, halt, memory).await
+        }
+        _ => None,
+    };
+    if value && landing.is_some_and(|slot| last < slot) && wanted.is_none() {
+        memory
+            .valuations_refused
+            .not_wanted(Refused::Valuations, client.chain_id, vault);
+    }
+    if let Some(why) = wanted {
+        tracing::debug!(%vault, why, "a valuation is wanted");
         // A valuation can't be recorded while the last one is still owed.
         let settled = settle(
             client,
@@ -2288,31 +2749,28 @@ async fn price(
         } else {
             now
         };
-        // A valuation recorded while the station reads as outside the band
-        // is void and prices nothing, so none is paid for then.
-        if due_for_valuation(
+        // A valuation recorded while the station reads as outside the band,
+        // or while a close is staged there, is void and prices nothing, so
+        // none is paid for then.
+        let due = due_for_valuation(
             now,
             timers.slotInterval,
             timers.slotWindow,
             block_interval,
             last,
-        ) && !station_outside_band(client, vault).await
-        {
-            let outcome = send_outcome(
-                client,
-                keeper,
-                vault,
-                IVault::recordValuationCall {},
-                "value",
-            )
-            .await;
-            memory.valuations_refused.note(
-                outcome,
-                Refused::Valuations,
-                client.chain_id,
-                vault,
-                slot_of(now, timers.slotInterval),
-            );
+        );
+        if due && !close_staged(client, vault).await && !station_outside_band(client, vault).await {
+            let outcome =
+                simulated_valuation(client, keeper, vault, timers, now, block_interval).await;
+            if let Some(outcome) = outcome {
+                memory.valuations_refused.note(
+                    outcome,
+                    Refused::Valuations,
+                    client.chain_id,
+                    vault,
+                    slot_of(now, timers.slotInterval),
+                );
+            }
         }
     }
     settle(client, keeper, vault, U256::from(SETTLE_BATCH), "settle").await;
@@ -4713,6 +5171,12 @@ fn execution_reverted(error: &anyhow::Error) -> bool {
 /// the revert data, or by name in the message, as some nodes give it.
 fn reverted_as_stale(error: &anyhow::Error) -> bool {
     use alloy::sol_types::SolError;
+    reverted_with(error, IVault::Stale::SELECTOR, "Stale()")
+}
+
+/// Whether the node's refusal names the error with this selector and
+/// signature: by the selector in the revert data, or by name in the message.
+fn reverted_with(error: &anyhow::Error, selector: [u8; 4], signature: &str) -> bool {
     error.chain().any(|cause| {
         cause
             .downcast_ref::<alloy::transports::TransportError>()
@@ -4720,8 +5184,8 @@ fn reverted_as_stale(error: &anyhow::Error) -> bool {
             .is_some_and(|refusal| {
                 refusal
                     .as_revert_data()
-                    .is_some_and(|data| data.starts_with(&IVault::Stale::SELECTOR))
-                    || refusal.message.contains("Stale()")
+                    .is_some_and(|data| data.starts_with(&selector))
+                    || refusal.message.contains(signature)
             })
     })
 }
@@ -4889,8 +5353,9 @@ mod tests {
     use crate::stand_in::{
         BETWEEN_SLOTS, Failing, Hook, KEEPER, SLOT_START, STATION, Shared, VAULT, answers, connect,
         connect_failing, connect_with_blocks_of, connect_with_hook, deployments, everything_sent,
-        executor, executor_serving_nothing, failing_executor, leaves_after_unwind, name, node,
-        refuses, reverts, sent, sent_at, takes, timers,
+        executor, executor_serving_nothing, failing_executor, keeps_the_window,
+        leaves_after_unwind, name, node, refuses, reverts, sent, sent_at, simulated_at, takes,
+        timers,
     };
 
     #[test]
@@ -9889,12 +10354,32 @@ mod tests {
         };
         for n in 0..MOST_SLOTS_REFUSED {
             node.lock().unwrap().timestamp = SLOT_START + 10 * n;
-            price(&client, KEEPER, vault, &timers(), 1, true, &mut memory).await;
+            price(
+                &client,
+                KEEPER,
+                vault,
+                &timers(),
+                1,
+                true,
+                Halt::Running,
+                &mut memory,
+            )
+            .await;
         }
         assert!(heard_of(), "setup: the refusals were not heard of");
 
         node.lock().unwrap().timestamp = SLOT_START + 10 * MOST_SLOTS_REFUSED;
-        price(&client, KEEPER, vault, &timers(), 1, false, &mut memory).await;
+        price(
+            &client,
+            KEEPER,
+            vault,
+            &timers(),
+            1,
+            false,
+            Halt::Running,
+            &mut memory,
+        )
+        .await;
         assert!(
             !heard_of(),
             "no valuation is wanted, and the vault is still said to refuse them"
@@ -9926,7 +10411,17 @@ mod tests {
         };
         let slot = async |n: u64, memory: &mut Memory| {
             node.lock().unwrap().timestamp = SLOT_START + 10 * n;
-            price(&client, KEEPER, vault, &timers(), 1, true, memory).await;
+            price(
+                &client,
+                KEEPER,
+                vault,
+                &timers(),
+                1,
+                true,
+                Halt::Running,
+                memory,
+            )
+            .await;
         };
 
         for n in 0..MOST_SLOTS_REFUSED - 1 {
@@ -11479,6 +11974,7 @@ mod tests {
             &timers(),
             1,
             true,
+            Halt::Running,
             &mut Memory::default(),
         )
         .await;
@@ -12026,5 +12522,583 @@ mod tests {
             memory.requests_from, 0,
             "an unread request was passed over for good"
         );
+    }
+
+    // Valuing only when a valuation is wanted ----------------------------------
+
+    /// A vault priced at `valued_at`, its payday a week off, with no request
+    /// waiting for its price and no staged close behind it: nothing waits
+    /// for a valuation.
+    fn a_quiet_vault(node: &Shared, valued_at: u64) {
+        answers(node, VAULT, IVault::valuationCountCall {}, U256::from(1u64));
+        answers(
+            node,
+            VAULT,
+            IVault::valuationAtCall { index: U256::ZERO },
+            Valuation {
+                time: valued_at,
+                status: ValuationStatus::Priced,
+                gross: U256::from(1_000_000_001u64),
+                grossExit: U256::from(1_000_000_001u64),
+                supply: U256::from(WAD),
+                fee: U256::ZERO,
+                feeExit: U256::ZERO,
+                cash: U256::from(1_000_000_000u64),
+                postsMissing: 0,
+            },
+        );
+        answers(
+            node,
+            VAULT,
+            IVault::lastPricedCall {},
+            IVault::lastPricedReturn {
+                priced: true,
+                index: U256::ZERO,
+                time: valued_at,
+            },
+        );
+        answers(node, VAULT, IVault::lastPaymentCall {}, SLOT_START - DAY);
+        answers(node, VAULT, IVault::nextUnpricedCall {}, 0);
+        answers(node, VAULT, IVault::needsValuationFirstCall {}, false);
+        answers(
+            node,
+            VAULT,
+            IVault::closeWantsValuationCall { time: 0 },
+            false,
+        );
+        answers(node, VAULT, IStationVault::unsettledCall {}, false);
+        answers(node, VAULT, IVault::homeStationCall {}, STATION);
+        answers(node, STATION, IStation::outsideBandCall {}, false);
+    }
+
+    /// One round's valuation step at the head's time `now`, on a chain of
+    /// one-second blocks.
+    async fn price_at(node: &Shared, client: &Client, now: u64, halt: Halt, memory: &mut Memory) {
+        node.lock().unwrap().timestamp = now;
+        price(client, KEEPER, VAULT, &timers(), 1, true, halt, memory).await;
+    }
+
+    #[tokio::test]
+    async fn a_vault_with_nothing_waiting_is_not_valued() {
+        let node = node(SLOT_START);
+        a_quiet_vault(&node, SLOT_START - 10);
+        let client = connect(&node).await;
+        let mut memory = Memory::default();
+
+        for slot in 0..30 {
+            price_at(
+                &node,
+                &client,
+                SLOT_START + 10 * slot,
+                Halt::Running,
+                &mut memory,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            sent::<IVault::recordValuationCall>(&node, VAULT),
+            0,
+            "{:?}",
+            everything_sent(&node)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_waiting_deposit_is_valued_at_its_slot() {
+        let node = node(SLOT_START);
+        a_quiet_vault(&node, SLOT_START - 10);
+        // Asked for after the last valuation, to be priced at the next slot.
+        answers(&node, VAULT, IVault::nextUnpricedCall {}, SLOT_START + 10);
+        let client = connect(&node).await;
+        let mut memory = Memory::default();
+
+        // A valuation in this slot wouldn't price it.
+        price_at(&node, &client, SLOT_START, Halt::Running, &mut memory).await;
+        assert_eq!(sent::<IVault::recordValuationCall>(&node, VAULT), 0);
+
+        price_at(&node, &client, SLOT_START + 10, Halt::Running, &mut memory).await;
+        assert_eq!(sent::<IVault::recordValuationCall>(&node, VAULT), 1);
+    }
+
+    #[tokio::test]
+    async fn payday_gets_its_valuation_with_nothing_queued() {
+        let node = node(SLOT_START);
+        a_quiet_vault(&node, SLOT_START - 10);
+        // Paid more than a week ago: the Monday after has passed.
+        answers(
+            &node,
+            VAULT,
+            IVault::lastPaymentCall {},
+            SLOT_START - 8 * DAY,
+        );
+        let client = connect(&node).await;
+
+        price_at(
+            &node,
+            &client,
+            SLOT_START,
+            Halt::Running,
+            &mut Memory::default(),
+        )
+        .await;
+
+        assert_eq!(sent::<IVault::recordValuationCall>(&node, VAULT), 1);
+    }
+
+    #[tokio::test]
+    async fn a_vault_nobody_moves_in_is_valued_once_a_day() {
+        let node = node(SLOT_START);
+        a_quiet_vault(&node, SLOT_START - DAY + 10);
+        let client = connect(&node).await;
+        let mut memory = Memory::default();
+
+        price_at(&node, &client, SLOT_START, Halt::Running, &mut memory).await;
+        assert_eq!(sent::<IVault::recordValuationCall>(&node, VAULT), 0);
+
+        price_at(&node, &client, SLOT_START + 10, Halt::Running, &mut memory).await;
+        assert_eq!(sent::<IVault::recordValuationCall>(&node, VAULT), 1);
+    }
+
+    /// A vault never priced is valued: the heartbeat counts from nothing.
+    #[tokio::test]
+    async fn a_vault_never_priced_is_valued() {
+        let node = node(SLOT_START);
+        a_quiet_vault(&node, SLOT_START - 10);
+        // Its one valuation was void.
+        answers(
+            &node,
+            VAULT,
+            IVault::lastPricedCall {},
+            IVault::lastPricedReturn {
+                priced: false,
+                index: U256::ZERO,
+                time: 0,
+            },
+        );
+        let client = connect(&node).await;
+
+        price_at(
+            &node,
+            &client,
+            SLOT_START,
+            Halt::Running,
+            &mut Memory::default(),
+        )
+        .await;
+
+        assert_eq!(sent::<IVault::recordValuationCall>(&node, VAULT), 1);
+    }
+
+    /// What can't be read is taken as wanting a valuation: one too many costs
+    /// a transaction, one too few keeps a depositor waiting.
+    #[tokio::test]
+    async fn a_vault_whose_requests_cannot_be_read_is_valued() {
+        let node = node(SLOT_START);
+        a_quiet_vault(&node, SLOT_START - 10);
+        reverts(&node, VAULT, IVault::nextUnpricedCall {}, "");
+        let client = connect(&node).await;
+
+        price_at(
+            &node,
+            &client,
+            SLOT_START,
+            Halt::Running,
+            &mut Memory::default(),
+        )
+        .await;
+
+        assert_eq!(sent::<IVault::recordValuationCall>(&node, VAULT), 1);
+    }
+
+    /// Once a close staged at the station has ended, the vault serves no
+    /// claim and no units until a valuation is priced, and says so: one is
+    /// sent while a claim or a unit holder waits, and none while nobody does
+    /// or once the vault no longer needs one. Who waits is read in the round
+    /// that decides, with nothing remembered from an earlier one: a claim
+    /// booked since the last look at the claims is seen, and one that can't
+    /// be read is taken as waiting.
+    #[tokio::test]
+    async fn a_staged_close_that_ended_is_followed_by_a_valuation_while_a_claim_or_units_wait() {
+        // Whether a claim waits: none, one, or one that can't be read.
+        #[derive(Clone, Copy, Debug)]
+        enum Claims {
+            None,
+            Waiting,
+            Unread,
+        }
+        for (needs, claims, units, valued) in [
+            (true, Claims::None, false, 0),
+            (true, Claims::Waiting, false, 1),
+            (true, Claims::Unread, false, 1),
+            (true, Claims::None, true, 1),
+            (false, Claims::Waiting, true, 0),
+        ] {
+            let node = node(SLOT_START);
+            a_quiet_vault(&node, SLOT_START - 10);
+            answers(&node, VAULT, IVault::needsValuationFirstCall {}, needs);
+            answers(
+                &node,
+                VAULT,
+                IVault::unitsCall {},
+                IVault::unitsReturn {
+                    total: U256::from(u64::from(units) * WAD),
+                    reserve: U256::ZERO,
+                },
+            );
+            match claims {
+                Claims::None => {
+                    answers(&node, VAULT, IVault::claimCountCall {}, U256::ZERO);
+                }
+                Claims::Waiting => {
+                    one_claim(&node, overdue_claim(SLOT_START, ClaimState::Pending));
+                }
+                Claims::Unread => {
+                    answers(&node, VAULT, IVault::claimCountCall {}, U256::from(1u64));
+                    reverts(
+                        &node,
+                        VAULT,
+                        IVault::claimAtCall {
+                            claimId: U256::from(1u64),
+                        },
+                        "",
+                    );
+                }
+            }
+            let client = connect(&node).await;
+
+            price_at(
+                &node,
+                &client,
+                SLOT_START,
+                Halt::Running,
+                &mut Memory::default(),
+            )
+            .await;
+
+            assert_eq!(
+                sent::<IVault::recordValuationCall>(&node, VAULT),
+                valued,
+                "needed first: {needs}, claims: {claims:?}, units waiting: {units}"
+            );
+        }
+    }
+
+    /// A holder's serve that brings nothing home clears the units only as
+    /// dust, judged on what the home station holds now or what the last
+    /// priced valuation counted there, whichever is more: once the station
+    /// has emptied since, the vault refuses the serve until a newer valuation
+    /// counts it. The keeper wants one then, rather than leaving the units to
+    /// wait for the day's; not while the serve goes through, is refused for
+    /// another reason, or waits on a settlement, nor when the station has
+    /// only moved with the market.
+    #[tokio::test]
+    async fn waiting_units_get_a_valuation_when_their_serve_needs_one() {
+        let holder = Address::repeat_byte(0x55);
+        // What the serve meets, what the station holds now, whether a
+        // settlement is owed, and whether a valuation is sent.
+        for (serve, mark, owed, valued) in [
+            (Some("NotYet()"), 0u64, false, 1),
+            (Some("NotYet()"), 400_000_000, false, 0),
+            (Some("NotYet()"), 0, true, 0),
+            (Some("NotAllowed()"), 0, false, 0),
+            (None, 0, false, 0),
+        ] {
+            let node = node(SLOT_START);
+            a_quiet_vault(&node, SLOT_START - 10);
+            // The last valuation counted 500 dollars at the stations.
+            answers(
+                &node,
+                VAULT,
+                IVault::valuationAtCall { index: U256::ZERO },
+                Valuation {
+                    time: SLOT_START - 10,
+                    status: ValuationStatus::Priced,
+                    gross: U256::from(1_500_000_001u64),
+                    grossExit: U256::from(1_500_000_001u64),
+                    supply: U256::from(WAD),
+                    fee: U256::ZERO,
+                    feeExit: U256::ZERO,
+                    cash: U256::from(1_000_000_000u64),
+                    postsMissing: 0,
+                },
+            );
+            answers(
+                &node,
+                STATION,
+                IStation::valueCall {},
+                IStation::valueReturn {
+                    mark: U256::from(mark),
+                    exit: U256::from(mark),
+                },
+            );
+            answers(&node, VAULT, IStationVault::unsettledCall {}, owed);
+            match serve {
+                Some(reason) => reverts(&node, VAULT, IVault::serveProRataCall { holder }, reason),
+                None => answers(
+                    &node,
+                    VAULT,
+                    IVault::serveProRataCall { holder },
+                    IVault::serveProRataReturn {},
+                ),
+            }
+            let client = connect(&node).await;
+            let mut memory = Memory {
+                holders: BTreeSet::from([holder]),
+                ..Memory::default()
+            };
+
+            price_at(&node, &client, SLOT_START, Halt::Running, &mut memory).await;
+
+            assert_eq!(
+                sent::<IVault::recordValuationCall>(&node, VAULT),
+                valued,
+                "serve: {serve:?}, station: {mark}, owed: {owed}"
+            );
+        }
+    }
+
+    /// A halted vault is valued for its close when the vault says a
+    /// valuation in the slot would let it close, and not otherwise.
+    #[tokio::test]
+    async fn a_halted_vault_is_valued_for_its_close_when_the_vault_says_one_would_let_it() {
+        for (wants, valued) in [(false, 0), (true, 1)] {
+            let node = node(SLOT_START);
+            a_quiet_vault(&node, SLOT_START - 10);
+            answers(
+                &node,
+                VAULT,
+                IVault::closeWantsValuationCall { time: 0 },
+                wants,
+            );
+            let client = connect(&node).await;
+
+            price_at(
+                &node,
+                &client,
+                SLOT_START,
+                Halt::Halted,
+                &mut Memory::default(),
+            )
+            .await;
+
+            assert_eq!(
+                sent::<IVault::recordValuationCall>(&node, VAULT),
+                valued,
+                "the close wants one: {wants}"
+            );
+        }
+    }
+
+    /// A close staged at the station voids any valuation recorded meanwhile:
+    /// none is paid for.
+    #[tokio::test]
+    async fn a_valuation_is_not_sent_while_a_close_is_staged() {
+        let node = node(SLOT_START);
+        a_quiet_vault(&node, SLOT_START - DAY);
+        answers(
+            &node,
+            STATION,
+            IStation::stageCall {},
+            chain::bindings::station::Stage {
+                fraction: U256::from(WAD / 4),
+                owed: U256::ZERO,
+                estimate: U256::ZERO,
+                fetched: U256::ZERO,
+                cost: U256::ZERO,
+                part: U256::ZERO,
+                arrivedAt: U256::ZERO,
+                stagedAt: SLOT_START - 5,
+                stagedBlock: 15,
+                sweptAt: 0,
+                sweptBlock: 0,
+                window: 10,
+                delay: 0,
+                forVault: true,
+            },
+        );
+        let client = connect(&node).await;
+
+        price_at(
+            &node,
+            &client,
+            SLOT_START,
+            Halt::Running,
+            &mut Memory::default(),
+        )
+        .await;
+
+        assert_eq!(sent::<IVault::recordValuationCall>(&node, VAULT), 0);
+    }
+
+    /// On a chain of two-second blocks a valuation sent with the head one
+    /// second into the slot lands at the window's last second if it makes
+    /// the next block, and outside it if it misses that block: the vault
+    /// would revert it, and it would still be paid for. Simulated landing a
+    /// block late, it isn't sent; the next slot's, sent a second before the
+    /// slot begins, lands inside the window even a block late, and is.
+    #[tokio::test]
+    async fn a_valuation_that_would_revert_is_not_sent() {
+        let node = node(SLOT_START);
+        a_quiet_vault(&node, SLOT_START - DAY);
+        keeps_the_window(&node, timers().slotInterval, timers().slotWindow);
+        let client = connect(&node).await;
+        let mut memory = Memory::default();
+        let at = async |now: u64, memory: &mut Memory| {
+            node.lock().unwrap().timestamp = now;
+            price(
+                &client,
+                KEEPER,
+                VAULT,
+                &timers(),
+                2,
+                true,
+                Halt::Running,
+                memory,
+            )
+            .await;
+        };
+
+        at(SLOT_START + 1, &mut memory).await;
+        assert_eq!(
+            sent::<IVault::recordValuationCall>(&node, VAULT),
+            0,
+            "simulated at {:?}",
+            simulated_at::<IVault::recordValuationCall>(&node, VAULT)
+        );
+        // Only late: the vault is not said to refuse it.
+        assert_eq!(memory.valuations_refused.slots, 0);
+
+        at(SLOT_START + 9, &mut memory).await;
+        assert_eq!(sent::<IVault::recordValuationCall>(&node, VAULT), 1);
+        assert_eq!(
+            simulated_at::<IVault::recordValuationCall>(&node, VAULT).last(),
+            Some(&(SLOT_START + 13))
+        );
+    }
+
+    /// A valuation the vault would refuse wherever it lands is not sent, and
+    /// counts toward the vault refusing its valuations.
+    #[tokio::test]
+    async fn a_valuation_the_vault_refuses_is_not_sent_and_is_counted_refused() {
+        let node = node(SLOT_START);
+        a_quiet_vault(&node, SLOT_START - DAY);
+        refuses(&node, VAULT, IVault::recordValuationCall {});
+        let client = connect(&node).await;
+        let mut memory = Memory::default();
+
+        price_at(&node, &client, SLOT_START, Halt::Running, &mut memory).await;
+
+        assert_eq!(sent::<IVault::recordValuationCall>(&node, VAULT), 0);
+        assert_eq!(memory.valuations_refused.slots, 1);
+        assert_eq!(
+            simulated_at::<IVault::recordValuationCall>(&node, VAULT),
+            [SLOT_START + 2, SLOT_START + 1]
+        );
+    }
+
+    /// A node that runs a call at the head's time, whatever time it is
+    /// given, would judge a valuation by the moment it was sent rather than
+    /// the one it lands at: sent a second before a slot, it would seem to
+    /// land outside the window either way and never be sent. Such a node is
+    /// found out and not trusted to simulate; the valuation goes on its gas
+    /// estimate, as before simulations, while a node that runs the call at
+    /// the time given judges it as it lands.
+    #[tokio::test]
+    async fn a_node_that_ignores_the_block_time_is_not_trusted_to_simulate() {
+        for ignores in [false, true] {
+            let node = node(SLOT_START - 1);
+            a_quiet_vault(&node, SLOT_START - DAY);
+            keeps_the_window(&node, timers().slotInterval, timers().slotWindow);
+            if ignores {
+                crate::stand_in::ignores_block_time(&node);
+            }
+            let client = connect(&node).await;
+            let mut memory = Memory::default();
+
+            price(
+                &client,
+                KEEPER,
+                VAULT,
+                &timers(),
+                2,
+                true,
+                Halt::Running,
+                &mut memory,
+            )
+            .await;
+
+            assert_eq!(
+                sent::<IVault::recordValuationCall>(&node, VAULT),
+                1,
+                "ignores the block time: {ignores}"
+            );
+            assert_eq!(memory.valuations_refused.slots, 0);
+            assert_eq!(
+                simulated_at::<IVault::recordValuationCall>(&node, VAULT),
+                if ignores {
+                    vec![]
+                } else {
+                    vec![SLOT_START + 3]
+                }
+            );
+        }
+    }
+
+    /// A node that refuses a call given a block time can't simulate a
+    /// valuation at its landing: it goes on its gas estimate.
+    #[tokio::test]
+    async fn a_node_that_refuses_the_block_time_leaves_the_valuation_to_its_estimate() {
+        let node = node(SLOT_START);
+        a_quiet_vault(&node, SLOT_START - DAY);
+        crate::stand_in::refuses_block_time(&node);
+        let client = connect(&node).await;
+
+        price_at(
+            &node,
+            &client,
+            SLOT_START,
+            Halt::Running,
+            &mut Memory::default(),
+        )
+        .await;
+
+        assert_eq!(sent::<IVault::recordValuationCall>(&node, VAULT), 1);
+    }
+
+    /// Whether an endpoint runs a call at the time given is asked once, not
+    /// before every valuation.
+    #[tokio::test]
+    async fn an_endpoint_is_asked_once_whether_it_runs_a_call_at_the_time_given() {
+        let node = node(SLOT_START);
+        a_quiet_vault(&node, SLOT_START - DAY);
+        let client = connect(&node).await;
+        let mut memory = Memory::default();
+
+        price_at(&node, &client, SLOT_START, Halt::Running, &mut memory).await;
+        price_at(&node, &client, SLOT_START + 10, Halt::Running, &mut memory).await;
+
+        assert_eq!(sent::<IVault::recordValuationCall>(&node, VAULT), 2);
+        assert_eq!(node.lock().unwrap().block_time_probes, 1);
+    }
+
+    #[test]
+    fn payday_falls_on_the_monday_after_the_last_one_as_the_vault_counts_it() {
+        // Monday 13 November 2023, 00:00 UTC.
+        let monday = 1_699_833_600;
+        assert_eq!(next_monday(monday - 1), monday);
+        assert_eq!(next_monday(monday), monday + 7 * DAY);
+        assert_eq!(next_monday(monday + 7 * DAY - 1), monday + 7 * DAY);
+        assert_eq!(next_monday(0), 4 * DAY);
+    }
+
+    #[test]
+    fn a_valuation_is_simulated_a_block_late_only_where_the_window_has_room_for_it() {
+        // Two-second blocks in a three-second window.
+        assert_eq!(landing_times(1_001, 3, 2), (1_003, 1_005));
+        // One-second blocks.
+        assert_eq!(landing_times(1_001, 3, 1), (1_002, 1_003));
+        // Blocks longer than the window: only the block it lands in.
+        assert_eq!(landing_times(1_000, 3, 3_600), (4_600, 4_600));
     }
 }

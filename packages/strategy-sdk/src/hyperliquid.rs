@@ -158,6 +158,13 @@ pub struct AccountState {
     pub vault_value: Decimal,
     /// The vault's cash, on its own contract.
     pub idle: Decimal,
+    /// The station's idle dollars on HyperEVM, beside the account: what a
+    /// move into the account can take without touching the vault's cash.
+    /// Zero in a reply from an executor that doesn't report it, so a payload
+    /// without it still reads; and an agent built before it reads a payload
+    /// with it, since a field it doesn't know is passed over.
+    #[serde(default)]
+    pub station_idle: Decimal,
     /// The account's perp side at mark.
     pub account_value: Decimal,
     pub withdrawable: Decimal,

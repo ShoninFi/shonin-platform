@@ -120,6 +120,10 @@ fn answer_call(state: &Chain, input: &[u8]) -> Vec<u8> {
             chain::bindings::station::IStation::approvedKeyCall::abi_encode_returns(&Address::ZERO)
         }
         IVault::stateCall::SELECTOR => IVault::stateCall::abi_encode_returns(&VaultState::Open),
+        // The station holds nothing at the venue.
+        chain::bindings::venue::ILocalVenue::marketsHeldByCall::SELECTOR => {
+            chain::bindings::venue::ILocalVenue::marketsHeldByCall::abi_encode_returns(&Vec::new())
+        }
         // Made a day before the chain's clock.
         IVault::createdAtCall::SELECTOR => {
             IVault::createdAtCall::abi_encode_returns(&(state.timestamp - 86_400))
@@ -921,6 +925,10 @@ pub mod killed {
                 IVault::homeStationCall::abi_encode_returns(&Address::repeat_byte(0x55))
             }
             IVault::strategyIdCall::SELECTOR => word(7),
+            // The station holds nothing at the venue.
+            ILocalVenue::marketsHeldByCall::SELECTOR => {
+                ILocalVenue::marketsHeldByCall::abi_encode_returns(&Vec::new())
+            }
             IVault::allowancesCall::SELECTOR => {
                 node.agent_starts += 1;
                 IVault::allowancesCall::abi_encode_returns(&chain::allowances(&node.allowances))
@@ -1056,6 +1064,204 @@ pub mod killed {
         B256::from_slice(&alloy::hex::decode(hash.trim_start_matches("sha256:")).unwrap())
     }
 
+    pub async fn start(node: Shared) -> chain::Client {
+        let app = Router::new().route("/", post(rpc)).with_state(node);
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        super::client(&format!("http://{address}")).await
+    }
+}
+
+/// A stand-in for the stand-in venue, for what a key's orders do there: each
+/// `place` sent is mined at once, every order in it decided on its own as
+/// `LocalVenue` decides it, and its receipt carries the venue's log for
+/// each. An order for the market `NOPE` is refused, a buy limited below 100
+/// finds no fill, and any other fills at 100. An order for `SINK` reverts
+/// the whole transaction, as an order that overflows the venue's arithmetic
+/// would: the node refuses to estimate it, so it is never sent.
+pub mod venue {
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+
+    use alloy::consensus::transaction::SignerRecoverable;
+    use alloy::consensus::{Transaction, TxEnvelope};
+    use alloy::eips::eip2718::Decodable2718;
+    use alloy::primitives::{Address, B256, Bytes, U256};
+    use alloy::sol_types::{SolCall, SolEvent};
+    use axum::extract::State;
+    use axum::response::{IntoResponse, Response};
+    use axum::{Json, Router, routing::post};
+    use chain::bindings::venue::{ILocalVenue, OrderRequest};
+    use serde_json::{Value, json};
+
+    pub const PRICE: u64 = 100_000_000;
+
+    #[derive(Default)]
+    pub struct Node {
+        /// Each `place` sent, with the orders in it, in order.
+        pub placed: Vec<Vec<OrderRequest>>,
+        /// Every receipt the node can give, by hash.
+        receipts: Vec<(B256, Value)>,
+        nonce: u64,
+    }
+
+    pub type Shared = Arc<Mutex<Node>>;
+
+    fn name(market: &B256) -> String {
+        crate::host::market_name(*market)
+    }
+
+    fn sinks(orders: &[OrderRequest]) -> bool {
+        orders.iter().any(|order| name(&order.market) == "SINK")
+    }
+
+    /// The venue's log for one order.
+    fn log_of(venue: Address, master: Address, by: Address, order: &OrderRequest) -> Value {
+        let price = U256::from(PRICE);
+        let data = if name(&order.market) == "NOPE" {
+            ILocalVenue::Rejected {
+                master,
+                market: order.market,
+                by,
+                reason: "no such market".to_string(),
+            }
+            .encode_log_data()
+        } else if order.isBuy && order.limitPrice < price {
+            ILocalVenue::Unfilled {
+                master,
+                market: order.market,
+                by,
+            }
+            .encode_log_data()
+        } else {
+            let notional = order.size * price / U256::from(10u64).pow(U256::from(18));
+            ILocalVenue::Filled {
+                master,
+                market: order.market,
+                by,
+                isBuy: order.isBuy,
+                reduceOnly: order.reduceOnly,
+                size: order.size,
+                price,
+                notional,
+            }
+            .encode_log_data()
+        };
+        json!({
+            "address": venue,
+            "topics": data.topics(),
+            "data": data.data,
+            "blockNumber": "0x11",
+            "blockHash": B256::repeat_byte(0xbb),
+            "transactionHash": B256::ZERO,
+            "transactionIndex": "0x0",
+            "logIndex": "0x0",
+            "removed": false,
+        })
+    }
+
+    fn reverted(id: Value) -> Response {
+        Json(json!({"jsonrpc": "2.0", "id": id, "error": {"code": 3, "message": "execution reverted"}}))
+            .into_response()
+    }
+
+    async fn rpc(State(node): State<Shared>, Json(request): Json<Value>) -> Response {
+        let id = request["id"].clone();
+        let method = request["method"].as_str().unwrap_or_default().to_string();
+        let mut node = node.lock().unwrap();
+        let result = match method.as_str() {
+            "eth_chainId" => json!("0x7a69"),
+            "eth_accounts" => json!([]),
+            "eth_blockNumber" => json!("0x10"),
+            "eth_getBlockByNumber" => {
+                let mut block =
+                    alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
+                block.header.inner.number = 16;
+                block.header.inner.timestamp = super::serving::NOW;
+                block.header.inner.base_fee_per_gas = Some(1_000_000_000);
+                serde_json::to_value(block).unwrap()
+            }
+            "eth_gasPrice" | "eth_maxPriorityFeePerGas" => json!("0x3b9aca00"),
+            "eth_feeHistory" => json!({
+                "oldestBlock": "0x1",
+                "baseFeePerGas": ["0x3b9aca00", "0x3b9aca00"],
+                "gasUsedRatio": [0.5],
+                "reward": [["0x3b9aca00"]],
+            }),
+            "eth_estimateGas" => {
+                let tx = &request["params"][0];
+                let data = tx["input"].as_str().or_else(|| tx["data"].as_str());
+                let input = data
+                    .and_then(|data| alloy::hex::decode(data).ok())
+                    .unwrap_or_default();
+                if let Ok(call) = ILocalVenue::placeCall::abi_decode(&input)
+                    && sinks(&call.orders)
+                {
+                    return reverted(id);
+                }
+                json!("0x30000")
+            }
+            "eth_getTransactionCount" => json!(format!("0x{:x}", node.nonce)),
+            "eth_getBalance" => json!(U256::from(10u128.pow(19))),
+            "eth_sign" => json!(Bytes::from(vec![0x11u8; 65])),
+            "eth_getLogs" => json!([]),
+            "eth_sendRawTransaction" => {
+                let raw = alloy::hex::decode(request["params"][0].as_str().unwrap()).unwrap();
+                let envelope = TxEnvelope::decode_2718(&mut raw.as_slice()).unwrap();
+                let hash = *envelope.tx_hash();
+                let venue = envelope.to().unwrap_or_default();
+                let by = envelope.recover_signer().unwrap_or_default();
+                let call = ILocalVenue::placeCall::abi_decode(envelope.input()).unwrap();
+                let logs: Vec<Value> = call
+                    .orders
+                    .iter()
+                    .map(|order| log_of(venue, call.master, by, order))
+                    .collect();
+                node.nonce += 1;
+                node.placed.push(call.orders);
+                node.receipts.push((
+                    hash,
+                    json!({
+                        "transactionHash": hash,
+                        "transactionIndex": "0x0",
+                        "blockHash": B256::repeat_byte(0xbb),
+                        "blockNumber": "0x11",
+                        "from": by,
+                        "to": venue,
+                        "cumulativeGasUsed": "0x5208",
+                        "gasUsed": "0x5208",
+                        "effectiveGasPrice": "0x3b9aca00",
+                        "contractAddress": null,
+                        "logs": logs,
+                        "logsBloom": format!("0x{}", "00".repeat(256)),
+                        "status": "0x1",
+                        "type": "0x2",
+                    }),
+                ));
+                json!(hash)
+            }
+            "eth_getTransactionReceipt" => {
+                let asked: B256 = request["params"][0].as_str().unwrap().parse().unwrap();
+                node.receipts
+                    .iter()
+                    .find(|(hash, _)| *hash == asked)
+                    .map(|(_, receipt)| receipt.clone())
+                    .unwrap_or(Value::Null)
+            }
+            "eth_call" if crate::stand_in::code_run(&request).is_some() => {
+                crate::stand_in::code_run(&request).unwrap()
+            }
+            _ => return reverted(id),
+        };
+        Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response()
+    }
+
+    /// Serve the stand-in on a port of its own, and connect to it.
     pub async fn start(node: Shared) -> chain::Client {
         let app = Router::new().route("/", post(rpc)).with_state(node);
         let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))

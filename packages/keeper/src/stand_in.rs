@@ -11,6 +11,11 @@
 //! [`leaves_after_unwind`] scripts, or else its scripted mark less what the
 //! unwind brings home; [`refuses_creation_calls`] has it refuse the former,
 //! and [`refuses_simulations`] both.
+//! A call run at a set block time (a send simulated at the moment it would
+//! land) goes through unless the send is refused, or it falls outside a
+//! window [`keeps_the_window`] scripts; Multicall3's read of the block's
+//! time answers the time set. [`ignores_block_time`] has the node run such a
+//! call at the head's time instead, and [`refuses_block_time`] refuse it.
 //! `eth_sendTransaction` is recorded and mined at once with a successful
 //! receipt: whether a send would revert on a real chain is not what these
 //! tests judge; what the keeper chose to send is. [`connect_with_blocks_of`]
@@ -67,6 +72,17 @@ pub struct Node {
     no_override_calls: bool,
     /// The gas limit each transaction taken was sent with, if any.
     gas_limits: Vec<(Address, Selector, Option<u64>)>,
+    /// Each send run at a set moment, and the moment.
+    simulated_at: Vec<(Address, Selector, u64)>,
+    /// The slot interval and window a send run at a set moment must land
+    /// inside, if any.
+    window: Option<(u64, u64)>,
+    /// Whether it runs a call given a block time at the head's time instead,
+    /// and whether it refuses one.
+    ignores_block_time: bool,
+    refuses_block_time: bool,
+    /// How many times it was asked the block's time with a time set.
+    pub block_time_probes: usize,
 }
 
 pub type Shared = Arc<Mutex<Node>>;
@@ -149,6 +165,41 @@ fn answer(node: &Shared, request: &Value) -> Value {
             } else {
                 node.log_reads.push((from, to));
                 Ok(json!([]))
+            }
+        }
+        // A send run at the moment it would land, the block's time set: it
+        // goes through unless the node refuses the send, or it would land
+        // outside the window [`keeps_the_window`] scripts.
+        "eth_call" if params.get(3).is_some_and(Value::is_object) => {
+            if node.refuses_block_time {
+                return json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": "block overrides are not supported"}});
+            }
+            let (to, data) = tx_fields(params);
+            let key = (to, selector_of(&data));
+            let given = params[3]["time"]
+                .as_str()
+                .and_then(|hex| u64::from_str_radix(hex.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(node.timestamp);
+            let time = if node.ignores_block_time {
+                node.timestamp
+            } else {
+                given
+            };
+            if to == crate::MULTICALL3 {
+                node.block_time_probes += 1;
+                let time = alloy::primitives::U256::from(time);
+                return json!({"jsonrpc": "2.0", "id": id, "result": alloy::hex::encode_prefixed(time.to_be_bytes::<32>())});
+            }
+            node.simulated_at.push((to, key.1, time));
+            if let Some(reason) = node.refused.get(&key) {
+                Err(format!("execution reverted: {reason}"))
+            } else if node
+                .window
+                .is_some_and(|(interval, window)| time % interval.max(1) > window)
+            {
+                Err("execution reverted: OutsideWindow()".to_string())
+            } else {
+                Ok(json!("0x"))
             }
         }
         "eth_call" if params[0].get("to").is_none_or(Value::is_null) => {
@@ -316,6 +367,35 @@ pub fn gas_limits_of<C: SolCall>(node: &Shared, to: Address) -> Vec<Option<u64>>
         .iter()
         .filter(|(at, selector, _)| *at == to && *selector == C::SELECTOR)
         .map(|(.., gas)| *gas)
+        .collect()
+}
+
+/// Have a send run at a set moment refused when that moment falls outside
+/// the window of a slot `interval` seconds long, as the vault refuses a
+/// valuation that lands late.
+pub fn keeps_the_window(node: &Shared, interval: u64, window: u64) {
+    node.lock().unwrap().window = Some((interval, window));
+}
+
+/// Have the node run a call given a block time at the head's time instead,
+/// without an error, as some nodes do.
+pub fn ignores_block_time(node: &Shared) {
+    node.lock().unwrap().ignores_block_time = true;
+}
+
+/// Have the node refuse a call given a block time.
+pub fn refuses_block_time(node: &Shared) {
+    node.lock().unwrap().refuses_block_time = true;
+}
+
+/// The moments each call `C` was run at before it was sent.
+pub fn simulated_at<C: SolCall>(node: &Shared, to: Address) -> Vec<u64> {
+    node.lock()
+        .unwrap()
+        .simulated_at
+        .iter()
+        .filter(|(at, selector, _)| *at == to && *selector == C::SELECTOR)
+        .map(|(.., time)| *time)
         .collect()
 }
 

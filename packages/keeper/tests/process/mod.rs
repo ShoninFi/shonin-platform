@@ -8,7 +8,9 @@
 //! leaves) is asked of the hooks as one to the zero address. The keeper's
 //! check, as a chain connects, that its node simulates (that probe, of a
 //! station at [`NOTHING_AT`]) is answered as a real node answers it, before
-//! the hooks, unless a request hook refuses it. Every address
+//! the hooks, unless a request hook refuses it. A call run at a set block
+//! time (a send simulated at the moment it would land) goes through; the
+//! send hook judges the send itself. Every address
 //! has code but those a test marks empty, and a call to one of those returns
 //! nothing, as a real chain's does. Every transaction it takes is mined at
 //! once with a successful receipt unless a test's hook turns it away.
@@ -202,6 +204,9 @@ fn answer(node: &Shared, asked: &Value) -> Value {
         // The keeper's check that the node simulates: the calls its probe
         // makes, to an address nothing lives at, return nothing.
         "eth_call" if simulation_check(params) => Ok(json!(alloy::hex::encode_prefixed([0u8; 96]))),
+        // A send run at the moment it would land (the block's time set) goes
+        // through: whether the send itself is taken is the send hook's to say.
+        "eth_call" if params.get(3).is_some_and(Value::is_object) => Ok(json!("0x")),
         "eth_call" => {
             let (to, data) = tx_fields(&params[0]);
             let selector: [u8; 4] = data

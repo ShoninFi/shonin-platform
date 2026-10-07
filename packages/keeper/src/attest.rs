@@ -443,12 +443,16 @@ fn stake_at(base: u128, worst_send: u128) -> u128 {
     base.max(worst_send.saturating_mul(3))
 }
 
-/// Below what a key is topped up: the stake less one worst-case send, never
-/// below two worst-case sends; half a stake when the fee couldn't be read.
+/// Below what a key is topped up (back to a whole stake): half a stake, so a
+/// key spends half its stake between top-ups rather than being sent a few
+/// thousandths of it after every send it makes, each top-up a transfer of its
+/// own. Never below two worst-case sends, so a key is topped up while it can
+/// still pay for its next one, however the stake compares with the fee.
 fn top_up_below(stake: u128, worst_send: Option<u128>) -> u128 {
+    let half = stake / 2;
     match worst_send {
-        Some(send) => stake.saturating_sub(send).max(send.saturating_mul(2)),
-        None => stake / 2,
+        Some(send) => half.max(send.saturating_mul(2)),
+        None => half,
     }
 }
 
@@ -466,8 +470,8 @@ async fn worst_send(chain: &Client) -> Result<u128> {
 }
 
 /// Keep a key stocked with gas from the keeper's account: when it holds
-/// less than a stake less one worst-case send, send it what brings it back
-/// up to one. A stake sent and not yet seen to land is waited for, not sent
+/// less than half a stake (see [`top_up_below`]), send it what brings it back
+/// up to a whole one. A stake sent and not yet seen to land is waited for, not sent
 /// again; the key's pending balance counts too.
 async fn fund_gas(
     chain: &Client,
@@ -854,12 +858,34 @@ mod tests {
     }
 
     #[test]
-    fn a_key_is_topped_up_below_its_stake_less_a_send_and_never_below_two_sends() {
+    fn a_key_is_topped_up_below_half_its_stake_and_never_below_two_sends() {
         assert_eq!(stake_at(500, 100), 500);
         assert_eq!(stake_at(500, 200), 600);
+        // Half the stake, however many sends that leaves room for.
+        assert_eq!(top_up_below(500, Some(10)), 250);
+        assert_eq!(top_up_below(600, Some(100)), 300);
+        // A stake of three sends would be topped up at a send and a half:
+        // two sends it is, so the next one can still be paid for.
         assert_eq!(top_up_below(600, Some(200)), 400);
         assert_eq!(top_up_below(500, Some(400)), 800);
         assert_eq!(top_up_below(500, None), 250);
+    }
+
+    /// The public chains' stake (half a thousandth of the coin), at a fee
+    /// whose worst-case send is three hundredths of a thousandth: the key is
+    /// left to spend down to half its stake, not topped up after each send.
+    #[test]
+    fn a_key_is_topped_up_only_below_half_its_stake() {
+        let send = 30_000_000_000_000;
+        let stake = stake_at(GAS_STAKE_PUBLIC, send);
+        assert_eq!(stake, 500_000_000_000_000);
+        let below = top_up_below(stake, Some(send));
+        assert_eq!(below, 250_000_000_000_000);
+        // A key one ordinary send short of its stake is not topped up.
+        assert!(stake - 7_000_000_000_000 >= below);
+        // Its top-up brings it from just under half a stake back to a whole
+        // one, which it can still spend a worst-case send from twice over.
+        assert!(below >= 2 * send);
     }
 
     #[test]

@@ -265,6 +265,7 @@ pub fn state_from(
     Ok(AccountState {
         vault_value: Decimal::ZERO,
         idle: Decimal::ZERO,
+        station_idle: Decimal::ZERO,
         account_value: figure(&perp["marginSummary"]["accountValue"], "value")?,
         withdrawable: figure(&perp["withdrawable"], "withdrawable dollars")?,
         positions,

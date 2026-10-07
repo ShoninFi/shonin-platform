@@ -725,6 +725,63 @@ library Valuations {
         emit IVault.FromStation(amount, toUnits);
     }
 
+    // Whether a valuation is wanted -----------------------------------------
+
+    /// The `earliest` of the oldest request neither done nor priced by the
+    /// newest priced valuation; zero if none. Every request is queued for
+    /// the first slot at least `slotLead` from when it is made, on timers
+    /// fixed for life, so the queue is in order of `earliest`: the first
+    /// request after the newest priced valuation's time is found by halving,
+    /// and only requests taken through the fallback are walked past.
+    function nextUnpriced() external view returns (uint64) {
+        Layout storage s = VaultStorage.layout();
+        uint256 count = s.requests.length;
+        uint256 i = s.requestCursor;
+        if (s.lastPriced != 0) {
+            uint64 priced = s.latest().time;
+            uint256 end = count;
+            while (i < end) {
+                uint256 mid = (i + end) / 2;
+                if (s.requests[mid].earliest <= priced) i = mid + 1;
+                else end = mid;
+            }
+        }
+        for (; i < count; i++) {
+            Request storage r = s.requests[i];
+            if (!r.done) return r.earliest;
+        }
+        return 0;
+    }
+
+    /// Whether a halted vault's close waits for a valuation recorded at slot
+    /// `time` with the home station as it stands: the same test `close`
+    /// makes of the newest priced valuation, on the figures this valuation
+    /// would record. Other chains' stations are counted only by the posts
+    /// the valuation gathers, so on a vault that has any this judges the
+    /// home station's part alone.
+    function closeWantsValuation(uint64 time) external view returns (bool) {
+        Layout storage s = VaultStorage.layout();
+        VaultState state = s.state;
+        if (
+            !s.halted() || state == VaultState.Activating || state == VaultState.Closed
+                || state == VaultState.Cancelled
+        ) return false;
+        if (time <= s.haltedAt || s.readyToClose() || s.valuing() || s.staging()) return false;
+        IStation station = IStation(s.homeStation);
+        // Void, as any valuation recorded with a market outside the band.
+        if (station.outsideBand()) return false;
+        (uint256 markValue, uint256 exitValue) = station.value();
+        // Counted as `recordValuation` counts it: the mark, plus the exit
+        // side above it, each the shares' part.
+        uint256 extra = exitValue > markValue ? exitValue - markValue : 0;
+        uint256 units = s.liveUnits();
+        if (units != 0) {
+            markValue = markValue.mulDiv(WAD - units, WAD);
+            extra = extra.mulDiv(WAD - units, WAD);
+        }
+        return markValue + extra <= s.minimumDeposit / 10;
+    }
+
     /// The idle floor in force: a lowering applies once its delay has passed.
     function floorNow(Layout storage s) internal view returns (uint256) {
         if (s.pendingFloorAt != 0 && block.timestamp >= s.pendingFloorAt) return s.pendingFloorBps;

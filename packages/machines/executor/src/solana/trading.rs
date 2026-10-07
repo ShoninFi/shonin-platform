@@ -543,13 +543,16 @@ fn halting(reason: chain::solana::programs::vault::state::HaltReason) -> VaultEv
 /// How often the cluster is looked at on an agent's behalf.
 const LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Follow one vault for its agent: each market's prices as the venue posts
-/// them, on the account stream, and the vault's halt, on the vault's. The
-/// halt is said once; a watcher started after it has passed says it first.
+/// Follow one vault for its agent: the prices of each market it follows as
+/// the venue posts them, on the account stream, and the vault's halt, on the
+/// vault's. A market it doesn't follow is passed over, so its posts don't
+/// wake the agent. The halt is said once; a watcher started after it has
+/// passed says it first.
 pub async fn watch(
     client: SolanaClient,
     platform: Platform,
     vault: Pubkey,
+    following: crate::watch::Following,
     account_events: UnboundedSender<Vec<u8>>,
     vault_events: UnboundedSender<VaultEvent>,
 ) {
@@ -566,6 +569,7 @@ pub async fn watch(
                     });
                     if changed {
                         if let Ok(state) = market_state(&market)
+                            && following.follows(&state.market)
                             && account_events
                                 .send(strategy_sdk::to_payload(&AccountEvent::Prices(state)))
                                 .is_err()

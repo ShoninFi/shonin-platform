@@ -97,6 +97,9 @@ pub struct Ctx {
     /// before this one left unread is read here first.
     pub account_events: Option<Reader<Vec<u8>>>,
     pub vault_events: Option<Reader<VaultEvent>>,
+    /// The stand-in venue's markets the agent follows, which its watcher
+    /// wakes it for: noted here as it asks about them and trades them.
+    pub following: crate::watch::Following,
     /// What the health report is made of. Shared, so a report can be sent
     /// while the strategy is still running: a strategy's `run` is meant never
     /// to return.
@@ -451,17 +454,44 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
             });
             return Ok(verdicts);
         }
-        for bytes in &actions {
-            let (verdict, tally) = match strategy_sdk::from_payload::<Action>(bytes) {
-                Ok(action) => match &place {
-                    Place::Evm(evm) => act(&evm.key, evm.station, evm.venue, action).await,
-                    Place::Solana(trading) => answer(trading.act(action).await),
-                },
-                Err(error) => (
+        // Every action that decodes is an order; those that don't are
+        // refused here, and the orders beside them still go.
+        let mut answers: Vec<Option<(Verdict, Tally)>> = Vec::with_capacity(actions.len());
+        let mut orders = Vec::new();
+        for (at, bytes) in actions.iter().enumerate() {
+            match strategy_sdk::from_payload::<Action>(bytes) {
+                Ok(Action::Place(order)) => {
+                    orders.push((at, order));
+                    answers.push(None);
+                }
+                Err(error) => answers.push(Some((
                     Verdict::Rejected(format!("that is not an action: {error}")),
                     Tally::Refused,
-                ),
-            };
+                ))),
+            }
+        }
+        // A market the agent sends an order for is one it follows.
+        accessor.with(|mut access| {
+            let ctx = access.get();
+            for (_, order) in &orders {
+                ctx.following.market(&order.market);
+            }
+        });
+        let (at, orders): (Vec<usize>, Vec<strategy_sdk::Order>) = orders.into_iter().unzip();
+        let done = match &place {
+            Place::Evm(evm) => place_all(&evm.key, evm.station, evm.venue, &orders).await,
+            Place::Solana(trading) => {
+                let mut done = Vec::with_capacity(orders.len());
+                for order in orders {
+                    done.push(trading.act(Action::Place(order)).await);
+                }
+                done
+            }
+        };
+        for (at, done) in at.into_iter().zip(done) {
+            answers[at] = Some(answer(done));
+        }
+        for (verdict, tally) in answers.into_iter().flatten() {
             tallies.push(tally);
             verdicts.push(verdict);
         }
@@ -524,12 +554,42 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
                 }
             });
         }
+        // The markets the agent asks about are the ones it follows from now
+        // on, noted before the account is read: an event the watcher passes
+        // over before then is in what this read finds.
+        let asked = asked_about(&query);
+        accessor.with(|mut access| {
+            let ctx = access.get();
+            match &asked {
+                Some(markets) => markets
+                    .iter()
+                    .for_each(|market| ctx.following.market(market)),
+                None => ctx.following.every(),
+            }
+        });
         let state = match &place {
             Place::Evm(evm) => {
-                read_account_state(&evm.chain, evm.vault, evm.station, evm.venue, evm.usd).await
+                read_account_state(
+                    &evm.chain,
+                    evm.vault,
+                    evm.station,
+                    evm.venue,
+                    evm.usd,
+                    asked.as_deref(),
+                )
+                .await
             }
             Place::Solana(trading) => trading.account_state().await,
         };
+        // And the markets it holds, which it reads of here.
+        if let Ok(state) = &state {
+            accessor.with(|mut access| {
+                let ctx = access.get();
+                for position in &state.positions {
+                    ctx.following.market(&position.market);
+                }
+            });
+        }
         match state {
             Ok(state) => Ok(Ok(strategy_sdk::to_payload(&state))),
             Err(error) => {
@@ -1552,22 +1612,6 @@ impl Tally {
     }
 }
 
-/// Do one action, and say whether the answer counts against the strategy's
-/// health. An order that found nobody at its price is the market's answer, not
-/// the venue's: a strategy whose orders are not crossing is trading, and one
-/// whose orders are being refused is not.
-async fn act(
-    key: &KeyClient,
-    station: Address,
-    venue: Address,
-    action: Action,
-) -> (Verdict, Tally) {
-    let done = match action {
-        Action::Place(order) => place(key, station, venue, &order).await,
-    };
-    answer(done)
-}
-
 /// What the agent is told of an action, and how it counts.
 pub fn answer(done: std::result::Result<Receipt, Refusal>) -> (Verdict, Tally) {
     match done {
@@ -1591,6 +1635,7 @@ pub fn answer(done: std::result::Result<Receipt, Refusal>) -> (Verdict, Tally) {
 pub const NO_FILL: &str = "no fill at that price";
 
 /// Why an action produced no receipt.
+#[derive(Clone, Debug)]
 pub enum Refusal {
     /// The venue would have taken the order; nobody was there at that price.
     NoFill,
@@ -1614,52 +1659,177 @@ impl From<anyhow::Error> for Refusal {
     }
 }
 
-async fn place(
-    key: &KeyClient,
-    station: Address,
-    venue: Address,
-    order: &strategy_sdk::Order,
-) -> std::result::Result<Receipt, Refusal> {
-    let request = OrderRequest {
+/// The order as the venue takes it, or why it can't be put that way.
+fn request_of(order: &strategy_sdk::Order) -> std::result::Result<OrderRequest, Refusal> {
+    Ok(OrderRequest {
         market: market_id(&order.market),
         isBuy: matches!(order.side, Side::Buy),
         size: to_units(order.size, SIZE_DECIMALS)?,
         limitPrice: to_units(order.limit_price, ASSET_DECIMALS)?,
         reduceOnly: order.reduce_only,
-    };
+    })
+}
+
+/// Place every order of one submission in one transaction, and say what
+/// became of each, in order. An order that can't be put as the venue takes
+/// it is refused on its own, and the rest still go.
+///
+/// The venue decides each order in a batch on its own: one it refuses or
+/// that finds no fill leaves the others standing, and it writes one log for
+/// each, in order. Only a batch the chain refuses as a whole (one order
+/// overflowing the venue's arithmetic, or a key the venue doesn't take)
+/// would tie the orders together, so such a batch is sent again an order at
+/// a time and each is decided on its own, as it would have been sent alone.
+/// A batch that was sent and never answered is not sent again: it may still
+/// land.
+async fn place_all(
+    key: &KeyClient,
+    station: Address,
+    venue: Address,
+    orders: &[strategy_sdk::Order],
+) -> Vec<std::result::Result<Receipt, Refusal>> {
+    let mut done: Vec<Option<std::result::Result<Receipt, Refusal>>> =
+        orders.iter().map(|_| None).collect();
+    let mut going = Vec::new();
+    let mut requests = Vec::new();
+    for (at, order) in orders.iter().enumerate() {
+        match request_of(order) {
+            Ok(request) => {
+                going.push(at);
+                requests.push(request);
+            }
+            Err(refusal) => done[at] = Some(Err(refusal)),
+        }
+    }
+    if !requests.is_empty() {
+        let sent: Vec<&strategy_sdk::Order> = going.iter().map(|at| &orders[*at]).collect();
+        let outcomes = match send_orders(key, station, venue, requests.clone(), &sent).await {
+            Err(Refusal::Refused(_)) if requests.len() > 1 => {
+                let mut each = Vec::with_capacity(requests.len());
+                for (request, order) in requests.into_iter().zip(&sent) {
+                    each.push(
+                        match send_orders(key, station, venue, vec![request], &[*order]).await {
+                            Ok(mut one) => one.remove(0),
+                            Err(refusal) => Err(refusal),
+                        },
+                    );
+                }
+                each
+            }
+            Ok(outcomes) => outcomes,
+            Err(refusal) => sent.iter().map(|_| Err(refusal.clone())).collect(),
+        };
+        for (at, outcome) in going.into_iter().zip(outcomes) {
+            done[at] = Some(outcome);
+        }
+    }
+    done.into_iter()
+        .map(|done| {
+            done.unwrap_or_else(|| {
+                Err(Refusal::Refused(
+                    "the venue said nothing about that order".to_string(),
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Send `requests` in one `place`, and read what became of each of
+/// `orders` (the same orders, as the agent put them) from the receipt; or
+/// why the transaction as a whole came to nothing.
+async fn send_orders(
+    key: &KeyClient,
+    station: Address,
+    venue: Address,
+    requests: Vec<OrderRequest>,
+    orders: &[&strategy_sdk::Order],
+) -> std::result::Result<Vec<std::result::Result<Receipt, Refusal>>, Refusal> {
     let receipt = key
         .send(
             venue,
             ILocalVenue::placeCall {
                 master: station,
-                orders: vec![request],
+                orders: requests,
             },
         )
         .await?;
+    Ok(outcomes_of(receipt.inner.logs(), venue, station, orders))
+}
 
-    // What the venue did is in its own log, where anyone reading the chain
-    // sees the same thing the strategy is told.
-    for log in receipt.inner.logs() {
-        if let Ok(filled) = log.log_decode::<ILocalVenue::Filled>() {
+/// What the venue did with each of `orders`, read from the logs of the one
+/// transaction that placed them. What the venue did is in its own log, where
+/// anyone reading the chain sees the same thing the strategy is told: one
+/// `Filled`, `Unfilled` or `Rejected` for each order, in the order they were
+/// placed. An order the venue wrote nothing for is said to be refused.
+pub fn outcomes_of(
+    logs: &[alloy::rpc::types::Log],
+    venue: Address,
+    station: Address,
+    orders: &[&strategy_sdk::Order],
+) -> Vec<std::result::Result<Receipt, Refusal>> {
+    let mut outcomes = Vec::with_capacity(orders.len());
+    let mut next = orders.iter();
+    for log in logs.iter().filter(|log| log.address() == venue) {
+        let said = if let Ok(filled) = log.log_decode::<ILocalVenue::Filled>() {
             let filled = filled.inner.data;
-            return Ok(Receipt::Filled {
-                market: order.market.clone(),
-                side: if filled.isBuy { Side::Buy } else { Side::Sell },
-                size: to_decimal(filled.size, SIZE_DECIMALS)?,
-                price: to_decimal(filled.price, ASSET_DECIMALS)?,
-                notional: to_decimal(filled.notional, ASSET_DECIMALS)?,
-            });
+            (filled.master, filled.market, Ok(Some(filled)))
+        } else if let Ok(unfilled) = log.log_decode::<ILocalVenue::Unfilled>() {
+            let unfilled = unfilled.inner.data;
+            (unfilled.master, unfilled.market, Ok(None))
+        } else if let Ok(rejected) = log.log_decode::<ILocalVenue::Rejected>() {
+            let rejected = rejected.inner.data;
+            (rejected.master, rejected.market, Err(rejected.reason))
+        } else {
+            continue;
+        };
+        let (master, market, said) = said;
+        if master != station {
+            continue;
         }
-        if log.log_decode::<ILocalVenue::Unfilled>().is_ok() {
-            return Err(Refusal::NoFill);
-        }
-        if let Ok(rejected) = log.log_decode::<ILocalVenue::Rejected>() {
-            return Err(Refusal::Refused(rejected.inner.data.reason));
-        }
+        let Some(order) = next.next() else {
+            break;
+        };
+        outcomes.push(if market != market_id(&order.market) {
+            Err(Refusal::Refused(
+                "the venue's answer for this order named another market".to_string(),
+            ))
+        } else {
+            match said {
+                Ok(Some(filled)) => filled_receipt(&order.market, &filled),
+                Ok(None) => Err(Refusal::NoFill),
+                Err(why) => Err(Refusal::Refused(why)),
+            }
+        });
     }
-    Err(Refusal::Refused(
-        "the venue said nothing about that order".to_string(),
-    ))
+    for _ in next {
+        outcomes.push(Err(Refusal::Refused(
+            "the venue said nothing about that order".to_string(),
+        )));
+    }
+    outcomes
+}
+
+/// What the agent is told of an order the venue filled.
+fn filled_receipt(
+    market: &str,
+    filled: &ILocalVenue::Filled,
+) -> std::result::Result<Receipt, Refusal> {
+    Ok(Receipt::Filled {
+        market: market.to_string(),
+        side: if filled.isBuy { Side::Buy } else { Side::Sell },
+        size: to_decimal(filled.size, SIZE_DECIMALS)?,
+        price: to_decimal(filled.price, ASSET_DECIMALS)?,
+        notional: to_decimal(filled.notional, ASSET_DECIMALS)?,
+    })
+}
+
+/// The markets a `local` account read names, or none if it names none: an
+/// empty query, or anything that isn't one, asks about every market.
+fn asked_about(query: &[u8]) -> Option<Vec<String>> {
+    strategy_sdk::from_payload::<strategy_sdk::Query>(query)
+        .ok()
+        .map(|query| query.markets)
+        .filter(|markets| !markets.is_empty())
 }
 
 // Reading the chain ----------------------------------------------------------
@@ -1670,6 +1840,7 @@ pub async fn read_account_state(
     station: Address,
     venue: Address,
     usd: Address,
+    asked: Option<&[String]>,
 ) -> Result<strategy_sdk::AccountState> {
     let cash = chain
         .read(venue, ILocalVenue::cashOfCall { master: station })
@@ -1716,15 +1887,30 @@ pub async fn read_account_state(
         idle: to_decimal(idle, ASSET_DECIMALS)?,
         station_idle: to_decimal(station_idle, ASSET_DECIMALS)?,
         margin_bps: margin.try_into().unwrap_or(u32::MAX),
+        // Every market, or those asked about and those held.
+        markets: read_some_markets(chain, venue, |name| {
+            asked.is_none_or(|asked| asked.iter().any(|market| market == name))
+                || positions.iter().any(|held| held.market == name)
+        })
+        .await?,
         positions,
-        markets: read_markets(chain, venue).await?,
     })
 }
 
 pub async fn read_markets(chain: &Client, venue: Address) -> Result<Vec<MarketState>> {
+    read_some_markets(chain, venue, |_| true).await
+}
+
+/// The venue's markets `keep` keeps, by name, in the venue's order: only
+/// those are read.
+pub async fn read_some_markets(
+    chain: &Client,
+    venue: Address,
+    keep: impl Fn(&str) -> bool,
+) -> Result<Vec<MarketState>> {
     let ids = chain.read(venue, ILocalVenue::marketsCall {}).await?;
     let mut markets = Vec::with_capacity(ids.len());
-    for id in ids {
+    for id in ids.into_iter().filter(|id| keep(&market_name(*id))) {
         let market = chain
             .read(venue, ILocalVenue::marketOfCall { market: id })
             .await?;
@@ -2058,5 +2244,166 @@ mod tests {
             counters.submitted(Tally::Unanswered);
             assert!(counters.rejection_rate() <= 100.0);
         }
+    }
+
+    fn order(market: &str, side: Side, limit: &str) -> strategy_sdk::Order {
+        strategy_sdk::Order {
+            market: market.to_string(),
+            side,
+            size: strategy_sdk::decimal("2"),
+            limit_price: strategy_sdk::decimal(limit),
+            reduce_only: false,
+        }
+    }
+
+    /// Orders placed at the stand-in venue, and the node they went to.
+    async fn placed(
+        orders: &[strategy_sdk::Order],
+    ) -> (
+        crate::stand_in::venue::Shared,
+        Vec<std::result::Result<Receipt, Refusal>>,
+    ) {
+        let node = crate::stand_in::venue::Shared::default();
+        let client = crate::stand_in::venue::start(node.clone()).await;
+        let key = crate::stand_in::key(&client);
+        let done = place_all(
+            &key,
+            Address::repeat_byte(0x55),
+            Address::repeat_byte(0x33),
+            orders,
+        )
+        .await;
+        (node, done)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn orders_in_one_submit_go_out_in_one_transaction() {
+        let orders = [
+            order("BTC", Side::Buy, "200"),
+            order("BTC-PERP", Side::Sell, "50"),
+            order("ETH", Side::Buy, "150"),
+        ];
+        let (node, done) = placed(&orders).await;
+        let node = node.lock().unwrap();
+        assert_eq!(node.placed.len(), 1, "one transaction for the three orders");
+        let markets: Vec<String> = node.placed[0]
+            .iter()
+            .map(|request| market_name(request.market))
+            .collect();
+        assert_eq!(markets, ["BTC", "BTC-PERP", "ETH"], "in the order given");
+        assert!(done.iter().all(Result::is_ok));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_order_in_a_batch_gets_its_own_verdict() {
+        let orders = [
+            order("BTC", Side::Buy, "200"),
+            order("NOPE", Side::Buy, "200"),
+            order("BTC", Side::Buy, "50"),
+            order("BTC-PERP", Side::Sell, "90"),
+        ];
+        let (node, done) = placed(&orders).await;
+        assert_eq!(node.lock().unwrap().placed.len(), 1);
+        let answers: Vec<(Verdict, Tally)> = done.into_iter().map(answer).collect();
+        match &answers[0] {
+            (Verdict::Accepted(receipt), Tally::Done) => assert_eq!(
+                strategy_sdk::from_payload::<Receipt>(receipt).unwrap(),
+                Receipt::Filled {
+                    market: "BTC".to_string(),
+                    side: Side::Buy,
+                    size: strategy_sdk::decimal("2"),
+                    price: strategy_sdk::decimal("100"),
+                    notional: strategy_sdk::decimal("200"),
+                }
+            ),
+            _ => panic!("the first order's fill was not said"),
+        }
+        assert!(
+            matches!(&answers[1], (Verdict::Rejected(why), Tally::Refused) if why == "no such market"),
+            "the refused order was not told why"
+        );
+        assert!(
+            matches!(&answers[2], (Verdict::Rejected(why), Tally::Done) if why == NO_FILL),
+            "the order that found no fill was not said to"
+        );
+        match &answers[3] {
+            (Verdict::Accepted(receipt), Tally::Done) => assert!(matches!(
+                strategy_sdk::from_payload::<Receipt>(receipt).unwrap(),
+                Receipt::Filled { market, side: Side::Sell, .. } if market == "BTC-PERP"
+            )),
+            _ => panic!("the order after a refused one lost its fill"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_order_that_reverts_its_batch_leaves_the_others_decided_on_their_own() {
+        let orders = [
+            order("BTC", Side::Buy, "200"),
+            order("SINK", Side::Buy, "200"),
+            order("ETH", Side::Buy, "200"),
+        ];
+        let (node, done) = placed(&orders).await;
+        // The batch was never sent; the two orders that go alone were.
+        assert_eq!(node.lock().unwrap().placed.len(), 2);
+        assert!(
+            done[0].is_ok() && done[2].is_ok(),
+            "the others lost their fills"
+        );
+        assert!(matches!(done[1], Err(Refusal::Refused(_))), "{:?}", done[1]);
+    }
+
+    #[test]
+    fn an_order_the_venue_said_nothing_about_is_refused_and_the_others_keep_their_answers() {
+        let station = Address::repeat_byte(0x55);
+        let venue = Address::repeat_byte(0x33);
+        let log = |data: alloy::primitives::LogData, address: Address| alloy::rpc::types::Log {
+            inner: alloy::primitives::Log { address, data },
+            ..Default::default()
+        };
+        use alloy::sol_types::SolEvent;
+        let unfilled = |market: &str| {
+            ILocalVenue::Unfilled {
+                master: station,
+                market: market_id(market),
+                by: Address::ZERO,
+            }
+            .encode_log_data()
+        };
+        let logs = [
+            // Another contract's log, and another account's, are not the
+            // venue's answer to these orders.
+            log(unfilled("BTC"), Address::repeat_byte(0x99)),
+            log(
+                ILocalVenue::Unfilled {
+                    master: Address::repeat_byte(0x66),
+                    market: market_id("BTC"),
+                    by: Address::ZERO,
+                }
+                .encode_log_data(),
+                venue,
+            ),
+            log(unfilled("BTC"), venue),
+        ];
+        let (btc, eth) = (order("BTC", Side::Buy, "1"), order("ETH", Side::Buy, "1"));
+        let outcomes = outcomes_of(&logs, venue, station, &[&btc, &eth]);
+        assert!(matches!(outcomes[0], Err(Refusal::NoFill)));
+        assert!(matches!(&outcomes[1], Err(Refusal::Refused(why)) if why.contains("said nothing")));
+    }
+
+    #[test]
+    fn a_local_account_read_naming_no_markets_asks_about_every_market() {
+        assert_eq!(asked_about(&[]), None);
+        assert_eq!(asked_about(b"not a query"), None);
+        assert_eq!(
+            asked_about(&strategy_sdk::to_payload(&strategy_sdk::Query::default())),
+            None
+        );
+        let query = strategy_sdk::Query {
+            markets: vec!["BTC".to_string(), "BTC-PERP".to_string()],
+        };
+        assert_eq!(
+            asked_about(&strategy_sdk::to_payload(&query)),
+            Some(query.markets)
+        );
     }
 }

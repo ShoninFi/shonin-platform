@@ -50,9 +50,10 @@ pub fn gas_stake(chain: &Client) -> u128 {
 
 /// The stake at today's fee: the chain's stake, or three of the key's
 /// worst-case sends if that is more. The lines below sit in order under it:
-/// the top-up at two sends at least, the warning at half the stake (a send
-/// and a half at least), the error at one send. So a key is topped up before
-/// it reads as low, and reads as low before it can't send.
+/// the top-up at half the stake (two sends at least), the warning at half
+/// the top-up line (a send at least), the error at one send. So a key is
+/// topped up before it reads as low, and reads as low no later than it
+/// can't send.
 fn stake_at(base: u128, worst_send: u128) -> u128 {
     base.max(worst_send.saturating_mul(3))
 }
@@ -63,16 +64,17 @@ pub async fn stake_today(chain: &Client) -> Result<u128> {
     Ok(stake_at(gas_stake(chain), worst_send(chain).await?))
 }
 
-/// Below what a key is topped up: the stake less one worst-case send, so the
-/// key is brought back up after every few sends rather than left to fall to
-/// the warning at half a stake. Never below two worst-case sends, so a key is
-/// topped up while it can still pay for its next one and before it reads as
-/// low, however the stake compares with the fee. A fee that couldn't be read
-/// tops up at half a stake.
+/// Below what the keeper tops a key up (back to a whole stake), by the
+/// keeper's own rule: half a stake, so a key spends half its stake between
+/// top-ups rather than being sent a little after every send. Never below two
+/// worst-case sends, so a key is topped up while it can still pay for its
+/// next one, however the stake compares with the fee. A fee that couldn't be
+/// read tops up at half a stake.
 fn top_up_below(stake: u128, worst_send: Option<u128>) -> u128 {
+    let half = stake / 2;
     match worst_send {
-        Some(send) => stake.saturating_sub(send).max(send.saturating_mul(2)),
-        None => stake / 2,
+        Some(send) => half.max(send.saturating_mul(2)),
+        None => half,
     }
 }
 
@@ -94,8 +96,8 @@ pub async fn worst_send(chain: &Client) -> Result<u128> {
 }
 
 /// The least a vault's key holds before its agent starts: the line below
-/// which the keeper tops a blessed key up (the stake less one worst-case
-/// send, never below two), so a key the keeper has stocked is past it.
+/// which the keeper tops a blessed key up (half a stake, never below two
+/// worst-case sends), so a key the keeper has stocked is past it.
 pub async fn gas_line(chain: &Client) -> Result<U256> {
     let send = worst_send(chain).await.ok();
     let stake = stake_at(gas_stake(chain), send.unwrap_or(0));
@@ -107,11 +109,11 @@ pub async fn gas_line(chain: &Client) -> Result<U256> {
 /// relied on to send anything.
 const ONE_SEND_GAS: u128 = 300_000;
 
-/// The key's gas, in the chain's coin: a warning below half a stake (the
-/// top-up is late), an error below one worst-case send at today's fees. The
-/// stake is at least three such sends and a key is topped up below two, so a
-/// key just topped up reads as fine and one at the top-up line is not yet
-/// low.
+/// The key's gas, in the chain's coin: a warning below half the line the
+/// keeper tops it up below (the top-up is late), an error below one
+/// worst-case send at today's fees. The top-up line is at least two such
+/// sends, so the warning is at least one: a key anywhere between its
+/// top-ups, down to the line and half of it again, reads as fine.
 fn key_gas(holds: U256, stake: u128, worst_send: u128) -> Signal {
     let coin = |wei: f64| wei / 1e18;
     Signal {
@@ -120,7 +122,7 @@ fn key_gas(holds: U256, stake: u128, worst_send: u128) -> Signal {
         unit: "coin".to_string(),
         // A signal reads as past a threshold at it, and the key is only short
         // below it: the threshold sits just under the line.
-        warn_at: coin((stake / 2) as f64).next_down(),
+        warn_at: coin((top_up_below(stake, Some(worst_send)) / 2) as f64).next_down(),
         error_at: coin(worst_send as f64).next_down(),
         lower_is_worse: true,
         window: "now".to_string(),
@@ -603,24 +605,47 @@ mod tests {
 
     #[test]
     fn a_key_low_on_gas_is_a_warning_and_one_that_cannot_send_is_an_error() {
-        let send = 1_000_000_000 * ONE_SEND_GAS;
+        // A cheap chain: the stake is many sends.
+        let send = 100_000_000 * ONE_SEND_GAS;
         let stake = stake_at(GAS_STAKE_PUBLIC, send);
         let level = |holds: u128| key_gas(U256::from(holds), stake, send).level();
         assert_eq!(level(stake), Level::Ok);
-        assert_eq!(level(stake / 3), Level::Warning);
+        assert_eq!(level(stake / 5), Level::Warning);
         assert_eq!(level(send / 2), Level::Error);
     }
 
     #[test]
-    fn a_key_is_topped_up_once_it_is_a_send_short_of_its_stake_before_it_reads_as_low() {
-        let send = 1_000_000_000 * ONE_SEND_GAS;
-        let stake = stake_at(GAS_STAKE_PUBLIC, send);
-        let below = top_up_below(stake, Some(send));
-        assert_eq!(below, stake - send);
-        // A key at the top-up line is still well clear of the warning.
-        assert_eq!(key_gas(U256::from(below), stake, send).level(), Level::Ok);
-        // A fee that couldn't be read tops up at half a stake.
-        assert_eq!(top_up_below(stake, None), stake / 2);
+    fn a_key_is_topped_up_below_half_its_stake_as_the_keeper_tops_it_up() {
+        // The keeper's rule: half a stake, never below two worst-case sends,
+        // and half a stake when the fee can't be read.
+        assert_eq!(top_up_below(500, Some(10)), 250);
+        assert_eq!(top_up_below(600, Some(100)), 300);
+        assert_eq!(top_up_below(600, Some(200)), 400);
+        assert_eq!(top_up_below(500, Some(400)), 800);
+        assert_eq!(top_up_below(500, None), 250);
+    }
+
+    #[test]
+    fn a_key_between_top_ups_never_reads_as_low() {
+        for send in [
+            1,
+            100_000_000 * ONE_SEND_GAS,
+            1_000_000_000 * ONE_SEND_GAS,
+            3 * GAS_STAKE_PUBLIC,
+        ] {
+            let stake = stake_at(GAS_STAKE_PUBLIC, send);
+            let below = top_up_below(stake, Some(send));
+            let level = |holds: u128| key_gas(U256::from(holds), stake, send).level();
+            // Anywhere from a whole stake down to the line it is topped up
+            // below reads as fine.
+            for holds in [stake, (stake + below) / 2, below, below - 1] {
+                assert_eq!(level(holds), Level::Ok, "send {send}, holds {holds}");
+            }
+            // Below half the line it is late, and below one send it can't
+            // send.
+            assert_ne!(level(below / 2 - 1), Level::Ok, "send {send}");
+            assert_eq!(level(send - 1), Level::Error, "send {send}");
+        }
     }
 
     #[test]
@@ -632,13 +657,10 @@ mod tests {
         let below = top_up_below(stake, Some(send));
         assert_eq!(below, 2 * send);
         let level = |holds: u128| key_gas(U256::from(holds), stake, send).level();
-        // A key just topped up reads as fine, and so does one at the top-up
-        // line: it is topped up before it reads as low.
         assert_eq!(level(stake), Level::Ok);
         assert_eq!(level(below), Level::Ok);
-        // Below half the stake it reads as low, and below one send it can't
-        // send.
-        assert_eq!(level(stake / 2 - send / 10), Level::Warning);
+        // Half the line is one send here, so the key reads as unable to send
+        // as soon as it reads as low.
         assert_eq!(level(send - send / 10), Level::Error);
         // Whatever the stake is told, the line never falls below two sends.
         assert_eq!(top_up_below(send, Some(send)), 2 * send);
@@ -664,6 +686,22 @@ mod tests {
             U256::from(send) < line,
             "one send's worth would start the agent"
         );
+    }
+
+    /// The keeper lets a key fall to half its stake before topping it up,
+    /// so an agent whose key holds a little more than that starts rather
+    /// than waiting for a top-up that isn't coming.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_holding_more_than_half_its_stake_is_past_the_line_its_agent_waits_for() {
+        // A cheap chain, where half the stake is more than two sends.
+        let (_node, client) = crate::stand_in::public::start(GWEI / 10, 0).await;
+        let send = worst_send(&client).await.unwrap();
+        let stake = stake_at(GAS_STAKE_PUBLIC, send);
+        assert!(stake / 2 > 2 * send, "half the stake is the line here");
+        let line = gas_line(&client).await.unwrap();
+        assert_eq!(line, U256::from(stake / 2));
+        assert!(U256::from(stake / 2 + 1) >= line);
+        assert!(U256::from(stake / 2 - 1) < line);
     }
 
     /// A report posted to a stand-in API, read back.

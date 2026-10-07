@@ -30,10 +30,34 @@ pub struct Order {
 }
 
 /// What a strategy submits.
+///
+/// Every order of one `submit` goes to the venue in one transaction, in the
+/// order given, and each is decided on its own: one refused or unfilled
+/// leaves the others' fills standing, so a submission is not atomic, and
+/// each order gets its own verdict. Only when the transaction as a whole is
+/// refused (the key isn't approved, say) are the orders sent again one at a
+/// time, so each is still decided on its own; a transaction that was sent and
+/// never answered is not sent again, and every order in it is `unknown`.
+/// Sending the orders a strategy means together in one `submit` is what keeps
+/// the vault's gas down.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Action {
     Place(Order),
+}
+
+/// What `account-state` is asked: the markets the strategy follows.
+///
+/// The venue's market operator posts quotes and funding for every market it
+/// lists, every few seconds. A strategy is woken only for the markets it
+/// follows: those named here, those it holds, and those it has sent an
+/// order for. An empty query (as any payload that isn't a `Query` is read)
+/// follows every market, from then on, as a strategy that names none always
+/// has. Naming them also keeps the reply's `markets` to those and the ones
+/// held, which are fewer reads.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Query {
+    pub markets: Vec<String>,
 }
 
 /// What came back inside an accepted verdict.
@@ -49,7 +73,16 @@ pub enum Receipt {
     },
 }
 
-/// Something that happened to the vault's account, as the venue saw it.
+/// Something that happened to the vault's account, or to a market the
+/// strategy follows (see [`Query`]), as the venue saw it. Each is a reason to
+/// read the account again rather than the whole story: the account read
+/// carries every market's latest quote and funding.
+///
+/// Each look at the chain wakes a strategy as little as it can: its fills,
+/// and funding posted for the markets it follows, are always said; a new
+/// quote for a market it follows is said as [`AccountEvent::Prices`] only
+/// when the look brought nothing else, since the operator posts quotes and
+/// funding together and the other event already says to look.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AccountEvent {
@@ -66,6 +99,8 @@ pub enum AccountEvent {
         market: String,
         paid_per_unit: Decimal,
     },
+    /// A market's latest quote, when nothing else in the same look said to
+    /// read the account.
     Prices(MarketState),
 }
 
