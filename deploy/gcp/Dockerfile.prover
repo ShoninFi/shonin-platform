@@ -20,10 +20,35 @@
 # the same path on both sides (RISC0_WORK_DIR), which that image mounts.
 # The prover holds no secret.
 
-FROM rust:1.98.1-slim-bookworm AS build
+# Where the build starts from: the `deps` stage below, or (in Cloud Build)
+# that stage already built and pushed as an image named for everything it
+# is made from (deploy/gcp/cloudbuild/build.sh).
+ARG DEPS=deps
+
+# The toolchain rust-toolchain.toml pins, with its targets, and cargo-chef.
+FROM rust:1.98.1-slim-bookworm AS chef
 WORKDIR /src
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install && rustup show active-toolchain && \
+    cargo install cargo-chef --locked --version 0.1.78
+
+# What the dependencies are, from the manifests alone.
+FROM chef AS recipe
 COPY . .
-# rust-toolchain.toml pins the same compiler; --locked builds exactly Cargo.lock.
+RUN cargo chef prepare --recipe-path recipe.json
+
+# The dependencies alone, compiled from the recipe.
+FROM chef AS deps
+COPY --from=recipe /src/recipe.json recipe.json
+# The Solana programs' crates the chain crate names by path: outside the
+# workspace, so the recipe carries no skeleton of them.
+COPY contracts/solana contracts/solana
+RUN cargo chef cook --release --locked -p shonin-attestation --bin attestation-prover --recipe-path recipe.json
+
+# Then the platform itself. rust-toolchain.toml pins the same compiler;
+# --locked builds exactly Cargo.lock.
+FROM ${DEPS} AS build
+COPY . .
 RUN cargo build --release --locked -p shonin-attestation --bin attestation-prover
 
 # RISC Zero's prover server (r0vm), the version the host crate speaks to, and

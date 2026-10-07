@@ -29,6 +29,8 @@ includes:
 vars:
   GCP_PROJECT: '{{if eq .NETWORK "testnet"}}{{.GCP_PROJECT_TESTNET}}{{else if eq .NETWORK "mainnet"}}{{.GCP_PROJECT_MAINNET}}{{end}}'
   GCP_REGISTRY: "{{.GCP_REGION}}-docker.pkg.dev/{{.GCP_PROJECT}}/{{.GCP_ARTIFACT_REPO}}"
+  # The bucket Cloud Build reads a build's staged source from.
+  GCP_CLOUDBUILD_BUCKET: "{{.GCP_PROJECT}}_cloudbuild"
   GIT_SHA:
     sh: git rev-parse --short=12 HEAD
   # The tag an image is built, pushed and launched under: the commit, unless
@@ -108,23 +110,34 @@ tasks:
       # repository's own context leaves .shonin out), the store's public copy,
       # the API's and the executor's internal URLs. The chains' endpoints are
       # the committed public ones: no keyed URL reaches an image.
-      - >-
-        docker build --platform linux/amd64
-        --build-arg NETWORK_FEATURE={{.NETWORK_FEATURE}}
-        --build-arg NETWORK={{.NETWORK}}
-        --build-arg WITHOUT_SOLANA={{.WITHOUT_SOLANA}}
-        --build-arg STORE_URL={{.CLOUD_URL_STORE}}
-        --build-arg API_URL={{.CLOUD_URL_API}}
-        --build-arg EXECUTOR_URL={{.CLOUD_URL_EXECUTOR}}
-        --build-context deployments="{{.PATH_DEPLOYMENTS_DIR}}"
-        {{.GUEST_CONTEXT}}
-        {{.SEALED_CONTEXT}}
-        -f "{{.PATH_ROOT}}/deploy/gcp/Dockerfile.{{.NAME}}"
-        -t "{{.NAME}}:{{.IMAGE_TAG}}"
-        "{{.PATH_ROOT}}"
+      # Only the public deployment files go in (each chain's addresses and
+      # its checkers'), never a deploy's progress records.
+      - |
+        set -e
+        deployments=$(mktemp -d)
+        trap 'rm -rf "$deployments"' EXIT
+        for file in "{{.PATH_DEPLOYMENTS_DIR}}"/*.json; do
+          case "$(basename "$file")" in
+            *.partial.json | *.run-*) ;;
+            evm-[0-9]*.json | attestation-evm-[0-9]*.json | solana-*.json) cp "$file" "$deployments/" ;;
+          esac
+        done
+        docker build --platform linux/amd64 \
+          --build-arg NETWORK_FEATURE={{.NETWORK_FEATURE}} \
+          --build-arg NETWORK={{.NETWORK}} \
+          --build-arg WITHOUT_SOLANA={{.WITHOUT_SOLANA}} \
+          --build-arg STORE_URL={{.CLOUD_URL_STORE}} \
+          --build-arg API_URL={{.CLOUD_URL_API}} \
+          --build-arg EXECUTOR_URL={{.CLOUD_URL_EXECUTOR}} \
+          --build-context deployments="$deployments" \
+          {{.GUEST_CONTEXT}} \
+          {{.SEALED_CONTEXT}} \
+          -f "{{.PATH_ROOT}}/deploy/gcp/Dockerfile.{{.NAME}}" \
+          -t "{{.NAME}}:{{.IMAGE_TAG}}" \
+          "{{.PATH_ROOT}}"
 
   push:
-    desc: "Build and push an image to the network's Artifact Registry, and print its digest (NAME=..., NETWORK=testnet|mainnet)"
+    desc: "Build and push an image to the network's Artifact Registry, and print its digest (NAME=..., NETWORK=testnet|mainnet; BUILDER=local, the default, cross-builds here with docker, BUILDER=cloud builds in Cloud Build with its layer cache: api, keeper, executor, prover)"
     requires:
       vars: [NAME, NETWORK, GCP_PROJECT]
     preconditions:
@@ -134,6 +147,23 @@ tasks:
       - &project
         sh: '[ -n "{{.GCP_PROJECT}}" ]'
         msg: "No Google Cloud project for {{.NETWORK}}: set GCP_PROJECT_{{upper .NETWORK}} in taskfiles/config.yml. The gcloud default project is never used."
+      - &builder
+        sh: '[ "{{.BUILDER}}" = "local" ] || [ "{{.BUILDER}}" = "cloud" ]'
+        msg: "BUILDER=local (docker here) or BUILDER=cloud (Cloud Build), not {{.BUILDER}}."
+    vars:
+      BUILDER: '{{.BUILDER | default "local"}}'
+    cmds:
+      - task: images
+        vars: { NAMES: "{{.NAME}}", NETWORK: "{{.NETWORK}}", TAG: "{{.IMAGE_TAG}}", BUILDER: "cloud" }
+        if: '[ "{{.BUILDER}}" = "cloud" ]'
+      - task: push:local
+        vars: { NAME: "{{.NAME}}", NETWORK: "{{.NETWORK}}", TAG: "{{.IMAGE_TAG}}", SEALED: "{{.SEALED}}" }
+        if: '[ "{{.BUILDER}}" = "local" ]'
+
+  push:local:
+    desc: "Build an image here with docker (linux/amd64) and push it: what cloud:push does with BUILDER=local (NAME=..., NETWORK=testnet|mainnet)"
+    requires:
+      vars: [NAME, NETWORK, GCP_PROJECT]
     cmds:
       - task: build
         vars: { NAME: "{{.NAME}}", NETWORK: "{{.NETWORK}}", TAG: "{{.IMAGE_TAG}}", SEALED: "{{.SEALED}}" }
@@ -141,6 +171,92 @@ tasks:
       - docker tag "{{.NAME}}:{{.IMAGE_TAG}}" "{{.GCP_REGISTRY}}/{{.NAME}}:{{.IMAGE_TAG}}"
       - docker push "{{.GCP_REGISTRY}}/{{.NAME}}:{{.IMAGE_TAG}}"
       - echo "{{.NAME}}:{{.IMAGE_TAG}} is $({{.DIGEST_OF}} "{{.GCP_REGISTRY}}/{{.NAME}}:{{.IMAGE_TAG}}")"
+
+  images:
+    desc: "Build and push several images at once, side by side in one Cloud Build with its layer cache (BUILDER=cloud, the default here) or one after another here (BUILDER=local), and print each digest (NAMES=\"api keeper executor prover\", NETWORK=testnet; TAG= the commit by default; SKIP_PUSHED=1 leaves an image already pushed under TAG)"
+    requires:
+      vars: [NETWORK, GCP_PROJECT]
+    preconditions:
+      - *network
+      - *project
+      - *builder
+      - sh: 'for n in {{.NAMES}}; do case " api keeper executor prover " in *" $n "*) ;; *) exit 1 ;; esac; done'
+        msg: "Cloud Build builds api, keeper, executor and prover (NAMES={{.NAMES}})."
+      - sh: 'ls "{{.PATH_DEPLOYMENTS_DIR}}"/evm-*.json >/dev/null 2>&1'
+        msg: "No deployment files in {{.PATH_DEPLOYMENTS_DIR}}: deploy the network's contracts first (task chains:deploy NETWORK={{.NETWORK}}). An image carries its network's deployments."
+    vars:
+      NAMES: '{{.NAMES | default "api keeper executor prover"}}'
+      BUILDER: '{{.BUILDER | default "cloud"}}'
+      DEVNET_IDS:
+        sh: '[ -s "{{.PATH_CONTRACTS_SOLANA}}/programs/shonin-registry/devnet-id" ] && echo yes || echo no'
+      NETWORK_FEATURE: '{{if eq .NETWORK "mainnet"}}mainnet{{else if eq .DEVNET_IDS "yes"}}devnet{{else}}none{{end}}'
+      WITHOUT_SOLANA: '{{if eq .NETWORK_FEATURE "none"}}1{{end}}'
+      GUEST_DIR:
+        sh: |
+          if [ -n "${GUEST_DIR:-}" ]; then echo "$GUEST_DIR"; exit 0; fi
+          elf=$(find "${CARGO_TARGET_DIR:-{{.PATH_ROOT}}/target}/riscv-guest" -path '*docker*' -name shonin-attestation-guest.bin 2>/dev/null | head -1)
+          [ -n "$elf" ] && dirname "$elf" || true
+    cmds:
+      - |
+        set -euo pipefail
+        names=""
+        for name in {{.NAMES}}; do
+          if [ -n "{{.SKIP_PUSHED}}" ] && [ -n "$({{.DIGEST_OF}} "{{.GCP_REGISTRY}}/$name:{{.IMAGE_TAG}}" 2>/dev/null)" ]; then
+            echo "$name:{{.IMAGE_TAG}} is already pushed"
+          else
+            names="$names $name"
+          fi
+        done
+        names=${names# }
+        [ -n "$names" ] || exit 0
+        started=$(date +%s)
+        if [ "{{.BUILDER}}" = "local" ]; then
+          for name in $names; do
+            task cloud:push:local NAME="$name" NETWORK={{.NETWORK}} TAG={{.IMAGE_TAG}}
+          done
+        else
+          case " $names " in
+            *" prover "*) [ -s "{{.GUEST_DIR}}/shonin-attestation-guest.bin" ] || { echo "no guest ELF: build it with SHONIN_ATTESTATION_BUILD_GUEST=1, or set GUEST_DIR"; exit 1; }
+                          guest="{{.GUEST_DIR}}" ;;
+            *) guest="" ;;
+          esac
+          scratch=$(mktemp -d)
+          trap 'rm -rf "$scratch"' EXIT
+          cd "{{.PATH_ROOT}}"
+          deploy/gcp/cloudbuild/stage.sh "$scratch/source.tgz" "{{.PATH_DEPLOYMENTS_DIR}}" $guest
+          object="gs://{{.GCP_CLOUDBUILD_BUCKET}}/source/{{.IMAGE_TAG}}-$(date +%s).tgz"
+          gcloud storage cp "$scratch/source.tgz" "$object" --project="{{.GCP_PROJECT}}" --quiet
+          # One build for them all, on one worker (the project's quota runs
+          # one 8-CPU build at a time; a second would only queue behind it).
+          gcloud builds submit "$object" \
+            --project="{{.GCP_PROJECT}}" --region="{{.GCP_REGION}}" \
+            --config=deploy/gcp/cloudbuild.yaml \
+            --substitutions="^~^_NAMES=$names~_TAG={{.IMAGE_TAG}}~_REGISTRY={{.GCP_REGISTRY}}~_NETWORK={{.NETWORK}}~_NETWORK_FEATURE={{.NETWORK_FEATURE}}~_WITHOUT_SOLANA={{.WITHOUT_SOLANA}}~_STORE_URL={{.CLOUD_URL_STORE}}~_API_URL={{.CLOUD_URL_API}}~_EXECUTOR_URL={{.CLOUD_URL_EXECUTOR}}" \
+            || { gcloud storage rm "$object" --project="{{.GCP_PROJECT}}" --quiet >/dev/null 2>&1; exit 1; }
+          gcloud storage rm "$object" --project="{{.GCP_PROJECT}}" --quiet >/dev/null 2>&1 || true
+        fi
+        echo "built and pushed $names in $(( $(date +%s) - started )) s"
+        for name in $names; do
+          echo "$name:{{.IMAGE_TAG}} is $({{.DIGEST_OF}} "{{.GCP_REGISTRY}}/$name:{{.IMAGE_TAG}}")"
+        done
+
+  vendor-groth16:
+    desc: "Copy RISC Zero's Groth16 prover image (the linux/amd64 manifest, by digest) into the network's Artifact Registry, so the prover's VM never pulls it from Docker Hub; already there is done (NETWORK=testnet)"
+    requires:
+      vars: [NETWORK, GCP_PROJECT]
+    preconditions:
+      - sh: '[ "{{.NETWORK}}" = "testnet" ]'
+        msg: "Only the testnet runs a prover so far (NETWORK={{.NETWORK}})."
+      - *project
+    cmds:
+      - |
+        if gcloud artifacts docker images describe "{{.GCP_REGISTRY}}/risc0-groth16-prover:v2025-04-03.1" --project="{{.GCP_PROJECT}}" >/dev/null 2>&1; then
+          echo "the Groth16 image is already in {{.GCP_REGISTRY}}"
+        else
+          gcloud builds submit --no-source --project="{{.GCP_PROJECT}}" --region="{{.GCP_REGION}}" \
+            --config="{{.PATH_ROOT}}/deploy/gcp/cloudbuild-vendor.yaml" \
+            --substitutions="_REGISTRY={{.GCP_REGISTRY}}"
+        fi
 
   deploy:machine:
     desc: "Launch a machine on a Confidential Space VM (hardened image, Intel TDX) from its pushed image's digest, nothing passed to it (NAME=executor|..., NETWORK=..., TAG= the commit by default)"

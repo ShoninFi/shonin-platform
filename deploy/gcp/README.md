@@ -43,6 +43,16 @@ task cloud:build NAME=api NETWORK=testnet      # docker build, tagged api:<git s
 task cloud:push NAME=api NETWORK=testnet       # to us-central1-docker.pkg.dev/shonin-testnet/shonin/api; prints the digest
 ```
 
+### In Cloud Build
+
+`BUILDER=cloud` builds in Google Cloud Build instead of cross-building here: `task cloud:push NAME=api NETWORK=testnet BUILDER=cloud`, or several side by side with `task cloud:images NETWORK=testnet NAMES="api keeper executor prover"` (Cloud Build is its default). `cloudbuild/stage.sh` stages the source (the files git tracks or would track, never `.env`, `.shonin` or a target directory, and refusing outright anything that looks like one), the public deployment files alone as `_deployments/`, and for the prover the guest as `_guest/`; the tarball goes to `gs://shonin-testnet_cloudbuild/source/` and `cloudbuild.yaml` builds each image with BuildKit as the `shonin-cloudbuild` account. The Dockerfiles compile the dependencies in a stage of their own (cargo-chef), which Cloud Build pushes as an image named for everything it is made from (`<registry>/deps-<name>:<key>`: the Dockerfile, the toolchain, `Cargo.lock`, every `Cargo.toml`, the Solana crates named by path, the network's feature), so a build with the same inputs starts from it and compiles only the platform's own crates. The images are pushed as plain image manifests, as `docker push` would. `BUILDER=local` (the default for `cloud:push`) is the laptop build, kept as the fallback.
+
+RISC Zero's Groth16 prover image is copied into the registry once (`task cloud:vendor-groth16 NETWORK=testnet`, `cloudbuild-vendor.yaml`), and the prover's VM pulls it from there by its digest (pinned in `prover/startup.sh`) and keeps it on its disk.
+
+### One command
+
+`task deploy:testnet SCOPE=services|contracts|all` (`deploy-testnet.sh`) runs every stage of a testnet deploy, each timed, safe to run again, and ends with the smoke check (`task chains:smoke NETWORK=testnet API=https://testnet-api.shonin.fi`, read-only, and the keeper's and the executor's health from inside the VPC).
+
 ## The machine: Confidential Space
 
 The executor is launched from its image's **digest**, because the digest is what the attestation measures, and with nothing passed to it: no `tee-env-`, no command override (the attestation refuses either; the image carries its settings and its arguments). The other launcher settings are not overrides: its lines go to Cloud Logging, and a container that stops is started again.

@@ -50,14 +50,39 @@ for try in 1 2 3 4 5; do
   sleep 15
 done
 [ -n "$pulled" ] || { echo "shonin-prover: could not pull the prover's image"; exit 1; }
-# RISC Zero's Groth16 prover image, pulled while the first proof's STARK
-# stages run.
-docker pull risczero/risc0-groth16-prover:v2025-04-03.1 >/dev/null 2>&1 &
+# RISC Zero's Groth16 prover image, which the prover runs by its Docker Hub
+# name: copied into this project's Artifact Registry (task
+# cloud:vendor-groth16) and pulled from there by its digest, next door and
+# without Docker Hub's limits, then given that name. The disk keeps it while
+# the VM is off, so only a fresh disk pulls it, while the first proof's
+# STARK stages run; Docker Hub only if the copy is missing.
+groth16_name=risczero/risc0-groth16-prover:v2025-04-03.1
+groth16_digest=sha256:7f173963196570b7a71816ed70565a4579264c5d2e3e0ecb028102538ad0e331
+groth16_copy="${image%/prover@*}/risc0-groth16-prover@$groth16_digest"
+if docker image inspect --format '{{join .RepoDigests " "}}' "$groth16_name" 2>/dev/null | grep -q "$groth16_digest"; then
+  echo "shonin-prover: the Groth16 image is already here"
+else
+  {
+    if docker pull "$groth16_copy" >/dev/null 2>&1; then
+      docker tag "$groth16_copy" "$groth16_name"
+      echo "shonin-prover: the Groth16 image pulled from the registry"
+    else
+      docker pull "$groth16_name" >/dev/null 2>&1
+      echo "shonin-prover: the Groth16 image pulled from Docker Hub (no copy in the registry)"
+    fi
+  } &
+fi
+
+# How long the prover waits with nothing to prove before the VM powers off:
+# the metadata's shonin-prover-idle-seconds (a deploy started it early and
+# raises it, so it is still up when the new executor asks), else 600.
+idle=$(metadata attributes/shonin-prover-idle-seconds 2>/dev/null) || idle=
+case "$idle" in '' | *[!0-9]*) idle=600 ;; esac
 
 started=$(date +%s)
 docker run --rm --name shonin-prover --log-driver gcplogs \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$work:$work" -e RISC0_WORK_DIR="$work" \
-  "$image" --executor-url "$executor" --idle-exit-seconds 600
+  "$image" --executor-url "$executor" --idle-exit-seconds "$idle"
 status=$?
 echo "shonin-prover: the prover exited ($status) after $(( $(date +%s) - started )) s"
