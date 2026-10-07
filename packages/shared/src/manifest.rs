@@ -279,10 +279,20 @@ pub struct Allowances {
 impl Allowances {
     /// Enough for an agent that watches one venue and trades on a signal
     /// rather than on every tick.
+    ///
+    /// Sized from what such agents were measured to burn: a carry's whole
+    /// decision step (reading the account, deciding, writing its orders) is
+    /// under 200,000 fuel, a venue's book of twenty levels a side about
+    /// 170,000 to read, and a company's filings document about 15 million.
+    /// Ten million a second covers a step on every one of thirty books a
+    /// second with room to spare, at a hundredth of a core. A burst above the
+    /// rate isn't stopped, so the rate is what it holds on average. Memory is reserved, so it is billed
+    /// whether used or not: these agents hold one to three MiB, and 64 leaves
+    /// room for a document many times the size of the ones they read.
     pub fn modest() -> Self {
         Self {
-            fuel_per_sec: 2_000_000,
-            memory_mib: 256,
+            fuel_per_sec: 10_000_000,
+            memory_mib: 64,
             requests_per_min: 120,
             bytes_per_day: 50_000_000,
             streams: 4,
@@ -291,11 +301,12 @@ impl Allowances {
         }
     }
 
-    /// An agent that carries a model: the same shape as a modest one, with
-    /// room to think and the bandwidth to fetch what it thinks about.
+    /// An agent that carries a model: a modest one with twice the fuel for
+    /// the reading it scores, room in memory for the model itself, the
+    /// inference to run it and the bandwidth to fetch what it thinks about.
     pub fn thinking() -> Self {
         Self {
-            fuel_per_sec: 4_000_000,
+            fuel_per_sec: 20_000_000,
             memory_mib: 512,
             bytes_per_day: 500_000_000,
             inference_ms_per_min: 2_000,
@@ -304,11 +315,14 @@ impl Allowances {
     }
 
     /// An agent that quotes: it answers every tick, so it needs the fuel to
-    /// price one and the request rate to place what it priced.
+    /// price one and the request rate to place what it priced. Reading a
+    /// book is about 190,000 fuel and a requote about 105,000, so sixteen
+    /// million a second keeps up with books arriving several times faster
+    /// than a venue sends them.
     pub fn quoting() -> Self {
         Self {
             fuel_per_sec: 16_000_000,
-            memory_mib: 1_024,
+            memory_mib: 128,
             requests_per_min: 6_000,
             bytes_per_day: 5_000_000_000,
             streams: 64,
@@ -331,6 +345,15 @@ impl Allowances {
         }
     }
 }
+
+/// How much Wasmtime fuel one core runs through in a second, as the price
+/// list publishes it: an allowance of this much fuel a second is billed as
+/// one core. Measured with the fuel benchmark (`packages/fuelbench`) under the
+/// executor's engine settings, and set below the slowest workload on the
+/// machines agents run on, with room for the yields and host work that fuel
+/// doesn't count, so a core's worth of fuel never costs more than it is
+/// billed. The deploy hands the same figure to the `Prices` contract.
+pub const FUEL_PER_CORE_SECOND: u64 = 1_000_000_000;
 
 /// The published price of each unit of an allowance, which is how a day's
 /// allowances become the cap the vault's contract enforces. The contract
@@ -360,10 +383,9 @@ impl Prices {
     /// What a day at these allowances costs, which is the most a day's usage
     /// may charge a tank.
     pub fn daily_cap(&self, allowances: &Allowances) -> f64 {
-        // Fuel stands for processor time: the executor's measured mapping is
-        // what turns one into the other, and until it is measured a million
-        // units of fuel a second is taken as one core.
-        let cores = allowances.fuel_per_sec as f64 / 1_000_000.0;
+        // Fuel stands for processor time, at the published fuel a core runs
+        // through in a second.
+        let cores = allowances.fuel_per_sec as f64 / FUEL_PER_CORE_SECOND as f64;
         let memory_gib = allowances.memory_mib as f64 / 1_024.0;
         let egress_gb = allowances.bytes_per_day as f64 / 1_000_000_000.0;
         let inference_seconds = allowances.inference_ms_per_min as f64 / 1_000.0 * 60.0 * 24.0;
@@ -568,15 +590,50 @@ exclude = ["GB"]
         assert!(hash_to_bytes("not a hash").is_none());
     }
 
-    /// The contract's `Prices.dailyCost` gives 7,267,500 for the same shape
-    /// without gas; this is the same figure in dollars.
+    /// The contract's `Prices.dailyCost` gives 58,500 for the same shape
+    /// without gas: a hundredth of a core at $0.15 an hour, 64 MiB at $0.01
+    /// a GiB-hour and 50 MB of egress at $0.15 a GB, for a day.
     #[test]
     fn a_days_allowances_cost_what_the_contract_says() {
         let mut modest = Allowances::modest();
         modest.gas_per_day = 0.0;
         let cap = Prices::published().daily_cap(&modest);
-        assert!((cap - 7.2675).abs() < 1e-9, "a day cost {cap}");
+        assert!((cap - 0.0585).abs() < 1e-9, "a day cost {cap}");
         modest.gas_per_day = 2.0;
-        assert!((Prices::published().daily_cap(&modest) - 9.2675).abs() < 1e-9);
+        assert!((Prices::published().daily_cap(&modest) - 2.0585).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_core_is_billed_at_the_measured_fuel_rate() {
+        let core = Allowances {
+            fuel_per_sec: FUEL_PER_CORE_SECOND,
+            memory_mib: 0,
+            requests_per_min: 0,
+            bytes_per_day: 0,
+            streams: 0,
+            inference_ms_per_min: 0,
+            gas_per_day: 0.0,
+        };
+        let prices = Prices::published();
+        assert!((prices.daily_cap(&core) - prices.vcpu_hour * 24.0).abs() < 1e-9);
+    }
+
+    /// What each shape costs a day, as the contract works it out: the
+    /// processor, memory, egress and inference, then the gas allowance.
+    #[test]
+    fn each_shape_costs_what_its_parts_do() {
+        let prices = Prices::published();
+        for (shape, without_gas, gas) in [
+            ("modest", 0.0585, 1.0),
+            // 0.072 + 0.12 + 0.075 + 0.12
+            ("thinking", 0.387, 1.0),
+            // 0.0576 + 0.03 + 0.75
+            ("quoting", 0.8376, 5.0),
+        ] {
+            let allowances = Allowances::shape(shape);
+            assert_eq!(allowances.gas_per_day, gas, "{shape}");
+            let cap = prices.daily_cap(&allowances);
+            assert!((cap - without_gas - gas).abs() < 1e-9, "{shape} cost {cap}");
+        }
     }
 }

@@ -1,0 +1,9 @@
+package shonin:fuelbench@0.1.0;
+
+/// The workloads the benchmark times: each named, and each run for as many
+/// iterations as it is asked, returning a checksum so none of it can be
+/// optimised away.
+world bench {
+    export workloads: func() -> list<string>;
+    export run: func(workload: u32, iterations: u32) -> u64;
+}
