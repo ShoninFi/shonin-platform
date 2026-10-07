@@ -125,6 +125,7 @@ struct Report {
     vault: Address,
     state: String,
     vault_value: f64,
+    priced_value: f64,
     share_price: f64,
     total_shares: f64,
     cash: f64,
@@ -320,8 +321,12 @@ pub async fn report(client: &Client, deployments: &Deployments, options: &Option
 
     let gas = gas_spent(client, deployments, vault, station, options).await?;
 
-    // The projections.
-    let vault_value = dollars(value);
+    // The projections, from what the vault holds now: its cash and its
+    // station's worth at the venue. The value at the last priced valuation
+    // can be a day old (a vault is valued only when something needs a
+    // price), and right after a first deposit it is the value before it.
+    let priced_value = dollars(value);
+    let vault_value = dollars(cash) + dollars(account_value);
     let measured =
         (vault_value > 0.0 && short_notional > 0.0).then(|| short_notional / vault_value);
     let (carry_share, carry_label) = match (options.carry_share, measured) {
@@ -370,6 +375,7 @@ pub async fn report(client: &Client, deployments: &Deployments, options: &Option
         vault,
         state: state_name(state as u8).to_string(),
         vault_value,
+        priced_value,
         share_price: dollars(share_price),
         total_shares: supply.to_string().parse::<f64>().unwrap_or(0.0) / 1e18,
         cash: dollars(cash),
@@ -430,8 +436,8 @@ pub async fn report(client: &Client, deployments: &Deployments, options: &Option
 fn print_report(r: &Report) {
     println!("Vault {:?} on chain {} ({})", r.vault, r.chain_id, r.state);
     println!(
-        "  value ${:.2}, share price ${:.6}, {:.4} shares, cash ${:.2}",
-        r.vault_value, r.share_price, r.total_shares, r.cash
+        "  value now ${:.2} (cash and the venue), ${:.2} at the last priced valuation; share price ${:.6}, {:.4} shares, cash ${:.2}",
+        r.vault_value, r.priced_value, r.share_price, r.total_shares, r.cash
     );
     println!(
         "  high-water mark ${:.6} a share; last payday at {}; fees (bps): holding {} a year, author {}, platform {}, transaction {}",
