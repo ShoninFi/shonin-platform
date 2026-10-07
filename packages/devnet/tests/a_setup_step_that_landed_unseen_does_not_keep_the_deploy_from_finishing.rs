@@ -1,4 +1,4 @@
-//! A deploy writes its addresses, then sends its setup one step at a time,
+//! A deploy writes its addresses, then sends its setup in waves,
 //! recording each step in the deployment file once its send is seen to land,
 //! so that a deploy which stops part-way is carried on by the next run.
 //!
@@ -31,6 +31,7 @@ use serde_json::{Value, json};
 
 /// The contracts a deploy reads from the build's output.
 const CONTRACTS: &[&str] = &[
+    "BatchCreate2",
     "LocalUsd",
     "LocalVenue",
     "DevAttestationVerifier",
@@ -304,9 +305,11 @@ fn a_setup_step_that_landed_unseen_does_not_keep_the_deploy_from_finishing() {
         .iter()
         .filter_map(|step| step.as_str())
         .collect();
+    // Steps go out in waves a block can hold, so others may wait beside the
+    // hidden one; what matters is that the hidden one is not recorded.
     assert!(
-        done.contains(&"image unwinder") && !done.contains(&"project"),
-        "the setup stopped elsewhere than at the project: {done:?}"
+        !done.contains(&"project"),
+        "the project was recorded as done though its receipt was never seen: {done:?}"
     );
 
     // The run after it carries on and finishes: the project is proposed

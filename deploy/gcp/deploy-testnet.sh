@@ -164,12 +164,14 @@ smoke() {
   local allow=""
   if [ -n "${ALLOW_NO_VAULT:-}" ]; then allow=1; fi
   # A freshly started API reads each chain for the first time within a
-  # minute or two: give it five before calling the check failed.
+  # minute or two, and up to about ten when a chain's vaults' histories have
+  # to be sampled through its one endpoint that answers past blocks: give it
+  # fifteen before calling the check failed.
   local tries=0
   until task chains:smoke NETWORK=testnet API="$API_URL" ALLOW_NO_VAULT="$allow"; do
     tries=$((tries + 1))
-    if [ "$tries" -ge 10 ]; then
-      echo "the smoke check still fails after five minutes"
+    if [ "$tries" -ge 30 ]; then
+      echo "the smoke check still fails after fifteen minutes"
       exit 1
     fi
     echo "trying the smoke check again in 30 s (the API may not have read every chain yet)"
