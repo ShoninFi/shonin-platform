@@ -457,10 +457,14 @@ impl Cluster {
             if let Ok(mut counters) = shared.counters.lock() {
                 counters.not_the_bundle = 0;
             }
+            // The markets this start of the agent follows, as it asks about
+            // them and trades them.
+            let following = crate::watch::Following::default();
             let watching = AbortOnDrop(tokio::spawn(trading::watch(
                 self.client.clone(),
                 self.platform.clone(),
                 vault,
+                following.clone(),
                 shared.account_events.sender(),
                 shared.vault_events.sender(),
             )));
@@ -477,6 +481,7 @@ impl Cluster {
                 running: shared.running.clone(),
                 instantiate_within: crate::runner::INSTANTIATE_WITHIN,
                 instantiated: instantiated.clone(),
+                following,
             };
             let mut ended_cleanly = false;
             tokio::select! {

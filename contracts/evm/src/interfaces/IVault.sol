@@ -430,4 +430,37 @@ interface IVault is IStationVault {
     function author() external view returns (address);
     function exitBandBps() external view returns (uint16);
     function createdAt() external view returns (uint64);
+    /// The least a deposit may be; a tenth of it is the most the stations may
+    /// hold and still be found empty for a halted vault's close.
+    function minimumDeposit() external view returns (uint256);
+
+    // Whether a valuation is wanted
+    /// The newest priced valuation (neither void nor waiting for posts): its
+    /// index and time; `priced` is false, and the others zero, before any.
+    function lastPriced() external view returns (bool priced, uint256 index, uint64 time);
+    /// The `earliest` of the oldest request still waiting for its price: not
+    /// done (settled, or taken through the fallback) and not priced by the
+    /// newest priced valuation. A valuation at or after this time prices it,
+    /// and none earlier does. Zero while no request waits.
+    function nextUnpriced() external view returns (uint64);
+    /// A close staged at the home station has ended since the newest priced
+    /// valuation: no claim is tried, no units are served and no close is
+    /// staged until a valuation is priced.
+    function needsValuationFirst() external view returns (bool);
+    /// The newest priced valuation lets the halted vault close: it came after
+    /// the halt and found the stations empty with nothing on its way. `close`
+    /// then waits only for that valuation's requests to be settled.
+    function readyToClose() external view returns (bool);
+    /// Whether the halted vault's close waits for a valuation that one
+    /// recorded at slot `time`, with the home station as it stands now,
+    /// would give it: the vault is halted and not closed, `time` is after the
+    /// halt, the newest priced valuation doesn't already let it close, no
+    /// valuation is waiting for posts, the home station is inside the band
+    /// with no close staged (either would void the valuation), and the
+    /// shares' part of the home station, as the valuation counts it, is no
+    /// more than a tenth of the minimum deposit. Stations on other chains are
+    /// known only from the posts the valuation itself gathers: on a vault
+    /// that trades on other chains, true says the home station's part would
+    /// let it close, and the posts decide.
+    function closeWantsValuation(uint64 time) external view returns (bool);
 }

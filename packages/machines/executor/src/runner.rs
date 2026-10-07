@@ -77,6 +77,9 @@ pub struct Runner {
     /// whether it ran for a good while: compiling and instantiating it are
     /// not running.
     pub instantiated: Arc<OnceLock<Instant>>,
+    /// The stand-in venue's markets the agent follows, shared with the
+    /// watcher that wakes it.
+    pub following: crate::watch::Following,
 }
 
 /// How a strategy that was started stopped.
@@ -153,6 +156,7 @@ impl Runner {
                 net,
                 account_events: Some(account_events),
                 vault_events: Some(vault_events),
+                following: self.following.clone(),
                 counters: counters.clone(),
                 halting_heard: self.halting_heard.clone(),
                 memory: Allowance::new(memory_mib as usize * 1024 * 1024),

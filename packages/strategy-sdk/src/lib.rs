@@ -67,7 +67,7 @@ pub use bindings::wasi::http;
 /// case.
 pub use bindings::wasi::keyvalue;
 pub use local::{
-    AccountEvent, AccountState, Action, MarketState, Order, PositionState, Receipt, Side,
+    AccountEvent, AccountState, Action, MarketState, Order, PositionState, Query, Receipt, Side,
 };
 pub use payload::{Decimal, decimal, from_payload, millionths, to_payload};
 pub use sizing::{Limits, size_for};

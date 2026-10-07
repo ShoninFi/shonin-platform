@@ -1671,6 +1671,18 @@ impl Client {
         &self.provider
     }
 
+    /// The `rpc` endpoints, each on its own, in the list's order: for a call
+    /// whose answer depends on which endpoint runs it, asked of one known to
+    /// run it as asked. Each is held to the chain, with its URL kept out of
+    /// its errors, as the client's own connection is.
+    pub fn each_endpoint(&self) -> Vec<DynProvider> {
+        self.endpoints
+            .each
+            .iter()
+            .map(|endpoint| endpoint.provider.clone())
+            .collect()
+    }
+
     /// Read a contract, without sending anything.
     pub async fn read<C: SolCall>(&self, to: Address, call: C) -> Result<C::Return> {
         let request = TransactionRequest::default()

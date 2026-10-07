@@ -27,9 +27,17 @@ interface types {
 interface drivers {
     use types.{driver-name, payload, verdict};
 
+    /// One verdict for each action, in the order given. Whether the actions
+    /// of one call land together is the driver's: the `local` driver sends
+    /// every order of one call in one transaction, each order decided on its
+    /// own (not atomic); the other drivers send each action on its own. No
+    /// driver makes a call's actions atomic, so read each verdict.
     submit: async func(driver: driver-name, actions: list<payload>) -> list<verdict>;
-    /// Fills, order updates and liquidations on the vault's own account.
+    /// Fills, order updates and liquidations on the vault's own account, and
+    /// news of the markets the agent follows.
     account-events: func(driver: driver-name) -> stream<payload>;
+    /// The account now. The query is the driver's: the `local` driver's names
+    /// the markets the agent follows, and so is woken for.
     account-state: async func(driver: driver-name, query: payload) -> result<payload, string>;
 }
 

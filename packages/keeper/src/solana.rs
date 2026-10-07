@@ -16,8 +16,10 @@
 //!   empty; the close is held for the vault's last bill exactly as on the EVM
 //!   (see [`collect_before_close`]);
 //! - settlement of whatever the last priced valuation owes, in batches,
-//!   before and after this slot's valuation, which is sent only when it
-//!   lands in the slot's window and a simulation shows it would not be void;
+//!   before and after this slot's valuation, which is sent only when
+//!   something waits for one (a request, the payday, a halted vault's close,
+//!   or a day without one), it lands in the slot's window and a simulation
+//!   shows it would not be void;
 //! - every claim that is waiting tried, at most once a slot and less often
 //!   the longer it keeps waiting; a vault whose claim is still unpaid after
 //!   its try past the freeze period frozen; a retired vault evicted once its
@@ -296,9 +298,62 @@ fn valuation_due(vault: &Vault, now: u64) -> bool {
         && (vault.valuation_count == 0 || vault.last_valued_at < start)
 }
 
-/// The slot `now` falls in.
+/// Why the vault wants a valuation in the slot starting at `slot`, if it
+/// does: as on the EVM (see [`crate::valuation_wanted`]), each one costs a
+/// transaction, so one is sent only when something waits for it. A request
+/// a valuation in the slot would price that the last priced one didn't
+/// (taken through the fallback or not: one valuation passes them all); the
+/// weekly payday; a halted vault's close, once after the halt and on every
+/// slot once its grace is over and its station is being emptied, until a
+/// valuation finds it empty; and a day since the last priced valuation, or
+/// none ever. The program keeps no close staged across transactions, so
+/// nothing waits on one here.
+fn valuation_wanted(vault: &Vault, slot: u64, grace_over: bool) -> Option<&'static str> {
+    if !vault.priced {
+        return Some("never priced");
+    }
+    if slot >= vault.latest.time.saturating_add(crate::HEARTBEAT) {
+        return Some("a day since the last priced valuation");
+    }
+    if vault.state != VaultState::Closed && slot >= vp::maths::next_monday(vault.last_payment) {
+        return Some("payday");
+    }
+    if vault.priced_by(slot) > vault.priced_through {
+        return Some("a request waits for its price");
+    }
+    if vault.halted()
+        && !vault.ready_to_close()
+        && (vault.latest.time <= vault.halted_at || grace_over)
+    {
+        return Some("its close");
+    }
+    None
+}
+
+/// Why the vault wants a valuation sent at `now`, if it does (see
+/// [`valuation_wanted`]): judged at the time the valuation is given, its
+/// slot's start, with the halt's grace as it stands at `now`.
+fn valuation_wanted_now(vault: &Vault, now: u64) -> Option<&'static str> {
+    let grace_over =
+        vault.halted() && now >= vault.halted_at.saturating_add(vault.timers.halt_grace);
+    valuation_wanted(
+        vault,
+        slot_start(now, vault.timers.slot_interval),
+        grace_over,
+    )
+}
+
+/// The slot `now` falls in, counted from the first: the keeper's own count,
+/// for when a claim or a holder's units are next tried.
 fn slot_of(now: u64, interval: u64) -> u64 {
     now / interval.max(1)
+}
+
+/// When the slot `now` falls in begins, in the chain's seconds: the time a
+/// valuation recorded in it is given, which the vault's own times are
+/// compared with.
+fn slot_start(now: u64, interval: u64) -> u64 {
+    now - now % interval.max(1)
 }
 
 /// The next try of a claim, after one at `slot` left it `state`: a claim
@@ -685,14 +740,19 @@ impl Keeping {
         Ok(())
     }
 
-    /// This slot's valuation, when it lands inside the window and a
-    /// simulation shows it would price: a void one is not paid for.
+    /// This slot's valuation, when something waits for one (see
+    /// [`valuation_wanted`]), it lands inside the window and a simulation
+    /// shows it would price: a void one is not paid for.
     async fn value(&self, v: &VaultAccounts, address: &Pubkey) -> Result<()> {
         let vault = self.platform.vault(&self.client, address).await?;
         let now = self.client.now().await?;
         if !valuation_due(&vault, now) || vault.owed() {
             return Ok(());
         }
+        let Some(why) = valuation_wanted_now(&vault, now) else {
+            return Ok(());
+        };
+        tracing::debug!(vault = %address, why, "a valuation is wanted");
         let ix = self.platform.ix_record_valuation(&self.client, v).await?;
         let simulated = match self
             .client
@@ -2029,6 +2089,94 @@ mod tests {
                 .all(|(_, detail)| !detail.contains(&format!("keep solana/{vault}")))
         );
         TROUBLES.lock().unwrap().unkept.clear();
+    }
+
+    /// A vault priced a slot ago, paid this week, with every request priced.
+    fn a_quiet_vault(now: u64) -> Vault {
+        let mut vault = a_vault();
+        vault.priced = true;
+        vault.latest.time = now - 10;
+        vault.valuation_count = 1;
+        vault.last_valued_at = now - 10;
+        vault.last_payment = now - DAY;
+        vault.request_count = 3;
+        vault.priced_through = 3;
+        vault.tail_earliest = now - 10;
+        vault.tail_start = 2;
+        vault.previous_earliest = now - 20;
+        vault.previous_start = 0;
+        vault
+    }
+
+    #[test]
+    fn a_solana_vault_is_valued_only_when_something_waits_for_it() {
+        // Monday 13 November 2023, 00:00 UTC, and a day and a half on.
+        let now = 1_699_833_600 + DAY + DAY / 2;
+        let quiet = a_quiet_vault(now);
+        assert_eq!(valuation_wanted(&quiet, now, false), None);
+
+        // A request made this slot, to be priced at the next one.
+        let mut asked = quiet.clone();
+        asked.note_request(now + 10);
+        assert_eq!(valuation_wanted(&asked, now, false), None);
+        assert_eq!(
+            valuation_wanted(&asked, now + 10, false),
+            Some("a request waits for its price")
+        );
+
+        let mut payday = quiet.clone();
+        payday.last_payment = now - 8 * DAY;
+        assert_eq!(valuation_wanted(&payday, now, false), Some("payday"));
+
+        let mut idle = quiet.clone();
+        idle.latest.time = now - DAY;
+        assert_eq!(
+            valuation_wanted(&idle, now, false),
+            Some("a day since the last priced valuation")
+        );
+
+        let mut never = quiet.clone();
+        never.priced = false;
+        assert_eq!(valuation_wanted(&never, now, false), Some("never priced"));
+
+        // Halted after its last valuation: once for the halt, then each slot
+        // only once the grace is over.
+        let mut halted = quiet.clone();
+        halted.halted_at = now - 5;
+        halted.latest.gross = 5_000_000;
+        assert_eq!(valuation_wanted(&halted, now, false), Some("its close"));
+        halted.latest.time = now - 1;
+        assert_eq!(valuation_wanted(&halted, now, false), None);
+        assert_eq!(valuation_wanted(&halted, now, true), Some("its close"));
+    }
+
+    /// What a valuation sent with the clock at `now` is wanted for is judged
+    /// in seconds, as the vault's own times are, not by the slot's number: a
+    /// deposit due now, the payday and the heartbeat are each seen.
+    #[test]
+    fn a_solana_vault_sent_a_valuation_now_is_judged_at_its_slot_s_time() {
+        // Monday 13 November 2023, 00:00 UTC, and a day and a half on: the
+        // start of a slot.
+        let now = 1_699_833_600 + DAY + DAY / 2;
+        assert_eq!(valuation_wanted_now(&a_quiet_vault(now), now), None);
+
+        let mut asked = a_quiet_vault(now);
+        asked.note_request(now);
+        assert_eq!(
+            valuation_wanted_now(&asked, now + 3),
+            Some("a request waits for its price")
+        );
+
+        let mut payday = a_quiet_vault(now);
+        payday.last_payment = now - 8 * DAY;
+        assert_eq!(valuation_wanted_now(&payday, now + 3), Some("payday"));
+
+        let mut idle = a_quiet_vault(now);
+        idle.latest.time = now - 2 * DAY;
+        assert_eq!(
+            valuation_wanted_now(&idle, now + 3),
+            Some("a day since the last priced valuation")
+        );
     }
 
     fn a_vault() -> Vault {

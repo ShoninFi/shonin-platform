@@ -478,4 +478,32 @@ contract Vault is IVault, ReentrancyGuardTransient {
     function createdAt() external view returns (uint64) {
         return VaultStorage.layout().createdAt;
     }
+
+    function minimumDeposit() external view returns (uint256) {
+        return VaultStorage.layout().minimumDeposit;
+    }
+
+    // Whether a valuation is wanted -----------------------------------------
+
+    function lastPriced() external view returns (bool priced, uint256 index, uint64 time) {
+        Layout storage s = VaultStorage.layout();
+        if (s.lastPriced == 0) return (false, 0, 0);
+        return (true, s.lastPriced - 1, s.latest().time);
+    }
+
+    function nextUnpriced() external view returns (uint64) {
+        return Valuations.nextUnpriced();
+    }
+
+    function needsValuationFirst() external view returns (bool) {
+        return VaultStorage.layout().valueFirst;
+    }
+
+    function readyToClose() external view returns (bool) {
+        return VaultStorage.layout().readyToClose();
+    }
+
+    function closeWantsValuation(uint64 time) external view returns (bool) {
+        return Valuations.closeWantsValuation(time);
+    }
 }
