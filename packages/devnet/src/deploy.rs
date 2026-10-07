@@ -1415,19 +1415,19 @@ fn timers(network: NetworkName) -> Timers {
     const DAY: u64 = 24 * HOUR;
     let local = network == NetworkName::Local;
     (
-        10,                                    // slot interval
-        5,                                     // slot lead
-        3,                                     // slot window
-        if local { 2 * HOUR } else { MINUTE }, // post deadline
-        if local { 3 * HOUR } else { HOUR },   // transit timeout
-        DAY,                                   // fallback after
+        10,                                     // slot interval
+        5,                                      // slot lead
+        3,                                      // slot window
+        if local { 2 * HOUR } else { MINUTE },  // post deadline
+        if local { 3 * HOUR } else { HOUR },    // transit timeout
+        DAY,                                    // fallback after
         if local { DAY } else { 10 * MINUTE }, // usage freshness: many local blocks pass between the executor's signings
         DAY,                                   // tank escape delay
         DAY,                                   // floor delay
         10 * MINUTE,                           // halt grace
-        7 * DAY,                               // freeze after
-        7 * DAY,                               // wind down
-        3 * DAY,                               // activation window
+        if local { 30 * DAY } else { 7 * DAY }, // freeze after: a staged close takes minutes, a week of local blocks
+        7 * DAY,                                // wind down
+        3 * DAY,                                // activation window
     )
 }
 
