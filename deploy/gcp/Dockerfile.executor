@@ -65,6 +65,8 @@ ENV SHONIN_NETWORK=${NETWORK} \
     SHONIN_STORE=/var/lib/shonin/store \
     SHONIN_STORE_URL=${STORE_URL} \
     SHONIN_API_URL=${API_URL}
+# Confidential Space opens only the ports an image declares.
+EXPOSE 19085/tcp
 ENTRYPOINT ["/usr/local/bin/executor"]
 # The status port is open to the VPC (the keeper, the waker and the prover
 # read it); the tokens come from the launcher.
