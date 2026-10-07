@@ -354,7 +354,9 @@ struct Served {
     serving: Option<tokio::task::JoinHandle<Ended>>,
     retry: Retry,
     /// The meter and the reports, which run for as long as the vault is
-    /// served: a halted vault's final bill is signed after its grace.
+    /// served: a halted vault's final bill is signed after its grace. The
+    /// reports stop as soon as the vault is found held by another executor
+    /// (see [`Served::stop_reports`]).
     _upkeep: [AbortOnDrop; 2],
     /// The vault's key in the instance's tree, for as long as the vault is
     /// held: its leaf leaves the tree when the vault is let go.
@@ -366,6 +368,15 @@ struct Served {
     /// the gas of the agent's last orders included, can still be collected;
     /// never later than [`LAST_SENDS_LAND_WITHIN`] after the stop.
     letting_go: Option<Instant>,
+}
+
+impl Served {
+    /// Stop the vault's health reports, keeping its meter: a vault another
+    /// executor holds is reported on by that executor alone, while the last
+    /// bill, which the meter signs, is still to be collected.
+    fn stop_reports(&self) {
+        self._upkeep[1].0.abort();
+    }
 }
 
 /// A vault's key in the instance's tree (see [`attestation`]), let go with
@@ -669,6 +680,7 @@ async fn sweep_one(
                 // once more, for the time up to now and the agent's last
                 // sends.
                 tracing::info!(%chain, vault = %vault, "this executor no longer holds the vault's approval; letting it go");
+                served.stop_reports();
                 served.letting_go = Some(Instant::now());
             } else if served.retry.ended(ended, Instant::now()) {
                 if let Ok(mut counters) = served.shared.counters.lock() {
@@ -997,11 +1009,13 @@ async fn fetch_bundle(
     Ok(())
 }
 
-/// How often a key waiting for its blessing or its gas is looked at.
+/// How often a key waiting for its blessing or its gas is looked at: often
+/// enough that a key the keeper has just blessed and stocked is approved at
+/// the station within seconds, well inside its blessing.
 const GAS_LOOK: Duration = if cfg!(test) {
     Duration::from_millis(100)
 } else {
-    Duration::from_secs(5)
+    Duration::from_secs(2)
 };
 
 /// Make a vault's key, put it in the instance's tree, and start what runs
@@ -1863,6 +1877,7 @@ async fn wait_blessed_and_stocked(
             vault,
             key,
             attestation::due(blessed, until, now, ttl),
+            until,
             ttl,
         );
         let waiting_for = if blessed {
@@ -1906,6 +1921,7 @@ async fn track_blessing(
                     vault,
                     key,
                     attestation::due(blessed, until, now, ttl),
+                    until,
                     ttl,
                 );
                 if seen_until.is_some_and(|seen| seen != until) {
@@ -4430,6 +4446,112 @@ mod tests {
         assert!(book.running.contains_key(&vault), "not taken on again");
         drop(book);
         let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// A replaced executor stops reporting on the vault at once, so only the
+    /// executor that holds it signs its reports, while its meter runs on for
+    /// the last bill.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replaced_executor_stops_its_reports_and_keeps_its_meter() {
+        use stand_in::serving::{NOW, TTL};
+        let node = stand_in::serving::node(VaultState::Open);
+        let bundle = node.lock().unwrap().bundle;
+        {
+            let mut node = node.lock().unwrap();
+            node.blessed_until = NOW + TTL;
+            node.approved_key = Address::repeat_byte(0x77);
+        }
+        let client = stand_in::client(&stand_in::serving::start(node.clone()).await).await;
+        let vault = Address::repeat_byte(0x11);
+        let store =
+            std::env::temp_dir().join(format!("executor-replaced-reports-{}", std::process::id()));
+        let component = bundle_path(&store, bundle);
+        std::fs::create_dir_all(component.parent().unwrap()).unwrap();
+        std::fs::write(&component, b"").unwrap();
+
+        /// A task that runs until it is stopped, and lowers its flag then.
+        fn flagged() -> (AbortOnDrop, Arc<AtomicBool>) {
+            struct Lowers(Arc<AtomicBool>);
+            impl Drop for Lowers {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            let flag = Arc::new(AtomicBool::new(true));
+            let lowers = Lowers(flag.clone());
+            let task = tokio::spawn(async move {
+                let _lowers = lowers;
+                std::future::pending::<()>().await
+            });
+            (AbortOnDrop(task), flag)
+        }
+        let (metering, meter_runs) = flagged();
+        let (reporting, reports_run) = flagged();
+        let served = Served {
+            shared: Shared {
+                vault_key: Arc::new(keys::Key::fresh().unwrap()),
+                attestation: crate::attestation::Attestation::new(
+                    crate::attestation::Mode::Development,
+                )
+                .unwrap(),
+                takes_over: Default::default(),
+                key: stand_in::key(&client),
+                dry: Default::default(),
+                metered: Default::default(),
+                running: Default::default(),
+                counters: Default::default(),
+                watched_to: Default::default(),
+                account_events: Default::default(),
+                vault_events: Default::default(),
+                wound_down: Default::default(),
+                signed_through: Default::default(),
+                approvals: Default::default(),
+                ceilings: Default::default(),
+                failed_starts: Default::default(),
+                halt_known: Default::default(),
+            },
+            serving: Some(tokio::spawn(async {
+                Ended {
+                    failed: false,
+                    replaced: true,
+                }
+            })),
+            retry: Default::default(),
+            _upkeep: [metering, reporting],
+            _leaf: no_leaf(),
+            letting_go: None,
+        };
+        let mut book = Book::default();
+        book.running.insert(vault, served);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        sweep_vault(
+            shared::Chain::Base,
+            &client,
+            &stand_in::deployments(),
+            None,
+            &runner::engine().unwrap(),
+            &args(&store),
+            &Default::default(),
+            &mut book,
+            vault,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = std::fs::remove_dir_all(&store);
+        assert!(
+            book.running.contains_key(&vault),
+            "let go before its last bill was signed"
+        );
+        assert!(
+            !reports_run.load(Ordering::SeqCst),
+            "a replaced executor still reports on the vault"
+        );
+        assert!(
+            meter_runs.load(Ordering::SeqCst),
+            "the meter stopped before the last bill was signed"
+        );
     }
 
     /// A status port that can't be bound is an error the executor stops on.

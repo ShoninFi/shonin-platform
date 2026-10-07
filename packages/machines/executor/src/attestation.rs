@@ -84,6 +84,10 @@ pub struct Leaf {
     /// Whether the key wants blessing: not blessed for this vault and
     /// bundle, or down to a third of its blessing.
     pub due: bool,
+    /// When the chain last said the key's blessing for this vault and bundle
+    /// runs out (`blessedUntil`), whether or not it still counts; zero until
+    /// it has said.
+    pub until: u64,
 }
 
 impl Leaf {
@@ -170,37 +174,68 @@ pub fn due(blessed: bool, until: u64, now: u64, ttl: u64) -> bool {
 }
 
 /// Whether a seal dated `issued_at` blesses for more than a third of `ttl`
-/// past `now`, so a key blessed from it is not due again at once.
+/// past `now`, so a key blessed from it is not due again at once. `now` is
+/// the clock of the chain the blessing is on, which is the clock the
+/// registry judges it by.
 fn still_gives_a_blessing(issued_at: u64, now: u64, ttl: u64) -> bool {
     issued_at.saturating_add(ttl.saturating_mul(2) / 3) > now
+}
+
+/// A key that wants blessing, as its chain last said: the chain's time now
+/// (`None` if it couldn't be read), and when the key's blessing runs out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Wanting {
+    chain_now: Option<u64>,
+    until: u64,
+}
+
+/// Whether a seal dated `sealed_at` answers a key that wants blessing: the
+/// chain hasn't applied it yet (a blessing it gave would end at `sealed_at +
+/// ttl`, and the key's ends sooner), and it would still give a blessing worth
+/// sending by that chain's clock. A seal the chain has applied, while the key
+/// still wants blessing, answers nothing: the registry no longer counts the
+/// key (the checker it was recorded against retired, say), and only a fresh
+/// attestation is sure to bring it back. A chain whose clock couldn't be read
+/// is taken to be answered until it can.
+fn seal_answers(sealed_at: u64, wanting: Wanting, ttl: u64) -> bool {
+    let Some(now) = wanting.chain_now else {
+        return true;
+    };
+    let applied = wanting.until >= sealed_at.saturating_add(ttl);
+    !applied && still_gives_a_blessing(sealed_at, now, ttl)
 }
 
 /// Whether to ask the launcher for a token now: some key wants blessing, and
 /// neither the token held for the current tree, waiting for its seal, nor
 /// the seal accepted for it answers that. A token waiting for its seal is
-/// asked for again once it is [`TOKEN_REFRESH`] old, so a prover still has
-/// time to prove within its hour.
+/// asked for again once it is [`TOKEN_REFRESH`] old by the wall clock (the
+/// clock the token's `iat` is on), so a prover still has time to prove within
+/// its hour; how much blessing a seal still gives is judged by each chain's
+/// own clock.
 fn token_wanted(
-    any_due: bool,
+    wanting: &[Wanting],
     nonce: &str,
     token: Option<(&str, u64)>,
     sealed: Option<(&str, u64)>,
-    now: u64,
+    wall_now: u64,
     ttl: u64,
 ) -> bool {
-    if !any_due {
+    if wanting.is_empty() {
         return false;
     }
     let sealed = sealed.filter(|(for_nonce, _)| *for_nonce == nonce);
     let token = token.filter(|(for_nonce, _)| *for_nonce == nonce);
+    let answered = |sealed_at: u64| {
+        wanting
+            .iter()
+            .all(|wanting| seal_answers(sealed_at, *wanting, ttl))
+    };
     match (token, sealed) {
         // A seal at least as fresh as the token: a new token is wanted only
-        // once that seal no longer gives a blessing worth sending.
-        (Some((_, iat)), Some((_, sealed_at))) if sealed_at >= iat => {
-            !still_gives_a_blessing(sealed_at, now, ttl)
-        }
-        (None, Some((_, sealed_at))) => !still_gives_a_blessing(sealed_at, now, ttl),
-        (Some((_, iat)), _) => now >= iat.saturating_add(TOKEN_REFRESH.as_secs()),
+        // once that seal no longer answers every key that wants blessing.
+        (Some((_, iat)), Some((_, sealed_at))) if sealed_at >= iat => !answered(sealed_at),
+        (None, Some((_, sealed_at))) => !answered(sealed_at),
+        (Some((_, iat)), _) => wall_now >= iat.saturating_add(TOKEN_REFRESH.as_secs()),
         (None, None) => true,
     }
 }
@@ -466,6 +501,7 @@ impl Attestation {
             strategy_hash,
             key,
             due: true,
+            until: 0,
         };
         let same = inner
             .leaves
@@ -490,19 +526,30 @@ impl Attestation {
         }
     }
 
-    /// Note whether a vault's key wants blessing, and the chain's TTL.
-    pub fn note(&self, chain_id: u64, vault: Address, key: Address, wants: bool, ttl: u64) {
+    /// Note whether a vault's key wants blessing, when the chain says its
+    /// blessing runs out, and the chain's TTL.
+    pub fn note(
+        &self,
+        chain_id: u64,
+        vault: Address,
+        key: Address,
+        wants: bool,
+        until: u64,
+        ttl: u64,
+    ) {
         let mut inner = self.inner();
         if ttl > 0 {
             inner.ttl = Some(inner.ttl.map_or(ttl, |held| held.min(ttl)));
         }
         if let Some(leaf) = inner.leaves.get_mut(&(chain_id, vault))
             && leaf.key == key
-            && leaf.due != wants
         {
-            leaf.due = wants;
-            if wants {
-                self.changed.notify_one();
+            leaf.until = until;
+            if leaf.due != wants {
+                leaf.due = wants;
+                if wants {
+                    self.changed.notify_one();
+                }
             }
         }
     }
@@ -589,9 +636,43 @@ impl Attestation {
         }
     }
 
+    /// The chains with a key that wants blessing.
+    fn chains_wanting(&self) -> Vec<u64> {
+        let mut chains: Vec<u64> = Self::leaves(&self.inner())
+            .iter()
+            .filter(|leaf| leaf.due)
+            .map(|leaf| leaf.chain_id)
+            .collect();
+        chains.dedup();
+        chains
+    }
+
+    /// Each served chain's clock, of those named: the head block's time. A
+    /// chain whose head couldn't be read is left out.
+    async fn chain_clocks(&self, chain_ids: &[u64]) -> BTreeMap<u64, u64> {
+        let clients: Vec<(u64, Client)> = self
+            .chains
+            .lock()
+            .map(|chains| {
+                chain_ids
+                    .iter()
+                    .filter_map(|id| chains.get(id).map(|(client, _)| (*id, client.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut clocks = BTreeMap::new();
+        for (id, client) in clients {
+            if let Ok(now) = client.block_timestamp().await {
+                clocks.insert(id, now);
+            }
+        }
+        clocks
+    }
+
     /// Whether something is to be asked for now: a token in launcher mode, a
-    /// development seal in development mode.
-    fn wanted(&self, now: u64) -> bool {
+    /// development seal in development mode. `wall_now` is the wall clock;
+    /// `clocks` each chain's own.
+    fn wanted(&self, wall_now: u64, clocks: &BTreeMap<u64, u64>) -> bool {
         let inner = self.inner();
         if inner
             .changed
@@ -601,7 +682,14 @@ impl Attestation {
         }
         let leaves = Self::leaves(&inner);
         let nonce = self.binding_of(&leaves).nonce();
-        let any_due = leaves.iter().any(|leaf| leaf.due);
+        let wanting: Vec<Wanting> = leaves
+            .iter()
+            .filter(|leaf| leaf.due)
+            .map(|leaf| Wanting {
+                chain_now: clocks.get(&leaf.chain_id).copied(),
+                until: leaf.until,
+            })
+            .collect();
         let ttl = inner.ttl.unwrap_or(DEFAULT_TTL);
         let sealed = inner
             .sealed
@@ -615,7 +703,7 @@ impl Attestation {
             // In development mode the seal is made at once: no token waits.
             Mode::Development => None,
         };
-        token_wanted(any_due, &nonce, token, sealed, now, ttl)
+        token_wanted(&wanting, &nonce, token, sealed, wall_now, ttl)
     }
 
     /// Keep a token, if it is for the current tree.
@@ -641,9 +729,10 @@ impl Attestation {
     }
 
     /// Check a posted seal against the current binding, without a chain:
-    /// what is left is the simulated `bless`. Says the journal, and the leaf
-    /// and chain to simulate it on.
-    fn check(&self, post: &SealPost) -> Result<(Sealed, Leaf, Vec<B256>), Refusal> {
+    /// what is left is the simulated `bless`. Says the journal, and one leaf
+    /// (with its proof) on each chain with a key, to simulate it on.
+    #[allow(clippy::type_complexity)]
+    fn check(&self, post: &SealPost) -> Result<(Sealed, Vec<(Leaf, Vec<B256>)>), Refusal> {
         let inner = self.inner();
         let leaves = Self::leaves(&inner);
         let binding = self.binding_of(&leaves);
@@ -692,9 +781,18 @@ impl Attestation {
             return Err(refused("the journal names another image or project"));
         }
         let (_, proofs) = tree(&leaves);
-        let (Some(leaf), Some(proof)) = (leaves.first(), proofs.first()) else {
+        let mut each_chain: Vec<(Leaf, Vec<B256>)> = Vec::new();
+        for (leaf, proof) in leaves.iter().zip(proofs) {
+            if each_chain
+                .last()
+                .is_none_or(|(last, _)| last.chain_id != leaf.chain_id)
+            {
+                each_chain.push((leaf.clone(), proof));
+            }
+        }
+        if each_chain.is_empty() {
             return Err(refused("the instance holds no key"));
-        };
+        }
         Ok((
             Sealed {
                 nonce,
@@ -702,48 +800,54 @@ impl Attestation {
                 journal: journal_bytes,
                 issued_at: journal.issued_at,
             },
-            leaf.clone(),
-            proof.clone(),
+            each_chain,
         ))
     }
 
     /// Take a seal a prover posts: checked against the binding, then a
-    /// `bless` of the first leaf simulated on its chain; kept only if it
-    /// would land.
+    /// `bless` of one leaf simulated on each chain the instance holds keys
+    /// on; kept only if it would land on every one of them, since a chain
+    /// whose checker refuses it would otherwise never see its keys blessed
+    /// until the seal aged.
     pub async fn accept(&self, post: SealPost) -> Result<(), Refusal> {
-        let (sealed, leaf, proof) = self.check(&post)?;
-        let chain = self
-            .chains
-            .lock()
-            .ok()
-            .and_then(|chains| chains.get(&leaf.chain_id).cloned());
-        let Some((client, deployments)) = chain else {
-            return Err(Refusal::Unavailable(format!(
-                "chain {} is not connected",
-                leaf.chain_id
-            )));
-        };
-        let simulated = client
-            .read(
-                deployments.attestation,
-                IAttestationRegistry::blessCall {
-                    seal: sealed.seal.clone(),
-                    journal: sealed.journal.clone(),
-                    vaultChain: U256::from(leaf.vault_chain),
-                    vault: leaf.vault,
-                    strategyHash: leaf.strategy_hash,
-                    key: leaf.key,
-                    merkleProof: proof,
-                },
-            )
-            .await;
-        if let Err(error) = simulated {
-            let why = format!("{error:#}");
-            return Err(if why.contains("revert") {
-                Refusal::Journal(format!("a simulated bless reverts: {why}"))
-            } else {
-                Refusal::Unavailable(why)
-            });
+        let (sealed, each_chain) = self.check(&post)?;
+        for (leaf, proof) in each_chain {
+            let chain = self
+                .chains
+                .lock()
+                .ok()
+                .and_then(|chains| chains.get(&leaf.chain_id).cloned());
+            let Some((client, deployments)) = chain else {
+                return Err(Refusal::Unavailable(format!(
+                    "chain {} is not connected",
+                    leaf.chain_id
+                )));
+            };
+            let simulated = client
+                .read(
+                    deployments.attestation,
+                    IAttestationRegistry::blessCall {
+                        seal: sealed.seal.clone(),
+                        journal: sealed.journal.clone(),
+                        vaultChain: U256::from(leaf.vault_chain),
+                        vault: leaf.vault,
+                        strategyHash: leaf.strategy_hash,
+                        key: leaf.key,
+                        merkleProof: proof,
+                    },
+                )
+                .await;
+            if let Err(error) = simulated {
+                let why = format!("{error:#}");
+                return Err(if why.contains("revert") {
+                    Refusal::Journal(format!(
+                        "a simulated bless reverts on chain {}: {why}",
+                        leaf.chain_id
+                    ))
+                } else {
+                    Refusal::Unavailable(why)
+                });
+            }
         }
         self.keep(sealed)
     }
@@ -817,7 +921,15 @@ impl Attestation {
                     tokio::time::sleep(SETTLE).await;
                 }
             }
-            if Instant::now() < next_try || !self.wanted(unix_now()) {
+            if Instant::now() < next_try {
+                continue;
+            }
+            let wanting = self.chains_wanting();
+            if wanting.is_empty() {
+                continue;
+            }
+            let clocks = self.chain_clocks(&wanting).await;
+            if !self.wanted(unix_now(), &clocks) {
                 continue;
             }
             let done = match self.mode {
@@ -1017,18 +1129,28 @@ mod tests {
         assert_eq!(attestation.binding().vaults_root, [0; 32]);
     }
 
+    /// A key that wants blessing on a chain whose clock reads `now`, and
+    /// which holds no blessing for it.
+    fn wanting(now: u64) -> Wanting {
+        Wanting {
+            chain_now: Some(now),
+            until: 0,
+        }
+    }
+
     #[test]
     fn a_token_is_asked_for_when_a_key_wants_blessing_and_nothing_held_answers_it() {
         let n = "n";
+        let want = [wanting(NOW)];
         // Nothing wants blessing: nothing is asked for.
-        assert!(!token_wanted(false, n, None, None, NOW, TTL));
+        assert!(!token_wanted(&[], n, None, None, NOW, TTL));
         // A key wants blessing and nothing is held.
-        assert!(token_wanted(true, n, None, None, NOW, TTL));
+        assert!(token_wanted(&want, n, None, None, NOW, TTL));
         // A token for another tree answers nothing.
-        assert!(token_wanted(true, n, Some(("old", NOW)), None, NOW, TTL));
+        assert!(token_wanted(&want, n, Some(("old", NOW)), None, NOW, TTL));
         // A token waiting for its seal is enough, until it is 40 minutes old.
         assert!(!token_wanted(
-            true,
+            &want,
             n,
             Some((n, NOW)),
             None,
@@ -1036,7 +1158,7 @@ mod tests {
             TTL
         ));
         assert!(token_wanted(
-            true,
+            &want,
             n,
             Some((n, NOW)),
             None,
@@ -1044,31 +1166,129 @@ mod tests {
             TTL
         ));
         // A seal for the tree answers it while it still gives a blessing
-        // with more than a third left.
+        // with more than a third left, by the chain's clock.
         let sealed = Some((n, NOW));
         assert!(!token_wanted(
-            true,
+            &[wanting(NOW + TTL * 2 / 3 - 1)],
             n,
             Some((n, NOW)),
             sealed,
-            NOW + TTL * 2 / 3 - 1,
+            NOW,
             TTL
         ));
         assert!(token_wanted(
-            true,
+            &[wanting(NOW + TTL * 2 / 3)],
             n,
             Some((n, NOW)),
             sealed,
-            NOW + TTL * 2 / 3,
+            NOW,
             TTL
         ));
-        assert!(!token_wanted(true, n, None, sealed, NOW + 60, TTL));
+        assert!(!token_wanted(
+            &[wanting(NOW + 60)],
+            n,
+            None,
+            sealed,
+            NOW + 60,
+            TTL
+        ));
         // A seal for another tree answers nothing.
         assert!(token_wanted(
-            true,
+            &[wanting(NOW + 60)],
             n,
             None,
             Some(("old", NOW)),
+            NOW + 60,
+            TTL
+        ));
+    }
+
+    /// How much blessing a seal still gives is judged by the clock of the
+    /// chain it blesses on, not the wall clock: a chain whose clock runs
+    /// ahead of the wall has a seal it dated go stale by its own time.
+    #[test]
+    fn a_seal_s_remaining_blessing_is_judged_by_the_chain_s_clock() {
+        let n = "n";
+        // Dated by a chain whose clock is far ahead of the wall.
+        let chain_now = NOW + 10 * TTL;
+        let sealed = Some((n, chain_now - 60));
+        assert!(!token_wanted(
+            &[wanting(chain_now)],
+            n,
+            None,
+            sealed,
+            NOW,
+            TTL
+        ));
+        // The chain's clock runs on past two thirds of the TTL, while the
+        // wall clock has barely moved: a fresh seal is wanted.
+        assert!(token_wanted(
+            &[wanting(chain_now - 60 + TTL * 2 / 3)],
+            n,
+            None,
+            sealed,
+            NOW + 1,
+            TTL
+        ));
+        // And a chain whose clock lags the wall is not judged stale early.
+        let lagging = NOW - 5 * TTL;
+        assert!(!token_wanted(
+            &[wanting(lagging + 60)],
+            n,
+            None,
+            Some((n, lagging)),
+            NOW,
+            TTL
+        ));
+        // A chain whose clock couldn't be read is not asked for.
+        assert!(!token_wanted(
+            &[Wanting {
+                chain_now: None,
+                until: 0
+            }],
+            n,
+            None,
+            sealed,
+            NOW,
+            TTL
+        ));
+    }
+
+    /// A key that wants blessing although the chain has applied the seal
+    /// held (the registry no longer counts it: the checker it was recorded
+    /// against retired) has a fresh attestation asked for, however young
+    /// that seal is; a seal not yet applied is waited for.
+    #[test]
+    fn a_seal_the_chain_has_applied_does_not_answer_a_key_that_still_wants_blessing() {
+        let n = "n";
+        let sealed = Some((n, NOW - 3_600));
+        let applied = Wanting {
+            chain_now: Some(NOW),
+            until: NOW - 3_600 + TTL,
+        };
+        // Development mode: no token, a fresh seal.
+        assert!(token_wanted(&[applied], n, None, sealed, NOW, TTL));
+        // Launcher mode: the token the seal proved.
+        assert!(token_wanted(
+            &[applied],
+            n,
+            Some((n, NOW - 3_600)),
+            sealed,
+            NOW,
+            TTL
+        ));
+        // Not yet applied (the keeper hasn't relayed it): waited for.
+        let unapplied = Wanting {
+            chain_now: Some(NOW),
+            until: NOW - 7_200 + TTL,
+        };
+        assert!(!token_wanted(&[unapplied], n, None, sealed, NOW, TTL));
+        // A fresh token asked for is then waited on, not asked for again.
+        assert!(!token_wanted(
+            &[applied],
+            n,
+            Some((n, NOW)),
+            sealed,
             NOW + 60,
             TTL
         ));
@@ -1249,6 +1469,106 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert!(attestation.status().seal.is_none());
+    }
+
+    /// A node for one chain that answers a simulated `bless` as told: it goes
+    /// through, or it reverts. Notes how many it was asked.
+    async fn bless_node(chain_id: u64, reverts: bool) -> (Client, Arc<Mutex<usize>>) {
+        let asked = Arc::new(Mutex::new(0usize));
+        let noted = asked.clone();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+                let noted = noted.clone();
+                async move {
+                    let id = request["id"].clone();
+                    let method = request["method"].as_str().unwrap_or_default();
+                    let answer = |result: serde_json::Value| {
+                        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
+                    };
+                    axum::Json(match method {
+                        "eth_chainId" => answer(serde_json::json!(format!("0x{chain_id:x}"))),
+                        "eth_blockNumber" => answer(serde_json::json!("0x10")),
+                        "eth_accounts" => answer(serde_json::json!([])),
+                        "eth_getBlockByNumber" => {
+                            let mut block = alloy::rpc::types::Block::<
+                                alloy::rpc::types::Transaction,
+                            >::default();
+                            block.header.inner.number = 16;
+                            block.header.inner.timestamp = NOW;
+                            answer(serde_json::to_value(block).unwrap())
+                        }
+                        "eth_call" if crate::stand_in::code_run(&request).is_some() => {
+                            answer(crate::stand_in::code_run(&request).unwrap())
+                        }
+                        "eth_call" => {
+                            *noted.lock().unwrap() += 1;
+                            if reverts {
+                                serde_json::json!({"jsonrpc": "2.0", "id": id, "error": {
+                                    "code": 3, "message": "execution reverted", "data": "0x5f0bc0fb"
+                                }})
+                            } else {
+                                answer(serde_json::json!("0x"))
+                            }
+                        }
+                        other => panic!("the stand-in node was asked {other}"),
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (crate::stand_in::client(&url).await, asked)
+    }
+
+    /// A seal is kept only once a `bless` simulated on every chain the
+    /// instance holds keys on goes through: one whose checker refuses it on
+    /// any chain is refused, so a fresh one is asked for.
+    #[tokio::test]
+    async fn a_seal_is_simulated_on_every_chain_with_a_key_before_it_is_kept() {
+        let attestation = Attestation::new(Mode::Development).unwrap();
+        for (chain_id, vault, strategy, key) in [
+            leaf(31337, 0x11, 0xa1),
+            leaf(31337, 0x22, 0xa2),
+            leaf(84532, 0x33, 0xa3),
+        ] {
+            attestation.put(chain_id, vault, strategy, key);
+        }
+        let (first, first_asked) = bless_node(31337, false).await;
+        let (second, second_asked) = bless_node(84532, true).await;
+        attestation.serve_chain(first, crate::stand_in::deployments());
+        attestation.serve_chain(second, crate::stand_in::deployments());
+        let journal = Journal {
+            image_digest: chain::attest::image_digest("executor"),
+            project_id: chain::attest::project_id(),
+            ..journal_for(&attestation, NOW)
+        };
+        let nonce = attestation.binding().nonce();
+
+        // The second chain's checker refuses it.
+        assert!(matches!(
+            attestation.accept(post(nonce.clone(), &journal)).await,
+            Err(Refusal::Journal(_))
+        ));
+        assert!(
+            attestation.status().seal.is_none(),
+            "kept a seal one chain refuses"
+        );
+        assert_eq!(*first_asked.lock().unwrap(), 1, "one leaf a chain");
+        assert_eq!(
+            *second_asked.lock().unwrap(),
+            1,
+            "the second chain was not asked"
+        );
+
+        // Every chain takes it: kept.
+        let (second, _) = bless_node(84532, false).await;
+        attestation.serve_chain(second, crate::stand_in::deployments());
+        attestation.accept(post(nonce, &journal)).await.unwrap();
+        assert!(attestation.status().seal.is_some());
     }
 
     #[test]

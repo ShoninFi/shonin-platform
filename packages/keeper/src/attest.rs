@@ -4,8 +4,11 @@
 //! leaves it holds keys for and, once one is made, the seal that proves them
 //! all. Anyone may send the registry's `bless` with them; the keeper does,
 //! in its turn on each chain, for every leaf of that chain whose key is not
-//! blessed for a while yet. A `bless` is simulated first and sent only if the
-//! simulation goes through, and never again while one sent may still land.
+//! blessed for a while yet, or whose blessing the registry no longer counts
+//! although it runs on (the checker it was recorded against retired: sent
+//! again, the seal is recorded against the newest checker that accepts it).
+//! A `bless` is simulated first and sent only if the simulation goes through,
+//! and never again while one sent may still land.
 //!
 //! Once the chain shows a key blessed as the executor of a vault that is
 //! still live, and for the bundle that vault runs, the keeper keeps that key
@@ -78,6 +81,10 @@ pub(crate) trait Registry {
     /// When the leaf's key's blessing for its vault and bundle runs out;
     /// zero if it has none.
     async fn blessed_until(&self, leaf: &Leaf) -> Result<u64>;
+    /// Whether the registry counts the leaf's key as blessed for its vault
+    /// and bundle now (`isBlessedFor`): it may not although the blessing
+    /// runs on, once the checker it was recorded against has been retired.
+    async fn counts(&self, leaf: &Leaf) -> Result<bool>;
     /// Whether the chain vouches for the key as the executor of a live
     /// vault running the leaf's bundle.
     async fn vouches_for(&self, leaf: &Leaf) -> Result<bool>;
@@ -112,6 +119,11 @@ pub(crate) struct Memory {
     /// Each leaf whose `bless` was sent, and until when no other is sent
     /// for it.
     held: HashMap<(u64, Address, B256, Address), Instant>,
+    /// Each leaf whose blessing the registry stopped counting although it
+    /// runs on, and the issue time of the seal sent again for it: that seal
+    /// is not sent again until the registry has counted the key once more,
+    /// so a send that changed nothing is not repeated round after round.
+    resent: HashMap<(u64, Address, B256, Address), u64>,
     pub stakes: Stakes,
     /// When the chain was last looked at.
     last: Option<Instant>,
@@ -170,6 +182,7 @@ pub(crate) async fn round(
     memory
         .held
         .retain(|id, until| published_ids.contains(id) && at < *until);
+    memory.resent.retain(|id, _| published_ids.contains(id));
     if leaves.is_empty() {
         return Ok(done);
     }
@@ -178,18 +191,31 @@ pub(crate) async fn round(
     let ttl = registry.ttl().await?;
     for leaf in &leaves {
         let until = registry.blessed_until(leaf).await?;
-        // Blessed for a while yet: nothing to send.
-        if until >= now.saturating_add(ttl / 3) {
+        let Some(issued) = published.journal.as_ref().map(|journal| issued_at(journal)) else {
+            continue;
+        };
+        // Down to a third of its blessing, and the seal adds something.
+        let renews = until < now.saturating_add(ttl / 3)
+            && issued.is_none_or(|issued| issued.saturating_add(ttl) > until);
+        // Or the blessing runs on but the registry no longer counts it (the
+        // checker it was recorded against retired): sending the seal again
+        // has the newest checker that accepts it record it afresh. Once per
+        // seal until the key counts again, so a send that changes nothing
+        // isn't repeated.
+        let mut recounts = false;
+        if !renews && leaf.vault != Address::ZERO && until >= now {
+            if registry.counts(leaf).await? {
+                memory.resent.remove(&leaf.id());
+            } else {
+                recounts = memory.resent.get(&leaf.id()) != issued.as_ref();
+            }
+        }
+        if !renews && !recounts {
             continue;
         }
         let (Some(seal), Some(journal)) = (&published.seal, &published.journal) else {
             continue;
         };
-        // This seal's blessing is already what the key holds: sending it
-        // again changes nothing. A newer seal is waited for.
-        if issued_at(journal).is_some_and(|issued| issued.saturating_add(ttl) <= until) {
-            continue;
-        }
         if memory.held.contains_key(&leaf.id()) {
             continue;
         }
@@ -208,6 +234,9 @@ pub(crate) async fn round(
             memory.held.insert(leaf.id(), at + hold);
         }
         if sent == Sent::Done {
+            if recounts && let Some(issued) = issued {
+                memory.resent.insert(leaf.id(), issued);
+            }
             tracing::info!(vault = %leaf.vault, key = %leaf.key, "a vault key's blessing was relayed");
         }
         done.sent.push(leaf.key);
@@ -288,12 +317,10 @@ impl Registry for OnChain<'_> {
             .await
     }
 
-    async fn vouches_for(&self, leaf: &Leaf) -> Result<bool> {
-        let attestation = self.deployments.attestation;
-        let blessed = self
-            .client
+    async fn counts(&self, leaf: &Leaf) -> Result<bool> {
+        self.client
             .read(
-                attestation,
+                self.deployments.attestation,
                 IAttestationRegistry::isBlessedForCall {
                     signer: leaf.key,
                     vaultChain: U256::from(leaf.vault_chain),
@@ -301,8 +328,12 @@ impl Registry for OnChain<'_> {
                     strategyHash: leaf.strategy_hash,
                 },
             )
-            .await?;
-        if !blessed {
+            .await
+    }
+
+    async fn vouches_for(&self, leaf: &Leaf) -> Result<bool> {
+        let attestation = self.deployments.attestation;
+        if !self.counts(leaf).await? {
             return Ok(false);
         }
         let info = self
@@ -491,7 +522,10 @@ async fn fund_gas(
         })
         .await;
     match sent {
-        Ok(_) => Ok(true),
+        Ok(_) => {
+            tracing::info!(%key, "a blessed vault key was stocked with gas");
+            Ok(true)
+        }
         Err(error) => {
             // A stake that went out and wasn't seen to land is waited for.
             if let Some(hash) = noted.lock().ok().and_then(|noted| *noted) {
@@ -514,6 +548,9 @@ mod tests {
         ttl: u64,
         until: HashMap<Address, u64>,
         vouched: HashSet<Address>,
+        /// Keys whose blessing the registry doesn't count although it runs
+        /// on (the checker it was recorded against retired).
+        uncounted: HashSet<Address>,
         simulation_fails: bool,
         sends_answer: Option<Sent>,
         sent: Mutex<Vec<Address>>,
@@ -529,6 +566,9 @@ mod tests {
         }
         async fn blessed_until(&self, leaf: &Leaf) -> Result<u64> {
             Ok(self.until.get(&leaf.key).copied().unwrap_or(0))
+        }
+        async fn counts(&self, leaf: &Leaf) -> Result<bool> {
+            Ok(!self.uncounted.contains(&leaf.key))
         }
         async fn vouches_for(&self, leaf: &Leaf) -> Result<bool> {
             Ok(self.vouched.contains(&leaf.key))
@@ -715,6 +755,102 @@ mod tests {
             .await
             .unwrap();
         assert!(stand.sent.lock().unwrap().is_empty());
+    }
+
+    /// A key the registry no longer counts as blessed (the checker its
+    /// blessing was recorded against retired), however far its blessing
+    /// still runs, has the seal it came from sent again, so the newest
+    /// checker that accepts it records it afresh.
+    #[tokio::test]
+    async fn a_key_the_registry_no_longer_counts_is_relayed_again_however_far_its_blessing_runs() {
+        let mut stand = stand();
+        // Attested an hour ago: the blessing runs almost a whole TTL yet.
+        let issued = NOW - 3_600;
+        stand.until.insert(Address::repeat_byte(1), issued + TTL);
+        stand.uncounted.insert(Address::repeat_byte(1));
+        let mut published = published(vec![leaf(1)]);
+        published.journal = Some(journal(issued));
+        let mut memory = Memory::default();
+        round(&stand, CHAIN, &published, &mut memory, Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(*stand.sent.lock().unwrap(), [Address::repeat_byte(1)]);
+    }
+
+    /// A seal sent again for a key the registry still doesn't count after
+    /// it went through changed nothing, and is not sent again round after
+    /// round; once the key counts again and then stops, it is.
+    #[tokio::test]
+    async fn a_seal_sent_again_that_changed_nothing_is_not_repeated() {
+        let mut stand = stand();
+        let issued = NOW - 3_600;
+        stand.until.insert(Address::repeat_byte(1), issued + TTL);
+        stand.uncounted.insert(Address::repeat_byte(1));
+        let mut published = published(vec![leaf(1)]);
+        published.journal = Some(journal(issued));
+        let mut memory = Memory::default();
+        let start = Instant::now();
+        for seconds in [0, 15, 120, 900, 3_600] {
+            round(
+                &stand,
+                CHAIN,
+                &published,
+                &mut memory,
+                start + Duration::from_secs(seconds),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(stand.sent.lock().unwrap().len(), 1);
+
+        // The key counts again, then stops (another rotation): the seal is
+        // sent once more.
+        stand.uncounted.clear();
+        round(
+            &stand,
+            CHAIN,
+            &published,
+            &mut memory,
+            start + Duration::from_secs(4_000),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stand.sent.lock().unwrap().len(), 1);
+        stand.uncounted.insert(Address::repeat_byte(1));
+        round(
+            &stand,
+            CHAIN,
+            &published,
+            &mut memory,
+            start + Duration::from_secs(4_100),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stand.sent.lock().unwrap().len(), 2);
+    }
+
+    /// A seal the registry would refuse is never sent again for a key it
+    /// doesn't count.
+    #[tokio::test]
+    async fn a_seal_sent_again_is_simulated_first() {
+        let mut stand = stand();
+        stand.simulation_fails = true;
+        let issued = NOW - 3_600;
+        stand.until.insert(Address::repeat_byte(1), issued + TTL);
+        stand.uncounted.insert(Address::repeat_byte(1));
+        let mut published = published(vec![leaf(1)]);
+        published.journal = Some(journal(issued));
+        let done = round(
+            &stand,
+            CHAIN,
+            &published,
+            &mut Memory::default(),
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert!(stand.sent.lock().unwrap().is_empty());
+        assert_eq!(done.not_simulated, [Address::repeat_byte(1)]);
     }
 
     #[test]

@@ -244,13 +244,22 @@ async fn main() -> Result<()> {
                 kept.cannot_simulate = false;
                 kept.connected = Some(std::time::Instant::now());
             });
+            // The executor's keys: their blessings relayed, and their gas
+            // kept, on a cadence of their own, so a round slowed by the
+            // vaults never holds up a fresh key's blessing, gas and approval.
+            tokio::spawn(keep_keys(
+                served.client.clone(),
+                served.key.clone(),
+                served.deployments.clone(),
+                keeper,
+                executor.clone(),
+                attestation_http.clone(),
+            ));
             let mut memory = HashMap::new();
             let mut factories = Factories::default();
             let mut said = Said::default();
             let mut closer = CloserAt::new(served.deployments.closer);
             let mut deployments = served.deployments.clone();
-            let mut blessings = attest::Memory::default();
-            let mut blessings_said = Said::default();
             loop {
                 deployments.closer = closer.usable(&served.client, &served.key).await;
                 let started = std::time::Instant::now();
@@ -283,45 +292,6 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                // The executor's keys: their blessings relayed, and their gas
-                // kept, every so often rather than every round.
-                if blessings.due(std::time::Instant::now()) {
-                    let at = std::time::Instant::now();
-                    let looked = match attest::published(&attestation_http, &executor).await {
-                        Ok(published) => {
-                            let registry = attest::OnChain {
-                                client: &served.client,
-                                deployments: &deployments,
-                                keeper,
-                            };
-                            attest::round(
-                                &registry,
-                                served.client.chain_id,
-                                &published,
-                                &mut blessings,
-                                at,
-                            )
-                            .await
-                            .map(|_| ())
-                        }
-                        Err(error) => {
-                            blessings.looked(at);
-                            Err(error)
-                        }
-                    };
-                    match looked {
-                        Ok(()) => {
-                            if blessings_said.over() {
-                                tracing::info!(chain = %served.key, "the executor's keys are looked after again");
-                            }
-                        }
-                        Err(error) => {
-                            if let Some(times) = blessings_said.due(std::time::Instant::now()) {
-                                tracing::warn!(chain = %served.key, times, error = format!("{error:#}"), "could not look after the executor's keys");
-                            }
-                        }
-                    }
-                }
                 tokio::time::sleep(ROUND_PAUSE).await;
             }
         });
@@ -333,6 +303,54 @@ async fn main() -> Result<()> {
     // Nothing is kept; the health route still says why.
     std::future::pending::<()>().await;
     Ok(())
+}
+
+/// Relay the executor's blessings on one chain and keep its blessed keys in
+/// gas, every [`attest::EVERY`], for as long as the keeper runs.
+async fn keep_keys(
+    client: Client,
+    key: chain::ChainKey,
+    deployments: Deployments,
+    keeper: Address,
+    executor: String,
+    http: reqwest::Client,
+) {
+    let mut blessings = attest::Memory::default();
+    let mut said = Said::default();
+    loop {
+        let at = std::time::Instant::now();
+        if blessings.due(at) {
+            let looked = match attest::published(&http, &executor).await {
+                Ok(published) => {
+                    let registry = attest::OnChain {
+                        client: &client,
+                        deployments: &deployments,
+                        keeper,
+                    };
+                    attest::round(&registry, client.chain_id, &published, &mut blessings, at)
+                        .await
+                        .map(|_| ())
+                }
+                Err(error) => {
+                    blessings.looked(at);
+                    Err(error)
+                }
+            };
+            match looked {
+                Ok(()) => {
+                    if said.over() {
+                        tracing::info!(chain = %key, "the executor's keys are looked after again");
+                    }
+                }
+                Err(error) => {
+                    if let Some(times) = said.due(std::time::Instant::now()) {
+                        tracing::warn!(chain = %key, times, error = format!("{error:#}"), "could not look after the executor's keys");
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(ROUND_PAUSE).await;
+    }
 }
 
 /// How long the keeper waits between one round of a chain and the next.
