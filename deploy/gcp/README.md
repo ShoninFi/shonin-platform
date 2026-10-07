@@ -18,7 +18,7 @@ Everything runs in one zone (`us-central1-a`), on the default network, with noth
 | --- | --- | --- | --- |
 | `shonin-executor-<network>` | the executor, attested: Confidential Space, hardened image, Intel TDX | `c3-standard-4` | `shonin-workload`: attest, pull images, write logs; no secret |
 | `shonin-services-<network>` | the API (the indexer inside), the keeper, the tunnel, the waker; Container-Optimized OS | `e2-small`, 10 GB standard disk | `shonin-services`: pull images, write logs, read two secrets, start and read the prover's instance |
-| `shonin-prover-<network>` | the attestation's prover; Spot, off when idle | `GCP_PROVER_MACHINE_TYPE` | `shonin-prover`: pull images, write logs |
+| `shonin-prover-<network>` | the attestation's prover; on-demand, off when idle | `GCP_PROVER_MACHINE_TYPE` | `shonin-prover`: pull images, write logs |
 
 They name each other by internal DNS: the executor's status port is `http://shonin-executor-testnet.us-central1-a.c.shonin-testnet.internal:19085`, the API `http://shonin-services-testnet.us-central1-a.c.shonin-testnet.internal:19081`.
 
@@ -83,7 +83,7 @@ What it runs is named in the instance's metadata (the images by digest), so `tas
 
 ## The prover's VM
 
-A Spot VM, stopped (not deleted) when reclaimed, created by `task cloud:deploy:prover` (it boots once then, finds nothing to prove, and powers off when idle); its startup script (`prover/startup.sh`) runs the prover and powers the VM off when it exits. Its metadata names `shonin-prover-image` (by digest) and `shonin-executor-url`. The services VM's account may start and read this instance and no other (a custom role, `shoninProverStarter`, bound on the instance).
+An on-demand VM, on only while proving, created by `task cloud:deploy:prover` (it boots once then, finds nothing to prove, and powers off when idle); its startup script (`prover/startup.sh`) runs the prover and powers the VM off when it exits. Its metadata names `shonin-prover-image` (by digest) and `shonin-executor-url`. The services VM's account may start and read this instance and no other (a custom role, `shoninProverStarter`, bound on the instance).
 
 ## Standing it up (testnet)
 

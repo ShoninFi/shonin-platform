@@ -17,7 +17,7 @@
 #   running the API (the indexer inside), the keeper, the Cloudflare tunnel
 #   that carries the API to its public name, and the waker that starts the
 #   prover when a seal is wanted (deploy/gcp/services).
-# - shonin-prover-<network>: a Spot VM that makes the attestation's proof
+# - shonin-prover-<network>: an on-demand VM that makes the attestation's proof
 #   when woken and powers itself off when idle (deploy/gcp/prover).
 version: "3"
 
@@ -40,7 +40,7 @@ vars:
   # requester, launched for a live exchange and deleted after.
   MACHINES: "reviewer builder executor unwinder requester"
   SERVICES: "api indexer keeper"
-  # B's image: the attestation's prover, run on its own Spot VM.
+  # B's image: the attestation's prover, run on its own VM, off when idle.
   PROVERS: "prover"
   # The VMs a network runs, by role: shonin-<role>-<network>.
   VMS: "executor services prover"
@@ -357,7 +357,7 @@ tasks:
         esac
 
   deploy:prover:
-    desc: "Create the prover's Spot VM (off when idle; the services VM's waker starts it) from the pushed prover image's digest, and let the services VM start it (NETWORK=testnet, TAG= the commit by default)"
+    desc: "Create the prover's VM (on-demand, off when idle; the services VM's waker starts it) from the pushed prover image's digest, and let the services VM start it (NETWORK=testnet, TAG= the commit by default)"
     requires:
       vars: [NETWORK, GCP_PROJECT]
     preconditions:
@@ -369,16 +369,15 @@ tasks:
       # The tag as this task was given it: file-level vars never see a caller's TAG.
       IMAGE_TAG: '{{.TAG | default .GIT_SHA}}'
     cmds:
-      # Spot, stopped (not deleted) when reclaimed, so the waker can start it
-      # again. The startup script runs the prover and powers the VM off when
-      # it exits.
+      # On-demand, and on only while proving: the startup script runs the
+      # prover and powers the VM off when it exits.
       - |
         prover=$({{.DIGEST_OF}} "{{.GCP_REGISTRY}}/prover:{{.IMAGE_TAG}}")
         [ -n "$prover" ] || { echo "push the prover first (task cloud:push NAME=prover TAG={{.IMAGE_TAG}})"; exit 1; }
         gcloud compute instances create "shonin-prover-{{.NETWORK}}" \
           --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" \
           --machine-type="{{.GCP_PROVER_MACHINE_TYPE}}" \
-          --provisioning-model=SPOT --instance-termination-action=STOP --maintenance-policy=TERMINATE \
+          --provisioning-model=STANDARD --maintenance-policy=TERMINATE \
           --image-project=cos-cloud --image-family=cos-stable \
           --boot-disk-size=30GB --boot-disk-type=pd-balanced \
           --shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring \
