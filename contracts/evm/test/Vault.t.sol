@@ -399,8 +399,10 @@ contract VaultTest is Fixture {
         blessServiceKey(BUILDER_IMAGE, builder);
         blessExecutorKey(executor, address(vault), bundle);
         address unwinder = vm.addr(UNWINDER_KEY);
-        bytes memory journal = journalFor(UNWINDER_IMAGE, unwinder, leafFor(address(vault), bundle));
-        attestation.bless(sealOf(journal), journal, block.chainid, address(vault), bundle, new bytes32[](0));
+        bytes memory journal = journalFor(UNWINDER_IMAGE, unwinder, leafFor(address(vault), bundle, unwinder));
+        attestation.bless(
+            sealOf(journal), journal, block.chainid, address(vault), bundle, unwinder, new bytes32[](0)
+        );
 
         uint64 asOf = uint64(vm.getBlockTimestamp());
         bytes memory byUnwinder = signed(UNWINDER_KEY, vault.usageDigest(2e6, asOf));

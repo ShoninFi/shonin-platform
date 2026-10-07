@@ -101,13 +101,18 @@ contract RegistriesTest is Fixture {
         attestation.proposeVerifier(address(second));
         assertFalse(attestation.isVerifierAllowed(address(second)));
 
-        bytes memory journal = journalFor(BUILDER_IMAGE, makeAddr("next builder"), serviceLeaf());
+        bytes memory journal =
+            journalFor(BUILDER_IMAGE, makeAddr("next builder"), serviceLeaf(makeAddr("next builder")));
         bytes memory proof = signedJournal(newAttestorKey, journal);
         vm.expectRevert(AttestationRegistry.ProofRejected.selector);
-        attestation.bless(proof, journal, 0, address(0), bytes32(0), new bytes32[](0));
+        attestation.bless(
+            proof, journal, 0, address(0), bytes32(0), makeAddr("next builder"), new bytes32[](0)
+        );
 
         skip(TIMELOCK);
-        attestation.bless(proof, journal, 0, address(0), bytes32(0), new bytes32[](0));
+        attestation.bless(
+            proof, journal, 0, address(0), bytes32(0), makeAddr("next builder"), new bytes32[](0)
+        );
         assertTrue(attestation.isBlessedAs(makeAddr("next builder"), ImageKind.Builder));
         // The first checker still blesses.
         blessServiceKey(BUILDER_IMAGE, makeAddr("another builder"));
@@ -116,9 +121,12 @@ contract RegistriesTest is Fixture {
     function test_retiring_a_checker_is_immediate() public {
         vm.prank(admin);
         attestation.retireVerifier(address(verifier));
-        bytes memory journal = journalFor(BUILDER_IMAGE, makeAddr("next builder"), serviceLeaf());
+        bytes memory journal =
+            journalFor(BUILDER_IMAGE, makeAddr("next builder"), serviceLeaf(makeAddr("next builder")));
         vm.expectRevert(AttestationRegistry.ProofRejected.selector);
-        attestation.bless(sealOf(journal), journal, 0, address(0), bytes32(0), new bytes32[](0));
+        attestation.bless(
+            sealOf(journal), journal, 0, address(0), bytes32(0), makeAddr("next builder"), new bytes32[](0)
+        );
     }
 
     function signedJournal(uint256 key, bytes memory journal) internal pure returns (bytes memory) {
@@ -135,10 +143,10 @@ contract RegistriesTest is Fixture {
     }
 
     function test_a_key_from_one_instance_cannot_be_claimed_by_another_image() public {
-        bytes memory journal = journalFor(REVIEWER_IMAGE, builder, serviceLeaf());
+        bytes memory journal = journalFor(REVIEWER_IMAGE, builder, serviceLeaf(builder));
         bytes memory proof = sealOf(journal);
         vm.expectRevert(AttestationRegistry.NotThisInstance.selector);
-        attestation.bless(proof, journal, 0, address(0), bytes32(0), new bytes32[](0));
+        attestation.bless(proof, journal, 0, address(0), bytes32(0), builder, new bytes32[](0));
     }
 
     function test_an_unwinder_key_is_never_approved_to_trade() public {
@@ -151,8 +159,10 @@ contract RegistriesTest is Fixture {
         (Vault vault, bytes32 bundle) = openVault();
         Station station = stationOf(vault);
         address unwinder = makeAddr("unwinder");
-        bytes memory journal = journalFor(unwinderImage, unwinder, leafFor(address(vault), bundle));
-        attestation.bless(sealOf(journal), journal, block.chainid, address(vault), bundle, new bytes32[](0));
+        bytes memory journal = journalFor(unwinderImage, unwinder, leafFor(address(vault), bundle, unwinder));
+        attestation.bless(
+            sealOf(journal), journal, block.chainid, address(vault), bundle, unwinder, new bytes32[](0)
+        );
         assertTrue(attestation.isBlessedFor(unwinder, block.chainid, address(vault), bundle));
         vm.expectRevert(Station.NotBlessed.selector);
         station.approveKey("local", unwinder);
@@ -272,13 +282,13 @@ contract RegistriesTest is Fixture {
     function test_a_proof_nobody_signed_is_refused() public {
         bytes memory journal = journalFor(EXECUTOR_IMAGE, executor, bytes32(0));
         vm.expectRevert(AttestationRegistry.ProofRejected.selector);
-        attestation.bless(hex"", journal, 0, address(0), bytes32(0), new bytes32[](0));
+        attestation.bless(hex"", journal, 0, address(0), bytes32(0), executor, new bytes32[](0));
     }
 
     function test_an_image_off_the_allowlist_cannot_bless() public {
         bytes memory journal = journalFor(keccak256("unknown image"), executor, bytes32(0));
         vm.expectRevert(AttestationRegistry.ImageNotAllowed.selector);
-        attestation.bless(sealOf(journal), journal, 0, address(0), bytes32(0), new bytes32[](0));
+        attestation.bless(sealOf(journal), journal, 0, address(0), bytes32(0), executor, new bytes32[](0));
     }
 
     function test_an_executor_key_is_blessed_for_one_vault_and_one_bundle() public {
@@ -303,26 +313,29 @@ contract RegistriesTest is Fixture {
         address mine = makeAddr("my vault");
         address yours = makeAddr("your vault");
         bytes32 bundle = keccak256("bundle");
-        bytes memory journal = journalFor(EXECUTOR_IMAGE, executor, leafFor(mine, bundle));
+        bytes memory journal = journalFor(EXECUTOR_IMAGE, executor, leafFor(mine, bundle, executor));
         vm.expectRevert(AttestationRegistry.NotAmongTheVaults.selector);
-        attestation.bless(sealOf(journal), journal, block.chainid, yours, bundle, new bytes32[](0));
+        attestation.bless(sealOf(journal), journal, block.chainid, yours, bundle, executor, new bytes32[](0));
     }
 
     function test_a_blessing_proved_for_one_chain_cannot_be_replayed_on_another() public {
         address vault = makeAddr("vault");
         bytes32 bundle = keccak256("bundle");
-        bytes memory journal = journalFor(EXECUTOR_IMAGE, executor, leafFor(vault, bundle));
+        bytes memory journal = journalFor(EXECUTOR_IMAGE, executor, leafFor(vault, bundle, executor));
         bytes memory proof = sealOf(journal);
         vm.chainId(block.chainid + 7);
         vm.expectRevert(AttestationRegistry.NotAmongTheVaults.selector);
-        attestation.bless(proof, journal, 31_337, vault, bundle, new bytes32[](0));
+        attestation.bless(proof, journal, 31_337, vault, bundle, executor, new bytes32[](0));
     }
 
     function test_a_service_key_names_no_vault() public {
-        bytes memory journal = journalFor(BUILDER_IMAGE, makeAddr("builder two"), serviceLeaf());
+        bytes memory journal =
+            journalFor(BUILDER_IMAGE, makeAddr("builder two"), serviceLeaf(makeAddr("builder two")));
         bytes memory proof = sealOf(journal);
         vm.expectRevert(AttestationRegistry.WrongKindForVault.selector);
-        attestation.bless(proof, journal, block.chainid, address(0), bytes32(0), new bytes32[](0));
+        attestation.bless(
+            proof, journal, block.chainid, address(0), bytes32(0), makeAddr("builder two"), new bytes32[](0)
+        );
     }
 
     function test_a_blessing_expires() public {

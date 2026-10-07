@@ -20,10 +20,13 @@ contract RemoteStationKnownDriversTest is Fixture {
         super.setUp();
         ownStations = new StationFactory(address(this));
         ownStations.initialize(address(attestation), address(usd), address(this), address(new Station()));
-        bytes32 leaf =
-            keccak256(bytes.concat(keccak256(abi.encode(VAULT_CHAIN, vaultAddr, BUNDLE, block.chainid))));
+        bytes32 leaf = keccak256(
+            bytes.concat(keccak256(abi.encode(VAULT_CHAIN, vaultAddr, BUNDLE, block.chainid, executor)))
+        );
         bytes memory journal = journalFor(EXECUTOR_IMAGE, executor, leaf);
-        attestation.bless(sealOf(journal), journal, VAULT_CHAIN, vaultAddr, BUNDLE, new bytes32[](0));
+        attestation.bless(
+            sealOf(journal), journal, VAULT_CHAIN, vaultAddr, BUNDLE, executor, new bytes32[](0)
+        );
     }
 
     function specWith(bytes32 driverName) internal view returns (StationSpec memory spec) {

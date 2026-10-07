@@ -12,6 +12,7 @@
 //! On any network it serves the ops dashboard on its port: what is running,
 //! locally and in the cloud.
 
+mod admin;
 mod checker;
 mod dashboard;
 mod deploy;
@@ -27,7 +28,7 @@ mod solana_seed;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chain::{
     ChainArgs, ChainConfig, ChainKey, ChainKind, Deployments, NetworkName, Target, connect_to,
 };
@@ -99,6 +100,35 @@ enum Command {
     /// network and propose it to the registry beside the development
     /// checker. Already proposed is done.
     ProposeChecker,
+    /// Propose a real image digest to every EVM chain's registry, signed
+    /// by the admin. Already proposed is done.
+    ProposeImage {
+        /// `sha256:<64 hex>`, as the container registry names the image.
+        #[arg(long)]
+        digest: String,
+        /// executor, builder, reviewer or unwinder.
+        #[arg(long)]
+        kind: String,
+    },
+    /// Propose an operator project (by its Google Cloud project id; the
+    /// registry holds its keccak256) to every EVM chain's registry, signed
+    /// by the admin. Already proposed is done.
+    ProposeProject {
+        /// The Google Cloud project id.
+        project: String,
+    },
+    /// Retire the development checker on every EVM chain, signed by the
+    /// admin; refused on a chain where no other checker is allowed. Already
+    /// retired is done.
+    RetireChecker {
+        /// The development checker (the only kind this retires).
+        #[arg(long)]
+        dev: bool,
+    },
+    /// Allow a development checker again on every EVM chain (a fresh one,
+    /// since a retired checker can't be proposed again), for a publish only
+    /// it can bless. Already allowed is done. Retire it again after.
+    AllowDevChecker,
     /// Top every role up on every EVM testnet from the funder, to the amounts
     /// in the funding file; buys HYPE on HyperCore for HyperEVM. Safe to run
     /// again; testnet only.
@@ -153,8 +183,9 @@ enum Command {
     /// Publish the reference agents through the platform's own flows, on the
     /// vault chain.
     Seed {
-        /// Where the API is answering.
-        #[arg(long)]
+        /// Where the API is answering: a local one or a remote URL. Not
+        /// needed with `--strategy`, which publishes nothing.
+        #[arg(long, default_value = "")]
         api: String,
         /// Where the strategies to publish live.
         #[arg(long, env = "SHONIN_AGENTS_DIR")]
@@ -167,6 +198,20 @@ enum Command {
         /// is used: a deposit priced and a claim booked and paid.
         #[arg(long)]
         live: bool,
+        /// With `--agent`, publish it and stop: no vault is activated. The
+        /// strategy's id is printed as `strategy <id>` for `--strategy`.
+        #[arg(long, conflicts_with = "live")]
+        publish_only: bool,
+        /// Run the live part (activate its vault if it has none, a deposit
+        /// priced, a claim booked and paid) on this already registered
+        /// strategy, publishing nothing.
+        #[arg(long, conflicts_with_all = ["agent", "publish_only", "live"])]
+        strategy: Option<u64>,
+        /// How long the executor has to take a new vault on before the seed
+        /// stops and says so. Where an attestation proof is in the path
+        /// (a testnet executor in an enclave), allow far longer.
+        #[arg(long, default_value_t = seed::TAKE_ON_SECONDS)]
+        take_on_seconds: u64,
     },
 }
 
@@ -191,6 +236,10 @@ async fn main() -> Result<()> {
                 | Command::Accounts
                 | Command::Fund
                 | Command::ProposeChecker
+                | Command::ProposeImage { .. }
+                | Command::ProposeProject { .. }
+                | Command::RetireChecker { .. }
+                | Command::AllowDevChecker
                 | Command::HyperliquidVaults { .. }
         )
     );
@@ -269,6 +318,38 @@ async fn main() -> Result<()> {
                 &target.deployments_dir,
                 &args.artifacts,
             )
+            .await
+        }
+        Some(Command::ProposeImage { digest, kind }) => {
+            let digest = admin::image_digest(&digest)?;
+            let kind = admin::kind_named(&kind)?;
+            on_each_registry(&target, one, |client, deployments| async move {
+                admin::propose_image(&client, &deployments, digest, kind).await
+            })
+            .await
+        }
+        Some(Command::ProposeProject { project }) => {
+            on_each_registry(&target, one, |client, deployments| {
+                let project = project.clone();
+                async move { admin::propose_project(&client, &deployments, &project).await }
+            })
+            .await
+        }
+        Some(Command::RetireChecker { dev }) => {
+            if !dev {
+                bail!("only the development checker is retired here: pass --dev");
+            }
+            on_each_registry(&target, one, |client, deployments| async move {
+                admin::retire_dev_checker(&client, &deployments).await
+            })
+            .await
+        }
+        Some(Command::AllowDevChecker) => {
+            let artifacts = args.artifacts.clone();
+            on_each_registry(&target, one, |client, deployments| {
+                let artifacts = artifacts.clone();
+                async move { admin::allow_dev_checker(&client, &deployments, &artifacts).await }
+            })
             .await
         }
         Some(Command::Fund) => {
@@ -409,11 +490,31 @@ async fn main() -> Result<()> {
             agents,
             agent,
             live,
+            publish_only,
+            strategy,
+            take_on_seconds,
         }) => {
             let client = target.connect().await?;
             let deployments = target.wait_for_deployments(&client).await?;
-            match agent {
-                Some(name) => {
+            let api = api.trim_end_matches('/').to_string();
+            if strategy.is_none() && api.is_empty() {
+                bail!("--api is needed to publish: where the API answers");
+            }
+            if publish_only && agent.is_none() {
+                bail!("--publish-only publishes one agent: name it with --agent");
+            }
+            match (strategy, agent) {
+                (Some(strategy), _) => {
+                    seed::on_strategy(
+                        &client,
+                        target.vault_chain,
+                        &deployments,
+                        strategy,
+                        take_on_seconds,
+                    )
+                    .await
+                }
+                (None, Some(name)) => {
                     seed::one(
                         &client,
                         target.vault_chain,
@@ -422,16 +523,19 @@ async fn main() -> Result<()> {
                         agents.as_deref(),
                         &name,
                         live,
+                        publish_only,
+                        take_on_seconds,
                     )
                     .await
                 }
-                None => {
+                (None, None) => {
                     seed::run(
                         &client,
                         target.vault_chain,
                         &deployments,
                         &api,
                         agents.as_deref(),
+                        take_on_seconds,
                     )
                     .await
                 }
@@ -510,6 +614,28 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Run one admin change against every EVM chain's registry of the network
+/// (or the one named), each from its deployment file, and say what it did.
+async fn on_each_registry<F, Fut>(target: &Target, one: bool, change: F) -> Result<()>
+where
+    F: Fn(chain::Client, Deployments) -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    for (key, config) in only(target, one, evm_chains(target)) {
+        let client = connect_to(target.network, &key, &config).await?;
+        let file = Deployments::file_in(&target.deployments_dir, &key);
+        let deployments = client
+            .deployments(&file)
+            .await
+            .with_context(|| format!("no deployment on {key}: run chains:deploy first"))?;
+        let said = change(client, deployments)
+            .await
+            .with_context(|| format!("on {} ({key})", config.label))?;
+        println!("{} ({key}): {said}", config.label);
+    }
+    Ok(())
 }
 
 /// Why the devnet never deploys to mainnet: what it deploys is the stand-in
@@ -680,4 +806,79 @@ fn name_and_value(text: &str) -> Result<(String, String), String> {
     text.split_once('=')
         .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
         .ok_or_else(|| format!("{text:?} is not name=value"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    const BASE: [&str; 5] = ["devnet", "--store", "s", "--artifacts", "a"];
+
+    fn parse(more: &[&str]) -> Result<Args, clap::Error> {
+        Args::try_parse_from(BASE.iter().chain(more))
+    }
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        Args::command().debug_assert();
+    }
+
+    #[test]
+    fn the_seed_takes_its_take_on_time_and_runs_on_a_registered_strategy_without_an_api() {
+        let Some(Command::Seed {
+            strategy,
+            take_on_seconds,
+            ..
+        }) = parse(&["seed", "--strategy", "7", "--take-on-seconds", "1500"])
+            .unwrap()
+            .command
+        else {
+            panic!("not the seed");
+        };
+        assert_eq!(strategy, Some(7));
+        assert_eq!(take_on_seconds, 1500);
+        let Some(Command::Seed {
+            take_on_seconds, ..
+        }) = parse(&["seed", "--api", "https://example.org"])
+            .unwrap()
+            .command
+        else {
+            panic!("not the seed");
+        };
+        assert_eq!(take_on_seconds, seed::TAKE_ON_SECONDS);
+        // Publishing only and running live on a strategy don't mix.
+        assert!(parse(&["seed", "--agent", "x", "--publish-only", "--live"]).is_err());
+        assert!(parse(&["seed", "--strategy", "7", "--agent", "x"]).is_err());
+    }
+
+    #[test]
+    fn the_admin_commands_parse() {
+        assert!(matches!(
+            parse(&[
+                "propose-image",
+                "--digest",
+                "sha256:00",
+                "--kind",
+                "executor"
+            ])
+            .unwrap()
+            .command,
+            Some(Command::ProposeImage { .. })
+        ));
+        assert!(matches!(
+            parse(&["propose-project", "shonin-testnet"])
+                .unwrap()
+                .command,
+            Some(Command::ProposeProject { .. })
+        ));
+        assert!(matches!(
+            parse(&["retire-checker", "--dev"]).unwrap().command,
+            Some(Command::RetireChecker { dev: true })
+        ));
+        assert!(matches!(
+            parse(&["allow-dev-checker"]).unwrap().command,
+            Some(Command::AllowDevChecker)
+        ));
+    }
 }

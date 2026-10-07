@@ -37,10 +37,10 @@ contract GasBurningCheckerCannotBlockBlessingsTest is Fixture {
     function test_a_blessing_goes_through_at_an_ordinary_budget_past_a_checker_that_burns_its_gas() public {
         address vault = makeAddr("vault");
         bytes32 bundle = keccak256("bundle");
-        bytes memory journal = journalFor(EXECUTOR_IMAGE, executor, leafFor(vault, bundle));
+        bytes memory journal = journalFor(EXECUTOR_IMAGE, executor, leafFor(vault, bundle, executor));
         bytes memory call = abi.encodeCall(
             AttestationRegistry.bless,
-            (sealOf(journal), journal, block.chainid, vault, bundle, new bytes32[](0))
+            (sealOf(journal), journal, block.chainid, vault, bundle, executor, new bytes32[](0))
         );
         // The burner's budget plus room for everything else, but well short
         // of what the burner would swallow if it were handed it all.

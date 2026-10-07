@@ -16,8 +16,10 @@ contract PaydayOnTheLowestPostTest is TwoChainVault {
     /// Blessings last 72 hours; a week on, the machines have re-attested.
     function rebless() internal {
         blessExecutorKey(executor, address(vault), bundle);
-        bytes memory journal = journalFor(UNWINDER_IMAGE, unwinder, leafFor(address(vault), bundle));
-        attestation.bless(sealOf(journal), journal, block.chainid, address(vault), bundle, new bytes32[](0));
+        bytes memory journal = journalFor(UNWINDER_IMAGE, unwinder, leafFor(address(vault), bundle, unwinder));
+        attestation.bless(
+            sealOf(journal), journal, block.chainid, address(vault), bundle, unwinder, new bytes32[](0)
+        );
     }
 
     function test_payday_charges_no_profit_only_the_higher_post_shows() public {

@@ -29,8 +29,8 @@ contract MultiVaultBlessingTest is Fixture {
         view
         returns (bytes memory journal, bytes32[] memory proofFirst, bytes32[] memory proofSecond)
     {
-        bytes32 leafFirst = leafFor(first, bundle);
-        bytes32 leafSecond = leafFor(second, bundle);
+        bytes32 leafFirst = leafFor(first, bundle, signer);
+        bytes32 leafSecond = leafFor(second, bundle, signer);
         journal = journalFor(EXECUTOR_IMAGE, signer, pair(leafFirst, leafSecond));
         proofFirst = new bytes32[](1);
         proofFirst[0] = leafSecond;
@@ -44,10 +44,10 @@ contract MultiVaultBlessingTest is Fixture {
             twoVaultJournal(executor, vaultA, vaultB);
         bytes memory seal = sealOf(journal);
 
-        attestation.bless(seal, journal, block.chainid, vaultA, bundle, proofA);
+        attestation.bless(seal, journal, block.chainid, vaultA, bundle, executor, proofA);
         assertTrue(attestation.isBlessedFor(executor, block.chainid, vaultA, bundle));
 
-        attestation.bless(seal, journal, block.chainid, vaultB, bundle, proofB);
+        attestation.bless(seal, journal, block.chainid, vaultB, bundle, executor, proofB);
         assertTrue(attestation.isBlessedFor(executor, block.chainid, vaultB, bundle));
         assertTrue(
             attestation.isBlessedFor(executor, block.chainid, vaultA, bundle),
@@ -62,11 +62,11 @@ contract MultiVaultBlessingTest is Fixture {
         (bytes memory journal, bytes32[] memory proofA, bytes32[] memory proofB) =
             twoVaultJournal(executor, vaultA, vaultB);
         bytes memory seal = sealOf(journal);
-        attestation.bless(seal, journal, block.chainid, vaultA, bundle, proofA);
+        attestation.bless(seal, journal, block.chainid, vaultA, bundle, executor, proofA);
 
         // Everything alice needs was in the calldata of the first blessing.
         vm.prank(alice);
-        attestation.bless(seal, journal, block.chainid, vaultB, bundle, proofB);
+        attestation.bless(seal, journal, block.chainid, vaultB, bundle, executor, proofB);
 
         assertTrue(
             attestation.isBlessedFor(executor, block.chainid, vaultA, bundle),
@@ -84,7 +84,7 @@ contract MultiVaultBlessingTest is Fixture {
         (bytes memory journal, bytes32[] memory proofLive, bytes32[] memory proofOther) =
             twoVaultJournal(executor, address(vault), vaultB);
         bytes memory seal = sealOf(journal);
-        attestation.bless(seal, journal, block.chainid, address(vault), bundle, proofLive);
+        attestation.bless(seal, journal, block.chainid, address(vault), bundle, executor, proofLive);
         station.approveKey("local", executor);
         assertTrue(venue.isAgent(address(station), executor));
 
@@ -95,7 +95,7 @@ contract MultiVaultBlessingTest is Fixture {
 
         // ...but can make it not stand, with the public seal and the other leaf.
         vm.startPrank(alice);
-        attestation.bless(seal, journal, block.chainid, vaultB, bundle, proofOther);
+        attestation.bless(seal, journal, block.chainid, vaultB, bundle, executor, proofOther);
         vm.expectRevert(Station.StillBlessed.selector);
         station.revokeKey("local", executor);
         vm.stopPrank();

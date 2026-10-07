@@ -1,0 +1,45 @@
+{
+  "evm_signer": "0x31D4821d2237B25d9208F9DE49E3C7CF535fe7d0",
+  "solana_signer": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "this_chain": "31337",
+  "vaults_root": "0xee0e32bf0f72c31a13dfcf6c967d6f67cb031bed6c8783908e476b180a5de090",
+  "nonce": "9eb8f44731e3edd9f186cf43b3c5f525e0e70221fea742fbeaf40fe5beaa8a7a",
+  "leaf_rule": "keccak256(keccak256(abi.encode(vaultChain, vault, strategyHash, chainid, key))), sorted pairs",
+  "leaves": [
+    {
+      "name": "vault_a",
+      "vault_chain": 31337,
+      "vault": "0x2222222222222222222222222222222222222222",
+      "strategy_hash": "0xd3b76bf6803fde2a360c1efa4b1c8e2e3b79cb80509ade1c0bb70d72c155456e",
+      "signer": "0x2E65Ce26d316338bd41096Cad5D377e977E3b034",
+      "leaf": "0xbc80e00c1b4cdadcaf1eda19533e3b25c36dcb90ba5bef83622d504b6ddacbd4",
+      "proof": [
+        "0x024c3e4d4d39cd2fdc538daf2e6231438a454c343ec3975bab09b9394ed95282",
+        "0x02299b7d11c9a11ef34cad96ca50ed6048577fe82ad30c974391067d88cd2d67"
+      ]
+    },
+    {
+      "name": "vault_b",
+      "vault_chain": 31337,
+      "vault": "0x3333333333333333333333333333333333333333",
+      "strategy_hash": "0xd3b76bf6803fde2a360c1efa4b1c8e2e3b79cb80509ade1c0bb70d72c155456e",
+      "signer": "0x22aa6A7E9f3024563dd4F39fdE22c76099B1cA6D",
+      "leaf": "0x024c3e4d4d39cd2fdc538daf2e6231438a454c343ec3975bab09b9394ed95282",
+      "proof": [
+        "0xbc80e00c1b4cdadcaf1eda19533e3b25c36dcb90ba5bef83622d504b6ddacbd4",
+        "0x02299b7d11c9a11ef34cad96ca50ed6048577fe82ad30c974391067d88cd2d67"
+      ]
+    },
+    {
+      "name": "builder",
+      "vault_chain": 0,
+      "vault": "0x0000000000000000000000000000000000000000",
+      "strategy_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "signer": "0xDA5459AA31D19C0ac2fBcD675f3637a659612261",
+      "leaf": "0x02299b7d11c9a11ef34cad96ca50ed6048577fe82ad30c974391067d88cd2d67",
+      "proof": [
+        "0x2696849d08824590ba94be26f0f0fd7350139c6fa984d8c4a183a520af93db67"
+      ]
+    }
+  ]
+}

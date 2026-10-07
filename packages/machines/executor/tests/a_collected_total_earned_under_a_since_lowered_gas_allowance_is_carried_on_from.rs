@@ -22,7 +22,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256, U256, keccak256};
-use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolCall;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
@@ -46,13 +45,15 @@ fn bundle() -> B256 {
     B256::repeat_byte(0x42)
 }
 
-/// The key the executor derives for a vault (`key_for` in its `main.rs`).
-fn executor_key(vault: Address) -> Address {
-    let mut seed = chain::attest::image_digest("executor").to_vec();
-    seed.extend_from_slice(vault.as_slice());
-    PrivateKeySigner::from_bytes(&keccak256(seed))
-        .unwrap()
-        .address()
+/// The executor's key for the vault: made inside the executor, so learnt
+/// here from its first question to the registry about its own key.
+static EXECUTOR_KEY: std::sync::Mutex<Option<Address>> = std::sync::Mutex::new(None);
+
+/// The key the station approves: none until the executor's own key has
+/// asked whether it is blessed (as it does before it asks for the
+/// approval), then that key, as the approval it would send leaves it.
+fn executor_key(_vault: Address) -> Address {
+    EXECUTOR_KEY.lock().unwrap().unwrap_or(Address::ZERO)
 }
 
 struct Node {
@@ -115,6 +116,11 @@ fn answer_call(node: &Node, input: &[u8]) -> Option<Vec<u8>> {
             IStation::approvedKeyCall::abi_encode_returns(&executor_key(vault()))
         }
         IAttestationRegistry::isBlessedForCall::SELECTOR => {
+            if let Ok(call) = IAttestationRegistry::isBlessedForCall::abi_decode(input)
+                && call.signer != Address::ZERO
+            {
+                EXECUTOR_KEY.lock().unwrap().get_or_insert(call.signer);
+            }
             IAttestationRegistry::isBlessedForCall::abi_encode_returns(&true)
         }
         IAttestationRegistry::blessingTtlCall::SELECTOR => word(TTL),

@@ -56,8 +56,10 @@ contract CrossChainClosingTest is Fixture {
         station = stationOf(vault);
 
         blessExecutorKey(executor, address(vault), bundle);
-        bytes memory journal = journalFor(UNWINDER_IMAGE, unwinder, leafFor(address(vault), bundle));
-        attestation.bless(sealOf(journal), journal, block.chainid, address(vault), bundle, new bytes32[](0));
+        bytes memory journal = journalFor(UNWINDER_IMAGE, unwinder, leafFor(address(vault), bundle, unwinder));
+        attestation.bless(
+            sealOf(journal), journal, block.chainid, address(vault), bundle, unwinder, new bytes32[](0)
+        );
         vm.prank(executor);
         vault.confirmStations();
         assertTrue(vault.state() == VaultState.Open);

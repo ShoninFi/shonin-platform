@@ -41,19 +41,29 @@ struct Args {
     chain_args: chain::ChainArgs,
     #[arg(long)]
     store: PathBuf,
+    /// A public copy of the store to read through to for any file not on
+    /// disk: fetched from `<url>/sha256-<hash>/<name>`, checked against its
+    /// hash, then kept.
+    #[arg(long, env = "SHONIN_STORE_URL")]
+    store_url: Option<String>,
     /// Where the build service answers, for the queue and for submissions.
+    /// Without one the snapshot has no queue and uploads are refused.
     #[arg(long)]
-    builder_url: String,
+    builder_url: Option<String>,
     /// Where the executor serves each vault's signed usage total.
-    #[arg(long)]
+    #[arg(long, env = "SHONIN_EXECUTOR_URL")]
     executor_url: String,
     #[arg(long, default_value_t = 19_081)]
     port: u16,
+    /// The address to listen on: 0.0.0.0 in a container.
+    #[arg(long, default_value = "127.0.0.1")]
+    listen: std::net::IpAddr,
 }
 
 struct Service {
     indexer: Arc<Indexer>,
-    builder: String,
+    /// None where no build service is attached: no queue, no uploads.
+    builder: Option<String>,
     executor: String,
     /// For asking the executor and the build service, bounded so one that
     /// stops answering can't hold a request open for good.
@@ -74,12 +84,19 @@ async fn main() -> Result<()> {
     // it connects: one chain out of reach holds up none of the others, and
     // is answered for as not connected yet.
     let connections = indexer::connections(&args.chain_args)?;
-    let indexer = Arc::new(Indexer::new(
+    let mut indexer = Indexer::new(
         connections.expected.clone(),
         args.store.clone(),
-        Some(args.builder_url.clone()),
-    ));
+        args.builder_url.clone(),
+    );
+    if let Some(url) = args.store_url.as_deref().filter(|url| !url.is_empty()) {
+        indexer = indexer.with_store_url(url);
+    }
+    let indexer = Arc::new(indexer);
     indexer.take(connections);
+    if args.builder_url.is_none() {
+        tracing::info!("no build service is attached: no queue, and uploads are refused");
+    }
     let reader = indexer.clone();
     tokio::spawn(async move { reader.run().await });
 
@@ -107,12 +124,13 @@ async fn main() -> Result<()> {
             )),
         )
         .route("/api/{chain}/health", post(post_health))
+        .route("/api/{chain}/health/{vault}/signed", get(signed_health))
         .route("/api/{chain}/usage/{vault}", get(usage))
         .route("/api/store/{hash}/{name}", get(store_file))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(service);
 
-    let address = SocketAddr::from(([127, 0, 0, 1], args.port));
+    let address = SocketAddr::from((args.listen, args.port));
     let listener = tokio::net::TcpListener::bind(address).await?;
     tracing::info!(%address, "the API is open");
     axum::serve(listener, app).await?;
@@ -597,9 +615,13 @@ async fn job(
     if !is_job_id(&id) {
         return Err(StatusCode::BAD_REQUEST);
     }
+    // No build service, no jobs.
+    let Some(builder) = &service.builder else {
+        return Err(StatusCode::NOT_FOUND);
+    };
     let reply = service
         .http
-        .get(format!("{}/jobs/{id}", service.builder))
+        .get(format!("{builder}/jobs/{id}"))
         .send()
         .await
         .map_err(|error| {
@@ -652,6 +674,9 @@ async fn uploads(
             }),
         )
     };
+    let Some(builder) = &service.builder else {
+        return Err(fail(StatusCode::SERVICE_UNAVAILABLE, NO_UPLOADS));
+    };
     let Json(upload) = upload.map_err(|rejection| {
         if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
             fail(rejection.status(), &shared::archive::upload_too_large())
@@ -661,7 +686,7 @@ async fn uploads(
     })?;
     let reply = service
         .http
-        .post(format!("{}/{chain}/uploads", service.builder))
+        .post(format!("{builder}/{chain}/uploads"))
         .timeout(service.upload_timeout)
         .json(&upload)
         .send()
@@ -695,6 +720,9 @@ async fn uploads(
     })
 }
 
+/// What an upload is told where no build service is attached.
+const NO_UPLOADS: &str = "this platform takes no uploads here: no build service is attached to it";
+
 /// An executor's report on how a strategy is running.
 /// Take a health report, but only from a key the registry blessed for that
 /// vault. Anyone may read a report; only the instance running the strategy may
@@ -705,6 +733,45 @@ async fn post_health(
     Json(post): Json<HealthPost>,
 ) -> StatusCode {
     service.indexer.take_health(chain, post).await.status()
+}
+
+/// The latest report taken for a vault, as its executor posted it, signature
+/// and all, so whoever reads it can check the signer and the time for
+/// themselves. 404 if none was taken since this API started.
+async fn signed_health(
+    State(service): State<Arc<Service>>,
+    UrlPath((chain, vault)): UrlPath<(Chain, String)>,
+) -> Result<Json<HealthPost>, (StatusCode, Json<shared::ApiError>)> {
+    let refused = |status: StatusCode, message: &str| {
+        (
+            status,
+            Json(shared::ApiError {
+                message: message.to_string(),
+            }),
+        )
+    };
+    let vault = match served(&service, chain)? {
+        On::Evm(_) => vault
+            .parse::<Address>()
+            .ok()
+            .map(|vault| shared::ChainAddress::Evm(vault.0.0)),
+        On::Solana(_) => vault
+            .parse::<chain::solana::Pubkey>()
+            .ok()
+            .map(|vault| shared::ChainAddress::Solana(vault.to_bytes())),
+    }
+    .ok_or_else(|| refused(StatusCode::BAD_REQUEST, "that is not an address"))?;
+    service
+        .indexer
+        .signed_health(chain, vault)
+        .await
+        .map(Json)
+        .ok_or_else(|| {
+            refused(
+                StatusCode::NOT_FOUND,
+                "no report has been taken for this vault",
+            )
+        })
 }
 
 /// A vault's running usage total, as its executor signed it: what an author
@@ -867,7 +934,7 @@ mod tests {
         let store = std::env::temp_dir().join(format!("shonin-api-store-{}", std::process::id()));
         Arc::new(Service {
             indexer: Arc::new(Indexer::new(Vec::new(), store, None)),
-            builder,
+            builder: Some(builder),
             executor: "http://127.0.0.1:1".to_string(),
             http: indexer::http(),
             upload_timeout: std::time::Duration::from_secs(3),
@@ -1345,6 +1412,64 @@ mod tests {
             sealed: false,
             package: None,
         }
+    }
+
+    /// The same service with no build service attached, as in the cloud.
+    fn without_a_builder(service: Arc<Service>) -> Arc<Service> {
+        Arc::new(Service {
+            indexer: service.indexer.clone(),
+            builder: None,
+            executor: service.executor.clone(),
+            http: indexer::http(),
+            upload_timeout: service.upload_timeout,
+        })
+    }
+
+    /// With no build service attached, an upload is refused at once and
+    /// says why, and a job is one there isn't.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_no_build_service_an_upload_is_refused_at_once_and_says_why() {
+        let service = without_a_builder(a_service_on_base(String::new()).await);
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            uploads(
+                State(service.clone()),
+                UrlPath(Chain::Base),
+                Ok(Json(an_upload())),
+            ),
+        )
+        .await
+        .expect("an upload with nowhere to go was answered at once");
+        let (status, Json(said)) = answer.expect_err("the upload is refused");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(said.message, NO_UPLOADS);
+        let answer = job(State(service), UrlPath("8800".to_string())).await;
+        assert_eq!(answer.err(), Some(StatusCode::NOT_FOUND));
+    }
+
+    /// A vault with no report taken has no signed report to give, and what
+    /// isn't an address is refused before anything is looked up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_vault_with_no_report_taken_has_no_signed_report() {
+        let service = a_service_on_base(String::new()).await;
+        let answer = signed_health(
+            State(service.clone()),
+            UrlPath((Chain::Base, format!("{VAULT:?}"))),
+        )
+        .await;
+        assert_eq!(
+            answer.err().map(|(status, _)| status),
+            Some(StatusCode::NOT_FOUND)
+        );
+        let answer = signed_health(
+            State(service),
+            UrlPath((Chain::Base, "../../health".to_string())),
+        )
+        .await;
+        assert_eq!(
+            answer.err().map(|(status, _)| status),
+            Some(StatusCode::BAD_REQUEST)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

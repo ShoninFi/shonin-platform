@@ -281,8 +281,8 @@ contract VaultPropertiesTest is Fixture {
         (Vault other, bytes32 otherBundle) = openVault();
         assertTrue(address(other) != address(vault));
         // The same executor key attested for both vaults.
-        bytes32 leafA = leafFor(address(vault), bundle);
-        bytes32 leafB = leafFor(address(other), otherBundle);
+        bytes32 leafA = leafFor(address(vault), bundle, executor);
+        bytes32 leafB = leafFor(address(other), otherBundle, executor);
         bytes32 root = leafA < leafB
             ? keccak256(abi.encodePacked(leafA, leafB))
             : keccak256(abi.encodePacked(leafB, leafA));
@@ -291,8 +291,10 @@ contract VaultPropertiesTest is Fixture {
         proofA[0] = leafB;
         bytes32[] memory proofB = new bytes32[](1);
         proofB[0] = leafA;
-        attestation.bless(sealOf(journal), journal, block.chainid, address(vault), bundle, proofA);
-        attestation.bless(sealOf(journal), journal, block.chainid, address(other), otherBundle, proofB);
+        attestation.bless(sealOf(journal), journal, block.chainid, address(vault), bundle, executor, proofA);
+        attestation.bless(
+            sealOf(journal), journal, block.chainid, address(other), otherBundle, executor, proofB
+        );
         assertTrue(attestation.isBlessedFor(executor, block.chainid, address(other), otherBundle));
 
         skip(1 days);

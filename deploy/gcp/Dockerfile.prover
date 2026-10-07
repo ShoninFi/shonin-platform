@@ -1,0 +1,59 @@
+# syntax=docker/dockerfile:1
+# The attestation's prover: proves the executor's token in RISC Zero's zkVM,
+# wraps the proof in Groth16 and posts the seal back to the executor.
+# Runs on the prover's Spot VM (Container-Optimized OS), started by
+# deploy/gcp/prover/startup.sh, which powers the VM off when it exits.
+# Built from the repository root by `task cloud:build NAME=prover NETWORK=testnet`:
+#   docker build --platform linux/amd64 --build-arg EXECUTOR_URL=... \
+#     --build-context guest=<directory holding shonin-attestation-guest.bin> \
+#     -f deploy/gcp/Dockerfile.prover .
+#
+# The guest is not built here: building it reproducibly needs Docker itself
+# (RISC Zero's guest-builder image). Its ELF, built by
+# `SHONIN_ATTESTATION_BUILD_GUEST=1 cargo build -p shonin-attestation-methods`
+# (under the target directory's riscv-guest/.../docker/), comes in as the
+# build context `guest`, and the prover refuses to start unless its image id
+# is the one every checker pins.
+#
+# The Groth16 step runs in RISC Zero's prover image through the VM's Docker:
+# the container is given the host's Docker socket and a work directory at
+# the same path on both sides (RISC0_WORK_DIR), which that image mounts.
+# The prover holds no secret.
+
+FROM rust:1.98.1-slim-bookworm AS build
+WORKDIR /src
+COPY . .
+# rust-toolchain.toml pins the same compiler; --locked builds exactly Cargo.lock.
+RUN cargo build --release --locked -p shonin-attestation --bin attestation-prover
+
+# RISC Zero's prover server (r0vm), the version the host crate speaks to, and
+# Docker's client for the Groth16 step, each checked against its hash.
+FROM debian:bookworm-slim AS tools
+ARG R0VM_VERSION=3.0.6
+ARG R0VM_SHA256=615d961bfb81d318db5071d7548389c850e324ac7f421c075176daf26082a60a
+ARG DOCKER_VERSION=28.5.1
+ARG DOCKER_SHA256=5c0d19f31fece1accd0358bb8cff591fe25d7b6cba19f0fd412cbfdc07f75ff6
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/*
+RUN curl -fsSLo /tmp/risczero.tgz \
+      "https://github.com/risc0/risc0/releases/download/v${R0VM_VERSION}/cargo-risczero-x86_64-unknown-linux-gnu.tgz" && \
+    echo "${R0VM_SHA256}  /tmp/risczero.tgz" | sha256sum -c - && \
+    tar -xzf /tmp/risczero.tgz -C /usr/local/bin r0vm && \
+    curl -fsSLo /tmp/docker.tgz \
+      "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz" && \
+    echo "${DOCKER_SHA256}  /tmp/docker.tgz" | sha256sum -c - && \
+    tar -xzf /tmp/docker.tgz -C /tmp && install /tmp/docker/docker /usr/local/bin/docker
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=tools /usr/local/bin/r0vm /usr/local/bin/docker /usr/local/bin/
+COPY --from=build /src/target/release/attestation-prover /usr/local/bin/attestation-prover
+COPY --from=guest shonin-attestation-guest.bin /opt/shonin/guest.elf
+ARG EXECUTOR_URL
+ENV SHONIN_EXECUTOR_URL=${EXECUTOR_URL} \
+    SHONIN_GUEST_ELF=/opt/shonin/guest.elf \
+    RISC0_SERVER_PATH=/usr/local/bin/r0vm \
+    RISC0_WORK_DIR=/var/lib/shonin/groth16
+ENTRYPOINT ["/usr/local/bin/attestation-prover"]
+CMD ["--idle-exit-seconds", "600"]

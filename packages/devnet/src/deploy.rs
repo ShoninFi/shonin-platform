@@ -25,6 +25,11 @@ const LOCAL_TIMELOCK: u64 = 2 * 24 * 60 * 60;
 const MAINNET_MIN_TIMELOCK: u64 = 2 * 24 * 60 * 60;
 /// How long a blessing lasts before an executor has to attest again.
 const BLESSING_TTL: u64 = 72 * 60 * 60;
+/// The same on a local chain, whose clock runs an hour a second: ninety
+/// days, so a blessing lasts over half an hour of real time and the path from
+/// a fresh key's blessing to its gas and its approval at the station is never
+/// a race against it, while renewals still come round within a run.
+const LOCAL_BLESSING_TTL: u64 = 90 * 24 * 60 * 60;
 /// What publishing costs, in the asset's own units: a flat dollar, for the
 /// review and the build.
 const PUBLISH_FEE: u64 = 1_000_000;
@@ -471,6 +476,7 @@ async fn deploy(
         NetworkName::Testnet => (0, 0, 0),
         NetworkName::Mainnet => (MAINNET_MIN_TIMELOCK, MAINNET_MIN_TIMELOCK, 0),
     };
+    let blessing_ttl = blessing_ttl(network);
     let roles = Roles {
         admin: client.account(Role::Admin)?,
         platform: client.account(Role::Platform)?,
@@ -527,7 +533,7 @@ async fn deploy(
         artifacts,
         admin,
         "AttestationRegistry",
-        (admin, verifier, timelock, min_timelock, BLESSING_TTL).abi_encode_params(),
+        (admin, verifier, timelock, min_timelock, blessing_ttl).abi_encode_params(),
     )
     .await?;
     let publishing = put(
@@ -827,6 +833,15 @@ type Timers = (
     u64,
 );
 
+/// How long a blessing lasts on `network`: stretched on the local chains,
+/// whose clock runs an hour a second, and three days everywhere else.
+fn blessing_ttl(network: NetworkName) -> u64 {
+    match network {
+        NetworkName::Local => LOCAL_BLESSING_TTL,
+        NetworkName::Testnet | NetworkName::Mainnet => BLESSING_TTL,
+    }
+}
+
 /// Every timer a vault runs on, in the order `Timers` declares them. The
 /// local chains move an hour per block, so anything a transaction has to beat
 /// is stretched to survive a block or two.
@@ -1125,7 +1140,11 @@ async fn put_everywhere(
 }
 
 /// A contract's creation code, with `libraries` linked in where it calls them.
-fn creation_code(artifacts: &Path, name: &str, libraries: &[(&str, Address)]) -> Result<Vec<u8>> {
+pub(crate) fn creation_code(
+    artifacts: &Path,
+    name: &str,
+    libraries: &[(&str, Address)],
+) -> Result<Vec<u8>> {
     let path = artifacts
         .join(format!("{name}.sol"))
         .join(format!("{name}.json"));
@@ -1607,6 +1626,16 @@ mod tests {
             station_factory,
             station_implementation: None,
         }
+    }
+
+    /// A blessing lasts three days on the public chains, and long enough on
+    /// a local chain (an hour a second) to last over half an hour of real
+    /// time.
+    #[test]
+    fn a_blessing_lasts_three_days_on_the_public_chains_and_half_an_hour_of_real_time_locally() {
+        assert_eq!(blessing_ttl(NetworkName::Testnet), 72 * 3_600);
+        assert_eq!(blessing_ttl(NetworkName::Mainnet), 72 * 3_600);
+        assert!(blessing_ttl(NetworkName::Local) / 3_600 >= 30 * 60);
     }
 
     #[test]

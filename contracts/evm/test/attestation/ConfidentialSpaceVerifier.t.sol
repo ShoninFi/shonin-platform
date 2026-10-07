@@ -128,8 +128,22 @@ contract ConfidentialSpaceVerifierTest is Test {
         vm.stopPrank();
     }
 
+    /// The fixture's instance holds one key, its own, for one vault: the
+    /// root is that one leaf, on the fixture's chain.
     function bless(AttestationRegistry attestation) internal {
-        attestation.bless(F.SEAL, F.JOURNAL, F.VAULT_CHAIN, F.VAULT, F.STRATEGY_HASH, new bytes32[](0));
+        vm.chainId(F.VAULT_CHAIN);
+        attestation.bless(
+            F.SEAL, F.JOURNAL, F.VAULT_CHAIN, F.VAULT, F.STRATEGY_HASH, F.SIGNER, new bytes32[](0)
+        );
+    }
+
+    function test_the_fixture_s_root_is_the_leaf_naming_its_key() public pure {
+        bytes32 leaf = keccak256(
+            bytes.concat(
+                keccak256(abi.encode(F.VAULT_CHAIN, F.VAULT, F.STRATEGY_HASH, F.VAULT_CHAIN, F.SIGNER))
+            )
+        );
+        assertEq(F.VAULTS_ROOT, leaf, "regenerate the fixture over the leaf that names the key");
     }
 
     function test_the_registry_blesses_an_executor_through_the_checker_within_budget() public {

@@ -1,0 +1,64 @@
+{
+  "aud": "https://shonin.fi/attestation",
+  "exp": 1791328347,
+  "iat": 1791324747,
+  "iss": "https://confidentialcomputing.googleapis.com",
+  "nbf": 1791324747,
+  "sub": "https://www.googleapis.com/compute/v1/projects/shonin-testnet/zones/us-central1-a/instances/shonin-smoke",
+  "eat_nonce": "9eb8f44731e3edd9f186cf43b3c5f525e0e70221fea742fbeaf40fe5beaa8a7a",
+  "eat_profile": "https://cloud.google.com/confidential-computing/confidential-space/docs/reference/token-claims",
+  "secboot": true,
+  "oemid": 11129,
+  "hwmodel": "GCP_INTEL_TDX",
+  "swname": "CONFIDENTIAL_SPACE",
+  "swversion": [
+    "260900"
+  ],
+  "attester_tcb": [
+    "INTEL"
+  ],
+  "dbgstat": "disabled-since-boot",
+  "submods": {
+    "confidential_space": {
+      "support_attributes": [
+        "LATEST",
+        "STABLE",
+        "USABLE"
+      ],
+      "monitoring_enabled": {
+        "memory": false
+      }
+    },
+    "container": {
+      "image_reference": "us-central1-docker.pkg.dev/shonin-testnet/shonin/smoke@sha256:eead1b2f4b6ca31b07ed6a06259dacfae647c3508b9e5f616d48df7fb85f14fc",
+      "image_digest": "sha256:eead1b2f4b6ca31b07ed6a06259dacfae647c3508b9e5f616d48df7fb85f14fc",
+      "restart_policy": "Never",
+      "image_id": "sha256:55b3a42d5dd63e6a50001a92b17d584276732e539e1cb5a6122a8f77905841c9",
+      "env": {
+        "CURL_CA_BUNDLE": "/cacert.pem",
+        "HOSTNAME": "shonin-smoke",
+        "NONCE": "9eb8f44731e3edd9f186cf43b3c5f525e0e70221fea742fbeaf40fe5beaa8a7a",
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      },
+      "args": [
+        "/bin/sh",
+        "/run.sh"
+      ]
+    },
+    "gce": {
+      "zone": "us-central1-a",
+      "project_id": "shonin-testnet",
+      "project_number": "889438049602",
+      "instance_name": "shonin-smoke",
+      "instance_id": "7168990097309224185"
+    }
+  },
+  "tdx": {
+    "gcp_attester_tcb_status": "UpToDate",
+    "gcp_attester_tcb_date": "2025-05-14T00:00:00Z",
+    "tcb_evaluation_data_number": 19
+  },
+  "google_service_accounts": [
+    "shonin-workload@shonin-testnet.iam.gserviceaccount.com"
+  ]
+}

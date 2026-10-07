@@ -42,13 +42,13 @@ async fn the_usage_total_is_signed_under_a_digest_the_executor_works_out_itself(
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
+    let key = executor.node.executor_key();
     drop(executor);
 
     let total: U256 = served["total"].as_str().unwrap().parse().unwrap();
     let as_of = served["as_of"].as_u64().unwrap();
     let signature = alloy::hex::decode(served["signature"].as_str().unwrap()).unwrap();
     let signature = Signature::try_from(signature.as_slice()).unwrap();
-    let key = black_box::executor_key(black_box::vault());
     let signer_of = |total: U256| -> Address {
         signature
             .recover_address_from_msg(black_box::usage_digest(total, as_of).as_slice())

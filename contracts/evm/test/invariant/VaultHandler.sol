@@ -2032,7 +2032,7 @@ contract VaultHandler is Test {
     /// checker's key or the admin's own.
     function _blessAs(address signer, bytes32 image, bytes32 project_, bool platformChecker) internal {
         bytes32 leaf = keccak256(
-            bytes.concat(keccak256(abi.encode(block.chainid, address(vault), bundle, block.chainid)))
+            bytes.concat(keccak256(abi.encode(block.chainid, address(vault), bundle, block.chainid, signer)))
         );
         bytes memory journal = abi.encode(
             AttestationRegistry.Journal({
@@ -2048,7 +2048,13 @@ contract VaultHandler is Test {
         // With a gas limit: a checker the walk proposed at a precompile's
         // address burns all the gas it is given.
         try attestation.bless{gas: 3_000_000}(
-            abi.encodePacked(r, s, v), journal, block.chainid, address(vault), bundle, new bytes32[](0)
+            abi.encodePacked(r, s, v),
+            journal,
+            block.chainid,
+            address(vault),
+            bundle,
+            signer,
+            new bytes32[](0)
         ) {
             _hit(
                 platformChecker
@@ -3395,7 +3401,9 @@ contract VaultHandler is Test {
 
     function _renew() internal {
         bytes32 leaf = keccak256(
-            bytes.concat(keccak256(abi.encode(block.chainid, address(vault), bundle, block.chainid)))
+            bytes.concat(
+                keccak256(abi.encode(block.chainid, address(vault), bundle, block.chainid, executor))
+            )
         );
         bytes memory journal = abi.encode(
             AttestationRegistry.Journal({
@@ -3408,7 +3416,13 @@ contract VaultHandler is Test {
         );
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(attestorKey, _ethSigned(keccak256(journal)));
         try attestation.bless(
-            abi.encodePacked(r, s, v), journal, block.chainid, address(vault), bundle, new bytes32[](0)
+            abi.encodePacked(r, s, v),
+            journal,
+            block.chainid,
+            address(vault),
+            bundle,
+            executor,
+            new bytes32[](0)
         ) {} catch {}
         if (!station.stopped()) {
             vm.prank(executor);

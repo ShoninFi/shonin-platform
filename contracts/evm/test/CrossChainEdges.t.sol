@@ -66,8 +66,8 @@ contract CrossChainEdgesTest is Fixture {
         assertTrue(v.state() == VaultState.Activating);
 
         blessExecutorKey(executor, address(v), b);
-        bytes memory journal = journalFor(UNWINDER_IMAGE, unwinder, leafFor(address(v), b));
-        attestation.bless(sealOf(journal), journal, block.chainid, address(v), b, new bytes32[](0));
+        bytes memory journal = journalFor(UNWINDER_IMAGE, unwinder, leafFor(address(v), b, unwinder));
+        attestation.bless(sealOf(journal), journal, block.chainid, address(v), b, unwinder, new bytes32[](0));
         vm.prank(executor);
         v.confirmStations();
         assertTrue(v.state() == VaultState.Open);

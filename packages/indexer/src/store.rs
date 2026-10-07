@@ -3,8 +3,16 @@
 //! The store is content-addressed: the chain holds a hash, and the bytes
 //! behind it are here. Nothing in it is believed on its own — a reader with
 //! the hash can check the bytes themselves.
+//!
+//! A store can read through to a public copy (`--store-url`): a file not on
+//! disk is fetched from `<base>/sha256-<hash>/<name>`, checked against the
+//! hash it is filed under, kept on disk, and from then on read as any file
+//! on disk is. A fetched file that doesn't match its hash is never kept.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use shared::Report;
 use shared::manifest::{Canonical, hash_bytes};
@@ -12,11 +20,54 @@ use shared::model::bundle::{Source, SourceFile};
 
 pub struct Store {
     root: PathBuf,
+    remote: Option<Remote>,
 }
+
+/// The public copy a store reads through to, and what it recently failed to
+/// find there.
+struct Remote {
+    base: String,
+    /// Files asked for and not had (absent, unreachable or not matching
+    /// their hash), and when: not asked again until [`MISS_RETRY`] has
+    /// passed, so a sealed strategy's absent source isn't asked for on every
+    /// read of the chain.
+    missed: Mutex<HashMap<(String, String), Instant>>,
+}
+
+/// How long a file the public copy didn't give is left before it is asked
+/// for again.
+pub const MISS_RETRY: Duration = Duration::from_secs(300);
+
+/// How many misses are held before those past [`MISS_RETRY`] are let go.
+const MOST_MISSES_HELD: usize = 4096;
+
+/// How long one fetch from the public copy may take.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The most a fetched file may hold: well past any bundle the builder makes.
+const MOST_FETCHED_BYTES: u64 = 256 * 1024 * 1024;
 
 impl Store {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self { root, remote: None }
+    }
+
+    /// Where the store is kept on disk.
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
+    /// A store that fetches what it doesn't hold from a public copy at
+    /// `base` (no trailing slash needed), checking each file against its
+    /// hash before keeping it.
+    pub fn with_remote(root: PathBuf, base: &str) -> Self {
+        Self {
+            root,
+            remote: Some(Remote {
+                base: base.trim_end_matches('/').to_string(),
+                missed: Mutex::new(HashMap::new()),
+            }),
+        }
     }
 
     /// Where a hash's files are kept, if it is a hash: anything else could
@@ -38,7 +89,101 @@ impl Store {
     }
 
     pub fn bytes(&self, hash: &str, name: &str) -> Option<Vec<u8>> {
-        std::fs::read(self.file(hash, name)?).ok()
+        let path = self.file(hash, name)?;
+        match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(_) => self.fetch(hash, name, &path),
+        }
+    }
+
+    /// Whether the store holds a file, on disk or (read through) in its
+    /// public copy.
+    fn holds(&self, hash: &str, name: &str) -> bool {
+        self.file(hash, name).is_some_and(|path| path.exists()) || self.bytes(hash, name).is_some()
+    }
+
+    /// A file from the public copy, if it has it and it is what its hash
+    /// says: kept at `path` and returned. Only the public names are ever
+    /// asked for, so nothing sealed is.
+    fn fetch(&self, hash: &str, name: &str, path: &std::path::Path) -> Option<Vec<u8>> {
+        let remote = self.remote.as_ref()?;
+        if !PUBLIC.contains(&name) {
+            return None;
+        }
+        let directory = hash.replace(':', "-");
+        let key = (directory.clone(), name.to_string());
+        {
+            let missed = remote.missed.lock().unwrap_or_else(|e| e.into_inner());
+            if missed.get(&key).is_some_and(|at| at.elapsed() < MISS_RETRY) {
+                return None;
+            }
+        }
+        let url = format!("{}/{directory}/{name}", remote.base);
+        let fetched = blocking(move || get(&url));
+        let checked = fetched.filter(|bytes| {
+            let good = self.matches(hash, name, bytes);
+            if !good {
+                tracing::warn!(
+                    hash,
+                    name,
+                    "a file from the public store did not match its hash, and was not kept"
+                );
+            }
+            good
+        });
+        let Some(bytes) = checked else {
+            let mut missed = remote.missed.lock().unwrap_or_else(|e| e.into_inner());
+            if missed.len() >= MOST_MISSES_HELD {
+                missed.retain(|_, at| at.elapsed() < MISS_RETRY);
+            }
+            missed.insert(key, Instant::now());
+            return None;
+        };
+        // Written aside and moved into place, so a reader never sees half a
+        // file under its name.
+        let kept = path.parent().is_some_and(|directory| {
+            let aside = directory.join(format!(".{name}.{}.part", std::process::id()));
+            std::fs::create_dir_all(directory).is_ok()
+                && std::fs::write(&aside, &bytes).is_ok()
+                && std::fs::rename(&aside, path).is_ok()
+        });
+        if !kept {
+            tracing::warn!(
+                hash,
+                name,
+                "a file from the public store could not be kept on disk"
+            );
+        }
+        Some(bytes)
+    }
+
+    /// Whether fetched bytes are what the hash they are filed under says.
+    /// A file the hash is of is checked against it: a source archive, a
+    /// bundle and a report by their bytes, a manifest by its canonical
+    /// hash. A bundle's component is checked against the component hash its
+    /// build recorded, and that record against the bundle it is filed
+    /// under; the record's other fields (the toolchain, the build time) are
+    /// the builder's word, as they are on disk.
+    fn matches(&self, hash: &str, name: &str, bytes: &[u8]) -> bool {
+        let Some(digits) = hash
+            .strip_prefix("sha256:")
+            .or_else(|| hash.strip_prefix("sha256-"))
+        else {
+            return false;
+        };
+        let hash = format!("sha256:{digits}");
+        match name {
+            "source.tar" | "bundle.tar" | "report.json" => hash_bytes(bytes) == hash,
+            "manifest.json" => serde_json::from_slice::<Canonical>(bytes)
+                .is_ok_and(|canonical| canonical.hash() == hash),
+            "hashes.json" => serde_json::from_slice::<serde_json::Value>(bytes)
+                .is_ok_and(|hashes| hashes["bundle"].as_str() == Some(hash.as_str())),
+            "component.wasm" => self
+                .hashes(&hash)
+                .and_then(|hashes| hashes["component"].as_str().map(str::to_string))
+                .is_some_and(|component| component == hash_bytes(bytes)),
+            _ => false,
+        }
     }
 
     /// The manifest the builder recorded: the author's file and what the
@@ -84,10 +229,7 @@ impl Store {
 
     /// Whether the source was published, and where to read it.
     pub fn source(&self, source_hash: &str) -> Source {
-        if self
-            .file(source_hash, "source.tar")
-            .is_some_and(|path| path.exists())
-        {
+        if self.holds(source_hash, "source.tar") {
             Source::Published {
                 repo: format!("the platform's store, at {source_hash}"),
                 commit: source_hash.to_string(),
@@ -136,6 +278,10 @@ impl Store {
     /// and the models it carries) is kept for the attested roles alone, as
     /// its source is, so the bundle's files are served only where its source
     /// was published.
+    ///
+    /// Only what is on disk is served: a request for a hash the chain never
+    /// named sends nothing to the public copy (whoever asks can ask it
+    /// themselves), and what the record names was read through already.
     pub fn read_path(&self, hash: &str, name: &str) -> Option<(Vec<u8>, &'static str)> {
         if !PUBLIC.contains(&name) {
             return None;
@@ -143,7 +289,7 @@ impl Store {
         if BUNDLE.contains(&name) && !self.bundle_published(hash) {
             return None;
         }
-        let bytes = self.bytes(hash, name)?;
+        let bytes = self.on_disk(hash, name)?;
         let kind = if name.ends_with(".json") {
             "application/json"
         } else if name.ends_with(".wasm") {
@@ -158,10 +304,60 @@ impl Store {
     /// build recorded. A bundle whose build says nothing of its source is
     /// taken for a sealed one.
     fn bundle_published(&self, bundle_hash: &str) -> bool {
-        self.hashes(bundle_hash)
+        self.on_disk(bundle_hash, "hashes.json")
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
             .and_then(|hashes| hashes["source"].as_str().map(str::to_string))
-            .is_some_and(|source| matches!(self.source(&source), Source::Published { .. }))
+            .and_then(|source| self.file(&source, "source.tar"))
+            .is_some_and(|path| path.is_file())
     }
+
+    /// A file as it is on disk, never read through.
+    fn on_disk(&self, hash: &str, name: &str) -> Option<Vec<u8>> {
+        std::fs::read(self.file(hash, name)?).ok()
+    }
+}
+
+/// Run a blocking fetch off the async runtime's own threads: on a thread of
+/// its own, with the runtime told this one is blocked where it can be.
+fn blocking<T: Send + 'static>(fetch: impl FnOnce() -> T + Send + 'static) -> T {
+    let run = move || {
+        std::thread::spawn(fetch)
+            .join()
+            .expect("a fetch from the public store panicked")
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(run)
+        }
+        _ => run(),
+    }
+}
+
+/// One file from the public copy: its bytes on a 200, nothing on anything
+/// else, or past [`MOST_FETCHED_BYTES`].
+fn get(url: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(FETCH_TIMEOUT)
+        .build()
+        .ok()?;
+    let reply = match client.get(url).send() {
+        Ok(reply) => reply,
+        Err(error) => {
+            tracing::debug!(%error, "the public store could not be asked for a file");
+            return None;
+        }
+    };
+    if !reply.status().is_success() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    reply
+        .take(MOST_FETCHED_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MOST_FETCHED_BYTES).then_some(bytes)
 }
 
 /// The files the store serves to anyone: what the builder and the reviewer

@@ -1,27 +1,60 @@
 # syntax=docker/dockerfile:1
 # The executor: runs strategies and trades for their vaults.
 # Runs on a Confidential Space VM, which attests to this image by its digest.
-# Built from the repository root: task cloud:build NAME=executor NETWORK=testnet
-#   (docker build --build-arg NETWORK_FEATURE=devnet -f deploy/gcp/Dockerfile.executor .)
+# Built from the repository root by `task cloud:build NAME=executor NETWORK=testnet`,
+# which passes the network's settings and its deployments directory:
+#   docker build --build-arg NETWORK_FEATURE=none --build-arg WITHOUT_SOLANA=1 --build-arg NETWORK=testnet \
+#     --build-arg STORE_URL=... --build-arg API_URL=... \
+#     --build-context deployments=.shonin/testnet/deployments \
+#     -f deploy/gcp/Dockerfile.executor .
+#
+# Everything it runs with is in the image, its arguments included: the
+# attestation refuses a launch that overrides the image's command or
+# environment, so a change of settings is a new image, and a new digest to
+# allow. It holds no key from outside: every key it signs with is made inside
+# the enclave.
 
 FROM rust:1.98.1-slim-bookworm AS build
 WORKDIR /src
 COPY . .
 # The network whose Solana program ids are compiled in: devnet for a testnet
-# image, mainnet for a mainnet one (task cloud:build passes it). The local
-# keypairs never reach the build, so an image without it could reach no
-# cluster.
+# image, mainnet for a mainnet one, or none for an image that serves no
+# Solana cluster (task cloud:build passes it, with WITHOUT_SOLANA=1 for none).
 ARG NETWORK_FEATURE
 # rust-toolchain.toml pins the same compiler; --locked builds exactly Cargo.lock.
-RUN : "${NETWORK_FEATURE:?pass --build-arg NETWORK_FEATURE=devnet or mainnet}" && \
-    cargo build --release --locked -p shonin-executor --bin executor --features "$NETWORK_FEATURE"
+RUN : "${NETWORK_FEATURE:?pass --build-arg NETWORK_FEATURE=devnet, mainnet or none}" && \
+    features="" && { [ "$NETWORK_FEATURE" = none ] || features="--features $NETWORK_FEATURE"; } && \
+    cargo build --release --locked -p shonin-executor --bin executor $features && \
+    mkdir -p /out/store
 
-FROM gcr.io/distroless/cc-debian12:nonroot
+# Root inside the container: the launcher's token socket
+# (/run/container_launcher/teeserver.sock) is the launcher's, and the
+# container is the machine's only workload.
+FROM gcr.io/distroless/cc-debian12
+# Confidential Space's hardened image sends the container's lines to Cloud
+# Logging only where the image allows it.
+LABEL "tee.launch_policy.log_redirect"="always"
+ARG NETWORK
+# 1 where the image serves the network's EVM chains alone (no Solana ids in it).
+ARG WITHOUT_SOLANA=
+ARG STORE_URL
+ARG API_URL
 COPY --from=build /src/target/release/executor /usr/local/bin/executor
 COPY config/chains.toml /etc/shonin/chains.toml
-# Only mainnet addresses are committed, so only they are baked in; the network
-# (SHONIN_NETWORK) and its deployments directory (SHONIN_DEPLOYMENTS_DIR) are
-# set where the image is launched.
-COPY config/deployments/mainnet /etc/shonin/deployments/mainnet
-ENV SHONIN_CHAINS=/etc/shonin/chains.toml
+# The generation's deployment files: the named build context `deployments`
+# (a build without it fails here).
+COPY --from=deployments *.json /etc/shonin/deployments/${NETWORK}/
+# The store's local copy: filled from the public store, each file believed
+# only for its hash.
+COPY --from=build /out/store /var/lib/shonin/store
+ENV SHONIN_NETWORK=${NETWORK} \
+    SHONIN_WITHOUT_SOLANA=${WITHOUT_SOLANA} \
+    SHONIN_CHAINS=/etc/shonin/chains.toml \
+    SHONIN_DEPLOYMENTS_DIR=/etc/shonin/deployments/${NETWORK} \
+    SHONIN_STORE=/var/lib/shonin/store \
+    SHONIN_STORE_URL=${STORE_URL} \
+    SHONIN_API_URL=${API_URL}
 ENTRYPOINT ["/usr/local/bin/executor"]
+# The status port is open to the VPC (the keeper, the waker and the prover
+# read it); the tokens come from the launcher.
+CMD ["--attestation", "launcher", "--port", "19085", "--listen", "0.0.0.0"]

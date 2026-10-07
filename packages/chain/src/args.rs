@@ -11,9 +11,12 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow, bail};
 use shared::Chain;
 
-use crate::client::{Client, ROLE_COUNT, Signing, keys_from_mnemonic};
+use alloy::primitives::Address;
+use alloy::signers::local::PrivateKeySigner;
+
+use crate::client::{Client, ROLE_COUNT, Role, Signing, keys_from_mnemonic};
 use crate::config::{ChainConfig, ChainConfigs, ChainKey, ChainKind, NetworkName};
-use crate::deployments::{Deployments, SolanaDeployments};
+use crate::deployments::{Deployments, Roles, SolanaDeployments};
 use crate::solana::{Platform, SolanaClient};
 
 #[derive(clap::Args, Clone, Debug)]
@@ -342,8 +345,40 @@ impl Target {
     }
 
     /// Connect to this target's chain, waiting for it to answer.
+    ///
+    /// On a testnet without the mnemonic the role accounts are the ones its
+    /// deployment names (from `SHONIN_DEPLOYMENTS_JSON` or the deployment
+    /// file, if either is there yet), and only the keeper may sign, with
+    /// [`TESTNET_KEEPER_KEY`] ([`signing_with_roles`]).
     pub async fn connect(&self) -> Result<Client> {
-        connect_to(self.network, &self.key, &self.config).await
+        let roles = match self.network {
+            NetworkName::Testnet if !mnemonic_is_set() => self.recorded_roles()?,
+            _ => None,
+        };
+        connect_with(
+            &self.key,
+            &self.config,
+            self.network,
+            signing_with_roles(self.network, roles.as_ref())?,
+        )
+        .await
+    }
+
+    /// The role accounts this chain's deployment names, if it is to hand.
+    fn recorded_roles(&self) -> Result<Option<Roles>> {
+        if let Some(value) = deployment_from_env(&self.key)? {
+            let deployments: Deployments = serde_json::from_value(value).map_err(|error| {
+                anyhow!(
+                    "{DEPLOYMENTS_JSON}'s deployment for {} is not an EVM one: {error}",
+                    self.key
+                )
+            })?;
+            return Ok(Some(deployments.roles));
+        }
+        Ok(std::fs::read_to_string(self.deployments_file())
+            .ok()
+            .and_then(|text| Deployments::from_json(&text).ok())
+            .map(|deployments| deployments.roles))
     }
 
     /// This chain's deployment: from `SHONIN_DEPLOYMENTS_JSON` when it is set
@@ -468,24 +503,100 @@ pub const DEPLOYMENTS_JSON: &str = "SHONIN_DEPLOYMENTS_JSON";
 /// The mnemonic the testnet role accounts are derived from.
 pub const TESTNET_EVM_MNEMONIC: &str = "SHONIN_TESTNET_EVM_MNEMONIC";
 
+/// The keeper's own testnet key (a `0x` private key), for a keeper that
+/// runs without the mnemonic: it signs as the keeper and nothing else.
+pub const TESTNET_KEEPER_KEY: &str = "SHONIN_TESTNET_KEEPER_KEY";
+
+fn mnemonic_is_set() -> bool {
+    std::env::var(TESTNET_EVM_MNEMONIC).is_ok_and(|v| !v.trim().is_empty())
+}
+
 /// Who signs on a network: the node on local chains, the developer's
 /// mnemonic on testnets, and nobody on mainnet, where clients only read.
+/// A testnet without the mnemonic signs nothing here; see
+/// [`signing_with_roles`].
 pub fn signing_for(network: NetworkName) -> Result<Signing> {
+    signing_with_roles(network, None)
+}
+
+/// Who signs on a network, given the role accounts its deployment names.
+///
+/// On a testnet with [`TESTNET_EVM_MNEMONIC`] set, every role signs with the
+/// key it derives. Without it, the role accounts are `roles` (none if no
+/// deployment is to hand) and the only key held is the keeper's, from
+/// [`TESTNET_KEEPER_KEY`], refused unless it is the account the deployment
+/// names as the keeper. With neither, the client only reads, and a send or
+/// a signature as a role fails at the call.
+pub fn signing_with_roles(network: NetworkName, roles: Option<&Roles>) -> Result<Signing> {
     match network {
         NetworkName::Local => Ok(Signing::Unlocked),
         NetworkName::Testnet => {
-            let phrase = std::env::var(TESTNET_EVM_MNEMONIC)
+            if let Some(phrase) = std::env::var(TESTNET_EVM_MNEMONIC)
                 .ok()
                 .filter(|v| !v.trim().is_empty())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "the testnet role accounts come from {TESTNET_EVM_MNEMONIC}; set it in .env"
-                    )
-                })?;
-            Ok(Signing::Keys(keys_from_mnemonic(&phrase, ROLE_COUNT)?))
+            {
+                return Ok(Signing::Keys(keys_from_mnemonic(&phrase, ROLE_COUNT)?));
+            }
+            let keeper_key = std::env::var(TESTNET_KEEPER_KEY)
+                .ok()
+                .filter(|v| !v.trim().is_empty());
+            roles_signing(roles, keeper_key.as_deref())
         }
         NetworkName::Mainnet => Ok(Signing::ReadOnly),
     }
+}
+
+/// The role accounts in role order ([`Role::account_index`]).
+fn role_accounts(roles: &Roles) -> Vec<Address> {
+    let mut accounts = vec![Address::ZERO; ROLE_COUNT];
+    for (role, account) in [
+        (Role::Admin, roles.admin),
+        (Role::Platform, roles.platform),
+        (Role::Attestor, roles.attestor),
+        (Role::Builder, roles.builder),
+        (Role::Reviewer, roles.reviewer),
+        (Role::Executor, roles.executor),
+        (Role::Keeper, roles.keeper),
+        (Role::Operator, roles.operator),
+        (Role::Author, roles.author),
+        (Role::Viewer, roles.viewer),
+    ] {
+        accounts[role.account_index()] = account;
+    }
+    accounts
+}
+
+/// A testnet's signing without the mnemonic: `roles` for the accounts, and
+/// the keeper's key alone if one is given and it is the deployment's keeper.
+/// The key never appears in an error.
+fn roles_signing(roles: Option<&Roles>, keeper_key: Option<&str>) -> Result<Signing> {
+    let accounts = roles.map(role_accounts).unwrap_or_default();
+    let Some(text) = keeper_key else {
+        return Ok(Signing::Roles {
+            accounts,
+            keys: Vec::new(),
+        });
+    };
+    let key: PrivateKeySigner = text
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("{TESTNET_KEEPER_KEY} is not a 0x private key"))?;
+    let Some(roles) = roles else {
+        bail!(
+            "{TESTNET_KEEPER_KEY} is checked against the keeper the deployment names, and no deployment is to hand: deploy first, or pass {DEPLOYMENTS_JSON}"
+        );
+    };
+    if key.address() != roles.keeper {
+        bail!(
+            "{TESTNET_KEEPER_KEY} is the key of {}, and the deployment's keeper is {}: refused",
+            key.address(),
+            roles.keeper
+        );
+    }
+    Ok(Signing::Roles {
+        accounts,
+        keys: vec![key],
+    })
 }
 
 /// Connect to any EVM chain of a network, and check it is the chain its key
@@ -494,6 +605,16 @@ pub async fn connect_to(
     network: NetworkName,
     key: &ChainKey,
     config: &ChainConfig,
+) -> Result<Client> {
+    connect_with(key, config, network, signing_for(network)?).await
+}
+
+/// [`connect_to`], signing as `signing` says.
+pub async fn connect_with(
+    key: &ChainKey,
+    config: &ChainConfig,
+    network: NetworkName,
+    signing: Signing,
 ) -> Result<Client> {
     if key.kind != ChainKind::Evm {
         bail!(
@@ -506,7 +627,7 @@ pub async fn connect_to(
     let expected = key
         .evm_chain_id()
         .ok_or_else(|| anyhow!("{key} names no EVM chain id"))?;
-    let client = Client::connect(config, signing_for(network)?).await?;
+    let client = Client::connect(config, signing).await?;
     if expected != client.chain_id {
         // Named by its label: the URL may be a paid one, carrying its key.
         bail!(
@@ -575,6 +696,67 @@ mod tests {
             vault_chain,
         };
         (args, dir)
+    }
+
+    fn roles() -> Roles {
+        let account = |byte| Address::repeat_byte(byte);
+        Roles {
+            admin: account(1),
+            platform: account(2),
+            attestor: account(3),
+            builder: account(4),
+            reviewer: account(5),
+            executor: account(6),
+            keeper: account(7),
+            operator: account(8),
+            author: account(9),
+            viewer: account(10),
+        }
+    }
+
+    #[test]
+    fn without_the_mnemonic_the_role_accounts_are_the_deployment_s_and_no_key_is_held() {
+        let Signing::Roles { accounts, keys } = roles_signing(Some(&roles()), None).unwrap() else {
+            panic!("not role accounts");
+        };
+        assert!(keys.is_empty());
+        assert_eq!(accounts.len(), ROLE_COUNT);
+        assert_eq!(accounts[Role::Admin.account_index()], roles().admin);
+        assert_eq!(accounts[Role::Keeper.account_index()], roles().keeper);
+        assert_eq!(accounts[Role::Attestor.account_index()], roles().attestor);
+        assert_eq!(accounts[Role::Platform.account_index()], roles().platform);
+    }
+
+    #[test]
+    fn the_keeper_key_is_held_only_when_it_is_the_deployment_s_keeper() {
+        let key = PrivateKeySigner::random();
+        let text = format!("0x{}", alloy::hex::encode(key.to_bytes()));
+        let mut ours = roles();
+        ours.keeper = key.address();
+        let Signing::Roles { keys, .. } = roles_signing(Some(&ours), Some(&text)).unwrap() else {
+            panic!("not role accounts");
+        };
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].address(), key.address());
+
+        // Another account's key is refused, and the error never shows it.
+        let error = format!(
+            "{:#}",
+            roles_signing(Some(&roles()), Some(&text)).err().unwrap()
+        );
+        assert!(error.contains("refused"), "{error}");
+        assert!(!error.contains(&text[2..]), "the key is in the error");
+        // No deployment to check it against: refused too.
+        let error = format!("{:#}", roles_signing(None, Some(&text)).err().unwrap());
+        assert!(!error.contains(&text[2..]), "the key is in the error");
+        // Not a key at all: refused without echoing it.
+        let error = format!(
+            "{:#}",
+            roles_signing(Some(&ours), Some("0xnot-a-key"))
+                .err()
+                .unwrap()
+        );
+        assert!(!error.contains("not-a-key"), "{error}");
     }
 
     #[test]

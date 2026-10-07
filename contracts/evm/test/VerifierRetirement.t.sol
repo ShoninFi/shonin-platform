@@ -43,9 +43,9 @@ contract VerifierRetirementTest is Fixture {
 
         // Whoever holds the leaked key attests any journal they like: the
         // image and project ids are public, and the key is their own.
-        bytes memory journal = journalFor(EXECUTOR_IMAGE, forged, leafFor(address(vault), bundle));
+        bytes memory journal = journalFor(EXECUTOR_IMAGE, forged, leafFor(address(vault), bundle, forged));
         attestation.bless(
-            forgedSeal(journal), journal, block.chainid, address(vault), bundle, new bytes32[](0)
+            forgedSeal(journal), journal, block.chainid, address(vault), bundle, forged, new bytes32[](0)
         );
         assertTrue(attestation.isBlessedFor(forged, block.chainid, address(vault), bundle));
 
@@ -72,8 +72,10 @@ contract VerifierRetirementTest is Fixture {
 
     function test_retiring_a_checker_stops_the_service_keys_it_blessed() public {
         address forgedBuilder = makeAddr("forged builder");
-        bytes memory journal = journalFor(BUILDER_IMAGE, forgedBuilder, serviceLeaf());
-        attestation.bless(forgedSeal(journal), journal, 0, address(0), bytes32(0), new bytes32[](0));
+        bytes memory journal = journalFor(BUILDER_IMAGE, forgedBuilder, serviceLeaf(forgedBuilder));
+        attestation.bless(
+            forgedSeal(journal), journal, 0, address(0), bytes32(0), forgedBuilder, new bytes32[](0)
+        );
         assertTrue(attestation.isBlessedAs(forgedBuilder, ImageKind.Builder));
 
         vm.prank(admin);

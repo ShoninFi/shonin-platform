@@ -31,7 +31,7 @@ bs58.workspace = true
 clap.workspace = true
 ed25519-dalek.workspace = true
 futures.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
 serde.workspace = true
 serde_json.workspace = true
 tar.workspace = true

@@ -631,8 +631,10 @@ contract ForwardPricingAcrossChainsTest is TwoChainVault {
     /// days outlives a blessing.
     function refreshKeys() internal {
         blessExecutorKey(executor, address(vault), bundle);
-        bytes memory journal = journalFor(UNWINDER_IMAGE, unwinder, leafFor(address(vault), bundle));
-        attestation.bless(sealOf(journal), journal, block.chainid, address(vault), bundle, new bytes32[](0));
+        bytes memory journal = journalFor(UNWINDER_IMAGE, unwinder, leafFor(address(vault), bundle, unwinder));
+        attestation.bless(
+            sealOf(journal), journal, block.chainid, address(vault), bundle, unwinder, new bytes32[](0)
+        );
     }
 
     function requestOut(address who, uint256 shares) internal returns (uint256 id) {

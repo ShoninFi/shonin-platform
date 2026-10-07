@@ -24,9 +24,9 @@ contract RegistryLowsTest is Fixture {
     function test_a_replay_that_changes_nothing_does_not_announce_an_earlier_expiry() public {
         address vault = makeAddr("vault");
         bytes32 bundle = keccak256("bundle");
-        bytes memory first = journalFor(EXECUTOR_IMAGE, executor, leafFor(vault, bundle));
+        bytes memory first = journalFor(EXECUTOR_IMAGE, executor, leafFor(vault, bundle, executor));
         bytes memory firstSeal = sealOf(first);
-        attestation.bless(firstSeal, first, block.chainid, vault, bundle, new bytes32[](0));
+        attestation.bless(firstSeal, first, block.chainid, vault, bundle, executor, new bytes32[](0));
         uint64 firstUntil = uint64(vm.getBlockTimestamp()) + BLESSING_TTL;
 
         // The instance attests again a day later; its blessing moves later.
@@ -38,7 +38,7 @@ contract RegistryLowsTest is Fixture {
         // A stranger replays the first seal. The chain keeps `later`...
         vm.recordLogs();
         vm.prank(alice);
-        attestation.bless(firstSeal, first, block.chainid, vault, bundle, new bytes32[](0));
+        attestation.bless(firstSeal, first, block.chainid, vault, bundle, executor, new bytes32[](0));
         assertEq(attestation.blessedUntil(executor, block.chainid, vault, bundle), later);
 
         // ...and announces `later`, never `firstUntil`.

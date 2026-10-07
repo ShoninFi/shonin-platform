@@ -1,27 +1,54 @@
 # syntax=docker/dockerfile:1
 # The API: the web app's server, running the indexer in-process.
-# Runs on Cloud Run.
-# Built from the repository root: task cloud:build NAME=api NETWORK=testnet
-#   (docker build --build-arg NETWORK_FEATURE=devnet -f deploy/gcp/Dockerfile.api .)
+# Runs on the services VM (deploy/gcp/services), beside the keeper.
+# Built from the repository root by `task cloud:build NAME=api NETWORK=testnet`,
+# which passes the network's settings and its deployments directory:
+#   docker build --build-arg NETWORK_FEATURE=none --build-arg WITHOUT_SOLANA=1 --build-arg NETWORK=testnet \
+#     --build-arg STORE_URL=... --build-arg EXECUTOR_URL=... \
+#     --build-context deployments=.shonin/testnet/deployments \
+#     -f deploy/gcp/Dockerfile.api .
+#
+# Everything it runs with is in the image: the network, its chains (the public
+# endpoints committed in config/chains.toml, never a keyed URL), the
+# generation's deployment files, the store's public copy and the executor's
+# status port. It holds no key.
 
 FROM rust:1.98.1-slim-bookworm AS build
 WORKDIR /src
 COPY . .
 # The network whose Solana program ids are compiled in: devnet for a testnet
-# image, mainnet for a mainnet one (task cloud:build passes it). The local
-# keypairs never reach the build, so an image without it could reach no
-# cluster.
+# image, mainnet for a mainnet one, or none for an image that serves no
+# Solana cluster (task cloud:build passes it, with WITHOUT_SOLANA=1 for none).
+# The local keypairs never reach the build, so an image without the ids could
+# reach no cluster.
 ARG NETWORK_FEATURE
 # rust-toolchain.toml pins the same compiler; --locked builds exactly Cargo.lock.
-RUN : "${NETWORK_FEATURE:?pass --build-arg NETWORK_FEATURE=devnet or mainnet}" && \
-    cargo build --release --locked -p shonin-api --bin api --features "$NETWORK_FEATURE"
+RUN : "${NETWORK_FEATURE:?pass --build-arg NETWORK_FEATURE=devnet, mainnet or none}" && \
+    features="" && { [ "$NETWORK_FEATURE" = none ] || features="--features $NETWORK_FEATURE"; } && \
+    cargo build --release --locked -p shonin-api --bin api $features
+# The store's directory, for the image's own user.
+RUN mkdir -p /out/var/lib/shonin/store
 
 FROM gcr.io/distroless/cc-debian12:nonroot
+ARG NETWORK
+# 1 where the image serves the network's EVM chains alone (no Solana ids in it).
+ARG WITHOUT_SOLANA=
+ARG STORE_URL
+ARG EXECUTOR_URL
 COPY --from=build /src/target/release/api /usr/local/bin/api
+COPY --from=build --chown=nonroot:nonroot /out/var/lib/shonin /var/lib/shonin
 COPY config/chains.toml /etc/shonin/chains.toml
-# Only mainnet addresses are committed, so only they are baked in; the network
-# (SHONIN_NETWORK) and its deployments directory (SHONIN_DEPLOYMENTS_DIR) are
-# set where the image is launched.
-COPY config/deployments/mainnet /etc/shonin/deployments/mainnet
-ENV SHONIN_CHAINS=/etc/shonin/chains.toml
+# The generation's deployment files: the named build context `deployments`
+# (a build without it fails here).
+COPY --from=deployments *.json /etc/shonin/deployments/${NETWORK}/
+ENV SHONIN_NETWORK=${NETWORK} \
+    SHONIN_WITHOUT_SOLANA=${WITHOUT_SOLANA} \
+    SHONIN_CHAINS=/etc/shonin/chains.toml \
+    SHONIN_DEPLOYMENTS_DIR=/etc/shonin/deployments/${NETWORK} \
+    SHONIN_STORE_URL=${STORE_URL} \
+    SHONIN_EXECUTOR_URL=${EXECUTOR_URL}
+# Run on the host's network (the services VM), the port open to the VPC and
+# the tunnel only; no build service is attached, so the snapshot has no queue
+# and uploads are refused.
 ENTRYPOINT ["/usr/local/bin/api"]
+CMD ["--store", "/var/lib/shonin/store", "--port", "19081", "--listen", "0.0.0.0"]

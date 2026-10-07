@@ -26,15 +26,15 @@ contract BlessingSoundnessTest is Fixture {
     /// use that path only while the blessing is dead; once the operator has
     /// revived it with the newer seal, the older one cannot shorten it.
     function test_an_older_seal_cannot_shorten_a_revived_blessing() public {
-        bytes memory old = journalFor(EXECUTOR_IMAGE, executor, leafFor(vault, bundle));
+        bytes memory old = journalFor(EXECUTOR_IMAGE, executor, leafFor(vault, bundle, executor));
         bytes memory oldSeal = sealOf(old);
-        attestation.bless(oldSeal, old, block.chainid, vault, bundle, new bytes32[](0));
+        attestation.bless(oldSeal, old, block.chainid, vault, bundle, executor, new bytes32[](0));
         uint64 oldUntil = uint64(vm.getBlockTimestamp()) + BLESSING_TTL;
 
         skip(1 days);
-        bytes memory fresh = journalFor(EXECUTOR_IMAGE, executor, leafFor(vault, bundle));
+        bytes memory fresh = journalFor(EXECUTOR_IMAGE, executor, leafFor(vault, bundle, executor));
         bytes memory freshSeal = sealOf(fresh);
-        attestation.bless(freshSeal, fresh, block.chainid, vault, bundle, new bytes32[](0));
+        attestation.bless(freshSeal, fresh, block.chainid, vault, bundle, executor, new bytes32[](0));
         uint64 freshUntil = uint64(vm.getBlockTimestamp()) + BLESSING_TTL;
         // Recorded against the newest checker.
         vm.prank(admin);
@@ -42,12 +42,12 @@ contract BlessingSoundnessTest is Fixture {
         assertFalse(attestation.isBlessedFor(executor, block.chainid, vault, bundle));
 
         // The operator revives it through the first checker.
-        attestation.bless(freshSeal, fresh, block.chainid, vault, bundle, new bytes32[](0));
+        attestation.bless(freshSeal, fresh, block.chainid, vault, bundle, executor, new bytes32[](0));
         assertEq(attestation.blessedUntil(executor, block.chainid, vault, bundle), freshUntil);
 
         // A stranger's older seal does nothing to it.
         vm.prank(alice);
-        attestation.bless(oldSeal, old, block.chainid, vault, bundle, new bytes32[](0));
+        attestation.bless(oldSeal, old, block.chainid, vault, bundle, executor, new bytes32[](0));
         assertEq(attestation.blessedUntil(executor, block.chainid, vault, bundle), freshUntil);
         assertTrue(oldUntil < freshUntil);
         assertTrue(attestation.isBlessedFor(executor, block.chainid, vault, bundle));
@@ -57,24 +57,24 @@ contract BlessingSoundnessTest is Fixture {
     /// the older expiry. That is never worse than dead, and the operator's
     /// newer seal still wins afterwards.
     function test_a_strangers_revival_with_an_older_seal_is_overtaken_by_the_newer_one() public {
-        bytes memory old = journalFor(EXECUTOR_IMAGE, executor, leafFor(vault, bundle));
+        bytes memory old = journalFor(EXECUTOR_IMAGE, executor, leafFor(vault, bundle, executor));
         bytes memory oldSeal = sealOf(old);
-        attestation.bless(oldSeal, old, block.chainid, vault, bundle, new bytes32[](0));
+        attestation.bless(oldSeal, old, block.chainid, vault, bundle, executor, new bytes32[](0));
         uint64 oldUntil = uint64(vm.getBlockTimestamp()) + BLESSING_TTL;
         skip(1 days);
-        bytes memory fresh = journalFor(EXECUTOR_IMAGE, executor, leafFor(vault, bundle));
+        bytes memory fresh = journalFor(EXECUTOR_IMAGE, executor, leafFor(vault, bundle, executor));
         bytes memory freshSeal = sealOf(fresh);
-        attestation.bless(freshSeal, fresh, block.chainid, vault, bundle, new bytes32[](0));
+        attestation.bless(freshSeal, fresh, block.chainid, vault, bundle, executor, new bytes32[](0));
         uint64 freshUntil = uint64(vm.getBlockTimestamp()) + BLESSING_TTL;
         vm.prank(admin);
         attestation.retireVerifier(address(second));
 
         vm.prank(alice);
-        attestation.bless(oldSeal, old, block.chainid, vault, bundle, new bytes32[](0));
+        attestation.bless(oldSeal, old, block.chainid, vault, bundle, executor, new bytes32[](0));
         assertEq(attestation.blessedUntil(executor, block.chainid, vault, bundle), oldUntil);
         assertTrue(attestation.isBlessedFor(executor, block.chainid, vault, bundle));
 
-        attestation.bless(freshSeal, fresh, block.chainid, vault, bundle, new bytes32[](0));
+        attestation.bless(freshSeal, fresh, block.chainid, vault, bundle, executor, new bytes32[](0));
         assertEq(attestation.blessedUntil(executor, block.chainid, vault, bundle), freshUntil);
     }
 
@@ -83,8 +83,8 @@ contract BlessingSoundnessTest is Fixture {
     /// cannot re-point them away from a later blessing.
     function test_keyinfo_follows_the_latest_blessing_even_through_a_retirement() public {
         address other = makeAddr("other vault");
-        bytes32 leafA = leafFor(vault, bundle);
-        bytes32 leafB = leafFor(other, bundle);
+        bytes32 leafA = leafFor(vault, bundle, executor);
+        bytes32 leafB = leafFor(other, bundle, executor);
         bytes32 root = leafA < leafB
             ? keccak256(abi.encodePacked(leafA, leafB))
             : keccak256(abi.encodePacked(leafB, leafA));
@@ -94,7 +94,7 @@ contract BlessingSoundnessTest is Fixture {
         proofA[0] = leafB;
         bytes32[] memory proofB = new bytes32[](1);
         proofB[0] = leafA;
-        attestation.bless(seal, journal, block.chainid, other, bundle, proofB);
+        attestation.bless(seal, journal, block.chainid, other, bundle, executor, proofB);
 
         skip(1 days);
         blessExecutorKey(executor, vault, bundle);
@@ -107,7 +107,7 @@ contract BlessingSoundnessTest is Fixture {
         assertEq(attestation.keyInfo(executor).vault, vault);
 
         vm.prank(alice);
-        attestation.bless(seal, journal, block.chainid, other, bundle, proofB);
+        attestation.bless(seal, journal, block.chainid, other, bundle, executor, proofB);
         assertEq(attestation.keyInfo(executor).vault, vault, "a stranger re-pointed keyInfo");
     }
 
@@ -145,8 +145,8 @@ contract BlessingSoundnessTest is Fixture {
         vm.prank(admin);
         attestation.proposeVerifier(address(third));
         skip(TIMELOCK);
-        bytes memory journal = journalFor(EXECUTOR_IMAGE, executor, leafFor(vault, bundle));
-        attestation.bless(sealOf(journal), journal, block.chainid, vault, bundle, new bytes32[](0));
+        bytes memory journal = journalFor(EXECUTOR_IMAGE, executor, leafFor(vault, bundle, executor));
+        attestation.bless(sealOf(journal), journal, block.chainid, vault, bundle, executor, new bytes32[](0));
         assertTrue(attestation.isBlessedFor(executor, block.chainid, vault, bundle));
         KeyInfo memory info = attestation.keyInfo(executor);
         assertEq(info.verifier, address(second));

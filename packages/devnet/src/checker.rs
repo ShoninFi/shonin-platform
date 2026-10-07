@@ -8,16 +8,26 @@
 //!
 //! The addresses are written beside the chain's deployment, and a checker
 //! already there is only proposed again if the registry doesn't list it, so
-//! running it twice deploys nothing new.
+//! running it twice deploys nothing new. A fresh deployment (a new
+//! generation) proposes the checkers already on the chain when their files
+//! (`attestation-<chain>.json`) are copied into its deployments directory:
+//! a checker named there that has code and trusts the guest this build
+//! pins is proposed as it is, never deployed again.
 
 use std::path::Path;
 
 use alloy::primitives::Address;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chain::{ChainConfig, ChainKey, Deployments, NetworkName, Role};
 use serde::{Deserialize, Serialize};
 use shonin_attestation_core::GOOGLE_JWKS_2026_10_06;
 use shonin_attestation_deploy::{GUEST_IMAGE_ID, deploy_and_propose, propose, trusted_keys};
+
+alloy::sol! {
+    interface IConfidentialSpaceChecker {
+        function imageId() external view returns (bytes32);
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct Written {
@@ -49,6 +59,17 @@ pub async fn run(
             .and_then(|text| serde_json::from_str::<Written>(&text).ok());
         let written = match existing {
             Some(written) if client.has_code(written.checker).await.unwrap_or(false) => {
+                let image = client
+                    .read(written.checker, IConfidentialSpaceChecker::imageIdCall {})
+                    .await
+                    .with_context(|| format!("reading the guest {:?} trusts", written.checker))?;
+                if image != GUEST_IMAGE_ID {
+                    bail!(
+                        "the checker {:?} named in {} trusts the guest {image}, not this build's {GUEST_IMAGE_ID}: move the file aside to deploy a new one",
+                        written.checker,
+                        written_file.display()
+                    );
+                }
                 propose(&client, admin, deployments.attestation, written.checker).await?;
                 written
             }

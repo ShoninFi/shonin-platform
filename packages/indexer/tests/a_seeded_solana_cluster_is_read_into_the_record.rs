@@ -131,6 +131,7 @@ async fn a_solana_health_report_is_taken_only_from_the_vault_s_blessed_executor(
             (time::OffsetDateTime::now_utc().unix_timestamp() + at) as u64,
         ),
         signed_by: executor.pubkey().to_string(),
+        at: 0,
     };
     let post = |by: &chain::solana::Keypair, report: shared::Health| {
         let digest =

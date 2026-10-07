@@ -5,12 +5,20 @@
 # - which chains they talk to: NETWORK=testnet or NETWORK=mainnet. The cloud
 #   never runs against `local`.
 # The project comes from NETWORK (GCP_PROJECT_TESTNET or GCP_PROJECT_MAINNET in
-# config.yml), and every gcloud call passes --project and --region/--zone, so
-# nothing ever falls back to the gcloud default.
+# config.yml), and every gcloud call passes --project, and --zone or --region
+# where the resource has one, so nothing ever falls back to the gcloud default.
 #
-# Machines (reviewer, builder, executor, unwinder) run on Confidential Space
-# VMs, launched from their image's digest because the digest is what the
-# attestation measures. Services (api, indexer, keeper) run on Cloud Run.
+# Three VMs per network, all in GCP_ZONE:
+# - shonin-executor-<network>: the executor, attested, on a Confidential Space
+#   VM launched from its image's digest (the digest is what the attestation
+#   measures). Its settings are baked into the image: nothing is passed to it
+#   at launch.
+# - shonin-services-<network>: a small plain VM (Container-Optimized OS)
+#   running the API (the indexer inside), the keeper, the Cloudflare tunnel
+#   that carries the API to its public name, and the waker that starts the
+#   prover when a seal is wanted (deploy/gcp/services).
+# - shonin-prover-<network>: a Spot VM that makes the attestation's proof
+#   when woken and powers itself off when idle (deploy/gcp/prover).
 version: "3"
 
 includes:
@@ -23,163 +31,437 @@ vars:
   GCP_REGISTRY: "{{.GCP_REGION}}-docker.pkg.dev/{{.GCP_PROJECT}}/{{.GCP_ARTIFACT_REPO}}"
   GIT_SHA:
     sh: git rev-parse --short=12 HEAD
+  # The tag an image is built, pushed and launched under: the commit, unless
+  # TAG names another.
+  IMAGE_TAG: "{{.TAG | default .GIT_SHA}}"
   MACHINES: "reviewer builder executor unwinder"
-  # Mainnet addresses are baked into the images; testnet ones are never
-  # committed, so a testnet launch is handed every chain's deployment whole,
-  # as SHONIN_DEPLOYMENTS_JSON (see `devnet deployment-env`).
-  DEPLOYMENT_ENV: "{{.DEVNET}} deployment-env"
   SERVICES: "api indexer keeper"
+  # B's image: the attestation's prover, run on its own Spot VM.
+  PROVERS: "prover"
+  # The VMs a network runs, by role: shonin-<role>-<network>.
+  VMS: "executor services prover"
+  # The ports inside the VPC (fixed: the images bake them).
+  CLOUD_PORT_API: "19081"
+  CLOUD_PORT_EXECUTOR: "19085"
+  CLOUD_PORT_KEEPER: "19087"
+  # Internal DNS names, so the images can name each other.
+  GCP_INTERNAL: "{{.GCP_ZONE}}.c.{{.GCP_PROJECT}}.internal"
+  CLOUD_URL_EXECUTOR: "http://shonin-executor-{{.NETWORK}}.{{.GCP_INTERNAL}}:{{.CLOUD_PORT_EXECUTOR}}"
+  CLOUD_URL_API: "http://shonin-services-{{.NETWORK}}.{{.GCP_INTERNAL}}:{{.CLOUD_PORT_API}}"
+  # The content store's public copy (an R2 bucket): testnet only so far.
+  CLOUD_URL_STORE: '{{if eq .NETWORK "testnet"}}{{.URL_STORE_TESTNET}}{{end}}'
+  PROVER_INSTANCE: "projects/{{.GCP_PROJECT}}/zones/{{.GCP_ZONE}}/instances/shonin-prover-{{.NETWORK}}"
+  SERVICES_ACCOUNT: "{{.GCP_SERVICES_SERVICE_ACCOUNT}}@{{.GCP_PROJECT}}.iam.gserviceaccount.com"
+  PROVER_ACCOUNT: "{{.GCP_PROVER_SERVICE_ACCOUNT}}@{{.GCP_PROJECT}}.iam.gserviceaccount.com"
+  WORKLOAD_ACCOUNT: "{{.GCP_WORKLOAD_SERVICE_ACCOUNT}}@{{.GCP_PROJECT}}.iam.gserviceaccount.com"
+  # The custom role that may start and read one instance: bound to the
+  # services VM's account on the prover's instance alone.
+  PROVER_STARTER_ROLE: "shoninProverStarter"
+  # How far back `task cloud:logs` looks.
+  LOGS_FRESHNESS: "{{.FRESHNESS | default \"30m\"}}"
+  # The image digest of NAME:IMAGE_TAG in the registry, for a shell to run.
+  DIGEST_OF: >-
+    gcloud artifacts docker images describe
+    --project="{{.GCP_PROJECT}}" --format='value(image_summary.digest)'
 
 tasks:
   build:
-    desc: "Build an image locally for a network (NAME=reviewer|builder|executor|unwinder|api|indexer|keeper, NETWORK=testnet|mainnet), tagged NAME:GIT_SHA"
+    desc: "Build an image locally for a network (NAME=reviewer|builder|executor|unwinder|api|indexer|keeper|prover, NETWORK=testnet|mainnet), tagged NAME:TAG (the commit by default), with the network's deployments and settings baked in"
     requires:
       vars: [NAME, NETWORK]
     preconditions:
-      - sh: 'for n in {{.MACHINES}} {{.SERVICES}}; do [ "$n" = "{{.NAME}}" ] && exit 0; done; exit 1'
-        msg: "No image is called {{.NAME}}: {{.MACHINES}} {{.SERVICES}}"
+      - sh: 'for n in {{.MACHINES}} {{.SERVICES}} {{.PROVERS}}; do [ "$n" = "{{.NAME}}" ] && exit 0; done; exit 1'
+        msg: "No image is called {{.NAME}}: {{.MACHINES}} {{.SERVICES}} {{.PROVERS}}"
       - sh: '[ "{{.NETWORK}}" = "testnet" ] || [ "{{.NETWORK}}" = "mainnet" ]'
         msg: "Name the chains: NETWORK=testnet or NETWORK=mainnet. An image is built for one network, and the cloud never runs against local chains (NETWORK={{.NETWORK}})."
+      - sh: 'ls "{{.PATH_DEPLOYMENTS_DIR}}"/evm-*.json >/dev/null 2>&1'
+        msg: "No deployment files in {{.PATH_DEPLOYMENTS_DIR}}: deploy the network's contracts first (task chains:deploy NETWORK={{.NETWORK}}). An image carries its network's deployments."
     vars:
-      # The Solana program ids an image compiles in: a testnet image the
-      # committed devnet ids, a mainnet one the committed mainnet ids.
-      NETWORK_FEATURE: '{{if eq .NETWORK "mainnet"}}mainnet{{else}}devnet{{end}}'
+      # The Solana program ids an image compiles in: a mainnet image the
+      # committed mainnet ids, a testnet one the committed devnet ids once
+      # they are committed. Until then a testnet image compiles in none and
+      # serves the EVM chains alone (SHONIN_WITHOUT_SOLANA=1, baked in).
+      DEVNET_IDS:
+        sh: '[ -s "{{.PATH_CONTRACTS_SOLANA}}/programs/shonin-registry/devnet-id" ] && echo yes || echo no'
+      NETWORK_FEATURE: '{{if eq .NETWORK "mainnet"}}mainnet{{else if eq .DEVNET_IDS "yes"}}devnet{{else}}none{{end}}'
+      WITHOUT_SOLANA: '{{if eq .NETWORK_FEATURE "none"}}1{{end}}'
+      # The prover's guest, built reproducibly beforehand
+      # (SHONIN_ATTESTATION_BUILD_GUEST=1): the directory holding its ELF,
+      # GUEST_DIR or found under the cargo target directory.
+      GUEST_DIR:
+        sh: |
+          if [ -n "${GUEST_DIR:-}" ]; then echo "$GUEST_DIR"; exit 0; fi
+          elf=$(find "${CARGO_TARGET_DIR:-{{.PATH_ROOT}}/target}/riscv-guest" -path '*docker*' -name shonin-attestation-guest.bin 2>/dev/null | head -1)
+          [ -n "$elf" ] && dirname "$elf" || true
+      GUEST_CONTEXT: '{{if eq .NAME "prover"}}--build-context guest="{{.GUEST_DIR}}"{{end}}'
     cmds:
-      # Confidential Space and Cloud Run both run linux/amd64.
+      - cmd: '[ "{{.NAME}}" != "prover" ] || [ -s "{{.GUEST_DIR}}/shonin-attestation-guest.bin" ] || { echo "no guest ELF: build it with SHONIN_ATTESTATION_BUILD_GUEST=1, or set GUEST_DIR"; exit 1; }'
+      # Confidential Space and Compute Engine run linux/amd64. Every image
+      # is handed the same settings and takes the ones it uses: the network,
+      # the deployments directory (as the build context `deployments`; the
+      # repository's own context leaves .shonin out), the store's public copy,
+      # the API's and the executor's internal URLs. The chains' endpoints are
+      # the committed public ones: no keyed URL reaches an image.
       - >-
         docker build --platform linux/amd64
         --build-arg NETWORK_FEATURE={{.NETWORK_FEATURE}}
+        --build-arg NETWORK={{.NETWORK}}
+        --build-arg WITHOUT_SOLANA={{.WITHOUT_SOLANA}}
+        --build-arg STORE_URL={{.CLOUD_URL_STORE}}
+        --build-arg API_URL={{.CLOUD_URL_API}}
+        --build-arg EXECUTOR_URL={{.CLOUD_URL_EXECUTOR}}
+        --build-context deployments="{{.PATH_DEPLOYMENTS_DIR}}"
+        {{.GUEST_CONTEXT}}
         -f "{{.PATH_ROOT}}/deploy/gcp/Dockerfile.{{.NAME}}"
-        -t "{{.NAME}}:{{.GIT_SHA}}"
+        -t "{{.NAME}}:{{.IMAGE_TAG}}"
         "{{.PATH_ROOT}}"
 
   push:
-    desc: "Push an image to the network's Artifact Registry (NAME=..., NETWORK=testnet|mainnet)"
+    desc: "Build and push an image to the network's Artifact Registry, and print its digest (NAME=..., NETWORK=testnet|mainnet)"
     requires:
       vars: [NAME, NETWORK, GCP_PROJECT]
     preconditions:
-      # Every task that reaches Google Cloud checks these first.
-      - sh: '[ "{{.NETWORK}}" = "testnet" ] || [ "{{.NETWORK}}" = "mainnet" ]'
+      - &network
+        sh: '[ "{{.NETWORK}}" = "testnet" ] || [ "{{.NETWORK}}" = "mainnet" ]'
         msg: "Name the chains: NETWORK=testnet or NETWORK=mainnet. The cloud never runs against local chains (NETWORK={{.NETWORK}})."
-      - sh: '[ -n "{{.GCP_PROJECT}}" ]'
+      - &project
+        sh: '[ -n "{{.GCP_PROJECT}}" ]'
         msg: "No Google Cloud project for {{.NETWORK}}: set GCP_PROJECT_{{upper .NETWORK}} in taskfiles/config.yml. The gcloud default project is never used."
     cmds:
       - task: build
-        vars: { NAME: "{{.NAME}}", NETWORK: "{{.NETWORK}}" }
+        vars: { NAME: "{{.NAME}}", NETWORK: "{{.NETWORK}}", TAG: "{{.IMAGE_TAG}}" }
       - gcloud auth configure-docker "{{.GCP_REGION}}-docker.pkg.dev" --project="{{.GCP_PROJECT}}" --quiet
-      - docker tag "{{.NAME}}:{{.GIT_SHA}}" "{{.GCP_REGISTRY}}/{{.NAME}}:{{.GIT_SHA}}"
-      - docker push "{{.GCP_REGISTRY}}/{{.NAME}}:{{.GIT_SHA}}"
+      - docker tag "{{.NAME}}:{{.IMAGE_TAG}}" "{{.GCP_REGISTRY}}/{{.NAME}}:{{.IMAGE_TAG}}"
+      - docker push "{{.GCP_REGISTRY}}/{{.NAME}}:{{.IMAGE_TAG}}"
+      - echo "{{.NAME}}:{{.IMAGE_TAG}} is $({{.DIGEST_OF}} "{{.GCP_REGISTRY}}/{{.NAME}}:{{.IMAGE_TAG}}")"
 
   deploy:machine:
-    desc: "Launch a machine on a Confidential Space VM from its pushed image's digest (NAME=reviewer|builder|executor|unwinder, NETWORK=...)"
+    desc: "Launch a machine on a Confidential Space VM (hardened image, Intel TDX) from its pushed image's digest, nothing passed to it (NAME=executor|..., NETWORK=..., TAG= the commit by default)"
     requires:
       vars: [NAME, NETWORK, GCP_PROJECT]
     preconditions:
-      # Every task that reaches Google Cloud checks these first.
-      - sh: '[ "{{.NETWORK}}" = "testnet" ] || [ "{{.NETWORK}}" = "mainnet" ]'
-        msg: "Name the chains: NETWORK=testnet or NETWORK=mainnet. The cloud never runs against local chains (NETWORK={{.NETWORK}})."
-      - sh: '[ -n "{{.GCP_PROJECT}}" ]'
-        msg: "No Google Cloud project for {{.NETWORK}}: set GCP_PROJECT_{{upper .NETWORK}} in taskfiles/config.yml. The gcloud default project is never used."
+      - *network
+      - *project
       - sh: 'for n in {{.MACHINES}}; do [ "$n" = "{{.NAME}}" ] && exit 0; done; exit 1'
         msg: "{{.NAME}} is not a machine: {{.MACHINES}}"
     cmds:
-      # The digest, not the tag: it is what the attestation measures.
+      # The digest, not the tag: it is what the attestation measures. No
+      # tee-env- and no tee-cmd: the image carries its settings, and the
+      # attestation refuses any override of either. The other launcher
+      # settings are not overrides: the container's lines go to Cloud
+      # Logging (the image allows it), and a container that stops is started
+      # again, with new keys (it takes its vaults back after the handover's
+      # silence).
       - |
-        extra=$({{.DEPLOYMENT_ENV}} --prefix tee-env-) || exit 1
-        digest=$(gcloud artifacts docker images describe "{{.GCP_REGISTRY}}/{{.NAME}}:{{.GIT_SHA}}" \
-          --project="{{.GCP_PROJECT}}" --format='value(image_summary.digest)')
-        [ -n "$digest" ] || { echo "no pushed image {{.NAME}}:{{.GIT_SHA}}: run task cloud:push first"; exit 1; }
+        digest=$({{.DIGEST_OF}} "{{.GCP_REGISTRY}}/{{.NAME}}:{{.IMAGE_TAG}}")
+        [ -n "$digest" ] || { echo "no pushed image {{.NAME}}:{{.IMAGE_TAG}}: run task cloud:push first"; exit 1; }
+        echo "launching {{.NAME}}@$digest"
         gcloud compute instances create "shonin-{{.NAME}}-{{.NETWORK}}" \
           --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" \
           --confidential-compute-type=TDX --machine-type="{{.GCP_MACHINE_TYPE}}" \
           --maintenance-policy=TERMINATE --shielded-secure-boot \
           --image-project=confidential-space-images --image-family=confidential-space \
-          --metadata="^~^tee-image-reference={{.GCP_REGISTRY}}/{{.NAME}}@${digest}~tee-container-log-redirect=true~tee-restart-policy=Always~tee-env-SHONIN_NETWORK={{.NETWORK}}~tee-env-SHONIN_DEPLOYMENTS_DIR=/etc/shonin/deployments/{{.NETWORK}}${extra}" \
-          --service-account="{{.GCP_WORKLOAD_SERVICE_ACCOUNT}}@{{.GCP_PROJECT}}.iam.gserviceaccount.com" \
+          --metadata="^~^tee-image-reference={{.GCP_REGISTRY}}/{{.NAME}}@${digest}~tee-container-log-redirect=true~tee-restart-policy=Always" \
+          --tags="shonin-{{.NAME}}" \
+          --service-account="{{.WORKLOAD_ACCOUNT}}" \
           --scopes=cloud-platform
 
-  deploy:service:
-    desc: "Deploy a service to Cloud Run from its pushed image (NAME=api|indexer|keeper, NETWORK=...)"
-    requires:
-      vars: [NAME, NETWORK, GCP_PROJECT]
-    preconditions:
-      # Every task that reaches Google Cloud checks these first.
-      - sh: '[ "{{.NETWORK}}" = "testnet" ] || [ "{{.NETWORK}}" = "mainnet" ]'
-        msg: "Name the chains: NETWORK=testnet or NETWORK=mainnet. The cloud never runs against local chains (NETWORK={{.NETWORK}})."
-      - sh: '[ -n "{{.GCP_PROJECT}}" ]'
-        msg: "No Google Cloud project for {{.NETWORK}}: set GCP_PROJECT_{{upper .NETWORK}} in taskfiles/config.yml. The gcloud default project is never used."
-      - sh: 'for n in {{.SERVICES}}; do [ "$n" = "{{.NAME}}" ] && exit 0; done; exit 1'
-        msg: "{{.NAME}} is not a service: {{.SERVICES}}"
-    cmds:
-      - |
-        extra=$({{.DEPLOYMENT_ENV}}) || exit 1
-        secrets=""
-        if [ "{{.NETWORK}}" = "testnet" ]; then
-          secrets="--set-secrets=SHONIN_TESTNET_EVM_MNEMONIC={{.GCP_SECRET_TESTNET_EVM_MNEMONIC}}:latest"
-        fi
-        gcloud run deploy "shonin-{{.NAME}}-{{.NETWORK}}" \
-          --project="{{.GCP_PROJECT}}" --region="{{.GCP_REGION}}" \
-          --image="{{.GCP_REGISTRY}}/{{.NAME}}:{{.GIT_SHA}}" \
-          --set-env-vars="^~^SHONIN_NETWORK={{.NETWORK}}~SHONIN_DEPLOYMENTS_DIR=/etc/shonin/deployments/{{.NETWORK}}${extra}" \
-          $secrets \
-          --service-account="{{.GCP_WORKLOAD_SERVICE_ACCOUNT}}@{{.GCP_PROJECT}}.iam.gserviceaccount.com" \
-          --no-allow-unauthenticated
-
-  secrets:
-    desc: "Upload the testnet role accounts' mnemonic from .env to Secret Manager (NETWORK=testnet)"
-    requires:
-      vars: [NETWORK, GCP_PROJECT, SHONIN_TESTNET_EVM_MNEMONIC]
-    preconditions:
-      - sh: '[ "{{.NETWORK}}" = "testnet" ]'
-        msg: "Only the testnets have role keys to upload; mainnet's roles are never keys in .env."
-      - sh: '[ -n "{{.GCP_PROJECT}}" ]'
-        msg: "No Google Cloud project for {{.NETWORK}}: set GCP_PROJECT_{{upper .NETWORK}} in taskfiles/config.yml. The gcloud default project is never used."
-      - sh: '[ -n "$SHONIN_TESTNET_EVM_MNEMONIC" ]'
-        msg: "SHONIN_TESTNET_EVM_MNEMONIC is empty in .env."
-    env:
-      MNEMONIC: "{{.SHONIN_TESTNET_EVM_MNEMONIC}}"
-    cmds:
-      # The value goes through stdin, never on a command line.
-      - |
-        name="{{.GCP_SECRET_TESTNET_EVM_MNEMONIC}}"
-        if ! gcloud secrets describe "$name" --project="{{.GCP_PROJECT}}" >/dev/null 2>&1; then
-          gcloud secrets create "$name" --project="{{.GCP_PROJECT}}" --replication-policy=automatic
-        fi
-        printf '%s' "$MNEMONIC" | gcloud secrets versions add "$name" --project="{{.GCP_PROJECT}}" --data-file=-
-
-  status:
-    desc: "What is running in the network's project (NETWORK=testnet|mainnet)"
+  deploy:services:
+    desc: "Create the services VM (Container-Optimized OS, e2-small): the API, the keeper, the tunnel and the waker, from the pushed api and keeper images' digests (NETWORK=testnet, TAG= the commit by default)"
     requires:
       vars: [NETWORK, GCP_PROJECT]
     preconditions:
-      # Every task that reaches Google Cloud checks these first.
-      - sh: '[ "{{.NETWORK}}" = "testnet" ] || [ "{{.NETWORK}}" = "mainnet" ]'
-        msg: "Name the chains: NETWORK=testnet or NETWORK=mainnet. The cloud never runs against local chains (NETWORK={{.NETWORK}})."
-      - sh: '[ -n "{{.GCP_PROJECT}}" ]'
-        msg: "No Google Cloud project for {{.NETWORK}}: set GCP_PROJECT_{{upper .NETWORK}} in taskfiles/config.yml. The gcloud default project is never used."
+      - &testnet
+        sh: '[ "{{.NETWORK}}" = "testnet" ]'
+        msg: "Only the testnet runs a services VM so far (NETWORK={{.NETWORK}})."
+      - *project
+    cmds:
+      - |
+        api=$({{.DIGEST_OF}} "{{.GCP_REGISTRY}}/api:{{.IMAGE_TAG}}")
+        keeper=$({{.DIGEST_OF}} "{{.GCP_REGISTRY}}/keeper:{{.IMAGE_TAG}}")
+        [ -n "$api" ] && [ -n "$keeper" ] || { echo "push api and keeper first (task cloud:push NAME=api, NAME=keeper; TAG={{.IMAGE_TAG}})"; exit 1; }
+        gcloud compute instances create "shonin-services-{{.NETWORK}}" \
+          --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" \
+          --machine-type="{{.GCP_SERVICES_MACHINE_TYPE}}" \
+          --image-project=cos-cloud --image-family=cos-stable \
+          --boot-disk-size=10GB --boot-disk-type=pd-standard \
+          --shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring \
+          --tags=shonin-services \
+          --service-account="{{.SERVICES_ACCOUNT}}" --scopes=cloud-platform \
+          --metadata-from-file="startup-script={{.PATH_ROOT}}/deploy/gcp/services/startup.sh,shonin-waker={{.PATH_ROOT}}/deploy/gcp/services/waker.sh" \
+          --metadata="^~^shonin-api-image={{.GCP_REGISTRY}}/api@${api}~shonin-keeper-image={{.GCP_REGISTRY}}/keeper@${keeper}~shonin-executor-url={{.CLOUD_URL_EXECUTOR}}~shonin-prover-instance={{.PROVER_INSTANCE}}~shonin-keeper-secret={{.GCP_SECRET_TESTNET_KEEPER_KEY}}~shonin-tunnel-secret={{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}~enable-oslogin=TRUE"
+
+  redeploy:services:
+    desc: "Point the services VM at newly pushed api and keeper images (and the current scripts), and restart it (NETWORK=testnet, TAG= the commit by default)"
+    requires:
+      vars: [NETWORK, GCP_PROJECT]
+    preconditions:
+      - *testnet
+      - *project
+    cmds:
+      - |
+        api=$({{.DIGEST_OF}} "{{.GCP_REGISTRY}}/api:{{.IMAGE_TAG}}")
+        keeper=$({{.DIGEST_OF}} "{{.GCP_REGISTRY}}/keeper:{{.IMAGE_TAG}}")
+        [ -n "$api" ] && [ -n "$keeper" ] || { echo "push api and keeper first (TAG={{.IMAGE_TAG}})"; exit 1; }
+        gcloud compute instances add-metadata "shonin-services-{{.NETWORK}}" \
+          --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" \
+          --metadata-from-file="startup-script={{.PATH_ROOT}}/deploy/gcp/services/startup.sh,shonin-waker={{.PATH_ROOT}}/deploy/gcp/services/waker.sh" \
+          --metadata="^~^shonin-api-image={{.GCP_REGISTRY}}/api@${api}~shonin-keeper-image={{.GCP_REGISTRY}}/keeper@${keeper}"
+        gcloud compute instances reset "shonin-services-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}"
+
+  deploy:prover:
+    desc: "Create the prover's Spot VM (off when idle; the services VM's waker starts it) from the pushed prover image's digest, and let the services VM start it (NETWORK=testnet, TAG= the commit by default)"
+    requires:
+      vars: [NETWORK, GCP_PROJECT]
+    preconditions:
+      - *testnet
+      - *project
+      - sh: '[ -f "{{.PATH_ROOT}}/deploy/gcp/prover/startup.sh" ]'
+        msg: "No deploy/gcp/prover/startup.sh: the prover's VM has nothing to run."
+    cmds:
+      # Spot, stopped (not deleted) when reclaimed, so the waker can start it
+      # again. The startup script runs the prover and powers the VM off when
+      # it exits.
+      - |
+        prover=$({{.DIGEST_OF}} "{{.GCP_REGISTRY}}/prover:{{.IMAGE_TAG}}")
+        [ -n "$prover" ] || { echo "push the prover first (task cloud:push NAME=prover TAG={{.IMAGE_TAG}})"; exit 1; }
+        gcloud compute instances create "shonin-prover-{{.NETWORK}}" \
+          --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" \
+          --machine-type="{{.GCP_PROVER_MACHINE_TYPE}}" \
+          --provisioning-model=SPOT --instance-termination-action=STOP --maintenance-policy=TERMINATE \
+          --image-project=cos-cloud --image-family=cos-stable \
+          --boot-disk-size=30GB --boot-disk-type=pd-balanced \
+          --shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring \
+          --tags=shonin-prover \
+          --service-account="{{.PROVER_ACCOUNT}}" --scopes=cloud-platform \
+          --metadata-from-file="startup-script={{.PATH_ROOT}}/deploy/gcp/prover/startup.sh" \
+          --metadata="^~^shonin-prover-image={{.GCP_REGISTRY}}/prover@${prover}~shonin-executor-url={{.CLOUD_URL_EXECUTOR}}~enable-oslogin=TRUE"
+      - task: iam:prover-start
+
+  iam:
+    desc: "The services' and the prover's accounts and their roles, and nothing more: idempotent (NETWORK=testnet)"
+    requires:
+      vars: [NETWORK, GCP_PROJECT]
+    preconditions:
+      - *testnet
+      - *project
+    cmds:
+      - |
+        set -e
+        project="{{.GCP_PROJECT}}"
+        for account in "{{.GCP_SERVICES_SERVICE_ACCOUNT}}" "{{.GCP_PROVER_SERVICE_ACCOUNT}}"; do
+          if ! gcloud iam service-accounts describe "$account@$project.iam.gserviceaccount.com" --project="$project" >/dev/null 2>&1; then
+            gcloud iam service-accounts create "$account" --project="$project" --display-name="$account"
+          fi
+        done
+        # Both pull images and write logs; nothing else project-wide.
+        for member in "serviceAccount:{{.SERVICES_ACCOUNT}}" "serviceAccount:{{.PROVER_ACCOUNT}}"; do
+          for role in roles/artifactregistry.reader roles/logging.logWriter; do
+            gcloud projects add-iam-policy-binding "$project" --member="$member" --role="$role" \
+              --condition=None --quiet >/dev/null
+          done
+        done
+        # The services VM reads the keeper's key and the tunnel's token, and
+        # no other secret.
+        for secret in "{{.GCP_SECRET_TESTNET_KEEPER_KEY}}" "{{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}"; do
+          if gcloud secrets describe "$secret" --project="$project" >/dev/null 2>&1; then
+            gcloud secrets add-iam-policy-binding "$secret" --project="$project" \
+              --member="serviceAccount:{{.SERVICES_ACCOUNT}}" --role=roles/secretmanager.secretAccessor >/dev/null
+          else
+            echo "secret $secret does not exist yet: run task cloud:secrets, then this again"
+          fi
+        done
+        # A role that may start and read an instance, bound below on the
+        # prover's instance alone.
+        if ! gcloud iam roles describe "{{.PROVER_STARTER_ROLE}}" --project="$project" >/dev/null 2>&1; then
+          gcloud iam roles create "{{.PROVER_STARTER_ROLE}}" --project="$project" \
+            --title="Start the prover" --description="Start and read one instance (bound on the prover's alone)" \
+            --permissions=compute.instances.start,compute.instances.get --stage=GA
+        fi
+      - task: iam:prover-start
+
+  iam:prover-start:
+    internal: true
+    requires:
+      vars: [NETWORK, GCP_PROJECT]
+    cmds:
+      # Bound on the instance itself: the services VM may start and read the
+      # prover and no other instance.
+      - |
+        if gcloud compute instances describe "shonin-prover-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" >/dev/null 2>&1; then
+          gcloud compute instances add-iam-policy-binding "shonin-prover-{{.NETWORK}}" \
+            --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" \
+            --member="serviceAccount:{{.SERVICES_ACCOUNT}}" \
+            --role="projects/{{.GCP_PROJECT}}/roles/{{.PROVER_STARTER_ROLE}}" >/dev/null
+          echo "the services VM may start shonin-prover-{{.NETWORK}}"
+        else
+          echo "no prover instance yet: task cloud:deploy:prover binds its starter"
+        fi
+
+  firewall:
+    desc: "Assert the network's firewall: SSH from Google's IAP range only, no RDP, the executor's status port and the services' ports open to the VPC only, nothing public (NETWORK=testnet)"
+    requires:
+      vars: [NETWORK, GCP_PROJECT]
+    preconditions:
+      - *testnet
+      - *project
+    cmds:
+      - |
+        set -e
+        project="{{.GCP_PROJECT}}"
+        exists() { gcloud compute firewall-rules describe "$1" --project="$project" >/dev/null 2>&1; }
+        if exists default-allow-rdp; then
+          gcloud compute firewall-rules delete default-allow-rdp --project="$project" --quiet
+        fi
+        if exists default-allow-ssh; then
+          gcloud compute firewall-rules update default-allow-ssh --project="$project" --source-ranges=35.235.240.0/20
+        else
+          exists shonin-allow-ssh-iap || gcloud compute firewall-rules create shonin-allow-ssh-iap --project="$project" \
+            --network=default --direction=INGRESS --action=ALLOW --rules=tcp:22 --source-ranges=35.235.240.0/20
+        fi
+        exists shonin-executor-status || gcloud compute firewall-rules create shonin-executor-status --project="$project" \
+          --network=default --direction=INGRESS --action=ALLOW --rules=tcp:{{.CLOUD_PORT_EXECUTOR}} \
+          --source-ranges=10.128.0.0/9 --target-tags=shonin-executor
+        exists shonin-services-internal || gcloud compute firewall-rules create shonin-services-internal --project="$project" \
+          --network=default --direction=INGRESS --action=ALLOW --rules=tcp:{{.CLOUD_PORT_API}},tcp:{{.CLOUD_PORT_KEEPER}} \
+          --source-ranges=10.128.0.0/9 --target-tags=shonin-services
+        gcloud compute firewall-rules list --project="$project" \
+          --format="table(name,direction,sourceRanges.list(),allowed[].map().firewall_rule().list(),targetTags.list())"
+        # Anything but ping open to the whole internet (filtered here: the
+        # list filter can't combine a range with a protocol's absence).
+        open=$(gcloud compute firewall-rules list --project="$project" \
+          --filter="direction=INGRESS" \
+          --format="value(name,sourceRanges.list(),allowed[].map().firewall_rule().list())" \
+          | awk -F'\t' '$2 ~ /(^|,)0\.0\.0\.0\/0(,|$)/ && $3 != "icmp" { print $1 }')
+        [ -z "$open" ] || { echo "open to the world: $open"; exit 1; }
+
+  secrets:
+    desc: "Upload the keeper's testnet key (derived here from the mnemonic, account 4) and the tunnel's token to Secret Manager, through stdin, and let the services VM read them (NETWORK=testnet)"
+    requires:
+      vars: [NETWORK, GCP_PROJECT]
+    preconditions:
+      - *testnet
+      - *project
+      - sh: 'command -v cast >/dev/null && command -v jq >/dev/null'
+        msg: "cast (foundry) and jq are needed to derive and check the keeper's key."
+      - sh: '[ -n "${SHONIN_TESTNET_EVM_MNEMONIC:-}" ]'
+        msg: "SHONIN_TESTNET_EVM_MNEMONIC is empty in .env."
+      - sh: '[ -n "${CLOUDFLARE_TUNNEL_TOKEN_TESTNET:-}" ]'
+        msg: "CLOUDFLARE_TUNNEL_TOKEN_TESTNET is empty in .env."
+      - sh: 'ls "{{.PATH_DEPLOYMENTS_DIR}}"/evm-*.json >/dev/null 2>&1'
+        msg: "No deployment files in {{.PATH_DEPLOYMENTS_DIR}}: the keeper's address is checked against them."
+    cmds:
+      # Nothing secret is printed or put on a command line: the mnemonic goes
+      # to cast in a file only this user can read, deleted on exit; each
+      # value reaches gcloud on stdin.
+      - |
+        set -eu
+        umask 077
+        project="{{.GCP_PROJECT}}"
+        scratch=$(mktemp -d)
+        trap 'rm -rf "$scratch"' EXIT
+        printf '%s\n' "$SHONIN_TESTNET_EVM_MNEMONIC" >"$scratch/mnemonic"
+        # The keeper is account 4. Its address, checked against every
+        # deployment before its key goes anywhere.
+        address=$(cast wallet address --mnemonic "$scratch/mnemonic" --mnemonic-index 4 | tr 'A-F' 'a-f')
+        for file in "{{.PATH_DEPLOYMENTS_DIR}}"/evm-*.json; do
+          keeper=$(jq -r '.roles.keeper // empty' "$file" | tr 'A-F' 'a-f')
+          [ "$keeper" = "$address" ] || { echo "$(basename "$file") names another keeper ($keeper), not account 4 ($address)"; exit 1; }
+        done
+        ensure() {
+          gcloud secrets describe "$1" --project="$project" >/dev/null 2>&1 ||
+            gcloud secrets create "$1" --project="$project" --replication-policy=automatic
+        }
+        ensure "{{.GCP_SECRET_TESTNET_KEEPER_KEY}}"
+        cast wallet private-key --mnemonic "$scratch/mnemonic" --mnemonic-index 4 | tr -d '\n' |
+          gcloud secrets versions add "{{.GCP_SECRET_TESTNET_KEEPER_KEY}}" --project="$project" --data-file=-
+        ensure "{{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}"
+        printf '%s' "$CLOUDFLARE_TUNNEL_TOKEN_TESTNET" |
+          gcloud secrets versions add "{{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}" --project="$project" --data-file=-
+        for secret in "{{.GCP_SECRET_TESTNET_KEEPER_KEY}}" "{{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}"; do
+          gcloud secrets add-iam-policy-binding "$secret" --project="$project" \
+            --member="serviceAccount:{{.SERVICES_ACCOUNT}}" --role=roles/secretmanager.secretAccessor >/dev/null
+        done
+        echo "uploaded the keeper's key ($address) and the tunnel's token; the services VM reads them at its next boot"
+
+  status:
+    desc: "What runs in the network's project: the VMs, the secrets' names, the images (NETWORK=testnet|mainnet)"
+    requires:
+      vars: [NETWORK, GCP_PROJECT]
+    preconditions:
+      - *network
+      - *project
     cmds:
       - echo "Compute Engine instances in {{.GCP_PROJECT}} ({{.NETWORK}})"
-      - gcloud compute instances list --project="{{.GCP_PROJECT}}" --format="table(name,zone.basename(),machineType.basename(),status)"
-      - echo "Cloud Run services in {{.GCP_PROJECT}}, {{.GCP_REGION}}"
-      - gcloud run services list --project="{{.GCP_PROJECT}}" --region="{{.GCP_REGION}}" --format="table(metadata.name,status.url,status.conditions[0].status)"
+      - gcloud compute instances list --project="{{.GCP_PROJECT}}" --filter="zone:{{.GCP_ZONE}}" --format="table(name,machineType.basename(),scheduling.provisioningModel,status,networkInterfaces[0].networkIP)"
+      - echo "Secrets"
+      - gcloud secrets list --project="{{.GCP_PROJECT}}" --format="table(name,createTime)"
+      - echo "Images in {{.GCP_REGISTRY}}"
+      - gcloud artifacts docker images list "{{.GCP_REGISTRY}}" --project="{{.GCP_PROJECT}}" --include-tags --format="table(package.basename(),version.basename(),tags,createTime)"
 
   logs:
-    desc: "Recent logs of a machine or service (NAME=..., NETWORK=testnet|mainnet)"
+    desc: "Recent logs (NAME=executor|api|keeper|tunnel|waker|services|prover, NETWORK=..., FRESHNESS=30m): a machine's container from Cloud Logging, the services' containers from Cloud Logging, a plain VM's boot from its serial port"
     requires:
       vars: [NAME, NETWORK, GCP_PROJECT]
     preconditions:
-      # Every task that reaches Google Cloud checks these first.
-      - sh: '[ "{{.NETWORK}}" = "testnet" ] || [ "{{.NETWORK}}" = "mainnet" ]'
-        msg: "Name the chains: NETWORK=testnet or NETWORK=mainnet. The cloud never runs against local chains (NETWORK={{.NETWORK}})."
-      - sh: '[ -n "{{.GCP_PROJECT}}" ]'
-        msg: "No Google Cloud project for {{.NETWORK}}: set GCP_PROJECT_{{upper .NETWORK}} in taskfiles/config.yml. The gcloud default project is never used."
+      - *network
+      - *project
     cmds:
       - |
+        project="{{.GCP_PROJECT}}"
         case " {{.MACHINES}} " in
           *" {{.NAME}} "*)
-            gcloud compute instances get-serial-port-output "shonin-{{.NAME}}-{{.NETWORK}}" \
-              --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" ;;
-          *)
-            gcloud run services logs read "shonin-{{.NAME}}-{{.NETWORK}}" \
-              --project="{{.GCP_PROJECT}}" --region="{{.GCP_REGION}}" --limit=100 ;;
+            # The launcher's log carries the container's own lines, each in
+            # jsonPayload.MESSAGE.
+            id=$(gcloud compute instances describe "shonin-{{.NAME}}-{{.NETWORK}}" --project="$project" --zone="{{.GCP_ZONE}}" --format='value(id)')
+            gcloud logging read "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"$id\" AND logName=\"projects/$project/logs/confidential-space-launcher\"" \
+              --project="$project" --freshness="{{.LOGS_FRESHNESS}}" --order=asc --format='value(timestamp,jsonPayload.MESSAGE)'
+            exit ;;
         esac
+        case "{{.NAME}}" in
+          api|keeper|tunnel|waker)
+            gcloud logging read "logName=\"projects/$project/logs/gcplogs-docker-driver\" AND jsonPayload.container.name=\"/shonin-{{.NAME}}\"" \
+              --project="$project" --freshness="{{.LOGS_FRESHNESS}}" --order=asc --format='value(timestamp,jsonPayload.data)' ;;
+          services|prover)
+            gcloud compute instances get-serial-port-output "shonin-{{.NAME}}-{{.NETWORK}}" \
+              --project="$project" --zone="{{.GCP_ZONE}}" | tail -n 200 ;;
+          *)
+            echo "no logs for {{.NAME}}: executor, api, keeper, tunnel, waker, services or prover"; exit 1 ;;
+        esac
+
+  start:
+    desc: "Start a stopped VM (NAME=executor|services|prover, NETWORK=...)"
+    requires:
+      vars: [NAME, NETWORK, GCP_PROJECT]
+    preconditions:
+      - *network
+      - *project
+      - &vm
+        sh: 'for n in {{.VMS}} {{.MACHINES}}; do [ "$n" = "{{.NAME}}" ] && exit 0; done; exit 1'
+        msg: "No VM is called {{.NAME}}: {{.VMS}}"
+    cmds:
+      - gcloud compute instances start "shonin-{{.NAME}}-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}"
+
+  stop:
+    desc: "Stop a VM; its disk stays, and it bills only for that (NAME=executor|services|prover, NETWORK=...)"
+    requires:
+      vars: [NAME, NETWORK, GCP_PROJECT]
+    preconditions:
+      - *network
+      - *project
+      - *vm
+    cmds:
+      - gcloud compute instances stop "shonin-{{.NAME}}-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}"
+
+  delete:
+    desc: "Delete a VM and its disk (NAME=executor|services|prover, NETWORK=..., CONFIRM=yes)"
+    requires:
+      vars: [NAME, NETWORK, GCP_PROJECT]
+    preconditions:
+      - *network
+      - *project
+      - *vm
+      - sh: '[ "{{.CONFIRM}}" = "yes" ]'
+        msg: "Deleting shonin-{{.NAME}}-{{.NETWORK}} can't be undone: pass CONFIRM=yes."
+    cmds:
+      - gcloud compute instances delete "shonin-{{.NAME}}-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" --quiet

@@ -7015,6 +7015,7 @@ name = "shonin-attestation"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "hex",
  "risc0-zkvm",
  "serde",
@@ -7023,6 +7024,7 @@ dependencies = [
  "shonin-attestation-core",
  "shonin-attestation-deploy",
  "shonin-attestation-methods",
+ "ureq",
 ]
 
 [[package]]
@@ -7190,11 +7192,13 @@ dependencies = [
  "alloy",
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "ciborium",
  "clap",
  "fastnum",
  "futures",
+ "getrandom 0.3.4",
  "hex",
  "http",
  "http-body",
@@ -7207,6 +7211,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "shonin-attestation-core",
+ "shonin-attestation-deploy",
  "shonin-chain",
  "shonin-hyperliquid",
  "shonin-lighter",
@@ -7218,12 +7224,14 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "tokio-tungstenite 0.30.0",
+ "tower",
  "tracing",
  "tracing-subscriber 0.3.23",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-http",
  "webpki-roots 1.0.9",
+ "zeroize",
 ]
 
 [[package]]

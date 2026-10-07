@@ -188,10 +188,11 @@ abstract contract StationBase is Fixture {
 
     /// Bless a key from `image` for a vault on `vaultChain`.
     function blessFor(bytes32 image, address signer, uint256 vaultChain, address forVault) internal {
-        bytes32 leaf =
-            keccak256(bytes.concat(keccak256(abi.encode(vaultChain, forVault, BUNDLE, block.chainid))));
+        bytes32 leaf = keccak256(
+            bytes.concat(keccak256(abi.encode(vaultChain, forVault, BUNDLE, block.chainid, signer)))
+        );
         bytes memory journal = journalFor(image, signer, leaf);
-        attestation.bless(sealOf(journal), journal, vaultChain, forVault, BUNDLE, new bytes32[](0));
+        attestation.bless(sealOf(journal), journal, vaultChain, forVault, BUNDLE, signer, new bytes32[](0));
     }
 
     /// The executor's money at the venue, one BTC long against one short.

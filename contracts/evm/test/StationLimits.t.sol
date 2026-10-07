@@ -71,10 +71,11 @@ contract StationLimitsTest is Fixture {
         ownStations.initialize(address(attestation), address(usd), address(this), address(new Station()));
         address vaultAddr = makeAddr("vault on chain 8453");
 
-        bytes32 leaf =
-            keccak256(bytes.concat(keccak256(abi.encode(uint256(8453), vaultAddr, BUNDLE, block.chainid))));
+        bytes32 leaf = keccak256(
+            bytes.concat(keccak256(abi.encode(uint256(8453), vaultAddr, BUNDLE, block.chainid, executor)))
+        );
         bytes memory journal = journalFor(EXECUTOR_IMAGE, executor, leaf);
-        attestation.bless(sealOf(journal), journal, 8453, vaultAddr, BUNDLE, new bytes32[](0));
+        attestation.bless(sealOf(journal), journal, 8453, vaultAddr, BUNDLE, executor, new bytes32[](0));
 
         bytes32[] memory drivers = new bytes32[](1);
         drivers[0] = "local";
@@ -109,10 +110,11 @@ contract StationLimitsTest is Fixture {
         StationFactory ownStations = new StationFactory(address(this));
         ownStations.initialize(address(attestation), address(usd), address(this), address(new Station()));
         address vaultAddr = makeAddr("vault on chain 8453");
-        bytes32 leaf =
-            keccak256(bytes.concat(keccak256(abi.encode(uint256(8453), vaultAddr, BUNDLE, block.chainid))));
+        bytes32 leaf = keccak256(
+            bytes.concat(keccak256(abi.encode(uint256(8453), vaultAddr, BUNDLE, block.chainid, executor)))
+        );
         bytes memory journal = journalFor(EXECUTOR_IMAGE, executor, leaf);
-        attestation.bless(sealOf(journal), journal, 8453, vaultAddr, BUNDLE, new bytes32[](0));
+        attestation.bless(sealOf(journal), journal, 8453, vaultAddr, BUNDLE, executor, new bytes32[](0));
 
         bytes32[] memory drivers = new bytes32[](1);
         drivers[0] = "local";

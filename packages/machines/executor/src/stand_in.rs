@@ -408,7 +408,8 @@ pub mod serving {
         pub station: Address,
         /// The key the station records as approved.
         pub approved_key: Address,
-        /// The registry's `blessedUntil` for the key.
+        /// The registry's `blessedUntil` for the key: a TTL from now at
+        /// first, the keeper having blessed every key the executor holds.
         pub blessed_until: u64,
         /// What the venue holds the key approved until: what decides whether
         /// the agent's orders are taken.
@@ -451,7 +452,7 @@ pub mod serving {
             bundle: B256::repeat_byte(0x42),
             station: Address::repeat_byte(0x55),
             approved_key: Address::ZERO,
-            blessed_until: 0,
+            blessed_until: NOW + TTL,
             venue_until: 0,
             failing_approvals: 0,
             unanswered_approvals: 0,
@@ -987,8 +988,18 @@ pub mod killed {
                     alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
                 block.header.inner.number = 16;
                 block.header.inner.timestamp = NOW;
+                block.header.inner.base_fee_per_gas = Some(1_000_000_000);
                 serde_json::to_value(block).unwrap()
             }
+            // The keeper has stocked the key.
+            "eth_getBalance" => json!(U256::from(10u128.pow(19))),
+            "eth_gasPrice" | "eth_maxPriorityFeePerGas" => json!("0x3b9aca00"),
+            "eth_feeHistory" => json!({
+                "oldestBlock": "0x1",
+                "baseFeePerGas": ["0x3b9aca00", "0x3b9aca00"],
+                "gasUsedRatio": [0.5],
+                "reward": [["0x3b9aca00"]],
+            }),
             "eth_call" if crate::stand_in::code_run(&request).is_some() => {
                 crate::stand_in::code_run(&request).unwrap()
             }

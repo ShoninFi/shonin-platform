@@ -25,11 +25,14 @@ pub mod logs;
 pub mod solana;
 
 #[cfg(feature = "args")]
-pub use args::{ChainArgs, Served, SolanaServed, Target, connect_solana, connect_to, signing_for};
+pub use args::{
+    ChainArgs, Served, SolanaServed, Target, connect_solana, connect_to, connect_with, signing_for,
+    signing_with_roles,
+};
 #[cfg(feature = "rpc")]
 pub use client::{
-    Client, KeyClient, NeverAcknowledged, NeverLanded, NeverSent, ROLE_COUNT, Reverted, Role,
-    Signing, Unanswered, keys_from_mnemonic, may_still_land, node_trouble, unanswered,
+    Client, KeyClient, NeverAcknowledged, NeverLanded, NeverSent, ROLE_COUNT, ROLES, Reverted,
+    Role, Signing, Unanswered, keys_from_mnemonic, may_still_land, node_trouble, unanswered,
 };
 pub use config::{ChainConfig, ChainConfigs, ChainKey, ChainKind, Network, NetworkName};
 pub use deployments::{ChainDeployments, Deployments, Roles, SolanaDeployments, SolanaRoles};

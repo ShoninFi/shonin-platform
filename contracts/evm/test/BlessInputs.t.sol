@@ -19,12 +19,13 @@ contract BlessInputsTest is Fixture {
     /// three being set.
     function test_an_executor_is_blessed_for_a_chain_and_a_bundle_not_just_a_vault() public {
         address vault = makeAddr("vault");
-        bytes32 leaf =
-            keccak256(bytes.concat(keccak256(abi.encode(uint256(0), vault, bytes32(0), block.chainid))));
+        bytes32 leaf = keccak256(
+            bytes.concat(keccak256(abi.encode(uint256(0), vault, bytes32(0), block.chainid, executor)))
+        );
         bytes memory journal = journalFor(EXECUTOR_IMAGE, executor, leaf);
         bytes memory seal = sealOf(journal);
         vm.expectRevert(AttestationRegistry.WrongKindForVault.selector);
-        attestation.bless(seal, journal, 0, vault, bytes32(0), new bytes32[](0));
+        attestation.bless(seal, journal, 0, vault, bytes32(0), executor, new bytes32[](0));
     }
 
     /// `bless` accepts `journal.signer == address(0)`. `StrategyRegistry`'s
@@ -34,10 +35,10 @@ contract BlessInputsTest is Fixture {
     /// clearance. The registry should refuse to bless the zero address, and
     /// `_signer` should revert rather than return the sentinel.
     function test_the_zero_address_cannot_be_blessed_as_a_builder() public {
-        bytes memory journal = journalFor(BUILDER_IMAGE, address(0), serviceLeaf());
+        bytes memory journal = journalFor(BUILDER_IMAGE, address(0), serviceLeaf(address(0)));
         bytes memory seal = sealOf(journal);
         vm.expectRevert();
-        attestation.bless(seal, journal, 0, address(0), bytes32(0), new bytes32[](0));
+        attestation.bless(seal, journal, 0, address(0), bytes32(0), address(0), new bytes32[](0));
     }
 
     function test_an_empty_signature_is_never_a_builder_signature() public {

@@ -83,6 +83,13 @@ pub enum Signing {
     Unlocked,
     /// These keys, in role order, signed for here.
     Keys(Vec<PrivateKeySigner>),
+    /// The role accounts as a deployment names them, in role order, and the
+    /// keys of the few this client signs for here (possibly none). Sending
+    /// or signing as any other account is refused at the call.
+    Roles {
+        accounts: Vec<Address>,
+        keys: Vec<PrivateKeySigner>,
+    },
     /// Nobody: the client only reads.
     ReadOnly,
 }
@@ -114,6 +121,20 @@ pub fn keys_from_mnemonic(phrase: &str, count: usize) -> Result<Vec<PrivateKeySi
 
 /// How many role accounts there are ([`Role::account_index`]).
 pub const ROLE_COUNT: usize = 10;
+
+/// Every role, in no particular order.
+pub const ROLES: [Role; ROLE_COUNT] = [
+    Role::Admin,
+    Role::Platform,
+    Role::Attestor,
+    Role::Builder,
+    Role::Reviewer,
+    Role::Executor,
+    Role::Keeper,
+    Role::Operator,
+    Role::Author,
+    Role::Viewer,
+];
 
 /// A connection to the chain, and the addresses of everything on it.
 #[derive(Clone)]
@@ -1481,7 +1502,7 @@ impl Client {
             .erased();
         let reading = asking.clone();
         let (provider, signing_provider) = match &signing {
-            Signing::Keys(keys) if !keys.is_empty() => {
+            Signing::Keys(keys) | Signing::Roles { keys, .. } if !keys.is_empty() => {
                 let mut wallet = EthereumWallet::from(keys[0].clone());
                 for key in &keys[1..] {
                     wallet.register_signer(key.clone());
@@ -1504,6 +1525,12 @@ impl Client {
             ),
             Signing::Keys(keys) => (
                 keys.iter().map(|key| key.address()).collect(),
+                Some(Arc::new(
+                    keys.into_iter().map(|key| (key.address(), key)).collect(),
+                )),
+            ),
+            Signing::Roles { accounts, keys } => (
+                accounts,
                 Some(Arc::new(
                     keys.into_iter().map(|key| (key.address(), key)).collect(),
                 )),
@@ -1602,6 +1629,31 @@ impl Client {
             .context("reading a balance")
     }
 
+    /// Whether this client can sign as `who`. Where it signs with keys of
+    /// its own, only with the account's key here: asking it of any other is
+    /// an error that says which role the account plays, before anything is
+    /// sent. Where it holds no keys, the node is asked to sign (a
+    /// development chain's unlocked accounts), as before, and the node
+    /// decides.
+    pub fn holds_key_for(&self, who: Address) -> Result<()> {
+        let Some(keys) = self.keys.as_ref() else {
+            return Ok(());
+        };
+        if keys.contains_key(&who) {
+            return Ok(());
+        }
+        let role = self
+            .accounts
+            .iter()
+            .position(|account| *account == who)
+            .and_then(|index| ROLES.iter().find(|role| role.account_index() == index))
+            .map(|role| format!("the {} role's account ", role.label()))
+            .unwrap_or_default();
+        bail!(
+            "this client holds no key for {role}{who}: on a testnet a role signs with SHONIN_TESTNET_EVM_MNEMONIC, or the keeper alone with SHONIN_TESTNET_KEEPER_KEY"
+        )
+    }
+
     /// The account that plays a part on this chain.
     pub fn account(&self, role: Role) -> Result<Address> {
         self.accounts
@@ -1609,7 +1661,7 @@ impl Client {
             .copied()
             .ok_or_else(|| {
                 anyhow!(
-                    "no account plays the {} role here: on a testnet, set SHONIN_TESTNET_EVM_MNEMONIC; on mainnet, clients only read",
+                    "no account plays the {} role here: on a testnet, set SHONIN_TESTNET_EVM_MNEMONIC or connect beside the chain's deployment file; on mainnet, clients only read",
                     role.label()
                 )
             })
@@ -1963,6 +2015,11 @@ impl Client {
         what: &str,
         sent_as: impl FnOnce(B256) + Send,
     ) -> Result<TransactionReceipt> {
+        if let Some(from) = request.from {
+            self.holds_key_for(from)
+                .with_context(|| sending.to_string())
+                .map_err(NeverSent::wrap)?;
+        }
         let _turn = match request.from {
             Some(from)
                 if self
@@ -2043,6 +2100,7 @@ impl Client {
     /// Have the node sign a digest as `who`, the way a wallet would: the
     /// signature a contract recovers with `toEthSignedMessageHash`.
     pub async fn sign(&self, who: Address, digest: B256) -> Result<Bytes> {
+        self.holds_key_for(who)?;
         if let Some(key) = self.keys.as_ref().and_then(|keys| keys.get(&who)) {
             let signature = key
                 .sign_message_sync(digest.as_slice())
@@ -2067,6 +2125,7 @@ impl Client {
         vault: Address,
         restricted: &str,
     ) -> Result<Bytes> {
+        self.holds_key_for(who)?;
         if let Some(key) = self.keys.as_ref().and_then(|keys| keys.get(&who)) {
             let digest = crate::statement::digest(self.chain_id, vault, who, restricted);
             let signature = key.sign_hash_sync(&digest).context("signing")?;
