@@ -81,6 +81,8 @@ tasks:
       - sh: 'ls "{{.PATH_DEPLOYMENTS_DIR}}"/evm-*.json >/dev/null 2>&1'
         msg: "No deployment files in {{.PATH_DEPLOYMENTS_DIR}}: deploy the network's contracts first (task chains:deploy NETWORK={{.NETWORK}}). An image carries its network's deployments."
     vars:
+      # The tag as this task was given it: file-level vars never see a caller's TAG.
+      IMAGE_TAG: '{{.TAG | default .GIT_SHA}}'
       # The Solana program ids an image compiles in: a mainnet image the
       # committed mainnet ids, a testnet one the committed devnet ids once
       # they are committed. Until then a testnet image compiles in none and
@@ -151,6 +153,8 @@ tasks:
         sh: '[ "{{.BUILDER}}" = "local" ] || [ "{{.BUILDER}}" = "cloud" ]'
         msg: "BUILDER=local (docker here) or BUILDER=cloud (Cloud Build), not {{.BUILDER}}."
     vars:
+      # The tag as this task was given it: file-level vars never see a caller's TAG.
+      IMAGE_TAG: '{{.TAG | default .GIT_SHA}}'
       BUILDER: '{{.BUILDER | default "local"}}'
     cmds:
       - task: images
@@ -164,6 +168,9 @@ tasks:
     desc: "Build an image here with docker (linux/amd64) and push it: what cloud:push does with BUILDER=local (NAME=..., NETWORK=testnet|mainnet)"
     requires:
       vars: [NAME, NETWORK, GCP_PROJECT]
+    vars:
+      # The tag as this task was given it: file-level vars never see a caller's TAG.
+      IMAGE_TAG: '{{.TAG | default .GIT_SHA}}'
     cmds:
       - task: build
         vars: { NAME: "{{.NAME}}", NETWORK: "{{.NETWORK}}", TAG: "{{.IMAGE_TAG}}", SEALED: "{{.SEALED}}" }
@@ -185,6 +192,8 @@ tasks:
       - sh: 'ls "{{.PATH_DEPLOYMENTS_DIR}}"/evm-*.json >/dev/null 2>&1'
         msg: "No deployment files in {{.PATH_DEPLOYMENTS_DIR}}: deploy the network's contracts first (task chains:deploy NETWORK={{.NETWORK}}). An image carries its network's deployments."
     vars:
+      # The tag as this task was given it: file-level vars never see a caller's TAG.
+      IMAGE_TAG: '{{.TAG | default .GIT_SHA}}'
       NAMES: '{{.NAMES | default "api keeper executor prover"}}'
       BUILDER: '{{.BUILDER | default "cloud"}}'
       DEVNET_IDS:
@@ -267,6 +276,9 @@ tasks:
       - *project
       - sh: 'for n in {{.MACHINES}}; do [ "$n" = "{{.NAME}}" ] && exit 0; done; exit 1'
         msg: "{{.NAME}} is not a machine: {{.MACHINES}}"
+    vars:
+      # The tag as this task was given it: file-level vars never see a caller's TAG.
+      IMAGE_TAG: '{{.TAG | default .GIT_SHA}}'
     cmds:
       # The digest, not the tag: it is what the attestation measures. No
       # tee-env- and no tee-cmd: the image carries its settings, and the
@@ -298,6 +310,9 @@ tasks:
         sh: '[ "{{.NETWORK}}" = "testnet" ]'
         msg: "Only the testnet runs a services VM so far (NETWORK={{.NETWORK}})."
       - *project
+    vars:
+      # The tag as this task was given it: file-level vars never see a caller's TAG.
+      IMAGE_TAG: '{{.TAG | default .GIT_SHA}}'
     cmds:
       - |
         api=$({{.DIGEST_OF}} "{{.GCP_REGISTRY}}/api:{{.IMAGE_TAG}}")
@@ -321,6 +336,9 @@ tasks:
     preconditions:
       - *testnet
       - *project
+    vars:
+      # The tag as this task was given it: file-level vars never see a caller's TAG.
+      IMAGE_TAG: '{{.TAG | default .GIT_SHA}}'
     cmds:
       - |
         api=$({{.DIGEST_OF}} "{{.GCP_REGISTRY}}/api:{{.IMAGE_TAG}}")
@@ -347,6 +365,9 @@ tasks:
       - *project
       - sh: '[ -f "{{.PATH_ROOT}}/deploy/gcp/prover/startup.sh" ]'
         msg: "No deploy/gcp/prover/startup.sh: the prover's VM has nothing to run."
+    vars:
+      # The tag as this task was given it: file-level vars never see a caller's TAG.
+      IMAGE_TAG: '{{.TAG | default .GIT_SHA}}'
     cmds:
       # Spot, stopped (not deleted) when reclaimed, so the waker can start it
       # again. The startup script runs the prover and powers the VM off when
