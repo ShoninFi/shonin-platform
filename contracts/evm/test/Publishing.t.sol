@@ -120,18 +120,19 @@ contract PublishingTest is Fixture {
     // Prices ----------------------------------------------------------------
 
     function modest() internal pure returns (Allowances memory a) {
-        a.fuelPerSec = 2_000_000;
-        a.memoryMib = 256;
+        a.fuelPerSec = 10_000_000;
+        a.memoryMib = 64;
         a.requestsPerMin = 120;
         a.bytesPerDay = 50_000_000;
         a.streams = 4;
     }
 
-    /// The same figure the Rust side computes for the modest shape:
-    /// 2 cores × $0.15 × 24 + 0.25 GiB × $0.01 × 24 + 0.05 GB × $0.15.
+    /// The same figure the Rust side computes for the modest shape: a
+    /// hundredth of a core × $0.15 × 24 + 1/16 GiB × $0.01 × 24 + 0.05 GB ×
+    /// $0.15.
     function test_a_day_at_the_modest_allowances_costs_what_the_app_says() public view {
-        assertEq(prices.dailyCost(modest()), 7_267_500);
-        assertEq(prices.costOf(modest(), 1000, 1000 + 1 days), 7_267_500);
+        assertEq(prices.dailyCost(modest()), 58_500);
+        assertEq(prices.costOf(modest(), 1000, 1000 + 1 days), 58_500);
     }
 
     function test_inference_and_gas_are_priced() public view {
@@ -154,14 +155,14 @@ contract PublishingTest is Fixture {
         vm.prank(admin);
         prices.schedule(doubled);
 
-        assertEq(prices.dailyCost(modest()), 7_267_500);
+        assertEq(prices.dailyCost(modest()), 58_500);
         skip(PRICE_NOTICE);
-        assertEq(prices.dailyCost(modest()), 2 * 7_267_500);
+        assertEq(prices.dailyCost(modest()), 2 * 58_500);
 
         // A day before the change at the old prices and a day after at the new.
         uint64 change = start + PRICE_NOTICE;
-        assertEq(prices.costOf(modest(), change - 1 days, change + 1 days), 3 * 7_267_500);
-        assertEq(prices.costOf(modest(), start, start + 1 days), 7_267_500);
+        assertEq(prices.costOf(modest(), change - 1 days, change + 1 days), 3 * 58_500);
+        assertEq(prices.costOf(modest(), start, start + 1 days), 58_500);
     }
 
     function test_only_the_admin_schedules_prices() public {

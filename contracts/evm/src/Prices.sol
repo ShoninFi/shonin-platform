@@ -19,15 +19,23 @@ contract Prices is IPrices {
 
     address public immutable admin;
     uint64 public immutable notice;
+    /// How much Wasmtime fuel one core runs through in a second, measured on
+    /// the machines agents run on: what turns a fuel allowance into the
+    /// processor time `vcpuHour` prices. Fixed for this deployment; a new
+    /// measurement is a new price list.
+    uint64 public immutable fuelPerCoreSecond;
 
     PricePeriod[] private _history;
 
     error NotAdmin();
     error Backwards();
+    error NoFuelRate();
 
-    constructor(address admin_, uint64 notice_, UnitPrices memory initial) {
+    constructor(address admin_, uint64 notice_, uint64 fuelPerCoreSecond_, UnitPrices memory initial) {
+        if (fuelPerCoreSecond_ == 0) revert NoFuelRate();
         admin = admin_;
         notice = notice_;
+        fuelPerCoreSecond = fuelPerCoreSecond_;
         _history.push(PricePeriod({effectiveFrom: 0, prices: initial}));
         emit PricesScheduled(0, initial);
     }
@@ -88,10 +96,10 @@ contract Prices is IPrices {
         Allowances calldata a,
         UnitPrices memory p,
         uint256 seconds_
-    ) private pure returns (uint256) {
-        // A million units of fuel a second is one core, until the
-        // fuel-to-processor mapping is measured.
-        uint256 cores = (uint256(a.fuelPerSec) * p.vcpuHour).mulDiv(seconds_, 1e6 * 1 hours);
+    ) private view returns (uint256) {
+        // The fuel allowance as a share of a core, at the measured rate.
+        uint256 cores =
+            (uint256(a.fuelPerSec) * p.vcpuHour).mulDiv(seconds_, uint256(fuelPerCoreSecond) * 1 hours);
         uint256 memory_ = (uint256(a.memoryMib) * p.gibHour).mulDiv(seconds_, 1024 * 1 hours);
         uint256 egress = (uint256(a.bytesPerDay) * p.gbEgress).mulDiv(seconds_, 1e9 * 1 days);
         // Milliseconds of inference a minute, as seconds of inference a second.

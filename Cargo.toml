@@ -14,6 +14,8 @@ members = [
     "packages/machines/unwinder",
     "packages/keeper",
     "packages/devnet",
+    "packages/fuelbench",
+    "packages/fuelbench/guest",
     "packages/strategy-sdk",
     "packages/drivers/hyperliquid",
     "packages/drivers/robinhood",
@@ -22,6 +24,7 @@ members = [
     "packages/attestation/methods",
     "packages/attestation/host",
     "packages/attestation/deploy",
+    "packages/rootkey",
 ]
 # The Solana programs are their own workspace, built with Anchor.
 exclude = ["contracts/solana"]

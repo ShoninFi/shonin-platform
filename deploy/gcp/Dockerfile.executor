@@ -14,9 +14,25 @@
 # allow. It holds no key from outside: every key it signs with is made inside
 # the enclave.
 
-FROM rust:1.98.1-slim-bookworm AS build
+# Where the build starts from: the `deps` stage below, or (in Cloud Build)
+# that stage already built and pushed as an image named for everything it
+# is made from (deploy/gcp/cloudbuild/build.sh).
+ARG DEPS=deps
+
+# The toolchain rust-toolchain.toml pins, with its targets, and cargo-chef.
+FROM rust:1.98.1-slim-bookworm AS chef
 WORKDIR /src
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install && rustup show active-toolchain && \
+    cargo install cargo-chef --locked --version 0.1.78
+
+# What the dependencies are, from the manifests alone.
+FROM chef AS recipe
 COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# The dependencies alone, compiled from the recipe.
+FROM chef AS deps
 # The network whose Solana program ids are compiled in: devnet for a testnet
 # image, mainnet for a mainnet one, or none for an image that serves no
 # Solana cluster (task cloud:build passes it, with WITHOUT_SOLANA=1 for none).
@@ -31,7 +47,25 @@ RUN mkdir -p /opt/onnxruntime && \
     ln -sf libonnxruntime.so.1 /opt/onnxruntime/lib/libonnxruntime.so
 ENV ORT_LIB_LOCATION=/opt/onnxruntime/lib \
     ORT_PREFER_DYNAMIC_LINK=1
-# rust-toolchain.toml pins the same compiler; --locked builds exactly Cargo.lock.
+# Thin LTO over 16 codegen units links in a fraction of the time of the
+# workspace's fat, single-unit release. It changes only how the host binary
+# is optimised: an agent's code is compiled by the runtime at start, so what
+# it is metered in fuel is the same, and the build stays reproducible.
+ENV CARGO_PROFILE_RELEASE_LTO=thin \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+COPY --from=recipe /src/recipe.json recipe.json
+# The Solana programs' crates the chain crate names by path: outside the
+# workspace, so the recipe carries no skeleton of them.
+COPY contracts/solana contracts/solana
+RUN : "${NETWORK_FEATURE:?pass --build-arg NETWORK_FEATURE=devnet, mainnet or none}" && \
+    features="" && { [ "$NETWORK_FEATURE" = none ] || features="--features $NETWORK_FEATURE"; } && \
+    cargo chef cook --release --locked -p shonin-executor --bin executor $features --recipe-path recipe.json
+
+# Then the platform itself. rust-toolchain.toml pins the same compiler;
+# --locked builds exactly Cargo.lock.
+FROM ${DEPS} AS build
+ARG NETWORK_FEATURE
+COPY . .
 RUN : "${NETWORK_FEATURE:?pass --build-arg NETWORK_FEATURE=devnet, mainnet or none}" && \
     features="" && { [ "$NETWORK_FEATURE" = none ] || features="--features $NETWORK_FEATURE"; } && \
     cargo build --release --locked -p shonin-executor --bin executor $features && \

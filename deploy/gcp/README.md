@@ -18,11 +18,15 @@ Everything runs in one zone (`us-central1-a`), on the default network, with noth
 | --- | --- | --- | --- |
 | `shonin-executor-<network>` | the executor, attested: Confidential Space, hardened image, Intel TDX | `c3-standard-4` | `shonin-workload`: attest, pull images, write logs; no secret |
 | `shonin-services-<network>` | the API (the indexer inside), the keeper, the tunnel, the waker; Container-Optimized OS | `e2-small`, 10 GB standard disk | `shonin-services`: pull images, write logs, read two secrets, start and read the prover's instance |
-| `shonin-prover-<network>` | the attestation's prover; Spot, off when idle | `GCP_PROVER_MACHINE_TYPE` | `shonin-prover`: pull images, write logs |
+| `shonin-prover-<network>` | the attestation's prover; on-demand, off when idle | `GCP_PROVER_MACHINE_TYPE` | `shonin-prover`: pull images, write logs |
 
 They name each other by internal DNS: the executor's status port is `http://shonin-executor-testnet.us-central1-a.c.shonin-testnet.internal:19085`, the API `http://shonin-services-testnet.us-central1-a.c.shonin-testnet.internal:19081`.
 
 **How a blessing happens.** The executor makes its keys inside the enclave, asks the launcher for a token binding them, and publishes the token and its keys' leaves on its status port (`GET /attestation`), saying when a seal is wanted. The waker on the services VM sees that, and starts the prover's VM if it is off; the prover proves the token, posts the seal back to the executor, and powers off once idle. The keeper relays the seal to each chain's registry (`bless`, simulated first), then stocks each key the registry shows blessed for a live vault with gas.
+
+**The root key.** The executor also holds the root key (`packages/rootkey`), on the network's canonical chain (`root` in `config/chains.toml`: Base Sepolia on the testnet). Finding no root recorded there, it makes one inside the enclave and adds its signer's leaf to the same tree, so the same seal records it: the keeper relays `setRootKey` to the canonical chain's registry alone, simulated first, once per seal. Once the registry records that signer, and while that record is live, the executor serves the root key service on its status port (`POST /rootkey/exchange`, `GET /rootkey/published/{purpose}`, `GET /rootkey`); the API relays the two reads (`/api/rootkey`, `/api/rootkey/published/{purpose}`). One executor holds the testnet's root, so replacing its VM loses it: the new executor finds another signer recorded and serves nothing derived (`GET /rootkey` says `holds_root: false`, and its log says why) until the admin clears the record (`task chains:clear-root-key NETWORK=testnet`), when it makes a new root. Everything sealed to the old root is sealed again (`task rootkey:seal`). `task chains:root-key NETWORK=testnet` prints the record.
+
+**The root key's test requester** (`Dockerfile.requester`) proves sealing and release end to end: seal a dummy file to `platform:dummy` with `task rootkey:seal NETWORK=testnet PURPOSE=platform:dummy IN=<file> OUT=<dir>/sealed.json`, push the image with that directory baked in (`task cloud:push NAME=requester NETWORK=testnet SEALED=<dir>`), propose its digest as a reviewer (`task chains:image NETWORK=testnet DIGEST=<digest> KIND=reviewer`, then wait out the timelock), and launch it (`task cloud:deploy:machine NAME=requester NETWORK=testnet`). It asks the executor's status port for the key by attested exchange, opens the sealed file, and logs only the sha256 of what it opened. Delete its VM and revoke its image afterwards.
 
 **Size.** The services VM is `e2-small` (`GCP_SERVICES_MACHINE_TYPE` in `taskfiles/config.yml`): the API, the keeper, cloudflared and the waker run beside Container-Optimized OS and Docker, and the indexer reads every chain every couple of seconds.
 
@@ -38,6 +42,16 @@ The API's and the keeper's images hold no key. The keeper is handed its key alon
 task cloud:build NAME=api NETWORK=testnet      # docker build, tagged api:<git sha>
 task cloud:push NAME=api NETWORK=testnet       # to us-central1-docker.pkg.dev/shonin-testnet/shonin/api; prints the digest
 ```
+
+### In Cloud Build
+
+`BUILDER=cloud` builds in Google Cloud Build instead of cross-building here: `task cloud:push NAME=api NETWORK=testnet BUILDER=cloud`, or several side by side with `task cloud:images NETWORK=testnet NAMES="api keeper executor prover"` (Cloud Build is its default). `cloudbuild/stage.sh` stages the source (the files git tracks or would track, never `.env`, `.shonin` or a target directory, and refusing outright anything that looks like one), the public deployment files alone as `_deployments/`, and for the prover the guest as `_guest/`; the tarball goes to `gs://shonin-testnet_cloudbuild/source/` and `cloudbuild.yaml` builds each image with BuildKit as the `shonin-cloudbuild` account. The Dockerfiles compile the dependencies in a stage of their own (cargo-chef), which Cloud Build pushes as an image named for everything it is made from (`<registry>/deps-<name>:<key>`: the Dockerfile, the toolchain, `Cargo.lock`, every `Cargo.toml`, the Solana crates named by path, the network's feature), so a build with the same inputs starts from it and compiles only the platform's own crates. The images are pushed as plain image manifests, as `docker push` would. `BUILDER=local` (the default for `cloud:push`) is the laptop build, kept as the fallback.
+
+RISC Zero's Groth16 prover image is copied into the registry once (`task cloud:vendor-groth16 NETWORK=testnet`, `cloudbuild-vendor.yaml`), and the prover's VM pulls it from there by its digest (pinned in `prover/startup.sh`) and keeps it on its disk.
+
+### One command
+
+`task deploy:testnet SCOPE=services|contracts|all` (`deploy-testnet.sh`) runs every stage of a testnet deploy, each timed, safe to run again, and ends with the smoke check (`task chains:smoke NETWORK=testnet API=https://testnet-api.shonin.fi`, read-only, and the keeper's and the executor's health from inside the VPC).
 
 ## The machine: Confidential Space
 
@@ -69,7 +83,7 @@ What it runs is named in the instance's metadata (the images by digest), so `tas
 
 ## The prover's VM
 
-A Spot VM, stopped (not deleted) when reclaimed, created by `task cloud:deploy:prover` (it boots once then, finds nothing to prove, and powers off when idle); its startup script (`prover/startup.sh`) runs the prover and powers the VM off when it exits. Its metadata names `shonin-prover-image` (by digest) and `shonin-executor-url`. The services VM's account may start and read this instance and no other (a custom role, `shoninProverStarter`, bound on the instance).
+An on-demand VM, on only while proving, created by `task cloud:deploy:prover` (it boots once then, finds nothing to prove, and powers off when idle); its startup script (`prover/startup.sh`) runs the prover and powers the VM off when it exits. Its metadata names `shonin-prover-image` (by digest) and `shonin-executor-url`. The services VM's account may start and read this instance and no other (a custom role, `shoninProverStarter`, bound on the instance).
 
 ## Standing it up (testnet)
 

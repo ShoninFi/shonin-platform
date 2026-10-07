@@ -1,0 +1,36 @@
+# One command for a testnet deploy, safe to run again, ending with the smoke
+# check (deploy/gcp/deploy-testnet.sh holds the stages):
+#   task deploy:testnet SCOPE=services     the API and the keeper
+#   task deploy:testnet SCOPE=contracts    a contract generation and everything that carries it
+#   task deploy:testnet SCOPE=all          the same as contracts
+version: "3"
+
+includes:
+  config:
+    taskfile: ./config.yml
+    flatten: true
+
+tasks:
+  testnet:
+    desc: "Deploy to the testnets in one go, safe to run again, each stage timed, ending with the smoke check: SCOPE=services (the API's and the keeper's images, built in Cloud Build, and the services VM on them) or SCOPE=contracts|all (a contract generation on every EVM testnet at once, GENERATION=<n> for a new one, then every image, the executor's digest proposed, the prover started warm, the executor and the services on the new images). BUILDER=local builds the images here instead"
+    requires:
+      vars: [SCOPE]
+    preconditions:
+      - sh: 'case "{{.SCOPE}}" in services|contracts|all) exit 0 ;; *) exit 1 ;; esac'
+        msg: "SCOPE=services, contracts or all (SCOPE={{.SCOPE}})."
+      - sh: 'command -v gcloud >/dev/null && command -v jq >/dev/null'
+        msg: "gcloud and jq are needed."
+    cmds:
+      - cmd: >-
+          SCOPE="{{.SCOPE}}"
+          GENERATION="{{.GENERATION}}"
+          BUILDER="{{.BUILDER | default "cloud"}}"
+          ALLOW_NO_VAULT="{{.ALLOW_NO_VAULT}}"
+          PROJECT="{{.GCP_PROJECT_TESTNET}}"
+          ZONE="{{.GCP_ZONE}}"
+          REGISTRY="{{.GCP_REGION}}-docker.pkg.dev/{{.GCP_PROJECT_TESTNET}}/{{.GCP_ARTIFACT_REPO}}"
+          DEPLOYMENTS_DIR="{{joinPath .PATH_ROOT ".shonin" "testnet" "deployments"}}"
+          API_URL="https://testnet-api.shonin.fi"
+          EXECUTOR_URL="http://shonin-executor-testnet.{{.GCP_ZONE}}.c.{{.GCP_PROJECT_TESTNET}}.internal:19085"
+          NETWORK=testnet
+          "{{.PATH_ROOT}}/deploy/gcp/deploy-testnet.sh"

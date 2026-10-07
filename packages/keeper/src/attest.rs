@@ -10,6 +10,16 @@
 //! A `bless` is simulated first and sent only if the simulation goes through,
 //! and never again while one sent may still land.
 //!
+//! The executor also publishes, while it holds the root key, its signer's
+//! leaf on the canonical chain. On that chain alone the keeper relays
+//! `setRootKey` with the same seal: only while the registry records no root,
+//! or records this same signer through a checker that a newer one, or its
+//! own retirement, lets the record move from (the registry's own rule);
+//! never while it records another signer; only once a simulation goes
+//! through; and once per seal, unless the record reads empty again while the
+//! executor still wants the leaf recorded (a reorganisation undid the
+//! recording; a signer the admin cleared is refused by the simulation).
+//!
 //! Once the chain shows a key blessed as the executor of a vault that is
 //! still live, and for the bundle that vault runs, the keeper keeps that key
 //! stocked with gas: the key sends the vault's own transactions, and its
@@ -37,6 +47,24 @@ pub(crate) struct Published {
     pub journal: Option<Bytes>,
     #[serde(default)]
     pub leaves: Vec<Leaf>,
+    /// The root key's signer's leaf, while the executor holds the root.
+    #[serde(default)]
+    pub root: Option<RootLeaf>,
+}
+
+/// The root key's signer, as a leaf of the tree the seal proves, on the
+/// canonical chain.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub(crate) struct RootLeaf {
+    /// The canonical chain, whose registry records the root.
+    pub chain_id: u64,
+    pub signer: Address,
+    /// Whether the executor wants it recorded: the record, as it reads it,
+    /// is empty, or names this signer through something no longer allowed.
+    #[serde(default)]
+    pub due: bool,
+    #[serde(default)]
+    pub proof: Vec<B256>,
 }
 
 /// One key the executor holds, the vault it is for, and its place in the
@@ -92,6 +120,25 @@ pub(crate) trait Registry {
     /// nothing).
     async fn simulate_bless(&self, seal: &Bytes, journal: &Bytes, leaf: &Leaf) -> Result<()>;
     async fn send_bless(&self, seal: &Bytes, journal: &Bytes, leaf: &Leaf) -> Sent;
+    /// The root key's record: its signer (zero for none) and the checker it
+    /// was recorded through.
+    async fn root_record(&self) -> Result<(Address, Address)>;
+    /// Whether the record wants moving to a later attestation of the same
+    /// root, which the registry accepts from any allowed image and project
+    /// through any allowed checker: the image, the project or the checker it
+    /// was recorded through is no longer allowed, or a newer allowed checker
+    /// exists (a rotation's overlap). While none of that holds, the record
+    /// stands, and a later seal of the same root changes nothing worth a
+    /// send.
+    async fn root_can_move(&self, checker: Address) -> Result<bool>;
+    /// Whether `checker`, the one the root's record was made through, is
+    /// still allowed: once it isn't, the record isn't live until a seal is
+    /// recorded again through an allowed one.
+    async fn root_checker_allowed(&self, checker: Address) -> Result<bool>;
+    /// Whether `setRootKey` with this seal would go through now.
+    async fn simulate_set_root(&self, seal: &Bytes, journal: &Bytes, root: &RootLeaf)
+    -> Result<()>;
+    async fn send_set_root(&self, seal: &Bytes, journal: &Bytes, root: &RootLeaf) -> Sent;
     /// Bring the key's gas back up to its stake if it has run below the
     /// top-up line. Says whether it holds its gas now.
     async fn stock(&self, key: Address, stakes: &mut Stakes) -> Result<bool>;
@@ -127,6 +174,20 @@ pub(crate) struct Memory {
     pub stakes: Stakes,
     /// When the chain was last looked at.
     last: Option<Instant>,
+    /// The seal (with its journal) whose `setRootKey` went through, and
+    /// when: relayed again only once the checker the record was made through
+    /// is no longer allowed, or once the record reads empty again while the
+    /// executor wants it recorded.
+    root_relayed: Option<(B256, Instant)>,
+    /// The seal relayed again for that, while the checker stays retired: it
+    /// is not relayed a third time until the record has been seen through an
+    /// allowed checker again, so a send that changed nothing isn't repeated
+    /// round after round.
+    root_resent: Option<B256>,
+    /// Each root signer with a `setRootKey` that may still land, and until
+    /// when no other is sent for it, from this seal or any other: a second
+    /// would revert once the first lands.
+    root_held: HashMap<Address, Instant>,
 }
 
 impl Memory {
@@ -259,6 +320,130 @@ pub(crate) async fn round(
         done.stocked.push(leaf.key);
     }
     Ok(done)
+}
+
+/// One look at a chain: the vault keys' blessings and gas first, then the
+/// root key's record. Each runs whatever became of the other, so a root that
+/// can't be recorded (its simulation reverts, or its record can't be read)
+/// never holds back a vault key's blessing from the same seal, and the other
+/// way round. Either one's error is said; the blessings' first.
+pub(crate) async fn look(
+    registry: &impl Registry,
+    chain_id: u64,
+    canonical: bool,
+    published: &Published,
+    memory: &mut Memory,
+    at: Instant,
+) -> Result<()> {
+    let blessed = round(registry, chain_id, published, memory, at).await;
+    let recorded = root_round(registry, chain_id, canonical, published, memory, at).await;
+    blessed.map(|_| ()).and(recorded.map(|_| ()))
+}
+
+/// What the root's relay did in one round, for the log and the tests.
+#[derive(Debug, PartialEq)]
+pub(crate) enum RootRelay {
+    /// Nothing to relay: not the canonical chain, no root published, no
+    /// seal, already relayed for this seal, or the record doesn't want it.
+    Nothing,
+    /// The registry records another signer: never relayed.
+    AnotherSigner(Address),
+    /// The simulation did not go through: not sent.
+    NotSimulated,
+    /// Sent, with what became of it.
+    Sent(Sent),
+}
+
+/// The seal and journal, as one: what "once per seal" counts by.
+fn seal_id(seal: &Bytes, journal: &Bytes) -> B256 {
+    alloy::primitives::keccak256([seal.as_ref(), journal.as_ref()].concat())
+}
+
+/// One look at the root key's record on a chain: relay `setRootKey` from the
+/// executor's seal if this is the canonical chain and the record wants it.
+pub(crate) async fn root_round(
+    registry: &impl Registry,
+    chain_id: u64,
+    canonical: bool,
+    published: &Published,
+    memory: &mut Memory,
+    at: Instant,
+) -> Result<RootRelay> {
+    let Some(root) = published.root.as_ref() else {
+        return Ok(RootRelay::Nothing);
+    };
+    // The root is recorded on the canonical chain alone, whatever chain the
+    // executor names.
+    if !canonical || root.chain_id != chain_id {
+        return Ok(RootRelay::Nothing);
+    }
+    let (Some(seal), Some(journal)) = (&published.seal, &published.journal) else {
+        return Ok(RootRelay::Nothing);
+    };
+    let id = seal_id(seal, journal);
+    memory.root_held.retain(|_, until| at < *until);
+    if memory.root_held.contains_key(&root.signer) {
+        return Ok(RootRelay::Nothing);
+    }
+    let relayed_at = memory
+        .root_relayed
+        .and_then(|(relayed, at)| (relayed == id).then_some(at));
+    let relayed = relayed_at.is_some();
+    let (recorded, checker) = registry.root_record().await?;
+    let mut resends = false;
+    if recorded == Address::ZERO {
+        // This seal recorded it, and the record is empty now: either the
+        // admin cleared it, and that signer is refused for good, or a
+        // reorganisation undid the recording. Sent again only while the
+        // executor still wants it recorded, and not before every node the
+        // keeper asks has had time to reach the block it went through in; a
+        // cleared signer's simulation reverts, so a clear is never undone.
+        if relayed_at.is_some_and(|done| !root.due || at < done + DONE_HOLD) {
+            return Ok(RootRelay::Nothing);
+        }
+    } else {
+        if recorded != root.signer {
+            return Ok(RootRelay::AnotherSigner(recorded));
+        }
+        if relayed {
+            // This seal recorded it already. Once the checker it was
+            // recorded through is retired, sending it again has an allowed
+            // checker record it afresh, as a vault key's blessing is: once
+            // per seal while that checker stays retired.
+            if registry.root_checker_allowed(checker).await? {
+                memory.root_resent = None;
+                return Ok(RootRelay::Nothing);
+            }
+            if memory.root_resent == Some(id) {
+                return Ok(RootRelay::Nothing);
+            }
+            resends = true;
+        } else if !registry.root_can_move(checker).await? {
+            return Ok(RootRelay::Nothing);
+        }
+    }
+    if let Err(error) = registry.simulate_set_root(seal, journal, root).await {
+        tracing::debug!(signer = %root.signer, error = format!("{error:#}"), "recording the root key would not go through; not sent");
+        return Ok(RootRelay::NotSimulated);
+    }
+    let sent = registry.send_set_root(seal, journal, root).await;
+    match sent {
+        Sent::Done => {
+            memory.root_relayed = Some((id, at));
+            if resends {
+                memory.root_resent = Some(id);
+            }
+            memory.root_held.remove(&root.signer);
+            tracing::info!(signer = %root.signer, "the root key's signer was relayed to the canonical chain's registry");
+        }
+        Sent::MayStillLand => {
+            memory.root_held.insert(root.signer, at + LANDING_HOLD);
+        }
+        Sent::Failed => {
+            memory.root_held.remove(&root.signer);
+        }
+    }
+    Ok(RootRelay::Sent(sent))
 }
 
 /// Ask the executor what it publishes about its attestation.
@@ -399,6 +584,134 @@ impl Registry for OnChain<'_> {
 
     async fn stock(&self, key: Address, stakes: &mut Stakes) -> Result<bool> {
         fund_gas(self.client, self.keeper, stakes, key).await
+    }
+
+    async fn root_record(&self) -> Result<(Address, Address)> {
+        let record = self
+            .client
+            .read(
+                self.deployments.attestation,
+                IAttestationRegistry::rootKeyCall {},
+            )
+            .await?;
+        Ok((record.signer, record.verifier))
+    }
+
+    async fn root_can_move(&self, checker: Address) -> Result<bool> {
+        let registry = self.deployments.attestation;
+        let allowed = |verifier| async move {
+            self.client
+                .read(
+                    registry,
+                    IAttestationRegistry::isVerifierAllowedCall { verifier },
+                )
+                .await
+        };
+        if !allowed(checker).await? {
+            return Ok(true);
+        }
+        // The image or the project it was recorded from revoked: a later
+        // attestation from another allowed image (one that received the
+        // root by attested exchange) moves it there.
+        let record = self
+            .client
+            .read(registry, IAttestationRegistry::rootKeyCall {})
+            .await?;
+        let image_allowed = self
+            .client
+            .read(
+                registry,
+                IAttestationRegistry::isImageAllowedCall {
+                    imageDigest: record.imageDigest,
+                },
+            )
+            .await?;
+        let project_allowed = self
+            .client
+            .read(
+                registry,
+                IAttestationRegistry::isProjectAllowedCall {
+                    projectId: record.projectId,
+                },
+            )
+            .await?;
+        if !image_allowed || !project_allowed {
+            return Ok(true);
+        }
+        // The checkers in the order they were proposed: one after the
+        // record's that is allowed now is newer.
+        let listed = self
+            .client
+            .read(registry, IAttestationRegistry::verifiersCall {})
+            .await?;
+        let Some(at) = listed.iter().position(|listed| *listed == checker) else {
+            return Ok(false);
+        };
+        for newer in &listed[at + 1..] {
+            if allowed(*newer).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn root_checker_allowed(&self, checker: Address) -> Result<bool> {
+        self.client
+            .read(
+                self.deployments.attestation,
+                IAttestationRegistry::isVerifierAllowedCall { verifier: checker },
+            )
+            .await
+    }
+
+    async fn simulate_set_root(
+        &self,
+        seal: &Bytes,
+        journal: &Bytes,
+        root: &RootLeaf,
+    ) -> Result<()> {
+        self.client
+            .read(
+                self.deployments.attestation,
+                set_root_call(seal, journal, root),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    async fn send_set_root(&self, seal: &Bytes, journal: &Bytes, root: &RootLeaf) -> Sent {
+        match self
+            .client
+            .send(
+                self.keeper,
+                self.deployments.attestation,
+                set_root_call(seal, journal, root),
+            )
+            .await
+        {
+            Ok(_) => Sent::Done,
+            Err(error) => {
+                tracing::warn!(signer = %root.signer, error = format!("{error:#}"), "recording the root key did not go through");
+                if chain::may_still_land(&error) {
+                    Sent::MayStillLand
+                } else {
+                    Sent::Failed
+                }
+            }
+        }
+    }
+}
+
+fn set_root_call(
+    seal: &Bytes,
+    journal: &Bytes,
+    root: &RootLeaf,
+) -> IAttestationRegistry::setRootKeyCall {
+    IAttestationRegistry::setRootKeyCall {
+        seal: seal.clone(),
+        journal: journal.clone(),
+        rootSigner: root.signer,
+        merkleProof: root.proof.clone(),
     }
 }
 
@@ -559,6 +872,17 @@ mod tests {
         sends_answer: Option<Sent>,
         sent: Mutex<Vec<Address>>,
         stocked: Mutex<Vec<Address>>,
+        /// The root key's record: its signer and checker.
+        root: (Address, Address),
+        /// Whether that record's checker lets it move.
+        root_moves: bool,
+        /// Whether that record's checker is retired.
+        root_checker_retired: bool,
+        root_simulation_fails: bool,
+        /// The root key's record can't be read (the node errs).
+        root_unreadable: bool,
+        roots_simulated: Mutex<usize>,
+        roots_sent: Mutex<Vec<Address>>,
     }
 
     impl Registry for Stand {
@@ -591,6 +915,29 @@ mod tests {
             self.stocked.lock().unwrap().push(key);
             Ok(true)
         }
+        async fn root_record(&self) -> Result<(Address, Address)> {
+            if self.root_unreadable {
+                anyhow::bail!("the node did not answer");
+            }
+            Ok(self.root)
+        }
+        async fn root_can_move(&self, _: Address) -> Result<bool> {
+            Ok(self.root_moves)
+        }
+        async fn root_checker_allowed(&self, _: Address) -> Result<bool> {
+            Ok(!self.root_checker_retired)
+        }
+        async fn simulate_set_root(&self, _: &Bytes, _: &Bytes, _: &RootLeaf) -> Result<()> {
+            *self.roots_simulated.lock().unwrap() += 1;
+            if self.root_simulation_fails {
+                anyhow::bail!("execution reverted: RootKeyAlreadySet");
+            }
+            Ok(())
+        }
+        async fn send_set_root(&self, _: &Bytes, _: &Bytes, root: &RootLeaf) -> Sent {
+            self.roots_sent.lock().unwrap().push(root.signer);
+            self.sends_answer.unwrap_or(Sent::Done)
+        }
     }
 
     const CHAIN: u64 = 46_630;
@@ -620,6 +967,7 @@ mod tests {
             seal: Some(Bytes::from(vec![7u8; 324])),
             journal: Some(journal(NOW - 60)),
             leaves,
+            root: None,
         }
     }
 
@@ -908,5 +1256,465 @@ mod tests {
         assert_eq!(published.leaves[0].key, Address::repeat_byte(0x33));
         assert_eq!(issued_at(&journal(42)), Some(42));
         assert_eq!(issued_at(&[0u8; 12]), None);
+    }
+    // The root key ---------------------------------------------------------
+
+    const SIGNER: Address = Address::repeat_byte(0x7e);
+
+    fn with_root(chain_id: u64) -> Published {
+        let mut published = published(vec![leaf(1)]);
+        published.root = Some(RootLeaf {
+            chain_id,
+            signer: SIGNER,
+            due: true,
+            proof: vec![B256::repeat_byte(0x61)],
+        });
+        published
+    }
+
+    async fn relay(
+        stand: &Stand,
+        canonical: bool,
+        published: &Published,
+        memory: &mut Memory,
+        at: Instant,
+    ) -> RootRelay {
+        root_round(stand, CHAIN, canonical, published, memory, at)
+            .await
+            .unwrap()
+    }
+
+    /// A root that can't be recorded (its `setRootKey` would revert, or its
+    /// record can't be read) never keeps the same seal's vault key from
+    /// being blessed and stocked in the same look.
+    #[tokio::test]
+    async fn a_root_that_cannot_be_recorded_never_holds_back_a_vault_key_blessing() {
+        for unreadable in [false, true] {
+            let mut stand = stand();
+            stand.root_simulation_fails = !unreadable;
+            stand.root_unreadable = unreadable;
+            stand.vouched.insert(Address::repeat_byte(1));
+            let mut memory = Memory::default();
+            let looked = look(
+                &stand,
+                CHAIN,
+                true,
+                &with_root(CHAIN),
+                &mut memory,
+                Instant::now(),
+            )
+            .await;
+            assert_eq!(looked.is_err(), unreadable);
+            assert_eq!(*stand.sent.lock().unwrap(), [Address::repeat_byte(1)]);
+            assert_eq!(*stand.stocked.lock().unwrap(), [Address::repeat_byte(1)]);
+            assert!(stand.roots_sent.lock().unwrap().is_empty());
+        }
+    }
+
+    /// The other way round: a vault key whose blessing would revert never
+    /// keeps the root's record from being relayed from the same seal.
+    #[tokio::test]
+    async fn a_vault_key_that_cannot_be_blessed_never_holds_back_the_root() {
+        let mut stand = stand();
+        stand.simulation_fails = true;
+        let mut memory = Memory::default();
+        look(
+            &stand,
+            CHAIN,
+            true,
+            &with_root(CHAIN),
+            &mut memory,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert!(stand.sent.lock().unwrap().is_empty());
+        assert_eq!(*stand.roots_sent.lock().unwrap(), [SIGNER]);
+    }
+
+    #[tokio::test]
+    async fn the_root_is_relayed_once_per_seal() {
+        let stand = stand();
+        let published = with_root(CHAIN);
+        let mut memory = Memory::default();
+        let start = Instant::now();
+        assert_eq!(
+            relay(&stand, true, &published, &mut memory, start).await,
+            RootRelay::Sent(Sent::Done)
+        );
+        // The node the keeper asks hasn't caught up (the record still reads
+        // empty) in the rounds just after: the same seal is not sent again.
+        for seconds in [15, 60] {
+            assert_eq!(
+                relay(
+                    &stand,
+                    true,
+                    &published,
+                    &mut memory,
+                    start + Duration::from_secs(seconds)
+                )
+                .await,
+                RootRelay::Nothing
+            );
+        }
+        // Nor, round after round and hours later, while the executor doesn't
+        // want it recorded.
+        let mut settled = published.clone();
+        settled.root.as_mut().unwrap().due = false;
+        for seconds in [120, 900, 7_200] {
+            assert_eq!(
+                relay(
+                    &stand,
+                    true,
+                    &settled,
+                    &mut memory,
+                    start + Duration::from_secs(seconds)
+                )
+                .await,
+                RootRelay::Nothing
+            );
+        }
+        assert_eq!(*stand.roots_sent.lock().unwrap(), [SIGNER]);
+        // A new seal is a new relay.
+        let mut fresh = published.clone();
+        fresh.journal = Some(journal(NOW));
+        assert_eq!(
+            relay(&stand, true, &fresh, &mut memory, start).await,
+            RootRelay::Sent(Sent::Done)
+        );
+        assert_eq!(stand.roots_sent.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_root_relay_that_may_still_land_is_not_sent_again_meanwhile() {
+        let mut stand = stand();
+        stand.sends_answer = Some(Sent::MayStillLand);
+        let published = with_root(CHAIN);
+        let mut memory = Memory::default();
+        let start = Instant::now();
+        relay(&stand, true, &published, &mut memory, start).await;
+        relay(
+            &stand,
+            true,
+            &published,
+            &mut memory,
+            start + Duration::from_secs(300),
+        )
+        .await;
+        assert_eq!(stand.roots_sent.lock().unwrap().len(), 1);
+    }
+
+    /// A `setRootKey` that may still land holds back every other for the
+    /// same root signer, from a new seal too: once the first lands, a second
+    /// would only revert. Another signer is not held back, and once the hold
+    /// has run out the newest seal is sent.
+    #[tokio::test]
+    async fn a_root_relay_that_may_still_land_holds_back_a_new_seal_for_the_same_signer() {
+        let mut stand = stand();
+        stand.sends_answer = Some(Sent::MayStillLand);
+        let published = with_root(CHAIN);
+        let mut memory = Memory::default();
+        let start = Instant::now();
+        assert_eq!(
+            relay(&stand, true, &published, &mut memory, start).await,
+            RootRelay::Sent(Sent::MayStillLand)
+        );
+        let mut fresh = published.clone();
+        fresh.journal = Some(journal(NOW));
+        assert_eq!(
+            relay(
+                &stand,
+                true,
+                &fresh,
+                &mut memory,
+                start + Duration::from_secs(60)
+            )
+            .await,
+            RootRelay::Nothing
+        );
+        assert_eq!(stand.roots_sent.lock().unwrap().len(), 1);
+
+        // Another signer (a root made after a clear) is its own relay.
+        let mut another = fresh.clone();
+        another.root.as_mut().unwrap().signer = Address::repeat_byte(0x7f);
+        assert_eq!(
+            relay(
+                &stand,
+                true,
+                &another,
+                &mut memory,
+                start + Duration::from_secs(60)
+            )
+            .await,
+            RootRelay::Sent(Sent::MayStillLand)
+        );
+
+        // The hold on the first signer has run out: its newest seal is sent.
+        assert_eq!(
+            relay(
+                &stand,
+                true,
+                &fresh,
+                &mut memory,
+                start + LANDING_HOLD + Duration::from_secs(1)
+            )
+            .await,
+            RootRelay::Sent(Sent::MayStillLand)
+        );
+        assert_eq!(
+            *stand.roots_sent.lock().unwrap(),
+            [SIGNER, Address::repeat_byte(0x7f), SIGNER]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_root_is_relayed_only_on_the_canonical_chain() {
+        let stand = stand();
+        let mut memory = Memory::default();
+        // Not the canonical chain, though the executor names this one.
+        assert_eq!(
+            relay(
+                &stand,
+                false,
+                &with_root(CHAIN),
+                &mut memory,
+                Instant::now()
+            )
+            .await,
+            RootRelay::Nothing
+        );
+        // The canonical chain, but the executor names another.
+        assert_eq!(
+            relay(
+                &stand,
+                true,
+                &with_root(84_532),
+                &mut memory,
+                Instant::now()
+            )
+            .await,
+            RootRelay::Nothing
+        );
+        assert!(stand.roots_sent.lock().unwrap().is_empty());
+        assert_eq!(*stand.roots_simulated.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_root_is_relayed_only_after_a_passing_simulation() {
+        let mut stand = stand();
+        stand.root_simulation_fails = true;
+        let mut memory = Memory::default();
+        assert_eq!(
+            relay(&stand, true, &with_root(CHAIN), &mut memory, Instant::now()).await,
+            RootRelay::NotSimulated
+        );
+        assert!(stand.roots_sent.lock().unwrap().is_empty());
+        // Without a seal there is nothing to simulate.
+        let mut bare = with_root(CHAIN);
+        bare.seal = None;
+        stand.root_simulation_fails = false;
+        assert_eq!(
+            relay(&stand, true, &bare, &mut memory, Instant::now()).await,
+            RootRelay::Nothing
+        );
+        assert!(stand.roots_sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_root_is_never_relayed_while_another_signer_is_recorded() {
+        let mut stand = stand();
+        let other = Address::repeat_byte(0x0e);
+        stand.root = (other, Address::repeat_byte(0xcc));
+        stand.root_moves = true;
+        let mut memory = Memory::default();
+        for _ in 0..3 {
+            assert_eq!(
+                relay(&stand, true, &with_root(CHAIN), &mut memory, Instant::now()).await,
+                RootRelay::AnotherSigner(other)
+            );
+        }
+        assert!(stand.roots_sent.lock().unwrap().is_empty());
+        assert_eq!(*stand.roots_simulated.lock().unwrap(), 0);
+    }
+
+    /// The same signer recorded is relayed again only where the registry
+    /// lets the record move: its checker retired, or a newer one allowed.
+    #[tokio::test]
+    async fn the_same_signer_is_relayed_again_only_when_its_record_can_move() {
+        let mut stand = stand();
+        stand.root = (SIGNER, Address::repeat_byte(0xcc));
+        let mut memory = Memory::default();
+        assert_eq!(
+            relay(&stand, true, &with_root(CHAIN), &mut memory, Instant::now()).await,
+            RootRelay::Nothing
+        );
+        assert_eq!(*stand.roots_simulated.lock().unwrap(), 0);
+        stand.root_moves = true;
+        assert_eq!(
+            relay(&stand, true, &with_root(CHAIN), &mut memory, Instant::now()).await,
+            RootRelay::Sent(Sent::Done)
+        );
+    }
+
+    /// A root recorded from a seal whose checker is then retired is not live
+    /// until it is recorded again through an allowed checker: the same seal
+    /// is sent again, once while that checker stays retired, and once more
+    /// only after the record has been seen through an allowed checker and
+    /// that one is retired in turn.
+    #[tokio::test]
+    async fn the_root_s_seal_is_relayed_again_once_its_record_s_checker_is_retired() {
+        let mut stand = stand();
+        let published = with_root(CHAIN);
+        let mut memory = Memory::default();
+        let start = Instant::now();
+        assert_eq!(
+            relay(&stand, true, &published, &mut memory, start).await,
+            RootRelay::Sent(Sent::Done)
+        );
+        // Recorded through an allowed checker: nothing more to send, even
+        // where a newer checker would let the record move.
+        stand.root = (SIGNER, Address::repeat_byte(0xcc));
+        stand.root_moves = true;
+        assert_eq!(
+            relay(&stand, true, &published, &mut memory, start).await,
+            RootRelay::Nothing
+        );
+        assert_eq!(stand.roots_sent.lock().unwrap().len(), 1);
+
+        // Its checker is retired: the seal is sent again, once.
+        stand.root_checker_retired = true;
+        assert_eq!(
+            relay(&stand, true, &published, &mut memory, start).await,
+            RootRelay::Sent(Sent::Done)
+        );
+        for seconds in [15, 120, 900] {
+            assert_eq!(
+                relay(
+                    &stand,
+                    true,
+                    &published,
+                    &mut memory,
+                    start + Duration::from_secs(seconds)
+                )
+                .await,
+                RootRelay::Nothing
+            );
+        }
+        assert_eq!(stand.roots_sent.lock().unwrap().len(), 2);
+
+        // Recorded again through an allowed checker, which is later retired
+        // too: one more send.
+        stand.root_checker_retired = false;
+        relay(&stand, true, &published, &mut memory, start).await;
+        stand.root_checker_retired = true;
+        assert_eq!(
+            relay(&stand, true, &published, &mut memory, start).await,
+            RootRelay::Sent(Sent::Done)
+        );
+        assert_eq!(stand.roots_sent.lock().unwrap().len(), 3);
+
+        // Cleared: the record is empty, and the signer retired for good, so
+        // the registry refuses the seal however long the executor still
+        // wants it recorded: never sent again.
+        stand.root = (Address::ZERO, Address::ZERO);
+        stand.root_simulation_fails = true;
+        for seconds in [15, 120, 900] {
+            assert_ne!(
+                relay(
+                    &stand,
+                    true,
+                    &published,
+                    &mut memory,
+                    start + Duration::from_secs(seconds)
+                )
+                .await,
+                RootRelay::Sent(Sent::Done)
+            );
+        }
+        assert_eq!(stand.roots_sent.lock().unwrap().len(), 3);
+    }
+
+    /// A recording a reorganisation undid (the record reads empty again, no
+    /// clear was logged, and the executor wants its leaf recorded) is sent
+    /// again from the same seal, once the nodes have had time to catch up;
+    /// and not while one sent may still land.
+    #[tokio::test]
+    async fn a_recording_undone_by_a_reorg_is_sent_again_from_the_same_seal() {
+        let mut stand = stand();
+        let published = with_root(CHAIN);
+        let mut memory = Memory::default();
+        let start = Instant::now();
+        assert_eq!(
+            relay(&stand, true, &published, &mut memory, start).await,
+            RootRelay::Sent(Sent::Done)
+        );
+        // Recorded: nothing more to do.
+        stand.root = (SIGNER, Address::repeat_byte(0xcc));
+        let mut settled = published.clone();
+        settled.root.as_mut().unwrap().due = false;
+        assert_eq!(
+            relay(
+                &stand,
+                true,
+                &settled,
+                &mut memory,
+                start + Duration::from_secs(15)
+            )
+            .await,
+            RootRelay::Nothing
+        );
+
+        // A reorganisation undoes the block that recorded it: the record
+        // reads empty, and the executor, which found no clear in the log,
+        // wants its leaf recorded again. The signer was never retired, so
+        // the registry takes the same seal.
+        stand.root = (Address::ZERO, Address::ZERO);
+        stand.sends_answer = Some(Sent::MayStillLand);
+        assert_eq!(
+            relay(
+                &stand,
+                true,
+                &published,
+                &mut memory,
+                start + Duration::from_secs(120)
+            )
+            .await,
+            RootRelay::Sent(Sent::MayStillLand)
+        );
+        assert_eq!(stand.roots_sent.lock().unwrap().len(), 2);
+        // Not sent a third time while that one may still land.
+        for seconds in [135, 300, 600] {
+            assert_eq!(
+                relay(
+                    &stand,
+                    true,
+                    &published,
+                    &mut memory,
+                    start + Duration::from_secs(seconds)
+                )
+                .await,
+                RootRelay::Nothing
+            );
+        }
+        assert_eq!(stand.roots_sent.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_executor_s_root_leaf_reads_as_published() {
+        let json = r#"{
+            "mode": "development", "nonce": "00", "seal": null, "journal": null,
+            "leaves": [],
+            "root": {"chain_id": 31337, "signer": "0x7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e",
+                "due": true,
+                "leaf": "0x4444444444444444444444444444444444444444444444444444444444444444",
+                "proof": ["0x6161616161616161616161616161616161616161616161616161616161616161"]}
+        }"#;
+        let published: Published = serde_json::from_str(json).unwrap();
+        let root = published.root.unwrap();
+        assert_eq!(
+            (root.chain_id, root.signer, root.due),
+            (31_337, SIGNER, true)
+        );
+        assert_eq!(root.proof, [B256::repeat_byte(0x61)]);
     }
 }

@@ -63,6 +63,9 @@ zeroize = "1.9.0"
 base64 = "0.22.1"
 # The nonce an attestation token binds, as the attestation guest checks it.
 shonin-attestation-core = { path = "../../attestation/core" }
+# The root key: held here, served on the status port, passed to peers by
+# attested exchange.
+shonin-rootkey = { path = "../../rootkey" }
 
 [dev-dependencies]
 # A paused clock, so a test can wait out a receipt timeout without waiting.

@@ -3,6 +3,13 @@
 //! A deploy is idempotent: if the file is there and the contracts it names are
 //! still on the chain, nothing happens. Restarting a service never redeploys
 //! anything, and a fresh chain is deployed to on the first service that asks.
+//!
+//! Every contract is created through the standard deterministic deployer, a
+//! few to a transaction by a batch creator, so each address follows from the
+//! build, the roles and the generation before anything is sent, and a chain
+//! whose transactions land a minute apart (HyperEVM's big blocks) takes the
+//! whole deployment in a handful of blocks. The chains of a network are
+//! deployed at once, each in its own order.
 
 use std::path::Path;
 
@@ -434,6 +441,58 @@ pub async fn ensure(
     Ok(deployments)
 }
 
+/// Deploy to each of `chains` (its key, client, deployment file, and
+/// whether it is kept as it is) at once, under `generation`: each chain's
+/// own sends stay in their order, and no chain waits for another. Every
+/// chain is carried as far as it goes before an error is returned, naming
+/// each chain that stopped, so a failure on one never leaves another
+/// stopped part-way. Says how long each took.
+pub async fn ensure_each(
+    chains: &[(ChainKey, Client, std::path::PathBuf, bool)],
+    network: NetworkName,
+    artifacts: &Path,
+    names: &[(String, u64)],
+    generation: u64,
+) -> Result<()> {
+    use tracing::Instrument;
+    let started = std::time::Instant::now();
+    let each = chains.iter().map(|(key, client, file, _)| {
+        let span = tracing::info_span!("deploy", chain = %key);
+        async move {
+            let began = std::time::Instant::now();
+            let result = ensure(client, network, key, artifacts, file, names, generation).await;
+            (key, began.elapsed(), result)
+        }
+        .instrument(span)
+    });
+    let mut stopped = Vec::new();
+    for (key, took, result) in futures::future::join_all(each).await {
+        match result {
+            Ok(_) => println!("{key}: deployed and set up in {:.0} s", took.as_secs_f64()),
+            Err(error) => {
+                println!(
+                    "{key}: stopped after {:.0} s: {error:#}",
+                    took.as_secs_f64()
+                );
+                stopped.push(format!("{key}: {error:#}"));
+            }
+        }
+    }
+    println!(
+        "every chain done in {:.0} s",
+        started.elapsed().as_secs_f64()
+    );
+    if !stopped.is_empty() {
+        bail!(
+            "{} of {} chains stopped; run the deploy again to carry on: {}",
+            stopped.len(),
+            chains.len(),
+            stopped.join("; ")
+        );
+    }
+    Ok(())
+}
+
 /// What a deployment file records beside the addresses: the generation,
 /// and the station implementation its station factory was initialised
 /// with, read back from the chain.
@@ -468,15 +527,6 @@ async fn deploy(
     generation: u64,
     file: &Path,
 ) -> Result<Deployments> {
-    // None on testnets: nobody else's money is at stake there, and their
-    // clocks run in real time, so two days would be two real days. Mainnet
-    // gets a floor the admin can never go under.
-    let (timelock, min_timelock, price_notice) = match network {
-        NetworkName::Local => (LOCAL_TIMELOCK, 0, LOCAL_PRICE_NOTICE),
-        NetworkName::Testnet => (0, 0, 0),
-        NetworkName::Mainnet => (MAINNET_MIN_TIMELOCK, MAINNET_MIN_TIMELOCK, 0),
-    };
-    let blessing_ttl = blessing_ttl(network);
     let roles = Roles {
         admin: client.account(Role::Admin)?,
         platform: client.account(Role::Platform)?,
@@ -500,60 +550,188 @@ async fn deploy(
     landed.build = Some(build_of(artifacts)?);
     landed.save()?;
 
-    let usd = put(
-        &mut landed,
-        client,
-        artifacts,
-        admin,
-        "LocalUsd",
-        ().abi_encode_params(),
-    )
-    .await?;
-    let venue = put(
-        &mut landed,
-        client,
-        artifacts,
-        admin,
+    // Every address follows from the build, the roles, the network and the
+    // generation, so the whole deployment is known before anything is sent,
+    // and its contracts go out a few to a transaction.
+    let plan = plan(artifacts, network, &roles, chains, generation)?;
+    create(client, admin, artifacts, &plan.creations, &mut landed).await?;
+    let at = plan.addresses;
+
+    let wanted = StationFactorySet {
+        attestation: at.attestation,
+        asset: at.usd,
+        vault_factory: at.factory,
+        implementation: at.station_implementation,
+    };
+    initialise_station_factory(client, admin, at.station_factory, wanted).await?;
+
+    let deployments = Deployments {
+        chain_key: key.to_string(),
+        chain_id: client.chain_id,
+        // Never the client's endpoints: one set from the environment is
+        // usually a paid URL, which carries its key. Nothing reads it.
+        rpc_url: String::new(),
+        deployed_block: from_block,
+        usd: at.usd,
+        venue: at.venue,
+        attestation_verifier: at.verifier,
+        attestation: at.attestation,
+        publishing: at.publishing,
+        prices: at.prices,
+        strategies: at.strategies,
+        reviews: at.reviews,
+        profiles: at.profiles,
+        factory: at.factory,
+        station_factory: at.station_factory,
+        driver: at.driver,
+        bridge: at.bridge,
+        closer: at.closer,
+        roles,
+    };
+
+    Ok(deployments)
+}
+
+/// One contract a deployment creates, through the deterministic deployer:
+/// its creation code (the build's, with its libraries linked and its
+/// constructor's arguments appended), its salt, and so its address.
+#[derive(Clone, Debug)]
+struct Creation {
+    name: &'static str,
+    salt: B256,
+    code: Vec<u8>,
+    address: Address,
+}
+
+impl Creation {
+    fn new(
+        artifacts: &Path,
+        name: &'static str,
+        salt: B256,
+        arguments: Vec<u8>,
+        libraries: &[(&str, Address)],
+    ) -> Result<Self> {
+        let mut code = creation_code(artifacts, name, libraries)?;
+        code.extend_from_slice(&arguments);
+        let address = CREATE2_DEPLOYER.create2(salt, keccak256(&code));
+        Ok(Self {
+            name,
+            salt,
+            code,
+            address,
+        })
+    }
+
+    /// More gas than its creation can take, from its size alone: the code
+    /// stored at 200 a byte (never more than the creation code), the
+    /// creation code carried and hashed, and room for what a constructor
+    /// writes. What batches are packed by, before they are measured.
+    fn gas_bound(&self) -> u64 {
+        60_000 + 230 * self.code.len() as u64 + 600_000
+    }
+}
+
+/// Where a deployment's contracts are.
+#[derive(Clone, Copy, Debug)]
+struct Planned {
+    usd: Address,
+    venue: Address,
+    verifier: Address,
+    attestation: Address,
+    publishing: Address,
+    prices: Address,
+    strategies: Address,
+    reviews: Address,
+    profiles: Address,
+    driver: Address,
+    bridge: Address,
+    station_implementation: Address,
+    station_factory: Address,
+    closer: Address,
+    factory: Address,
+}
+
+/// Every contract a deployment creates, and where.
+struct Plan {
+    creations: Vec<Creation>,
+    addresses: Planned,
+}
+
+/// The salt a deployment's own contracts are created under: its generation
+/// and its admin, so no two deployments on a chain share one. (The
+/// contracts at one address on every chain use [`salt`] alone, as their
+/// creation code names the admin where it matters.)
+fn deployment_salt(generation: u64, admin: Address) -> B256 {
+    keccak256(("shonin-deployment", U256::from(generation), admin).abi_encode_params())
+}
+
+/// The deployment's contracts in the order they are created, each with its
+/// address, worked out from the build alone: nothing is asked of a chain.
+fn plan(
+    artifacts: &Path,
+    network: NetworkName,
+    roles: &Roles,
+    chains: &[(String, u64)],
+    generation: u64,
+) -> Result<Plan> {
+    // None on testnets: nobody else's money is at stake there, and their
+    // clocks run in real time, so two days would be two real days. Mainnet
+    // gets a floor the admin can never go under.
+    let (timelock, min_timelock, price_notice) = match network {
+        NetworkName::Local => (LOCAL_TIMELOCK, 0, LOCAL_PRICE_NOTICE),
+        NetworkName::Testnet => (0, 0, 0),
+        NetworkName::Mainnet => (MAINNET_MIN_TIMELOCK, MAINNET_MIN_TIMELOCK, 0),
+    };
+    let blessing_ttl = blessing_ttl(network);
+    let admin = roles.admin;
+    let own = deployment_salt(generation, admin);
+    let everywhere = salt(generation);
+    let mut creations = Vec::new();
+    let mut add = |name: &'static str,
+                   salt: B256,
+                   arguments: Vec<u8>,
+                   libraries: &[(&str, Address)]|
+     -> Result<Address> {
+        let creation = Creation::new(artifacts, name, salt, arguments, libraries)?;
+        let address = creation.address;
+        creations.push(creation);
+        Ok(address)
+    };
+
+    let usd = add("LocalUsd", own, ().abi_encode_params(), &[])?;
+    let venue = add(
         "LocalVenue",
+        own,
         (usd, roles.operator, U256::from(MARGIN_BPS)).abi_encode_params(),
-    )
-    .await?;
-    let verifier = put(
-        &mut landed,
-        client,
-        artifacts,
-        admin,
+        &[],
+    )?;
+    let verifier = add(
         "DevAttestationVerifier",
+        own,
         (roles.attestor,).abi_encode_params(),
-    )
-    .await?;
-    let attestation = put(
-        &mut landed,
-        client,
-        artifacts,
-        admin,
+        &[],
+    )?;
+    let attestation = add(
         "AttestationRegistry",
+        own,
         (admin, verifier, timelock, min_timelock, blessing_ttl).abi_encode_params(),
-    )
-    .await?;
-    let publishing = put(
-        &mut landed,
-        client,
-        artifacts,
-        admin,
+        &[],
+    )?;
+    let publishing = add(
         "Publishing",
+        own,
         (usd, roles.platform, U256::from(PUBLISH_FEE)).abi_encode_params(),
-    )
-    .await?;
-    let prices = put(
-        &mut landed,
-        client,
-        artifacts,
-        admin,
+        &[],
+    )?;
+    let prices = add(
         "Prices",
+        own,
         (
             admin,
             price_notice,
+            // The fuel one core runs through in a second, from the same
+            // constant the executor bills with.
+            shared::manifest::FUEL_PER_CORE_SECOND,
             // The published prices, in dollars scaled by 1e18, in the order
             // `UnitPrices` declares them: a core-hour, a GiB-hour, a GB of
             // egress, a second of inference.
@@ -565,53 +743,28 @@ async fn deploy(
             ),
         )
             .abi_encode_params(),
-    )
-    .await?;
-    let strategies = put(
-        &mut landed,
-        client,
-        artifacts,
-        admin,
+        &[],
+    )?;
+    let strategies = add(
         "StrategyRegistry",
+        own,
         (attestation, publishing).abi_encode_params(),
-    )
-    .await?;
-    let reviews = put(
-        &mut landed,
-        client,
-        artifacts,
-        admin,
+        &[],
+    )?;
+    let reviews = add(
         "ReviewRegistry",
+        own,
         (attestation, strategies, publishing).abi_encode_params(),
-    )
-    .await?;
-    let profiles = put(
-        &mut landed,
-        client,
-        artifacts,
-        admin,
-        "AuthorProfiles",
-        ().abi_encode_params(),
-    )
-    .await?;
-    let driver = put(
-        &mut landed,
-        client,
-        artifacts,
-        admin,
-        "LocalDriver",
-        (venue, usd).abi_encode_params(),
-    )
-    .await?;
-    let bridge = put(
-        &mut landed,
-        client,
-        artifacts,
-        admin,
+        &[],
+    )?;
+    let profiles = add("AuthorProfiles", own, ().abi_encode_params(), &[])?;
+    let driver = add("LocalDriver", own, (venue, usd).abi_encode_params(), &[])?;
+    let bridge = add(
         "LocalBridge",
+        own,
         (usd, roles.operator).abi_encode_params(),
-    )
-    .await?;
+        &[],
+    )?;
 
     // The station factory and its implementation carry nothing chain-specific
     // in their creation code, so they land at the same addresses on every
@@ -619,56 +772,30 @@ async fn deploy(
     // The station's closes run in a library linked into it, itself at the
     // same address everywhere, so the station's creation code is too.
     // Each is under the deployment's generation.
-    let everywhere = |name: &'static str,
-                      arguments: Vec<u8>,
-                      libraries: Vec<(&'static str, Address)>| {
-        async move {
-            put_everywhere(
-                client, artifacts, admin, name, arguments, &libraries, generation,
-            )
-            .await
-        }
-    };
-    let station_closes = everywhere("StationCloses", Vec::new(), Vec::new()).await?;
-    let station_implementation = everywhere(
+    let station_closes = add("StationCloses", everywhere, Vec::new(), &[])?;
+    let station_implementation = add(
         "Station",
+        everywhere,
         Vec::new(),
-        vec![("StationCloses", station_closes)],
-    )
-    .await?;
-    let station_factory =
-        everywhere("StationFactory", (admin,).abi_encode_params(), Vec::new()).await?;
-    let closer = everywhere("Closer", Vec::new(), Vec::new()).await?;
+        &[("StationCloses", station_closes)],
+    )?;
+    let station_factory = add(
+        "StationFactory",
+        everywhere,
+        (admin,).abi_encode_params(),
+        &[],
+    )?;
+    let closer = add("Closer", everywhere, Vec::new(), &[])?;
 
     // The vault is too large for one contract: its logic is in four
     // libraries linked into it.
-    let valuations = put(
-        &mut landed,
-        client,
-        artifacts,
-        admin,
-        "Valuations",
-        Vec::new(),
-    )
-    .await?;
-    let claims = put(&mut landed, client, artifacts, admin, "Claims", Vec::new()).await?;
-    let posts = put(&mut landed, client, artifacts, admin, "Posts", Vec::new()).await?;
-    let upkeep = put_linked(
-        &mut landed,
-        client,
-        artifacts,
-        admin,
-        "Upkeep",
-        Vec::new(),
-        &[("Valuations", valuations)],
-    )
-    .await?;
-    let vault_implementation = put_linked(
-        &mut landed,
-        client,
-        artifacts,
-        admin,
+    let valuations = add("Valuations", own, Vec::new(), &[])?;
+    let claims = add("Claims", own, Vec::new(), &[])?;
+    let posts = add("Posts", own, Vec::new(), &[])?;
+    let upkeep = add("Upkeep", own, Vec::new(), &[("Valuations", valuations)])?;
+    let vault_implementation = add(
         "Vault",
+        own,
         Vec::new(),
         &[
             ("Valuations", valuations),
@@ -676,19 +803,15 @@ async fn deploy(
             ("Claims", claims),
             ("Posts", posts),
         ],
-    )
-    .await?;
+    )?;
 
     let names: Vec<(B256, U256)> = chains
         .iter()
         .map(|(name, id)| (name_id(name), U256::from(*id)))
         .collect();
-    let factory = put(
-        &mut landed,
-        client,
-        artifacts,
-        admin,
+    let factory = add(
         "VaultFactory",
+        own,
         (
             // What the factory reads, in the order `VaultFactory.Deps`
             // declares it.
@@ -722,42 +845,483 @@ async fn deploy(
             names,
         )
             .abi_encode_params(),
+        &[],
+    )?;
+
+    // Kept in step with what a deployment's generation fixes elsewhere.
+    debug_assert_eq!(
+        everywhere_addresses(artifacts, admin, generation).ok(),
+        Some(EverywhereAddresses {
+            station_closes,
+            station_implementation,
+            station_factory,
+            closer,
+        })
+    );
+    Ok(Plan {
+        creations,
+        addresses: Planned {
+            usd,
+            venue,
+            verifier,
+            attestation,
+            publishing,
+            prices,
+            strategies,
+            reviews,
+            profiles,
+            driver,
+            bridge,
+            station_implementation,
+            station_factory,
+            closer,
+            factory,
+        },
+    })
+}
+
+alloy::sol! {
+    /// The batch creator (`contracts/evm/src/deploy/BatchCreate2.sol`).
+    interface IBatchCreate2 {
+        struct Creation {
+            bytes32 salt;
+            bytes code;
+        }
+        function create(Creation[] calldata creations)
+            external
+            returns (address[] memory created, uint256[] memory gasUsed);
+    }
+}
+
+/// The salt the batch creator itself is created under: one address on
+/// every chain, for every deployment.
+const BATCH_CREATOR_SALT: B256 = B256::ZERO;
+
+/// The most creation code one batch carries: under the 128 KB a node's pool
+/// takes in one transaction, with room for the call around it.
+const BATCH_BYTES: usize = 96_000;
+
+/// The gas a big block holds on HyperEVM.
+const HYPEREVM_BIG_BLOCK_GAS: u64 = 30_000_000;
+
+/// The most gas one transaction may carry on this chain: a big block's on
+/// HyperEVM (the deployer's transactions go into them), and elsewhere the
+/// per-transaction cap the newest chains enforce.
+fn transaction_gas_cap(client: &Client) -> u64 {
+    if hyperliquid::Api::for_chain(client.chain_id).is_some() {
+        HYPEREVM_BIG_BLOCK_GAS
+    } else {
+        16_777_216
+    }
+}
+
+/// The gas a creation is packed and sent by: what it was measured to
+/// take, with a quarter more, or else its bound.
+fn packing_gas(creation: &Creation, measured: Option<u64>) -> u64 {
+    match measured {
+        Some(used) => used / 4 * 5,
+        None => creation.gas_bound(),
+    }
+}
+
+/// Split `creations` (each with the gas it is packed by) into batches, in
+/// order, each within the bytes a transaction may carry and within seven
+/// tenths of the gas one may: two batches can then share a block whose
+/// gas is the cap.
+fn batches(creations: &[(Creation, u64)], gas_cap: u64) -> Vec<Vec<(Creation, u64)>> {
+    let budget = gas_cap / 10 * 7;
+    let mut out: Vec<Vec<(Creation, u64)>> = Vec::new();
+    let (mut bytes, mut gas) = (0usize, 0u64);
+    for (creation, needs) in creations {
+        let fits = out.last().is_some_and(|batch| {
+            !batch.is_empty() && bytes + creation.code.len() <= BATCH_BYTES && gas + needs <= budget
+        });
+        if !fits {
+            out.push(Vec::new());
+            (bytes, gas) = (0, 0);
+        }
+        bytes += creation.code.len();
+        gas += needs;
+        out.last_mut()
+            .expect("a batch was just started")
+            .push((creation.clone(), *needs));
+    }
+    out
+}
+
+/// The batch creator's call creating `creations`.
+fn batch_call(creations: &[&Creation]) -> Vec<u8> {
+    IBatchCreate2::createCall {
+        creations: creations
+            .iter()
+            .map(|creation| IBatchCreate2::Creation {
+                salt: creation.salt,
+                code: Bytes::from(creation.code.clone()),
+            })
+            .collect(),
+    }
+    .abi_encode()
+}
+
+/// What creating `creation` takes, asked of the chain without sending it
+/// (the creator reports each creation's gas): `None` from an endpoint that
+/// won't run so large a call.
+async fn measure(
+    client: &Client,
+    from: Address,
+    creator: Address,
+    creation: &Creation,
+    cap: u64,
+) -> Option<u64> {
+    use alloy::providers::Provider;
+    let asked = alloy::rpc::types::TransactionRequest::default()
+        .from(from)
+        .to(creator)
+        .input(Bytes::from(batch_call(&[creation])).into())
+        .gas_limit(cap);
+    match client.provider().call(asked).await {
+        Ok(returned) => IBatchCreate2::createCall::abi_decode_returns(&returned)
+            .ok()
+            .and_then(|returned| returned.gasUsed.first().map(|used| used.to::<u64>())),
+        Err(error) => {
+            tracing::warn!(contract = creation.name, error = %error, "a creation could not be measured: packed by its bound");
+            None
+        }
+    }
+}
+
+/// The batch creator's address, and its creation code.
+fn batch_creator(artifacts: &Path) -> Result<(Address, Vec<u8>)> {
+    let code = creation_code(artifacts, "BatchCreate2", &[])?;
+    Ok((
+        CREATE2_DEPLOYER.create2(BATCH_CREATOR_SALT, keccak256(&code)),
+        code,
+    ))
+}
+
+/// Wait until a contract's code is seen at `address`: a public RPC is often
+/// several nodes behind one name, and the one that answers next may not
+/// have the block yet.
+async fn wait_for_code(client: &Client, name: &str, address: Address) -> Result<()> {
+    for _ in 0..15 {
+        if client.has_code(address).await? {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    bail!("{name} did not land at {address}")
+}
+
+/// Put the batch creator on the chain if it isn't there, through the
+/// deterministic deployer.
+async fn ensure_batch_creator(client: &Client, from: Address, artifacts: &Path) -> Result<Address> {
+    let (address, code) = batch_creator(artifacts)?;
+    if client.has_code(address).await? {
+        return Ok(address);
+    }
+    if !client.has_code(CREATE2_DEPLOYER).await? {
+        bail!("this chain has no deterministic deployer at {CREATE2_DEPLOYER}");
+    }
+    let mut data = BATCH_CREATOR_SALT.to_vec();
+    data.extend_from_slice(&code);
+    client
+        .send_raw_with_gas_limit(
+            from,
+            CREATE2_DEPLOYER,
+            Bytes::from(data),
+            creation_gas(client),
+        )
+        .await
+        .context("creating the batch creator")?;
+    wait_for_code(client, "the batch creator", address).await?;
+    tracing::info!(%address, "the batch creator is on the chain");
+    Ok(address)
+}
+
+/// Create every contract of `creations` not yet on the chain, a batch to a
+/// transaction, the batches sent one after another without waiting between
+/// them, then wait for them all. Each batch is measured without sending it
+/// first, and sent with that gas and some room. A contract already there
+/// (an earlier try's, its address following from its code) is kept.
+async fn create(
+    client: &Client,
+    from: Address,
+    artifacts: &Path,
+    creations: &[Creation],
+    landed: &mut Landed,
+) -> Result<()> {
+    let there = futures::future::try_join_all(
+        creations
+            .iter()
+            .map(|creation| client.has_code(creation.address)),
     )
     .await?;
+    let mut missing = Vec::new();
+    for (creation, there) in creations.iter().zip(there) {
+        if there {
+            tracing::info!(address = %creation.address, contract = creation.name, "already on the chain: kept");
+            landed.record(creation.name, creation.address, keccak256(&creation.code))?;
+        } else {
+            missing.push(creation.clone());
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let creator = ensure_batch_creator(client, from, artifacts).await?;
+    let cap = transaction_gas_cap(client);
+    let measured = futures::future::join_all(
+        missing
+            .iter()
+            .map(|creation| measure(client, from, creator, creation, cap)),
+    )
+    .await;
+    let packed: Vec<(Creation, u64)> = missing
+        .iter()
+        .zip(measured)
+        .map(|(creation, measured)| (creation.clone(), packing_gas(creation, measured)))
+        .collect();
+    let mut outgoing = Vec::new();
+    for batch in batches(&packed, cap) {
+        let creations: Vec<&Creation> = batch.iter().map(|(creation, _)| creation).collect();
+        let data = batch_call(&creations);
+        let calldata: u64 = data
+            .iter()
+            .map(|byte| if *byte == 0 { 4 } else { 16 })
+            .sum();
+        let gas =
+            (21_000 + calldata + batch.iter().map(|(_, gas)| gas).sum::<u64>() + 100_000).min(cap);
+        tracing::info!(
+            contracts = batch.len(),
+            bytes = creations
+                .iter()
+                .map(|creation| creation.code.len())
+                .sum::<usize>(),
+            gas,
+            "a batch of creations"
+        );
+        outgoing.push(Outgoing {
+            name: format!(
+                "creating {}",
+                creations
+                    .iter()
+                    .map(|creation| creation.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            to: creator,
+            data,
+            gas_limit: Some(gas),
+        });
+    }
+    send_together(client, from, &outgoing, |_, _| {}).await?;
+    for creation in &missing {
+        wait_for_code(client, creation.name, creation.address).await?;
+        landed.record(creation.name, creation.address, keccak256(&creation.code))?;
+        tracing::info!(address = %creation.address, contract = creation.name, "created");
+    }
+    Ok(())
+}
 
-    let wanted = StationFactorySet {
-        attestation,
-        asset: usd,
-        vault_factory: factory,
-        implementation: station_implementation,
-    };
-    initialise_station_factory(client, admin, station_factory, wanted).await?;
+/// One transaction among several one account sends together.
+struct Outgoing {
+    /// What it does, for its errors.
+    name: String,
+    to: Address,
+    data: Vec<u8>,
+    /// Its gas, or the node's estimate (with a fifth more) when `None`.
+    gas_limit: Option<u64>,
+}
 
-    let deployments = Deployments {
-        chain_key: key.to_string(),
-        chain_id: client.chain_id,
-        // Never the client's endpoints: one set from the environment is
-        // usually a paid URL, which carries its key. Nothing reads it.
-        rpc_url: String::new(),
-        deployed_block: from_block,
-        usd,
-        venue,
-        attestation_verifier: verifier,
-        attestation,
-        publishing,
-        prices,
-        strategies,
-        reviews,
-        profiles,
-        factory,
-        station_factory,
-        driver,
-        bridge,
-        closer,
-        roles,
-    };
+/// How many of one account's transactions are handed to the chain before
+/// they are waited for: a node's pool holds only a few of one account's
+/// transactions ahead of the next it can run (HyperEVM's, eight).
+const IN_FLIGHT: usize = 8;
 
-    Ok(deployments)
+/// How long one of them may take to land: a big block on HyperEVM comes
+/// about once a minute, and a batch fills one.
+const TOGETHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How many looks a second apart find a sent transaction unknown to every
+/// node before it is taken for dropped: a node behind the one that took it
+/// may not have seen it yet, and on HyperEVM a transaction waiting for a big
+/// block (about one a minute) is unknown to the nodes until it lands, so this
+/// spans three of them.
+const DROPPED_AFTER: u32 = 180;
+
+/// The key `from` is signed with here: the role's, derived from the
+/// testnet mnemonic, when it is set and derives `from`. `None` leaves the
+/// signing to the node, as a development chain does for its own accounts.
+fn own_key(from: Address) -> Result<Option<alloy::signers::local::PrivateKeySigner>> {
+    let phrase = std::env::var(chain::args::TESTNET_EVM_MNEMONIC).unwrap_or_default();
+    if phrase.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(chain::keys_from_mnemonic(&phrase, chain::ROLE_COUNT)?
+        .into_iter()
+        .find(|key| key.address() == from))
+}
+
+/// Send `outgoing` from `from`, numbered one after another, in waves that
+/// one block can hold (at most [`IN_FLIGHT`] transactions, their gas within
+/// a block's), each wave's sent before any is waited for, telling `sent`
+/// each one's place and hash as soon as a node has it; a wave is waited for
+/// until each has landed before the next goes. A chain that lands an
+/// account's transactions a block apart (HyperEVM's big blocks, a minute
+/// each) takes a wave in one block rather than one a block, and no
+/// transaction waits behind one its block had no room for (some nodes drop
+/// those). A send refused stops the rest; one that lands reverted, or is
+/// dropped, is an error naming it. Nothing else may send from `from`
+/// meanwhile: the numbers are counted here.
+async fn send_together(
+    client: &Client,
+    from: Address,
+    outgoing: &[Outgoing],
+    mut sent: impl FnMut(usize, B256),
+) -> Result<()> {
+    use alloy::providers::Provider;
+    let signing = own_key(from)?
+        .map(|key| client.signing_provider(key))
+        .transpose()?;
+    let reading = client.provider();
+    // Each one's gas first, estimated as if it were next, whatever its
+    // number: a node may refuse to run a call numbered ahead of the
+    // account's count.
+    let mut requests = Vec::new();
+    for out in outgoing {
+        let request = alloy::rpc::types::TransactionRequest::default()
+            .from(from)
+            .to(out.to)
+            .input(Bytes::from(out.data.clone()).into());
+        let gas = match out.gas_limit {
+            Some(gas) => gas,
+            None => {
+                reading
+                    .estimate_gas(request.clone())
+                    .await
+                    .with_context(|| format!("estimating {}", out.name))?
+                    / 5
+                    * 6
+            }
+        };
+        requests.push(request.gas_limit(gas));
+    }
+    let block_gas = block_gas(client).await?;
+    let mut nonce = reading
+        .get_transaction_count(from)
+        .pending()
+        .await
+        .context("counting the sender's transactions")?;
+    let mut index = 0;
+    while index < requests.len() {
+        // Fees with room for the base fee to climb while they wait: the
+        // blocks they fill raise it, and one priced at the fee of the
+        // moment could be passed over. Only what each block asks is paid.
+        let fees = reading
+            .estimate_eip1559_fees()
+            .await
+            .context("reading the chain's fees")?;
+        let mut waiting = Vec::new();
+        let mut gas_in_wave = 0u64;
+        while index < requests.len() && waiting.len() < IN_FLIGHT {
+            let gas = requests[index].gas.unwrap_or_default();
+            if !waiting.is_empty() && gas_in_wave + gas > block_gas {
+                break;
+            }
+            gas_in_wave += gas;
+            let out = &outgoing[index];
+            let request = requests[index]
+                .clone()
+                .nonce(nonce)
+                .max_fee_per_gas(fees.max_fee_per_gas.saturating_mul(2))
+                .max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
+            let hash = match &signing {
+                Some(signing) => *signing
+                    .send_transaction(request)
+                    .await
+                    .with_context(|| format!("sending {}", out.name))?
+                    .tx_hash(),
+                None => *reading
+                    .send_transaction(request)
+                    .await
+                    .with_context(|| format!("sending {}", out.name))?
+                    .tx_hash(),
+            };
+            sent(index, hash);
+            waiting.push((out, hash));
+            nonce += 1;
+            index += 1;
+        }
+        for (out, hash) in waiting {
+            landed_together(reading, &out.name, hash).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The gas one block holds for an account's transactions: a big block's on
+/// HyperEVM (the deployer's go into them), the latest block's elsewhere.
+async fn block_gas(client: &Client) -> Result<u64> {
+    use alloy::providers::Provider;
+    if hyperliquid::Api::for_chain(client.chain_id).is_some() {
+        return Ok(HYPEREVM_BIG_BLOCK_GAS);
+    }
+    let latest = client
+        .provider()
+        .get_block(alloy::eips::BlockId::latest())
+        .await
+        .context("reading the latest block")?
+        .ok_or_else(|| anyhow!("the chain gave no latest block"))?;
+    Ok(latest.header.gas_limit)
+}
+
+/// Wait until the transaction `hash` (`name`) has landed, for at most
+/// [`TOGETHER_TIMEOUT`]: an error if it lands reverted, or if no node knows
+/// it for [`DROPPED_AFTER`] looks in a row.
+async fn landed_together(
+    reading: &alloy::providers::DynProvider,
+    name: &str,
+    hash: B256,
+) -> Result<()> {
+    use alloy::providers::Provider;
+    let deadline = tokio::time::Instant::now() + TOGETHER_TIMEOUT;
+    let mut unknown = 0;
+    loop {
+        if let Some(receipt) = reading
+            .get_transaction_receipt(hash)
+            .await
+            .with_context(|| format!("waiting for {name}"))?
+        {
+            if !receipt.status() {
+                bail!("{name} ({hash}) was reverted by the chain");
+            }
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "{name} ({hash}) has not landed after {} s: run the deploy again once it has",
+                TOGETHER_TIMEOUT.as_secs()
+            );
+        }
+        // A transaction no node knows any more was dropped: it will never
+        // land, and the deploy run again sends it afresh.
+        if reading
+            .get_transaction_by_hash(hash)
+            .await
+            .with_context(|| format!("waiting for {name}"))?
+            .is_none()
+        {
+            unknown += 1;
+            if unknown >= DROPPED_AFTER {
+                bail!(
+                    "{name} ({hash}) was dropped before it landed: run the deploy again to send it afresh"
+                );
+            }
+        } else {
+            unknown = 0;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 }
 
 /// Initialise a station factory with `wanted`, and read it back: a station
@@ -851,19 +1415,19 @@ fn timers(network: NetworkName) -> Timers {
     const DAY: u64 = 24 * HOUR;
     let local = network == NetworkName::Local;
     (
-        10,                                    // slot interval
-        5,                                     // slot lead
-        3,                                     // slot window
-        if local { 2 * HOUR } else { MINUTE }, // post deadline
-        if local { 3 * HOUR } else { HOUR },   // transit timeout
-        DAY,                                   // fallback after
+        10,                                     // slot interval
+        5,                                      // slot lead
+        3,                                      // slot window
+        if local { 2 * HOUR } else { MINUTE },  // post deadline
+        if local { 3 * HOUR } else { HOUR },    // transit timeout
+        DAY,                                    // fallback after
         if local { DAY } else { 10 * MINUTE }, // usage freshness: many local blocks pass between the executor's signings
         DAY,                                   // tank escape delay
         DAY,                                   // floor delay
         10 * MINUTE,                           // halt grace
-        7 * DAY,                               // freeze after
-        7 * DAY,                               // wind down
-        3 * DAY,                               // activation window
+        if local { 30 * DAY } else { 7 * DAY }, // freeze after: a staged close takes minutes, a week of local blocks
+        7 * DAY,                                // wind down
+        3 * DAY,                                // activation window
     )
 }
 
@@ -872,43 +1436,6 @@ fn name_id(name: &str) -> B256 {
     let mut out = [0u8; 32];
     out[..name.len()].copy_from_slice(name.as_bytes());
     B256::from(out)
-}
-
-/// Deploy one contract, from the bytecode the build tool left behind.
-async fn put(
-    landed: &mut Landed,
-    client: &Client,
-    artifacts: &Path,
-    from: Address,
-    name: &str,
-    arguments: Vec<u8>,
-) -> Result<Address> {
-    put_linked(landed, client, artifacts, from, name, arguments, &[]).await
-}
-
-/// The same, with the libraries it links to filled in.
-async fn put_linked(
-    landed: &mut Landed,
-    client: &Client,
-    artifacts: &Path,
-    from: Address,
-    name: &str,
-    arguments: Vec<u8>,
-    libraries: &[(&str, Address)],
-) -> Result<Address> {
-    let mut bytecode = creation_code(artifacts, name, libraries)?;
-    bytecode.extend_from_slice(&arguments);
-    let init = keccak256(&bytecode);
-    if let Some(address) = landed.reusable(client, name, init).await? {
-        tracing::info!(%address, contract = name, "landed in an earlier try: kept");
-        return Ok(address);
-    }
-    let address = client
-        .deploy_with_gas_limit(from, bytecode, creation_gas(client))
-        .await?;
-    landed.record(name, address, init)?;
-    tracing::info!(%address, contract = name, "deployed");
-    Ok(address)
 }
 
 /// The gas a contract creation is given on HyperEVM, rather than an
@@ -924,11 +1451,13 @@ pub fn creation_gas(client: &Client) -> Option<u64> {
 }
 
 /// The contracts a deploy has landed so far, written beside its deployment
-/// file (`<file>.partial.json`) after each one, so a deploy that stops
-/// part-way keeps them when run again under the same generation, rather
-/// than deploying them all again. A contract is kept only if its creation
-/// code and arguments are the same as this try's and it is still on the
-/// chain. The record goes once the deployment file is written.
+/// file (`<file>.partial.json`) after each batch, with the block the first
+/// try began at and the build it was made from. Each contract's address
+/// follows from its creation code, its arguments and the salt, so one still
+/// on the chain is kept by a deploy run again under the same generation,
+/// never created twice; the record is what tells an earlier try of this
+/// very deploy from another deployment. It goes once the deployment file
+/// is written.
 struct Landed {
     path: std::path::PathBuf,
     generation: u64,
@@ -1042,16 +1571,6 @@ impl Landed {
             && at("AttestationRegistry") == Some(set.attestation)
     }
 
-    async fn reusable(&self, client: &Client, name: &str, init: B256) -> Result<Option<Address>> {
-        let Some((address, recorded)) = self.contracts.get(name) else {
-            return Ok(None);
-        };
-        if *recorded != init || !client.has_code(*address).await? {
-            return Ok(None);
-        }
-        Ok(Some(*address))
-    }
-
     fn record(&mut self, name: &str, address: Address, init: B256) -> Result<()> {
         self.contracts.insert(name.to_string(), (address, init));
         self.save()
@@ -1087,56 +1606,6 @@ impl Landed {
     fn finished(file: &Path) {
         let _ = std::fs::remove_file(Self::path_for(file));
     }
-}
-
-/// Deploy through the deterministic deployer under `generation`'s salt, so
-/// the contract has the same address on every chain its creation code is
-/// the same on. Already there is already done.
-async fn put_everywhere(
-    client: &Client,
-    artifacts: &Path,
-    from: Address,
-    name: &str,
-    arguments: Vec<u8>,
-    libraries: &[(&str, Address)],
-    generation: u64,
-) -> Result<Address> {
-    let mut init = creation_code(artifacts, name, libraries)?;
-    init.extend_from_slice(&arguments);
-    let salt = salt(generation);
-    let address = CREATE2_DEPLOYER.create2(salt, keccak256(&init));
-    if client.has_code(address).await? {
-        tracing::info!(%address, contract = name, "already deployed");
-        return Ok(address);
-    }
-    if !client.has_code(CREATE2_DEPLOYER).await? {
-        bail!("this chain has no deterministic deployer at {CREATE2_DEPLOYER}");
-    }
-    let mut data = salt.to_vec();
-    data.extend_from_slice(&init);
-    client
-        .send_raw_with_gas_limit(
-            from,
-            CREATE2_DEPLOYER,
-            Bytes::from(data),
-            creation_gas(client),
-        )
-        .await?;
-    // A public RPC is often several nodes behind one name, and the one that
-    // answers next may not have the block yet: give it a moment.
-    let mut landed = false;
-    for _ in 0..15 {
-        if client.has_code(address).await? {
-            landed = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    }
-    if !landed {
-        bail!("{name} did not land at {address}");
-    }
-    tracing::info!(%address, contract = name, "deployed at its address on every chain");
-    Ok(address)
 }
 
 /// A contract's creation code, with `libraries` linked in where it calls them.
@@ -1253,6 +1722,7 @@ fn setup_steps(deployments: &Deployments) -> Vec<Step> {
         ("builder", ImageKind::Builder),
         ("reviewer", ImageKind::Reviewer),
         ("unwinder", ImageKind::Unwinder),
+        ("holder", ImageKind::Holder),
     ] {
         steps.push(Step {
             name: format!("image {service}"),
@@ -1520,63 +1990,112 @@ fn write_file(
 /// on the chain before it is sent, and its earlier send by its hash, so a
 /// step that landed unseen (its receipt not read in time, or the deploy
 /// stopped between the send and the record) is recorded, never sent again.
-/// A step whose send failed stops the deploy: run it again to carry on.
+/// The steps left go out together, each sender's numbered one after
+/// another and sent before any is waited for, the senders at once: on a
+/// chain whose blocks come a minute apart they take a block or two, not one
+/// each. A step whose send failed stops the deploy: run it again to carry
+/// on.
 async fn set_up(
     client: &Client,
     deployments: &Deployments,
     file: &Path,
     written: &Written,
-    mut setup: Setup,
+    setup: Setup,
 ) -> Result<()> {
-    for step in setup_steps(deployments) {
-        if setup.done.contains(&step.name) {
-            continue;
-        }
-        let context = || {
-            format!(
-                "the deployment's setup step \"{}\"; the addresses are written, so run the deploy \
-                 again to carry on from this step",
-                step.name
-            )
-        };
-        let mut done = shown_done(client, deployments, &step)
+    let steps: Vec<Step> = setup_steps(deployments)
+        .into_iter()
+        .filter(|step| !setup.done.contains(&step.name))
+        .collect();
+    let context = |step: &Step| {
+        format!(
+            "the deployment's setup step \"{}\"; the addresses are written, so run the deploy \
+             again to carry on from this step",
+            step.name
+        )
+    };
+    let shown = futures::future::join_all(steps.iter().map(|step| async move {
+        shown_done(client, deployments, step)
             .await
-            .with_context(context)?;
-        if !done && let Some(hash) = setup.sent.get(&step.name) {
-            done = landed_by_hash(client, *hash, step.from)
+            .with_context(|| context(step))
+    }))
+    .await;
+    let setup = std::sync::Mutex::new(setup);
+    let record = |setup: &mut Setup| {
+        if let Err(error) = write_file(file, deployments, written, Some(setup)) {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "a setup step could not be recorded"
+            );
+        }
+    };
+    let mut left: std::collections::BTreeMap<Address, Vec<&Step>> = Default::default();
+    for (step, shown) in steps.iter().zip(shown) {
+        let mut done = shown?;
+        let earlier = lock(&setup).sent.get(&step.name).copied();
+        if !done && let Some(hash) = earlier {
+            done = landed_by_hash(client, hash, step.from)
                 .await
-                .with_context(context)?;
+                .with_context(|| context(step))?;
         }
         if done {
             tracing::info!(step = step.name, "already done on the chain");
+            let mut setup = lock(&setup);
+            setup.sent.remove(&step.name);
+            setup.done.push(step.name.clone());
+            write_file(file, deployments, written, Some(&setup))?;
         } else {
-            // Its hash is in the file as soon as the node has it, before its
-            // receipt is waited for.
-            let mut noted = setup.clone();
-            let name = step.name.clone();
-            client
-                .send_raw_noting(step.from, step.to, Bytes::from(step.call.clone()), |hash| {
-                    noted.sent.insert(name, hash);
-                    if let Err(error) = write_file(file, deployments, written, Some(&noted)) {
-                        tracing::warn!(
-                            error = format!("{error:#}"),
-                            "a setup send's hash could not be recorded"
-                        );
-                    }
-                })
-                .await
-                .with_context(context)?;
-            tracing::info!(step = step.name, "set up");
+            left.entry(step.from).or_default().push(step);
         }
-        setup.sent.remove(&step.name);
-        setup.done.push(step.name);
-        write_file(file, deployments, written, Some(&setup))?;
+    }
+    let senders = left.iter().map(|(from, steps)| {
+        let setup = &setup;
+        async move {
+            let outgoing: Vec<Outgoing> = steps
+                .iter()
+                .map(|step| Outgoing {
+                    name: format!("the setup step \"{}\"", step.name),
+                    to: step.to,
+                    data: step.call.clone(),
+                    gas_limit: None,
+                })
+                .collect();
+            // Its hash is in the file as soon as a node has it, before its
+            // receipt is waited for.
+            send_together(client, *from, &outgoing, |index, hash| {
+                let mut setup = lock(setup);
+                setup.sent.insert(steps[index].name.clone(), hash);
+                record(&mut setup);
+            })
+            .await
+            .with_context(|| {
+                "the deployment's setup; the addresses are written, so run the deploy again to \
+                 carry on from the steps not yet done"
+                    .to_string()
+            })?;
+            let mut setup = lock(setup);
+            for step in steps {
+                tracing::info!(step = step.name, "set up");
+                setup.sent.remove(&step.name);
+                setup.done.push(step.name.clone());
+            }
+            write_file(file, deployments, written, Some(&setup))
+        }
+    });
+    for result in futures::future::join_all(senders).await {
+        result?;
     }
     write_file(file, deployments, written, None)?;
     tracing::info!(
         "the deployment is set up: markets listed, images and drivers proposed, accounts funded"
     );
     Ok(())
+}
+
+/// The setup's record, held a moment by whichever sender is writing it.
+fn lock(setup: &std::sync::Mutex<Setup>) -> std::sync::MutexGuard<'_, Setup> {
+    setup
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// A market's name, as the contract stores it.
@@ -1998,7 +2517,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         // A copy of the build, which then changes as a later build would.
         let artifacts = dir.join("out");
-        for name in DEPLOYED {
+        for name in DEPLOYED.into_iter().chain(["BatchCreate2"]) {
             let into = artifacts.join(format!("{name}.sol"));
             std::fs::create_dir_all(&into).unwrap();
             std::fs::copy(
@@ -2046,6 +2565,191 @@ mod tests {
             "something was sent before the refusal"
         );
         assert!(!file.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_batch_keeps_within_the_bytes_a_transaction_carries_and_its_share_of_the_gas() {
+        let creation = |bytes: usize| Creation {
+            name: "Some",
+            salt: B256::ZERO,
+            code: vec![1; bytes],
+            address: Address::ZERO,
+        };
+        let packed: Vec<(Creation, u64)> = [40_000, 40_000, 30_000, 10_000, 5_000]
+            .into_iter()
+            .map(|bytes| (creation(bytes), 2_000_000))
+            .collect();
+        let made = batches(&packed, 30_000_000);
+        let sizes: Vec<usize> = made.iter().map(Vec::len).collect();
+        // 80,000 bytes fit; the third would pass 96,000.
+        assert_eq!(sizes, vec![2, 3]);
+        for batch in &made {
+            assert!(batch.iter().map(|(c, _)| c.code.len()).sum::<usize>() <= BATCH_BYTES);
+        }
+        // By gas: seven tenths of 10M holds three of 2M.
+        let made = batches(&packed, 10_000_000);
+        assert!(made.iter().all(|batch| batch.len() <= 3));
+        assert_eq!(made.iter().map(Vec::len).sum::<usize>(), packed.len());
+        // A creation over the budget alone still goes, in a batch of its own.
+        let made = batches(&[(creation(10), 50_000_000)], 10_000_000);
+        assert_eq!(made.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_contracts_land_where_the_plan_puts_them_a_few_to_a_transaction_and_within_their_bounds()
+     {
+        let Some(artifacts) = artifacts() else {
+            eprintln!("the contracts are not built: skipping");
+            return;
+        };
+        let Some((_anvil, client)) = anvil().await else {
+            eprintln!("anvil is not installed: skipping");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("shonin-batched-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let names = [("base".to_string(), 31337u64)];
+        let network = NetworkName::Testnet;
+        let admin = client.account(Role::Admin).unwrap();
+        let roles = Roles {
+            admin,
+            platform: client.account(Role::Platform).unwrap(),
+            attestor: client.account(Role::Attestor).unwrap(),
+            builder: client.account(Role::Builder).unwrap(),
+            reviewer: client.account(Role::Reviewer).unwrap(),
+            executor: client.account(Role::Executor).unwrap(),
+            keeper: client.account(Role::Keeper).unwrap(),
+            operator: client.account(Role::Operator).unwrap(),
+            author: client.account(Role::Author).unwrap(),
+            viewer: client.account(Role::Viewer).unwrap(),
+        };
+        let planned = plan(&artifacts, network, &roles, &names, 3).unwrap();
+
+        // Every creation's measured gas is within the bound a batch falls
+        // back on when an endpoint won't measure it.
+        let (creator, _) = batch_creator(&artifacts).unwrap();
+        ensure_batch_creator(&client, admin, &artifacts)
+            .await
+            .unwrap();
+        assert!(client.has_code(creator).await.unwrap());
+        for creation in &planned.creations {
+            let measured = measure(&client, admin, creator, creation, 30_000_000)
+                .await
+                .unwrap_or_else(|| panic!("{} could not be measured", creation.name));
+            assert!(
+                packing_gas(creation, Some(measured)) <= creation.gas_bound(),
+                "{} took {measured}, over its bound {}",
+                creation.name,
+                creation.gas_bound()
+            );
+        }
+
+        let sent_before = client
+            .provider()
+            .get_transaction_count(admin)
+            .await
+            .unwrap();
+        let file = dir.join("evm-31337.json");
+        let deployed = ensure(&client, network, &key(31337), &artifacts, &file, &names, 3)
+            .await
+            .unwrap();
+        let sent = client
+            .provider()
+            .get_transaction_count(admin)
+            .await
+            .unwrap()
+            - sent_before;
+        // Twenty-one contracts, the station factory's initialisation and
+        // twelve setup steps of the admin's, in far fewer transactions than
+        // one a creation.
+        assert!(sent < 21 + 1 + 12, "the admin sent {sent} transactions");
+        for creation in &planned.creations {
+            assert!(
+                client.has_code(creation.address).await.unwrap(),
+                "{} is not at {}",
+                creation.name,
+                creation.address
+            );
+        }
+        assert_eq!(deployed.factory, planned.addresses.factory);
+        assert_eq!(deployed.usd, planned.addresses.usd);
+        let everywhere = everywhere_addresses(&artifacts, admin, 3).unwrap();
+        assert_eq!(deployed.station_factory, everywhere.station_factory);
+        assert_eq!(deployed.closer, everywhere.closer);
+        assert_eq!(
+            station_factory_set(&client, deployed.station_factory)
+                .await
+                .unwrap()
+                .unwrap()
+                .implementation,
+            everywhere.station_implementation
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chains_deploy_at_once_and_a_second_run_sends_nothing() {
+        let Some(artifacts) = artifacts() else {
+            eprintln!("the contracts are not built: skipping");
+            return;
+        };
+        let (Some((_one, first)), Some((_two, second))) = (anvil().await, anvil().await) else {
+            eprintln!("anvil is not installed: skipping");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("shonin-at-once-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let names = [("base".to_string(), 31337u64)];
+        let chains = vec![
+            (
+                key(31337),
+                first,
+                dir.join("one").join("evm-31337.json"),
+                false,
+            ),
+            (
+                key(31337),
+                second,
+                dir.join("two").join("evm-31337.json"),
+                false,
+            ),
+        ];
+        ensure_each(&chains, NetworkName::Testnet, &artifacts, &names, 0)
+            .await
+            .unwrap();
+        let mut counts = Vec::new();
+        for (_, client, file, _) in &chains {
+            assert!(recorded_setup(&std::fs::read_to_string(file).unwrap()).is_none());
+            let admin = client.account(Role::Admin).unwrap();
+            counts.push(
+                client
+                    .provider()
+                    .get_transaction_count(admin)
+                    .await
+                    .unwrap(),
+            );
+        }
+        // The same addresses on both: they follow from the build alone.
+        let one = Deployments::from_json(&std::fs::read_to_string(&chains[0].2).unwrap()).unwrap();
+        let two = Deployments::from_json(&std::fs::read_to_string(&chains[1].2).unwrap()).unwrap();
+        assert_eq!(one.factory, two.factory);
+        assert_eq!(one.station_factory, two.station_factory);
+        ensure_each(&chains, NetworkName::Testnet, &artifacts, &names, 0)
+            .await
+            .unwrap();
+        for ((_, client, _, _), before) in chains.iter().zip(counts) {
+            let admin = client.account(Role::Admin).unwrap();
+            assert_eq!(
+                client
+                    .provider()
+                    .get_transaction_count(admin)
+                    .await
+                    .unwrap(),
+                before,
+                "a second run sent something"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

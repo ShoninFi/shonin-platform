@@ -742,11 +742,34 @@ mod tests {
         );
     }
 
+    /// Allowances that accrue over ten units a second, held in full by the
+    /// default ceilings, so a test of totals doesn't hang on what a preset
+    /// happens to cost.
+    fn accruing() -> Allowances {
+        Allowances {
+            fuel_per_sec: Ceilings::FUEL_PER_SEC,
+            memory_mib: Ceilings::MEMORY_MIB,
+            bytes_per_day: 5_000_000_000,
+            ..Allowances::modest()
+        }
+    }
+
+    #[test]
+    fn the_accruing_allowances_accrue_over_ten_units_a_second_and_are_held_in_full() {
+        assert_eq!(Ceilings::default().hold(&accruing()), accruing());
+        assert!(
+            per_second(&accruing()) > 10.0,
+            "{}",
+            per_second(&accruing())
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dry_tank_stops_the_bill_until_it_is_topped_up() {
         // A tank with a millionth of a dollar in it: the first tick runs it
         // dry.
         let state = stand_in::chain(1, 0);
+        state.lock().unwrap().allowances = chain::allowances(&accruing());
         let client = stand_in::client(&stand_in::start(state.clone()).await).await;
         let key = stand_in::key(&client);
         let vault = Address::repeat_byte(0x11);
@@ -915,6 +938,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_restarted_meter_carries_on_from_a_total_its_predecessor_had_collected() {
         let state = stand_in::chain(1_000_000_000, 0);
+        state.lock().unwrap().allowances = chain::allowances(&accruing());
         let url = stand_in::start(state.clone()).await;
         let vault = Address::repeat_byte(0x22);
         let totals: Totals = Default::default();

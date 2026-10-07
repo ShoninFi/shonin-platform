@@ -55,6 +55,8 @@ contract Fixture is Test {
     uint64 internal constant SLOT = 10;
     uint64 internal constant HALT_GRACE = 10 minutes;
     uint64 internal constant PRICE_NOTICE = 30 days;
+    /// The fuel a core runs through in a second, as the deploy publishes it.
+    uint64 internal constant FUEL_PER_CORE_SECOND = 1e9;
 
     address internal admin = makeAddr("admin");
     address internal platform = makeAddr("platform");
@@ -107,7 +109,7 @@ contract Fixture is Test {
         verifier = new DevAttestationVerifier(attestor);
         attestation = new AttestationRegistry(admin, verifier, TIMELOCK, 0, BLESSING_TTL);
         publishing = new Publishing(IERC20(address(usd)), platform, PUBLISH_FEE);
-        prices = new Prices(admin, PRICE_NOTICE, publishedPrices());
+        prices = new Prices(admin, PRICE_NOTICE, FUEL_PER_CORE_SECOND, publishedPrices());
         strategies = new StrategyRegistry(attestation, publishing);
         reviews = new ReviewRegistry(attestation, strategies, publishing);
         profiles = new AuthorProfiles();

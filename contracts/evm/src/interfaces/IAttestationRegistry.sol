@@ -8,7 +8,11 @@ enum ImageKind {
     Executor,
     Unwinder,
     Builder,
-    Reviewer
+    Reviewer,
+    /// A dedicated holder of the root key. It holds no key for any vault,
+    /// signs no build or review, and can do nothing on chain but record the
+    /// root key's public half: `bless` refuses it.
+    Holder
 }
 
 /// What the registry knows about one blessed key: its image and project, and
@@ -45,6 +49,28 @@ struct Image {
     /// When the timelock ran out and it became blessable. Zero until proposed.
     uint64 allowedAt;
     bool revoked;
+}
+
+/// The root key's public half, as the registry recorded it.
+///
+/// The root key is made inside an attested instance and only ever passes
+/// between attested instances; every key derived from it is signed by
+/// `signer`. Anyone sealing a secret to a derived key checks that signature
+/// against this record, and that the record is live.
+struct RootKeyRecord {
+    /// The address of the root's signing key; zero while none is recorded.
+    address signer;
+    /// When the instance that last recorded it attested.
+    uint64 issuedAt;
+    /// The checker that accepted that proof.
+    address verifier;
+    /// When it was last recorded: first set, or moved to a later
+    /// attestation or a newer checker.
+    uint64 setAt;
+    /// The image of the instance that last recorded it.
+    bytes32 imageDigest;
+    /// The operator project that instance ran in.
+    bytes32 projectId;
 }
 
 /// Which code is allowed to hold a key, and which keys it currently holds.
@@ -91,7 +117,8 @@ interface IAttestationRegistry {
     /// and its own key, on this chain. One proof so blesses every key the
     /// instance holds, each for its own vault only. Anyone may send it, and
     /// sending it again changes nothing: a blessing lasts a TTL from the
-    /// attestation, not from the transaction.
+    /// attestation, not from the transaction. A holder's image blesses
+    /// nothing.
     function bless(
         bytes calldata seal,
         bytes calldata journal,
@@ -101,6 +128,62 @@ interface IAttestationRegistry {
         address key,
         bytes32[] calldata merkleProof
     ) external;
+
+    /// The root key was recorded: set for the first time since a clear, or,
+    /// for the signer already recorded, moved to a newer checker.
+    event RootKeySet(
+        address indexed signer, bytes32 imageDigest, bytes32 projectId, address verifier, uint64 issuedAt
+    );
+    /// The record was cleared, and its signer can never be recorded again.
+    event RootKeyCleared(address indexed signer);
+
+    /// Record `rootSigner` as the root key's signing address.
+    ///
+    /// The proof is checked as a blessing's is: an allowed checker accepts
+    /// `seal` over `journal`, the image is allowed as an executor or a holder,
+    /// the project is allowed, and the attestation is within a blessing's TTL.
+    /// `merkleProof` shows the root leaf, which names `rootSigner` on this
+    /// chain, is among the instance's leaves, so the same attestation that
+    /// blesses an executor's vault keys also carries its root. Anyone may
+    /// send it.
+    ///
+    /// While a record is in place, another signer is refused. The same
+    /// signer is recorded again from an attestation no earlier than the
+    /// recorded one, from any allowed executor or holder image and project,
+    /// through any allowed checker; the same attestation again (same time,
+    /// image and project) moves only to a newer checker, or off one no longer
+    /// allowed. So the record follows the root to another image that
+    /// received it by attested exchange, a checker rotation's overlap carries
+    /// it past the old checker's retirement, and a re-attestation revives it
+    /// after its image's successor or its checker takes over. A record has to
+    /// be cleared before another root can be set, only an attestation made
+    /// after the clear can set it, and a cleared signer is never recorded
+    /// again.
+    function setRootKey(
+        bytes calldata seal,
+        bytes calldata journal,
+        address rootSigner,
+        bytes32[] calldata merkleProof
+    ) external;
+    /// Admin only, at once: forget the root key, to rotate it or because it
+    /// is lost, and refuse its signer for good. The admin can clear a record
+    /// but never make one.
+    function clearRootKey() external;
+    /// The record, whether or not it is still live.
+    function rootKey() external view returns (RootKeyRecord memory);
+    /// Whether a root key is recorded and the image, the project and the
+    /// checker of the attestation that last recorded it are all still
+    /// allowed. Revoking any of those three makes the root untrusted at once.
+    ///
+    /// The registry knows only the instance that last recorded the root, not
+    /// every image that has ever held it, so revoking another image that
+    /// held it leaves the record live. When an image is revoked for a flaw
+    /// that could have exposed the root, the admin clears the record as well,
+    /// which retires that root for good and lets a new one be set.
+    function isRootKeyLive() external view returns (bool);
+    /// The purpose the root leaf carries where a key's leaf carries its
+    /// bundle; `bless` refuses it as a bundle.
+    function ROOT_KEY_PURPOSE() external view returns (bytes32);
 
     function keyInfo(address signer) external view returns (KeyInfo memory);
     /// When the key's blessing for this vault and bundle expires; zero if it

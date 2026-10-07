@@ -227,6 +227,30 @@ pub fn key_leaf(
     ))
 }
 
+/// The purpose the registry's root leaf carries where a key's leaf carries
+/// its bundle: `keccak256("shonin:root-key:v1")`, the registry's
+/// `ROOT_KEY_PURPOSE`.
+pub fn root_key_purpose() -> B256 {
+    keccak256("shonin:root-key:v1")
+}
+
+/// The leaf an instance commits to for the root key's signer on the
+/// canonical chain `chain_id`: a key's leaf with no vault, carrying
+/// [`root_key_purpose`] where a bundle would be. It matches
+/// `AttestationRegistry.setRootKey`: `keccak256(bytes.concat(keccak256(
+/// abi.encode(uint256(0), address(0), ROOT_KEY_PURPOSE, block.chainid,
+/// rootSigner))))`. The same tree, and so the same attestation, that
+/// blesses the instance's vault keys carries it.
+pub fn root_leaf(chain_id: u64, signer: Address) -> B256 {
+    key_leaf(
+        U256::ZERO,
+        Address::ZERO,
+        root_key_purpose(),
+        U256::from(chain_id),
+        signer,
+    )
+}
+
 /// One level up the tree: the pair hashed in sorted order, as OpenZeppelin's
 /// `MerkleProof` does.
 fn hash_pair(a: B256, b: B256) -> B256 {
@@ -537,6 +561,7 @@ pub fn kind_of(service: &str) -> ImageKind {
         "builder" => ImageKind::Builder,
         "reviewer" => ImageKind::Reviewer,
         "unwinder" => ImageKind::Unwinder,
+        "holder" => ImageKind::Holder,
         _ => ImageKind::Executor,
     }
 }
@@ -643,6 +668,40 @@ mod tests {
             vec![hash_pair(leaves[0], leaves[1])]
         );
     }
+
+    /// The vector `RootKeyAttestation.t.sol` checks on the contract side:
+    /// the registry records a root whose journal's root is this leaf alone.
+    #[test]
+    fn the_root_leaf_matches_the_contract_s_vector() {
+        assert_eq!(
+            root_key_purpose(),
+            keccak256("shonin:root-key:v1"),
+            "the registry's ROOT_KEY_PURPOSE"
+        );
+        let signer = Address::repeat_byte(0xe1);
+        assert_eq!(
+            root_leaf(31_337, signer),
+            ROOT_LEAF_VECTOR.parse::<B256>().unwrap()
+        );
+        // The chain is part of it: the same signer on another chain is
+        // another leaf.
+        assert_ne!(root_leaf(84_532, signer), root_leaf(31_337, signer));
+        // And it is never a vault key's leaf, nor a service key's.
+        assert_ne!(
+            root_leaf(31_337, signer),
+            key_leaf(
+                U256::ZERO,
+                Address::ZERO,
+                B256::ZERO,
+                U256::from(31_337),
+                signer
+            )
+        );
+    }
+
+    /// `root_leaf(31337, 0xe1e1…e1)`.
+    const ROOT_LEAF_VECTOR: &str =
+        "0xfb5b63d20acbdca3915f1a92aee1020f9b765f3f37160cf0599ec25861db59c4";
 
     #[tokio::test(start_paused = true)]
     async fn a_renewal_is_not_sent_again_while_an_unanswered_one_may_still_land() {

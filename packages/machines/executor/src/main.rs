@@ -25,6 +25,7 @@ mod inference;
 mod keys;
 mod net;
 mod robinhood;
+mod root;
 mod runner;
 mod scale;
 mod solana;
@@ -104,6 +105,15 @@ struct Args {
     /// reads from: its testnet's unless the network is mainnet.
     #[arg(long, env = "SHONIN_HYPERLIQUID_STREAM")]
     hyperliquid_stream: Option<String>,
+    /// Other holders of the root key (their status ports), asked for it by
+    /// attested exchange when the canonical chain records a root this
+    /// instance doesn't hold. Baked into the image; none on the testnet.
+    #[arg(long, env = "SHONIN_ROOT_PEERS", value_delimiter = ',')]
+    root_peers: Vec<String>,
+    /// Hold no root key, whatever the network's chain config says: for a
+    /// test that runs an executor beside one that does.
+    #[arg(long, hide = true)]
+    no_root_key: bool,
 }
 
 #[tokio::main]
@@ -162,6 +172,35 @@ async fn main() -> Result<()> {
         "the executor is up"
     );
 
+    // The root key, on the network's canonical chain where it names one that
+    // this executor serves: the service is on the status port from the
+    // start, and reads the chain once it is connected.
+    let root_chain = if args.no_root_key {
+        None
+    } else {
+        args.chain_args
+            .root_chain()?
+            .filter(|key| evm_targets.iter().any(|target| target.key.same_chain(key)))
+            .and_then(|key| key.evm_chain_id())
+    };
+    let root_service = root_chain.map(|chain_id| {
+        // Until the holder has looked at the record, it may be about to make
+        // a root: the first token waits for that, a bounded while.
+        attestation.await_root(attestation::ROOT_DECIDED_WITHIN);
+        let service = shonin_rootkey::Service::new(shonin_rootkey::NetworkView::new(chain_id));
+        // Google's keys check a token only inside Confidential Space, where
+        // there is a launcher to give one.
+        if args.attestation == attestation::Mode::Launcher {
+            tokio::spawn(root::keep_google_keys(service.clone()));
+        }
+        service
+    });
+    if root_chain.is_none() {
+        tracing::info!(
+            "no canonical chain for the root key is served here: this executor holds no root"
+        );
+    }
+
     let totals: usage::Totals = Default::default();
     let solana_totals: solana::Totals = Default::default();
     // Every vault chain to be served, each said connected as it connects: the
@@ -185,6 +224,7 @@ async fn main() -> Result<()> {
             solana_totals.clone(),
             served_chains.clone(),
             attestation.clone(),
+            root_service.clone(),
         ));
     }
 
@@ -235,6 +275,37 @@ async fn main() -> Result<()> {
     while let Some(served) = connecting.recv().await {
         served_chains.connected(served.vault_chain);
         attestation.serve_chain(served.client.clone(), served.deployments.clone());
+        // Every chain served has its registry read by the root key service:
+        // a vault key is blessed on its vault's own chain, so that is where
+        // the exchange reads it. The canonical chain's also answers for the
+        // asker's image, project and checkers.
+        if let Some(service) = &root_service {
+            service.view().connect(shonin_rootkey::RegistryView::new(
+                served.client.clone(),
+                served.deployments.attestation,
+                served.deployments.chain_id,
+            ));
+        }
+        if let (Some(service), Some(chain_id)) = (&root_service, root_chain)
+            && served.deployments.chain_id == chain_id
+        {
+            let holder = root::Holder::new(
+                service.clone(),
+                attestation.clone(),
+                chain_id,
+                root::OnChain {
+                    client: served.client.clone(),
+                    deployments: served.deployments.clone(),
+                },
+                root::Exchange {
+                    urls: args.root_peers.clone(),
+                    mode: args.attestation,
+                    socket: args.launcher_socket.clone(),
+                    http: reqwest::Client::new(),
+                },
+            );
+            tokio::spawn(holder.run());
+        }
         let attestation = attestation.clone();
         let engine = engine.clone();
         let args = args.clone();
@@ -2649,15 +2720,21 @@ async fn bind_status(address: SocketAddr) -> Result<tokio::net::TcpListener> {
 
 /// The machine's own health (unavailable while a vault chain it serves isn't
 /// connected), each vault's signed running total for the keeper to collect,
-/// and the instance's attestation (see [`attestation::routes`]).
+/// the instance's attestation (see [`attestation::routes`]), and the root
+/// key service where this executor holds the root (see [`root`]).
 async fn serve_status(
     listener: tokio::net::TcpListener,
     totals: usage::Totals,
     solana_totals: solana::Totals,
     chains: health::Chains,
     attestation: attestation::Attestation,
+    root: Option<shonin_rootkey::Service<shonin_rootkey::NetworkView>>,
 ) {
-    let app = attestation::routes(attestation)
+    let mut app = attestation::routes(attestation);
+    if let Some(service) = root {
+        app = app.merge(shonin_rootkey::routes(service));
+    }
+    let app = app
         .route(
             "/health",
             axum::routing::get(move || {
@@ -2919,6 +2996,8 @@ mod tests {
             store_url: None,
             ceilings: Default::default(),
             hyperliquid_stream: None,
+            root_peers: Vec::new(),
+            no_root_key: false,
         }
     }
 

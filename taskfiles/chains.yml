@@ -78,11 +78,18 @@ tasks:
       - "{{.DEVNET}} propose-checker"
 
   image:
-    desc: "Propose a real image digest on every EVM chain's registry, as the admin (DIGEST=sha256:<hex> KIND=executor|builder|reviewer|unwinder; NETWORK=testnet); already proposed is done"
+    desc: "Propose a real image digest on every EVM chain's registry, or only SHONIN_VAULT_CHAIN=<name>'s, as the admin (DIGEST=sha256:<hex> KIND=executor|builder|reviewer|unwinder|holder; NETWORK=testnet); already proposed is done. The root key's test requester is proposed as KIND=reviewer: the canonical chain's registry is the one its exchange checks"
     requires:
       vars: [DIGEST, KIND]
     cmds:
       - "{{.DEVNET}} propose-image --digest {{.DIGEST}} --kind {{.KIND}}"
+
+  revoke-image:
+    desc: "Revoke an image digest on every EVM chain's registry, or only SHONIN_VAULT_CHAIN=<name>'s, as the admin (DIGEST=sha256:<hex>; NETWORK=testnet); already revoked is done. Revoked takes effect at once and for good: keys blessed from it stop counting, and a root key recorded from it stops being live, on the chains revoked"
+    requires:
+      vars: [DIGEST]
+    cmds:
+      - "{{.DEVNET}} revoke-image --digest {{.DIGEST}}"
 
   project:
     desc: "Propose an operator's Google Cloud project (its keccak256) on every EVM chain's registry, as the admin (PROJECT=<project id>; NETWORK=testnet); already proposed is done"
@@ -106,3 +113,23 @@ tasks:
     desc: "Top every role up on every EVM testnet from the funder, buying HYPE on HyperCore for HyperEVM; safe to run again (NETWORK=testnet only)"
     cmds:
       - "{{.DEVNET}} fund"
+
+  root-key:
+    desc: "Print the root key's record on the network's canonical chain (`root` in config/chains.toml): its signer, when and through which checker it was recorded, its image and project, and whether it is live (local, or NETWORK=testnet)"
+    cmds:
+      - "{{.DEVNET}} root-key"
+
+  clear-root-key:
+    desc: "Clear the root key's record on the network's canonical chain, as the admin, and print the signer cleared: for a root that is lost (its executor replaced) or to rotate it. That signer is refused for good; the executor then makes a new root and the keeper records it, and everything sealed to the old one must be sealed again (NETWORK=testnet)"
+    cmds:
+      - "{{.DEVNET}} clear-root-key"
+
+  market:
+    desc: "On the testnets, play the stand-in venue's market in real time as its operator, signed from the mnemonic on this machine (never in the cloud): every EVERY_MINUTES (10 by default) one post per chain of both markets' prices and the funding accrued since the last, from a tape like bitcoin's (spot about 0.6% an hour; funding about 10% a year, near 0.000295 a day outside a lull, sinking towards nothing for 8 hours about once every 4 days), minting the venue whatever its accounts are owed beyond what it holds. Resumable: it starts from the venue's prices. Every EVM testnet, or VAULT_CHAIN=<name>; logs each post's gas and the coin a day it comes to (NETWORK=testnet)"
+    cmds:
+      - "{{.DEVNET}} {{.VAULT_CHAIN_ARG}} market {{if .EVERY_MINUTES}}--every-minutes {{.EVERY_MINUTES}}{{end}}"
+
+  smoke:
+    desc: "The smoke check a deploy ends with, read-only: each EVM chain's deployment read back from the chain (or only VAULT_CHAIN=<name>'s), and with API=<url> the API's health, each of those chains served with a fresh reading, and a vault priced (ALLOW_NO_VAULT=1 before any is). Fails if any check does (local, or NETWORK=testnet)"
+    cmds:
+      - "{{.DEVNET}} {{.VAULT_CHAIN_ARG}} smoke {{if .API}}--api {{.API}}{{end}} {{if .ALLOW_NO_VAULT}}--allow-no-vault{{end}}"

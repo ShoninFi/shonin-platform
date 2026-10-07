@@ -4,7 +4,8 @@ pragma solidity ^0.8.30;
 /// The most an agent may use, set by its author on the live vault. The vault
 /// only believes a usage bill up to these allowances at the published prices.
 struct Allowances {
-    /// Wasmtime fuel a second; a million a second stands for one core.
+    /// Wasmtime fuel a second, priced as processor time at the price list's
+    /// `fuelPerCoreSecond`.
     uint64 fuelPerSec;
     uint32 memoryMib;
     /// Enforced by the executor, not priced.
@@ -51,5 +52,8 @@ interface IPrices {
     function current() external view returns (UnitPrices memory);
     function history() external view returns (PricePeriod[] memory);
     function notice() external view returns (uint64);
+    /// The Wasmtime fuel one core runs through in a second: an allowance of
+    /// this much fuel a second is billed as one core at `vcpuHour`.
+    function fuelPerCoreSecond() external view returns (uint64);
     function admin() external view returns (address);
 }

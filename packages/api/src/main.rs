@@ -4,8 +4,10 @@
 //! snapshot that carries everything a page renders, the platform's terms as
 //! the contracts state them, a depositor's portfolio, the build queue, and
 //! the store's files by hash. Submissions pass through to the build service
-//! and health reports are taken only from a key blessed for their vault.
+//! and health reports are taken only from a key blessed for their vault. The
+//! root key's status and its published keys are relayed from the executor.
 
+mod rootkey;
 mod solana;
 
 use std::net::SocketAddr;
@@ -70,6 +72,8 @@ struct Service {
     http: reqwest::Client,
     /// How long an upload may take to be taken by the build service.
     upload_timeout: std::time::Duration,
+    /// The published root keys' relays to the executor.
+    rootkey: rootkey::Relays,
 }
 
 #[tokio::main]
@@ -106,6 +110,7 @@ async fn main() -> Result<()> {
         executor: args.executor_url.clone(),
         http: indexer::http(),
         upload_timeout: UPLOAD_TIMEOUT,
+        rootkey: rootkey::Relays::default(),
     });
 
     let app = axum::Router::new()
@@ -127,6 +132,9 @@ async fn main() -> Result<()> {
         .route("/api/{chain}/health/{vault}/signed", get(signed_health))
         .route("/api/{chain}/usage/{vault}", get(usage))
         .route("/api/store/{hash}/{name}", get(store_file))
+        // The root key service's public reads, from the executor.
+        .route("/api/rootkey", get(rootkey::status))
+        .route("/api/rootkey/published/{purpose}", get(rootkey::published))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(service);
 
@@ -938,6 +946,7 @@ mod tests {
             executor: "http://127.0.0.1:1".to_string(),
             http: indexer::http(),
             upload_timeout: std::time::Duration::from_secs(3),
+            rootkey: rootkey::Relays::default(),
         })
     }
 
@@ -1422,6 +1431,7 @@ mod tests {
             executor: service.executor.clone(),
             http: indexer::http(),
             upload_timeout: service.upload_timeout,
+            rootkey: rootkey::Relays::default(),
         })
     }
 

@@ -17,11 +17,13 @@ mod checker;
 mod dashboard;
 mod deploy;
 mod devnet_keys;
+mod economics;
 mod fund;
 mod hyperliquid_vaults;
 mod market;
 mod publish;
 mod seed;
+mod smoke;
 mod solana;
 mod solana_seed;
 
@@ -91,6 +93,18 @@ enum Command {
     /// local network the programs to its Solana cluster, and write the
     /// addresses, then stop. Local and testnet only.
     Deploy,
+    /// The smoke check a deploy ends with, read-only: each EVM chain's
+    /// deployment read back from the chain (or only `--vault-chain`'s), and
+    /// with `--api` the API's health, every one of those chains served with
+    /// a fresh reading, and a vault priced. Fails if any check does.
+    Smoke {
+        /// The API's public address, e.g. https://testnet-api.shonin.fi
+        #[arg(long)]
+        api: Option<String>,
+        /// Pass when no vault is priced yet (a fresh generation)
+        #[arg(long)]
+        allow_no_vault: bool,
+    },
     /// Show the funder and each role's account on every EVM chain of the
     /// network, with what each holds for gas and what it is short, and the
     /// Solana deployer, roles and programs: what to fund before a testnet
@@ -110,6 +124,13 @@ enum Command {
         #[arg(long)]
         kind: String,
     },
+    /// Revoke an image digest on every EVM chain's registry, signed by the
+    /// admin: at once and for good. Already revoked is done.
+    RevokeImage {
+        /// `sha256:<64 hex>`, as the container registry names the image.
+        #[arg(long)]
+        digest: String,
+    },
     /// Propose an operator project (by its Google Cloud project id; the
     /// registry holds its keccak256) to every EVM chain's registry, signed
     /// by the admin. Already proposed is done.
@@ -125,6 +146,16 @@ enum Command {
         #[arg(long)]
         dev: bool,
     },
+    /// Print the root key's record on the network's canonical chain (its
+    /// `root` in the chain config): the signer, when and through which
+    /// checker it was recorded, the image and project, and whether it is
+    /// live.
+    RootKey,
+    /// Clear the root key's record on the network's canonical chain, signed
+    /// by the admin, and print the signer cleared. That signer is refused for
+    /// good; the executor makes a new root and the keeper records it. Already
+    /// clear is done.
+    ClearRootKey,
     /// Allow a development checker again on every EVM chain (a fresh one,
     /// since a retired checker can't be proposed again), for a publish only
     /// it can bless. Already allowed is done. Retire it again after.
@@ -213,16 +244,89 @@ enum Command {
         #[arg(long, default_value_t = seed::TAKE_ON_SECONDS)]
         take_on_seconds: u64,
     },
+    /// On a testnet, play the stand-in venue's market in real time, signed
+    /// by the operator from the mnemonic (never from the cloud): every
+    /// `--every-minutes` one post of both markets' prices and the funding
+    /// accrued since the last, from a tape like bitcoin's (spot about 0.6%
+    /// an hour, funding about 10% a year with rare lulls), minting the venue
+    /// whatever its accounts are owed beyond what it holds. It starts from
+    /// the venue's prices as they stand, so it can be stopped and started
+    /// again. Every EVM chain of the network at once, or `--vault-chain`'s.
+    Market {
+        #[arg(long, default_value_t = 10)]
+        every_minutes: u64,
+    },
+    /// A demonstration that pays its own way, on the vault chain: a fresh
+    /// vault for the agent (published again, or a strategy published with
+    /// `--publish-only` and never activated), activated at the modest
+    /// allowances with its tank filled to and kept at `--tank-days` of the
+    /// daily cap by auto-fill, a depositor's money in and at work, then left
+    /// running. Needs the market operator (`market`) posting.
+    Demo {
+        /// Where the API is answering. Not needed with `--strategy`.
+        #[arg(long, default_value = "")]
+        api: String,
+        #[arg(long, env = "SHONIN_AGENTS_DIR")]
+        agents: Option<PathBuf>,
+        #[arg(long, default_value = "funding-basis")]
+        agent: String,
+        /// Activate this strategy, published and never activated, rather
+        /// than publish again.
+        #[arg(long)]
+        strategy: Option<u64>,
+        /// The depositor's money, in dollars.
+        #[arg(long, default_value_t = 25_000)]
+        deposit: u64,
+        /// The tank, and what auto-fill keeps it at, in days of the
+        /// allowances' daily cap.
+        #[arg(long, default_value_t = 30)]
+        tank_days: u64,
+        #[arg(long, default_value_t = seed::TAKE_ON_SECONDS)]
+        take_on_seconds: u64,
+        /// How long the agent has to put the money to work once priced.
+        #[arg(long, default_value_t = 30)]
+        work_minutes: u64,
+    },
+    /// Whether a vault pays its own way, read from the chain alone: its
+    /// value, share price, tank, allowances and their daily cost, fees owed,
+    /// the author's shares, the gas its key and the keeper spent on it over
+    /// `--hours`, and a day projected (the bill against the author's fee,
+    /// and the break-even deposit). Sends nothing.
+    Economics {
+        #[arg(long)]
+        vault: alloy::primitives::Address,
+        #[arg(long, default_value_t = 6.0)]
+        hours: f64,
+        /// The chain's coin in dollars for the mainnet-like gas figures
+        /// (ETH 2,500 or HYPE 25 when not given).
+        #[arg(long)]
+        coin_usd: Option<f64>,
+        /// The share of the vault held short, to project with, instead of
+        /// what the station holds.
+        #[arg(long)]
+        carry_share: Option<f64>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+    // A report asked for as JSON is the only thing on standard output; its
+    // log goes to standard error.
+    let json_out = matches!(args.command, Some(Command::Economics { json: true, .. }));
+    let writer = if json_out {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
+    } else {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
+    };
     tracing_subscriber::fmt()
         .with_env_filter(chain::log_filter())
         .with_target(false)
+        .with_writer(writer)
         .init();
 
-    let args = Args::parse();
     let target = args.chain_args.resolve()?;
     let local = target.network == NetworkName::Local;
     // A vault chain named on the command line: the devnet deploys to and
@@ -237,10 +341,14 @@ async fn main() -> Result<()> {
                 | Command::Fund
                 | Command::ProposeChecker
                 | Command::ProposeImage { .. }
+                | Command::RevokeImage { .. }
                 | Command::ProposeProject { .. }
                 | Command::RetireChecker { .. }
                 | Command::AllowDevChecker
+                | Command::ClearRootKey
                 | Command::HyperliquidVaults { .. }
+                | Command::Market { .. }
+                | Command::Demo { .. }
         )
     );
     if target.network == NetworkName::Mainnet && changes_chains {
@@ -288,18 +396,8 @@ async fn main() -> Result<()> {
                     .await?;
                 }
             }
-            for (key, client, file, _) in &chains {
-                deploy::ensure(
-                    client,
-                    target.network,
-                    key,
-                    &args.artifacts,
-                    file,
-                    &names,
-                    generation,
-                )
+            deploy::ensure_each(&chains, target.network, &args.artifacts, &names, generation)
                 .await?;
-            }
             if local {
                 for (key, config) in only(&target, one, solana_clusters(&target)) {
                     let client = chain::connect_solana(target.network, &key, &config).await?;
@@ -309,6 +407,32 @@ async fn main() -> Result<()> {
                 }
             }
             Ok(())
+        }
+        Some(Command::Smoke {
+            api,
+            allow_no_vault,
+        }) => {
+            let chains: Vec<_> = target
+                .configs
+                .network(target.network)
+                .into_iter()
+                .flat_map(|network| network.iter())
+                .filter(|(_, key)| key.kind == ChainKind::Evm)
+                .filter(|(_, key)| !one || key.same_chain(&target.key))
+                .filter_map(|(chain, key)| {
+                    Some((chain, key.clone(), target.configs.get(key)?.clone()))
+                })
+                .collect();
+            smoke::run(
+                target.network,
+                &chains,
+                &target.deployments_dir,
+                &smoke::Options {
+                    api,
+                    allow_no_vault,
+                },
+            )
+            .await
         }
         Some(Command::Accounts) => accounts(&target, &args.funding).await,
         Some(Command::ProposeChecker) => {
@@ -325,6 +449,13 @@ async fn main() -> Result<()> {
             let kind = admin::kind_named(&kind)?;
             on_each_registry(&target, one, |client, deployments| async move {
                 admin::propose_image(&client, &deployments, digest, kind).await
+            })
+            .await
+        }
+        Some(Command::RevokeImage { digest }) => {
+            let digest = admin::image_digest(&digest)?;
+            on_each_registry(&target, one, |client, deployments| async move {
+                admin::revoke_image(&client, &deployments, digest).await
             })
             .await
         }
@@ -351,6 +482,18 @@ async fn main() -> Result<()> {
                 async move { admin::allow_dev_checker(&client, &deployments, &artifacts).await }
             })
             .await
+        }
+        Some(Command::RootKey) => {
+            let (label, key, client, deployments) = root_registry(&target).await?;
+            let said = admin::root_key(&client, &deployments).await?;
+            println!("{label} ({key}): {said}");
+            Ok(())
+        }
+        Some(Command::ClearRootKey) => {
+            let (label, key, client, deployments) = root_registry(&target).await?;
+            let said = admin::clear_root_key(&client, &deployments).await?;
+            println!("{label} ({key}): {said}");
+            Ok(())
         }
         Some(Command::Fund) => {
             fund::run(
@@ -541,6 +684,127 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Some(Command::Market { every_minutes }) => {
+            if target.network != NetworkName::Testnet {
+                bail!(
+                    "the market operator is for the testnets: the local chain's market runs with the chain"
+                );
+            }
+            let every = std::time::Duration::from_secs(every_minutes.max(1) * 60);
+            let mut running = tokio::task::JoinSet::new();
+            for (key, config) in only(&target, one, evm_chains(&target)) {
+                let network = target.network;
+                let file = Deployments::file_in(&target.deployments_dir, &key);
+                // Each chain on its own: one whose endpoint is down, or that
+                // stops, is started again after a pause, and holds up none
+                // of the others.
+                running.spawn(async move {
+                    loop {
+                        let ran = async {
+                            let client = connect_to(network, &key, &config).await?;
+                            let deployments =
+                                client.deployments(&file).await.with_context(|| {
+                                    format!("no deployment on {key}: run chains:deploy first")
+                                })?;
+                            market::operate(
+                                &client,
+                                &deployments,
+                                every,
+                                market::TapeParams::TESTNET,
+                            )
+                            .await
+                        }
+                        .await;
+                        let Err(error) = ran else { continue };
+                        let error = error.context(format!("the market on {key}"));
+                        if !market::worth_restarting(&error) {
+                            return Err::<(), _>(error);
+                        }
+                        tracing::warn!(
+                            error = format!("{error:#}"),
+                            "the market operator stopped on this chain; it starts again shortly"
+                        );
+                        tokio::time::sleep(market::RESTART_AFTER).await;
+                    }
+                });
+            }
+            let mut failed = None;
+            while let Some(finished) = running.join_next().await {
+                let error = match finished {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(error)) => error,
+                    Err(error) => anyhow::Error::new(error),
+                };
+                tracing::error!(
+                    error = format!("{error:#}"),
+                    "a chain's market operator stopped for good"
+                );
+                failed.get_or_insert(error);
+            }
+            failed.map_or(Ok(()), Err)
+        }
+        Some(Command::Demo {
+            api,
+            agents,
+            agent,
+            strategy,
+            deposit,
+            tank_days,
+            take_on_seconds,
+            work_minutes,
+        }) => {
+            let client = target.connect().await?;
+            let deployments = target.wait_for_deployments(&client).await?;
+            let api = api.trim_end_matches('/').to_string();
+            if strategy.is_none() && api.is_empty() {
+                bail!("--api is needed to publish: where the API answers");
+            }
+            seed::demo(
+                &client,
+                target.vault_chain,
+                &deployments,
+                &seed::Demo {
+                    network: target.network.name(),
+                    api: &api,
+                    agents: agents.as_deref(),
+                    agent: &agent,
+                    strategy,
+                    deposit_dollars: deposit,
+                    tank_days,
+                    take_on: take_on_seconds,
+                    work_within: std::time::Duration::from_secs(work_minutes * 60),
+                },
+            )
+            .await
+        }
+        Some(Command::Economics {
+            vault,
+            hours,
+            coin_usd,
+            carry_share,
+            json,
+        }) => {
+            let client = target.connect().await?;
+            let deployments = target.wait_for_deployments(&client).await?;
+            economics::report(
+                &client,
+                &deployments,
+                &economics::Options {
+                    vault,
+                    hours,
+                    coin_usd,
+                    billed_coin_usd: target.config.native_usd.unwrap_or(0.0),
+                    carry_share,
+                    mean_funding: if local {
+                        market::TapeParams::LOCAL.funding_mean()
+                    } else {
+                        market::TESTNET_MEAN_FUNDING
+                    },
+                    json,
+                },
+            )
+            .await
+        }
         None => {
             let mut running = tokio::task::JoinSet::new();
             if args.port != 0 {
@@ -623,19 +887,68 @@ where
     F: Fn(chain::Client, Deployments) -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
 {
-    for (key, config) in only(target, one, evm_chains(target)) {
-        let client = connect_to(target.network, &key, &config).await?;
-        let file = Deployments::file_in(&target.deployments_dir, &key);
-        let deployments = client
-            .deployments(&file)
-            .await
-            .with_context(|| format!("no deployment on {key}: run chains:deploy first"))?;
-        let said = change(client, deployments)
-            .await
-            .with_context(|| format!("on {} ({key})", config.label))?;
-        println!("{} ({key}): {said}", config.label);
+    // Every chain at once: each registry is its own chain and its own
+    // admin nonce, so one chain's slow blocks never hold up another's.
+    // Each chain's outcome is printed; the command fails if any chain did.
+    let each = only(target, one, evm_chains(target))
+        .into_iter()
+        .map(|(key, config)| {
+            let change = &change;
+            async move {
+                let outcome = async {
+                    let client = connect_to(target.network, &key, &config).await?;
+                    let file = Deployments::file_in(&target.deployments_dir, &key);
+                    let deployments = client.deployments(&file).await.with_context(|| {
+                        format!("no deployment on {key}: run chains:deploy first")
+                    })?;
+                    change(client, deployments).await
+                }
+                .await;
+                (key, config, outcome)
+            }
+        });
+    let mut failed = Vec::new();
+    for (key, config, outcome) in futures::future::join_all(each).await {
+        match outcome {
+            Ok(said) => println!("{} ({key}): {said}", config.label),
+            Err(error) => {
+                println!("{} ({key}): failed: {error:#}", config.label);
+                failed.push(format!("{} ({key})", config.label));
+            }
+        }
+    }
+    if !failed.is_empty() {
+        bail!("not done on {}", failed.join(", "));
     }
     Ok(())
+}
+
+/// The network's canonical chain for the root key, connected, with its
+/// deployment.
+async fn root_registry(target: &Target) -> Result<(String, ChainKey, chain::Client, Deployments)> {
+    let key = target
+        .configs
+        .network(target.network)
+        .and_then(|network| network.root())
+        .map(|(_, key)| key.clone())
+        .with_context(|| {
+            format!(
+                "the {} network names no canonical chain for the root key (`root` in the chain config)",
+                target.network
+            )
+        })?;
+    let config = target
+        .configs
+        .get(&key)
+        .with_context(|| format!("no chain has the key {key}"))?
+        .clone();
+    let client = connect_to(target.network, &key, &config).await?;
+    let file = Deployments::file_in(&target.deployments_dir, &key);
+    let deployments = client
+        .deployments(&file)
+        .await
+        .with_context(|| format!("no deployment on {key}: run chains:deploy first"))?;
+    Ok((config.label, key, client, deployments))
 }
 
 /// Why the devnet never deploys to mainnet: what it deploys is the stand-in
@@ -853,6 +1166,42 @@ mod tests {
     }
 
     #[test]
+    fn the_market_demo_and_economics_commands_parse() {
+        let Some(Command::Market { every_minutes }) = parse(&["market"]).unwrap().command else {
+            panic!("not the market");
+        };
+        assert_eq!(every_minutes, 10);
+        let Some(Command::Demo {
+            agent,
+            deposit,
+            tank_days,
+            ..
+        }) = parse(&["demo", "--api", "https://example.org"])
+            .unwrap()
+            .command
+        else {
+            panic!("not the demo");
+        };
+        assert_eq!(
+            (agent.as_str(), deposit, tank_days),
+            ("funding-basis", 25_000, 30)
+        );
+        let Some(Command::Economics { hours, json, .. }) = parse(&[
+            "economics",
+            "--vault",
+            "0x0000000000000000000000000000000000000001",
+            "--json",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("not the economics");
+        };
+        assert_eq!(hours, 6.0);
+        assert!(json);
+    }
+
+    #[test]
     fn the_admin_commands_parse() {
         assert!(matches!(
             parse(&[
@@ -879,6 +1228,14 @@ mod tests {
         assert!(matches!(
             parse(&["allow-dev-checker"]).unwrap().command,
             Some(Command::AllowDevChecker)
+        ));
+        assert!(matches!(
+            parse(&["root-key"]).unwrap().command,
+            Some(Command::RootKey)
+        ));
+        assert!(matches!(
+            parse(&["clear-root-key"]).unwrap().command,
+            Some(Command::ClearRootKey)
         ));
     }
 }

@@ -1,0 +1,33 @@
+# RISC Zero's Groth16 prover image, copied into the project's Artifact
+# Registry so the prover's VM pulls it from next door, not from Docker Hub:
+# `task cloud:vendor-groth16 NETWORK=testnet`. The linux/amd64 manifest is
+# copied as it is (under a list naming it alone), so its digest is the one
+# pinned in prover/startup.sh; the copy is checked by that digest.
+
+substitutions:
+  _REGISTRY: "us-central1-docker.pkg.dev/shonin-testnet/shonin"
+  # The image the risc0-groth16 crate runs, by tag, and its linux/amd64
+  # manifest's digest.
+  _SOURCE: "docker.io/risczero/risc0-groth16-prover"
+  _VERSION: "v2025-04-03.1"
+  _DIGEST: "sha256:7f173963196570b7a71816ed70565a4579264c5d2e3e0ecb028102538ad0e331"
+
+steps:
+  - id: copy
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -eu
+        target="${_REGISTRY}/risc0-groth16-prover:${_VERSION}"
+        docker buildx imagetools create --tag "$$target" "${_SOURCE}@${_DIGEST}"
+        # The tag names a list holding the one manifest, copied as it is:
+        # the prover pulls that manifest by its digest.
+        docker buildx imagetools inspect --raw "${_REGISTRY}/risc0-groth16-prover@${_DIGEST}" >/dev/null
+        echo "copied: ${_REGISTRY}/risc0-groth16-prover@${_DIGEST}"
+
+serviceAccount: projects/shonin-testnet/serviceAccounts/shonin-cloudbuild@shonin-testnet.iam.gserviceaccount.com
+timeout: 1800s
+options:
+  logging: CLOUD_LOGGING_ONLY

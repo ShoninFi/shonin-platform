@@ -127,18 +127,26 @@ dollar = "USDC"
 # --- Networks: which chain each vault chain means ----------------------------
 # Choose one with SHONIN_NETWORK (or --network / NETWORK=). The names on the
 # left are the vault chains a strategy's shonin.toml names.
+#
+# `root` names the vault chain canonical for the root key: its
+# AttestationRegistry holds the root key's record (`rootKey()`), and its
+# allowlist decides which attested images may be given the root or a key
+# derived from it. It must be one of the network's EVM chains. Mainnet names
+# none yet, so it has no root key.
 
 [networks.local]
 base = "evm:31337"
 hyperliquid = "evm:31338"
 robinhood = "evm:31339"
 solana = "solana:localnet"
+root = "base"
 
 [networks.testnet]
 base = "evm:84532"
 hyperliquid = "evm:998"
 robinhood = "evm:46630"
 solana = "solana:devnet"
+root = "base"
 
 [networks.mainnet]
 base = "evm:8453"

@@ -770,13 +770,17 @@ mod tests {
         );
     }
 
-    /// The vault asks for the modest shape's 256 MiB on an executor whose
-    /// ceiling is 64 MiB: its report warns that the agent is held to the
-    /// ceiling, and its runway is counted at what is billed.
+    /// The vault asks for 256 MiB on an executor whose ceiling is 64 MiB:
+    /// its report warns that the agent is held to the ceiling, and its
+    /// runway is counted at what is billed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_allowance_held_to_its_ceiling_is_said_in_the_health_report() {
         let (node, client) = crate::stand_in::public::start(GWEI, 0).await;
         node.lock().unwrap().key_holds = GAS_STAKE_PUBLIC;
+        node.lock().unwrap().allowances = shared::Allowances {
+            memory_mib: 256,
+            ..shared::Allowances::modest()
+        };
         let held = Ceilings {
             memory_mib: 64,
             ..Ceilings::default()

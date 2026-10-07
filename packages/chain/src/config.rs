@@ -276,16 +276,32 @@ impl FromStr for NetworkName {
     }
 }
 
-/// One network: the chain each vault chain name means in it.
+/// One network: the chain each vault chain name means in it, and which of
+/// them is canonical for the root key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Network {
     pub name: NetworkName,
     chains: BTreeMap<Chain, ChainKey>,
+    /// The vault chain whose registry records the root key and whose
+    /// allowlist the root key's exchange checks (`root = "base"`). A
+    /// network that names none has no root key.
+    root: Option<Chain>,
 }
+
+/// The entry of a `[networks.*]` table that names the root key's chain
+/// rather than a vault chain.
+pub const ROOT_ENTRY: &str = "root";
 
 impl Network {
     pub fn get(&self, chain: Chain) -> Option<&ChainKey> {
         self.chains.get(&chain)
+    }
+
+    /// The canonical chain for the root key: the vault chain the network's
+    /// `root` entry names, and the chain it means. Always an EVM chain.
+    pub fn root(&self) -> Option<(Chain, &ChainKey)> {
+        let chain = self.root?;
+        Some((chain, self.chains.get(&chain)?))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (Chain, &ChainKey)> {
@@ -374,7 +390,17 @@ impl ChainConfigs {
         for (name, entries) in file.networks {
             let name: NetworkName = name.parse()?;
             let mut map: BTreeMap<Chain, ChainKey> = BTreeMap::new();
+            let mut root = None;
             for (vault_chain, key) in entries {
+                // `root` names one of the network's vault chains, not a
+                // chain key: the one canonical for the root key.
+                if vault_chain == ROOT_ENTRY {
+                    let chain: Chain = key.parse().map_err(|error| {
+                        ConfigError::new(format!("network {name}'s root: {error}"))
+                    })?;
+                    root = Some(chain);
+                    continue;
+                }
                 let vault_chain: Chain = vault_chain.parse().map_err(ConfigError::new)?;
                 let key: ChainKey = key.parse()?;
                 if !chains.contains_key(&key) {
@@ -391,7 +417,31 @@ impl ChainConfigs {
                 }
                 map.insert(vault_chain, key);
             }
-            networks.insert(name, Network { name, chains: map });
+            // The root key's record lives in an `AttestationRegistry`, which
+            // only the EVM chains have.
+            if let Some(chain) = root {
+                match map.get(&chain) {
+                    Some(key) if key.kind == ChainKind::Evm => {}
+                    Some(key) => {
+                        return Err(ConfigError::new(format!(
+                            "network {name}'s root is {chain} ({key}); the root key's chain must be an EVM chain"
+                        )));
+                    }
+                    None => {
+                        return Err(ConfigError::new(format!(
+                            "network {name}'s root is {chain}, which the network does not name"
+                        )));
+                    }
+                }
+            }
+            networks.insert(
+                name,
+                Network {
+                    name,
+                    chains: map,
+                    root,
+                },
+            );
         }
 
         Ok(Self { chains, networks })
@@ -673,6 +723,66 @@ mod tests {
                 };
                 assert_eq!(key.kind, expected, "{network} {chain}");
             }
+        }
+    }
+    #[test]
+    fn the_committed_file_names_base_as_the_root_key_s_chain_on_local_and_testnet_only() {
+        let text = include_str!("../../../config/chains.toml");
+        let configs = ChainConfigs::from_toml(text, no_env).unwrap();
+        let root = |network| {
+            configs
+                .network(network)
+                .unwrap()
+                .root()
+                .map(|(chain, key)| (chain, key.to_string()))
+        };
+        assert_eq!(
+            root(NetworkName::Local),
+            Some((Chain::Base, "evm:31337".to_string()))
+        );
+        assert_eq!(
+            root(NetworkName::Testnet),
+            Some((Chain::Base, "evm:84532".to_string()))
+        );
+        assert_eq!(root(NetworkName::Mainnet), None);
+    }
+
+    #[test]
+    fn a_root_that_is_not_one_of_the_network_s_evm_chains_is_refused() {
+        let file = |root: &str| {
+            format!(
+                r#"
+                [chains."evm:1"]
+                label = "One"
+                rpc = "http://one"
+                dollar = "USDC"
+
+                [chains."solana:localnet"]
+                label = "Solana"
+                rpc = "http://solana"
+                dollar = "USDC"
+
+                [networks.local]
+                base = "evm:1"
+                solana = "solana:localnet"
+                root = "{root}"
+            "#
+            )
+        };
+        let configs = ChainConfigs::from_toml(&file("base"), no_env).unwrap();
+        assert_eq!(
+            configs.network(NetworkName::Local).unwrap().root(),
+            Some((Chain::Base, &"evm:1".parse().unwrap()))
+        );
+        for (root, says) in [
+            ("solana", "EVM"),
+            ("robinhood", "does not name"),
+            ("evm:1", "root"),
+        ] {
+            let error = ChainConfigs::from_toml(&file(root), no_env)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(says), "{root}: {error}");
         }
     }
 }

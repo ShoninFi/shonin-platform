@@ -141,7 +141,7 @@ vars:
   # SDK's real target is wasm32-wasip2, where a strategy is compiled into a
   # component.
   CARGO_WASM_PACKAGES: "-p shonin-app -p shonin-shared -p shonin-chain"
-  CARGO_WASIP2_PACKAGES: "-p shonin-strategy-sdk"
+  CARGO_WASIP2_PACKAGES: "-p shonin-strategy-sdk -p shonin-fuelbench-guest"
 
   # Ports: a base (override with SHONIN_START_PORT_DEV in .env) plus fixed offsets.
   # Offsets are stable; reserved ones stay reserved.

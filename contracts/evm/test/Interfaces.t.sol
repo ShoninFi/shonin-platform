@@ -46,6 +46,7 @@ contract InterfacesTest is Fixture {
 
         IPrices asPrices = IPrices(address(prices));
         assertEq(asPrices.notice(), PRICE_NOTICE);
+        assertEq(asPrices.fuelPerCoreSecond(), FUEL_PER_CORE_SECOND);
         assertEq(asPrices.history().length, 1);
         assertEq(asPrices.current().vcpuHour, 0.15e18);
         assertEq(asPrices.dailyCost(allowancesCosting(5e6)), 5e6);

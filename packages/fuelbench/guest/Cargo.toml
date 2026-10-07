@@ -1,0 +1,22 @@
+[package]
+name = "shonin-fuelbench-guest"
+description = "The Wasm workloads the fuel benchmark times"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ciborium.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+strategy-sdk.workspace = true
+wit-bindgen.workspace = true
+
+[lints]
+workspace = true

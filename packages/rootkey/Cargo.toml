@@ -1,0 +1,58 @@
+[package]
+name = "shonin-rootkey"
+description = "The root key: its derived keys, sealing to them, and passing them between attested enclaves"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "shonin-seal"
+path = "src/bin/seal.rs"
+
+[[bin]]
+name = "shonin-rootkey-requester"
+path = "src/bin/requester.rs"
+
+[dependencies]
+chain = { workspace = true, features = ["rpc"] }
+alloy.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+base64 = "0.22.1"
+# The root, made from the operating system's randomness and wiped from
+# memory when dropped.
+getrandom = "0.3.4"
+zeroize = "1.9.0"
+# Every derived key is expanded from the root under its own label.
+hkdf = "0.13.0"
+# Sealing (RFC 9180): DHKEM(X25519, HKDF-SHA256), HKDF-SHA256,
+# ChaCha20-Poly1305, base mode.
+hpke = { version = "0.14.1", default-features = false, features = ["alloc", "x25519", "chacha", "getrandom"] }
+# The token check the attestation guest runs, reused as it is.
+shonin-attestation-core = { path = "../attestation/core" }
+
+[dev-dependencies]
+# Signed test tokens under the fixture's test key.
+shonin-attestation-core = { path = "../attestation/core", features = ["fixture"] }
+# Asking the routes without binding a port.
+tower = { workspace = true, features = ["util"] }
+
+[lints]
+workspace = true

@@ -1,6 +1,7 @@
 //! The admin's changes to a chain's attestation registry that a deployment
-//! doesn't make by itself: a real image digest, an operator's project, and
-//! the development checker retired or allowed again.
+//! doesn't make by itself: a real image digest, an operator's project, the
+//! development checker retired or allowed again, and the root key's record
+//! read or cleared.
 //!
 //! Each is signed by the admin role and safe to run again: a change already
 //! made is reported and nothing is sent.
@@ -34,7 +35,8 @@ pub fn kind_named(name: &str) -> Result<ImageKind> {
         "builder" => ImageKind::Builder,
         "reviewer" => ImageKind::Reviewer,
         "unwinder" => ImageKind::Unwinder,
-        other => bail!("no image kind {other:?}: executor, builder, reviewer or unwinder"),
+        "holder" => ImageKind::Holder,
+        other => bail!("no image kind {other:?}: executor, builder, reviewer, unwinder or holder"),
     })
 }
 
@@ -102,6 +104,47 @@ pub async fn propose_image(
         .await
         .context("proposing the image")?;
     Ok(format!("the image {digest} is proposed"))
+}
+
+/// Revoke the image `digest`, unless it already is. A revoked image can
+/// never be allowed again, and what was blessed or recorded from it stops
+/// counting.
+pub async fn revoke_image(
+    client: &Client,
+    deployments: &Deployments,
+    digest: B256,
+) -> Result<String> {
+    let image = client
+        .read(
+            deployments.attestation,
+            IAttestationRegistry::imageOfCall {
+                imageDigest: digest,
+            },
+        )
+        .await?;
+    if image.revoked {
+        return Ok(format!("the image {digest} is already revoked"));
+    }
+    // One never proposed here has nothing to revoke, and a revocation of it
+    // wouldn't last: proposing it later allows it afresh. So nothing is
+    // sent, and the digest is checked rather than a mistyped one "revoked".
+    if image.allowedAt == 0 {
+        return Ok(format!(
+            "the image {digest} was never proposed here: nothing to revoke"
+        ));
+    }
+    let admin = client.account(Role::Admin)?;
+    client
+        .send(
+            admin,
+            deployments.attestation,
+            IAttestationRegistry::revokeImageCall {
+                imageDigest: digest,
+            },
+        )
+        .await
+        .context("revoking the image")?;
+    Ok(format!("the image {digest} is revoked"))
 }
 
 /// Propose the operator project `project` (its hash), unless it already is.
@@ -261,6 +304,64 @@ pub async fn allow_dev_checker(
     ))
 }
 
+/// The root key's record, said in one line: the signer, when and through
+/// which checker it was recorded, its image and project, and whether it is
+/// live.
+pub async fn root_key(client: &Client, deployments: &Deployments) -> Result<String> {
+    let record = client
+        .read(
+            deployments.attestation,
+            IAttestationRegistry::rootKeyCall {},
+        )
+        .await?;
+    if record.signer == Address::ZERO {
+        return Ok("no root key is recorded".to_string());
+    }
+    let live = client
+        .read(
+            deployments.attestation,
+            IAttestationRegistry::isRootKeyLiveCall {},
+        )
+        .await?;
+    Ok(format!(
+        "root key signer {} ({}), attested at {} and recorded at {} through checker {}, image {}, project {}",
+        record.signer,
+        if live { "live" } else { "NOT live" },
+        record.issuedAt,
+        record.setAt,
+        record.verifier,
+        record.imageDigest,
+        record.projectId,
+    ))
+}
+
+/// Clear the root key's record, as the admin, and say the signer cleared.
+/// That signer can never be recorded again.
+pub async fn clear_root_key(client: &Client, deployments: &Deployments) -> Result<String> {
+    let record = client
+        .read(
+            deployments.attestation,
+            IAttestationRegistry::rootKeyCall {},
+        )
+        .await?;
+    if record.signer == Address::ZERO {
+        return Ok("no root key is recorded: nothing to clear".to_string());
+    }
+    let admin = client.account(Role::Admin)?;
+    client
+        .send(
+            admin,
+            deployments.attestation,
+            IAttestationRegistry::clearRootKeyCall {},
+        )
+        .await
+        .with_context(|| format!("clearing the root key {}", record.signer))?;
+    Ok(format!(
+        "cleared the root key signer {}; it is refused for good, and the executor makes a new root",
+        record.signer
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,9 +396,10 @@ mod tests {
     }
 
     #[test]
-    fn only_the_four_image_kinds_are_named() {
+    fn only_the_five_image_kinds_are_named() {
         assert!(kind_named("executor").is_ok());
         assert!(kind_named("unwinder").is_ok());
+        assert!(kind_named("holder").is_ok());
         assert!(kind_named("none").is_err());
     }
 }

@@ -742,6 +742,9 @@ pub mod public {
         pub key_holds: u128,
         /// Transfers asked of the node, by value.
         pub sent: Vec<U256>,
+        /// The vault's allowances as it reports them: modest unless a test
+        /// says otherwise.
+        pub allowances: shared::Allowances,
     }
 
     pub type Node = Arc<Mutex<Public>>;
@@ -831,7 +834,7 @@ pub mod public {
                         fillPending: false,
                     }),
                     IVault::allowancesCall::SELECTOR => IVault::allowancesCall::abi_encode_returns(
-                        &chain::allowances(&shared::Allowances::modest()),
+                        &chain::allowances(&node.allowances),
                     ),
                     other => panic!("the stand-in was asked {other:?}"),
                 };
@@ -849,6 +852,7 @@ pub mod public {
             base_fee,
             key_holds,
             sent: Vec::new(),
+            allowances: shared::Allowances::modest(),
         }));
         let app = Router::new().route("/", post(rpc)).with_state(node.clone());
         let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))

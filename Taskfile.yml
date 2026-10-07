@@ -17,6 +17,8 @@ includes:
   services: taskfiles/services.yml
   cloud: taskfiles/cloud.yml
   store: taskfiles/store.yml
+  rootkey: taskfiles/rootkey.yml
+  deploy: taskfiles/deploy.yml
 
 tasks:
   default:
