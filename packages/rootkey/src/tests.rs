@@ -8,7 +8,7 @@ use shonin_attestation_core::{Binding, Jwk, fixture};
 
 use crate::chain_view::{ChainView, ImageKind};
 use crate::exchange::{
-    MAX_TOKEN_AGE, Permission, Received, Requester, VaultProof, authorise, permission,
+    CLOCK_SKEW, MAX_TOKEN_AGE, Permission, Received, Requester, VaultProof, authorise, permission,
 };
 use crate::purpose::{DUMMY, Purpose, REVIEWER_MODEL};
 use crate::{Error, PublishedKey, Root, open, seal};
@@ -586,10 +586,10 @@ async fn a_token_failing_any_of_the_guests_checks_is_refused() {
             Error::Token(Guest::NotFresh),
         ),
         (
-            "issued in the future",
+            "issued further in the future than clocks differ",
             Box::new(|c| {
-                c["iat"] = json!(NOW + 60);
-                c["nbf"] = json!(NOW + 60);
+                c["iat"] = json!(NOW + CLOCK_SKEW + 1);
+                c["nbf"] = json!(NOW + CLOCK_SKEW + 1);
             }),
             Error::Token(Guest::NotFresh),
         ),
@@ -609,6 +609,19 @@ async fn a_token_failing_any_of_the_guests_checks_is_refused() {
             "{what}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_token_stamped_by_a_clock_a_little_ahead_is_accepted() {
+    // Google stamps a token seconds ahead of the machines' own clocks, and a
+    // requester sends it at once: the holder takes it, up to the skew.
+    let chain = StandIn::new();
+    let received = reviewer_with(&chain, |c| {
+        c["iat"] = json!(NOW + CLOCK_SKEW);
+        c["nbf"] = json!(NOW + CLOCK_SKEW);
+    })
+    .await;
+    assert!(received.is_ok(), "{received:?}");
 }
 
 #[tokio::test]

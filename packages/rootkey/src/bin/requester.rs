@@ -44,6 +44,19 @@ struct Args {
 async fn attempt(args: &Args, purpose: &Purpose, sealed: &Sealed) -> Result<String> {
     let requester = Requester::new(purpose.clone())?;
     let token = request_token(&args.socket, &requester.nonce()).await?;
+    // A token is stamped by a clock seconds ahead of this machine's (and a
+    // holder's): wait until it is no longer in the future here, so a holder
+    // that allows no skew takes it too.
+    if let Some((Some(issued_at), _, _)) = token_times(&token) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or(0);
+        let ahead = issued_at.saturating_sub(now).min(60);
+        if ahead > 0 {
+            tokio::time::sleep(Duration::from_secs(ahead + 1)).await;
+        }
+    }
     let request = requester.request(token, None);
     let url = format!("{}/rootkey/exchange", args.holder.trim_end_matches('/'));
     let answer = reqwest::Client::new()

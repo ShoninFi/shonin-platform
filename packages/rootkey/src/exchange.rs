@@ -12,7 +12,8 @@
 //! 1. checks the token exactly as the attestation guest does, with the
 //!    exchange's nonce in place of a blessing's, against the Google keys an
 //!    allowed checker on the canonical chain trusts, and refuses one issued
-//!    more than [`MAX_TOKEN_AGE`] ago;
+//!    more than [`MAX_TOKEN_AGE`] ago (and accepts one issued up to
+//!    [`CLOCK_SKEW`] ahead of its own clock);
 //! 2. reads the canonical chain for the image's kind and the project;
 //! 3. decides what that kind may have ([`permission`]), and for a vault's
 //!    keys checks the vault key's proof and its blessing, read from the
@@ -64,6 +65,12 @@ pub const RELEASE_VERSION: u32 = 1;
 /// requester asks for its token just before it asks; the token's own hour
 /// is for a prover, which an exchange doesn't wait for.
 pub const MAX_TOKEN_AGE: u64 = 10 * 60;
+
+/// How far ahead of the holder's clock a token's `iat` and `nbf` may be:
+/// Google's attestation service stamps a token seconds ahead of the
+/// machines' own clocks (about 8 seconds, measured on Confidential Space in
+/// October 2026), and a requester sends its token at once.
+pub const CLOCK_SKEW: u64 = 30;
 
 /// The nonce the asking enclave puts in its token: the lowercase hex of
 /// `sha256("shonin-root-exchange:v1" ‖ ephemeral public key ‖ purpose)`.
@@ -385,10 +392,12 @@ pub fn check_token(
         .filter(|key| trusted.contains(&key.key_hash()))
         .cloned()
         .collect();
+    // Checked as of a moment `CLOCK_SKEW` ahead, so a token stamped by a
+    // clock a little ahead of ours passes; its age is judged at `now`.
     let input = Input {
         token: token.into(),
         keys: keys.clone(),
-        now,
+        now: now.saturating_add(CLOCK_SKEW),
         binding: Binding::default(),
     };
     match shonin_attestation_core::verify(&input) {
