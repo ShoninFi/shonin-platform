@@ -98,19 +98,25 @@ propose_executor() {
   task chains:image NETWORK=testnet DIGEST="$digest" KIND=executor
 }
 
-# The prover's VM, pointed at the new prover image and started now, with
-# a longer idle time, so it is up (its Groth16 image already on its disk)
-# when the new executor asks for a seal.
+# The prover's VM (created if the zone has none yet), pointed at the new
+# prover image and started now, with a longer idle time for the next 45
+# minutes, so it is up (its Groth16 image already on its disk) when the new
+# executor asks for a seal; after that it powers off after the usual 600 s.
 prover_warm() {
-  local digest current
+  local digest current until
   digest=$(digest_of prover)
   [ -n "$digest" ] || { echo "no prover image under $TAG"; exit 1; }
+  if ! gcloud_vm describe shonin-prover-testnet >/dev/null 2>&1; then
+    task cloud:deploy:prover NETWORK=testnet TAG="$TAG"
+  fi
+  until=$(($(date +%s) + 45 * 60))
   current=$(metadata_of shonin-prover-testnet shonin-prover-image)
   if [ "$current" != "$REGISTRY/prover@$digest" ]; then
     gcloud_vm add-metadata shonin-prover-testnet \
-      --metadata="shonin-prover-image=$REGISTRY/prover@$digest,shonin-prover-idle-seconds=1800"
+      --metadata="shonin-prover-image=$REGISTRY/prover@$digest,shonin-prover-idle-seconds=1800,shonin-prover-idle-until=$until"
   else
-    gcloud_vm add-metadata shonin-prover-testnet --metadata="shonin-prover-idle-seconds=1800"
+    gcloud_vm add-metadata shonin-prover-testnet \
+      --metadata="shonin-prover-idle-seconds=1800,shonin-prover-idle-until=$until"
   fi
   case "$(gcloud_vm describe shonin-prover-testnet --format='value(status)')" in
     TERMINATED | STOPPED) gcloud_vm start shonin-prover-testnet --async ;;
@@ -137,6 +143,10 @@ executor() {
 
 services() {
   local api keeper
+  if ! gcloud_vm describe shonin-services-testnet >/dev/null 2>&1; then
+    task cloud:deploy:services NETWORK=testnet TAG="$TAG"
+    return
+  fi
   api=$(digest_of api)
   keeper=$(digest_of keeper)
   if [ "$(metadata_of shonin-services-testnet shonin-api-image)" = "$REGISTRY/api@$api" ] &&

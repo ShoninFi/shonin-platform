@@ -12,7 +12,7 @@ The project is chosen by the network, from `GCP_PROJECT_TESTNET` (`shonin-testne
 
 ## Three VMs
 
-Everything runs in one zone (`us-central1-a`), on the default network, with nothing reachable from the internet: SSH only from Google's IAP range, the services' ports open to the VPC alone, and the API carried out to `https://testnet-api.shonin.fi` by a Cloudflare tunnel the services VM dials.
+Everything runs in one zone (`europe-west4-a`), on the default network, with nothing reachable from the internet: SSH only from Google's IAP range, the services' ports open to the VPC alone, and the API carried out to `https://testnet-api.shonin.fi` by a Cloudflare tunnel the services VM dials.
 
 | VM | What runs | Machine | Account |
 | --- | --- | --- | --- |
@@ -20,7 +20,7 @@ Everything runs in one zone (`us-central1-a`), on the default network, with noth
 | `shonin-services-<network>` | the API (the indexer inside), the keeper, the tunnel, the waker; Container-Optimized OS | `e2-small`, 10 GB standard disk | `shonin-services`: pull images, write logs, read two secrets, start and read the prover's instance |
 | `shonin-prover-<network>` | the attestation's prover; on-demand, off when idle | `GCP_PROVER_MACHINE_TYPE` | `shonin-prover`: pull images, write logs |
 
-They name each other by internal DNS: the executor's status port is `http://shonin-executor-testnet.us-central1-a.c.shonin-testnet.internal:19085`, the API `http://shonin-services-testnet.us-central1-a.c.shonin-testnet.internal:19081`.
+They name each other by internal DNS: the executor's status port is `http://shonin-executor-testnet.europe-west4-a.c.shonin-testnet.internal:19085`, the API `http://shonin-services-testnet.europe-west4-a.c.shonin-testnet.internal:19081`.
 
 **How a blessing happens.** The executor makes its keys inside the enclave, asks the launcher for a token binding them, and publishes the token and its keys' leaves on its status port (`GET /attestation`), saying when a seal is wanted. The waker on the services VM sees that, and starts the prover's VM if it is off; the prover proves the token, posts the seal back to the executor, and powers off once idle. The keeper relays the seal to each chain's registry (`bless`, simulated first), then stocks each key the registry shows blessed for a live vault with gas.
 
@@ -40,7 +40,7 @@ The API's and the keeper's images hold no key. The keeper is handed its key alon
 
 ```bash
 task cloud:build NAME=api NETWORK=testnet      # docker build, tagged api:<git sha>
-task cloud:push NAME=api NETWORK=testnet       # to us-central1-docker.pkg.dev/shonin-testnet/shonin/api; prints the digest
+task cloud:push NAME=api NETWORK=testnet       # to europe-west4-docker.pkg.dev/shonin-testnet/shonin/api; prints the digest
 ```
 
 ### In Cloud Build
@@ -59,11 +59,11 @@ The executor is launched from its image's **digest**, because the digest is what
 
 ```text
 gcloud compute instances create shonin-executor-testnet \
-  --project=shonin-testnet --zone=us-central1-a \
+  --project=shonin-testnet --zone=europe-west4-a \
   --confidential-compute-type=TDX --machine-type=c3-standard-4 --maintenance-policy=TERMINATE \
   --shielded-secure-boot \
   --image-project=confidential-space-images --image-family=confidential-space \
-  --metadata="^~^tee-image-reference=us-central1-docker.pkg.dev/shonin-testnet/shonin/executor@sha256:<digest>~tee-container-log-redirect=true~tee-restart-policy=Always" \
+  --metadata="^~^tee-image-reference=europe-west4-docker.pkg.dev/shonin-testnet/shonin/executor@sha256:<digest>~tee-container-log-redirect=true~tee-restart-policy=Always" \
   --tags=shonin-executor \
   --service-account=shonin-workload@shonin-testnet.iam.gserviceaccount.com --scopes=cloud-platform
 ```
@@ -100,6 +100,6 @@ task cloud:status NETWORK=testnet
 task cloud:logs NAME=api NETWORK=testnet         # executor | api | keeper | tunnel | waker | services | prover
 ```
 
-Stopping and deleting: `task cloud:stop NAME=executor|services|prover NETWORK=testnet` (the disk stays and bills), `task cloud:start ...`, `task cloud:delete NAME=... NETWORK=testnet CONFIRM=yes`. Images: `gcloud artifacts docker images delete us-central1-docker.pkg.dev/shonin-testnet/shonin/<name>@<digest> --project=shonin-testnet`.
+Stopping and deleting: `task cloud:stop NAME=executor|services|prover NETWORK=testnet` (the disk stays and bills), `task cloud:start ...`, `task cloud:delete NAME=... NETWORK=testnet CONFIRM=yes`. Images: `gcloud artifacts docker images delete europe-west4-docker.pkg.dev/shonin-testnet/shonin/<name>@<digest> --project=shonin-testnet`.
 
 The machines are never handed a mnemonic, nor any key: each makes its own inside the enclave and is blessed through attestation. The only keys in the cloud are the keeper's testnet key and the tunnel's token, readable by the services VM's account alone.

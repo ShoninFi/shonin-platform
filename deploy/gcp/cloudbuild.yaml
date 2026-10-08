@@ -18,7 +18,7 @@
 substitutions:
   _NAMES: "api keeper executor prover"
   _TAG: "scratch"
-  _REGISTRY: "us-central1-docker.pkg.dev/shonin-testnet/shonin"
+  _REGISTRY: "europe-west4-docker.pkg.dev/shonin-testnet/shonin"
   _NETWORK: "testnet"
   _NETWORK_FEATURE: "none"
   _WITHOUT_SOLANA: "1"

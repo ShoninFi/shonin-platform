@@ -208,8 +208,9 @@ vars:
   # project for their network is empty.
   GCP_PROJECT_TESTNET: "shonin-testnet"
   GCP_PROJECT_MAINNET: ""
-  GCP_REGION: "us-central1"
-  GCP_ZONE: "us-central1-a"
+  # europe-west4 on C3: Confidential Space attests Intel TDX on C3 there.
+  GCP_REGION: "europe-west4"
+  GCP_ZONE: "europe-west4-a"
   # The Artifact Registry repository the images are pushed to.
   GCP_ARTIFACT_REPO: "shonin"
   # Confidential Space VMs: Intel TDX needs a C3 machine.

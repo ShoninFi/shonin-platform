@@ -8,7 +8,7 @@
 # Container-Optimized OS runs this as root (the instance's `startup-script`).
 # The instance's metadata names the prover's image (by digest) and the
 # executor's status port:
-#   shonin-prover-image   us-central1-docker.pkg.dev/<project>/shonin/prover@sha256:<digest>
+#   shonin-prover-image   europe-west4-docker.pkg.dev/<project>/shonin/prover@sha256:<digest>
 #   shonin-executor-url   http://<executor's internal name>:19085
 #
 # The Groth16 step runs in RISC Zero's prover image through this VM's Docker:
@@ -74,10 +74,15 @@ else
 fi
 
 # How long the prover waits with nothing to prove before the VM powers off:
-# the metadata's shonin-prover-idle-seconds (a deploy started it early and
-# raises it, so it is still up when the new executor asks), else 600.
+# 600 s, or the metadata's shonin-prover-idle-seconds until the time in
+# shonin-prover-idle-until (a deploy starts the prover early and raises its
+# idle time for a while, so it is still up when the new executor asks; the
+# raise lapses by itself, so later proofs keep the VM up no longer than 600 s).
 idle=$(metadata attributes/shonin-prover-idle-seconds 2>/dev/null) || idle=
+until=$(metadata attributes/shonin-prover-idle-until 2>/dev/null) || until=
 case "$idle" in '' | *[!0-9]*) idle=600 ;; esac
+case "$until" in '' | *[!0-9]*) until=0 ;; esac
+if [ "$(date +%s)" -ge "$until" ]; then idle=600; fi
 
 started=$(date +%s)
 docker run --rm --name shonin-prover --log-driver gcplogs \
