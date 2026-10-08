@@ -225,6 +225,9 @@ struct Service {
     idle: cloud::Idle,
     /// The work loops' turns, closed before the state is written at exit.
     turns: cloud::Turns,
+    /// The sweep a job's end started, apart from the runtime, until it is
+    /// waited for (see [`Fresh`]).
+    sweeping: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Service {
@@ -248,7 +251,12 @@ impl Service {
     /// Let go of the archives of these jobs off the machine too. Not waited
     /// for: an archive left behind is only space.
     fn let_go(&self, ids: Vec<String>) {
-        let Some(internal) = &self.internal else {
+        // Before the API takes the build service's writes, they are left.
+        let Some(internal) = self
+            .internal
+            .as_ref()
+            .filter(|internal| internal.writable())
+        else {
             return;
         };
         for id in ids {
@@ -292,6 +300,28 @@ impl Service {
         match (&self.attestation, self.canonical) {
             (Some(attestation), Some(chain_id)) => attestation.ready(chain_id),
             _ => true,
+        }
+    }
+
+    /// Whether the state kept off the machine can be written, and is this
+    /// build service's own: the key is blessed, and whatever was found
+    /// sealed under another key is set aside (see [`settle`]). Until then no
+    /// upload is taken and no job is started, since neither could be kept.
+    fn keeps_state(&self) -> bool {
+        self.internal
+            .as_ref()
+            .is_none_or(|internal| internal.writable() && internal.settled())
+    }
+
+    /// Wait for the sweep a job's end started, if one is under way.
+    async fn swept(&self) {
+        let sweeping = self
+            .sweeping
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(sweeping) = sweeping {
+            let _ = sweeping.await;
         }
     }
 
@@ -546,6 +576,21 @@ async fn main() -> Result<()> {
         }
         None => None,
     };
+    let targets = args.chain_args.targets()?;
+    // The network's root chain, or base where it names none, as the API
+    // takes it.
+    let canonical = args
+        .chain_args
+        .root_chain()?
+        .and_then(|key| key.evm_chain_id())
+        .or_else(|| {
+            targets
+                .iter()
+                .find(|target| target.vault_chain == Chain::Base)
+                .and_then(|target| target.key.evm_chain_id())
+        });
+    // In the attested image the API takes the build service's writes only
+    // once its key is blessed on the canonical chain: none is sent before.
     let internal = match &args.state_url {
         Some(url) => Some(match &launched {
             Some(launched) => cloud::Internal::new(
@@ -553,7 +598,11 @@ async fn main() -> Result<()> {
                 "builder",
                 cloud::Signer::Key(launched.key.clone()),
                 launched.sealing.clone(),
-            )?,
+            )?
+            .writes_once({
+                let attestation = launched.attestation.clone();
+                move || canonical.is_none_or(|chain_id| attestation.ready(chain_id))
+            }),
             None => {
                 cloud::development(url, "builder", &args.chain_args, |roles| roles.builder).await?
             }
@@ -564,13 +613,16 @@ async fn main() -> Result<()> {
     // user: it is closed to all but root before builds are checked against
     // it.
     let unclosed = if launcher {
-        isolation::restrict(&args.launcher_socket)
+        isolation::restrict(
+            &args.launcher_socket,
+            &[&jobs, &args.builds, &args.sdk, &args.vendor].map(PathBuf::as_path),
+        )
     } else {
         Vec::new()
     };
     let reach = isolation::probe(&args.launcher_socket);
     // Nothing of the build user's runs from before this start.
-    isolation::sweep();
+    isolation::sweep_apart().await;
     let exposed = isolation::holds_the_queue(&reach, launcher).map(|why| {
         if unclosed.is_empty() {
             why
@@ -606,7 +658,6 @@ async fn main() -> Result<()> {
     let payments_read: BTreeMap<String, u64> = read_kept(&payments_file)?.unwrap_or_default();
 
     let network = args.chain_args.network.to_string();
-    let targets = args.chain_args.targets()?;
     let confirmations = targets
         .iter()
         .map(|target| {
@@ -617,18 +668,6 @@ async fn main() -> Result<()> {
         })
         .collect();
     let configured = targets.iter().map(|target| target.vault_chain).collect();
-    // The network's root chain, or base where it names none, as the API
-    // takes it.
-    let canonical = args
-        .chain_args
-        .root_chain()?
-        .and_then(|key| key.evm_chain_id())
-        .or_else(|| {
-            targets
-                .iter()
-                .find(|target| target.vault_chain == Chain::Base)
-                .and_then(|target| target.key.evm_chain_id())
-        });
     // Each chain is taken on as soon as it connects: one out of reach (its
     // node down, its deployment missing) is tried again in the background,
     // and doesn't keep the build service from the others.
@@ -669,13 +708,15 @@ async fn main() -> Result<()> {
         payments_seen: Mutex::new(BTreeMap::new()),
         idle: cloud::Idle::new(args.idle_exit_seconds.map(Duration::from_secs)),
         turns: cloud::Turns::default(),
+        sweeping: std::sync::Mutex::new(None),
     });
     service.let_go(swept);
     if let Some(key) = &service.key {
         tracing::info!(key = %key.address(), "the build service's own key, derived for this image");
     }
+    // Not written yet, it is written once it can be (see [`settle`]).
     if moved {
-        write_queue(&service, &mut *service.queue.lock().await).await?;
+        let _ = write_queue(&service, &mut *service.queue.lock().await).await;
     }
 
     let joining = service.clone();
@@ -734,7 +775,12 @@ async fn main() -> Result<()> {
     stopping.notify_one();
     let _ = server.await;
     service.turns.close().await;
-    write_queue(&service, &mut *service.queue.lock().await).await?;
+    service.swept().await;
+    match write_queue(&service, &mut *service.queue.lock().await).await {
+        // Before the blessing nothing has changed that the API would keep.
+        Err(error) if error.is::<cloud::NotBlessed>() => tracing::info!("{error}"),
+        written => written?,
+    }
     // Busy as it stands now: a payment or a job that came in while closing
     // has the waker start the build service again.
     let busy = service.busy(unread_payments(&service).await).await;
@@ -858,7 +904,15 @@ async fn watch_idle(service: &Service) {
     let mut told = None;
     let mut said_not_blessed = false;
     let mut said_waiting = false;
+    let mut said_kept = false;
     loop {
+        settle(service).await;
+        if service.internal.is_some() && service.keeps_state() && !said_kept {
+            tracing::info!(
+                "the key is blessed and the state kept is the build service's own: uploads and jobs are taken"
+            );
+            said_kept = true;
+        }
         let busy = service.busy(unread_payments(service).await).await;
         let plan = plan(service, busy).await;
         let taken = service.plan_taken();
@@ -896,8 +950,33 @@ async fn watch_idle(service: &Service) {
     }
 }
 
+/// Once the API takes the build service's writes, set aside what was found
+/// sealed under another key, and write the queue down if its last write
+/// failed. What fails is said and tried again next time round.
+async fn settle(service: &Service) {
+    let Some(internal) = &service.internal else {
+        return;
+    };
+    if !internal.writable() {
+        return;
+    }
+    if !internal.settled()
+        && let Err(error) = internal.set_aside().await
+    {
+        tracing::warn!(
+            error = format!("{error:#}"),
+            "the state sealed under another key could not be set aside; trying again"
+        );
+    }
+    let mut queue = service.queue.lock().await;
+    if queue.unwritten {
+        let _ = write_queue(service, &mut queue).await;
+    }
+}
+
 /// The health route: 503 while the queue is held (see [`held_by`]), naming
-/// what holds it, and while a job has gone back in the queue more than
+/// what holds it, while the last sweep of the build user's processes was
+/// not clean (see [`isolation::unswept`]), and while a job has gone back in the queue more than
 /// [`MOST_REVIEWER_AWAY`] times in a row for want of a verdict (it still
 /// waits, and is asked again), naming the jobs.
 async fn health(State(service): State<Arc<Service>>) -> (StatusCode, String) {
@@ -905,6 +984,14 @@ async fn health(State(service): State<Arc<Service>>) -> (StatusCode, String) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             format!("builder: taking no jobs: {why}"),
+        );
+    }
+    if let Some(why) = isolation::unswept() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "builder: taking no jobs until the build user's processes are all killed: {why}"
+            ),
         );
     }
     let held = service
@@ -1383,6 +1470,16 @@ async fn upload(
     })?;
     if !service.configured.contains(&chain) {
         return Err(bad(format!("this build service does not serve {chain}")));
+    }
+    // Neither the upload nor its job could be kept yet: asked again, it is
+    // taken once they can.
+    if !service.keeps_state() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the build service is starting and takes uploads once its key is blessed: try \
+             again shortly"
+                .to_string(),
+        ));
     }
     if service.on(chain).is_err() {
         return Err((
@@ -2043,8 +2140,18 @@ fn placed(jobs: &[Entry]) -> Vec<Job> {
 /// Forget the uploads never paid for, then take the oldest paid job, have it
 /// reviewed, and build it.
 async fn take_one(service: &Arc<Service>) -> Result<()> {
-    if service.exposed.is_some() {
+    if service.exposed.is_some() || !service.keeps_state() {
         return Ok(());
+    }
+    // Nothing of the last job's is left running: a sweep that left some, or
+    // could not run, is tried again, and no job is taken until one is clean.
+    service.swept().await;
+    if isolation::unswept().is_some() {
+        isolation::sweep_apart().await;
+        if isolation::unswept().is_some() {
+            return Ok(());
+        }
+        tracing::info!("the build user's processes are all killed: jobs are taken again");
     }
     let found = held_by(&service.jobs);
     let held = found.is_some();
@@ -2240,7 +2347,10 @@ async fn run(service: &Arc<Service>, entry: &Entry) -> Result<(JobState, Option<
     );
 
     set_state(service, &entry.job.id, JobState::Building, None, started).await;
-    let job = Fresh(build::fresh(&service.jobs, &entry.job.id).context("a job's directory")?);
+    let job = Fresh(
+        build::fresh(&service.jobs, &entry.job.id).context("a job's directory")?,
+        service.clone(),
+    );
     let source = job.0.join("source");
     shared::archive::unpack(&archive, &source)?;
     // What was checked before payment is checked again before anything is
@@ -2411,13 +2521,25 @@ fn waiting_for_the_reviewer(times: u32) -> time::Duration {
 /// A job's own directory, removed whenever the job is done with it, however
 /// it ends: nothing a job unpacked or built is needed once it has ended.
 /// Every process of the build user is killed first, so nothing of the job
-/// runs on into the next (see [`isolation::sweep`]).
-struct Fresh(PathBuf);
+/// runs on into the next (see [`isolation::sweep`]). Both block, so on the
+/// async runtime they are done on a thread kept for blocking work, and the
+/// next job waits for them (see [`Service::swept`]).
+struct Fresh(PathBuf, Arc<Service>);
 
 impl Drop for Fresh {
     fn drop(&mut self) {
-        isolation::sweep();
-        let _ = std::fs::remove_dir_all(&self.0);
+        let directory = std::mem::take(&mut self.0);
+        let done = move || {
+            isolation::sweep();
+            let _ = std::fs::remove_dir_all(&directory);
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                let sweeping = runtime.spawn_blocking(done);
+                *self.1.sweeping.lock().unwrap_or_else(|e| e.into_inner()) = Some(sweeping);
+            }
+            Err(_) => done(),
+        }
     }
 }
 
@@ -2785,6 +2907,7 @@ mod tests {
             payments_seen: Mutex::new(BTreeMap::new()),
             idle: cloud::Idle::new(None),
             turns: cloud::Turns::default(),
+            sweeping: std::sync::Mutex::new(None),
         }
     }
 
@@ -2849,6 +2972,77 @@ mod tests {
         *api.refuse.lock().unwrap() = None;
         watch_idle(&service).await;
         assert_eq!(api.plans.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On a new image, with the queue kept under the old image's key: until
+    /// the key is blessed the build service reads its state and writes none,
+    /// a failed write does not stop it, and it takes no upload; once
+    /// blessed, the old queue is set aside, the queue written, and uploads
+    /// are taken.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_state_is_written_until_the_key_is_blessed_and_the_old_image_s_state_is_set_aside() {
+        let (url, api) = cloud::stand_in::serve().await;
+        let old = a_scratch("old-image");
+        let service = a_service(&old, Some(internal_at(&url, [1; 32])));
+        write_queue(&service, &mut *service.queue.lock().await)
+            .await
+            .unwrap();
+        let sealed_before = api.blobs.lock().unwrap()["builder/queue"].clone();
+        let writes_before = api.signers.lock().unwrap().len();
+
+        let dir = a_scratch("new-image");
+        let blessing = Arc::new(Blessing(false.into()));
+        let internal = internal_at(&url, [2; 32]).writes_once({
+            let blessing = blessing.clone();
+            move || cloud::Attesting::ready(&*blessing, 8453)
+        });
+        let mut service = a_service(&dir, Some(internal));
+        service.attestation = Some(blessing.clone());
+        service.canonical = Some(8453);
+        service.idle = cloud::Idle::new(Some(Duration::ZERO));
+        restore(
+            service.internal.as_ref().unwrap(),
+            &service.queue_file,
+            &service.payments_file,
+            &service.archives,
+        )
+        .await
+        .expect("a queue under another key does not stop the start");
+        assert!(
+            !service.keeps_state(),
+            "uploads are taken before the blessing"
+        );
+        let failed = write_queue(&service, &mut *service.queue.lock().await)
+            .await
+            .unwrap_err();
+        assert!(failed.is::<cloud::NotBlessed>(), "{failed:#}");
+        assert!(service.queue.lock().await.unwritten);
+        watch_idle(&service).await;
+        assert_eq!(
+            api.signers.lock().unwrap().len(),
+            writes_before,
+            "a write was sent before the key was blessed"
+        );
+        assert_eq!(api.blobs.lock().unwrap()["builder/queue"], sealed_before);
+
+        blessing.0.store(true, Ordering::SeqCst);
+        watch_idle(&service).await;
+        assert!(service.keeps_state());
+        assert!(!service.queue.lock().await.unwritten);
+        let blobs = api.blobs.lock().unwrap();
+        let aside: Vec<_> = blobs
+            .iter()
+            .filter(|(name, _)| name.starts_with("builder/queue-orphan-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "the old queue was not set aside");
+        assert_eq!(aside[0].1, &sealed_before);
+        assert_ne!(
+            blobs["builder/queue"], sealed_before,
+            "the queue was not written"
+        );
+        drop(blobs);
+        let _ = std::fs::remove_dir_all(&old);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -189,6 +189,9 @@ struct Reviewer {
     attestation: Option<Arc<dyn cloud::Attesting>>,
     /// Where the reviewer's state is kept off the machine, if it is.
     internal: Option<cloud::Internal>,
+    /// The chain id of the canonical chain, whose registry the API reads to
+    /// count the key blessed: the API takes no write until it is.
+    canonical: Option<u64>,
     /// Each signed review request taken so far, by its signer and what it
     /// signed, with the time it was signed at, kept while that time is
     /// within the allowed skew: the same signed request sent again is
@@ -282,6 +285,25 @@ impl Reviewer {
         Ok(())
     }
 
+    /// Whether the API would take the wake plan: in the attested image, once
+    /// the key is blessed on the canonical chain; anywhere else, always.
+    fn plan_taken(&self) -> bool {
+        match (&self.attestation, self.canonical) {
+            (Some(attestation), Some(chain_id)) => attestation.ready(chain_id),
+            _ => true,
+        }
+    }
+
+    /// Whether the state kept off the machine can be written, and is the
+    /// reviewer's own: the key is blessed, and whatever was found sealed
+    /// under another key is set aside. Until then no review is made, since
+    /// its go-ahead could not be kept.
+    fn keeps_state(&self) -> bool {
+        self.internal
+            .as_ref()
+            .is_none_or(|internal| internal.writable() && internal.settled())
+    }
+
     fn on(&self, chain: Chain) -> Result<Arc<Served>, Unserved> {
         if !self.configured.contains(&chain) {
             return Err(Unserved::NotServed);
@@ -336,6 +358,21 @@ async fn main() -> Result<()> {
         ),
         _ => None,
     };
+    let targets = args.chain_args.targets()?;
+    // The network's root chain, or base where it names none, as the API
+    // takes it.
+    let canonical = args
+        .chain_args
+        .root_chain()?
+        .and_then(|key| key.evm_chain_id())
+        .or_else(|| {
+            targets
+                .iter()
+                .find(|target| target.vault_chain == Chain::Base)
+                .and_then(|target| target.key.evm_chain_id())
+        });
+    // In the attested image the API takes the reviewer's writes only once
+    // its key is blessed on the canonical chain: none is sent before.
     let internal = match &args.state_url {
         Some(url) => Some(match &launched {
             Some(launched) => cloud::Internal::new(
@@ -343,7 +380,11 @@ async fn main() -> Result<()> {
                 "reviewer",
                 cloud::Signer::Key(launched.key.clone()),
                 launched.sealing.clone(),
-            )?,
+            )?
+            .writes_once({
+                let attestation = launched.attestation.clone();
+                move || canonical.is_none_or(|chain_id| attestation.ready(chain_id))
+            }),
             None => {
                 cloud::development(url, "reviewer", &args.chain_args, |roles| roles.reviewer)
                     .await?
@@ -351,12 +392,7 @@ async fn main() -> Result<()> {
         }),
         None => None,
     };
-    let configured = args
-        .chain_args
-        .targets()?
-        .iter()
-        .map(|target| target.vault_chain)
-        .collect();
+    let configured = targets.iter().map(|target| target.vault_chain).collect();
     // Each chain is taken on as soon as it connects: one out of reach (its
     // node down, its deployment missing) is tried again in the background,
     // and keeps the reviewer from no other.
@@ -414,6 +450,7 @@ async fn main() -> Result<()> {
             .as_ref()
             .map(|launched| launched.attestation.clone()),
         internal,
+        canonical,
         taken: Default::default(),
         in_flight: AtomicUsize::new(0),
         idle: cloud::Idle::new(args.idle_exit_seconds.map(Duration::from_secs)),
@@ -477,13 +514,22 @@ async fn main() -> Result<()> {
     let _ = server.await;
     reviewer.turns.close().await;
     let pending = reviewer.pending.lock().await;
-    write_pending(&reviewer, &pending).await?;
+    match write_pending(&reviewer, &pending).await {
+        // Before the blessing no review is made, so none waits unwritten.
+        Err(error) if error.is::<cloud::NotBlessed>() => tracing::info!("{error}"),
+        written => written?,
+    }
     drop(pending);
     // Busy as it stands now: a review cleared while closing and not yet
     // posted has the waker start the reviewer again.
     let busy = reviewer.busy().await;
-    if let Some(internal) = &reviewer.internal {
-        internal.put_plan(&plan(&reviewer, busy)).await?;
+    if let Some(internal) = &reviewer.internal
+        && reviewer.plan_taken()
+    {
+        match internal.put_plan(&plan(&reviewer, busy)).await {
+            Err(error) if error.is::<cloud::NotBlessed>() => tracing::info!("{error}"),
+            told => told?,
+        }
     }
     tracing::info!("idle: the reviewer exits");
     Ok(())
@@ -503,17 +549,42 @@ fn plan(reviewer: &Reviewer, busy: bool) -> cloud::WakePlan {
 
 /// Watch whether the reviewer has anything to do, telling the API's waker
 /// each time that changes, and return once it has been idle long enough to
-/// exit (never, without an idle exit).
+/// exit (never, without an idle exit). No plan is sent until the API would
+/// take it (see [`Reviewer::plan_taken`]); one it refuses for want of the
+/// blessing is said once, at info, and sent again next time round. Once the
+/// API takes the reviewer's writes, what was found sealed under another key
+/// is set aside and the reviews waiting are written down (see [`settle`]).
 async fn watch_idle(reviewer: &Reviewer) {
     let mut told = None;
+    let mut said_not_blessed = false;
+    let mut said_waiting = false;
+    let mut settled = false;
     loop {
+        if !settled {
+            settled = settle(reviewer).await;
+        }
         let busy = reviewer.busy().await;
         let plan = plan(reviewer, busy);
+        let taken = reviewer.plan_taken();
+        if reviewer.internal.is_some() && !taken && !said_waiting {
+            tracing::info!(
+                chain_id = reviewer.canonical,
+                "the wake plan is sent once the key is blessed on the canonical chain"
+            );
+            said_waiting = true;
+        }
         if let Some(internal) = &reviewer.internal
             && told.as_ref() != Some(&plan)
+            && taken
         {
             match internal.put_plan(&plan).await {
                 Ok(()) => told = Some(plan),
+                Err(error) if error.is::<cloud::NotBlessed>() => {
+                    if !said_not_blessed {
+                        tracing::info!("{error}");
+                        said_not_blessed = true;
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(
                         error = format!("{error:#}"),
@@ -527,6 +598,33 @@ async fn watch_idle(reviewer: &Reviewer) {
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
+}
+
+/// Once the API takes the reviewer's writes, set aside what was found sealed
+/// under another key, and write down the reviews waiting to be posted, a
+/// write of which may have been refused before. Whether that is done: what
+/// fails is said, and tried again next time round.
+async fn settle(reviewer: &Reviewer) -> bool {
+    let Some(internal) = &reviewer.internal else {
+        return true;
+    };
+    if !internal.writable() {
+        return false;
+    }
+    if let Err(error) = internal.set_aside().await {
+        tracing::warn!(
+            error = format!("{error:#}"),
+            "the state sealed under another key could not be set aside; trying again"
+        );
+        return false;
+    }
+    let pending = reviewer.pending.lock().await;
+    if let Err(error) = write_pending(reviewer, &pending).await {
+        tracing::warn!(error = format!("{error:#}"), "trying again");
+        return false;
+    }
+    tracing::info!("the key is blessed and the state kept is the reviewer's own: reviews are made");
+    true
 }
 
 /// How often a chain waiting to be taken on is looked at again: whether the
@@ -607,6 +705,15 @@ async fn review(
     body: axum::body::Bytes,
 ) -> Result<Json<ReviewAnswer>, (StatusCode, String)> {
     let _working = Working::start(&reviewer);
+    // Its go-ahead could not be kept yet: the build service asks again.
+    if !reviewer.keeps_state() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the reviewer is starting and makes reviews once its key is blessed: ask again \
+             shortly"
+                .to_string(),
+        ));
+    }
     // Asked about a chain not connected yet, the build service puts the job
     // back in its queue and asks again later.
     match reviewer.on(chain) {
@@ -1807,6 +1914,7 @@ mod tests {
             key: None,
             attestation: None,
             internal: None,
+            canonical: None,
             taken: Default::default(),
             in_flight: AtomicUsize::new(0),
             idle: cloud::Idle::new(None),
@@ -1955,6 +2063,7 @@ mod tests {
             key: None,
             attestation: None,
             internal: None,
+            canonical: None,
             taken: Default::default(),
             in_flight: AtomicUsize::new(0),
             idle: cloud::Idle::new(None),
@@ -2053,6 +2162,7 @@ mod tests {
             key: Some(PrivateKeySigner::random()),
             attestation: Some(blessing.clone()),
             internal: None,
+            canonical: None,
             taken: Default::default(),
             in_flight: AtomicUsize::new(0),
             idle: cloud::Idle::new(None),

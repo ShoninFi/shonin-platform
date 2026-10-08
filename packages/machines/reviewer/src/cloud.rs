@@ -8,11 +8,19 @@
 //! machine, under its own key, before they leave it, and each write signed,
 //! so only the machine can read them and nobody else can change them.
 //!
+//! The API takes a machine's writes only from a key blessed on the canonical
+//! chain. Until its key is, a machine writes nothing there (see
+//! [`Internal::writes_once`]): reads are unsigned and go on, and a write
+//! asked for meanwhile is [`NotBlessed`], which is never fatal.
+//!
 //! A blob that does not open under the machine's key was sealed under an
 //! earlier one (a new image or a new root): it is set aside under a name of
 //! its own, kept for whoever wants to look at it, and the machine carries on
-//! without it, saying so loudly. A blob under the machine's own key that does
-//! not open is damage, and stops the machine rather than lose what it held.
+//! without it, saying so loudly. Setting it aside is a write, so it waits
+//! for the blessing (see [`Internal::set_aside`]), and nothing is written
+//! under its name before it is set aside. A blob under the machine's own
+//! key that does not open is damage, and stops the machine rather than lose
+//! what it held.
 //!
 //! The same port takes the built files into the API's store, the asks to
 //! wake a machine, and each machine's wake plan: whether it stopped busy,
@@ -143,6 +151,14 @@ pub struct Internal {
     http: reqwest::Client,
     signer: Signer,
     sealing: Arc<dyn Sealing>,
+    /// Whether the API takes this machine's writes now: none when it always
+    /// does (see [`Internal::writes_once`]).
+    blessed: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// The blobs found sealed under another key, by name, as found: each
+    /// waits to be set aside (see [`Internal::set_aside`]).
+    aside: Arc<tokio::sync::Mutex<BTreeMap<String, Vec<u8>>>>,
+    /// How many of them wait, read without waiting for the lock.
+    unsettled: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl std::fmt::Debug for Internal {
@@ -175,7 +191,37 @@ impl Internal {
             http,
             signer,
             sealing,
+            blessed: None,
+            aside: Default::default(),
+            unsettled: Default::default(),
         })
+    }
+
+    /// Write nothing until `blessed` says the key is blessed on the
+    /// canonical chain, the API taking no write from it before: until then
+    /// every write is [`NotBlessed`], unsent.
+    pub fn writes_once(mut self, blessed: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        self.blessed = Some(Arc::new(blessed));
+        self
+    }
+
+    /// Whether the API takes this machine's writes now, as far as it knows.
+    pub fn writable(&self) -> bool {
+        self.blessed.as_ref().is_none_or(|blessed| blessed())
+    }
+
+    /// Whether every blob found under another key is set aside: the state
+    /// is then this machine's own.
+    pub fn settled(&self) -> bool {
+        self.unsettled.load(std::sync::atomic::Ordering::SeqCst) == 0
+    }
+
+    fn may_write(&self) -> Result<()> {
+        if self.writable() {
+            Ok(())
+        } else {
+            Err(NotBlessed.into())
+        }
     }
 
     pub fn signer(&self) -> &Signer {
@@ -220,8 +266,9 @@ impl Internal {
     }
 
     /// The blob `name`, opened: `None` if there is none, or if it was sealed
-    /// under another key (it is then set aside, and that is said). Damage
-    /// under this machine's own key is an error.
+    /// under another key (it is then set aside, once the API takes this
+    /// machine's writes, and that is said). Damage under this machine's own
+    /// key is an error.
     pub async fn read_state(&self, name: &str) -> Result<Option<Zeroizing<Vec<u8>>>> {
         let answer = self
             .send(
@@ -245,16 +292,27 @@ impl Internal {
         match self.sealing.open_state(name, &sealed) {
             Ok(plain) => Ok(Some(plain)),
             Err(Unopened::OtherKey) => {
-                let aside = format!("{name}-orphan-{}", now());
-                self.put_state_raw(&aside, sealed.to_vec()).await?;
-                self.remove_state(name).await?;
                 tracing::error!(
                     name,
-                    aside,
                     machine = self.machine,
                     "the state was sealed under another key (a new image or a new root): it is \
-                     set aside, and this machine starts without it"
+                     set aside once the API takes this machine's writes, and this machine starts \
+                     without it"
                 );
+                {
+                    let mut aside = self.aside.lock().await;
+                    aside.insert(name.to_string(), sealed.to_vec());
+                    self.unsettled
+                        .store(aside.len(), std::sync::atomic::Ordering::SeqCst);
+                }
+                if self.writable()
+                    && let Err(error) = self.set_aside().await
+                {
+                    tracing::warn!(
+                        error = format!("{error:#}"),
+                        "the state sealed under another key is not set aside yet"
+                    );
+                }
                 Ok(None)
             }
             Err(Unopened::Corrupt) => bail!(
@@ -264,13 +322,69 @@ impl Internal {
         }
     }
 
+    /// Set aside every blob found under another key: each kept under a name
+    /// of its own, then removed from its own name. [`NotBlessed`] until the
+    /// API takes this machine's writes; one that fails is left to be set
+    /// aside next time.
+    pub async fn set_aside(&self) -> Result<()> {
+        let mut aside = self.aside.lock().await;
+        let names: Vec<String> = aside.keys().cloned().collect();
+        for name in names {
+            let Some(sealed) = aside.get(&name).cloned() else {
+                continue;
+            };
+            let kept = self.keep_aside(&name, sealed).await?;
+            self.remove_raw(&name).await?;
+            aside.remove(&name);
+            self.unsettled
+                .store(aside.len(), std::sync::atomic::Ordering::SeqCst);
+            tracing::info!(
+                name,
+                aside = kept,
+                machine = self.machine,
+                "the state sealed under another key is set aside"
+            );
+        }
+        Ok(())
+    }
+
+    /// Keep `sealed`, found as the blob `name`, under a name of its own,
+    /// returned.
+    async fn keep_aside(&self, name: &str, sealed: Vec<u8>) -> Result<String> {
+        let aside = format!("{name}-orphan-{}", now());
+        self.put_state_raw(&aside, sealed).await?;
+        Ok(aside)
+    }
+
+    /// Before anything is written under `name`, set aside the blob found
+    /// there under another key, if one was.
+    async fn settle(&self, name: &str) -> Result<()> {
+        let mut aside = self.aside.lock().await;
+        if let Some(sealed) = aside.get(name).cloned() {
+            let kept = self.keep_aside(name, sealed).await?;
+            aside.remove(name);
+            self.unsettled
+                .store(aside.len(), std::sync::atomic::Ordering::SeqCst);
+            tracing::info!(
+                name,
+                aside = kept,
+                machine = self.machine,
+                "the state sealed under another key is set aside"
+            );
+        }
+        Ok(())
+    }
+
     /// Seal `plain` and keep it as the blob `name`, replacing what was there.
     pub async fn write_state(&self, name: &str, plain: &[u8]) -> Result<()> {
+        self.may_write()?;
+        self.settle(name).await?;
         let sealed = self.sealing.seal_state(name, plain)?;
         self.put_state_raw(name, sealed).await
     }
 
     async fn put_state_raw(&self, name: &str, sealed: Vec<u8>) -> Result<()> {
+        self.may_write()?;
         let answer = self
             .send(
                 Method::PUT,
@@ -280,6 +394,9 @@ impl Internal {
             )
             .await?;
         let status = answer.status();
+        if status == StatusCode::FORBIDDEN {
+            return Err(NotBlessed.into());
+        }
         anyhow::ensure!(
             status.is_success(),
             "the API answered {status} keeping the state {name}"
@@ -289,6 +406,13 @@ impl Internal {
 
     /// Remove the blob `name`; one already gone is no failure.
     pub async fn remove_state(&self, name: &str) -> Result<()> {
+        self.may_write()?;
+        self.settle(name).await?;
+        self.remove_raw(name).await
+    }
+
+    async fn remove_raw(&self, name: &str) -> Result<()> {
+        self.may_write()?;
         let answer = self
             .send(
                 Method::DELETE,
@@ -298,6 +422,9 @@ impl Internal {
             )
             .await?;
         let status = answer.status();
+        if status == StatusCode::FORBIDDEN {
+            return Err(NotBlessed.into());
+        }
         anyhow::ensure!(
             status.is_success() || status == StatusCode::NOT_FOUND,
             "the API answered {status} removing the state {name}"
@@ -308,6 +435,7 @@ impl Internal {
     /// Tell the API this machine's wake plan. A plan the API refuses for
     /// want of the key's blessing is [`NotBlessed`].
     pub async fn put_plan(&self, plan: &WakePlan) -> Result<()> {
+        self.may_write()?;
         let answer = self
             .send(
                 Method::PUT,
@@ -329,6 +457,7 @@ impl Internal {
 
     /// Ask the API to wake `machine`.
     pub async fn wake(&self, machine: &str) -> Result<()> {
+        self.may_write()?;
         let answer = self
             .send(
                 Method::POST,
@@ -349,6 +478,7 @@ impl Internal {
     /// writes it, `sha256-<hex>`). Kept, or held already, is done; anything
     /// else is an error.
     pub async fn push_store(&self, hash: &str, name: &str, bytes: Vec<u8>) -> Result<()> {
+        self.may_write()?;
         let answer = self
             .send(
                 Method::PUT,
@@ -392,15 +522,17 @@ impl Turns {
     }
 }
 
-/// The API's refusal of a wake plan signed by a key it does not count as
-/// blessed yet: the API takes plans only from a key blessed on the canonical
-/// chain.
+/// A write the API refuses, or would refuse, as signed by a key it does not
+/// count as blessed yet: the API takes a machine's writes (its state, its
+/// wake plan) only from a key blessed on the canonical chain.
 #[derive(Debug)]
 pub struct NotBlessed;
 
 impl std::fmt::Display for NotBlessed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the API takes the wake plan once the key is blessed")
+        f.write_str(
+            "the API takes this machine's writes once its key is blessed on the canonical chain",
+        )
     }
 }
 
@@ -823,6 +955,83 @@ mod tests {
         *api.refuse.lock().unwrap() = None;
         one.put_plan(&plan).await.unwrap();
         assert_eq!(api.plans.lock().unwrap().len(), 1);
+    }
+
+    /// Until the key is blessed nothing is written, a blob under another
+    /// key is read and left where it is; once blessed, it is set aside
+    /// before anything is written under its name, and a state write the API
+    /// refuses for want of the blessing is told apart.
+    #[tokio::test]
+    async fn nothing_is_written_until_the_key_is_blessed_and_a_blob_under_another_key_is_set_aside_first()
+     {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (url, api) = serve().await;
+        let key = PrivateKeySigner::random();
+        let old = internal(&url, [1; 32], &key);
+        old.write_state("queue", b"old queue").await.unwrap();
+        old.write_state("payments", b"old payments").await.unwrap();
+        let sealed_queue = api.blobs.lock().unwrap()["builder/queue"].clone();
+        let writes_before = api.signers.lock().unwrap().len();
+
+        let blessed = Arc::new(AtomicBool::new(false));
+        let fresh = internal(&url, [2; 32], &key).writes_once({
+            let blessed = blessed.clone();
+            move || blessed.load(Ordering::SeqCst)
+        });
+        assert!(!fresh.writable());
+        assert!(fresh.read_state("queue").await.unwrap().is_none());
+        assert!(fresh.read_state("payments").await.unwrap().is_none());
+        assert!(!fresh.settled(), "what waits to be set aside is not said");
+        for refused in [
+            fresh.write_state("queue", b"new").await.unwrap_err(),
+            fresh.set_aside().await.unwrap_err(),
+            fresh.put_plan(&WakePlan::default()).await.unwrap_err(),
+        ] {
+            assert!(refused.is::<NotBlessed>(), "{refused:#}");
+        }
+        assert_eq!(
+            api.signers.lock().unwrap().len(),
+            writes_before,
+            "a write was sent before the key was blessed"
+        );
+        assert_eq!(api.blobs.lock().unwrap()["builder/queue"], sealed_queue);
+
+        blessed.store(true, Ordering::SeqCst);
+        fresh.write_state("queue", b"new").await.unwrap();
+        {
+            let blobs = api.blobs.lock().unwrap();
+            let aside: Vec<_> = blobs
+                .iter()
+                .filter(|(name, _)| name.starts_with("builder/queue-orphan-"))
+                .collect();
+            assert_eq!(aside.len(), 1, "the old queue was not set aside");
+            assert_eq!(aside[0].1, &sealed_queue);
+            assert!(
+                blobs.contains_key("builder/payments"),
+                "set aside before it was asked"
+            );
+        }
+        assert_eq!(
+            fresh.read_state("queue").await.unwrap().unwrap().as_slice(),
+            b"new"
+        );
+        assert!(!fresh.settled());
+        fresh.set_aside().await.unwrap();
+        assert!(fresh.settled());
+        {
+            let blobs = api.blobs.lock().unwrap();
+            assert!(!blobs.contains_key("builder/payments"));
+            assert!(
+                blobs
+                    .keys()
+                    .any(|name| name.starts_with("builder/payments-orphan-"))
+            );
+        }
+
+        *api.refuse.lock().unwrap() = Some(403);
+        let refused = fresh.write_state("queue", b"x").await.unwrap_err();
+        assert!(refused.is::<NotBlessed>(), "{refused:#}");
     }
 
     #[tokio::test]
