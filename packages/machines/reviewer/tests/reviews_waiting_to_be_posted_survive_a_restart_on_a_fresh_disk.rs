@@ -23,7 +23,7 @@ use axum::routing::{get, put};
 type Blobs = Arc<Mutex<BTreeMap<String, Vec<u8>>>>;
 
 /// A stand-in for the API's internal port: state blobs kept as they are
-/// sent, and wake plans taken.
+/// sent, and files pushed to the store and wake plans taken.
 async fn internal_port() -> (String, Blobs) {
     let blobs: Blobs = Default::default();
     let app = axum::Router::new()
@@ -48,6 +48,10 @@ async fn internal_port() -> (String, Blobs) {
                     StatusCode::NO_CONTENT
                 },
             ),
+        )
+        .route(
+            "/internal/store/{hash}/{name}",
+            put(|| async { StatusCode::CREATED }),
         )
         .route(
             "/internal/wake/{machine}/plan",

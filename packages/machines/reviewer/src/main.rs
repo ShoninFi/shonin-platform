@@ -189,6 +189,11 @@ struct Reviewer {
     attestation: Option<Arc<dyn cloud::Attesting>>,
     /// Where the reviewer's state is kept off the machine, if it is.
     internal: Option<cloud::Internal>,
+    /// Each signed review request taken so far, by its signer and what it
+    /// signed, with the time it was signed at, kept while that time is
+    /// within the allowed skew: the same signed request sent again is
+    /// refused, however its signature is spelt.
+    taken: std::sync::Mutex<BTreeMap<(Address, B256), u64>>,
     /// Reviews being made now.
     in_flight: AtomicUsize,
     /// When the reviewer last had anything to do.
@@ -302,6 +307,18 @@ async fn main() -> Result<()> {
     if args.attestation == Attestation::Launcher && args.holder_url.is_none() {
         bail!("launcher mode needs the key holder: set SHONIN_HOLDER_URL");
     }
+    // The attested image answers the battery with its pinned model alone:
+    // source is sent nowhere the image does not name.
+    if args.attestation == Attestation::Launcher
+        && (args.calibrator_key.is_some()
+            || args.calibrator_url.is_some()
+            || args.calibrator_model.is_some())
+    {
+        bail!(
+            "launcher mode takes no calibrator: unset SHONIN_CALIBRATOR_KEY, \
+             SHONIN_CALIBRATOR_URL and SHONIN_CALIBRATOR_MODEL"
+        );
+    }
     let api = match &args.model_key_sealed {
         Some(sealed) => Some(model_api(&args, sealed).await?),
         None => None,
@@ -395,6 +412,7 @@ async fn main() -> Result<()> {
             .as_ref()
             .map(|launched| launched.attestation.clone()),
         internal,
+        taken: Default::default(),
         in_flight: AtomicUsize::new(0),
         idle: cloud::Idle::new(args.idle_exit_seconds.map(Duration::from_secs)),
     });
@@ -600,7 +618,7 @@ async fn review(
         let on = reviewer
             .on(chain)
             .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
-        asked_by_the_builder(&on, uri.path(), &headers, &body).await?;
+        asked_by_the_builder(&reviewer.taken, &on, uri.path(), &headers, &body).await?;
     }
     let request: ReviewRequest = serde_json::from_slice(&body).map_err(|error| {
         (
@@ -639,10 +657,12 @@ impl Drop for Working<'_> {
 }
 
 /// Check that a review request at `path` was signed, within the allowed
-/// skew of now, by a key blessed as a build service on the request's chain.
-/// Unsigned or wrongly signed is 401, signed by any other key 403, and a
-/// registry that could not be read 503.
+/// skew of now, by a key blessed as a build service on the request's chain,
+/// and that its signature has not been taken before. Unsigned, wrongly
+/// signed or sent again is 401, signed by any other key 403, and a registry
+/// that could not be read 503.
 async fn asked_by_the_builder(
+    taken: &std::sync::Mutex<BTreeMap<(Address, B256), u64>>,
     on: &Served,
     path: &str,
     headers: &axum::http::HeaderMap,
@@ -693,7 +713,26 @@ async fn asked_by_the_builder(
             format!("{signer} is not blessed as a build service on this chain"),
         ));
     }
-    Ok(())
+    let signed = cloud::request_digest("POST", path, body, at);
+    take_once(taken, (signer, signed), at, cloud::now())
+        .map_err(|()| unsigned("this request was taken already"))
+}
+
+/// Take a request signed at `at` once: refused if it was taken already.
+/// Requests signed outside the allowed skew of `now` are forgotten, since
+/// one signed then is refused for its time alone.
+fn take_once(
+    taken: &std::sync::Mutex<BTreeMap<(Address, B256), u64>>,
+    request: (Address, B256),
+    at: u64,
+    now: u64,
+) -> Result<(), ()> {
+    let mut taken = taken.lock().unwrap_or_else(|e| e.into_inner());
+    taken.retain(|_, signed_at| now.abs_diff(*signed_at) <= cloud::MOST_SKEW_SECONDS);
+    match taken.insert(request, at) {
+        None => Ok(()),
+        Some(_) => Err(()),
+    }
 }
 
 /// What a review that could not be made is answered with. Only a verdict
@@ -738,16 +777,37 @@ async fn review_one(
             )
             .await?;
             // The battery's answers come from the calibrator when there is
-            // one, and from the pinned model otherwise.
-            let (answered_by, answers) = match &reviewer.calibrator {
+            // one and it answers the battery whole, and from the pinned
+            // model otherwise.
+            let calibrated = match &reviewer.calibrator {
                 Some(client) => match client.ask(&reviewer.battery, &source).await {
-                    Ok((calibrator, answers)) => (format!("{model}+{calibrator}"), answers),
+                    Ok((calibrator, answers)) => match reviewer.battery.answered_whole(&answers) {
+                        Ok(()) => Some((format!("{model}+{calibrator}"), answers)),
+                        Err(why) => {
+                            tracing::warn!(%why, "the calibrator's answers are not taken; the model's own stand");
+                            None
+                        }
+                    },
                     Err(error) => {
                         tracing::warn!(%error, "the battery went unanswered; the model's own answers stand");
-                        (model.clone(), prose.answers.clone())
+                        None
                     }
                 },
-                None => (model.clone(), prose.answers.clone()),
+                None => None,
+            };
+            let (answered_by, answers) = match calibrated {
+                Some(calibrated) => calibrated,
+                None => {
+                    // A report that leaves any question unanswered is no
+                    // answer: the build service asks again.
+                    reviewer
+                        .battery
+                        .answered_whole(&prose.answers)
+                        .map_err(|why| {
+                            anyhow!("the reviewer's model gave no whole answer: {why}")
+                        })?;
+                    (model.clone(), prose.answers.clone())
+                }
             };
             (prose, answers, answered_by)
         }
@@ -787,6 +847,15 @@ async fn review_one(
     let body = serde_json::to_vec_pretty(&report)?;
     let report_hash = hash_bytes(&body);
     write(&reviewer.store, &report_hash, "report.json", &body)?;
+    // Off the machine, the report is put into the API's store before the
+    // chain names it or the build service is told its hash: this machine's
+    // disk is gone when it powers off. Not put, no review is made.
+    if let Some(internal) = &reviewer.internal {
+        internal
+            .push_store(&report_hash.replace(':', "-"), "report.json", body.clone())
+            .await
+            .context("the report could not be put into the API's store")?;
+    }
 
     let source_bytes = to_b256(&source_hash)?;
     let report_bytes = to_b256(&report_hash)?;
@@ -1357,6 +1426,31 @@ fn to_b256(hash: &str) -> Result<B256> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_signed_request_is_taken_once_while_its_time_holds() {
+        let taken = std::sync::Mutex::new(BTreeMap::new());
+        let request = (Address::repeat_byte(1), B256::repeat_byte(2));
+        let at = 1_000_000;
+        assert_eq!(take_once(&taken, request, at, at), Ok(()));
+        assert_eq!(take_once(&taken, request, at, at + 1), Err(()));
+        assert_eq!(
+            take_once(&taken, request, at, at + cloud::MOST_SKEW_SECONDS),
+            Err(())
+        );
+        // The same request from another signer is its own.
+        let other = (Address::repeat_byte(3), request.1);
+        assert_eq!(take_once(&taken, other, at, at + 2), Ok(()));
+        // Past the skew it is forgotten, and refused for its time instead.
+        take_once(&taken, request, at, at + 3 * cloud::MOST_SKEW_SECONDS).ok();
+        assert!(
+            taken
+                .lock()
+                .unwrap()
+                .keys()
+                .all(|(signer, _)| *signer != Address::repeat_byte(3))
+        );
+    }
     use shared::{Area, Severity};
 
     fn schema() -> serde_json::Value {
@@ -1701,6 +1795,7 @@ mod tests {
             key: None,
             attestation: None,
             internal: None,
+            taken: Default::default(),
             in_flight: AtomicUsize::new(0),
             idle: cloud::Idle::new(None),
         };
@@ -1779,47 +1874,53 @@ mod tests {
         let body = br#"{"strategy_id":7}"#;
         let now = cloud::now();
         let status = |outcome: Result<(), (StatusCode, String)>| outcome.err().map(|(s, _)| s);
+        let taken = std::sync::Mutex::new(BTreeMap::new());
 
         assert_eq!(
-            status(asked_by_the_builder(&on, path, &Default::default(), body).await),
+            status(asked_by_the_builder(&taken, &on, path, &Default::default(), body).await),
             Some(StatusCode::UNAUTHORIZED),
             "an unsigned request was taken"
         );
         let stale = signed(&the_builder(), path, body, now - 200);
         assert_eq!(
-            status(asked_by_the_builder(&on, path, &stale, body).await),
+            status(asked_by_the_builder(&taken, &on, path, &stale, body).await),
             Some(StatusCode::UNAUTHORIZED),
             "a request signed long ago was taken"
         );
         let ahead = signed(&the_builder(), path, body, now + 200);
         assert_eq!(
-            status(asked_by_the_builder(&on, path, &ahead, body).await),
+            status(asked_by_the_builder(&taken, &on, path, &ahead, body).await),
             Some(StatusCode::UNAUTHORIZED),
             "a request signed in the future was taken"
         );
         let other_body = signed(&the_builder(), path, b"something else", now);
         assert_eq!(
-            status(asked_by_the_builder(&on, path, &other_body, body).await),
+            status(asked_by_the_builder(&taken, &on, path, &other_body, body).await),
             Some(StatusCode::FORBIDDEN),
             "a signature over another body was taken"
         );
         let other_chain = signed(&the_builder(), "/robinhood/reviews", body, now);
         assert_eq!(
-            status(asked_by_the_builder(&on, path, &other_chain, body).await),
+            status(asked_by_the_builder(&taken, &on, path, &other_chain, body).await),
             Some(StatusCode::FORBIDDEN),
             "a signature for another chain's path was taken"
         );
         let stranger = signed(&PrivateKeySigner::random(), path, body, now);
         assert_eq!(
-            status(asked_by_the_builder(&on, path, &stranger, body).await),
+            status(asked_by_the_builder(&taken, &on, path, &stranger, body).await),
             Some(StatusCode::FORBIDDEN),
             "a key not blessed as a build service was taken"
         );
         let builder = signed(&the_builder(), path, body, now);
         assert!(
-            asked_by_the_builder(&on, path, &builder, body)
+            asked_by_the_builder(&taken, &on, path, &builder, body)
                 .await
                 .is_ok()
+        );
+        assert_eq!(
+            status(asked_by_the_builder(&taken, &on, path, &builder, body).await),
+            Some(StatusCode::UNAUTHORIZED),
+            "the same signed request was taken twice"
         );
     }
 
@@ -1841,6 +1942,7 @@ mod tests {
             key: None,
             attestation: None,
             internal: None,
+            taken: Default::default(),
             in_flight: AtomicUsize::new(0),
             idle: cloud::Idle::new(None),
         };
@@ -1937,6 +2039,7 @@ mod tests {
             key: Some(PrivateKeySigner::random()),
             attestation: Some(blessing.clone()),
             internal: None,
+            taken: Default::default(),
             in_flight: AtomicUsize::new(0),
             idle: cloud::Idle::new(None),
         });

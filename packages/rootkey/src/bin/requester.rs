@@ -43,8 +43,13 @@ struct Args {
 }
 
 async fn attempt(args: &Args, purpose: &Purpose, sealed: &Sealed) -> Result<String> {
-    let received =
-        exchange_once(&reqwest::Client::new(), &args.holder, &args.socket, purpose).await?;
+    // Never through a proxy, whatever the environment names, and never on
+    // to wherever a redirect points: the exchange is with the holder alone.
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let received = exchange_once(&http, &args.holder, &args.socket, purpose).await?;
     let Received::Key(pair) = received else {
         bail!("the holder released something other than a key");
     };
