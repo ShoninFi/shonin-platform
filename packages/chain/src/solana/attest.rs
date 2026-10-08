@@ -142,9 +142,10 @@ impl Platform {
     /// `payer` paying. While two checkers' accounts make the transaction
     /// too large to name by address, and `payer` has no lookup table holding
     /// them yet, it is simulated without the leaf's proof: the registry asks
-    /// its checkers before anything else, and checks the image, the project,
-    /// the instance and the kind before the leaf, so the leaf being all it
-    /// refuses says the rest would go through.
+    /// its checkers before anything else and checks the leaf last of all,
+    /// after the image, the project, the kind, the journal's age and the
+    /// instance, so the leaf being all it refuses says the rest would go
+    /// through.
     pub async fn simulate_bless(
         &self,
         client: &SolanaClient,

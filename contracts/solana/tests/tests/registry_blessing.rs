@@ -264,6 +264,52 @@ fn a_key_cannot_be_claimed_by_another_project() {
     );
 }
 
+/// The leaf is checked after everything else, so a blessing refused only for
+/// its leaf would pass every other check: a simulation that leaves the proof
+/// out to fit in a transaction learns of anything else wrong first.
+#[test]
+fn a_blessing_checks_the_leaf_after_everything_else() {
+    let mut env = Env::new();
+    let executor = env.executor.pubkey();
+    let cluster = env.cluster();
+
+    // From the future, and naming a vault the tree doesn't hold.
+    let mut journal = env.journal_for(
+        executor_image(),
+        executor,
+        env.leaf_for(vault(), bundle(), executor),
+    );
+    journal.issued_at = env.now() + 1;
+    expect_code(
+        env.bless(&journal, cluster, hash("another vault"), bundle(), vec![]),
+        registry_error(RegistryError::Stale),
+    );
+
+    // Long past its TTL, and with no proof.
+    let mut journal = env.journal_for(
+        executor_image(),
+        executor,
+        env.leaf_for(
+            vault(),
+            bundle(),
+            Pubkey::new_from_array(hash("another key")),
+        ),
+    );
+    env.skip(BLESSING_TTL + 1);
+    journal.issued_at = env.now() - BLESSING_TTL - 1;
+    expect_code(
+        env.bless(&journal, cluster, vault(), bundle(), vec![]),
+        registry_error(RegistryError::Stale),
+    );
+
+    // Another image claiming a key, from a tree that doesn't hold it.
+    let journal = env.journal_for(reviewer_image(), env.builder.pubkey(), hash("no such tree"));
+    expect_code(
+        env.bless(&journal, [0; 32], [0; 32], [0; 32], vec![]),
+        registry_error(RegistryError::NotThisInstance),
+    );
+}
+
 // What a blessing grants ---------------------------------------------------------
 
 #[test]

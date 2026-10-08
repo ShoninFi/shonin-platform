@@ -447,22 +447,6 @@ pub mod shonin_registry {
             strategy_hash != digest::root_key_purpose(),
             RegistryError::WrongKindForVault
         );
-        // The key may act for this vault and this bundle only, on this
-        // cluster only, and the instance had to have said so, naming the key,
-        // before it saw this transaction. A builder or a reviewer proves the
-        // leaf with no vault and its own key.
-        let leaf = digest::blessing_leaf(
-            &vault_chain,
-            &vault,
-            &strategy_hash,
-            &config.cluster,
-            &key.to_bytes(),
-        );
-        require!(
-            digest::merkle_verify(&merkle_proof, &journal.vaults_root, leaf),
-            RegistryError::NotAmongTheVaults
-        );
-
         // A blessing runs from the attestation, so replaying an old one can
         // never extend it.
         let until = journal
@@ -481,6 +465,24 @@ pub mod shonin_registry {
                     && info.project_id == journal.project_id),
             RegistryError::NotThisInstance
         );
+        // The key may act for this vault and this bundle only, on this
+        // cluster only, and the instance had to have said so, naming the key,
+        // before it saw this transaction. A builder or a reviewer proves the
+        // leaf with no vault and its own key. Checked last of all: a
+        // simulation that names no proof and is refused only here says every
+        // other check would pass.
+        let leaf = digest::blessing_leaf(
+            &vault_chain,
+            &vault,
+            &strategy_hash,
+            &config.cluster,
+            &key.to_bytes(),
+        );
+        require!(
+            digest::merkle_verify(&merkle_proof, &journal.vaults_root, leaf),
+            RegistryError::NotAmongTheVaults
+        );
+
         // A blessing only ever moves later, and remembers the checker that
         // gave it, so retiring that checker retires it. Also when the
         // checker it was recorded against has since been retired: an allowed
