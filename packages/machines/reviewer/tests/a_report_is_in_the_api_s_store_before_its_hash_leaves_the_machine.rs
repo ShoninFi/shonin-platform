@@ -157,6 +157,19 @@ async fn a_report_the_api_s_store_does_not_take_is_no_clearance() {
         ..Default::default()
     })
     .await;
+    // A reviewer that may keep its state writes down the reviews waiting,
+    // none yet, once at start: what is there before the review must be
+    // what is there after it.
+    let started = std::time::Instant::now();
+    let before = loop {
+        if let Some(blob) = api.blobs.lock().unwrap().get("reviewer/pending").cloned() {
+            break Some(blob);
+        }
+        if started.elapsed() > std::time::Duration::from_secs(10) {
+            break None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
     let (status, body) = reviewer.review(7, &black_box::project("store-down")).await;
     assert_eq!(
         status,
@@ -168,8 +181,9 @@ async fn a_report_the_api_s_store_does_not_take_is_no_clearance() {
         !body.contains("clearance"),
         "a go-ahead was given for a report the store did not take: {body}"
     );
-    assert!(
-        !api.blobs.lock().unwrap().contains_key("reviewer/pending"),
+    assert_eq!(
+        api.blobs.lock().unwrap().get("reviewer/pending").cloned(),
+        before,
         "a review waits to be posted whose report the store did not take"
     );
 }
