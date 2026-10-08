@@ -485,7 +485,7 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
         driver: String,
         actions: Vec<Vec<u8>>,
     ) -> HostResult<Vec<Verdict>> {
-        let (place, drivers, mut room) = accessor.with(|mut access| {
+        let (place, drivers, room) = accessor.with(|mut access| {
             let ctx = access.get();
             (
                 ctx.place.clone(),
@@ -494,19 +494,8 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
             )
         });
 
-        // One verdict is handed back for each action, whatever becomes of
-        // it, so a submission is weighed by the most its verdicts could
-        // take before anything is sent. One too big for the agent to take
-        // in is a fault in the agent: nothing of it is sent.
-        if actions
-            .iter()
-            .try_for_each(|_| room.take(VERDICT_MOST))
-            .is_err()
-        {
-            wasmtime::bail!(
-                "a submission of {} actions would be answered with more than the agent's memory allowance holds",
-                actions.len()
-            );
+        if let Some(refused) = refused_whole(actions.len(), room)? {
+            return Ok(refused);
         }
 
         if !drivers.contains(&driver) {
@@ -735,7 +724,44 @@ const REASON_MOST: usize = 1024;
 /// driver's receipt, which is a short record of its own making.
 const VERDICT_MOST: usize = std::mem::size_of::<Verdict>() + REASON_MOST + 64;
 
-/// `verdict` with its reason cut to [`REASON_MOST`].
+/// One verdict is handed back for each action, whatever becomes of it, so a
+/// submission of `actions` is weighed by the most its verdicts could take of
+/// `room` before anything is sent. One whose verdicts could be too big for
+/// the agent to take in is refused whole: nothing of it is sent, and each
+/// action is told so in a few words. Only a submission too big for even those
+/// words to be handed back is a fault in the agent.
+fn refused_whole(actions: usize, room: Room) -> wasmtime::Result<Option<Vec<Verdict>>> {
+    let mut most = room;
+    if (0..actions)
+        .try_for_each(|_| most.take(VERDICT_MOST))
+        .is_ok()
+    {
+        return Ok(None);
+    }
+    let mut refusals = room;
+    let refusal = std::mem::size_of::<Verdict>().saturating_add(TOO_MANY.len());
+    if (0..actions)
+        .try_for_each(|_| refusals.take(refusal))
+        .is_err()
+    {
+        wasmtime::bail!(
+            "a submission of {actions} actions could not be answered within the agent's memory allowance"
+        );
+    }
+    Ok(Some(
+        (0..actions)
+            .map(|_| Verdict::Rejected(TOO_MANY.to_string()))
+            .collect(),
+    ))
+}
+
+/// What each action of a submission whose verdicts could be bigger than the
+/// agent's memory allowance is told.
+const TOO_MANY: &str = "too many actions in one submission; nothing was sent";
+
+/// `verdict` with its reason cut to [`REASON_MOST`], and a receipt longer
+/// than a verdict is counted as taking (which no driver makes) handed back
+/// as a verdict saying the action was taken but its receipt isn't given.
 fn within(verdict: Verdict) -> Verdict {
     let cut = |why: String| match crate::runner::at_most(&why, REASON_MOST) {
         std::borrow::Cow::Borrowed(_) => why,
@@ -744,6 +770,10 @@ fn within(verdict: Verdict) -> Verdict {
     match verdict {
         Verdict::Rejected(why) => Verdict::Rejected(cut(why)),
         Verdict::Unknown(why) => Verdict::Unknown(cut(why)),
+        Verdict::Accepted(receipt) if receipt.len() > REASON_MOST => Verdict::Unknown(format!(
+            "taken, but its receipt of {} bytes is too long to hand back",
+            receipt.len()
+        )),
         accepted => accepted,
     }
 }
@@ -1463,10 +1493,7 @@ impl shonin::agent::websocket::HostConnectionWithStore<Ctx> for HasSelf<Ctx> {
     ) -> HostResult<StreamReader<shonin::agent::websocket::Message>> {
         let incoming = access.get().table.get_mut(&connection)?.messages();
         match incoming {
-            Some(incoming) => StreamReader::new(
-                &mut access,
-                crate::feed::FromStream(tokio_stream::wrappers::ReceiverStream::new(incoming)),
-            ),
+            Some(incoming) => StreamReader::new(&mut access, crate::feed::FromStream(incoming)),
             // Asked for twice: the second is a stream that has ended.
             None => StreamReader::new(&mut access, Vec::<shonin::agent::websocket::Message>::new()),
         }
@@ -1944,7 +1971,7 @@ pub fn outcomes_of(
             ))
         } else {
             match said {
-                Ok(Some(filled)) => filled_receipt(&order.market, &filled),
+                Ok(Some(filled)) => filled_receipt(&filled),
                 Ok(None) => Err(Refusal::NoFill),
                 Err(why) => Err(Refusal::Refused(why)),
             }
@@ -1958,13 +1985,12 @@ pub fn outcomes_of(
     outcomes
 }
 
-/// What the agent is told of an order the venue filled.
-fn filled_receipt(
-    market: &str,
-    filled: &ILocalVenue::Filled,
-) -> std::result::Result<Receipt, Refusal> {
+/// What the agent is told of an order the venue filled. The market is named
+/// as the venue knows it, so a receipt is no longer than the venue's name
+/// for it whatever the agent sent.
+fn filled_receipt(filled: &ILocalVenue::Filled) -> std::result::Result<Receipt, Refusal> {
     Ok(Receipt::Filled {
-        market: market.to_string(),
+        market: market_name(filled.market),
         side: if filled.isBuy { Side::Buy } else { Side::Sell },
         size: to_decimal(filled.size, SIZE_DECIMALS)?,
         price: to_decimal(filled.price, ASSET_DECIMALS)?,
@@ -2482,6 +2508,60 @@ mod tests {
             )),
             _ => panic!("the order after a refused one lost its fill"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_filled_order_s_verdict_is_held_to_what_a_submission_counts_it_as() {
+        // The venue knows a market by its first 32 bytes; an agent can send
+        // a name of any length that comes to the same market.
+        let long = format!("BTC{}", "\0".repeat(1 << 20));
+        let (_node, done) = placed(&[order(&long, Side::Buy, "200")]).await;
+        let (verdict, tally) = done.into_iter().map(answer).next().unwrap();
+        let verdict = within(verdict);
+        let held = std::mem::size_of::<Verdict>()
+            + match &verdict {
+                Verdict::Accepted(receipt) => receipt.len(),
+                Verdict::Rejected(why) | Verdict::Unknown(why) => why.len(),
+            };
+        assert!(
+            held <= VERDICT_MOST,
+            "one verdict holds {held} bytes, counted as {VERDICT_MOST}"
+        );
+        assert!(matches!(tally, Tally::Done));
+        match verdict {
+            Verdict::Accepted(receipt) => assert!(matches!(
+                strategy_sdk::from_payload::<Receipt>(&receipt).unwrap(),
+                Receipt::Filled { market, .. } if market == "BTC"
+            )),
+            other => panic!("the fill was not said: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_receipt_longer_than_a_verdict_is_counted_as_is_not_handed_back() {
+        let verdict = within(Verdict::Accepted(vec![0; REASON_MOST + 1]));
+        assert!(
+            matches!(&verdict, Verdict::Unknown(why) if why.len() <= REASON_MOST),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_submission_whose_verdicts_could_outgrow_the_allowance_is_refused_action_by_action() {
+        let fits = 10_000 / VERDICT_MOST;
+        assert!(refused_whole(fits, Room::new(10_000)).unwrap().is_none());
+
+        let refused = refused_whole(fits + 1, Room::new(10_000)).unwrap().unwrap();
+        assert_eq!(refused.len(), fits + 1, "one verdict for each action");
+        assert!(
+            refused
+                .iter()
+                .all(|verdict| matches!(verdict, Verdict::Rejected(why) if why == TOO_MANY))
+        );
+
+        // Not even the refusals could be handed back: a fault in the agent.
+        let one = std::mem::size_of::<Verdict>() + TOO_MANY.len();
+        assert!(refused_whole(10_000 / one + 1, Room::new(10_000)).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

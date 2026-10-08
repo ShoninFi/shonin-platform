@@ -132,12 +132,6 @@ impl Runner {
         crate::host::link(&mut linker)?;
 
         let (fuel_per_sec, memory_mib) = enforced(&self.allowances);
-        let (state, net) = services(
-            self.network,
-            &self.allowances,
-            &self.home_chain,
-            &self.place.vault(),
-        );
         // The models are held in the agent's memory allowance: what they
         // take, its instance doesn't have.
         let memory = u64::from(memory_mib) * 1024 * 1024;
@@ -151,6 +145,13 @@ impl Runner {
         };
         let models = inference.as_ref().map_or(0, |models| models.bytes());
         let memory = usize::try_from(memory.saturating_sub(models)).unwrap_or(usize::MAX);
+        let (state, net) = services(
+            self.network,
+            &self.allowances,
+            memory,
+            &self.home_chain,
+            &self.place.vault(),
+        );
         let mut store = Paced::new(
             Store::new(
                 engine,
@@ -576,10 +577,12 @@ impl<T: 'static> Drop for Paced<T> {
 
 /// What a start of an agent is given besides its imports: its state, empty
 /// at every start, so an agent rebuilds from the venue; and its network,
-/// whose usage is the vault's and carries on from one start to the next.
+/// whose usage is the vault's and carries on from one start to the next, and
+/// whose messages waiting for the agent are held to its `memory` allowance.
 pub fn services(
     network: bool,
     allowances: &shared::Allowances,
+    memory: usize,
     home_chain: &str,
     vault: &str,
 ) -> (crate::state::Store, crate::net::Net) {
@@ -588,6 +591,7 @@ pub fn services(
         quotas: crate::net::Quotas::of(allowances),
         usage: crate::net::usage_of(home_chain, vault),
         reach: crate::net::Reach::Public,
+        waiting: crate::net::Waiting::new(memory),
     };
     (crate::state::Store::default(), net)
 }
@@ -1012,7 +1016,7 @@ mod tests {
     #[test]
     fn an_agent_started_again_has_empty_state_and_its_vault_s_bandwidth_so_far() {
         let allowances = shared::Allowances::modest();
-        let (mut state, net) = services(true, &allowances, "base", "0xrestarted");
+        let (mut state, net) = services(true, &allowances, 1 << 20, "base", "0xrestarted");
         state.set("state", "peak", b"100".to_vec()).unwrap();
         net.usage
             .bytes(&net.quotas, 1_000, std::time::Instant::now())
@@ -1020,7 +1024,7 @@ mod tests {
         assert!(net.declared);
 
         // Started again: nothing kept in state, the day's bytes still counted.
-        let (state, net) = services(true, &allowances, "base", "0xrestarted");
+        let (state, net) = services(true, &allowances, 1 << 20, "base", "0xrestarted");
         assert_eq!(state.get("state", "peak"), None);
         assert_eq!(net.usage.bytes_today(), 1_000);
         // Held to the vault's allowances.

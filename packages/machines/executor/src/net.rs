@@ -22,7 +22,12 @@
 //! - **size**: each WebSocket message, and each request or response body,
 //!   at most [`MESSAGE_MOST`];
 //! - **bandwidth**: every byte sent and received (bodies and messages),
-//!   at most the `bytes_per_day` allowance in a day.
+//!   at most the `bytes_per_day` allowance in a day;
+//! - **waiting**: the bytes of WebSocket messages received and not yet
+//!   taken by the agent, across all its connections, at most its memory
+//!   allowance. Past it, nothing more is read from any of its connections
+//!   until the agent takes some: a host sending faster waits, and messages
+//!   left unread on one connection hold up the others.
 //!
 //! Past any of them the call is refused, or the connection or body ends with
 //! an error, and the agent decides what to do. The day's bytes and the
@@ -233,6 +238,54 @@ pub struct Net {
     pub quotas: Quotas,
     pub usage: Arc<Usage>,
     pub reach: Reach,
+    pub waiting: Waiting,
+}
+
+/// The bytes of messages received for one run of an agent and not yet
+/// taken by it, across all its connections, held to its memory allowance.
+#[derive(Clone, Debug)]
+pub struct Waiting {
+    most: usize,
+    room: Arc<tokio::sync::Semaphore>,
+}
+
+impl Waiting {
+    /// Room for `most` bytes of messages waiting at once.
+    pub fn new(most: usize) -> Self {
+        let most = most.min(tokio::sync::Semaphore::MAX_PERMITS);
+        Self {
+            most,
+            room: Arc::new(tokio::sync::Semaphore::new(most)),
+        }
+    }
+
+    /// Room for a message of `size` bytes, once there is some; none if it
+    /// could never fit.
+    async fn room_for(&self, size: usize) -> Option<Held> {
+        if size > self.most {
+            return None;
+        }
+        let size = u32::try_from(size).ok()?;
+        self.room
+            .clone()
+            .acquire_many_owned(size)
+            .await
+            .ok()
+            .map(|room| Held { _room: room })
+    }
+
+    /// The bytes waiting now.
+    #[cfg(test)]
+    pub fn held(&self) -> usize {
+        self.most - self.room.available_permits()
+    }
+}
+
+/// A received message's room among those waiting, given back when the agent
+/// takes the message.
+#[derive(Debug)]
+struct Held {
+    _room: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// Which addresses an agent may reach.
@@ -637,7 +690,7 @@ pub use crate::host::shonin::agent::websocket::Message;
 pub struct Connection {
     outgoing: tokio::sync::mpsc::Sender<Message>,
     /// Taken by the first call to `messages`.
-    incoming: Option<tokio::sync::mpsc::Receiver<Message>>,
+    incoming: Option<Incoming>,
     net: Net,
     _task: crate::AbortOnDrop,
 }
@@ -699,7 +752,7 @@ impl Connection {
         )));
         Ok(Connection {
             outgoing,
-            incoming: Some(incoming),
+            incoming: Some(Incoming(incoming)),
             net: net.clone(),
             _task: task,
         })
@@ -722,8 +775,30 @@ impl Connection {
 
     /// What the host sends, once: a second call is handed a stream that has
     /// already ended.
-    pub fn messages(&mut self) -> Option<tokio::sync::mpsc::Receiver<Message>> {
+    pub fn messages(&mut self) -> Option<Incoming> {
         self.incoming.take()
+    }
+}
+
+/// The messages a host sends on one connection, in the order it sent them.
+/// Each one's room among those waiting is given back as the agent takes it.
+pub struct Incoming(tokio::sync::mpsc::Receiver<(Message, Held)>);
+
+impl Incoming {
+    /// The next message, once there is one; none once the connection ends.
+    #[cfg(test)]
+    pub async fn recv(&mut self) -> Option<Message> {
+        self.0.recv().await.map(|(message, _held)| message)
+    }
+}
+
+impl futures::Stream for Incoming {
+    type Item = Message;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Message>> {
+        self.0
+            .poll_recv(cx)
+            .map(|taken| taken.map(|(message, _held)| message))
     }
 }
 
@@ -757,11 +832,13 @@ impl Outgoing {
 
 /// Carry messages both ways until either side closes, counting what comes
 /// in. A host that sends faster than the agent reads waits: nothing is
-/// read from it while [`WAITING_MOST`] messages wait.
+/// read from it while [`WAITING_MOST`] messages wait on it, or while the
+/// messages waiting on all the agent's connections hold its memory
+/// allowance. Messages are handed on in the order they came, none dropped.
 async fn pump<S>(
     socket: tokio_tungstenite::WebSocketStream<S>,
     mut to_send: tokio::sync::mpsc::Receiver<Message>,
-    received: tokio::sync::mpsc::Sender<Message>,
+    received: tokio::sync::mpsc::Sender<(Message, Held)>,
     net: Net,
     _slot: Slot,
 ) where
@@ -769,6 +846,9 @@ async fn pump<S>(
 {
     use tokio_tungstenite::tungstenite::Message as Frame;
     let (mut sink, mut stream) = socket.split();
+    // The message read and not yet handed on: nothing more is read until it
+    // is, while what the agent sends still goes.
+    let mut handing_on: Option<Pin<Box<dyn Future<Output = bool> + Send>>> = None;
     loop {
         tokio::select! {
             outgoing = to_send.recv() => {
@@ -784,7 +864,20 @@ async fn pump<S>(
                     return;
                 }
             }
-            incoming = stream.next() => {
+            handed_on = async {
+                match handing_on.as_mut() {
+                    Some(handing_on) => handing_on.await,
+                    None => std::future::pending().await,
+                }
+            }, if handing_on.is_some() => {
+                handing_on = None;
+                if !handed_on {
+                    // The agent let go of the stream.
+                    let _ = sink.send(Frame::Close(None)).await;
+                    return;
+                }
+            }
+            incoming = stream.next(), if handing_on.is_none() => {
                 let message = match incoming {
                     Some(Ok(Frame::Text(text))) => Message::Text(text.as_str().to_string()),
                     Some(Ok(Frame::Binary(bytes))) => Message::Binary(bytes.to_vec()),
@@ -801,11 +894,18 @@ async fn pump<S>(
                     let _ = sink.send(Frame::Close(None)).await;
                     return;
                 }
-                if received.send(message).await.is_err() {
-                    // The agent let go of the stream.
-                    let _ = sink.send(Frame::Close(None)).await;
-                    return;
-                }
+                let waiting = net.waiting.clone();
+                let received = received.clone();
+                handing_on = Some(Box::pin(async move {
+                    // A message bigger than the agent's whole allowance could
+                    // never be taken in: the connection ends rather than
+                    // leave it out.
+                    let Some(held) = waiting.room_for(size).await else {
+                        tracing::debug!(size, "a WebSocket message was over the memory allowance");
+                        return false;
+                    };
+                    received.send((message, held)).await.is_ok()
+                }));
             }
         }
     }
@@ -830,6 +930,7 @@ mod tests {
             quotas: quotas(),
             usage: Arc::new(Usage::default()),
             reach: Reach::Anywhere,
+            waiting: Waiting::new(1024),
         }
     }
 
@@ -1119,6 +1220,97 @@ mod tests {
         drop(connection);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(net.usage.open_now(), 0, "the slot was given back");
+    }
+
+    /// A WebSocket server on this machine that sends, as fast as it can,
+    /// numbered binary messages of `size` bytes, each starting with its
+    /// number.
+    async fn flooding(size: usize) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let Ok(mut socket) = tokio_tungstenite::accept_async(tcp).await else {
+                        return;
+                    };
+                    for number in 0u64.. {
+                        let mut message = vec![0u8; size];
+                        message[..8].copy_from_slice(&number.to_le_bytes());
+                        let frame = tokio_tungstenite::tungstenite::Message::binary(message);
+                        if socket.send(frame).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        address
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_never_reads_holds_no_more_waiting_than_its_memory_allowance() {
+        const SIZE: usize = 8 * 1024;
+        const ALLOWANCE: usize = 64 * 1024;
+        let address = flooding(SIZE).await;
+        let net = Net {
+            quotas: Quotas {
+                per_minute: 100,
+                per_day: u64::MAX,
+                open: 4,
+                message_most: 16 * 1024,
+            },
+            waiting: Waiting::new(ALLOWANCE),
+            ..net(true)
+        };
+        let url = format!("ws://{address}");
+        let mut connections = Vec::new();
+        let mut streams = Vec::new();
+        for _ in 0..4 {
+            let mut connection = Connection::open(&net, &url, &[]).await.unwrap();
+            streams.push(connection.messages().unwrap());
+            connections.push(connection);
+        }
+
+        // Nothing is read by the agent: what waits fills the allowance and
+        // stops there, and the hosts are no longer read from.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let held = net.waiting.held();
+        assert!(held <= ALLOWANCE, "{held} bytes wait, over {ALLOWANCE}");
+        assert!(held > ALLOWANCE - SIZE, "only {held} bytes came in");
+        let read = net.usage.bytes_today();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            net.usage.bytes_today(),
+            read,
+            "the hosts were still read from"
+        );
+        // At most one message more for each connection, read and waiting
+        // for room.
+        assert!(
+            read as usize <= ALLOWANCE + 4 * SIZE,
+            "{read} bytes were read"
+        );
+
+        // Taking messages, from whichever connection has one, makes room;
+        // and every connection's messages come in the order sent, none
+        // missing.
+        let mut all = futures::stream::select_all(
+            streams
+                .into_iter()
+                .enumerate()
+                .map(|(at, stream)| stream.map(move |message| (at, message))),
+        );
+        let mut next = [0u64; 4];
+        while next.iter().any(|taken| *taken < 64) {
+            let Some((at, Message::Binary(message))) = all.next().await else {
+                panic!("a connection ended");
+            };
+            let number = u64::from_le_bytes(message[..8].try_into().unwrap());
+            assert_eq!(number, next[at], "a message was dropped or out of order");
+            next[at] += 1;
+        }
+        assert!(net.waiting.held() <= ALLOWANCE);
     }
 
     #[tokio::test]
