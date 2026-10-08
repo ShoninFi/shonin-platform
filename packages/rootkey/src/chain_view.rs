@@ -68,6 +68,17 @@ impl ImageKind {
         }
     }
 
+    /// The kind as the registry's bindings spell it.
+    pub fn to_chain(self) -> ChainImageKind {
+        match self {
+            ImageKind::Executor => ChainImageKind::Executor,
+            ImageKind::Unwinder => ChainImageKind::Unwinder,
+            ImageKind::Builder => ChainImageKind::Builder,
+            ImageKind::Reviewer => ChainImageKind::Reviewer,
+            ImageKind::Holder => ChainImageKind::Holder,
+        }
+    }
+
     fn from_chain(kind: ChainImageKind) -> Option<ImageKind> {
         match kind {
             ChainImageKind::Executor => Some(ImageKind::Executor),

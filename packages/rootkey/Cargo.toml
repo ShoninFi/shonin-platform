@@ -15,6 +15,10 @@ path = "src/bin/seal.rs"
 name = "shonin-rootkey-requester"
 path = "src/bin/requester.rs"
 
+[features]
+# `service::Identity::from_seed`, for other crates' tests.
+test-identity = []
+
 [dependencies]
 chain = { workspace = true, features = ["rpc"] }
 alloy.workspace = true
@@ -45,6 +49,9 @@ hkdf = "0.13.0"
 # Sealing (RFC 9180): DHKEM(X25519, HKDF-SHA256), HKDF-SHA256,
 # ChaCha20-Poly1305, base mode.
 hpke = { version = "0.14.1", default-features = false, features = ["alloc", "x25519", "chacha", "getrandom"] }
+# A service's state, sealed under a key derived from its seed:
+# XChaCha20-Poly1305, so a random nonce is safe for every write.
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
 # The token check the attestation guest runs, reused as it is.
 shonin-attestation-core = { path = "../attestation/core" }
 

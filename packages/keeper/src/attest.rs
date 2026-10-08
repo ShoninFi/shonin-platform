@@ -25,6 +25,16 @@
 //! stocked with gas: the key sends the vault's own transactions, and its
 //! approval at the stations. A key the chain doesn't vouch for is never
 //! given anything, whatever the executor says about it.
+//!
+//! A builder and a reviewer publish the same status, with one leaf per chain
+//! naming their own key and no vault. Such a leaf is relayed whenever the
+//! published seal extends the key's blessing (the service asks for a seal
+//! with half its blessing left, and a renewal at a third would never come),
+//! and sent again once the registry stops counting the key as its kind
+//! although its blessing runs on. Its key is stocked with gas once the
+//! registry records it as a builder or a reviewer and counts it blessed as
+//! that kind; a key the registry records as anything else is never stocked
+//! from a leaf with no vault. Only the executor's root leaf is ever relayed.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -116,6 +126,12 @@ pub(crate) trait Registry {
     /// Whether the chain vouches for the key as the executor of a live
     /// vault running the leaf's bundle.
     async fn vouches_for(&self, leaf: &Leaf) -> Result<bool>;
+    /// The kind of image the registry records the key as blessed from
+    /// (`keyInfo(key).kind`): `None` for a key it has never blessed.
+    async fn key_kind(&self, key: Address) -> Result<ImageKind>;
+    /// Whether the registry counts the key as blessed as `kind` now
+    /// (`isBlessedAs`).
+    async fn blessed_as(&self, key: Address, kind: ImageKind) -> Result<bool>;
     /// Whether `bless` with this seal would go through now (a read: it costs
     /// nothing).
     async fn simulate_bless(&self, seal: &Bytes, journal: &Bytes, leaf: &Leaf) -> Result<()>;
@@ -255,17 +271,24 @@ pub(crate) async fn round(
         let Some(issued) = published.journal.as_ref().map(|journal| issued_at(journal)) else {
             continue;
         };
-        // Down to a third of its blessing, and the seal adds something.
-        let renews = until < now.saturating_add(ttl / 3)
-            && issued.is_none_or(|issued| issued.saturating_add(ttl) > until);
+        let renews = match issued {
+            // A service's key: whenever the seal extends its blessing.
+            Some(issued) if leaf.vault == Address::ZERO => issued.saturating_add(ttl) > until,
+            // A vault key: down to a third of its blessing, and the seal
+            // adds something.
+            _ => {
+                until < now.saturating_add(ttl / 3)
+                    && issued.is_none_or(|issued| issued.saturating_add(ttl) > until)
+            }
+        };
         // Or the blessing runs on but the registry no longer counts it (the
         // checker it was recorded against retired): sending the seal again
         // has the newest checker that accepts it record it afresh. Once per
         // seal until the key counts again, so a send that changes nothing
         // isn't repeated.
         let mut recounts = false;
-        if !renews && leaf.vault != Address::ZERO && until >= now {
-            if registry.counts(leaf).await? {
+        if !renews && until >= now {
+            if counts(registry, leaf).await? {
                 memory.resent.remove(&leaf.id());
             } else {
                 recounts = memory.resent.get(&leaf.id()) != issued.as_ref();
@@ -304,13 +327,19 @@ pub(crate) async fn round(
     }
 
     // Each key is stocked once a round, whatever number of leaves name it,
-    // and only once the chain vouches for it.
+    // and only once the chain vouches for it: a vault key as the executor of
+    // a live vault, a service's key as a builder or a reviewer.
     let mut looked = HashSet::new();
     for leaf in &leaves {
-        if leaf.vault == Address::ZERO || !looked.insert(leaf.key) {
+        if !looked.insert(leaf.key) {
             continue;
         }
-        if !registry.vouches_for(leaf).await? {
+        let vouched = if leaf.vault == Address::ZERO {
+            service_kind(registry, leaf.key).await?.is_some()
+        } else {
+            registry.vouches_for(leaf).await?
+        };
+        if !vouched {
             continue;
         }
         registry
@@ -320,6 +349,27 @@ pub(crate) async fn round(
         done.stocked.push(leaf.key);
     }
     Ok(done)
+}
+
+/// The kind a service's key is counted blessed as now: a builder or a
+/// reviewer, and nothing else.
+async fn service_kind(registry: &impl Registry, key: Address) -> Result<Option<ImageKind>> {
+    let kind = registry.key_kind(key).await?;
+    if !matches!(kind, ImageKind::Builder | ImageKind::Reviewer) {
+        return Ok(None);
+    }
+    Ok(registry.blessed_as(key, kind).await?.then_some(kind))
+}
+
+/// Whether the registry counts the leaf's key as blessed now: for its vault
+/// and bundle, or, for a leaf with no vault, as the service kind it is
+/// recorded as.
+async fn counts(registry: &impl Registry, leaf: &Leaf) -> Result<bool> {
+    if leaf.vault == Address::ZERO {
+        Ok(service_kind(registry, leaf.key).await?.is_some())
+    } else {
+        registry.counts(leaf).await
+    }
 }
 
 /// One look at a chain: the vault keys' blessings and gas first, then the
@@ -446,23 +496,24 @@ pub(crate) async fn root_round(
     Ok(RootRelay::Sent(sent))
 }
 
-/// Ask the executor what it publishes about its attestation.
-pub(crate) async fn published(http: &reqwest::Client, executor: &str) -> Result<Published> {
+/// Ask an attested machine (the executor, a builder, a reviewer) what it
+/// publishes about its attestation.
+pub(crate) async fn published(http: &reqwest::Client, source: &str) -> Result<Published> {
     let reply = http
-        .get(format!("{}/attestation", executor.trim_end_matches('/')))
+        .get(format!("{}/attestation", source.trim_end_matches('/')))
         .timeout(Duration::from_secs(5))
         .send()
         .await
-        .context("asking the executor for its attestation")?;
+        .with_context(|| format!("asking {source} for its attestation"))?;
     anyhow::ensure!(
         reply.status().is_success(),
-        "the executor answered {} for its attestation",
+        "{source} answered {} for its attestation",
         reply.status()
     );
     reply
         .json()
         .await
-        .context("reading the executor's attestation")
+        .with_context(|| format!("reading {source}'s attestation"))
 }
 
 // The chain itself --------------------------------------------------------
@@ -548,6 +599,26 @@ impl Registry for OnChain<'_> {
             .read(leaf.vault, IVault::bundleHashCall {})
             .await?;
         Ok(bundle == leaf.strategy_hash)
+    }
+
+    async fn key_kind(&self, key: Address) -> Result<ImageKind> {
+        Ok(self
+            .client
+            .read(
+                self.deployments.attestation,
+                IAttestationRegistry::keyInfoCall { signer: key },
+            )
+            .await?
+            .kind)
+    }
+
+    async fn blessed_as(&self, key: Address, kind: ImageKind) -> Result<bool> {
+        self.client
+            .read(
+                self.deployments.attestation,
+                IAttestationRegistry::isBlessedAsCall { signer: key, kind },
+            )
+            .await
     }
 
     async fn simulate_bless(&self, seal: &Bytes, journal: &Bytes, leaf: &Leaf) -> Result<()> {
@@ -840,7 +911,7 @@ async fn fund_gas(
         .await;
     match sent {
         Ok(_) => {
-            tracing::info!(%key, "a blessed vault key was stocked with gas");
+            tracing::info!(%key, "a blessed key was stocked with gas");
             Ok(true)
         }
         Err(error) => {
@@ -883,6 +954,10 @@ mod tests {
         root_unreadable: bool,
         roots_simulated: Mutex<usize>,
         roots_sent: Mutex<Vec<Address>>,
+        /// The kind each key is recorded as; `None` for any other.
+        kinds: HashMap<Address, ImageKind>,
+        /// The keys counted blessed as their recorded kind.
+        blessed_as: HashSet<Address>,
     }
 
     impl Registry for Stand {
@@ -900,6 +975,16 @@ mod tests {
         }
         async fn vouches_for(&self, leaf: &Leaf) -> Result<bool> {
             Ok(self.vouched.contains(&leaf.key))
+        }
+        async fn key_kind(&self, key: Address) -> Result<ImageKind> {
+            Ok(self.kinds.get(&key).copied().unwrap_or(ImageKind::None))
+        }
+        async fn blessed_as(&self, key: Address, kind: ImageKind) -> Result<bool> {
+            Ok(self.blessed_as.contains(&key)
+                && self
+                    .kinds
+                    .get(&key)
+                    .is_some_and(|held| *held as u8 == kind as u8))
         }
         async fn simulate_bless(&self, _: &Bytes, _: &Bytes, _: &Leaf) -> Result<()> {
             if self.simulation_fails {
@@ -1716,5 +1801,177 @@ mod tests {
             (31_337, SIGNER, true)
         );
         assert_eq!(root.proof, [B256::repeat_byte(0x61)]);
+    }
+
+    /// A builder's or a reviewer's leaf: its own key, no vault.
+    fn service(key: u8) -> Leaf {
+        Leaf {
+            chain_id: CHAIN,
+            vault_chain: 0,
+            vault: Address::ZERO,
+            strategy_hash: B256::ZERO,
+            key: Address::repeat_byte(key),
+            proof: vec![B256::repeat_byte(0x61)],
+        }
+    }
+
+    #[tokio::test]
+    async fn the_keeper_relays_and_stocks_a_blessed_builder_key() {
+        let mut stand = stand();
+        let key = Address::repeat_byte(5);
+        // Blessed from an earlier seal, with well over a third left: a vault
+        // key would not be renewed yet, but this seal extends it.
+        stand.until.insert(key, NOW + TTL * 2 / 3);
+        stand.kinds.insert(key, ImageKind::Builder);
+        stand.blessed_as.insert(key);
+        let published = published(vec![service(5)]);
+        let mut memory = Memory::default();
+        let done = round(&stand, CHAIN, &published, &mut memory, Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(done.sent, [key]);
+        assert_eq!(done.stocked, [key]);
+
+        // Once the seal is applied it adds nothing, and isn't sent again
+        // however long after; the key is still stocked each round.
+        let mut stand = stand_with(&stand);
+        stand.until.insert(key, NOW - 60 + TTL);
+        let later = Instant::now() + LANDING_HOLD;
+        let done = round(&stand, CHAIN, &published, &mut memory, later)
+            .await
+            .unwrap();
+        assert!(done.sent.is_empty());
+        assert_eq!(done.stocked, [key]);
+    }
+
+    fn stand_with(other: &Stand) -> Stand {
+        Stand {
+            now: other.now,
+            ttl: other.ttl,
+            until: other.until.clone(),
+            kinds: other.kinds.clone(),
+            blessed_as: other.blessed_as.clone(),
+            ..Stand::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reviewer_key_is_stocked_as_a_builder_s_is() {
+        let mut stand = stand();
+        let key = Address::repeat_byte(6);
+        stand.until.insert(key, NOW - 60 + TTL);
+        stand.kinds.insert(key, ImageKind::Reviewer);
+        stand.blessed_as.insert(key);
+        let mut memory = Memory::default();
+        let done = round(
+            &stand,
+            CHAIN,
+            &published(vec![service(6)]),
+            &mut memory,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(done.stocked, [key]);
+    }
+
+    #[tokio::test]
+    async fn the_keeper_never_stocks_an_unblessed_or_executor_kind_key_from_a_leaf_with_no_vault() {
+        let mut stand = stand();
+        // Key 7: recorded as a builder, but not counted blessed as one.
+        stand
+            .kinds
+            .insert(Address::repeat_byte(7), ImageKind::Builder);
+        stand.until.insert(Address::repeat_byte(7), NOW + TTL);
+        // Key 8: blessed, but as an executor.
+        stand
+            .kinds
+            .insert(Address::repeat_byte(8), ImageKind::Executor);
+        stand.blessed_as.insert(Address::repeat_byte(8));
+        stand.vouched.insert(Address::repeat_byte(8));
+        stand.until.insert(Address::repeat_byte(8), NOW + TTL);
+        // Key 9: never blessed at all.
+        let published = published(vec![service(7), service(8), service(9)]);
+        let mut memory = Memory::default();
+        for _ in 0..3 {
+            let done = round(&stand, CHAIN, &published, &mut memory, Instant::now())
+                .await
+                .unwrap();
+            assert!(done.stocked.is_empty(), "{done:?}");
+        }
+        assert!(stand.stocked.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_service_key_the_registry_no_longer_counts_is_relayed_again_once_per_seal() {
+        let mut stand = stand();
+        let key = Address::repeat_byte(5);
+        // The seal's blessing is recorded, but its checker retired.
+        stand.until.insert(key, NOW - 60 + TTL);
+        stand.kinds.insert(key, ImageKind::Builder);
+        let published = published(vec![service(5)]);
+        let mut memory = Memory::default();
+        let done = round(&stand, CHAIN, &published, &mut memory, Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(done.sent, [key]);
+        assert!(done.stocked.is_empty());
+        let later = Instant::now() + LANDING_HOLD;
+        let done = round(&stand, CHAIN, &published, &mut memory, later)
+            .await
+            .unwrap();
+        assert!(done.sent.is_empty(), "the same seal was sent again");
+    }
+
+    #[tokio::test]
+    async fn a_service_key_s_blessing_is_not_relayed_from_a_seal_that_fails_simulation() {
+        let mut stand = stand();
+        stand.simulation_fails = true;
+        let mut memory = Memory::default();
+        let done = round(
+            &stand,
+            CHAIN,
+            &published(vec![service(5)]),
+            &mut memory,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert!(done.sent.is_empty());
+        assert_eq!(done.not_simulated, [Address::repeat_byte(5)]);
+    }
+
+    /// A builder's status, as `rootkey::service` serves it.
+    #[test]
+    fn a_service_s_attestation_reads_as_published() {
+        let json = serde_json::json!({
+            "mode": "launcher",
+            "binding": {
+                "evm_signer": format!("0x{}", "11".repeat(20)),
+                "solana_signer": format!("0x{}", "00".repeat(32)),
+                "vaults_root": format!("0x{}", "22".repeat(32)),
+            },
+            "nonce": "ab",
+            "token": null,
+            "token_issued_at": null,
+            "seal": "0x0102",
+            "journal": "0x0304",
+            "seal_wanted": false,
+            "leaves": [{
+                "chain_id": 84532,
+                "vault_chain": 0,
+                "vault": format!("0x{}", "00".repeat(20)),
+                "strategy_hash": format!("0x{}", "00".repeat(32)),
+                "key": format!("0x{}", "55".repeat(20)),
+                "leaf": format!("0x{}", "66".repeat(32)),
+                "proof": [format!("0x{}", "77".repeat(32))],
+            }],
+            "root": null,
+        });
+        let published: Published = serde_json::from_value(json).unwrap();
+        assert!(published.root.is_none());
+        assert_eq!(published.leaves.len(), 1);
+        assert_eq!(published.leaves[0].vault, Address::ZERO);
+        assert_eq!(published.leaves[0].key, Address::repeat_byte(0x55));
     }
 }

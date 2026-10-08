@@ -49,6 +49,7 @@ pub mod published;
 pub mod purpose;
 pub mod root;
 pub mod sealed;
+pub mod service;
 
 pub use chain_view::{ChainView, ImageKind, NetworkView, RegistryView};
 pub use error::Error;

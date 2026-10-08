@@ -36,7 +36,7 @@ const KINDS: [ImageKind; 5] = [
     ImageKind::Holder,
 ];
 
-fn digest_of(kind: ImageKind) -> B256 {
+pub(crate) fn digest_of(kind: ImageKind) -> B256 {
     B256::repeat_byte(match kind {
         ImageKind::Executor => 0xE1,
         ImageKind::Unwinder => 0xE2,
@@ -54,7 +54,7 @@ fn image_claim(digest: B256) -> String {
 /// and root record, and each chain's own registry of blessings, read per
 /// chain as the holder reads them.
 #[derive(Clone)]
-struct StandIn {
+pub(crate) struct StandIn {
     trusted: Vec<[u8; 32]>,
     images: HashMap<B256, ImageKind>,
     projects: HashSet<B256>,
@@ -72,7 +72,7 @@ struct StandIn {
 }
 
 impl StandIn {
-    fn new() -> StandIn {
+    pub(crate) fn new() -> StandIn {
         StandIn {
             trusted: vec![fixture::test_jwk().key_hash()],
             images: KINDS.iter().map(|kind| (digest_of(*kind), *kind)).collect(),
@@ -105,7 +105,7 @@ impl StandIn {
     }
 
     /// The record names `signer` as the live root key, or nothing.
-    fn record_root(&self, signer: Option<Address>) {
+    pub(crate) fn record_root(&self, signer: Option<Address>) {
         *self.live_root.lock().unwrap() = signer;
     }
 
