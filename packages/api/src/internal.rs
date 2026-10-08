@@ -7,7 +7,8 @@
 //! changes anything is signed ([`AT_HEADER`], [`SIGNATURE_HEADER`]) by a key
 //! the canonical chain's registry blesses as the kind of machine the route
 //! is for (`isBlessedAs`), within [`MOST_SKEW_SECONDS`] of this clock, and
-//! each signature is taken once.
+//! each signed request is taken once, whatever form its signature is written
+//! in.
 //!
 //! | route | what |
 //! | --- | --- |
@@ -23,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256};
 use anyhow::{Context, Result};
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Path as UrlPath, State};
@@ -292,8 +293,11 @@ pub struct Internal {
     /// Where the machines' state blobs are kept, one directory per machine.
     blobs: PathBuf,
     blessings: Mutex<HashMap<(Address, Machine), (bool, Instant)>>,
-    /// Each signature taken in the last while, so none is taken twice.
-    taken: Mutex<HashMap<Vec<u8>, u64>>,
+    /// Each signed request taken in the last while, by its signer and the
+    /// digest signed, so none is taken twice: not by the signature's bytes,
+    /// since one signature can be written in more than one form that
+    /// recovers the same signer.
+    taken: Mutex<HashMap<(Address, B256), u64>>,
 }
 
 impl Internal {
@@ -369,6 +373,7 @@ impl Internal {
             &signature,
         )
         .map_err(|_| unsigned("the signature recovers no signer"))?;
+        let digest = shonin_rootkey::service::request_digest(method.as_str(), uri.path(), body, at);
         let mut blessed_as = None;
         for &machine in machines {
             match self.blessed(signer, machine).await {
@@ -390,11 +395,12 @@ impl Internal {
             tracing::warn!(%signer, path = uri.path(), "a request to the internal port signed by a key not blessed for it");
             return Err((StatusCode::FORBIDDEN, "the signer is not blessed for this"));
         }
-        // Each signature is taken once: the same request sent again is
-        // refused, however soon.
+        // Each signed request is taken once: the same request sent again,
+        // its signature written the same or otherwise, is refused, however
+        // soon.
         let mut taken = self.taken.lock().unwrap_or_else(|e| e.into_inner());
         taken.retain(|_, at| now.abs_diff(*at) <= 2 * MOST_SKEW_SECONDS);
-        if taken.insert(signature, at).is_some() {
+        if taken.insert((signer, digest), at).is_some() {
             return Err(unsigned("this request was taken already"));
         }
         Ok(signer)
@@ -1000,6 +1006,81 @@ mod tests {
             .0,
             StatusCode::NOT_FOUND
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A signed request taken once is refused again with its signature
+    /// written in any other form that recovers the same signer: `v` as 0 or
+    /// 1 in place of 27 or 28, and `s` as `n - s` with the parity flipped.
+    #[tokio::test]
+    async fn a_request_taken_is_refused_again_whatever_form_its_signature_is_written_in() {
+        use alloy::primitives::U256;
+
+        // The secp256k1 group order.
+        let n = U256::from_str_radix(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
+            16,
+        )
+        .unwrap();
+        let other_v = |signature: &[u8]| {
+            let mut out = signature.to_vec();
+            out[64] = match signature[64] {
+                27 => 0,
+                28 => 1,
+                0 => 27,
+                1 => 28,
+                other => other,
+            };
+            out
+        };
+        let flipped_s = |signature: &[u8]| {
+            let mut out = signature.to_vec();
+            let s = U256::from_be_slice(&signature[32..64]);
+            out[32..64].copy_from_slice(&(n - s).to_be_bytes::<32>());
+            out[64] = match signature[64] {
+                27 => 28,
+                28 => 27,
+                0 => 1,
+                1 => 0,
+                other => other,
+            };
+            out
+        };
+
+        let (_, app, dir) = a_port(&[]);
+        let now = unix_now();
+        let signature = alloy::hex::decode(
+            builder_key()
+                .sign_request("PUT", QUEUE, b"sealed", now)
+                .unwrap(),
+        )
+        .unwrap();
+        let sent = |signature: Vec<u8>| {
+            Request::builder()
+                .method("PUT")
+                .uri(QUEUE)
+                .header(AT_HEADER, now.to_string())
+                .header(SIGNATURE_HEADER, alloy::hex::encode(signature))
+                .body(Body::from(b"sealed".to_vec()))
+                .unwrap()
+        };
+        assert_eq!(
+            send(&app, sent(signature.clone())).await.0,
+            StatusCode::NO_CONTENT
+        );
+        for (how, written) in [
+            ("v written the other way", other_v(&signature)),
+            ("s flipped to n - s", flipped_s(&signature)),
+            ("both", other_v(&flipped_s(&signature))),
+        ] {
+            let (status, body) = send(&app, sent(written)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{how}");
+            assert_eq!(
+                String::from_utf8_lossy(&body),
+                "this request was taken already",
+                "{how}"
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

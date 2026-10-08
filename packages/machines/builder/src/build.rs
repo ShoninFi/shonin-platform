@@ -516,7 +516,9 @@ pub fn load_here(wasm: &Path) -> bool {
 /// group is killed when the step ends, however it ends: once the child is
 /// seen to end, whether it succeeded or failed, and when this is dropped
 /// before then, on a time limit, an error or a panic. Nothing a step started
-/// in its group outlives the step.
+/// in its group outlives the step; and where builds run as a user of their
+/// own, nothing that user runs outlives it, in the group or not (see
+/// [`crate::isolation::sweep`]).
 struct Group {
     child: std::process::Child,
     reaped: bool,
@@ -553,6 +555,8 @@ impl Group {
         kill_group(self.child.id());
         let status = self.child.wait()?;
         self.reaped = true;
+        // And whatever the step started outside its group.
+        crate::isolation::sweep();
         Ok(Some(status))
     }
 }
@@ -567,6 +571,7 @@ impl Drop for Group {
         kill_group(self.child.id());
         let _ = self.child.kill();
         let _ = self.child.wait();
+        crate::isolation::sweep();
     }
 }
 

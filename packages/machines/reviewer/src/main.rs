@@ -198,6 +198,8 @@ struct Reviewer {
     in_flight: AtomicUsize,
     /// When the reviewer last had anything to do.
     idle: cloud::Idle,
+    /// The work loops' turns, closed before the state is written at exit.
+    turns: cloud::Turns,
 }
 
 /// Why a chain can't be acted on.
@@ -415,6 +417,7 @@ async fn main() -> Result<()> {
         taken: Default::default(),
         in_flight: AtomicUsize::new(0),
         idle: cloud::Idle::new(args.idle_exit_seconds.map(Duration::from_secs)),
+        turns: cloud::Turns::default(),
     });
     if let Some(key) = &reviewer.key {
         tracing::info!(key = %key.address(), "the reviewer's own key, derived for this image");
@@ -430,7 +433,11 @@ async fn main() -> Result<()> {
     let poster = reviewer.clone();
     tokio::spawn(async move {
         loop {
+            let Some(turn) = poster.turns.turn().await else {
+                return;
+            };
             post_pending(&poster).await;
+            drop(turn);
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
@@ -463,15 +470,20 @@ async fn main() -> Result<()> {
             .await
     });
     watch_idle(&reviewer).await;
-    // Idle: stop listening, let what is being answered finish, write down
-    // what is waiting and the wake plan, and exit.
+    // Idle: stop listening, let what is being answered finish, end the
+    // posting of reviews, write down what is waiting and the wake plan, and
+    // exit.
     stopping.notify_one();
     let _ = server.await;
+    reviewer.turns.close().await;
     let pending = reviewer.pending.lock().await;
     write_pending(&reviewer, &pending).await?;
     drop(pending);
+    // Busy as it stands now: a review cleared while closing and not yet
+    // posted has the waker start the reviewer again.
+    let busy = reviewer.busy().await;
     if let Some(internal) = &reviewer.internal {
-        internal.put_plan(&plan(&reviewer, false)).await?;
+        internal.put_plan(&plan(&reviewer, busy)).await?;
     }
     tracing::info!("idle: the reviewer exits");
     Ok(())
@@ -1798,6 +1810,7 @@ mod tests {
             taken: Default::default(),
             in_flight: AtomicUsize::new(0),
             idle: cloud::Idle::new(None),
+            turns: cloud::Turns::default(),
         };
 
         post_pending(&reviewer).await;
@@ -1945,6 +1958,7 @@ mod tests {
             taken: Default::default(),
             in_flight: AtomicUsize::new(0),
             idle: cloud::Idle::new(None),
+            turns: cloud::Turns::default(),
         };
         assert!(!reviewer.busy().await);
         {
@@ -2042,6 +2056,7 @@ mod tests {
             taken: Default::default(),
             in_flight: AtomicUsize::new(0),
             idle: cloud::Idle::new(None),
+            turns: cloud::Turns::default(),
         });
         tokio::spawn(take_on(
             reviewer.clone(),

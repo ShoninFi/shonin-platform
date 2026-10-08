@@ -305,7 +305,8 @@ impl Internal {
         Ok(())
     }
 
-    /// Tell the API this machine's wake plan.
+    /// Tell the API this machine's wake plan. A plan the API refuses for
+    /// want of the key's blessing is [`NotBlessed`].
     pub async fn put_plan(&self, plan: &WakePlan) -> Result<()> {
         let answer = self
             .send(
@@ -316,6 +317,9 @@ impl Internal {
             )
             .await?;
         let status = answer.status();
+        if status == StatusCode::FORBIDDEN {
+            return Err(NotBlessed.into());
+        }
         anyhow::ensure!(
             status.is_success(),
             "the API answered {status} to the wake plan"
@@ -361,6 +365,46 @@ impl Internal {
         Ok(())
     }
 }
+
+/// The turns of a machine's work loops (reading payments, taking jobs,
+/// posting reviews), closed before it writes its state down and exits: once
+/// closed, every turn under way has ended and no other starts, so nothing
+/// changes the state after it is written.
+pub struct Turns(tokio::sync::RwLock<bool>);
+
+impl Default for Turns {
+    fn default() -> Self {
+        Self(tokio::sync::RwLock::new(true))
+    }
+}
+
+impl Turns {
+    /// A turn of a work loop, held while it lasts; none once closed, and the
+    /// loop then ends.
+    pub async fn turn(&self) -> Option<tokio::sync::RwLockReadGuard<'_, bool>> {
+        let open = self.0.read().await;
+        (*open).then_some(open)
+    }
+
+    /// Close: wait for every turn under way to end, and start no other.
+    pub async fn close(&self) {
+        *self.0.write().await = false;
+    }
+}
+
+/// The API's refusal of a wake plan signed by a key it does not count as
+/// blessed yet: the API takes plans only from a key blessed on the canonical
+/// chain.
+#[derive(Debug)]
+pub struct NotBlessed;
+
+impl std::fmt::Display for NotBlessed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the API takes the wake plan once the key is blessed")
+    }
+}
+
+impl std::error::Error for NotBlessed {}
 
 /// The attestation of a machine that is no vault's: its key blessed on each
 /// chain it serves, by tokens from Confidential Space's launcher, and its
@@ -423,6 +467,42 @@ pub async fn launch(
         sealing: Arc::new(identity),
         attestation: Arc::new(attestation),
     })
+}
+
+/// The image this machine runs, as Confidential Space's launcher at `socket`
+/// attests it: the image digest a token it gives now names. The token is
+/// asked for with a nonce naming the machine's own key `signer`, and is
+/// read here only, never sent on.
+pub async fn attested_image(socket: &std::path::Path, signer: Address) -> Result<B256> {
+    let token = shonin_rootkey::launcher::request_token(socket, &format!("{signer:x}")).await?;
+    token_image(&token)
+}
+
+/// The image digest a launcher token's claims name
+/// (`submods.container.image_digest`, `sha256:<hex>`), read without checking
+/// the token: it came from the launcher over its own socket.
+fn token_image(token: &str) -> Result<B256> {
+    let claims = token.split('.').nth(1).context("the token is not a JWT")?;
+    // The claims are URL-safe base64, which the standard alphabet reads once
+    // its two other characters are put back.
+    let standard: String = claims
+        .chars()
+        .map(|c| match c {
+            '-' => '+',
+            '_' => '/',
+            other => other,
+        })
+        .collect();
+    let bytes = shared::base64::decode(&standard).map_err(|error| anyhow!(error))?;
+    let claims: serde_json::Value =
+        serde_json::from_slice(&bytes).context("the token's claims are not JSON")?;
+    claims
+        .pointer("/submods/container/image_digest")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .context("the token names no image digest")?
+        .parse()
+        .context("the token's image digest is not 32 bytes")
 }
 
 /// The API's internal port for a machine in development mode: its requests
@@ -678,6 +758,71 @@ mod tests {
             }),
             "{signers:?}"
         );
+    }
+
+    /// The image a launcher token names is read from its claims.
+    #[test]
+    fn the_image_is_read_from_the_token_s_claims() {
+        let digest = "ab".repeat(32);
+        let claims = serde_json::json!({
+            "iat": 1,
+            "submods": {"container": {"image_digest": format!("sha256:{digest}")}},
+        });
+        let encoded: String = shared::base64::encode(claims.to_string().as_bytes())
+            .trim_end_matches('=')
+            .chars()
+            .map(|c| match c {
+                '+' => '-',
+                '/' => '_',
+                other => other,
+            })
+            .collect();
+        let token = format!("eyJhbGciOiJSUzI1NiJ9.{encoded}.c2lnbmF0dXJl");
+        assert_eq!(
+            token_image(&token).unwrap(),
+            digest.parse::<B256>().unwrap()
+        );
+        assert!(token_image("eyJ9.e30.c2ln").is_err(), "names no image");
+        assert!(token_image("not a token").is_err());
+    }
+
+    /// Closing the turns waits for the one under way to end, and no turn
+    /// starts after.
+    #[tokio::test]
+    async fn once_closed_no_turn_is_under_way_or_starts() {
+        let turns = Arc::new(Turns::default());
+        let turn = turns.turn().await.expect("open");
+        let closing = tokio::spawn({
+            let turns = turns.clone();
+            async move { turns.close().await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!closing.is_finished(), "closed while a turn was under way");
+        drop(turn);
+        closing.await.unwrap();
+        assert!(turns.turn().await.is_none());
+    }
+
+    /// A wake plan the API refuses as signed by a key it does not count as
+    /// blessed is told apart from any other refusal.
+    #[tokio::test]
+    async fn a_plan_refused_for_want_of_a_blessing_is_told_apart() {
+        let (url, api) = serve().await;
+        let one = internal(&url, [1; 32], &PrivateKeySigner::random());
+        let plan = WakePlan {
+            busy: false,
+            renew_at: None,
+            payments_seen: BTreeMap::new(),
+        };
+        *api.refuse.lock().unwrap() = Some(403);
+        let refused = one.put_plan(&plan).await.unwrap_err();
+        assert!(refused.is::<NotBlessed>(), "{refused:#}");
+        *api.refuse.lock().unwrap() = Some(500);
+        let failed = one.put_plan(&plan).await.unwrap_err();
+        assert!(!failed.is::<NotBlessed>(), "{failed:#}");
+        *api.refuse.lock().unwrap() = None;
+        one.put_plan(&plan).await.unwrap();
+        assert_eq!(api.plans.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

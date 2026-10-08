@@ -204,6 +204,12 @@ struct Service {
     /// (see [`isolation`]): while so, no job is taken, and the health route
     /// says why.
     exposed: Option<String>,
+    /// The chain id of the canonical chain, whose registry the API reads to
+    /// count the key blessed: the API takes no wake plan until it is.
+    canonical: Option<u64>,
+    /// The image the build service runs, as the launcher attests it, in the
+    /// attested image: what the manifest names as the builder's image.
+    image: Option<B256>,
     /// The build service's own key, in the attested image; the role key the
     /// node holds otherwise.
     key: Option<PrivateKeySigner>,
@@ -217,6 +223,8 @@ struct Service {
     payments_seen: Mutex<BTreeMap<String, u64>>,
     /// When the build service last had anything to do.
     idle: cloud::Idle,
+    /// The work loops' turns, closed before the state is written at exit.
+    turns: cloud::Turns,
 }
 
 impl Service {
@@ -276,6 +284,15 @@ impl Service {
                     JobState::Queued { .. } | JobState::Reviewing | JobState::Building
                 )
             })
+    }
+
+    /// Whether the API would take the wake plan: in the attested image, once
+    /// the key is blessed on the canonical chain; anywhere else, always.
+    fn plan_taken(&self) -> bool {
+        match (&self.attestation, self.canonical) {
+            (Some(attestation), Some(chain_id)) => attestation.ready(chain_id),
+            _ => true,
+        }
     }
 
     fn on(&self, chain: Chain) -> Result<Arc<Served>> {
@@ -479,6 +496,7 @@ async fn main() -> Result<()> {
             std::process::exit(if loads { 0 } else { 1 });
         }
         Some(first) if first == build::WATCH => std::process::exit(build::watch_here(given)),
+        Some(first) if first == isolation::SWEEP => std::process::exit(isolation::sweep_here()),
         Some(first) if first == isolation::PROBE => {
             let socket = given.next().context("--probe-socket names a socket")?;
             std::process::exit(isolation::probe_here(Path::new(&socket)));
@@ -516,6 +534,18 @@ async fn main() -> Result<()> {
         ),
         _ => None,
     };
+    // The image the manifests name as the builder's: the one the launcher
+    // attests this machine runs.
+    let image = match &launched {
+        Some(launched) => {
+            let image = cloud::attested_image(&args.launcher_socket, launched.key.address())
+                .await
+                .context("the image this machine runs, from the launcher's token")?;
+            tracing::info!(%image, "the image the launcher attests");
+            Some(image)
+        }
+        None => None,
+    };
     let internal = match &args.state_url {
         Some(url) => Some(match &launched {
             Some(launched) => cloud::Internal::new(
@@ -530,8 +560,24 @@ async fn main() -> Result<()> {
         }),
         None => None,
     };
+    // In the attested image the launcher's socket may come open to every
+    // user: it is closed to all but root before builds are checked against
+    // it.
+    let unclosed = if launcher {
+        isolation::restrict(&args.launcher_socket)
+    } else {
+        Vec::new()
+    };
     let reach = isolation::probe(&args.launcher_socket);
-    let exposed = isolation::holds_the_queue(&reach, launcher);
+    // Nothing of the build user's runs from before this start.
+    isolation::sweep();
+    let exposed = isolation::holds_the_queue(&reach, launcher).map(|why| {
+        if unclosed.is_empty() {
+            why
+        } else {
+            format!("{why}; closing it failed: {}", unclosed.join("; "))
+        }
+    });
     match &exposed {
         Some(why) => tracing::error!(
             why,
@@ -571,6 +617,18 @@ async fn main() -> Result<()> {
         })
         .collect();
     let configured = targets.iter().map(|target| target.vault_chain).collect();
+    // The network's root chain, or base where it names none, as the API
+    // takes it.
+    let canonical = args
+        .chain_args
+        .root_chain()?
+        .and_then(|key| key.evm_chain_id())
+        .or_else(|| {
+            targets
+                .iter()
+                .find(|target| target.vault_chain == Chain::Base)
+                .and_then(|target| target.key.evm_chain_id())
+        });
     // Each chain is taken on as soon as it connects: one out of reach (its
     // node down, its deployment missing) is tried again in the background,
     // and doesn't keep the build service from the others.
@@ -601,6 +659,8 @@ async fn main() -> Result<()> {
         payments_read_to: Mutex::new(BTreeMap::new()),
         held: std::sync::Mutex::new(None),
         exposed,
+        canonical,
+        image,
         key: launched.as_ref().map(|launched| launched.key.clone()),
         attestation: launched
             .as_ref()
@@ -608,6 +668,7 @@ async fn main() -> Result<()> {
         internal,
         payments_seen: Mutex::new(BTreeMap::new()),
         idle: cloud::Idle::new(args.idle_exit_seconds.map(Duration::from_secs)),
+        turns: cloud::Turns::default(),
     });
     service.let_go(swept);
     if let Some(key) = &service.key {
@@ -627,9 +688,13 @@ async fn main() -> Result<()> {
     let worker = service.clone();
     tokio::spawn(async move {
         loop {
+            let Some(turn) = worker.turns.turn().await else {
+                return;
+            };
             if let Err(error) = take_one(&worker).await {
                 tracing::warn!(%error, "the queue stalled");
             }
+            drop(turn);
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
@@ -663,13 +728,26 @@ async fn main() -> Result<()> {
             .await
     });
     watch_idle(&service).await;
-    // Idle: stop listening, let what is being answered finish, write down
-    // the queue and the wake plan, and exit.
+    // Idle: stop listening, let what is being answered finish, end the
+    // reading of payments and the taking of jobs, write down the queue and
+    // the wake plan, and exit.
     stopping.notify_one();
     let _ = server.await;
+    service.turns.close().await;
     write_queue(&service, &mut *service.queue.lock().await).await?;
-    if let Some(internal) = &service.internal {
-        internal.put_plan(&plan(&service, false).await).await?;
+    // Busy as it stands now: a payment or a job that came in while closing
+    // has the waker start the build service again.
+    let busy = service.busy(unread_payments(&service).await).await;
+    if busy {
+        tracing::info!("work came in while closing: the wake plan says busy");
+    }
+    if let Some(internal) = &service.internal
+        && service.plan_taken()
+    {
+        match internal.put_plan(&plan(&service, busy).await).await {
+            Err(error) if error.is::<cloud::NotBlessed>() => tracing::info!("{error}"),
+            told => told?,
+        }
     }
     tracing::info!("idle: the build service exits");
     Ok(())
@@ -773,17 +851,36 @@ async fn unread_payments(service: &Service) -> bool {
 
 /// Watch whether the build service has anything to do, telling the API's
 /// waker each time its plan changes, and return once it has been idle long
-/// enough to exit (never, without an idle exit).
+/// enough to exit (never, without an idle exit). No plan is sent until the
+/// API would take it (see [`Service::plan_taken`]); one it refuses for want
+/// of the blessing is said once, at info, and sent again next time round.
 async fn watch_idle(service: &Service) {
     let mut told = None;
+    let mut said_not_blessed = false;
+    let mut said_waiting = false;
     loop {
         let busy = service.busy(unread_payments(service).await).await;
         let plan = plan(service, busy).await;
+        let taken = service.plan_taken();
+        if service.internal.is_some() && !taken && !said_waiting {
+            tracing::info!(
+                chain_id = service.canonical,
+                "the wake plan is sent once the key is blessed on the canonical chain"
+            );
+            said_waiting = true;
+        }
         if let Some(internal) = &service.internal
             && told.as_ref() != Some(&plan)
+            && taken
         {
             match internal.put_plan(&plan).await {
                 Ok(()) => told = Some(plan),
+                Err(error) if error.is::<cloud::NotBlessed>() => {
+                    if !said_not_blessed {
+                        tracing::info!("{error}");
+                        said_not_blessed = true;
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(
                         error = format!("{error:#}"),
@@ -1159,10 +1256,14 @@ async fn take_on(service: Arc<Service>, on: Arc<Served>) {
         .copied()
         .unwrap_or(on.deployments.deployed_block);
     loop {
+        let Some(turn) = service.turns.turn().await else {
+            return;
+        };
         match admit(&service, &on, &mut from).await {
             Ok(()) => note_payments_seen(&service, &on, from).await,
             Err(error) => tracing::warn!(%chain, %error, "could not read payments"),
         }
+        drop(turn);
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
@@ -2309,10 +2410,13 @@ fn waiting_for_the_reviewer(times: u32) -> time::Duration {
 
 /// A job's own directory, removed whenever the job is done with it, however
 /// it ends: nothing a job unpacked or built is needed once it has ended.
+/// Every process of the build user is killed first, so nothing of the job
+/// runs on into the next (see [`isolation::sweep`]).
 struct Fresh(PathBuf);
 
 impl Drop for Fresh {
     fn drop(&mut self) {
+        isolation::sweep();
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -2333,23 +2437,11 @@ async fn register(
     let chain = entry.job.chain;
     let on = service.on(chain)?;
 
-    // The image the registry knows the build service's key by: in the
-    // attested image, the one its token named; on a development chain, the
-    // name standing for it.
-    let builder_image = match &service.key {
-        Some(key) => {
-            on.client
-                .read(
-                    on.deployments.attestation,
-                    chain::bindings::attestation::IAttestationRegistry::keyInfoCall {
-                        signer: key.address(),
-                    },
-                )
-                .await?
-                .imageDigest
-        }
-        None => chain::attest::image_digest("builder"),
-    };
+    // The builder's image: in the attested image, the one the launcher
+    // attests it runs; on a development chain, the name standing for it.
+    let builder_image = service
+        .image
+        .unwrap_or_else(|| chain::attest::image_digest("builder"));
     let canonical = Canonical {
         strategy_id,
         vault_chain: chain,
@@ -2685,11 +2777,14 @@ mod tests {
             payments_read_to: Mutex::new(BTreeMap::new()),
             held: std::sync::Mutex::new(None),
             exposed: None,
+            canonical: None,
+            image: None,
             key: None,
             attestation: None,
             internal,
             payments_seen: Mutex::new(BTreeMap::new()),
             idle: cloud::Idle::new(None),
+            turns: cloud::Turns::default(),
         }
     }
 
@@ -2708,6 +2803,53 @@ mod tests {
             Arc::new(cloud::stand_in::Sealed(key)),
         )
         .unwrap()
+    }
+
+    /// An attestation whose blessing on every chain is as the test sets it.
+    struct Blessing(std::sync::atomic::AtomicBool);
+
+    impl cloud::Attesting for Blessing {
+        fn serve_chain(&self, _: chain::Client, _: chain::Deployments) {}
+        fn ready(&self, _: u64) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+        fn renew_at(&self) -> Option<u64> {
+            None
+        }
+        fn busy(&self) -> bool {
+            false
+        }
+        fn routes(&self) -> axum::Router {
+            axum::Router::new()
+        }
+    }
+
+    /// In the attested image no wake plan goes to the API while the key is
+    /// not blessed on the canonical chain; once it is, the plan goes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_wake_plan_is_sent_until_the_key_is_blessed_on_the_canonical_chain() {
+        let (url, api) = cloud::stand_in::serve().await;
+        let dir = a_scratch("plan-blessed");
+        let blessing = Arc::new(Blessing(false.into()));
+        let mut service = a_service(&dir, Some(internal_at(&url, [1; 32])));
+        service.attestation = Some(blessing.clone());
+        service.canonical = Some(8453);
+        // Idle at once: each watch looks once and returns.
+        service.idle = cloud::Idle::new(Some(Duration::ZERO));
+
+        watch_idle(&service).await;
+        assert!(api.plans.lock().unwrap().is_empty());
+
+        // Refused by the API all the same: said once, and not fatal.
+        blessing.0.store(true, Ordering::SeqCst);
+        *api.refuse.lock().unwrap() = Some(403);
+        watch_idle(&service).await;
+        assert!(api.plans.lock().unwrap().is_empty());
+
+        *api.refuse.lock().unwrap() = None;
+        watch_idle(&service).await;
+        assert_eq!(api.plans.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// What an upload is answered for (its archive and the queue naming it)
