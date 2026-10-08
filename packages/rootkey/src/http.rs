@@ -3,7 +3,8 @@
 //!
 //! - `POST /rootkey/exchange`: an [`ExchangeRequest`] in, a [`Release`] out,
 //!   or the reason it was refused;
-//! - `GET /rootkey/published/{purpose}`: the purpose's [`PublishedKey`];
+//! - `GET /rootkey/published/{purpose}`: the purpose's [`PublishedKey`]
+//!   (none for `service`, whose seed has no key pair: 404);
 //! - `GET /rootkey`: the root signer's address, whether this instance
 //!   holds the root, and whether it serves it ([`RootStatus`]).
 //!
@@ -187,10 +188,13 @@ impl<V: ChainView> Service<V> {
 
     /// The purpose's public key, signed for the canonical chain, while the
     /// root is served. A platform secret no image may ever be given is not
-    /// published.
+    /// published, nor a service's seed, which has no key pair.
     pub async fn published(&self, purpose: &Purpose) -> Result<PublishedKey, Error> {
         if purpose.is_unknown_platform_secret() {
             return Err(Error::UnknownPlatformSecret(purpose.clone()));
+        }
+        if *purpose == Purpose::Service {
+            return Err(Error::NoKeyPair(Purpose::Service));
         }
         self.served_root()
             .await?
@@ -236,7 +240,7 @@ impl<V: ChainView> Service<V> {
 pub fn status_of(error: &Error) -> StatusCode {
     match error {
         Error::Malformed(_) | Error::RootHasNoKeyPair => StatusCode::BAD_REQUEST,
-        Error::UnknownPlatformSecret(_) => StatusCode::NOT_FOUND,
+        Error::UnknownPlatformSecret(_) | Error::NoKeyPair(_) => StatusCode::NOT_FOUND,
         Error::ChainUnavailable
         | Error::VaultChainNotRead(_)
         | Error::NoRoot

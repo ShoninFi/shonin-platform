@@ -1,7 +1,9 @@
 //! `/api/jobs/{id}` asks the build service for the job. A build service that
-//! can't be reached is answered 502, and one that answers 503 (restarting, or
-//! the job's chain not connected yet) is answered 503: the job is not gone,
-//! and only the build service saying there is no such job is answered 404.
+//! can't be reached (off until there is work) is answered for from the queue
+//! it last gave, and 503 for a job not in it; one that answers 503
+//! (restarting, or the job's chain not connected yet) is answered 503: the
+//! job is not gone, and only the build service saying there is no such job is
+//! answered 404.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -233,8 +235,8 @@ async fn a_job_the_build_service_cannot_be_asked_for_is_not_answered_as_not_foun
     drop(api);
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(
-        status, 502,
-        "a job the build service can't be reached for is answered as a bad gateway"
+        status, 503,
+        "a job the build service can't be reached for, and never listed, is unavailable"
     );
 }
 

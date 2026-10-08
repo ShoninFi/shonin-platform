@@ -723,6 +723,59 @@ struct Endpoint {
     /// asked, `None` if that could not be found out ([`honours_blocks`]);
     /// and when it was last asked.
     honours_blocks: Arc<std::sync::Mutex<(Option<bool>, tokio::time::Instant)>>,
+    /// How wide a log query it has been seen to take and to refuse.
+    log_width: Arc<std::sync::Mutex<LogWidth>>,
+}
+
+/// What one endpoint has shown of the widest log query it takes: the
+/// widest range it answered whole, and the narrowest it refused as too
+/// wide. Free endpoints cap the width at anything from a hundred blocks to
+/// ten thousand, and say so only by refusing.
+#[derive(Clone, Copy, Debug, Default)]
+struct LogWidth {
+    taken: u64,
+    refused: Option<u64>,
+}
+
+impl LogWidth {
+    /// Whether a range `width` blocks wide may be taken whole: it is not
+    /// known to be refused.
+    fn may_take(self, width: u64) -> bool {
+        self.refused.is_none_or(|refused| width < refused)
+    }
+
+    /// The widest range it may take: one block short of the narrowest it
+    /// refused.
+    fn widest_possible(self) -> u64 {
+        self.refused.map_or(u64::MAX, |refused| refused - 1)
+    }
+
+    /// The width to read a range `width` blocks wide in, when it is known
+    /// to refuse it whole: the widest it has taken, or half, if it has
+    /// taken none yet.
+    fn part(self, width: u64) -> u64 {
+        if self.taken > 0 {
+            self.taken
+        } else {
+            width.div_ceil(2)
+        }
+    }
+
+    fn took(&mut self, width: u64) {
+        self.taken = self.taken.max(width);
+        // An endpoint whose nodes differ may take what it once refused:
+        // what it refused is then no longer known.
+        if self.refused.is_some_and(|refused| refused <= self.taken) {
+            self.refused = None;
+        }
+    }
+
+    fn refused(&mut self, width: u64) {
+        self.refused = Some(self.refused.map_or(width, |refused| refused.min(width)));
+        if self.taken >= width {
+            self.taken = 0;
+        }
+    }
 }
 
 /// How long an endpoint not known to honour a past block goes before it
@@ -730,6 +783,25 @@ struct Endpoint {
 const PROBE_AGAIN_AFTER: Duration = Duration::from_secs(60);
 
 impl Endpoint {
+    fn log_width(&self) -> LogWidth {
+        *self
+            .log_width
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn saw_log_width(&self, width: u64, taken: bool) {
+        let mut known = self
+            .log_width
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if taken {
+            known.took(width);
+        } else {
+            known.refused(width);
+        }
+    }
+
     fn honours(&self) -> Option<bool> {
         self.honours_blocks
             .lock()
@@ -790,6 +862,7 @@ impl Endpoints {
                         None,
                         tokio::time::Instant::now(),
                     ))),
+                    log_width: Default::default(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -3177,12 +3250,24 @@ enum Passed {
     Behind(anyhow::Error),
     /// It limited the rate of requests.
     Limited(anyhow::Error, Option<Duration>),
+    /// It refused the range as too wide, and was not to read it in parts.
+    TooWide(anyhow::Error),
     /// Anything else.
     Over(anyhow::Error),
 }
 
 /// The logs `filter` matches from `from` to `to`, read whole by an endpoint
 /// that had reached `to` ([`Client::logs`]).
+///
+/// Endpoints of one list may cap a log query's width very differently, so
+/// the window goes first to those not known to refuse it whole, and an
+/// endpoint that refuses it as too wide passes it on while another may yet
+/// take it whole. Only an endpoint known to refuse it, or the last that may
+/// take it, reads it in parts: those known to refuse it last, the widest
+/// first, each in parts as wide as the widest it has taken. Were it
+/// instead halved at the first endpoint to refuse it, an endpoint that
+/// takes a hundred blocks would read a window another takes whole in
+/// dozens of queries, every window, for as long as it answered first.
 async fn read_window(
     endpoints: &Endpoints,
     heads: &Heads,
@@ -3193,11 +3278,26 @@ async fn read_window(
     let mut last = None;
     let mut behind_tries = 0;
     let mut limits = RateLimits::default();
+    let width = to - from + 1;
+    // Once every endpoint that could have taken the window whole has
+    // refused it as too wide, or was passed over, each reads it in parts.
+    let mut in_parts = false;
     loop {
         let mut behind = false;
+        let mut too_wide = false;
         let mut round = RateLimits::round();
-        for at in endpoints.order() {
-            let provider = &endpoints.each[at].provider;
+        let mut order = endpoints.order();
+        order.sort_by_key(|at| {
+            let known = endpoints.each[*at].log_width();
+            if known.may_take(width) {
+                (false, std::cmp::Reverse(0))
+            } else {
+                (true, std::cmp::Reverse(known.widest_possible()))
+            }
+        });
+        for at in order {
+            let endpoint = &endpoints.each[at];
+            let provider = &endpoint.provider;
             // Its head, asked again only when the last it gave falls short.
             let head = match heads.of(at).filter(|head| *head >= to) {
                 Some(head) => head,
@@ -3225,10 +3325,22 @@ async fn read_window(
                 ));
                 continue;
             }
-            match read_range(provider, filter, from, to).await {
+            let parts = in_parts
+                || !endpoint.log_width().may_take(width)
+                || !endpoints
+                    .each
+                    .iter()
+                    .enumerate()
+                    .any(|(other, each)| other != at && each.log_width().may_take(width));
+            match read_range(endpoint, filter, from, to, parts).await {
                 Ok(logs) => {
                     endpoints.answered(at);
                     return Ok(logs);
+                }
+                Err(Passed::TooWide(error)) => {
+                    too_wide = true;
+                    round.other();
+                    last = Some(error);
                 }
                 Err(Passed::Behind(error)) => {
                     behind = true;
@@ -3246,6 +3358,10 @@ async fn read_window(
                 }
             }
         }
+        if too_wide && !in_parts {
+            in_parts = true;
+            continue;
+        }
         if behind && behind_tries < LOGS_BEHIND_TRIES {
             behind_tries += 1;
             tokio::time::sleep(LOGS_BEHIND_PAUSE).await;
@@ -3261,26 +3377,59 @@ async fn read_window(
         .context(format!("reading logs from block {from} to {to}")))
 }
 
-/// The logs `filter` matches from `from` to `to` at one endpoint, halving a
-/// range it refuses as too wide.
+/// The logs `filter` matches from `from` to `to` at one endpoint. With
+/// `parts`, a range it refuses as too wide is halved, and one it is known to
+/// refuse is not asked for but read in parts as wide as the widest it has
+/// taken; without, a refusal as too wide is [`Passed::TooWide`]. What it
+/// takes and refuses is kept ([`LogWidth`]).
 async fn read_range(
-    provider: &DynProvider,
+    endpoint: &Endpoint,
     filter: &Filter,
     from: u64,
     to: u64,
+    parts: bool,
 ) -> Result<Vec<Log>, Passed> {
+    let provider = &endpoint.provider;
     let mut found = Vec::new();
+    // Popped last-in first-out: the earliest is pushed last.
     let mut pending = vec![(from, to)];
     while let Some((from, to)) = pending.pop() {
+        let width = to - from + 1;
+        let known = endpoint.log_width();
+        if parts && to > from && !known.may_take(width) {
+            let part = known.part(width);
+            let mut parts_of = Vec::new();
+            let mut start = from;
+            loop {
+                let end = start.saturating_add(part - 1).min(to);
+                parts_of.push((start, end));
+                if end == to {
+                    break;
+                }
+                start = end + 1;
+            }
+            pending.extend(parts_of.into_iter().rev());
+            continue;
+        }
         let part = filter.clone().from_block(from).to_block(to);
         match provider.get_logs(&part).await {
-            Ok(logs) => found.extend(logs),
+            Ok(logs) => {
+                endpoint.saw_log_width(to - from + 1, true);
+                found.extend(logs);
+            }
             Err(error) => {
                 let text = error.to_string();
                 // A rate limit, or missing logs, is the endpoint's trouble,
                 // whatever else its words say.
                 let trouble = rate_limited(&error) || text.contains(MISSING_STATE);
                 if !trouble && to > from && refused_as_too_wide(&text) {
+                    endpoint.saw_log_width(to - from + 1, false);
+                    if !parts {
+                        return Err(Passed::TooWide(
+                            anyhow::Error::new(error)
+                                .context(format!("reading logs from block {from} to {to}")),
+                        ));
+                    }
                     let middle = from + (to - from) / 2;
                     // Popped last-in first-out: the earlier half first.
                     pending.push((middle + 1, to));
@@ -3313,8 +3462,21 @@ const LOGS_BEHIND_PAUSE: Duration = Duration::from_millis(1_500);
 
 /// Whether a provider refused a log range for its width, in any of the ways
 /// providers say so.
+///
+/// A proxy over several upstreams may lead with one upstream's complaint
+/// that it hasn't the block and name another's that the range is too wide
+/// only among the causes: that is a refusal of the width, since the proxy
+/// has the block (a window goes only to an endpoint whose head has reached
+/// it) and one of its upstreams would take a narrower range.
 fn refused_as_too_wide(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
+    if ["too large complaint", "errendpointrequesttoolarge"]
+        .iter()
+        .any(|phrase| error.contains(phrase))
+        && !is_rate_limit(0, &error)
+    {
+        return true;
+    }
     [
         "range",
         "too many",
@@ -3584,6 +3746,12 @@ mod tests {
         }
         assert!(!refused_as_too_wide("execution reverted"));
         assert!(!refused_as_not_there_yet("rate limited"));
+    }
+
+    #[test]
+    fn a_proxy_naming_an_upstream_s_too_wide_complaint_refused_the_range_for_its_width() {
+        let proxied = r#"server returned an error response: error code -32603: block not found, because requested block (toBlock 66301299) is not available on the upstream node, data: {"code":"ErrUpstreamsExhausted","message":"all upstream attempts failed (1 upstream missing data, 1 upstream too large complaints)","cause":[{"code":"ErrEndpointMissingData"},{"code":"ErrEndpointRequestTooLarge"}]}"#;
+        assert!(refused_as_too_wide(proxied));
     }
 
     /// Every block of `from..=to` in exactly one window, in order, none

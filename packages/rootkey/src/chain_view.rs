@@ -56,6 +56,29 @@ impl fmt::Display for ImageKind {
 }
 
 impl ImageKind {
+    /// The kind's value in the registry's `ImageKind` (`Executor` is 1,
+    /// `Holder` 5).
+    pub fn to_byte(self) -> u8 {
+        match self {
+            ImageKind::Executor => 1,
+            ImageKind::Unwinder => 2,
+            ImageKind::Builder => 3,
+            ImageKind::Reviewer => 4,
+            ImageKind::Holder => 5,
+        }
+    }
+
+    /// The kind as the registry's bindings spell it.
+    pub fn to_chain(self) -> ChainImageKind {
+        match self {
+            ImageKind::Executor => ChainImageKind::Executor,
+            ImageKind::Unwinder => ChainImageKind::Unwinder,
+            ImageKind::Builder => ChainImageKind::Builder,
+            ImageKind::Reviewer => ChainImageKind::Reviewer,
+            ImageKind::Holder => ChainImageKind::Holder,
+        }
+    }
+
     fn from_chain(kind: ChainImageKind) -> Option<ImageKind> {
         match kind {
             ChainImageKind::Executor => Some(ImageKind::Executor),

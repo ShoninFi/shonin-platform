@@ -18,7 +18,6 @@ use chain::bindings::venue::{ILocalVenue, OrderRequest};
 use chain::{Client, KeyClient};
 use hyperliquid::agent::Outcome;
 use strategy_sdk::{Action, MarketState, PositionState, Receipt, Side};
-use wasmtime::AsContextMut;
 use wasmtime::Result as HostResult;
 use wasmtime::component::{Access, Accessor, HasSelf, Resource, ResourceTable, StreamReader};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
@@ -66,7 +65,45 @@ pub fn link(linker: &mut wasmtime::component::Linker<Ctx>) -> Result<()> {
     wasi::keyvalue::store::add_to_linker::<_, HasSelf<Ctx>>(linker, |ctx| ctx).map_err(ours)?;
     wasi::keyvalue::atomics::add_to_linker::<_, HasSelf<Ctx>>(linker, |ctx| ctx).map_err(ours)?;
     wasi::keyvalue::batch::add_to_linker::<_, HasSelf<Ctx>>(linker, |ctx| ctx).map_err(ours)?;
+    link_random(linker).map_err(|error| anyhow!("the WASI randomness imports: {error}"))?;
     Ok(())
+}
+
+/// The most random bytes one call may ask for. A call is the host's work
+/// from start to end, charged once it is done: held to this, no call runs
+/// long past the strategy's budget.
+pub const RANDOM_AT_MOST: u64 = 1024 * 1024;
+
+/// `wasi:random`'s calls for bytes, in place of WASI's own: at most
+/// [`RANDOM_AT_MOST`] a call, made by the operating system's generator in
+/// one go rather than a byte at a time. The insecure call is served the
+/// same way: secure bytes are never worse.
+fn link_random(linker: &mut wasmtime::component::Linker<Ctx>) -> wasmtime::Result<()> {
+    linker.allow_shadowing(true);
+    let linked = [
+        ("wasi:random/random@0.2.12", "get-random-bytes"),
+        ("wasi:random/insecure@0.2.12", "get-insecure-random-bytes"),
+    ]
+    .into_iter()
+    .try_for_each(|(interface, function)| {
+        linker.instance(interface)?.func_wrap(
+            function,
+            |_, (len,): (u64,)| -> wasmtime::Result<(Vec<u8>,)> { Ok((random_bytes(len)?,)) },
+        )
+    });
+    linker.allow_shadowing(false);
+    linked
+}
+
+/// `len` random bytes, or a trap past [`RANDOM_AT_MOST`].
+fn random_bytes(len: u64) -> wasmtime::Result<Vec<u8>> {
+    if len > RANDOM_AT_MOST {
+        wasmtime::bail!("requested len {len} exceeds limit {RANDOM_AT_MOST}");
+    }
+    let mut bytes = vec![0; usize::try_from(len)?];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| wasmtime::format_err!("the system's randomness: {error}"))?;
+    Ok(bytes)
 }
 
 /// The stand-in venue's driver, whose half is this module's own.
@@ -107,8 +144,6 @@ pub struct Ctx {
     /// Raised once the vault's halting notice has been handed to the
     /// strategy, so an agent that then ends is known to have been told.
     pub halting_heard: Arc<std::sync::atomic::AtomicBool>,
-    /// How much fuel a second of running is worth, and when it was last
-    /// topped up.
     /// The most memory the strategy's instance may hold, from its manifest.
     pub memory: Allowance,
 }
@@ -155,30 +190,10 @@ impl Place {
 }
 
 impl Ctx {
-    fn count(&self, change: impl FnOnce(&mut Counters)) {
+    pub(crate) fn count(&self, change: impl FnOnce(&mut Counters)) {
         if let Ok(mut counters) = self.counters.lock() {
             change(&mut counters);
         }
-    }
-}
-
-/// Top the strategy back up for the time that has passed.
-///
-/// Fuel is kept topped up, because it is not what bounds a strategy here: the
-/// engine's epoch is, and it takes the machine back every few milliseconds
-/// whatever the strategy is doing. What the declared fuel rate decides is how
-/// often the strategy yields, and what its vault's tank is charged for. Until
-/// the mapping from fuel to processor time is measured, a rate that stopped a
-/// strategy mid-thought would be an arbitrary number deciding whether a
-/// strategy works at all.
-fn refuel<S>(access: &mut Access<'_, Ctx, S>)
-where
-    S: wasmtime::component::HasData,
-    for<'a> S::Data<'a>: std::ops::DerefMut<Target = Ctx>,
-{
-    let mut store = access.as_context_mut();
-    if store.get_fuel().unwrap_or(0) < crate::runner::BANK / 2 {
-        let _ = store.set_fuel(crate::runner::BANK);
     }
 }
 
@@ -195,9 +210,22 @@ pub struct Counters {
     /// How many times the component in the store was found not to be the
     /// vault's bundle, and was not run.
     pub not_the_bundle: u64,
+    /// How many times the agent was parked for want of fuel, having burnt
+    /// what its rate gives it, and when it last was (Unix seconds).
+    pub held_back: u64,
+    pub last_held_back: Option<u64>,
 }
 
 impl Counters {
+    /// Count the agent parked for want of fuel, now.
+    pub fn held_back(&mut self) {
+        self.held_back = self.held_back.saturating_add(1);
+        self.last_held_back = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|since| since.as_secs());
+    }
+
     /// Count one thing the agent asked to have done, and how it was
     /// answered. A refusal or an unanswered request is always one of the
     /// submissions too, so the share refused can never pass the whole.
@@ -264,6 +292,13 @@ impl Allowance {
         Self { bytes, held: 0 }
     }
 
+    /// What one call may hand back to the strategy: an answer is lowered
+    /// into the strategy's own memory, so one bigger than its whole
+    /// allowance could never be taken in, and the host doesn't build it.
+    pub fn answer_room(&self) -> Room {
+        Room::new(self.bytes)
+    }
+
     fn grow(&mut self, current: usize, desired: usize, maximum: Option<usize>) -> bool {
         if maximum.is_some_and(|maximum| desired > maximum) {
             return false;
@@ -276,6 +311,65 @@ impl Allowance {
             }
             _ => false,
         }
+    }
+}
+
+/// What is left of the most one call may hand back to the strategy,
+/// counted as the host would hold the answer before handing it over, and
+/// taken before any of it is built. Data the strategy hands the host is held
+/// to the same allowance by the store's hostcall fuel.
+#[derive(Clone, Copy, Debug)]
+pub struct Room {
+    left: usize,
+    most: usize,
+}
+
+impl Room {
+    pub fn new(most: usize) -> Self {
+        Self { left: most, most }
+    }
+
+    /// Take `bytes` more of the answer, or say the answer is too big.
+    pub fn take(&mut self, bytes: usize) -> Result<(), TooMuch> {
+        match self.left.checked_sub(bytes) {
+            Some(left) => {
+                self.left = left;
+                Ok(())
+            }
+            None => Err(TooMuch { most: self.most }),
+        }
+    }
+
+    /// What a string of the answer takes: its bytes and what holds them.
+    pub fn string(text: &str) -> usize {
+        std::mem::size_of::<String>().saturating_add(text.len())
+    }
+
+    /// What a list of bytes of the answer takes.
+    pub fn bytes(bytes: &[u8]) -> usize {
+        std::mem::size_of::<Vec<u8>>().saturating_add(bytes.len())
+    }
+}
+
+/// An answer bigger than the strategy's memory allowance, refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TooMuch {
+    pub most: usize,
+}
+
+impl std::fmt::Display for TooMuch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the answer would take more than the agent's memory allowance of {} bytes",
+            self.most
+        )
+    }
+}
+
+impl From<TooMuch> for StoreError {
+    fn from(too_much: TooMuch) -> Self {
+        StoreError::Other(too_much.to_string())
     }
 }
 
@@ -391,14 +485,24 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
         driver: String,
         actions: Vec<Vec<u8>>,
     ) -> HostResult<Vec<Verdict>> {
-        let (place, drivers) = accessor.with(|mut access| {
-            refuel(&mut access);
+        let (place, drivers, room) = accessor.with(|mut access| {
             let ctx = access.get();
-            (ctx.place.clone(), ctx.drivers.clone())
+            (
+                ctx.place.clone(),
+                ctx.drivers.clone(),
+                ctx.memory.answer_room(),
+            )
         });
 
+        if let Some(refused) = refused_whole(actions.len(), room)? {
+            return Ok(refused);
+        }
+
         if !drivers.contains(&driver) {
-            let refusal = format!("this agent trades through {drivers:?}, not {driver}");
+            let refusal = format!(
+                "this agent trades through {drivers:?}, not {}",
+                crate::runner::at_most(&driver, NAMED_MOST)
+            );
             return Ok(actions
                 .iter()
                 .map(|_| Verdict::Rejected(refusal.clone()))
@@ -437,15 +541,17 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
                     Some(Outcome::Refused(why)) => (Verdict::Rejected(why), Tally::Refused),
                     Some(Outcome::Unknown(why)) => (Verdict::Unknown(why), Tally::Unanswered),
                     None => (
-                        Verdict::Rejected(format!("this vault has no {driver} account here")),
+                        Verdict::Rejected(format!(
+                            "this vault has no {} account here",
+                            crate::runner::at_most(&driver, NAMED_MOST)
+                        )),
                         Tally::Refused,
                     ),
                 };
                 tallies.push(tally);
-                verdicts.push(verdict);
+                verdicts.push(within(verdict));
             }
             accessor.with(|mut access| {
-                refuel(&mut access);
                 access.get().count(|counters| {
                     for tally in tallies {
                         counters.submitted(tally);
@@ -493,10 +599,9 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
         }
         for (verdict, tally) in answers.into_iter().flatten() {
             tallies.push(tally);
-            verdicts.push(verdict);
+            verdicts.push(within(verdict));
         }
         accessor.with(|mut access| {
-            refuel(&mut access);
             access.get().count(|counters| {
                 for tally in tallies {
                     counters.submitted(tally);
@@ -603,9 +708,73 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
         mut access: Access<'_, Ctx, Self>,
         _driver: String,
     ) -> HostResult<StreamReader<Vec<u8>>> {
-        refuel(&mut access);
         let events = access.get().account_events.take();
         stream_of(&mut access, events)
+    }
+}
+
+/// The most of a name the agent gave that a refusal repeats.
+const NAMED_MOST: usize = 128;
+
+/// The most a verdict's reason may say: a longer one is cut.
+const REASON_MOST: usize = 1024;
+
+/// The most one verdict is counted as taking of the answer to a submission:
+/// a reason cut to [`REASON_MOST`] (and the few bytes cutting adds), or a
+/// driver's receipt, which is a short record of its own making.
+const VERDICT_MOST: usize = std::mem::size_of::<Verdict>() + REASON_MOST + 64;
+
+/// One verdict is handed back for each action, whatever becomes of it, so a
+/// submission of `actions` is weighed by the most its verdicts could take of
+/// `room` before anything is sent. One whose verdicts could be too big for
+/// the agent to take in is refused whole: nothing of it is sent, and each
+/// action is told so in a few words. Only a submission too big for even those
+/// words to be handed back is a fault in the agent.
+fn refused_whole(actions: usize, room: Room) -> wasmtime::Result<Option<Vec<Verdict>>> {
+    let mut most = room;
+    if (0..actions)
+        .try_for_each(|_| most.take(VERDICT_MOST))
+        .is_ok()
+    {
+        return Ok(None);
+    }
+    let mut refusals = room;
+    let refusal = std::mem::size_of::<Verdict>().saturating_add(TOO_MANY.len());
+    if (0..actions)
+        .try_for_each(|_| refusals.take(refusal))
+        .is_err()
+    {
+        wasmtime::bail!(
+            "a submission of {actions} actions could not be answered within the agent's memory allowance"
+        );
+    }
+    Ok(Some(
+        (0..actions)
+            .map(|_| Verdict::Rejected(TOO_MANY.to_string()))
+            .collect(),
+    ))
+}
+
+/// What each action of a submission whose verdicts could be bigger than the
+/// agent's memory allowance is told.
+const TOO_MANY: &str = "too many actions in one submission; nothing was sent";
+
+/// `verdict` with its reason cut to [`REASON_MOST`], and a receipt longer
+/// than a verdict is counted as taking (which no driver makes) handed back
+/// as a verdict saying the action was taken but its receipt isn't given.
+fn within(verdict: Verdict) -> Verdict {
+    let cut = |why: String| match crate::runner::at_most(&why, REASON_MOST) {
+        std::borrow::Cow::Borrowed(_) => why,
+        std::borrow::Cow::Owned(cut) => cut,
+    };
+    match verdict {
+        Verdict::Rejected(why) => Verdict::Rejected(cut(why)),
+        Verdict::Unknown(why) => Verdict::Unknown(cut(why)),
+        Verdict::Accepted(receipt) if receipt.len() > REASON_MOST => Verdict::Unknown(format!(
+            "taken, but its receipt of {} bytes is too long to hand back",
+            receipt.len()
+        )),
+        accepted => accepted,
     }
 }
 
@@ -780,7 +949,6 @@ fn route(
 
 impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
     async fn home_chain(mut access: Access<'_, Ctx, Self>) -> HostResult<String> {
-        refuel(&mut access);
         Ok(access.get().home_chain.clone())
     }
 
@@ -791,7 +959,6 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
         amount: u64,
     ) -> HostResult<Moved> {
         let (place, home, drivers) = accessor.with(|mut access| {
-            refuel(&mut access);
             let ctx = access.get();
             (
                 ctx.place.clone(),
@@ -1003,7 +1170,6 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
         amount: u64,
     ) -> HostResult<Moved> {
         let (place, home) = accessor.with(|mut access| {
-            refuel(&mut access);
             let ctx = access.get();
             (ctx.place.clone(), ctx.home_chain.clone())
         });
@@ -1062,7 +1228,6 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
 
     async fn balances(accessor: &Accessor<Ctx, Self>) -> HostResult<Vec<Balance>> {
         let (place, home, drivers) = accessor.with(|mut access| {
-            refuel(&mut access);
             let ctx = access.get();
             (
                 ctx.place.clone(),
@@ -1186,7 +1351,6 @@ async fn chain_id_of(chain: &Client, factory: Address, name: &str) -> Result<U25
 
 impl shonin::agent::vault::HostWithStore<Ctx> for HasSelf<Ctx> {
     async fn events(mut access: Access<'_, Ctx, Self>) -> HostResult<StreamReader<VaultEvent>> {
-        refuel(&mut access);
         let events = access.get().vault_events.take();
         let heard = access.get().halting_heard.clone();
         match events {
@@ -1237,10 +1401,7 @@ impl shonin::agent::data::HostWithStore<Ctx> for HasSelf<Ctx> {
                 "this executor knows no source called {source}"
             )));
         }
-        let place = accessor.with(|mut access| {
-            refuel(&mut access);
-            access.get().place.clone()
-        });
+        let place = accessor.with(|mut access| access.get().place.clone());
         let markets = match &place {
             Place::Evm(evm) => read_markets(&evm.chain, evm.venue).await,
             Place::Solana(trading) => trading.markets().await,
@@ -1258,7 +1419,6 @@ impl shonin::agent::data::HostWithStore<Ctx> for HasSelf<Ctx> {
         source: String,
         feed: Vec<u8>,
     ) -> HostResult<Result<StreamReader<shonin::agent::data::Stamped>, String>> {
-        refuel(&mut access);
         let net = access.get().net.clone();
         let slot = match net.usage.open(&net.quotas) {
             Ok(slot) => slot,
@@ -1291,10 +1451,7 @@ impl shonin::agent::websocket::HostWithStore<Ctx> for HasSelf<Ctx> {
         url: String,
         headers: Vec<(String, String)>,
     ) -> HostResult<Result<Resource<crate::net::Connection>, String>> {
-        let net = accessor.with(|mut access| {
-            refuel(&mut access);
-            access.get().net.clone()
-        });
+        let net = accessor.with(|mut access| access.get().net.clone());
         match crate::net::Connection::open(&net, &url, &headers).await {
             Ok(connection) => {
                 let held = accessor.with(|mut access| access.get().table.push(connection))?;
@@ -1321,7 +1478,6 @@ impl shonin::agent::websocket::HostConnectionWithStore<Ctx> for HasSelf<Ctx> {
         message: shonin::agent::websocket::Message,
     ) -> HostResult<Result<(), String>> {
         let sender = accessor.with(|mut access| {
-            refuel(&mut access);
             access
                 .get()
                 .table
@@ -1335,13 +1491,9 @@ impl shonin::agent::websocket::HostConnectionWithStore<Ctx> for HasSelf<Ctx> {
         mut access: Access<'_, Ctx, Self>,
         connection: Resource<crate::net::Connection>,
     ) -> HostResult<StreamReader<shonin::agent::websocket::Message>> {
-        refuel(&mut access);
         let incoming = access.get().table.get_mut(&connection)?.messages();
         match incoming {
-            Some(incoming) => StreamReader::new(
-                &mut access,
-                crate::feed::FromStream(tokio_stream::wrappers::ReceiverStream::new(incoming)),
-            ),
+            Some(incoming) => StreamReader::new(&mut access, crate::feed::FromStream(incoming)),
             // Asked for twice: the second is a stream that has ended.
             None => StreamReader::new(&mut access, Vec::<shonin::agent::websocket::Message>::new()),
         }
@@ -1372,15 +1524,26 @@ fn bucket_of(ctx: &Ctx, bucket: &Resource<crate::state::Bucket>) -> Result<Strin
 impl wasi::keyvalue::store::HostWithStore<Ctx> for HasSelf<Ctx> {
     /// Any name opens a bucket of the agent's own: buckets are only names,
     /// and every one of them shares the agent's one allowance.
+    ///
+    /// A handle keeps its name on the host while it is open, so the names
+    /// of the handles open at once are held to the memory allowance.
     async fn open(
         mut access: Access<'_, Ctx, Self>,
         identifier: String,
     ) -> HostResult<Result<Resource<crate::state::Bucket>, StoreError>> {
-        refuel(&mut access);
-        Ok(Ok(access
-            .get()
-            .table
-            .push(crate::state::Bucket { name: identifier })?))
+        let ctx = access.get();
+        let named = identifier.len();
+        if let Err(too_much) = ctx.state.open(named, ctx.memory.bytes) {
+            return Ok(Err(too_much.into()));
+        }
+        match ctx.table.push(crate::state::Bucket { name: identifier }) {
+            Ok(bucket) => Ok(Ok(bucket)),
+            Err(error) => {
+                // Never opened, so its name is not held.
+                ctx.state.close(named);
+                Err(error.into())
+            }
+        }
     }
 }
 
@@ -1390,9 +1553,15 @@ impl wasi::keyvalue::store::HostBucketWithStore<Ctx> for HasSelf<Ctx> {
         bucket: Resource<crate::state::Bucket>,
         key: String,
     ) -> HostResult<Result<Option<Vec<u8>>, StoreError>> {
-        refuel(&mut access);
         let ctx = access.get();
-        Ok(bucket_of(ctx, &bucket).map(|name| ctx.state.get(&name, &key).cloned()))
+        let mut room = ctx.memory.answer_room();
+        Ok(bucket_of(ctx, &bucket).and_then(|name| {
+            let Some(value) = ctx.state.get(&name, &key) else {
+                return Ok(None);
+            };
+            room.take(Room::bytes(value))?;
+            Ok(Some(value.clone()))
+        }))
     }
 
     async fn set(
@@ -1401,11 +1570,10 @@ impl wasi::keyvalue::store::HostBucketWithStore<Ctx> for HasSelf<Ctx> {
         key: String,
         value: Vec<u8>,
     ) -> HostResult<Result<(), StoreError>> {
-        refuel(&mut access);
         let ctx = access.get();
         Ok(bucket_of(ctx, &bucket).and_then(|name| {
             ctx.state
-                .set(&name, &key, value)
+                .set(&name, key, value)
                 .map_err(|refused| StoreError::Other(refused.to_string()))
         }))
     }
@@ -1415,7 +1583,6 @@ impl wasi::keyvalue::store::HostBucketWithStore<Ctx> for HasSelf<Ctx> {
         bucket: Resource<crate::state::Bucket>,
         key: String,
     ) -> HostResult<Result<(), StoreError>> {
-        refuel(&mut access);
         let ctx = access.get();
         Ok(bucket_of(ctx, &bucket).map(|name| ctx.state.delete(&name, &key)))
     }
@@ -1425,7 +1592,6 @@ impl wasi::keyvalue::store::HostBucketWithStore<Ctx> for HasSelf<Ctx> {
         bucket: Resource<crate::state::Bucket>,
         key: String,
     ) -> HostResult<Result<bool, StoreError>> {
-        refuel(&mut access);
         let ctx = access.get();
         Ok(bucket_of(ctx, &bucket).map(|name| ctx.state.get(&name, &key).is_some()))
     }
@@ -1435,11 +1601,11 @@ impl wasi::keyvalue::store::HostBucketWithStore<Ctx> for HasSelf<Ctx> {
         bucket: Resource<crate::state::Bucket>,
         cursor: Option<u64>,
     ) -> HostResult<Result<KeyResponse, StoreError>> {
-        refuel(&mut access);
         let ctx = access.get();
-        Ok(bucket_of(ctx, &bucket).map(|name| {
-            let (keys, cursor) = ctx.state.keys(&name, cursor);
-            KeyResponse { keys, cursor }
+        let most = ctx.memory.bytes;
+        Ok(bucket_of(ctx, &bucket).and_then(|name| {
+            let (keys, cursor) = ctx.state.keys(&name, cursor, most)?;
+            Ok(KeyResponse { keys, cursor })
         }))
     }
 
@@ -1447,8 +1613,12 @@ impl wasi::keyvalue::store::HostBucketWithStore<Ctx> for HasSelf<Ctx> {
         accessor: &Accessor<Ctx, Self>,
         rep: Resource<crate::state::Bucket>,
     ) -> HostResult<()> {
-        accessor.with(|mut access| access.get().table.delete(rep))?;
-        Ok(())
+        accessor.with(|mut access| {
+            let ctx = access.get();
+            let bucket = ctx.table.delete(rep)?;
+            ctx.state.close(bucket.name.len());
+            HostResult::Ok(())
+        })
     }
 }
 
@@ -1459,7 +1629,6 @@ impl wasi::keyvalue::atomics::HostWithStore<Ctx> for HasSelf<Ctx> {
         key: String,
         delta: u64,
     ) -> HostResult<Result<u64, StoreError>> {
-        refuel(&mut access);
         let ctx = access.get();
         Ok(bucket_of(ctx, &bucket).and_then(|name| {
             ctx.state
@@ -1475,15 +1644,24 @@ impl wasi::keyvalue::batch::HostWithStore<Ctx> for HasSelf<Ctx> {
         bucket: Resource<crate::state::Bucket>,
         keys: Vec<String>,
     ) -> HostResult<Result<Vec<Option<(String, Vec<u8>)>>, StoreError>> {
-        refuel(&mut access);
         let ctx = access.get();
-        Ok(bucket_of(ctx, &bucket).map(|name| {
-            keys.into_iter()
+        let mut room = ctx.memory.answer_room();
+        Ok(bucket_of(ctx, &bucket).and_then(|name| {
+            // The whole answer is weighed before any of it is copied: every
+            // key named is a value handed back, however often it is named.
+            for key in &keys {
+                room.take(std::mem::size_of::<Option<(String, Vec<u8>)>>())?;
+                if let Some(value) = ctx.state.get(&name, key) {
+                    room.take(Room::string(key).saturating_add(Room::bytes(value)))?;
+                }
+            }
+            Ok(keys
+                .into_iter()
                 .map(|key| {
                     let value = ctx.state.get(&name, &key).cloned();
                     value.map(|value| (key, value))
                 })
-                .collect()
+                .collect())
         }))
     }
 
@@ -1494,12 +1672,11 @@ impl wasi::keyvalue::batch::HostWithStore<Ctx> for HasSelf<Ctx> {
         bucket: Resource<crate::state::Bucket>,
         entries: Vec<(String, Vec<u8>)>,
     ) -> HostResult<Result<(), StoreError>> {
-        refuel(&mut access);
         let ctx = access.get();
         Ok(bucket_of(ctx, &bucket).and_then(|name| {
             entries.into_iter().try_for_each(|(key, value)| {
                 ctx.state
-                    .set(&name, &key, value)
+                    .set(&name, key, value)
                     .map_err(|refused| StoreError::Other(refused.to_string()))
             })
         }))
@@ -1510,7 +1687,6 @@ impl wasi::keyvalue::batch::HostWithStore<Ctx> for HasSelf<Ctx> {
         bucket: Resource<crate::state::Bucket>,
         keys: Vec<String>,
     ) -> HostResult<Result<(), StoreError>> {
-        refuel(&mut access);
         let ctx = access.get();
         Ok(bucket_of(ctx, &bucket).map(|name| {
             for key in keys {
@@ -1533,9 +1709,9 @@ impl shonin::agent::inference::HostWithStore<Ctx> for HasSelf<Ctx> {
     > {
         use crate::inference::{Data, Named, Refusal};
         use shonin::agent::inference::{InferenceError, NamedTensor, Tensor, TensorData};
-        let inference = accessor.with(|mut access| {
-            refuel(&mut access);
-            access.get().inference.clone()
+        let (inference, most) = accessor.with(|mut access| {
+            let ctx = access.get();
+            (ctx.inference.clone(), ctx.memory.bytes)
         });
         // A bundle without models: every name is unknown, an error the
         // strategy handles rather than a stall.
@@ -1556,7 +1732,7 @@ impl shonin::agent::inference::HostWithStore<Ctx> for HasSelf<Ctx> {
                 },
             })
             .collect();
-        Ok(match inference.infer(&model, inputs).await {
+        Ok(match inference.infer(&model, inputs, most).await {
             Ok(outputs) => Ok(outputs
                 .into_iter()
                 .map(|named| NamedTensor {
@@ -1795,7 +1971,7 @@ pub fn outcomes_of(
             ))
         } else {
             match said {
-                Ok(Some(filled)) => filled_receipt(&order.market, &filled),
+                Ok(Some(filled)) => filled_receipt(&filled),
                 Ok(None) => Err(Refusal::NoFill),
                 Err(why) => Err(Refusal::Refused(why)),
             }
@@ -1809,13 +1985,12 @@ pub fn outcomes_of(
     outcomes
 }
 
-/// What the agent is told of an order the venue filled.
-fn filled_receipt(
-    market: &str,
-    filled: &ILocalVenue::Filled,
-) -> std::result::Result<Receipt, Refusal> {
+/// What the agent is told of an order the venue filled. The market is named
+/// as the venue knows it, so a receipt is no longer than the venue's name
+/// for it whatever the agent sent.
+fn filled_receipt(filled: &ILocalVenue::Filled) -> std::result::Result<Receipt, Refusal> {
     Ok(Receipt::Filled {
-        market: market.to_string(),
+        market: market_name(filled.market),
         side: if filled.isBuy { Side::Buy } else { Side::Sell },
         size: to_decimal(filled.size, SIZE_DECIMALS)?,
         price: to_decimal(filled.price, ASSET_DECIMALS)?,
@@ -2336,6 +2511,60 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_filled_order_s_verdict_is_held_to_what_a_submission_counts_it_as() {
+        // The venue knows a market by its first 32 bytes; an agent can send
+        // a name of any length that comes to the same market.
+        let long = format!("BTC{}", "\0".repeat(1 << 20));
+        let (_node, done) = placed(&[order(&long, Side::Buy, "200")]).await;
+        let (verdict, tally) = done.into_iter().map(answer).next().unwrap();
+        let verdict = within(verdict);
+        let held = std::mem::size_of::<Verdict>()
+            + match &verdict {
+                Verdict::Accepted(receipt) => receipt.len(),
+                Verdict::Rejected(why) | Verdict::Unknown(why) => why.len(),
+            };
+        assert!(
+            held <= VERDICT_MOST,
+            "one verdict holds {held} bytes, counted as {VERDICT_MOST}"
+        );
+        assert!(matches!(tally, Tally::Done));
+        match verdict {
+            Verdict::Accepted(receipt) => assert!(matches!(
+                strategy_sdk::from_payload::<Receipt>(&receipt).unwrap(),
+                Receipt::Filled { market, .. } if market == "BTC"
+            )),
+            other => panic!("the fill was not said: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_receipt_longer_than_a_verdict_is_counted_as_is_not_handed_back() {
+        let verdict = within(Verdict::Accepted(vec![0; REASON_MOST + 1]));
+        assert!(
+            matches!(&verdict, Verdict::Unknown(why) if why.len() <= REASON_MOST),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_submission_whose_verdicts_could_outgrow_the_allowance_is_refused_action_by_action() {
+        let fits = 10_000 / VERDICT_MOST;
+        assert!(refused_whole(fits, Room::new(10_000)).unwrap().is_none());
+
+        let refused = refused_whole(fits + 1, Room::new(10_000)).unwrap().unwrap();
+        assert_eq!(refused.len(), fits + 1, "one verdict for each action");
+        assert!(
+            refused
+                .iter()
+                .all(|verdict| matches!(verdict, Verdict::Rejected(why) if why == TOO_MANY))
+        );
+
+        // Not even the refusals could be handed back: a fault in the agent.
+        let one = std::mem::size_of::<Verdict>() + TOO_MANY.len();
+        assert!(refused_whole(10_000 / one + 1, Room::new(10_000)).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_order_that_reverts_its_batch_leaves_the_others_decided_on_their_own() {
         let orders = [
             order("BTC", Side::Buy, "200"),
@@ -2405,5 +2634,23 @@ mod tests {
             asked_about(&strategy_sdk::to_payload(&query)),
             Some(query.markets)
         );
+    }
+
+    #[test]
+    fn a_call_for_random_bytes_gets_them_up_to_a_mib_and_traps_past_it() {
+        let bytes = random_bytes(RANDOM_AT_MOST).unwrap();
+        assert_eq!(bytes.len() as u64, RANDOM_AT_MOST);
+        assert!(bytes.iter().any(|byte| *byte != 0));
+        assert!(random_bytes(0).unwrap().is_empty());
+        assert!(random_bytes(RANDOM_AT_MOST + 1).is_err());
+    }
+
+    #[test]
+    fn the_executor_s_randomness_is_linked_in_place_of_wasi_s() {
+        let engine = crate::runner::engine().unwrap();
+        let mut linker = wasmtime::component::Linker::new(&engine);
+        link(&mut linker).unwrap();
+        // Linking again over it is refused: shadowing is not left allowed.
+        assert!(link(&mut linker).is_err());
     }
 }

@@ -110,6 +110,9 @@ pub fn seal(published: &PublishedKey, plaintext: &[u8], aad_: &[u8]) -> Result<S
     if published.purpose == Purpose::Root {
         return Err(Error::RootHasNoKeyPair);
     }
+    if published.purpose == Purpose::Service {
+        return Err(Error::NoKeyPair(Purpose::Service));
+    }
     let public: [u8; 32] = published.public_key.0;
     let (enc, ciphertext) = hpke_seal(
         &public,

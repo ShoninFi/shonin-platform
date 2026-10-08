@@ -2,6 +2,9 @@
 # goes into the build context: only what `cargo build --locked` needs.
 .env
 .env.*
+claude-api-key
+*.key
+*.pem
 .private/
 .claude/
 .git/

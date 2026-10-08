@@ -286,9 +286,10 @@ impl Allowances {
     /// 170,000 to read, and a company's filings document about 15 million.
     /// Ten million a second covers a step on every one of thirty books a
     /// second with room to spare, at a hundredth of a core. A burst above the
-    /// rate isn't stopped, so the rate is what it holds on average. Memory is reserved, so it is billed
-    /// whether used or not: these agents hold one to three MiB, and 64 leaves
-    /// room for a document many times the size of the ones they read.
+    /// rate is free within a second; past that the agent waits for its rate.
+    /// Memory is reserved, so it is billed whether used or not: these agents
+    /// hold one to three MiB, and 64 leaves room for a document many times
+    /// the size of the ones they read.
     pub fn modest() -> Self {
         Self {
             fuel_per_sec: 10_000_000,

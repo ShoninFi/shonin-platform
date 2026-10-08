@@ -4,7 +4,7 @@
 # Built from the repository root by `task cloud:build NAME=executor NETWORK=testnet`,
 # which passes the network's settings and its deployments directory:
 #   docker build --build-arg NETWORK_FEATURE=none --build-arg WITHOUT_SOLANA=1 --build-arg NETWORK=testnet \
-#     --build-arg STORE_URL=... --build-arg API_URL=... \
+#     --build-arg STORE_READ_URL=... --build-arg API_URL=... \
 #     --build-context deployments=.shonin/testnet/deployments \
 #     -f deploy/gcp/Dockerfile.executor .
 #
@@ -81,7 +81,10 @@ LABEL "tee.launch_policy.log_redirect"="always"
 ARG NETWORK
 # 1 where the image serves the network's EVM chains alone (no Solana ids in it).
 ARG WITHOUT_SOLANA=
-ARG STORE_URL
+# Where the store's files are read from: the API's store (its internal
+# name), which reads through to the public copy for files built before the
+# cloud built them.
+ARG STORE_READ_URL
 ARG API_URL
 COPY --from=build /src/target/release/executor /usr/local/bin/executor
 COPY --from=build /opt/onnxruntime/lib/libonnxruntime.so.1 /opt/onnxruntime/lib/libonnxruntime.so.1.28.0 /usr/lib/x86_64-linux-gnu/
@@ -89,7 +92,7 @@ COPY config/chains.toml /etc/shonin/chains.toml
 # The generation's deployment files: the named build context `deployments`
 # (a build without it fails here).
 COPY --from=deployments *.json /etc/shonin/deployments/${NETWORK}/
-# The store's local copy: filled from the public store, each file believed
+# The store's local copy: filled from the API's store, each file believed
 # only for its hash.
 COPY --from=build /out/store /var/lib/shonin/store
 ENV SHONIN_NETWORK=${NETWORK} \
@@ -97,7 +100,7 @@ ENV SHONIN_NETWORK=${NETWORK} \
     SHONIN_CHAINS=/etc/shonin/chains.toml \
     SHONIN_DEPLOYMENTS_DIR=/etc/shonin/deployments/${NETWORK} \
     SHONIN_STORE=/var/lib/shonin/store \
-    SHONIN_STORE_URL=${STORE_URL} \
+    SHONIN_STORE_URL=${STORE_READ_URL} \
     SHONIN_API_URL=${API_URL}
 # Confidential Space opens only the ports an image declares.
 EXPOSE 19085/tcp

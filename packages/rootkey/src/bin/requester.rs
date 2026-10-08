@@ -16,8 +16,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use sha2::{Digest, Sha256};
-use shonin_rootkey::launcher::{LAUNCHER_SOCKET, request_token};
-use shonin_rootkey::{Purpose, Received, Release, Requester, Sealed, open};
+use shonin_rootkey::launcher::LAUNCHER_SOCKET;
+use shonin_rootkey::service::exchange_once;
+use shonin_rootkey::{Purpose, Received, Sealed, open};
 
 #[derive(Parser)]
 struct Args {
@@ -42,67 +43,19 @@ struct Args {
 }
 
 async fn attempt(args: &Args, purpose: &Purpose, sealed: &Sealed) -> Result<String> {
-    let requester = Requester::new(purpose.clone())?;
-    let token = request_token(&args.socket, &requester.nonce()).await?;
-    // A token is stamped by a clock seconds ahead of this machine's (and a
-    // holder's): wait until it is no longer in the future here, so a holder
-    // that allows no skew takes it too.
-    if let Some((Some(issued_at), _, _)) = token_times(&token) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_secs())
-            .unwrap_or(0);
-        let ahead = issued_at.saturating_sub(now).min(60);
-        if ahead > 0 {
-            tokio::time::sleep(Duration::from_secs(ahead + 1)).await;
-        }
-    }
-    let request = requester.request(token, None);
-    let url = format!("{}/rootkey/exchange", args.holder.trim_end_matches('/'));
-    let answer = reqwest::Client::new()
-        .post(&url)
-        .timeout(Duration::from_secs(60))
-        .json(&request)
-        .send()
-        .await
-        .context("posting the exchange request")?;
-    let status = answer.status();
-    if !status.is_success() {
-        let why = answer.text().await.unwrap_or_default();
-        // The token's times beside this machine's clock: a refusal over
-        // freshness is a matter of clocks, and this says whose.
-        let times = token_times(&request.token);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_secs_f64())
-            .unwrap_or(0.0);
-        tracing::warn!(
-            ?times,
-            now,
-            "the refused token's iat, nbf and exp, and this machine's clock"
-        );
-        bail!("the holder refused ({status}): {why}");
-    }
-    let release: Release = answer.json().await.context("the holder's release")?;
-    let Received::Key(pair) = requester.open(&request, &release)? else {
-        bail!("the holder released the root, not a key");
+    // Never through a proxy, whatever the environment names, and never on
+    // to wherever a redirect points: the exchange is with the holder alone.
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let received = exchange_once(&http, &args.holder, &args.socket, purpose).await?;
+    let Received::Key(pair) = received else {
+        bail!("the holder released something other than a key");
     };
     tracing::info!("opened the release");
     let plaintext = open(&pair, sealed, args.aad.as_bytes())?;
     Ok(hex::encode(Sha256::digest(plaintext.as_slice())))
-}
-
-/// A token's `iat`, `nbf` and `exp`, read without checking it (it is our own
-/// and only logged).
-fn token_times(token: &str) -> Option<(Option<u64>, Option<u64>, Option<u64>)> {
-    use base64::Engine as _;
-    let claims = token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(claims.trim_end_matches('='))
-        .ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let time = |name: &str| value.get(name).and_then(serde_json::Value::as_u64);
-    Some((time("iat"), time("nbf"), time("exp")))
 }
 
 #[tokio::main]

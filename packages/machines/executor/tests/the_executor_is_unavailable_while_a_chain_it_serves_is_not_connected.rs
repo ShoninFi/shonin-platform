@@ -92,9 +92,13 @@ fn deployments(chain_key: &str, chain_id: u64) -> String {
 /// An executor on the local network, base answered by a node of its own and
 /// every other chain out of reach; `only_base` serves base alone.
 async fn an_executor(only_base: bool) -> (status_port::Started, std::path::PathBuf) {
+    // A directory of its own: the two tests here start theirs at once, and a
+    // clock read alone can give both the same name.
+    static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "shonin-executor-health-{}-{}",
+        "shonin-executor-health-{}-{}-{}",
         std::process::id(),
+        MADE.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

@@ -294,6 +294,7 @@ impl Exchange {
         match requester.open(&request, &release)? {
             Received::Root(root) => Ok(root),
             Received::Key(_) => bail!("the peer released a key, not the root"),
+            Received::Seed(_) => bail!("the peer released a service's seed, not the root"),
         }
     }
 }

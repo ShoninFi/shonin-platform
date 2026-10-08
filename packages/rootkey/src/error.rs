@@ -16,6 +16,10 @@ pub enum Error {
     /// The root is passed whole, between holders; it has no key pair.
     #[error("the root has no key pair of its own")]
     RootHasNoKeyPair,
+    /// The purpose's secret is a seed released only by exchange: it has no
+    /// key pair, and so no published key.
+    #[error("{0} is a seed released only by exchange: it has no published key")]
+    NoKeyPair(Purpose),
     /// The token fails one of the attestation guest's checks.
     #[error("the attestation token is refused: {0}")]
     Token(shonin_attestation_core::Error),

@@ -315,6 +315,16 @@ pub struct Indexer {
     /// Where the build service answers, for the queue. Without one the record
     /// is the chains alone and the queue reads as empty.
     pub builder: Option<String>,
+    /// Where the build service's last answer for its queue is kept, so the
+    /// queue is still shown after a restart while the build service is off
+    /// ([`Indexer::with_jobs_cache`]).
+    jobs_cache: Option<PathBuf>,
+    /// The queue as the cache had it at start, until it is shown or the
+    /// build service answers, and when it was written.
+    cached_jobs: std::sync::Mutex<Option<(Vec<Job>, Option<time::PrimitiveDateTime>)>>,
+    /// What was last written to the cache, so an unchanged queue is not
+    /// written again.
+    jobs_written: std::sync::Mutex<Vec<u8>>,
     /// For asking other services, bounded so one that stops answering holds
     /// nothing up for good.
     pub http: reqwest::Client,
@@ -352,6 +362,9 @@ impl Indexer {
             signed: RwLock::new(HashMap::new()),
             store: Store::new(store),
             builder,
+            jobs_cache: None,
+            cached_jobs: std::sync::Mutex::new(None),
+            jobs_written: std::sync::Mutex::new(Vec::new()),
             http: http(),
             parts: RwLock::new(HashMap::new()),
             queue: RwLock::new(Queue::default()),
@@ -365,6 +378,56 @@ impl Indexer {
     pub fn with_store_url(mut self, base: &str) -> Self {
         self.store = Store::with_remote(self.store.root().to_path_buf(), base);
         self
+    }
+
+    /// The same indexer, keeping the build service's last answer for its
+    /// queue at `path` and showing it, marked stale, while the build service
+    /// is off: after a restart as before one. A cache that can't be read is
+    /// no queue.
+    pub fn with_jobs_cache(mut self, path: PathBuf) -> Self {
+        let cached = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Vec<Job>>(&bytes).ok())
+            .map(|jobs| {
+                let at = std::fs::metadata(&path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .map(|modified| {
+                        let at = time::OffsetDateTime::from(modified);
+                        time::PrimitiveDateTime::new(at.date(), at.time())
+                    });
+                (jobs, at)
+            });
+        *self.cached_jobs.lock().unwrap_or_else(|e| e.into_inner()) = cached;
+        self.jobs_cache = Some(path);
+        self
+    }
+
+    /// Keep the build service's answer for its queue in the cache, if there
+    /// is one and the answer changed. Written aside and moved into place, so
+    /// a restart never reads half of it.
+    fn keep_jobs(&self, jobs: &[Job]) {
+        let Some(path) = &self.jobs_cache else {
+            return;
+        };
+        let Ok(bytes) = serde_json::to_vec(jobs) else {
+            return;
+        };
+        let mut written = self.jobs_written.lock().unwrap_or_else(|e| e.into_inner());
+        if *written == bytes {
+            return;
+        }
+        let aside = path.with_extension("json.part");
+        let kept = path
+            .parent()
+            .is_none_or(|directory| std::fs::create_dir_all(directory).is_ok())
+            && std::fs::write(&aside, &bytes).is_ok()
+            && std::fs::rename(&aside, path).is_ok();
+        if kept {
+            *written = bytes;
+        } else {
+            tracing::warn!(path = %path.display(), "the build queue could not be kept on disk");
+        }
     }
 
     /// Start reading a chain that has connected.
@@ -752,7 +815,25 @@ impl Indexer {
             }
             Err(error) => {
                 tracing::debug!(%error, "could not read the build queue");
-                self.queue.write().await.stale = true;
+                // The queue kept from before a restart, shown as it was last
+                // given, until the build service answers again.
+                let cached = self
+                    .cached_jobs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                match cached {
+                    Some((jobs, as_of)) => {
+                        let (jobs, wallets) = self.completed(jobs).await;
+                        *self.queue.write().await = Queue {
+                            jobs,
+                            wallets,
+                            as_of,
+                            stale: true,
+                        };
+                    }
+                    None => self.queue.write().await.stale = true,
+                }
             }
         }
         self.compose().await;
@@ -1063,8 +1144,24 @@ impl Indexer {
             .get(format!("{builder}/jobs"))
             .send()
             .await?
+            .error_for_status()?
             .json()
             .await?;
+        self.keep_jobs(&jobs);
+        // The build service has answered: what the cache held is out of date.
+        self.cached_jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        Ok(self.completed(jobs).await)
+    }
+
+    /// The build service's jobs with what each chain adds to them, and the
+    /// wallet each names, by chain and job id.
+    async fn completed(
+        &self,
+        jobs: Vec<Job>,
+    ) -> (Vec<Job>, HashMap<(Chain, String), ChainAddress>) {
         let wallets = wallets(&jobs);
         let mut chains: Vec<Chain> = jobs.iter().map(|job| job.chain).collect();
         chains.sort();
@@ -1092,12 +1189,12 @@ impl Indexer {
             .flatten()
             .map(|job| (job.id.clone(), job))
             .collect();
-        Ok((
+        (
             jobs.into_iter()
                 .map(|job| completed.remove(&job.id).unwrap_or(job))
                 .collect(),
             wallets,
-        ))
+        )
     }
 
     /// One job, as the build service gives it, with what its chain adds:

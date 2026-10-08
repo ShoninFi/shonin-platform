@@ -2189,6 +2189,7 @@ dependencies = [
  "cipher 0.5.2",
  "cpufeatures 0.3.1",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -2201,6 +2202,7 @@ dependencies = [
  "chacha20",
  "cipher 0.5.2",
  "poly1305",
+ "zeroize",
 ]
 
 [[package]]
@@ -7067,12 +7069,15 @@ dependencies = [
  "futures",
  "http-body-util",
  "reqwest",
+ "serde",
  "serde_json",
  "shonin-chain",
  "shonin-indexer",
  "shonin-rootkey",
  "shonin-shared",
+ "time",
  "tokio",
+ "tower",
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber 0.3.23",
@@ -7166,6 +7171,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "shonin-chain",
+ "shonin-rootkey",
  "shonin-shared",
  "tar",
  "time",
@@ -7175,6 +7181,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.23",
  "wasmtime",
+ "zeroize",
 ]
 
 [[package]]
@@ -7524,13 +7531,16 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "shonin-chain",
+ "shonin-rootkey",
  "shonin-shared",
  "tar",
  "time",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
+ "zeroize",
 ]
 
 [[package]]
@@ -7553,6 +7563,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "chacha20poly1305",
  "clap",
  "getrandom 0.3.4",
  "hex",
@@ -7633,10 +7644,16 @@ dependencies = [
 name = "shonin-unwinder"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "clap",
+ "reqwest",
+ "serde_json",
+ "shonin-attestation-core",
  "shonin-chain",
+ "shonin-rootkey",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",

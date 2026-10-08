@@ -87,7 +87,12 @@ impl Client {
             endpoint: endpoint.unwrap_or_else(|| ENDPOINT.to_string()),
             key,
             model: model.unwrap_or_else(|| MODEL.to_string()),
+            // Never through a proxy, whatever the environment names, and
+            // never on to wherever a redirect points: the source and the key
+            // go to the endpoint and nowhere else.
             http: reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
                 .timeout(TIMEOUT)
                 .build()
                 .expect("an http client"),

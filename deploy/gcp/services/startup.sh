@@ -2,16 +2,21 @@
 # The services VM's startup script (Container-Optimized OS), run as root on
 # every boot. It starts, on the host's network:
 #
-#   shonin-api      the API (the indexer inside), on :19081, open to the VPC
+#   shonin-api      the API (the indexer inside), on :19081, open to the VPC,
+#                   and its internal port :19082, for the builder and the
+#                   reviewer alone (the cloud's firewall), never tunneled
 #   shonin-keeper   the keeper, health on :19087, with the keeper's key alone
 #   shonin-tunnel   cloudflared, carrying the API out to its public name
-#   shonin-waker    a small loop that starts the prover's VM when the
-#                   executor wants a seal and the prover is off
+#   shonin-waker    a small loop that starts the prover's VM when a machine
+#                   wants a seal, and the builder's and the reviewer's when
+#                   the API says they are wanted
 #
 # What it runs is named in the instance's metadata (`task cloud:deploy:services`
 # sets it): shonin-api-image and shonin-keeper-image (by digest),
-# shonin-executor-url, shonin-prover-instance, shonin-keeper-secret,
-# shonin-tunnel-secret, and the waker's script as shonin-waker.
+# shonin-executor-url, shonin-prover-instance, shonin-builder-url,
+# shonin-builder-instance, shonin-reviewer-url, shonin-reviewer-instance,
+# shonin-keeper-secret, shonin-tunnel-secret, and the waker's script as
+# shonin-waker.
 #
 # The two secrets are read from Secret Manager with the VM's own token and
 # written to files only root can read; they are never echoed, never put on a
@@ -30,8 +35,10 @@ metadata() {
 
 # Container-Optimized OS drops every inbound connection but SSH. The API and
 # the keeper's health answer the VPC (the executor posts its reports to the
-# API); the cloud firewall keeps the rest of the world out.
-for port in 19081 19087; do
+# API), and the API's internal port the builder and the reviewer; the cloud
+# firewall keeps the rest of the world out, and the internal port from all
+# but those two machines.
+for port in 19081 19082 19087; do
   iptables -C INPUT -p tcp -s 10.128.0.0/9 --dport "$port" -j ACCEPT 2>/dev/null ||
     iptables -I INPUT -p tcp -s 10.128.0.0/9 --dport "$port" -j ACCEPT
 done
@@ -60,17 +67,25 @@ api_image=$(attribute shonin-api-image)
 keeper_image=$(attribute shonin-keeper-image)
 executor_url=$(attribute shonin-executor-url)
 prover_instance=$(attribute shonin-prover-instance)
+# The machines that run on demand: absent from an older deploy's metadata.
+builder_url=$(attribute shonin-builder-url 2>/dev/null || true)
+builder_instance=$(attribute shonin-builder-instance 2>/dev/null || true)
+reviewer_url=$(attribute shonin-reviewer-url 2>/dev/null || true)
+reviewer_instance=$(attribute shonin-reviewer-instance 2>/dev/null || true)
 keeper_secret=$(attribute shonin-keeper-secret)
 tunnel_secret=$(attribute shonin-tunnel-secret)
 cloudflared_image=$(attribute shonin-cloudflared-image 2>/dev/null || echo cloudflare/cloudflared:latest)
 waker_image=$(attribute shonin-waker-image 2>/dev/null || echo curlimages/curl:latest)
 
-mkdir -p "$STATE/secrets" "$STATE/store" "$STATE/docker"
+mkdir -p "$STATE/secrets" "$STATE/store" "$STATE/api-state" "$STATE/docker"
 chmod 700 "$STATE/secrets" "$STATE/docker"
 # The API's store, kept across restarts, for the images' own user (nonroot,
-# 65532 in the distroless images).
-chown 65532:65532 "$STATE/store"
+# 65532 in the distroless images); and its own state beside it: the
+# builder's and the reviewer's sealed state, their wake plans, the build
+# queue as last given. Readable by that user alone.
+chown 65532:65532 "$STATE/store" "$STATE/api-state"
 chmod 755 "$STATE" "$STATE/store"
+chmod 700 "$STATE/api-state"
 
 # The secrets: each into a variable, checked, then into an env file only root
 # can read (docker reads it as root and hands it to the container alone).
@@ -109,11 +124,16 @@ run() {
   say "$name started"
 }
 
-run shonin-api -v "$STATE/store:/var/lib/shonin/store" "$api_image"
+run shonin-api -v "$STATE/store:/var/lib/shonin/store" -v "$STATE/api-state:/var/lib/shonin/api-state" "$api_image"
 run shonin-keeper --env-file "$STATE/secrets/keeper.env" "$keeper_image"
 run shonin-tunnel --env-file "$STATE/secrets/tunnel.env" "$cloudflared_image" tunnel --no-autoupdate run
 run shonin-waker -v "$STATE/waker.sh:/waker.sh:ro" \
   -e "SHONIN_EXECUTOR_URL=$executor_url" \
   -e "SHONIN_PROVER_INSTANCE=$prover_instance" \
+  -e "SHONIN_BUILDER_URL=$builder_url" \
+  -e "SHONIN_BUILDER_INSTANCE=$builder_instance" \
+  -e "SHONIN_REVIEWER_URL=$reviewer_url" \
+  -e "SHONIN_REVIEWER_INSTANCE=$reviewer_instance" \
+  -e "SHONIN_WAKE_URL=http://localhost:19082/internal/wake" \
   --entrypoint sh "$waker_image" /waker.sh
 say "up"

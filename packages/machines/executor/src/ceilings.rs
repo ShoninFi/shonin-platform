@@ -38,8 +38,11 @@ pub struct Ceilings {
 impl Ceilings {
     /// Four times the quoting shape's.
     pub const FUEL_PER_SEC: u64 = 64_000_000;
-    /// 4 GiB: four times the quoting shape's.
-    pub const MEMORY_MIB: u32 = 4_096;
+    /// 256 MiB: twice the quoting shape's, and room for an agent's models
+    /// (at most 128 MiB in all, counted against its memory) and its own
+    /// working memory beside them. An allowance asking for more (the
+    /// thinking shape's 512 MiB) runs, and is billed, at this.
+    pub const MEMORY_MIB: u32 = 256;
     /// Twice the quoting shape's.
     pub const REQUESTS_PER_MIN: u32 = 12_000;
     /// 50 GB: ten times the quoting shape's.
@@ -121,13 +124,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_shape_an_author_picks_between_is_given_in_full() {
+    fn every_shape_an_author_picks_between_is_given_in_full_but_memory_past_the_ceiling() {
         let ceilings = Ceilings::default();
         for name in Allowances::SHAPES {
             let shape = Allowances::shape(name);
-            assert_eq!(ceilings.hold(&shape), shape, "{name}");
-            assert!(ceilings.held_below(&shape).is_empty(), "{name}");
+            let held = ceilings.hold(&shape);
+            assert_eq!(
+                held,
+                Allowances {
+                    memory_mib: shape.memory_mib.min(Ceilings::MEMORY_MIB),
+                    ..shape
+                },
+                "{name}"
+            );
+            let below = ceilings.held_below(&shape);
+            if shape.memory_mib > Ceilings::MEMORY_MIB {
+                assert_eq!(below.len(), 1, "{name}: {below:?}");
+                assert!(below[0].starts_with("memory"), "{name}: {below:?}");
+            } else {
+                assert!(below.is_empty(), "{name}: {below:?}");
+            }
         }
+    }
+
+    #[test]
+    fn the_thinking_shape_s_memory_is_held_to_the_ceiling() {
+        let thinking = Allowances::thinking();
+        assert!(thinking.memory_mib > Ceilings::MEMORY_MIB);
+        let held = Ceilings::default().hold(&thinking);
+        assert_eq!(held.memory_mib, 256);
+        assert_eq!(held.fuel_per_sec, thinking.fuel_per_sec);
     }
 
     #[test]

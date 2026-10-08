@@ -36,7 +36,7 @@ const KINDS: [ImageKind; 5] = [
     ImageKind::Holder,
 ];
 
-fn digest_of(kind: ImageKind) -> B256 {
+pub(crate) fn digest_of(kind: ImageKind) -> B256 {
     B256::repeat_byte(match kind {
         ImageKind::Executor => 0xE1,
         ImageKind::Unwinder => 0xE2,
@@ -54,7 +54,7 @@ fn image_claim(digest: B256) -> String {
 /// and root record, and each chain's own registry of blessings, read per
 /// chain as the holder reads them.
 #[derive(Clone)]
-struct StandIn {
+pub(crate) struct StandIn {
     trusted: Vec<[u8; 32]>,
     images: HashMap<B256, ImageKind>,
     projects: HashSet<B256>,
@@ -72,7 +72,7 @@ struct StandIn {
 }
 
 impl StandIn {
-    fn new() -> StandIn {
+    pub(crate) fn new() -> StandIn {
         StandIn {
             trusted: vec![fixture::test_jwk().key_hash()],
             images: KINDS.iter().map(|kind| (digest_of(*kind), *kind)).collect(),
@@ -105,7 +105,7 @@ impl StandIn {
     }
 
     /// The record names `signer` as the live root key, or nothing.
-    fn record_root(&self, signer: Option<Address>) {
+    pub(crate) fn record_root(&self, signer: Option<Address>) {
         *self.live_root.lock().unwrap() = signer;
     }
 
@@ -217,6 +217,11 @@ async fn ask_as(
     ask(chain, root, &requester, token, proof).await
 }
 
+/// The fixture's operator project, as the registry lists it.
+fn project() -> B256 {
+    B256::from(shonin_attestation_core::project_id(fixture::PROJECT))
+}
+
 fn venue() -> Purpose {
     Purpose::venue(VAULT_CHAIN, vault(), "hyperliquid").unwrap()
 }
@@ -266,12 +271,17 @@ fn derivations_are_deterministic_and_domain_separated() {
         root.key_pair(&Purpose::Root).unwrap_err(),
         Error::RootHasNoKeyPair
     );
+    assert_eq!(
+        root.key_pair(&Purpose::Service).unwrap_err(),
+        Error::NoKeyPair(Purpose::Service)
+    );
 }
 
 #[test]
 fn purposes_have_one_string_form_and_distinct_bytes() {
     let mut all = purposes();
     all.push(Purpose::Root);
+    all.push(Purpose::Service);
     let mut bytes = HashSet::new();
     for purpose in &all {
         let text = purpose.to_string();
@@ -413,6 +423,7 @@ async fn the_exchange_releases_each_kind_only_what_it_may_have() {
     let root = Root::for_tests(7);
     let mut asked = purposes();
     asked.push(Purpose::Root);
+    asked.push(Purpose::Service);
     asked.push(Purpose::platform("something-else").unwrap());
 
     for kind in KINDS {
@@ -436,7 +447,8 @@ async fn the_exchange_releases_each_kind_only_what_it_may_have() {
                         && matches!(purpose, Purpose::Venue { vault_chain, .. } if *vault_chain == VAULT_CHAIN)
                 }
                 (ImageKind::Executor, Purpose::Bundle(hash)) => *hash == strategy(),
-                (ImageKind::Builder, Purpose::Builder) => true,
+                (ImageKind::Builder | ImageKind::Reviewer, Purpose::Builder) => true,
+                (ImageKind::Builder | ImageKind::Reviewer, Purpose::Service) => true,
                 (ImageKind::Reviewer, Purpose::Platform(name)) => {
                     name == REVIEWER_MODEL || name == DUMMY
                 }
@@ -455,6 +467,11 @@ async fn the_exchange_releases_each_kind_only_what_it_may_have() {
                         pair.public_key(),
                         root.key_pair(purpose).unwrap().public_key()
                     );
+                }
+                Ok(Received::Seed(seed)) => {
+                    assert!(expected, "{kind} was given {purpose}");
+                    assert_eq!(*purpose, Purpose::Service);
+                    assert_eq!(*seed, *root.service_seed(kind, digest_of(kind), project()));
                 }
                 Err(error) => {
                     assert!(!expected, "{kind} was refused {purpose}: {error}");
@@ -964,6 +981,20 @@ async fn the_roots_bytes_never_appear_in_debug_output_or_errors() {
     }
     let requester = Requester::new(Purpose::Root).unwrap();
     said.push(format!("{requester:?}"));
+    let mut secrets = secrets;
+    for kind in [ImageKind::Builder, ImageKind::Reviewer] {
+        let seed = root.service_seed(kind, digest_of(kind), project());
+        secrets.push(hex::encode(seed.as_slice()));
+        said.push(format!("{:?}", Received::Seed(seed.clone())));
+        said.push(format!("{:#?}", Received::Seed(seed)));
+        let Received::Seed(given) = ask_as(&StandIn::new(), &root, kind, &Purpose::Service, None)
+            .await
+            .unwrap()
+        else {
+            panic!("{kind} is given its seed");
+        };
+        said.push(format!("{:?}", Received::Seed(given)));
+    }
 
     let mut chain = StandIn::new();
     let errors = [
@@ -1428,4 +1459,187 @@ async fn only_the_platform_secrets_an_image_may_be_given_are_published() {
     assert_eq!(answer.status(), 404);
     // Every other kind of purpose is published as before.
     assert!(service.published(&Purpose::Builder).await.is_ok());
+}
+
+/// A service's seed is its own: another image, project or kind (or another
+/// root) derives another, and the same four always derive the same one.
+#[test]
+fn a_service_seed_differs_by_image_project_and_kind() {
+    let root = Root::for_tests(7);
+    let image = B256::repeat_byte(0x11);
+    let project = B256::repeat_byte(0x22);
+    let seed = root.service_seed(ImageKind::Builder, image, project);
+    assert_eq!(
+        *seed,
+        *Root::for_tests(7).service_seed(ImageKind::Builder, image, project)
+    );
+    let others = [
+        root.service_seed(ImageKind::Reviewer, image, project),
+        root.service_seed(ImageKind::Builder, B256::repeat_byte(0x12), project),
+        root.service_seed(ImageKind::Builder, image, B256::repeat_byte(0x23)),
+        Root::for_tests(8).service_seed(ImageKind::Builder, image, project),
+    ];
+    let mut seen = HashSet::from([*seed]);
+    for other in others {
+        assert!(seen.insert(*other), "two services share a seed");
+    }
+    // Nor is it the root, the root signer or any purpose's key.
+    assert_ne!(*seed, *root.expose());
+    assert_ne!(seed.as_slice(), root.signer().to_bytes().as_slice());
+    for purpose in purposes() {
+        let pair = root.key_pair(&purpose).unwrap();
+        assert_ne!(seed.as_slice(), pair.private_bytes().as_slice());
+    }
+}
+
+#[test]
+fn an_image_kind_s_byte_is_the_registry_s_value() {
+    use chain::bindings::attestation::ImageKind as Chain;
+    for (kind, chain) in [
+        (ImageKind::Executor, Chain::Executor),
+        (ImageKind::Unwinder, Chain::Unwinder),
+        (ImageKind::Builder, Chain::Builder),
+        (ImageKind::Reviewer, Chain::Reviewer),
+        (ImageKind::Holder, Chain::Holder),
+    ] {
+        assert_eq!(kind.to_byte(), chain as u8, "{kind}");
+    }
+}
+
+#[tokio::test]
+async fn a_service_seed_is_never_given_to_an_executor_holder_or_unwinder() {
+    let root = Root::for_tests(7);
+    let chain = StandIn::new();
+    for kind in [ImageKind::Executor, ImageKind::Holder, ImageKind::Unwinder] {
+        assert_eq!(permission(kind, &Purpose::Service), Permission::Never);
+        assert_eq!(
+            ask_as(&chain, &root, kind, &Purpose::Service, None)
+                .await
+                .unwrap_err(),
+            Error::NotForKind {
+                kind,
+                purpose: Purpose::Service
+            }
+        );
+    }
+}
+
+/// The holder derives the seed from what the token attests, so a builder
+/// is given its own image's seed, the reviewer its own.
+#[tokio::test]
+async fn a_service_is_given_the_seed_for_its_attested_image_project_and_kind() {
+    let root = Root::for_tests(7);
+    let chain = StandIn::new();
+    for kind in [ImageKind::Builder, ImageKind::Reviewer] {
+        let Received::Seed(seed) = ask_as(&chain, &root, kind, &Purpose::Service, None)
+            .await
+            .unwrap()
+        else {
+            panic!("{kind} is given a seed");
+        };
+        assert_eq!(*seed, *root.service_seed(kind, digest_of(kind), project()));
+    }
+    // Under another allowed project, another seed.
+    let mut chain = StandIn::new();
+    let elsewhere = "another-project";
+    chain
+        .projects
+        .insert(B256::from(shonin_attestation_core::project_id(elsewhere)));
+    let requester = Requester::new(Purpose::Service).unwrap();
+    let token = token(&requester.nonce(), ImageKind::Builder, |claims| {
+        claims["submods"]["gce"]["project_id"] = json!(elsewhere);
+    });
+    let Received::Seed(seed) = ask(&chain, &root, &requester, token, None).await.unwrap() else {
+        panic!("a builder is given a seed");
+    };
+    assert_ne!(
+        *seed,
+        *root.service_seed(ImageKind::Builder, digest_of(ImageKind::Builder), project())
+    );
+}
+
+/// The reviewer is given the builder key, so it can open sealed source it
+/// reviews.
+#[tokio::test]
+async fn a_reviewer_is_given_the_builder_key() {
+    let root = Root::for_tests(7);
+    let chain = StandIn::new();
+    let published = root.publish(&Purpose::Builder, CANONICAL).unwrap();
+    let sealed = seal(&published, b"sealed source", b"").unwrap();
+    let Received::Key(pair) = ask_as(&chain, &root, ImageKind::Reviewer, &Purpose::Builder, None)
+        .await
+        .unwrap()
+    else {
+        panic!("a reviewer asking for the builder key is given it");
+    };
+    assert_eq!(
+        open(&pair, &sealed, b"").unwrap().as_slice(),
+        b"sealed source"
+    );
+}
+
+/// A seed's release opens only with the ephemeral key its token binds:
+/// another requester, even one asking for the same purpose, gets nothing.
+#[tokio::test]
+async fn a_service_seed_opens_only_for_its_ephemeral_key() {
+    let root = Root::for_tests(7);
+    let chain = StandIn::new();
+    let requester = Requester::new(Purpose::Service).unwrap();
+    let token = token(&requester.nonce(), ImageKind::Builder, |_| {});
+    let request = requester.request(token, None);
+    let release = authorise(&root, &google_keys(), &request, NOW, &chain)
+        .await
+        .unwrap();
+    assert!(matches!(
+        requester.open(&request, &release),
+        Ok(Received::Seed(_))
+    ));
+
+    let thief = Requester::new(Purpose::Service).unwrap();
+    assert_eq!(
+        thief.open(&request, &release).unwrap_err(),
+        Error::Open,
+        "another ephemeral key opened the seed"
+    );
+    // Its own request relabelled with the stolen release's token and key.
+    let mut relabelled = thief.request(request.token.clone(), None);
+    relabelled.ephemeral_public = request.ephemeral_public;
+    assert_eq!(thief.open(&relabelled, &release).unwrap_err(), Error::Open);
+    let forged = thief.request(request.token.clone(), None);
+    assert_eq!(thief.open(&forged, &release).unwrap_err(), Error::Open);
+}
+
+/// A service's seed has no key pair: nothing is published for it, and
+/// nothing can be sealed to it.
+#[tokio::test]
+async fn a_service_seed_has_no_published_key() {
+    let chain = StandIn::new();
+    let service = crate::Service::new(chain.clone());
+    let root = Root::for_tests(7);
+    chain.record_root(Some(root.signer_address()));
+    let builder = root.publish(&Purpose::Builder, CANONICAL).unwrap();
+    service.hold(root);
+    service.set_serving(true);
+    assert_eq!(
+        service.published(&Purpose::Service).await,
+        Err(Error::NoKeyPair(Purpose::Service))
+    );
+    let app = crate::routes(service.clone());
+    let answer = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::get("/rootkey/published/service")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(answer.status(), 404);
+    let relabelled = PublishedKey {
+        purpose: Purpose::Service,
+        ..builder
+    };
+    assert_eq!(
+        seal(&relabelled, b"x", b"").unwrap_err(),
+        Error::NoKeyPair(Purpose::Service)
+    );
 }

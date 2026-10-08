@@ -1,8 +1,9 @@
 # The images, built in Google Cloud Build rather than cross-built on a
-# laptop: `task cloud:push NAME=<name|all> NETWORK=testnet BUILDER=cloud`
-# stages the source (tracked files only, never .env, .shonin or a target
-# directory), the network's public deployment files (`_deployments/`) and,
-# for the prover, the reproducibly built guest (`_guest/`), and submits this.
+# laptop: `task cloud:images NAMES="..." NETWORK=testnet` stages the source
+# (tracked files only, never .env, .shonin, a target directory or a key),
+# the network's public deployment files (`_deployments/`), for the prover
+# the reproducibly built guest (`_guest/`), and for the reviewer its sealed
+# model key, the ciphertext alone (`_sealed/sealed.json`), and submits this.
 #
 # Each image is built by BuildKit on a high-CPU worker (the largest the
 # project's quota allows: 8 CPUs, one build at a time). Its compiled
@@ -18,18 +19,24 @@
 substitutions:
   _NAMES: "api keeper executor prover"
   _TAG: "scratch"
-  _REGISTRY: "us-central1-docker.pkg.dev/shonin-testnet/shonin"
+  _REGISTRY: "europe-west4-docker.pkg.dev/shonin-testnet/shonin"
   _NETWORK: "testnet"
   _NETWORK_FEATURE: "none"
   _WITHOUT_SOLANA: "1"
   _STORE_URL: ""
   _API_URL: ""
   _EXECUTOR_URL: ""
+  # The machines that run on demand, and the API's two faces for them, by
+  # their internal names.
+  _BUILDER_URL: ""
+  _REVIEWER_URL: ""
+  _STORE_READ_URL: ""
+  _API_INTERNAL_URL: ""
 
 steps:
   # A BuildKit builder of its own (the steps share it: they run on one
   # worker's Docker), so the images' common stages are built once.
-  - id: builder
+  - id: buildkit
     name: gcr.io/cloud-builders/docker
     entrypoint: bash
     args:
@@ -40,7 +47,7 @@ steps:
         docker buildx create --name shonin --driver docker-container --bootstrap --use
 
   - id: api
-    waitFor: [builder]
+    waitFor: [buildkit]
     name: gcr.io/cloud-builders/docker
     entrypoint: bash
     args: [deploy/gcp/cloudbuild/build.sh, api]
@@ -54,26 +61,51 @@ steps:
       - STORE_URL=${_STORE_URL}
       - API_URL=${_API_URL}
       - EXECUTOR_URL=${_EXECUTOR_URL}
+      - BUILDER_URL=${_BUILDER_URL}
+      - REVIEWER_URL=${_REVIEWER_URL}
+      - STORE_READ_URL=${_STORE_READ_URL}
+      - API_INTERNAL_URL=${_API_INTERNAL_URL}
 
   - id: keeper
-    waitFor: [builder]
+    waitFor: [buildkit]
     name: gcr.io/cloud-builders/docker
     entrypoint: bash
     args: [deploy/gcp/cloudbuild/build.sh, keeper]
     env: *settings
 
   - id: executor
-    waitFor: [builder]
+    waitFor: [buildkit]
     name: gcr.io/cloud-builders/docker
     entrypoint: bash
     args: [deploy/gcp/cloudbuild/build.sh, executor]
     env: *settings
 
   - id: prover
-    waitFor: [builder]
+    waitFor: [buildkit]
     name: gcr.io/cloud-builders/docker
     entrypoint: bash
     args: [deploy/gcp/cloudbuild/build.sh, prover]
+    env: *settings
+
+  - id: builder
+    waitFor: [buildkit]
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args: [deploy/gcp/cloudbuild/build.sh, builder]
+    env: *settings
+
+  - id: reviewer
+    waitFor: [buildkit]
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args: [deploy/gcp/cloudbuild/build.sh, reviewer]
+    env: *settings
+
+  - id: unwinder
+    waitFor: [buildkit]
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args: [deploy/gcp/cloudbuild/build.sh, unwinder]
     env: *settings
 
 serviceAccount: projects/shonin-testnet/serviceAccounts/shonin-cloudbuild@shonin-testnet.iam.gserviceaccount.com

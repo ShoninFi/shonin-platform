@@ -75,12 +75,50 @@ impl Battery {
         serde_json::from_str(BATTERY).expect("the battery this image ships with parses")
     }
 
+    /// Whether `answers` answer the battery whole: each question exactly
+    /// once. An answer to no question in the battery is not rated, and is
+    /// let be. A review is made only from answers that do
+    /// (see [`Battery::rate`]); anything less is no answer at all.
+    ///
+    /// Every question is required, not just the one that refuses: an answer
+    /// left out would otherwise make its area read from the questions that
+    /// were answered, and a model can already say it could not tell, with a
+    /// low confidence, so leaving a question out says nothing a reader could
+    /// check. A question answered twice is ambiguous, and is refused alike.
+    pub fn answered_whole(&self, answers: &[Answer]) -> Result<(), String> {
+        let mut missing = Vec::new();
+        let mut twice = Vec::new();
+        for question in &self.questions {
+            match answers.iter().filter(|a| a.id == question.id).count() {
+                0 => missing.push(question.id.as_str()),
+                1 => {}
+                _ => twice.push(question.id.as_str()),
+            }
+        }
+        let mut wrong = Vec::new();
+        if !missing.is_empty() {
+            wrong.push(format!("left unanswered: {}", missing.join(", ")));
+        }
+        if !twice.is_empty() {
+            wrong.push(format!("answered more than once: {}", twice.join(", ")));
+        }
+        if wrong.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the battery was not answered whole ({})",
+                wrong.join("; ")
+            ))
+        }
+    }
+
     /// The ratings those answers come to, and whether they refuse the build.
     ///
     /// An area's concern is its worst answer: the probability of a problem,
     /// or for a question about good practice, the probability it is missing.
-    /// An answer the model did not give counts as nothing either way, and an
-    /// area with no confident answer at all reads couldn't tell.
+    /// An area with no confident answer at all reads couldn't tell. The
+    /// arithmetic skips an answer that is not there, so the reviewer rates
+    /// only answers that [`Battery::answered_whole`] takes.
     pub fn rate(&self, answers: &[Answer]) -> ([Rating; 6], bool) {
         let t = self.thresholds;
         let mut ratings = [Rating::CouldntTell; 6];
@@ -221,6 +259,26 @@ mod tests {
         let (nothing, refused) = Battery::pinned().rate(&[]);
         assert_eq!(nothing, [Rating::CouldntTell; 6]);
         assert!(!refused);
+    }
+
+    #[test]
+    fn only_a_battery_answered_whole_is_taken() {
+        let battery = Battery::pinned();
+        assert_eq!(battery.answered_whole(&all_clean()), Ok(()));
+        assert!(battery.answered_whole(&[]).is_err());
+        let mut without_malicious = all_clean();
+        without_malicious.retain(|a| a.id != "malicious");
+        let why = battery.answered_whole(&without_malicious).unwrap_err();
+        assert!(why.contains("malicious"), "{why}");
+        let mut without_one = all_clean();
+        without_one.retain(|a| a.id != "restart-unsafe");
+        assert!(battery.answered_whole(&without_one).is_err());
+        let mut twice = all_clean();
+        twice.push(answer("malicious", 0.95));
+        assert!(battery.answered_whole(&twice).is_err());
+        let mut more = all_clean();
+        more.push(answer("not-a-question", 0.5));
+        assert_eq!(battery.answered_whole(&more), Ok(()));
     }
 
     #[test]

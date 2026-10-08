@@ -5,7 +5,7 @@
 # pinned in prover/startup.sh; the copy is checked by that digest.
 
 substitutions:
-  _REGISTRY: "us-central1-docker.pkg.dev/shonin-testnet/shonin"
+  _REGISTRY: "europe-west4-docker.pkg.dev/shonin-testnet/shonin"
   # The image the risc0-groth16 crate runs, by tag, and its linux/amd64
   # manifest's digest.
   _SOURCE: "docker.io/risczero/risc0-groth16-prover"

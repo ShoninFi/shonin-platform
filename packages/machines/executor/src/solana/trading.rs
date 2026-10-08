@@ -224,6 +224,9 @@ impl Trading {
             limit_price: units(to_units(order.limit_price, ASSET_DECIMALS))?,
             reduce_only: order.reduce_only,
         };
+        // The receipt names the market as the venue knows it, so it is no
+        // longer than the venue's name for it whatever the agent sent.
+        let market = market_name(&request.market);
         let authority = self.authority().await.map_err(refusal)?;
         self.opened(&authority).await.map_err(refusal)?;
         let place = self
@@ -234,7 +237,7 @@ impl Trading {
         let landed = self.through_the_guard(place, 0).await.map_err(refusal)?;
         match on_chain::venue_outcome(&landed.record, &authority) {
             VenueOutcome::Filled(filled) => Ok(Receipt::Filled {
-                market: order.market.clone(),
+                market,
                 side: if filled.is_buy { Side::Buy } else { Side::Sell },
                 size: to_decimal(U256::from(filled.size), SIZE_DECIMALS)?,
                 price: to_decimal(U256::from(filled.price), ASSET_DECIMALS)?,

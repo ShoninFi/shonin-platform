@@ -10,6 +10,7 @@ use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::Error;
+use crate::chain_view::ImageKind;
 use crate::published::PublishedKey;
 use crate::purpose::Purpose;
 use crate::sealed::{Kem, PrivateKey, PublicKey};
@@ -20,6 +21,9 @@ pub const SALT: &[u8] = b"shonin:rootkey:v1";
 pub const SIGNER_LABEL: &[u8] = b"shonin:rootkey:v1:root-signer";
 /// The label a purpose's key is expanded under, before the purpose's bytes.
 pub const PURPOSE_LABEL: &[u8] = b"shonin:rootkey:v1:purpose";
+/// The label a service's seed is expanded under, before its kind, image and
+/// project.
+pub const SERVICE_LABEL: &[u8] = b"shonin:rootkey:v1:service";
 
 /// The root key: 32 bytes from the operating system's randomness.
 ///
@@ -73,10 +77,13 @@ impl Root {
         self.signer().address()
     }
 
-    /// The key pair for `purpose`. The root has none.
+    /// The key pair for `purpose`. The root and a service's seed have none.
     pub fn key_pair(&self, purpose: &Purpose) -> Result<KeyPair, Error> {
         if *purpose == Purpose::Root {
             return Err(Error::RootHasNoKeyPair);
+        }
+        if *purpose == Purpose::Service {
+            return Err(Error::NoKeyPair(Purpose::Service));
         }
         if !purpose.is_well_formed() {
             return Err(Error::Malformed("purpose"));
@@ -85,6 +92,34 @@ impl Root {
         self.expand(&[PURPOSE_LABEL, &purpose.to_bytes()], ikm.as_mut());
         let (private, public) = Kem::derive_keypair(ikm.as_slice());
         Ok(KeyPair::new(purpose.clone(), private, public))
+    }
+
+    /// The seed of a service of `kind` running the image `image_digest` in
+    /// the operator project `project_id` (`keccak256` of its id, as the
+    /// registry lists projects): expanded under `shonin:rootkey:v1:service`
+    /// ‖ the kind's registry value (1 byte) ‖ image digest (32) ‖ project
+    /// (32).
+    ///
+    /// It is the same for every boot of that image under this root, so a
+    /// service's keys (and their blessings and gas) outlive a restart, and
+    /// another image, project or kind never shares it.
+    pub fn service_seed(
+        &self,
+        kind: ImageKind,
+        image_digest: B256,
+        project_id: B256,
+    ) -> Zeroizing<[u8; 32]> {
+        let mut seed = Zeroizing::new([0u8; 32]);
+        self.expand(
+            &[
+                SERVICE_LABEL,
+                &[kind.to_byte()],
+                image_digest.as_slice(),
+                project_id.as_slice(),
+            ],
+            seed.as_mut(),
+        );
+        seed
     }
 
     /// The public key for `purpose`, signed by the root signer for the

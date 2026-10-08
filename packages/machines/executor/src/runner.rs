@@ -1,7 +1,8 @@
 //! Running one strategy.
 //!
 //! Its component is instantiated once and its `run` is called once. Fuel is
-//! metered so a runaway loop cannot take the machine, and an epoch deadline
+//! metered and held to the rate the strategy declared, so a runaway loop
+//! cannot take more of the machine than it pays for, and an epoch deadline
 //! makes it yield every few milliseconds so one strategy cannot starve
 //! another. If it faults, it is started again from the venue's own state: the
 //! cache it had is gone, and it was promised to nobody.
@@ -23,9 +24,10 @@ use crate::watch::VaultEvent;
 /// says.
 const FUEL_FLOOR: u64 = 100_000;
 
-/// What a strategy's fuel is kept at. It is deliberately far more than any
-/// strategy could burn between host calls: fairness between strategies is the
-/// epoch's job, and the declared fuel rate is what the tank is charged for.
+/// The fuel a strategy's store starts with. It is never topped up: it is how
+/// much the strategy has burnt that is read, and what it may burn is its
+/// budget's to say ([`crate::pace`]). Held to the highest rate there is, a
+/// strategy would take thousands of years to burn through it.
 pub const BANK: u64 = u64::MAX / 4;
 
 /// How long between the host taking control back, so no strategy can hold a
@@ -54,8 +56,9 @@ pub const SAID_AT_MOST: usize = 1_024;
 
 /// The longest a strategy is given to be instantiated: its start functions
 /// (a module's constructors among them) are its own code, run and billed as
-/// its `run` is. One that takes longer is stopped as a fault, and started
-/// again later.
+/// its `run` is. The time it spends parked for want of fuel is not counted,
+/// so a heavy start at a small rate is given what it pays for. One that
+/// takes longer is stopped as a fault, and started again later.
 pub const INSTANTIATE_WITHIN: Duration = Duration::from_secs(30);
 
 pub struct Runner {
@@ -128,62 +131,70 @@ impl Runner {
         let mut linker: Linker<Ctx> = Linker::new(engine);
         crate::host::link(&mut linker)?;
 
-        let (_, memory_mib) = enforced(&self.allowances);
-        let (state, net) = services(
-            self.network,
-            &self.allowances,
-            &self.home_chain,
-            &self.place.vault(),
-        );
+        let (fuel_per_sec, memory_mib) = enforced(&self.allowances);
+        // The models are held in the agent's memory allowance: what they
+        // take, its instance doesn't have.
+        let memory = u64::from(memory_mib) * 1024 * 1024;
         let inference = match &self.models {
             Some(dir) => Some(Arc::new(crate::inference::Inference::load(
                 dir,
                 crate::inference::Budget::from_allowance(self.allowances.inference_ms_per_min),
+                memory,
             )?)),
             None => None,
         };
-        let mut store = Store::new(
-            engine,
-            Ctx {
-                // A strategy gets a clock, randomness and somewhere to print.
-                // No filesystem, no environment, no sockets of its own.
-                wasi: WasiCtxBuilder::new()
-                    .inherit_stdout()
-                    .inherit_stderr()
-                    .allow_tcp(false)
-                    .allow_udp(false)
-                    .allow_ip_name_lookup(false)
-                    .build(),
-                table: handle_table(),
-                place: self.place.clone(),
-                home_chain: self.home_chain.clone(),
-                drivers: self.drivers.clone(),
-                inference,
-                state,
-                http: Default::default(),
-                http_hooks: crate::net::Http { net: net.clone() },
-                net,
-                account_events: Some(account_events),
-                vault_events: Some(vault_events),
-                following: self.following.clone(),
-                counters: counters.clone(),
-                halting_heard: self.halting_heard.clone(),
-                memory: Allowance::new(memory_mib as usize * 1024 * 1024),
-            },
+        let models = inference.as_ref().map_or(0, |models| models.bytes());
+        let memory = usize::try_from(memory.saturating_sub(models)).unwrap_or(usize::MAX);
+        let (state, net) = services(
+            self.network,
+            &self.allowances,
+            memory,
+            &self.home_chain,
+            &self.place.vault(),
         );
+        let mut store = Paced::new(
+            Store::new(
+                engine,
+                Ctx {
+                    // A strategy gets a clock, randomness and somewhere to print.
+                    // No filesystem, no environment, no sockets of its own.
+                    wasi: WasiCtxBuilder::new()
+                        .max_random_size(crate::host::RANDOM_AT_MOST)
+                        .inherit_stdout()
+                        .inherit_stderr()
+                        .allow_tcp(false)
+                        .allow_udp(false)
+                        .allow_ip_name_lookup(false)
+                        .build(),
+                    table: handle_table(),
+                    place: self.place.clone(),
+                    home_chain: self.home_chain.clone(),
+                    drivers: self.drivers.clone(),
+                    inference,
+                    state,
+                    http: Default::default(),
+                    http_hooks: crate::net::Http { net: net.clone() },
+                    net,
+                    account_events: Some(account_events),
+                    vault_events: Some(vault_events),
+                    following: self.following.clone(),
+                    counters: counters.clone(),
+                    halting_heard: self.halting_heard.clone(),
+                    memory: Allowance::new(memory),
+                },
+            ),
+            crate::pace::budget_of(&self.home_chain, &self.place.vault(), fuel_per_sec),
+            Box::new(|ctx: &mut Ctx| ctx.count(Counters::held_back)),
+        )?;
 
         // The strategy may grow to the memory it declared and no further. Set
         // before instantiating, so the memories and tables the strategy
         // declares are counted as well as what it grows them to.
         store.limiter(|ctx| ctx);
-
-        // Kept full: the declared rate is what the tank is billed for, not
-        // whether the strategy may carry on. It yields every
-        // [`YIELD_FUEL`] and at every epoch tick.
-        store.set_fuel(BANK)?;
-        store.fuel_async_yield_interval(Some(YIELD_FUEL))?;
-        store.set_epoch_deadline(1);
-        store.epoch_deadline_async_yield_and_update(1);
+        // And what it hands the host in one call (strings and lists, however
+        // often they repeat the same bytes of its memory) is held to the same
+        // allowance: past it, the call traps before the host copies more.
+        store.set_hostcall_fuel(memory);
 
         let vault = self.place.vault();
         let fault = |why: String| {
@@ -198,21 +209,23 @@ impl Runner {
         // function), so it is billed as running from here, held to the same
         // fuel, epoch and memory as `run`, and given only so long.
         let _running = Running::start(self.running.clone());
-        let instance = match tokio::time::timeout(
-            self.instantiate_within,
-            Agent::instantiate_async(&mut store, &component, &linker),
-        )
-        .await
+        let drive = store.drive();
+        let instance = match drive
+            .within(
+                self.instantiate_within,
+                Agent::instantiate_async(&mut *store, &component, &linker),
+            )
+            .await
         {
-            Ok(Ok(instance)) => {
+            Some(Ok(instance)) => {
                 let _ = self.instantiated.set(Instant::now());
                 instance
             }
-            Ok(Err(error)) => {
+            Some(Err(error)) => {
                 fault(format!("instantiating the strategy: {error:#}"));
                 return Ok(Stopped::NotInstantiated);
             }
-            Err(_) => {
+            None => {
                 fault(format!(
                     "instantiating the strategy took longer than {} s",
                     self.instantiate_within.as_secs_f64()
@@ -221,8 +234,8 @@ impl Runner {
             }
         };
 
-        let outcome = store
-            .run_concurrent(async |accessor| instance.call_run(accessor).await)
+        let outcome = drive
+            .run(store.run_concurrent(async |accessor| instance.call_run(accessor).await))
             .await;
         match outcome {
             Ok(Ok(Ok(()))) => {
@@ -238,12 +251,338 @@ impl Runner {
     }
 }
 
+/// What is done to a strategy's store each time it is parked for want of
+/// fuel: counted, for its health report.
+pub type OnParked<T> = Box<dyn FnMut(&mut T) + Send + Sync>;
+
+/// A strategy's store, metered as it runs and held to its fuel budget.
+///
+/// It yields every [`YIELD_FUEL`] of work and every [`YIELD_INTERVAL`] of
+/// time. At every tick of the engine's clock ([`crate::pace::CHECK_EVERY`])
+/// what it used since the last is charged to the budget, and a strategy
+/// whose budget is dry is parked there, between two instructions, until it
+/// has filled. Whatever was used after the last tick is charged when the
+/// store is dropped, however the run ended.
+///
+/// What it used is the fuel its own code burnt and the time the host spent
+/// working for it ([`HostClock`]), a core's second being worth
+/// [`shared::manifest::FUEL_PER_CORE_SECOND`]. The store is driven through
+/// [`Drive`], so that only the time it is being run is counted.
+pub struct Paced<T: 'static> {
+    store: Store<T>,
+    budget: Arc<crate::pace::Budget>,
+    /// The fuel the store held when it was last charged.
+    seen: Arc<std::sync::atomic::AtomicU64>,
+    host: Arc<HostClock>,
+    parked: Arc<Parked>,
+}
+
+impl<T: 'static> Paced<T> {
+    pub fn new(
+        mut store: Store<T>,
+        budget: Arc<crate::pace::Budget>,
+        mut parked: OnParked<T>,
+    ) -> Result<Self> {
+        store.set_fuel(BANK)?;
+        store.fuel_async_yield_interval(Some(YIELD_FUEL))?;
+        store.set_epoch_deadline(1);
+        let seen = Arc::new(std::sync::atomic::AtomicU64::new(BANK));
+        let host = Arc::new(HostClock::default());
+        let parked_for = Arc::new(Parked::default());
+        // Every way out of the strategy's code into the host's (an import,
+        // a call the runtime makes for it, a return from an export) and
+        // back passes through here: what lies between is the host's time.
+        let watched = host.clone();
+        store.call_hook(move |_, hook| {
+            if hook.entering_host() {
+                watched.enter();
+            } else {
+                watched.leave();
+            }
+            Ok(())
+        });
+        let mut yielded = tokio::time::Instant::now();
+        let (charged, seen_by_checks, host_by_checks, parked_by_checks) = (
+            budget.clone(),
+            seen.clone(),
+            host.clone(),
+            parked_for.clone(),
+        );
+        store.epoch_deadline_callback(move |mut store| {
+            use wasmtime::UpdateDeadline;
+            // Fuel is never topped up, so the store holds less of it only
+            // for what the strategy burnt.
+            let left = store.get_fuel()?;
+            let used = seen_by_checks
+                .swap(left, Ordering::SeqCst)
+                .saturating_sub(left)
+                .saturating_add(host_by_checks.take());
+            let now = tokio::time::Instant::now();
+            let park = charged.spend(used, now);
+            if park {
+                parked(store.data_mut());
+            }
+            // The metering's own work is not the strategy's.
+            host_by_checks.skip();
+            if park {
+                yielded = now;
+                let (budget, parked) = (charged.clone(), parked_by_checks.clone());
+                return Ok(UpdateDeadline::YieldCustom(
+                    1,
+                    Box::pin(async move {
+                        let _parked = parked.start();
+                        budget.refilled().await
+                    }),
+                ));
+            }
+            if now.duration_since(yielded) >= YIELD_INTERVAL {
+                yielded = now;
+                return Ok(UpdateDeadline::Yield(1));
+            }
+            Ok(UpdateDeadline::Continue(1))
+        });
+        Ok(Self {
+            store,
+            budget,
+            seen,
+            host,
+            parked: parked_for,
+        })
+    }
+
+    /// What drives the store: every future that runs the strategy is run
+    /// through it.
+    pub fn drive(&self) -> Drive {
+        Drive {
+            host: self.host.clone(),
+            parked: self.parked.clone(),
+        }
+    }
+}
+
+/// The time the host spends working for a strategy, outside its own code:
+/// in its imports, lifting and lowering what they take and give, in the
+/// runtime's calls on its behalf, and in polling the work its calls set
+/// going. Counted only while the strategy's store is being driven
+/// ([`Drive`]): a call waiting on the network, or a strategy parked, takes
+/// nothing of the machine. Charged at a core's rate, a nanosecond of it a
+/// unit of fuel at the published [`shared::manifest::FUEL_PER_CORE_SECOND`].
+///
+/// The host's code is everything that runs between the strategy's code
+/// handing over (calling an import, returning from an export) and taking
+/// back (an import returning, an export called); the runtime switches
+/// between the strategy's tasks only from the host's side, so this holds
+/// however its tasks interleave.
+#[derive(Debug)]
+pub struct HostClock {
+    state: Mutex<HostState>,
+}
+
+#[derive(Debug)]
+struct HostState {
+    /// Whether the host's code is the one running.
+    in_host: bool,
+    /// When the host's latest stretch of running began, while it runs.
+    since: Option<Instant>,
+    /// The host's time not yet charged, in nanoseconds.
+    owed: u128,
+}
+
+impl Default for HostClock {
+    fn default() -> Self {
+        // Before the strategy's code first runs, the host is instantiating
+        // it.
+        Self {
+            state: Mutex::new(HostState {
+                in_host: true,
+                since: None,
+                owed: 0,
+            }),
+        }
+    }
+}
+
+impl HostState {
+    fn count(&mut self, now: Instant) {
+        if let Some(since) = self.since.take() {
+            self.owed = self
+                .owed
+                .saturating_add(now.saturating_duration_since(since).as_nanos());
+        }
+    }
+}
+
+impl HostClock {
+    fn state(&self) -> std::sync::MutexGuard<'_, HostState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The strategy's code handed over to the host's.
+    fn enter(&self) {
+        let mut state = self.state();
+        state.in_host = true;
+        state.since = Some(Instant::now());
+    }
+
+    /// The host's code handed back to the strategy's.
+    fn leave(&self) {
+        let mut state = self.state();
+        state.count(Instant::now());
+        state.in_host = false;
+    }
+
+    /// The store is being driven again.
+    fn resume(&self) {
+        let mut state = self.state();
+        if state.in_host {
+            state.since = Some(Instant::now());
+        }
+    }
+
+    /// The store is no longer being driven: it waits, or is parked.
+    fn pause(&self) {
+        self.state().count(Instant::now());
+    }
+
+    /// Leave the time since the latest count out: work that is the host's
+    /// own.
+    fn skip(&self) {
+        let mut state = self.state();
+        if state.since.is_some() {
+            state.since = Some(Instant::now());
+        }
+    }
+
+    /// The host's time not yet charged, as fuel, counted up to now.
+    pub fn take(&self) -> u64 {
+        let mut state = self.state();
+        let now = Instant::now();
+        if state.since.is_some() {
+            state.count(now);
+            state.since = Some(now);
+        }
+        let owed = std::mem::take(&mut state.owed);
+        let fuel =
+            owed.saturating_mul(u128::from(shared::manifest::FUEL_PER_CORE_SECOND)) / 1_000_000_000;
+        u64::try_from(fuel).unwrap_or(u64::MAX)
+    }
+}
+
+/// How long a strategy has been parked for want of fuel.
+#[derive(Debug, Default)]
+struct Parked {
+    state: Mutex<(Duration, Option<tokio::time::Instant>)>,
+}
+
+impl Parked {
+    fn state(&self) -> std::sync::MutexGuard<'_, (Duration, Option<tokio::time::Instant>)> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Parked from now until what is returned is dropped.
+    fn start(self: &Arc<Self>) -> ParkedNow {
+        self.state().1 = Some(tokio::time::Instant::now());
+        ParkedNow(self.clone())
+    }
+
+    /// All the time parked up to `now`.
+    fn so_far(&self, now: tokio::time::Instant) -> Duration {
+        let (total, since) = *self.state();
+        total + since.map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
+    }
+}
+
+struct ParkedNow(Arc<Parked>);
+
+impl Drop for ParkedNow {
+    fn drop(&mut self) {
+        let mut state = self.0.state();
+        if let Some(since) = state.1.take() {
+            state.0 += tokio::time::Instant::now().saturating_duration_since(since);
+        }
+    }
+}
+
+/// Drives a strategy's store: runs a future that runs the strategy, so the
+/// host's time is counted only while it is being polled.
+#[derive(Clone)]
+pub struct Drive {
+    host: Arc<HostClock>,
+    parked: Arc<Parked>,
+}
+
+impl Drive {
+    /// Run `future`, counting the host's time only while it is polled.
+    pub async fn run<F: std::future::Future>(&self, future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        std::future::poll_fn(|cx| {
+            self.host.resume();
+            let polled = future.as_mut().poll(cx);
+            self.host.pause();
+            polled
+        })
+        .await
+    }
+
+    /// Run `future` for at most `limit`, not counting the time the strategy
+    /// is parked for want of fuel: `None` if it took longer.
+    pub async fn within<F: std::future::Future>(
+        &self,
+        limit: Duration,
+        future: F,
+    ) -> Option<F::Output> {
+        let started = tokio::time::Instant::now();
+        let mut future = std::pin::pin!(self.run(future));
+        loop {
+            let now = tokio::time::Instant::now();
+            let spent = now
+                .saturating_duration_since(started)
+                .saturating_sub(self.parked.so_far(now));
+            if spent >= limit {
+                return None;
+            }
+            if let Ok(output) = tokio::time::timeout(limit - spent, future.as_mut()).await {
+                return Some(output);
+            }
+        }
+    }
+}
+
+impl<T: 'static> std::ops::Deref for Paced<T> {
+    type Target = Store<T>;
+    fn deref(&self) -> &Store<T> {
+        &self.store
+    }
+}
+
+impl<T: 'static> std::ops::DerefMut for Paced<T> {
+    fn deref_mut(&mut self) -> &mut Store<T> {
+        &mut self.store
+    }
+}
+
+impl<T: 'static> Drop for Paced<T> {
+    fn drop(&mut self) {
+        let mut used = self.host.take();
+        if let Ok(left) = self.store.get_fuel() {
+            used = used.saturating_add(self.seen.swap(left, Ordering::SeqCst).saturating_sub(left));
+        }
+        self.budget.settle(used, tokio::time::Instant::now());
+    }
+}
+
 /// What a start of an agent is given besides its imports: its state, empty
 /// at every start, so an agent rebuilds from the venue; and its network,
-/// whose usage is the vault's and carries on from one start to the next.
+/// whose usage is the vault's and carries on from one start to the next, and
+/// whose messages waiting for the agent are held to its `memory` allowance.
 pub fn services(
     network: bool,
     allowances: &shared::Allowances,
+    memory: usize,
     home_chain: &str,
     vault: &str,
 ) -> (crate::state::Store, crate::net::Net) {
@@ -252,6 +591,7 @@ pub fn services(
         quotas: crate::net::Quotas::of(allowances),
         usage: crate::net::usage_of(home_chain, vault),
         reach: crate::net::Reach::Public,
+        waiting: crate::net::Waiting::new(memory),
     };
     (crate::state::Store::default(), net)
 }
@@ -363,12 +703,14 @@ impl Drop for Running {
     }
 }
 
-/// Keep the engine's clock ticking, so an epoch deadline means something.
+/// Keep the engine's clock ticking, so an epoch deadline means something:
+/// at every tick a running strategy's fuel is charged, and every few it
+/// yields.
 pub fn start_epoch_ticker(engine: &Engine) {
     let engine = engine.clone();
     std::thread::spawn(move || {
         loop {
-            std::thread::sleep(YIELD_INTERVAL);
+            std::thread::sleep(crate::pace::CHECK_EVERY);
             engine.increment_epoch();
         }
     });
@@ -405,6 +747,97 @@ mod tests {
         const { assert!(YIELD_FUEL >= 1_000_000) };
     }
 
+    /// A core module whose `spin` never returns, the busiest an agent can
+    /// be: one loop, no calls, counting its turns in `$turns` so what it
+    /// burnt can be told from the turns even where the store's own count of
+    /// fuel lags. `turn(n)` makes `n` turns and returns, to weigh one.
+    const SPINS: &str = r#"(module
+        (global $turns (export "turns") (mut i64) (i64.const 0))
+        (func (export "spin")
+            (loop $on
+                (global.set $turns (i64.add (global.get $turns) (i64.const 1)))
+                (br $on)))
+        (func (export "turn") (param $n i64)
+            (loop $on
+                (global.set $turns (i64.add (global.get $turns) (i64.const 1)))
+                (local.set $n (i64.sub (local.get $n) (i64.const 1)))
+                (br_if $on (i64.gt_s (local.get $n) (i64.const 0))))))"#;
+
+    /// The fuel a store metered as an agent's, declared at `rate`, burns
+    /// spinning for `over`, from the turns it made; and what its budget was
+    /// charged.
+    async fn fuel_spun(rate: u64, over: Duration) -> (u64, u64) {
+        let engine = engine().unwrap();
+        start_epoch_ticker(&engine);
+        let module = wasmtime::Module::new(&engine, SPINS).unwrap();
+
+        // What a turn of `spin` costs: a turn of `turn` less its own count
+        // and test.
+        let mut weighing = Store::new(&engine, ());
+        weighing.set_fuel(BANK).unwrap();
+        weighing.set_epoch_deadline(1 << 40);
+        let instance = wasmtime::Instance::new(&mut weighing, &module, &[]).unwrap();
+        let turn = instance
+            .get_typed_func::<i64, ()>(&mut weighing, "turn")
+            .unwrap();
+        let mut cost = |turns: i64| {
+            let before = weighing.get_fuel().unwrap();
+            turn.call(&mut weighing, turns).unwrap();
+            before - weighing.get_fuel().unwrap()
+        };
+        let per_turn = (cost(2_001) - cost(1_001)) / 1_000;
+        // `local.get`, `i64.const`, `i64.sub`, `local.set`, `local.get`,
+        // `i64.const`, `i64.gt_s` and `br_if` against `br`.
+        let per_turn = per_turn - 7;
+
+        let budget = Arc::new(crate::pace::Budget::new(rate, tokio::time::Instant::now()));
+        let mut store =
+            Paced::new(Store::new(&engine, ()), budget.clone(), Box::new(|_| {})).unwrap();
+        let drive = store.drive();
+        let instance = drive
+            .run(wasmtime::Instance::new_async(&mut *store, &module, &[]))
+            .await
+            .unwrap();
+        let spin = instance
+            .get_typed_func::<(), ()>(&mut *store, "spin")
+            .unwrap();
+        let spun = tokio::time::timeout(over, drive.run(spin.call_async(&mut *store, ()))).await;
+        assert!(spun.is_err(), "the spinning agent stopped by itself");
+        let turns = instance
+            .get_global(&mut *store, "turns")
+            .unwrap()
+            .get(&mut *store)
+            .i64()
+            .unwrap();
+        drop(store);
+        (turns as u64 * per_turn, budget.used())
+    }
+
+    /// An agent that declared ten million fuel a second and spins flat out
+    /// uses no more than that over ten seconds, give or take the one slice
+    /// of work ([`YIELD_FUEL`]) a loop without calls is seen in, and is
+    /// given at least half of it; all it used is charged to its budget, but
+    /// for the part of that slice it was stopped in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_agent_that_spins_uses_no_more_fuel_a_second_than_it_declared() {
+        let rate = 10_000_000;
+        let over = Duration::from_secs(10);
+        let (used, charged) = fuel_spun(rate, over).await;
+        let most = rate * over.as_secs() + YIELD_FUEL;
+        assert!(
+            used <= most,
+            "declared {rate} fuel a second, used {used} over ten seconds, past {most}"
+        );
+        assert!(
+            used >= rate * over.as_secs() / 2,
+            "declared {rate} fuel a second, was given only {used} over ten seconds"
+        );
+        assert!(
+            charged <= used && used - charged <= YIELD_FUEL,
+            "used {used} fuel, charged {charged}"
+        );
+    }
+
     #[test]
     fn the_agent_is_billed_as_running_only_while_the_flag_is_held() {
         let flag = Arc::new(AtomicBool::new(false));
@@ -412,6 +845,139 @@ mod tests {
         assert!(flag.load(Ordering::SeqCst));
         drop(held);
         assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    /// A core module that calls its import `host.work` once from `go`.
+    const CALLS_THE_HOST: &str = r#"(module
+        (import "host" "work" (func $work))
+        (func (export "go") (call $work)))"#;
+
+    /// What the budget of a store declared at a large rate is charged for
+    /// one call of `go`, whose import is `work`, driven as an agent's is.
+    async fn charged_for(work: impl Fn(&mut wasmtime::Linker<()>) -> wasmtime::Result<()>) -> u64 {
+        let engine = engine().unwrap();
+        start_epoch_ticker(&engine);
+        let module = wasmtime::Module::new(&engine, CALLS_THE_HOST).unwrap();
+        let mut linker = wasmtime::Linker::new(&engine);
+        work(&mut linker).unwrap();
+        let budget = Arc::new(crate::pace::Budget::new(
+            shared::manifest::FUEL_PER_CORE_SECOND,
+            tokio::time::Instant::now(),
+        ));
+        let mut store =
+            Paced::new(Store::new(&engine, ()), budget.clone(), Box::new(|_| {})).unwrap();
+        let drive = store.drive();
+        let instance = drive
+            .run(linker.instantiate_async(&mut *store, &module))
+            .await
+            .unwrap();
+        // What instantiating cost, left out.
+        store.host.take();
+        let before = budget.used();
+        let go = instance
+            .get_typed_func::<(), ()>(&mut *store, "go")
+            .unwrap();
+        drive.run(go.call_async(&mut *store, ())).await.unwrap();
+        drop(store);
+        budget.used() - before
+    }
+
+    /// The host working for an agent inside one of its imports is charged
+    /// to its budget at a core's rate, though its own code burnt next to
+    /// nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_host_s_work_inside_an_import_is_charged_at_a_core_s_rate() {
+        let busy = Duration::from_millis(50);
+        let charged = charged_for(|linker| {
+            linker.func_wrap("host", "work", move || {
+                let began = Instant::now();
+                while began.elapsed() < busy {
+                    std::hint::spin_loop();
+                }
+            })?;
+            Ok(())
+        })
+        .await;
+        let core = shared::manifest::FUEL_PER_CORE_SECOND as f64;
+        let least = (busy.as_secs_f64() * core) as u64;
+        assert!(
+            charged >= least && charged < least * 2,
+            "the host worked {busy:?} in an import, charged {charged} fuel"
+        );
+    }
+
+    /// An import waiting (on the network, say) takes nothing of the
+    /// machine, and is charged nothing for the wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_import_waiting_is_not_charged_for_the_wait() {
+        let wait = Duration::from_millis(200);
+        let charged = charged_for(|linker| {
+            linker.func_wrap_async("host", "work", move |_, ()| {
+                Box::new(async move { tokio::time::sleep(wait).await })
+            })?;
+            Ok(())
+        })
+        .await;
+        // A twentieth of the wait at most: the host's own steps around it.
+        let most =
+            (wait.as_secs_f64() / 20.0 * shared::manifest::FUEL_PER_CORE_SECOND as f64) as u64;
+        assert!(
+            charged < most,
+            "an import waited {wait:?}, charged {charged} fuel"
+        );
+    }
+
+    /// Time an agent spends parked for want of fuel is not counted against
+    /// the time it is given: work it pays for slowly is given time to
+    /// finish.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_parked_is_not_counted_against_a_time_limit() {
+        let engine = engine().unwrap();
+        start_epoch_ticker(&engine);
+        let module = wasmtime::Module::new(&engine, SPINS).unwrap();
+        // Work of a few seconds of what the rate pays for, seen by the
+        // budget a slice ([`YIELD_FUEL`]) at a time.
+        let rate = 20_000_000;
+        let budget = Arc::new(crate::pace::Budget::new(rate, tokio::time::Instant::now()));
+        let mut store =
+            Paced::new(Store::new(&engine, ()), budget.clone(), Box::new(|_| {})).unwrap();
+        let drive = store.drive();
+        let instance = drive
+            .run(wasmtime::Instance::new_async(&mut *store, &module, &[]))
+            .await
+            .unwrap();
+        let turn = instance
+            .get_typed_func::<i64, ()>(&mut *store, "turn")
+            .unwrap();
+        let limit = Duration::from_millis(500);
+        let began = Instant::now();
+        let done = drive
+            .within(limit, turn.call_async(&mut *store, 5_000_000))
+            .await;
+        assert!(done.is_some(), "slow work was cut short");
+        assert!(began.elapsed() > 2 * limit, "{:?}", began.elapsed());
+        drop(store);
+        assert!(budget.used() >= rate, "{}", budget.used());
+        // Work that never ends is still cut short.
+        let rich = Arc::new(crate::pace::Budget::new(
+            shared::manifest::FUEL_PER_CORE_SECOND,
+            tokio::time::Instant::now(),
+        ));
+        let mut store = Paced::new(Store::new(&engine, ()), rich, Box::new(|_| {})).unwrap();
+        let drive = store.drive();
+        let instance = drive
+            .run(wasmtime::Instance::new_async(&mut *store, &module, &[]))
+            .await
+            .unwrap();
+        let spin = instance
+            .get_typed_func::<(), ()>(&mut *store, "spin")
+            .unwrap();
+        assert!(
+            drive
+                .within(limit, spin.call_async(&mut *store, ()))
+                .await
+                .is_none()
+        );
     }
 
     /// A component that does nothing, told apart from others by `tag`.
@@ -450,7 +1016,7 @@ mod tests {
     #[test]
     fn an_agent_started_again_has_empty_state_and_its_vault_s_bandwidth_so_far() {
         let allowances = shared::Allowances::modest();
-        let (mut state, net) = services(true, &allowances, "base", "0xrestarted");
+        let (mut state, net) = services(true, &allowances, 1 << 20, "base", "0xrestarted");
         state.set("state", "peak", b"100".to_vec()).unwrap();
         net.usage
             .bytes(&net.quotas, 1_000, std::time::Instant::now())
@@ -458,7 +1024,7 @@ mod tests {
         assert!(net.declared);
 
         // Started again: nothing kept in state, the day's bytes still counted.
-        let (state, net) = services(true, &allowances, "base", "0xrestarted");
+        let (state, net) = services(true, &allowances, 1 << 20, "base", "0xrestarted");
         assert_eq!(state.get("state", "peak"), None);
         assert_eq!(net.usage.bytes_today(), 1_000);
         // Held to the vault's allowances.

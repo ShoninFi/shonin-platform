@@ -13,10 +13,14 @@ use indexer::store::{Store, is_file_name, is_hash, is_sealed};
 const SOURCE: &str = "5ea1ed0000000000000000000000000000000000000000000000000000000000";
 const BUNDLE: &str = "b0d1e00000000000000000000000000000000000000000000000000000000000";
 
+/// A directory of its own for each store: tests run at once, and a clock
+/// alone can give two of them the same name.
 fn scratch() -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "shonin-store-sealed-{}-{}",
+        "shonin-store-sealed-{}-{}-{}",
         std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

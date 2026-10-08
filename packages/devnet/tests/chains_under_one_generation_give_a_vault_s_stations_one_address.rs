@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 
 /// The contracts a deploy reads from the build's output.
 const CONTRACTS: &[&str] = &[
+    "BatchCreate2",
     "LocalUsd",
     "LocalVenue",
     "DevAttestationVerifier",

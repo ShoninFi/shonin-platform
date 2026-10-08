@@ -8,15 +8,19 @@
 # config.yml), and every gcloud call passes --project, and --zone or --region
 # where the resource has one, so nothing ever falls back to the gcloud default.
 #
-# Three VMs per network, all in GCP_ZONE:
+# The VMs of a network, all in GCP_ZONE:
 # - shonin-executor-<network>: the executor, attested, on a Confidential Space
 #   VM launched from its image's digest (the digest is what the attestation
 #   measures). Its settings are baked into the image: nothing is passed to it
 #   at launch.
+# - shonin-builder-<network> and shonin-reviewer-<network>: the build service
+#   and the reviewer, attested the same way, on demand: each exits once idle
+#   and its VM powers off, and the waker starts it again when there is work.
 # - shonin-services-<network>: a small plain VM (Container-Optimized OS)
 #   running the API (the indexer inside), the keeper, the Cloudflare tunnel
 #   that carries the API to its public name, and the waker that starts the
-#   prover when a seal is wanted (deploy/gcp/services).
+#   prover, the builder and the reviewer when they are wanted
+#   (deploy/gcp/services).
 # - shonin-prover-<network>: an on-demand VM that makes the attestation's proof
 #   when woken and powers itself off when idle (deploy/gcp/prover).
 version: "3"
@@ -43,24 +47,47 @@ vars:
   # B's image: the attestation's prover, run on its own VM, off when idle.
   PROVERS: "prover"
   # The VMs a network runs, by role: shonin-<role>-<network>.
-  VMS: "executor services prover"
+  VMS: "executor services prover builder reviewer"
+  # The machines started on demand by the waker, and powered off when idle.
+  ON_DEMAND: "builder reviewer"
   # The ports inside the VPC (fixed: the images bake them).
   CLOUD_PORT_API: "19081"
+  CLOUD_PORT_API_INTERNAL: "19082"
+  CLOUD_PORT_BUILDER: "19084"
   CLOUD_PORT_EXECUTOR: "19085"
+  CLOUD_PORT_REVIEWER: "19086"
   CLOUD_PORT_KEEPER: "19087"
   # Internal DNS names, so the images can name each other.
   GCP_INTERNAL: "{{.GCP_ZONE}}.c.{{.GCP_PROJECT}}.internal"
   CLOUD_URL_EXECUTOR: "http://shonin-executor-{{.NETWORK}}.{{.GCP_INTERNAL}}:{{.CLOUD_PORT_EXECUTOR}}"
   CLOUD_URL_API: "http://shonin-services-{{.NETWORK}}.{{.GCP_INTERNAL}}:{{.CLOUD_PORT_API}}"
-  # The content store's public copy (an R2 bucket): testnet only so far.
+  # The API's internal port: the builder's and the reviewer's state, their
+  # built files, and their asks to be woken.
+  CLOUD_URL_API_INTERNAL: "http://shonin-services-{{.NETWORK}}.{{.GCP_INTERNAL}}:{{.CLOUD_PORT_API_INTERNAL}}"
+  CLOUD_URL_BUILDER: "http://shonin-builder-{{.NETWORK}}.{{.GCP_INTERNAL}}:{{.CLOUD_PORT_BUILDER}}"
+  CLOUD_URL_REVIEWER: "http://shonin-reviewer-{{.NETWORK}}.{{.GCP_INTERNAL}}:{{.CLOUD_PORT_REVIEWER}}"
+  # The content store's public copy (an R2 bucket): testnet only so far. The
+  # API reads through to it.
   CLOUD_URL_STORE: '{{if eq .NETWORK "testnet"}}{{.URL_STORE_TESTNET}}{{end}}'
+  # Where the executor reads the store's files: the API's store, which holds
+  # what the cloud built and reads through to the public copy for the rest.
+  CLOUD_URL_STORE_READ: "{{.CLOUD_URL_API}}/api/store"
   PROVER_INSTANCE: "projects/{{.GCP_PROJECT}}/zones/{{.GCP_ZONE}}/instances/shonin-prover-{{.NETWORK}}"
+  BUILDER_INSTANCE: "projects/{{.GCP_PROJECT}}/zones/{{.GCP_ZONE}}/instances/shonin-builder-{{.NETWORK}}"
+  REVIEWER_INSTANCE: "projects/{{.GCP_PROJECT}}/zones/{{.GCP_ZONE}}/instances/shonin-reviewer-{{.NETWORK}}"
   SERVICES_ACCOUNT: "{{.GCP_SERVICES_SERVICE_ACCOUNT}}@{{.GCP_PROJECT}}.iam.gserviceaccount.com"
   PROVER_ACCOUNT: "{{.GCP_PROVER_SERVICE_ACCOUNT}}@{{.GCP_PROJECT}}.iam.gserviceaccount.com"
   WORKLOAD_ACCOUNT: "{{.GCP_WORKLOAD_SERVICE_ACCOUNT}}@{{.GCP_PROJECT}}.iam.gserviceaccount.com"
-  # The custom role that may start and read one instance: bound to the
-  # services VM's account on the prover's instance alone.
+  # The custom role that may start, stop and read one instance: bound to the
+  # services VM's account on the prover's, the builder's and the reviewer's
+  # instances alone.
   PROVER_STARTER_ROLE: "shoninProverStarter"
+  PROVER_STARTER_PERMISSIONS: "compute.instances.start,compute.instances.stop,compute.instances.get"
+  # What the waker on the services VM watches and starts, beside the prover:
+  # the builder's and the reviewer's status ports and instances.
+  WAKER_METADATA: "shonin-builder-url={{.CLOUD_URL_BUILDER}}~shonin-builder-instance={{.BUILDER_INSTANCE}}~shonin-reviewer-url={{.CLOUD_URL_REVIEWER}}~shonin-reviewer-instance={{.REVIEWER_INSTANCE}}"
+  # The status ports the prover proves for, beside the executor's.
+  PROVER_STATUS_URLS: "{{.CLOUD_URL_BUILDER}},{{.CLOUD_URL_REVIEWER}}"
   # How far back `task cloud:logs` looks.
   LOGS_FRESHNESS: "{{.FRESHNESS | default \"30m\"}}"
   # The image digest of NAME:IMAGE_TAG in the registry, for a shell to run.
@@ -70,7 +97,7 @@ vars:
 
 tasks:
   build:
-    desc: "Build an image locally for a network (NAME=reviewer|builder|executor|unwinder|requester|api|indexer|keeper|prover, NETWORK=testnet|mainnet; SEALED=<dir holding sealed.json> for the requester), tagged NAME:TAG (the commit by default), with the network's deployments and settings baked in"
+    desc: "Build an image locally for a network (NAME=reviewer|builder|executor|unwinder|requester|api|indexer|keeper|prover, NETWORK=testnet|mainnet; SEALED=<dir holding sealed.json> for the requester and the reviewer), tagged NAME:TAG (the commit by default), with the network's deployments and settings baked in"
     requires:
       vars: [NAME, NETWORK]
     preconditions:
@@ -102,10 +129,10 @@ tasks:
       GUEST_CONTEXT: '{{if eq .NAME "prover"}}--build-context guest="{{.GUEST_DIR}}"{{end}}'
       # The requester's sealed message (made with shonin-seal): the
       # directory holding its sealed.json.
-      SEALED_CONTEXT: '{{if eq .NAME "requester"}}--build-context sealed="{{.SEALED}}"{{end}}'
+      SEALED_CONTEXT: '{{if or (eq .NAME "requester") (eq .NAME "reviewer")}}--build-context sealed="{{.SEALED}}"{{end}}'
     cmds:
       - cmd: '[ "{{.NAME}}" != "prover" ] || [ -s "{{.GUEST_DIR}}/shonin-attestation-guest.bin" ] || { echo "no guest ELF: build it with SHONIN_ATTESTATION_BUILD_GUEST=1, or set GUEST_DIR"; exit 1; }'
-      - cmd: '[ "{{.NAME}}" != "requester" ] || [ -s "{{.SEALED}}/sealed.json" ] || { echo "no sealed message: pass SEALED=<dir holding sealed.json>, made with shonin-seal"; exit 1; }'
+      - cmd: '{ [ "{{.NAME}}" != "requester" ] && [ "{{.NAME}}" != "reviewer" ]; } || [ -s "{{.SEALED}}/sealed.json" ] || { echo "no sealed message: pass SEALED=<dir holding sealed.json>, made with task rootkey:seal"; exit 1; }'
       # Confidential Space and Compute Engine run linux/amd64. Every image
       # is handed the same settings and takes the ones it uses: the network,
       # the deployments directory (as the build context `deployments`; the
@@ -131,6 +158,10 @@ tasks:
           --build-arg STORE_URL={{.CLOUD_URL_STORE}} \
           --build-arg API_URL={{.CLOUD_URL_API}} \
           --build-arg EXECUTOR_URL={{.CLOUD_URL_EXECUTOR}} \
+          --build-arg BUILDER_URL={{.CLOUD_URL_BUILDER}} \
+          --build-arg REVIEWER_URL={{.CLOUD_URL_REVIEWER}} \
+          --build-arg STORE_READ_URL={{.CLOUD_URL_STORE_READ}} \
+          --build-arg API_INTERNAL_URL={{.CLOUD_URL_API_INTERNAL}} \
           --build-context deployments="$deployments" \
           {{.GUEST_CONTEXT}} \
           {{.SEALED_CONTEXT}} \
@@ -180,15 +211,17 @@ tasks:
       - echo "{{.NAME}}:{{.IMAGE_TAG}} is $({{.DIGEST_OF}} "{{.GCP_REGISTRY}}/{{.NAME}}:{{.IMAGE_TAG}}")"
 
   images:
-    desc: "Build and push several images at once, side by side in one Cloud Build with its layer cache (BUILDER=cloud, the default here) or one after another here (BUILDER=local), and print each digest (NAMES=\"api keeper executor prover\", NETWORK=testnet; TAG= the commit by default; SKIP_PUSHED=1 leaves an image already pushed under TAG)"
+    desc: "Build and push several images at once, side by side in one Cloud Build with its layer cache (BUILDER=cloud, the default here) or one after another here (BUILDER=local), and print each digest (NAMES=\"api keeper executor prover builder reviewer unwinder\", NETWORK=testnet; the reviewer needs SEALED=<dir holding sealed.json>, its sealed model key; TAG= the commit by default; SKIP_PUSHED=1 leaves an image already pushed under TAG)"
     requires:
       vars: [NETWORK, GCP_PROJECT]
     preconditions:
       - *network
       - *project
       - *builder
-      - sh: 'for n in {{.NAMES}}; do case " api keeper executor prover " in *" $n "*) ;; *) exit 1 ;; esac; done'
-        msg: "Cloud Build builds api, keeper, executor and prover (NAMES={{.NAMES}})."
+      - sh: 'for n in {{.NAMES}}; do case " api keeper executor prover builder reviewer unwinder " in *" $n "*) ;; *) exit 1 ;; esac; done'
+        msg: "Cloud Build builds api, keeper, executor, prover, builder, reviewer and unwinder (NAMES={{.NAMES}})."
+      - sh: 'case " {{.NAMES}} " in *" reviewer "*) [ -s "{{.SEALED}}/sealed.json" ] ;; esac'
+        msg: "The reviewer's image carries its model key, sealed: pass SEALED=<dir holding sealed.json> (task cloud:reviewer makes it)."
       - sh: 'ls "{{.PATH_DEPLOYMENTS_DIR}}"/evm-*.json >/dev/null 2>&1'
         msg: "No deployment files in {{.PATH_DEPLOYMENTS_DIR}}: deploy the network's contracts first (task chains:deploy NETWORK={{.NETWORK}}). An image carries its network's deployments."
     vars:
@@ -221,7 +254,7 @@ tasks:
         started=$(date +%s)
         if [ "{{.BUILDER}}" = "local" ]; then
           for name in $names; do
-            task cloud:push:local NAME="$name" NETWORK={{.NETWORK}} TAG={{.IMAGE_TAG}}
+            task cloud:push:local NAME="$name" NETWORK={{.NETWORK}} TAG={{.IMAGE_TAG}} SEALED="{{.SEALED}}"
           done
         else
           case " $names " in
@@ -229,10 +262,14 @@ tasks:
                           guest="{{.GUEST_DIR}}" ;;
             *) guest="" ;;
           esac
+          case " $names " in
+            *" reviewer "*) sealed="{{.SEALED}}" ;;
+            *) sealed="" ;;
+          esac
           scratch=$(mktemp -d)
           trap 'rm -rf "$scratch"' EXIT
           cd "{{.PATH_ROOT}}"
-          deploy/gcp/cloudbuild/stage.sh "$scratch/source.tgz" "{{.PATH_DEPLOYMENTS_DIR}}" $guest
+          deploy/gcp/cloudbuild/stage.sh "$scratch/source.tgz" "{{.PATH_DEPLOYMENTS_DIR}}" "$guest" "$sealed"
           object="gs://{{.GCP_CLOUDBUILD_BUCKET}}/source/{{.IMAGE_TAG}}-$(date +%s).tgz"
           gcloud storage cp "$scratch/source.tgz" "$object" --project="{{.GCP_PROJECT}}" --quiet
           # One build for them all, on one worker (the project's quota runs
@@ -240,7 +277,7 @@ tasks:
           gcloud builds submit "$object" \
             --project="{{.GCP_PROJECT}}" --region="{{.GCP_REGION}}" \
             --config=deploy/gcp/cloudbuild.yaml \
-            --substitutions="^~^_NAMES=$names~_TAG={{.IMAGE_TAG}}~_REGISTRY={{.GCP_REGISTRY}}~_NETWORK={{.NETWORK}}~_NETWORK_FEATURE={{.NETWORK_FEATURE}}~_WITHOUT_SOLANA={{.WITHOUT_SOLANA}}~_STORE_URL={{.CLOUD_URL_STORE}}~_API_URL={{.CLOUD_URL_API}}~_EXECUTOR_URL={{.CLOUD_URL_EXECUTOR}}" \
+            --substitutions="^~^_NAMES=$names~_TAG={{.IMAGE_TAG}}~_REGISTRY={{.GCP_REGISTRY}}~_NETWORK={{.NETWORK}}~_NETWORK_FEATURE={{.NETWORK_FEATURE}}~_WITHOUT_SOLANA={{.WITHOUT_SOLANA}}~_STORE_URL={{.CLOUD_URL_STORE}}~_API_URL={{.CLOUD_URL_API}}~_EXECUTOR_URL={{.CLOUD_URL_EXECUTOR}}~_BUILDER_URL={{.CLOUD_URL_BUILDER}}~_REVIEWER_URL={{.CLOUD_URL_REVIEWER}}~_STORE_READ_URL={{.CLOUD_URL_STORE_READ}}~_API_INTERNAL_URL={{.CLOUD_URL_API_INTERNAL}}" \
             || { gcloud storage rm "$object" --project="{{.GCP_PROJECT}}" --quiet >/dev/null 2>&1; exit 1; }
           gcloud storage rm "$object" --project="{{.GCP_PROJECT}}" --quiet >/dev/null 2>&1 || true
         fi
@@ -268,7 +305,7 @@ tasks:
         fi
 
   deploy:machine:
-    desc: "Launch a machine on a Confidential Space VM (hardened image, Intel TDX) from its pushed image's digest, nothing passed to it (NAME=executor|..., NETWORK=..., TAG= the commit by default)"
+    desc: "Launch a machine on a Confidential Space VM (hardened image, Intel TDX) from its pushed image's digest, nothing passed to it (NAME=executor|builder|reviewer|unwinder|requester, NETWORK=..., TAG= the commit by default). The executor is restarted whenever it stops; the builder, the reviewer and the unwinder are not, and their VM powers off when they exit"
     requires:
       vars: [NAME, NETWORK, GCP_PROJECT]
     preconditions:
@@ -279,27 +316,38 @@ tasks:
     vars:
       # The tag as this task was given it: file-level vars never see a caller's TAG.
       IMAGE_TAG: '{{.TAG | default .GIT_SHA}}'
+      # The executor and the root key's test requester run until stopped; the
+      # machines that run on demand (and the unwinder's one-off check) exit,
+      # and the hardened image then powers the VM off.
+      RESTART_POLICY: '{{if or (eq .NAME "executor") (eq .NAME "requester")}}Always{{else}}Never{{end}}'
+      # The builder compiles (the toolchain image and its target directories
+      # on the boot disk); the reviewer mostly waits on its model.
+      MACHINE_TYPE: '{{if eq .NAME "reviewer"}}{{.GCP_REVIEWER_MACHINE_TYPE}}{{else}}{{.GCP_MACHINE_TYPE}}{{end}}'
+      BOOT_DISK: '{{if eq .NAME "builder"}}--boot-disk-size=30GB{{end}}'
     cmds:
       # The digest, not the tag: it is what the attestation measures. No
       # tee-env- and no tee-cmd: the image carries its settings, and the
       # attestation refuses any override of either. The other launcher
       # settings are not overrides: the container's lines go to Cloud
-      # Logging (the image allows it), and a container that stops is started
-      # again, with new keys (it takes its vaults back after the handover's
-      # silence).
+      # Logging (the image allows it), and the restart policy above.
       - |
         digest=$({{.DIGEST_OF}} "{{.GCP_REGISTRY}}/{{.NAME}}:{{.IMAGE_TAG}}")
         [ -n "$digest" ] || { echo "no pushed image {{.NAME}}:{{.IMAGE_TAG}}: run task cloud:push first"; exit 1; }
-        echo "launching {{.NAME}}@$digest"
+        echo "launching {{.NAME}}@$digest (restart policy {{.RESTART_POLICY}})"
         gcloud compute instances create "shonin-{{.NAME}}-{{.NETWORK}}" \
           --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" \
-          --confidential-compute-type=TDX --machine-type="{{.GCP_MACHINE_TYPE}}" \
+          --confidential-compute-type=TDX --machine-type="{{.MACHINE_TYPE}}" {{.BOOT_DISK}} \
           --maintenance-policy=TERMINATE --shielded-secure-boot \
           --image-project=confidential-space-images --image-family=confidential-space \
-          --metadata="^~^tee-image-reference={{.GCP_REGISTRY}}/{{.NAME}}@${digest}~tee-container-log-redirect=true~tee-restart-policy=Always" \
+          --metadata="^~^tee-image-reference={{.GCP_REGISTRY}}/{{.NAME}}@${digest}~tee-container-log-redirect=true~tee-restart-policy={{.RESTART_POLICY}}" \
           --tags="shonin-{{.NAME}}" \
           --service-account="{{.WORKLOAD_ACCOUNT}}" \
           --scopes=cloud-platform
+      # The waker may start (and, should one not power off, stop) the
+      # machines that run on demand.
+      - task: iam:prover-start
+        vars: { NETWORK: "{{.NETWORK}}", INSTANCE: "{{.NAME}}" }
+        if: 'case " {{.ON_DEMAND}} " in *" {{.NAME}} "*) exit 0 ;; *) exit 1 ;; esac'
 
   deploy:services:
     desc: "Create the services VM (Container-Optimized OS, e2-small): the API, the keeper, the tunnel and the waker, from the pushed api and keeper images' digests (NETWORK=testnet, TAG= the commit by default)"
@@ -327,7 +375,7 @@ tasks:
           --tags=shonin-services \
           --service-account="{{.SERVICES_ACCOUNT}}" --scopes=cloud-platform \
           --metadata-from-file="startup-script={{.PATH_ROOT}}/deploy/gcp/services/startup.sh,shonin-waker={{.PATH_ROOT}}/deploy/gcp/services/waker.sh" \
-          --metadata="^~^shonin-api-image={{.GCP_REGISTRY}}/api@${api}~shonin-keeper-image={{.GCP_REGISTRY}}/keeper@${keeper}~shonin-executor-url={{.CLOUD_URL_EXECUTOR}}~shonin-prover-instance={{.PROVER_INSTANCE}}~shonin-keeper-secret={{.GCP_SECRET_TESTNET_KEEPER_KEY}}~shonin-tunnel-secret={{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}~enable-oslogin=TRUE"
+          --metadata="^~^shonin-api-image={{.GCP_REGISTRY}}/api@${api}~shonin-keeper-image={{.GCP_REGISTRY}}/keeper@${keeper}~shonin-executor-url={{.CLOUD_URL_EXECUTOR}}~shonin-prover-instance={{.PROVER_INSTANCE}}~{{.WAKER_METADATA}}~shonin-keeper-secret={{.GCP_SECRET_TESTNET_KEEPER_KEY}}~shonin-tunnel-secret={{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}~enable-oslogin=TRUE"
 
   redeploy:services:
     desc: "Point the services VM at newly pushed api and keeper images (and the current scripts), and restart it (NETWORK=testnet, TAG= the commit by default)"
@@ -347,7 +395,7 @@ tasks:
         gcloud compute instances add-metadata "shonin-services-{{.NETWORK}}" \
           --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" \
           --metadata-from-file="startup-script={{.PATH_ROOT}}/deploy/gcp/services/startup.sh,shonin-waker={{.PATH_ROOT}}/deploy/gcp/services/waker.sh" \
-          --metadata="^~^shonin-api-image={{.GCP_REGISTRY}}/api@${api}~shonin-keeper-image={{.GCP_REGISTRY}}/keeper@${keeper}"
+          --metadata="^~^shonin-api-image={{.GCP_REGISTRY}}/api@${api}~shonin-keeper-image={{.GCP_REGISTRY}}/keeper@${keeper}~shonin-executor-url={{.CLOUD_URL_EXECUTOR}}~shonin-prover-instance={{.PROVER_INSTANCE}}~{{.WAKER_METADATA}}"
         # A stopped VM is started (it reads the new images at boot); a running
         # one is reset, since a reset needs a running VM.
         status=$(gcloud compute instances describe "shonin-services-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" --format='value(status)')
@@ -384,8 +432,9 @@ tasks:
           --tags=shonin-prover \
           --service-account="{{.PROVER_ACCOUNT}}" --scopes=cloud-platform \
           --metadata-from-file="startup-script={{.PATH_ROOT}}/deploy/gcp/prover/startup.sh" \
-          --metadata="^~^shonin-prover-image={{.GCP_REGISTRY}}/prover@${prover}~shonin-executor-url={{.CLOUD_URL_EXECUTOR}}~enable-oslogin=TRUE"
+          --metadata="^~^shonin-prover-image={{.GCP_REGISTRY}}/prover@${prover}~shonin-executor-url={{.CLOUD_URL_EXECUTOR}}~shonin-status-urls={{.PROVER_STATUS_URLS}}~enable-oslogin=TRUE"
       - task: iam:prover-start
+        vars: { NETWORK: "{{.NETWORK}}", INSTANCE: "prover" }
 
   iam:
     desc: "The services' and the prover's accounts and their roles, and nothing more: idempotent (NETWORK=testnet)"
@@ -420,35 +469,43 @@ tasks:
             echo "secret $secret does not exist yet: run task cloud:secrets, then this again"
           fi
         done
-        # A role that may start and read an instance, bound below on the
-        # prover's instance alone.
+        # A role that may start, stop and read an instance, bound below on
+        # the prover's, the builder's and the reviewer's instances alone (the
+        # waker stops a machine that exited and did not power off). An older
+        # role is brought up to these permissions.
         if ! gcloud iam roles describe "{{.PROVER_STARTER_ROLE}}" --project="$project" >/dev/null 2>&1; then
           gcloud iam roles create "{{.PROVER_STARTER_ROLE}}" --project="$project" \
-            --title="Start the prover" --description="Start and read one instance (bound on the prover's alone)" \
-            --permissions=compute.instances.start,compute.instances.get --stage=GA
+            --title="Start the on-demand machines" --description="Start, stop and read one instance (bound on the prover's, the builder's and the reviewer's alone)" \
+            --permissions={{.PROVER_STARTER_PERMISSIONS}} --stage=GA
+        else
+          gcloud iam roles update "{{.PROVER_STARTER_ROLE}}" --project="$project" \
+            --permissions={{.PROVER_STARTER_PERMISSIONS}} --quiet >/dev/null
         fi
-      - task: iam:prover-start
+      - for: [prover, builder, reviewer]
+        task: iam:prover-start
+        vars: { NETWORK: "{{.NETWORK}}", INSTANCE: "{{.ITEM}}" }
 
   iam:prover-start:
     internal: true
     requires:
-      vars: [NETWORK, GCP_PROJECT]
+      vars: [NETWORK, GCP_PROJECT, INSTANCE]
     cmds:
-      # Bound on the instance itself: the services VM may start and read the
-      # prover and no other instance.
+      # Bound on the instance itself: the services VM may start, stop and
+      # read this instance and no other. An instance made again (a new image)
+      # needs it bound again; deploy:machine and deploy:prover do so.
       - |
-        if gcloud compute instances describe "shonin-prover-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" >/dev/null 2>&1; then
-          gcloud compute instances add-iam-policy-binding "shonin-prover-{{.NETWORK}}" \
+        if gcloud compute instances describe "shonin-{{.INSTANCE}}-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" >/dev/null 2>&1; then
+          gcloud compute instances add-iam-policy-binding "shonin-{{.INSTANCE}}-{{.NETWORK}}" \
             --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" \
             --member="serviceAccount:{{.SERVICES_ACCOUNT}}" \
             --role="projects/{{.GCP_PROJECT}}/roles/{{.PROVER_STARTER_ROLE}}" >/dev/null
-          echo "the services VM may start shonin-prover-{{.NETWORK}}"
+          echo "the services VM may start shonin-{{.INSTANCE}}-{{.NETWORK}}"
         else
-          echo "no prover instance yet: task cloud:deploy:prover binds its starter"
+          echo "no {{.INSTANCE}} instance yet: deploying it binds its starter"
         fi
 
   firewall:
-    desc: "Assert the network's firewall: SSH from Google's IAP range only, no RDP, the executor's status port and the services' ports open to the VPC only, nothing public (NETWORK=testnet)"
+    desc: "Assert the network's firewall: SSH from Google's IAP range only, no RDP, the executor's status port and the services' ports open to the VPC only, the builder's, the reviewer's and the API's internal port to the machines that use them alone, nothing public (NETWORK=testnet)"
     requires:
       vars: [NETWORK, GCP_PROJECT]
     preconditions:
@@ -474,6 +531,20 @@ tasks:
         exists shonin-services-internal || gcloud compute firewall-rules create shonin-services-internal --project="$project" \
           --network=default --direction=INGRESS --action=ALLOW --rules=tcp:{{.CLOUD_PORT_API}},tcp:{{.CLOUD_PORT_KEEPER}} \
           --source-ranges=10.128.0.0/9 --target-tags=shonin-services
+        # The machines that run on demand: the builder answers the API (its
+        # uploads, the waker) and the prover and keeper (its status); the
+        # reviewer answers the builder, the waker, the prover and the keeper;
+        # the API's internal port answers those two machines alone (the waker
+        # asks it on the services VM itself).
+        exists shonin-builder-port || gcloud compute firewall-rules create shonin-builder-port --project="$project" \
+          --network=default --direction=INGRESS --action=ALLOW --rules=tcp:{{.CLOUD_PORT_BUILDER}} \
+          --source-tags=shonin-services,shonin-prover --target-tags=shonin-builder
+        exists shonin-reviewer-port || gcloud compute firewall-rules create shonin-reviewer-port --project="$project" \
+          --network=default --direction=INGRESS --action=ALLOW --rules=tcp:{{.CLOUD_PORT_REVIEWER}} \
+          --source-tags=shonin-builder,shonin-services,shonin-prover --target-tags=shonin-reviewer
+        exists shonin-api-internal || gcloud compute firewall-rules create shonin-api-internal --project="$project" \
+          --network=default --direction=INGRESS --action=ALLOW --rules=tcp:{{.CLOUD_PORT_API_INTERNAL}} \
+          --source-tags=shonin-builder,shonin-reviewer --target-tags=shonin-services
         gcloud compute firewall-rules list --project="$project" \
           --format="table(name,direction,sourceRanges.list(),allowed[].map().firewall_rule().list(),targetTags.list())"
         # Anything but ping open to the whole internet (filtered here: the
@@ -533,6 +604,93 @@ tasks:
         done
         echo "uploaded the keeper's key ($address) and the tunnel's token; the services VM reads them at its next boot"
 
+  drain:
+    desc: "Wait until the builder or the reviewer holds nothing a new image or a new root would lose: no paid job unfinished in the API's queue and, for the reviewer, no review waiting to be posted (NAME=builder|reviewer, NETWORK=testnet; DRAIN_MINUTES=60). Run before replacing either image or the executor"
+    requires:
+      vars: [NAME, NETWORK]
+    preconditions:
+      - *testnet
+      - sh: '[ "{{.NAME}}" = "builder" ] || [ "{{.NAME}}" = "reviewer" ]'
+        msg: "Only the builder and the reviewer are drained (NAME={{.NAME}})."
+      - sh: 'command -v jq >/dev/null'
+        msg: "jq is needed to read the queue."
+    vars:
+      DRAIN_MINUTES: '{{.DRAIN_MINUTES | default "60"}}'
+    cmds:
+      # The queue as the API last had it from the build service (it serves
+      # that while the build service is off). A job paid for and not finished
+      # is the builder's; a job built and still without its review is the
+      # reviewer's to post.
+      - |
+        set -eu
+        filter='[.[] | select(.state.state == "queued" or .state.state == "reviewing" or .state.state == "building"'
+        {{if eq .NAME "reviewer"}}filter="$filter"' or ((.state.state == "ready" or .state.state == "activated") and .review == null)'{{end}}
+        filter="$filter)] | length"
+        deadline=$(( $(date +%s) + {{.DRAIN_MINUTES}} * 60 ))
+        while :; do
+          if left=$(curl -fsS -m 20 "{{.URL_API_TESTNET}}/api/jobs" | jq "$filter"); then
+            if [ "$left" = 0 ]; then
+              echo "the {{.NAME}} holds nothing unfinished"
+              exit 0
+            fi
+            echo "the {{.NAME}} has $left job(s) unfinished; waiting"
+          else
+            echo "the queue could not be read; asking again"
+          fi
+          [ "$(date +%s)" -lt "$deadline" ] || { echo "still not drained after {{.DRAIN_MINUTES}} minutes"; exit 1; }
+          sleep 30
+        done
+
+  reviewer:
+    desc: "Bring a reviewer up for the network's current root: seal its model key to the root's reviewer-model purpose, build its image with that seal, propose it on every chain, drain and replace the reviewer's VM, then revoke the image it ran before. Run after every new root (NETWORK=testnet; KEY=<the model key's file>, claude-api-key at the root by default; SEALED=<dir for sealed.json>; TAG=)"
+    requires:
+      vars: [NETWORK, GCP_PROJECT]
+    preconditions:
+      - *testnet
+      - *project
+      - sh: '[ -s "{{.KEY}}" ]'
+        msg: "No model key at {{.KEY}}: put it there (it is gitignored and never staged), or pass KEY=<file>."
+    vars:
+      KEY: '{{.KEY | default (joinPath .PATH_ROOT "claude-api-key")}}'
+      SEALED: '{{.SEALED | default (joinPath .PATH_NETWORK_STATE "reviewer-sealed")}}'
+    cmds:
+      # Sealed to the published key of the root the canonical chain records
+      # (checked before anything is encrypted); the key itself never leaves
+      # this machine, and only sealed.json is staged.
+      - mkdir -p "{{.SEALED}}"
+      - task rootkey:seal NETWORK={{.NETWORK}} PURPOSE=platform:reviewer-model IN="{{.KEY}}" OUT="{{.SEALED}}/sealed.json"
+      # The image is the commit's and the seal's: a new seal is a new image.
+      - |
+        set -eu
+        seal=$(shasum -a 256 "{{.SEALED}}/sealed.json" | cut -c1-8)
+        tag="{{.TAG | default .GIT_SHA}}-sealed-$seal"
+        old=$(gcloud compute instances describe "shonin-reviewer-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" --format=json 2>/dev/null |
+          jq -r '.metadata.items[]? | select(.key == "tee-image-reference") | .value' | sed -n 's/.*@//p' || true)
+        task cloud:images NETWORK={{.NETWORK}} NAMES=reviewer SEALED="{{.SEALED}}" TAG="$tag" SKIP_PUSHED=1
+        digest=$({{.DIGEST_OF}} "{{.GCP_REGISTRY}}/reviewer:$tag")
+        [ -n "$digest" ] || { echo "no reviewer image under $tag"; exit 1; }
+        task chains:image NETWORK={{.NETWORK}} DIGEST="$digest" KIND=reviewer
+        if [ "$old" = "$digest" ]; then
+          echo "the reviewer already runs reviewer@$digest"
+          exit 0
+        fi
+        # Confidential Space takes its image when the VM is made: a new image
+        # is a new VM, once the old one holds nothing unfinished.
+        if [ -n "$old" ]; then
+          task cloud:drain NAME=reviewer NETWORK={{.NETWORK}}
+          gcloud compute instances delete "shonin-reviewer-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" --quiet
+        fi
+        task cloud:deploy:machine NAME=reviewer NETWORK={{.NETWORK}} TAG="$tag"
+        # The old image no longer gets the model key or the sealed sources.
+        if [ -n "$old" ]; then
+          task chains:revoke-image NETWORK={{.NETWORK}} DIGEST="$old"
+        fi
+
+  test-waker:
+    desc: "Run the services VM's waker against a stand-in API, metadata server and Compute Engine, and check what it starts and stops (needs python3; nothing in the cloud is touched)"
+    cmds:
+      - '"{{.PATH_ROOT}}/deploy/gcp/services/waker-test.sh"'
+
   status:
     desc: "What runs in the network's project: the VMs, the secrets' names, the images (NETWORK=testnet|mainnet)"
     requires:
@@ -549,7 +707,7 @@ tasks:
       - gcloud artifacts docker images list "{{.GCP_REGISTRY}}" --project="{{.GCP_PROJECT}}" --include-tags --format="table(package.basename(),version.basename(),tags,createTime)"
 
   logs:
-    desc: "Recent logs (NAME=executor|api|keeper|tunnel|waker|services|prover, NETWORK=..., FRESHNESS=30m): a machine's container from Cloud Logging, the services' containers from Cloud Logging, a plain VM's boot from its serial port"
+    desc: "Recent logs (NAME=executor|builder|reviewer|unwinder|api|keeper|tunnel|waker|services|prover, NETWORK=..., FRESHNESS=30m): a machine's container from Cloud Logging, the services' containers from Cloud Logging, a plain VM's boot from its serial port"
     requires:
       vars: [NAME, NETWORK, GCP_PROJECT]
     preconditions:
@@ -579,7 +737,7 @@ tasks:
         esac
 
   start:
-    desc: "Start a stopped VM (NAME=executor|services|prover, NETWORK=...)"
+    desc: "Start a stopped VM (NAME=executor|services|prover|builder|reviewer, NETWORK=...)"
     requires:
       vars: [NAME, NETWORK, GCP_PROJECT]
     preconditions:
@@ -592,7 +750,7 @@ tasks:
       - gcloud compute instances start "shonin-{{.NAME}}-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}"
 
   stop:
-    desc: "Stop a VM; its disk stays, and it bills only for that (NAME=executor|services|prover, NETWORK=...)"
+    desc: "Stop a VM; its disk stays, and it bills only for that (NAME=executor|services|prover|builder|reviewer, NETWORK=...)"
     requires:
       vars: [NAME, NETWORK, GCP_PROJECT]
     preconditions:
@@ -603,7 +761,7 @@ tasks:
       - gcloud compute instances stop "shonin-{{.NAME}}-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}"
 
   delete:
-    desc: "Delete a VM and its disk (NAME=executor|services|prover, NETWORK=..., CONFIRM=yes)"
+    desc: "Delete a VM and its disk (NAME=executor|services|prover|builder|reviewer|unwinder, NETWORK=..., CONFIRM=yes)"
     requires:
       vars: [NAME, NETWORK, GCP_PROJECT]
     preconditions:

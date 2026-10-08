@@ -103,6 +103,7 @@ tasks:
         cargo run -q -p shonin-api --
         {{.SERVICE_ARGS}}
         --port {{.PORT_API}}
+        --internal-port {{.PORT_API_INTERNAL}}
         --builder-url "{{.URL_BUILDER_DEV}}"
         --executor-url "{{.URL_EXECUTOR_DEV}}"
 
@@ -116,7 +117,9 @@ tasks:
         --builder-url "{{.URL_BUILDER_DEV}}"
 
   builder:
-    desc: "The build service"
+    desc: "The build service (STATE=1 keeps its state on the API's internal port, as in the cloud; IDLE_EXIT=<seconds> makes it exit once idle that long)"
+    vars:
+      MACHINE_ARGS: '{{if .STATE}}--state-url "{{.URL_API_INTERNAL_DEV}}"{{end}} {{if .IDLE_EXIT}}--idle-exit-seconds {{.IDLE_EXIT}}{{end}}'
     cmds:
       - >-
         test -d "{{.PATH_VENDOR}}" ||
@@ -129,14 +132,18 @@ tasks:
         --sdk "{{.PATH_PACKAGE_SDK}}"
         --vendor "{{.PATH_VENDOR}}"
         --reviewer-url "{{.URL_REVIEWER_DEV}}"
+        {{.MACHINE_ARGS}}
 
   reviewer:
-    desc: "The reviewer"
+    desc: "The reviewer (STATE=1 keeps its state on the API's internal port, as in the cloud; IDLE_EXIT=<seconds> makes it exit once idle that long)"
+    vars:
+      MACHINE_ARGS: '{{if .STATE}}--state-url "{{.URL_API_INTERNAL_DEV}}"{{end}} {{if .IDLE_EXIT}}--idle-exit-seconds {{.IDLE_EXIT}}{{end}}'
     cmds:
       - >-
         cargo run -q -p shonin-reviewer --bin reviewer --
         {{.SERVICE_ARGS}}
         --port {{.PORT_REVIEWER}}
+        {{.MACHINE_ARGS}}
 
   calibrate:
     desc: "Compare the prose reviewer with the battery (PROJECTS=dir... [INJECTION=1])"

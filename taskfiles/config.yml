@@ -150,7 +150,10 @@ vars:
   PORT_APP_DEV: "{{add (atoi .SHONIN_START_PORT_DEV) 0}}"
   PORT_API: "{{add (atoi .SHONIN_START_PORT_DEV) 1}}"
   PORT_MARKETING_DEV: "{{add (atoi .SHONIN_START_PORT_DEV) 2}}"
-  # +3 reserved
+  # The API's internal port: the builder's and the reviewer's state, their
+  # built files, and when to wake them (19082 in the cloud, where nothing
+  # else shares the services VM).
+  PORT_API_INTERNAL: "{{add (atoi .SHONIN_START_PORT_DEV) 3}}"
   PORT_BUILDER: "{{add (atoi .SHONIN_START_PORT_DEV) 4}}"
   PORT_EXECUTOR: "{{add (atoi .SHONIN_START_PORT_DEV) 5}}"
   PORT_REVIEWER: "{{add (atoi .SHONIN_START_PORT_DEV) 6}}"
@@ -171,7 +174,7 @@ vars:
   PORT_SOLANA_FAUCET: "{{add (atoi .SHONIN_START_PORT_DEV) 32}}"
   # Every port a local run listens on, for `task down`.
   PORTS_DEV: >-
-    {{.PORT_APP_DEV}} {{.PORT_API}} {{.PORT_MARKETING_DEV}} {{.PORT_BUILDER}} {{.PORT_EXECUTOR}}
+    {{.PORT_APP_DEV}} {{.PORT_API}} {{.PORT_MARKETING_DEV}} {{.PORT_API_INTERNAL}} {{.PORT_BUILDER}} {{.PORT_EXECUTOR}}
     {{.PORT_REVIEWER}} {{.PORT_KEEPER}} {{.PORT_DEVNET}} {{.PORT_UNWINDER}} {{.PORT_INDEXER}}
     {{.PORT_EVM_BASE}} {{.PORT_EVM_HYPERLIQUID}} {{.PORT_EVM_ROBINHOOD}}
     {{.PORT_SOLANA_RPC}} {{.PORT_SOLANA_WS}} {{.PORT_SOLANA_FAUCET}}
@@ -186,6 +189,7 @@ vars:
   URL_SITE_PROD: "https://shonin.fi"
   URL_DOCS_PROD: "https://docs.shonin.fi"
   URL_API_DEV: "http://localhost:{{.PORT_API}}"
+  URL_API_INTERNAL_DEV: "http://localhost:{{.PORT_API_INTERNAL}}"
   URL_BUILDER_DEV: "http://localhost:{{.PORT_BUILDER}}"
   URL_REVIEWER_DEV: "http://localhost:{{.PORT_REVIEWER}}"
   URL_EXECUTOR_DEV: "http://127.0.0.1:{{.PORT_EXECUTOR}}"
@@ -208,12 +212,16 @@ vars:
   # project for their network is empty.
   GCP_PROJECT_TESTNET: "shonin-testnet"
   GCP_PROJECT_MAINNET: ""
-  GCP_REGION: "us-central1"
-  GCP_ZONE: "us-central1-a"
+  # europe-west4 on C3: Confidential Space attests Intel TDX on C3 there.
+  GCP_REGION: "europe-west4"
+  GCP_ZONE: "europe-west4-a"
   # The Artifact Registry repository the images are pushed to.
   GCP_ARTIFACT_REPO: "shonin"
   # Confidential Space VMs: Intel TDX needs a C3 machine.
   GCP_MACHINE_TYPE: "c3-standard-4"
+  # The reviewer mostly waits on its model, but Confidential Space's TDX
+  # takes the standard C3 shapes only (c3-highcpu-4 is refused).
+  GCP_REVIEWER_MACHINE_TYPE: "c3-standard-4"
   # The service account the attested machines run as, in the project: it may
   # attest, pull images and write logs, and reads no secret.
   GCP_WORKLOAD_SERVICE_ACCOUNT: "shonin-workload"

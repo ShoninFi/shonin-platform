@@ -37,6 +37,14 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 wasmtime.workspace = true
+# Keys by attested exchange, and the launcher's socket.
+shonin-rootkey = { path = "../../rootkey" }
+# State kept off the machine is wiped from memory once written.
+zeroize = "1.9.0"
+
+[dev-dependencies]
+# The service identity of a fixed seed, to seal state with in tests.
+shonin-rootkey = { path = "../../rootkey", features = ["test-identity"] }
 
 [lints]
 workspace = true

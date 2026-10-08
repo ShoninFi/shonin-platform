@@ -104,6 +104,12 @@ struct Args {
     /// that proves them, which the keeper relays to each chain's registry.
     #[arg(long, env = "SHONIN_EXECUTOR_URL")]
     executor_url: String,
+    /// Where the builder and the reviewer publish their attestation, in the
+    /// executor's shape: their keys' blessings are relayed and their keys
+    /// stocked with gas as the executor's are. Either may be off; that is
+    /// normal, and nothing is said above debug.
+    #[arg(long, env = "SHONIN_SERVICE_ATTESTATION_URLS", value_delimiter = ',')]
+    service_attestation_urls: Vec<String>,
     #[arg(long, default_value_t = 0)]
     port: u16,
     /// The address the health route listens on: 0.0.0.0 in a container.
@@ -236,6 +242,12 @@ async fn main() -> Result<()> {
             }
         };
         let executor = args.executor_url.clone();
+        let services: Vec<String> = args
+            .service_attestation_urls
+            .iter()
+            .map(|url| url.trim().to_string())
+            .filter(|url| !url.is_empty())
+            .collect();
         let attestation_http = attestation_http.clone();
         let canonical = root_chain
             .as_ref()
@@ -267,6 +279,17 @@ async fn main() -> Result<()> {
                 attestation_http.clone(),
                 canonical,
             ));
+            // The builder's and the reviewer's keys, each on its own cadence.
+            for service in &services {
+                tokio::spawn(keep_service_keys(
+                    served.client.clone(),
+                    served.key.clone(),
+                    served.deployments.clone(),
+                    keeper,
+                    service.clone(),
+                    attestation_http.clone(),
+                ));
+            }
             let mut memory = HashMap::new();
             let mut factories = Factories::default();
             let mut said = Said::default();
@@ -366,6 +389,62 @@ async fn keep_keys(
                     if let Some(times) = said.due(std::time::Instant::now()) {
                         tracing::warn!(chain = %key, times, error = format!("{error:#}"), "could not look after the executor's keys");
                     }
+                }
+            }
+        }
+        tokio::time::sleep(ROUND_PAUSE).await;
+    }
+}
+
+/// Relay a builder's or a reviewer's blessings on one chain and keep its
+/// blessed key in gas, every [`attest::EVERY`], for as long as the keeper
+/// runs. The service is often off: that is said at debug only. Nothing it
+/// publishes records the root key.
+async fn keep_service_keys(
+    client: Client,
+    key: chain::ChainKey,
+    deployments: Deployments,
+    keeper: Address,
+    service: String,
+    http: reqwest::Client,
+) {
+    let mut blessings = attest::Memory::default();
+    let mut said = Said::default();
+    loop {
+        let at = std::time::Instant::now();
+        if blessings.due(at) {
+            match attest::published(&http, &service).await {
+                Ok(published) => {
+                    let registry = attest::OnChain {
+                        client: &client,
+                        deployments: &deployments,
+                        keeper,
+                    };
+                    let looked = attest::look(
+                        &registry,
+                        client.chain_id,
+                        false,
+                        &published,
+                        &mut blessings,
+                        at,
+                    )
+                    .await;
+                    match looked {
+                        Ok(()) => {
+                            if said.over() {
+                                tracing::info!(chain = %key, %service, "the service's key is looked after again");
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(times) = said.due(std::time::Instant::now()) {
+                                tracing::warn!(chain = %key, %service, times, error = format!("{error:#}"), "could not look after the service's key");
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    blessings.looked(at);
+                    tracing::debug!(chain = %key, %service, error = format!("{error:#}"), "the service does not answer");
                 }
             }
         }

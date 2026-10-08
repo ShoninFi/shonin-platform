@@ -1,20 +1,27 @@
 //! The attestation's prover.
 //!
-//! It asks the executor's status port what the executor wants
-//! (`GET /attestation`), and whenever a seal is wanted for the token it holds,
-//! proves that token in the zkVM with the pinned guest, wraps the proof in
-//! Groth16 (RISC Zero runs that step in Docker), checks the receipt as a
-//! chain's checker would, and posts the seal back (`POST
-//! /attestation/seal`). It holds no secret: the token, the binding and the
-//! seal are all public, and only a seal that verifies is of any use.
+//! It asks each attested machine's status port (the executor's, the
+//! builder's, the reviewer's) what it wants (`GET /attestation`), and
+//! whenever one wants a seal for the token it holds, proves that token in the
+//! zkVM with the pinned guest, wraps the proof in Groth16 (RISC Zero runs
+//! that step in Docker), checks the receipt as a chain's checker would, and
+//! posts the seal back to the machine it came from (`POST
+//! /attestation/seal`). It proves one token at a time, each once. A machine
+//! that is off is passed over quietly: the builder and the reviewer run only
+//! on demand. It holds no secret: the token, the binding and the seal are
+//! all public, and only a seal that verifies is of any use.
 //!
 //! It exits once it has had nothing to do for the idle time, so the machine
 //! it runs on can power off.
 //!
 //! ```text
-//! attestation-prover --executor-url <url> [--idle-exit-seconds 600]
-//!     [--guest-elf <path>] [--keys <jwks.json>] [--poll-seconds 15]
+//! attestation-prover [--executor-url <url>] [--status-url <url>]...
+//!     [--idle-exit-seconds 600] [--guest-elf <path>] [--keys <jwks.json>]
+//!     [--poll-seconds 15]
 //! ```
+//!
+//! `--executor-url` is one status URL like the others; `SHONIN_EXECUTOR_URL`
+//! and `SHONIN_STATUS_URLS` (comma-delimited) add to them.
 //!
 //! `--guest-elf` names the guest's ELF when this binary was built without it
 //! (an image builds the prover without Docker, and ships the ELF built
@@ -22,7 +29,7 @@
 //! checker pins, or the prover refuses to start. `--keys` is the key set the
 //! token is checked against: Google's as pinned when it is left out.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -32,10 +39,14 @@ use shonin_attestation::{
 };
 use shonin_attestation_core::GOOGLE_JWKS_2026_10_06;
 
-const USAGE: &str = "usage: attestation-prover --executor-url <url> [--idle-exit-seconds 600] [--guest-elf <path>] [--keys <jwks.json>] [--poll-seconds 15]";
+const USAGE: &str = "usage: attestation-prover [--executor-url <url>] [--status-url <url>]... [--idle-exit-seconds 600] [--guest-elf <path>] [--keys <jwks.json>] [--poll-seconds 15]";
+
+/// How often a machine that doesn't answer is said to.
+const UNREACHABLE_SAID_EVERY: Duration = Duration::from_secs(10 * 60);
 
 struct Args {
-    executor_url: String,
+    /// Every status port asked, in order, each once.
+    status_urls: Vec<String>,
     idle_exit: Duration,
     guest_elf: Option<String>,
     keys: Option<String>,
@@ -44,7 +55,16 @@ struct Args {
 
 fn args() -> Result<Args> {
     let mut args = Args {
-        executor_url: std::env::var("SHONIN_EXECUTOR_URL").unwrap_or_default(),
+        status_urls: std::env::var("SHONIN_EXECUTOR_URL")
+            .into_iter()
+            .chain(
+                std::env::var("SHONIN_STATUS_URLS")
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            )
+            .collect(),
         idle_exit: Duration::from_secs(600),
         guest_elf: std::env::var("SHONIN_GUEST_ELF").ok(),
         keys: None,
@@ -54,7 +74,7 @@ fn args() -> Result<Args> {
     while let Some(arg) = given.next() {
         let mut value = || given.next().context(USAGE);
         match arg.as_str() {
-            "--executor-url" => args.executor_url = value()?,
+            "--executor-url" | "--status-url" => args.status_urls.push(value()?),
             "--idle-exit-seconds" => {
                 args.idle_exit = Duration::from_secs(value()?.parse().context(USAGE)?)
             }
@@ -64,10 +84,17 @@ fn args() -> Result<Args> {
             _ => bail!(USAGE),
         }
     }
-    if args.executor_url.is_empty() {
+    let mut urls = Vec::new();
+    for url in &args.status_urls {
+        let url = url.trim().trim_end_matches('/').to_string();
+        if !url.is_empty() && !urls.contains(&url) {
+            urls.push(url);
+        }
+    }
+    if urls.is_empty() {
         bail!(USAGE);
     }
-    args.executor_url = args.executor_url.trim_end_matches('/').to_string();
+    args.status_urls = urls;
     Ok(args)
 }
 
@@ -157,28 +184,52 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
-fn fetch(agent: &ureq::Agent, executor: &str) -> Result<Status> {
+fn fetch(agent: &ureq::Agent, url: &str) -> Result<Status> {
     let mut answer = agent
-        .get(format!("{executor}/attestation"))
+        .get(format!("{url}/attestation"))
         .call()
-        .context("asking the executor what it wants")?;
+        .with_context(|| format!("asking {url} what it wants"))?;
     if !answer.status().is_success() {
-        bail!("the executor answered {}", answer.status());
+        bail!("{url} answered {}", answer.status());
     }
     let text = answer
         .body_mut()
         .read_to_string()
-        .context("reading the executor's answer")?;
-    serde_json::from_str(&text).context("the executor's answer")
+        .with_context(|| format!("reading {url}'s answer"))?;
+    serde_json::from_str(&text).with_context(|| format!("{url}'s answer"))
 }
 
-fn post(
-    agent: &ureq::Agent,
-    executor: &str,
-    nonce: &str,
-    seal: &[u8],
-    journal: &[u8],
-) -> Result<()> {
+/// What has been proved already, by where it came from, its nonce and its
+/// token's issue time: each is proved once.
+type Tried = HashSet<(String, String, u64)>;
+
+/// The next token to prove, and the status URL it came from: the first, in
+/// the order given, of the machines that answer and want a seal for a token
+/// not yet tried. A machine that doesn't answer, or answers something that
+/// can't be proved, is passed over; each such failure is handed to `failed`.
+fn next_work(
+    urls: &[String],
+    fetch: impl Fn(&str) -> Result<Status>,
+    keys: &[Jwk],
+    now: u64,
+    tried: &Tried,
+    mut failed: impl FnMut(&str, anyhow::Error),
+) -> Option<(String, Work)> {
+    for url in urls {
+        match fetch(url).and_then(|status| work(&status, keys, now)) {
+            Ok(Some(work))
+                if !tried.contains(&(url.clone(), work.nonce.clone(), work.issued_at)) =>
+            {
+                return Some((url.clone(), work));
+            }
+            Ok(_) => {}
+            Err(error) => failed(url, error),
+        }
+    }
+    None
+}
+
+fn post(agent: &ureq::Agent, url: &str, nonce: &str, seal: &[u8], journal: &[u8]) -> Result<()> {
     let body = serde_json::json!({
         "nonce": nonce,
         "seal": format!("0x{}", hex::encode(seal)),
@@ -186,7 +237,7 @@ fn post(
     })
     .to_string();
     let mut answer = agent
-        .post(format!("{executor}/attestation/seal"))
+        .post(format!("{url}/attestation/seal"))
         .header("content-type", "application/json")
         .send(body)
         .context("posting the seal")?;
@@ -195,7 +246,7 @@ fn post(
         return Ok(());
     }
     let why = answer.body_mut().read_to_string().unwrap_or_default();
-    bail!("the executor refused the seal ({status}): {why}")
+    bail!("{url} refused the seal ({status}): {why}")
 }
 
 /// Prove one token, check the receipt as a chain would, and say the EVM
@@ -233,45 +284,53 @@ fn main() -> Result<()> {
     let keys = Jwk::from_jwks(&jwks).map_err(|error| anyhow::anyhow!("the key set: {error}"))?;
     let trusted: Vec<[u8; 32]> = keys.iter().map(Jwk::key_hash).collect();
     println!(
-        "the prover is up: guest {PINNED_IMAGE_ID}, {} keys, executor {}, idle exit after {} s",
+        "the prover is up: guest {PINNED_IMAGE_ID}, {} keys, status {}, idle exit after {} s",
         keys.len(),
-        args.executor_url,
+        args.status_urls.join(", "),
         args.idle_exit.as_secs()
     );
 
     let agent = agent();
-    let mut tried: HashSet<(String, u64)> = HashSet::new();
+    let mut tried: Tried = HashSet::new();
     let mut last_work = Instant::now();
-    let mut unreachable_said: Option<Instant> = None;
+    let mut unreachable_said: HashMap<String, Instant> = HashMap::new();
     loop {
-        match fetch(&agent, &args.executor_url).and_then(|status| work(&status, &keys, unix_now()))
-        {
-            Ok(Some(work)) if !tried.contains(&(work.nonce.clone(), work.issued_at)) => {
-                tried.insert((work.nonce.clone(), work.issued_at));
-                println!(
-                    "proving the token issued at {} for nonce {}",
-                    work.issued_at, work.nonce
-                );
-                let started = Instant::now();
-                match prove(&guest, &trusted, &work) {
-                    Ok((seal, journal)) => {
-                        println!("proved in {} s", started.elapsed().as_secs());
-                        match post(&agent, &args.executor_url, &work.nonce, &seal, &journal) {
-                            Ok(()) => println!("the executor took the seal"),
-                            Err(error) => println!("{error:#}"),
-                        }
-                    }
-                    Err(error) => println!("could not prove the token: {error:#}"),
-                }
-                last_work = Instant::now();
-            }
-            Ok(_) => {}
-            Err(error) => {
-                if unreachable_said.is_none_or(|said| said.elapsed() >= Duration::from_secs(60)) {
+        let next = next_work(
+            &args.status_urls,
+            |url| fetch(&agent, url),
+            &keys,
+            unix_now(),
+            &tried,
+            |url, error| {
+                if unreachable_said
+                    .get(url)
+                    .is_none_or(|said| said.elapsed() >= UNREACHABLE_SAID_EVERY)
+                {
                     println!("{error:#}");
-                    unreachable_said = Some(Instant::now());
+                    unreachable_said.insert(url.to_string(), Instant::now());
                 }
+            },
+        );
+        if let Some((url, work)) = next {
+            tried.insert((url.clone(), work.nonce.clone(), work.issued_at));
+            println!(
+                "proving {url}'s token issued at {} for nonce {}",
+                work.issued_at, work.nonce
+            );
+            let started = Instant::now();
+            match prove(&guest, &trusted, &work) {
+                Ok((seal, journal)) => {
+                    println!("proved in {} s", started.elapsed().as_secs());
+                    match post(&agent, &url, &work.nonce, &seal, &journal) {
+                        Ok(()) => println!("{url} took the seal"),
+                        Err(error) => println!("{error:#}"),
+                    }
+                }
+                Err(error) => println!("could not prove the token: {error:#}"),
             }
+            last_work = Instant::now();
+            // Look again at once: another machine may be waiting.
+            continue;
         }
         if last_work.elapsed() >= args.idle_exit {
             println!(
@@ -368,5 +427,79 @@ mod tests {
         let status: Status = serde_json::from_value(json).unwrap();
         assert!(status.seal_wanted);
         assert_eq!(status.token_issued_at, Some(5));
+    }
+
+    #[test]
+    fn the_prover_proves_for_the_second_url_while_the_first_is_down() {
+        let urls = vec!["http://executor".to_string(), "http://builder".to_string()];
+        let fetch = |url: &str| -> Result<Status> {
+            match url {
+                "http://builder" => Ok(status(&binding(), true)),
+                _ => bail!("connection refused"),
+            }
+        };
+        let mut failures = Vec::new();
+        let (url, work) = next_work(&urls, fetch, &[], 2_000, &HashSet::new(), |url, _| {
+            failures.push(url.to_string())
+        })
+        .unwrap();
+        assert_eq!(url, "http://builder");
+        assert_eq!(work.nonce, binding().nonce());
+        assert_eq!(failures, ["http://executor"]);
+    }
+
+    #[test]
+    fn each_machine_s_token_is_proved_once_and_another_s_is_not_held_back_by_it() {
+        let urls = vec!["http://executor".to_string(), "http://builder".to_string()];
+        // Both want a seal for a token with the same nonce and time (as
+        // two stand-ins may): tried by its URL, so each is proved once.
+        let fetch = |_: &str| -> Result<Status> { Ok(status(&binding(), true)) };
+        let mut tried: Tried = HashSet::new();
+        let mut proved = Vec::new();
+        while let Some((url, work)) = next_work(&urls, fetch, &[], 2_000, &tried, |_, _| {}) {
+            tried.insert((url.clone(), work.nonce.clone(), work.issued_at));
+            proved.push(url);
+        }
+        assert_eq!(proved, urls);
+        // A fresh token from the first machine is proved again.
+        let fresh = |url: &str| -> Result<Status> {
+            let mut status = status(&binding(), true);
+            if url == "http://executor" {
+                status.token_issued_at = Some(1_500);
+            }
+            Ok(status)
+        };
+        let (url, work) = next_work(&urls, fresh, &[], 2_000, &tried, |_, _| {}).unwrap();
+        assert_eq!((url.as_str(), work.issued_at), ("http://executor", 1_500));
+    }
+
+    #[test]
+    fn a_service_s_status_reads_as_its_status_port_serves_it() {
+        let json = serde_json::json!({
+            "mode": "launcher",
+            "binding": {
+                "evm_signer": format!("0x{}", "11".repeat(20)),
+                "solana_signer": format!("0x{}", "00".repeat(32)),
+                "vaults_root": format!("0x{}", "22".repeat(32)),
+            },
+            "nonce": "ab",
+            "token": "a.b.c",
+            "token_issued_at": 5,
+            "seal": null,
+            "journal": null,
+            "seal_wanted": true,
+            "leaves": [{
+                "chain_id": 84532,
+                "vault_chain": 0,
+                "vault": format!("0x{}", "00".repeat(20)),
+                "strategy_hash": format!("0x{}", "00".repeat(32)),
+                "key": format!("0x{}", "55".repeat(20)),
+                "leaf": format!("0x{}", "66".repeat(32)),
+                "proof": [],
+            }],
+            "root": null,
+        });
+        let status: Status = serde_json::from_value(json).unwrap();
+        assert!(status.seal_wanted);
     }
 }
