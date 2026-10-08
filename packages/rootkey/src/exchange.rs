@@ -18,8 +18,10 @@
 //! 3. decides what that kind may have ([`permission`]), and for a vault's
 //!    keys checks the vault key's proof and its blessing, read from the
 //!    registry on the vault's own chain, where vault keys are blessed;
-//! 4. seals the root, or the purpose's private key, to the ephemeral key,
-//!    binding the token's hash and the purpose ([`Release`]).
+//! 4. seals the root, the purpose's private key, or (for a service) the
+//!    seed derived for the attested image's kind, digest and project, to
+//!    the ephemeral key, binding the token's hash and the purpose
+//!    ([`Release`]).
 //!
 //! A replayed request gets nothing its sender could not already open: the
 //! release is sealed to the ephemeral key in the token's nonce, which only
@@ -197,10 +199,23 @@ fn token_hash(token: &str) -> [u8; 32] {
 }
 
 /// What an exchange gave.
-#[derive(Debug)]
 pub enum Received {
     Root(Root),
     Key(KeyPair),
+    /// A service's seed ([`Purpose::Service`]), wiped when dropped.
+    Seed(Zeroizing<[u8; 32]>),
+}
+
+/// The root and a key pair say only their public parts; a seed says
+/// nothing of itself.
+impl std::fmt::Debug for Received {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Received::Root(root) => f.debug_tuple("Root").field(root).finish(),
+            Received::Key(pair) => f.debug_tuple("Key").field(pair).finish(),
+            Received::Seed(_) => f.write_str("Seed(..)"),
+        }
+    }
 }
 
 /// The asking side of one exchange: an ephemeral key, made for it alone.
@@ -311,6 +326,14 @@ impl Requester {
                     .map_err(|_| Error::Malformed("released root"))?;
                 Ok(Received::Root(Root::from_bytes(Zeroizing::new(bytes))))
             }
+            Purpose::Service => {
+                let mut seed = Zeroizing::new([0u8; 32]);
+                if secret.len() != seed.len() {
+                    return Err(Error::Malformed("released seed"));
+                }
+                seed.copy_from_slice(&secret);
+                Ok(Received::Seed(seed))
+            }
             _ => KeyPair::from_private_bytes(self.purpose.clone(), &secret).map(Received::Key),
         }
     }
@@ -333,15 +356,19 @@ pub enum Permission {
 /// | holder | the root |
 /// | executor | the root; a vault's venue keys and its bundle's key, with that vault's key's proof |
 /// | unwinder | a vault's venue keys, with that vault's key's proof |
-/// | builder | the builder key |
-/// | reviewer | the platform secrets `reviewer-model` and `dummy` |
+/// | builder | the builder key; its service seed |
+/// | reviewer | the platform secrets `reviewer-model` and `dummy`; the builder key, to read sealed source it reviews; its service seed |
+///
+/// A service seed is derived for the asking image's own kind, digest and
+/// project, so no image is ever given another's.
 pub fn permission(kind: ImageKind, purpose: &Purpose) -> Permission {
     use ImageKind::*;
     match (kind, purpose) {
         (Holder | Executor, Purpose::Root) => Permission::Granted,
         (Executor | Unwinder, Purpose::Venue { .. }) => Permission::WithVaultProof,
         (Executor, Purpose::Bundle(_)) => Permission::WithVaultProof,
-        (Builder, Purpose::Builder) => Permission::Granted,
+        (Builder | Reviewer, Purpose::Builder) => Permission::Granted,
+        (Builder | Reviewer, Purpose::Service) => Permission::Granted,
         (Reviewer, Purpose::Platform(name)) if PLATFORM_SECRETS.contains(&name.as_str()) => {
             Permission::Granted
         }
@@ -539,6 +566,10 @@ pub async fn authorise_at<V: ChainView>(
 
     let secret: Zeroizing<Vec<u8>> = match purpose {
         Purpose::Root => Zeroizing::new(root.expose().to_vec()),
+        Purpose::Service => Zeroizing::new(
+            root.service_seed(kind, attested.image_digest, attested.project_id)
+                .to_vec(),
+        ),
         _ => root.key_pair(purpose)?.private_bytes(),
     };
     let hash = token_hash(&request.token);

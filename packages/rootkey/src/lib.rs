@@ -26,6 +26,7 @@
 //! | a derived secret | HKDF-SHA256, salt `shonin:rootkey:v1`, ikm the root, info a label below |
 //! | the root signer | info `shonin:rootkey:v1:root-signer` ‖ a counter byte (0, then 1, ... until the 32 bytes are a valid scalar) |
 //! | a purpose's key pair | info `shonin:rootkey:v1:purpose` ‖ the purpose's bytes, 32 bytes, then RFC 9180's `DeriveKeyPair` |
+//! | a service's seed | info `shonin:rootkey:v1:service` ‖ the image's kind (1 byte, the registry's value) ‖ image digest (32) ‖ project (32), 32 bytes |
 //! | a purpose's bytes | see [`Purpose::to_bytes`] |
 //! | a published key's digest | `keccak256("shonin:published-key:v1" ‖ chainId (32 bytes, big-endian) ‖ purpose bytes ‖ public key)`, signed as an Ethereum signed message (EIP-191), 65 bytes |
 //! | sealed to a purpose | HPKE base mode, info `shonin:sealed:v1` ‖ purpose bytes, aad `len(purpose bytes)` (2 bytes, big-endian) ‖ purpose bytes ‖ the caller's aad |

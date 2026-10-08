@@ -37,6 +37,12 @@ pub enum Purpose {
     /// One of the platform's own secrets, by name ([`REVIEWER_MODEL`],
     /// [`DUMMY`]).
     Platform(String),
+    /// An attested service's own seed (a builder's or a reviewer's): its
+    /// signing key and its state key are derived from it. It has no key
+    /// pair and nothing is sealed to it; the holder derives the seed for
+    /// the asking image's kind, digest and project
+    /// ([`crate::Root::service_seed`]).
+    Service,
 }
 
 fn valid_name(name: &str) -> bool {
@@ -79,6 +85,7 @@ impl Purpose {
     /// | bundle | `02` ‖ bundle hash (32) |
     /// | venue | `03` ‖ vault chain (8, big-endian) ‖ vault (20) ‖ len (1) ‖ venue |
     /// | platform | `04` ‖ len (1) ‖ name |
+    /// | service | `05` |
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             Purpose::Root => vec![0],
@@ -105,6 +112,7 @@ impl Purpose {
                 out.extend_from_slice(name.as_bytes());
                 out
             }
+            Purpose::Service => vec![5],
         }
     }
 
@@ -127,7 +135,7 @@ impl Purpose {
 }
 
 /// The string form: `root`, `builder`, `bundle:0x<64 hex>`,
-/// `venue:<vault chain id>:0x<vault>:<venue>`, `platform:<name>`.
+/// `venue:<vault chain id>:0x<vault>:<venue>`, `platform:<name>`, `service`.
 impl fmt::Display for Purpose {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -140,6 +148,7 @@ impl fmt::Display for Purpose {
                 venue,
             } => write!(f, "venue:{vault_chain}:{vault:#x}:{venue}"),
             Purpose::Platform(name) => write!(f, "platform:{name}"),
+            Purpose::Service => write!(f, "service"),
         }
     }
 }
@@ -152,6 +161,7 @@ impl FromStr for Purpose {
         match text {
             "root" => return Ok(Purpose::Root),
             "builder" => return Ok(Purpose::Builder),
+            "service" => return Ok(Purpose::Service),
             _ => {}
         }
         let (kind, rest) = text.split_once(':').ok_or(Error::Malformed("purpose"))?;
