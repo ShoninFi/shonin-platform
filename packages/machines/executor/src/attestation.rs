@@ -645,6 +645,7 @@ impl Attestation {
     }
 
     /// The instance's Solana key: the token's Solana signer.
+    #[cfg(test)]
     pub fn solana_instance(&self) -> Pubkey {
         self.solana_instance.pubkey()
     }

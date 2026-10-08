@@ -113,7 +113,6 @@ mod tests {
 
     #[test]
     fn a_solana_key_never_prints_its_secret() {
-        use chain::solana::Signer;
         let key = fresh_solana().unwrap();
         let secret = alloy::hex::encode(&key.to_bytes()[..32]);
         let printed = format!("{key:?}");

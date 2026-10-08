@@ -238,6 +238,12 @@ struct Shared {
     account_events: crate::feed::Feed<Vec<u8>>,
     vault_events: crate::feed::Feed<crate::watch::VaultEvent>,
     failed_starts: Arc<AtomicU32>,
+    /// Whether this key may take the station's approval from another key
+    /// the registry still counts: only once, for the takeover the vault was
+    /// taken on for (after the other key's silence, or with no other key).
+    /// A serve started again after the key was approved finds another key in
+    /// place only if that executor took the vault since, and lets it go.
+    may_replace: Arc<AtomicBool>,
     /// The moment the meter's latest signed total counts up to.
     signed_through: SignedThrough,
 }
@@ -351,7 +357,9 @@ impl Cluster {
         book.waiting_for_bundle.remove(&address);
 
         if !book.running.contains_key(&address)
-            && !self.may_take_on(book, address, &vault.bundle_hash).await?
+            && !self
+                .may_take_on(book, address, vault.strategy_id, &vault.bundle_hash)
+                .await?
         {
             return Ok(());
         }
@@ -377,10 +385,14 @@ impl Cluster {
     /// approval, or one does and has been silent for the whole handover
     /// silence. A vault another executor took from this one is taken on
     /// again only once no counted key holds it.
-    async fn may_take_on(&self, book: &mut Book, vault: Pubkey, bundle: &[u8; 32]) -> Result<bool> {
-        let v = self
-            .platform
-            .vault_accounts(self.platform.vault(&self.client, &vault).await?.strategy_id);
+    async fn may_take_on(
+        &self,
+        book: &mut Book,
+        vault: Pubkey,
+        strategy_id: u64,
+        bundle: &[u8; 32],
+    ) -> Result<bool> {
+        let v = self.platform.vault_accounts(strategy_id);
         let Some(by) = self.held_by_another(&v, None, bundle).await? else {
             book.watching.remove(&vault);
             if book.replaced.remove(&vault) {
@@ -511,6 +523,7 @@ impl Cluster {
                 account_events: Default::default(),
                 vault_events: Default::default(),
                 failed_starts: Default::default(),
+                may_replace: Arc::new(AtomicBool::new(true)),
                 signed_through: tank.signed_through,
             },
             serving: None,
@@ -530,6 +543,17 @@ impl Cluster {
         let bundle = shared.bundle;
         let v = shared.accounts.clone();
 
+        // One executor at a time: once this key has held the approval,
+        // another counted key in its place took the vault.
+        if !shared.may_replace.load(Ordering::SeqCst)
+            && let Some(other) = self
+                .held_by_another(&v, Some(&key.pubkey()), &bundle)
+                .await?
+        {
+            tracing::info!(%vault, %other, "another executor's key holds the station's approval; not serving");
+            return Ok(Stop::Replaced);
+        }
+
         // The keeper blesses the key and, once the registry vouches for it,
         // gives it lamports; then it takes the station's approval, in the
         // place of a key that went silent if it must.
@@ -545,7 +569,16 @@ impl Cluster {
             tokio::time::sleep(LOOK_EVERY).await;
         }
         tracing::info!(%vault, key = %key.pubkey(), "the key is blessed and holds its lamports");
+        if !shared.may_replace.load(Ordering::SeqCst)
+            && let Some(other) = self
+                .held_by_another(&v, Some(&key.pubkey()), &bundle)
+                .await?
+        {
+            tracing::info!(%vault, %other, "another executor's key holds the station's approval; not serving");
+            return Ok(Stop::Replaced);
+        }
         self.approved(&v, &key, &bundle).await?;
+        shared.may_replace.store(false, Ordering::SeqCst);
 
         // Kept blessed and stocked for as long as the serve runs.
         let replaced = Arc::new(AtomicBool::new(false));
