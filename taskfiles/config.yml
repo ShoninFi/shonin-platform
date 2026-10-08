@@ -126,8 +126,7 @@ vars:
   # takes. The chain tasks, the Solana deploy and the cloud tasks call it.
   # Not quiet: a build waiting on another's lock says so rather than sitting
   # silent.
-  DEVNET: >-
-    cargo run -p shonin-devnet --
+  DEVNET_ARGS: >-
     --network "{{.NETWORK}}"
     --chains "{{.PATH_CHAINS}}"
     --deployments-dir "{{.PATH_DEPLOYMENTS_DIR}}"
@@ -135,6 +134,15 @@ vars:
     --artifacts "{{.PATH_ARTIFACTS}}"
     --solana-programs "{{.PATH_SOLANA_PROGRAMS}}"
     {{.GENERATION_ARG}}
+  DEVNET: "cargo run -p shonin-devnet -- {{.DEVNET_ARGS}}"
+  # The same, built with the network's Solana program ids (the committed
+  # devnet ids on the testnets), for the commands that send to the Solana
+  # programs: a program's id is compiled in, so a build with the local ids
+  # would look for devnet's programs where they aren't (it refuses). The
+  # Solana deploy itself uses DEVNET, since it writes those ids.
+  DEVNET_SOLANA: >-
+    cargo run -p shonin-devnet {{if eq .NETWORK "testnet"}}--features devnet{{end}} --
+    {{.DEVNET_ARGS}}
 
   # Cargo: crates that run as wasm are also checked for wasm32-unknown-unknown.
   # The app builds natively too (its seo tool runs at build time). The

@@ -27,7 +27,7 @@ pub mod solana;
 #[cfg(feature = "args")]
 pub use args::{
     ChainArgs, Served, SolanaServed, Target, connect_solana, connect_to, connect_with, signing_for,
-    signing_with_roles,
+    signing_with_roles, solana_built_for,
 };
 #[cfg(feature = "rpc")]
 pub use client::{

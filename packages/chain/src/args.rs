@@ -279,6 +279,14 @@ impl BuiltFor {
     }
 }
 
+/// Whether this build's compiled Solana program ids are `network`'s, and if
+/// not, which build is: a program's id is compiled in, never read from a
+/// deployment file, so a tool sending to a cluster's programs is refused by
+/// a build for another network rather than look for them where they aren't.
+pub fn solana_built_for(network: NetworkName) -> Result<()> {
+    BuiltFor::THIS.serves(network)
+}
+
 /// How long a chain that could not be connected to is first waited on
 /// before it is tried again. Each try after waits twice as long as the last,
 /// up to [`CONNECT_RETRY_MOST`].

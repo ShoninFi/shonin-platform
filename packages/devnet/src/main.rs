@@ -400,7 +400,8 @@ async fn main() -> Result<()> {
                 let file = Deployments::file_in(&target.deployments_dir, &key);
                 let deployments =
                     solana::set_up_public(&client, &key, &config.public_rpc, &file, &settings)
-                        .await?;
+                        .await
+                        .map_err(|error| for_this_build(target.network, error))?;
                 println!(
                     "{} ({key}): set up; the dollar is {}, written to {}",
                     config.label,
@@ -1034,7 +1035,8 @@ where
                     client.check_deployments(&deployments).await?;
                     change(client, deployments).await
                 }
-                .await;
+                .await
+                .map_err(|error| for_this_build(target.network, error));
                 (key, config, outcome)
             }
         });
@@ -1057,6 +1059,17 @@ where
         bail!("not done on {}", failed.join(", "));
     }
     Ok(())
+}
+
+/// A Solana command's failure, with what most likely caused it when this
+/// build's program ids are another network's: a program's id is compiled
+/// in, so such a build looks for the cluster's programs where they aren't
+/// (the Solana-facing tasks build with the network's feature).
+fn for_this_build(network: NetworkName, error: anyhow::Error) -> anyhow::Error {
+    match chain::solana_built_for(network) {
+        Ok(()) => error,
+        Err(why) => error.context(format!("{why:#}")),
+    }
 }
 
 /// The network's canonical chain for the root key, connected, with its

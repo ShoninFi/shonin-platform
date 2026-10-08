@@ -74,7 +74,7 @@ tasks:
       - sh: '[ -n "${SHONIN_TESTNET_SOLANA_MNEMONIC:-}" ]'
         msg: "SHONIN_TESTNET_SOLANA_MNEMONIC is empty in .env: the roles and the deployer are its keys."
     cmds:
-      - "{{.DEVNET}} --vault-chain solana solana-setup --project {{.GCP_PROJECT_TESTNET}}"
+      - "{{.DEVNET_SOLANA}} --vault-chain solana solana-setup --project {{.GCP_PROJECT_TESTNET}}"
 
   accounts:
     desc: "Each role's account and gas on every EVM chain, the funders and what they need, and on Solana devnet the deployer (its funder), each role's SOL and what it is short, the dollar's mint and the programs (NETWORK=testnet)"
@@ -92,32 +92,32 @@ tasks:
     requires:
       vars: [DIGEST, KIND]
     cmds:
-      - "{{.DEVNET}} propose-image --digest {{.DIGEST}} --kind {{.KIND}}"
+      - "{{.DEVNET_SOLANA}} propose-image --digest {{.DIGEST}} --kind {{.KIND}}"
 
   revoke-image:
     desc: "Revoke an image digest on every chain's registry (Solana's too, once it is set up), or only SHONIN_VAULT_CHAIN=<name>'s, as the admin (DIGEST=sha256:<hex>; NETWORK=testnet); already revoked is done. Revoked takes effect at once and for good: keys blessed from it stop counting, and a root key recorded from it stops being live, on the chains revoked"
     requires:
       vars: [DIGEST]
     cmds:
-      - "{{.DEVNET}} revoke-image --digest {{.DIGEST}}"
+      - "{{.DEVNET_SOLANA}} revoke-image --digest {{.DIGEST}}"
 
   project:
     desc: "Propose an operator's Google Cloud project (its keccak256) on every chain's registry (Solana's too, once it is set up), or only SHONIN_VAULT_CHAIN=<name>'s, as the admin (PROJECT=<project id>; NETWORK=testnet); already proposed is done"
     requires:
       vars: [PROJECT]
     cmds:
-      - "{{.DEVNET}} propose-project {{.PROJECT}}"
+      - "{{.DEVNET_SOLANA}} propose-project {{.PROJECT}}"
 
   retire-dev-checker:
     desc: "Retire the development checker on every chain (Solana's too, once it is set up), or only SHONIN_VAULT_CHAIN=<name>'s, as the admin; refused where no other checker is allowed (NETWORK=testnet)"
     cmds:
-      - "{{.DEVNET}} retire-checker --dev"
+      - "{{.DEVNET_SOLANA}} retire-checker --dev"
 
   allow-dev-checker:
     desc: "Deploy and propose a fresh development checker on every chain (Solana's too, once it is set up), or only SHONIN_VAULT_CHAIN=<name>'s, for a publish only it can bless; retire it again after (NETWORK=testnet)"
     cmds:
       - task: :contracts:build
-      - "{{.DEVNET}} allow-dev-checker"
+      - "{{.DEVNET_SOLANA}} allow-dev-checker"
 
   fund:
     desc: "Top every role up on every EVM testnet from the funder, buying HYPE on HyperCore for HyperEVM; safe to run again (NETWORK=testnet only)"
