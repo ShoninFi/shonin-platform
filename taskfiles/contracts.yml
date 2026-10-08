@@ -120,7 +120,7 @@ tasks:
         {{.DEVNET}} solana-keypair --role deployer --out "$deployer" >/dev/null
         {{.DEVNET}} solana-program-keypairs --out "$dir" > "$dir/programs"
         cd "{{.PATH_CONTRACTS_SOLANA}}"
-        while read -r name id kind <&3; do
+        while read -r name id kind; do
           file="programs/$(echo "$name" | tr _ -)/devnet-id"
           if [ -s "$file" ]; then
             committed=$(tr -d '[:space:]' < "$file")
@@ -132,24 +132,24 @@ tasks:
             echo "$id" > "$file"
             echo "wrote $file: commit it, so every devnet build has $name at $id"
           fi
-        done 3< "$dir/programs"
-        while read -r name id kind <&3; do
+        done < "$dir/programs"
+        while read -r name id kind; do
           cargo build-sbf --manifest-path "programs/$(echo "$name" | tr _ -)/Cargo.toml" \
-            --features devnet --sbf-out-dir "$dir"
-        done 3< "$dir/programs"
+            --features devnet --sbf-out-dir "$dir" < /dev/null
+        done < "$dir/programs"
         programs='{}'
-        while read -r name id kind <&3; do
-          if [ "$kind" = final ] && solana program show "$id" --url "$rpc" >/dev/null 2>&1; then
+        while read -r name id kind; do
+          if [ "$kind" = final ] && solana program show "$id" --url "$rpc" < /dev/null >/dev/null 2>&1; then
             echo "$name is already at $id, final"
           else
             final=""
             [ "$kind" = final ] && final="--final"
             solana program deploy --use-rpc --commitment confirmed --url "$rpc" \
-              --keypair "$deployer" --program-id "$dir/$name-keypair.json" $final "$dir/$name.so"
+              --keypair "$deployer" --program-id "$dir/$name-keypair.json" $final "$dir/$name.so" < /dev/null
             echo "$name is at $id"
           fi
           programs=$(echo "$programs" | jq --arg name "$name" --arg id "$id" '. + {($name): $id}')
-        done 3< "$dir/programs"
+        done < "$dir/programs"
         mkdir -p "$(dirname "$record")"
         [ -s "$record" ] || echo '{}' > "$record"
         jq --argjson programs "$programs" '.programs = $programs' "$record" > "$record.new"
