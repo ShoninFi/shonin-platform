@@ -19,7 +19,7 @@ Everything runs in one zone (`europe-west4-a`), on the default network, with not
 | `shonin-executor-<network>` | the executor, attested: Confidential Space, hardened image, Intel TDX | `c3-standard-4` | `shonin-workload`: attest, pull images, write logs; no secret |
 | `shonin-builder-<network>` | the build service, attested the same way; on demand, off when idle | `c3-standard-4`, 30 GB disk | `shonin-workload` |
 | `shonin-reviewer-<network>` | the reviewer, attested the same way; on demand, off when idle | `GCP_REVIEWER_MACHINE_TYPE` | `shonin-workload` |
-| `shonin-services-<network>` | the API (the indexer inside), the keeper, the tunnel, the waker; Container-Optimized OS | `e2-small`, 10 GB standard disk | `shonin-services`: pull images, write logs, read two secrets, start, stop and read the prover's, the builder's and the reviewer's instances |
+| `shonin-services-<network>` | the API (the indexer inside), the keeper, the tunnel, the waker; Container-Optimized OS | `e2-small`, 10 GB standard disk | `shonin-services`: pull images, write logs, read three secrets, start, stop and read the prover's, the builder's and the reviewer's instances |
 | `shonin-prover-<network>` | the attestation's prover; on-demand, off when idle | `GCP_PROVER_MACHINE_TYPE` | `shonin-prover`: pull images, write logs |
 
 They name each other by internal DNS: the executor's status port is `http://shonin-executor-testnet.europe-west4-a.c.shonin-testnet.internal:19085`, the API `http://shonin-services-testnet.europe-west4-a.c.shonin-testnet.internal:19081`.
@@ -76,10 +76,10 @@ gcloud compute instances create shonin-executor-testnet \
 
 ## The services VM
 
-`services/startup.sh` runs at every boot. It reads the keeper's key and the tunnel's token from Secret Manager with the VM's own token (never echoing them; each goes into an env file only root can read), logs in to Artifact Registry, and starts four containers on the host's network, each restarted by Docker if it stops and logging to Cloud Logging (`gcplogs-docker-driver`):
+`services/startup.sh` runs at every boot. It reads the keeper's keys (its EVM key and its Solana devnet key) and the tunnel's token from Secret Manager with the VM's own token (never echoing them; each goes into an env file only root can read), logs in to Artifact Registry, and starts four containers on the host's network, each restarted by Docker if it stops and logging to Cloud Logging (`gcplogs-docker-driver`):
 
 - `shonin-api`: the API on `0.0.0.0:19081`, reading through to `https://testnet-store.shonin.fi` for store files it doesn't hold, its store kept in `/var/lib/shonin/store`; uploads go to the builder, and its queue is kept beside the store (`/var/lib/shonin/api-state`) and shown while the builder is off. Its internal port `0.0.0.0:19082` keeps the builder's and the reviewer's sealed state and takes their built files.
-- `shonin-keeper`: the keeper, health on `0.0.0.0:19087`, with `SHONIN_TESTNET_KEEPER_KEY` alone.
+- `shonin-keeper`: the keeper, health on `0.0.0.0:19087`, with `SHONIN_TESTNET_KEEPER_KEY` and `SHONIN_TESTNET_KEEPER_SOLANA_KEY` alone (never a mnemonic). Without the Solana key (a secret not made yet) it keeps the EVM chains, and its health says Solana devnet is not kept.
 - `shonin-tunnel`: `cloudflared tunnel run`, its token from the env file.
 - `shonin-waker`: `services/waker.sh`, every 30 seconds: when the executor, the builder or the reviewer wants a seal (`GET /attestation`) and the prover's instance is `TERMINATED`, it starts it (`POST .../instances/shonin-prover-testnet/start` with the VM's token), at most once every 15 minutes; when the API says the builder or the reviewer is wanted (`GET localhost:19082/internal/wake`) and it is `TERMINATED`, it starts it, at most once every 5 minutes; and it stops one still running after it exited or after 15 minutes without answering. `task cloud:test-waker` runs it against stand-ins.
 
@@ -93,7 +93,7 @@ An on-demand VM, on only while proving, created by `task cloud:deploy:prover` (i
 
 ```bash
 task cloud:firewall NETWORK=testnet              # SSH from IAP only, no RDP, internal ports, nothing public
-task cloud:secrets NETWORK=testnet               # the keeper's key (derived here, account 4) and the tunnel's token, through stdin
+task cloud:secrets NETWORK=testnet               # the keeper's keys (derived here: EVM account 4, its Solana devnet key) and the tunnel's token, through stdin
 task cloud:iam NETWORK=testnet                   # accounts, roles, secret access, the prover-starter role
 for name in executor api keeper prover; do task cloud:push NAME=$name NETWORK=testnet; done
 task cloud:deploy:machine NAME=executor NETWORK=testnet

@@ -102,10 +102,61 @@ impl Funding {
     pub fn reserve(&self, chain: &ChainKey) -> Option<U256> {
         coin(self.testnet.get(&chain.to_string())?.reserve).ok()
     }
+
+    /// On a Solana cluster, where the deployer is the funder: what it keeps
+    /// and what each role is topped up to. `None` if the cluster isn't
+    /// listed.
+    pub fn solana(&self, cluster: &ChainKey) -> Result<Option<SolanaAmounts>> {
+        let Some(amounts) = self.testnet.get(&cluster.to_string()) else {
+            return Ok(None);
+        };
+        let reserve = lamports(amounts.reserve)?;
+        let roles = ROLES
+            .iter()
+            .map(|role| {
+                let amount = amounts
+                    .roles
+                    .get(role.label())
+                    .copied()
+                    .unwrap_or(amounts.default);
+                Ok((*role, lamports(amount)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(SolanaAmounts { reserve, roles }))
+    }
+}
+
+/// A Solana cluster's amounts, in lamports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SolanaAmounts {
+    /// What the deployer keeps for itself: its own set-up's rent and fees
+    /// come out of it.
+    pub reserve: u64,
+    /// What each role is topped up to, in [`ROLES`]' order.
+    pub roles: Vec<(Role, u64)>,
 }
 
 fn coin(amount: f64) -> Result<U256> {
     parse_ether(&format!("{amount}")).map_err(|error| anyhow!("{amount}: {error}"))
+}
+
+/// An amount of SOL as lamports, exactly as written: an amount under the
+/// least an account may hold (rent-exempt, about 0.00089 SOL) is refused,
+/// since a fresh account given it would be refused by the cluster; zero
+/// funds nothing.
+fn lamports(amount: f64) -> Result<u64> {
+    const LEAST: u64 = 1_000_000;
+    let parsed = alloy::primitives::utils::parse_units(&format!("{amount}"), 9)
+        .map_err(|error| anyhow!("{amount} SOL: {error}"))?;
+    if parsed.is_negative() {
+        bail!("{amount} SOL is not an amount a role can be given");
+    }
+    let lamports = u64::try_from(parsed.get_absolute())
+        .map_err(|_| anyhow!("{amount} SOL is not an amount a role can be given"))?;
+    if lamports != 0 && lamports < LEAST {
+        bail!("{amount} SOL is less than an account may hold (0.001 SOL or more, or 0)");
+    }
+    Ok(lamports)
 }
 
 /// The funder's key, from the EVM mnemonic.
@@ -575,5 +626,60 @@ activation_usd = 2.0
     fn the_shipped_funding_file_names_only_roles() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/funding.toml");
         Funding::read(&path).unwrap();
+    }
+
+    #[test]
+    fn a_solana_cluster_s_roles_are_funded_in_lamports_exactly_as_written() {
+        let funding: Funding = toml::from_str(
+            r#"
+[testnet."solana:devnet"]
+reserve = 2
+default = 0.05
+keeper = 1.5
+executor = 0
+attestor = 0.003
+
+[hyperliquid]
+max_price = 35.0
+max_per_run = 3.0
+activation_usd = 2.0
+"#,
+        )
+        .unwrap();
+        let devnet: ChainKey = "solana:devnet".parse().unwrap();
+        let SolanaAmounts { reserve, roles } = funding.solana(&devnet).unwrap().unwrap();
+        assert_eq!(reserve, 2_000_000_000);
+        assert_eq!(roles.len(), ROLES.len());
+        let of = |role: Role| roles.iter().find(|(r, _)| *r == role).unwrap().1;
+        assert_eq!(of(Role::Keeper), 1_500_000_000);
+        assert_eq!(of(Role::Executor), 0);
+        assert_eq!(of(Role::Attestor), 3_000_000);
+        assert_eq!(of(Role::Viewer), 50_000_000);
+        let other: ChainKey = "solana:mainnet-beta".parse().unwrap();
+        assert!(funding.solana(&other).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_solana_amount_under_what_an_account_may_hold_is_refused() {
+        assert_eq!(lamports(0.0).unwrap(), 0);
+        assert_eq!(lamports(0.001).unwrap(), 1_000_000);
+        assert!(lamports(0.0005).is_err());
+        assert!(lamports(-1.0).is_err());
+    }
+
+    #[test]
+    fn the_shipped_funding_file_funds_solana_devnet_by_transfer() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/funding.toml");
+        let devnet: ChainKey = "solana:devnet".parse().unwrap();
+        let SolanaAmounts { reserve, roles } = Funding::read(&path)
+            .unwrap()
+            .solana(&devnet)
+            .unwrap()
+            .expect("solana:devnet is in the funding file");
+        assert!(reserve > 0);
+        // The keys that sign the set-up and keep the vaults are funded.
+        for role in [Role::Admin, Role::Operator, Role::Keeper] {
+            assert!(roles.iter().any(|(r, amount)| *r == role && *amount > 0));
+        }
     }
 }

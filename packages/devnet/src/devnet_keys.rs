@@ -7,10 +7,16 @@
 //!
 //! An index is never reused or renumbered: a program's devnet address is its
 //! index's key, so moving it moves the program. A new program takes the next
-//! index after the last one here, and a retired program's entry stays, so its
-//! index is never handed out again. Below 100, index 0 is the deployer and 1
-//! the registry; the role keys are at 10 and up. Programs that serve tests
-//! only have no index: they never leave a test.
+//! index after the last one here (the dollar's mint included), and a retired
+//! program's entry stays, so its index is never handed out again. Below 100,
+//! index 0 is the deployer and 1 the registry; the role keys are at 10 and
+//! up. Programs that serve tests only have no index: they never leave a test.
+//!
+//! One index above 100 holds no program: [`DOLLAR_MINT`], the stand-in
+//! dollar's mint account, so the devnet's dollar has one address however
+//! often the set-up runs, and nobody but the team can create the account
+//! first (a mint at a key of the published development mnemonic could be
+//! taken by anyone).
 
 use std::path::Path;
 
@@ -30,6 +36,10 @@ pub const PROGRAM_KEYS: [(&str, u32); 9] = [
     ("shonin_local_venue", 106),
     ("shonin_local_driver", 107),
 ];
+
+/// The stand-in dollar's mint account on devnet: not a program, and never
+/// reused.
+pub const DOLLAR_MINT: u32 = 108;
 
 /// Write each program's keypair, from `phrase`, into `dir` as
 /// `<name>-keypair.json`, and return each name with its address.
@@ -55,8 +65,12 @@ mod tests {
 
     #[test]
     fn every_index_is_used_once() {
-        let indices: BTreeSet<u32> = PROGRAM_KEYS.iter().map(|(_, index)| *index).collect();
+        let mut indices: BTreeSet<u32> = PROGRAM_KEYS.iter().map(|(_, index)| *index).collect();
         assert_eq!(indices.len(), PROGRAM_KEYS.len());
+        assert!(
+            indices.insert(DOLLAR_MINT),
+            "the mint's index is a program's"
+        );
         let names: BTreeSet<&str> = PROGRAM_KEYS.iter().map(|(name, _)| *name).collect();
         assert_eq!(names.len(), PROGRAM_KEYS.len());
     }
@@ -80,6 +94,16 @@ mod tests {
                 assert!(index >= FIRST_PROGRAM_INDEX, "{name} is at {index}");
             }
         }
+    }
+
+    #[test]
+    fn the_dollar_s_mint_is_at_its_fixed_index_after_every_program() {
+        assert_eq!(DOLLAR_MINT, 108);
+        let last_program = PROGRAM_KEYS.iter().map(|(_, index)| *index).max().unwrap();
+        assert!(DOLLAR_MINT > last_program);
+        let last_role = keys::ROLE_BASE + chain::client::ROLE_COUNT as u32 - 1;
+        assert!(![DEPLOYER, PROGRAM].contains(&DOLLAR_MINT));
+        assert!(!(keys::ROLE_BASE..=last_role).contains(&DOLLAR_MINT));
     }
 
     #[test]

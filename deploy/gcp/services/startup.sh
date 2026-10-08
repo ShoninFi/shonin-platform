@@ -5,7 +5,8 @@
 #   shonin-api      the API (the indexer inside), on :19081, open to the VPC,
 #                   and its internal port :19082, for the builder and the
 #                   reviewer alone (the cloud's firewall), never tunneled
-#   shonin-keeper   the keeper, health on :19087, with the keeper's key alone
+#   shonin-keeper   the keeper, health on :19087, with the keeper's keys alone
+#                   (its EVM key, and its Solana devnet key)
 #   shonin-tunnel   cloudflared, carrying the API out to its public name
 #   shonin-waker    a small loop that starts the prover's VM when a machine
 #                   wants a seal, and the builder's and the reviewer's when
@@ -15,12 +16,14 @@
 # sets it): shonin-api-image and shonin-keeper-image (by digest),
 # shonin-executor-url, shonin-prover-instance, shonin-builder-url,
 # shonin-builder-instance, shonin-reviewer-url, shonin-reviewer-instance,
-# shonin-keeper-secret, shonin-tunnel-secret, and the waker's script as
-# shonin-waker.
+# shonin-keeper-secret, shonin-keeper-solana-secret, shonin-tunnel-secret,
+# and the waker's script as shonin-waker.
 #
-# The two secrets are read from Secret Manager with the VM's own token and
+# The secrets are read from Secret Manager with the VM's own token and
 # written to files only root can read; they are never echoed, never put on a
-# command line, and never logged.
+# command line, and never logged. The keeper's Solana key is the one a VM
+# made before it existed may lack: without it the keeper keeps the EVM chains
+# and its health says Solana devnet is not kept.
 set -euo pipefail
 umask 077
 
@@ -73,6 +76,7 @@ builder_instance=$(attribute shonin-builder-instance 2>/dev/null || true)
 reviewer_url=$(attribute shonin-reviewer-url 2>/dev/null || true)
 reviewer_instance=$(attribute shonin-reviewer-instance 2>/dev/null || true)
 keeper_secret=$(attribute shonin-keeper-secret)
+keeper_solana_secret=$(attribute shonin-keeper-solana-secret 2>/dev/null || true)
 tunnel_secret=$(attribute shonin-tunnel-secret)
 cloudflared_image=$(attribute shonin-cloudflared-image 2>/dev/null || echo cloudflare/cloudflared:latest)
 waker_image=$(attribute shonin-waker-image 2>/dev/null || echo curlimages/curl:latest)
@@ -93,6 +97,15 @@ keeper_key=$(secret "$project" "$keeper_secret")
 [ -n "$keeper_key" ] || { say "the keeper's key could not be read"; exit 1; }
 printf 'SHONIN_TESTNET_KEEPER_KEY=%s\n' "$keeper_key" >"$STATE/secrets/keeper.env"
 unset keeper_key
+if [ -n "$keeper_solana_secret" ]; then
+  keeper_solana_key=$(secret "$project" "$keeper_solana_secret" || true)
+  if [ -n "$keeper_solana_key" ]; then
+    printf 'SHONIN_TESTNET_KEEPER_SOLANA_KEY=%s\n' "$keeper_solana_key" >>"$STATE/secrets/keeper.env"
+  else
+    say "the keeper's Solana key could not be read: Solana devnet is not kept (task cloud:secrets makes it)"
+  fi
+  unset keeper_solana_key
+fi
 tunnel_token=$(secret "$project" "$tunnel_secret")
 [ -n "$tunnel_token" ] || { say "the tunnel's token could not be read"; exit 1; }
 printf 'TUNNEL_TOKEN=%s\n' "$tunnel_token" >"$STATE/secrets/tunnel.env"

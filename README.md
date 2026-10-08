@@ -85,6 +85,7 @@ The same stand-in stack deploys to the public testnets (Base Sepolia, Hyperliqui
 task chains:accounts NETWORK=testnet          # every role's address and gas: fund these from the faucets
 task chains:deploy NETWORK=testnet            # deploy to every EVM testnet
 task contracts:solana:deploy NETWORK=testnet  # deploy the programs to Solana devnet
+task chains:solana-setup NETWORK=testnet      # set them up: roles funded from the deployer, the dollar, markets, project
 NETWORK=testnet task dev:services             # run everything here, against them
 ```
 

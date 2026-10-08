@@ -279,6 +279,14 @@ impl BuiltFor {
     }
 }
 
+/// Whether this build's compiled Solana program ids are `network`'s, and if
+/// not, which build is: a program's id is compiled in, never read from a
+/// deployment file, so a tool sending to a cluster's programs is refused by
+/// a build for another network rather than look for them where they aren't.
+pub fn solana_built_for(network: NetworkName) -> Result<()> {
+    BuiltFor::THIS.serves(network)
+}
+
 /// How long a chain that could not be connected to is first waited on
 /// before it is tried again. Each try after waits twice as long as the last,
 /// up to [`CONNECT_RETRY_MOST`].
@@ -447,6 +455,14 @@ impl Target {
                     .await?
             }
         };
+        // A keeper signing with its own key signs only as the keeper this
+        // deployment names.
+        let keeper = deployments
+            .roles
+            .as_ref()
+            .map(|roles| roles.keeper.as_str())
+            .unwrap_or_default();
+        client.signing().check_keeper(keeper)?;
         let platform = Platform::from_deployments(&deployments)?;
         Ok(SolanaServed {
             vault_chain: self.vault_chain,
@@ -495,7 +511,8 @@ pub struct SolanaServed {
 
 /// Connect to a Solana cluster of a network, and check it is the cluster
 /// its key names. The role keys are the network's: the development ones
-/// locally, the team's on devnet, none on mainnet.
+/// locally, the team's on devnet (or the keeper's own key alone, or none,
+/// without the team's mnemonic), none on mainnet.
 pub async fn connect_solana(
     network: NetworkName,
     key: &ChainKey,

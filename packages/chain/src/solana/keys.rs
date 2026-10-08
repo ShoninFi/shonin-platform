@@ -7,9 +7,12 @@
 //! The platform's roles on a cluster are keys of one mnemonic: on a local
 //! cluster the well-known development phrase, on devnet the team's
 //! (`SHONIN_TESTNET_SOLANA_MNEMONIC`), and on mainnet none, where clients
-//! only read.
+//! only read. A devnet client without the mnemonic (a service in the cloud)
+//! only reads, or signs as the keeper alone with the keeper's own key
+//! ([`TESTNET_KEEPER_SOLANA_KEY`]), and never holds the mnemonic.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha512};
@@ -20,6 +23,12 @@ use crate::config::NetworkName;
 
 /// The mnemonic the testnet Solana accounts are derived from.
 pub const TESTNET_SOLANA_MNEMONIC: &str = "SHONIN_TESTNET_SOLANA_MNEMONIC";
+
+/// The keeper's own devnet key, for a keeper that runs without the mnemonic:
+/// it signs as the keeper and nothing else. Its keypair as the Solana tools
+/// write one (a JSON array of its 64 bytes) or as wallets export one (the
+/// same 64 bytes in base58).
+pub const TESTNET_KEEPER_SOLANA_KEY: &str = "SHONIN_TESTNET_KEEPER_SOLANA_KEY";
 
 /// The phrase every development chain publishes its accounts under. Nothing
 /// it derives is a secret, which is what makes a chain a development one.
@@ -57,13 +66,146 @@ pub fn testnet_mnemonic() -> Result<String> {
         })
 }
 
-/// The mnemonic a network's role keys come from, or none on mainnet.
-pub fn mnemonic_for(network: NetworkName) -> Result<Option<String>> {
-    match network {
-        NetworkName::Local => Ok(Some(DEVELOPMENT_MNEMONIC.to_string())),
-        NetworkName::Testnet => testnet_mnemonic().map(Some),
-        NetworkName::Mainnet => Ok(None),
+/// Who signs on a Solana cluster.
+pub enum Signing {
+    /// Every role, from a mnemonic: the development one locally, the team's
+    /// on devnet.
+    Roles(Arc<RoleKeys>),
+    /// The keeper alone, from its own key: a devnet service without the
+    /// mnemonic. Checked against the keeper the deployment names before it
+    /// signs anything ([`Signing::check_keeper`]).
+    Keeper(Box<Keypair>),
+    /// Nobody: mainnet, or devnet with neither the mnemonic nor the keeper's
+    /// key.
+    ReadOnly,
+}
+
+impl Signing {
+    /// Who signs on `network`, from the environment: the development
+    /// mnemonic locally; on a testnet the team's mnemonic when it is set,
+    /// otherwise the keeper's own key when that is set, otherwise nobody;
+    /// nobody on mainnet.
+    pub fn for_network(network: NetworkName) -> Result<Self> {
+        let set = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+        Self::from(
+            network,
+            set(TESTNET_SOLANA_MNEMONIC).as_deref(),
+            set(TESTNET_KEEPER_SOLANA_KEY).as_deref(),
+        )
     }
+
+    /// [`Signing::for_network`], given what the environment holds. A testnet
+    /// mnemonic that is the published development phrase is refused: every
+    /// key it derives is anyone's, so a public cluster's roles must never
+    /// come from it.
+    pub fn from(
+        network: NetworkName,
+        mnemonic: Option<&str>,
+        keeper_key: Option<&str>,
+    ) -> Result<Self> {
+        match network {
+            NetworkName::Local => Ok(Self::Roles(Arc::new(RoleKeys::from_mnemonic(
+                DEVELOPMENT_MNEMONIC,
+            )?))),
+            NetworkName::Testnet => {
+                if let Some(phrase) = mnemonic {
+                    let keys = RoleKeys::from_mnemonic(phrase)?;
+                    if is_development(&keys) {
+                        bail!(
+                            "{TESTNET_SOLANA_MNEMONIC} is the published development phrase, whose keys are anyone's: a public cluster's roles come from the team's own"
+                        );
+                    }
+                    return Ok(Self::Roles(Arc::new(keys)));
+                }
+                match keeper_key {
+                    Some(text) => keypair_from_text(text)
+                        .map(|key| Self::Keeper(Box::new(key)))
+                        .map_err(|_| anyhow!("{TESTNET_KEEPER_SOLANA_KEY} is not a keypair")),
+                    None => Ok(Self::ReadOnly),
+                }
+            }
+            NetworkName::Mainnet => Ok(Self::ReadOnly),
+        }
+    }
+
+    /// The key that signs as `role`, if this holds it.
+    pub fn get(&self, role: Role) -> Option<&Keypair> {
+        match self {
+            Self::Roles(keys) => Some(keys.get(role)),
+            Self::Keeper(key) if role == Role::Keeper => Some(&**key),
+            Self::Keeper(_) | Self::ReadOnly => None,
+        }
+    }
+
+    /// The key at `address`, the deployer's or a role's, if this holds it.
+    pub fn find(&self, address: &Pubkey) -> Option<&Keypair> {
+        match self {
+            Self::Roles(keys) => keys.find(address),
+            Self::Keeper(key) => (key.pubkey() == *address).then_some(&**key),
+            Self::ReadOnly => None,
+        }
+    }
+
+    /// A keeper's own key is refused unless it is the keeper `named` (the
+    /// deployment's, base58): signing as anyone else's keeper is never right.
+    /// The key itself never appears in the error.
+    pub fn check_keeper(&self, named: &str) -> Result<()> {
+        let Self::Keeper(key) = self else {
+            return Ok(());
+        };
+        if key.pubkey().to_string() != named.trim() {
+            bail!(
+                "{TESTNET_KEEPER_SOLANA_KEY} is the key of {}, and the deployment's keeper is {named}: refused",
+                key.pubkey()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Whether `keys` are the development mnemonic's.
+fn is_development(keys: &RoleKeys) -> bool {
+    keypair_from_mnemonic(DEVELOPMENT_MNEMONIC, DEPLOYER)
+        .is_ok_and(|development| development.pubkey() == keys.deployer.pubkey())
+}
+
+/// A keypair as text: a JSON array of its 64 bytes, as the Solana tools
+/// write one, or the same 64 bytes in base58, as wallets export one. The
+/// text is never quoted back in an error.
+pub fn keypair_from_text(text: &str) -> Result<Keypair> {
+    let text = text.trim();
+    let bytes: Vec<u8> = if text.starts_with('[') {
+        keypair_bytes(text).ok_or_else(|| anyhow!("not a keypair's JSON array"))?
+    } else {
+        bs58::decode(text)
+            .into_vec()
+            .map_err(|_| anyhow!("neither a keypair's JSON array nor base58"))?
+    };
+    keypair_of(&bytes)
+}
+
+/// The numbers of a keypair file's JSON array.
+fn keypair_bytes(text: &str) -> Option<Vec<u8>> {
+    text.trim()
+        .strip_prefix('[')?
+        .strip_suffix(']')?
+        .split(',')
+        .map(|n| n.trim().parse::<u8>().ok())
+        .collect()
+}
+
+/// The keypair of 64 bytes, its secret then its public key, checked to be
+/// one.
+fn keypair_of(bytes: &[u8]) -> Result<Keypair> {
+    if bytes.len() != 64 {
+        bail!("{} bytes, not a keypair's 64", bytes.len());
+    }
+    let secret: [u8; 32] = bytes[..32].try_into().expect("32 bytes");
+    let pair = Keypair::new_from_array(secret);
+    if pair.pubkey().to_bytes()[..] != bytes[32..] {
+        bail!("the public key is not the secret's");
+    }
+    Ok(pair)
 }
 
 /// The platform's role keys on one cluster.
@@ -102,26 +244,9 @@ impl RoleKeys {
 pub fn read_keypair(path: &Path) -> Result<Keypair> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let bytes: Vec<u8> = text
-        .trim()
-        .trim_matches(['[', ']'])
-        .split(',')
-        .map(|n| n.trim().parse::<u8>())
-        .collect::<std::result::Result<_, _>>()
-        .with_context(|| format!("{} is not a keypair file", path.display()))?;
-    if bytes.len() != 64 {
-        bail!(
-            "{} holds {} bytes, not a keypair's 64",
-            path.display(),
-            bytes.len()
-        );
-    }
-    let secret: [u8; 32] = bytes[..32].try_into().expect("32 bytes");
-    let pair = Keypair::new_from_array(secret);
-    if pair.pubkey().to_bytes()[..] != bytes[32..] {
-        bail!("{}'s public key is not its secret's", path.display());
-    }
-    Ok(pair)
+    let bytes =
+        keypair_bytes(&text).ok_or_else(|| anyhow!("{} is not a keypair file", path.display()))?;
+    keypair_of(&bytes).with_context(|| format!("{} is not a keypair", path.display()))
 }
 
 /// Write a keypair file the Solana tools read, readable only by its owner.
@@ -230,6 +355,117 @@ mod tests {
         write_keypair(&pair, &path).unwrap();
         assert_eq!(read_keypair(&path).unwrap().pubkey(), pair.pubkey());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A valid phrase that is not the development one (BIP-39's own test
+    /// vector).
+    const ANOTHER_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn keeper_of(phrase: &str) -> Keypair {
+        RoleKeys::from_mnemonic(phrase)
+            .unwrap()
+            .get(Role::Keeper)
+            .insecure_clone()
+    }
+
+    fn json_of(pair: &Keypair) -> String {
+        let bytes: Vec<String> = pair.to_bytes().iter().map(u8::to_string).collect();
+        format!("[{}]", bytes.join(","))
+    }
+
+    #[test]
+    fn a_testnet_without_the_mnemonic_signs_as_the_keeper_alone_with_its_own_key() {
+        let keeper = keeper_of(ANOTHER_MNEMONIC);
+        let as_base58 = bs58::encode(keeper.to_bytes()).into_string();
+        for text in [
+            json_of(&keeper),
+            as_base58,
+            format!("  {}\n", json_of(&keeper)),
+        ] {
+            let signing = Signing::from(NetworkName::Testnet, None, Some(&text)).unwrap();
+            assert_eq!(
+                signing.get(Role::Keeper).map(Signer::pubkey),
+                Some(keeper.pubkey())
+            );
+            for role in [Role::Admin, Role::Executor, Role::Attestor, Role::Operator] {
+                assert!(signing.get(role).is_none(), "{role:?} has no key here");
+            }
+            assert!(signing.find(&keeper.pubkey()).is_some());
+            assert!(matches!(signing, Signing::Keeper(_)));
+        }
+    }
+
+    #[test]
+    fn a_testnet_with_neither_the_mnemonic_nor_the_keeper_s_key_only_reads() {
+        let signing = Signing::from(NetworkName::Testnet, None, None).unwrap();
+        assert!(matches!(signing, Signing::ReadOnly));
+        assert!(signing.get(Role::Keeper).is_none());
+    }
+
+    #[test]
+    fn the_team_s_mnemonic_signs_as_every_role_and_wins_over_the_keeper_s_key() {
+        let other = json_of(&keeper_of(DEVELOPMENT_MNEMONIC));
+        let signing =
+            Signing::from(NetworkName::Testnet, Some(ANOTHER_MNEMONIC), Some(&other)).unwrap();
+        assert_eq!(
+            signing.get(Role::Keeper).map(Signer::pubkey),
+            Some(keeper_of(ANOTHER_MNEMONIC).pubkey())
+        );
+        assert!(signing.get(Role::Admin).is_some());
+    }
+
+    #[test]
+    fn the_development_mnemonic_is_refused_on_a_testnet() {
+        let refused = Signing::from(
+            NetworkName::Testnet,
+            Some(&format!(" {DEVELOPMENT_MNEMONIC} ")),
+            None,
+        );
+        assert!(refused.is_err());
+        // Locally it is the only phrase, whatever the environment holds.
+        let local = Signing::from(NetworkName::Local, Some(ANOTHER_MNEMONIC), None).unwrap();
+        assert_eq!(
+            local.get(Role::Keeper).map(Signer::pubkey),
+            Some(keeper_of(DEVELOPMENT_MNEMONIC).pubkey())
+        );
+    }
+
+    #[test]
+    fn mainnet_only_reads_whatever_the_environment_holds() {
+        let key = json_of(&keeper_of(ANOTHER_MNEMONIC));
+        let signing =
+            Signing::from(NetworkName::Mainnet, Some(ANOTHER_MNEMONIC), Some(&key)).unwrap();
+        assert!(matches!(signing, Signing::ReadOnly));
+    }
+
+    #[test]
+    fn a_keeper_s_own_key_is_refused_unless_it_is_the_deployment_s_keeper() {
+        let keeper = keeper_of(ANOTHER_MNEMONIC);
+        let signing = Signing::from(NetworkName::Testnet, None, Some(&json_of(&keeper))).unwrap();
+        signing.check_keeper(&keeper.pubkey().to_string()).unwrap();
+        let other = keeper_of(DEVELOPMENT_MNEMONIC).pubkey().to_string();
+        assert!(signing.check_keeper(&other).is_err());
+        assert!(signing.check_keeper("").is_err());
+        // Signing as every role, or as none, there is no single key to check.
+        let roles = Signing::from(NetworkName::Testnet, Some(ANOTHER_MNEMONIC), None).unwrap();
+        roles.check_keeper(&other).unwrap();
+    }
+
+    #[test]
+    fn a_keeper_s_key_that_is_not_a_keypair_is_refused_without_being_quoted() {
+        let keeper = keeper_of(ANOTHER_MNEMONIC);
+        let mut bytes = keeper.to_bytes();
+        // The public half no longer the secret's.
+        bytes[40] ^= 1;
+        let mismatched = bs58::encode(bytes).into_string();
+        let short = bs58::encode(&keeper.to_bytes()[..32]).into_string();
+        for text in [mismatched.as_str(), short.as_str(), "[1,2,3]", "zz-junk-zz"] {
+            let error = match Signing::from(NetworkName::Testnet, None, Some(text)) {
+                Ok(_) => panic!("{text:?} was taken as a key"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(!error.contains(text), "the error quotes the key: {error}");
+        }
     }
 
     #[test]

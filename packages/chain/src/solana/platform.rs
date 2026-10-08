@@ -565,6 +565,56 @@ impl Platform {
         }
     }
 
+    /// Revoke an image, at once and for good.
+    pub fn ix_revoke_image(&self, digest: [u8; 32]) -> Instruction {
+        Instruction {
+            program_id: shonin_registry::ID,
+            accounts: shonin_registry::accounts::ImageChange {
+                admin: self.admin,
+                config: registry::config_address(),
+                image: registry::image_address(&digest),
+                system_program: SYSTEM,
+            }
+            .to_account_metas(None),
+            data: shonin_registry::instruction::RevokeImage {
+                image_digest: digest,
+            }
+            .data(),
+        }
+    }
+
+    /// Propose a checker (a final program and its state account): it counts
+    /// once the timelock has passed.
+    pub fn ix_propose_verifier(&self, program: Pubkey, state: Pubkey) -> Instruction {
+        Instruction {
+            program_id: shonin_registry::ID,
+            accounts: shonin_registry::accounts::ProposeVerifier {
+                admin: self.admin,
+                config: registry::config_address(),
+                verifier_program: program,
+                verifier_program_data: Some(program_data_address(&program)),
+                verifier_state: state,
+                verifier_record: registry::verifier_address(&state),
+                system_program: SYSTEM,
+            }
+            .to_account_metas(None),
+            data: shonin_registry::instruction::ProposeVerifier {}.data(),
+        }
+    }
+
+    /// Retire the checker named by its state account, at once and for good.
+    pub fn ix_retire_verifier(&self, state: Pubkey) -> Instruction {
+        Instruction {
+            program_id: shonin_registry::ID,
+            accounts: shonin_registry::accounts::Admin {
+                admin: self.admin,
+                config: registry::config_address(),
+            }
+            .to_account_metas(None),
+            data: shonin_registry::instruction::RetireVerifier { state }.data(),
+        }
+    }
+
     pub fn ix_propose_project(&self, id: [u8; 32]) -> Instruction {
         Instruction {
             program_id: shonin_registry::ID,

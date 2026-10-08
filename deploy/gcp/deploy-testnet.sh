@@ -198,8 +198,11 @@ services() {
   fi
   api=$(digest_of api)
   keeper=$(digest_of keeper)
+  # A VM made before the keeper had a Solana key names no secret for it:
+  # redeployed, it is given the name, and reads the key at its next boot.
   if [ "$(metadata_of shonin-services-testnet shonin-api-image)" = "$REGISTRY/api@$api" ] &&
-    [ "$(metadata_of shonin-services-testnet shonin-keeper-image)" = "$REGISTRY/keeper@$keeper" ]; then
+    [ "$(metadata_of shonin-services-testnet shonin-keeper-image)" = "$REGISTRY/keeper@$keeper" ] &&
+    [ -n "$(metadata_of shonin-services-testnet shonin-keeper-solana-secret)" ]; then
     echo "the services VM already runs api@$api and keeper@$keeper"
     return
   fi

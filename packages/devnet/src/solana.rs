@@ -9,9 +9,15 @@
 //! upgradeable by the deployer locally, which is the key that sets each of
 //! them up.
 //!
-//! On testnets the same programs are deployed by `task
-//! contracts:solana:deploy`, at keys of the team's mnemonic
-//! ([`crate::devnet_keys`]); nothing here touches a public cluster.
+//! On devnet the same programs are deployed by `task
+//! contracts:solana:deploy NETWORK=testnet`, at keys of the team's mnemonic
+//! ([`crate::devnet_keys`]), and [`set_up_public`] sets them up from there
+//! as a development cluster is set up, with a public cluster's choices
+//! ([`Settings::testnet`]): the roles funded by transfer from the deployer,
+//! the dollar's mint at its fixed index of the team's mnemonic, no timelock,
+//! the operator's real project, and no image at all until a real digest is
+//! proposed (`chains:image`). Nothing there is driven: devnet keeps its own
+//! time.
 
 use std::path::Path;
 use std::time::Duration;
@@ -22,8 +28,9 @@ use chain::solana::platform::{Platform, image_digest, program_data_address, proj
 use chain::solana::programs::{
     common, local_driver, local_venue, prices, registry, station, vault,
 };
-use chain::solana::{Pubkey, Signer, SolanaClient, name};
+use chain::solana::{Keypair, Pubkey, Signer, SolanaClient, name};
 use chain::{ChainKey, Role, SolanaDeployments, SolanaRoles};
+use registry::state::ImageKind;
 
 use crate::market::{Tape, half_spread};
 
@@ -34,12 +41,15 @@ pub use chain::solana::keys::{DEPLOYER, PROGRAM, keypair_from_mnemonic, testnet_
 const MINT_KEY: u32 = 2;
 
 /// How long an image or a driver waits between being proposed and becoming
-/// usable: two days, under a minute on the fast clock.
+/// usable on a local cluster: two days, under a minute on the fast clock.
+/// None on devnet, as on the EVM testnets: nobody else's money is at stake
+/// there, and its clock runs in real time.
 const TIMELOCK: u64 = 2 * DAY;
 const BLESSING_TTL: u64 = 72 * HOUR;
 /// What publishing costs: a flat dollar.
 const PUBLISH_FEE: u64 = 1_000_000;
-/// How long before a new price list takes effect: thirty days.
+/// How long before a new price list takes effect on a local cluster: thirty
+/// days. None on devnet, as on the EVM testnets.
 const PRICE_NOTICE: u64 = 30 * DAY;
 const MARGIN_BPS: u64 = 1_000;
 /// What every account is given, in dollars and in coin.
@@ -77,6 +87,159 @@ pub fn deployed_final(program: &str) -> bool {
     PROGRAMS.contains(&(program, true))
 }
 
+/// Whether the program at `id` is final, and if not, who may still replace
+/// it, from its program-data account; `None` if no program is there.
+async fn upgrade_authority(client: &SolanaClient, id: &Pubkey) -> Result<Option<Option<Pubkey>>> {
+    if !client
+        .account(id)
+        .await?
+        .is_some_and(|account| account.executable)
+    {
+        return Ok(None);
+    }
+    // The upgradeable loader's program-data header: a tag of 3, the slot
+    // it was deployed in, then an optional authority.
+    let data = client
+        .account(&program_data_address(id))
+        .await?
+        .map(|account| account.data)
+        .unwrap_or_default();
+    match (data.get(..4), data.get(12)) {
+        (Some([3, 0, 0, 0]), Some(0)) => Ok(Some(None)),
+        (Some([3, 0, 0, 0]), Some(1)) => {
+            let authority = data
+                .get(13..45)
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                .ok_or_else(|| anyhow!("{id}'s program data is cut short"))?;
+            Ok(Some(Some(Pubkey::new_from_array(authority))))
+        }
+        _ => bail!("{id} is not a program of the upgradeable loader this can read"),
+    }
+}
+
+/// What sets a cluster up: everything a development cluster and a public one
+/// do differently. The rest of the set-up is the same on both.
+pub struct Settings {
+    /// The dollar's mint account.
+    pub mint: Keypair,
+    /// The registry's timelock and its floor.
+    pub timelock: u64,
+    pub min_timelock: u64,
+    pub blessing_ttl: u64,
+    /// How long a new price list waits before it applies.
+    pub price_notice: u64,
+    /// The terms every vault is created with.
+    pub terms: vault::state::Terms,
+    /// The images proposed with the registry. A development cluster's are
+    /// its placeholders; a public cluster's are none: a real image's digest
+    /// is proposed once it is built (`chains:image`).
+    pub images: Vec<([u8; 32], ImageKind)>,
+    /// The operator's project, as the registry holds it.
+    pub project: [u8; 32],
+    pub funding: Funding,
+}
+
+/// How the roles are given coin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Funding {
+    /// From the cluster's faucet: a development cluster's.
+    Airdrop,
+    /// By transfer from the deployer, the Solana funder, which keeps
+    /// `reserve` lamports for itself: each role topped up to its amount, and
+    /// left alone once it holds it.
+    Transfer {
+        reserve: u64,
+        roles: Vec<(Role, u64)>,
+    },
+}
+
+impl Settings {
+    /// A local cluster's: the development mnemonic's mint, a two-day
+    /// timelock on the fast clock, placeholder images and project, and the
+    /// faucet.
+    pub fn local() -> Result<Self> {
+        Ok(Self {
+            mint: keys::keypair_from_mnemonic(keys::DEVELOPMENT_MNEMONIC, MINT_KEY)?,
+            timelock: TIMELOCK,
+            min_timelock: 0,
+            blessing_ttl: BLESSING_TTL,
+            price_notice: PRICE_NOTICE,
+            terms: terms(),
+            images: ["executor", "builder", "reviewer", "unwinder"]
+                .into_iter()
+                .zip([
+                    ImageKind::Executor,
+                    ImageKind::Builder,
+                    ImageKind::Reviewer,
+                    ImageKind::Unwinder,
+                ])
+                .map(|(service, kind)| (image_digest(service), kind))
+                .collect(),
+            project: project_id(),
+            funding: Funding::Airdrop,
+        })
+    }
+
+    /// Devnet's, as the EVM testnets are set up: the dollar's mint at its
+    /// fixed index of the team's mnemonic `phrase` (never the published
+    /// development one, whose keys anyone holds), no timelock, the testnet
+    /// terms, no image until a real digest is proposed, the operator's real
+    /// Google Cloud `project`, and every role funded by transfer from the
+    /// deployer as the funding file gives `cluster`'s amounts.
+    pub fn testnet(
+        phrase: &str,
+        project: &str,
+        funding: &crate::fund::Funding,
+        cluster: &ChainKey,
+    ) -> Result<Self> {
+        let mint = keys::keypair_from_mnemonic(phrase, crate::devnet_keys::DOLLAR_MINT)?;
+        let development = keys::keypair_from_mnemonic(
+            keys::DEVELOPMENT_MNEMONIC,
+            crate::devnet_keys::DOLLAR_MINT,
+        )?;
+        if mint.pubkey() == development.pubkey() {
+            bail!(
+                "{} is the published development phrase, whose keys are anyone's: a public cluster is set up from the team's own",
+                keys::TESTNET_SOLANA_MNEMONIC
+            );
+        }
+        let crate::fund::SolanaAmounts { reserve, roles } =
+            funding.solana(cluster)?.ok_or_else(|| {
+                anyhow!(
+                    "the funding file has no [testnet.\"{cluster}\"]: what each role is given there"
+                )
+            })?;
+        Ok(Self {
+            mint,
+            timelock: 0,
+            min_timelock: 0,
+            blessing_ttl: BLESSING_TTL,
+            price_notice: 0,
+            terms: testnet_terms(),
+            images: Vec::new(),
+            project: crate::admin::project_id(checked_project(project)?).0,
+            funding: Funding::Transfer { reserve, roles },
+        })
+    }
+}
+
+/// A Google Cloud project id as the console makes one: 6 to 30 lowercase
+/// letters, digits and hyphens, starting with a letter and not ending with a
+/// hyphen. Anything else is a typo, and its hash would allow nothing.
+fn checked_project(project: &str) -> Result<&str> {
+    let project = project.trim();
+    let shaped = (6..=30).contains(&project.len())
+        && project.starts_with(|c: char| c.is_ascii_lowercase())
+        && !project.ends_with('-')
+        && project
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !shaped {
+        bail!("{project:?} is not a Google Cloud project id");
+    }
+    Ok(project)
+}
+
 /// The terms every local vault is created with: the EVM factory's.
 pub fn terms() -> vault::state::Terms {
     use vault::state::{Fees, Terms, Timers};
@@ -98,6 +261,37 @@ pub fn terms() -> vault::state::Terms {
             fallback_after: DAY,
             // Many local blocks pass between an executor's signings.
             usage_freshness: DAY,
+            tank_escape_delay: DAY,
+            floor_delay: DAY,
+            halt_grace: 10 * MINUTE,
+            freeze_after: 7 * DAY,
+            wind_down: 7 * DAY,
+        },
+    }
+}
+
+/// The terms every devnet vault is created with: the EVM testnets' (their
+/// fees, minimums and timers; the executor signs its usage totals every few
+/// minutes, so a total is fresh for ten).
+pub fn testnet_terms() -> vault::state::Terms {
+    use vault::state::{Fees, Terms, Timers};
+    Terms {
+        fees: Fees {
+            holding_bps: 100,
+            author_bps: 1_000,
+            platform_bps: 500,
+            transaction_bps: 10,
+        },
+        exit_band_bps: 100,
+        minimum_deposit: 10_000_000,
+        minimum_tank: 10_000_000,
+        dead_assets: 10_000,
+        timers: Timers {
+            slot_interval: 10,
+            slot_lead: 5,
+            slot_window: 3,
+            fallback_after: DAY,
+            usage_freshness: 10 * MINUTE,
             tank_escape_delay: DAY,
             floor_delay: DAY,
             halt_grace: 10 * MINUTE,
@@ -137,9 +331,10 @@ pub async fn ensure(
         .join("solana-deployer.json");
     keys::write_keypair(&keys.deployer, &deployer_file)?;
 
-    fund(client, keys).await?;
+    let settings = Settings::local()?;
+    fund(client, keys, &settings.funding).await?;
     let ids = deploy_programs(client, rpc, programs, &deployer_file).await?;
-    let (platform, checker) = set_up(client, keys).await?;
+    let (platform, checker) = set_up(client, keys, &settings).await?;
 
     let deployments = SolanaDeployments {
         chain_key: key.to_string(),
@@ -179,16 +374,221 @@ fn roles(keys: &RoleKeys) -> SolanaRoles {
     }
 }
 
-/// Coin for the deployer and every role, from the cluster's faucet.
-async fn fund(client: &SolanaClient, keys: &RoleKeys) -> Result<()> {
-    let mut everyone = vec![keys.deployer.pubkey()];
-    everyone.extend(ROLES.iter().map(|role| keys.address(*role)));
-    for who in everyone {
-        if client.lamports(&who).await? < STARTING_LAMPORTS / 2 {
-            client.airdrop(&who, STARTING_LAMPORTS).await?;
+/// Set a public cluster up from the programs already deployed to it, and
+/// write its deployment file (`deployments/solana-devnet.json`): every role
+/// funded, then everything a development cluster has before anyone
+/// publishes, with `settings`' choices. Safe to run again: every step looks
+/// at the cluster first, a role holding its amount is given nothing, and the
+/// file keeps the slot of the first run. Fails, once the rest is done, if
+/// the deployer couldn't cover a role past its reserve.
+pub async fn set_up_public(
+    client: &SolanaClient,
+    key: &ChainKey,
+    public_rpc: &str,
+    file: &Path,
+    settings: &Settings,
+) -> Result<SolanaDeployments> {
+    let keys = client.keys()?;
+    let ids = programs_in_place(client).await?;
+    // The slot the first run began in is where an indexer starts reading.
+    let earlier = std::fs::read_to_string(file)
+        .ok()
+        .and_then(|text| SolanaDeployments::from_json(&text).ok());
+    let deployed_slot = match earlier {
+        Some(earlier)
+            if earlier.deployed_slot != 0 && earlier.genesis_hash == client.genesis_hash =>
+        {
+            earlier.deployed_slot
+        }
+        _ => client.rpc.slot().await?,
+    };
+
+    let short = fund(client, keys, &settings.funding).await?;
+    // The admin and the operator sign the set-up: nothing goes on without
+    // them.
+    if let Some(role) = short
+        .iter()
+        .find(|role| matches!(role, Role::Admin | Role::Operator))
+    {
+        bail!(
+            "the deployer can't give the {} its amount past its reserve: fund the deployer ({}) and run this again",
+            role.label(),
+            keys.deployer.pubkey()
+        );
+    }
+    let (platform, checker) = set_up(client, keys, settings).await?;
+
+    let deployments = SolanaDeployments {
+        chain_key: key.to_string(),
+        cluster: client.cluster.clone(),
+        // The chain list's endpoint, never an override, which may carry a
+        // key: this file goes into images.
+        rpc_url: public_rpc.to_string(),
+        genesis_hash: client.genesis_hash.clone(),
+        deployed_slot,
+        programs: ids,
+        mint: Some(platform.mint.to_string()),
+        token_program: Some(chain::solana::programs::anchor_spl::token::ID.to_string()),
+        checker: Some(checker.to_string()),
+        roles: Some(roles(keys)),
+    };
+    client
+        .check_deployments(&deployments)
+        .await
+        .context("the deployment just set up does not check out")?;
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("making {}", parent.display()))?;
+    }
+    std::fs::write(file, deployments.to_json())
+        .with_context(|| format!("writing {}", file.display()))?;
+    tracing::info!(file = %file.display(), "the cluster is set up and written down");
+    if !short.is_empty() {
+        let named: Vec<&str> = short.iter().map(|role| role.label()).collect();
+        bail!(
+            "set up, but the deployer ({}) couldn't give {} their amounts past its reserve: fund it and run this again",
+            keys.deployer.pubkey(),
+            named.join(", ")
+        );
+    }
+    Ok(deployments)
+}
+
+/// Every program this build speaks to, deployed at the id compiled in, and
+/// final where it must be (the development checker and the stand-in
+/// driver, which the registry checks for itself); their ids by name.
+async fn programs_in_place(
+    client: &SolanaClient,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut ids = std::collections::BTreeMap::new();
+    for (program, id) in chain::solana::programs::compiled() {
+        match upgrade_authority(client, &id).await? {
+            None => bail!(
+                "{program} is not deployed at {id} on {}: deploy the programs first (task contracts:solana:deploy NETWORK=testnet)",
+                client.key
+            ),
+            Some(Some(authority)) if deployed_final(program) => bail!(
+                "{program} at {id} can still be replaced (by {authority}): a checker or a driver must be final"
+            ),
+            Some(_) => {}
+        }
+        ids.insert(program.to_string(), id.to_string());
+    }
+    Ok(ids)
+}
+
+/// Coin for the deployer and every role: from the faucet on a development
+/// cluster, by transfer from the deployer on a public one. The roles the
+/// deployer couldn't cover past its reserve are returned: none is given part
+/// of its amount.
+async fn fund(client: &SolanaClient, keys: &RoleKeys, funding: &Funding) -> Result<Vec<Role>> {
+    match funding {
+        Funding::Airdrop => {
+            let mut everyone = vec![keys.deployer.pubkey()];
+            everyone.extend(ROLES.iter().map(|role| keys.address(*role)));
+            for who in everyone {
+                if client.lamports(&who).await? < STARTING_LAMPORTS / 2 {
+                    client.airdrop(&who, STARTING_LAMPORTS).await?;
+                }
+            }
+            Ok(Vec::new())
+        }
+        Funding::Transfer { reserve, roles } => {
+            let deployer = &keys.deployer;
+            let mut holdings = Vec::new();
+            for (role, _) in roles {
+                holdings.push(client.lamports(&keys.address(*role)).await?);
+            }
+            let available = client
+                .lamports(&deployer.pubkey())
+                .await?
+                .saturating_sub(*reserve);
+            let plan = transfers(roles, &holdings, available);
+            for (role, holds, need) in &plan.rows {
+                let address = keys.address(*role);
+                match need {
+                    Need::Enough => {
+                        tracing::info!(role = role.label(), %address, lamports = holds, "holds its amount")
+                    }
+                    Need::Sent(lamports) => {
+                        tracing::info!(role = role.label(), %address, lamports, "topped up")
+                    }
+                    Need::Short(lamports) => {
+                        tracing::warn!(role = role.label(), %address, lamports, "the deployer can't cover this role past its reserve")
+                    }
+                }
+            }
+            let sends: Vec<_> = plan
+                .rows
+                .iter()
+                .filter_map(|(role, _, need)| match need {
+                    Need::Sent(lamports) => Some(chain::solana::executor::ix_fund(
+                        &deployer.pubkey(),
+                        &keys.address(*role),
+                        *lamports,
+                    )),
+                    _ => None,
+                })
+                .collect();
+            if !sends.is_empty() {
+                client
+                    .send(sends, &[deployer])
+                    .await
+                    .context("funding the roles from the deployer")?;
+            }
+            Ok(plan.short())
         }
     }
-    Ok(())
+}
+
+/// What one role is given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Need {
+    /// It holds its amount already.
+    Enough,
+    /// This many lamports, to bring it to its amount.
+    Sent(u64),
+    /// This many lamports, more than the deployer holds past its reserve:
+    /// nothing is sent.
+    Short(u64),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Transfers {
+    /// Each role, what it holds, and what it is given.
+    rows: Vec<(Role, u64, Need)>,
+}
+
+impl Transfers {
+    fn short(&self) -> Vec<Role> {
+        self.rows
+            .iter()
+            .filter(|(_, _, need)| matches!(need, Need::Short(_)))
+            .map(|(role, _, _)| *role)
+            .collect()
+    }
+}
+
+/// Who is topped up, in order, from `available` lamports: each role short of
+/// its amount is given exactly what it lacks while the deployer can cover
+/// it, and a role it can't cover is given nothing, never part.
+fn transfers(roles: &[(Role, u64)], holdings: &[u64], mut available: u64) -> Transfers {
+    let rows = roles
+        .iter()
+        .zip(holdings)
+        .map(|((role, target), holds)| {
+            let need = target.saturating_sub(*holds);
+            let given = if need == 0 {
+                Need::Enough
+            } else if need <= available {
+                available -= need;
+                Need::Sent(need)
+            } else {
+                Need::Short(need)
+            };
+            (*role, *holds, given)
+        })
+        .collect();
+    Transfers { rows }
 }
 
 const ROLES: [Role; 10] = [
@@ -291,11 +691,15 @@ async fn deploy_programs(
 /// Everything a development cluster has before anyone publishes: the
 /// dollar, the development checker, every program set up, the venue's
 /// markets, the images, project and driver proposed, and money handed out.
-async fn set_up(client: &SolanaClient, keys: &RoleKeys) -> Result<(Platform, Pubkey)> {
+async fn set_up(
+    client: &SolanaClient,
+    keys: &RoleKeys,
+    settings: &Settings,
+) -> Result<(Platform, Pubkey)> {
     let deployer = &keys.deployer;
     let admin = keys.get(Role::Admin);
     let operator = keys.get(Role::Operator);
-    let mint = keys::keypair_from_mnemonic(keys::DEVELOPMENT_MNEMONIC, MINT_KEY)?;
+    let mint = &settings.mint;
     let cluster = client.cluster.clone();
     let (create_checker, checker) = Platform::ix_create_checker(
         &deployer.pubkey(),
@@ -322,7 +726,7 @@ async fn set_up(client: &SolanaClient, keys: &RoleKeys) -> Result<(Platform, Pub
         let ixs =
             Platform::ix_create_mint(&deployer.pubkey(), &mint.pubkey(), &admin.pubkey(), rent)?;
         client
-            .send(ixs, &[deployer, &mint])
+            .send(ixs, &[deployer, mint])
             .await
             .context("creating the dollar")?;
     }
@@ -345,9 +749,9 @@ async fn set_up(client: &SolanaClient, keys: &RoleKeys) -> Result<(Platform, Pub
             registry::InitializeArgs {
                 admin: admin.pubkey(),
                 cluster_name: cluster.clone(),
-                timelock: TIMELOCK,
-                min_timelock: 0,
-                blessing_ttl: BLESSING_TTL,
+                timelock: settings.timelock,
+                min_timelock: settings.min_timelock,
+                blessing_ttl: settings.blessing_ttl,
             },
             checker,
         );
@@ -372,8 +776,11 @@ async fn set_up(client: &SolanaClient, keys: &RoleKeys) -> Result<(Platform, Pub
         .await?
         .is_none()
     {
-        let ix =
-            platform.ix_initialize_prices(&deployer.pubkey(), PRICE_NOTICE, published_prices());
+        let ix = platform.ix_initialize_prices(
+            &deployer.pubkey(),
+            settings.price_notice,
+            published_prices(),
+        );
         client
             .send(vec![ix], &[deployer])
             .await
@@ -402,7 +809,7 @@ async fn set_up(client: &SolanaClient, keys: &RoleKeys) -> Result<(Platform, Pub
         .await?
         .is_none()
     {
-        let ix = platform.ix_initialize_vaults(&deployer.pubkey(), terms());
+        let ix = platform.ix_initialize_vaults(&deployer.pubkey(), settings.terms);
         client
             .send(vec![ix], &[deployer])
             .await
@@ -420,42 +827,41 @@ async fn set_up(client: &SolanaClient, keys: &RoleKeys) -> Result<(Platform, Pub
             client.send(vec![ix], &[operator]).await?;
         }
     }
-    client
-        .send(
-            vec![platform.ix_mint_into(
-                &admin.pubkey(),
-                &local_venue::vault_address(),
-                VENUE_RESERVES,
-            )?],
-            &[admin],
-        )
-        .await
-        .context("the venue's reserves")?;
+    // Topped up to them, not added to on every run.
+    let reserves =
+        VENUE_RESERVES.saturating_sub(client.token_balance(&local_venue::vault_address()).await?);
+    if reserves > 0 {
+        client
+            .send(
+                vec![platform.ix_mint_into(
+                    &admin.pubkey(),
+                    &local_venue::vault_address(),
+                    reserves,
+                )?],
+                &[admin],
+            )
+            .await
+            .context("the venue's reserves")?;
+    }
     tracing::info!("the stand-in venue has listed its markets");
 
     // The images, the project and the stand-in driver, behind the timelock.
     let mut proposals = Vec::new();
-    for (service, kind) in [
-        ("executor", registry::state::ImageKind::Executor),
-        ("builder", registry::state::ImageKind::Builder),
-        ("reviewer", registry::state::ImageKind::Reviewer),
-        ("unwinder", registry::state::ImageKind::Unwinder),
-    ] {
-        let digest = image_digest(service);
+    for (digest, kind) in &settings.images {
         if client
-            .account(&registry::read::image_address(&digest))
+            .account(&registry::read::image_address(digest))
             .await?
             .is_none()
         {
-            proposals.push(platform.ix_propose_image(digest, kind));
+            proposals.push(platform.ix_propose_image(*digest, *kind));
         }
     }
     if client
-        .account(&registry::read::project_address(&project_id()))
+        .account(&registry::read::project_address(&settings.project))
         .await?
         .is_none()
     {
-        proposals.push(platform.ix_propose_project(project_id()));
+        proposals.push(platform.ix_propose_project(settings.project));
     }
     if !proposals.is_empty() {
         client
@@ -490,15 +896,24 @@ async fn set_up(client: &SolanaClient, keys: &RoleKeys) -> Result<(Platform, Pub
         open.push(platform.ix_open_dollars(&deployer.pubkey(), &keys.address(role)));
     }
     client.send(open, &[deployer]).await?;
+    // Each topped up to its starting dollars, as on the EVM: one that holds
+    // them is given nothing.
     let mut minting = Vec::new();
     for role in [Role::Author, Role::Viewer, Role::Keeper, Role::Admin] {
-        minting.push(platform.ix_mint_to(
-            &admin.pubkey(),
-            &keys.address(role),
-            STARTING_DOLLARS,
-        )?);
+        let holds = client
+            .token_balance(&platform.dollars(&keys.address(role)))
+            .await?;
+        if holds < STARTING_DOLLARS {
+            minting.push(platform.ix_mint_to(
+                &admin.pubkey(),
+                &keys.address(role),
+                STARTING_DOLLARS - holds,
+            )?);
+        }
     }
-    client.send(minting, &[admin]).await?;
+    if !minting.is_empty() {
+        client.send(minting, &[admin]).await?;
+    }
     tracing::info!("the accounts are funded");
     Ok((platform, checker))
 }
@@ -578,5 +993,179 @@ fn quote(market: &str, price: f64) -> local_venue::Quote {
         oracle: mark,
         bid: mark.saturating_sub(half),
         ask: mark + half,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A valid phrase that is not the development one (BIP-39's own test
+    /// vector), standing for the team's.
+    const TEAM: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn funding() -> crate::fund::Funding {
+        toml::from_str(
+            r#"
+[testnet."solana:devnet"]
+reserve = 1
+default = 0.2
+keeper = 2
+platform = 0
+
+[hyperliquid]
+max_price = 35.0
+max_per_run = 3.0
+activation_usd = 2.0
+"#,
+        )
+        .unwrap()
+    }
+
+    fn devnet() -> ChainKey {
+        "solana:devnet".parse().unwrap()
+    }
+
+    fn testnet() -> Settings {
+        Settings::testnet(TEAM, "shonin-testnet", &funding(), &devnet()).unwrap()
+    }
+
+    #[test]
+    fn a_public_cluster_is_set_up_with_no_placeholder_image() {
+        assert!(testnet().images.is_empty());
+        // A development cluster's placeholders are all it has.
+        let local = Settings::local().unwrap();
+        assert_eq!(local.images.len(), 4);
+        assert!(local.images.iter().all(|(digest, _)| {
+            ["executor", "builder", "reviewer", "unwinder"]
+                .iter()
+                .any(|service| image_digest(service) == *digest)
+        }));
+    }
+
+    #[test]
+    fn a_public_cluster_allows_the_operator_s_real_project_not_the_placeholder() {
+        let settings = testnet();
+        assert_eq!(
+            settings.project,
+            crate::admin::project_id("shonin-testnet").0,
+            "the project is proposed as chains:project proposes it on the EVM"
+        );
+        assert_ne!(settings.project, project_id());
+        for typo in [
+            "",
+            "Shonin-Testnet",
+            "shonin_testnet",
+            "shonin-",
+            "short",
+            "1shonin",
+        ] {
+            assert!(
+                Settings::testnet(TEAM, typo, &funding(), &devnet()).is_err(),
+                "{typo:?} was taken as a project"
+            );
+        }
+    }
+
+    #[test]
+    fn the_devnet_dollar_s_mint_is_at_its_fixed_index_of_the_team_s_mnemonic() {
+        let mint = testnet().mint.pubkey();
+        assert_eq!(
+            mint,
+            keys::keypair_from_mnemonic(TEAM, crate::devnet_keys::DOLLAR_MINT)
+                .unwrap()
+                .pubkey()
+        );
+        // Never the local dollar's, nor any program's or role's key.
+        assert_ne!(mint, Settings::local().unwrap().mint.pubkey());
+        for index in crate::devnet_keys::PROGRAM_KEYS
+            .iter()
+            .map(|(_, index)| *index)
+            .chain([keys::DEPLOYER])
+            .chain((0..chain::client::ROLE_COUNT as u32).map(|role| keys::ROLE_BASE + role))
+        {
+            assert_ne!(
+                mint,
+                keys::keypair_from_mnemonic(TEAM, index).unwrap().pubkey()
+            );
+        }
+    }
+
+    #[test]
+    fn a_public_cluster_is_never_set_up_from_the_development_mnemonic() {
+        let refused = Settings::testnet(
+            &format!("  {}  ", keys::DEVELOPMENT_MNEMONIC),
+            "shonin-testnet",
+            &funding(),
+            &devnet(),
+        );
+        assert!(refused.is_err());
+    }
+
+    #[test]
+    fn a_public_cluster_s_roles_are_funded_by_transfer_from_the_deployer_not_the_faucet() {
+        let Funding::Transfer { reserve, roles } = testnet().funding else {
+            panic!("a public cluster is not funded from its faucet");
+        };
+        assert_eq!(reserve, LAMPORTS_PER_SOL);
+        let of = |role: Role| roles.iter().find(|(r, _)| *r == role).unwrap().1;
+        assert_eq!(of(Role::Keeper), 2 * LAMPORTS_PER_SOL);
+        assert_eq!(of(Role::Admin), LAMPORTS_PER_SOL / 5);
+        assert_eq!(of(Role::Platform), 0);
+        assert_eq!(Settings::local().unwrap().funding, Funding::Airdrop);
+        // A cluster the funding file doesn't list is refused, not funded
+        // with nothing.
+        let mainnet: ChainKey = "solana:mainnet-beta".parse().unwrap();
+        assert!(Settings::testnet(TEAM, "shonin-testnet", &funding(), &mainnet).is_err());
+    }
+
+    #[test]
+    fn each_role_is_given_exactly_what_it_lacks_or_nothing() {
+        let roles = [
+            (Role::Admin, 500),
+            (Role::Keeper, 2_000),
+            (Role::Author, 1_000),
+            (Role::Platform, 0),
+            (Role::Viewer, 300),
+        ];
+        let holdings = [500, 1_200, 0, 7, 100];
+        let plan = transfers(&roles, &holdings, 1_000);
+        assert_eq!(
+            plan.rows,
+            vec![
+                (Role::Admin, 500, Need::Enough),
+                (Role::Keeper, 1_200, Need::Sent(800)),
+                // 200 left: the author's 1,000 can't be covered, and it is
+                // given none of it.
+                (Role::Author, 0, Need::Short(1_000)),
+                (Role::Platform, 7, Need::Enough),
+                (Role::Viewer, 100, Need::Sent(200)),
+            ]
+        );
+        assert_eq!(plan.short(), vec![Role::Author]);
+        // A second run, every amount held, sends nothing.
+        let again = transfers(&roles, &[500, 2_000, 1_000, 0, 300], 0);
+        assert!(again.rows.iter().all(|(_, _, need)| *need == Need::Enough));
+    }
+
+    #[test]
+    fn a_public_cluster_has_no_timelock_and_the_testnet_terms() {
+        let settings = testnet();
+        assert_eq!((settings.timelock, settings.min_timelock), (0, 0));
+        assert_eq!(settings.price_notice, 0);
+        assert_eq!(settings.blessing_ttl, 72 * HOUR);
+        assert_eq!(settings.terms, testnet_terms());
+        // The EVM testnets': a $10 tank and deposit, totals fresh for ten
+        // minutes, a week to freeze.
+        assert_eq!(settings.terms.minimum_tank, 10_000_000);
+        assert_eq!(settings.terms.minimum_deposit, 10_000_000);
+        assert_eq!(settings.terms.timers.usage_freshness, 10 * MINUTE);
+        assert_eq!(settings.terms.timers.freeze_after, 7 * DAY);
+    }
+
+    #[test]
+    fn every_cluster_s_terms_are_within_the_vault_program_s_bounds() {
+        vault::factory::checked(&testnet_terms()).unwrap();
+        vault::factory::checked(&terms()).unwrap();
     }
 }

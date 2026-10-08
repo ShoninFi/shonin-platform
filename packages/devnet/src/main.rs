@@ -91,8 +91,24 @@ struct Args {
 enum Command {
     /// Deploy the contracts to every EVM chain of the network, and on the
     /// local network the programs to its Solana cluster, and write the
-    /// addresses, then stop. Local and testnet only.
+    /// addresses, then stop. Local and testnet only. On the testnets the
+    /// Solana programs are deployed by `task contracts:solana:deploy` and set
+    /// up by `solana-setup`.
     Deploy,
+    /// On the testnets, set Solana devnet up from the programs already
+    /// deployed there, as a development cluster is set up: every role funded
+    /// by transfer from the deployer (the funding file's amounts), the
+    /// dollar's mint at its fixed index of the team's mnemonic, the
+    /// registry with no timelock and the development checker, the operator's
+    /// project, the stand-in driver and the venue's markets, every role's
+    /// dollar account; then the deployment file, with the roles. No image
+    /// is proposed: a real digest is, with `propose-image`. Safe to run
+    /// again.
+    SolanaSetup {
+        /// The operator's Google Cloud project id.
+        #[arg(long)]
+        project: String,
+    },
     /// The smoke check a deploy ends with, read-only: each EVM chain's
     /// deployment read back from the chain (or only `--vault-chain`'s), and
     /// with `--api` the API's health, every one of those chains served with
@@ -114,8 +130,9 @@ enum Command {
     /// network and propose it to the registry beside the development
     /// checker. Already proposed is done.
     ProposeChecker,
-    /// Propose a real image digest to every EVM chain's registry, signed
-    /// by the admin. Already proposed is done.
+    /// Propose a real image digest to every chain's registry (each EVM
+    /// chain's and the Solana cluster's, once it is set up), signed by the
+    /// admin. Already proposed is done.
     ProposeImage {
         /// `sha256:<64 hex>`, as the container registry names the image.
         #[arg(long)]
@@ -124,7 +141,7 @@ enum Command {
         #[arg(long)]
         kind: String,
     },
-    /// Revoke an image digest on every EVM chain's registry, signed by the
+    /// Revoke an image digest on every chain's registry, signed by the
     /// admin: at once and for good. Already revoked is done.
     RevokeImage {
         /// `sha256:<64 hex>`, as the container registry names the image.
@@ -132,15 +149,15 @@ enum Command {
         digest: String,
     },
     /// Propose an operator project (by its Google Cloud project id; the
-    /// registry holds its keccak256) to every EVM chain's registry, signed
-    /// by the admin. Already proposed is done.
+    /// registry holds its keccak256) to every chain's registry, signed by
+    /// the admin. Already proposed is done.
     ProposeProject {
         /// The Google Cloud project id.
         project: String,
     },
-    /// Retire the development checker on every EVM chain, signed by the
-    /// admin; refused on a chain where no other checker is allowed. Already
-    /// retired is done.
+    /// Retire the development checker on every chain, signed by the admin;
+    /// refused on a chain where no other checker is allowed. Already retired
+    /// is done.
     RetireChecker {
         /// The development checker (the only kind this retires).
         #[arg(long)]
@@ -156,9 +173,9 @@ enum Command {
     /// good; the executor makes a new root and the keeper records it. Already
     /// clear is done.
     ClearRootKey,
-    /// Allow a development checker again on every EVM chain (a fresh one,
-    /// since a retired checker can't be proposed again), for a publish only
-    /// it can bless. Already allowed is done. Retire it again after.
+    /// Allow a development checker again on every chain (a fresh one, since
+    /// a retired checker can't be proposed again), for a publish only it can
+    /// bless. Already allowed is done. Retire it again after.
     AllowDevChecker,
     /// Top every role up on every EVM testnet from the funder, to the amounts
     /// in the funding file; buys HYPE on HyperCore for HyperEVM. Safe to run
@@ -177,10 +194,12 @@ enum Command {
         #[arg(long, default_value = "")]
         prefix: String,
     },
-    /// Write a Solana keypair derived from the testnet Solana mnemonic.
+    /// Write a Solana keypair derived from the testnet Solana mnemonic, and
+    /// print its address.
     SolanaKeypair {
-        /// Which: the deployer, or the registry's own address.
-        #[arg(long, value_parser = ["deployer", "program"])]
+        /// Which: the deployer, the registry's own address, or the keeper
+        /// (for the cloud's keeper, which holds that key alone).
+        #[arg(long, value_parser = ["deployer", "program", "keeper"])]
         role: String,
         #[arg(long)]
         out: PathBuf,
@@ -336,6 +355,7 @@ async fn main() -> Result<()> {
         args.command,
         Some(
             Command::Deploy
+                | Command::SolanaSetup { .. }
                 | Command::Seed { .. }
                 | Command::Accounts
                 | Command::Fund
@@ -356,6 +376,41 @@ async fn main() -> Result<()> {
     }
 
     match args.command {
+        Some(Command::Deploy) if !local && one && target.key.kind == ChainKind::Solana => {
+            bail!(
+                "on {} the Solana programs are deployed by task contracts:solana:deploy and set up by solana-setup (task chains:solana-setup)",
+                target.network
+            )
+        }
+        Some(Command::SolanaSetup { project }) => {
+            if target.network != NetworkName::Testnet {
+                bail!(
+                    "solana-setup sets up Solana devnet (NETWORK=testnet): the local cluster is set up with the chains"
+                );
+            }
+            let phrase = solana::testnet_mnemonic()?;
+            let funding = fund::Funding::read(&args.funding)?;
+            let clusters = only(&target, one, solana_clusters(&target));
+            if clusters.is_empty() {
+                bail!("the {} network has no Solana cluster", target.network);
+            }
+            for (key, config) in clusters {
+                let settings = solana::Settings::testnet(&phrase, &project, &funding, &key)?;
+                let client = chain::connect_solana(target.network, &key, &config).await?;
+                let file = Deployments::file_in(&target.deployments_dir, &key);
+                let deployments =
+                    solana::set_up_public(&client, &key, &config.public_rpc, &file, &settings)
+                        .await
+                        .map_err(|error| for_this_build(target.network, error))?;
+                println!(
+                    "{} ({key}): set up; the dollar is {}, written to {}",
+                    config.label,
+                    deployments.mint.as_deref().unwrap_or_default(),
+                    file.display()
+                );
+            }
+            Ok(())
+        }
         Some(Command::Deploy) => {
             let names = chain_names(&target);
             let chosen = only(&target, one, evm_chains(&target));
@@ -447,40 +502,74 @@ async fn main() -> Result<()> {
         Some(Command::ProposeImage { digest, kind }) => {
             let digest = admin::image_digest(&digest)?;
             let kind = admin::kind_named(&kind)?;
-            on_each_registry(&target, one, |client, deployments| async move {
-                admin::propose_image(&client, &deployments, digest, kind).await
-            })
+            on_each_registry(
+                &target,
+                one,
+                |client, deployments| async move {
+                    admin::propose_image(&client, &deployments, digest, kind).await
+                },
+                |client, deployments| async move {
+                    admin::solana::propose_image(&client, &deployments, digest.0, kind).await
+                },
+            )
             .await
         }
         Some(Command::RevokeImage { digest }) => {
             let digest = admin::image_digest(&digest)?;
-            on_each_registry(&target, one, |client, deployments| async move {
-                admin::revoke_image(&client, &deployments, digest).await
-            })
+            on_each_registry(
+                &target,
+                one,
+                |client, deployments| async move {
+                    admin::revoke_image(&client, &deployments, digest).await
+                },
+                |client, deployments| async move {
+                    admin::solana::revoke_image(&client, &deployments, digest.0).await
+                },
+            )
             .await
         }
-        Some(Command::ProposeProject { project }) => {
-            on_each_registry(&target, one, |client, deployments| {
+        Some(Command::ProposeProject { project }) => on_each_registry(
+            &target,
+            one,
+            |client, deployments| {
                 let project = project.clone();
                 async move { admin::propose_project(&client, &deployments, &project).await }
-            })
-            .await
-        }
+            },
+            |client, deployments| {
+                let project = project.clone();
+                async move { admin::solana::propose_project(&client, &deployments, &project).await }
+            },
+        )
+        .await,
         Some(Command::RetireChecker { dev }) => {
             if !dev {
                 bail!("only the development checker is retired here: pass --dev");
             }
-            on_each_registry(&target, one, |client, deployments| async move {
-                admin::retire_dev_checker(&client, &deployments).await
-            })
+            on_each_registry(
+                &target,
+                one,
+                |client, deployments| async move {
+                    admin::retire_dev_checker(&client, &deployments).await
+                },
+                |client, deployments| async move {
+                    admin::solana::retire_dev_checker(&client, &deployments).await
+                },
+            )
             .await
         }
         Some(Command::AllowDevChecker) => {
             let artifacts = args.artifacts.clone();
-            on_each_registry(&target, one, |client, deployments| {
-                let artifacts = artifacts.clone();
-                async move { admin::allow_dev_checker(&client, &deployments, &artifacts).await }
-            })
+            on_each_registry(
+                &target,
+                one,
+                |client, deployments| {
+                    let artifacts = artifacts.clone();
+                    async move { admin::allow_dev_checker(&client, &deployments, &artifacts).await }
+                },
+                |client, deployments| async move {
+                    admin::solana::allow_dev_checker(&client, &deployments).await
+                },
+            )
             .await
         }
         Some(Command::RootKey) => {
@@ -546,10 +635,12 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::SolanaKeypair { role, out }) => {
-            let index = if role == "program" {
-                solana::PROGRAM
-            } else {
-                solana::DEPLOYER
+            let index = match role.as_str() {
+                "program" => solana::PROGRAM,
+                "keeper" => {
+                    chain::solana::keys::ROLE_BASE + chain::Role::Keeper.account_index() as u32
+                }
+                _ => solana::DEPLOYER,
             };
             let pair = solana::keypair_from_mnemonic(&solana::testnet_mnemonic()?, index)?;
             chain::solana::keys::write_keypair(&pair, &out)?;
@@ -880,20 +971,28 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Run one admin change against every EVM chain's registry of the network
-/// (or the one named), each from its deployment file, and say what it did.
-async fn on_each_registry<F, Fut>(target: &Target, one: bool, change: F) -> Result<()>
+/// Run one admin change against every registry of the network (or the
+/// chain named): each EVM chain's with `evm`, the Solana cluster's with
+/// `solana`, each from its deployment file, and say what it did.
+async fn on_each_registry<F, Fut, G, Gut>(
+    target: &Target,
+    one: bool,
+    evm: F,
+    solana: G,
+) -> Result<()>
 where
     F: Fn(chain::Client, Deployments) -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
+    G: Fn(chain::solana::SolanaClient, chain::SolanaDeployments) -> Gut,
+    Gut: std::future::Future<Output = Result<String>>,
 {
     // Every chain at once: each registry is its own chain and its own
     // admin nonce, so one chain's slow blocks never hold up another's.
     // Each chain's outcome is printed; the command fails if any chain did.
-    let each = only(target, one, evm_chains(target))
+    let evm_each = only(target, one, evm_chains(target))
         .into_iter()
         .map(|(key, config)| {
-            let change = &change;
+            let change = &evm;
             async move {
                 let outcome = async {
                     let client = connect_to(target.network, &key, &config).await?;
@@ -907,8 +1006,47 @@ where
                 (key, config, outcome)
             }
         });
+    // A cluster not set up yet is passed over and said to be, unless it was
+    // named alone: the EVM chains' changes don't wait on it.
+    let solana_each = only(target, one, solana_clusters(target))
+        .into_iter()
+        .map(|(key, config)| {
+            let change = &solana;
+            async move {
+                let outcome = async {
+                    let file = Deployments::file_in(&target.deployments_dir, &key);
+                    let deployments = std::fs::read_to_string(&file)
+                        .ok()
+                        .and_then(|text| chain::SolanaDeployments::from_json(&text).ok())
+                        .filter(|deployments| deployments.roles.is_some());
+                    let Some(deployments) = deployments else {
+                        if one {
+                            bail!(
+                                "{key} is not set up ({} names no roles): run chains:solana-setup first",
+                                file.display()
+                            );
+                        }
+                        return Ok(format!(
+                            "not set up yet ({} names no roles): skipped",
+                            file.display()
+                        ));
+                    };
+                    let client = chain::connect_solana(target.network, &key, &config).await?;
+                    client.check_deployments(&deployments).await?;
+                    change(client, deployments).await
+                }
+                .await
+                .map_err(|error| for_this_build(target.network, error));
+                (key, config, outcome)
+            }
+        });
+    let (evm_done, solana_done) = futures::future::join(
+        futures::future::join_all(evm_each),
+        futures::future::join_all(solana_each),
+    )
+    .await;
     let mut failed = Vec::new();
-    for (key, config, outcome) in futures::future::join_all(each).await {
+    for (key, config, outcome) in evm_done.into_iter().chain(solana_done) {
         match outcome {
             Ok(said) => println!("{} ({key}): {said}", config.label),
             Err(error) => {
@@ -921,6 +1059,17 @@ where
         bail!("not done on {}", failed.join(", "));
     }
     Ok(())
+}
+
+/// A Solana command's failure, with what most likely caused it when this
+/// build's program ids are another network's: a program's id is compiled
+/// in, so such a build looks for the cluster's programs where they aren't
+/// (the Solana-facing tasks build with the network's feature).
+fn for_this_build(network: NetworkName, error: anyhow::Error) -> anyhow::Error {
+    match chain::solana_built_for(network) {
+        Ok(()) => error,
+        Err(why) => error.context(format!("{why:#}")),
+    }
 }
 
 /// The network's canonical chain for the root key, connected, with its
@@ -1031,26 +1180,88 @@ async fn accounts(target: &Target, funding_file: &std::path::Path) -> Result<()>
         }
     }
     if testnet {
+        use chain::solana::Signer;
         let phrase = solana::testnet_mnemonic()?;
         let deployer = solana::keypair_from_mnemonic(&phrase, solana::DEPLOYER)?;
-        println!("Solana devnet");
-        println!(
-            "  {:<20} {}  (the Solana funder: it pays for the programs and funds the roles)",
-            "FUNDER (deployer)",
-            chain::solana::Signer::pubkey(&deployer)
-        );
-        for role in fund::ROLES {
-            let index = chain::solana::keys::ROLE_BASE + role.account_index() as u32;
-            let pair = solana::keypair_from_mnemonic(&phrase, index)?;
+        for (key, config) in solana_clusters(target) {
+            println!("{} ({key})", config.label);
+            // What each holds, where the cluster answers: the addresses are
+            // shown either way.
+            let client = match chain::connect_solana(target.network, &key, &config).await {
+                Ok(client) => Some(client),
+                Err(error) => {
+                    println!("  (not reached: {error:#}; the addresses alone)");
+                    None
+                }
+            };
+            let amounts = funding
+                .as_ref()
+                .map(|funding| funding.solana(&key))
+                .transpose()?
+                .flatten();
+            let sol = |lamports: u64| format!("{} SOL", lamports as f64 / 1e9);
+            let held = |address: chain::solana::Pubkey| {
+                let client = client.clone();
+                async move {
+                    match &client {
+                        Some(client) => client.lamports(&address).await.ok(),
+                        None => None,
+                    }
+                }
+            };
+            let mut short_total = 0u64;
+            let mut rows = Vec::new();
+            for role in fund::ROLES {
+                let index = chain::solana::keys::ROLE_BASE + role.account_index() as u32;
+                let address = solana::keypair_from_mnemonic(&phrase, index)?.pubkey();
+                let holds = held(address).await;
+                let target_amount = amounts.as_ref().and_then(|amounts| {
+                    amounts
+                        .roles
+                        .iter()
+                        .find(|(r, _)| *r == role)
+                        .map(|(_, a)| *a)
+                });
+                let short = match (holds, target_amount) {
+                    (Some(holds), Some(target)) => target.saturating_sub(holds),
+                    _ => 0,
+                };
+                short_total += short;
+                rows.push((role, address, holds, short));
+            }
+            let reserve = amounts.as_ref().map_or(0, |amounts| amounts.reserve);
+            let funder = deployer.pubkey();
+            let funder_holds = held(funder).await;
             println!(
-                "  {:<20} {}",
-                role.label(),
-                chain::solana::Signer::pubkey(&pair)
+                "  {:<20} {funder}  {}  (the Solana funder: it pays for the programs and funds the roles; the roles are short {}, the reserve is {}{})",
+                "FUNDER (deployer)",
+                funder_holds.map_or("?".to_string(), sol),
+                sol(short_total),
+                sol(reserve),
+                match funder_holds {
+                    Some(holds) if holds < short_total + reserve =>
+                        format!("; it needs {} more", sol(short_total + reserve - holds)),
+                    _ => String::new(),
+                }
             );
-        }
-        for (name, index) in devnet_keys::PROGRAM_KEYS {
-            let program = solana::keypair_from_mnemonic(&phrase, index)?;
-            println!("  {name:<20} {}", chain::solana::Signer::pubkey(&program));
+            for (role, address, holds, short) in rows {
+                println!(
+                    "  {:<20} {address}  {}{}",
+                    role.label(),
+                    holds.map_or("?".to_string(), sol),
+                    if short == 0 {
+                        String::new()
+                    } else {
+                        format!("  (short {})", sol(short))
+                    }
+                );
+            }
+            let mint = solana::keypair_from_mnemonic(&phrase, devnet_keys::DOLLAR_MINT)?;
+            println!("  {:<20} {}", "dollar (mint)", mint.pubkey());
+            for (name, index) in devnet_keys::PROGRAM_KEYS {
+                let program = solana::keypair_from_mnemonic(&phrase, index)?;
+                println!("  {name:<20} {}", program.pubkey());
+            }
         }
     }
     Ok(())
@@ -1237,5 +1448,59 @@ mod tests {
             parse(&["clear-root-key"]).unwrap().command,
             Some(Command::ClearRootKey)
         ));
+    }
+
+    #[test]
+    fn the_admin_commands_reach_the_solana_registry_when_the_vault_chain_names_it() {
+        for command in [
+            vec![
+                "propose-image",
+                "--digest",
+                "sha256:00",
+                "--kind",
+                "builder",
+            ],
+            vec!["revoke-image", "--digest", "sha256:00"],
+            vec!["propose-project", "shonin-testnet"],
+            vec!["retire-checker", "--dev"],
+            vec!["allow-dev-checker"],
+        ] {
+            let args = parse(
+                &[
+                    ["--network", "testnet", "--vault-chain", "solana"].as_slice(),
+                    &command,
+                ]
+                .concat(),
+            )
+            .unwrap();
+            assert_eq!(args.chain_args.vault_chain, Some(shared::Chain::Solana));
+            assert!(args.command.is_some());
+        }
+    }
+
+    #[test]
+    fn the_solana_set_up_needs_the_operator_s_project() {
+        let Some(Command::SolanaSetup { project }) =
+            parse(&["solana-setup", "--project", "shonin-testnet"])
+                .unwrap()
+                .command
+        else {
+            panic!("not the set-up");
+        };
+        assert_eq!(project, "shonin-testnet");
+        assert!(parse(&["solana-setup"]).is_err());
+    }
+
+    #[test]
+    fn a_solana_keypair_is_written_for_the_deployer_the_registry_or_the_keeper_alone() {
+        for role in ["deployer", "program", "keeper"] {
+            assert!(matches!(
+                parse(&["solana-keypair", "--role", role, "--out", "k.json"])
+                    .unwrap()
+                    .command,
+                Some(Command::SolanaKeypair { .. })
+            ));
+        }
+        assert!(parse(&["solana-keypair", "--role", "admin", "--out", "k.json"]).is_err());
     }
 }
