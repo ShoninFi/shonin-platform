@@ -4,14 +4,14 @@
 # Built from the repository root by `task cloud:build NAME=api NETWORK=testnet`,
 # which passes the network's settings and its deployments directory:
 #   docker build --build-arg NETWORK_FEATURE=none --build-arg WITHOUT_SOLANA=1 --build-arg NETWORK=testnet \
-#     --build-arg STORE_URL=... --build-arg EXECUTOR_URL=... \
+#     --build-arg STORE_URL=... --build-arg EXECUTOR_URL=... --build-arg BUILDER_URL=... \
 #     --build-context deployments=.shonin/testnet/deployments \
 #     -f deploy/gcp/Dockerfile.api .
 #
 # Everything it runs with is in the image: the network, its chains (the public
 # endpoints committed in config/chains.toml, never a keyed URL), the
-# generation's deployment files, the store's public copy and the executor's
-# status port. It holds no key.
+# generation's deployment files, the store's public copy, the executor's
+# status port and the build service's port. It holds no key.
 
 # Where the build starts from: the `deps` stage below, or (in Cloud Build)
 # that stage already built and pushed as an image named for everything it
@@ -59,8 +59,8 @@ COPY . .
 RUN : "${NETWORK_FEATURE:?pass --build-arg NETWORK_FEATURE=devnet, mainnet or none}" && \
     features="" && { [ "$NETWORK_FEATURE" = none ] || features="--features $NETWORK_FEATURE"; } && \
     cargo build --release --locked -p shonin-api --bin api $features
-# The store's directory, for the image's own user.
-RUN mkdir -p /out/var/lib/shonin/store
+# The store's directory and the API's own state, for the image's own user.
+RUN mkdir -p /out/var/lib/shonin/store /out/var/lib/shonin/api-state
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 ARG NETWORK
@@ -68,6 +68,8 @@ ARG NETWORK
 ARG WITHOUT_SOLANA=
 ARG STORE_URL
 ARG EXECUTOR_URL
+# The build service, by its internal name; empty for none.
+ARG BUILDER_URL=
 COPY --from=build /src/target/release/api /usr/local/bin/api
 COPY --from=build --chown=nonroot:nonroot /out/var/lib/shonin /var/lib/shonin
 COPY config/chains.toml /etc/shonin/chains.toml
@@ -79,9 +81,12 @@ ENV SHONIN_NETWORK=${NETWORK} \
     SHONIN_CHAINS=/etc/shonin/chains.toml \
     SHONIN_DEPLOYMENTS_DIR=/etc/shonin/deployments/${NETWORK} \
     SHONIN_STORE_URL=${STORE_URL} \
-    SHONIN_EXECUTOR_URL=${EXECUTOR_URL}
-# Run on the host's network (the services VM), the port open to the VPC and
-# the tunnel only; no build service is attached, so the snapshot has no queue
-# and uploads are refused.
+    SHONIN_EXECUTOR_URL=${EXECUTOR_URL} \
+    SHONIN_BUILDER_URL=${BUILDER_URL} \
+    SHONIN_API_STATE=/var/lib/shonin/api-state
+# Run on the host's network (the services VM): the public port open to the
+# VPC and the tunnel only; the internal port (the builder's and the
+# reviewer's state, their built files, and when to start them) to those two
+# machines alone, by the cloud's firewall, and never tunneled.
 ENTRYPOINT ["/usr/local/bin/api"]
-CMD ["--store", "/var/lib/shonin/store", "--port", "19081", "--listen", "0.0.0.0"]
+CMD ["--store", "/var/lib/shonin/store", "--port", "19081", "--listen", "0.0.0.0", "--internal-port", "19082", "--internal-listen", "0.0.0.0"]

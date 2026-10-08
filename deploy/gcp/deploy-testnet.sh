@@ -6,10 +6,15 @@
 #   contracts  a contract generation on every EVM testnet (the chains in
 #              parallel, Hyperliquid's creations batched), the checker and
 #              the project proposed, every image rebuilt with the new
-#              deployment baked in, the executor's digest proposed, the
-#              executor and the services moved onto them (the prover started
-#              first, so the seal waits on no cold boot); then the smoke
-#              check.
+#              deployment baked in, the executor's and the builder's digests
+#              proposed, the executor and the services moved onto them (the
+#              prover started first, so the seal waits on no cold boot), the
+#              firewall and the waker's grants asserted; then the smoke
+#              check, and the builder moved onto its image once the
+#              executor's root is live (run again after the root is made, if
+#              it was not yet). The reviewer follows with `task
+#              cloud:reviewer` once the root is live: its model key is sealed
+#              to that root.
 #   all        the same as contracts.
 #
 # Safe to run again: every stage looks at what is there before it acts (the
@@ -20,13 +25,16 @@
 #
 # Environment (the task passes these): SCOPE, GENERATION (contracts),
 # PROJECT, ZONE, REGISTRY, DEPLOYMENTS_DIR, API_URL (public), EXECUTOR_URL
-# (internal), BUILDER (cloud or local), ALLOW_NO_VAULT (1 for a smoke check
-# before any vault is priced; a fresh generation sets it itself).
+# (internal), STATUS_URLS (the builder's and the reviewer's status ports,
+# internal, for the prover), BUILDER (cloud or local), ALLOW_NO_VAULT (1 for
+# a smoke check before any vault is priced; a fresh generation sets it
+# itself).
 set -euo pipefail
 
 : "${SCOPE:?SCOPE=services, contracts or all}"
 : "${PROJECT:?}" "${ZONE:?}" "${REGISTRY:?}" "${DEPLOYMENTS_DIR:?}" "${API_URL:?}" "${EXECUTOR_URL:?}"
 BUILDER=${BUILDER:-cloud}
+STATUS_URLS=${STATUS_URLS:-}
 case "$SCOPE" in services | contracts | all) ;; *) echo "SCOPE=services, contracts or all, not $SCOPE"; exit 1 ;; esac
 
 started=$(date +%s)
@@ -91,11 +99,13 @@ images() {
   task cloud:images NETWORK=testnet NAMES="$1" BUILDER="$BUILDER" TAG="$TAG" SKIP_PUSHED=1
 }
 
-propose_executor() {
-  local digest
-  digest=$(digest_of executor)
-  [ -n "$digest" ] || { echo "no executor image under $TAG"; exit 1; }
-  task chains:image NETWORK=testnet DIGEST="$digest" KIND=executor
+propose() {
+  local name digest
+  for name in "$@"; do
+    digest=$(digest_of "$name")
+    [ -n "$digest" ] || { echo "no $name image under $TAG"; exit 1; }
+    task chains:image NETWORK=testnet DIGEST="$digest" KIND="$name"
+  done
 }
 
 # The prover's VM (created if the zone has none yet), pointed at the new
@@ -111,12 +121,14 @@ prover_warm() {
   fi
   until=$(($(date +%s) + 45 * 60))
   current=$(metadata_of shonin-prover-testnet shonin-prover-image)
+  # The status ports it proves for, beside the executor's (a prover made
+  # before them has none).
   if [ "$current" != "$REGISTRY/prover@$digest" ]; then
     gcloud_vm add-metadata shonin-prover-testnet \
-      --metadata="shonin-prover-image=$REGISTRY/prover@$digest,shonin-prover-idle-seconds=1800,shonin-prover-idle-until=$until"
+      --metadata="^~^shonin-prover-image=$REGISTRY/prover@$digest~shonin-status-urls=$STATUS_URLS~shonin-prover-idle-seconds=1800~shonin-prover-idle-until=$until"
   else
     gcloud_vm add-metadata shonin-prover-testnet \
-      --metadata="shonin-prover-idle-seconds=1800,shonin-prover-idle-until=$until"
+      --metadata="^~^shonin-status-urls=$STATUS_URLS~shonin-prover-idle-seconds=1800~shonin-prover-idle-until=$until"
   fi
   case "$(gcloud_vm describe shonin-prover-testnet --format='value(status)')" in
     TERMINATED | STOPPED) gcloud_vm start shonin-prover-testnet --async ;;
@@ -139,6 +151,39 @@ executor() {
     gcloud_vm delete shonin-executor-testnet --quiet
   fi
   task cloud:deploy:machine NAME=executor NETWORK=testnet TAG="$TAG"
+}
+
+# The firewall's rules and the waker's grants on the machines that run on
+# demand: asserted, each idempotent.
+grants() {
+  task cloud:firewall NETWORK=testnet
+  task cloud:iam NETWORK=testnet
+}
+
+# The builder's VM on the pushed digest, once the executor's root is live
+# (its key is derived from the root): left as it is if it already runs it;
+# otherwise drained and replaced (Confidential Space takes its image at
+# creation). Its first boot gets its key blessed on every chain, then it
+# exits when idle and the waker starts it when there is work.
+builder() {
+  local digest current
+  if ! curl -fsS -m 10 "$API_URL/api/rootkey" | jq -e '.serving == true' >/dev/null 2>&1; then
+    echo "the root key is not live yet: once it is (task chains:root-key), run this deploy again, or task cloud:deploy:machine NAME=builder NETWORK=testnet TAG=$TAG"
+    return
+  fi
+  digest=$(digest_of builder)
+  [ -n "$digest" ] || { echo "no builder image under $TAG"; exit 1; }
+  current=$(metadata_of shonin-builder-testnet tee-image-reference)
+  if [ "$current" = "$REGISTRY/builder@$digest" ]; then
+    echo "the builder already runs builder@$digest"
+    return
+  fi
+  if [ -n "$current" ]; then
+    echo "replacing the builder (it runs ${current##*@}) once it holds nothing unfinished"
+    task cloud:drain NAME=builder NETWORK=testnet
+    gcloud_vm delete shonin-builder-testnet --quiet
+  fi
+  task cloud:deploy:machine NAME=builder NETWORK=testnet TAG="$TAG"
 }
 
 services() {
@@ -208,14 +253,17 @@ case "$SCOPE" in
     # The deployment changed: so do the images that carry it.
     TAG=$(image_tag)
     ALLOW_NO_VAULT=${ALLOW_NO_VAULT:-1}
-    stage "images: api, keeper, executor, prover" images "api keeper executor prover"
-    stage "executor digest proposed" propose_executor
+    stage "images: api, keeper, executor, prover, builder" images "api keeper executor prover builder"
+    stage "executor and builder digests proposed" propose executor builder
     stage "prover started, warm" prover_warm
     stage "executor VM" executor
+    stage "firewall and grants" grants
     stage "services VM" services
     stage "API up" api_up
     stage "smoke check" smoke
+    stage "builder VM" builder
     echo
-    echo "Next, to publish on the new generation: task chains:allow-dev-checker NETWORK=testnet, the seed (PUBLISH_ONLY=1) per chain, task store:sync NETWORK=testnet, task chains:retire-dev-checker NETWORK=testnet"
+    echo "Next: the root key (task chains:root-key NETWORK=testnet) if it is not live, then this deploy again for the builder, and task cloud:reviewer NETWORK=testnet for the reviewer. To publish on the new generation: the seed (PUBLISH_ONLY=1) per chain, through the API."
+    echo "Or, with the build service on this machine: task chains:allow-dev-checker NETWORK=testnet, the seed (PUBLISH_ONLY=1) per chain, task store:sync NETWORK=testnet, task chains:retire-dev-checker NETWORK=testnet"
     ;;
 esac

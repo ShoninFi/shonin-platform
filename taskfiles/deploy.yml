@@ -12,7 +12,7 @@ includes:
 
 tasks:
   testnet:
-    desc: "Deploy to the testnets in one go, safe to run again, each stage timed, ending with the smoke check: SCOPE=services (the API's and the keeper's images, built in Cloud Build, and the services VM on them) or SCOPE=contracts|all (a contract generation on every EVM testnet at once, GENERATION=<n> for a new one, then every image, the executor's digest proposed, the prover started warm, the executor and the services on the new images). BUILDER=local builds the images here instead"
+    desc: "Deploy to the testnets in one go, safe to run again, each stage timed, ending with the smoke check: SCOPE=services (the API's and the keeper's images, built in Cloud Build, and the services VM on them) or SCOPE=contracts|all (a contract generation on every EVM testnet at once, GENERATION=<n> for a new one, then every image, the executor's and the builder's digests proposed, the prover started warm, the executor and the services on the new images, and the builder once the root is live; the reviewer follows with task cloud:reviewer). BUILDER=local builds the images here instead"
     requires:
       vars: [SCOPE]
     preconditions:
@@ -32,5 +32,6 @@ tasks:
           DEPLOYMENTS_DIR="{{joinPath .PATH_ROOT ".shonin" "testnet" "deployments"}}"
           API_URL="https://testnet-api.shonin.fi"
           EXECUTOR_URL="http://shonin-executor-testnet.{{.GCP_ZONE}}.c.{{.GCP_PROJECT_TESTNET}}.internal:19085"
+          STATUS_URLS="http://shonin-builder-testnet.{{.GCP_ZONE}}.c.{{.GCP_PROJECT_TESTNET}}.internal:19084,http://shonin-reviewer-testnet.{{.GCP_ZONE}}.c.{{.GCP_PROJECT_TESTNET}}.internal:19086"
           NETWORK=testnet
           "{{.PATH_ROOT}}/deploy/gcp/deploy-testnet.sh"

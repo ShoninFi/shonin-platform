@@ -6,7 +6,12 @@
 //! the store's files by hash. Submissions pass through to the build service
 //! and health reports are taken only from a key blessed for their vault. The
 //! root key's status and its published keys are relayed from the executor.
+//!
+//! On a port of its own, never public ([`internal`]), it keeps what the
+//! machines that run on demand keep off themselves, and tells the waker when
+//! to start them.
 
+mod internal;
 mod rootkey;
 mod solana;
 
@@ -50,7 +55,7 @@ struct Args {
     store_url: Option<String>,
     /// Where the build service answers, for the queue and for submissions.
     /// Without one the snapshot has no queue and uploads are refused.
-    #[arg(long)]
+    #[arg(long, env = "SHONIN_BUILDER_URL")]
     builder_url: Option<String>,
     /// Where the executor serves each vault's signed usage total.
     #[arg(long, env = "SHONIN_EXECUTOR_URL")]
@@ -60,6 +65,20 @@ struct Args {
     /// The address to listen on: 0.0.0.0 in a container.
     #[arg(long, default_value = "127.0.0.1")]
     listen: std::net::IpAddr,
+    /// The internal port, for the machines that run on demand: their state,
+    /// their built files, and when to start them. Never carried to the
+    /// public name. Without it there is none.
+    #[arg(long, env = "SHONIN_INTERNAL_PORT")]
+    internal_port: Option<u16>,
+    /// The address the internal port listens on: 0.0.0.0 on the services
+    /// machine, where the cloud's firewall lets only those machines reach it.
+    #[arg(long, env = "SHONIN_INTERNAL_LISTEN", default_value = "127.0.0.1")]
+    internal_listen: std::net::IpAddr,
+    /// Where the API keeps what is its own: the machines' state, their wake
+    /// plans, and the build queue as last given. By default `api-state`
+    /// beside the store.
+    #[arg(long, env = "SHONIN_API_STATE")]
+    state: Option<PathBuf>,
 }
 
 struct Service {
@@ -74,6 +93,8 @@ struct Service {
     upload_timeout: std::time::Duration,
     /// The published root keys' relays to the executor.
     rootkey: rootkey::Relays,
+    /// The asks to start the machines that run on demand.
+    wake: Arc<internal::Wake>,
 }
 
 #[tokio::main]
@@ -83,7 +104,15 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let args = Args::parse();
+    let mut args = Args::parse();
+    // An image built without a build service names it empty.
+    args.builder_url = args.builder_url.filter(|url| !url.is_empty());
+    let state = args.state.clone().unwrap_or_else(|| {
+        args.store
+            .parent()
+            .map(|parent| parent.join("api-state"))
+            .unwrap_or_else(|| PathBuf::from("api-state"))
+    });
     // The port is bound at once, and each chain is served from the moment
     // it connects: one chain out of reach holds up none of the others, and
     // is answered for as not connected yet.
@@ -96,6 +125,9 @@ async fn main() -> Result<()> {
     if let Some(url) = args.store_url.as_deref().filter(|url| !url.is_empty()) {
         indexer = indexer.with_store_url(url);
     }
+    if args.builder_url.is_some() {
+        indexer = indexer.with_jobs_cache(state.join("jobs-cache.json"));
+    }
     let indexer = Arc::new(indexer);
     indexer.take(connections);
     if args.builder_url.is_none() {
@@ -104,6 +136,41 @@ async fn main() -> Result<()> {
     let reader = indexer.clone();
     tokio::spawn(async move { reader.run().await });
 
+    let wake = Arc::new(internal::Wake::new(Some(state.join("plans"))));
+    if let Some(port) = args.internal_port {
+        // The registry that blesses the machines' keys: the network's
+        // canonical chain.
+        let canonical = chain::ChainConfigs::load(&args.chain_args.chains)?
+            .network(args.chain_args.network)
+            .and_then(|network| network.root())
+            .map(|(chain, _)| chain)
+            .unwrap_or(Chain::Base);
+        let reads = Arc::new(internal::ChainReads {
+            indexer: indexer.clone(),
+            canonical,
+        });
+        let internal = Arc::new(internal::Internal::new(
+            indexer.clone(),
+            reads,
+            wake.clone(),
+            state.join("blobs"),
+        ));
+        let address = SocketAddr::from((args.internal_listen, port));
+        let listener = tokio::net::TcpListener::bind(address).await?;
+        tracing::info!(%address, "the internal port is open");
+        let app = internal::routes(internal);
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
+                tracing::error!(%error, "the internal port stopped");
+            }
+        });
+    }
+
     let service = Arc::new(Service {
         indexer,
         builder: args.builder_url.clone(),
@@ -111,6 +178,7 @@ async fn main() -> Result<()> {
         http: indexer::http(),
         upload_timeout: UPLOAD_TIMEOUT,
         rootkey: rootkey::Relays::default(),
+        wake,
     });
 
     let app = axum::Router::new()
@@ -612,8 +680,9 @@ async fn jobs(State(service): State<Arc<Service>>) -> Json<Vec<Job>> {
 
 /// One job, as fresh as the build service has it, with what the chain adds.
 /// 404 only when the build service says there is no such job; 503 when it
-/// says it can't answer for now; 502 when it can't be reached, or answers
-/// anything else.
+/// says it can't answer for now; 502 when it answers anything else. A build
+/// service that can't be reached (it is off until there is work) is answered
+/// for from the queue as it last gave it, and 503 for a job not in it.
 async fn job(
     State(service): State<Arc<Service>>,
     UrlPath(id): UrlPath<String>,
@@ -631,11 +700,14 @@ async fn job(
         .http
         .get(format!("{builder}/jobs/{id}"))
         .send()
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "the build service could not be asked for a job");
-            StatusCode::BAD_GATEWAY
-        })?;
+        .await;
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(error) => {
+            tracing::debug!(%error, "the build service could not be asked for a job");
+            return last_known(&service, &id).await;
+        }
+    };
     let status = reply.status();
     match status {
         StatusCode::NOT_FOUND => return Err(StatusCode::NOT_FOUND),
@@ -653,6 +725,21 @@ async fn job(
     Ok(Json(service.indexer.complete(job).await))
 }
 
+/// A job as the queue was last given, for when the build service is off.
+async fn last_known(service: &Service, id: &str) -> Result<Json<Job>, StatusCode> {
+    service
+        .indexer
+        .snapshot
+        .read()
+        .await
+        .jobs
+        .iter()
+        .find(|job| job.id == id)
+        .cloned()
+        .map(Json)
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
+}
+
 /// A job's id as the build service gives it: a number, in plain digits.
 fn is_job_id(id: &str) -> bool {
     (1..=20).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_digit())
@@ -663,24 +750,66 @@ fn is_job_id(id: &str) -> bool {
 /// timeout of any other ask.
 const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How long a caller is told to wait before trying an upload again while
+/// the build service starts.
+const RETRY_AFTER_SECONDS: u64 = 30;
+
+/// A refusal: its status, what the caller is told, and when to try again if
+/// it should.
+#[derive(Debug)]
+struct Refused {
+    status: StatusCode,
+    message: String,
+    retry_after: Option<u64>,
+}
+
+impl IntoResponse for Refused {
+    fn into_response(self) -> axum::response::Response {
+        let body = Json(shared::ApiError {
+            message: self.message,
+        });
+        match self.retry_after {
+            Some(seconds) => (
+                self.status,
+                [(header::RETRY_AFTER, seconds.to_string())],
+                body,
+            )
+                .into_response(),
+            None => (self.status, body).into_response(),
+        }
+    }
+}
+
+impl From<(StatusCode, Json<shared::ApiError>)> for Refused {
+    fn from((status, Json(error)): (StatusCode, Json<shared::ApiError>)) -> Refused {
+        Refused {
+            status,
+            message: error.message,
+            retry_after: None,
+        }
+    }
+}
+
 /// Uploads go straight to the build service; the API only carries them. The
 /// build service's refusal of an upload (a manifest it won't take, source
 /// over the limit) is the author's to read and is passed on; anything else
 /// that goes wrong is logged here and answered in general terms, so nothing
 /// about the services behind the API reaches a caller.
+///
+/// The build service runs only while there is work: one that can't be
+/// reached is asked to be started (the waker reads the ask), and the caller
+/// is told at once to try again shortly (503, `Retry-After`), never held
+/// while it starts.
 async fn uploads(
     State(service): State<Arc<Service>>,
     UrlPath(chain): UrlPath<Chain>,
     upload: Result<Json<Upload>, JsonRejection>,
-) -> Result<Json<UploadAccepted>, (StatusCode, Json<shared::ApiError>)> {
+) -> Result<Json<UploadAccepted>, Refused> {
     served(&service, chain)?;
-    let fail = |status: StatusCode, message: &str| {
-        (
-            status,
-            Json(shared::ApiError {
-                message: message.to_string(),
-            }),
-        )
+    let fail = |status: StatusCode, message: &str| Refused {
+        status,
+        message: message.to_string(),
+        retry_after: None,
     };
     let Some(builder) = &service.builder else {
         return Err(fail(StatusCode::SERVICE_UNAVAILABLE, NO_UPLOADS));
@@ -700,16 +829,26 @@ async fn uploads(
         .send()
         .await
         .map_err(|error| {
-            tracing::warn!(%error, "an upload could not be passed to the build service");
-            fail(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the build service is not answering; try again shortly",
-            )
+            tracing::info!(%error, "an upload could not be passed to the build service: asking for it to be started");
+            service.wake.ask(internal::Machine::Builder);
+            Refused {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: STARTING.to_string(),
+                retry_after: Some(RETRY_AFTER_SECONDS),
+            }
         })?;
     let status = reply.status();
     if status.is_client_error() {
         let body = reply.text().await.unwrap_or_default();
-        return Err((status, Json(shared::ApiError { message: body })));
+        return Err(fail(status, &body));
+    }
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        // Up, and not taking uploads yet (its key not blessed yet, say).
+        return Err(Refused {
+            status,
+            message: STARTING.to_string(),
+            retry_after: Some(RETRY_AFTER_SECONDS),
+        });
     }
     if !status.is_success() {
         let body = reply.text().await.unwrap_or_default();
@@ -727,6 +866,9 @@ async fn uploads(
         )
     })
 }
+
+/// What an upload is told while the build service starts.
+const STARTING: &str = "the build service is starting; try again shortly";
 
 /// What an upload is told where no build service is attached.
 const NO_UPLOADS: &str = "this platform takes no uploads here: no build service is attached to it";
@@ -947,6 +1089,7 @@ mod tests {
             http: indexer::http(),
             upload_timeout: std::time::Duration::from_secs(3),
             rootkey: rootkey::Relays::default(),
+            wake: Arc::new(internal::Wake::new(None)),
         })
     }
 
@@ -1432,6 +1575,7 @@ mod tests {
             http: indexer::http(),
             upload_timeout: service.upload_timeout,
             rootkey: rootkey::Relays::default(),
+            wake: service.wake.clone(),
         })
     }
 
@@ -1450,8 +1594,8 @@ mod tests {
         )
         .await
         .expect("an upload with nowhere to go was answered at once");
-        let (status, Json(said)) = answer.expect_err("the upload is refused");
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let said = answer.expect_err("the upload is refused");
+        assert_eq!(said.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(said.message, NO_UPLOADS);
         let answer = job(State(service), UrlPath("8800".to_string())).await;
         assert_eq!(answer.err(), Some(StatusCode::NOT_FOUND));
@@ -1483,6 +1627,44 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_upload_to_a_build_service_that_is_off_answers_503_at_once_and_asks_for_it() {
+        // Nothing listens there: the build service's machine is off.
+        let service = a_service_on_base("http://127.0.0.1:1".to_string()).await;
+        let plan = |service: &Service| {
+            internal::wanted(
+                service.wake.asks_builder(),
+                None,
+                0,
+                Some(&Default::default()),
+            )
+        };
+        assert!(!plan(&service), "nobody asked for it yet");
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            uploads(
+                State(service.clone()),
+                UrlPath(Chain::Base),
+                Ok(Json(an_upload())),
+            ),
+        )
+        .await
+        .expect("the upload was answered at once, not held while the build service starts");
+        let refused = answer.expect_err("the upload is refused for now");
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused.retry_after, Some(RETRY_AFTER_SECONDS));
+        assert_eq!(refused.message, STARTING);
+        let answer = refused.into_response();
+        assert_eq!(
+            answer.headers().get(header::RETRY_AFTER).unwrap(),
+            &RETRY_AFTER_SECONDS.to_string()
+        );
+        assert!(
+            plan(&service),
+            "the waker is asked to start the build service"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_upload_to_a_build_service_that_never_answers_is_given_up_on() {
         let service = a_service_on_base(a_builder_that_never_answers().await).await;
         let answer = tokio::time::timeout(
@@ -1492,7 +1674,7 @@ mod tests {
         .await
         .expect("the upload was still waiting on the build service after 45 s");
         assert_eq!(
-            answer.err().map(|(status, _)| status),
+            answer.err().map(|refused| refused.status),
             Some(StatusCode::SERVICE_UNAVAILABLE)
         );
     }
@@ -1517,7 +1699,8 @@ mod tests {
         for builder in [unreachable.clone(), failing, garbled] {
             let service = a_service_on_base(builder.clone()).await;
             let answer = uploads(State(service), UrlPath(Chain::Base), Ok(Json(an_upload()))).await;
-            let (status, Json(said)) = answer.expect_err("the upload is refused");
+            let said = answer.expect_err("the upload is refused");
+            let status = said.status;
             assert!(status.is_server_error(), "{builder}: {status}");
             let address = builder.trim_start_matches("http://");
             assert!(
@@ -1538,8 +1721,8 @@ mod tests {
         .await;
         let service = a_service_on_base(refusing).await;
         let answer = uploads(State(service), UrlPath(Chain::Base), Ok(Json(an_upload()))).await;
-        let (status, Json(said)) = answer.expect_err("the upload is refused");
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let said = answer.expect_err("the upload is refused");
+        assert_eq!(said.status, StatusCode::BAD_REQUEST);
         assert_eq!(said.message, "shonin.toml puts the vault on robinhood");
     }
 }

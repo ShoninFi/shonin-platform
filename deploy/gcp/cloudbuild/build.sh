@@ -18,11 +18,16 @@ case " $NAMES " in
 esac
 
 # The staged source carries the public deployment files and, for the
-# prover, the guest as directories of their own.
+# prover, the guest, and for the reviewer its sealed model key, as
+# directories of their own.
 contexts=(--build-context "deployments=_deployments")
 if [ "$name" = prover ]; then
   [ -s _guest/shonin-attestation-guest.bin ] || { echo "no guest ELF staged in _guest/"; exit 1; }
   contexts+=(--build-context "guest=_guest")
+fi
+if [ "$name" = reviewer ]; then
+  [ -s _sealed/sealed.json ] || { echo "no sealed model key staged in _sealed/"; exit 1; }
+  contexts+=(--build-context "sealed=_sealed")
 fi
 args=(
   --builder shonin --platform linux/amd64 --provenance=false --sbom=false
@@ -32,6 +37,10 @@ args=(
   --build-arg "STORE_URL=$STORE_URL"
   --build-arg "API_URL=$API_URL"
   --build-arg "EXECUTOR_URL=$EXECUTOR_URL"
+  --build-arg "BUILDER_URL=${BUILDER_URL:-}"
+  --build-arg "REVIEWER_URL=${REVIEWER_URL:-}"
+  --build-arg "STORE_READ_URL=${STORE_READ_URL:-}"
+  --build-arg "API_INTERNAL_URL=${API_INTERNAL_URL:-}"
   "${contexts[@]}"
   -f "deploy/gcp/Dockerfile.$name"
 )

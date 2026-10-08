@@ -7,9 +7,11 @@
 #
 # Container-Optimized OS runs this as root (the instance's `startup-script`).
 # The instance's metadata names the prover's image (by digest) and the
-# executor's status port:
+# status ports it proves for, the executor's and the other attested
+# machines' (comma-delimited, optional):
 #   shonin-prover-image   europe-west4-docker.pkg.dev/<project>/shonin/prover@sha256:<digest>
 #   shonin-executor-url   http://<executor's internal name>:19085
+#   shonin-status-urls    http://<builder's internal name>:19084,http://<reviewer's>:19086
 #
 # The Groth16 step runs in RISC Zero's prover image through this VM's Docker:
 # the prover's container gets the Docker socket and a work directory at the
@@ -25,6 +27,7 @@ metadata() {
 
 image=$(metadata attributes/shonin-prover-image) || { echo "shonin-prover: no shonin-prover-image in the metadata"; exit 1; }
 executor=$(metadata attributes/shonin-executor-url) || { echo "shonin-prover: no shonin-executor-url in the metadata"; exit 1; }
+status_urls=$(metadata attributes/shonin-status-urls 2>/dev/null) || status_urls=
 work=/var/lib/shonin/groth16
 export DOCKER_CONFIG=/var/lib/shonin/docker
 mkdir -p "$work" "$DOCKER_CONFIG"
@@ -84,10 +87,18 @@ case "$idle" in '' | *[!0-9]*) idle=600 ;; esac
 case "$until" in '' | *[!0-9]*) until=0 ;; esac
 if [ "$(date +%s)" -ge "$until" ]; then idle=600; fi
 
+# Every status port, each its own --status-url: one that is off is passed
+# over until it answers.
+statuses=()
+IFS=',' read -r -a others <<<"$status_urls"
+for url in "${others[@]}"; do
+  [ -n "$url" ] && statuses+=(--status-url "$url")
+done
+
 started=$(date +%s)
 docker run --rm --name shonin-prover --log-driver gcplogs \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$work:$work" -e RISC0_WORK_DIR="$work" \
-  "$image" --executor-url "$executor" --idle-exit-seconds "$idle"
+  "$image" --executor-url "$executor" "${statuses[@]}" --idle-exit-seconds "$idle"
 status=$?
 echo "shonin-prover: the prover exited ($status) after $(( $(date +%s) - started )) s"

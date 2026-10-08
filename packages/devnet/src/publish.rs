@@ -201,20 +201,53 @@ pub async fn activate_it(
         .context("reading the new vault")
 }
 
+/// How long an upload is offered for before the seed gives up: the build
+/// service may be off (it runs only while there is work), and starting it,
+/// on a first boot after a new image or root getting its key blessed too,
+/// takes minutes.
+const UPLOAD_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+/// How long to wait between offers when the API doesn't say.
+const UPLOAD_PAUSE: Duration = Duration::from_secs(2);
+
+/// The longest pause between offers the API may ask for.
+const MOST_UPLOAD_PAUSE: Duration = Duration::from_secs(60);
+
+/// How long a job is followed before the seed gives up: a review by a model
+/// takes minutes, a build a minute or two more, and in the cloud the
+/// reviewer and the build service may each have to be started first.
+const FOLLOW_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+/// How long the queue may go unanswered while a job is followed.
+const FOLLOW_UNANSWERED: Duration = Duration::from_secs(15 * 60);
+
 /// Offer the project, waiting for the build service to be ready.
 ///
 /// A service that starts with the chain waits out its image's timelock before
-/// it can sign anything, so arriving early is ordinary rather than an error.
+/// it can sign anything, and one in the cloud may be off until the upload
+/// wakes it, so arriving early is ordinary rather than an error. The API's
+/// `Retry-After` is honoured.
 async fn upload(api: &str, chain: shared::Chain, upload: &Upload) -> Result<UploadAccepted> {
+    upload_within(api, chain, upload, UPLOAD_WINDOW).await
+}
+
+async fn upload_within(
+    api: &str,
+    chain: shared::Chain,
+    upload: &Upload,
+    window: Duration,
+) -> Result<UploadAccepted> {
     let client = reqwest::Client::new();
-    let mut last = String::new();
-    for attempt in 0..60 {
+    let started = std::time::Instant::now();
+    let mut said = false;
+    loop {
         let reply = client
             .post(format!("{api}/api/{chain}/uploads"))
             .json(upload)
             .send()
             .await;
-        match reply {
+        let mut pause = UPLOAD_PAUSE;
+        let last = match reply {
             Ok(reply) if reply.status().is_success() => {
                 return reply
                     .json()
@@ -230,41 +263,106 @@ async fn upload(api: &str, chain: shared::Chain, upload: &Upload) -> Result<Uplo
             }
             Ok(reply) => {
                 let status = reply.status();
-                last = format!(
+                if let Some(asked) = retry_after(reply.headers()) {
+                    pause = asked.min(MOST_UPLOAD_PAUSE);
+                }
+                format!(
                     "{status}: {}",
                     reply.text().await.unwrap_or_default().trim()
-                );
+                )
             }
-            Err(error) => last = error.to_string(),
+            Err(error) => error.to_string(),
+        };
+        let left = window.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            bail!(
+                "the build service never took the upload in {} minutes ({last})",
+                window.as_secs() / 60
+            );
         }
-        if attempt == 0 {
-            tracing::info!("waiting for the build service");
+        if !said {
+            tracing::info!(%last, "waiting for the build service");
+            said = true;
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(pause.min(left)).await;
     }
-    bail!("the build service never took the upload ({last})")
+}
+
+/// The wait a reply asks for in seconds (`Retry-After`), if it asks for one.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
 }
 
 /// Watch a job until it finishes. The queue is public, so this is the same
-/// view anyone else has of it.
+/// view anyone else has of it. A queue that doesn't answer for a while (the
+/// API restarting, the build service off between steps) is waited out.
 async fn follow(api: &str, job_id: &str) -> Result<Job> {
-    let client = reqwest::Client::new();
-    // A review by a model takes minutes; a build, a minute or two more.
-    for _ in 0..1_800 {
-        let job: Job = client
-            .get(format!("{api}/api/jobs/{job_id}"))
-            .send()
-            .await
-            .context("the queue did not answer")?
-            .json()
-            .await
-            .context("the queue said something unexpected")?;
-        if job.state.is_finished() {
-            return Ok(job);
+    follow_within(
+        api,
+        job_id,
+        FOLLOW_WINDOW,
+        FOLLOW_UNANSWERED,
+        Duration::from_secs(1),
+    )
+    .await
+}
+
+async fn follow_within(
+    api: &str,
+    job_id: &str,
+    window: Duration,
+    unanswered: Duration,
+    pause: Duration,
+) -> Result<Job> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let started = std::time::Instant::now();
+    let mut answered = std::time::Instant::now();
+    while started.elapsed() < window {
+        match ask_job(&client, api, job_id).await {
+            Ok(job) if job.state.is_finished() => return Ok(job),
+            Ok(_) => answered = std::time::Instant::now(),
+            Err(error) => {
+                if answered.elapsed() >= unanswered {
+                    return Err(error.context(format!(
+                        "the queue did not answer for job {job_id} in {} minutes",
+                        unanswered.as_secs() / 60
+                    )));
+                }
+                tracing::debug!(
+                    error = format!("{error:#}"),
+                    "the queue did not answer; asking again"
+                );
+            }
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(pause).await;
     }
-    bail!("job {job_id} is still running after half an hour")
+    bail!(
+        "job {job_id} is still running after {} minutes",
+        window.as_secs() / 60
+    )
+}
+
+/// The job as the queue has it now.
+async fn ask_job(client: &reqwest::Client, api: &str, job_id: &str) -> Result<Job> {
+    client
+        .get(format!("{api}/api/jobs/{job_id}"))
+        .send()
+        .await
+        .context("the queue did not answer")?
+        .error_for_status()
+        .context("the queue did not answer")?
+        .json()
+        .await
+        .context("the queue said something unexpected")
 }
 
 /// The cargo package a project is, from its `Cargo.toml`.
@@ -322,6 +420,155 @@ mod tests {
         std::fs::write(project.join("Cargo.toml"), b"[package]\nname = \"one\"\n").unwrap();
         assert_eq!(workspace_root(&project), root);
         assert_eq!(package_of(&project).as_deref(), Some("one"));
+    }
+
+    /// An API that answers each request with the next of `replies` (the
+    /// last again once they run out): a status, a `Retry-After` if any, and
+    /// a body.
+    async fn an_api_answering(replies: Vec<(u16, Option<u64>, String)>) -> String {
+        let replies = std::sync::Arc::new(std::sync::Mutex::new(replies));
+        let app = axum::Router::new().fallback(move || {
+            let replies = replies.clone();
+            async move {
+                let (status, after, body) = {
+                    let mut replies = replies.lock().unwrap();
+                    if replies.len() > 1 {
+                        replies.remove(0)
+                    } else {
+                        replies[0].clone()
+                    }
+                };
+                let mut answer = axum::response::Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json");
+                if let Some(after) = after {
+                    answer = answer.header("retry-after", after.to_string());
+                }
+                answer.body(axum::body::Body::from(body)).unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    fn an_upload() -> Upload {
+        Upload {
+            author: "0x2222222222222222222222222222222222222222".to_string(),
+            archive_base64: String::new(),
+            sealed: false,
+            package: None,
+        }
+    }
+
+    fn a_job(state: JobState) -> String {
+        serde_json::to_string(&Job {
+            id: "8801".to_string(),
+            chain: shared::Chain::Base,
+            strategy_id: None,
+            title: "funding basis".to_string(),
+            author: "0x2222222222222222222222222222222222222222".to_string(),
+            state,
+            submitted: time::PrimitiveDateTime::new(
+                time::Date::from_ordinal_date(2026, 281).unwrap(),
+                time::Time::MIDNIGHT,
+            ),
+            duration_seconds: 0,
+            source_hash: String::new(),
+            sealed: false,
+            bundle_hash: None,
+            review: None,
+            strategy_slug: None,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_upload_waits_as_long_as_the_api_asks_while_the_build_service_starts() {
+        let accepted =
+            serde_json::json!({"job_id": "8801", "upload": format!("0x{}", "11".repeat(32))})
+                .to_string();
+        let api = an_api_answering(vec![
+            (503, Some(2), "the build service is starting".to_string()),
+            (200, None, accepted),
+        ])
+        .await;
+        let started = std::time::Instant::now();
+        let taken = upload_within(
+            &api,
+            shared::Chain::Base,
+            &an_upload(),
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(taken.is_ok(), "{taken:?}");
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "the Retry-After was honoured"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upload_is_given_up_on_at_the_end_of_its_window_and_a_refused_project_at_once() {
+        let api = an_api_answering(vec![(503, Some(1), "starting".to_string())]).await;
+        let started = std::time::Instant::now();
+        let given_up = upload_within(
+            &api,
+            shared::Chain::Base,
+            &an_upload(),
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(given_up.is_err());
+        assert!(started.elapsed() < Duration::from_secs(10));
+
+        let api = an_api_answering(vec![(400, None, "not a project".to_string())]).await;
+        let started = std::time::Instant::now();
+        let refused = upload_within(
+            &api,
+            shared::Chain::Base,
+            &an_upload(),
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(refused.unwrap_err().to_string().contains("not a project"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn following_a_job_waits_out_a_queue_that_does_not_answer_for_a_while() {
+        let api = an_api_answering(vec![
+            (502, None, "the build service is unavailable".to_string()),
+            (200, None, a_job(JobState::Reviewing)),
+            (503, None, String::new()),
+            (200, None, "not a job".to_string()),
+            (200, None, a_job(JobState::Ready)),
+        ])
+        .await;
+        let job = follow_within(
+            &api,
+            "8801",
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+        assert_eq!(job.state, JobState::Ready);
+
+        // A queue that never answers is given up on once it has been silent
+        // for the while allowed.
+        let api = an_api_answering(vec![(503, None, String::new())]).await;
+        let silent = follow_within(
+            &api,
+            "8801",
+            Duration::from_secs(30),
+            Duration::from_millis(300),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(silent.is_err());
     }
 
     #[test]

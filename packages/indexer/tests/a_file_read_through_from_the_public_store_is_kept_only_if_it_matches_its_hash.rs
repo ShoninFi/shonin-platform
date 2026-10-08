@@ -199,3 +199,61 @@ async fn nothing_sealed_is_asked_of_the_public_copy_and_the_public_route_reads_o
     );
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bundle_the_record_named_is_served_read_through_and_no_other() {
+    let source = b"published source".to_vec();
+    let source_hash = hash_bytes(&source);
+    let component = b"\0asm a component".to_vec();
+    let bundle = b"a bundle".to_vec();
+    let bundle_hash = hash_bytes(&bundle);
+    let hashes = serde_json::json!({
+        "bundle": bundle_hash,
+        "component": hash_bytes(&component),
+        "source": source_hash,
+    })
+    .to_string()
+    .into_bytes();
+    let unnamed = hash_bytes(b"a bundle nobody named");
+    let mut files = HashMap::new();
+    for (hash, name, bytes) in [
+        (&bundle_hash, "component.wasm", component.clone()),
+        (&bundle_hash, "bundle.tar", bundle.clone()),
+        (&unnamed, "component.wasm", component.clone()),
+    ] {
+        files.insert(format!("sha256-{}/{name}", digits(hash)), bytes);
+    }
+    let (url, asked) = a_public_copy(files).await;
+    let root = scratch();
+    let store = Store::with_remote(root.clone(), &url);
+
+    // Not named yet: nothing is served, and nothing asked of the copy.
+    assert!(store.read_path(&bundle_hash, "component.wasm").is_none());
+    assert!(asked.lock().unwrap().is_empty());
+
+    // The record read the build's record and the source (here, on disk).
+    for (hash, name, bytes) in [
+        (&bundle_hash, "hashes.json", &hashes),
+        (&source_hash, "source.tar", &source),
+    ] {
+        let dir = root.join(format!("sha256-{}", digits(hash)));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), bytes).unwrap();
+    }
+    assert_eq!(
+        store.read_path(&bundle_hash, "component.wasm").unwrap().0,
+        component
+    );
+    assert_eq!(
+        store.read_path(&bundle_hash, "bundle.tar").unwrap().0,
+        bundle
+    );
+    // A bundle the record never named is still not asked for.
+    assert!(store.read_path(&unnamed, "component.wasm").is_none());
+    let asked = asked.lock().unwrap().clone();
+    assert!(
+        !asked.iter().any(|path| path.contains(digits(&unnamed))),
+        "{asked:?}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}

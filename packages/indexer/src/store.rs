@@ -281,15 +281,23 @@ impl Store {
     ///
     /// Only what is on disk is served: a request for a hash the chain never
     /// named sends nothing to the public copy (whoever asks can ask it
-    /// themselves), and what the record names was read through already.
+    /// themselves), and what the record names was read through already. A
+    /// bundle the record named (its build's record and its published source
+    /// on disk) is read through for its component and its archive too, which
+    /// the record itself never reads: the executor fetches them here.
     pub fn read_path(&self, hash: &str, name: &str) -> Option<(Vec<u8>, &'static str)> {
         if !PUBLIC.contains(&name) {
             return None;
         }
-        if BUNDLE.contains(&name) && !self.bundle_published(hash) {
+        let bundle = BUNDLE.contains(&name);
+        if bundle && !self.bundle_published(hash) {
             return None;
         }
-        let bytes = self.on_disk(hash, name)?;
+        let bytes = match self.on_disk(hash, name) {
+            Some(bytes) => bytes,
+            None if bundle => self.bytes(hash, name)?,
+            None => return None,
+        };
         let kind = if name.ends_with(".json") {
             "application/json"
         } else if name.ends_with(".wasm") {
@@ -315,6 +323,61 @@ impl Store {
     fn on_disk(&self, hash: &str, name: &str) -> Option<Vec<u8>> {
         std::fs::read(self.file(hash, name)?).ok()
     }
+
+    /// Keep a file pushed to the store, only if it is what the hash it is
+    /// filed under says (as a fetched file is checked, [`Store::matches`]).
+    /// Only the public names are taken, never a sealed one. A component is
+    /// checked against the hash its build recorded, so it is taken only once
+    /// that record is on disk. A file held already is left as it is.
+    pub fn put_checked(&self, hash: &str, name: &str, bytes: &[u8]) -> Put {
+        if !is_hash(hash) || !PUBLIC.contains(&name) {
+            return Put::Refused;
+        }
+        let Some(path) = self.file(hash, name) else {
+            return Put::Refused;
+        };
+        if name == "component.wasm" && self.on_disk(hash, "hashes.json").is_none() {
+            return Put::OutOfOrder;
+        }
+        if !self.matches(hash, name, bytes) {
+            return Put::Mismatch;
+        }
+        if path.is_file() {
+            return Put::Held;
+        }
+        let Some(directory) = path.parent() else {
+            return Put::Failed;
+        };
+        // Written aside and moved into place, so a reader never sees half a
+        // file under its name.
+        let aside = directory.join(format!(".{name}.{}.push", std::process::id()));
+        let kept = std::fs::create_dir_all(directory).is_ok()
+            && std::fs::write(&aside, bytes).is_ok()
+            && std::fs::rename(&aside, &path).is_ok();
+        if kept {
+            Put::Kept
+        } else {
+            let _ = std::fs::remove_file(&aside);
+            Put::Failed
+        }
+    }
+}
+
+/// What became of a file pushed to the store ([`Store::put_checked`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Put {
+    /// Checked against its hash, and kept.
+    Kept,
+    /// Checked against its hash, and held already.
+    Held,
+    /// Not what its hash says: not kept.
+    Mismatch,
+    /// A component pushed before the record of its build.
+    OutOfOrder,
+    /// Not a hash, or not a name the store takes.
+    Refused,
+    /// Checked, and could not be written.
+    Failed,
 }
 
 /// Run a blocking fetch off the async runtime's own threads: on a thread of
