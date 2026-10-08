@@ -62,6 +62,8 @@ test-ledger/
 !.env.example
 *.pem
 *.key
+# The reviewer's model key, sealed from here with task rootkey:seal
+claude-api-key
 
 # Logs and scratch
 *.log
