@@ -28,6 +28,8 @@ pub struct Store {
     /// What the entries count as, held at or under `limit`.
     held: usize,
     limit: usize,
+    /// The bytes of the names of the bucket handles the agent holds open.
+    names_open: usize,
 }
 
 /// An open bucket, as the agent holds it.
@@ -82,6 +84,7 @@ impl Store {
             entries: BTreeMap::new(),
             held: 0,
             limit,
+            names_open: 0,
         }
     }
 
@@ -95,15 +98,42 @@ impl Store {
         self.entries.get(bucket)?.get(key)
     }
 
+    /// Count a bucket handle the agent opens, whose name is `named` bytes,
+    /// or refuse it if the names of the handles it holds would come to more
+    /// than `most` bytes: each handle keeps its name on the host for as long
+    /// as it is open.
+    pub fn open(&mut self, named: usize, most: usize) -> Result<(), crate::host::TooMuch> {
+        match self.names_open.checked_add(named) {
+            Some(open) if open <= most => {
+                self.names_open = open;
+                Ok(())
+            }
+            _ => Err(crate::host::TooMuch { most }),
+        }
+    }
+
+    /// A bucket handle whose name is `named` bytes, let go of.
+    pub fn close(&mut self, named: usize) {
+        self.names_open = self.names_open.saturating_sub(named);
+    }
+
     /// Set `key` to `value`, or refuse and change nothing if that would take
     /// the store past its limit. Replacing a value counts only the
     /// difference.
-    pub fn set(&mut self, bucket: &str, key: &str, value: Vec<u8>) -> Result<(), Refused> {
+    ///
+    /// The key and the value are kept as they are given, not copied.
+    pub fn set(
+        &mut self,
+        bucket: &str,
+        key: impl Into<String>,
+        value: Vec<u8>,
+    ) -> Result<(), Refused> {
+        let key = key.into();
         let old = self
-            .get(bucket, key)
-            .map(|old| size(bucket, key, old))
+            .get(bucket, &key)
+            .map(|old| size(bucket, &key, old))
             .unwrap_or(0);
-        let new = size(bucket, key, &value);
+        let new = size(bucket, &key, &value);
         let wanted = self.held.saturating_sub(old).saturating_add(new);
         if wanted > self.limit {
             return Err(Refused::Full {
@@ -112,10 +142,15 @@ impl Store {
                 limit: self.limit,
             });
         }
-        self.entries
-            .entry(bucket.to_string())
-            .or_default()
-            .insert(key.to_string(), value);
+        match self.entries.get_mut(bucket) {
+            Some(entries) => {
+                entries.insert(key, value);
+            }
+            None => {
+                self.entries
+                    .insert(bucket.to_string(), BTreeMap::from([(key, value)]));
+            }
+        }
         self.held = wanted;
         Ok(())
     }
@@ -133,16 +168,33 @@ impl Store {
     }
 
     /// A page of keys, in order, from the `cursor`th on, and where the next
-    /// page starts if there is one.
-    pub fn keys(&self, bucket: &str, cursor: Option<u64>) -> (Vec<String>, Option<u64>) {
+    /// page starts if there is one. A page is at most [`PAGE`] keys, and
+    /// fewer if more would come to over `most` bytes as the host holds them;
+    /// a page that could not hold even one is refused.
+    pub fn keys(
+        &self,
+        bucket: &str,
+        cursor: Option<u64>,
+        most: usize,
+    ) -> Result<(Vec<String>, Option<u64>), crate::host::TooMuch> {
         let Some(entries) = self.entries.get(bucket) else {
-            return (Vec::new(), None);
+            return Ok((Vec::new(), None));
         };
-        let from = cursor.unwrap_or(0) as usize;
-        let keys: Vec<String> = entries.keys().skip(from).take(PAGE).cloned().collect();
-        let next = from + keys.len();
+        let from = usize::try_from(cursor.unwrap_or(0)).unwrap_or(usize::MAX);
+        let mut room = crate::host::Room::new(most);
+        let fitting = entries
+            .keys()
+            .skip(from)
+            .take(PAGE)
+            .take_while(|key| room.take(crate::host::Room::string(key)).is_ok())
+            .count();
+        let next = from.saturating_add(fitting);
         let more = next < entries.len();
-        (keys, more.then_some(next as u64))
+        if fitting == 0 && more {
+            return Err(crate::host::TooMuch { most });
+        }
+        let keys = entries.keys().skip(from).take(fitting).cloned().collect();
+        Ok((keys, more.then_some(next as u64)))
     }
 
     /// Add `delta` to the counter at `key`, a little-endian `u64` (zero if
@@ -233,15 +285,46 @@ mod tests {
     fn keys_come_a_page_at_a_time_in_order() {
         let mut store = Store::default();
         for at in 0..(PAGE + 5) {
-            store.set("b", &format!("{at:05}"), Vec::new()).unwrap();
+            store.set("b", format!("{at:05}"), Vec::new()).unwrap();
         }
-        let (first, cursor) = store.keys("b", None);
+        let (first, cursor) = store.keys("b", None, usize::MAX).unwrap();
         assert_eq!(first.len(), PAGE);
         assert_eq!(first[0], "00000");
-        let (rest, end) = store.keys("b", cursor);
+        let (rest, end) = store.keys("b", cursor, usize::MAX).unwrap();
         assert_eq!(rest.len(), 5);
         assert_eq!(rest[4], format!("{:05}", PAGE + 4));
         assert_eq!(end, None);
-        assert_eq!(store.keys("nothing", None), (Vec::new(), None));
+        assert_eq!(
+            store.keys("nothing", None, usize::MAX).unwrap(),
+            (Vec::new(), None)
+        );
+    }
+
+    #[test]
+    fn a_page_of_keys_is_cut_to_what_one_answer_may_hold() {
+        let mut store = Store::default();
+        for at in 0..10 {
+            store.set("b", format!("{at:05}"), Vec::new()).unwrap();
+        }
+        let one = crate::host::Room::string("00000");
+        // Room for three keys: three come, and the cursor carries on.
+        let (page, cursor) = store.keys("b", None, 3 * one).unwrap();
+        assert_eq!(page, ["00000", "00001", "00002"]);
+        assert_eq!(cursor, Some(3));
+        let (page, _) = store.keys("b", cursor, 3 * one + one - 1).unwrap();
+        assert_eq!(page, ["00003", "00004", "00005"]);
+        // Room for none while keys are left is refused, not an empty page
+        // that would never move on.
+        assert!(store.keys("b", cursor, one - 1).is_err());
+    }
+
+    #[test]
+    fn the_names_of_open_buckets_are_held_to_a_bound() {
+        let mut store = Store::default();
+        store.open(4, 8).unwrap();
+        store.open(4, 8).unwrap();
+        assert!(store.open(1, 8).is_err());
+        store.close(4);
+        store.open(4, 8).unwrap();
     }
 }

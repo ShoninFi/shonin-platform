@@ -292,6 +292,13 @@ impl Allowance {
         Self { bytes, held: 0 }
     }
 
+    /// What one call may hand back to the strategy: an answer is lowered
+    /// into the strategy's own memory, so one bigger than its whole
+    /// allowance could never be taken in, and the host doesn't build it.
+    pub fn answer_room(&self) -> Room {
+        Room::new(self.bytes)
+    }
+
     fn grow(&mut self, current: usize, desired: usize, maximum: Option<usize>) -> bool {
         if maximum.is_some_and(|maximum| desired > maximum) {
             return false;
@@ -304,6 +311,65 @@ impl Allowance {
             }
             _ => false,
         }
+    }
+}
+
+/// What is left of the most one call may hand back to the strategy,
+/// counted as the host would hold the answer before handing it over, and
+/// taken before any of it is built. Data the strategy hands the host is held
+/// to the same allowance by the store's hostcall fuel.
+#[derive(Clone, Copy, Debug)]
+pub struct Room {
+    left: usize,
+    most: usize,
+}
+
+impl Room {
+    pub fn new(most: usize) -> Self {
+        Self { left: most, most }
+    }
+
+    /// Take `bytes` more of the answer, or say the answer is too big.
+    pub fn take(&mut self, bytes: usize) -> Result<(), TooMuch> {
+        match self.left.checked_sub(bytes) {
+            Some(left) => {
+                self.left = left;
+                Ok(())
+            }
+            None => Err(TooMuch { most: self.most }),
+        }
+    }
+
+    /// What a string of the answer takes: its bytes and what holds them.
+    pub fn string(text: &str) -> usize {
+        std::mem::size_of::<String>().saturating_add(text.len())
+    }
+
+    /// What a list of bytes of the answer takes.
+    pub fn bytes(bytes: &[u8]) -> usize {
+        std::mem::size_of::<Vec<u8>>().saturating_add(bytes.len())
+    }
+}
+
+/// An answer bigger than the strategy's memory allowance, refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TooMuch {
+    pub most: usize,
+}
+
+impl std::fmt::Display for TooMuch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the answer would take more than the agent's memory allowance of {} bytes",
+            self.most
+        )
+    }
+}
+
+impl From<TooMuch> for StoreError {
+    fn from(too_much: TooMuch) -> Self {
+        StoreError::Other(too_much.to_string())
     }
 }
 
@@ -419,13 +485,35 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
         driver: String,
         actions: Vec<Vec<u8>>,
     ) -> HostResult<Vec<Verdict>> {
-        let (place, drivers) = accessor.with(|mut access| {
+        let (place, drivers, mut room) = accessor.with(|mut access| {
             let ctx = access.get();
-            (ctx.place.clone(), ctx.drivers.clone())
+            (
+                ctx.place.clone(),
+                ctx.drivers.clone(),
+                ctx.memory.answer_room(),
+            )
         });
 
+        // One verdict is handed back for each action, whatever becomes of
+        // it, so a submission is weighed by the most its verdicts could
+        // take before anything is sent. One too big for the agent to take
+        // in is a fault in the agent: nothing of it is sent.
+        if actions
+            .iter()
+            .try_for_each(|_| room.take(VERDICT_MOST))
+            .is_err()
+        {
+            wasmtime::bail!(
+                "a submission of {} actions would be answered with more than the agent's memory allowance holds",
+                actions.len()
+            );
+        }
+
         if !drivers.contains(&driver) {
-            let refusal = format!("this agent trades through {drivers:?}, not {driver}");
+            let refusal = format!(
+                "this agent trades through {drivers:?}, not {}",
+                crate::runner::at_most(&driver, NAMED_MOST)
+            );
             return Ok(actions
                 .iter()
                 .map(|_| Verdict::Rejected(refusal.clone()))
@@ -464,12 +552,15 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
                     Some(Outcome::Refused(why)) => (Verdict::Rejected(why), Tally::Refused),
                     Some(Outcome::Unknown(why)) => (Verdict::Unknown(why), Tally::Unanswered),
                     None => (
-                        Verdict::Rejected(format!("this vault has no {driver} account here")),
+                        Verdict::Rejected(format!(
+                            "this vault has no {} account here",
+                            crate::runner::at_most(&driver, NAMED_MOST)
+                        )),
                         Tally::Refused,
                     ),
                 };
                 tallies.push(tally);
-                verdicts.push(verdict);
+                verdicts.push(within(verdict));
             }
             accessor.with(|mut access| {
                 access.get().count(|counters| {
@@ -519,7 +610,7 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
         }
         for (verdict, tally) in answers.into_iter().flatten() {
             tallies.push(tally);
-            verdicts.push(verdict);
+            verdicts.push(within(verdict));
         }
         accessor.with(|mut access| {
             access.get().count(|counters| {
@@ -630,6 +721,30 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
     ) -> HostResult<StreamReader<Vec<u8>>> {
         let events = access.get().account_events.take();
         stream_of(&mut access, events)
+    }
+}
+
+/// The most of a name the agent gave that a refusal repeats.
+const NAMED_MOST: usize = 128;
+
+/// The most a verdict's reason may say: a longer one is cut.
+const REASON_MOST: usize = 1024;
+
+/// The most one verdict is counted as taking of the answer to a submission:
+/// a reason cut to [`REASON_MOST`] (and the few bytes cutting adds), or a
+/// driver's receipt, which is a short record of its own making.
+const VERDICT_MOST: usize = std::mem::size_of::<Verdict>() + REASON_MOST + 64;
+
+/// `verdict` with its reason cut to [`REASON_MOST`].
+fn within(verdict: Verdict) -> Verdict {
+    let cut = |why: String| match crate::runner::at_most(&why, REASON_MOST) {
+        std::borrow::Cow::Borrowed(_) => why,
+        std::borrow::Cow::Owned(cut) => cut,
+    };
+    match verdict {
+        Verdict::Rejected(why) => Verdict::Rejected(cut(why)),
+        Verdict::Unknown(why) => Verdict::Unknown(cut(why)),
+        accepted => accepted,
     }
 }
 
@@ -1382,14 +1497,26 @@ fn bucket_of(ctx: &Ctx, bucket: &Resource<crate::state::Bucket>) -> Result<Strin
 impl wasi::keyvalue::store::HostWithStore<Ctx> for HasSelf<Ctx> {
     /// Any name opens a bucket of the agent's own: buckets are only names,
     /// and every one of them shares the agent's one allowance.
+    ///
+    /// A handle keeps its name on the host while it is open, so the names
+    /// of the handles open at once are held to the memory allowance.
     async fn open(
         mut access: Access<'_, Ctx, Self>,
         identifier: String,
     ) -> HostResult<Result<Resource<crate::state::Bucket>, StoreError>> {
-        Ok(Ok(access
-            .get()
-            .table
-            .push(crate::state::Bucket { name: identifier })?))
+        let ctx = access.get();
+        let named = identifier.len();
+        if let Err(too_much) = ctx.state.open(named, ctx.memory.bytes) {
+            return Ok(Err(too_much.into()));
+        }
+        match ctx.table.push(crate::state::Bucket { name: identifier }) {
+            Ok(bucket) => Ok(Ok(bucket)),
+            Err(error) => {
+                // Never opened, so its name is not held.
+                ctx.state.close(named);
+                Err(error.into())
+            }
+        }
     }
 }
 
@@ -1400,7 +1527,14 @@ impl wasi::keyvalue::store::HostBucketWithStore<Ctx> for HasSelf<Ctx> {
         key: String,
     ) -> HostResult<Result<Option<Vec<u8>>, StoreError>> {
         let ctx = access.get();
-        Ok(bucket_of(ctx, &bucket).map(|name| ctx.state.get(&name, &key).cloned()))
+        let mut room = ctx.memory.answer_room();
+        Ok(bucket_of(ctx, &bucket).and_then(|name| {
+            let Some(value) = ctx.state.get(&name, &key) else {
+                return Ok(None);
+            };
+            room.take(Room::bytes(value))?;
+            Ok(Some(value.clone()))
+        }))
     }
 
     async fn set(
@@ -1412,7 +1546,7 @@ impl wasi::keyvalue::store::HostBucketWithStore<Ctx> for HasSelf<Ctx> {
         let ctx = access.get();
         Ok(bucket_of(ctx, &bucket).and_then(|name| {
             ctx.state
-                .set(&name, &key, value)
+                .set(&name, key, value)
                 .map_err(|refused| StoreError::Other(refused.to_string()))
         }))
     }
@@ -1441,9 +1575,10 @@ impl wasi::keyvalue::store::HostBucketWithStore<Ctx> for HasSelf<Ctx> {
         cursor: Option<u64>,
     ) -> HostResult<Result<KeyResponse, StoreError>> {
         let ctx = access.get();
-        Ok(bucket_of(ctx, &bucket).map(|name| {
-            let (keys, cursor) = ctx.state.keys(&name, cursor);
-            KeyResponse { keys, cursor }
+        let most = ctx.memory.bytes;
+        Ok(bucket_of(ctx, &bucket).and_then(|name| {
+            let (keys, cursor) = ctx.state.keys(&name, cursor, most)?;
+            Ok(KeyResponse { keys, cursor })
         }))
     }
 
@@ -1451,8 +1586,12 @@ impl wasi::keyvalue::store::HostBucketWithStore<Ctx> for HasSelf<Ctx> {
         accessor: &Accessor<Ctx, Self>,
         rep: Resource<crate::state::Bucket>,
     ) -> HostResult<()> {
-        accessor.with(|mut access| access.get().table.delete(rep))?;
-        Ok(())
+        accessor.with(|mut access| {
+            let ctx = access.get();
+            let bucket = ctx.table.delete(rep)?;
+            ctx.state.close(bucket.name.len());
+            HostResult::Ok(())
+        })
     }
 }
 
@@ -1479,13 +1618,23 @@ impl wasi::keyvalue::batch::HostWithStore<Ctx> for HasSelf<Ctx> {
         keys: Vec<String>,
     ) -> HostResult<Result<Vec<Option<(String, Vec<u8>)>>, StoreError>> {
         let ctx = access.get();
-        Ok(bucket_of(ctx, &bucket).map(|name| {
-            keys.into_iter()
+        let mut room = ctx.memory.answer_room();
+        Ok(bucket_of(ctx, &bucket).and_then(|name| {
+            // The whole answer is weighed before any of it is copied: every
+            // key named is a value handed back, however often it is named.
+            for key in &keys {
+                room.take(std::mem::size_of::<Option<(String, Vec<u8>)>>())?;
+                if let Some(value) = ctx.state.get(&name, key) {
+                    room.take(Room::string(key).saturating_add(Room::bytes(value)))?;
+                }
+            }
+            Ok(keys
+                .into_iter()
                 .map(|key| {
                     let value = ctx.state.get(&name, &key).cloned();
                     value.map(|value| (key, value))
                 })
-                .collect()
+                .collect())
         }))
     }
 
@@ -1500,7 +1649,7 @@ impl wasi::keyvalue::batch::HostWithStore<Ctx> for HasSelf<Ctx> {
         Ok(bucket_of(ctx, &bucket).and_then(|name| {
             entries.into_iter().try_for_each(|(key, value)| {
                 ctx.state
-                    .set(&name, &key, value)
+                    .set(&name, key, value)
                     .map_err(|refused| StoreError::Other(refused.to_string()))
             })
         }))
@@ -1533,7 +1682,10 @@ impl shonin::agent::inference::HostWithStore<Ctx> for HasSelf<Ctx> {
     > {
         use crate::inference::{Data, Named, Refusal};
         use shonin::agent::inference::{InferenceError, NamedTensor, Tensor, TensorData};
-        let inference = accessor.with(|mut access| access.get().inference.clone());
+        let (inference, most) = accessor.with(|mut access| {
+            let ctx = access.get();
+            (ctx.inference.clone(), ctx.memory.bytes)
+        });
         // A bundle without models: every name is unknown, an error the
         // strategy handles rather than a stall.
         let Some(inference) = inference else {
@@ -1553,7 +1705,7 @@ impl shonin::agent::inference::HostWithStore<Ctx> for HasSelf<Ctx> {
                 },
             })
             .collect();
-        Ok(match inference.infer(&model, inputs).await {
+        Ok(match inference.infer(&model, inputs, most).await {
             Ok(outputs) => Ok(outputs
                 .into_iter()
                 .map(|named| NamedTensor {

@@ -190,6 +190,10 @@ impl Runner {
         // before instantiating, so the memories and tables the strategy
         // declares are counted as well as what it grows them to.
         store.limiter(|ctx| ctx);
+        // And what it hands the host in one call (strings and lists, however
+        // often they repeat the same bytes of its memory) is held to the same
+        // allowance: past it, the call traps before the host copies more.
+        store.set_hostcall_fuel(memory);
 
         let vault = self.place.vault();
         let fault = |why: String| {

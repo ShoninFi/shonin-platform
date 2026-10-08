@@ -226,8 +226,15 @@ impl Inference {
         spent.used += took;
     }
 
-    /// Run `model` on `inputs`, within the budget.
-    pub async fn infer(&self, model: &str, inputs: Vec<Named>) -> Result<Vec<Named>, Refusal> {
+    /// Run `model` on `inputs`, within the budget, handing back outputs of
+    /// at most `most` bytes in all: more is refused as over quota, before it
+    /// is copied out of the model's own.
+    pub async fn infer(
+        &self,
+        model: &str,
+        inputs: Vec<Named>,
+        most: usize,
+    ) -> Result<Vec<Named>, Refusal> {
         let session = self
             .models
             .get(model)
@@ -245,7 +252,7 @@ impl Inference {
             }
         });
         let began = Instant::now();
-        let outcome = tokio::task::spawn_blocking(move || run(&session, inputs, &options))
+        let outcome = tokio::task::spawn_blocking(move || run(&session, inputs, &options, most))
             .await
             .map_err(|error| Refusal::Backend(error.to_string()))?;
         let _ = done_tx.send(());
@@ -297,6 +304,7 @@ fn run(
     session: &Mutex<Session>,
     inputs: Vec<Named>,
     options: &RunOptions,
+    most: usize,
 ) -> Result<Vec<Named>, Refusal> {
     let mut values: Vec<(String, DynValue)> = Vec::with_capacity(inputs.len());
     for input in inputs {
@@ -331,8 +339,14 @@ fn run(
     let outputs = session
         .run_with_options(values, options)
         .map_err(|error| Refusal::InvalidInput(error.to_string()))?;
+    let mut room = crate::host::Room::new(most);
+    let mut fits = |bytes: usize| {
+        room.take(bytes)
+            .map_err(|too_much| Refusal::QuotaExceeded(too_much.to_string()))
+    };
     let mut named = Vec::new();
     for (name, value) in outputs.iter() {
+        fits(std::mem::size_of::<Named>().saturating_add(name.len()))?;
         let ValueType::Tensor { ty, .. } = value.dtype() else {
             return Err(Refusal::Backend(format!("output {name} is not a tensor")));
         };
@@ -340,22 +354,27 @@ fn run(
         let (shape, data) = match ty {
             T::Float32 => {
                 let (shape, data) = value.try_extract_tensor::<f32>().map_err(backend)?;
+                fits(weight(shape, data))?;
                 (shape.to_vec(), Data::F32(data.to_vec()))
             }
             T::Float64 => {
                 let (shape, data) = value.try_extract_tensor::<f64>().map_err(backend)?;
+                fits(weight(shape, data))?;
                 (shape.to_vec(), Data::F64(data.to_vec()))
             }
             T::Int32 => {
                 let (shape, data) = value.try_extract_tensor::<i32>().map_err(backend)?;
+                fits(weight(shape, data))?;
                 (shape.to_vec(), Data::I32(data.to_vec()))
             }
             T::Int64 => {
                 let (shape, data) = value.try_extract_tensor::<i64>().map_err(backend)?;
+                fits(weight(shape, data))?;
                 (shape.to_vec(), Data::I64(data.to_vec()))
             }
             T::Uint8 => {
                 let (shape, data) = value.try_extract_tensor::<u8>().map_err(backend)?;
+                fits(weight(shape, data))?;
                 (shape.to_vec(), Data::U8(data.to_vec()))
             }
             other => {
@@ -371,6 +390,11 @@ fn run(
         });
     }
     Ok(named)
+}
+
+/// What an output's shape and values take once copied out.
+fn weight<T>(shape: &[i64], data: &[T]) -> usize {
+    std::mem::size_of_val(shape).saturating_add(std::mem::size_of_val(data))
 }
 
 #[cfg(test)]
@@ -399,7 +423,10 @@ mod tests {
     #[tokio::test]
     async fn a_bundled_model_scores_its_input() {
         let host = Inference::from_bytes(&[("scorer", PLACEHOLDER)], budget(5_000)).unwrap();
-        let out = host.infer("scorer", features(vec![0.0; 8])).await.unwrap();
+        let out = host
+            .infer("scorer", features(vec![0.0; 8]), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(out[0].name, "score");
         assert_eq!(out[0].shape, vec![1, 1]);
         let Data::F32(score) = &out[0].data else {
@@ -410,14 +437,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outputs_bigger_than_the_agent_may_take_in_are_refused_as_over_quota() {
+        let host = Inference::from_bytes(&[("scorer", PLACEHOLDER)], budget(5_000)).unwrap();
+        assert!(matches!(
+            host.infer("scorer", features(vec![0.0; 8]), 16).await,
+            Err(Refusal::QuotaExceeded(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn an_unknown_model_or_a_misshapen_input_is_the_agents_error() {
         let host = Inference::from_bytes(&[("scorer", PLACEHOLDER)], budget(5_000)).unwrap();
         assert!(matches!(
-            host.infer("other", features(vec![0.0; 8])).await,
+            host.infer("other", features(vec![0.0; 8]), usize::MAX)
+                .await,
             Err(Refusal::UnknownModel(_))
         ));
         assert!(matches!(
-            host.infer("scorer", features(vec![0.0; 7])).await,
+            host.infer("scorer", features(vec![0.0; 7]), usize::MAX)
+                .await,
             Err(Refusal::InvalidInput(_))
         ));
     }
@@ -427,7 +465,8 @@ mod tests {
         let host = Inference::from_bytes(&[("scorer", PLACEHOLDER)], budget(5_000)).unwrap();
         host.charge(Duration::from_millis(5_000));
         assert!(matches!(
-            host.infer("scorer", features(vec![0.0; 8])).await,
+            host.infer("scorer", features(vec![0.0; 8]), usize::MAX)
+                .await,
             Err(Refusal::QuotaExceeded(_))
         ));
     }
