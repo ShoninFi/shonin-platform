@@ -119,6 +119,10 @@ prover_warm() {
   if ! gcloud_vm describe shonin-prover-testnet >/dev/null 2>&1; then
     task cloud:deploy:prover NETWORK=testnet TAG="$TAG"
   fi
+  # The startup script too: a prover made before a change to it would
+  # otherwise keep running the old one.
+  gcloud_vm add-metadata shonin-prover-testnet \
+    --metadata-from-file="startup-script=$(dirname "$0")/prover/startup.sh"
   until=$(($(date +%s) + 45 * 60))
   current=$(metadata_of shonin-prover-testnet shonin-prover-image)
   # The status ports it proves for, beside the executor's (a prover made
