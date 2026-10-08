@@ -21,7 +21,7 @@ use solana_message::VersionedMessage;
 use solana_transaction::versioned::VersionedTransaction;
 
 use super::events::TransactionRecord;
-use super::keys::{RoleKeys, mnemonic_for};
+use super::keys::{RoleKeys, Signing};
 use super::rpc::{Account, Rpc, RpcError, Simulated};
 use super::tables::{self, Table};
 use super::{Keypair, Pubkey, Signer, programs};
@@ -188,7 +188,7 @@ pub struct SolanaClient {
     /// The cluster's name: the chain key's id (`localnet`).
     pub cluster: String,
     pub genesis_hash: String,
-    keys: Option<Arc<RoleKeys>>,
+    signing: Arc<Signing>,
     /// Each paying key's lookup tables, as last read: `None` until they have
     /// been looked for on the cluster. One key's tables are set up one send
     /// at a time.
@@ -199,29 +199,37 @@ type KeyTables = Arc<tokio::sync::Mutex<Option<Vec<Table>>>>;
 
 impl SolanaClient {
     /// Connect, waiting for the cluster to answer, and check it is the
-    /// cluster `key` names. The role keys are the network's
-    /// ([`mnemonic_for`]): none on mainnet, where the client only reads.
+    /// cluster `key` names. The keys are the network's
+    /// ([`Signing::for_network`]): every role's locally and with the team's
+    /// mnemonic, the keeper's alone with its own key, none on mainnet, where
+    /// the client only reads.
     pub async fn connect(
         network: NetworkName,
         key: &ChainKey,
         config: &ChainConfig,
     ) -> Result<Self> {
-        if key.kind != ChainKind::Solana {
-            bail!("{key} is not a Solana cluster");
-        }
-        let keys = match mnemonic_for(network)? {
-            Some(phrase) => Some(Arc::new(RoleKeys::from_mnemonic(&phrase)?)),
-            None => None,
-        };
-        Self::connect_with(key, config, keys).await
+        Self::connect_signing(key, config, Signing::for_network(network)?).await
     }
 
-    /// The same, signing with these keys (or none).
+    /// The same, signing with these role keys (or none).
     pub async fn connect_with(
         key: &ChainKey,
         config: &ChainConfig,
         keys: Option<Arc<RoleKeys>>,
     ) -> Result<Self> {
+        let signing = keys.map_or(Signing::ReadOnly, Signing::Roles);
+        Self::connect_signing(key, config, signing).await
+    }
+
+    /// The same, signing as `signing` says.
+    pub async fn connect_signing(
+        key: &ChainKey,
+        config: &ChainConfig,
+        signing: Signing,
+    ) -> Result<Self> {
+        if key.kind != ChainKind::Solana {
+            bail!("{key} is not a Solana cluster");
+        }
         let rpc = Rpc::new(&config.rpc, &config.label)?;
         let started = Instant::now();
         let genesis_hash = loop {
@@ -242,20 +250,39 @@ impl SolanaClient {
             key: key.clone(),
             cluster: key.id.clone(),
             genesis_hash,
-            keys,
+            signing: Arc::new(signing),
             tables: Arc::default(),
         })
     }
 
-    /// The platform's role keys, where this client signs.
+    /// The platform's role keys, where this client signs as every role.
     pub fn keys(&self) -> Result<&RoleKeys> {
-        self.keys
-            .as_deref()
-            .ok_or_else(|| anyhow!("{} is read-only here: no role keys", self.key))
+        match &*self.signing {
+            Signing::Roles(keys) => Ok(keys),
+            Signing::Keeper(_) => bail!(
+                "{} signs as the keeper alone here: the other roles' keys come from {}",
+                self.key,
+                super::keys::TESTNET_SOLANA_MNEMONIC
+            ),
+            Signing::ReadOnly => bail!("{} is read-only here: no role keys", self.key),
+        }
+    }
+
+    /// Who signs on this cluster.
+    pub fn signing(&self) -> &Signing {
+        &self.signing
     }
 
     pub fn role(&self, role: Role) -> Result<&Keypair> {
-        Ok(self.keys()?.get(role))
+        self.signing.get(role).ok_or_else(|| {
+            anyhow!(
+                "this client holds no key for {} on {}: on devnet a role signs with {}, or the keeper alone with {}",
+                role.label(),
+                self.key,
+                super::keys::TESTNET_SOLANA_MNEMONIC,
+                super::keys::TESTNET_KEEPER_SOLANA_KEY
+            )
+        })
     }
 
     pub fn address(&self, role: Role) -> Result<Pubkey> {
@@ -587,7 +614,7 @@ impl SolanaClient {
 
     /// The role key at `address`, if this client holds it.
     fn own_key(&self, address: &Pubkey) -> Option<&Keypair> {
-        self.keys.as_deref()?.find(address)
+        self.signing.find(address)
     }
 
     // Lookup tables -------------------------------------------------------------

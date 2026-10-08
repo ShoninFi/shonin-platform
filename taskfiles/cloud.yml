@@ -375,7 +375,7 @@ tasks:
           --tags=shonin-services \
           --service-account="{{.SERVICES_ACCOUNT}}" --scopes=cloud-platform \
           --metadata-from-file="startup-script={{.PATH_ROOT}}/deploy/gcp/services/startup.sh,shonin-waker={{.PATH_ROOT}}/deploy/gcp/services/waker.sh" \
-          --metadata="^~^shonin-api-image={{.GCP_REGISTRY}}/api@${api}~shonin-keeper-image={{.GCP_REGISTRY}}/keeper@${keeper}~shonin-executor-url={{.CLOUD_URL_EXECUTOR}}~shonin-prover-instance={{.PROVER_INSTANCE}}~{{.WAKER_METADATA}}~shonin-keeper-secret={{.GCP_SECRET_TESTNET_KEEPER_KEY}}~shonin-tunnel-secret={{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}~enable-oslogin=TRUE"
+          --metadata="^~^shonin-api-image={{.GCP_REGISTRY}}/api@${api}~shonin-keeper-image={{.GCP_REGISTRY}}/keeper@${keeper}~shonin-executor-url={{.CLOUD_URL_EXECUTOR}}~shonin-prover-instance={{.PROVER_INSTANCE}}~{{.WAKER_METADATA}}~shonin-keeper-secret={{.GCP_SECRET_TESTNET_KEEPER_KEY}}~shonin-keeper-solana-secret={{.GCP_SECRET_TESTNET_KEEPER_SOLANA_KEY}}~shonin-tunnel-secret={{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}~enable-oslogin=TRUE"
 
   redeploy:services:
     desc: "Point the services VM at newly pushed api and keeper images (and the current scripts), and restart it (NETWORK=testnet, TAG= the commit by default)"
@@ -395,7 +395,7 @@ tasks:
         gcloud compute instances add-metadata "shonin-services-{{.NETWORK}}" \
           --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" \
           --metadata-from-file="startup-script={{.PATH_ROOT}}/deploy/gcp/services/startup.sh,shonin-waker={{.PATH_ROOT}}/deploy/gcp/services/waker.sh" \
-          --metadata="^~^shonin-api-image={{.GCP_REGISTRY}}/api@${api}~shonin-keeper-image={{.GCP_REGISTRY}}/keeper@${keeper}~shonin-executor-url={{.CLOUD_URL_EXECUTOR}}~shonin-prover-instance={{.PROVER_INSTANCE}}~{{.WAKER_METADATA}}"
+          --metadata="^~^shonin-api-image={{.GCP_REGISTRY}}/api@${api}~shonin-keeper-image={{.GCP_REGISTRY}}/keeper@${keeper}~shonin-executor-url={{.CLOUD_URL_EXECUTOR}}~shonin-prover-instance={{.PROVER_INSTANCE}}~{{.WAKER_METADATA}}~shonin-keeper-solana-secret={{.GCP_SECRET_TESTNET_KEEPER_SOLANA_KEY}}"
         # A stopped VM is started (it reads the new images at boot); a running
         # one is reset, since a reset needs a running VM.
         status=$(gcloud compute instances describe "shonin-services-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" --format='value(status)')
@@ -459,9 +459,9 @@ tasks:
               --condition=None --quiet >/dev/null
           done
         done
-        # The services VM reads the keeper's key and the tunnel's token, and
-        # no other secret.
-        for secret in "{{.GCP_SECRET_TESTNET_KEEPER_KEY}}" "{{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}"; do
+        # The services VM reads the keeper's two keys and the tunnel's token,
+        # and no other secret.
+        for secret in "{{.GCP_SECRET_TESTNET_KEEPER_KEY}}" "{{.GCP_SECRET_TESTNET_KEEPER_SOLANA_KEY}}" "{{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}"; do
           if gcloud secrets describe "$secret" --project="$project" >/dev/null 2>&1; then
             gcloud secrets add-iam-policy-binding "$secret" --project="$project" \
               --member="serviceAccount:{{.SERVICES_ACCOUNT}}" --role=roles/secretmanager.secretAccessor >/dev/null
@@ -556,7 +556,7 @@ tasks:
         [ -z "$open" ] || { echo "open to the world: $open"; exit 1; }
 
   secrets:
-    desc: "Upload the keeper's testnet key (derived here from the mnemonic, account 4) and the tunnel's token to Secret Manager, through stdin, and let the services VM read them (NETWORK=testnet)"
+    desc: "Upload the keeper's testnet keys (derived here: account 4 of the EVM mnemonic, and the keeper's key of the Solana mnemonic, never the mnemonics) and the tunnel's token to Secret Manager, through stdin, and let the services VM read them (NETWORK=testnet)"
     requires:
       vars: [NETWORK, GCP_PROJECT]
     preconditions:
@@ -566,6 +566,10 @@ tasks:
         msg: "cast (foundry) and jq are needed to derive and check the keeper's key."
       - sh: '[ -n "${SHONIN_TESTNET_EVM_MNEMONIC:-}" ]'
         msg: "SHONIN_TESTNET_EVM_MNEMONIC is empty in .env."
+      - sh: '[ -n "${SHONIN_TESTNET_SOLANA_MNEMONIC:-}" ]'
+        msg: "SHONIN_TESTNET_SOLANA_MNEMONIC is empty in .env."
+      - sh: '[ -s "{{.PATH_DEPLOYMENTS_DIR}}/solana-devnet.json" ]'
+        msg: "No {{.PATH_DEPLOYMENTS_DIR}}/solana-devnet.json: set devnet up first (task chains:solana-setup NETWORK=testnet); the keeper's Solana key is checked against it."
       - sh: '[ -n "${CLOUDFLARE_TUNNEL_TOKEN_TESTNET:-}" ]'
         msg: "CLOUDFLARE_TUNNEL_TOKEN_TESTNET is empty in .env."
       - sh: 'ls "{{.PATH_DEPLOYMENTS_DIR}}"/evm-*.json >/dev/null 2>&1'
@@ -595,14 +599,23 @@ tasks:
         ensure "{{.GCP_SECRET_TESTNET_KEEPER_KEY}}"
         cast wallet private-key --mnemonic "$scratch/mnemonic" --mnemonic-index 4 | tr -d '\n' |
           gcloud secrets versions add "{{.GCP_SECRET_TESTNET_KEEPER_KEY}}" --project="$project" --data-file=-
+        # The keeper's Solana key: its keypair file, written by the devnet
+        # from the mnemonic into this scratch directory (it prints only the
+        # address), its address checked against devnet's deployment.
+        solana_address=$({{.DEVNET}} solana-keypair --role keeper --out "$scratch/keeper-solana.json")
+        solana_keeper=$(jq -r '.roles.keeper // empty' "{{.PATH_DEPLOYMENTS_DIR}}/solana-devnet.json")
+        [ "$solana_keeper" = "$solana_address" ] || { echo "solana-devnet.json names another keeper ($solana_keeper), not the mnemonic's ($solana_address)"; exit 1; }
+        ensure "{{.GCP_SECRET_TESTNET_KEEPER_SOLANA_KEY}}"
+        tr -d '\n' <"$scratch/keeper-solana.json" |
+          gcloud secrets versions add "{{.GCP_SECRET_TESTNET_KEEPER_SOLANA_KEY}}" --project="$project" --data-file=-
         ensure "{{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}"
         printf '%s' "$CLOUDFLARE_TUNNEL_TOKEN_TESTNET" |
           gcloud secrets versions add "{{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}" --project="$project" --data-file=-
-        for secret in "{{.GCP_SECRET_TESTNET_KEEPER_KEY}}" "{{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}"; do
+        for secret in "{{.GCP_SECRET_TESTNET_KEEPER_KEY}}" "{{.GCP_SECRET_TESTNET_KEEPER_SOLANA_KEY}}" "{{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}"; do
           gcloud secrets add-iam-policy-binding "$secret" --project="$project" \
             --member="serviceAccount:{{.SERVICES_ACCOUNT}}" --role=roles/secretmanager.secretAccessor >/dev/null
         done
-        echo "uploaded the keeper's key ($address) and the tunnel's token; the services VM reads them at its next boot"
+        echo "uploaded the keeper's keys ($address, and $solana_address on Solana devnet) and the tunnel's token; the services VM reads them at its next boot"
 
   drain:
     desc: "Wait until the builder or the reviewer holds nothing a new image or a new root would lose: no paid job unfinished in the API's queue and, for the reviewer, no review waiting to be posted (NAME=builder|reviewer, NETWORK=testnet; DRAIN_MINUTES=60). Run before replacing either image or the executor"

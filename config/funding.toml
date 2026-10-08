@@ -43,6 +43,28 @@ executor = 0
 keeper = 0.002
 author = 0.001
 
+# Solana devnet, SOL. The funder is the deployer (m/44'/501'/0'/0' of the
+# Solana mnemonic), which paid for the programs; `task chains:solana-setup
+# NETWORK=testnet` tops each role up by transfer (devnet's faucet is
+# rate-limited), and its own set-up's rent and fees come out of the reserve.
+# Each amount is 0.001 SOL or more, or 0. Enough for a week of sends at
+# 5,000 lamports a signature, with room for the rent the keys put into
+# accounts: the keeper's lookup tables and the vault keys it stocks; the
+# executor's stake of 0.05 SOL for each vault key it makes (a handover makes
+# one more); the author's activations (a vault, its station, their dollar
+# accounts); the operator's market listings and its posts every ten minutes.
+# The platform and the attestor sign no transaction there.
+[testnet."solana:devnet"]
+reserve = 1
+default = 0.2
+admin = 0.5
+operator = 0.25
+keeper = 2
+executor = 1
+author = 1
+platform = 0
+attestor = 0
+
 # On Hyperliquid testnet the funder holds dollars on HyperCore and no HYPE on
 # HyperEVM, so the task buys HYPE on HyperCore's spot market and sends it to
 # HyperEVM itself, never paying more than `max_price` dollars a HYPE or buying

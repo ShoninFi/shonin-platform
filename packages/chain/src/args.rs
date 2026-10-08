@@ -447,6 +447,14 @@ impl Target {
                     .await?
             }
         };
+        // A keeper signing with its own key signs only as the keeper this
+        // deployment names.
+        let keeper = deployments
+            .roles
+            .as_ref()
+            .map(|roles| roles.keeper.as_str())
+            .unwrap_or_default();
+        client.signing().check_keeper(keeper)?;
         let platform = Platform::from_deployments(&deployments)?;
         Ok(SolanaServed {
             vault_chain: self.vault_chain,
@@ -495,7 +503,8 @@ pub struct SolanaServed {
 
 /// Connect to a Solana cluster of a network, and check it is the cluster
 /// its key names. The role keys are the network's: the development ones
-/// locally, the team's on devnet, none on mainnet.
+/// locally, the team's on devnet (or the keeper's own key alone, or none,
+/// without the team's mnemonic), none on mainnet.
 pub async fn connect_solana(
     network: NetworkName,
     key: &ChainKey,

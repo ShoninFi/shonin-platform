@@ -238,7 +238,9 @@ vars:
   URL_API_TESTNET: "https://testnet-api.shonin.fi"
   URL_STORE_TESTNET: "https://testnet-store.shonin.fi"
   R2_BUCKET_STORE_TESTNET: "shonin-testnet-store"
-  # The keeper's testnet key alone, and the tunnel's token: the only secrets
-  # in the cloud (read by the services VM's account).
+  # The keeper's testnet keys alone (its EVM key, and its Solana devnet key
+  # as its keypair's JSON; never a mnemonic) and the tunnel's token: the only
+  # secrets in the cloud (read by the services VM's account).
   GCP_SECRET_TESTNET_KEEPER_KEY: "shonin-testnet-keeper-key"
+  GCP_SECRET_TESTNET_KEEPER_SOLANA_KEY: "shonin-testnet-keeper-solana-key"
   GCP_SECRET_TESTNET_TUNNEL_TOKEN: "shonin-testnet-tunnel-token"
