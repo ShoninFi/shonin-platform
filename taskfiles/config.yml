@@ -219,9 +219,9 @@ vars:
   GCP_ARTIFACT_REPO: "shonin"
   # Confidential Space VMs: Intel TDX needs a C3 machine.
   GCP_MACHINE_TYPE: "c3-standard-4"
-  # The reviewer mostly waits on its model: the C3 shape with the least
-  # memory.
-  GCP_REVIEWER_MACHINE_TYPE: "c3-highcpu-4"
+  # The reviewer mostly waits on its model, but Confidential Space's TDX
+  # takes the standard C3 shapes only (c3-highcpu-4 is refused).
+  GCP_REVIEWER_MACHINE_TYPE: "c3-standard-4"
   # The service account the attested machines run as, in the project: it may
   # attest, pull images and write logs, and reads no secret.
   GCP_WORKLOAD_SERVICE_ACCOUNT: "shonin-workload"
