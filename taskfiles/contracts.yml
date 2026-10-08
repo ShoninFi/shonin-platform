@@ -144,7 +144,11 @@ tasks:
           else
             final=""
             [ "$kind" = final ] && final="--final"
-            solana program deploy --use-rpc --commitment confirmed --url "$rpc" \
+            # Straight to the cluster's leaders (QUIC), with a priority fee:
+            # a program's hundreds of buffer writes sent through an RPC
+            # endpoint stall at its rate limit on devnet.
+            solana program deploy --commitment confirmed --url "$rpc" \
+              --with-compute-unit-price 20000 --max-sign-attempts 50 \
               --keypair "$deployer" --program-id "$dir/$name-keypair.json" $final "$dir/$name.so" < /dev/null
             echo "$name is at $id"
           fi
