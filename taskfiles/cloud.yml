@@ -580,9 +580,11 @@ tasks:
       # value reaches gcloud on stdin.
       - |
         set -eu
-        umask 077
         project="{{.GCP_PROJECT}}"
+        # Only this user can enter the scratch directory (Task's shell has no
+        # umask, so the directory's own mode keeps its files private).
         scratch=$(mktemp -d)
+        chmod 700 "$scratch"
         trap 'rm -rf "$scratch"' EXIT
         printf '%s\n' "$SHONIN_TESTNET_EVM_MNEMONIC" >"$scratch/mnemonic"
         # The keeper is account 4. Its address, checked against every
