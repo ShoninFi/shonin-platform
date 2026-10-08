@@ -337,18 +337,90 @@ fn found(path: &Path) -> String {
     }
 }
 
+/// What closing the launcher's socket came to (see [`close`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Closing {
+    /// Whether a build is kept from the socket once it is done, as the
+    /// check after the last step found.
+    pub closed: bool,
+    /// Each step that failed, saying why.
+    pub failed: Vec<String>,
+}
+
+impl Closing {
+    /// The level the failed steps are logged at, if any failed: info where
+    /// a later step closed the path all the same (on a read-only mount, the
+    /// socket and its directory can't be changed, every time, and a
+    /// directory above closes them), error where the socket is left
+    /// reachable.
+    pub fn level(&self) -> Option<tracing::Level> {
+        match (self.failed.is_empty(), self.closed) {
+            (true, _) => None,
+            (false, true) => Some(tracing::Level::INFO),
+            (false, false) => Some(tracing::Level::ERROR),
+        }
+    }
+
+    /// Log the failed steps at [`Closing::level`].
+    fn say(&self, socket: &Path) {
+        let socket = socket.display();
+        let failed = &self.failed;
+        match self.level() {
+            Some(tracing::Level::ERROR) => {
+                tracing::error!(%socket, ?failed, "the launcher's socket could not be closed to builds")
+            }
+            Some(_) => {
+                tracing::info!(%socket, ?failed, "steps that could not be taken were passed over: a later one closed the launcher's socket to builds")
+            }
+            None => {}
+        }
+    }
+}
+
+/// What the build service does about the build user and the launcher's
+/// socket at `socket` before it takes any job: every process the build user
+/// owns is killed (see [`sweep_apart`]); then, in the attested image
+/// (`launcher`), the socket is closed to all but root (see [`restrict`]);
+/// then a build's reach of it is checked (see [`probe`]). In that order:
+/// nothing a build left running from before this start is there while the
+/// socket is closed and checked. `needed` are the paths builds use.
+pub async fn at_start(socket: &Path, needed: &[&Path], launcher: bool) -> (Closing, Reach) {
+    at_start_with(
+        sweep_apart(),
+        || {
+            if launcher {
+                restrict(socket, needed)
+            } else {
+                Closing::default()
+            }
+        },
+        || probe(socket),
+    )
+    .await
+}
+
+/// [`at_start`], with its three steps given.
+async fn at_start_with(
+    sweep: impl std::future::Future<Output = ()>,
+    restrict: impl FnOnce() -> Closing,
+    probe: impl FnOnce() -> Reach,
+) -> (Closing, Reach) {
+    sweep.await;
+    let closing = restrict();
+    (closing, probe())
+}
+
 /// Close the socket at `socket` to all but root (see [`close`]), checking
 /// each step by having the build user try to connect (see [`probe`]).
-/// `needed` are the paths builds use, under which nothing is closed. Each
-/// step that failed is returned, saying why.
-pub fn restrict(socket: &Path, needed: &[&Path]) -> Vec<String> {
+/// `needed` are the paths builds use, under which nothing is closed.
+pub fn restrict(socket: &Path, needed: &[&Path]) -> Closing {
     let mut needed: Vec<std::path::PathBuf> =
         needed.iter().map(|path| path.to_path_buf()).collect();
     // The probe and the sweep run the build service's own program as the
     // build user, and a build may write temporary files.
     needed.extend(std::env::current_exe().ok());
     needed.push(std::env::temp_dir());
-    let closed = close(socket, 0, 0, Path::new("/"), &needed, || {
+    let closing = close(socket, 0, 0, Path::new("/"), &needed, || {
         matches!(probe(socket), Reach::Reached | Reach::Unknown(_))
     });
     // Root is refused nothing by a mode: its own token requests go on.
@@ -361,7 +433,7 @@ pub fn restrict(socket: &Path, needed: &[&Path]) -> Vec<String> {
         }
         Err(_) => {}
     }
-    closed
+    closing
 }
 
 /// Hand `path` to `owner` and `group`, where it is not theirs already, and
@@ -374,15 +446,17 @@ fn close_one(path: &Path, owner: u32, group: u32, mode: u32, what: &str) -> Vec<
     let before = found(path);
     let owned = std::fs::metadata(path)
         .is_ok_and(|metadata| metadata.uid() == owner && metadata.gid() == group);
+    // Whether a failure matters is known only once it is seen whether a
+    // later step closes the path (see [`Closing::say`]).
     if !owned && let Err(error) = std::os::unix::fs::chown(path, Some(owner), Some(group)) {
-        tracing::error!(path = %path.display(), owner, group, %error, found = before, "{what} could not be handed to its owner");
+        tracing::debug!(path = %path.display(), owner, group, %error, found = before, "{what} could not be handed to its owner");
         failed.push(format!(
             "chown {owner}:{group} {}: {error} ({before})",
             path.display()
         ));
     }
     if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
-        tracing::error!(path = %path.display(), mode = format!("{mode:04o}"), %error, found = before, "{what}'s mode could not be set");
+        tracing::debug!(path = %path.display(), mode = format!("{mode:04o}"), %error, found = before, "{what}'s mode could not be set");
         failed.push(format!(
             "chmod {mode:04o} {}: {error} ({before})",
             path.display()
@@ -406,7 +480,9 @@ fn close_one(path: &Path, owner: u32, group: u32, mode: u32, what: &str) -> Vec<
 /// checked with `reached` before going higher. `top` and what is above it
 /// are never closed, nor a directory holding any of `needed` (nor, then,
 /// anything above it); what each directory holds is logged before it is
-/// closed. Each step that failed is returned, saying why.
+/// closed. Each step that failed is returned, saying why, and logged at
+/// info where a later step closed the path, at error where none did (see
+/// [`Closing::level`]).
 pub fn close(
     socket: &Path,
     owner: u32,
@@ -414,8 +490,10 @@ pub fn close(
     top: &Path,
     needed: &[std::path::PathBuf],
     reached: impl FnMut() -> bool,
-) -> Vec<String> {
-    close_with(socket, owner, group, top, needed, reached, close_one)
+) -> Closing {
+    let closing = close_with(socket, owner, group, top, needed, reached, close_one);
+    closing.say(socket);
+    closing
 }
 
 /// [`close`], each file closed by `close_one`.
@@ -427,10 +505,13 @@ fn close_with(
     needed: &[std::path::PathBuf],
     mut reached: impl FnMut() -> bool,
     close_one: impl Fn(&Path, u32, u32, u32, &str) -> Vec<String>,
-) -> Vec<String> {
+) -> Closing {
     if !socket.exists() {
         tracing::warn!(socket = %socket.display(), "the launcher's socket is not there to close");
-        return Vec::new();
+        return Closing {
+            closed: !reached(),
+            failed: Vec::new(),
+        };
     }
     let directory = socket.parent().unwrap_or(Path::new("/"));
     let mut failed = close_one(
@@ -448,7 +529,10 @@ fn close_with(
         "the launcher's socket",
     ));
     if !reached() {
-        return failed;
+        return Closing {
+            closed: true,
+            failed,
+        };
     }
     tracing::warn!(
         socket = %socket.display(),
@@ -489,11 +573,17 @@ fn close_with(
         );
         if unclosed.is_empty() && !reached() {
             tracing::info!(path = %above.display(), "the launcher's socket is closed to builds by the directory above it");
-            return failed;
+            return Closing {
+                closed: true,
+                failed,
+            };
         }
         failed.extend(unclosed);
     }
-    failed
+    Closing {
+        closed: false,
+        failed,
+    }
 }
 
 /// Why no job may be taken, given what a build can reach of `socket`, and
@@ -577,10 +667,17 @@ mod tests {
         // only to themselves.
         let owner = rustix::process::geteuid().as_raw();
         let group = rustix::process::getegid().as_raw();
-        let failed = close(&socket, owner, group, &directory, &[], || {
+        let closing = close(&socket, owner, group, &directory, &[], || {
             root && child_probe(&socket) == REACHED
         });
-        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(
+            closing,
+            Closing {
+                closed: true,
+                failed: Vec::new()
+            }
+        );
+        assert_eq!(closing.level(), None, "nothing failed, yet it is logged");
         for (path, mode) in [(&directory, DIRECTORY_MODE), (&socket, SOCKET_MODE)] {
             let metadata = std::fs::metadata(path).unwrap();
             assert_eq!(metadata.mode() & 0o7777, mode, "{}", path.display());
@@ -678,7 +775,7 @@ mod tests {
                 "the build user reaches the open socket"
             );
         }
-        let failed = close_with(
+        let closing = close_with(
             &socket,
             owner,
             group,
@@ -694,7 +791,8 @@ mod tests {
             read_only_below(&launcher),
         );
         // The read-only steps are said, and the one above closed the path.
-        assert_eq!(failed.len(), 2, "{failed:?}");
+        assert_eq!(closing.failed.len(), 2, "{closing:?}");
+        assert!(closing.closed, "{closing:?}");
         assert_eq!(mode_of(&run), DIRECTORY_MODE);
         let metadata = std::fs::metadata(&run).unwrap();
         assert_eq!((metadata.uid(), metadata.gid()), (owner, group));
@@ -725,6 +823,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&top);
     }
 
+    /// Steps that failed are logged at info where a later step closed the
+    /// path (the socket and its directory on a read-only mount, closed by
+    /// the directory above), and at error only where the socket is left
+    /// reachable; either way they are kept, to be said in health.
+    #[test]
+    fn failed_steps_are_an_error_only_where_the_socket_is_left_reachable() {
+        let (socket, _listening, [launcher, _run, top]) = a_tree("levels");
+        let owner = rustix::process::geteuid().as_raw();
+        let group = rustix::process::getegid().as_raw();
+        let reached = || open_to_others(&socket, &top);
+
+        let closed_above = close_with(
+            &socket,
+            owner,
+            group,
+            &top,
+            &[],
+            reached,
+            read_only_below(&launcher),
+        );
+        assert!(closed_above.closed, "{closed_above:?}");
+        assert!(!closed_above.failed.is_empty());
+        assert_eq!(closed_above.level(), Some(tracing::Level::INFO));
+
+        let left_reachable = Closing {
+            closed: false,
+            failed: vec!["chmod 0700 /run: Read-only file system".into()],
+        };
+        assert_eq!(left_reachable.level(), Some(tracing::Level::ERROR));
+        let _ = std::fs::remove_dir_all(&top);
+    }
+
+    /// At start the build user's processes are swept before the socket is
+    /// closed, and the socket is closed before a build's reach of it is
+    /// checked.
+    #[tokio::test]
+    async fn at_start_the_build_user_is_swept_before_the_socket_is_closed_and_checked() {
+        let steps = std::sync::Mutex::new(Vec::new());
+        let (closing, reach) = at_start_with(
+            async { steps.lock().unwrap().push("sweep") },
+            || {
+                steps.lock().unwrap().push("restrict");
+                Closing::default()
+            },
+            || {
+                steps.lock().unwrap().push("probe");
+                Reach::Refused
+            },
+        )
+        .await;
+        assert_eq!(*steps.lock().unwrap(), ["sweep", "restrict", "probe"]);
+        assert_eq!((closing, reach), (Closing::default(), Reach::Refused));
+    }
+
     /// A directory above the socket that holds what builds use is not
     /// closed, nor is anything above it, and the top is never closed: the
     /// socket is left reachable, and that is said.
@@ -735,7 +887,7 @@ mod tests {
         let group = rustix::process::getegid().as_raw();
         let reached = || open_to_others(&socket, &top);
 
-        let failed = close_with(
+        let closing = close_with(
             &socket,
             owner,
             group,
@@ -746,15 +898,19 @@ mod tests {
         );
         assert_eq!(mode_of(&run), 0o777, "a directory builds use was closed");
         assert_eq!(mode_of(&top), 0o777, "the top was closed");
+        assert!(!closing.closed, "{closing:?}");
         assert!(
-            failed.iter().any(|why| why.contains("which builds use")),
-            "{failed:?}"
+            closing
+                .failed
+                .iter()
+                .any(|why| why.contains("which builds use")),
+            "{closing:?}"
         );
         assert!(open_to_others(&socket, &top));
 
         // Every directory below the top read-only too: the top is still
         // left as it is.
-        let failed = close_with(
+        let closing = close_with(
             &socket,
             owner,
             group,
@@ -763,7 +919,8 @@ mod tests {
             reached,
             read_only_below(&run),
         );
-        assert_eq!(failed.len(), 3, "{failed:?}");
+        assert_eq!(closing.failed.len(), 3, "{closing:?}");
+        assert!(!closing.closed, "{closing:?}");
         assert_eq!(mode_of(&top), 0o777, "the top was closed");
         assert!(open_to_others(&socket, &top));
         let _ = std::fs::remove_dir_all(&top);

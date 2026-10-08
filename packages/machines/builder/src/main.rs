@@ -308,9 +308,20 @@ impl Service {
     /// sealed under another key is set aside (see [`settle`]). Until then no
     /// upload is taken and no job is started, since neither could be kept.
     fn keeps_state(&self) -> bool {
-        self.internal
-            .as_ref()
-            .is_none_or(|internal| internal.writable() && internal.settled())
+        self.unkept().is_none()
+    }
+
+    /// Why the state kept off the machine can't be kept yet (see
+    /// [`Service::keeps_state`]), or `None` once it can.
+    fn unkept(&self) -> Option<&'static str> {
+        let internal = self.internal.as_ref()?;
+        if !internal.writable() {
+            Some("its key is not blessed yet")
+        } else if !internal.settled() {
+            Some("the state found sealed under another key is not set aside yet")
+        } else {
+            None
+        }
     }
 
     /// Wait for the sweep a job's end started, if one is under way.
@@ -609,25 +620,21 @@ async fn main() -> Result<()> {
         }),
         None => None,
     };
-    // In the attested image the launcher's socket may come open to every
-    // user: it is closed to all but root before builds are checked against
-    // it.
-    let unclosed = if launcher {
-        isolation::restrict(
-            &args.launcher_socket,
-            &[&jobs, &args.builds, &args.sdk, &args.vendor].map(PathBuf::as_path),
-        )
-    } else {
-        Vec::new()
-    };
-    let reach = isolation::probe(&args.launcher_socket);
-    // Nothing of the build user's runs from before this start.
-    isolation::sweep_apart().await;
+    // Nothing of the build user's from before this start is left running,
+    // and in the attested image the launcher's socket, which may come open to
+    // every user, is closed to all but root; then builds are checked against
+    // it (see [`isolation::at_start`]).
+    let (closing, reach) = isolation::at_start(
+        &args.launcher_socket,
+        &[&jobs, &args.builds, &args.sdk, &args.vendor].map(PathBuf::as_path),
+        launcher,
+    )
+    .await;
     let exposed = isolation::holds_the_queue(&reach, launcher).map(|why| {
-        if unclosed.is_empty() {
+        if closing.failed.is_empty() {
             why
         } else {
-            format!("{why}; closing it failed: {}", unclosed.join("; "))
+            format!("{why}; closing it failed: {}", closing.failed.join("; "))
         }
     });
     match &exposed {
@@ -974,7 +981,9 @@ async fn settle(service: &Service) {
     }
 }
 
-/// The health route: 503 while the queue is held (see [`held_by`]), naming
+/// The health route: 503 while the state kept off the machine can't be kept
+/// yet (see [`Service::keeps_state`]), since no upload nor job is taken
+/// meanwhile, saying why; while the queue is held (see [`held_by`]), naming
 /// what holds it, while the last sweep of the build user's processes was
 /// not clean (see [`isolation::unswept`]), and while a job has gone back in the queue more than
 /// [`MOST_REVIEWER_AWAY`] times in a row for want of a verdict (it still
@@ -992,6 +1001,12 @@ async fn health(State(service): State<Arc<Service>>) -> (StatusCode, String) {
             format!(
                 "builder: taking no jobs until the build user's processes are all killed: {why}"
             ),
+        );
+    }
+    if let Some(why) = service.unkept() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("builder: taking no uploads and no jobs until its state can be kept: {why}"),
         );
     }
     let held = service
@@ -3042,6 +3057,57 @@ mod tests {
             "the queue was not written"
         );
         drop(blobs);
+        let _ = std::fs::remove_dir_all(&old);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// While no upload nor job is taken for want of the blessing, or of the
+    /// old image's state set aside, health answers 503 saying which; once
+    /// both are done, 200.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_is_unavailable_until_the_key_is_blessed_and_the_old_image_s_state_is_set_aside()
+    {
+        let (url, _api) = cloud::stand_in::serve().await;
+        let old = a_scratch("health-old-image");
+        let service = a_service(&old, Some(internal_at(&url, [1; 32])));
+        write_queue(&service, &mut *service.queue.lock().await)
+            .await
+            .unwrap();
+
+        let dir = a_scratch("health-new-image");
+        let blessing = Arc::new(Blessing(false.into()));
+        let internal = internal_at(&url, [2; 32]).writes_once({
+            let blessing = blessing.clone();
+            move || cloud::Attesting::ready(&*blessing, 8453)
+        });
+        let mut service = a_service(&dir, Some(internal));
+        service.attestation = Some(blessing.clone());
+        service.canonical = Some(8453);
+        service.idle = cloud::Idle::new(Some(Duration::ZERO));
+        restore(
+            service.internal.as_ref().unwrap(),
+            &service.queue_file,
+            &service.payments_file,
+            &service.archives,
+        )
+        .await
+        .unwrap();
+        let service = Arc::new(service);
+
+        let (status, said) = health(State(service.clone())).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{said}");
+        assert!(said.contains("not blessed"), "{said}");
+
+        // Blessed, with the old queue not yet set aside.
+        blessing.0.store(true, Ordering::SeqCst);
+        let (status, said) = health(State(service.clone())).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{said}");
+        assert!(said.contains("another key"), "{said}");
+
+        watch_idle(&service).await;
+        assert!(service.keeps_state());
+        let (status, said) = health(State(service.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{said}");
         let _ = std::fs::remove_dir_all(&old);
         let _ = std::fs::remove_dir_all(&dir);
     }
