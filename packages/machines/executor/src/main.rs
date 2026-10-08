@@ -394,6 +394,10 @@ struct Book {
     /// executor's key, still blessed: watched for that key's health reports,
     /// and taken over once it has been silent long enough (see [`handover`]).
     watching: HashMap<Address, handover::Watch>,
+    /// Vaults being let go because the key this executor was taking them over
+    /// from reported again: once let go, watched afresh rather than counted
+    /// as replaced.
+    rewatch: HashSet<Address>,
 }
 
 impl Book {
@@ -495,9 +499,13 @@ struct Shared {
     attestation: attestation::Attestation,
     /// Another executor's key, still blessed, that this one takes the vault
     /// over from once its own key is blessed: the station's approval is
-    /// taken from that key, and from no other. Cleared once this key holds
-    /// the approval; one that replaces it after that ends the serve.
-    takes_over: Arc<Mutex<Option<Address>>>,
+    /// taken from that key, and from no other, and only while it is still
+    /// silent. Cleared once this key holds the approval; one that replaces it
+    /// after that ends the serve.
+    takes_over: Arc<Mutex<Option<handover::Takeover>>>,
+    /// The API a takeover asks, before taking the approval, whether the key
+    /// it takes over from is still silent.
+    api_url: String,
     /// Whether the tank is dry, as the meter last found it.
     dry: Arc<AtomicBool>,
     /// Whether the meter has read the tank at all yet. Until it has, nobody
@@ -553,6 +561,9 @@ struct Ended {
     /// Whether it ended because another executor's key, still blessed, holds
     /// the station's approval.
     replaced: bool,
+    /// Whether it ended because the key it was taking the vault over from
+    /// reported again.
+    resumed: bool,
 }
 
 /// Why a serve that didn't fail ended.
@@ -565,6 +576,10 @@ enum Stop {
     /// approve this key (see [`refused`]), and this one stops the same way,
     /// its agent unable to trade.
     Replaced,
+    /// The key this one was taking the vault over from reported again before
+    /// this key took the approval: the vault is left to it, and its silence
+    /// watched afresh.
+    Resumed,
 }
 
 /// Starts in a row that failed, and when the next may start.
@@ -734,6 +749,7 @@ async fn sweep_one(
         book.taking_on.remove(&vault);
         book.warned.remove(&vault);
         book.replaced.remove(&vault);
+        book.rewatch.remove(&vault);
         book.watching.remove(&vault);
         return Ok(());
     }
@@ -749,8 +765,17 @@ async fn sweep_one(
             let ended = task.await.unwrap_or(Ended {
                 failed: true,
                 replaced: false,
+                resumed: false,
             });
-            if ended.replaced {
+            if ended.resumed {
+                // The key this executor was taking the vault over from is
+                // heard from again: its own key never took the approval, and
+                // the vault is left to the other, its silence watched afresh.
+                tracing::info!(%chain, vault = %vault, "the key taken over from reported again; letting the vault go and watching it afresh");
+                served.stop_reports();
+                served.letting_go = Some(Instant::now());
+                book.rewatch.insert(vault);
+            } else if ended.replaced {
                 // Another executor has taken the vault over, or the station
                 // refuses this key. Its agent has stopped and its key is no
                 // longer attested once the vault is let go. The meter signs
@@ -772,7 +797,9 @@ async fn sweep_one(
         if let Some(stopped) = served.letting_go {
             if last_sends_billed(served, stopped) || stopped.elapsed() >= LAST_SENDS_LAND_WITHIN {
                 book.running.remove(&vault);
-                book.replaced.insert(vault);
+                if !book.rewatch.remove(&vault) {
+                    book.replaced.insert(vault);
+                }
             }
             return Ok(());
         }
@@ -929,7 +956,7 @@ async fn sweep_one(
                 }
             }
             tracing::info!(%chain, vault = %vault, %by, silence = args.handover_silence_seconds, "the approved key has sent no report for the whole watch; taking the vault over");
-            takes_over = Some(by);
+            takes_over = Some(handover::Takeover::new(by, unix_now()));
         }
         book.watching.remove(&vault);
         // A vault let go is taken on again only once the station would
@@ -981,6 +1008,7 @@ async fn sweep_one(
                     Ended {
                         failed: true,
                         replaced: false,
+                        resumed: false,
                     },
                     Instant::now(),
                 );
@@ -1020,6 +1048,7 @@ async fn sweep_one(
         Ended {
             failed: served.is_err(),
             replaced: matches!(served, Ok(Stop::Replaced)),
+            resumed: matches!(served, Ok(Stop::Resumed)),
         }
     }));
     Ok(())
@@ -1115,7 +1144,7 @@ fn take_on(
     vault: Address,
     bundle: B256,
     head: u64,
-    takes_over: Option<Address>,
+    takes_over: Option<handover::Takeover>,
     args: &Args,
     totals: &usage::Totals,
     attestation: &attestation::Attestation,
@@ -1190,6 +1219,7 @@ fn take_on(
             vault_key,
             attestation: attestation.clone(),
             takes_over: Arc::new(Mutex::new(takes_over)),
+            api_url: args.api_url.clone(),
             dry,
             metered,
             running,
@@ -1234,6 +1264,7 @@ async fn serve(
         vault_key,
         attestation,
         takes_over,
+        api_url,
         dry,
         metered,
         running,
@@ -1254,7 +1285,8 @@ async fn serve(
     // which carries on if this serve stops.
     let platform = key.unmetered();
     let approving = platform.noting(&approvals);
-    let taking_over = || takes_over.lock().ok().and_then(|from| *from);
+    let takeover = || takes_over.lock().ok().and_then(|from| *from);
+    let taking_over = || takeover().map(|takeover| takeover.from);
 
     // One executor at a time: a vault another executor's key has taken over,
     // that key still blessed, is not served; unless this executor is taking
@@ -1297,6 +1329,20 @@ async fn serve(
             == Approval::Behind
     {
         tokio::time::sleep(LANDING_LOOK).await;
+    }
+    // A takeover waits for its key's blessing, which can take a while: the
+    // key it takes over from, still in place, is looked at once more, and
+    // one heard from again meanwhile keeps the vault. Its silence is then
+    // watched afresh.
+    if let Some(takeover) = takeover()
+        && approval_of(&chain, &deployments, station, key.address, vault, bundle).await?
+            == Approval::Replaced(takeover.from)
+    {
+        let latest = handover::latest_report(&HTTP, &api_url, vault_chain, vault).await?;
+        if !takeover.still_silent(latest, unix_now()) {
+            tracing::info!(%vault, key = %key.address, from = %takeover.from, "the key taken over from has reported again; leaving it the vault");
+            return Ok(Stop::Resumed);
+        }
     }
     match approve_if_behind(
         &chain,
@@ -2913,6 +2959,7 @@ mod tests {
         let failed = Ended {
             failed: true,
             replaced: false,
+            resumed: false,
         };
         let mut retry = Retry::default();
         assert!(retry.ended(failed, now));
@@ -2928,6 +2975,7 @@ mod tests {
         let finished = Ended {
             failed: false,
             replaced: false,
+            resumed: false,
         };
         assert!(!retry.ended(finished, now));
         assert!(!retry.waiting(now));
@@ -2953,6 +3001,7 @@ mod tests {
                 )
                 .unwrap(),
                 takes_over: Default::default(),
+                api_url: Default::default(),
                 key: stand_in::key(&client),
                 dry: Default::default(),
                 metered: Default::default(),
@@ -3163,6 +3212,7 @@ mod tests {
             )
             .unwrap(),
             takes_over: Default::default(),
+            api_url: Default::default(),
             key,
             dry: Default::default(),
             metered: Default::default(),
@@ -3241,6 +3291,7 @@ mod tests {
             vault_key: Arc::new(keys::Key::fresh().unwrap()),
             attestation: attestation.clone(),
             takes_over: Default::default(),
+            api_url: Default::default(),
             key: key.clone(),
             dry: Default::default(),
             metered: Default::default(),
@@ -3538,6 +3589,7 @@ mod tests {
             )
             .unwrap(),
             takes_over: Default::default(),
+            api_url: Default::default(),
             key,
             dry: Default::default(),
             metered: Arc::new(AtomicBool::new(true)),
@@ -4178,6 +4230,7 @@ mod tests {
             )
             .unwrap(),
             takes_over: Default::default(),
+            api_url: Default::default(),
             key,
             dry: Default::default(),
             metered: Default::default(),
@@ -4347,6 +4400,7 @@ mod tests {
                 )
                 .unwrap(),
                 takes_over: Default::default(),
+                api_url: Default::default(),
                 key: stand_in::key(&client),
                 dry: Default::default(),
                 metered: Default::default(),
@@ -4496,6 +4550,7 @@ mod tests {
                 )
                 .unwrap(),
                 takes_over: Default::default(),
+                api_url: Default::default(),
                 key: stand_in::key(&client),
                 dry: Default::default(),
                 metered: Default::default(),
@@ -4515,6 +4570,7 @@ mod tests {
                 Ended {
                     failed: false,
                     replaced: true,
+                    resumed: false,
                 }
             })),
             retry: Default::default(),
@@ -4601,6 +4657,7 @@ mod tests {
                 )
                 .unwrap(),
                 takes_over: Default::default(),
+                api_url: Default::default(),
                 key: stand_in::key(&client),
                 dry: Default::default(),
                 metered: Default::default(),
@@ -4620,6 +4677,7 @@ mod tests {
                 Ended {
                     failed: false,
                     replaced: true,
+                    resumed: false,
                 }
             })),
             retry: Default::default(),
@@ -5005,6 +5063,7 @@ mod tests {
             )
             .unwrap(),
             takes_over: Default::default(),
+            api_url: Default::default(),
             key,
             dry: Default::default(),
             metered: Default::default(),
@@ -5234,6 +5293,7 @@ mod tests {
             )
             .unwrap(),
             takes_over: Default::default(),
+            api_url: Default::default(),
             key,
             dry: Default::default(),
             metered: Default::default(),
@@ -5838,6 +5898,7 @@ mod tests {
                     )
                     .unwrap(),
                     takes_over: Default::default(),
+                    api_url: Default::default(),
                     key: key.clone(),
                     dry: Default::default(),
                     metered: Default::default(),
@@ -5861,6 +5922,7 @@ mod tests {
                     Ended {
                         failed: false,
                         replaced: true,
+                        resumed: false,
                     }
                 })),
                 retry: Default::default(),
@@ -5937,7 +5999,8 @@ mod tests {
     async fn serve_taking_over(
         client: Client,
         key: chain::KeyClient,
-        takes_over: Option<Address>,
+        takes_over: Option<crate::handover::Takeover>,
+        api: &str,
     ) -> Result<Stop> {
         let shared = Shared {
             vault_key: Arc::new(keys::Key::fresh().unwrap()),
@@ -5946,6 +6009,7 @@ mod tests {
             )
             .unwrap(),
             takes_over: Arc::new(Mutex::new(takes_over)),
+            api_url: api.to_string(),
             key,
             dry: Default::default(),
             metered: Default::default(),
@@ -5987,7 +6051,10 @@ mod tests {
         node.lock().unwrap().approved_key = silent;
         let client = stand_in::client(&stand_in::serving::start(node.clone()).await).await;
         let key = stand_in::key(&client);
-        let served = serve_taking_over(client, key.clone(), Some(silent)).await;
+        // The API has heard nothing from it since.
+        let (api, _api) = api_holding(None).await;
+        let takeover = crate::handover::Takeover::new(silent, unix_now() - 60);
+        let served = serve_taking_over(client, key.clone(), Some(takeover), &api).await;
         assert!(served.is_err(), "the stand-in reverts the strategy's id");
         assert_eq!(node.lock().unwrap().approved_key, key.address);
         assert_eq!(stand_in::serving::approvals(&node), 1);
@@ -5998,9 +6065,37 @@ mod tests {
         node.lock().unwrap().approved_key = Address::repeat_byte(0xdd);
         let client = stand_in::client(&stand_in::serving::start(node.clone()).await).await;
         let key = stand_in::key(&client);
-        let served = serve_taking_over(client, key, Some(silent)).await;
+        let served = serve_taking_over(client, key, Some(takeover), &api).await;
         assert_eq!(served.unwrap(), Stop::Replaced);
         assert!(node.lock().unwrap().sent.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_takeover_leaves_the_vault_to_the_key_it_watched_once_that_key_reports_again() {
+        let watched = alloy::signers::local::PrivateKeySigner::random();
+        let node = stand_in::serving::node(VaultState::Open);
+        node.lock().unwrap().approved_key = watched.address();
+        let client = stand_in::client(&stand_in::serving::start(node.clone()).await).await;
+        let key = stand_in::key(&client);
+        // The takeover was decided a while ago; while the new key waited for
+        // its blessing, the watched key signed a report again.
+        let decided = unix_now() - 1_200;
+        let (api, _api) = api_holding(Some((&watched, unix_now() - 30))).await;
+        let takeover = crate::handover::Takeover::new(watched.address(), decided);
+        let served = serve_taking_over(client, key, Some(takeover), &api).await;
+        assert_eq!(served.unwrap(), Stop::Resumed);
+        assert_eq!(node.lock().unwrap().approved_key, watched.address());
+        assert_eq!(stand_in::serving::approvals(&node), 0);
+
+        // An API that can't be asked is no silence: nothing is approved.
+        let node = stand_in::serving::node(VaultState::Open);
+        node.lock().unwrap().approved_key = watched.address();
+        let client = stand_in::client(&stand_in::serving::start(node.clone()).await).await;
+        let key = stand_in::key(&client);
+        let served = serve_taking_over(client, key, Some(takeover), "http://127.0.0.1:9").await;
+        assert!(served.is_err());
+        assert_eq!(node.lock().unwrap().approved_key, watched.address());
+        assert_eq!(stand_in::serving::approvals(&node), 0);
     }
 
     /// An API that holds, for every vault, the given report signed by `by`
@@ -6113,7 +6208,12 @@ mod tests {
             .get(&vault)
             .expect("a silent executor's vault was not taken over");
         assert_eq!(
-            *served.shared.takes_over.lock().unwrap(),
+            served
+                .shared
+                .takes_over
+                .lock()
+                .unwrap()
+                .map(|takeover| takeover.from),
             Some(other.address()),
             "the takeover does not name the silent key"
         );

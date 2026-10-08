@@ -238,12 +238,13 @@ struct Shared {
     account_events: crate::feed::Feed<Vec<u8>>,
     vault_events: crate::feed::Feed<crate::watch::VaultEvent>,
     failed_starts: Arc<AtomicU32>,
-    /// Whether this key may take the station's approval from another key
-    /// the registry still counts: only once, for the takeover the vault was
-    /// taken on for (after the other key's silence, or with no other key).
-    /// A serve started again after the key was approved finds another key in
-    /// place only if that executor took the vault since, and lets it go.
-    may_replace: Arc<AtomicBool>,
+    /// The other executor's key, still counted, that this one takes the
+    /// vault over from once its own key is blessed: the station's approval is
+    /// taken from that key, and from no other, and only while it is still
+    /// silent. Cleared once this key holds the approval; a serve started
+    /// again after that finds another key in place only if that executor
+    /// took the vault since, and lets it go.
+    takes_over: Arc<Mutex<Option<handover::Takeover<Pubkey>>>>,
     /// The moment the meter's latest signed total counts up to.
     signed_through: SignedThrough,
 }
@@ -255,6 +256,43 @@ enum Stop {
     Finished,
     /// Another executor's key, still blessed, holds the station's approval.
     Replaced,
+    /// The key this one was taking the vault over from reported again before
+    /// this key took the approval: the vault is left to it, and its silence
+    /// watched afresh.
+    Resumed,
+}
+
+/// Whether a vault this executor holds no key for may be taken on, and from
+/// which key.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TakeOn {
+    /// Not now.
+    Not,
+    /// No other key the registry counts holds the station's approval.
+    Free,
+    /// From the key that has been silent for the whole watch.
+    Over(handover::Takeover<Pubkey>),
+}
+
+/// Whether a key may take the station's approval while `held`, another key
+/// the registry counts, holds it (or none does): only from no key, or from
+/// the very key it takes the vault over from.
+fn may_take_from(held: Option<Pubkey>, takes_over: Option<Pubkey>) -> bool {
+    held.is_none_or(|held| takes_over == Some(held))
+}
+
+/// The key the station approves other than `key`, through any of its
+/// drivers. Every approval withdraws all others, so there is at most one.
+fn other_key(keys: &[Pubkey], key: Option<&Pubkey>) -> Option<Pubkey> {
+    keys.iter()
+        .copied()
+        .find(|held| *held != Pubkey::default() && Some(held) != key)
+}
+
+/// Whether the station approves `key` through the driver it approves keys
+/// through (the first), and no other key through any driver.
+fn approved_alone(keys: &[Pubkey], key: &Pubkey) -> bool {
+    keys.first() == Some(key) && other_key(keys, Some(key)).is_none()
 }
 
 impl Cluster {
@@ -314,6 +352,10 @@ impl Cluster {
                         served.letting_go = Some(Instant::now());
                         book.replaced.insert(address);
                     }
+                    Ok(Ok(Stop::Resumed)) => {
+                        tracing::info!(vault = %address, "the key taken over from reported again; letting the vault go and watching it afresh");
+                        served.letting_go = Some(Instant::now());
+                    }
                     Ok(Err(error)) => {
                         served.failures += 1;
                         served.retry_at = Some(Instant::now() + crate::backoff(served.failures));
@@ -356,17 +398,22 @@ impl Cluster {
         }
         book.waiting_for_bundle.remove(&address);
 
-        if !book.running.contains_key(&address)
-            && !self
+        let takes_over = if book.running.contains_key(&address) {
+            None
+        } else {
+            match self
                 .may_take_on(book, address, vault.strategy_id, &vault.bundle_hash)
                 .await?
-        {
-            return Ok(());
-        }
+            {
+                TakeOn::Not => return Ok(()),
+                TakeOn::Free => None,
+                TakeOn::Over(takeover) => Some(takeover),
+            }
+        };
         let served = match book.running.entry(address) {
             std::collections::hash_map::Entry::Occupied(served) => served.into_mut(),
             std::collections::hash_map::Entry::Vacant(empty) => {
-                let served = self.take_on(address, vault)?;
+                let served = self.take_on(address, vault, takes_over)?;
                 tracing::info!(vault = %address, key = %served.shared.key.pubkey(), "taking on a vault");
                 empty.insert(served)
             }
@@ -383,25 +430,26 @@ impl Cluster {
     /// Whether a vault this executor holds no key for may be taken on: no
     /// other executor's key the registry counts holds its station's
     /// approval, or one does and has been silent for the whole handover
-    /// silence. A vault another executor took from this one is taken on
-    /// again only once no counted key holds it.
+    /// silence, and then it is that key the approval is taken from. A vault
+    /// another executor took from this one is taken on again only once no
+    /// counted key holds it.
     async fn may_take_on(
         &self,
         book: &mut Book,
         vault: Pubkey,
         strategy_id: u64,
         bundle: &[u8; 32],
-    ) -> Result<bool> {
+    ) -> Result<TakeOn> {
         let v = self.platform.vault_accounts(strategy_id);
         let Some(by) = self.held_by_another(&v, None, bundle).await? else {
             book.watching.remove(&vault);
             if book.replaced.remove(&vault) {
                 tracing::info!(%vault, "no other executor's key holds the station's approval; taking the vault on again");
             }
-            return Ok(true);
+            return Ok(TakeOn::Free);
         };
         if book.replaced.contains(&vault) {
-            return Ok(false);
+            return Ok(TakeOn::Not);
         }
         let now = crate::unix_now();
         let watch = book.watching.entry(vault).or_insert_with(|| {
@@ -413,7 +461,7 @@ impl Cluster {
             *watch = handover::Watch::new(by, now);
         }
         if !watch.look_due(Instant::now()) {
-            return Ok(false);
+            return Ok(TakeOn::Not);
         }
         let latest = handover::latest_solana_report(
             &crate::HTTP,
@@ -428,24 +476,31 @@ impl Cluster {
                 if watch.heard(latest, crate::unix_now()) == handover::Heard::Report
                     || !watch.silent_for(self.args.handover_silence_seconds, crate::unix_now())
                 {
-                    return Ok(false);
+                    return Ok(TakeOn::Not);
                 }
             }
             Err(error) => {
                 if book.warned.entry(vault).or_default().due(Instant::now()) {
                     tracing::warn!(%vault, error = format!("{error:#}"), "could not read the vault's latest report; the watch goes on");
                 }
-                return Ok(false);
+                return Ok(TakeOn::Not);
             }
         }
         tracing::info!(%vault, %by, silence = self.args.handover_silence_seconds, "the approved key has sent no report for the whole watch; taking the vault over");
         book.watching.remove(&vault);
-        Ok(true)
+        Ok(TakeOn::Over(handover::Takeover::new(by, crate::unix_now())))
     }
 
     /// Make the vault's key, and start its meter and its reports, which run
-    /// for as long as the vault is served.
-    fn take_on(&self, address: Pubkey, vault: &Vault) -> Result<Served> {
+    /// for as long as the vault is served. `takes_over` is the other
+    /// executor's key whose approval this one takes, once its own key is
+    /// blessed.
+    fn take_on(
+        &self,
+        address: Pubkey,
+        vault: &Vault,
+        takes_over: Option<handover::Takeover<Pubkey>>,
+    ) -> Result<Served> {
         let key = Arc::new(crate::keys::fresh_solana()?);
         self.attestation.put_solana(
             &self.chain_key,
@@ -523,7 +578,7 @@ impl Cluster {
                 account_events: Default::default(),
                 vault_events: Default::default(),
                 failed_starts: Default::default(),
-                may_replace: Arc::new(AtomicBool::new(true)),
+                takes_over: Arc::new(Mutex::new(takes_over)),
                 signed_through: tank.signed_through,
             },
             serving: None,
@@ -542,13 +597,16 @@ impl Cluster {
         let key = shared.key.clone();
         let bundle = shared.bundle;
         let v = shared.accounts.clone();
+        let takeover = || shared.takes_over.lock().ok().and_then(|from| *from);
 
-        // One executor at a time: once this key has held the approval,
-        // another counted key in its place took the vault.
-        if !shared.may_replace.load(Ordering::SeqCst)
-            && let Some(other) = self
-                .held_by_another(&v, Some(&key.pubkey()), &bundle)
-                .await?
+        // One executor at a time: a counted key in place is that executor's,
+        // unless this one is taking the vault over from that very key. Once
+        // this key has held the approval, another in its place took the
+        // vault.
+        if let Some(other) = self
+            .held_by_another(&v, Some(&key.pubkey()), &bundle)
+            .await?
+            && !may_take_from(Some(other), takeover().map(|takeover| takeover.from))
         {
             tracing::info!(%vault, %other, "another executor's key holds the station's approval; not serving");
             return Ok(Stop::Replaced);
@@ -569,16 +627,17 @@ impl Cluster {
             tokio::time::sleep(LOOK_EVERY).await;
         }
         tracing::info!(%vault, key = %key.pubkey(), "the key is blessed and holds its lamports");
-        if !shared.may_replace.load(Ordering::SeqCst)
-            && let Some(other) = self
-                .held_by_another(&v, Some(&key.pubkey()), &bundle)
-                .await?
-        {
-            tracing::info!(%vault, %other, "another executor's key holds the station's approval; not serving");
-            return Ok(Stop::Replaced);
+        // The blessing can take a while: where the approval stands is read
+        // again now, and it is taken only from no counted key, or from the
+        // key this one takes over from while that key is still silent.
+        if let Some(stop) = self.approved(&v, &key, &bundle, takeover()).await? {
+            return Ok(stop);
         }
-        self.approved(&v, &key, &bundle).await?;
-        shared.may_replace.store(false, Ordering::SeqCst);
+        // The approval is this key's now: a key that takes it from here on
+        // has replaced this executor, which lets the vault go.
+        if let Ok(mut from) = shared.takes_over.lock() {
+            *from = None;
+        }
 
         // Kept blessed and stocked for as long as the serve runs.
         let replaced = Arc::new(AtomicBool::new(false));
@@ -739,17 +798,17 @@ impl Cluster {
         bundle: &[u8; 32],
     ) -> Result<Option<Pubkey>> {
         let station = self.platform.station(&self.client, &v.station).await?;
-        let approved = station
-            .drivers
-            .iter()
-            .map(|driver| driver.key)
-            .find(|held| *held != Pubkey::default() && Some(held) != key);
-        let Some(approved) = approved else {
+        let keys: Vec<Pubkey> = station.drivers.iter().map(|driver| driver.key).collect();
+        let Some(approved) = other_key(&keys, key) else {
             return Ok(None);
         };
-        let other =
-            Blessed::read(&self.client, &self.platform, &approved, &v.vault, bundle).await?;
-        Ok(other.holds(self.client.now().await?).then_some(approved))
+        Ok(self.counts(&approved, v, bundle).await?.then_some(approved))
+    }
+
+    /// Whether the registry counts `key` as this vault's executor.
+    async fn counts(&self, key: &Pubkey, v: &VaultAccounts, bundle: &[u8; 32]) -> Result<bool> {
+        let blessed = Blessed::read(&self.client, &self.platform, key, &v.vault, bundle).await?;
+        Ok(blessed.holds(self.client.now().await?))
     }
 
     /// Read where the key's blessing for the vault stands, and tell the
@@ -768,15 +827,47 @@ impl Cluster {
         Ok(blessed.holds(now))
     }
 
-    /// Have the station approve the key, if it doesn't already.
-    async fn approved(&self, v: &VaultAccounts, key: &Keypair, bundle: &[u8; 32]) -> Result<()> {
+    /// Have the station approve the key, if it doesn't already: in the place
+    /// of no key the registry counts, or of the key `takes_over` names while
+    /// that key is still silent. The station lets any blessed key displace
+    /// another, so this is the rule that keeps one executor at a time. Says
+    /// why the serve stops if the key is not to be approved.
+    async fn approved(
+        &self,
+        v: &VaultAccounts,
+        key: &Keypair,
+        bundle: &[u8; 32],
+        takes_over: Option<handover::Takeover<Pubkey>>,
+    ) -> Result<Option<Stop>> {
         let station = self.platform.station(&self.client, &v.station).await?;
-        if station
-            .drivers
-            .first()
-            .is_some_and(|driver| driver.key == key.pubkey())
+        let keys: Vec<Pubkey> = station.drivers.iter().map(|driver| driver.key).collect();
+        if approved_alone(&keys, &key.pubkey()) {
+            return Ok(None);
+        }
+        if let Some(other) = other_key(&keys, Some(&key.pubkey()))
+            && self.counts(&other, v, bundle).await?
         {
-            return Ok(());
+            let takeover = match takes_over {
+                Some(takeover) if may_take_from(Some(other), Some(takeover.from)) => takeover,
+                _ => {
+                    tracing::info!(vault = %v.vault, %other, "another executor's key holds the station's approval; not serving");
+                    return Ok(Some(Stop::Replaced));
+                }
+            };
+            // An API that can't be asked is no silence: the serve fails, and
+            // is tried again.
+            let latest = handover::latest_solana_report(
+                &crate::HTTP,
+                &self.args.api_url,
+                self.vault_chain,
+                &self.client.cluster_value(),
+                &v.vault,
+            )
+            .await?;
+            if !takeover.still_silent(latest, crate::unix_now()) {
+                tracing::info!(vault = %v.vault, from = %other, "the key taken over from has reported again; leaving it the vault");
+                return Ok(Some(Stop::Resumed));
+            }
         }
         let ix = self
             .platform
@@ -787,7 +878,7 @@ impl Cluster {
             .await
             .context("the station would not approve the key")?;
         tracing::info!(vault = %v.vault, key = %key.pubkey(), "approved at the station");
-        Ok(())
+        Ok(None)
     }
 
     /// Keep the attestation told where the key's blessing stands, and raise
@@ -818,8 +909,12 @@ impl Cluster {
                     return anyhow::Ok(false);
                 }
                 // A key the station dropped (another's approval that lapsed
-                // and was then replaced) is approved again.
-                self.approved(&v, &key, &bundle).await?;
+                // and was then replaced) is approved again, in the place of
+                // no counted key.
+                if self.approved(&v, &key, &bundle, None).await?.is_some() {
+                    replaced.store(true, Ordering::SeqCst);
+                    return anyhow::Ok(true);
+                }
                 anyhow::Ok(false)
             };
             match kept.await {
@@ -838,6 +933,40 @@ impl Cluster {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The station lets any blessed key displace another, so the executor's
+    /// rule is what keeps one executor at a time: a key takes the approval
+    /// from no counted key, or from the key it takes the vault over from, and
+    /// from no other, whichever came in meanwhile.
+    #[test]
+    fn a_takeover_takes_the_approval_only_from_the_key_it_watched_go_silent() {
+        let watched = Pubkey::new_from_array([0xaa; 32]);
+        let third = Pubkey::new_from_array([0xcc; 32]);
+        assert!(may_take_from(None, None));
+        assert!(may_take_from(None, Some(watched)));
+        assert!(may_take_from(Some(watched), Some(watched)));
+        assert!(!may_take_from(Some(third), Some(watched)));
+        assert!(!may_take_from(Some(watched), None));
+        assert!(!may_take_from(Some(third), None));
+    }
+
+    /// Whether another key holds the station, and whether this key holds it
+    /// alone, are read from every driver alike.
+    #[test]
+    fn the_key_in_place_is_read_from_every_driver_of_the_station() {
+        let mine = Pubkey::new_from_array([0x11; 32]);
+        let other = Pubkey::new_from_array([0x22; 32]);
+        let none = Pubkey::default();
+        assert_eq!(other_key(&[none, none], Some(&mine)), None);
+        assert_eq!(other_key(&[mine, none], Some(&mine)), None);
+        assert_eq!(other_key(&[none, other], Some(&mine)), Some(other));
+        assert_eq!(other_key(&[mine, other], Some(&mine)), Some(other));
+        assert_eq!(other_key(&[other, none], None), Some(other));
+        assert!(approved_alone(&[mine, none], &mine));
+        assert!(!approved_alone(&[mine, other], &mine));
+        assert!(!approved_alone(&[none, mine], &mine));
+        assert!(!approved_alone(&[], &mine));
+    }
 
     /// A vault let go is kept while a send of its agent's may still land,
     /// and until a total signed after the send settled counts its cost.

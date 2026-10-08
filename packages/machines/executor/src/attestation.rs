@@ -1398,12 +1398,31 @@ impl Attestation {
         let blesses = simulate
             .iter()
             .any(|each| matches!(each, Simulate::Bless(..) | Simulate::SolanaBless(..)));
+        // A Solana cluster is asked through a far less reliable endpoint, and
+        // allows images and checkers through an admin path of its own: one
+        // that can't be asked, or refuses, holds back only its own keys,
+        // whose blessing the keeper simulates again before it relays one. The
+        // seal is refused over Solana only when no key in the tree would be
+        // blessed with it anywhere.
+        let mut sealable = false;
+        let mut solana_refused = None;
         for each in simulate {
             let chain_id = match &each {
                 Simulate::Bless(leaf, _) => leaf.chain_id,
                 Simulate::SetRoot(root, _) => root.chain_id,
                 Simulate::SolanaBless(leaf, proof) => {
-                    self.simulate_solana(&sealed, leaf, proof).await?;
+                    match self.simulate_solana(&sealed, leaf, proof).await {
+                        Ok(()) => sealable = true,
+                        Err(refusal) => {
+                            tracing::warn!(
+                                cluster = leaf.cluster,
+                                vault = %leaf.vault,
+                                why = ?refusal,
+                                "a simulated bless on this cluster did not go through; its keys wait for the keeper's own simulation or a later seal"
+                            );
+                            solana_refused.get_or_insert(refusal);
+                        }
+                    }
                     continue;
                 }
             };
@@ -1477,6 +1496,14 @@ impl Attestation {
                     Refusal::Unavailable(why)
                 });
             }
+            if what == "bless" {
+                sealable = true;
+            }
+        }
+        if let Some(refusal) = solana_refused
+            && !sealable
+        {
+            return Err(refusal);
         }
         self.keep(sealed)
     }
@@ -2809,5 +2836,141 @@ mod tests {
         assert_eq!(asked["nonces"], serde_json::json!([nonce]));
         assert_eq!(attestation.status().token_issued_at, Some(NOW));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Solana node that names devnet's genesis and answers everything else
+    /// with HTTP 429, as a public endpoint does under its rate limit.
+    async fn rate_limited_devnet() -> (SolanaClient, crate::AbortOnDrop) {
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(
+                |axum::Json(request): axum::Json<serde_json::Value>| async move {
+                    let id = request["id"].clone();
+                    match request["method"].as_str().unwrap_or_default() {
+                        "getGenesisHash" => (
+                            StatusCode::OK,
+                            axum::Json(serde_json::json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "result": "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
+                            })),
+                        ),
+                        _ => (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            axum::Json(serde_json::json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "error": {"code": 429, "message": "Too many requests"}
+                            })),
+                        ),
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = crate::AbortOnDrop(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let key: chain::ChainKey = "solana:devnet".parse().unwrap();
+        let config: chain::ChainConfig = serde_json::from_value(serde_json::json!({
+            "label": "Solana devnet (stand-in)",
+            "rpc": url,
+            "dollar": "4Gw9TmkKDvnGtBcMpJwR4rRDEWc6KVujegc1j4ebtHTK",
+        }))
+        .unwrap();
+        (
+            SolanaClient::connect_with(&key, &config, None)
+                .await
+                .unwrap(),
+            server,
+        )
+    }
+
+    fn devnet_platform() -> Platform {
+        Platform {
+            cluster_name: "devnet".into(),
+            cluster: chain::solana::programs::common::digest::cluster_value("devnet"),
+            mint: Pubkey::new_from_array([1; 32]),
+            admin: Pubkey::new_from_array([2; 32]),
+            platform: Pubkey::new_from_array([3; 32]),
+            operator: Pubkey::new_from_array([4; 32]),
+            checker: None,
+        }
+    }
+
+    /// An instance holding a key on devnet, served by a node that can't be
+    /// asked, and a token held for its tree.
+    async fn with_devnet_key_unreachable(
+        attestation: &Attestation,
+    ) -> (String, crate::AbortOnDrop) {
+        let devnet = chain::solana::programs::common::digest::cluster_value("devnet");
+        attestation.put_solana(
+            "solana:devnet",
+            devnet,
+            Pubkey::new_from_array([0x21; 32]),
+            [7; 32],
+            Pubkey::new_from_array([0x22; 32]),
+        );
+        let nonce = attestation.binding().nonce();
+        attestation.hold(token(&nonce, NOW)).unwrap();
+        let (client, server) = rate_limited_devnet().await;
+        attestation.serve_solana(
+            "solana:devnet".into(),
+            SolanaServed {
+                client,
+                platform: devnet_platform(),
+                payer: Pubkey::new_from_array([9; 32]),
+            },
+        );
+        (nonce, server)
+    }
+
+    /// The prover's seal for the instance: the Groth16 seal, then this
+    /// instance's Solana key and the Google key's hash.
+    fn seal_post(attestation: &Attestation, nonce: String) -> SealPost {
+        let journal = journal_for(attestation, NOW);
+        let mut seal = vec![7u8; 260];
+        seal.extend_from_slice(&attestation.solana_instance().to_bytes());
+        seal.extend_from_slice(&[5u8; 32]);
+        SealPost {
+            nonce,
+            seal: alloy::hex::encode_prefixed(&seal),
+            journal: alloy::hex::encode_prefixed(journal.encode()),
+        }
+    }
+
+    /// A seal every EVM chain accepts blesses the EVM vault keys even while
+    /// a Solana cluster the instance also holds a key on can't be asked: a
+    /// cluster holds back its own keys, never another chain's.
+    #[tokio::test]
+    async fn a_seal_every_evm_chain_accepts_is_kept_while_a_solana_cluster_cannot_be_asked() {
+        let attestation = Attestation::new(Mode::Launcher).unwrap();
+        attestation.put(
+            31337,
+            Address::repeat_byte(0x11),
+            B256::repeat_byte(0x5b),
+            Address::repeat_byte(0xa1),
+        );
+        let (nonce, _devnet) = with_devnet_key_unreachable(&attestation).await;
+        let (node, evm_asked) = bless_node(31337, false).await;
+        attestation.serve_chain(node, crate::stand_in::deployments());
+
+        let accepted = attestation.accept(seal_post(&attestation, nonce)).await;
+        assert_eq!(accepted, Ok(()));
+        assert!(attestation.status().seal.is_some());
+        assert_eq!(*evm_asked.lock().unwrap(), 1);
+    }
+
+    /// With keys on Solana alone, a cluster that can't be asked leaves the
+    /// seal unproven by any chain, so it is refused.
+    #[tokio::test]
+    async fn a_seal_for_solana_keys_alone_is_refused_while_their_cluster_cannot_be_asked() {
+        let attestation = Attestation::new(Mode::Launcher).unwrap();
+        let (nonce, _devnet) = with_devnet_key_unreachable(&attestation).await;
+        let refused = attestation.accept(seal_post(&attestation, nonce)).await;
+        assert!(
+            matches!(refused, Err(Refusal::Unavailable(_))),
+            "{refused:?}"
+        );
+        assert!(attestation.status().seal.is_none());
     }
 }

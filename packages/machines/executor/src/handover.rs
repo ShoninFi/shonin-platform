@@ -103,6 +103,34 @@ impl<K: PartialEq + Copy> Watch<K> {
     }
 }
 
+/// A takeover decided: the key whose silence lasted the whole watch, and
+/// when that was found. The new key takes the station's approval from that
+/// key alone, and only while it is still silent once the new key is blessed:
+/// the blessing can take a while, and a key heard from again meanwhile is
+/// left in place.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Takeover<K = Address> {
+    /// The key taken over from.
+    pub from: K,
+    /// When its silence was found to have lasted the whole watch, in unix
+    /// seconds.
+    pub decided_at: u64,
+}
+
+impl<K: PartialEq + Copy> Takeover<K> {
+    pub fn new(from: K, decided_at: u64) -> Takeover<K> {
+        Takeover { from, decided_at }
+    }
+
+    /// Whether the key taken over from is still silent, given the latest
+    /// report the API holds for the vault: none from that key dated since the
+    /// takeover was decided (give or take [`CLOCK_SKEW`]), as a watch begun
+    /// then would hear it.
+    pub fn still_silent(&self, latest: Option<(K, u64)>, now: u64) -> bool {
+        Watch::new(self.from, self.decided_at).heard(latest, now) == Heard::Nothing
+    }
+}
+
 /// The latest report the API took for a vault: who signed it, and when it
 /// says it was signed. `None` if the API has none.
 pub async fn latest_report(
@@ -189,6 +217,24 @@ mod tests {
     use super::*;
 
     const NOW: u64 = 1_800_000_000;
+
+    #[test]
+    fn a_key_taken_over_from_that_reports_again_before_the_approval_is_left_in_place() {
+        let by = Address::repeat_byte(0xee);
+        let decided = NOW + HANDOVER_SILENCE;
+        let takeover = Takeover::new(by, decided);
+        // Only the report from before the silence: still silent.
+        assert!(takeover.still_silent(Some((by, NOW - 5)), decided + 1_800));
+        assert!(takeover.still_silent(None, decided + 1_800));
+        // Another key's report says nothing about this one.
+        let other = Address::repeat_byte(0xdd);
+        assert!(takeover.still_silent(Some((other, decided + 60)), decided + 1_800));
+        // A report from the key since the takeover was decided: heard again.
+        assert!(!takeover.still_silent(Some((by, decided + 60)), decided + 1_800));
+        assert!(!takeover.still_silent(Some((by, decided - CLOCK_SKEW)), decided + 1_800));
+        // One dated in the future is not believed.
+        assert!(takeover.still_silent(Some((by, decided + 1_800 + 3_600)), decided + 1_800));
+    }
 
     #[test]
     fn a_key_silent_for_the_whole_watch_is_taken_over() {
