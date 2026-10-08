@@ -12,7 +12,7 @@
 //! index 0 is the deployer and 1 the registry; the role keys are at 10 and
 //! up. Programs that serve tests only have no index: they never leave a test.
 //!
-//! One index above 100 holds no program: [`DOLLAR_MINT`], the stand-in
+//! One index above 100 holds no program: [`DOLLAR_MINT`] (108), the stand-in
 //! dollar's mint account, so the devnet's dollar has one address however
 //! often the set-up runs, and nobody but the team can create the account
 //! first (a mint at a key of the published development mnemonic could be
@@ -25,7 +25,7 @@ use chain::solana::Signer;
 use chain::solana::keys::{self, PROGRAM};
 
 /// Every program deployed to devnet, by its library name, and its index.
-pub const PROGRAM_KEYS: [(&str, u32); 9] = [
+pub const PROGRAM_KEYS: [(&str, u32); 10] = [
     ("shonin_registry", PROGRAM),
     ("shonin_publishing", 100),
     ("shonin_prices", 101),
@@ -35,6 +35,8 @@ pub const PROGRAM_KEYS: [(&str, u32); 9] = [
     ("shonin_dev_verifier", 105),
     ("shonin_local_venue", 106),
     ("shonin_local_driver", 107),
+    // 108 is the dollar's mint.
+    ("shonin_cs_verifier", 109),
 ];
 
 /// The stand-in dollar's mint account on devnet: not a program, and never
@@ -97,13 +99,30 @@ mod tests {
     }
 
     #[test]
-    fn the_dollar_s_mint_is_at_its_fixed_index_after_every_program() {
+    fn the_dollar_s_mint_is_at_its_fixed_index_after_the_programs_before_it() {
         assert_eq!(DOLLAR_MINT, 108);
-        let last_program = PROGRAM_KEYS.iter().map(|(_, index)| *index).max().unwrap();
-        assert!(DOLLAR_MINT > last_program);
+        // Every program deployed before the mint was given its index comes
+        // before it; the Confidential Space checker, added after, after.
+        let before = PROGRAM_KEYS
+            .iter()
+            .filter(|(name, _)| *name != "shonin_cs_verifier")
+            .map(|(_, index)| *index)
+            .max()
+            .unwrap();
+        assert!(DOLLAR_MINT > before);
         let last_role = keys::ROLE_BASE + chain::client::ROLE_COUNT as u32 - 1;
         assert!(![DEPLOYER, PROGRAM].contains(&DOLLAR_MINT));
         assert!(!(keys::ROLE_BASE..=last_role).contains(&DOLLAR_MINT));
+    }
+
+    #[test]
+    fn the_confidential_space_checker_is_at_the_index_after_the_mint() {
+        assert_eq!(
+            PROGRAM_KEYS
+                .iter()
+                .find(|(name, _)| *name == "shonin_cs_verifier"),
+            Some(&("shonin_cs_verifier", DOLLAR_MINT + 1))
+        );
     }
 
     #[test]

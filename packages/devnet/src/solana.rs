@@ -70,8 +70,9 @@ const STARTING_PRICE: u64 = crate::deploy::STARTING_PRICE;
 
 /// Every program a development cluster runs, by its library name, and
 /// whether it is deployed final.
-const PROGRAMS: [(&str, bool); 9] = [
+const PROGRAMS: [(&str, bool); 10] = [
     ("shonin_dev_verifier", true),
+    ("shonin_cs_verifier", true),
     ("shonin_local_driver", true),
     ("shonin_registry", false),
     ("shonin_publishing", false),

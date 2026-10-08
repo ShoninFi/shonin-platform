@@ -26,6 +26,8 @@ solana = [
     "dep:shonin-driver",
     "dep:shonin-registry",
     "dep:shonin-dev-verifier",
+    "dep:shonin-cs-verifier",
+    "dep:shonin-attestation-core",
     "dep:shonin-publishing",
     "dep:shonin-prices",
     "dep:shonin-profiles",
@@ -54,6 +56,7 @@ solana = [
 # keep their local ids, which no mainnet deployment names.
 mainnet = [
     "shonin-registry?/mainnet",
+    "shonin-cs-verifier?/mainnet",
     "shonin-publishing?/mainnet",
     "shonin-prices?/mainnet",
     "shonin-profiles?/mainnet",
@@ -63,6 +66,7 @@ mainnet = [
 devnet = [
     "shonin-registry?/devnet",
     "shonin-dev-verifier?/devnet",
+    "shonin-cs-verifier?/devnet",
     "shonin-publishing?/devnet",
     "shonin-prices?/devnet",
     "shonin-profiles?/devnet",
@@ -96,6 +100,8 @@ shonin-common = { path = "../../contracts/solana/crates/shonin-common", optional
 shonin-driver = { path = "../../contracts/solana/crates/shonin-driver", optional = true }
 shonin-registry = { path = "../../contracts/solana/programs/shonin-registry", optional = true, features = ["no-entrypoint"] }
 shonin-dev-verifier = { path = "../../contracts/solana/programs/shonin-dev-verifier", optional = true, features = ["no-entrypoint"] }
+shonin-attestation-core = { path = "../attestation/core", optional = true }
+shonin-cs-verifier = { path = "../../contracts/solana/programs/shonin-cs-verifier", optional = true, features = ["no-entrypoint"] }
 shonin-publishing = { path = "../../contracts/solana/programs/shonin-publishing", optional = true, features = ["no-entrypoint"] }
 shonin-prices = { path = "../../contracts/solana/programs/shonin-prices", optional = true, features = ["no-entrypoint"] }
 shonin-profiles = { path = "../../contracts/solana/programs/shonin-profiles", optional = true, features = ["no-entrypoint"] }

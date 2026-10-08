@@ -6,7 +6,10 @@
 //!
 //! The test plays the build service, the Reviewer, the author, a depositor
 //! and the keeper with the development keys, as the seed does, so the vault
-//! runs a real component. It needs a cluster, so it is ignored unless asked
+//! runs a real component. As the keeper, it relays the blessing of the key
+//! the executor publishes on its status port, sealed for the development
+//! checker, and gives the key lamports once the registry counts it: the
+//! executor itself holds no role account. It needs a cluster, so it is ignored unless asked
 //! for:
 //!
 //! ```text
@@ -24,9 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::{Json, Router, routing::post};
-use chain::solana::executor::{
-    Blessed, SignedTotal, signature_from_base58, vault_key, verify_ed25519,
-};
+use chain::solana::executor::{Blessed, SignedTotal, signature_from_base58, verify_ed25519};
 use chain::solana::platform::{Declared, Registration, VaultAccounts};
 use chain::solana::programs::{local_driver, prices, publishing, vault};
 use chain::solana::{Platform, Pubkey, Signer, SolanaClient, name};
@@ -240,6 +241,76 @@ impl Cluster {
         }
     }
 
+    /// Play the keeper once: relay the blessing of the key the executor
+    /// publishes for `vault`, and give it lamports once it is counted.
+    /// Answers the key, once published.
+    async fn keep(&self, port: u16, vault: &Pubkey, bundle: &[u8; 32]) -> Option<Pubkey> {
+        let status: serde_json::Value =
+            reqwest::get(format!("http://127.0.0.1:{port}/attestation"))
+                .await
+                .ok()?
+                .json()
+                .await
+                .ok()?;
+        let cluster = status["solana"].as_array()?.first()?.clone();
+        let leaf = cluster["leaves"]
+            .as_array()?
+            .iter()
+            .find(|leaf| leaf["vault"].as_str() == Some(&vault.to_string()))?
+            .clone();
+        let key: Pubkey = leaf["key"].as_str()?.parse().ok()?;
+        let keeper = self.client.role(Role::Keeper).unwrap();
+        let now = self.client.now().await.unwrap();
+        if self.blessed(&key, vault, bundle).await.due(now) {
+            let journal = alloy::hex::decode(cluster["journal"].as_str()?).ok()?;
+            let journal = <chain::solana::programs::registry::state::Journal as chain::solana::programs::anchor_lang::AnchorDeserialize>::deserialize(&mut journal.as_slice()).ok()?;
+            let seal: chain::solana::attest::SolanaSeal =
+                serde_json::from_value(cluster["seal"].clone()).ok()?;
+            let proof = leaf["proof"]
+                .as_array()?
+                .iter()
+                .map(|node| {
+                    alloy::hex::decode(node.as_str().unwrap())
+                        .unwrap()
+                        .try_into()
+                        .unwrap()
+                })
+                .collect();
+            let config = self.platform.registry_config(&self.client).await.unwrap();
+            let ixs = self
+                .platform
+                .bless_with(
+                    &config,
+                    now,
+                    &keeper.pubkey(),
+                    &journal,
+                    &seal,
+                    &chain::solana::attest::KeyLeaf {
+                        vault_chain: self.platform.cluster,
+                        vault: vault.to_bytes(),
+                        strategy_hash: *bundle,
+                        key,
+                        proof,
+                    },
+                )
+                .unwrap();
+            let _ = self.client.send(ixs, &[keeper]).await;
+        } else if self.client.lamports(&key).await.unwrap() < 1_000_000_000 {
+            let _ = self
+                .client
+                .send(
+                    vec![chain::solana::executor::ix_fund(
+                        &keeper.pubkey(),
+                        &key,
+                        2_000_000_000,
+                    )],
+                    &[keeper],
+                )
+                .await;
+        }
+        Some(key)
+    }
+
     async fn blessed(&self, key: &Pubkey, vault: &Pubkey, bundle: &[u8; 32]) -> Blessed {
         Blessed::read(&self.client, &self.platform, key, vault, bundle)
             .await
@@ -309,12 +380,20 @@ async fn a_solana_vault_is_taken_on_blessed_and_traded_through_the_guard() {
             .args(["--api-url", &format!("http://127.0.0.1:{api_port}")]),
     )
     .await;
-    let key = vault_key(&v.vault).pubkey();
     let began = Instant::now();
     let said = || executor.said.lock().unwrap().clone();
 
-    // Blessed and approved at the station.
-    let first = loop {
+    // Blessed (the keeper relaying) and approved at the station.
+    let (key, first) = loop {
+        let Some(key) = cluster.keep(executor.port, &v.vault, &bundle).await else {
+            assert!(
+                began.elapsed() < PATIENCE,
+                "the key was never published:\n{}",
+                said()
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        };
         let blessed = cluster.blessed(&key, &v.vault, &bundle).await;
         let station = cluster
             .platform
@@ -322,7 +401,7 @@ async fn a_solana_vault_is_taken_on_blessed_and_traded_through_the_guard() {
             .await
             .unwrap();
         if blessed.holds(cluster.client.now().await.unwrap()) && station.drivers[0].key == key {
-            break blessed;
+            break (key, blessed);
         }
         assert!(
             began.elapsed() < PATIENCE,
@@ -375,6 +454,7 @@ async fn a_solana_vault_is_taken_on_blessed_and_traded_through_the_guard() {
 
     // Blessed again before the first blessing ran out, and still approved.
     loop {
+        cluster.keep(executor.port, &v.vault, &bundle).await;
         let blessed = cluster.blessed(&key, &v.vault, &bundle).await;
         if blessed.until > first.until {
             assert!(blessed.holds(cluster.client.now().await.unwrap()));

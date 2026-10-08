@@ -1,16 +1,21 @@
 //! Serving the vaults of a Solana cluster.
 //!
 //! As on an EVM chain: each open vault whose bundle is in the store gets a
-//! key of its own, made here from the image and the vault; the key is given
-//! lamports, blessed for the vault and its bundle (with the development
-//! seal on a development cluster) and blessed again before half its
-//! blessing has gone; the vault's station approves it; and the vault's
-//! agent runs, its trades carried to the stand-in venue through the
+//! key of its own, made here from the enclave's randomness and held in
+//! memory only. Its leaf joins the instance's attestation, and the keeper,
+//! not this executor, sends the blessing and, once the registry vouches for
+//! the key, its lamports: the executor holds no role account on Solana. Once
+//! blessed and stocked, the key has the vault's station approve it, and the
+//! vault's agent runs, its trades carried to the stand-in venue through the
 //! station's guard. What running it costs is metered and signed for the
 //! keeper, and how it runs is reported, signed with the same key.
 //!
 //! One executor at a time: a vault whose station approves another key that
-//! is still blessed as its executor is left to that key.
+//! the registry still counts as its executor is that executor's while it is
+//! heard from. Once the API has had no report signed by that key for the
+//! whole handover silence, the vault is taken over: this executor's key,
+//! blessed, has the station approve it in the other's place. A key whose
+//! image was revoked, or whose blessing lapsed, no longer holds a vault.
 
 mod trading;
 mod upkeep;
@@ -22,13 +27,15 @@ use std::time::{Duration, Instant};
 
 use alloy::primitives::B256;
 use anyhow::{Context, Result, anyhow};
+use chain::SolanaServed as Served_;
 use chain::solana::executor::{self as on_chain, Blessed};
 use chain::solana::platform::VaultAccounts;
 use chain::solana::programs::vault::state::{Vault, VaultState};
 use chain::solana::{Keypair, Platform, Pubkey, Signer, SolanaClient};
-use chain::{Role, SolanaServed};
 use wasmtime::Engine;
 
+use crate::attestation::{Attestation, SolanaServed};
+use crate::handover;
 use crate::host::{Counters, Place};
 use crate::usage::SignedThrough;
 use crate::{AbortOnDrop, Args, Throttle};
@@ -80,13 +87,35 @@ fn may_drop(
 
 /// Serve one cluster's vaults, for as long as the executor runs.
 pub async fn run(
-    served: SolanaServed,
+    served: Served_,
     native_usd: Option<f64>,
     engine: Engine,
     args: Arc<Args>,
     totals: Totals,
+    attestation: Attestation,
 ) {
+    // A simulated blessing is paid for by the keeper, which sends it.
+    let payer = served
+        .deployments
+        .roles
+        .as_ref()
+        .and_then(|roles| roles.keeper.parse::<Pubkey>().ok());
+    let Some(payer) = payer else {
+        tracing::warn!(chain = %served.key, "the deployment names no keeper; its vaults are not served");
+        return;
+    };
+    attestation.serve_solana(
+        served.key.to_string(),
+        SolanaServed {
+            client: served.client.clone(),
+            platform: served.platform.clone(),
+            payer,
+        },
+    );
     let cluster = Cluster {
+        attestation,
+        chain_key: served.key.to_string(),
+        vault_chain: served.vault_chain,
         client: served.client.clone(),
         platform: served.platform.clone(),
         native_usd,
@@ -115,6 +144,10 @@ pub async fn run(
 /// One cluster, and what serving its vaults needs.
 #[derive(Clone)]
 struct Cluster {
+    attestation: Attestation,
+    /// The cluster's chain key, as the attestation names it.
+    chain_key: String,
+    vault_chain: shared::Chain,
     client: SolanaClient,
     platform: Platform,
     native_usd: Option<f64>,
@@ -130,6 +163,28 @@ struct Book {
     running: HashMap<Pubkey, Served>,
     waiting_for_bundle: HashSet<Pubkey>,
     warned: HashMap<Pubkey, Throttle>,
+    /// Vaults whose station approves another executor's key, still counted:
+    /// watched for that key's reports.
+    watching: HashMap<Pubkey, handover::Watch<Pubkey>>,
+    /// Vaults another executor took from this one: never taken back while
+    /// the key that took them is counted.
+    replaced: HashSet<Pubkey>,
+}
+
+/// A vault key's leaf in the instance's attestation, taken out when the
+/// vault is let go.
+struct HeldLeaf {
+    attestation: Attestation,
+    cluster: String,
+    vault: Pubkey,
+    key: Pubkey,
+}
+
+impl Drop for HeldLeaf {
+    fn drop(&mut self) {
+        self.attestation
+            .remove_solana(&self.cluster, self.vault, self.key);
+    }
 }
 
 /// One vault taken on: its key, meter and reports, and its agent's serve,
@@ -141,6 +196,7 @@ struct Served {
     retry_at: Option<Instant>,
     failures: u32,
     _upkeep: [AbortOnDrop; 2],
+    _leaf: HeldLeaf,
     /// When the vault was let go (it closed, or another executor holds it)
     /// and its agent stopped. It is dropped, its meter with it, once every
     /// send of the agent's has landed or been given up on and a total
@@ -250,6 +306,7 @@ impl Cluster {
                     Ok(Ok(Stop::Replaced)) => {
                         tracing::info!(vault = %address, "another executor's key holds the station's approval; letting the vault go");
                         served.letting_go = Some(Instant::now());
+                        book.replaced.insert(address);
                     }
                     Ok(Err(error)) => {
                         served.failures += 1;
@@ -293,6 +350,11 @@ impl Cluster {
         }
         book.waiting_for_bundle.remove(&address);
 
+        if !book.running.contains_key(&address)
+            && !self.may_take_on(book, address, &vault.bundle_hash).await?
+        {
+            return Ok(());
+        }
         let served = match book.running.entry(address) {
             std::collections::hash_map::Entry::Occupied(served) => served.into_mut(),
             std::collections::hash_map::Entry::Vacant(empty) => {
@@ -310,10 +372,82 @@ impl Cluster {
         Ok(())
     }
 
+    /// Whether a vault this executor holds no key for may be taken on: no
+    /// other executor's key the registry counts holds its station's
+    /// approval, or one does and has been silent for the whole handover
+    /// silence. A vault another executor took from this one is taken on
+    /// again only once no counted key holds it.
+    async fn may_take_on(&self, book: &mut Book, vault: Pubkey, bundle: &[u8; 32]) -> Result<bool> {
+        let v = self
+            .platform
+            .vault_accounts(self.platform.vault(&self.client, &vault).await?.strategy_id);
+        let Some(by) = self.held_by_another(&v, None, bundle).await? else {
+            book.watching.remove(&vault);
+            if book.replaced.remove(&vault) {
+                tracing::info!(%vault, "no other executor's key holds the station's approval; taking the vault on again");
+            }
+            return Ok(true);
+        };
+        if book.replaced.contains(&vault) {
+            return Ok(false);
+        }
+        let now = crate::unix_now();
+        let watch = book.watching.entry(vault).or_insert_with(|| {
+            tracing::info!(%vault, %by, "another executor's key holds the approval; watching for its reports");
+            handover::Watch::new(by, now)
+        });
+        if watch.by != by {
+            tracing::info!(%vault, %by, "another key holds the approval now; watching for its reports");
+            *watch = handover::Watch::new(by, now);
+        }
+        if !watch.look_due(Instant::now()) {
+            return Ok(false);
+        }
+        let latest = handover::latest_solana_report(
+            &crate::HTTP,
+            &self.args.api_url,
+            self.vault_chain,
+            &self.client.cluster_value(),
+            &vault,
+        )
+        .await;
+        match latest {
+            Ok(latest) => {
+                if watch.heard(latest, crate::unix_now()) == handover::Heard::Report
+                    || !watch.silent_for(self.args.handover_silence_seconds, crate::unix_now())
+                {
+                    return Ok(false);
+                }
+            }
+            Err(error) => {
+                if book.warned.entry(vault).or_default().due(Instant::now()) {
+                    tracing::warn!(%vault, error = format!("{error:#}"), "could not read the vault's latest report; the watch goes on");
+                }
+                return Ok(false);
+            }
+        }
+        tracing::info!(%vault, %by, silence = self.args.handover_silence_seconds, "the approved key has sent no report for the whole watch; taking the vault over");
+        book.watching.remove(&vault);
+        Ok(true)
+    }
+
     /// Make the vault's key, and start its meter and its reports, which run
     /// for as long as the vault is served.
     fn take_on(&self, address: Pubkey, vault: &Vault) -> Result<Served> {
-        let key = Arc::new(on_chain::vault_key(&address));
+        let key = Arc::new(crate::keys::fresh_solana()?);
+        self.attestation.put_solana(
+            &self.chain_key,
+            self.client.cluster_value(),
+            address,
+            vault.bundle_hash,
+            key.pubkey(),
+        );
+        let leaf = HeldLeaf {
+            attestation: self.attestation.clone(),
+            cluster: self.chain_key.clone(),
+            vault: address,
+            key: key.pubkey(),
+        };
         let accounts = self.platform.vault_accounts(vault.strategy_id);
         if accounts.vault != address {
             return Err(anyhow!(
@@ -383,6 +517,7 @@ impl Cluster {
             retry_at: None,
             failures: 0,
             _upkeep: [AbortOnDrop(metering), AbortOnDrop(reports)],
+            _leaf: leaf,
             letting_go: None,
         })
     }
@@ -395,13 +530,21 @@ impl Cluster {
         let bundle = shared.bundle;
         let v = shared.accounts.clone();
 
-        // One executor at a time.
-        if let Some(other) = self.held_by_another(&v, &key.pubkey(), &bundle).await? {
-            tracing::info!(%vault, %other, "another executor's key holds the station's approval; not serving");
-            return Ok(Stop::Replaced);
+        // The keeper blesses the key and, once the registry vouches for it,
+        // gives it lamports; then it takes the station's approval, in the
+        // place of a key that went silent if it must.
+        loop {
+            if self.finished(&vault).await? {
+                return Ok(Stop::Finished);
+            }
+            let blessed = self.note_blessing(&key.pubkey(), &vault, &bundle).await?;
+            let stocked = self.client.lamports(&key.pubkey()).await? >= self.stake / 2;
+            if blessed && stocked {
+                break;
+            }
+            tokio::time::sleep(LOOK_EVERY).await;
         }
-        self.stocked(&key.pubkey()).await?;
-        self.blessed(&key, &vault, &bundle).await?;
+        tracing::info!(%vault, key = %key.pubkey(), "the key is blessed and holds its lamports");
         self.approved(&v, &key, &bundle).await?;
 
         // Kept blessed and stocked for as long as the serve runs.
@@ -554,71 +697,42 @@ impl Cluster {
         }
     }
 
-    /// Another key the station approves that is still blessed as this
-    /// vault's executor, if there is one.
+    /// Another key the station approves that the registry still counts as
+    /// this vault's executor, if there is one: any approved key but `key`.
     async fn held_by_another(
         &self,
         v: &VaultAccounts,
-        key: &Pubkey,
+        key: Option<&Pubkey>,
         bundle: &[u8; 32],
     ) -> Result<Option<Pubkey>> {
         let station = self.platform.station(&self.client, &v.station).await?;
         let approved = station
             .drivers
-            .first()
+            .iter()
             .map(|driver| driver.key)
-            .unwrap_or_default();
-        if approved == Pubkey::default() || approved == *key {
+            .find(|held| *held != Pubkey::default() && Some(held) != key);
+        let Some(approved) = approved else {
             return Ok(None);
-        }
+        };
         let other =
             Blessed::read(&self.client, &self.platform, &approved, &v.vault, bundle).await?;
         Ok(other.holds(self.client.now().await?).then_some(approved))
     }
 
-    /// Give the key lamports when it holds less than half its stake: it
-    /// pays for its blessing, its approval and the agent's sends. The
-    /// platform's executor account pays.
-    async fn stocked(&self, key: &Pubkey) -> Result<()> {
-        let holds = self.client.lamports(key).await?;
-        if holds >= self.stake / 2 {
-            return Ok(());
-        }
-        let payer = self.client.role(Role::Executor)?;
-        self.client
-            .send(
-                vec![on_chain::ix_fund(&payer.pubkey(), key, self.stake - holds)],
-                &[payer],
-            )
-            .await
-            .context("giving the key lamports")?;
-        Ok(())
-    }
-
-    /// Bless the key for the vault and its bundle unless it is blessed with
-    /// more than half its blessing left. On a development cluster the
-    /// development attestor seals the attestation; a cluster with no
-    /// attestor key here can't be served yet.
-    async fn blessed(&self, key: &Keypair, vault: &Pubkey, bundle: &[u8; 32]) -> Result<bool> {
+    /// Read where the key's blessing for the vault stands, and tell the
+    /// attestation whether it wants a fresh one. Says whether it holds.
+    async fn note_blessing(&self, key: &Pubkey, vault: &Pubkey, bundle: &[u8; 32]) -> Result<bool> {
         let now = self.client.now().await?;
-        let blessed =
-            Blessed::read(&self.client, &self.platform, &key.pubkey(), vault, bundle).await?;
-        if blessed.for_a_while(now) {
-            return Ok(false);
-        }
-        let attestor = self
-            .client
-            .role(Role::Attestor)
-            .context("no attestor key to seal the attestation with")?;
-        self.platform
-            .bless_executor(&self.client, key, attestor, &key.pubkey(), vault, bundle)
-            .await
-            .context("blessing the key")?;
-        let until = Blessed::read(&self.client, &self.platform, &key.pubkey(), vault, bundle)
-            .await?
-            .until;
-        tracing::info!(%vault, key = %key.pubkey(), until, "blessed");
-        Ok(true)
+        let blessed = Blessed::read(&self.client, &self.platform, key, vault, bundle).await?;
+        self.attestation.note_solana(
+            &self.chain_key,
+            *vault,
+            *key,
+            blessed.due(now),
+            blessed.until,
+            blessed.ttl,
+        );
+        Ok(blessed.holds(now))
     }
 
     /// Have the station approve the key, if it doesn't already.
@@ -643,8 +757,9 @@ impl Cluster {
         Ok(())
     }
 
-    /// Keep the key blessed and stocked, and raise `replaced` once another
-    /// executor's key, still blessed, holds the station's approval.
+    /// Keep the attestation told where the key's blessing stands, and raise
+    /// `replaced` once another executor's key, still counted, holds the
+    /// station's approval.
     async fn keep_blessed(
         &self,
         key: Arc<Keypair>,
@@ -656,13 +771,19 @@ impl Cluster {
         loop {
             tokio::time::sleep(LOOK_EVERY).await;
             let kept = async {
-                if let Some(other) = self.held_by_another(&v, &key.pubkey(), &bundle).await? {
+                if let Some(other) = self
+                    .held_by_another(&v, Some(&key.pubkey()), &bundle)
+                    .await?
+                {
                     tracing::info!(vault = %v.vault, %other, "another executor's key holds the station's approval");
                     replaced.store(true, Ordering::SeqCst);
                     return anyhow::Ok(true);
                 }
-                self.stocked(&key.pubkey()).await?;
-                self.blessed(&key, &v.vault, &bundle).await?;
+                // The keeper renews the blessing and the lamports; a key
+                // that no longer holds isn't approved again until it does.
+                if !self.note_blessing(&key.pubkey(), &v.vault, &bundle).await? {
+                    return anyhow::Ok(false);
+                }
                 // A key the station dropped (another's approval that lapsed
                 // and was then replaced) is approved again.
                 self.approved(&v, &key, &bundle).await?;

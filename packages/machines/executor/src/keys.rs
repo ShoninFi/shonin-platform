@@ -31,6 +31,15 @@ pub fn fresh() -> Result<PrivateKeySigner> {
     }
 }
 
+/// An ed25519 key for Solana made from the operating system's randomness:
+/// a vault's key on a Solana cluster, or the instance's Solana key. The seed
+/// it was made from is wiped at once; the keypair is held in memory only.
+pub fn fresh_solana() -> Result<chain::solana::Keypair> {
+    let mut secret = Zeroizing::new([0u8; 32]);
+    getrandom::fill(secret.as_mut()).context("reading the operating system's randomness")?;
+    Ok(chain::solana::Keypair::new_from_array(*secret))
+}
+
 /// A key and nothing to print of it but its address.
 pub struct Key(PrivateKeySigner);
 
@@ -84,6 +93,32 @@ mod tests {
             assert!(!printed.to_lowercase().contains(&secret[..16]));
         }
         assert!(format!("{key:?}").contains(&key.address().to_string()));
+    }
+
+    #[test]
+    fn every_solana_key_is_a_new_one_and_none_is_the_one_a_public_seed_would_give() {
+        use chain::solana::Signer;
+        let keys: std::collections::HashSet<_> =
+            (0..64).map(|_| fresh_solana().unwrap().pubkey()).collect();
+        assert_eq!(keys.len(), 64);
+        // What the executor once derived from the image and the vault.
+        let vault = chain::solana::Pubkey::new_from_array([0x11; 32]);
+        let seed = chain::solana::programs::common::digest::keccak(&[
+            &chain::solana::platform::image_digest("executor"),
+            vault.as_ref(),
+        ]);
+        let public = chain::solana::Keypair::new_from_array(seed);
+        assert!(!keys.contains(&public.pubkey()));
+    }
+
+    #[test]
+    fn a_solana_key_never_prints_its_secret() {
+        use chain::solana::Signer;
+        let key = fresh_solana().unwrap();
+        let secret = alloy::hex::encode(&key.to_bytes()[..32]);
+        let printed = format!("{key:?}");
+        assert!(!printed.contains(&secret));
+        assert!(!printed.contains(&key.to_base58_string()));
     }
 
     #[test]

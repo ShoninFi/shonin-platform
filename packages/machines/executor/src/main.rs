@@ -253,6 +253,7 @@ async fn main() -> Result<()> {
         let engine = engine.clone();
         let args = args.clone();
         let served_chains = served_chains.clone();
+        let attestation = attestation.clone();
         chains.spawn(async move {
             let mut clusters = tokio::task::JoinSet::new();
             while let Some(served) = connecting_solana.recv().await {
@@ -264,6 +265,7 @@ async fn main() -> Result<()> {
                     engine.clone(),
                     args.clone(),
                     solana_totals.clone(),
+                    attestation.clone(),
                 ));
             }
             while clusters.join_next().await.is_some() {}

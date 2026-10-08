@@ -106,7 +106,7 @@ fn only_the_executor_bills_and_a_total_never_goes_backwards() {
     let journal = env.journal_for(
         unwinder_image(),
         unwinder.pubkey(),
-        env.leaf_for(v.vault.to_bytes(), v.bundle),
+        env.leaf_for(v.vault.to_bytes(), v.bundle, unwinder.pubkey()),
     );
     let cluster = env.cluster();
     expect_ok(env.bless(&journal, cluster, v.vault.to_bytes(), v.bundle, vec![]));

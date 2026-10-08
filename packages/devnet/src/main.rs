@@ -491,13 +491,29 @@ async fn main() -> Result<()> {
         }
         Some(Command::Accounts) => accounts(&target, &args.funding).await,
         Some(Command::ProposeChecker) => {
-            checker::run(
+            let evm = checker::run(
                 target.network,
                 only(&target, one, evm_chains(&target)),
                 &target.deployments_dir,
                 &args.artifacts,
             )
-            .await
+            .await;
+            // The Solana cluster's checker: the same guest and Google keys.
+            let image = shonin_attestation_deploy::GUEST_IMAGE_ID.0;
+            let keys: Vec<[u8; 32]> = shonin_attestation_deploy::trusted_keys(
+                shonin_attestation_core::GOOGLE_JWKS_2026_10_06,
+            )?
+            .into_iter()
+            .map(|key| key.0)
+            .collect();
+            let solana = on_each_cluster(&target, one, |client, deployments| {
+                let keys = keys.clone();
+                async move {
+                    admin::solana::propose_cs_checker(&client, &deployments, image, &keys).await
+                }
+            })
+            .await;
+            evm.and(solana)
         }
         Some(Command::ProposeImage { digest, kind }) => {
             let digest = admin::image_digest(&digest)?;
@@ -1006,12 +1022,67 @@ where
                 (key, config, outcome)
             }
         });
+    let (evm_done, solana_done) = futures::future::join(
+        futures::future::join_all(evm_each),
+        solana_changes(target, one, &solana),
+    )
+    .await;
+    let mut failed = Vec::new();
+    for (key, config, outcome) in evm_done.into_iter().chain(solana_done) {
+        match outcome {
+            Ok(said) => println!("{} ({key}): {said}", config.label),
+            Err(error) => {
+                println!("{} ({key}): failed: {error:#}", config.label);
+                failed.push(format!("{} ({key})", config.label));
+            }
+        }
+    }
+    if !failed.is_empty() {
+        bail!("not done on {}", failed.join(", "));
+    }
+    Ok(())
+}
+
+/// Run one admin change against every Solana cluster of the network (or the
+/// one named) alone, and say what it did.
+async fn on_each_cluster<G, Gut>(target: &Target, one: bool, solana: G) -> Result<()>
+where
+    G: Fn(chain::solana::SolanaClient, chain::SolanaDeployments) -> Gut,
+    Gut: std::future::Future<Output = Result<String>>,
+{
+    let mut failed = Vec::new();
+    for (key, config, outcome) in solana_changes(target, one, &solana).await {
+        match outcome {
+            Ok(said) => println!("{} ({key}): {said}", config.label),
+            Err(error) => {
+                println!("{} ({key}): failed: {error:#}", config.label);
+                failed.push(format!("{} ({key})", config.label));
+            }
+        }
+    }
+    if !failed.is_empty() {
+        bail!("not done on {}", failed.join(", "));
+    }
+    Ok(())
+}
+
+/// One admin change on each Solana cluster of the network (or the one
+/// named), from its deployment file: each cluster's outcome.
+async fn solana_changes<G, Gut>(
+    target: &Target,
+    one: bool,
+    solana: &G,
+) -> Vec<(ChainKey, ChainConfig, Result<String>)>
+where
+    G: Fn(chain::solana::SolanaClient, chain::SolanaDeployments) -> Gut,
+    Gut: std::future::Future<Output = Result<String>>,
+{
     // A cluster not set up yet is passed over and said to be, unless it was
     // named alone: the EVM chains' changes don't wait on it.
     let solana_each = only(target, one, solana_clusters(target))
         .into_iter()
         .map(|(key, config)| {
-            let change = &solana;
+            let change = solana;
             async move {
                 let outcome = async {
                     let file = Deployments::file_in(&target.deployments_dir, &key);
@@ -1040,25 +1111,7 @@ where
                 (key, config, outcome)
             }
         });
-    let (evm_done, solana_done) = futures::future::join(
-        futures::future::join_all(evm_each),
-        futures::future::join_all(solana_each),
-    )
-    .await;
-    let mut failed = Vec::new();
-    for (key, config, outcome) in evm_done.into_iter().chain(solana_done) {
-        match outcome {
-            Ok(said) => println!("{} ({key}): {said}", config.label),
-            Err(error) => {
-                println!("{} ({key}): failed: {error:#}", config.label);
-                failed.push(format!("{} ({key})", config.label));
-            }
-        }
-    }
-    if !failed.is_empty() {
-        bail!("not done on {}", failed.join(", "));
-    }
-    Ok(())
+    futures::future::join_all(solana_each).await
 }
 
 /// A Solana command's failure, with what most likely caused it when this

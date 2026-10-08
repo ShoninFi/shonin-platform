@@ -255,7 +255,7 @@ fn a_record_owned_by_another_program_reads_as_never_recorded() {
     let journal = env.journal_for(
         planted,
         env.executor.pubkey(),
-        env.leaf_for(hash("vault"), hash("bundle")),
+        env.leaf_for(hash("vault"), hash("bundle"), env.executor.pubkey()),
     );
     let cluster = env.cluster();
     expect_code(

@@ -377,7 +377,7 @@ fn only_the_approved_key_still_blessed_sends_anything() {
     let journal = env.journal_for(
         unwinder_image(),
         unwinder.pubkey(),
-        env.leaf_for(home.vault.to_bytes(), home.bundle),
+        env.leaf_for(home.vault.to_bytes(), home.bundle, unwinder.pubkey()),
     );
     let cluster = env.cluster();
     expect_ok(env.bless(

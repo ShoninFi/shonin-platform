@@ -369,7 +369,7 @@ pub mod solana {
     use anyhow::{Context, Result, anyhow, bail};
     use chain::bindings::attestation::ImageKind as EvmKind;
     use chain::solana::Platform;
-    use chain::solana::programs::{common, dev_verifier, registry};
+    use chain::solana::programs::{common, cs_verifier, dev_verifier, registry};
     use chain::solana::{Keypair, Pubkey, Signer, SolanaClient};
     use chain::{Role, SolanaDeployments};
     use registry::state::{Config, ImageKind, ImageRecord, ProjectRecord};
@@ -568,6 +568,59 @@ pub mod solana {
         Ok(format!(
             "retired the development checker {}",
             named.join(", ")
+        ))
+    }
+
+    /// Create the Confidential Space checker for the attestation guest
+    /// `image_id`, trusting the Google keys `keys`, and propose it beside the
+    /// checkers already listed; it counts after the timelock. Its address is
+    /// fixed by the guest and the keys, so running this again creates
+    /// nothing and proposes nothing: a checker the registry ever listed is
+    /// never proposed again (one retired stays retired).
+    pub async fn propose_cs_checker(
+        client: &SolanaClient,
+        deployments: &SolanaDeployments,
+        image_id: [u8; 32],
+        keys: &[[u8; 32]],
+    ) -> Result<String> {
+        let (platform, admin) = admin(client, deployments)?;
+        let (create, state) = Platform::ix_create_cs_checker(&admin.pubkey(), image_id, keys);
+        let record: Option<registry::state::VerifierRecord> = client
+            .load(&registry::read::verifier_address(&state))
+            .await?;
+        if record.is_some_and(|record| record.proposed) {
+            let listed = checkers(client).await?;
+            return Ok(
+                match listed.iter().find(|(listed, _, _)| *listed == state) {
+                    Some((_, true, _)) => {
+                        format!("the Confidential Space checker {state} is already allowed")
+                    }
+                    Some((_, false, _)) => format!(
+                        "the Confidential Space checker {state} is proposed; it counts after the timelock"
+                    ),
+                    None => format!(
+                        "the Confidential Space checker {state} was proposed once and retired: it is never proposed again (a new guest or key set is a new checker)"
+                    ),
+                },
+            );
+        }
+        let mut ixs = Vec::new();
+        if client.account(&state).await?.is_none() {
+            ixs.push(create);
+        }
+        ixs.push(platform.ix_propose_verifier(cs_verifier::ID, state));
+        client
+            .send(ixs, &[admin])
+            .await
+            .context("creating and proposing the Confidential Space checker")?;
+        let now = client.now().await?;
+        let config: Config = client
+            .load(&registry::read::config_address())
+            .await?
+            .ok_or_else(|| anyhow!("the registry is not set up"))?;
+        Ok(format!(
+            "the Confidential Space checker {state} is proposed; it counts after the timelock ({} s)",
+            config.timelock(now)
         ))
     }
 

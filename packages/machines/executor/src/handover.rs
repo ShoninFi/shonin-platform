@@ -35,11 +35,12 @@ const LOOK_EVERY: Duration = if cfg!(test) {
     Duration::from_secs(30)
 };
 
-/// One vault's watch on another executor's key.
+/// One vault's watch on another executor's key: an EVM address, or a
+/// Solana key.
 #[derive(Debug)]
-pub struct Watch {
+pub struct Watch<K = Address> {
     /// The key the station approves.
-    pub by: Address,
+    pub by: K,
     /// When the current stretch of silence began, in unix seconds: the watch
     /// began then, or the key's latest report was heard then.
     began: u64,
@@ -55,8 +56,8 @@ pub enum Heard {
     Nothing,
 }
 
-impl Watch {
-    pub fn new(by: Address, now: u64) -> Watch {
+impl<K: PartialEq + Copy> Watch<K> {
+    pub fn new(by: K, now: u64) -> Watch<K> {
         Watch {
             by,
             began: now,
@@ -79,7 +80,7 @@ impl Watch {
     /// signer and when it was signed. One from the watched key, dated after
     /// the watch began (give or take [`CLOCK_SKEW`]) and not in the future,
     /// starts the silence again.
-    pub fn heard(&mut self, latest: Option<(Address, u64)>, now: u64) -> Heard {
+    pub fn heard(&mut self, latest: Option<(K, u64)>, now: u64) -> Heard {
         match latest {
             Some((signer, at))
                 if signer == self.by
@@ -123,6 +124,54 @@ pub async fn latest_report(
         .context("the API would not say the vault's latest report")?;
     let post: HealthPost = answer.json().await.context("the API's report")?;
     Ok(Some((signer(chain, &post)?, post.report.at)))
+}
+
+/// The latest report the API took for a Solana vault: the key that signed it
+/// and when it says it was signed, once its signature is checked here, as
+/// that key's ed25519 signature over the report's digest on this cluster.
+/// `None` if the API has none; a report whose signature doesn't check is no
+/// report.
+pub async fn latest_solana_report(
+    http: &reqwest::Client,
+    api: &str,
+    chain: shared::Chain,
+    cluster: &[u8; 32],
+    vault: &chain::solana::Pubkey,
+) -> Result<Option<(chain::solana::Pubkey, u64)>> {
+    let answer = http
+        .get(format!("{api}/api/{chain}/health/{vault}/signed"))
+        .send()
+        .await
+        .context("asking the API for the vault's latest report")?;
+    if answer.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let answer = answer
+        .error_for_status()
+        .context("the API would not say the vault's latest report")?;
+    let post: HealthPost = answer.json().await.context("the API's report")?;
+    Ok(solana_signer(cluster, vault, &post).map(|signer| (signer, post.report.at)))
+}
+
+/// Who signed a Solana report: the key it names, if the signature is that
+/// key's over the report's digest for this vault on this cluster.
+pub fn solana_signer(
+    cluster: &[u8; 32],
+    vault: &chain::solana::Pubkey,
+    post: &HealthPost,
+) -> Option<chain::solana::Pubkey> {
+    use chain::solana::Signer;
+    fn parsed_like<T: std::str::FromStr>(_: &T, text: &str) -> Option<T> {
+        text.parse().ok()
+    }
+    if post.vault != vault.to_string() {
+        return None;
+    }
+    let signer: chain::solana::Pubkey = post.signer.as_deref()?.parse().ok()?;
+    let probe = chain::solana::Keypair::new_from_array([1; 32]).sign_message(&[]);
+    let signature: [u8; 64] = parsed_like(&probe, &post.signature)?.into();
+    let digest = HealthPost::solana_digest(cluster, &post.vault, &post.report);
+    chain::solana::executor::verify_ed25519(&signer, &digest, signature).then_some(signer)
 }
 
 /// Who signed a report, recovered from its signature over the report's
@@ -188,6 +237,54 @@ mod tests {
         assert_eq!(
             watch.heard(Some((by, NOW - CLOCK_SKEW)), NOW + 20),
             Heard::Report
+        );
+    }
+
+    #[test]
+    fn a_solana_report_counts_only_with_the_named_key_s_signature_for_this_vault_and_cluster() {
+        use chain::solana::Signer;
+        let key = crate::keys::fresh_solana().unwrap();
+        let vault = chain::solana::Pubkey::new_from_array([0x11; 32]);
+        let cluster = [7u8; 32];
+        let report = shared::model::health::Health {
+            signals: vec![],
+            entries: vec![],
+            updated: time::PrimitiveDateTime::new(
+                time::Date::from_ordinal_date(2026, 280).unwrap(),
+                time::Time::MIDNIGHT,
+            ),
+            signed_by: key.pubkey().to_string(),
+            at: NOW,
+        };
+        let digest = HealthPost::solana_digest(&cluster, &vault.to_string(), &report);
+        let mut post = HealthPost {
+            vault: vault.to_string(),
+            report,
+            signature: key.sign_message(&digest).to_string(),
+            signer: Some(key.pubkey().to_string()),
+        };
+        assert_eq!(solana_signer(&cluster, &vault, &post), Some(key.pubkey()));
+        // Another cluster, another vault, a changed report, another named
+        // key: none is the key's report.
+        assert_eq!(solana_signer(&[8u8; 32], &vault, &post), None);
+        let other = chain::solana::Pubkey::new_from_array([0x22; 32]);
+        assert_eq!(solana_signer(&cluster, &other, &post), None);
+        let stranger = crate::keys::fresh_solana().unwrap();
+        post.signer = Some(stranger.pubkey().to_string());
+        assert_eq!(solana_signer(&cluster, &vault, &post), None);
+        post.signer = Some(key.pubkey().to_string());
+        post.report.at += 1;
+        assert_eq!(solana_signer(&cluster, &vault, &post), None);
+
+        // And the watch takes a Solana key like an address.
+        let mut watch = Watch::new(key.pubkey(), NOW);
+        assert_eq!(
+            watch.heard(Some((key.pubkey(), NOW + 5)), NOW + 10),
+            Heard::Report
+        );
+        assert_eq!(
+            watch.heard(Some((stranger.pubkey(), NOW + 15)), NOW + 20),
+            Heard::Nothing
         );
     }
 

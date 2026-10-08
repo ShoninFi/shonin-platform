@@ -374,17 +374,23 @@ pub mod shonin_registry {
 
     // Blessing ------------------------------------------------------------
 
-    /// Blesses the key the attested instance generated.
+    /// Blesses `key`, a key the attested instance generated, for one vault
+    /// and one bundle on one vault chain, or, for a builder or a reviewer,
+    /// for no vault at all.
     ///
-    /// `journal` is what the instance attested to; `seal` is the proof over
-    /// its Borsh bytes, which the allowed checkers are asked about, newest
-    /// first, each with the accounts it was proposed with followed by any it
-    /// reads (`verifier_accounts` gives how many accounts, from the remaining
-    /// ones, each checker asked takes). `merkle_proof` shows that this vault
-    /// and this bundle, on this cluster, are among the leaves the instance
-    /// attested to; a builder or a reviewer proves the leaf with no vault.
-    /// Anyone may send it, and sending it again changes nothing: a blessing
-    /// lasts a TTL from the attestation, not from the transaction.
+    /// `journal` is what the instance attested to; its signer is the
+    /// instance's own key, which names the instance and is blessed for
+    /// nothing by itself. `seal` is the proof over the journal's Borsh bytes,
+    /// which the allowed checkers are asked about, newest first, each with
+    /// the accounts it was proposed with followed by any it reads
+    /// (`verifier_accounts` gives how many accounts, from the remaining ones,
+    /// each checker asked takes). `merkle_proof` shows that this key, for
+    /// this vault and this bundle, on this cluster, is among the leaves the
+    /// instance attested to; a builder or a reviewer proves the leaf with no
+    /// vault and its own key. So one attestation and one proof bless every
+    /// key an instance holds, each only for what its own leaf names. Anyone
+    /// may send it, and sending it again changes nothing: a blessing lasts a
+    /// TTL from the attestation, not from the transaction.
     #[allow(clippy::too_many_arguments)]
     pub fn bless<'info>(
         ctx: Context<'_, '_, 'info, 'info, Bless<'info>>,
@@ -393,6 +399,7 @@ pub mod shonin_registry {
         vault_chain: [u8; 32],
         vault: [u8; 32],
         strategy_hash: [u8; 32],
+        key: Pubkey,
         merkle_proof: Vec<[u8; 32]>,
         verifier_accounts: Vec<u8>,
     ) -> Result<()> {
@@ -419,7 +426,9 @@ pub mod shonin_registry {
         );
         let kind = image.map(|image| image.kind).unwrap_or_default();
 
+        // The instance names itself, and the key has to be a key.
         require_keys_neq!(journal.signer, Pubkey::default(), RegistryError::NoSigner);
+        require_keys_neq!(key, Pubkey::default(), RegistryError::NoSigner);
         let serves_one_vault = kind == ImageKind::Executor || kind == ImageKind::Unwinder;
         let zero = [0u8; 32];
         let names_a_vault = vault_chain != zero && vault != zero && strategy_hash != zero;
@@ -432,11 +441,23 @@ pub mod shonin_registry {
             },
             RegistryError::WrongKindForVault
         );
+        // The root key's purpose is never a bundle, so a root leaf can never
+        // bless a key, whatever the vault.
+        require!(
+            strategy_hash != digest::root_key_purpose(),
+            RegistryError::WrongKindForVault
+        );
         // The key may act for this vault and this bundle only, on this
-        // cluster only, and the instance had to have said so before it saw
-        // this transaction. A builder or a reviewer proves the leaf with no
-        // vault.
-        let leaf = digest::blessing_leaf(&vault_chain, &vault, &strategy_hash, &config.cluster);
+        // cluster only, and the instance had to have said so, naming the key,
+        // before it saw this transaction. A builder or a reviewer proves the
+        // leaf with no vault and its own key.
+        let leaf = digest::blessing_leaf(
+            &vault_chain,
+            &vault,
+            &strategy_hash,
+            &config.cluster,
+            &key.to_bytes(),
+        );
         require!(
             digest::merkle_verify(&merkle_proof, &journal.vaults_root, leaf),
             RegistryError::NotAmongTheVaults
@@ -453,44 +474,56 @@ pub mod shonin_registry {
             RegistryError::Stale
         );
 
-        let key = &mut ctx.accounts.key;
+        let info = &mut ctx.accounts.key_info;
         require!(
-            key.kind == ImageKind::None
-                || (key.image_digest == journal.image_digest
-                    && key.project_id == journal.project_id),
+            info.kind == ImageKind::None
+                || (info.image_digest == journal.image_digest
+                    && info.project_id == journal.project_id),
             RegistryError::NotThisInstance
         );
         // A blessing only ever moves later, and remembers the checker that
         // gave it, so retiring that checker retires it. Also when the
         // checker it was recorded against has since been retired: an allowed
-        // checker vouching for it again revives it.
+        // checker vouching for it again revives it. And an attestation no
+        // earlier than the one recorded, accepted by a newer checker, moves
+        // the blessing to that checker without changing how long it lasts,
+        // so a rotation's overlap carries every key relayed through it past
+        // the old checker's retirement.
         let blessing = &mut ctx.accounts.blessing;
-        if until > blessing.until || !config.is_verifier_allowed(&blessing.verifier, now) {
+        if until > blessing.until
+            || !config.is_verifier_allowed(&blessing.verifier, now)
+            || (until == blessing.until && config.is_newer(&verifier, &blessing.verifier))
+        {
             blessing.until = until;
             blessing.verifier = verifier;
         }
-        blessing.signer = journal.signer;
+        blessing.signer = key;
         blessing.vault_chain = vault_chain;
         blessing.vault = vault;
         blessing.strategy_hash = strategy_hash;
         blessing.bump = ctx.bumps.blessing;
 
-        key.image_digest = journal.image_digest;
-        key.project_id = journal.project_id;
-        key.kind = kind;
-        key.bump = ctx.bumps.key;
+        info.image_digest = journal.image_digest;
+        info.project_id = journal.project_id;
+        info.kind = kind;
+        info.bump = ctx.bumps.key_info;
         // What the key is reported as serving moves only with a later
         // blessing, so replaying a public seal can't change it.
-        if until > key.blessed_until || !config.is_verifier_allowed(&key.verifier, now) {
-            key.strategy_hash = strategy_hash;
-            key.vault_chain = vault_chain;
-            key.vault = vault;
-            key.blessed_until = until;
-            key.trust_root = trust_root;
-            key.verifier = verifier;
+        if until > info.blessed_until || !config.is_verifier_allowed(&info.verifier, now) {
+            info.strategy_hash = strategy_hash;
+            info.vault_chain = vault_chain;
+            info.vault = vault;
+            info.blessed_until = until;
+            info.trust_root = trust_root;
+            info.verifier = verifier;
+        } else if until == info.blessed_until && config.is_newer(&verifier, &info.verifier) {
+            // The same attestation, vouched for by a newer checker: only the
+            // checker it counts through moves.
+            info.trust_root = trust_root;
+            info.verifier = verifier;
         }
         emit!(Blessed {
-            signer: journal.signer,
+            signer: key,
             vault_chain,
             vault,
             strategy_hash,
@@ -730,6 +763,7 @@ pub struct Revoke<'info> {
     vault_chain: [u8; 32],
     vault: [u8; 32],
     strategy_hash: [u8; 32],
+    key: Pubkey,
 )]
 pub struct Bless<'info> {
     #[account(mut)]
@@ -748,17 +782,17 @@ pub struct Bless<'info> {
         init_if_needed,
         payer = payer,
         space = 8 + KeyInfo::INIT_SPACE,
-        seeds = [KEY_SEED, journal.signer.as_ref()],
+        seeds = [KEY_SEED, key.as_ref()],
         bump,
     )]
-    pub key: Account<'info, KeyInfo>,
+    pub key_info: Account<'info, KeyInfo>,
     #[account(
         init_if_needed,
         payer = payer,
         space = 8 + Blessing::INIT_SPACE,
         seeds = [
             BLESSING_SEED,
-            journal.signer.as_ref(),
+            key.as_ref(),
             vault_chain.as_ref(),
             vault.as_ref(),
             strategy_hash.as_ref(),

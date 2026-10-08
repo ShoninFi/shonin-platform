@@ -49,18 +49,20 @@ author = 0.001
 # rate-limited), and its own set-up's rent and fees come out of the reserve.
 # Each amount is 0.001 SOL or more, or 0. Enough for a week of sends at
 # 5,000 lamports a signature, with room for the rent the keys put into
-# accounts: the keeper's lookup tables and the vault keys it stocks; the
-# executor's stake of 0.05 SOL for each vault key it makes (a handover makes
-# one more); the author's activations (a vault, its station, their dollar
-# accounts); the operator's market listings and its posts every ten minutes.
-# The platform and the attestor sign no transaction there.
+# accounts: the keeper's lookup tables, the blessings it relays and the
+# vault keys it stocks (0.05 SOL each, once the registry vouches for them; a
+# handover makes one more); the author's activations (a vault, its station,
+# their dollar accounts); the operator's market listings and its posts every
+# ten minutes. The executor, the platform and the attestor sign no
+# transaction there: the executor's keys are made in the enclave and stocked
+# by the keeper.
 [testnet."solana:devnet"]
 reserve = 1
 default = 0.2
 admin = 0.5
 operator = 0.25
 keeper = 2
-executor = 1
+executor = 0
 author = 1
 platform = 0
 attestor = 0

@@ -55,7 +55,7 @@ fn an_unblessed_or_unwinder_or_elsewhere_blessed_key_is_never_approved() {
     let unwinder = funded(&mut env);
     expect_ok(env.propose_image(unwinder_image(), ImageKind::Unwinder));
     env.skip(TIMELOCK);
-    let leaf = env.leaf_for(home.vault.to_bytes(), home.bundle);
+    let leaf = env.leaf_for(home.vault.to_bytes(), home.bundle, unwinder.pubkey());
     let journal = env.journal_for(unwinder_image(), unwinder.pubkey(), leaf);
     let cluster = env.cluster();
     expect_ok(env.bless(

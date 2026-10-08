@@ -1,7 +1,6 @@
 //! What the executor reads, sends and signs on Solana, beside what
 //! [`Platform`] builds for every service.
 //!
-//! - [`vault_key`]: the key a vault's agent trades with, made where it runs.
 //! - [`vaults`]: every vault the vault program holds.
 //! - [`Blessed`]: where a key's blessing for a vault stands.
 //! - [`venue_withdraw`], [`venue_outcome`]: the stand-in venue's way home,
@@ -15,21 +14,15 @@ use anchor_spl::token::spl_token;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use shonin_registry::read as registry;
-use shonin_registry::state::{Blessing, ImageKind, KeyInfo};
+use shonin_registry::state::{
+    Blessing, ImageKind, ImageRecord, KeyInfo, ProjectRecord, is_blessed_for,
+};
 use shonin_vault::state::Vault;
 
 use super::client::SolanaClient;
 use super::events::TransactionRecord;
-use super::platform::{Platform, image_digest};
+use super::platform::Platform;
 use super::{AccountMeta, Instruction, Keypair, Pubkey, Signer};
-
-/// The key a vault's agent trades with: an ed25519 key from the executor's
-/// image and the vault, so a restart picks the same one back up and the
-/// station's approval still stands. Never written down.
-pub fn vault_key(vault: &Pubkey) -> Keypair {
-    let seed = shonin_common::digest::keccak(&[&image_digest("executor"), vault.as_ref()]);
-    Keypair::new_from_array(seed)
-}
 
 /// Every vault the vault program holds, with its account.
 pub async fn vaults(client: &SolanaClient) -> Result<Vec<(Pubkey, Vault)>> {
@@ -76,6 +69,10 @@ pub struct Blessed {
     pub until: u64,
     /// Whether the key's record says it is an executor's.
     pub executor: bool,
+    /// Whether the registry counts the blessing now: it hasn't run out, and
+    /// the checker it came through, the key's image and its project are all
+    /// still allowed. A revoked image's keys no longer count.
+    pub counts: bool,
     /// How long a blessing lasts on this cluster.
     pub ttl: u64,
 }
@@ -99,7 +96,26 @@ impl Blessed {
             ))
             .await?;
         let info: Option<KeyInfo> = client.load(&registry::key_address(key)).await?;
+        let counts = match (&blessing, &info) {
+            (Some(blessing), Some(info)) => {
+                let image: Option<ImageRecord> = client
+                    .load(&registry::image_address(&info.image_digest))
+                    .await?;
+                let project: Option<ProjectRecord> = client
+                    .load(&registry::project_address(&info.project_id))
+                    .await?;
+                is_blessed_for(
+                    &config,
+                    blessing,
+                    image.as_ref(),
+                    project.as_ref(),
+                    client.now().await?,
+                )
+            }
+            _ => false,
+        };
         Ok(Self {
+            counts,
             until: blessing.map_or(0, |blessing| blessing.until),
             executor: info.is_some_and(|info| {
                 info.kind == ImageKind::Executor
@@ -110,15 +126,15 @@ impl Blessed {
         })
     }
 
-    /// Whether it holds at `now`.
+    /// Whether it holds at `now`: an executor's key the registry counts.
     pub fn holds(&self, now: u64) -> bool {
-        self.executor && now < self.until
+        self.executor && self.counts && now < self.until
     }
 
-    /// Whether it has more than half its life left at `now`: blessing it
-    /// again before then would be paying for nothing.
-    pub fn for_a_while(&self, now: u64) -> bool {
-        self.executor && self.until.saturating_sub(now).saturating_mul(2) > self.ttl
+    /// Whether it wants blessing at `now`, as the attestation asks: not
+    /// counted, or a third of its blessing or less left.
+    pub fn due(&self, now: u64) -> bool {
+        !self.holds(now) || self.until.saturating_sub(now).saturating_mul(3) <= self.ttl
     }
 }
 
@@ -321,18 +337,42 @@ pub fn verify_ed25519(signer: &Pubkey, message: &[u8], signature: [u8; 64]) -> b
 mod tests {
     use super::*;
 
+    fn some_key() -> Keypair {
+        Keypair::new_from_array([42; 32])
+    }
+
     #[test]
-    fn a_vault_key_is_the_same_for_the_same_vault_and_differs_between_vaults() {
-        let one = Pubkey::new_from_array([1; 32]);
-        let two = Pubkey::new_from_array([2; 32]);
-        assert_eq!(vault_key(&one).pubkey(), vault_key(&one).pubkey());
-        assert_ne!(vault_key(&one).pubkey(), vault_key(&two).pubkey());
+    fn a_blessing_holds_only_while_the_registry_counts_it() {
+        let blessed = Blessed {
+            until: 1_000,
+            executor: true,
+            counts: true,
+            ttl: 300,
+        };
+        assert!(blessed.holds(999));
+        assert!(!blessed.due(799));
+        assert!(blessed.due(900));
+        // The image revoked, or the checker retired: it no longer holds,
+        // however long it runs, and wants blessing again.
+        let revoked = Blessed {
+            counts: false,
+            ..blessed
+        };
+        assert!(!revoked.holds(500));
+        assert!(revoked.due(500));
+        assert!(
+            !Blessed {
+                executor: false,
+                ..blessed
+            }
+            .holds(500)
+        );
     }
 
     #[test]
     fn a_signed_total_verifies_only_for_what_was_signed() {
         let vault = Pubkey::new_from_array([7; 32]);
-        let key = vault_key(&vault);
+        let key = some_key();
         let cluster = shonin_common::digest::cluster_value("localnet");
         let signed = SignedTotal::sign(&key, &vault, &cluster, 1_234, 99);
         assert!(signed.verify(&cluster));
@@ -364,7 +404,7 @@ mod tests {
     #[test]
     fn a_signed_total_travels_in_an_ed25519_instruction_the_vault_reads() {
         let vault = Pubkey::new_from_array([7; 32]);
-        let key = vault_key(&vault);
+        let key = some_key();
         let cluster = shonin_common::digest::cluster_value("localnet");
         let signed = SignedTotal::sign(&key, &vault, &cluster, 5, 6);
         let ix = signed.ed25519_ix(&cluster).unwrap();

@@ -49,7 +49,8 @@ fn sign(signer: &Keypair, message: &[u8]) -> [u8; 64] {
 }
 
 fn service_journal(env: &Env) -> Journal {
-    env.journal_for(builder_image(), Keypair::new().pubkey(), env.service_leaf())
+    let key = Keypair::new().pubkey();
+    env.journal_for(builder_image(), key, env.service_leaf(key))
 }
 
 fn bless_service(env: &Env, payer: &Pubkey, journal: &Journal, seal: Vec<u8>) -> Instruction {

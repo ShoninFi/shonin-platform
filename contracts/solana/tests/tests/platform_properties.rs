@@ -307,7 +307,13 @@ fn a_blessing_is_granted_exactly_as_the_rules_say_and_only_moves_later() {
         } else {
             (now + HOUR).saturating_sub(rng.below(101 * HOUR))
         };
-        let leaf = blessing_leaf(&vault_chain, &vault, &strategy_hash, &cluster);
+        let leaf = blessing_leaf(
+            &vault_chain,
+            &vault,
+            &strategy_hash,
+            &cluster,
+            &signer.to_bytes(),
+        );
         let journal = Journal {
             image_digest: image,
             project_id: if project_ok {

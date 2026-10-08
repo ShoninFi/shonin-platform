@@ -82,10 +82,10 @@ tasks:
       - "{{.DEVNET}} accounts"
 
   checker:
-    desc: "Propose the Confidential Space checker beside the development checker on every EVM chain of the network: the one named in the deployments directory's attestation-<chain>.json if it is on the chain, else a new one (local or NETWORK=testnet)"
+    desc: "Propose the Confidential Space checker beside the development checker on every EVM chain of the network (the one named in the deployments directory's attestation-<chain>.json if it is on the chain, else a new one) and on its Solana cluster once set up (the checker program's account for the pinned guest and Google keys), SHONIN_VAULT_CHAIN=solana for Solana alone (local or NETWORK=testnet)"
     cmds:
       - task: :contracts:build
-      - "{{.DEVNET}} propose-checker"
+      - "{{.DEVNET_SOLANA}} propose-checker"
 
   image:
     desc: "Propose a real image digest on every chain's registry (each EVM chain's, and Solana's once it is set up), or only SHONIN_VAULT_CHAIN=<name>'s, as the admin (DIGEST=sha256:<hex> KIND=executor|builder|reviewer|unwinder|holder; NETWORK=testnet); already proposed is done. Solana has no holder kind. The root key's test requester is proposed as KIND=reviewer: the canonical chain's registry is the one its exchange checks"

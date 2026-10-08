@@ -33,6 +33,7 @@ pub use shonin_prices::{Allowances, PricePeriod, UnitPrices};
 pub use shonin_publishing::state::{ChainNeed, Lists, Review, ReviewInput, Strategy, Submission};
 pub use shonin_registry::state::{ApprovalKind, ImageKind, Journal, KeyInfo};
 
+pub mod real_token;
 pub mod station;
 pub mod vault;
 
@@ -302,6 +303,9 @@ impl Env {
         }
         let elf = env.elf.clone();
         env.svm.add_program(shonin_dev_verifier::ID, &elf).unwrap();
+        env.svm
+            .add_program(shonin_cs_verifier::ID, &so("shonin_cs_verifier"))
+            .unwrap();
         // The drivers are final, as every driver must be; the vault stand-in
         // needs no setting up.
         for (id, file) in [
@@ -416,6 +420,53 @@ impl Env {
         };
         expect_ok(self.send(vec![ix], &[&payer]));
         checker
+    }
+
+    /// A Confidential Space checker for the guest `image_id`, trusting the
+    /// Google keys `keys` (sorted here, as a checker takes them).
+    pub fn create_cs_checker(&mut self, image_id: [u8; 32], keys: &[[u8; 32]]) -> Pubkey {
+        let mut keys = keys.to_vec();
+        keys.sort();
+        let ix = self.ix_create_cs_checker(image_id, keys.clone());
+        let payer = self.payer.insecure_clone();
+        expect_ok(self.send(vec![ix], &[&payer]));
+        shonin_cs_verifier::checker_address(&image_id, &keys)
+    }
+
+    /// The instruction creating a Confidential Space checker, the keys as
+    /// given.
+    pub fn ix_create_cs_checker(&self, image_id: [u8; 32], keys: Vec<[u8; 32]>) -> Instruction {
+        let checker = Pubkey::find_program_address(
+            &[
+                shonin_cs_verifier::CHECKER_SEED,
+                &image_id,
+                &shonin_cs_verifier::keys_digest(&keys),
+            ],
+            &shonin_cs_verifier::ID,
+        )
+        .0;
+        Instruction {
+            program_id: shonin_cs_verifier::ID,
+            accounts: shonin_cs_verifier::accounts::CreateChecker {
+                payer: self.payer.pubkey(),
+                checker,
+                system_program: solana_sdk_ids::system_program::ID,
+            }
+            .to_account_metas(None),
+            data: shonin_cs_verifier::instruction::CreateChecker {
+                image_id,
+                keys: shonin_cs_verifier::keys_digest(&keys),
+                trusted_keys: keys,
+            }
+            .data(),
+        }
+    }
+
+    /// Proposes the Confidential Space checker `state`.
+    pub fn propose_cs_checker(&mut self, state: Pubkey) -> TxResult {
+        let ix =
+            self.ix_propose_verifier(&self.admin.pubkey(), shonin_cs_verifier::ID, None, state);
+        self.as_admin(ix)
     }
 
     // Time ----------------------------------------------------------------
@@ -1170,16 +1221,28 @@ impl Env {
         }
     }
 
-    /// The leaf a builder or a reviewer commits to: no vault, on this
-    /// cluster.
-    pub fn service_leaf(&self) -> [u8; 32] {
-        blessing_leaf(&[0; 32], &[0; 32], &[0; 32], &self.cluster())
+    /// The leaf a builder or a reviewer commits to for its `key`: no vault,
+    /// on this cluster.
+    pub fn service_leaf(&self, key: Pubkey) -> [u8; 32] {
+        blessing_leaf(
+            &[0; 32],
+            &[0; 32],
+            &[0; 32],
+            &self.cluster(),
+            &key.to_bytes(),
+        )
     }
 
-    /// The leaf an instance commits to for one vault on this cluster and one
-    /// bundle.
-    pub fn leaf_for(&self, vault: [u8; 32], strategy_hash: [u8; 32]) -> [u8; 32] {
-        blessing_leaf(&self.cluster(), &vault, &strategy_hash, &self.cluster())
+    /// The leaf an instance commits to for its `key`, for one vault on this
+    /// cluster and one bundle.
+    pub fn leaf_for(&self, vault: [u8; 32], strategy_hash: [u8; 32], key: Pubkey) -> [u8; 32] {
+        blessing_leaf(
+            &self.cluster(),
+            &vault,
+            &strategy_hash,
+            &self.cluster(),
+            &key.to_bytes(),
+        )
     }
 
     /// The seal `attestor` puts on `journal` for the development checker:
@@ -1191,8 +1254,9 @@ impl Env {
         (Vec::new(), Self::ed25519(attestor, &message))
     }
 
-    /// The bless instruction, with every allowed checker's accounts, newest
-    /// first, as a relayer would send it.
+    /// The bless instruction for the instance's own key (the journal's
+    /// signer, named in its leaf), with every allowed checker's accounts,
+    /// newest first, as a relayer would send it.
     #[allow(clippy::too_many_arguments)]
     pub fn ix_bless(
         &self,
@@ -1204,6 +1268,36 @@ impl Env {
         strategy_hash: [u8; 32],
         merkle_proof: Vec<[u8; 32]>,
     ) -> Instruction {
+        self.ix_bless_key(
+            payer,
+            journal,
+            seal,
+            vault_chain,
+            vault,
+            strategy_hash,
+            journal.signer,
+            merkle_proof,
+            3,
+        )
+    }
+
+    /// The bless instruction for `key`, with every allowed checker's
+    /// accounts, newest first: a Confidential Space checker its program and
+    /// its state, and any other `dev_accounts` accounts (its program, its
+    /// state and the instructions sysvar).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ix_bless_key(
+        &self,
+        payer: &Pubkey,
+        journal: &Journal,
+        seal: Vec<u8>,
+        vault_chain: [u8; 32],
+        vault: [u8; 32],
+        strategy_hash: [u8; 32],
+        key: Pubkey,
+        merkle_proof: Vec<[u8; 32]>,
+        dev_accounts: u8,
+    ) -> Instruction {
         let config = self.config();
         let now = self.now();
         let mut groups = Vec::new();
@@ -1212,26 +1306,27 @@ impl Env {
             if now < entry.ready_at {
                 continue;
             }
-            groups.push(3u8);
             remaining.push(AccountMeta::new_readonly(entry.program, false));
             remaining.push(AccountMeta::new_readonly(entry.state, false));
-            remaining.push(AccountMeta::new_readonly(
-                anchor_lang::solana_program::sysvar::instructions::ID,
-                false,
-            ));
+            if entry.program == shonin_cs_verifier::ID {
+                groups.push(2);
+            } else {
+                groups.push(dev_accounts);
+                if dev_accounts > 2 {
+                    remaining.push(AccountMeta::new_readonly(
+                        anchor_lang::solana_program::sysvar::instructions::ID,
+                        false,
+                    ));
+                }
+            }
         }
         let mut accounts = shonin_registry::accounts::Bless {
             payer: *payer,
             config: registry::config_address(),
             image: registry::image_address(&journal.image_digest),
             project: registry::project_address(&journal.project_id),
-            key: registry::key_address(&journal.signer),
-            blessing: registry::blessing_address(
-                &journal.signer,
-                &vault_chain,
-                &vault,
-                &strategy_hash,
-            ),
+            key_info: registry::key_address(&key),
+            blessing: registry::blessing_address(&key, &vault_chain, &vault, &strategy_hash),
             system_program: solana_sdk_ids::system_program::ID,
         }
         .to_account_metas(None);
@@ -1245,6 +1340,7 @@ impl Env {
                 vault_chain,
                 vault,
                 strategy_hash,
+                key,
                 merkle_proof,
                 verifier_accounts: groups,
             }
@@ -1300,7 +1396,7 @@ impl Env {
 
     /// A builder or a reviewer key: it serves every strategy and no vault.
     pub fn bless_service_key(&mut self, image: [u8; 32], signer: Pubkey) {
-        let journal = self.journal_for(image, signer, self.service_leaf());
+        let journal = self.journal_for(image, signer, self.service_leaf(signer));
         expect_ok(self.bless(&journal, [0; 32], [0; 32], [0; 32], vec![]));
     }
 
@@ -1310,7 +1406,7 @@ impl Env {
         let journal = self.journal_for(
             executor_image(),
             signer,
-            self.leaf_for(vault, strategy_hash),
+            self.leaf_for(vault, strategy_hash, signer),
         );
         let cluster = self.cluster();
         expect_ok(self.bless(&journal, cluster, vault, strategy_hash, vec![]));

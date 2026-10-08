@@ -35,7 +35,7 @@ fn the_heaviest_blessing_fits_one_transaction_and_the_default_compute() {
     let executor = env.executor.pubkey();
     let bundle = hash("bundle");
     let mut leaves: Vec<[u8; 32]> = (0..16u8)
-        .map(|i| env.leaf_for([i + 1; 32], bundle))
+        .map(|i| env.leaf_for([i + 1; 32], bundle, executor))
         .collect();
     // The proof of the first leaf, built level by level.
     let mut proof = Vec::new();
