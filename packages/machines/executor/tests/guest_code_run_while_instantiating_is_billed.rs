@@ -7,8 +7,10 @@
 //!
 //! This runs the executor binary against a stand-in node answering as an
 //! open vault does, its key blessed and approved, and a store holding a
-//! component that spins in its start function. The processor it burns is
-//! weighed against what the meter signs.
+//! component that spins in its start function. Held to its fuel rate, it
+//! burns little of the processor, but it is being instantiated the whole
+//! time, and billing is for the time it runs, so the meter must sign a total
+//! above nothing.
 
 mod status_port;
 
@@ -255,20 +257,6 @@ const SPINS_WHILE_INSTANTIATING: &str = r#"(component
         (canon lift (core func $i "run") (memory (core memory $i "memory"))))
     (export "run" (func $run)))"#;
 
-/// The processor time a process has used so far, in seconds.
-fn cpu_seconds(pid: u32) -> f64 {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "time=", "-p", &pid.to_string()])
-        .output()
-        .unwrap();
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    // [[dd-]hh:]mm:ss[.ff]
-    let text = text.rsplit('-').next().unwrap_or("0").to_string();
-    text.split(':').fold(0.0, |total, part| {
-        total * 60.0 + part.parse::<f64>().unwrap_or(0.0)
-    })
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guest_code_run_while_instantiating_is_billed() {
     let component = SPINS_WHILE_INSTANTIATING;
@@ -349,7 +337,6 @@ async fn guest_code_run_while_instantiating_is_billed() {
     .await;
     let port = started.port;
     let executor = Killed(started.child);
-    let pid = executor.0.id();
 
     let url = format!("http://127.0.0.1:{port}/usage/31337/{:?}", vault());
     let http = reqwest::Client::new();
@@ -364,13 +351,13 @@ async fn guest_code_run_while_instantiating_is_billed() {
             signed = body["total"].as_str().and_then(|t| t.parse::<u64>().ok());
         }
     }
-    let burned = cpu_seconds(pid);
     drop(executor);
     let _ = std::fs::remove_dir_all(&dir);
     let signed = signed.expect("the executor took the vault on and its meter signed a total");
+    // Its start function never returns, so all the time it ran was spent
+    // being instantiated.
     assert!(
-        burned < 5.0 || signed > 0,
-        "the agent's start function ran for {burned:.1} s of processor time and the vault was \
-         billed {signed}"
+        signed > 0,
+        "the agent's start function ran for the whole of 25 s and the vault was billed nothing"
     );
 }

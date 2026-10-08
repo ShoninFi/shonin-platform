@@ -5,7 +5,7 @@
 //! backoff (up to five minutes) of the halt's grace untold.
 //!
 //! Sequence: an open vault; its agent busies itself for a few seconds after
-//! `run` is called and then traps, so it is held off 5 s, 10 s, 20 s. During
+//! `run` is called (held to the vault's fuel rate) and then traps, so it is held off 5 s, 10 s, 20 s. During
 //! its fourth run the vault halts. The agent traps without having read the
 //! notice (it never reads the vault's stream), and it is started again at
 //! once rather than after the 40 s that would follow.
@@ -15,7 +15,10 @@ mod black_box;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-/// A component that loops for a few seconds once `run` is called, and traps.
+/// A component that loops for a few seconds once `run` is called, and traps:
+/// eight fuel a turn, 7.5 million turns, which at the stand-in vault's
+/// modest fuel rate (ten million a second, a second of it saved up before
+/// each run) lasts about five seconds.
 const BUSY_THEN_TRAPS: &str = r#"(component
     (core module $m
         (memory (export "memory") 1)
@@ -23,7 +26,7 @@ const BUSY_THEN_TRAPS: &str = r#"(component
             (local $i i64)
             (loop $l
                 (local.set $i (i64.add (local.get $i) (i64.const 1)))
-                (br_if $l (i64.lt_u (local.get $i) (i64.const 6000000000))))
+                (br_if $l (i64.lt_u (local.get $i) (i64.const 7500000))))
             unreachable))
     (core instance $i (instantiate $m))
     (func $run async (result (result (error string)))

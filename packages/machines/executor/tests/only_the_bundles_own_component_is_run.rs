@@ -41,19 +41,22 @@ fn bundle() -> B256 {
     B256::repeat_byte(0x42)
 }
 
-/// The executor's key for the vault: made inside the executor, so learnt
-/// here from its first question to the registry about its own key.
-static EXECUTOR_KEY: std::sync::Mutex<Option<Address>> = std::sync::Mutex::new(None);
-
-/// The key the station approves: none until the executor's own key has
-/// asked whether it is blessed (as it does before it asks for the
-/// approval), then that key, as the approval it would send leaves it.
-fn executor_key(_vault: Address) -> Address {
-    EXECUTOR_KEY.lock().unwrap().unwrap_or(Address::ZERO)
-}
-
 struct Node {
     manifest_hash: B256,
+    /// The executor's key for the vault: made inside the executor, so learnt
+    /// here from its first question to the registry about its own key. Each
+    /// test's executor has its own node, so neither is approved under the
+    /// other's key.
+    executor_key: std::sync::Mutex<Option<Address>>,
+}
+
+impl Node {
+    /// The key the station approves: none until the executor's own key has
+    /// asked whether it is blessed (as it does before it asks for the
+    /// approval), then that key, as the approval it would send leaves it.
+    fn executor_key(&self) -> Address {
+        self.executor_key.lock().unwrap().unwrap_or(Address::ZERO)
+    }
 }
 
 fn word(value: u64) -> Vec<u8> {
@@ -98,13 +101,13 @@ fn answer_call(node: &Node, input: &[u8]) -> Option<Vec<u8>> {
         | IVault::claimCountCall::SELECTOR => word(0),
         IVault::idleFloorCall::SELECTOR => [0u8; 96].to_vec(),
         IStation::approvedKeyCall::SELECTOR => {
-            IStation::approvedKeyCall::abi_encode_returns(&executor_key(vault()))
+            IStation::approvedKeyCall::abi_encode_returns(&node.executor_key())
         }
         IAttestationRegistry::isBlessedForCall::SELECTOR => {
             if let Ok(call) = IAttestationRegistry::isBlessedForCall::abi_decode(input)
                 && call.signer != Address::ZERO
             {
-                EXECUTOR_KEY.lock().unwrap().get_or_insert(call.signer);
+                node.executor_key.lock().unwrap().get_or_insert(call.signer);
             }
             IAttestationRegistry::isBlessedForCall::abi_encode_returns(&true)
         }
@@ -238,10 +241,14 @@ fn a_component(tag: u32) -> String {
     )
 }
 
+/// A directory of its own for each executor: the two tests here start theirs
+/// at once, and a clock read alone can give both the same name.
 fn scratch() -> PathBuf {
+    static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "shonin-executor-component-{}-{}",
+        "shonin-executor-component-{}-{}-{}",
         std::process::id(),
+        MADE.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -276,7 +283,10 @@ async fn billed(recorded: &str, stored: &str, watch: Duration) -> u64 {
 
     let app = Router::new()
         .route("/", post(rpc))
-        .with_state(Arc::new(Node { manifest_hash }));
+        .with_state(Arc::new(Node {
+            manifest_hash,
+            executor_key: Default::default(),
+        }));
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .unwrap();
