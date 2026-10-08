@@ -41,7 +41,9 @@ time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-wasmtime.workspace = true
+# The call hook times the host's work for each agent, which its fuel budget
+# is charged for.
+wasmtime = { workspace = true, features = ["call-hook"] }
 wasmtime-wasi.workspace = true
 wasmtime-wasi-http.workspace = true
 hyper.workspace = true

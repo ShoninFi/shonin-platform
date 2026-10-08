@@ -140,6 +140,8 @@ const HOUR: Duration = Duration::from_secs(3_600);
 pub(crate) struct Hourly {
     restarts: u64,
     venue_errors: u64,
+    /// Times the agent was parked for want of fuel.
+    held_back: u64,
 }
 
 /// What changed in the last hour: the counters now, less the newest reading
@@ -165,6 +167,7 @@ pub(crate) fn last_hour(
     Hourly {
         restarts: counters.restarts.saturating_sub(before.restarts),
         venue_errors: counters.venue_errors.saturating_sub(before.venue_errors),
+        held_back: counters.held_back.saturating_sub(before.held_back),
     }
 }
 
@@ -425,7 +428,7 @@ pub(crate) fn report(
             },
             gas,
         ],
-        entries: entries(at, counters, dry, held_below),
+        entries: entries(at, counters, hourly, dry, held_below),
         updated: at,
         signed_by,
         at: now.unix_timestamp().max(0) as u64,
@@ -448,10 +451,13 @@ pub(crate) fn runway(balance: U256, unpaid: U256, daily: f64, dry: bool) -> Resu
 /// the strategy is stopped until it is topped up. A strategy stopped for its
 /// tank leaves its positions as they are, and that is an error worth saying.
 /// An allowance held below what the author asked for (`held_below`) is a
-/// warning: the agent runs, at less than its author meant it to.
+/// warning: the agent runs, at less than its author meant it to. So is an
+/// agent held to its fuel rate in the last hour: it wanted more processor
+/// than its allowance pays for, and ran slower than it would have.
 fn entries(
     at: time::PrimitiveDateTime,
     counters: Counters,
+    hourly: Hourly,
     dry: bool,
     held_below: &[String],
 ) -> Vec<Entry> {
@@ -474,6 +480,29 @@ fn entries(
             message: format!(
                 "The component in the executor's store is not the vault's bundle: it was refused {} times and never run",
                 counters.not_the_bundle
+            ),
+        });
+    }
+    if hourly.held_back > 0 {
+        let last = counters
+            .last_held_back
+            .and_then(|secs| OffsetDateTime::from_unix_timestamp(secs as i64).ok())
+            .map(|last| {
+                format!(
+                    ", last at {} {:02}:{:02}:{:02} UTC",
+                    last.date(),
+                    last.hour(),
+                    last.minute(),
+                    last.second()
+                )
+            })
+            .unwrap_or_default();
+        entries.push(Entry {
+            at,
+            level: Level::Warning,
+            message: format!(
+                "The agent used all the fuel its allowance gives it and was held back until more came {} times in the last hour{last} ({} since it started): it runs at its fuel allowance, and a larger one would let it run faster",
+                hourly.held_back, counters.held_back
             ),
         });
     }
@@ -844,7 +873,8 @@ mod tests {
             hourly,
             Hourly {
                 restarts: 2,
-                venue_errors: 1
+                venue_errors: 1,
+                held_back: 0,
             }
         );
     }
@@ -862,7 +892,8 @@ mod tests {
             hourly,
             Hourly {
                 restarts: 3,
-                venue_errors: 1
+                venue_errors: 1,
+                held_back: 0,
             }
         );
     }
@@ -908,14 +939,14 @@ mod tests {
 
         let now = OffsetDateTime::now_utc();
         let at = time::PrimitiveDateTime::new(now.date(), now.time());
-        let said = entries(at, Counters::default(), true, &[]);
+        let said = entries(at, Counters::default(), Hourly::default(), true, &[]);
         assert!(
             said.iter()
                 .any(|entry| entry.level == Level::Error && entry.message.contains("stopped")),
             "{said:?}"
         );
         assert!(
-            entries(at, Counters::default(), false, &[])
+            entries(at, Counters::default(), Hourly::default(), false, &[])
                 .iter()
                 .all(|entry| entry.level != Level::Error)
         );
@@ -929,11 +960,44 @@ mod tests {
             not_the_bundle: 2,
             ..Counters::default()
         };
-        let said = entries(at, refused, false, &[]);
+        let said = entries(at, refused, Hourly::default(), false, &[]);
         assert!(
             said.iter().any(|entry| entry.level == Level::Error
                 && entry.message.contains("not the vault's bundle")),
             "{said:?}"
+        );
+    }
+
+    #[test]
+    fn an_agent_held_to_its_fuel_rate_in_the_last_hour_is_said_with_when() {
+        let now = OffsetDateTime::now_utc();
+        let at = time::PrimitiveDateTime::new(now.date(), now.time());
+        let start = Instant::now();
+        let mut readings = VecDeque::from([(start, Counters::default())]);
+        let mut counters = Counters::default();
+        counters.held_back();
+        counters.held_back();
+        let hourly = last_hour(&mut readings, start + Duration::from_secs(60), counters);
+        assert_eq!(hourly.held_back, 2);
+        let said = entries(at, counters, hourly, false, &[]);
+        let held = said
+            .iter()
+            .find(|entry| entry.message.contains("held back"))
+            .unwrap_or_else(|| panic!("{said:?}"));
+        assert_eq!(held.level, Level::Warning);
+        assert!(
+            held.message.contains("2 times in the last hour"),
+            "{held:?}"
+        );
+        assert!(held.message.contains("last at"), "{held:?}");
+
+        // Not held back in the last hour: nothing said, whatever came before.
+        let hourly = last_hour(&mut readings, start + HOUR * 2, counters);
+        assert_eq!(hourly.held_back, 0);
+        assert!(
+            entries(at, counters, hourly, false, &[])
+                .iter()
+                .all(|entry| !entry.message.contains("held back"))
         );
     }
 }

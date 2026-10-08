@@ -18,7 +18,6 @@ use chain::bindings::venue::{ILocalVenue, OrderRequest};
 use chain::{Client, KeyClient};
 use hyperliquid::agent::Outcome;
 use strategy_sdk::{Action, MarketState, PositionState, Receipt, Side};
-use wasmtime::AsContextMut;
 use wasmtime::Result as HostResult;
 use wasmtime::component::{Access, Accessor, HasSelf, Resource, ResourceTable, StreamReader};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
@@ -66,7 +65,45 @@ pub fn link(linker: &mut wasmtime::component::Linker<Ctx>) -> Result<()> {
     wasi::keyvalue::store::add_to_linker::<_, HasSelf<Ctx>>(linker, |ctx| ctx).map_err(ours)?;
     wasi::keyvalue::atomics::add_to_linker::<_, HasSelf<Ctx>>(linker, |ctx| ctx).map_err(ours)?;
     wasi::keyvalue::batch::add_to_linker::<_, HasSelf<Ctx>>(linker, |ctx| ctx).map_err(ours)?;
+    link_random(linker).map_err(|error| anyhow!("the WASI randomness imports: {error}"))?;
     Ok(())
+}
+
+/// The most random bytes one call may ask for. A call is the host's work
+/// from start to end, charged once it is done: held to this, no call runs
+/// long past the strategy's budget.
+pub const RANDOM_AT_MOST: u64 = 1024 * 1024;
+
+/// `wasi:random`'s calls for bytes, in place of WASI's own: at most
+/// [`RANDOM_AT_MOST`] a call, made by the operating system's generator in
+/// one go rather than a byte at a time. The insecure call is served the
+/// same way: secure bytes are never worse.
+fn link_random(linker: &mut wasmtime::component::Linker<Ctx>) -> wasmtime::Result<()> {
+    linker.allow_shadowing(true);
+    let linked = [
+        ("wasi:random/random@0.2.12", "get-random-bytes"),
+        ("wasi:random/insecure@0.2.12", "get-insecure-random-bytes"),
+    ]
+    .into_iter()
+    .try_for_each(|(interface, function)| {
+        linker.instance(interface)?.func_wrap(
+            function,
+            |_, (len,): (u64,)| -> wasmtime::Result<(Vec<u8>,)> { Ok((random_bytes(len)?,)) },
+        )
+    });
+    linker.allow_shadowing(false);
+    linked
+}
+
+/// `len` random bytes, or a trap past [`RANDOM_AT_MOST`].
+fn random_bytes(len: u64) -> wasmtime::Result<Vec<u8>> {
+    if len > RANDOM_AT_MOST {
+        wasmtime::bail!("requested len {len} exceeds limit {RANDOM_AT_MOST}");
+    }
+    let mut bytes = vec![0; usize::try_from(len)?];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| wasmtime::format_err!("the system's randomness: {error}"))?;
+    Ok(bytes)
 }
 
 /// The stand-in venue's driver, whose half is this module's own.
@@ -107,8 +144,6 @@ pub struct Ctx {
     /// Raised once the vault's halting notice has been handed to the
     /// strategy, so an agent that then ends is known to have been told.
     pub halting_heard: Arc<std::sync::atomic::AtomicBool>,
-    /// How much fuel a second of running is worth, and when it was last
-    /// topped up.
     /// The most memory the strategy's instance may hold, from its manifest.
     pub memory: Allowance,
 }
@@ -155,30 +190,10 @@ impl Place {
 }
 
 impl Ctx {
-    fn count(&self, change: impl FnOnce(&mut Counters)) {
+    pub(crate) fn count(&self, change: impl FnOnce(&mut Counters)) {
         if let Ok(mut counters) = self.counters.lock() {
             change(&mut counters);
         }
-    }
-}
-
-/// Top the strategy back up for the time that has passed.
-///
-/// Fuel is kept topped up, because it is not what bounds a strategy here: the
-/// engine's epoch is, and it takes the machine back every few milliseconds
-/// whatever the strategy is doing. What the declared fuel rate decides is how
-/// often the strategy yields, and what its vault's tank is charged for. Until
-/// the mapping from fuel to processor time is measured, a rate that stopped a
-/// strategy mid-thought would be an arbitrary number deciding whether a
-/// strategy works at all.
-fn refuel<S>(access: &mut Access<'_, Ctx, S>)
-where
-    S: wasmtime::component::HasData,
-    for<'a> S::Data<'a>: std::ops::DerefMut<Target = Ctx>,
-{
-    let mut store = access.as_context_mut();
-    if store.get_fuel().unwrap_or(0) < crate::runner::BANK / 2 {
-        let _ = store.set_fuel(crate::runner::BANK);
     }
 }
 
@@ -195,9 +210,22 @@ pub struct Counters {
     /// How many times the component in the store was found not to be the
     /// vault's bundle, and was not run.
     pub not_the_bundle: u64,
+    /// How many times the agent was parked for want of fuel, having burnt
+    /// what its rate gives it, and when it last was (Unix seconds).
+    pub held_back: u64,
+    pub last_held_back: Option<u64>,
 }
 
 impl Counters {
+    /// Count the agent parked for want of fuel, now.
+    pub fn held_back(&mut self) {
+        self.held_back = self.held_back.saturating_add(1);
+        self.last_held_back = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|since| since.as_secs());
+    }
+
     /// Count one thing the agent asked to have done, and how it was
     /// answered. A refusal or an unanswered request is always one of the
     /// submissions too, so the share refused can never pass the whole.
@@ -392,7 +420,6 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
         actions: Vec<Vec<u8>>,
     ) -> HostResult<Vec<Verdict>> {
         let (place, drivers) = accessor.with(|mut access| {
-            refuel(&mut access);
             let ctx = access.get();
             (ctx.place.clone(), ctx.drivers.clone())
         });
@@ -445,7 +472,6 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
                 verdicts.push(verdict);
             }
             accessor.with(|mut access| {
-                refuel(&mut access);
                 access.get().count(|counters| {
                     for tally in tallies {
                         counters.submitted(tally);
@@ -496,7 +522,6 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
             verdicts.push(verdict);
         }
         accessor.with(|mut access| {
-            refuel(&mut access);
             access.get().count(|counters| {
                 for tally in tallies {
                     counters.submitted(tally);
@@ -603,7 +628,6 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
         mut access: Access<'_, Ctx, Self>,
         _driver: String,
     ) -> HostResult<StreamReader<Vec<u8>>> {
-        refuel(&mut access);
         let events = access.get().account_events.take();
         stream_of(&mut access, events)
     }
@@ -780,7 +804,6 @@ fn route(
 
 impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
     async fn home_chain(mut access: Access<'_, Ctx, Self>) -> HostResult<String> {
-        refuel(&mut access);
         Ok(access.get().home_chain.clone())
     }
 
@@ -791,7 +814,6 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
         amount: u64,
     ) -> HostResult<Moved> {
         let (place, home, drivers) = accessor.with(|mut access| {
-            refuel(&mut access);
             let ctx = access.get();
             (
                 ctx.place.clone(),
@@ -1003,7 +1025,6 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
         amount: u64,
     ) -> HostResult<Moved> {
         let (place, home) = accessor.with(|mut access| {
-            refuel(&mut access);
             let ctx = access.get();
             (ctx.place.clone(), ctx.home_chain.clone())
         });
@@ -1062,7 +1083,6 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
 
     async fn balances(accessor: &Accessor<Ctx, Self>) -> HostResult<Vec<Balance>> {
         let (place, home, drivers) = accessor.with(|mut access| {
-            refuel(&mut access);
             let ctx = access.get();
             (
                 ctx.place.clone(),
@@ -1186,7 +1206,6 @@ async fn chain_id_of(chain: &Client, factory: Address, name: &str) -> Result<U25
 
 impl shonin::agent::vault::HostWithStore<Ctx> for HasSelf<Ctx> {
     async fn events(mut access: Access<'_, Ctx, Self>) -> HostResult<StreamReader<VaultEvent>> {
-        refuel(&mut access);
         let events = access.get().vault_events.take();
         let heard = access.get().halting_heard.clone();
         match events {
@@ -1237,10 +1256,7 @@ impl shonin::agent::data::HostWithStore<Ctx> for HasSelf<Ctx> {
                 "this executor knows no source called {source}"
             )));
         }
-        let place = accessor.with(|mut access| {
-            refuel(&mut access);
-            access.get().place.clone()
-        });
+        let place = accessor.with(|mut access| access.get().place.clone());
         let markets = match &place {
             Place::Evm(evm) => read_markets(&evm.chain, evm.venue).await,
             Place::Solana(trading) => trading.markets().await,
@@ -1258,7 +1274,6 @@ impl shonin::agent::data::HostWithStore<Ctx> for HasSelf<Ctx> {
         source: String,
         feed: Vec<u8>,
     ) -> HostResult<Result<StreamReader<shonin::agent::data::Stamped>, String>> {
-        refuel(&mut access);
         let net = access.get().net.clone();
         let slot = match net.usage.open(&net.quotas) {
             Ok(slot) => slot,
@@ -1291,10 +1306,7 @@ impl shonin::agent::websocket::HostWithStore<Ctx> for HasSelf<Ctx> {
         url: String,
         headers: Vec<(String, String)>,
     ) -> HostResult<Result<Resource<crate::net::Connection>, String>> {
-        let net = accessor.with(|mut access| {
-            refuel(&mut access);
-            access.get().net.clone()
-        });
+        let net = accessor.with(|mut access| access.get().net.clone());
         match crate::net::Connection::open(&net, &url, &headers).await {
             Ok(connection) => {
                 let held = accessor.with(|mut access| access.get().table.push(connection))?;
@@ -1321,7 +1333,6 @@ impl shonin::agent::websocket::HostConnectionWithStore<Ctx> for HasSelf<Ctx> {
         message: shonin::agent::websocket::Message,
     ) -> HostResult<Result<(), String>> {
         let sender = accessor.with(|mut access| {
-            refuel(&mut access);
             access
                 .get()
                 .table
@@ -1335,7 +1346,6 @@ impl shonin::agent::websocket::HostConnectionWithStore<Ctx> for HasSelf<Ctx> {
         mut access: Access<'_, Ctx, Self>,
         connection: Resource<crate::net::Connection>,
     ) -> HostResult<StreamReader<shonin::agent::websocket::Message>> {
-        refuel(&mut access);
         let incoming = access.get().table.get_mut(&connection)?.messages();
         match incoming {
             Some(incoming) => StreamReader::new(
@@ -1376,7 +1386,6 @@ impl wasi::keyvalue::store::HostWithStore<Ctx> for HasSelf<Ctx> {
         mut access: Access<'_, Ctx, Self>,
         identifier: String,
     ) -> HostResult<Result<Resource<crate::state::Bucket>, StoreError>> {
-        refuel(&mut access);
         Ok(Ok(access
             .get()
             .table
@@ -1390,7 +1399,6 @@ impl wasi::keyvalue::store::HostBucketWithStore<Ctx> for HasSelf<Ctx> {
         bucket: Resource<crate::state::Bucket>,
         key: String,
     ) -> HostResult<Result<Option<Vec<u8>>, StoreError>> {
-        refuel(&mut access);
         let ctx = access.get();
         Ok(bucket_of(ctx, &bucket).map(|name| ctx.state.get(&name, &key).cloned()))
     }
@@ -1401,7 +1409,6 @@ impl wasi::keyvalue::store::HostBucketWithStore<Ctx> for HasSelf<Ctx> {
         key: String,
         value: Vec<u8>,
     ) -> HostResult<Result<(), StoreError>> {
-        refuel(&mut access);
         let ctx = access.get();
         Ok(bucket_of(ctx, &bucket).and_then(|name| {
             ctx.state
@@ -1415,7 +1422,6 @@ impl wasi::keyvalue::store::HostBucketWithStore<Ctx> for HasSelf<Ctx> {
         bucket: Resource<crate::state::Bucket>,
         key: String,
     ) -> HostResult<Result<(), StoreError>> {
-        refuel(&mut access);
         let ctx = access.get();
         Ok(bucket_of(ctx, &bucket).map(|name| ctx.state.delete(&name, &key)))
     }
@@ -1425,7 +1431,6 @@ impl wasi::keyvalue::store::HostBucketWithStore<Ctx> for HasSelf<Ctx> {
         bucket: Resource<crate::state::Bucket>,
         key: String,
     ) -> HostResult<Result<bool, StoreError>> {
-        refuel(&mut access);
         let ctx = access.get();
         Ok(bucket_of(ctx, &bucket).map(|name| ctx.state.get(&name, &key).is_some()))
     }
@@ -1435,7 +1440,6 @@ impl wasi::keyvalue::store::HostBucketWithStore<Ctx> for HasSelf<Ctx> {
         bucket: Resource<crate::state::Bucket>,
         cursor: Option<u64>,
     ) -> HostResult<Result<KeyResponse, StoreError>> {
-        refuel(&mut access);
         let ctx = access.get();
         Ok(bucket_of(ctx, &bucket).map(|name| {
             let (keys, cursor) = ctx.state.keys(&name, cursor);
@@ -1459,7 +1463,6 @@ impl wasi::keyvalue::atomics::HostWithStore<Ctx> for HasSelf<Ctx> {
         key: String,
         delta: u64,
     ) -> HostResult<Result<u64, StoreError>> {
-        refuel(&mut access);
         let ctx = access.get();
         Ok(bucket_of(ctx, &bucket).and_then(|name| {
             ctx.state
@@ -1475,7 +1478,6 @@ impl wasi::keyvalue::batch::HostWithStore<Ctx> for HasSelf<Ctx> {
         bucket: Resource<crate::state::Bucket>,
         keys: Vec<String>,
     ) -> HostResult<Result<Vec<Option<(String, Vec<u8>)>>, StoreError>> {
-        refuel(&mut access);
         let ctx = access.get();
         Ok(bucket_of(ctx, &bucket).map(|name| {
             keys.into_iter()
@@ -1494,7 +1496,6 @@ impl wasi::keyvalue::batch::HostWithStore<Ctx> for HasSelf<Ctx> {
         bucket: Resource<crate::state::Bucket>,
         entries: Vec<(String, Vec<u8>)>,
     ) -> HostResult<Result<(), StoreError>> {
-        refuel(&mut access);
         let ctx = access.get();
         Ok(bucket_of(ctx, &bucket).and_then(|name| {
             entries.into_iter().try_for_each(|(key, value)| {
@@ -1510,7 +1511,6 @@ impl wasi::keyvalue::batch::HostWithStore<Ctx> for HasSelf<Ctx> {
         bucket: Resource<crate::state::Bucket>,
         keys: Vec<String>,
     ) -> HostResult<Result<(), StoreError>> {
-        refuel(&mut access);
         let ctx = access.get();
         Ok(bucket_of(ctx, &bucket).map(|name| {
             for key in keys {
@@ -1533,10 +1533,7 @@ impl shonin::agent::inference::HostWithStore<Ctx> for HasSelf<Ctx> {
     > {
         use crate::inference::{Data, Named, Refusal};
         use shonin::agent::inference::{InferenceError, NamedTensor, Tensor, TensorData};
-        let inference = accessor.with(|mut access| {
-            refuel(&mut access);
-            access.get().inference.clone()
-        });
+        let inference = accessor.with(|mut access| access.get().inference.clone());
         // A bundle without models: every name is unknown, an error the
         // strategy handles rather than a stall.
         let Some(inference) = inference else {
@@ -2405,5 +2402,23 @@ mod tests {
             asked_about(&strategy_sdk::to_payload(&query)),
             Some(query.markets)
         );
+    }
+
+    #[test]
+    fn a_call_for_random_bytes_gets_them_up_to_a_mib_and_traps_past_it() {
+        let bytes = random_bytes(RANDOM_AT_MOST).unwrap();
+        assert_eq!(bytes.len() as u64, RANDOM_AT_MOST);
+        assert!(bytes.iter().any(|byte| *byte != 0));
+        assert!(random_bytes(0).unwrap().is_empty());
+        assert!(random_bytes(RANDOM_AT_MOST + 1).is_err());
+    }
+
+    #[test]
+    fn the_executor_s_randomness_is_linked_in_place_of_wasi_s() {
+        let engine = crate::runner::engine().unwrap();
+        let mut linker = wasmtime::component::Linker::new(&engine);
+        link(&mut linker).unwrap();
+        // Linking again over it is refused: shadowing is not left allowed.
+        assert!(link(&mut linker).is_err());
     }
 }

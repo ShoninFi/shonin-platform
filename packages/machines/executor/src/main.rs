@@ -24,6 +24,7 @@ mod hyperliquid;
 mod inference;
 mod keys;
 mod net;
+mod pace;
 mod robinhood;
 mod root;
 mod runner;

@@ -5,6 +5,11 @@
 //!   (and so checked) before the agent starts: a model that won't load stops
 //!   the start, not a trade. A model is named by its file name without
 //!   `.onnx`.
+//! - **Memory.** The models are held in the agent's memory allowance, each
+//!   counted at its size: together they may take at most [`MODELS_MOST`],
+//!   and must leave the agent at least [`AGENT_LEAST`] of the allowance, and
+//!   what they take the agent's own memory doesn't have. Models past that stop the start, before any is
+//!   read.
 //! - **Operators.** No custom operator library is ever registered, so a model
 //!   can use only the runtime's own operators: a custom operator would be
 //!   arbitrary native code.
@@ -25,6 +30,16 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use ort::session::{RunOptions, Session};
 use ort::value::{DynValue, Tensor, ValueType};
+
+/// The most memory a bundle's models may take in all, of the agent's
+/// allowance.
+pub const MODELS_MOST: u64 = 128 * 1024 * 1024;
+
+/// The least memory the models leave the agent's own instance: room for a
+/// compiled agent's stack (a MiB by default), its data and a small heap, so
+/// an agent whose models fill its allowance is refused at the start rather
+/// than started with no memory to run in.
+pub const AGENT_LEAST: u64 = 8 * 1024 * 1024;
 
 /// A tensor as the agent sees it: a shape, row-major data of one type.
 #[derive(Clone, Debug, PartialEq)]
@@ -81,44 +96,76 @@ struct Spent {
 /// A bundle's models, and what its agent has spent on them.
 pub struct Inference {
     models: BTreeMap<String, Arc<Mutex<Session>>>,
+    /// What the models take of the agent's memory: their sizes, together.
+    bytes: u64,
     budget: Budget,
     spent: Mutex<Spent>,
 }
 
 impl Inference {
-    /// Load every `.onnx` file in `dir`. No directory is no models.
-    pub fn load(dir: &Path, budget: Budget) -> Result<Self> {
+    /// Load every `.onnx` file in `dir`, refused if together they come to
+    /// more than [`MODELS_MOST`], or leave the agent less than
+    /// [`AGENT_LEAST`] of its `memory`. No directory is no models.
+    pub fn load(dir: &Path, budget: Budget, memory: u64) -> Result<Self> {
         let mut models = BTreeMap::new();
+        let mut bytes = 0u64;
         if dir.is_dir() {
             let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
             entries.sort_by_key(|entry| entry.file_name());
+            entries
+                .retain(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("onnx"));
+            // Weighed before any is read, each by what its name leads to: a
+            // link is weighed by its target, and anything but a file is
+            // refused.
+            let mut weighed = Vec::with_capacity(entries.len());
             for entry in entries {
                 let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("onnx") {
-                    continue;
+                let metadata = std::fs::metadata(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                if !metadata.is_file() {
+                    anyhow::bail!("the model {} is not a file", path.display());
                 }
+                bytes = bytes.saturating_add(metadata.len());
+                weighed.push((path, metadata.len()));
+            }
+            fits(bytes, memory)?;
+            for (path, size) in weighed {
                 let name = path
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .context("a model's name")?
                     .to_string();
-                let bytes =
-                    std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+                // Read no more than it was weighed at: a model that grew
+                // since is refused rather than held past its room.
+                let mut read = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut std::io::Read::take(
+                        std::fs::File::open(&path)
+                            .with_context(|| format!("reading {}", path.display()))?,
+                        size.saturating_add(1),
+                    ),
+                    &mut read,
+                )
+                .with_context(|| format!("reading {}", path.display()))?;
+                if read.len() as u64 != size {
+                    anyhow::bail!("the model {name} changed as it was read");
+                }
                 models.insert(
                     name.clone(),
                     Arc::new(Mutex::new(
-                        session(&bytes).with_context(|| format!("loading model {name}"))?,
+                        session(&read).with_context(|| format!("loading model {name}"))?,
                     )),
                 );
             }
         }
-        Ok(Self::with(models, budget))
+        Ok(Self::with(models, bytes, budget))
     }
 
     /// From models already in memory, by name.
     #[cfg(test)]
     pub fn from_bytes(models: &[(&str, &[u8])], budget: Budget) -> Result<Self> {
         let mut loaded = BTreeMap::new();
+        let bytes = models.iter().map(|(_, model)| model.len() as u64).sum();
         for (name, bytes) in models {
             loaded.insert(
                 name.to_string(),
@@ -127,18 +174,24 @@ impl Inference {
                 )),
             );
         }
-        Ok(Self::with(loaded, budget))
+        Ok(Self::with(loaded, bytes, budget))
     }
 
-    fn with(models: BTreeMap<String, Arc<Mutex<Session>>>, budget: Budget) -> Self {
+    fn with(models: BTreeMap<String, Arc<Mutex<Session>>>, bytes: u64, budget: Budget) -> Self {
         Self {
             models,
+            bytes,
             budget,
             spent: Mutex::new(Spent {
                 since: Instant::now(),
                 used: Duration::ZERO,
             }),
         }
+    }
+
+    /// What the models take of the agent's memory.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
     }
 
     #[cfg(test)]
@@ -206,6 +259,21 @@ impl Inference {
             other => other,
         }
     }
+}
+
+/// Whether models of `bytes` in all fit in the agent's `memory`, leaving it
+/// [`AGENT_LEAST`], and in [`MODELS_MOST`].
+fn fits(bytes: u64, memory: u64) -> Result<()> {
+    let most = memory.saturating_sub(AGENT_LEAST).min(MODELS_MOST);
+    if bytes > most {
+        let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+        anyhow::bail!(
+            "the bundle's models come to {:.1} MiB, more than the {:.1} MiB they may take of the agent's memory",
+            mib(bytes),
+            mib(most)
+        );
+    }
+    Ok(())
 }
 
 fn backend(error: impl std::fmt::Display) -> Refusal {
@@ -375,14 +443,79 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("scorer.onnx"), PLACEHOLDER).unwrap();
         std::fs::write(dir.join("notes.txt"), b"ignored").unwrap();
-        let host = Inference::load(&dir, budget(1_000)).unwrap();
+        let host = Inference::load(&dir, budget(1_000), MODELS_MOST + AGENT_LEAST).unwrap();
         assert_eq!(host.names(), vec!["scorer".to_string()]);
+        assert_eq!(host.bytes(), PLACEHOLDER.len() as u64);
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(
-            Inference::load(&dir, budget(1_000))
+            Inference::load(&dir, budget(1_000), MODELS_MOST)
                 .unwrap()
                 .names()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn models_past_the_room_they_have_in_the_agent_s_memory_stop_the_load() {
+        let dir = std::env::temp_dir().join(format!("shonin-models-room-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.onnx"), PLACEHOLDER).unwrap();
+        std::fs::write(dir.join("b.onnx"), PLACEHOLDER).unwrap();
+        let both = 2 * PLACEHOLDER.len() as u64;
+        // Two models, counted together against the room, which is what the
+        // agent's memory has past the least it keeps.
+        assert!(Inference::load(&dir, budget(1_000), both + AGENT_LEAST).is_ok());
+        let refused = Inference::load(&dir, budget(1_000), both + AGENT_LEAST - 1)
+            .err()
+            .expect("models past their room were loaded");
+        assert!(
+            format!("{refused:#}").contains("models come to"),
+            "{refused:#}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn models_take_at_most_128_mib_in_all_whatever_the_allowance() {
+        assert_eq!(MODELS_MOST, 128 * 1024 * 1024);
+        assert!(fits(MODELS_MOST, u64::MAX).is_ok());
+        assert!(fits(MODELS_MOST + 1, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn models_always_leave_the_agent_the_least_memory_it_keeps() {
+        let memory = 64 * 1024 * 1024;
+        assert!(fits(memory - AGENT_LEAST, memory).is_ok());
+        assert!(fits(memory - AGENT_LEAST + 1, memory).is_err());
+        // Models filling the allowance exactly are refused.
+        assert!(fits(memory, memory).is_err());
+        // An allowance below the least leaves room for no model at all.
+        assert!(fits(1, AGENT_LEAST).is_err());
+        assert!(fits(0, AGENT_LEAST / 2).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_model_is_weighed_by_what_its_name_leads_to() {
+        let dir = std::env::temp_dir().join(format!("shonin-models-linked-{}", std::process::id()));
+        let elsewhere = dir.join("elsewhere");
+        let models = dir.join("models");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(elsewhere.join("big"), PLACEHOLDER).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("big"), models.join("scorer.onnx")).unwrap();
+        // A link is weighed by its target: no room for it is no load.
+        let size = PLACEHOLDER.len() as u64;
+        let host = Inference::load(&models, budget(1_000), size + AGENT_LEAST).unwrap();
+        assert_eq!(host.bytes(), size);
+        assert!(Inference::load(&models, budget(1_000), size + AGENT_LEAST - 1).is_err());
+        // Anything but a file is refused.
+        std::fs::remove_file(models.join("scorer.onnx")).unwrap();
+        std::fs::create_dir(models.join("scorer.onnx")).unwrap();
+        let refused = Inference::load(&models, budget(1_000), MODELS_MOST)
+            .err()
+            .expect("a directory was loaded as a model");
+        assert!(format!("{refused:#}").contains("not a file"), "{refused:#}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
