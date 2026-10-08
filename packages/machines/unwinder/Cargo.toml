@@ -25,6 +25,13 @@ clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+alloy.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+base64 = "0.22.1"
+# The launcher's token, checked as the key exchange checks one.
+shonin-rootkey = { path = "../../rootkey" }
+shonin-attestation-core = { path = "../../attestation/core" }
 
 [lints]
 workspace = true

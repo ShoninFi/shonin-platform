@@ -215,6 +215,12 @@ pub fn build(
     }
     let wasm = compile(source, package).map_err(|failure| (failure, seconds()))?;
     load_apart(&wasm).map_err(|failure| (failure, seconds()))?;
+    // The build's own user owns everything in its job directory, so the
+    // component is read only if it is in there, through no link out of it.
+    let job = source.parent().unwrap_or(source);
+    if !inside(&wasm, job) {
+        return Err((Failure::Build, seconds()));
+    }
     let component = read_component(&wasm).map_err(|failure| (failure, seconds()))?;
     let bundle =
         shared::archive::bundle(&component, &[]).map_err(|_| (Failure::Service, seconds()))?;
@@ -226,6 +232,17 @@ pub fn build(
         bundle,
         seconds: seconds(),
     })
+}
+
+/// Whether `path`, every link in it followed, is inside `directory`.
+fn inside(path: &Path, directory: &Path) -> bool {
+    match (
+        std::fs::canonicalize(path),
+        std::fs::canonicalize(directory),
+    ) {
+        (Ok(path), Ok(directory)) => path.starts_with(directory),
+        _ => false,
+    }
 }
 
 /// A `Cargo.toml` or a `.cargo` in any directory above `source`, up to the
@@ -354,17 +371,18 @@ fn cargo(source: &Path, target: &Path, home: &Path, package: &str) -> Command {
         // rustup takes this ahead of any toolchain file in the project.
         .env("RUSTUP_TOOLCHAIN", RUST)
         .env("CARGO_TARGET_DIR", target)
-        .env("CARGO_HOME", home)
-        .args([
-            "build",
-            "--release",
-            "--locked",
-            "--offline",
-            "--target",
-            "wasm32-wasip2",
-            "-p",
-            package,
-        ]);
+        .env("CARGO_HOME", home);
+    crate::isolation::as_build_user(&mut command);
+    command.args([
+        "build",
+        "--release",
+        "--locked",
+        "--offline",
+        "--target",
+        "wasm32-wasip2",
+        "-p",
+        package,
+    ]);
     command
 }
 
@@ -417,6 +435,11 @@ fn compile(source: &Path, package: &str) -> Result<PathBuf, Failure> {
     let home = source.join("../cargo");
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).map_err(|_| Failure::Service)?;
+    // The job's directory is the build user's, and nothing else is.
+    crate::isolation::hand_over(source.parent().unwrap_or(source)).map_err(|error| {
+        tracing::error!(%error, "a job's directory could not be handed to the build user");
+        Failure::Service
+    })?;
     let mut child =
         Group::spawn(cargo(source, &target, &home, package)).map_err(|_| Failure::Service)?;
 
@@ -466,6 +489,7 @@ fn load_apart(wasm: &Path) -> Result<(), Failure> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    crate::isolation::as_build_user(&mut command);
     let mut child = Group::spawn(command).map_err(|_| Failure::Service)?;
     let started = Instant::now();
     loop {

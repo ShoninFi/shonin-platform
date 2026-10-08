@@ -5,5 +5,7 @@
 //! comparison that used its own copies would be measuring itself.
 
 pub mod battery;
+pub mod cloud;
 pub mod jev;
+pub mod messages;
 pub mod source;

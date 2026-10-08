@@ -38,11 +38,20 @@ reqwest.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 time.workspace = true
 tar.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# The model's key, held in memory only and wiped when dropped.
+zeroize = "1.9.0"
+# Opening the model's key by attested exchange.
+shonin-rootkey = { path = "../../rootkey" }
+
+[dev-dependencies]
+# The service identity of a fixed seed, to seal state with in tests.
+shonin-rootkey = { path = "../../rootkey", features = ["test-identity"] }
 
 [lints]
 workspace = true

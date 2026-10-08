@@ -231,6 +231,19 @@ async fn rpc(State(node): State<Arc<Node>>, Json(request): Json<Value>) -> Respo
                 .and_then(|s| s.try_into().ok())
                 .unwrap_or([0; 4]);
             let out = match selector {
+                // How many payments the registry had taken by the block asked
+                // about (the head, if none is named).
+                IPublishing::countCall::SELECTOR => {
+                    let at = hex_u64(&request["params"][1]).unwrap_or(head);
+                    let count = node
+                        .payments
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(block, _)| *block <= at)
+                        .count();
+                    IPublishing::countCall::abi_encode_returns(&U256::from(count))
+                }
                 IStrategyRegistry::isRegisteredCall::SELECTOR => {
                     let call = IStrategyRegistry::isRegisteredCall::abi_decode(&input).unwrap();
                     let id: u64 = call.strategyId.try_into().unwrap();
@@ -507,6 +520,11 @@ impl Builder {
 /// Start the builder binary, its store already holding each of `files`
 /// (`queue.json`, say) as given, without waiting for it to open.
 pub async fn spawn(node: Node, files: &[(&str, String)]) -> Builder {
+    spawn_with(node, files, &[]).await
+}
+
+/// [`spawn`], the builder given `args` besides.
+pub async fn spawn_with(node: Node, files: &[(&str, String)], args: &[&str]) -> Builder {
     let dir = scratch();
     let store = dir.join("store");
     std::fs::create_dir_all(&store).unwrap();
@@ -596,6 +614,7 @@ pub async fn spawn(node: Node, files: &[(&str, String)]) -> Builder {
         .arg("--reviewer-url")
         .arg(format!("http://{reviewer_at}"))
         .args(["--port", &port.to_string()])
+        .args(args)
         .env_remove("SHONIN_DEPLOYMENTS_JSON")
         .env("NO_COLOR", "1")
         .env("RUST_LOG", "info")
