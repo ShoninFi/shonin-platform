@@ -144,6 +144,16 @@ tasks:
           else
             final=""
             [ "$kind" = final ] && final="--final"
+            # An upgrade larger than the program's account fails: grow the
+            # account first, with room for a few more upgrades.
+            if [ "$kind" != final ]; then
+              have=$(solana program show "$id" --url "$rpc" --output json < /dev/null 2>/dev/null | jq -r '.dataLen // 0')
+              need=$(wc -c < "$dir/$name.so" | tr -d ' ')
+              if [ "$have" -gt 0 ] && [ "$need" -gt "$have" ]; then
+                solana program extend "$id" $((need - have + 32768)) --url "$rpc" \
+                  --keypair "$deployer" --commitment confirmed < /dev/null
+              fi
+            fi
             # Straight to the cluster's leaders (QUIC), with a priority fee:
             # a program's hundreds of buffer writes sent through an RPC
             # endpoint stall at its rate limit on devnet.
