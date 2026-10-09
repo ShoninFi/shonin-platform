@@ -26,6 +26,7 @@
 //!   payouts, a closed vault's doors), and finding every vault, request and
 //!   claim.
 
+pub mod attest;
 pub mod client;
 pub mod events;
 pub mod executor;
@@ -50,6 +51,7 @@ pub mod programs {
     pub use anchor_lang;
     pub use anchor_spl;
     pub use shonin_common as common;
+    pub use shonin_cs_verifier as cs_verifier;
     pub use shonin_dev_verifier as dev_verifier;
     pub use shonin_driver as driver;
     pub use shonin_local_driver as local_driver;
@@ -69,6 +71,7 @@ pub mod programs {
         vec![
             ("shonin_registry", shonin_registry::ID),
             ("shonin_dev_verifier", shonin_dev_verifier::ID),
+            ("shonin_cs_verifier", shonin_cs_verifier::ID),
             ("shonin_publishing", shonin_publishing::ID),
             ("shonin_prices", shonin_prices::ID),
             ("shonin_profiles", shonin_profiles::ID),

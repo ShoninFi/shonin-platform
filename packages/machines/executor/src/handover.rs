@@ -35,11 +35,12 @@ const LOOK_EVERY: Duration = if cfg!(test) {
     Duration::from_secs(30)
 };
 
-/// One vault's watch on another executor's key.
+/// One vault's watch on another executor's key: an EVM address, or a
+/// Solana key.
 #[derive(Debug)]
-pub struct Watch {
+pub struct Watch<K = Address> {
     /// The key the station approves.
-    pub by: Address,
+    pub by: K,
     /// When the current stretch of silence began, in unix seconds: the watch
     /// began then, or the key's latest report was heard then.
     began: u64,
@@ -55,8 +56,8 @@ pub enum Heard {
     Nothing,
 }
 
-impl Watch {
-    pub fn new(by: Address, now: u64) -> Watch {
+impl<K: PartialEq + Copy> Watch<K> {
+    pub fn new(by: K, now: u64) -> Watch<K> {
         Watch {
             by,
             began: now,
@@ -79,7 +80,7 @@ impl Watch {
     /// signer and when it was signed. One from the watched key, dated after
     /// the watch began (give or take [`CLOCK_SKEW`]) and not in the future,
     /// starts the silence again.
-    pub fn heard(&mut self, latest: Option<(Address, u64)>, now: u64) -> Heard {
+    pub fn heard(&mut self, latest: Option<(K, u64)>, now: u64) -> Heard {
         match latest {
             Some((signer, at))
                 if signer == self.by
@@ -99,6 +100,34 @@ impl Watch {
     /// counts as a silent executor.
     pub fn silent_for(&self, silence: u64, now: u64) -> bool {
         now >= self.began.saturating_add(silence)
+    }
+}
+
+/// A takeover decided: the key whose silence lasted the whole watch, and
+/// when that was found. The new key takes the station's approval from that
+/// key alone, and only while it is still silent once the new key is blessed:
+/// the blessing can take a while, and a key heard from again meanwhile is
+/// left in place.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Takeover<K = Address> {
+    /// The key taken over from.
+    pub from: K,
+    /// When its silence was found to have lasted the whole watch, in unix
+    /// seconds.
+    pub decided_at: u64,
+}
+
+impl<K: PartialEq + Copy> Takeover<K> {
+    pub fn new(from: K, decided_at: u64) -> Takeover<K> {
+        Takeover { from, decided_at }
+    }
+
+    /// Whether the key taken over from is still silent, given the latest
+    /// report the API holds for the vault: none from that key dated since the
+    /// takeover was decided (give or take [`CLOCK_SKEW`]), as a watch begun
+    /// then would hear it.
+    pub fn still_silent(&self, latest: Option<(K, u64)>, now: u64) -> bool {
+        Watch::new(self.from, self.decided_at).heard(latest, now) == Heard::Nothing
     }
 }
 
@@ -125,6 +154,54 @@ pub async fn latest_report(
     Ok(Some((signer(chain, &post)?, post.report.at)))
 }
 
+/// The latest report the API took for a Solana vault: the key that signed it
+/// and when it says it was signed, once its signature is checked here, as
+/// that key's ed25519 signature over the report's digest on this cluster.
+/// `None` if the API has none; a report whose signature doesn't check is no
+/// report.
+pub async fn latest_solana_report(
+    http: &reqwest::Client,
+    api: &str,
+    chain: shared::Chain,
+    cluster: &[u8; 32],
+    vault: &chain::solana::Pubkey,
+) -> Result<Option<(chain::solana::Pubkey, u64)>> {
+    let answer = http
+        .get(format!("{api}/api/{chain}/health/{vault}/signed"))
+        .send()
+        .await
+        .context("asking the API for the vault's latest report")?;
+    if answer.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let answer = answer
+        .error_for_status()
+        .context("the API would not say the vault's latest report")?;
+    let post: HealthPost = answer.json().await.context("the API's report")?;
+    Ok(solana_signer(cluster, vault, &post).map(|signer| (signer, post.report.at)))
+}
+
+/// Who signed a Solana report: the key it names, if the signature is that
+/// key's over the report's digest for this vault on this cluster.
+pub fn solana_signer(
+    cluster: &[u8; 32],
+    vault: &chain::solana::Pubkey,
+    post: &HealthPost,
+) -> Option<chain::solana::Pubkey> {
+    use chain::solana::Signer;
+    fn parsed_like<T: std::str::FromStr>(_: &T, text: &str) -> Option<T> {
+        text.parse().ok()
+    }
+    if post.vault != vault.to_string() {
+        return None;
+    }
+    let signer: chain::solana::Pubkey = post.signer.as_deref()?.parse().ok()?;
+    let probe = chain::solana::Keypair::new_from_array([1; 32]).sign_message(&[]);
+    let signature: [u8; 64] = parsed_like(&probe, &post.signature)?.into();
+    let digest = HealthPost::solana_digest(cluster, &post.vault, &post.report);
+    chain::solana::executor::verify_ed25519(&signer, &digest, signature).then_some(signer)
+}
+
 /// Who signed a report, recovered from its signature over the report's
 /// digest: the API is not trusted to say.
 pub fn signer(chain: shared::Chain, post: &HealthPost) -> Result<Address> {
@@ -140,6 +217,24 @@ mod tests {
     use super::*;
 
     const NOW: u64 = 1_800_000_000;
+
+    #[test]
+    fn a_key_taken_over_from_that_reports_again_before_the_approval_is_left_in_place() {
+        let by = Address::repeat_byte(0xee);
+        let decided = NOW + HANDOVER_SILENCE;
+        let takeover = Takeover::new(by, decided);
+        // Only the report from before the silence: still silent.
+        assert!(takeover.still_silent(Some((by, NOW - 5)), decided + 1_800));
+        assert!(takeover.still_silent(None, decided + 1_800));
+        // Another key's report says nothing about this one.
+        let other = Address::repeat_byte(0xdd);
+        assert!(takeover.still_silent(Some((other, decided + 60)), decided + 1_800));
+        // A report from the key since the takeover was decided: heard again.
+        assert!(!takeover.still_silent(Some((by, decided + 60)), decided + 1_800));
+        assert!(!takeover.still_silent(Some((by, decided - CLOCK_SKEW)), decided + 1_800));
+        // One dated in the future is not believed.
+        assert!(takeover.still_silent(Some((by, decided + 1_800 + 3_600)), decided + 1_800));
+    }
 
     #[test]
     fn a_key_silent_for_the_whole_watch_is_taken_over() {
@@ -188,6 +283,54 @@ mod tests {
         assert_eq!(
             watch.heard(Some((by, NOW - CLOCK_SKEW)), NOW + 20),
             Heard::Report
+        );
+    }
+
+    #[test]
+    fn a_solana_report_counts_only_with_the_named_key_s_signature_for_this_vault_and_cluster() {
+        use chain::solana::Signer;
+        let key = crate::keys::fresh_solana().unwrap();
+        let vault = chain::solana::Pubkey::new_from_array([0x11; 32]);
+        let cluster = [7u8; 32];
+        let report = shared::model::health::Health {
+            signals: vec![],
+            entries: vec![],
+            updated: time::PrimitiveDateTime::new(
+                time::Date::from_ordinal_date(2026, 280).unwrap(),
+                time::Time::MIDNIGHT,
+            ),
+            signed_by: key.pubkey().to_string(),
+            at: NOW,
+        };
+        let digest = HealthPost::solana_digest(&cluster, &vault.to_string(), &report);
+        let mut post = HealthPost {
+            vault: vault.to_string(),
+            report,
+            signature: key.sign_message(&digest).to_string(),
+            signer: Some(key.pubkey().to_string()),
+        };
+        assert_eq!(solana_signer(&cluster, &vault, &post), Some(key.pubkey()));
+        // Another cluster, another vault, a changed report, another named
+        // key: none is the key's report.
+        assert_eq!(solana_signer(&[8u8; 32], &vault, &post), None);
+        let other = chain::solana::Pubkey::new_from_array([0x22; 32]);
+        assert_eq!(solana_signer(&cluster, &other, &post), None);
+        let stranger = crate::keys::fresh_solana().unwrap();
+        post.signer = Some(stranger.pubkey().to_string());
+        assert_eq!(solana_signer(&cluster, &vault, &post), None);
+        post.signer = Some(key.pubkey().to_string());
+        post.report.at += 1;
+        assert_eq!(solana_signer(&cluster, &vault, &post), None);
+
+        // And the watch takes a Solana key like an address.
+        let mut watch = Watch::new(key.pubkey(), NOW);
+        assert_eq!(
+            watch.heard(Some((key.pubkey(), NOW + 5)), NOW + 10),
+            Heard::Report
+        );
+        assert_eq!(
+            watch.heard(Some((stranger.pubkey(), NOW + 15)), NOW + 20),
+            Heard::Nothing
         );
     }
 

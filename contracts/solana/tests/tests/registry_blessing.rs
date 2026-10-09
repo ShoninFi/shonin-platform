@@ -60,7 +60,8 @@ fn a_proof_nobody_signed_is_refused() {
 #[test]
 fn a_proof_signed_by_any_other_key_is_refused() {
     let mut env = Env::new();
-    let journal = env.journal_for(builder_image(), Keypair::new().pubkey(), env.service_leaf());
+    let key = Keypair::new().pubkey();
+    let journal = env.journal_for(builder_image(), key, env.service_leaf(key));
     let (payer, stranger) = (env.payer.insecure_clone(), Keypair::new());
     expect_code(
         env.bless_by(
@@ -81,7 +82,8 @@ fn a_proof_signed_by_any_other_key_is_refused() {
 #[test]
 fn a_seal_proves_only_the_journal_it_was_made_for() {
     let mut env = Env::new();
-    let honest = env.journal_for(builder_image(), Keypair::new().pubkey(), env.service_leaf());
+    let key = Keypair::new().pubkey();
+    let honest = env.journal_for(builder_image(), key, env.service_leaf(key));
     let attestor = env.attestor.insecure_clone();
     let (_, ed25519) = env.seal(&attestor, &honest);
     let mut swapped = honest;
@@ -116,11 +118,8 @@ fn an_image_off_the_allowlist_cannot_bless() {
 fn an_image_still_waiting_cannot_bless() {
     let mut env = Env::new();
     expect_ok(env.propose_image(hash("next builder image"), ImageKind::Builder));
-    let journal = env.journal_for(
-        hash("next builder image"),
-        Keypair::new().pubkey(),
-        env.service_leaf(),
-    );
+    let key = Keypair::new().pubkey();
+    let journal = env.journal_for(hash("next builder image"), key, env.service_leaf(key));
     expect_code(
         env.bless(&journal, [0; 32], [0; 32], [0; 32], vec![]),
         registry_error(RegistryError::ImageNotAllowed),
@@ -130,7 +129,8 @@ fn an_image_still_waiting_cannot_bless() {
 #[test]
 fn a_project_off_the_allowlist_cannot_bless() {
     let mut env = Env::new();
-    let mut journal = env.journal_for(builder_image(), Keypair::new().pubkey(), env.service_leaf());
+    let key = Keypair::new().pubkey();
+    let mut journal = env.journal_for(builder_image(), key, env.service_leaf(key));
     journal.project_id = hash("another operator");
     expect_code(
         env.bless(&journal, [0; 32], [0; 32], [0; 32], vec![]),
@@ -143,7 +143,11 @@ fn a_project_off_the_allowlist_cannot_bless() {
 #[test]
 fn the_zero_key_cannot_be_blessed() {
     let mut env = Env::new();
-    let journal = env.journal_for(builder_image(), Pubkey::default(), env.service_leaf());
+    let journal = env.journal_for(
+        builder_image(),
+        Pubkey::default(),
+        env.service_leaf(Pubkey::default()),
+    );
     expect_code(
         env.bless(&journal, [0; 32], [0; 32], [0; 32], vec![]),
         registry_error(RegistryError::NoSigner),
@@ -154,7 +158,8 @@ fn the_zero_key_cannot_be_blessed() {
 #[test]
 fn a_service_key_names_no_vault() {
     let mut env = Env::new();
-    let journal = env.journal_for(builder_image(), Keypair::new().pubkey(), env.service_leaf());
+    let key = Keypair::new().pubkey();
+    let journal = env.journal_for(builder_image(), key, env.service_leaf(key));
     let cluster = env.cluster();
     expect_code(
         env.bless(&journal, cluster, [0; 32], [0; 32], vec![]),
@@ -167,15 +172,22 @@ fn a_service_key_names_no_vault() {
 #[test]
 fn an_executor_is_blessed_for_a_chain_and_a_bundle_not_just_a_vault() {
     let mut env = Env::new();
-    let leaf = blessing_leaf(&[0; 32], &vault(), &[0; 32], &env.cluster());
+    let executor = env.executor.pubkey();
+    let leaf = blessing_leaf(
+        &[0; 32],
+        &vault(),
+        &[0; 32],
+        &env.cluster(),
+        &executor.to_bytes(),
+    );
     let journal = env.journal_for(executor_image(), env.executor.pubkey(), leaf);
     expect_code(
         env.bless(&journal, [0; 32], vault(), [0; 32], vec![]),
         registry_error(RegistryError::WrongKindForVault),
     );
     let cluster = env.cluster();
-    let leaf = blessing_leaf(&cluster, &vault(), &[0; 32], &cluster);
-    let journal = env.journal_for(executor_image(), env.executor.pubkey(), leaf);
+    let leaf = blessing_leaf(&cluster, &vault(), &[0; 32], &cluster, &executor.to_bytes());
+    let journal = env.journal_for(executor_image(), executor, leaf);
     expect_code(
         env.bless(&journal, cluster, vault(), [0; 32], vec![]),
         registry_error(RegistryError::WrongKindForVault),
@@ -188,7 +200,7 @@ fn an_executor_cannot_claim_a_vault_it_did_not_attest_to() {
     let journal = env.journal_for(
         executor_image(),
         env.executor.pubkey(),
-        env.leaf_for(hash("my vault"), bundle()),
+        env.leaf_for(hash("my vault"), bundle(), env.executor.pubkey()),
     );
     let cluster = env.cluster();
     expect_code(
@@ -203,14 +215,16 @@ fn an_executor_cannot_claim_a_vault_it_did_not_attest_to() {
 fn a_blessing_proved_for_another_cluster_cannot_be_replayed_here() {
     let mut env = Env::new();
     let devnet = cluster_value("devnet");
-    let leaf = blessing_leaf(&devnet, &vault(), &bundle(), &devnet);
+    let executor = env.executor.pubkey();
+    let leaf = blessing_leaf(&devnet, &vault(), &bundle(), &devnet, &executor.to_bytes());
     let journal = env.journal_for(executor_image(), env.executor.pubkey(), leaf);
     expect_code(
         env.bless(&journal, devnet, vault(), bundle(), vec![]),
         registry_error(RegistryError::NotAmongTheVaults),
     );
-    let service = blessing_leaf(&[0; 32], &[0; 32], &[0; 32], &devnet);
-    let journal = env.journal_for(builder_image(), Keypair::new().pubkey(), service);
+    let key = Keypair::new().pubkey();
+    let service = blessing_leaf(&[0; 32], &[0; 32], &[0; 32], &devnet, &key.to_bytes());
+    let journal = env.journal_for(builder_image(), key, service);
     expect_code(
         env.bless(&journal, [0; 32], [0; 32], [0; 32], vec![]),
         registry_error(RegistryError::NotAmongTheVaults),
@@ -220,7 +234,11 @@ fn a_blessing_proved_for_another_cluster_cannot_be_replayed_here() {
 #[test]
 fn a_key_from_one_instance_cannot_be_claimed_by_another_image() {
     let mut env = Env::new();
-    let journal = env.journal_for(reviewer_image(), env.builder.pubkey(), env.service_leaf());
+    let journal = env.journal_for(
+        reviewer_image(),
+        env.builder.pubkey(),
+        env.service_leaf(env.builder.pubkey()),
+    );
     expect_code(
         env.bless(&journal, [0; 32], [0; 32], [0; 32], vec![]),
         registry_error(RegistryError::NotThisInstance),
@@ -238,8 +256,54 @@ fn a_key_cannot_be_claimed_by_another_project() {
     env.skip(TIMELOCK);
     let builder = env.builder.pubkey();
     env.bless_service_key(builder_image(), builder);
-    let mut journal = env.journal_for(builder_image(), builder, env.service_leaf());
+    let mut journal = env.journal_for(builder_image(), builder, env.service_leaf(builder));
     journal.project_id = other;
+    expect_code(
+        env.bless(&journal, [0; 32], [0; 32], [0; 32], vec![]),
+        registry_error(RegistryError::NotThisInstance),
+    );
+}
+
+/// The leaf is checked after everything else, so a blessing refused only for
+/// its leaf would pass every other check: a simulation that leaves the proof
+/// out to fit in a transaction learns of anything else wrong first.
+#[test]
+fn a_blessing_checks_the_leaf_after_everything_else() {
+    let mut env = Env::new();
+    let executor = env.executor.pubkey();
+    let cluster = env.cluster();
+
+    // From the future, and naming a vault the tree doesn't hold.
+    let mut journal = env.journal_for(
+        executor_image(),
+        executor,
+        env.leaf_for(vault(), bundle(), executor),
+    );
+    journal.issued_at = env.now() + 1;
+    expect_code(
+        env.bless(&journal, cluster, hash("another vault"), bundle(), vec![]),
+        registry_error(RegistryError::Stale),
+    );
+
+    // Long past its TTL, and with no proof.
+    let mut journal = env.journal_for(
+        executor_image(),
+        executor,
+        env.leaf_for(
+            vault(),
+            bundle(),
+            Pubkey::new_from_array(hash("another key")),
+        ),
+    );
+    env.skip(BLESSING_TTL + 1);
+    journal.issued_at = env.now() - BLESSING_TTL - 1;
+    expect_code(
+        env.bless(&journal, cluster, vault(), bundle(), vec![]),
+        registry_error(RegistryError::Stale),
+    );
+
+    // Another image claiming a key, from a tree that doesn't hold it.
+    let journal = env.journal_for(reviewer_image(), env.builder.pubkey(), hash("no such tree"));
     expect_code(
         env.bless(&journal, [0; 32], [0; 32], [0; 32], vec![]),
         registry_error(RegistryError::NotThisInstance),
@@ -287,7 +351,13 @@ fn a_key_is_blessed_for_a_vault_on_another_chain_by_that_chain() {
     let mut evm_vault = [0u8; 32];
     evm_vault[12..].copy_from_slice(&[0xAB; 20]);
     let executor = env.executor.pubkey();
-    let leaf = blessing_leaf(&base, &evm_vault, &bundle(), &env.cluster());
+    let leaf = blessing_leaf(
+        &base,
+        &evm_vault,
+        &bundle(),
+        &env.cluster(),
+        &executor.to_bytes(),
+    );
     let journal = env.journal_for(executor_image(), executor, leaf);
     expect_ok(env.bless(&journal, base, evm_vault, bundle(), vec![]));
     assert!(env.is_blessed_for(&executor, base, evm_vault, bundle()));
@@ -303,7 +373,11 @@ fn an_unwinder_key_is_never_blessed_as_an_executor() {
     expect_ok(env.propose_image(unwinder_image(), ImageKind::Unwinder));
     env.skip(TIMELOCK);
     let unwinder = Keypair::new().pubkey();
-    let journal = env.journal_for(unwinder_image(), unwinder, env.leaf_for(vault(), bundle()));
+    let journal = env.journal_for(
+        unwinder_image(),
+        unwinder,
+        env.leaf_for(vault(), bundle(), unwinder),
+    );
     let cluster = env.cluster();
     expect_ok(env.bless(&journal, cluster, vault(), bundle(), vec![]));
     assert!(env.is_blessed_for(&unwinder, cluster, vault(), bundle()));
@@ -338,7 +412,11 @@ fn nobody_is_blessed_for_the_zero_vault() {
 fn a_lapsed_blessing_cannot_be_renewed_by_replaying_the_old_seal() {
     let mut env = Env::new();
     let executor = env.executor.pubkey();
-    let journal = env.journal_for(executor_image(), executor, env.leaf_for(vault(), bundle()));
+    let journal = env.journal_for(
+        executor_image(),
+        executor,
+        env.leaf_for(vault(), bundle(), executor),
+    );
     let cluster = env.cluster();
     expect_ok(env.bless(&journal, cluster, vault(), bundle(), vec![]));
     env.skip(BLESSING_TTL + 1);
@@ -368,7 +446,8 @@ fn a_lapsed_blessing_cannot_be_renewed_by_replaying_the_old_seal() {
 #[test]
 fn an_attestation_from_the_future_is_refused() {
     let mut env = Env::new();
-    let mut journal = env.journal_for(builder_image(), Keypair::new().pubkey(), env.service_leaf());
+    let key = Keypair::new().pubkey();
+    let mut journal = env.journal_for(builder_image(), key, env.service_leaf(key));
     journal.issued_at = env.now() + 1;
     expect_code(
         env.bless(&journal, [0; 32], [0; 32], [0; 32], vec![]),
@@ -388,7 +467,11 @@ fn expiry_follows_the_clock_not_the_slot() {
     clock.unix_timestamp += (BLESSING_TTL + 1) as i64;
     env.svm.set_sysvar(&clock);
     assert!(!env.is_blessed_for(&executor, env.cluster(), vault(), bundle()));
-    let journal = env.journal_for(executor_image(), executor, env.leaf_for(vault(), bundle()));
+    let journal = env.journal_for(
+        executor_image(),
+        executor,
+        env.leaf_for(vault(), bundle(), executor),
+    );
     let cluster = env.cluster();
     expect_ok(env.bless(&journal, cluster, vault(), bundle(), vec![]));
     assert!(env.is_blessed_for(&executor, cluster, vault(), bundle()));
@@ -431,7 +514,10 @@ fn a_key_attested_for_two_vaults_serves_both() {
     let mut env = Env::new();
     let executor = env.executor.pubkey();
     let (a, b) = (hash("vault A"), hash("vault B"));
-    let (root, proof_a, proof_b) = pair(env.leaf_for(a, bundle()), env.leaf_for(b, bundle()));
+    let (root, proof_a, proof_b) = pair(
+        env.leaf_for(a, bundle(), executor),
+        env.leaf_for(b, bundle(), executor),
+    );
     let journal = env.journal_for(executor_image(), executor, root);
     let cluster = env.cluster();
     expect_ok(env.bless(&journal, cluster, a, bundle(), proof_a));
@@ -452,7 +538,10 @@ fn a_stranger_cannot_move_a_key_to_another_vault() {
     let mut env = Env::new();
     let executor = env.executor.pubkey();
     let (a, b) = (hash("vault A"), hash("vault B"));
-    let (root, proof_a, proof_b) = pair(env.leaf_for(a, bundle()), env.leaf_for(b, bundle()));
+    let (root, proof_a, proof_b) = pair(
+        env.leaf_for(a, bundle(), executor),
+        env.leaf_for(b, bundle(), executor),
+    );
     let journal = env.journal_for(executor_image(), executor, root);
     let cluster = env.cluster();
     expect_ok(env.bless(&journal, cluster, a, bundle(), proof_a));
@@ -472,7 +561,10 @@ fn a_stranger_cannot_change_what_a_key_is_reported_as_serving() {
     let mut env = Env::new();
     let executor = env.executor.pubkey();
     let (a, b) = (hash("vault A"), hash("vault B"));
-    let (root, proof_a, proof_b) = pair(env.leaf_for(a, bundle()), env.leaf_for(b, bundle()));
+    let (root, proof_a, proof_b) = pair(
+        env.leaf_for(a, bundle(), executor),
+        env.leaf_for(b, bundle(), executor),
+    );
     let journal = env.journal_for(executor_image(), executor, root);
     let cluster = env.cluster();
     expect_ok(env.bless(&journal, cluster, a, bundle(), proof_a));
@@ -495,7 +587,11 @@ fn a_replay_that_changes_nothing_does_not_announce_an_earlier_expiry() {
     let mut env = Env::new();
     let executor = env.executor.pubkey();
     let cluster = env.cluster();
-    let first = env.journal_for(executor_image(), executor, env.leaf_for(vault(), bundle()));
+    let first = env.journal_for(
+        executor_image(),
+        executor,
+        env.leaf_for(vault(), bundle(), executor),
+    );
     expect_ok(env.bless(&first, cluster, vault(), bundle(), vec![]));
     let first_until = env.now() + BLESSING_TTL;
 
@@ -539,7 +635,11 @@ fn an_older_seal_never_shortens_a_blessing() {
     let mut env = Env::new();
     let executor = env.executor.pubkey();
     let cluster = env.cluster();
-    let old = env.journal_for(executor_image(), executor, env.leaf_for(vault(), bundle()));
+    let old = env.journal_for(
+        executor_image(),
+        executor,
+        env.leaf_for(vault(), bundle(), executor),
+    );
     env.skip(HOUR);
     env.bless_executor_key(executor, vault(), bundle());
     let fresh_until = env.now() + BLESSING_TTL;
@@ -575,19 +675,19 @@ fn the_journal_is_its_fields_in_order() {
 }
 
 /// The leaf is the EVM contract's: `keccak256(keccak256(abi.encode(vaultChain,
-/// vault, strategyHash, chain)))`, four 32-byte words.
+/// vault, strategyHash, chain, key)))`, five 32-byte words.
 #[test]
 fn the_leaf_is_the_evm_contracts() {
     let mut chain = [0u8; 32];
     chain[31] = 1;
-    let words = [[7u8; 32], [8u8; 32], [9u8; 32], chain];
+    let words = [[7u8; 32], [8u8; 32], [9u8; 32], chain, [10u8; 32]];
     let mut encoded = Vec::new();
     for word in &words {
         encoded.extend_from_slice(word);
     }
     let expected = keccak(&[&keccak(&[&encoded])]);
     assert_eq!(
-        blessing_leaf(&words[0], &words[1], &words[2], &words[3]),
+        blessing_leaf(&words[0], &words[1], &words[2], &words[3], &words[4]),
         expected
     );
 }

@@ -256,6 +256,36 @@ impl Platform {
         (ix, checker)
     }
 
+    /// The Confidential Space checker for the attestation guest `image_id`,
+    /// trusting the Google keys `keys` (sorted here, as a checker takes
+    /// them), at the address they give it.
+    pub fn ix_create_cs_checker(
+        payer: &Pubkey,
+        image_id: [u8; 32],
+        keys: &[[u8; 32]],
+    ) -> (Instruction, Pubkey) {
+        let mut keys = keys.to_vec();
+        keys.sort();
+        keys.dedup();
+        let checker = shonin_cs_verifier::checker_address(&image_id, &keys);
+        let ix = Instruction {
+            program_id: shonin_cs_verifier::ID,
+            accounts: shonin_cs_verifier::accounts::CreateChecker {
+                payer: *payer,
+                checker,
+                system_program: SYSTEM,
+            }
+            .to_account_metas(None),
+            data: shonin_cs_verifier::instruction::CreateChecker {
+                image_id,
+                keys: shonin_cs_verifier::keys_digest(&keys),
+                trusted_keys: keys,
+            }
+            .data(),
+        };
+        (ix, checker)
+    }
+
     /// Set the registry up, trusting the development checker, which must be
     /// a final program by then.
     pub fn ix_initialize_registry(
@@ -721,16 +751,22 @@ impl Platform {
 
     // Blessing ------------------------------------------------------------------
 
-    /// The leaf a builder or a reviewer commits to: no vault, on this
-    /// cluster.
-    pub fn service_leaf(&self) -> [u8; 32] {
-        blessing_leaf(&[0; 32], &[0; 32], &[0; 32], &self.cluster)
+    /// The leaf a builder or a reviewer commits to for its `key`: no vault,
+    /// on this cluster.
+    pub fn service_leaf(&self, key: &Pubkey) -> [u8; 32] {
+        blessing_leaf(&[0; 32], &[0; 32], &[0; 32], &self.cluster, &key.to_bytes())
     }
 
-    /// The leaf an executor commits to for one vault on this cluster and one
-    /// bundle.
-    pub fn vault_leaf(&self, vault: &Pubkey, bundle: &[u8; 32]) -> [u8; 32] {
-        blessing_leaf(&self.cluster, &vault.to_bytes(), bundle, &self.cluster)
+    /// The leaf an executor commits to for its `key`, for one vault on this
+    /// cluster and one bundle.
+    pub fn vault_leaf(&self, vault: &Pubkey, bundle: &[u8; 32], key: &Pubkey) -> [u8; 32] {
+        blessing_leaf(
+            &self.cluster,
+            &vault.to_bytes(),
+            bundle,
+            &self.cluster,
+            &key.to_bytes(),
+        )
     }
 
     /// The development seal: the attestor's Ed25519 signature over what the
@@ -741,62 +777,95 @@ impl Platform {
         Ok(ed25519(attestor, &message))
     }
 
-    /// The bless instruction, with every allowed checker's accounts, newest
-    /// first, as a relayer sends it.
+    /// The bless instruction for `key`, with every allowed checker's
+    /// accounts, newest first, as a relayer sends it: a Confidential Space
+    /// checker reads only its state, and the development checker its state
+    /// and the transaction's instructions, where its seal is (`seal` is then
+    /// empty, and the Ed25519 instruction goes before this one).
     #[allow(clippy::too_many_arguments)]
     pub async fn ix_bless(
         &self,
         client: &SolanaClient,
         payer: &Pubkey,
         journal: &Journal,
+        seal: Vec<u8>,
         vault_chain: [u8; 32],
         vault: [u8; 32],
         strategy_hash: [u8; 32],
+        key: &Pubkey,
         merkle_proof: Vec<[u8; 32]>,
     ) -> Result<Instruction> {
         let config = self.registry_config(client).await?;
         let now = client.now().await?;
+        Ok(Self::bless_instruction(
+            &config,
+            now,
+            payer,
+            journal,
+            seal,
+            vault_chain,
+            vault,
+            strategy_hash,
+            key,
+            merkle_proof,
+        ))
+    }
+
+    /// [`Platform::ix_bless`], from the registry's settings as read at `now`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bless_instruction(
+        config: &shonin_registry::state::Config,
+        now: u64,
+        payer: &Pubkey,
+        journal: &Journal,
+        seal: Vec<u8>,
+        vault_chain: [u8; 32],
+        vault: [u8; 32],
+        strategy_hash: [u8; 32],
+        key: &Pubkey,
+        merkle_proof: Vec<[u8; 32]>,
+    ) -> Instruction {
         let mut groups = Vec::new();
         let mut remaining = Vec::new();
         for entry in config.verifiers.iter().rev() {
             if now < entry.ready_at {
                 continue;
             }
-            groups.push(3u8);
             remaining.push(AccountMeta::new_readonly(entry.program, false));
             remaining.push(AccountMeta::new_readonly(entry.state, false));
-            remaining.push(AccountMeta::new_readonly(INSTRUCTIONS, false));
+            if entry.program == shonin_cs_verifier::ID {
+                groups.push(2u8);
+            } else {
+                groups.push(3u8);
+                remaining.push(AccountMeta::new_readonly(INSTRUCTIONS, false));
+            }
         }
         let mut accounts = shonin_registry::accounts::Bless {
             payer: *payer,
             config: registry::config_address(),
             image: registry::image_address(&journal.image_digest),
             project: registry::project_address(&journal.project_id),
-            key: registry::key_address(&journal.signer),
-            blessing: registry::blessing_address(
-                &journal.signer,
-                &vault_chain,
-                &vault,
-                &strategy_hash,
-            ),
+            key_info: registry::key_address(key),
+            blessing: registry::blessing_address(key, &vault_chain, &vault, &strategy_hash),
             system_program: SYSTEM,
         }
         .to_account_metas(None);
         accounts.extend(remaining);
-        Ok(Instruction {
+        Instruction {
             program_id: shonin_registry::ID,
             accounts,
             data: shonin_registry::instruction::Bless {
                 journal: *journal,
-                seal: Vec::new(),
+                seal,
                 vault_chain,
                 vault,
                 strategy_hash,
+                key: *key,
                 merkle_proof,
                 verifier_accounts: groups,
             }
             .data(),
-        })
+        }
     }
 
     /// Bless `signer` as a `service` (builder, reviewer: no vault), sealed by
@@ -813,7 +882,7 @@ impl Platform {
             image_digest: image_digest(service),
             project_id: project_id(),
             signer: *signer,
-            vaults_root: self.service_leaf(),
+            vaults_root: self.service_leaf(signer),
             issued_at: client.now().await?,
         };
         let seal = self.dev_seal(attestor, &journal)?;
@@ -822,9 +891,11 @@ impl Platform {
                 client,
                 &payer.pubkey(),
                 &journal,
+                Vec::new(),
                 [0; 32],
                 [0; 32],
                 [0; 32],
+                signer,
                 vec![],
             )
             .await?;
@@ -845,7 +916,7 @@ impl Platform {
             image_digest: image_digest("executor"),
             project_id: project_id(),
             signer: *signer,
-            vaults_root: self.vault_leaf(vault, bundle),
+            vaults_root: self.vault_leaf(vault, bundle, signer),
             issued_at: client.now().await?,
         };
         let seal = self.dev_seal(attestor, &journal)?;
@@ -854,9 +925,11 @@ impl Platform {
                 client,
                 &payer.pubkey(),
                 &journal,
+                Vec::new(),
                 self.cluster,
                 vault.to_bytes(),
                 *bundle,
+                signer,
                 vec![],
             )
             .await?;

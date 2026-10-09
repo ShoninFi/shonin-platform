@@ -10,6 +10,13 @@
 //! so one proof of that token blesses every key in the tree, each with its
 //! own Merkle proof.
 //!
+//! Every vault taken on on a Solana cluster is one leaf too, naming the
+//! vault's own ed25519 key in the Solana registry's layout
+//! ([`SolanaLeaf::hash`]); the instance's Solana key, made here as its EVM
+//! key is, is the token's Solana signer. One proof serves both: the Solana
+//! journal and seal are rebuilt from the EVM ones the prover posts
+//! (`chain::solana::attest::SolanaSeal::from_evm`) and published beside them.
+//!
 //! The executor never blesses anything itself and holds no account that
 //! could: it publishes the tree, the token and, once a prover has posted
 //! one, the seal on its status port (`GET /attestation`), and the keeper
@@ -34,6 +41,8 @@ use serde::{Deserialize, Serialize};
 use shonin_attestation_core::Binding;
 
 use crate::keys::Key;
+use chain::solana::attest::{KeyLeaf, SolanaSeal};
+use chain::solana::{Keypair as SolanaKeypair, Platform, Pubkey, Signer as _, SolanaClient};
 
 /// The audience the executor asks its token for, and the only one the
 /// attestation guest accepts.
@@ -111,6 +120,50 @@ impl Leaf {
     }
 }
 
+/// One key the instance holds on a Solana cluster, for one of its vaults.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SolanaLeaf {
+    /// The cluster's chain key (`solana:devnet`), where the blessing is sent.
+    pub cluster: String,
+    /// What stands for the cluster in the leaf: `keccak256("solana:" +
+    /// name)`. The vault lives on it.
+    pub cluster_value: [u8; 32],
+    pub vault: Pubkey,
+    pub strategy_hash: [u8; 32],
+    /// The vault's own key, made in the enclave.
+    pub key: Pubkey,
+    /// Whether the key wants blessing.
+    pub due: bool,
+    /// When the cluster last said the key's blessing for this vault and
+    /// bundle runs out; zero until it has said.
+    pub until: u64,
+}
+
+impl SolanaLeaf {
+    /// The Solana registry's leaf for the key: the vault's cluster, the
+    /// vault, the bundle, the cluster it is blessed on and the key, as
+    /// `chain::solana::Platform::vault_leaf` lays them out.
+    pub fn hash(&self) -> B256 {
+        B256::from(chain::solana::programs::common::digest::blessing_leaf(
+            &self.cluster_value,
+            &self.vault.to_bytes(),
+            &self.strategy_hash,
+            &self.cluster_value,
+            &self.key.to_bytes(),
+        ))
+    }
+}
+
+/// The development checker's seal on a Solana cluster: the attestor's
+/// signature over the journal, made for one nonce.
+#[derive(Clone, Debug)]
+struct SolanaDevSeal {
+    nonce: String,
+    issued_at: u64,
+    journal: chain::solana::programs::registry::state::Journal,
+    seal: SolanaSeal,
+}
+
 /// The root key's signer, as a leaf of the tree on the canonical chain.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RootLeaf {
@@ -156,6 +209,10 @@ struct Sealed {
 struct Inner {
     /// By chain and vault, so the tree's order is the same at every look.
     leaves: BTreeMap<(u64, Address), Leaf>,
+    /// By cluster and vault: after the EVM leaves, before the root's.
+    solana_leaves: BTreeMap<(String, Pubkey), SolanaLeaf>,
+    /// The development seal on each Solana cluster, in development mode.
+    solana_dev: BTreeMap<String, SolanaDevSeal>,
     /// The root's signer, while the instance holds the root: the tree's last
     /// leaf.
     root: Option<RootLeaf>,
@@ -181,11 +238,26 @@ pub struct Attestation {
     /// The key the journal names. It identifies the instance and signs
     /// nothing.
     instance: Arc<Key>,
+    /// The instance's Solana key, the token's Solana signer: it too
+    /// identifies the instance and signs nothing.
+    solana_instance: Arc<SolanaKeypair>,
     inner: Arc<Mutex<Inner>>,
     changed: Arc<tokio::sync::Notify>,
     /// The chains served, for simulating a `bless` and for sealing in
     /// development mode.
     chains: Arc<Mutex<BTreeMap<u64, (Client, Deployments)>>>,
+    /// The Solana clusters served, by chain key, with who pays for a
+    /// simulated `bless` there (the keeper, which relays it).
+    solana: Arc<Mutex<BTreeMap<String, SolanaServed>>>,
+}
+
+/// A Solana cluster served.
+#[derive(Clone)]
+pub struct SolanaServed {
+    pub client: SolanaClient,
+    pub platform: Platform,
+    /// The key a simulated `bless` is paid by: the keeper's, which sends it.
+    pub payer: Pubkey,
 }
 
 fn unix_now() -> u64 {
@@ -195,12 +267,17 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// The tree's root over the vault leaves and, last, the root's signer's
-/// leaf, and each leaf's proof, in that order.
-fn tree(leaves: &[Leaf], root: Option<&RootLeaf>) -> (B256, Vec<Vec<B256>>) {
+/// The tree's root over the vault leaves, the Solana vault leaves and, last,
+/// the root's signer's leaf, and each leaf's proof, in that order.
+fn tree_of(
+    leaves: &[Leaf],
+    solana: &[SolanaLeaf],
+    root: Option<&RootLeaf>,
+) -> (B256, Vec<Vec<B256>>) {
     let hashes: Vec<B256> = leaves
         .iter()
         .map(Leaf::hash)
+        .chain(solana.iter().map(SolanaLeaf::hash))
         .chain(root.map(RootLeaf::hash))
         .collect();
     let top = chain::attest::merkle_root(&hashes);
@@ -313,6 +390,8 @@ fn dated(head: u64, floor: u64) -> u64 {
 enum Simulate {
     /// A `bless` of one vault key, the first on its chain.
     Bless(Leaf, Vec<B256>),
+    /// A `bless` of one vault key on a Solana cluster, the first there.
+    SolanaBless(SolanaLeaf, Vec<B256>),
     /// `setRootKey` for the root's signer, on the canonical chain.
     SetRoot(RootLeaf, Vec<B256>),
 }
@@ -498,6 +577,31 @@ pub struct Status {
     /// keeper to relay `setRootKey` with.
     #[serde(default)]
     pub root: Option<RootLeafView>,
+    /// Each Solana cluster's keys, with the journal and seal its registry
+    /// takes.
+    #[serde(default)]
+    pub solana: Vec<SolanaView>,
+}
+
+/// One Solana cluster's part of the status.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct SolanaView {
+    /// The cluster's chain key.
+    pub cluster: String,
+    /// The Solana registry's journal (Borsh, hex), once a seal is held.
+    pub journal: Option<String>,
+    pub seal: Option<SolanaSeal>,
+    pub leaves: Vec<SolanaLeafView>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct SolanaLeafView {
+    pub vault: String,
+    pub strategy_hash: String,
+    pub key: String,
+    pub due: bool,
+    pub leaf: String,
+    pub proof: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -532,10 +636,105 @@ impl Attestation {
         Ok(Attestation {
             mode,
             instance: Arc::new(Key::fresh()?),
+            solana_instance: Arc::new(crate::keys::fresh_solana()?),
             inner: Default::default(),
             changed: Default::default(),
             chains: Default::default(),
+            solana: Default::default(),
         })
+    }
+
+    /// The instance's Solana key: the token's Solana signer.
+    #[cfg(test)]
+    pub fn solana_instance(&self) -> Pubkey {
+        self.solana_instance.pubkey()
+    }
+
+    /// A Solana cluster served: where a `bless` is simulated, and (in
+    /// development mode) where the journal is sealed.
+    pub fn serve_solana(&self, cluster: String, served: SolanaServed) {
+        if let Ok(mut solana) = self.solana.lock() {
+            solana.insert(cluster, served);
+        }
+    }
+
+    /// Hold a key for a Solana vault: its leaf joins the tree, wanting a
+    /// blessing. The same leaf again changes nothing.
+    pub fn put_solana(
+        &self,
+        cluster: &str,
+        cluster_value: [u8; 32],
+        vault: Pubkey,
+        strategy_hash: [u8; 32],
+        key: Pubkey,
+    ) {
+        let mut inner = self.inner();
+        let at = (cluster.to_string(), vault);
+        let same = inner
+            .solana_leaves
+            .get(&at)
+            .is_some_and(|held| held.key == key && held.strategy_hash == strategy_hash);
+        if !same {
+            inner.solana_leaves.insert(
+                at,
+                SolanaLeaf {
+                    cluster: cluster.to_string(),
+                    cluster_value,
+                    vault,
+                    strategy_hash,
+                    key,
+                    due: true,
+                    until: 0,
+                },
+            );
+            self.touched(&mut inner);
+        }
+    }
+
+    /// Let a Solana vault's key go, if it is still `key`'s leaf.
+    pub fn remove_solana(&self, cluster: &str, vault: Pubkey, key: Pubkey) {
+        let mut inner = self.inner();
+        let at = (cluster.to_string(), vault);
+        if inner
+            .solana_leaves
+            .get(&at)
+            .is_some_and(|held| held.key == key)
+        {
+            inner.solana_leaves.remove(&at);
+            self.touched(&mut inner);
+        }
+    }
+
+    /// Note whether a Solana vault's key wants blessing, when the cluster
+    /// says its blessing runs out, and the cluster's TTL.
+    pub fn note_solana(
+        &self,
+        cluster: &str,
+        vault: Pubkey,
+        key: Pubkey,
+        wants: bool,
+        until: u64,
+        ttl: u64,
+    ) {
+        let mut inner = self.inner();
+        if ttl > 0 {
+            inner.ttl = Some(inner.ttl.map_or(ttl, |held| held.min(ttl)));
+        }
+        if let Some(leaf) = inner.solana_leaves.get_mut(&(cluster.to_string(), vault))
+            && leaf.key == key
+        {
+            leaf.until = until;
+            if leaf.due != wants {
+                leaf.due = wants;
+                if wants {
+                    self.changed.notify_one();
+                }
+            }
+        }
+    }
+
+    fn solana_leaves(inner: &Inner) -> Vec<SolanaLeaf> {
+        inner.solana_leaves.values().cloned().collect()
     }
 
     /// The key the journal names.
@@ -727,8 +926,14 @@ impl Attestation {
     fn binding_of(&self, inner: &Inner) -> Binding {
         Binding {
             evm_signer: self.instance.address().into_array(),
-            solana_signer: [0; 32],
-            vaults_root: tree(&Self::leaves(inner), inner.root.as_ref()).0.0,
+            solana_signer: self.solana_instance.pubkey().to_bytes(),
+            vaults_root: tree_of(
+                &Self::leaves(inner),
+                &Self::solana_leaves(inner),
+                inner.root.as_ref(),
+            )
+            .0
+            .0,
         }
     }
 
@@ -756,15 +961,19 @@ impl Attestation {
     pub fn status(&self) -> Status {
         let inner = self.inner();
         let leaves = Self::leaves(&inner);
+        let solana_leaves = Self::solana_leaves(&inner);
         let binding = self.binding_of(&inner);
         let nonce = binding.nonce();
-        let (_, mut proofs) = tree(&leaves, inner.root.as_ref());
+        let (_, mut proofs) = tree_of(&leaves, &solana_leaves, inner.root.as_ref());
         let root_proof = inner.root.as_ref().and_then(|_| proofs.pop());
-        let any_due =
-            leaves.iter().any(|leaf| leaf.due) || inner.root.as_ref().is_some_and(|root| root.due);
+        let solana_proofs = proofs.split_off(leaves.len());
+        let any_due = leaves.iter().any(|leaf| leaf.due)
+            || solana_leaves.iter().any(|leaf| leaf.due)
+            || inner.root.as_ref().is_some_and(|root| root.due);
         let token = inner.token.as_ref().filter(|held| held.nonce == nonce);
         let sealed = inner.sealed.as_ref().filter(|sealed| sealed.nonce == nonce);
         let hex = |bytes: &[u8]| alloy::hex::encode_prefixed(bytes);
+        let solana = self.solana_views(&inner, &nonce, sealed, &solana_leaves, solana_proofs);
         Status {
             mode: match self.mode {
                 Mode::Launcher => "launcher",
@@ -786,8 +995,13 @@ impl Attestation {
             nonce,
             token: token.map(|held| held.token.clone()),
             token_issued_at: token.map(|held| held.issued_at),
-            seal: sealed.map(|sealed| hex(&sealed.seal)),
-            journal: sealed.map(|sealed| hex(&sealed.journal)),
+            seal: sealed
+                .filter(|sealed| !sealed.seal.is_empty())
+                .map(|sealed| hex(&sealed.seal)),
+            journal: sealed
+                .filter(|sealed| !sealed.journal.is_empty())
+                .map(|sealed| hex(&sealed.journal)),
+            solana,
             leaves: leaves
                 .iter()
                 .zip(proofs)
@@ -813,6 +1027,98 @@ impl Attestation {
                     .collect(),
             }),
         }
+    }
+
+    /// Each cluster's keys, and the journal and seal its registry takes for
+    /// the current tree: rebuilt from the prover's seal, or the development
+    /// seal made for the cluster.
+    fn solana_views(
+        &self,
+        inner: &Inner,
+        nonce: &str,
+        sealed: Option<&Sealed>,
+        leaves: &[SolanaLeaf],
+        proofs: Vec<Vec<B256>>,
+    ) -> Vec<SolanaView> {
+        let hex = |bytes: &[u8]| alloy::hex::encode_prefixed(bytes);
+        let mut views: BTreeMap<String, SolanaView> = BTreeMap::new();
+        for (leaf, proof) in leaves.iter().zip(proofs) {
+            let view = views.entry(leaf.cluster.clone()).or_insert_with(|| {
+                let (journal, seal) = match self.mode {
+                    Mode::Launcher => sealed
+                        .and_then(|sealed| SolanaSeal::from_evm(&sealed.journal, &sealed.seal))
+                        .filter(|(journal, _)| journal.signer == self.solana_instance.pubkey())
+                        .map_or((None, None), |(journal, seal)| (Some(journal), Some(seal))),
+                    Mode::Development => inner
+                        .solana_dev
+                        .get(&leaf.cluster)
+                        .filter(|dev| dev.nonce == nonce)
+                        .map_or((None, None), |dev| {
+                            (Some(dev.journal), Some(dev.seal.clone()))
+                        }),
+                };
+                SolanaView {
+                    cluster: leaf.cluster.clone(),
+                    journal: journal.map(|journal| {
+                        hex(
+                            &chain::solana::programs::anchor_lang::AnchorSerialize::try_to_vec(
+                                &journal,
+                            )
+                            .unwrap_or_default(),
+                        )
+                    }),
+                    seal,
+                    leaves: Vec::new(),
+                }
+            });
+            view.leaves.push(SolanaLeafView {
+                vault: leaf.vault.to_string(),
+                strategy_hash: hex(&leaf.strategy_hash),
+                key: leaf.key.to_string(),
+                due: leaf.due,
+                leaf: leaf.hash().to_string(),
+                proof: proof.iter().map(ToString::to_string).collect(),
+            });
+        }
+        views.into_values().collect()
+    }
+
+    /// The Solana clusters with a key that wants blessing.
+    fn clusters_wanting(&self) -> Vec<String> {
+        let inner = self.inner();
+        let mut clusters: Vec<String> = Self::solana_leaves(&inner)
+            .into_iter()
+            .filter(|leaf| leaf.due)
+            .map(|leaf| leaf.cluster)
+            .collect();
+        clusters.dedup();
+        clusters
+    }
+
+    /// Each served cluster's clock, of those named. A cluster whose clock
+    /// couldn't be read is left out.
+    async fn cluster_clocks(&self, clusters: &[String]) -> BTreeMap<String, u64> {
+        let served: Vec<(String, SolanaClient)> = self
+            .solana
+            .lock()
+            .map(|solana| {
+                clusters
+                    .iter()
+                    .filter_map(|cluster| {
+                        solana
+                            .get(cluster)
+                            .map(|served| (cluster.clone(), served.client.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut clocks = BTreeMap::new();
+        for (cluster, client) in served {
+            if let Ok(now) = client.now().await {
+                clocks.insert(cluster, now);
+            }
+        }
+        clocks
     }
 
     /// The chains with a key that wants blessing, or the root's that wants
@@ -861,7 +1167,18 @@ impl Attestation {
     /// Whether something is to be asked for now: a token in launcher mode, a
     /// development seal in development mode. `wall_now` is the wall clock;
     /// `clocks` each chain's own.
+    #[cfg(test)]
     fn wanted(&self, wall_now: u64, clocks: &BTreeMap<u64, u64>) -> bool {
+        self.wanted_with(wall_now, clocks, &BTreeMap::new())
+    }
+
+    /// [`Attestation::wanted`], with each Solana cluster's clock.
+    fn wanted_with(
+        &self,
+        wall_now: u64,
+        clocks: &BTreeMap<u64, u64>,
+        solana_clocks: &BTreeMap<String, u64>,
+    ) -> bool {
         let inner = self.inner();
         if inner
             .changed
@@ -879,7 +1196,7 @@ impl Attestation {
         let nonce = self.binding_of(&inner).nonce();
         // The root's signer wants recording as a key wants blessing: a seal
         // the chain has applied while it still wants it answers nothing.
-        let wanting: Vec<Wanting> = leaves
+        let evm_wanting: Vec<Wanting> = leaves
             .iter()
             .filter(|leaf| leaf.due)
             .map(|leaf| (leaf.chain_id, leaf.until))
@@ -895,20 +1212,50 @@ impl Attestation {
                 until,
             })
             .collect();
+        let mut solana_wanting: BTreeMap<String, Vec<Wanting>> = BTreeMap::new();
+        for leaf in Self::solana_leaves(&inner)
+            .into_iter()
+            .filter(|leaf| leaf.due)
+        {
+            solana_wanting
+                .entry(leaf.cluster.clone())
+                .or_default()
+                .push(Wanting {
+                    chain_now: solana_clocks.get(&leaf.cluster).copied(),
+                    until: leaf.until,
+                });
+        }
         let ttl = inner.ttl.unwrap_or(DEFAULT_TTL);
         let sealed = inner
             .sealed
             .as_ref()
             .map(|sealed| (sealed.nonce.as_str(), sealed.issued_at));
-        let token = match self.mode {
-            Mode::Launcher => inner
-                .token
-                .as_ref()
-                .map(|held| (held.nonce.as_str(), held.issued_at)),
-            // In development mode the seal is made at once: no token waits.
-            Mode::Development => None,
-        };
-        token_wanted(&wanting, &nonce, token, sealed, wall_now, ttl)
+        match self.mode {
+            // One token, and one proof, for every chain.
+            Mode::Launcher => {
+                let wanting: Vec<Wanting> = evm_wanting
+                    .into_iter()
+                    .chain(solana_wanting.into_values().flatten())
+                    .collect();
+                let token = inner
+                    .token
+                    .as_ref()
+                    .map(|held| (held.nonce.as_str(), held.issued_at));
+                token_wanted(&wanting, &nonce, token, sealed, wall_now, ttl)
+            }
+            // A development seal is made at once, on each chain by its own
+            // clock: no token waits.
+            Mode::Development => {
+                token_wanted(&evm_wanting, &nonce, None, sealed, wall_now, ttl)
+                    || solana_wanting.iter().any(|(cluster, wanting)| {
+                        let dev = inner
+                            .solana_dev
+                            .get(cluster)
+                            .map(|dev| (dev.nonce.as_str(), dev.issued_at));
+                        token_wanted(wanting, &nonce, None, dev, wall_now, ttl)
+                    })
+            }
+        }
     }
 
     /// Keep a token, if it is for the current tree.
@@ -941,6 +1288,7 @@ impl Attestation {
     fn check(&self, post: &SealPost) -> Result<(Sealed, Vec<Simulate>), Refusal> {
         let inner = self.inner();
         let leaves = Self::leaves(&inner);
+        let solana_leaves = Self::solana_leaves(&inner);
         let binding = self.binding_of(&inner);
         let nonce = binding.nonce();
         if post.nonce != nonce {
@@ -986,16 +1334,34 @@ impl Attestation {
         {
             return Err(refused("the journal names another image or project"));
         }
-        let (_, mut proofs) = tree(&leaves, inner.root.as_ref());
+        // The Solana registry reads the same proof with the instance's
+        // Solana key after it: it has to be this instance's.
+        if !solana_leaves.is_empty()
+            && SolanaSeal::from_evm(&journal_bytes, &seal)
+                .is_none_or(|(journal, _)| journal.signer != self.solana_instance.pubkey())
+        {
+            return Err(refused("the seal names another Solana key"));
+        }
+        let (_, mut proofs) = tree_of(&leaves, &solana_leaves, inner.root.as_ref());
         let root_proof = inner.root.as_ref().and_then(|_| proofs.pop());
+        let solana_proofs = proofs.split_off(leaves.len());
         let mut simulate: Vec<Simulate> = Vec::new();
         for (leaf, proof) in leaves.iter().zip(proofs) {
             let new_chain = !simulate.iter().any(|done| match done {
                 Simulate::Bless(last, _) => last.chain_id == leaf.chain_id,
-                Simulate::SetRoot(..) => false,
+                _ => false,
             });
             if new_chain {
                 simulate.push(Simulate::Bless(leaf.clone(), proof));
+            }
+        }
+        for (leaf, proof) in solana_leaves.iter().zip(solana_proofs) {
+            let new_cluster = !simulate.iter().any(|done| match done {
+                Simulate::SolanaBless(last, _) => last.cluster == leaf.cluster,
+                _ => false,
+            });
+            if new_cluster {
+                simulate.push(Simulate::SolanaBless(leaf.clone(), proof));
             }
         }
         if let (Some(root), Some(proof)) = (inner.root.as_ref(), root_proof)
@@ -1003,7 +1369,7 @@ impl Attestation {
         {
             simulate.push(Simulate::SetRoot(root.clone(), proof));
         }
-        if leaves.is_empty() && inner.root.is_none() {
+        if leaves.is_empty() && solana_leaves.is_empty() && inner.root.is_none() {
             return Err(refused("the instance holds no key"));
         }
         Ok((
@@ -1031,11 +1397,34 @@ impl Attestation {
         let (sealed, simulate) = self.check(&post)?;
         let blesses = simulate
             .iter()
-            .any(|each| matches!(each, Simulate::Bless(..)));
+            .any(|each| matches!(each, Simulate::Bless(..) | Simulate::SolanaBless(..)));
+        // A Solana cluster is asked through a far less reliable endpoint, and
+        // allows images and checkers through an admin path of its own: one
+        // that can't be asked, or refuses, holds back only its own keys,
+        // whose blessing the keeper simulates again before it relays one. The
+        // seal is refused over Solana only when nothing in the tree would
+        // land anywhere with it: no key blessed, and no root recorded.
+        let mut sealable = false;
+        let mut solana_refused = None;
         for each in simulate {
             let chain_id = match &each {
                 Simulate::Bless(leaf, _) => leaf.chain_id,
                 Simulate::SetRoot(root, _) => root.chain_id,
+                Simulate::SolanaBless(leaf, proof) => {
+                    match self.simulate_solana(&sealed, leaf, proof).await {
+                        Ok(()) => sealable = true,
+                        Err(refusal) => {
+                            tracing::warn!(
+                                cluster = leaf.cluster,
+                                vault = %leaf.vault,
+                                why = ?refusal,
+                                "a simulated bless on this cluster did not go through; its keys wait for the keeper's own simulation or a later seal"
+                            );
+                            solana_refused.get_or_insert(refusal);
+                        }
+                    }
+                    continue;
+                }
             };
             let chain = self
                 .chains
@@ -1073,6 +1462,7 @@ impl Attestation {
                         .await
                         .map(|_| ()),
                 ),
+                Simulate::SolanaBless(..) => continue,
                 Simulate::SetRoot(root, proof) => (
                     "setRootKey",
                     client
@@ -1106,8 +1496,61 @@ impl Attestation {
                     Refusal::Unavailable(why)
                 });
             }
+            // Something in the tree lands with this seal: a key blessed, or
+            // the root recorded.
+            sealable = true;
+        }
+        if let Some(refusal) = solana_refused
+            && !sealable
+        {
+            return Err(refusal);
         }
         self.keep(sealed)
+    }
+
+    /// Simulate a `bless` of one Solana leaf with the seal, as the keeper
+    /// would send it on that cluster.
+    async fn simulate_solana(
+        &self,
+        sealed: &Sealed,
+        leaf: &SolanaLeaf,
+        proof: &[B256],
+    ) -> Result<(), Refusal> {
+        let served = self
+            .solana
+            .lock()
+            .ok()
+            .and_then(|solana| solana.get(&leaf.cluster).cloned())
+            .ok_or_else(|| Refusal::Unavailable(format!("{} is not connected", leaf.cluster)))?;
+        let (journal, seal) =
+            SolanaSeal::from_evm(&sealed.journal, &sealed.seal).ok_or_else(|| {
+                Refusal::Journal("the seal is not one the Solana checker reads".into())
+            })?;
+        let key_leaf = KeyLeaf {
+            vault_chain: leaf.cluster_value,
+            vault: leaf.vault.to_bytes(),
+            strategy_hash: leaf.strategy_hash,
+            key: leaf.key,
+            proof: proof.iter().map(|hash| hash.0).collect(),
+        };
+        served
+            .platform
+            .simulate_bless(&served.client, &served.payer, &journal, &seal, &key_leaf)
+            .await
+            .map_err(|error| {
+                let why = format!("{error:#}");
+                if error
+                    .downcast_ref::<chain::solana::TransactionFailed>()
+                    .is_some()
+                {
+                    Refusal::Journal(format!(
+                        "a simulated bless fails on {}: {why}",
+                        leaf.cluster
+                    ))
+                } else {
+                    Refusal::Unavailable(why)
+                }
+            })
     }
 
     fn keep(&self, sealed: Sealed) -> Result<(), Refusal> {
@@ -1125,46 +1568,118 @@ impl Attestation {
     }
 
     /// Seal the journal with the attestor role, as the development checker
-    /// trusts, dated by the served chains' clocks.
+    /// trusts, dated by the served chains' and clusters' clocks: on each EVM
+    /// chain the EVM journal, and on each Solana cluster with a key the
+    /// Solana journal, signed by that cluster's attestor role.
     async fn seal_development(&self) -> Result<()> {
         let chains: Vec<(Client, Deployments)> = self
             .chains
             .lock()
             .map(|chains| chains.values().cloned().collect())
             .unwrap_or_default();
-        let Some((first, deployments)) = chains.first().cloned() else {
-            bail!("no chain is connected");
+        let clusters: Vec<String> = {
+            let inner = self.inner();
+            let mut named: Vec<String> = Self::solana_leaves(&inner)
+                .into_iter()
+                .map(|leaf| leaf.cluster)
+                .collect();
+            named.dedup();
+            named
         };
+        let solana: Vec<(String, SolanaServed)> = self
+            .solana
+            .lock()
+            .map(|solana| {
+                clusters
+                    .iter()
+                    .filter_map(|cluster| {
+                        solana
+                            .get(cluster)
+                            .map(|served| (cluster.clone(), served.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if chains.is_empty() && solana.is_empty() {
+            bail!("no chain is connected");
+        }
+        // Each chain's journal is dated by its own clock: a development
+        // cluster's runs fast, and an EVM chain's doesn't.
         let mut head = u64::MAX;
         for (client, _) in &chains {
             head = head.min(client.block_timestamp().await?);
         }
         let floor = self.inner().dated_after;
-        let issued_at = dated(head, floor);
+        let issued_at = if chains.is_empty() {
+            0
+        } else {
+            dated(head, floor)
+        };
         let (nonce, root) = {
             let inner = self.inner();
             let binding = self.binding_of(&inner);
             (binding.nonce(), B256::from(binding.vaults_root))
         };
-        let journal = Journal {
-            image_digest: chain::attest::image_digest("executor"),
-            project_id: chain::attest::project_id(),
-            signer: self.instance.address(),
-            vaults_root: root,
-            issued_at,
+        let (seal, journal) = match chains.first() {
+            Some((first, deployments)) => {
+                let journal = Journal {
+                    image_digest: chain::attest::image_digest("executor"),
+                    project_id: chain::attest::project_id(),
+                    signer: self.instance.address(),
+                    vaults_root: root,
+                    issued_at,
+                }
+                .encode();
+                let seal = first
+                    .sign(deployments.roles.attestor, keccak256(&journal))
+                    .await
+                    .context("sealing the journal with the attestor role")?;
+                (seal, Bytes::from(journal))
+            }
+            None => (Bytes::new(), Bytes::new()),
+        };
+        let mut dev = BTreeMap::new();
+        for (cluster, served) in solana {
+            let issued_at = dated(served.client.now().await?, 0);
+            let journal = chain::solana::programs::registry::state::Journal {
+                image_digest: chain::solana::platform::image_digest("executor"),
+                project_id: chain::solana::platform::project_id(),
+                signer: self.solana_instance.pubkey(),
+                vaults_root: root.0,
+                issued_at,
+            };
+            let attestor = served.client.role(chain::Role::Attestor).with_context(|| {
+                format!("no attestor key to seal the journal with on {cluster}")
+            })?;
+            let bytes =
+                chain::solana::programs::anchor_lang::AnchorSerialize::try_to_vec(&journal)?;
+            let message = chain::solana::programs::dev_verifier::attestation_digest(
+                &served.platform.cluster,
+                &bytes,
+            );
+            let signature = attestor.sign_message(&message);
+            dev.insert(
+                cluster,
+                SolanaDevSeal {
+                    nonce: nonce.clone(),
+                    issued_at,
+                    journal,
+                    seal: SolanaSeal::Development {
+                        attestor: attestor.pubkey().to_string(),
+                        signature: alloy::hex::encode_prefixed(signature.as_ref()),
+                    },
+                },
+            );
         }
-        .encode();
-        let seal = first
-            .sign(deployments.roles.attestor, keccak256(&journal))
-            .await
-            .context("sealing the journal with the attestor role")?;
         self.keep(Sealed {
             nonce,
             seal,
-            journal: journal.into(),
+            journal,
             issued_at,
         })
-        .map_err(|_| anyhow!("the tree moved while the journal was sealed"))
+        .map_err(|_| anyhow!("the tree moved while the journal was sealed"))?;
+        self.inner().solana_dev.extend(dev);
+        Ok(())
     }
 
     /// Ask for a token (or, in development mode, seal) whenever the tree
@@ -1184,11 +1699,13 @@ impl Attestation {
                 continue;
             }
             let wanting = self.chains_wanting();
-            if wanting.is_empty() {
+            let clusters = self.clusters_wanting();
+            if wanting.is_empty() && clusters.is_empty() {
                 continue;
             }
             let clocks = self.chain_clocks(&wanting).await;
-            if !self.wanted(unix_now(), &clocks) {
+            let solana_clocks = self.cluster_clocks(&clusters).await;
+            if !self.wanted_with(unix_now(), &clocks, &solana_clocks) {
                 continue;
             }
             let done = match self.mode {
@@ -1344,6 +1861,173 @@ mod tests {
             status.binding.evm_signer,
             attestation.instance().to_string().to_lowercase()
         );
+    }
+
+    fn solana_key(n: u8) -> Pubkey {
+        Pubkey::new_from_array([n; 32])
+    }
+
+    #[test]
+    fn a_solana_key_s_leaf_is_the_solana_registry_s_and_proves_under_the_one_bound_root() {
+        let attestation = with(&[leaf(31337, 0x11, 0xa1)]);
+        let devnet = chain::solana::programs::common::digest::cluster_value("devnet");
+        attestation.put_solana(
+            "solana:devnet",
+            devnet,
+            solana_key(1),
+            [7; 32],
+            solana_key(2),
+        );
+        attestation.put_solana(
+            "solana:devnet",
+            devnet,
+            solana_key(3),
+            [8; 32],
+            solana_key(4),
+        );
+        let status = attestation.status();
+        let root: B256 = status.binding.vaults_root.parse().unwrap();
+        assert_eq!(status.leaves.len(), 1);
+        assert_eq!(status.solana.len(), 1);
+        let cluster = &status.solana[0];
+        assert_eq!(cluster.cluster, "solana:devnet");
+        assert_eq!(cluster.leaves.len(), 2);
+        for view in &cluster.leaves {
+            let key: Pubkey = view.key.parse().unwrap();
+            let vault: Pubkey = view.vault.parse().unwrap();
+            let bundle: [u8; 32] = alloy::hex::decode(&view.strategy_hash)
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let expected = B256::from(chain::solana::programs::common::digest::blessing_leaf(
+                &devnet,
+                &vault.to_bytes(),
+                &bundle,
+                &devnet,
+                &key.to_bytes(),
+            ));
+            assert_eq!(view.leaf.parse::<B256>().unwrap(), expected);
+            let proof: Vec<B256> = view
+                .proof
+                .iter()
+                .map(|node| node.parse().unwrap())
+                .collect();
+            assert!(verifies(&proof, root, expected));
+        }
+        // The EVM leaf still proves under the same root.
+        let proof: Vec<B256> = status.leaves[0]
+            .proof
+            .iter()
+            .map(|node| node.parse().unwrap())
+            .collect();
+        assert!(verifies(
+            &proof,
+            root,
+            status.leaves[0].leaf.parse().unwrap()
+        ));
+        // The token's Solana signer is the instance's own Solana key.
+        assert_eq!(
+            status.binding.solana_signer,
+            alloy::hex::encode_prefixed(attestation.solana_instance().to_bytes())
+        );
+    }
+
+    #[test]
+    fn a_solana_key_let_go_leaves_the_tree_and_a_new_key_moves_it() {
+        let attestation = with(&[leaf(31337, 0x11, 0xa1)]);
+        let before = attestation.binding().vaults_root;
+        let devnet = chain::solana::programs::common::digest::cluster_value("devnet");
+        attestation.put_solana(
+            "solana:devnet",
+            devnet,
+            solana_key(1),
+            [7; 32],
+            solana_key(2),
+        );
+        let with_solana = attestation.binding().vaults_root;
+        assert_ne!(before, with_solana);
+        attestation.put_solana(
+            "solana:devnet",
+            devnet,
+            solana_key(1),
+            [7; 32],
+            solana_key(2),
+        );
+        assert_eq!(attestation.binding().vaults_root, with_solana);
+        // Another key's leaf is not let go by a stale one.
+        attestation.remove_solana("solana:devnet", solana_key(1), solana_key(9));
+        assert_eq!(attestation.binding().vaults_root, with_solana);
+        attestation.put_solana(
+            "solana:devnet",
+            devnet,
+            solana_key(1),
+            [7; 32],
+            solana_key(5),
+        );
+        assert_ne!(attestation.binding().vaults_root, with_solana);
+        attestation.remove_solana("solana:devnet", solana_key(1), solana_key(5));
+        assert_eq!(attestation.binding().vaults_root, before);
+    }
+
+    #[test]
+    fn the_solana_journal_and_seal_are_the_proof_s_for_this_instance_alone() {
+        let attestation = Attestation::new(Mode::Launcher).unwrap();
+        let devnet = chain::solana::programs::common::digest::cluster_value("devnet");
+        attestation.put_solana(
+            "solana:devnet",
+            devnet,
+            solana_key(1),
+            [7; 32],
+            solana_key(2),
+        );
+        let nonce = attestation.binding().nonce();
+        attestation.hold(token(&nonce, NOW)).unwrap();
+        let journal = journal_for(&attestation, NOW);
+        // A seal naming another Solana key after it is refused.
+        let mut seal = vec![7u8; 260];
+        seal.extend_from_slice(&[9u8; 32]);
+        seal.extend_from_slice(&[5u8; 32]);
+        let refused = attestation.check(&SealPost {
+            nonce: nonce.clone(),
+            seal: alloy::hex::encode_prefixed(&seal),
+            journal: alloy::hex::encode_prefixed(journal.encode()),
+        });
+        assert!(matches!(refused, Err(Refusal::Journal(_))));
+        // The instance's own: kept, and published in the Solana registry's
+        // layout, simulated on the cluster first.
+        seal[260..292].copy_from_slice(&attestation.solana_instance().to_bytes());
+        let (sealed, simulate) = attestation
+            .check(&SealPost {
+                nonce,
+                seal: alloy::hex::encode_prefixed(&seal),
+                journal: alloy::hex::encode_prefixed(journal.encode()),
+            })
+            .unwrap();
+        assert!(
+            simulate
+                .iter()
+                .any(|each| matches!(each, Simulate::SolanaBless(..)))
+        );
+        attestation.keep(sealed).unwrap();
+        let status = attestation.status();
+        let cluster = &status.solana[0];
+        let solana_journal = alloy::hex::decode(cluster.journal.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            &solana_journal[64..96],
+            attestation.solana_instance().as_ref()
+        );
+        assert_eq!(
+            &solana_journal[96..128],
+            attestation.binding().vaults_root.as_slice()
+        );
+        assert_eq!(&solana_journal[128..136], &NOW.to_le_bytes());
+        let Some(SolanaSeal::Proof { seal: published }) = &cluster.seal else {
+            panic!("a proof");
+        };
+        let published = alloy::hex::decode(published).unwrap();
+        assert_eq!(&published[..260], &seal[..260]);
+        assert_eq!(&published[260..280], attestation.instance().as_slice());
+        assert_eq!(&published[280..], &seal[292..]);
     }
 
     #[test]
@@ -2152,5 +2836,176 @@ mod tests {
         assert_eq!(asked["nonces"], serde_json::json!([nonce]));
         assert_eq!(attestation.status().token_issued_at, Some(NOW));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Solana node that names devnet's genesis and answers everything else
+    /// with HTTP 429, as a public endpoint does under its rate limit.
+    async fn rate_limited_devnet() -> (SolanaClient, crate::AbortOnDrop) {
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(
+                |axum::Json(request): axum::Json<serde_json::Value>| async move {
+                    let id = request["id"].clone();
+                    match request["method"].as_str().unwrap_or_default() {
+                        "getGenesisHash" => (
+                            StatusCode::OK,
+                            axum::Json(serde_json::json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "result": "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
+                            })),
+                        ),
+                        _ => (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            axum::Json(serde_json::json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "error": {"code": 429, "message": "Too many requests"}
+                            })),
+                        ),
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = crate::AbortOnDrop(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let key: chain::ChainKey = "solana:devnet".parse().unwrap();
+        let config: chain::ChainConfig = serde_json::from_value(serde_json::json!({
+            "label": "Solana devnet (stand-in)",
+            "rpc": url,
+            "dollar": "4Gw9TmkKDvnGtBcMpJwR4rRDEWc6KVujegc1j4ebtHTK",
+        }))
+        .unwrap();
+        (
+            SolanaClient::connect_with(&key, &config, None)
+                .await
+                .unwrap(),
+            server,
+        )
+    }
+
+    fn devnet_platform() -> Platform {
+        Platform {
+            cluster_name: "devnet".into(),
+            cluster: chain::solana::programs::common::digest::cluster_value("devnet"),
+            mint: Pubkey::new_from_array([1; 32]),
+            admin: Pubkey::new_from_array([2; 32]),
+            platform: Pubkey::new_from_array([3; 32]),
+            operator: Pubkey::new_from_array([4; 32]),
+            checker: None,
+        }
+    }
+
+    /// An instance holding a key on devnet, served by a node that can't be
+    /// asked, and a token held for its tree.
+    async fn with_devnet_key_unreachable(
+        attestation: &Attestation,
+    ) -> (String, crate::AbortOnDrop) {
+        let devnet = chain::solana::programs::common::digest::cluster_value("devnet");
+        attestation.put_solana(
+            "solana:devnet",
+            devnet,
+            Pubkey::new_from_array([0x21; 32]),
+            [7; 32],
+            Pubkey::new_from_array([0x22; 32]),
+        );
+        let nonce = attestation.binding().nonce();
+        attestation.hold(token(&nonce, NOW)).unwrap();
+        let (client, server) = rate_limited_devnet().await;
+        attestation.serve_solana(
+            "solana:devnet".into(),
+            SolanaServed {
+                client,
+                platform: devnet_platform(),
+                payer: Pubkey::new_from_array([9; 32]),
+            },
+        );
+        (nonce, server)
+    }
+
+    /// The prover's seal for the instance: the Groth16 seal, then this
+    /// instance's Solana key and the Google key's hash.
+    fn seal_post(attestation: &Attestation, nonce: String) -> SealPost {
+        let journal = journal_for(attestation, NOW);
+        let mut seal = vec![7u8; 260];
+        seal.extend_from_slice(&attestation.solana_instance().to_bytes());
+        seal.extend_from_slice(&[5u8; 32]);
+        SealPost {
+            nonce,
+            seal: alloy::hex::encode_prefixed(&seal),
+            journal: alloy::hex::encode_prefixed(journal.encode()),
+        }
+    }
+
+    /// A seal the canonical chain would record the root from is kept while
+    /// a Solana cluster the instance also holds keys on can't be asked: a
+    /// cluster holds back its own keys, never the root.
+    #[tokio::test]
+    async fn a_seal_recording_the_root_is_kept_while_a_solana_cluster_cannot_be_asked() {
+        let attestation = Attestation::new(Mode::Launcher).unwrap();
+        attestation.put_root(31337, Address::repeat_byte(0x7e));
+        let (nonce, _devnet) = with_devnet_key_unreachable(&attestation).await;
+        let (node, asked) = bless_node(31337, false).await;
+        attestation.serve_chain(node, crate::stand_in::deployments());
+
+        let accepted = attestation.accept(seal_post(&attestation, nonce)).await;
+        assert_eq!(accepted, Ok(()));
+        assert!(attestation.status().seal.is_some());
+        assert_eq!(
+            *asked.lock().unwrap(),
+            1,
+            "recording the root was not simulated"
+        );
+
+        // Nothing in the tree would land anywhere: the root would not be
+        // recorded either, so the cluster's refusal stands.
+        let attestation = Attestation::new(Mode::Launcher).unwrap();
+        attestation.put_root(31337, Address::repeat_byte(0x7e));
+        let (nonce, _devnet) = with_devnet_key_unreachable(&attestation).await;
+        let (node, _) = bless_node(31337, true).await;
+        attestation.serve_chain(node, crate::stand_in::deployments());
+        let accepted = attestation.accept(seal_post(&attestation, nonce)).await;
+        assert!(
+            matches!(accepted, Err(Refusal::Unavailable(_))),
+            "{accepted:?}"
+        );
+        assert!(attestation.status().seal.is_none());
+    }
+
+    /// A seal every EVM chain accepts blesses the EVM vault keys even while
+    /// a Solana cluster the instance also holds a key on can't be asked: a
+    /// cluster holds back its own keys, never another chain's.
+    #[tokio::test]
+    async fn a_seal_every_evm_chain_accepts_is_kept_while_a_solana_cluster_cannot_be_asked() {
+        let attestation = Attestation::new(Mode::Launcher).unwrap();
+        attestation.put(
+            31337,
+            Address::repeat_byte(0x11),
+            B256::repeat_byte(0x5b),
+            Address::repeat_byte(0xa1),
+        );
+        let (nonce, _devnet) = with_devnet_key_unreachable(&attestation).await;
+        let (node, evm_asked) = bless_node(31337, false).await;
+        attestation.serve_chain(node, crate::stand_in::deployments());
+
+        let accepted = attestation.accept(seal_post(&attestation, nonce)).await;
+        assert_eq!(accepted, Ok(()));
+        assert!(attestation.status().seal.is_some());
+        assert_eq!(*evm_asked.lock().unwrap(), 1);
+    }
+
+    /// With keys on Solana alone, a cluster that can't be asked leaves the
+    /// seal unproven by any chain, so it is refused.
+    #[tokio::test]
+    async fn a_seal_for_solana_keys_alone_is_refused_while_their_cluster_cannot_be_asked() {
+        let attestation = Attestation::new(Mode::Launcher).unwrap();
+        let (nonce, _devnet) = with_devnet_key_unreachable(&attestation).await;
+        let refused = attestation.accept(seal_post(&attestation, nonce)).await;
+        assert!(
+            matches!(refused, Err(Refusal::Unavailable(_))),
+            "{refused:?}"
+        );
+        assert!(attestation.status().seal.is_none());
     }
 }

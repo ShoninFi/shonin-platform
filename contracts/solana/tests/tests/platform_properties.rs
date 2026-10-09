@@ -307,7 +307,13 @@ fn a_blessing_is_granted_exactly_as_the_rules_say_and_only_moves_later() {
         } else {
             (now + HOUR).saturating_sub(rng.below(101 * HOUR))
         };
-        let leaf = blessing_leaf(&vault_chain, &vault, &strategy_hash, &cluster);
+        let leaf = blessing_leaf(
+            &vault_chain,
+            &vault,
+            &strategy_hash,
+            &cluster,
+            &signer.to_bytes(),
+        );
         let journal = Journal {
             image_digest: image,
             project_id: if project_ok {
@@ -334,8 +340,6 @@ fn a_blessing_is_granted_exactly_as_the_rules_say_and_only_moves_later() {
             let known = env.key_info(&signer);
             if if one_vault { target != 1 } else { target != 0 } {
                 registry_error(RegistryError::WrongKindForVault)
-            } else if !honest_root {
-                registry_error(RegistryError::NotAmongTheVaults)
             } else if issued_at > now || issued_at + BLESSING_TTL <= now {
                 registry_error(RegistryError::Stale)
             } else if known.is_some_and(|key| {
@@ -343,6 +347,9 @@ fn a_blessing_is_granted_exactly_as_the_rules_say_and_only_moves_later() {
                     && (key.image_digest != image || key.project_id != project())
             }) {
                 registry_error(RegistryError::NotThisInstance)
+            } else if !honest_root {
+                // The leaf is checked last: every other refusal comes first.
+                registry_error(RegistryError::NotAmongTheVaults)
             } else {
                 0
             }

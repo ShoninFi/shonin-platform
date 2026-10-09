@@ -45,18 +45,19 @@ pub enum ImageKind {
 }
 
 /// What an instance attests to. The proof is over these bytes, Borsh-encoded:
-/// the image digest (32), the project id (32), the key it generated (32), the
+/// the image digest (32), the project id (32), the instance's key (32), the
 /// root of its leaves (32) and when it attested (u64, little-endian): 136
 /// bytes.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Journal {
     pub image_digest: [u8; 32],
     pub project_id: [u8; 32],
-    /// The ed25519 key generated inside the instance.
+    /// The instance's own ed25519 key, generated inside it: it names the
+    /// instance, and is blessed for nothing unless a leaf names it.
     pub signer: Pubkey,
-    /// The root of the (vault chain, vault, bundle, chain) leaves this
-    /// instance holds keys for. A builder or a reviewer commits to the leaf
-    /// with no vault, for each chain it serves.
+    /// The root of the (vault chain, vault, bundle, chain, key) leaves of the
+    /// keys this instance holds. A builder or a reviewer commits to the leaf
+    /// with no vault and its own key, for each chain it serves.
     pub vaults_root: [u8; 32],
     /// When the instance attested. A blessing lasts a TTL from here.
     pub issued_at: u64,
@@ -156,6 +157,20 @@ impl Config {
     /// When something proposed at `now` becomes ready.
     pub fn ready_at(&self, now: u64) -> Option<u64> {
         now.checked_add(self.timelock(now))
+    }
+
+    /// Whether checker `a` was proposed after checker `b`, both still on the
+    /// list (one retired is never newer, and nothing is newer than it).
+    pub fn is_newer(&self, a: &Pubkey, b: &Pubkey) -> bool {
+        let place = |state: &Pubkey| {
+            self.verifiers
+                .iter()
+                .position(|entry| &entry.state == state)
+        };
+        match (place(a), place(b)) {
+            (Some(a), Some(b)) => a > b,
+            _ => false,
+        }
     }
 
     /// Whether the checker named by its state account is allowed at `now`.

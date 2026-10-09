@@ -20,7 +20,11 @@ fn bundle() -> [u8; 32] {
 
 /// Blesses `signer` as an executor for the test vault, sealed by `attestor`.
 fn bless_executor(env: &mut Env, attestor: &Keypair, signer: Pubkey) -> TxResult {
-    let journal = env.journal_for(executor_image(), signer, env.leaf_for(vault(), bundle()));
+    let journal = env.journal_for(
+        executor_image(),
+        signer,
+        env.leaf_for(vault(), bundle(), signer),
+    );
     let payer = env.payer.insecure_clone();
     let cluster = env.cluster();
     env.bless_by(
@@ -52,7 +56,7 @@ fn a_new_checker_waits_out_the_timelock_and_the_old_one_keeps_working() {
     assert!(!env.is_verifier_allowed(&second));
 
     let next = Keypair::new().pubkey();
-    let journal = env.journal_for(builder_image(), next, env.service_leaf());
+    let journal = env.journal_for(builder_image(), next, env.service_leaf(next));
     let payer = env.payer.insecure_clone();
     expect_code(
         env.bless_by(
@@ -68,7 +72,7 @@ fn a_new_checker_waits_out_the_timelock_and_the_old_one_keeps_working() {
     );
 
     env.skip(TIMELOCK);
-    let journal = env.journal_for(builder_image(), next, env.service_leaf());
+    let journal = env.journal_for(builder_image(), next, env.service_leaf(next));
     expect_ok(env.bless_by(
         &payer,
         &second_key,
@@ -91,7 +95,8 @@ fn retiring_a_checker_is_immediate() {
     let first = env.checker;
     expect_ok(env.retire_verifier(first));
     assert!(!env.is_verifier_allowed(&first));
-    let journal = env.journal_for(builder_image(), Keypair::new().pubkey(), env.service_leaf());
+    let key = Keypair::new().pubkey();
+    let journal = env.journal_for(builder_image(), key, env.service_leaf(key));
     expect_code(
         env.bless(&journal, [0; 32], [0; 32], [0; 32], vec![]),
         registry_error(RegistryError::ProofRejected),
@@ -274,7 +279,7 @@ fn checkers_are_asked_newest_first_and_none_can_be_skipped() {
     let second = env.propose_checker(env.attestor.pubkey());
     env.skip(TIMELOCK);
     let key = Keypair::new().pubkey();
-    let journal = env.journal_for(builder_image(), key, env.service_leaf());
+    let journal = env.journal_for(builder_image(), key, env.service_leaf(key));
     let attestor = env.attestor.insecure_clone();
     let (seal, ed25519) = env.seal(&attestor, &journal);
     let payer = env.payer.insecure_clone();
@@ -331,7 +336,7 @@ fn checkers_are_asked_newest_first_and_none_can_be_skipped() {
 fn a_blessing_asks_at_least_one_checker() {
     let mut env = Env::new();
     let key = Keypair::new().pubkey();
-    let journal = env.journal_for(builder_image(), key, env.service_leaf());
+    let journal = env.journal_for(builder_image(), key, env.service_leaf(key));
     let attestor = env.attestor.insecure_clone();
     let (_, ed25519) = env.seal(&attestor, &journal);
     let payer = env.payer.insecure_clone();
@@ -352,6 +357,7 @@ fn a_blessing_asks_at_least_one_checker() {
         vault_chain: [0; 32],
         vault: [0; 32],
         strategy_hash: [0; 32],
+        key,
         merkle_proof: vec![],
         verifier_accounts: vec![],
     }
@@ -394,7 +400,11 @@ fn a_proof_the_new_checker_accepts_can_be_re_blessed_after_the_old_one_retires()
     let mut env = Env::new();
     let executor = env.executor.pubkey();
     let attestor = env.attestor.insecure_clone();
-    let journal = env.journal_for(executor_image(), executor, env.leaf_for(vault(), bundle()));
+    let journal = env.journal_for(
+        executor_image(),
+        executor,
+        env.leaf_for(vault(), bundle(), executor),
+    );
     let cluster = env.cluster();
     expect_ok(env.bless(&journal, cluster, vault(), bundle(), vec![]));
     env.propose_checker(attestor.pubkey());
@@ -477,7 +487,7 @@ fn retiring_a_checker_stops_the_service_keys_it_blessed() {
     let checker = env.propose_checker(leaked.pubkey());
     env.skip(TIMELOCK);
     let forged = Keypair::new().pubkey();
-    let journal = env.journal_for(builder_image(), forged, env.service_leaf());
+    let journal = env.journal_for(builder_image(), forged, env.service_leaf(forged));
     let payer = env.payer.insecure_clone();
     expect_ok(env.bless_by(&payer, &leaked, &journal, [0; 32], [0; 32], [0; 32], vec![]));
     assert!(env.is_blessed_as(&forged, ImageKind::Builder));
@@ -501,12 +511,20 @@ fn an_older_seal_cannot_shorten_a_revived_blessing() {
     env.skip(TIMELOCK);
     let executor = env.executor.pubkey();
     let cluster = env.cluster();
-    let old = env.journal_for(executor_image(), executor, env.leaf_for(vault(), bundle()));
+    let old = env.journal_for(
+        executor_image(),
+        executor,
+        env.leaf_for(vault(), bundle(), executor),
+    );
     expect_ok(env.bless(&old, cluster, vault(), bundle(), vec![]));
     let old_until = env.now() + BLESSING_TTL;
 
     env.skip(DAY);
-    let fresh = env.journal_for(executor_image(), executor, env.leaf_for(vault(), bundle()));
+    let fresh = env.journal_for(
+        executor_image(),
+        executor,
+        env.leaf_for(vault(), bundle(), executor),
+    );
     expect_ok(env.bless(&fresh, cluster, vault(), bundle(), vec![]));
     let fresh_until = env.now() + BLESSING_TTL;
     // Recorded against the newest checker.
@@ -535,11 +553,19 @@ fn a_strangers_revival_with_an_older_seal_is_overtaken_by_the_newer_one() {
     env.skip(TIMELOCK);
     let executor = env.executor.pubkey();
     let cluster = env.cluster();
-    let old = env.journal_for(executor_image(), executor, env.leaf_for(vault(), bundle()));
+    let old = env.journal_for(
+        executor_image(),
+        executor,
+        env.leaf_for(vault(), bundle(), executor),
+    );
     expect_ok(env.bless(&old, cluster, vault(), bundle(), vec![]));
     let old_until = env.now() + BLESSING_TTL;
     env.skip(DAY);
-    let fresh = env.journal_for(executor_image(), executor, env.leaf_for(vault(), bundle()));
+    let fresh = env.journal_for(
+        executor_image(),
+        executor,
+        env.leaf_for(vault(), bundle(), executor),
+    );
     expect_ok(env.bless(&fresh, cluster, vault(), bundle(), vec![]));
     let fresh_until = env.now() + BLESSING_TTL;
     expect_ok(env.retire_verifier(second));
@@ -565,14 +591,18 @@ fn key_info_follows_the_latest_blessing_even_through_a_retirement() {
     let cluster = env.cluster();
     let other = hash("other vault");
     let (root, _proof_a, proof_b) = pair(
-        env.leaf_for(vault(), bundle()),
-        env.leaf_for(other, bundle()),
+        env.leaf_for(vault(), bundle(), executor),
+        env.leaf_for(other, bundle(), executor),
     );
     let journal = env.journal_for(executor_image(), executor, root);
     expect_ok(env.bless(&journal, cluster, other, bundle(), proof_b.clone()));
 
     env.skip(DAY);
-    let fresh = env.journal_for(executor_image(), executor, env.leaf_for(vault(), bundle()));
+    let fresh = env.journal_for(
+        executor_image(),
+        executor,
+        env.leaf_for(vault(), bundle(), executor),
+    );
     expect_ok(env.bless(&fresh, cluster, vault(), bundle(), vec![]));
     assert_eq!(env.key_info(&executor).unwrap().vault, vault());
 

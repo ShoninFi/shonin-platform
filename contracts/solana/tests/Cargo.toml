@@ -15,6 +15,7 @@ litesvm = "0.7"
 shonin-common = { workspace = true }
 shonin-registry = { path = "../programs/shonin-registry", features = ["no-entrypoint"] }
 shonin-dev-verifier = { path = "../programs/shonin-dev-verifier", features = ["no-entrypoint"] }
+shonin-cs-verifier = { path = "../programs/shonin-cs-verifier", features = ["no-entrypoint"] }
 shonin-publishing = { path = "../programs/shonin-publishing", features = ["no-entrypoint"] }
 shonin-prices = { path = "../programs/shonin-prices", features = ["no-entrypoint"] }
 shonin-profiles = { path = "../programs/shonin-profiles", features = ["no-entrypoint"] }

@@ -97,6 +97,16 @@ pub async fn keep_chain(served: SolanaServed, executor: String) {
     };
     tracing::info!(chain = %served.key, keeper = %keeper.pubkey(), "the keeper is up");
     chain_kept(chain, |kept| kept.connected = Some(Instant::now()));
+    // The executor's keys on this cluster: blessings relayed, lamports
+    // given once the registry vouches for a key.
+    let keys = tokio::spawn(crate::solana_keys::keep_keys(
+        served.client.clone(),
+        served.platform.clone(),
+        served.key.to_string(),
+        keeper.insecure_clone(),
+        executor.clone(),
+    ));
+    let _keys = Aborting(keys);
     let keeping = Keeping {
         client: served.client.clone(),
         platform: served.platform.clone(),
@@ -128,6 +138,15 @@ pub async fn keep_chain(served: SolanaServed, executor: String) {
             }
         }
         tokio::time::sleep(ROUND_PAUSE).await;
+    }
+}
+
+/// Aborts the task when dropped.
+struct Aborting(tokio::task::JoinHandle<()>);
+
+impl Drop for Aborting {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

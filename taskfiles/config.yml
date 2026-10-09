@@ -252,3 +252,4 @@ vars:
   GCP_SECRET_TESTNET_KEEPER_KEY: "shonin-testnet-keeper-key"
   GCP_SECRET_TESTNET_KEEPER_SOLANA_KEY: "shonin-testnet-keeper-solana-key"
   GCP_SECRET_TESTNET_TUNNEL_TOKEN: "shonin-testnet-tunnel-token"
+  GCP_SECRET_TESTNET_RPC: "shonin-testnet-rpc"

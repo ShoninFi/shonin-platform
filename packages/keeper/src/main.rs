@@ -5423,6 +5423,7 @@ async fn serve_status(address: SocketAddr) {
 mod attest;
 mod delayed;
 mod solana;
+mod solana_keys;
 
 #[cfg(test)]
 mod stand_in;

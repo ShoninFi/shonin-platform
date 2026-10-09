@@ -1,0 +1,38 @@
+[package]
+name = "shonin-cs-verifier"
+version = "0.1.0"
+description = "Checks a zero-knowledge proof of a genuine Google Confidential Space attestation token"
+edition = "2021"
+license = "BUSL-1.1"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "shonin_cs_verifier"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build"]
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+# Build with the committed mainnet id (mainnet-id) instead of the local keypair's.
+mainnet = []
+# Build with the committed devnet id (devnet-id), derived from the team's mnemonic.
+devnet = []
+
+[dependencies]
+anchor-lang = { workspace = true }
+shonin-common = { workspace = true }
+solana-bn254 = { workspace = true }
+solana-sha256-hasher = { workspace = true }
+
+[build-dependencies]
+shonin-program-id = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

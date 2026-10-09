@@ -2760,6 +2760,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "shonin-cs-verifier"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang",
+ "shonin-common",
+ "shonin-program-id",
+ "solana-bn254",
+ "solana-sha256-hasher",
+]
+
+[[package]]
 name = "shonin-dev-verifier"
 version = "0.1.0"
 dependencies = [
@@ -2895,6 +2906,7 @@ dependencies = [
  "bincode",
  "litesvm",
  "shonin-common",
+ "shonin-cs-verifier",
  "shonin-dev-verifier",
  "shonin-driver",
  "shonin-local-driver",

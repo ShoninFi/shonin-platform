@@ -17,7 +17,8 @@
 # shonin-executor-url, shonin-prover-instance, shonin-builder-url,
 # shonin-builder-instance, shonin-reviewer-url, shonin-reviewer-instance,
 # shonin-keeper-secret, shonin-keeper-solana-secret, shonin-tunnel-secret,
-# and the waker's script as shonin-waker.
+# shonin-rpc-secret (the paid endpoints, optional), and the waker's script as
+# shonin-waker.
 #
 # The secrets are read from Secret Manager with the VM's own token and
 # written to files only root can read; they are never echoed, never put on a
@@ -78,6 +79,7 @@ reviewer_instance=$(attribute shonin-reviewer-instance 2>/dev/null || true)
 keeper_secret=$(attribute shonin-keeper-secret)
 keeper_solana_secret=$(attribute shonin-keeper-solana-secret 2>/dev/null || true)
 tunnel_secret=$(attribute shonin-tunnel-secret)
+rpc_secret=$(attribute shonin-rpc-secret 2>/dev/null || true)
 cloudflared_image=$(attribute shonin-cloudflared-image 2>/dev/null || echo cloudflare/cloudflared:latest)
 waker_image=$(attribute shonin-waker-image 2>/dev/null || echo curlimages/curl:latest)
 
@@ -110,7 +112,16 @@ tunnel_token=$(secret "$project" "$tunnel_secret")
 [ -n "$tunnel_token" ] || { say "the tunnel's token could not be read"; exit 1; }
 printf 'TUNNEL_TOKEN=%s\n' "$tunnel_token" >"$STATE/secrets/tunnel.env"
 unset tunnel_token
-chmod 600 "$STATE/secrets/keeper.env" "$STATE/secrets/tunnel.env"
+# The paid endpoints (SHONIN_RPC_* lines) for the API and the keeper; without
+# them both read the committed public endpoints.
+: >"$STATE/secrets/rpc.env"
+if [ -n "$rpc_secret" ]; then
+  rpc=$(secret "$project" "$rpc_secret" || true)
+  printf '%s\n' "$rpc" | grep -E '^SHONIN_RPC_[A-Z0-9_]+=https?://' >"$STATE/secrets/rpc.env" || true
+  unset rpc
+  say "$(grep -c . "$STATE/secrets/rpc.env" || true) paid endpoint(s)"
+fi
+chmod 600 "$STATE/secrets/keeper.env" "$STATE/secrets/tunnel.env" "$STATE/secrets/rpc.env"
 
 attribute shonin-waker >"$STATE/waker.sh"
 chmod 644 "$STATE/waker.sh"
@@ -137,8 +148,8 @@ run() {
   say "$name started"
 }
 
-run shonin-api -v "$STATE/store:/var/lib/shonin/store" -v "$STATE/api-state:/var/lib/shonin/api-state" "$api_image"
-run shonin-keeper --env-file "$STATE/secrets/keeper.env" "$keeper_image"
+run shonin-api --env-file "$STATE/secrets/rpc.env" -v "$STATE/store:/var/lib/shonin/store" -v "$STATE/api-state:/var/lib/shonin/api-state" "$api_image"
+run shonin-keeper --env-file "$STATE/secrets/keeper.env" --env-file "$STATE/secrets/rpc.env" "$keeper_image"
 run shonin-tunnel --env-file "$STATE/secrets/tunnel.env" "$cloudflared_image" tunnel --no-autoupdate run
 run shonin-waker -v "$STATE/waker.sh:/waker.sh:ro" \
   -e "SHONIN_EXECUTOR_URL=$executor_url" \

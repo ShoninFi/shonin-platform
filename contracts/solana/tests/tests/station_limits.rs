@@ -278,7 +278,7 @@ fn a_keys_close_of_a_running_station_with_funding_owed_fits() {
     env.svm.airdrop(&unwinder.pubkey(), 1_000_000_000).unwrap();
     expect_ok(env.propose_image(unwinder_image(), ImageKind::Unwinder));
     env.skip(TIMELOCK);
-    let leaf = env.leaf_for(home.vault.to_bytes(), home.bundle);
+    let leaf = env.leaf_for(home.vault.to_bytes(), home.bundle, unwinder.pubkey());
     let journal = env.journal_for(unwinder_image(), unwinder.pubkey(), leaf);
     let cluster = env.cluster();
     expect_ok(env.bless(

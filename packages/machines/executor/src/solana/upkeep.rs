@@ -19,7 +19,7 @@ use shared::HealthPost;
 use shared::model::health::Signal;
 
 use crate::ceilings::Ceilings;
-use crate::health::{last_hour, report, runway};
+use crate::health::{Holds, Hourly, last_hour, report, runway};
 use crate::host::Counters;
 use crate::usage::{AGREE_BLOCKS, Meter, SAMPLE, SAMPLES_PER_TICK, SignedThrough};
 
@@ -192,95 +192,83 @@ const REPORT_EVERY: Duration = Duration::from_secs(15);
 /// A lamport, in the cluster's coin.
 const SOL: f64 = 1e9;
 
-/// Send a signed report on the vault every so often, while the key is
-/// blessed for it: nobody would believe one from a key that isn't.
-#[allow(clippy::too_many_arguments)]
-pub async fn report_on(
-    client: SolanaClient,
-    platform: Platform,
-    key: Arc<Keypair>,
-    vault: Pubkey,
-    bundle: [u8; 32],
-    api: String,
-    counters: Arc<Mutex<Counters>>,
-    tank: Tank,
-    totals: Totals,
-    ceilings: Ceilings,
-    stake: u64,
-) {
-    let dry = tank.dry.clone();
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap_or_default();
-    let mut window = std::collections::VecDeque::from([(Instant::now(), Counters::default())]);
-    let mut unsent = crate::Throttle::default();
+/// Send a signed report on the vault every so often, while the serve holds
+/// the station's approval with the key and the key is blessed for the vault:
+/// the vault is reported on by the key it trades through alone, and nobody
+/// would believe a report from a key that isn't blessed.
+pub async fn report_on(reporting: Reporting) {
+    let mut reporter = Reporter::new(reporting);
     loop {
         tokio::time::sleep(REPORT_EVERY).await;
-        let now = counters
+        reporter.round().await;
+    }
+}
+
+/// What a vault's reports need.
+pub struct Reporting {
+    pub client: SolanaClient,
+    pub platform: Platform,
+    pub key: Arc<Keypair>,
+    pub vault: Pubkey,
+    pub bundle: [u8; 32],
+    pub api: String,
+    /// Whether the serve holds the station's approval with the key.
+    pub holds: Holds,
+    pub counters: Arc<Mutex<Counters>>,
+    pub tank: Tank,
+    pub totals: Totals,
+    pub ceilings: Ceilings,
+    pub stake: u64,
+}
+
+/// A vault's reports, and what they keep from one to the next.
+struct Reporter {
+    reporting: Reporting,
+    http: reqwest::Client,
+    window: std::collections::VecDeque<(Instant, Counters)>,
+    unsent: crate::Throttle,
+}
+
+impl Reporter {
+    fn new(reporting: Reporting) -> Self {
+        Self {
+            reporting,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
+            window: std::collections::VecDeque::from([(Instant::now(), Counters::default())]),
+            unsent: crate::Throttle::default(),
+        }
+    }
+
+    /// Send one report, if there is one to send.
+    async fn round(&mut self) {
+        let now = self
+            .reporting
+            .counters
             .lock()
             .map(|counters| *counters)
             .unwrap_or_default();
-        let hourly = last_hour(&mut window, Instant::now(), now);
-        let post = async {
-            let blessed = Blessed::read(&client, &platform, &key.pubkey(), &vault, &bundle).await?;
-            if !blessed.holds(client.now().await?) {
-                return Ok(None);
-            }
-            let account = platform.vault(&client, &vault).await?;
-            let asked = allowances(&account.allowances);
-            let held_below = ceilings.held_below(&asked);
-            let daily = shared::Prices::published().daily_cap(&ceilings.hold(&asked));
-            let signed = totals
-                .lock()
-                .ok()
-                .and_then(|totals| {
-                    totals
-                        .get(&(client.cluster.clone(), vault.to_string()))
-                        .and_then(|signed| signed.total().ok())
-                })
-                .unwrap_or_default();
-            let unpaid = signed.saturating_sub(account.tank.usage_settled);
-            let is_dry = dry.load(Ordering::SeqCst);
-            let runway = runway(
-                U256::from(account.tank.balance),
-                U256::from(unpaid),
-                daily,
-                is_dry,
-            )?;
-            let holds = client.lamports(&key.pubkey()).await?;
-            let mut health = report(
-                now,
-                hourly,
-                runway,
-                now.rejection_rate(),
-                key_lamports(holds, stake),
-                is_dry,
-                &held_below,
-                key.pubkey().to_string(),
-            );
-            say_other_cluster(&mut health, tank.other_cluster.load(Ordering::SeqCst));
-            let address = vault.to_string();
-            let digest = HealthPost::solana_digest(&client.cluster_value(), &address, &health);
-            anyhow::Ok(Some(HealthPost {
-                vault: address,
-                report: health,
-                signature: key.sign_message(&digest).to_string(),
-                signer: Some(key.pubkey().to_string()),
-            }))
-        };
-        let post = match post.await {
+        let hourly = last_hour(&mut self.window, Instant::now(), now);
+        let vault = self.reporting.vault;
+        let post = match self.post(now, hourly).await {
             Ok(Some(post)) => post,
-            Ok(None) => continue,
+            Ok(None) => return,
             Err(error) => {
-                if unsent.due(Instant::now()) {
+                if self.unsent.due(Instant::now()) {
                     tracing::warn!(%vault, error = format!("{error:#}"), "could not make a report");
                 }
-                continue;
+                return;
             }
         };
-        let sent = http
-            .post(format!("{api}/api/{}/health", shared::Chain::Solana))
+        let sent = self
+            .http
+            .post(format!(
+                "{}/api/{}/health",
+                self.reporting.api,
+                shared::Chain::Solana
+            ))
             .json(&post)
             .send()
             .await
@@ -291,10 +279,75 @@ pub async fn report_on(
                     .context("the API refused the report")
             });
         if let Err(error) = sent
-            && unsent.due(Instant::now())
+            && self.unsent.due(Instant::now())
         {
             tracing::warn!(%vault, error = format!("{error:#}"), "the report did not land");
         }
+    }
+
+    /// The report to send, if the key is to send one.
+    async fn post(&self, now: Counters, hourly: Hourly) -> anyhow::Result<Option<HealthPost>> {
+        let Reporting {
+            client,
+            platform,
+            key,
+            vault,
+            bundle,
+            holds,
+            tank,
+            totals,
+            ceilings,
+            stake,
+            ..
+        } = &self.reporting;
+        if !holds.holds() {
+            return Ok(None);
+        }
+        let blessed = Blessed::read(client, platform, &key.pubkey(), vault, bundle).await?;
+        if !blessed.holds(client.now().await?) {
+            return Ok(None);
+        }
+        let account = platform.vault(client, vault).await?;
+        let asked = allowances(&account.allowances);
+        let held_below = ceilings.held_below(&asked);
+        let daily = shared::Prices::published().daily_cap(&ceilings.hold(&asked));
+        let signed = totals
+            .lock()
+            .ok()
+            .and_then(|totals| {
+                totals
+                    .get(&(client.cluster.clone(), vault.to_string()))
+                    .and_then(|signed| signed.total().ok())
+            })
+            .unwrap_or_default();
+        let unpaid = signed.saturating_sub(account.tank.usage_settled);
+        let is_dry = tank.dry.load(Ordering::SeqCst);
+        let runway = runway(
+            U256::from(account.tank.balance),
+            U256::from(unpaid),
+            daily,
+            is_dry,
+        )?;
+        let lamports = client.lamports(&key.pubkey()).await?;
+        let mut health = report(
+            now,
+            hourly,
+            runway,
+            now.rejection_rate(),
+            key_lamports(lamports, *stake),
+            is_dry,
+            &held_below,
+            key.pubkey().to_string(),
+        );
+        say_other_cluster(&mut health, tank.other_cluster.load(Ordering::SeqCst));
+        let address = vault.to_string();
+        let digest = HealthPost::solana_digest(&client.cluster_value(), &address, &health);
+        Ok(Some(HealthPost {
+            vault: address,
+            report: health,
+            signature: key.sign_message(&digest).to_string(),
+            signer: Some(key.pubkey().to_string()),
+        }))
     }
 }
 
@@ -331,6 +384,58 @@ fn key_lamports(holds: u64, stake: u64) -> Signal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A vault is reported on by the key it trades through alone: a key
+    /// whose serve doesn't hold the station's approval (one waiting to take
+    /// a vault over, or one whose vault was let go) makes no report and
+    /// doesn't so much as ask the cluster for one; a key whose serve holds
+    /// it goes on to read what a report says.
+    #[tokio::test]
+    async fn only_a_solana_key_whose_serve_holds_the_station_s_approval_reports_on_the_vault() {
+        let (client, asked, _cluster) = super::super::counting_cluster().await;
+        let holds = Holds::default();
+        let reporter = Reporter::new(Reporting {
+            client,
+            platform: super::super::devnet_platform(),
+            key: Arc::new(Keypair::new_from_array([7; 32])),
+            vault: Pubkey::new_from_array([0x21; 32]),
+            bundle: [5; 32],
+            api: "http://127.0.0.1:9".into(),
+            holds: holds.clone(),
+            counters: Default::default(),
+            tank: Tank {
+                dry: Default::default(),
+                metered: Default::default(),
+                signed_through: Default::default(),
+                other_cluster: Default::default(),
+            },
+            totals: Default::default(),
+            ceilings: Ceilings::default(),
+            stake: 50_000_000,
+        });
+        let hourly = Hourly::default();
+
+        let made = reporter.post(Counters::default(), hourly).await;
+        assert!(matches!(made, Ok(None)), "{made:?}");
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "the cluster was asked");
+
+        holds.take();
+        assert!(reporter.post(Counters::default(), hourly).await.is_err());
+        assert!(
+            asked.load(Ordering::SeqCst) > 0,
+            "the cluster was not asked"
+        );
+
+        holds.let_go();
+        let before = asked.load(Ordering::SeqCst);
+        let made = reporter.post(Counters::default(), hourly).await;
+        assert!(matches!(made, Ok(None)), "{made:?}");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            before,
+            "the cluster was asked"
+        );
+    }
 
     #[test]
     fn a_vaults_allowances_read_as_the_platforms_own_with_gas_in_dollars() {

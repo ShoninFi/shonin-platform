@@ -89,7 +89,7 @@ fn lamports_sent_ahead_never_block_any_registry_record() {
         image_digest: image,
         project_id,
         signer: executor,
-        vaults_root: env.leaf_for(vault(), bundle()),
+        vaults_root: env.leaf_for(vault(), bundle(), executor),
         issued_at: env.now(),
     };
     let cluster = env.cluster();
@@ -105,7 +105,11 @@ fn lamports_sent_ahead_never_block_any_registry_record() {
 fn a_blessing_reads_only_the_records_its_journal_names() {
     let mut env = Env::new();
     let executor = env.executor.pubkey();
-    let journal = env.journal_for(executor_image(), executor, env.leaf_for(vault(), bundle()));
+    let journal = env.journal_for(
+        executor_image(),
+        executor,
+        env.leaf_for(vault(), bundle(), executor),
+    );
     let attestor = env.attestor.insecure_clone();
     let payer = env.payer.insecure_clone();
     let (seal, ed25519) = env.seal(&attestor, &journal);
