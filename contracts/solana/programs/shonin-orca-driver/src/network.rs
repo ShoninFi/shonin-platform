@@ -34,11 +34,19 @@ pub const FEED_ID: [u8; 32] = [
     0x2a, 0x0d, 0x2f, 0x8e, 0xd0, 0xc6, 0xc7, 0xbc, 0x0f, 0x4c, 0xfa, 0xc8, 0xc2, 0x80, 0xb5, 0x6d,
 ];
 
-/// One listed pool: its address, and the tick spacing its seeds name.
+/// One listed pool: its address, the tick spacing its seeds name, and the
+/// least change of liquidity a tick must make for a sale to cross it
+/// exactly and count it against its crossings (see [`crate::sale::sell`]).
+///
+/// The threshold is fixed for the pool, never read from the pool's state,
+/// which anyone can shape: a tick at it holds real capital at the price, not
+/// a position's rent. A smaller tick is worked into a sale so that the sale
+/// never fetches more than Orca's swap would.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pool {
     pub address: Pubkey,
     pub tick_spacing: u16,
+    pub theta: u128,
 }
 
 #[cfg(feature = "mainnet")]
@@ -48,10 +56,17 @@ mod listed {
     pub const CONFIG: Pubkey = pubkey!("2LecshUwdy9xi7meFgHtFJQNSKk4KdTrcpvaB56dP2NQ");
     /// USDC.
     pub const DOLLAR_MINT: Pubkey = pubkey!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
-    /// SOL/USDC at tick spacing 4 (a 0.04% fee).
+    /// SOL/USDC at tick spacing 4 (a 0.04% fee). Its threshold is the
+    /// liquidity that holds about $1,000 across one spacing at the price: at
+    /// SOL near $110 the square-root price is about 0.3325 (in the pool's
+    /// units, lamports and USDC's millionths), a spacing moves it by a
+    /// factor of 1.0002, so a spacing of liquidity L holds L × 0.3325 ×
+    /// 0.0002 = L × 6.65e-5 millionths of a dollar, and $1,000 is L =
+    /// 1.5e13. The pool's active liquidity was about 6.29e14 (2.4% of it).
     pub const POOLS: &[Pool] = &[Pool {
         address: pubkey!("Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"),
         tick_spacing: 4,
+        theta: 15_000_000_000_000,
     }];
     pub const MAX_AGE: u64 = 120;
 }
@@ -64,10 +79,16 @@ mod listed {
     /// The platform's testnet dollar on devnet.
     pub const DOLLAR_MINT: Pubkey = pubkey!("4Gw9TmkKDvnGtBcMpJwR4rRDEWc6KVujegc1j4ebtHTK");
     /// Wrapped SOL against the testnet dollar at tick spacing 64, created at
-    /// Pyth's price for the platform's own use.
+    /// Pyth's price for the platform's own use. Its threshold is a
+    /// twentieth of the operator's seed: 40 SOL across ±2% of the price is
+    /// liquidity of about 40e9 × 0.332 / 0.00985 = 1.35e12 at SOL near $110
+    /// (square-root price 0.332; ±2% is a factor of 1.00995 in it), so
+    /// 6.7e10, which holds about $71 across one spacing (a factor of 1.0032
+    /// in the square-root price): some ninety positions' rent.
     pub const POOLS: &[Pool] = &[Pool {
         address: pubkey!("Dwk9XXFQJPiLuyXhgbVayAErCfZK2zSKhw2cPAimTUGQ"),
         tick_spacing: 64,
+        theta: 67_000_000_000,
     }];
     pub const MAX_AGE: u64 = 900;
 }
@@ -79,9 +100,12 @@ mod listed {
     pub const CONFIG: Pubkey = pubkey!("FcrweFY1G9HJAHG5inkGB6pKg1HZ6x9UC2WioAfWrGkR");
     /// The local dollar: the development mnemonic's mint.
     pub const DOLLAR_MINT: Pubkey = pubkey!("CqMbRgMuEhQi9BUS8xP44Wk5nENm48FqJnfjEi4eNb1k");
+    /// The tests' pool, its active liquidity about 9.5e11 from one wide
+    /// position: a hundredth of it, about $12 across one spacing at $150.
     pub const POOLS: &[Pool] = &[Pool {
         address: pubkey!("3jTN5MsREtjxh4gPdSuysPJY1o6F2w4quvmTehe9jXuS"),
         tick_spacing: 64,
+        theta: 10_000_000_000,
     }];
     pub const MAX_AGE: u64 = 900;
 }

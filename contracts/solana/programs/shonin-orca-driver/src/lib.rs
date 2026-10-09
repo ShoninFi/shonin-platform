@@ -58,19 +58,21 @@
 //! where a close's sale may go, or when that sale can't take all the SOL
 //! before it gets there: nobody is paid at a value no sale inside the band
 //! reaches. A sale crosses exactly only ticks changing the liquidity by at
-//! least a hundredth of the most on its way, and no more than so many of
-//! them, stopping a unit short of the next: a valuation's as many as cover
-//! the widest band a station may have ([`sale::VALUE_CROSSINGS`]), a close's
-//! as many as one close can afford ([`sale::CLOSE_CROSSINGS`]). Smaller
-//! ticks, which anyone can place for a position's rent, are worked in so
-//! that the sale never fetches more than Orca's swap would (see
-//! [`sale::THETA`]). A valuation whose sale stops so short of all the SOL
-//! is outside, and so is a claim's close (the claim waits); so is a claim's
-//! close whose own swap would cross more initialized ticks of any size than
-//! one close affords ([`sale::SWAP_CROSSINGS`]), the valuation standing. A
-//! stopped station's unwind sells up to where its sale stops, by either
-//! count, inside the band, its valuation what that sale fetches, and leaves
-//! the rest to the next unwind. With nothing of worth held at Orca (no position with liquidity
+//! least the listed pool's fixed threshold (real capital at the price,
+//! never read from the pool's state), and no more than so many of them: a
+//! valuation's as many as cover the widest band a station may have
+//! ([`sale::VALUE_CROSSINGS`]), a close's as many as one close can afford
+//! ([`sale::CLOSE_CROSSINGS`]); what is left unsold there is valued at the
+//! band's limit, the worst price inside the band, and is never outside for
+//! that alone. Smaller ticks, which anyone can place for a position's rent,
+//! are paired so that the sale never fetches more than Orca's swap would
+//! (see [`sale::sell`]). A claim's close whose own swap would cross more
+//! initialized ticks of any size than one close affords
+//! ([`sale::SWAP_CROSSINGS`]) is refused this try, the valuation standing,
+//! and the vault may serve the claim in parts. A stopped station's unwind
+//! sells up to a unit short of the tick past those, inside the band, its
+//! valuation what that sale fetches, and leaves the rest to the next
+//! unwind. With nothing of worth held at Orca (no position with liquidity
 //! or fees, and wrapped SOL worth under a dollar at Pyth's last price),
 //! the valuation is nothing, never outside, and a close leaves it. At the
 //! full band, a stopped station's last resort, nothing is outside: the sale
@@ -96,14 +98,20 @@
 //! prepares nothing. A pool that can't take the sale inside the band leaves
 //! the close short, and the station refuses it whole.
 //!
-//! **Compute.** A claim's close of a full slot with its fees, its swap
-//! crossing as many initialized ticks as one close may and from one of
-//! Orca's tick arrays into the next, measures at most about 375,000 units
-//! with the vault's call around it with dynamic arrays, 365,000 with fixed
-//! ones (`orca_driver.rs`), inside `shonin_driver::COMPUTE_PER_DRIVER`; each
-//! crossing more by Orca's swap costs about 7,500, and each slot more about
-//! 85,000, which is why there is one. A stopped station's unwind measures at
-//! most about 312,000, a valuation 30,000 to 85,000.
+//! **Compute.** Measured with the vault's call around it (`orca_driver.rs`),
+//! with Orca's fixed tick arrays and its dynamic ones, the sale crossing from
+//! one array into the next: a claim's close of a full slot with its fees,
+//! its swap crossing as many initialized ticks as one close may, at most
+//! about 379,000 units on a pool with a tick initialized at every spacing on
+//! the way, and 382,000 with every tick of the sale's three arrays
+//! initialized; a stopped station's unwind at most about 273,000; a
+//! valuation at a 10% band about 67,000, at the full band (every tick of the
+//! three arrays initialized) about 242,000. All inside
+//! `shonin_driver::COMPUTE_PER_DRIVER`. A valuation and a claim's close read
+//! every initialized tick on the way to the band's limit, about 800 units
+//! each: at spacing 64 a 10% band is some 17 of them; at spacing 4 a band of
+//! a few percent is already more than one close affords. Each slot more
+//! costs about 85,000, which is why there is one.
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program::set_return_data;
@@ -872,16 +880,24 @@ pub mod logic {
             let asset = clamp(asset);
             let pool = &self.pools[0];
             let own = self.own();
-            // An unwind's swap crosses no more initialized ticks than one
-            // transaction affords, however small: it goes no further than a
-            // unit short of the one past them.
             let band_limit = self.sale_limit(band_bps)?;
+            // A valuation's sale, and a claim's, is worked out over every
+            // tick on the way to the limit (the stayers' valuation after a
+            // close then meets no tick the one before it didn't), and what
+            // its crossings leave unsold is valued at the limit. An unwind's
+            // swap crosses no more initialized ticks than one transaction
+            // affords, however small: it reads no further than the one past
+            // them, and goes no further than a unit short of it.
             let path = sale::path(
                 pool,
                 &self.sale_arrays,
                 &self.sale_starts,
                 network::asset_is_a(),
-                band_limit,
+                if unwind {
+                    sale::Reach::First(sale::SWAP_CROSSINGS + 1)
+                } else {
+                    sale::Reach::Limit(band_limit)
+                },
             )?;
             let limit = if unwind {
                 Self::swap_limit(&path, band_limit)?
@@ -895,11 +911,13 @@ pub mod logic {
                     pool,
                     &self.sale_starts,
                     &path,
+                    POOLS[0].theta,
                     &own,
                     asset,
                     network::asset_is_a(),
                     limit,
                     crossings,
+                    !unwind,
                 )?
             };
             let worth = dollars.saturating_add(sold.proceeds as u128);
@@ -922,7 +940,10 @@ pub mod logic {
                 sold.sold >= asset,
                 SaleEnd {
                     sells: sold.sold > 0,
+                    // Where an unwind's swap stops; a claim's is decided on
+                    // its own sale.
                     stop: match sold.stop {
+                        _ if !unwind => None,
                         Some(stop) => Some(stop),
                         // Stopped by what Orca's swap may cross.
                         None if limit != band_limit && sold.end == limit && sold.sold < asset => {
@@ -1198,7 +1219,11 @@ pub mod logic {
                         &self.sale_arrays,
                         &self.sale_starts,
                         asset_is_a,
-                        band_limit,
+                        if unwind {
+                            sale::Reach::First(sale::SWAP_CROSSINGS + 1)
+                        } else {
+                            sale::Reach::Limit(band_limit)
+                        },
                     )?,
                 };
                 let limit = match ending.stop {
@@ -1208,18 +1233,20 @@ pub mod logic {
                         // A claim's swap crosses no more initialized ticks
                         // than one close affords: if the leaver's own sale,
                         // worked out through less liquidity than Orca's
-                        // swap will find, can't be made before that, the
-                        // claim waits.
+                        // swap will find, can't be made before that, this
+                        // try is refused (the vault may serve a part).
                         let limit = Self::swap_limit(&path, band_limit)?;
                         let theirs = sale::sell(
                             pool,
                             &self.sale_starts,
                             &path,
+                            POOLS[0].theta,
                             &self.own(),
                             sale,
                             asset_is_a,
                             limit,
                             sale::CLOSE_CROSSINGS,
+                            false,
                         )?;
                         if theirs.sold < sale {
                             return Ok(Plan {
