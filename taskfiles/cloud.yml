@@ -375,7 +375,7 @@ tasks:
           --tags=shonin-services \
           --service-account="{{.SERVICES_ACCOUNT}}" --scopes=cloud-platform \
           --metadata-from-file="startup-script={{.PATH_ROOT}}/deploy/gcp/services/startup.sh,shonin-waker={{.PATH_ROOT}}/deploy/gcp/services/waker.sh" \
-          --metadata="^~^shonin-api-image={{.GCP_REGISTRY}}/api@${api}~shonin-keeper-image={{.GCP_REGISTRY}}/keeper@${keeper}~shonin-executor-url={{.CLOUD_URL_EXECUTOR}}~shonin-prover-instance={{.PROVER_INSTANCE}}~{{.WAKER_METADATA}}~shonin-keeper-secret={{.GCP_SECRET_TESTNET_KEEPER_KEY}}~shonin-keeper-solana-secret={{.GCP_SECRET_TESTNET_KEEPER_SOLANA_KEY}}~shonin-tunnel-secret={{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}~enable-oslogin=TRUE"
+          --metadata="^~^shonin-api-image={{.GCP_REGISTRY}}/api@${api}~shonin-keeper-image={{.GCP_REGISTRY}}/keeper@${keeper}~shonin-executor-url={{.CLOUD_URL_EXECUTOR}}~shonin-prover-instance={{.PROVER_INSTANCE}}~{{.WAKER_METADATA}}~shonin-keeper-secret={{.GCP_SECRET_TESTNET_KEEPER_KEY}}~shonin-keeper-solana-secret={{.GCP_SECRET_TESTNET_KEEPER_SOLANA_KEY}}~shonin-tunnel-secret={{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}~shonin-rpc-secret={{.GCP_SECRET_TESTNET_RPC}}~enable-oslogin=TRUE"
 
   redeploy:services:
     desc: "Point the services VM at newly pushed api and keeper images (and the current scripts), and restart it (NETWORK=testnet, TAG= the commit by default)"
@@ -395,7 +395,7 @@ tasks:
         gcloud compute instances add-metadata "shonin-services-{{.NETWORK}}" \
           --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" \
           --metadata-from-file="startup-script={{.PATH_ROOT}}/deploy/gcp/services/startup.sh,shonin-waker={{.PATH_ROOT}}/deploy/gcp/services/waker.sh" \
-          --metadata="^~^shonin-api-image={{.GCP_REGISTRY}}/api@${api}~shonin-keeper-image={{.GCP_REGISTRY}}/keeper@${keeper}~shonin-executor-url={{.CLOUD_URL_EXECUTOR}}~shonin-prover-instance={{.PROVER_INSTANCE}}~{{.WAKER_METADATA}}~shonin-keeper-solana-secret={{.GCP_SECRET_TESTNET_KEEPER_SOLANA_KEY}}"
+          --metadata="^~^shonin-api-image={{.GCP_REGISTRY}}/api@${api}~shonin-keeper-image={{.GCP_REGISTRY}}/keeper@${keeper}~shonin-executor-url={{.CLOUD_URL_EXECUTOR}}~shonin-prover-instance={{.PROVER_INSTANCE}}~{{.WAKER_METADATA}}~shonin-keeper-solana-secret={{.GCP_SECRET_TESTNET_KEEPER_SOLANA_KEY}}~shonin-rpc-secret={{.GCP_SECRET_TESTNET_RPC}}"
         # A stopped VM is started (it reads the new images at boot); a running
         # one is reset, since a reset needs a running VM.
         status=$(gcloud compute instances describe "shonin-services-{{.NETWORK}}" --project="{{.GCP_PROJECT}}" --zone="{{.GCP_ZONE}}" --format='value(status)')
@@ -459,9 +459,9 @@ tasks:
               --condition=None --quiet >/dev/null
           done
         done
-        # The services VM reads the keeper's two keys and the tunnel's token,
-        # and no other secret.
-        for secret in "{{.GCP_SECRET_TESTNET_KEEPER_KEY}}" "{{.GCP_SECRET_TESTNET_KEEPER_SOLANA_KEY}}" "{{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}"; do
+        # The services VM reads the keeper's two keys, the tunnel's token and
+        # the paid endpoints, and no other secret.
+        for secret in "{{.GCP_SECRET_TESTNET_KEEPER_KEY}}" "{{.GCP_SECRET_TESTNET_KEEPER_SOLANA_KEY}}" "{{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}" "{{.GCP_SECRET_TESTNET_RPC}}"; do
           if gcloud secrets describe "$secret" --project="$project" >/dev/null 2>&1; then
             gcloud secrets add-iam-policy-binding "$secret" --project="$project" \
               --member="serviceAccount:{{.SERVICES_ACCOUNT}}" --role=roles/secretmanager.secretAccessor >/dev/null
@@ -613,11 +613,18 @@ tasks:
         ensure "{{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}"
         printf '%s' "$CLOUDFLARE_TUNNEL_TOKEN_TESTNET" |
           gcloud secrets versions add "{{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}" --project="$project" --data-file=-
-        for secret in "{{.GCP_SECRET_TESTNET_KEEPER_KEY}}" "{{.GCP_SECRET_TESTNET_KEEPER_SOLANA_KEY}}" "{{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}"; do
+        # The paid endpoints: every SHONIN_RPC_* override in .env, one per
+        # line, for the API and the keeper (never an image: only committed
+        # public endpoints go into one).
+        rpc=$(env | grep -E '^SHONIN_RPC_[A-Z0-9_]+=.+' | sort || true)
+        ensure "{{.GCP_SECRET_TESTNET_RPC}}"
+        printf '%s\n' "$rpc" |
+          gcloud secrets versions add "{{.GCP_SECRET_TESTNET_RPC}}" --project="$project" --data-file=-
+        for secret in "{{.GCP_SECRET_TESTNET_KEEPER_KEY}}" "{{.GCP_SECRET_TESTNET_KEEPER_SOLANA_KEY}}" "{{.GCP_SECRET_TESTNET_TUNNEL_TOKEN}}" "{{.GCP_SECRET_TESTNET_RPC}}"; do
           gcloud secrets add-iam-policy-binding "$secret" --project="$project" \
             --member="serviceAccount:{{.SERVICES_ACCOUNT}}" --role=roles/secretmanager.secretAccessor >/dev/null
         done
-        echo "uploaded the keeper's keys ($address, and $solana_address on Solana devnet) and the tunnel's token; the services VM reads them at its next boot"
+        echo "uploaded the keeper's keys ($address, and $solana_address on Solana devnet), the tunnel's token and $(printf '%s' "$rpc" | grep -c . || true) paid endpoint(s); the services VM reads them at its next boot"
 
   drain:
     desc: "Wait until the builder or the reviewer holds nothing a new image or a new root would lose: no paid job unfinished in the API's queue and, for the reviewer, no review waiting to be posted (NAME=builder|reviewer, NETWORK=testnet; DRAIN_MINUTES=60). Run before replacing either image or the executor"
