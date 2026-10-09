@@ -471,8 +471,16 @@ exclude = ["GB"]
         let mixed = manifest("[drivers.robinhood]\n[drivers.lighter]\n");
         let refused = mixed.check(&catalogue, "testnet").unwrap_err();
         assert!(refused.contains("one kind only"), "{refused}");
-        assert!(manifest("[drivers.lighter]\n").check(&catalogue, "testnet").is_ok());
-        assert!(manifest("[drivers.robinhood]\n").check(&catalogue, "testnet").is_ok());
+        assert!(
+            manifest("[drivers.lighter]\n")
+                .check(&catalogue, "testnet")
+                .is_ok()
+        );
+        assert!(
+            manifest("[drivers.robinhood]\n")
+                .check(&catalogue, "testnet")
+                .is_ok()
+        );
     }
 
     #[test]
