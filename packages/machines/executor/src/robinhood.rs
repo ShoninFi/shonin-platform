@@ -81,7 +81,7 @@ const EXPLORER_LOOK_EVERY: Duration = Duration::from_secs(1);
 const WITHDRAWAL_PAGES: u64 = 5;
 
 /// A driver's name as a station keys it: the name, zero-padded.
-fn name(driver: &str) -> B256 {
+pub fn name(driver: &str) -> B256 {
     let mut bytes = [0u8; 32];
     bytes[..driver.len()].copy_from_slice(driver.as_bytes());
     B256::from(bytes)

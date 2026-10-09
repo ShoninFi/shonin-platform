@@ -892,10 +892,13 @@ async fn sweep_one(
     if !servable {
         return Ok(());
     }
-    if finished(client, vault).await? {
+    if finished(client, vault).await? && !posts_for_lighter(client, book, vault).await? {
         // Past its grace the vault's station is stopped and its key has
         // nothing left to send. The meter runs on, so the final bill can
-        // still be collected.
+        // still be collected. A station with Lighter accounts still needs
+        // their posts, read after each of its unwinds, until the vault
+        // closes: such a vault is still taken on (after a restart, or a
+        // serve that failed) to post them, with no agent run.
         return Ok(());
     }
     let bundle = client.read(vault, IVault::bundleHashCall {}).await?;
@@ -1523,6 +1526,11 @@ async fn serve(
         (None, None)
     };
 
+    // Taken on past its grace only to post its Lighter accounts: no agent.
+    if _lighter_posts.is_some() && matches!(finished(&chain, vault).await, Ok(true)) {
+        return posted_until_closed(&chain, vault, &replaced, _lighter_posts.is_some()).await;
+    }
+
     // Until the vault's halt is known (see [`Shared::halt_known`]), a halted
     // vault starts a faulting agent again at once, however long ago it
     // halted, so an agent that faulted before it heard of the halt is not
@@ -1751,6 +1759,26 @@ async fn serve(
     }
 }
 
+/// Whether `vault`'s station trades on Lighter, whose accounts only posts
+/// value.
+async fn posts_for_lighter(client: &Client, book: &mut Book, vault: Address) -> Result<bool> {
+    let station = match book.stations.get(&vault) {
+        Some(station) => *station,
+        None => {
+            let station = client.read(vault, IVault::homeStationCall {}).await?;
+            book.stations.insert(vault, station);
+            station
+        }
+    };
+    let spec = client
+        .read(station, chain::bindings::station::IStation::specCall {})
+        .await?;
+    Ok(spec
+        .drivers
+        .iter()
+        .any(|driver| *driver == robinhood::name(robinhood::LIGHTER)))
+}
+
 /// How often Hyperliquid's spot pairs are read again for their feed names.
 const SPOT_PAIRS_READ_EVERY: Duration = Duration::from_secs(600);
 
@@ -1775,10 +1803,12 @@ async fn posted_until_closed(
         return Ok(Stop::Finished);
     }
     tracing::info!(%vault, "the agent's grace is over; posting the Lighter accounts until the vault closes");
+    // Nothing is traded any more, so nothing here waits on holding the
+    // station's approval: a driver of the station's revoked, or another
+    // executor's key approved, leaves these posts as useful as before (the
+    // board takes any blessed key's newer reading).
+    let _ = replaced;
     loop {
-        if replaced.load(Ordering::SeqCst) {
-            return Ok(Stop::Replaced);
-        }
         match chain.read(vault, IVault::stateCall {}).await {
             Ok(VaultState::None | VaultState::Closed | VaultState::Cancelled) => {
                 tracing::info!(%vault, "the vault has closed; letting it go");
