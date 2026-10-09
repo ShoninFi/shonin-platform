@@ -160,6 +160,8 @@ pub struct PositionState {
 /// What the pool reads now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PoolState {
+    /// The liquidity active at the pool's price.
+    pub liquidity: u128,
     pub sqrt_price: u128,
     pub tick: i32,
     pub vault_a: Pubkey,
@@ -384,6 +386,7 @@ impl Env {
     pub fn pool_state(&self) -> PoolState {
         let data = self.svm.get_account(&pool()).unwrap().data;
         PoolState {
+            liquidity: u128::from_le_bytes(data[49..65].try_into().unwrap()),
             sqrt_price: u128::from_le_bytes(data[65..81].try_into().unwrap()),
             tick: i32::from_le_bytes(data[81..85].try_into().unwrap()),
             vault_a: Pubkey::try_from(&data[133..165]).unwrap(),
@@ -1047,30 +1050,47 @@ impl Env {
     /// apart, `count` of them from the one below the pool's price down:
     /// every one of those ticks initialized.
     pub fn crowd_below(&mut self, count: i32) {
+        let top = self.pool_state().tick.div_euclid(SPACING) * SPACING;
+        let ranges: Vec<(i32, i32)> = (1..=count)
+            .map(|i| (top - i * SPACING, top - (i - 1) * SPACING))
+            .collect();
+        self.provide_ranges(&ranges, 1_000_000_000);
+    }
+
+    /// Bob opens a position of `liquidity` on each of `ranges`.
+    pub fn provide_ranges(&mut self, ranges: &[(i32, i32)], liquidity: u128) {
         let bob = self.bob.insecure_clone();
         let usd = get_associated_token_address(&bob.pubkey(), &self.mint);
-        let top = self.pool_state().tick.div_euclid(SPACING) * SPACING;
-        for i in 1..=count {
-            let lower = top - i * SPACING;
+        for &(lower, upper) in ranges {
             let mint = Keypair::new();
-            let open = self.ix_open_position(
-                &bob.pubkey(),
-                &bob.pubkey(),
-                &mint.pubkey(),
-                lower,
-                lower + SPACING,
-            );
+            let open =
+                self.ix_open_position(&bob.pubkey(), &bob.pubkey(), &mint.pubkey(), lower, upper);
             expect_ok(self.send(vec![open], &[&bob, &mint]));
             let add = self.ix_increase(
                 &bob.pubkey(),
                 &mint.pubkey(),
                 &self.wsol_of(&bob.pubkey()),
                 &usd,
-                1_000_000_000,
+                liquidity,
                 u64::MAX,
                 u64::MAX,
             );
             expect_ok(self.send(vec![add], &[&bob]));
+        }
+    }
+
+    /// The tick arrays at `starts` made Orca's dynamic kind, as whoever
+    /// initializes an array first may choose, before anything is placed in
+    /// them.
+    pub fn make_dynamic(&mut self, starts: &[i32]) {
+        let payer = self.payer.insecure_clone();
+        for &start in starts {
+            let address = tick_array_address(&pool(), start);
+            self.svm
+                .set_account(address, solana_account::Account::default())
+                .unwrap();
+            let ix = self.ix_initialize_tick_array(&pool(), start, true);
+            expect_ok(self.send(vec![ix], &[&payer]));
         }
     }
 

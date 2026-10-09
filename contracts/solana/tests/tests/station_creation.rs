@@ -546,44 +546,32 @@ fn a_look_alike_station_account_is_never_read_as_one() {
     );
 }
 
-/// The interface's discriminators are the ones Anchor gives the stand-in
-/// driver's and the vault stand-in's instructions.
+/// The interface's discriminators are the ones Anchor gives every driver's
+/// instructions, `unwind` included, and the vault stand-in's.
 #[test]
 fn the_interfaces_discriminators_are_the_programs_own() {
     use anchor_lang::Discriminator;
     use shonin_driver::discriminator as d;
-    assert_eq!(
-        shonin_local_driver::instruction::Allowlist::DISCRIMINATOR,
-        d::ALLOWLIST
-    );
-    assert_eq!(
-        shonin_local_driver::instruction::Restricted::DISCRIMINATOR,
-        d::RESTRICTED
-    );
-    assert_eq!(
-        shonin_local_driver::instruction::Describe::DISCRIMINATOR,
-        d::DESCRIBE
-    );
-    assert_eq!(
-        shonin_local_driver::instruction::Value::DISCRIMINATOR,
-        d::VALUE
-    );
-    assert_eq!(
-        shonin_local_driver::instruction::Close::DISCRIMINATOR,
-        d::CLOSE
-    );
-    assert_eq!(
-        shonin_local_driver::instruction::Sweep::DISCRIMINATOR,
-        d::SWEEP
-    );
-    assert_eq!(
-        shonin_local_driver::instruction::Unwind::DISCRIMINATOR,
-        d::UNWIND
-    );
-    assert_eq!(
-        shonin_orca_driver::instruction::Unwind::DISCRIMINATOR,
-        d::UNWIND
-    );
+    macro_rules! answers_all {
+        ($driver:ident) => {
+            assert_eq!($driver::instruction::Describe::DISCRIMINATOR, d::DESCRIBE);
+            answers_all!($driver, without describe);
+        };
+        ($driver:ident, without describe) => {
+            assert_eq!($driver::instruction::Allowlist::DISCRIMINATOR, d::ALLOWLIST);
+            assert_eq!($driver::instruction::Restricted::DISCRIMINATOR, d::RESTRICTED);
+            assert_eq!($driver::instruction::Value::DISCRIMINATOR, d::VALUE);
+            assert_eq!($driver::instruction::Close::DISCRIMINATOR, d::CLOSE);
+            assert_eq!($driver::instruction::Sweep::DISCRIMINATOR, d::SWEEP);
+            assert_eq!($driver::instruction::Unwind::DISCRIMINATOR, d::UNWIND);
+        };
+    }
+    answers_all!(shonin_local_driver);
+    answers_all!(shonin_local_driver_2);
+    answers_all!(shonin_local_driver_3);
+    // The test driver answers what a station asks; it describes nothing.
+    answers_all!(shonin_test_driver, without describe);
+    answers_all!(shonin_orca_driver);
     assert_eq!(
         shonin_test_vault::instruction::StationView::DISCRIMINATOR,
         shonin_station::state::vault::STATION_VIEW

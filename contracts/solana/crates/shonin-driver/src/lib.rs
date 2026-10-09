@@ -77,8 +77,11 @@
 //!
 //! - its allowlist pins every account through which the station's money could
 //!   reach someone else (above);
+//! - it answers every instruction in [`discriminator`], `unwind` included:
+//!   a stopped station's unwind asks it, and a driver without it leaves its
+//!   venue's money where it is;
 //! - its venue holds the station's account to at most [`MAX_MARKETS`]
-//!   markets, and its close fits [`COMPUTE_PER_DRIVER`];
+//!   markets, and its close and its unwind each fit [`COMPUTE_PER_DRIVER`];
 //! - its venue never pays the authority's token accounts outside a station
 //!   call: no close a keeper fills later, no crank, no remainder of a
 //!   liquidation paid there afterwards. The station counts only what reaches

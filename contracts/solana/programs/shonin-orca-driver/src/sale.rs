@@ -13,6 +13,12 @@
 //! theirs. And a fraction, sold through more liquidity than the whole would
 //! be, never fetches less than its share of the whole's proceeds.
 //!
+//! Ticks too small to count (see [`THETA`]) are never stepped through: their
+//! removals are made from the start and their additions left out, so the
+//! sale works with no more liquidity than the pool has anywhere on its way
+//! and fetches no more than Orca's swap would, the stayers keeping any
+//! difference.
+//!
 //! Rounding is the pool's at every step, and against the seller. The sale
 //! goes no further than the band's limit, and no further than the tick
 //! arrays it was given reach (an array not there yet holds no ticks): what
@@ -40,38 +46,151 @@ pub struct Sale {
     pub sold: u64,
     /// Of the other token, what it paid.
     pub proceeds: u64,
-    /// Where it stopped short of the next initialized tick, having crossed
-    /// all it may: a swap made no further than this crosses no more.
+    /// Where it stopped short of the next exact tick, having crossed all it
+    /// may: a swap made no further than this crosses no more of them.
     pub stop: Option<u128>,
+    /// The square-root price it ended at.
+    pub end: u128,
 }
 
 const FEE_ONE: u128 = 1_000_000;
 
-/// The most initialized ticks a close's sale may cross: what a claim's
-/// close can afford, its sale worked out here and made by Orca's swap and the
-/// stayers' part valued again after, inside
-/// `shonin_driver::COMPUTE_PER_DRIVER` with room to spare. A claim's close
-/// at this many, from a position with fees, measures about 367,000 units;
-/// one more would take it past 370,000. A sale that would cross more stops
-/// just short of the next, so that Orca's swap made to the same price
-/// crosses no more either.
+/// The most ticks at least the threshold ([`THETA`]) a close's sale may
+/// cross: the sale of everything is worked out twice in a claim's close
+/// (before, and for the stayers' part after), about 4,000 units a crossing
+/// each. A sale that would cross more stops just short of the next.
 pub const CLOSE_CROSSINGS: u32 = 7;
 
-/// The most a valuation's sale may cross: about 4,000 units each on a
-/// valuation's 29,000. From a pool at the top of the widest band a station
-/// may be created with (10%) to the sale's limit at its bottom is about 32
-/// spacings of 64 ticks; this covers that with room.
+/// The most ticks at least the threshold a valuation's sale may cross:
+/// about 4,000 units each on a valuation's 30,000 to 55,000. From a pool at
+/// the top of the widest band a station may be created with (10%) to the
+/// sale's limit at its bottom is about 32 spacings of 64 ticks; this covers
+/// that with room.
 pub const VALUE_CROSSINGS: u32 = 40;
 
-/// Sells `amount` of token A (`a_to_b`) or of token B in `pool`, no further
-/// than the square-root price `limit` nor across more than `crossings`
-/// initialized ticks, through the pool's liquidity less `own`, with the
-/// ticks of `arrays` (those a swap would be given, starting at `starts`).
-#[allow(clippy::too_many_arguments)]
-pub fn sell(
+/// The least change of liquidity a tick must make to be crossed exactly
+/// and counted against a sale's crossings: `1 / THETA` of the most liquidity
+/// active anywhere between the pool's price and the sale's limit.
+///
+/// Anyone can initialize a tick with a sliver of liquidity for the rent of a
+/// position, so a sale must never be held to a number of initialized ticks
+/// alone. A tick that changes the liquidity by less than this is not crossed
+/// at all: where crossing it would remove liquidity, that removal is made
+/// from the start of the sale; where it would add liquidity, it is left out.
+/// The liquidity the sale works with is then never more than the pool's at
+/// any price on its way: it is the pool's as the exact ticks change it,
+/// less every small removal on the way to the limit (those not yet crossed
+/// included) and without any small addition, never below nothing; so the
+/// sale never fetches more than Orca's swap does, a unit of the asset sold
+/// through less liquidity moving the price further and being paid less.
+///
+/// A hundredth: on the mainnet pool, whose active liquidity across one
+/// spacing holds about $42,000 of each token, a tick counted against the
+/// crossings must hold about $420 at the price the sale would reach, rather
+/// than a position's rent; a real provider's tick that big is crossed
+/// exactly, and one smaller costs the sale at most a hundredth of the
+/// liquidity it would have had beyond it, the stayers keeping the difference.
+///
+/// The most liquidity on the way, not the liquidity where the sale starts:
+/// a close moves the price on and withdraws the leaver's part, and the
+/// stayers' part is valued again from where it ended, toward the same limit;
+/// on that shorter way, with less liquidity, the threshold is never higher,
+/// so no tick crossed exactly before the close is worked in as small after
+/// it, and what the leaver's sale fetched and the stayers' part are worth
+/// after it add up to at least what everything was worth before.
+pub const THETA: u128 = 100;
+
+/// The most initialized ticks of any size Orca's swap in one close may
+/// cross, each costing it about 7,500 units: a claim's close at this many,
+/// from a position with fees, across a boundary between two of Orca's
+/// dynamic tick arrays, measures about 375,000 units, inside
+/// `shonin_driver::COMPUTE_PER_DRIVER`. A claim whose own swap would cross
+/// more waits; a stopped station's unwind sells up to a unit short of the
+/// tick past them, and the next goes on.
+pub const SWAP_CROSSINGS: u32 = 7;
+
+/// The initialized ticks between the pool's price and a sale's limit, in
+/// the sale's direction, with each one's change of liquidity going up, and
+/// the threshold ([`THETA`]) for a sale that way.
+#[derive(Clone, Debug, Default)]
+pub struct Path {
+    pub ticks: Vec<(i32, i128)>,
+    pub theta: u128,
+}
+
+/// The [`Path`] from the pool's price to the square-root price `limit`
+/// through `arrays` (as far as `starts` reach), selling A if `a_to_b`.
+pub fn path(
     pool: &Whirlpool,
     arrays: &[TickArray],
     starts: &[i32],
+    a_to_b: bool,
+    limit: u128,
+) -> Result<Path> {
+    let spacing = pool.tick_spacing as i32;
+    let price = pool.sqrt_price;
+    let start = pool.tick_current;
+    let mut out = Path {
+        ticks: Vec::new(),
+        theta: pool.liquidity / THETA,
+    };
+    if starts.is_empty() || (a_to_b && limit >= price) || (!a_to_b && limit <= price) {
+        return Ok(out);
+    }
+    // How many ticks lie between the price and the limit, bounded both
+    // ways: ticks surely on the way, and ticks surely past it; between the
+    // two, a tick's own price decides.
+    let (high, low) = if price >= limit {
+        (price, limit)
+    } else {
+        (limit, price)
+    };
+    let gap = high - low;
+    let near = gap
+        .checked_mul(19_999)
+        .map_or(0, |n| n / high)
+        .saturating_sub(2);
+    let far = gap
+        .checked_mul(20_001)
+        .map_or(u128::MAX, |n| n / low.max(1))
+        .saturating_add(2);
+    let mut liquidity = pool.liquidity as i128;
+    let mut most = pool.liquidity;
+    let mut cursor = start;
+    for _ in 0..3 * TICKS_PER_ARRAY + 3 {
+        let Some((found, net)) = next_tick(arrays, starts, cursor, spacing, a_to_b)? else {
+            break;
+        };
+        let distance = (start as i64 - found as i64).unsigned_abs() as u128;
+        if distance > far {
+            break;
+        }
+        if distance > near {
+            let root = math::sqrt_price_at(found).map_err(math_error)?;
+            let on_the_way = if a_to_b { root >= limit } else { root <= limit };
+            if !on_the_way {
+                break;
+            }
+        }
+        out.ticks.push((found, net));
+        liquidity += if a_to_b { -net } else { net };
+        most = most.max(liquidity.max(0) as u128);
+        cursor = if a_to_b { found - 1 } else { found };
+    }
+    out.theta = most / THETA;
+    Ok(out)
+}
+
+/// Sells `amount` of token A (`a_to_b`) or of token B in `pool`, no further
+/// than the square-root price `limit` nor across more than `crossings` ticks
+/// of `path` at least its threshold, the others worked in as [`THETA`]
+/// says, through the pool's liquidity less `own`; a sale stops where the
+/// arrays at `starts` end.
+#[allow(clippy::too_many_arguments)]
+pub fn sell(
+    pool: &Whirlpool,
+    starts: &[i32],
+    path: &Path,
     own: &[Own],
     amount: u64,
     a_to_b: bool,
@@ -81,43 +200,57 @@ pub fn sell(
     let spacing = pool.tick_spacing as i32;
     let span = TICKS_PER_ARRAY * spacing;
     let fee_rate = pool.fee_rate as u128;
-    // The pool's liquidity at its price, and the station's there.
-    let mut liquidity = pool_liquidity(pool) as i128;
     let mut price = pool.sqrt_price;
     let mut tick = pool.tick_current;
     let mut remaining = amount;
     let mut proceeds: u64 = 0;
-    // How far the given arrays reach in the sale's direction; a sale stops
-    // there.
-    if starts.is_empty() {
-        return Ok(Sale::default());
+    let unsold = Sale {
+        end: price,
+        ..Sale::default()
+    };
+    if starts.is_empty() || (a_to_b && limit >= price) || (!a_to_b && limit <= price) {
+        return Ok(unsold);
     }
     let lowest = *starts.iter().min().unwrap();
     let highest = *starts.iter().max().unwrap() + span;
-    // A limit on the wrong side of the price sells nothing.
-    if (a_to_b && limit >= price) || (!a_to_b && limit <= price) {
-        return Ok(Sale::default());
+    // The ticks crossed exactly (big enough, or the station's own), as many
+    // as may be and the one past them; and every small removal on the way.
+    let mut exact: Vec<(i32, i128)> = Vec::new();
+    let mut removed: u128 = 0;
+    for &(at, net) in &path.ticks {
+        let own_tick = own.iter().any(|o| o.tick_lower == at || o.tick_upper == at);
+        if own_tick || net.unsigned_abs() >= path.theta {
+            if exact.len() <= crossings as usize {
+                exact.push((at, net));
+            }
+        } else {
+            let change = if a_to_b { -net } else { net };
+            if change < 0 {
+                removed = removed.saturating_add(change.unsigned_abs());
+            }
+        }
     }
-    let mut crossed = 0u32;
+    let removed = removed.min(i128::MAX as u128) as i128;
+    // The pool's liquidity as the exact ticks change it; the sale works with
+    // that less every small removal, never below nothing.
+    let mut liquidity = pool.liquidity as i128;
     let mut stop = None;
-    // Each step crosses an initialized tick or ends the sale (sold out, at
-    // the limit, at the arrays' edge, at the last crossing allowed).
-    for _ in 0..crossings + 3 {
+    for at in 0..=exact.len() {
         if remaining == 0 || price == limit || stop.is_some() {
             break;
         }
-        // The next initialized tick in the sale's direction, or the edge of
-        // what the arrays cover.
-        let next = next_tick(arrays, starts, tick, spacing, a_to_b)?;
-        let (next_tick, initialized) = match next {
-            Some(found) => (found, true),
-            None => (if a_to_b { lowest } else { highest }, false),
+        // The next exact tick, or the edge of what the arrays cover.
+        let next = exact.get(at).copied();
+        let next_tick = match next {
+            Some((found, _)) => found,
+            None if a_to_b => lowest,
+            None => highest,
         };
         let tick_price = math::sqrt_price_at(next_tick.clamp(math::MIN_TICK, math::MAX_TICK))
             .map_err(math_error)?;
-        // With every crossing allowed made, a unit short of the next
-        // initialized tick: the sale stops there, crossing nothing more.
-        let last = initialized && crossed == crossings;
+        // With every crossing allowed made, a unit short of the next exact
+        // tick: the sale stops there, crossing nothing more.
+        let last = next.is_some() && at == crossings as usize;
         let edge = match (last, a_to_b) {
             (false, _) => tick_price,
             (true, true) => tick_price + 1,
@@ -128,9 +261,9 @@ pub fn sell(
         } else {
             edge.min(limit)
         };
-        let theirs = liquidity - own_at(own, tick) as i128;
-        require!(theirs >= 0, crate::DriverError::WrongAccounts);
-        let step = step(remaining, fee_rate, theirs as u128, price, target, a_to_b)?;
+        let working = (liquidity - removed).max(0) as u128;
+        let theirs = working.saturating_sub(own_at(own, tick));
+        let step = step(remaining, fee_rate, theirs, price, target, a_to_b)?;
         remaining -= step.consumed;
         proceeds = proceeds.saturating_add(step.out);
         price = step.next;
@@ -138,39 +271,31 @@ pub fn sell(
             if price == edge {
                 stop = Some(edge);
             }
-            continue;
+            break;
         }
-        if price != tick_price || !initialized {
-            if price == tick_price && !initialized {
-                // At the edge of the given arrays: nothing further is known.
-                break;
-            }
-            continue;
+        let Some((found, net)) = next else {
+            // At the edge of the given arrays: nothing further is known.
+            break;
+        };
+        if price != tick_price {
+            // Sold out or at the limit before the tick.
+            break;
         }
-        // Crossing an initialized tick: the liquidity that starts or ends
-        // there.
-        let net = tick_net(arrays, next_tick, spacing)?;
+        // Crossing it: the liquidity that starts or ends there.
         if a_to_b {
             liquidity -= net;
-            tick = next_tick - 1;
+            tick = found - 1;
         } else {
             liquidity += net;
-            tick = next_tick;
+            tick = found;
         }
-        require!(liquidity >= 0, crate::DriverError::WrongAccounts);
-        crossed += 1;
     }
     Ok(Sale {
         sold: amount - remaining,
         proceeds,
         stop,
+        end: price,
     })
-}
-
-/// The pool's active liquidity. (Orca keeps it in the pool's account; the
-/// driver reads it with the rest.)
-fn pool_liquidity(pool: &Whirlpool) -> u128 {
-    pool.liquidity
 }
 
 /// The station's own liquidity active at `tick`.
@@ -182,14 +307,15 @@ fn own_at(own: &[Own], tick: i32) -> u128 {
 }
 
 /// The next initialized tick from `tick` in the sale's direction among
-/// `arrays`: at or below it selling A, above it selling B.
+/// `arrays`, at or below it selling A, above it selling B, with its
+/// liquidity's change going up.
 fn next_tick(
     arrays: &[TickArray],
     starts: &[i32],
     tick: i32,
     spacing: i32,
     a_to_b: bool,
-) -> Result<Option<i32>> {
+) -> Result<Option<(i32, i128)>> {
     let span = TICKS_PER_ARRAY * spacing;
     // The array holding the tick, and the tick's offset in it.
     let mut start = tick.div_euclid(span) * span;
@@ -201,7 +327,9 @@ fn next_tick(
         // An array not there yet holds no initialized tick.
         if let Some(array) = arrays.iter().find(|a| a.start == start) {
             if let Some(found) = array.next_initialized(offset, a_to_b) {
-                return Ok(Some(start + found * spacing));
+                let at = start + found * spacing;
+                let net = array.tick(at, spacing as u16)?.liquidity_net;
+                return Ok(Some((at, net)));
             }
         }
         // On to the next array in the sale's direction.
@@ -213,16 +341,6 @@ fn next_tick(
             offset = -1;
         }
     }
-}
-
-fn tick_net(arrays: &[TickArray], tick: i32, spacing: i32) -> Result<i128> {
-    let span = TICKS_PER_ARRAY * spacing;
-    let start = tick.div_euclid(span) * span;
-    let array = arrays
-        .iter()
-        .find(|a| a.start == start)
-        .ok_or(crate::DriverError::WrongAccounts)?;
-    Ok(array.tick(tick, spacing as u16)?.liquidity_net)
 }
 
 struct Step {
