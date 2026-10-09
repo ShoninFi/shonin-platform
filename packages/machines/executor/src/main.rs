@@ -6485,3 +6485,6 @@ mod key_driver_tests {
         assert_eq!(key_driver_of(&[]), None);
     }
 }
+
+#[cfg(test)]
+mod manifest_tests;

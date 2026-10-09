@@ -850,6 +850,21 @@ impl Cluster {
             .strategy(&self.client, strategy_id)
             .await?
             .ok_or_else(|| anyhow!("strategy {strategy_id} is not registered"))?;
+        // Different strategies can share a component while recording
+        // different manifests. A cached component says nothing about this
+        // strategy's manifest; read both through before loading its rules.
+        if let Some(base) = self.args.store_url.as_deref() {
+            anyhow::ensure!(
+                crate::fetch_registered(
+                    &self.args.store,
+                    base,
+                    B256::from(registered.manifest_hash),
+                    B256::from(bundle),
+                )
+                .await?,
+                "the strategy's manifest or component is not in the public store yet"
+            );
+        }
         let recorded = crate::recorded_in(
             &self.args.store,
             B256::from(registered.bundle_hash),
