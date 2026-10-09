@@ -144,10 +144,17 @@ pub async fn drivers_of(
 /// part that closed); once its dollars have landed, or a delivery window
 /// after the ask, to deliver it, in whole or the part that landed. A call
 /// that can't go yet (`NotYet`) is simply tried next round, and nothing is
-/// sent.
+/// sent. Every round simulates it, so the proof goes in the first round it
+/// would go through, a window ahead of its deadline (`provedBy`), while the
+/// executor holds the agent off the venue; past the deadline the same call
+/// ends the stage with nothing paid, and the claim is tried again.
 pub async fn settle_close(client: &Client, keeper: Address, station: Address) -> Result<()> {
     let stage = client.read(station, IStation::stageCall {}).await?;
-    let Some(what) = close_step(stage.stagedAt, stage.sweptBlock) else {
+    if stage.stagedAt == 0 {
+        return Ok(());
+    }
+    let now = client.block_timestamp().await?;
+    let Some(what) = close_step(stage.stagedAt, stage.sweptBlock, stage.provedBy, now) else {
         return Ok(());
     };
     if client
@@ -161,12 +168,21 @@ pub async fn settle_close(client: &Client, keeper: Address, station: Address) ->
     Ok(())
 }
 
-/// What `settleClose` would do for a stage placed at `staged_at` and swept in
-/// `swept_block` (zero for none), as the keeper's log says it; `None` with
-/// nothing staged, when there is nothing to send.
-pub fn close_step(staged_at: u64, swept_block: u64) -> Option<&'static str> {
+/// What `settleClose` would do at chain time `now` for a stage placed at
+/// `staged_at`, swept in `swept_block` (zero for none) and provable until
+/// `proved_by`, as the keeper's log says it; `None` with nothing staged,
+/// when there is nothing to send.
+pub fn close_step(
+    staged_at: u64,
+    swept_block: u64,
+    proved_by: u64,
+    now: u64,
+) -> Option<&'static str> {
     match (staged_at, swept_block) {
         (0, _) => None,
+        (_, 0) if now >= proved_by => {
+            Some("end the staged close, not proved by its deadline, with nothing paid")
+        }
         (_, 0) => Some("prove, measure and sweep the staged close, or end it with its window"),
         _ => Some("deliver the staged close, or the part of it that has landed"),
     }
@@ -725,10 +741,22 @@ mod tests {
 
     #[test]
     fn a_staged_close_is_moved_on_only_while_one_is_staged() {
-        assert_eq!(close_step(0, 0), None, "nothing staged: nothing to send");
-        assert_eq!(close_step(0, 9), None);
-        assert!(close_step(100, 0).unwrap().starts_with("prove"));
-        assert!(close_step(100, 7).unwrap().starts_with("deliver"));
+        assert_eq!(
+            close_step(0, 0, 0, 50),
+            None,
+            "nothing staged: nothing to send"
+        );
+        assert_eq!(close_step(0, 9, 0, 50), None);
+        assert!(close_step(100, 0, 700, 160).unwrap().starts_with("prove"));
+        assert!(close_step(100, 7, 700, 160).unwrap().starts_with("deliver"));
+    }
+
+    #[test]
+    fn a_stage_not_proved_by_its_deadline_is_ended_and_a_proved_one_is_still_delivered() {
+        assert!(close_step(100, 0, 700, 699).unwrap().starts_with("prove"));
+        assert!(close_step(100, 0, 700, 700).unwrap().starts_with("end"));
+        // Proved before its deadline: delivered whenever its dollars land.
+        assert!(close_step(100, 7, 700, 900).unwrap().starts_with("deliver"));
     }
 
     #[test]

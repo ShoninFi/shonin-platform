@@ -110,6 +110,7 @@ async fn a_claim_whose_own_try_staged_its_close_does_not_freeze_the_vault_in_tha
                     sweptBlock: 0,
                     window: 1_800,
                     delay: 120,
+                    provedBy: u64::MAX,
                     forVault: true,
                 })));
             }

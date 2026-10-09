@@ -98,6 +98,7 @@ async fn a_stopped_station_whose_venue_never_changes_is_not_unwound_for_good() {
             sweptBlock: 0,
             window: 0,
             delay: 0,
+            provedBy: u64::MAX,
             forVault: false,
         },
     );

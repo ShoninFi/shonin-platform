@@ -124,6 +124,10 @@ contract LighterDriver is IDriver, IDelayedDriver {
     /// What the freed margin is counted at when judging whether a claim's
     /// close could come home: nine tenths.
     uint256 private constant SAFETY_BPS = 1000;
+    /// What a taker fill pays the exchange at most, in basis points,
+    /// counted against a close's least: nothing on a standard account, and
+    /// under three on a premium one at its base tier.
+    uint256 private constant FEE_BOUND_BPS = 10;
     /// The name stations know the driver by.
     bytes32 private constant NAME = "lighter";
     /// What a withdrawn key is replaced with: five field elements nobody
@@ -562,8 +566,10 @@ contract LighterDriver is IDriver, IDelayedDriver {
     /// `closedPart` asks): the exchange's side now, less the rest
     /// (1 - `fraction` x `part`, rounded up) of `dollars` and `before`'s
     /// positions repriced at the marks now, never below `bandBps` of what
-    /// the close ordered at those marks. A market the newest post has no
-    /// price for keeps the mark it had.
+    /// the close ordered at those marks, nor below her part of the accounts
+    /// as they were with every order filled at its limit from the stage's
+    /// index, less what a fill pays the exchange. A market the newest post
+    /// has no price for keeps the mark it had.
     function measure(
         address station,
         int256 dollars,
@@ -606,22 +612,22 @@ contract LighterDriver is IDriver, IDelayedDriver {
                 uint256 index = uint256(before[end + m]);
                 if (index == 0) index = uint256(before[n + 1 + m]);
                 orderedThen += uint256(_notional(m, int256(ordered), int256(index)));
-                // At the worse of the stage's index and the newest post's (its
-                // mark where it has no index): her order may have missed and
-                // the position shrunk since by a sale of the agent's.
-                uint256 indexNow = uint256(_priceOf(report, market).index);
-                if (indexNow == 0) indexNow = uint256(marks[m]);
+                // At the limit her order was placed at, from the stage's index
+                // alone, less what a fill pays the exchange: nothing but her
+                // orders trades the accounts until the proof, so a position
+                // smaller since is her fill, at its limit or better.
                 worst += was > 0
-                    ? _notional(m, was, int256(Math.min(index, indexNow).mulDiv(BPS - band, BPS)))
-                    : _notional(
-                        m, was, int256(Math.max(index, indexNow).mulDiv(BPS + band, BPS, Math.Rounding.Ceil))
-                    );
+                    ? _notional(m, was, int256(index.mulDiv(BPS - band - FEE_BOUND_BPS, BPS)))
+                    : _notional(m, was, int256(index.mulDiv(BPS + band + FEE_BOUND_BPS, BPS, Math.Rounding.Ceil)));
             }
         }
         // Her part of the accounts as they were, every order filled at its
-        // limit: the least her close fetched. What the agent's trading or
-        // funding lost since the stage is the stayers' as much as hers, and
-        // a price that moved after her orders filled is nobody's to claim.
+        // limit: the least her close fetched. A measure below it is a loss
+        // her orders could not have made (funding, an order resting before
+        // the stage that filled before the executor cancelled it), the
+        // stayers' as much as hers. A price that moved after her orders
+        // filled changes neither figure: her part was sold, and the rest is
+        // repriced on both sides.
         uint256 worstSize = uint256(worst < 0 ? -worst : worst);
         uint256 share = worstSize.mulDiv(
             fraction.mulDiv(part, WAD), WAD, worst < 0 ? Math.Rounding.Ceil : Math.Rounding.Floor

@@ -75,6 +75,7 @@ fn a_stopped_delayed_station(node: &process::Shared) {
             sweptBlock: 0,
             window: 0,
             delay: 0,
+            provedBy: u64::MAX,
             forVault: false,
         },
     );

@@ -132,6 +132,7 @@ async fn a_claim_tried_after_the_others_is_still_tried_once_they_are_paid() {
                     sweptBlock: 0,
                     window: 10,
                     delay: 0,
+                    provedBy: u64::MAX,
                     forVault: true,
                 })));
             }

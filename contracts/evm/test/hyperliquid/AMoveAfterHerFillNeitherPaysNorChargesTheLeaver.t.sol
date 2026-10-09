@@ -50,9 +50,10 @@ contract AMoveAfterHerFillNeitherPaysNorChargesTheLeaverTest is HyperliquidVault
         assertLe(bobUp, bobFlat + 5e6, "the stayer paid the leaver's fill");
     }
 
-    /// Up 3%: she is paid the estimate (the bid at the stage), her whole
-    /// fill the stayers'; down 3%: her fill stays hers. One-sided.
-    function test_a_rise_after_her_fill_pays_her_nothing_more() public {
+    /// Up 3% or down 3% at the proof: she is paid what her fill fetched
+    /// either way. Nothing but her orders trades the account until the
+    /// proof, and her least reads the stage's prices alone.
+    function test_a_move_either_way_after_her_fill_pays_her_neither_more_nor_less() public {
         uint256 start = vm.snapshotState();
         (uint256 flat,) = _payout(ETH_PX);
         vm.revertToState(start);
@@ -63,5 +64,6 @@ contract AMoveAfterHerFillNeitherPaysNorChargesTheLeaverTest is HyperliquidVault
         emit log_named_decimal_uint("paid, ETH +3% at the proof", up, 6);
         emit log_named_decimal_uint("paid, ETH -3% at the proof", down, 6);
         assertApproxEqAbs(up, flat, 5e6, "an up-move after her fill paid her more");
+        assertApproxEqAbs(down, flat, 5e6, "a fall after her fill paid her less");
     }
 }

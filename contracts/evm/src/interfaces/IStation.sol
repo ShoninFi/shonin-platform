@@ -44,6 +44,12 @@ struct Stage {
     /// How long after it was placed it may first be proved: the longest
     /// settle delay of its drivers.
     uint64 delay;
+    /// The moment it may no longer be proved: from then on the agent may
+    /// trade the venue accounts again, so nothing read there tells the
+    /// close from the agent's trading, and the stage can only lapse. Until
+    /// it is proved or this has passed, the attested executor neither
+    /// places nor changes an order nor moves dollars at its venues.
+    uint64 provedBy;
     /// Placed by the vault for one of its claims or one holder's units, and
     /// delivered through the vault's own door for them.
     bool forVault;

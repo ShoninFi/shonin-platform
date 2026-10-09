@@ -144,14 +144,18 @@ interface IDelayedDriver {
     ///
     /// And `least`, what the close fetched at the least: her part of the
     /// account as it was, every order filled at its limit (the venue's own
-    /// price at the stage, less or plus the band), never below what the
-    /// orders could lose at their limits at the prices now. A fill is never
-    /// worse than its limit, so a measure below it is a loss made after the
-    /// close was placed (the agent's trading, funding), which is the
-    /// stayers' as much as the leaver's; and being fixed at the stage, it
-    /// gives no leaver a price that moved after her orders filled. The
-    /// station adds what reached it from the venue meanwhile to the
-    /// measures, and takes the larger of that and the sum of the leasts.
+    /// price at the stage, less or plus the band) and paying the venue's
+    /// taker fee at most, never below what the orders could lose at their
+    /// limits at the prices now. It reads the stage's prices only: from the
+    /// stage until the proof the attested executor trades nothing at the
+    /// venue, so a position smaller since is her fill, never worse than its
+    /// limit, and a measure below the least is a loss her orders could not
+    /// have made (funding, an order resting before the stage that filled
+    /// before it was cancelled), which is the stayers' as much as the
+    /// leaver's. A price that moved after her orders filled changes neither
+    /// figure. The station adds what reached it from the venue meanwhile to
+    /// the measures, and takes the larger of that and the sum of the
+    /// leasts.
     function measure(
         address station,
         int256 dollars,

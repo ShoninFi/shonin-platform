@@ -7775,6 +7775,7 @@ mod tests {
                 sweptBlock: 0,
                 window: 300,
                 delay: 0,
+                provedBy: u64::MAX,
                 forVault: true,
             },
         );
@@ -13084,6 +13085,7 @@ mod tests {
                 sweptBlock: 0,
                 window: 10,
                 delay: 0,
+                provedBy: u64::MAX,
                 forVault: true,
             },
         );

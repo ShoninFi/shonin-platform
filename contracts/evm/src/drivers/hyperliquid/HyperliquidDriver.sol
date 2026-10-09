@@ -606,8 +606,8 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
     /// now, less the rest of its worth then (1 - `fraction` x `part`,
     /// rounded up) repriced at the same prices; and the least the close
     /// fetched, her part of the account then with every order filled at its
-    /// limit from the stage's own prices, never below `bandBps` of what the
-    /// close ordered. Figures are kept in hundredths of a millionth until the
+    /// limit from the stage's own prices, less what a fill pays the venue,
+    /// never below `bandBps` of what the close ordered. Figures are kept in hundredths of a millionth until the
     /// end, which rounds down.
     function measure(
         address station,
@@ -630,12 +630,8 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
             int256 was = before[i];
             int256 is_ = current[i];
             uint256 px;
-            // The market's own price now, as the close's orders were limited
-            // by it at the stage.
-            uint256 ownPx;
             if (i < _perps.length) {
                 px = uint256(HyperCore.markPx(_perps[i].index)) * 100;
-                ownPx = uint256(HyperCore.oraclePx(_perps[i].index)) * 100;
             } else {
                 // What the account held then and didn't count (HYPE up to
                 // the reserve, a holding worth less than the smallest
@@ -646,7 +642,6 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
                 // whatever it holds less than that (HYPE spent on a send)
                 // is never the leaver's.
                 px = HyperCore.spotPx(_spots[i - _perps.length].pair);
-                ownPx = px;
                 int256 counted = _sellable(i == _perps.length + _gas ? _overReserve(was) : was, px);
                 int256 uncounted = was - counted;
                 was = counted;
@@ -655,26 +650,28 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
             then += was * int256(px);
             now_ += is_ * int256(px);
             ordered += _part(uint256(was < 0 ? -was : was), fraction) * px;
-            // A long sold no lower than its own price less the band, a short
-            // bought back no higher than it plus the band, at the worse of
-            // the stage's price and the price now: her order may have missed
-            // and the position shrunk since by a sale of the agent's, which
-            // fetched what the market gave then. Less what a fill pays the
-            // venue.
+            // A long sold no lower than the stage's own price less the band,
+            // a short bought back no higher than it plus the band: the
+            // limits her orders were placed at, less what a fill pays the
+            // venue. Only the stage's prices: nothing but her orders trades
+            // the account until the proof, so a position smaller since is
+            // her fill, at its limit or better.
             uint256 stagePx = uint256(before[n + i]);
             orderedThen += _part(uint256(was < 0 ? -was : was), fraction) * stagePx;
             worst += was > 0
-                ? was * int256(Math.min(stagePx, ownPx).mulDiv(BPS - band - FEE_BOUND_BPS, BPS))
-                : was
-                    * int256(Math.max(stagePx, ownPx).mulDiv(BPS + band + FEE_BOUND_BPS, BPS, Math.Rounding.Ceil));
+                ? was * int256(stagePx.mulDiv(BPS - band - FEE_BOUND_BPS, BPS))
+                : was * int256(stagePx.mulDiv(BPS + band + FEE_BOUND_BPS, BPS, Math.Rounding.Ceil));
         }
         uint256 share = fraction.mulDiv(part, WAD);
         measured = now_ - _keptPart(then, share);
         least = -int256(ordered.mulDiv(band, BPS, Math.Rounding.Ceil));
         // Her part of the account as it was with every order of the part
-        // closed filled at its limit: the least her close fetched. What the agent's trading or
-        // funding lost since the stage is the stayers' as much as hers, and
-        // a price that moved after her orders filled is nobody's to claim.
+        // closed filled at its limit: the least her close fetched. A
+        // measure below it is a loss her orders could not have made
+        // (funding, an order resting before the stage that filled before the
+        // executor cancelled it), the stayers' as much as hers. A price that
+        // moved after her orders filled changes neither figure: her part
+        // was sold, and the rest is repriced on both sides.
         // What wasn't closed of what was ordered may have filled and been
         // traded back since: no more than the band on it at the stage's
         // prices is the leaver's to lose.

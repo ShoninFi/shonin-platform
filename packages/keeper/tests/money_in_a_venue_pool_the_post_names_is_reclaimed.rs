@@ -140,6 +140,7 @@ async fn money_in_a_venue_pool_the_post_names_is_reclaimed() {
             sweptBlock: 0,
             window: 0,
             delay: 0,
+            provedBy: u64::MAX,
             forVault: false,
         },
     );

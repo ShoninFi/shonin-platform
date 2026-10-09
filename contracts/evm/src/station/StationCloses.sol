@@ -24,8 +24,16 @@ import {Math} from "openzeppelin/utils/math/Math.sol";
 /// the venue, and delivered once it has landed, or, a delivery window after
 /// the ask, the part of it that has landed is delivered. A measure below
 /// nothing is a loss the stage's own sale made, owed by whom it was for.
-/// Only a stage nothing at all could be measured for by the end of its
-/// window (no reading of the venue after it) lapses with nothing paid.
+///
+/// The account can't tell the stage's fills from anyone else's trades, so
+/// the proof has a fixed span: from the stage until it is proved, or until
+/// `PROOF_WINDOWS` windows after it was placed, the attested executor
+/// trades nothing at its venues (it cancels the account's resting orders
+/// and refuses the agent's orders and moves there), and what the account
+/// did meanwhile is the stage's own. A stage not proved by then can no
+/// longer be: it lapses with nothing paid, as does one nothing at all
+/// could be measured for by the end of its window (no reading of the venue
+/// after it), and the claim can be staged again.
 library StationCloses {
     using StationStorage for StationLayout;
     using SafeERC20 for IERC20;
@@ -33,6 +41,13 @@ library StationCloses {
 
     uint256 private constant WAD = 1e18;
     uint256 private constant BPS = 10_000;
+    /// How many delivery windows after it was placed a stage may still be
+    /// proved. A partial close is first proved once one window is over; a
+    /// second gives the keeper, or anyone, the leaver included, as long
+    /// again to land the proof, while it bounds how long the agent is kept
+    /// from trading its venues (ten minutes on Hyperliquid, an hour on
+    /// Lighter).
+    uint64 private constant PROOF_WINDOWS = 2;
 
     error NotAllowed();
     error NotYet();
@@ -291,6 +306,7 @@ library StationCloses {
             sweptBlock: 0,
             window: window,
             delay: delay,
+            provedBy: uint64(block.timestamp) + PROOF_WINDOWS * window,
             forVault: s.isHome()
         });
         emit IStation.CloseStaged(fraction, owed, estimate);
@@ -310,6 +326,12 @@ library StationCloses {
                     || block.timestamp < uint256(current.stagedAt) + current.delay
             ) {
                 revert NotYet();
+            }
+            // Past its deadline the agent may have traded the account again:
+            // nothing read there now is the stage's alone, and it lapses.
+            if (block.timestamp >= current.provedBy) {
+                _lapse(s);
+                return;
             }
             bool over = block.timestamp >= uint256(current.stagedAt) + current.window;
             (uint256 part, bool known) = _closedPart(s, current);
