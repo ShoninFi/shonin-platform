@@ -157,7 +157,8 @@ impl Manifest {
                 .count();
             if delayed != 0 && delayed != need.drivers.len() {
                 return Err(format!(
-                    "on {} the drivers {} mix venues that close in the transaction with venues                      whose closes settle after it; a vault's station closes through one kind only",
+                    "on {} the drivers {} mix venues that close in the transaction with venues \
+                     whose closes settle after it; a vault's station closes through one kind only",
                     need.chain.name(),
                     need.drivers.join(", ")
                 ));
