@@ -1003,6 +1003,27 @@ impl Env {
         Ok(Valuation::try_from_slice(&meta.return_data.data).expect("a valuation"))
     }
 
+    /// Orca's driver's own `value` at `band_bps`, asked directly with
+    /// `group` (the program first), for what it answers or why it fails.
+    pub fn driver_value(
+        &mut self,
+        group: &[AccountMeta],
+        band_bps: u16,
+    ) -> std::result::Result<Valuation, FailedTx> {
+        let accounts = group[1..]
+            .iter()
+            .map(|meta| AccountMeta::new_readonly(meta.pubkey, false))
+            .collect();
+        let ix = Instruction {
+            program_id: shonin_orca_driver::ID,
+            accounts,
+            data: shonin_orca_driver::instruction::Value { band_bps }.data(),
+        };
+        let payer = self.payer.insecure_clone();
+        let meta = self.send_fitting(vec![ix], &[&payer])?;
+        Ok(Valuation::try_from_slice(&meta.return_data.data).expect("a valuation"))
+    }
+
     /// Where an account stands in the driver's group (the program first).
     pub fn group_index(group: &[AccountMeta], key: &Pubkey) -> usize {
         group

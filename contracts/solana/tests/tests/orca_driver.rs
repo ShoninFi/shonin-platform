@@ -541,33 +541,131 @@ fn a_position_at_any_mint_but_the_authority_s_slots_is_refused() {
     );
 }
 
-/// SOL no sale inside the band can take counts for nothing at `exit`: on a
-/// pool too thin for what the station holds, `exit` is what a close of
-/// everything really fetches, never a price no sale inside the band reaches.
+/// SOL the pool can't take inside the band puts the valuation outside: on a
+/// pool too thin for what the station holds, nobody is paid at a value no
+/// sale inside the band reaches, so the vault's valuations are void and every
+/// claim waits, even one whose own fraction the pool could take.
 #[test]
-fn sol_no_sale_inside_the_band_can_take_counts_for_nothing_at_exit() {
+fn sol_the_pool_can_t_take_inside_the_band_puts_the_valuation_outside_and_blocks_claims() {
     let (mut env, home) = world();
     // About 60 SOL, far more than the pool takes inside the band.
     expect_ok(env.station_buys_sol(&home, 9_000_000_000));
     env.price_follows_pool();
-    let idle = env.idle(&home);
     let value = env.value(&home);
-    assert!(!value.outside, "{value:?}");
-    let (mark, exit) = (value.mark - idle, value.exit - idle);
-    // Most of it can't be sold inside the band, and is worth nothing there.
-    assert!(exit < mark * 9 / 10, "mark {mark} exit {exit}");
-    // A close of everything fetches at least that, and leaves the SOL the
-    // pool can't take inside the band where it is.
+    assert!(value.outside, "{value:?}");
+    // A tenth, about 6 SOL, which the pool alone would take.
     let held = wsol(&env, &home);
-    let (outcome, received, _) = ok(env.orca_unwind(&home, WAD));
-    assert!(!outcome.blocked);
-    assert!(received >= value.exit, "{received} {value:?}");
-    assert!(
-        received - value.exit < value.exit / 1_000,
-        "{received} {value:?}"
+    let (outcome, received, _) = ok(env.orca_unwind(&home, WAD / 10));
+    assert!(outcome.blocked && received == 0, "{outcome:?} {received}");
+    assert_eq!(wsol(&env, &home), held);
+}
+
+/// A stopped station holding more SOL than the pool takes inside its band
+/// sells nothing while the band can't take it all, and all of it once the
+/// band has widened far enough.
+#[test]
+fn a_stopped_station_holding_more_sol_than_the_band_takes_sells_it_once_the_band_widens() {
+    let (mut env, home) = world();
+    expect_ok(env.station_buys_sol(&home, 9_000_000_000));
+    let held = wsol(&env, &home);
+    env.halt_and_stop(&home);
+    let payer = env.payer.insecure_clone();
+    let mut widenings = 0;
+    loop {
+        env.price_follows_pool();
+        let ix = env.ix_unwind_stopped(&home, &payer.pubkey(), &[0]);
+        let meta = expect_ok(env.send_fitting(vec![ix], &[&payer]));
+        let outcome = Outcome::try_from_slice(&meta.return_data.data).unwrap();
+        if !outcome.blocked {
+            break;
+        }
+        assert_eq!(wsol(&env, &home), held, "sold while outside");
+        widenings += 1;
+        assert!(widenings < 8, "the band never let it sell");
+        env.skip(shonin_station::state::WIDEN_AFTER);
+    }
+    assert!(widenings > 0);
+    assert!(wsol(&env, &home) <= 2, "{} left", wsol(&env, &home));
+}
+
+/// At the full band a stopped station sells as far as three arrays from the
+/// pool's price reach, a tick spacing short of their edge, and keeps the
+/// rest; the next unwind goes on from there, and a pool with nothing left to
+/// take is not asked to.
+#[test]
+fn at_the_full_band_a_sale_stops_inside_the_arrays_it_was_given_and_the_next_goes_on() {
+    let (mut env, home) = world();
+    // Far more SOL than the pool holds liquidity for.
+    let bob = env.bob.insecure_clone();
+    env.svm.airdrop(&bob.pubkey(), 6_000 * SOL).unwrap();
+    env.wrap(&bob, 5_000 * SOL);
+    let gift = spl_token::instruction::transfer(
+        &spl_token::ID,
+        &env.wsol_of(&bob.pubkey()),
+        &env.wsol_of(&home.authority(0)),
+        &bob.pubkey(),
+        &[],
+        5_000 * SOL,
+    )
+    .unwrap();
+    expect_ok(env.send(vec![gift], &[&bob]));
+    env.halt_and_stop(&home);
+    env.skip(8 * shonin_station::state::WIDEN_AFTER);
+    let edge = array_start(env.pool_state().tick) - 2 * SPAN;
+    let payer = env.payer.insecure_clone();
+    let held = wsol(&env, &home);
+    let mut sends = Vec::new();
+    for _ in 0..2 {
+        let sent = env.sent_home(&home);
+        let ix = env.ix_unwind_stopped(&home, &payer.pubkey(), &[0]);
+        let meta = expect_ok(env.send_fitting(vec![ix], &[&payer]));
+        let outcome = Outcome::try_from_slice(&meta.return_data.data).unwrap();
+        assert!(!outcome.blocked);
+        println!(
+            "sent {} home, {} lamports left, the pool at tick {}",
+            env.sent_home(&home) - sent,
+            wsol(&env, &home),
+            env.pool_state().tick
+        );
+        sends.push(env.sent_home(&home) - sent);
+    }
+    // The first sold what the pool could take there; the pool had nothing
+    // more to take, and the second asked it for nothing.
+    assert!(sends[0] > 0 && sends[1] == 0, "{sends:?}");
+    assert!(wsol(&env, &home) > 0 && wsol(&env, &home) < held);
+    assert!(env.pool_state().tick >= edge, "{}", env.pool_state().tick);
+}
+
+/// Whoever gives the sale's tick arrays must give a set reaching the sale's
+/// limit: the one before the pool's price, which reaches an array less, is
+/// refused where its reach falls short, and at the full band, where the sale
+/// goes as far as its arrays reach, only the set from the price is taken.
+#[test]
+fn a_sale_tick_array_set_falling_short_of_the_sale_s_limit_is_refused() {
+    let (mut env, home) = providing();
+    let group = env.orca_group(&home.station);
+    let at = Env::group_index(&group, &oracle_address(&pool())) + 1;
+    let base = array_start(env.pool_state().tick);
+    let mut before = group.clone();
+    before[at..at + 3].clone_from_slice(
+        &[base + SPAN, base, base - SPAN]
+            .map(|s| AccountMeta::new(tick_array_address(&pool(), s), false)),
     );
-    let left = wsol(&env, &home);
-    assert!(left > held / 2, "{left} of {held}");
+    // A band whose limit the set from the price reaches and the one before
+    // it doesn't.
+    assert!(env.driver_value(&group, 8_000).is_ok());
+    expect_err(
+        env.driver_value(&before, 8_000),
+        orca_error(OrcaError::WrongAccounts),
+    );
+    // Narrower, both reach it.
+    assert!(env.driver_value(&before, 6_400).is_ok());
+    // The full band.
+    assert!(env.driver_value(&group, 10_000).is_ok());
+    expect_err(
+        env.driver_value(&before, 10_000),
+        orca_error(OrcaError::WrongAccounts),
+    );
 }
 
 /// Bob provides 400 SOL and as many dollars within about 6% of the price.
@@ -636,7 +734,7 @@ fn a_pool_pushed_inside_the_band_does_not_move_the_mark() {
 #[test]
 fn a_leaver_s_close_whose_sale_crosses_into_the_next_tick_array_is_served() {
     let (mut env, home) = world();
-    expect_ok(env.station_buys_sol(&home, 3_000_000_000));
+    expect_ok(env.station_buys_sol(&home, 1_000_000_000));
     // The pool's price just above the first tick of an array.
     let edge = -3 * SPAN;
     let bob = env.bob.insecure_clone();
@@ -645,14 +743,14 @@ fn a_leaver_s_close_whose_sale_crosses_into_the_next_tick_array_is_served() {
         &env.wsol_of(&bob.pubkey()),
         &get_associated_token_address_with_program_id(&bob.pubkey(), &env.mint, &spl_token::ID),
         1_000_000_000_000,
-        orca_math::sqrt_price_at(edge + 5).unwrap(),
+        orca_math::sqrt_price_at(edge + 3).unwrap(),
         false,
     );
     expect_ok(env.send(vec![up], &[&bob]));
     assert_eq!(array_start(env.pool_state().tick), edge);
     env.price_follows_pool();
     assert!(!env.value(&home).outside);
-    let (outcome, received, _) = ok(env.orca_unwind(&home, WAD / 20));
+    let (outcome, received, _) = ok(env.orca_unwind(&home, WAD / 4));
     assert!(!outcome.blocked && received > 0);
     assert_eq!(array_start(env.pool_state().tick), edge - SPAN);
 }
@@ -717,9 +815,10 @@ fn a_pool_at_the_limit_of_a_close_s_sale_is_outside_and_blocks_it() {
     assert!(outcome.blocked && received == 0);
 }
 
-/// A station holding nothing of worth at Orca (an emptied position, a few
-/// lamports of wrapped SOL anyone could send) is never outside, however
-/// stale Pyth's price or far the pool: nothing there to value or close.
+/// A station holding nothing of worth at Orca (an emptied position, wrapped
+/// SOL worth under a dollar that anyone could send) is valued at nothing
+/// there and never outside, however stale Pyth's price or far the pool:
+/// nothing there to value or close.
 #[test]
 fn a_station_holding_nothing_of_worth_at_orca_is_never_outside() {
     let (mut env, home) = providing();
@@ -733,7 +832,7 @@ fn a_station_holding_nothing_of_worth_at_orca_is_never_outside() {
         (left.liquidity, left.fee_owed_a, left.fee_owed_b),
         (0, 0, 0)
     );
-    // Someone sends the authority a little wrapped SOL, worth under a cent.
+    // Someone sends the authority a little wrapped SOL, worth under a dollar.
     let bob = env.bob.insecure_clone();
     let gift = spl_token::instruction::transfer(
         &spl_token::ID,
@@ -741,7 +840,7 @@ fn a_station_holding_nothing_of_worth_at_orca_is_never_outside() {
         &env.wsol_of(&home.authority(0)),
         &bob.pubkey(),
         &[],
-        50_000,
+        UNDER_A_DOLLAR,
     )
     .unwrap();
     expect_ok(env.send(vec![gift], &[&bob]));
@@ -750,7 +849,8 @@ fn a_station_holding_nothing_of_worth_at_orca_is_never_outside() {
     env.bob_swaps(60 * SOL, true);
     let value = env.value(&home);
     assert!(!value.outside, "{value:?}");
-    assert!(value.mark - env.idle(&home) < CENT_UNITS, "{value:?}");
+    let idle = env.idle(&home);
+    assert_eq!((value.mark, value.exit), (idle, idle), "{value:?}");
     // A stopped station's unwind is never held up by it.
     env.halt_and_stop(&home);
     let payer = env.payer.insecure_clone();
@@ -760,8 +860,128 @@ fn a_station_holding_nothing_of_worth_at_orca_is_never_outside() {
     assert!(!outcome.blocked);
 }
 
-/// A cent, in the dollar's units.
-const CENT_UNITS: u64 = 10_000;
+/// Wrapped SOL worth $0.90 at $150, and $1.05.
+const UNDER_A_DOLLAR: u64 = 6_000_000;
+const OVER_A_DOLLAR: u64 = 7_000_000;
+
+fn send_wsol(env: &mut Env, home: &Home, lamports: u64) {
+    let bob = env.bob.insecure_clone();
+    let ix = spl_token::instruction::transfer(
+        &spl_token::ID,
+        &env.wsol_of(&bob.pubkey()),
+        &env.wsol_of(&home.authority(0)),
+        &bob.pubkey(),
+        &[],
+        lamports,
+    )
+    .unwrap();
+    expect_ok(env.send(vec![ix], &[&bob]));
+}
+
+/// Wrapped SOL worth under a dollar, with nothing else at Orca, is valued at
+/// nothing and closed by nobody: the valuation agrees with the close, so a
+/// claim's close, a fraction of it, is served, and leaves it where it is.
+#[test]
+fn wrapped_sol_worth_under_a_dollar_is_valued_at_nothing_and_never_blocks_a_claim() {
+    let (mut env, home) = world();
+    env.price_follows_pool();
+    send_wsol(&mut env, &home, UNDER_A_DOLLAR);
+    let idle = env.idle(&home);
+    let value = env.value(&home);
+    assert_eq!(
+        (value.mark, value.exit, value.outside),
+        (idle, idle, false),
+        "{value:?}"
+    );
+    for fraction in [WAD / 3, WAD / 2] {
+        let (outcome, _, _) = ok(env.orca_unwind(&home, fraction));
+        assert!(!outcome.blocked);
+    }
+    assert_eq!(wsol(&env, &home), UNDER_A_DOLLAR);
+    // Nor does it void a valuation when Pyth's price goes stale.
+    env.skip(1_000);
+    assert!(!env.value(&home).outside);
+}
+
+/// A stopped station's unwind of Orca is never held up by wrapped SOL worth
+/// under a dollar.
+#[test]
+fn a_stopped_station_holding_wrapped_sol_worth_under_a_dollar_unwinds() {
+    let (mut env, home) = world();
+    env.price_follows_pool();
+    send_wsol(&mut env, &home, UNDER_A_DOLLAR);
+    env.halt_and_stop(&home);
+    env.price_follows_pool();
+    let payer = env.payer.insecure_clone();
+    let ix = env.ix_unwind_stopped(&home, &payer.pubkey(), &[0]);
+    let meta = expect_ok(env.send_fitting(vec![ix], &[&payer]));
+    let outcome = Outcome::try_from_slice(&meta.return_data.data).unwrap();
+    assert!(!outcome.blocked);
+}
+
+/// A dollar's worth of wrapped SOL is something held: valued at Pyth's
+/// price, and outside on a stale one. With no price to read at all, any
+/// wrapped SOL is; with nothing there at all, nothing is outside.
+#[test]
+fn a_dollar_of_wrapped_sol_or_any_with_no_price_to_read_is_something_held() {
+    let (mut env, home) = world();
+    env.price_follows_pool();
+    let idle = env.idle(&home);
+    env.set_price(0, 0, true);
+    assert_eq!(
+        env.value(&home),
+        Valuation {
+            mark: idle,
+            exit: idle,
+            outside: false
+        }
+    );
+    send_wsol(&mut env, &home, 1);
+    assert!(env.value(&home).outside);
+    env.price_follows_pool();
+    send_wsol(&mut env, &home, OVER_A_DOLLAR - 1);
+    let value = env.value(&home);
+    assert!(!value.outside && value.mark > idle + 1_000_000, "{value:?}");
+    env.skip(1_000);
+    assert!(env.value(&home).outside);
+}
+
+/// A pool pushed up inside the band lifts `exit` above the Pyth-priced
+/// `mark` (the vault takes the difference from deposits of that moment), by
+/// no more than the band.
+#[test]
+fn a_push_inside_the_band_lifts_exit_above_the_mark_by_less_than_the_band() {
+    let (mut env, home) = world();
+    // A station mostly in SOL: $1,500 of it.
+    expect_ok(env.station_buys_sol(&home, 1_500_000_000));
+    env.price_follows_pool();
+    let bob = env.bob.insecure_clone();
+    let (bob_wsol, bob_usd) = (
+        env.wsol_of(&bob.pubkey()),
+        get_associated_token_address_with_program_id(&bob.pubkey(), &env.mint, &spl_token::ID),
+    );
+    // Up to just inside the band's high root (half the band from Pyth's).
+    let pyth_root = sqrt_at(env.sol_price());
+    let target = pyth_root * (2 * BPS as u128 + EXIT_BAND as u128) / (2 * BPS as u128) - 2;
+    let push = env.ix_swap(
+        &bob.pubkey(),
+        &bob_wsol,
+        &bob_usd,
+        1_000_000_000_000,
+        target,
+        false,
+    );
+    expect_ok(env.send(vec![push], &[&bob]));
+    let pushed = env.value(&home);
+    let idle = env.idle(&home);
+    let (mark, exit) = (pushed.mark - idle, pushed.exit - idle);
+    assert!(!pushed.outside);
+    assert!(exit > mark, "mark {mark} exit {exit}");
+    assert!(
+        exit - mark <= mark * EXIT_BAND as u64 / BPS,
+        "mark {mark} exit {exit}"
+    );
+}
 
 #[test]
 fn a_station_s_wrapped_sol_and_dollars_are_never_left_with_a_delegate() {

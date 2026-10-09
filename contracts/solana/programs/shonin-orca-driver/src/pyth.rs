@@ -5,7 +5,8 @@
 //! price at all, and the driver refuses it rather than answer. Whether the
 //! price is fit to value with (fully verified, fresh, its confidence inside
 //! the band) is a fact about the price, and a driver answers it with
-//! `outside` instead.
+//! `outside` instead; so is a price that can't be read as one at all
+//! (nothing or less, or an exponent out of reach).
 
 use anchor_lang::prelude::*;
 
@@ -27,8 +28,9 @@ pub struct Price {
 }
 
 impl Price {
-    /// Reads the listed price account.
-    pub fn load(info: &AccountInfo) -> Result<Self> {
+    /// Reads the listed price account: `None` when it is the price account
+    /// but holds no price the driver can read.
+    pub fn load(info: &AccountInfo) -> Result<Option<Self>> {
         require_keys_eq!(*info.key, PRICE_ACCOUNT, DriverError::WrongAccounts);
         require_keys_eq!(*info.owner, PYTH_RECEIVER, DriverError::WrongAccounts);
         let data = info.try_borrow_data()?;
@@ -54,15 +56,16 @@ impl Price {
         let exponent = i32::from_le_bytes(data[at + 48..at + 52].try_into().unwrap());
         let publish_time = i64_at(52);
         // A price of nothing or less prices nothing.
-        require!(price > 0, DriverError::BadPrice);
-        require!((-18..=18).contains(&exponent), DriverError::BadPrice);
-        Ok(Self {
+        if price <= 0 || !(-18..=18).contains(&exponent) {
+            return Ok(None);
+        }
+        Ok(Some(Self {
             price: price as u64,
             confidence,
             exponent,
             publish_time,
             full,
-        })
+        }))
     }
 
     /// Whether the price is fit to value with at `now` inside `band_bps`:
