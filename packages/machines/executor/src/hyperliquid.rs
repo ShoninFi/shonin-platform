@@ -55,7 +55,7 @@ const USDC_TOKEN: u64 = 0;
 const GAS_TOKEN_NAME: &str = "HYPE";
 /// How often the venue's markets are read again to find which of the
 /// pinned driver's markets it doesn't list for trading.
-const MISSING_LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+pub const MISSING_LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// One vault's Hyperliquid account, and the key that trades it.
 pub struct Half {
@@ -154,48 +154,14 @@ impl Half {
     pub fn missing_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let half = self.clone();
         tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(MISSING_LOOK_EVERY).await;
-                let markets = match Markets::read(&half.api).await {
-                    Ok(markets) => markets,
-                    Err(error) => {
-                        tracing::warn!(
-                            station = %half.station,
-                            error = %format!("{error:#}"),
-                            "the venue's markets couldn't be read to look for the missing ones"
-                        );
-                        continue;
-                    }
-                };
-                let Ok(allowlist) =
-                    Allowlist::from_driver(half.station, markets, &half.perps, &half.spots)
-                else {
-                    continue;
-                };
-                let was = half.trader.allowlist();
-                if allowlist.missing != was.missing {
-                    for market in was.missing.keys() {
-                        if !allowlist.missing.contains_key(market) {
-                            tracing::info!(
-                                station = %half.station,
-                                market,
-                                "a market the station's driver lists is listed for trading again, and traded"
-                            );
-                        }
-                    }
-                    for (market, why) in &allowlist.missing {
-                        if !was.missing.contains_key(market) {
-                            tracing::warn!(
-                                station = %half.station,
-                                market,
-                                why,
-                                "a market the station's driver lists is no longer listed for trading, and is not traded"
-                            );
-                        }
-                    }
-                    half.trader.hold_to(allowlist);
-                }
-            }
+            look_for_missing(
+                &half.trader,
+                &half.api,
+                half.station,
+                (&half.perps, &half.spots),
+                MISSING_LOOK_EVERY,
+            )
+            .await
         })
     }
 
@@ -938,6 +904,61 @@ fn with_the_vault(
 fn dollars(millionths: alloy::primitives::U256) -> hyperliquid::payload::Decimal {
     let units = u64::try_from(millionths).unwrap_or(u64::MAX);
     hyperliquid::payload::Decimal::from(units) / hyperliquid::payload::Decimal::from(1_000_000u32)
+}
+
+/// Read the venue's markets every `every`, for as long as it runs, and hold
+/// `trader` to the markets of the driver `station` pinned (its `perps` and
+/// `spots`), as the venue lists them then, whenever the set of those missing
+/// from the venue's listing has changed, either way: a market the venue
+/// stops listing is refused from then on while the others carry on, and one
+/// it lists again is traded again.
+pub async fn look_for_missing(
+    trader: &Trader,
+    api: &Api,
+    station: Address,
+    (perps, spots): (&[u32], &[u32]),
+    every: std::time::Duration,
+) {
+    loop {
+        tokio::time::sleep(every).await;
+        let markets = match Markets::read(api).await {
+            Ok(markets) => markets,
+            Err(error) => {
+                tracing::warn!(
+                    station = %station,
+                    error = %format!("{error:#}"),
+                    "the venue's markets couldn't be read to look for the missing ones"
+                );
+                continue;
+            }
+        };
+        let Ok(allowlist) = Allowlist::from_driver(station, markets, perps, spots) else {
+            continue;
+        };
+        let was = trader.allowlist();
+        if allowlist.missing != was.missing {
+            for market in was.missing.keys() {
+                if !allowlist.missing.contains_key(market) {
+                    tracing::info!(
+                        station = %station,
+                        market,
+                        "a market the station's driver lists is listed for trading again, and traded"
+                    );
+                }
+            }
+            for (market, why) in &allowlist.missing {
+                if !was.missing.contains_key(market) {
+                    tracing::warn!(
+                        station = %station,
+                        market,
+                        why,
+                        "a market the station's driver lists is no longer listed for trading, and is not traded"
+                    );
+                }
+            }
+            trader.hold_to(allowlist);
+        }
+    }
 }
 
 #[cfg(test)]
