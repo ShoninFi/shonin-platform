@@ -456,6 +456,7 @@ impl Served {
     /// executor holds is reported on by that executor alone, while the last
     /// bill, which the meter signs, is still to be collected.
     fn stop_reports(&self) {
+        self.shared.holds.let_go();
         self._upkeep[1].0.abort();
     }
 }
@@ -506,6 +507,9 @@ struct Shared {
     /// The API a takeover asks, before taking the approval, whether the key
     /// it takes over from is still silent.
     api_url: String,
+    /// Whether this serve holds the station's approval with the key, which
+    /// alone lets the key's reports go.
+    holds: health::Holds,
     /// Whether the tank is dry, as the meter last found it.
     dry: Arc<AtomicBool>,
     /// Whether the meter has read the tank at all yet. Until it has, nobody
@@ -1190,6 +1194,7 @@ fn take_on(
     // for it: the counters are shared and sent while it is still running, and
     // they outlive a restart so that restarts can be counted at all.
     let counters = Arc::new(Mutex::new(host::Counters::default()));
+    let holds = health::Holds::default();
     let mut reporter = health::Reporter::new(
         client.clone(),
         vault_chain,
@@ -1197,6 +1202,7 @@ fn take_on(
         key.clone(),
         vault,
         args.api_url.clone(),
+        holds.clone(),
         dry.clone(),
         totals.clone(),
         args.ceilings,
@@ -1220,6 +1226,7 @@ fn take_on(
             attestation: attestation.clone(),
             takes_over: Arc::new(Mutex::new(takes_over)),
             api_url: args.api_url.clone(),
+            holds,
             dry,
             metered,
             running,
@@ -1265,6 +1272,7 @@ async fn serve(
         attestation,
         takes_over,
         api_url,
+        holds,
         dry,
         metered,
         running,
@@ -1384,10 +1392,12 @@ async fn serve(
         }
     }
     // The approval is this key's now: a key that takes it from here on has
-    // replaced this executor, which lets the vault go.
+    // replaced this executor, which lets the vault go. Its reports may go
+    // from here on.
     if let Ok(mut from) = takes_over.lock() {
         *from = None;
     }
+    holds.take();
 
     // Keep the venue's approval following the blessing, and note whether the
     // key wants blessing again, so the instance asks for a fresh token in
@@ -3002,6 +3012,7 @@ mod tests {
                 .unwrap(),
                 takes_over: Default::default(),
                 api_url: Default::default(),
+                holds: Default::default(),
                 key: stand_in::key(&client),
                 dry: Default::default(),
                 metered: Default::default(),
@@ -3213,6 +3224,7 @@ mod tests {
             .unwrap(),
             takes_over: Default::default(),
             api_url: Default::default(),
+            holds: Default::default(),
             key,
             dry: Default::default(),
             metered: Default::default(),
@@ -3292,6 +3304,7 @@ mod tests {
             attestation: attestation.clone(),
             takes_over: Default::default(),
             api_url: Default::default(),
+            holds: Default::default(),
             key: key.clone(),
             dry: Default::default(),
             metered: Default::default(),
@@ -3590,6 +3603,7 @@ mod tests {
             .unwrap(),
             takes_over: Default::default(),
             api_url: Default::default(),
+            holds: Default::default(),
             key,
             dry: Default::default(),
             metered: Arc::new(AtomicBool::new(true)),
@@ -4231,6 +4245,7 @@ mod tests {
             .unwrap(),
             takes_over: Default::default(),
             api_url: Default::default(),
+            holds: Default::default(),
             key,
             dry: Default::default(),
             metered: Default::default(),
@@ -4401,6 +4416,7 @@ mod tests {
                 .unwrap(),
                 takes_over: Default::default(),
                 api_url: Default::default(),
+                holds: Default::default(),
                 key: stand_in::key(&client),
                 dry: Default::default(),
                 metered: Default::default(),
@@ -4551,6 +4567,7 @@ mod tests {
                 .unwrap(),
                 takes_over: Default::default(),
                 api_url: Default::default(),
+                holds: Default::default(),
                 key: stand_in::key(&client),
                 dry: Default::default(),
                 metered: Default::default(),
@@ -4658,6 +4675,7 @@ mod tests {
                 .unwrap(),
                 takes_over: Default::default(),
                 api_url: Default::default(),
+                holds: Default::default(),
                 key: stand_in::key(&client),
                 dry: Default::default(),
                 metered: Default::default(),
@@ -5064,6 +5082,7 @@ mod tests {
             .unwrap(),
             takes_over: Default::default(),
             api_url: Default::default(),
+            holds: Default::default(),
             key,
             dry: Default::default(),
             metered: Default::default(),
@@ -5294,6 +5313,7 @@ mod tests {
             .unwrap(),
             takes_over: Default::default(),
             api_url: Default::default(),
+            holds: Default::default(),
             key,
             dry: Default::default(),
             metered: Default::default(),
@@ -5899,6 +5919,7 @@ mod tests {
                     .unwrap(),
                     takes_over: Default::default(),
                     api_url: Default::default(),
+                    holds: Default::default(),
                     key: key.clone(),
                     dry: Default::default(),
                     metered: Default::default(),
@@ -6002,6 +6023,18 @@ mod tests {
         takes_over: Option<crate::handover::Takeover>,
         api: &str,
     ) -> Result<Stop> {
+        serve_taking_over_holding(client, key, takes_over, api, Default::default()).await
+    }
+
+    /// The same, with the serve's hold on the station's approval kept in
+    /// `holds`.
+    async fn serve_taking_over_holding(
+        client: Client,
+        key: chain::KeyClient,
+        takes_over: Option<crate::handover::Takeover>,
+        api: &str,
+        holds: health::Holds,
+    ) -> Result<Stop> {
         let shared = Shared {
             vault_key: Arc::new(keys::Key::fresh().unwrap()),
             attestation: crate::attestation::Attestation::new(
@@ -6010,6 +6043,7 @@ mod tests {
             .unwrap(),
             takes_over: Arc::new(Mutex::new(takes_over)),
             api_url: api.to_string(),
+            holds,
             key,
             dry: Default::default(),
             metered: Default::default(),
@@ -6103,28 +6137,7 @@ mod tests {
     async fn api_holding(
         report: Option<(&alloy::signers::local::PrivateKeySigner, u64)>,
     ) -> (String, AbortOnDrop) {
-        let post = report.map(|(by, at)| {
-            let report = shared::model::health::Health {
-                signals: vec![],
-                entries: vec![],
-                updated: time::PrimitiveDateTime::new(
-                    time::Date::from_ordinal_date(2026, 280).unwrap(),
-                    time::Time::MIDNIGHT,
-                ),
-                signed_by: by.address().to_string(),
-                at,
-            };
-            let vault = format!("{:?}", Address::repeat_byte(0x11));
-            let digest = shared::HealthPost::digest(shared::Chain::Base, &vault, &report);
-            use alloy::signers::SignerSync;
-            let signature = by.sign_message_sync(&digest).unwrap();
-            shared::HealthPost {
-                vault,
-                report,
-                signature: alloy::hex::encode_prefixed(signature.as_bytes()),
-                signer: None,
-            }
-        });
+        let post = report.map(|(by, at)| signed_report(by, at));
         let app = axum::Router::new().route(
             "/api/{chain}/health/{vault}/signed",
             axum::routing::get(move || {
@@ -6145,6 +6158,165 @@ mod tests {
                 axum::serve(listener, app).await.unwrap();
             })),
         )
+    }
+
+    /// A report on vault 0x11 signed by `by`, dated `at`.
+    fn signed_report(by: &alloy::signers::local::PrivateKeySigner, at: u64) -> shared::HealthPost {
+        let report = shared::model::health::Health {
+            signals: vec![],
+            entries: vec![],
+            updated: time::PrimitiveDateTime::new(
+                time::Date::from_ordinal_date(2026, 280).unwrap(),
+                time::Time::MIDNIGHT,
+            ),
+            signed_by: by.address().to_string(),
+            at,
+        };
+        let vault = format!("{:?}", Address::repeat_byte(0x11));
+        let digest = shared::HealthPost::digest(shared::Chain::Base, &vault, &report);
+        use alloy::signers::SignerSync;
+        let signature = by.sign_message_sync(&digest).unwrap();
+        shared::HealthPost {
+            vault,
+            report,
+            signature: alloy::hex::encode_prefixed(signature.as_bytes()),
+            signer: None,
+        }
+    }
+
+    /// An API that, as the indexer does, keeps the reports posted to it and
+    /// answers a vault's newest; it starts out holding `held`. Says its URL
+    /// and every report posted to it.
+    async fn api_keeping_the_newest(
+        held: Vec<shared::HealthPost>,
+    ) -> (String, Arc<Mutex<Vec<shared::HealthPost>>>, AbortOnDrop) {
+        let held = Arc::new(Mutex::new(held));
+        let posted: Arc<Mutex<Vec<shared::HealthPost>>> = Default::default();
+        let app = axum::Router::new()
+            .route(
+                "/api/{chain}/health",
+                axum::routing::post({
+                    let held = held.clone();
+                    let posted = posted.clone();
+                    move |axum::Json(post): axum::Json<shared::HealthPost>| async move {
+                        posted.lock().unwrap().push(post.clone());
+                        held.lock().unwrap().push(post);
+                        axum::http::StatusCode::ACCEPTED
+                    }
+                }),
+            )
+            .route(
+                "/api/{chain}/health/{vault}/signed",
+                axum::routing::get(move || {
+                    let newest = held
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .max_by_key(|post| post.report.at)
+                        .cloned();
+                    async move {
+                        match newest {
+                            Some(post) => axum::Json(post).into_response(),
+                            None => axum::http::StatusCode::NOT_FOUND.into_response(),
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        (
+            url,
+            posted,
+            AbortOnDrop(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            })),
+        )
+    }
+
+    /// The vault's key reports only once its serve holds the station's
+    /// approval. A takeover's key, blessed and waiting for its gas, sends
+    /// nothing, so a watched key heard from again during that wait is never
+    /// hidden behind the waiting key's own newer reports: the vault is left
+    /// to it. A takeover from a key that stays silent takes the approval,
+    /// and its key reports from then on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_waiting_to_take_a_vault_over_sends_no_report_that_could_hide_the_watched_key_s()
+    {
+        let watched = alloy::signers::local::PrivateKeySigner::random();
+        let node = stand_in::serving::node(VaultState::Open);
+        node.lock().unwrap().approved_key = watched.address();
+        let client = stand_in::client(&stand_in::serving::start(node.clone()).await).await;
+        let key = stand_in::key(&client);
+        // The takeover was decided 20 minutes ago; the watched key came back
+        // and reported 30 s ago, while this key, blessed meanwhile, waited.
+        let decided = unix_now() - 1_200;
+        let (api, posted, _api) =
+            api_keeping_the_newest(vec![signed_report(&watched, unix_now() - 30)]).await;
+        let holds = health::Holds::default();
+        let mut reporter = health::Reporter::new(
+            client.clone(),
+            shared::Chain::Base,
+            stand_in::deployments().attestation,
+            key.clone(),
+            Address::repeat_byte(0x11),
+            api.clone(),
+            holds.clone(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        reporter.post(Default::default()).await;
+        let takeover = crate::handover::Takeover::new(watched.address(), decided);
+        let served =
+            serve_taking_over_holding(client, key.clone(), Some(takeover), &api, holds.clone())
+                .await;
+        reporter.post(Default::default()).await;
+        assert_eq!(served.unwrap(), Stop::Resumed);
+        assert_eq!(stand_in::serving::approvals(&node), 0);
+        assert_eq!(node.lock().unwrap().approved_key, watched.address());
+        assert!(
+            posted.lock().unwrap().is_empty(),
+            "a key that never held the station's approval reported on the vault"
+        );
+
+        // The watched key stays silent: the takeover takes the approval, and
+        // its key's reports go from then on.
+        let node = stand_in::serving::node(VaultState::Open);
+        node.lock().unwrap().approved_key = watched.address();
+        let client = stand_in::client(&stand_in::serving::start(node.clone()).await).await;
+        let key = stand_in::key(&client);
+        let (api, posted, _api) =
+            api_keeping_the_newest(vec![signed_report(&watched, decided - 600)]).await;
+        let holds = health::Holds::default();
+        let mut reporter = health::Reporter::new(
+            client.clone(),
+            shared::Chain::Base,
+            stand_in::deployments().attestation,
+            key.clone(),
+            Address::repeat_byte(0x11),
+            api.clone(),
+            holds.clone(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        let served =
+            serve_taking_over_holding(client, key.clone(), Some(takeover), &api, holds.clone())
+                .await;
+        assert!(served.is_err(), "the stand-in reverts the strategy's id");
+        assert_eq!(node.lock().unwrap().approved_key, key.address);
+        assert!(holds.holds());
+        reporter.post(Default::default()).await;
+        let posted = posted.lock().unwrap();
+        assert_eq!(
+            posted.len(),
+            1,
+            "the key holding the approval sent no report"
+        );
+        assert_eq!(
+            posted[0].report.signed_by.to_lowercase(),
+            format!("{:?}", key.address).to_lowercase()
+        );
     }
 
     /// One sweep of vault 0x11 against the serving stand-in, whose station

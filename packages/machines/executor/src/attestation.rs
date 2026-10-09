@@ -1402,8 +1402,8 @@ impl Attestation {
         // allows images and checkers through an admin path of its own: one
         // that can't be asked, or refuses, holds back only its own keys,
         // whose blessing the keeper simulates again before it relays one. The
-        // seal is refused over Solana only when no key in the tree would be
-        // blessed with it anywhere.
+        // seal is refused over Solana only when nothing in the tree would
+        // land anywhere with it: no key blessed, and no root recorded.
         let mut sealable = false;
         let mut solana_refused = None;
         for each in simulate {
@@ -1496,9 +1496,9 @@ impl Attestation {
                     Refusal::Unavailable(why)
                 });
             }
-            if what == "bless" {
-                sealable = true;
-            }
+            // Something in the tree lands with this seal: a key blessed, or
+            // the root recorded.
+            sealable = true;
         }
         if let Some(refusal) = solana_refused
             && !sealable
@@ -2936,6 +2936,41 @@ mod tests {
             seal: alloy::hex::encode_prefixed(&seal),
             journal: alloy::hex::encode_prefixed(journal.encode()),
         }
+    }
+
+    /// A seal the canonical chain would record the root from is kept while
+    /// a Solana cluster the instance also holds keys on can't be asked: a
+    /// cluster holds back its own keys, never the root.
+    #[tokio::test]
+    async fn a_seal_recording_the_root_is_kept_while_a_solana_cluster_cannot_be_asked() {
+        let attestation = Attestation::new(Mode::Launcher).unwrap();
+        attestation.put_root(31337, Address::repeat_byte(0x7e));
+        let (nonce, _devnet) = with_devnet_key_unreachable(&attestation).await;
+        let (node, asked) = bless_node(31337, false).await;
+        attestation.serve_chain(node, crate::stand_in::deployments());
+
+        let accepted = attestation.accept(seal_post(&attestation, nonce)).await;
+        assert_eq!(accepted, Ok(()));
+        assert!(attestation.status().seal.is_some());
+        assert_eq!(
+            *asked.lock().unwrap(),
+            1,
+            "recording the root was not simulated"
+        );
+
+        // Nothing in the tree would land anywhere: the root would not be
+        // recorded either, so the cluster's refusal stands.
+        let attestation = Attestation::new(Mode::Launcher).unwrap();
+        attestation.put_root(31337, Address::repeat_byte(0x7e));
+        let (nonce, _devnet) = with_devnet_key_unreachable(&attestation).await;
+        let (node, _) = bless_node(31337, true).await;
+        attestation.serve_chain(node, crate::stand_in::deployments());
+        let accepted = attestation.accept(seal_post(&attestation, nonce)).await;
+        assert!(
+            matches!(accepted, Err(Refusal::Unavailable(_))),
+            "{accepted:?}"
+        );
+        assert!(attestation.status().seal.is_none());
     }
 
     /// A seal every EVM chain accepts blesses the EVM vault keys even while

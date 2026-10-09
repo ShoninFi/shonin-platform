@@ -171,6 +171,33 @@ pub(crate) fn last_hour(
     }
 }
 
+/// Whether this executor's serve holds the vault's station approval with
+/// the vault's key: taken once the station approves the key, let go once
+/// the vault is. Only the key the vault trades through reports on it, on
+/// every chain: a key still waiting for the approval (a takeover's, during
+/// its blessing) or one another executor has replaced sends nothing, so
+/// the vault's public health is its trading executor's alone, and a watch
+/// for the approved key's reports never has them hidden behind another
+/// key's newer ones.
+#[derive(Clone, Debug, Default)]
+pub struct Holds(Arc<AtomicBool>);
+
+impl Holds {
+    /// The station approves the vault's key: its reports may go.
+    pub fn take(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// The vault is let go: no more reports.
+    pub fn let_go(&self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+
+    pub fn holds(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 pub struct Reporter {
     chain: Client,
     vault_chain: shared::Chain,
@@ -178,6 +205,8 @@ pub struct Reporter {
     key: KeyClient,
     vault: Address,
     api: String,
+    /// Whether the serve holds the station's approval with this key.
+    holds: Holds,
     /// Bounded, so an API that stops answering never holds up the next
     /// report.
     http: reqwest::Client,
@@ -213,6 +242,7 @@ impl Reporter {
         key: KeyClient,
         vault: Address,
         api: String,
+        holds: Holds,
         dry: Arc<AtomicBool>,
         totals: crate::usage::Totals,
         ceilings: Ceilings,
@@ -224,6 +254,7 @@ impl Reporter {
             key,
             vault,
             api,
+            holds,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
@@ -244,6 +275,10 @@ impl Reporter {
     /// depositor's exit never waited on it.
     pub async fn post(&mut self, counters: Counters) {
         let hourly = last_hour(&mut self.window, Instant::now(), counters);
+        // The vault is reported on by the key it trades through alone.
+        if !self.holds.holds() {
+            return;
+        }
         // Nobody would believe a report from a key the vault hasn't blessed,
         // so there is no sending one: before the blessing lands, or once it
         // has lapsed with the vault.
@@ -735,6 +770,15 @@ mod tests {
 
     /// A report posted to a stand-in API, read back.
     async fn one_report(client: Client, ceilings: Ceilings) -> HealthPost {
+        let holds = Holds::default();
+        holds.take();
+        let report = posted_by(client, ceilings, &holds).await;
+        report.expect("the report was posted")
+    }
+
+    /// What one report round posts to a stand-in API, by a key whose serve
+    /// holds the station's approval as `holds` says.
+    async fn posted_by(client: Client, ceilings: Ceilings, holds: &Holds) -> Option<HealthPost> {
         use axum::{Json, Router, routing::post};
         let posted: Arc<Mutex<Option<HealthPost>>> = Default::default();
         let keep = posted.clone();
@@ -760,13 +804,44 @@ mod tests {
             crate::stand_in::key(&client),
             Address::repeat_byte(0x11),
             api,
+            holds.clone(),
             Default::default(),
             Default::default(),
             ceilings,
         );
         reporter.post(Default::default()).await;
-        let report = posted.lock().unwrap().take();
-        report.expect("the report was posted")
+        posted.lock().unwrap().take()
+    }
+
+    /// A vault is reported on by the key it trades through alone: a key
+    /// blessed for the vault whose serve has not taken the station's
+    /// approval (a takeover's, waiting on its blessing and its gas) sends no
+    /// report, nor does one whose vault was let go; one whose serve holds the
+    /// approval does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_key_whose_serve_holds_the_station_s_approval_reports_on_the_vault() {
+        let (node, client) = crate::stand_in::public::start(GWEI, 0).await;
+        node.lock().unwrap().key_holds = GAS_STAKE_PUBLIC;
+        let holds = Holds::default();
+        assert!(
+            posted_by(client.clone(), Ceilings::default(), &holds)
+                .await
+                .is_none(),
+            "a key not yet approved at the station reported on the vault"
+        );
+        holds.take();
+        assert!(
+            posted_by(client.clone(), Ceilings::default(), &holds)
+                .await
+                .is_some()
+        );
+        holds.let_go();
+        assert!(
+            posted_by(client, Ceilings::default(), &holds)
+                .await
+                .is_none(),
+            "a key whose vault was let go reported on it"
+        );
     }
 
     /// On a public chain at 100 gwei one send costs more than the public

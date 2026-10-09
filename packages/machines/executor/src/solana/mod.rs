@@ -36,6 +36,7 @@ use wasmtime::Engine;
 
 use crate::attestation::{Attestation, SolanaServed};
 use crate::handover;
+use crate::health::Holds;
 use crate::host::{Counters, Place};
 use crate::usage::SignedThrough;
 use crate::{AbortOnDrop, Args, Throttle};
@@ -206,6 +207,23 @@ struct Served {
 }
 
 impl Served {
+    /// Stop the vault's health reports, keeping its meter: a vault another
+    /// executor holds is reported on by that executor alone, while the last
+    /// bill, which the meter signs, is still to be collected.
+    fn stop_reports(&self) {
+        self.shared.holds.let_go();
+        self._upkeep[1].0.abort();
+    }
+
+    /// Let the vault go, its agent having stopped because another key holds
+    /// the station's approval or the key taken over from is heard from again:
+    /// its reports stop at once, and it is dropped, its meter with it, once
+    /// the agent's last sends are billed.
+    fn let_go(&mut self) {
+        self.stop_reports();
+        self.letting_go = Some(Instant::now());
+    }
+
     fn may_drop(&self, stopped: Instant) -> bool {
         may_drop(
             &self.shared.trading.flights,
@@ -245,6 +263,9 @@ struct Shared {
     /// again after that finds another key in place only if that executor
     /// took the vault since, and lets it go.
     takes_over: Arc<Mutex<Option<handover::Takeover<Pubkey>>>>,
+    /// Whether this serve holds the station's approval with the key, which
+    /// alone lets the key's reports go.
+    holds: Holds,
     /// The moment the meter's latest signed total counts up to.
     signed_through: SignedThrough,
 }
@@ -349,12 +370,12 @@ impl Cluster {
                     Ok(Ok(Stop::Finished)) => {}
                     Ok(Ok(Stop::Replaced)) => {
                         tracing::info!(vault = %address, "another executor's key holds the station's approval; letting the vault go");
-                        served.letting_go = Some(Instant::now());
+                        served.let_go();
                         book.replaced.insert(address);
                     }
                     Ok(Ok(Stop::Resumed)) => {
                         tracing::info!(vault = %address, "the key taken over from reported again; letting the vault go and watching it afresh");
-                        served.letting_go = Some(Instant::now());
+                        served.let_go();
                     }
                     Ok(Err(error)) => {
                         served.failures += 1;
@@ -552,19 +573,21 @@ impl Cluster {
             spent,
             self.args.ceilings,
         ));
-        let reports = tokio::spawn(upkeep::report_on(
-            self.client.clone(),
-            self.platform.clone(),
-            key.clone(),
-            address,
-            vault.bundle_hash,
-            self.args.api_url.clone(),
-            counters.clone(),
-            tank.clone(),
-            self.totals.clone(),
-            self.args.ceilings,
-            self.stake,
-        ));
+        let holds = Holds::default();
+        let reports = tokio::spawn(upkeep::report_on(upkeep::Reporting {
+            client: self.client.clone(),
+            platform: self.platform.clone(),
+            key: key.clone(),
+            vault: address,
+            bundle: vault.bundle_hash,
+            api: self.args.api_url.clone(),
+            holds: holds.clone(),
+            counters: counters.clone(),
+            tank: tank.clone(),
+            totals: self.totals.clone(),
+            ceilings: self.args.ceilings,
+            stake: self.stake,
+        }));
         Ok(Served {
             shared: Shared {
                 key,
@@ -579,6 +602,7 @@ impl Cluster {
                 vault_events: Default::default(),
                 failed_starts: Default::default(),
                 takes_over: Arc::new(Mutex::new(takes_over)),
+                holds,
                 signed_through: tank.signed_through,
             },
             serving: None,
@@ -634,10 +658,12 @@ impl Cluster {
             return Ok(stop);
         }
         // The approval is this key's now: a key that takes it from here on
-        // has replaced this executor, which lets the vault go.
+        // has replaced this executor, which lets the vault go. Its reports
+        // may go from here on.
         if let Ok(mut from) = shared.takes_over.lock() {
             *from = None;
         }
+        shared.holds.take();
 
         // Kept blessed and stocked for as long as the serve runs.
         let replaced = Arc::new(AtomicBool::new(false));
@@ -930,9 +956,135 @@ impl Cluster {
     }
 }
 
+/// A cluster that answers who it is (devnet) and counts every other
+/// question, each of which it turns away as rate-limited.
+#[cfg(test)]
+pub(crate) async fn counting_cluster() -> (
+    SolanaClient,
+    Arc<std::sync::atomic::AtomicUsize>,
+    AbortOnDrop,
+) {
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counting = asked.clone();
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+            let counting = counting.clone();
+            async move {
+                let id = request["id"].clone();
+                if request["method"] == "getGenesisHash" {
+                    return (
+                        axum::http::StatusCode::OK,
+                        axum::Json(serde_json::json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
+                        })),
+                    );
+                }
+                counting.fetch_add(1, Ordering::SeqCst);
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    axum::Json(serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": {"code": 429, "message": "Too many requests"}
+                    })),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = AbortOnDrop(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    }));
+    let key: chain::ChainKey = "solana:devnet".parse().unwrap();
+    let config: chain::ChainConfig = serde_json::from_value(serde_json::json!({
+        "label": "Solana devnet (stand-in)",
+        "rpc": url,
+        "dollar": "4Gw9TmkKDvnGtBcMpJwR4rRDEWc6KVujegc1j4ebtHTK",
+    }))
+    .unwrap();
+    let client = SolanaClient::connect_with(&key, &config, None)
+        .await
+        .unwrap();
+    (client, asked, server)
+}
+
+/// The platform on devnet, as a stand-in names it.
+#[cfg(test)]
+pub(crate) fn devnet_platform() -> Platform {
+    Platform {
+        cluster_name: "devnet".into(),
+        cluster: chain::solana::programs::common::digest::cluster_value("devnet"),
+        mint: Pubkey::new_from_array([1; 32]),
+        admin: Pubkey::new_from_array([2; 32]),
+        platform: Pubkey::new_from_array([3; 32]),
+        operator: Pubkey::new_from_array([4; 32]),
+        checker: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A vault let go because another key holds the station's approval, or
+    /// because the key taken over from is heard from again, stops reporting
+    /// at once, its key no longer counted as holding the approval, while its
+    /// meter runs on for the agent's last bill.
+    #[tokio::test]
+    async fn a_solana_vault_let_go_stops_its_reports_at_once_and_keeps_its_meter() {
+        let (client, _asked, _cluster) = counting_cluster().await;
+        let platform = devnet_platform();
+        let key = Arc::new(Keypair::new_from_array([7; 32]));
+        let accounts = platform.vault_accounts(1);
+        let holds = Holds::default();
+        holds.take();
+        let never = || AbortOnDrop(tokio::spawn(std::future::pending::<()>()));
+        let attestation = Attestation::new(crate::attestation::Mode::Development).unwrap();
+        let mut served = Served {
+            shared: Shared {
+                key: key.clone(),
+                accounts: accounts.clone(),
+                bundle: [5; 32],
+                trading: Arc::new(Trading::new(
+                    client,
+                    platform,
+                    key.clone(),
+                    accounts.clone(),
+                    [5; 32],
+                    Default::default(),
+                )),
+                dry: Default::default(),
+                metered: Default::default(),
+                running: Default::default(),
+                counters: Default::default(),
+                account_events: Default::default(),
+                vault_events: Default::default(),
+                failed_starts: Default::default(),
+                takes_over: Default::default(),
+                holds: holds.clone(),
+                signed_through: Default::default(),
+            },
+            serving: None,
+            retry_at: None,
+            failures: 0,
+            _upkeep: [never(), never()],
+            _leaf: HeldLeaf {
+                attestation,
+                cluster: "solana:devnet".into(),
+                vault: accounts.vault,
+                key: key.pubkey(),
+            },
+            letting_go: None,
+        };
+        served.let_go();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!holds.holds());
+        assert!(served._upkeep[1].0.is_finished(), "the reports go on");
+        assert!(!served._upkeep[0].0.is_finished(), "the meter stopped");
+        assert!(served.letting_go.is_some());
+    }
 
     /// The station lets any blessed key displace another, so the executor's
     /// rule is what keeps one executor at a time: a key takes the approval
