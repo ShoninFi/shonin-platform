@@ -1517,13 +1517,14 @@ async fn serve(
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
             tracing::info!(%vault, "the vault has stopped; letting it go");
-            return Ok(Stop::Finished);
+            return posted_until_closed(&chain, vault, &replaced, _lighter_posts.is_some()).await;
         }
         // A dry tank, or one not yet read, holds the agent back: a tank
         // already dry when the vault was taken on is never traded on.
         if dry.load(Ordering::SeqCst) || !metered.load(Ordering::SeqCst) {
             if finished(&chain, vault).await? {
-                return Ok(Stop::Finished);
+                return posted_until_closed(&chain, vault, &replaced, _lighter_posts.is_some())
+                    .await;
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
@@ -1668,7 +1669,7 @@ async fn serve(
         let done = done_its_part(ended_cleanly, halting_heard.load(Ordering::SeqCst));
         if after_the_agent(&chain, vault, &wound_down, done).await? {
             tracing::info!(%vault, "the vault has stopped; letting it go");
-            return Ok(Stop::Finished);
+            return posted_until_closed(&chain, vault, &replaced, _lighter_posts.is_some()).await;
         }
         if stopped_dry {
             continue;
@@ -1715,10 +1716,50 @@ async fn serve(
             }
             Some(Woken::Finished) => {
                 tracing::info!(%vault, "the vault has stopped; letting it go");
-                return Ok(Stop::Finished);
+                return posted_until_closed(&chain, vault, &replaced, _lighter_posts.is_some())
+                    .await;
             }
             Some(Woken::Replaced) => return Ok(Stop::Replaced),
         }
+    }
+}
+
+/// How often a halted vault whose Lighter accounts are still posted for is
+/// looked at to see whether it has closed.
+const POSTED_UNTIL_CLOSED_LOOK: Duration = Duration::from_secs(10);
+
+/// The serve's end once its agent has nothing left to run. A Lighter
+/// account is valued and its closes proved only by posts read after them,
+/// and a halted vault's full unwind runs after the agent's grace: so while
+/// this executor posts for the vault's Lighter accounts it goes on posting,
+/// its post loop kept alive here, until the vault has closed (everything
+/// its stations held has come home or been given up) or another executor's
+/// key holds the station's approval.
+async fn posted_until_closed(
+    chain: &Client,
+    vault: Address,
+    replaced: &AtomicBool,
+    posting: bool,
+) -> Result<Stop> {
+    if !posting {
+        return Ok(Stop::Finished);
+    }
+    tracing::info!(%vault, "the agent's grace is over; posting the Lighter accounts until the vault closes");
+    loop {
+        if replaced.load(Ordering::SeqCst) {
+            return Ok(Stop::Replaced);
+        }
+        match chain.read(vault, IVault::stateCall {}).await {
+            Ok(VaultState::None | VaultState::Closed | VaultState::Cancelled) => {
+                tracing::info!(%vault, "the vault has closed; letting it go");
+                return Ok(Stop::Finished);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!(%vault, error = %format!("{error:#}"), "the vault's state wasn't read");
+            }
+        }
+        tokio::time::sleep(POSTED_UNTIL_CLOSED_LOOK).await;
     }
 }
 
