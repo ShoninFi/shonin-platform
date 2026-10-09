@@ -784,12 +784,18 @@ impl Env {
     /// approved, its money pulled to the station, and the authority's
     /// wrapped-SOL account opened by the executor.
     pub fn orca_home(&mut self, label: &str) -> Home {
-        let home = self.new_home(
+        self.orca_home_with_band(label, EXIT_BAND)
+    }
+
+    /// [`Env::orca_home`], its station's exit band `band`.
+    pub fn orca_home_with_band(&mut self, label: &str, band: u16) -> Home {
+        let home = self.new_home_with_band(
             label,
             &[Declared {
                 name: orca(),
                 program: shonin_orca_driver::ID,
             }],
+            band,
         );
         expect_ok(self.pull(&home, FUNDS));
         self.approve_executor(&home);
@@ -1010,6 +1016,16 @@ impl Env {
         group: &[AccountMeta],
         band_bps: u16,
     ) -> std::result::Result<Valuation, FailedTx> {
+        self.driver_value_metered(group, band_bps)
+            .map(|(value, _)| value)
+    }
+
+    /// [`Self::driver_value`], with the compute it took.
+    pub fn driver_value_metered(
+        &mut self,
+        group: &[AccountMeta],
+        band_bps: u16,
+    ) -> std::result::Result<(Valuation, u64), FailedTx> {
         let accounts = group[1..]
             .iter()
             .map(|meta| AccountMeta::new_readonly(meta.pubkey, false))
@@ -1021,7 +1037,41 @@ impl Env {
         };
         let payer = self.payer.insecure_clone();
         let meta = self.send_fitting(vec![ix], &[&payer])?;
-        Ok(Valuation::try_from_slice(&meta.return_data.data).expect("a valuation"))
+        Ok((
+            Valuation::try_from_slice(&meta.return_data.data).expect("a valuation"),
+            meta.compute_units_consumed,
+        ))
+    }
+
+    /// Bob opens a sliver of liquidity between every two ticks a spacing
+    /// apart, `count` of them from the one below the pool's price down:
+    /// every one of those ticks initialized.
+    pub fn crowd_below(&mut self, count: i32) {
+        let bob = self.bob.insecure_clone();
+        let usd = get_associated_token_address(&bob.pubkey(), &self.mint);
+        let top = self.pool_state().tick.div_euclid(SPACING) * SPACING;
+        for i in 1..=count {
+            let lower = top - i * SPACING;
+            let mint = Keypair::new();
+            let open = self.ix_open_position(
+                &bob.pubkey(),
+                &bob.pubkey(),
+                &mint.pubkey(),
+                lower,
+                lower + SPACING,
+            );
+            expect_ok(self.send(vec![open], &[&bob, &mint]));
+            let add = self.ix_increase(
+                &bob.pubkey(),
+                &mint.pubkey(),
+                &self.wsol_of(&bob.pubkey()),
+                &usd,
+                1_000_000_000,
+                u64::MAX,
+                u64::MAX,
+            );
+            expect_ok(self.send(vec![add], &[&bob]));
+        }
     }
 
     /// Where an account stands in the driver's group (the program first).

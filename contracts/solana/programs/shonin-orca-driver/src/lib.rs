@@ -72,7 +72,12 @@
 //! the decreases freed and `f` of the rest of the authority's SOL (the fees
 //! collected included), a lamport less for each instruction that paid it
 //! (should Orca round a unit differently), never past half the band from
-//! Pyth's square-root price. Every dollar it brings goes home with the
+//! Pyth's square-root price. A close that would leave no position with
+//! liquidity and under a dollar of wrapped SOL sells all of it instead, so
+//! what remains is nothing of worth both before and after: the station keeps
+//! the stayers' part of the proceeds, counted. At the full band the swap is
+//! made even through arrays with nothing to sell into, walking the price on
+//! for the next unwind. Every dollar it brings goes home with the
 //! station's own sweep of the authority's dollar account, so a sweep here
 //! prepares nothing. A pool that can't take the sale inside the band leaves
 //! the close short, and the station refuses it whole.
@@ -206,8 +211,8 @@ pub mod shonin_orca_driver {
         band_bps: u16,
     ) -> Result<()> {
         let book = logic::read(&ctx.accounts.given(), ctx.remaining_accounts)?;
-        let (value, sells) = book.assess(band_bps)?;
-        let plan = book.close(fraction, band_bps, value.outside, sells)?;
+        let (value, sale) = book.assess(band_bps)?;
+        let plan = book.close(fraction, band_bps, value.outside, sale)?;
         answer(&Close { value, plan })
     }
 
@@ -765,8 +770,8 @@ pub mod logic {
             Ok(self.assess(band_bps)?.0)
         }
 
-        /// The valuation, and whether the sale it works out sells anything.
-        pub fn assess(&self, band_bps: u16) -> Result<(Valuation, bool)> {
+        /// The valuation, and how the sale it works out ends.
+        pub fn assess(&self, band_bps: u16) -> Result<(Valuation, SaleEnd)> {
             let nothing = |outside| {
                 Ok((
                     Valuation {
@@ -774,7 +779,7 @@ pub mod logic {
                         exit: 0,
                         outside,
                     },
-                    false,
+                    SaleEnd::default(),
                 ))
             };
             if !self.holds_anything() {
@@ -789,22 +794,34 @@ pub mod logic {
                 None if full => 0,
                 None => return nothing(true),
             };
-            let (exit, sold_all, sells) = self.liquidation(band_bps)?;
-            let outside = !full && (!sold_all || self.prices_outside(band_bps));
+            // Prices outside the band answer that before any sale is worked
+            // out, so no sale's reach can be asked of them; `exit` is then
+            // nothing, as nobody is paid at it.
+            if !full && self.prices_outside(band_bps) {
+                return Ok((
+                    Valuation {
+                        mark: clamp(mark),
+                        exit: 0,
+                        outside: true,
+                    },
+                    SaleEnd::default(),
+                ));
+            }
+            let (exit, sold_all, sale) = self.liquidation(band_bps)?;
+            let outside = !full && !sold_all;
             Ok((
                 Valuation {
                     mark: clamp(mark),
                     exit: clamp(exit),
                     outside,
                 },
-                sells,
+                sale,
             ))
         }
 
         /// What selling everything now fetches, as [`Self::valuation`]'s
-        /// `exit` says, whether the sale takes all the SOL, and whether it
-        /// takes any.
-        fn liquidation(&self, band_bps: u16) -> Result<(u128, bool, bool)> {
+        /// `exit` says, whether the sale takes all the SOL, and how it ends.
+        fn liquidation(&self, band_bps: u16) -> Result<(u128, bool, SaleEnd)> {
             let (asset, dollars) = self.holdings(|p| self.pools[p].sqrt_price, true)?;
             let asset = clamp(asset);
             let pool = &self.pools[0];
@@ -850,7 +867,10 @@ pub mod logic {
             Ok((
                 worth.saturating_sub(off + 1),
                 sold.sold >= asset,
-                sold.sold > 0,
+                SaleEnd {
+                    sells: sold.sold > 0,
+                    stop: sold.stop,
+                },
             ))
         }
 
@@ -927,16 +947,18 @@ pub mod logic {
         }
 
         /// The plan closing `fraction` of everything, as the module's
-        /// documentation says, `outside` as the valuation says and `sells`
-        /// whether its sale of everything sells anything: when it doesn't (at
-        /// the full band, a pool with nothing left to take), no swap is
-        /// prepared.
+        /// documentation says, `outside` as the valuation says and `ending`
+        /// how its sale of everything ends: when it sells nothing through the
+        /// given arrays, no swap is prepared, except at the full band, where
+        /// Orca's walks the price on; when it stops short of a tick it may
+        /// not cross (only ever at the full band, as it is outside below),
+        /// the swap goes no further either.
         pub fn close(
             &self,
             fraction: u64,
             band_bps: u16,
             outside: bool,
-            sells: bool,
+            ending: SaleEnd,
         ) -> Result<Plan> {
             require!(fraction <= WAD, DriverError::WrongAccounts);
             // Nothing of worth at Orca: nothing to close.
@@ -967,6 +989,8 @@ pub mod logic {
             // that much back rather than fail for want of it.
             let mut margin: u64 = 0;
             let mut decreases: u8 = 0;
+            // Whether any position keeps liquidity after the close.
+            let mut keeps = false;
             // The band's highest and lowest square-root prices, which bound
             // what each withdrawal may pay; at the full band, anything.
             let band = band_bps as u64;
@@ -987,6 +1011,7 @@ pub mod logic {
                 let pool = &self.pools[h.pool];
                 let liquidity = math::mul_div_u128(p.liquidity, fraction as u128, WAD as u128)
                     .ok_or(DriverError::Overflow)?;
+                keeps |= p.liquidity > liquidity;
                 if liquidity > 0 {
                     let (a, b) = math::withdrawal_between(
                         pool.tick_current,
@@ -1057,10 +1082,25 @@ pub mod logic {
             // of what the authority held and collected besides.
             let rest = math::mul_div_u128(self.asset as u128 + fees, fraction as u128, WAD as u128)
                 .ok_or(DriverError::Overflow)?;
-            let sale = clamp(freed + rest).saturating_sub(margin);
+            // Every fee is collected, so a close that leaves no position
+            // with liquidity and less than a dollar of wrapped SOL leaves
+            // nothing of worth: it sells all the wrapped SOL, and the station
+            // keeps the stayers' part of what it brings, counted, rather than
+            // have them hold what no valuation counts.
+            let all = self.asset as u128 + fees;
+            let left = all - rest;
+            let sell_all = !keeps && self.price.is_some() && Self::worth(left, self.pyth) < DOLLAR;
+            let sale = clamp(freed + if sell_all { all } else { rest }).saturating_sub(margin);
+            let full = band_bps as u64 >= BPS;
             let mut orders = decreases;
-            if sale > 0 && sells {
-                let limit = self.sale_limit(band_bps)?;
+            // At the full band the swap is made even when the given arrays
+            // hold nothing to sell into: Orca's own walks the price on
+            // towards the limit, and the next unwind from there.
+            if sale > 0 && (ending.sells || full) {
+                let limit = match ending.stop {
+                    Some(stop) => stop,
+                    None => self.sale_limit(band_bps)?,
+                };
                 let pool = &self.pools[0];
                 // Inside the band the pool's price is short of the limit by
                 // construction; a pool sitting on it can't sell at all.
@@ -1101,6 +1141,14 @@ pub mod logic {
                 orders: orders.min(MAX_MARKETS as u8),
             })
         }
+    }
+
+    /// How a sale of everything ends: whether it sells anything, and where
+    /// it stops short of a tick it may not cross, if it does.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct SaleEnd {
+        pub sells: bool,
+        pub stop: Option<u128>,
     }
 
     fn clamp(value: u128) -> u64 {

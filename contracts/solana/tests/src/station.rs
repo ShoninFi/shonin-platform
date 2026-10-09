@@ -198,8 +198,13 @@ impl Env {
     /// Another vault, `label`, with [`FUNDS`], whose station pins `drivers`,
     /// with the executor blessed for it.
     pub fn new_home(&mut self, label: &str, drivers: &[Declared]) -> Home {
+        self.new_home_with_band(label, drivers, EXIT_BAND)
+    }
+
+    /// [`Env::new_home`], its station's exit band `band`.
+    pub fn new_home_with_band(&mut self, label: &str, drivers: &[Declared], band: u16) -> Home {
         let home = self.open_vault(label);
-        expect_ok(self.create_station(&home, EXIT_BAND, drivers));
+        expect_ok(self.create_station(&home, band, drivers));
         let programs: Vec<Pubkey> = drivers.iter().map(|driver| driver.program).collect();
         let home = self.home_of(label, &programs);
         let executor = self.executor.pubkey();

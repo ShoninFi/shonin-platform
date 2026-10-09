@@ -40,13 +40,27 @@ pub struct Sale {
     pub sold: u64,
     /// Of the other token, what it paid.
     pub proceeds: u64,
+    /// Where it stopped short of the next initialized tick, having crossed
+    /// all it may: a swap made no further than this crosses no more.
+    pub stop: Option<u128>,
 }
 
 const FEE_ONE: u128 = 1_000_000;
 
+/// The most initialized ticks a sale may cross: what a claim's close can
+/// afford, its sale worked out here and made by Orca's swap, inside
+/// `shonin_driver::COMPUTE_PER_DRIVER` with room to spare. A sale that would
+/// cross more stops just short of the next, so that Orca's swap made to the
+/// same price crosses no more either. A claim's close crossing this many,
+/// from a position with fees, measures about 367,000 units; one more would
+/// take it past 370,000.
+pub const MAX_CROSSINGS: u32 = 7;
+
 /// Sells `amount` of token A (`a_to_b`) or of token B in `pool`, no further
-/// than the square-root price `limit`, through the pool's liquidity less
-/// `own`, with the ticks of `arrays` (those a swap would be given).
+/// than the square-root price `limit` nor across more than
+/// [`MAX_CROSSINGS`] initialized ticks, through the pool's liquidity less
+/// `own`, with the ticks of `arrays` (those a swap would be given, starting
+/// at `starts`).
 pub fn sell(
     pool: &Whirlpool,
     arrays: &[TickArray],
@@ -76,8 +90,12 @@ pub fn sell(
     if (a_to_b && limit >= price) || (!a_to_b && limit <= price) {
         return Ok(Sale::default());
     }
-    for _ in 0..64 {
-        if remaining == 0 || price == limit {
+    let mut crossed = 0u32;
+    let mut stop = None;
+    // Each step crosses an initialized tick or ends the sale (sold out, at
+    // the limit, at the arrays' edge, at the last crossing allowed).
+    for _ in 0..MAX_CROSSINGS + 3 {
+        if remaining == 0 || price == limit || stop.is_some() {
             break;
         }
         // The next initialized tick in the sale's direction, or the edge of
@@ -89,10 +107,18 @@ pub fn sell(
         };
         let tick_price = math::sqrt_price_at(next_tick.clamp(math::MIN_TICK, math::MAX_TICK))
             .map_err(math_error)?;
+        // With every crossing allowed made, a unit short of the next
+        // initialized tick: the sale stops there, crossing nothing more.
+        let last = initialized && crossed == MAX_CROSSINGS;
+        let edge = match (last, a_to_b) {
+            (false, _) => tick_price,
+            (true, true) => tick_price + 1,
+            (true, false) => tick_price - 1,
+        };
         let target = if a_to_b {
-            tick_price.max(limit)
+            edge.max(limit)
         } else {
-            tick_price.min(limit)
+            edge.min(limit)
         };
         let theirs = liquidity - own_at(own, tick) as i128;
         require!(theirs >= 0, crate::DriverError::WrongAccounts);
@@ -100,6 +126,12 @@ pub fn sell(
         remaining -= step.consumed;
         proceeds = proceeds.saturating_add(step.out);
         price = step.next;
+        if last {
+            if price == edge {
+                stop = Some(edge);
+            }
+            continue;
+        }
         if price != tick_price || !initialized {
             if price == tick_price && !initialized {
                 // At the edge of the given arrays: nothing further is known.
@@ -118,10 +150,12 @@ pub fn sell(
             tick = next_tick;
         }
         require!(liquidity >= 0, crate::DriverError::WrongAccounts);
+        crossed += 1;
     }
     Ok(Sale {
         sold: amount - remaining,
         proceeds,
+        stop,
     })
 }
 
