@@ -15,8 +15,8 @@
 //!
 //! Rounding is the pool's at every step, and against the seller. The sale
 //! goes no further than the band's limit, and no further than the tick
-//! arrays it was given reach: what is left unsold is valued at the limit,
-//! the least a sale inside the band could fetch for it.
+//! arrays it was given reach (an array not there yet holds no ticks): what
+//! is left unsold fetched nothing, and is worth nothing to `exit`.
 
 use anchor_lang::prelude::*;
 
@@ -50,6 +50,7 @@ const FEE_ONE: u128 = 1_000_000;
 pub fn sell(
     pool: &Whirlpool,
     arrays: &[TickArray],
+    starts: &[i32],
     own: &[Own],
     amount: u64,
     a_to_b: bool,
@@ -64,12 +65,15 @@ pub fn sell(
     let mut tick = pool.tick_current;
     let mut remaining = amount;
     let mut proceeds: u64 = 0;
-    // How far the given arrays reach in the sale's direction.
-    let reach = |a: &TickArray| a.start;
-    let (lowest, highest) = arrays.iter().fold((i32::MAX, i32::MIN), |(lo, hi), a| {
-        (lo.min(reach(a)), hi.max(reach(a) + span))
-    });
-    if arrays.is_empty() {
+    // How far the given arrays reach in the sale's direction; a sale stops
+    // there.
+    if starts.is_empty() {
+        return Ok(Sale::default());
+    }
+    let lowest = *starts.iter().min().unwrap();
+    let highest = *starts.iter().max().unwrap() + span;
+    // A limit on the wrong side of the price sells nothing.
+    if (a_to_b && limit >= price) || (!a_to_b && limit <= price) {
         return Ok(Sale::default());
     }
     for _ in 0..64 {
@@ -78,7 +82,7 @@ pub fn sell(
         }
         // The next initialized tick in the sale's direction, or the edge of
         // what the arrays cover.
-        let next = next_tick(arrays, tick, spacing, a_to_b)?;
+        let next = next_tick(arrays, starts, tick, spacing, a_to_b)?;
         let (next_tick, initialized) = match next {
             Some(found) => (found, true),
             None => (if a_to_b { lowest } else { highest }, false),
@@ -137,17 +141,26 @@ fn own_at(own: &[Own], tick: i32) -> u128 {
 
 /// The next initialized tick from `tick` in the sale's direction among
 /// `arrays`: at or below it selling A, above it selling B.
-fn next_tick(arrays: &[TickArray], tick: i32, spacing: i32, a_to_b: bool) -> Result<Option<i32>> {
+fn next_tick(
+    arrays: &[TickArray],
+    starts: &[i32],
+    tick: i32,
+    spacing: i32,
+    a_to_b: bool,
+) -> Result<Option<i32>> {
     let span = TICKS_PER_ARRAY * spacing;
     // The array holding the tick, and the tick's offset in it.
     let mut start = tick.div_euclid(span) * span;
     let mut offset = (tick - start).div_euclid(spacing);
     loop {
-        let Some(array) = arrays.iter().find(|a| a.start == start) else {
+        if !starts.contains(&start) {
             return Ok(None);
-        };
-        if let Some(found) = array.next_initialized(offset, a_to_b) {
-            return Ok(Some(start + found * spacing));
+        }
+        // An array not there yet holds no initialized tick.
+        if let Some(array) = arrays.iter().find(|a| a.start == start) {
+            if let Some(found) = array.next_initialized(offset, a_to_b) {
+                return Ok(Some(start + found * spacing));
+            }
         }
         // On to the next array in the sale's direction.
         if a_to_b {

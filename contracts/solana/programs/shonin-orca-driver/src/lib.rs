@@ -26,7 +26,7 @@
 //! | 4 | Pyth's SOL/USD price | the listed address, owned by Pyth's receiver, a `PriceUpdateV2` of the SOL/USD feed |
 //! | 5 | the authority's wrapped-SOL account | the authority's associated account for wrapped SOL; its balance counts (nothing there if it doesn't exist) |
 //! | 6 + 3p, 7 + 3p, 8 + 3p | each listed pool `p`, in the listed order, then its vault for A and for B | the listed address, Orca's, a pool of the listed settings, mints and tick spacing on a plain fee tier; the vaults are the pool's |
-//! | then 4 accounts | the first pool's oracle, then the three tick arrays a swap selling the SOL there would cross from its price now, in that order | the oracle is handed to Orca's swap, which checks it; each array is Orca's, of that pool, at the start the price gives, or, not there yet, its address holding nothing |
+//! | then 4 accounts | the first pool's oracle, then three consecutive tick arrays of that pool in the sale's direction, the first holding the pool's price or the one before it | the oracle is handed to Orca's swap, which checks it; each array is Orca's, of that pool, at its start, or, not there yet, its address holding nothing |
 //! | then [`MAX_SLOTS`] accounts | slot by slot: the slot's position, or, for a slot holding none, its mint's address | a position is Orca's, of the slot's mint and a listed pool; an empty slot's mint address holds nothing |
 //! | then one a position | each position's token account, in slot order | under a token program, holding the slot's mint, the authority's, amount 1, no delegate |
 //! | the rest | tick arrays, any order | Orca's, of a listed pool; each position with liquidity must find the arrays of both its ticks among them |
@@ -43,18 +43,21 @@
 //! position withdrawn at its pool's price (as a withdrawal pays), its fees,
 //! and all the SOL sold in the first pool, worked out step by step as Orca's
 //! swap works it out through everyone else's liquidity, no further than
-//! half the band from Pyth's square-root price; what that can't take counts
-//! at that limit. Less a small allowance (twice Orca's share of the pool's
-//! fee, and a millionth) for what a leaver's sale leaks to Orca where the
-//! stayers' own liquidity takes part of it. So a leaver's part never fetches
-//! less than its share of `exit` (selling part of it, through more
-//! liquidity, does better than selling all), and what it fetches and what
-//! the stayers keep add up to it: the station pays the leaver no more than
-//! came home and the stayers keep their part. A deposit takes the higher of
-//! the two, so `mark` is never below `exit`. `outside` when Pyth's price is
-//! not fully verified, older than allowed or less certain than the band, or
-//! the selling pool or a pool holding liquidity has a price further from
-//! Pyth's than the band; with nothing held at Orca, never.
+//! half the band from Pyth's square-root price nor than the given tick
+//! arrays reach; SOL that can't be sold so counts for nothing. Less a small
+//! allowance (twice Orca's share of the pool's fee, and a millionth) for
+//! what a leaver's sale leaks to Orca where the stayers' own liquidity takes
+//! part of it. So a leaver's part never fetches less than its share of
+//! `exit` (selling part of it, through more liquidity, does better than
+//! selling all), and what it fetches and what the stayers keep add up to it:
+//! the station pays the leaver no more than came home and the stayers keep
+//! their part. `exit` may be above `mark` when a pool sits above Pyth inside
+//! the band; the vault pays nobody more than the lower. `outside` when
+//! Pyth's price is not fully verified, older than allowed or less certain
+//! than the band, or the selling pool or a pool where the station has
+//! liquidity is at or past where a close's sale may go; with nothing of
+//! worth held at Orca (an emptied position, wrapped SOL worth under a cent),
+//! never.
 //!
 //! **Close.** For a fraction `f` of everything: each position's liquidity is
 //! decreased by `floor(f * L)`, its minimums what a withdrawal pays anywhere
@@ -108,6 +111,10 @@ pub const TOKEN_PROGRAM: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss62
 pub const TOKEN_2022_PROGRAM: Pubkey = pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 pub const ASSOCIATED_TOKEN_PROGRAM: Pubkey =
     pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+
+/// A cent, in the dollar's units: wrapped SOL worth less than this at Orca
+/// is nothing held there.
+pub const CENT: u128 = 10_000;
 
 /// The station's authority at the venue and its dollar account, which come
 /// first.
@@ -286,9 +293,11 @@ pub mod logic {
         /// The authority's wrapped SOL.
         pub asset: u64,
         pub held: Vec<Held>,
-        /// The selling pool's tick arrays a sale now would cross, those
-        /// that exist.
+        /// The selling pool's tick arrays a sale may cross, those that
+        /// exist, and the starts of all three given, in the sale's
+        /// direction.
         pub sale_arrays: Vec<TickArray<'a>>,
+        pub sale_starts: [i32; 3],
     }
 
     /// Reads the station's holdings at Orca from `accounts` (the authority
@@ -434,54 +443,74 @@ pub mod logic {
             h.fees_b = p.fee_owed_b.wrapping_add(earned_b);
             h.earning = earned_a != 0 || earned_b != 0;
         }
-        // The sale's tick arrays: the three a swap selling the asset in the
-        // first pool would cross from its price now, each at its own
-        // address, so that nobody valuing the station can pass others and
-        // make a sale look poorer than it is.
-        let mut sale_arrays = Vec::with_capacity(3);
+        // The sale's tick arrays: three consecutive arrays of the first pool
+        // in the sale's direction, each at its own address (Orca's, or not
+        // there yet and holding nothing), the pool's price in one of the
+        // first two. Those a swap selling now would cross, or, after a
+        // close's own sale has taken the price into the next array, the
+        // same three the close was prepared with. Nobody valuing the
+        // station can pass others and make a sale look poorer than it is.
         let first = &pools[0];
         let span = orca::TICKS_PER_ARRAY * first.tick_spacing as i32;
-        let base = first.array_start(first.tick_current);
-        let starts: [i32; 3] = if network::asset_is_a() {
-            [base, base - span, base - 2 * span]
-        } else if first.tick_current + first.tick_spacing as i32 >= base + span {
-            [base + span, base + 2 * span, base + 3 * span]
-        } else {
-            [base, base + span, base + 2 * span]
-        };
-        for (i, start) in starts.into_iter().enumerate() {
-            let info = at(layout::sale_arrays() + i)?;
-            match TickArray::load(info)? {
-                Some(array) => {
-                    require!(
-                        array.whirlpool == POOLS[0].address && array.start == start,
-                        DriverError::WrongAccounts
-                    );
-                    sale_arrays.push(array);
-                }
-                None => {
-                    // Not there yet: then it must be at that array's address,
-                    // holding nothing.
-                    let (address, _) = Pubkey::find_program_address(
-                        &[
-                            b"tick_array",
-                            POOLS[0].address.as_ref(),
-                            start.to_string().as_bytes(),
-                        ],
-                        &WHIRLPOOL_PROGRAM,
-                    );
-                    require!(
-                        info.key == &address
-                            && info.owner == &anchor_lang::system_program::ID
-                            && info.data_is_empty(),
-                        DriverError::WrongAccounts
-                    );
-                }
+        let current = first.array_start(first.tick_current);
+        let step = if network::asset_is_a() { -span } else { span };
+        let infos = [
+            at(layout::sale_arrays())?,
+            at(layout::sale_arrays() + 1)?,
+            at(layout::sale_arrays() + 2)?,
+        ];
+        let mut loaded: [Option<TickArray<'a>>; 3] = [None, None, None];
+        for (slot, info) in loaded.iter_mut().zip(infos) {
+            *slot = TickArray::load(info)?;
+            if let Some(array) = slot {
+                require_keys_eq!(
+                    array.whirlpool,
+                    POOLS[0].address,
+                    DriverError::WrongAccounts
+                );
             }
         }
+        // The first array's start: the price's own array, or the one before
+        // it in the sale's direction, when a close's own sale has moved the
+        // price on.
+        let mut sale_starts = None;
+        for candidate in [current, current - step] {
+            let starts = [candidate, candidate + step, candidate + 2 * step];
+            let mut fits = true;
+            for (i, info) in infos.iter().enumerate() {
+                fits &= match &loaded[i] {
+                    Some(array) => array.start == starts[i],
+                    // Not there yet: then it must be at that array's
+                    // address, holding nothing.
+                    None => {
+                        let (address, _) = Pubkey::find_program_address(
+                            &[
+                                b"tick_array",
+                                POOLS[0].address.as_ref(),
+                                starts[i].to_string().as_bytes(),
+                            ],
+                            &WHIRLPOOL_PROGRAM,
+                        );
+                        info.key == &address
+                            && info.owner == &anchor_lang::system_program::ID
+                            && info.data_is_empty()
+                    }
+                };
+                if !fits {
+                    break;
+                }
+            }
+            if fits {
+                sale_starts = Some(starts);
+                break;
+            }
+        }
+        let sale_starts = sale_starts.ok_or(DriverError::WrongAccounts)?;
+        let sale_arrays: Vec<TickArray<'a>> = loaded.into_iter().flatten().collect();
         let mut book = Book {
             price,
             sale_arrays,
+            sale_starts,
             pyth: W::ZERO,
             pyth_sqrt: 0,
             now: Clock::get()?.unix_timestamp,
@@ -595,25 +624,6 @@ pub mod logic {
                 .clamp(math::MIN_SQRT_PRICE, math::MAX_SQRT_PRICE)
         }
 
-        /// `raw` with the asset `bps` basis points dearer, or cheaper.
-        fn moved(raw: Raw, bps: u64, dearer: bool) -> Raw {
-            let factor = if dearer {
-                BPS + bps
-            } else {
-                BPS.saturating_sub(bps)
-            };
-            let (times, over) = if network::asset_is_a() {
-                (factor, BPS)
-            } else {
-                (BPS, factor)
-            };
-            if over == 0 {
-                return W::MAX;
-            }
-            raw.mul_word(times)
-                .map_or(W::MAX, |product| product.div_word(over).0)
-        }
-
         /// What `amount` of the asset is worth in dollar-units at `raw`,
         /// rounded down.
         fn worth(amount: u128, raw: Raw) -> u128 {
@@ -664,60 +674,67 @@ pub mod logic {
             Ok((asset, dollars))
         }
 
-        /// Whether a pool's price is further from Pyth's than the band, on
-        /// either side.
-        fn pool_outside(&self, (low, high): (Raw, Raw), p: usize) -> bool {
-            let pool = self.pool_raw(p);
-            pool < low || pool > high
+        /// The square-root prices the band reaches either side of Pyth's,
+        /// as a close's sale limit is worked out: a pool at or past either
+        /// can't be closed through inside the band.
+        fn band_roots(&self, band_bps: u16) -> (u128, u128) {
+            let band = band_bps as u64;
+            (
+                self.scaled_root(2 * BPS - band, 2 * BPS).saturating_add(1),
+                self.scaled_root(2 * BPS + band, 2 * BPS),
+            )
         }
 
-        /// Pyth's price moved by the band both ways, the lower first.
-        fn band_bounds(&self, band_bps: u16) -> (Raw, Raw) {
-            let band = band_bps as u64;
-            let (x, y) = (
-                Self::moved(self.pyth, band, false),
-                Self::moved(self.pyth, band, true),
-            );
-            (x.min(y), x.max(y))
+        /// Whether the station holds anything of worth at Orca: a position
+        /// with liquidity or fees, or wrapped SOL worth a cent or more at
+        /// Pyth's price. An emptied position and a few lamports anyone could
+        /// send are nothing to value or close.
+        fn holds_anything(&self) -> bool {
+            self.held
+                .iter()
+                .any(|h| h.position.liquidity > 0 || h.fees_a != 0 || h.fees_b != 0)
+                || Self::worth(self.asset as u128, self.pyth) >= CENT
         }
 
         /// Whether the station's holdings can't be valued or closed inside the
         /// band: Pyth's price unfit, or the selling pool or a pool holding
-        /// liquidity priced further from it than the band. At the full band,
-        /// or with nothing held, nothing is.
+        /// liquidity priced at or past the band's reach from it (where a
+        /// close's sale could not go). At the full band, or with nothing of
+        /// worth held, nothing is.
         pub fn outside(&self, band_bps: u16) -> Result<bool> {
-            if band_bps as u64 >= BPS || (self.held.is_empty() && self.asset == 0) {
+            if band_bps as u64 >= BPS || !self.holds_anything() {
                 return Ok(false);
             }
             if !self.price.fit(self.now, network::MAX_AGE, band_bps) {
                 return Ok(true);
             }
-            let bounds = self.band_bounds(band_bps);
+            let (low, high) = self.band_roots(band_bps);
             Ok((0..self.pools.len()).any(|p| {
                 let holds = p == 0
                     || self
                         .held
                         .iter()
                         .any(|h| h.pool == p && h.position.liquidity > 0);
-                holds && self.pool_outside(bounds, p)
+                let price = self.pools[p].sqrt_price;
+                holds && (price <= low || price >= high)
             }))
         }
 
-        /// The valuation. `mark` counts every token at Pyth's price. `exit`
-        /// is what closing everything now would fetch: each position
-        /// withdrawn at its pool's own price (as a withdrawal pays), and all
-        /// the SOL sold in the first pool through everyone else's liquidity
-        /// (see [`crate::sale`]), no further than the band allows; anything a
-        /// sale inside the band can't take is counted at the band's limit.
-        /// A deposit takes the higher of the two, so `mark` is never below
-        /// `exit`.
+        /// The valuation. `mark` counts every token at Pyth's price, whatever
+        /// the pools' own prices. `exit` is what closing everything now would
+        /// fetch: each position withdrawn at its pool's own price (as a
+        /// withdrawal pays), and all the SOL sold in the first pool through
+        /// everyone else's liquidity (see [`crate::sale`]), no further than
+        /// the band allows; what no sale inside the band can take counts for
+        /// nothing. A pool pushed inside the band may lift `exit` above
+        /// `mark`; the vault pays nobody more than the lower of the two.
         pub fn valuation(&self, band_bps: u16) -> Result<Valuation> {
             let (asset, dollars) = self.holdings(|_| self.pyth_sqrt, false)?;
-            let at_pyth = dollars.saturating_add(Self::worth(asset, self.pyth));
+            let mark = dollars.saturating_add(Self::worth(asset, self.pyth));
             let exit = self.liquidation(band_bps)?;
             let outside = self.outside(band_bps)?;
             Ok(Valuation {
-                mark: clamp(at_pyth.max(exit)),
+                mark: clamp(mark),
                 exit: clamp(exit),
                 outside,
             })
@@ -746,24 +763,16 @@ pub mod logic {
                 sale::sell(
                     pool,
                     &self.sale_arrays,
+                    &self.sale_starts,
                     &own,
                     asset,
                     network::asset_is_a(),
                     limit,
                 )?
             };
-            // What a sale inside the band can't take, at the band's limit.
-            let unsold = (asset - sold.sold) as u128;
-            let at_limit = Self::worth(unsold, W::mul(limit, limit));
-            let keep = 1_000_000 - (pool.fee_rate as u128).min(1_000_000);
-            let at_limit = W::mul(at_limit, keep)
-                .div_word(1_000_000)
-                .0
-                .to_u128()
-                .unwrap_or(u128::MAX);
-            let worth = dollars
-                .saturating_add(sold.proceeds as u128)
-                .saturating_add(at_limit);
+            // What no sale inside the band can take counts for nothing: a
+            // leaver is never paid for what the station can't sell for them.
+            let worth = dollars.saturating_add(sold.proceeds as u128);
             // Less what a leaver's sale may leak out of the station that a
             // sale of everything wouldn't: where the stayers' own liquidity
             // takes part of the sale, Orca keeps its share of the fee the
@@ -831,6 +840,10 @@ pub mod logic {
         /// documentation says.
         pub fn close(&self, fraction: u64, band_bps: u16) -> Result<Plan> {
             require!(fraction <= WAD, DriverError::WrongAccounts);
+            // Nothing of worth at Orca: nothing to close.
+            if !self.holds_anything() {
+                return Ok(Plan::default());
+            }
             if self.outside(band_bps)? {
                 return Ok(Plan {
                     outside: true,
