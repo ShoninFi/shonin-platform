@@ -46,8 +46,9 @@ const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 const STARTING_DOLLARS: u64 = 1_000_000_000_000;
 
 /// Every program, by its library name, and whether it is deployed final.
-const PROGRAMS: [(&str, bool); 9] = [
+const PROGRAMS: [(&str, bool); 10] = [
     ("shonin_dev_verifier", true),
+    ("shonin_cs_verifier", true),
     ("shonin_local_driver", true),
     ("shonin_registry", false),
     ("shonin_publishing", false),
