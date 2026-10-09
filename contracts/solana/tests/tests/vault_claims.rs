@@ -419,3 +419,75 @@ fn a_withdrawal_asked_while_a_market_is_outside_the_band_becomes_a_claim_after_a
     expect_ok(env.settle_claim(&v, id));
     assert_eq!(env.claim(&v, id).unwrap().state, ClaimState::Paid);
 }
+
+/// A claim a venue can't bring home whole in one transaction is served in
+/// parts: each part is closed and paid as a claim of it alone would be, its
+/// shares burned, and the rest stays booked, still the claim's own. Served
+/// in two halves it is paid what it would be whole, within the rounding.
+#[test]
+fn a_claim_served_in_parts_is_paid_what_it_would_be_whole() {
+    let paid = |halves: bool| {
+        let (mut env, v) = Env::with_vault();
+        let (alice, bob) = (env.alice.insecure_clone(), env.bob.insecure_clone());
+        let a = env.deposit_as(&v, &alice, 100_000_000_000);
+        env.deposit_as(&v, &bob, 100_000_000_000);
+        hedge(&mut env, &v, 190_000_000_000, UNIT);
+        let id = claim_for(&mut env, &v, &alice, a);
+        let before = env.usd_balance(&alice.pubkey());
+        if halves {
+            expect_ok(env.settle_claim_part(&v, id, a / 2));
+            let claim = env.claim(&v, id).unwrap();
+            assert_eq!(claim.state, ClaimState::Pending);
+            assert_eq!(claim.shares, a - a / 2);
+            assert_eq!(claim.booked_at, env.now());
+            assert!(claim.paid > 0);
+            assert_eq!(env.vault(&v).pending_shares, a - a / 2);
+        }
+        expect_ok(env.settle_claim(&v, id));
+        let claim = env.claim(&v, id).unwrap();
+        assert_eq!(claim.state, ClaimState::Paid);
+        assert_eq!(claim.shares, 0);
+        let got = env.usd_balance(&alice.pubkey()) - before;
+        assert_eq!(got, claim.paid);
+        got
+    };
+    let (whole, halves) = (paid(false), paid(true));
+    println!("whole {whole}, in halves {halves}");
+    approx_rel(halves as u128, whole as u128, 1_000_000_000_000_000);
+}
+
+/// A part is some of the claim's shares, never none of them nor all: a
+/// whole claim is tried as a whole.
+#[test]
+fn a_part_of_a_claim_is_neither_none_of_its_shares_nor_all() {
+    let (mut env, v) = Env::with_vault();
+    let (alice, bob) = (env.alice.insecure_clone(), env.bob.insecure_clone());
+    let a = env.deposit_as(&v, &alice, 100_000_000_000);
+    env.deposit_as(&v, &bob, 100_000_000_000);
+    hedge(&mut env, &v, 190_000_000_000, UNIT);
+    let id = claim_for(&mut env, &v, &alice, a);
+    for part in [0, a, a + 1] {
+        expect_code(
+            env.settle_claim_part(&v, id, part),
+            vault_error(VaultError::NotAllowed),
+        );
+    }
+}
+
+/// A part paid is progress: the freeze counts from the last part paid, so a
+/// claim served bit by bit never freezes the vault while its parts are paid.
+#[test]
+fn a_part_paid_restarts_the_count_to_the_freeze() {
+    let (mut env, v) = Env::with_vault();
+    let (alice, bob) = (env.alice.insecure_clone(), env.bob.insecure_clone());
+    let a = env.deposit_as(&v, &alice, 100_000_000_000);
+    env.deposit_as(&v, &bob, 100_000_000_000);
+    hedge(&mut env, &v, 190_000_000_000, UNIT);
+    let id = claim_for(&mut env, &v, &alice, a);
+    env.skip(6 * DAY);
+    expect_ok(env.settle_claim_part(&v, id, a / 2));
+    env.skip(2 * DAY);
+    expect_code(env.freeze(&v, id), vault_error(VaultError::NotYet));
+    env.skip(5 * DAY);
+    expect_ok(env.freeze(&v, id));
+}

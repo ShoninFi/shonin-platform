@@ -528,7 +528,7 @@ pub struct Claim {
     pub booked_at: u64,
     pub last_attempt_at: u64,
     pub state: ClaimState,
-    /// What it paid.
+    /// What it paid, over every part paid.
     pub paid: u64,
     /// The request a queued claim is priced by, the last if it was queued
     /// more than once: the nonce of the next one's address, whose maker is

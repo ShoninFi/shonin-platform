@@ -841,6 +841,20 @@ impl Env {
         }
     }
 
+    /// A try serving only `shares` of a claim's shares.
+    pub fn settle_claim_part(&mut self, v: &V, claim_id: u64, shares: u128) -> TxResult {
+        let payer = self.payer.insecure_clone();
+        let mut ix = self.ix_settle_claim(v, &payer.pubkey(), claim_id);
+        let (_, sizes) = self.groups(&v.home, &v.home.drivers);
+        ix.data = shonin_vault::instruction::SettleClaimPart {
+            claim_id,
+            groups: sizes,
+            shares,
+        }
+        .data();
+        self.send_fitting(vec![ix], &[&payer])
+    }
+
     pub fn settle_claim(&mut self, v: &V, claim_id: u64) -> TxResult {
         let payer = self.payer.insecure_clone();
         let ix = self.ix_settle_claim(v, &payer.pubkey(), claim_id);

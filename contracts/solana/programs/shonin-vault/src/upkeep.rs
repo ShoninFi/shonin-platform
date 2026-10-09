@@ -867,7 +867,7 @@ pub fn claim_closed<'info>(
     vault.burn_held(claim.shares, &vault_key, said)?;
     vault.cash -= assets;
     claim.state = ClaimState::Paid;
-    claim.paid = assets;
+    claim.paid += assets;
     let owner = claim.owner;
     if !purse.pay(&a.to, &owner, assets, said)? {
         crate::claims::hold_on_claim(vault, &mut claim, assets)?;

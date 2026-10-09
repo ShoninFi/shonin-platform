@@ -972,7 +972,7 @@ fn queued_claim<'info>(
     vault.cash -= payout;
     vault.exit_paid += payout as u128;
     claim.state = ClaimState::Paid;
-    claim.paid = payout;
+    claim.paid += payout;
     if !purse.pay(to, &claim.owner, payout, said)? {
         crate::claims::hold_on_claim(vault, &mut claim, payout)?;
     }
