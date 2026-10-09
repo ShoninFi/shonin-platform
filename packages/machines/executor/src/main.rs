@@ -137,6 +137,33 @@ async fn main() -> Result<()> {
         }
         .to_string()
     }));
+    // Agents name a spot pair's book as their orders name the pair; the
+    // venue numbers pairs per network, so their feed names are read from it,
+    // and read again now and then for pairs listed since.
+    let pairs_network = if args.chain_args.network == chain::NetworkName::Mainnet {
+        ::hyperliquid::Network::Mainnet
+    } else {
+        ::hyperliquid::Network::Testnet
+    };
+    tokio::spawn(async move {
+        let api = ::hyperliquid::Api::new(pairs_network);
+        let mut warned = Throttle::default();
+        loop {
+            let wait = match ::hyperliquid::Markets::read(&api).await {
+                Ok(markets) => {
+                    data::name_spot_pairs(&markets);
+                    SPOT_PAIRS_READ_EVERY
+                }
+                Err(error) => {
+                    if warned.due(std::time::Instant::now()) {
+                        tracing::warn!(error = %format!("{error:#}"), "Hyperliquid's spot pairs weren't read; agents can't yet ask for a pair's book by its name");
+                    }
+                    Duration::from_secs(5)
+                }
+            };
+            tokio::time::sleep(wait).await;
+        }
+    });
     // The EVM chains and the Solana clusters to serve. A Solana vault chain
     // named alone is served alone.
     let solana_targets = args.chain_args.solana_targets()?;
@@ -1723,6 +1750,9 @@ async fn serve(
         }
     }
 }
+
+/// How often Hyperliquid's spot pairs are read again for their feed names.
+const SPOT_PAIRS_READ_EVERY: Duration = Duration::from_secs(600);
 
 /// How often a halted vault whose Lighter accounts are still posted for is
 /// looked at to see whether it has closed.

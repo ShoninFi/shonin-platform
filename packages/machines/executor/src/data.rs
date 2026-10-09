@@ -16,7 +16,7 @@
 //! Nothing is promised beyond each value's stamps: an agent that reads too
 //! slowly is handed the newest values, and the ones it missed are dropped.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -173,6 +173,39 @@ pub fn configure(hyperliquid: String) {
     let _ = HYPERLIQUID_URL.set(hyperliquid);
 }
 
+/// Each spot pair's name as an agent names it in an order (`HYPE/USDC`), and
+/// the venue's own name for it in its feeds (`@1035` on testnet, `@107` on
+/// mainnet: the venue numbers pairs per network). Read from the venue.
+static SPOT_COINS: std::sync::RwLock<BTreeMap<String, String>> =
+    std::sync::RwLock::new(BTreeMap::new());
+
+/// Learn the spot pairs' feed names from the venue's markets, so an agent
+/// can ask for a pair's book by the name its orders use, on any network.
+pub fn name_spot_pairs(markets: &::hyperliquid::Markets) {
+    let coins: BTreeMap<String, String> = markets
+        .spot()
+        .map(|market| (market.name.clone(), market.coin.clone()))
+        .collect();
+    *SPOT_COINS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = coins;
+}
+
+/// The venue's feed name for `coin`: a pair named as orders name it
+/// (`BASE/USDC`) becomes the venue's own name for it; anything else is
+/// already the venue's name.
+fn venue_coin(coin: &str) -> Result<String, String> {
+    if !coin.contains('/') {
+        return Ok(coin.to_string());
+    }
+    SPOT_COINS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(coin)
+        .cloned()
+        .ok_or_else(|| format!("{coin:?} is not a spot pair the venue lists (or its pairs aren't read yet)"))
+}
+
 /// The executor's hub.
 pub fn hub() -> &'static Hub {
     HUB.get_or_init(|| {
@@ -208,14 +241,21 @@ impl Venue for Hyperliquid {
     fn feed(&self, request: &[u8]) -> Result<Vec<u8>, String> {
         let feed: HyperliquidFeed =
             from_payload(request).map_err(|error| format!("not a Hyperliquid feed: {error}"))?;
-        match &feed {
+        let feed = match feed {
             HyperliquidFeed::Book { coin } | HyperliquidFeed::Funding { coin }
                 if coin.is_empty() || coin.len() > 32 =>
             {
-                Err(format!("{coin:?} is not a Hyperliquid coin"))
+                return Err(format!("{coin:?} is not a Hyperliquid coin"));
             }
-            _ => Ok(to_payload(&feed)),
-        }
+            HyperliquidFeed::Book { coin } => HyperliquidFeed::Book {
+                coin: venue_coin(&coin)?,
+            },
+            HyperliquidFeed::Funding { coin } => HyperliquidFeed::Funding {
+                coin: venue_coin(&coin)?,
+            },
+            other => other,
+        };
+        Ok(to_payload(&feed))
     }
 
     fn run(self: Arc<Self>, outlets: Arc<Outlets>) -> BoxFuture<'static, ()> {
@@ -619,6 +659,42 @@ mod tests {
                 (feed, read) => panic!("{feed:?} carried {read:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_spot_pair_s_book_is_asked_for_by_the_name_orders_use_and_reaches_the_venue_by_its_own() {
+        let meta = serde_json::json!({"universe": [
+            {"name": "ETH", "szDecimals": 4, "maxLeverage": 25}
+        ]});
+        let spot = serde_json::json!({
+            "tokens": [
+                {"name": "USDC", "index": 0, "szDecimals": 8, "weiDecimals": 8, "tokenId": "0xaa"},
+                {"name": "HYPE", "index": 1105, "szDecimals": 2, "weiDecimals": 8, "tokenId": "0xbb"}
+            ],
+            "universe": [{"name": "@1035", "tokens": [1105, 0], "index": 1035}]
+        });
+        name_spot_pairs(&::hyperliquid::Markets::from_meta(&meta, &spot).unwrap());
+        let venue = Hyperliquid { url: String::new() };
+        let asked = |coin: &str| {
+            venue.feed(&to_payload(&HyperliquidFeed::Book {
+                coin: coin.to_string(),
+            }))
+        };
+        assert_eq!(
+            asked("HYPE/USDC").unwrap(),
+            to_payload(&HyperliquidFeed::Book {
+                coin: "@1035".to_string()
+            }),
+            "the same feed as the venue's own name, so both share one subscription"
+        );
+        assert_eq!(asked("@1035").unwrap(), asked("HYPE/USDC").unwrap());
+        assert_eq!(
+            asked("ETH").unwrap(),
+            to_payload(&HyperliquidFeed::Book {
+                coin: "ETH".to_string()
+            })
+        );
+        assert!(asked("NOPE/USDC").is_err(), "a pair the venue doesn't list");
     }
 
     #[test]

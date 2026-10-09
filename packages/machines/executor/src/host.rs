@@ -875,6 +875,55 @@ async fn station_holds(chain: &Client, usd: Address, station: Address) -> Option
 /// block or two behind to catch up.
 const WITHDRAWAL_SEEN_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
 
+/// How long a withdrawal through `driver` is looked for in the station's
+/// balance after its receipt. HyperCore pays out a block or so later, so it
+/// is given as long as a deposit into it; any other venue's payout is read
+/// again for [`WITHDRAWAL_SEEN_WAIT`], in case the first read comes from an
+/// endpoint a block behind the receipt.
+fn withdrawal_wait(driver: &str) -> std::time::Duration {
+    if driver == crate::hyperliquid::DRIVER {
+        crate::hyperliquid::DEPOSIT_CONFIRM_WAIT
+    } else {
+        WITHDRAWAL_SEEN_WAIT
+    }
+}
+
+/// A withdrawal of `amount` millionths (`units`) whose receipt came back,
+/// judged by how far the station's balance rose (`risen`) within `wait`:
+/// done once it has risen by all of it. Otherwise it is a send that may
+/// still land, never a refusal: the rest may still arrive, or still be at
+/// the venue.
+fn withdrawal_seen(
+    risen: Option<U256>,
+    units: U256,
+    amount: u64,
+    wait: std::time::Duration,
+) -> anyhow::Result<()> {
+    if risen.is_some_and(|risen| risen >= units) {
+        return Ok(());
+    }
+    let found = match risen {
+        Some(risen) => format!("the station's balance rose by {risen} millionths"),
+        None => "the station's balance can't be read, so what reached it can't be told".to_string(),
+    };
+    Err(anyhow::Error::new(chain::NeverLanded).context(format!(
+        "the withdrawal of {amount} millionths was asked of the venue, and {found} within {} s: the rest may still arrive, or still be at the venue",
+        wait.as_secs()
+    )))
+}
+
+/// What the agent is told of a move whose money left one of the vault's
+/// accounts at `step` and hasn't been seen arriving where it was going: a
+/// withdrawal not yet all at the station is unknown, a deposit not yet
+/// credited at the venue is on its way there. Never a refusal: either may
+/// still arrive.
+fn not_yet_arrived(step: Step, why: String) -> Moved {
+    match step {
+        Step::Withdraw => Moved::Unknown(why),
+        _ => left_for_the_venue(why),
+    }
+}
+
 /// How far the station's idle dollars have risen over `before`, looking
 /// every two seconds for at most `wait` until they have risen by `units`;
 /// `None` when that can't be read. A fall (the station paying out meanwhile)
@@ -1075,36 +1124,21 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
                                 .await;
                             match sent {
                                 Ok(receipt) => {
-                                    // HyperCore pays out a block or so later;
-                                    // any other venue's payout is read again
-                                    // for a few seconds, in case the first
-                                    // read comes from an endpoint a block
-                                    // behind the receipt.
-                                    let wait = if driver == crate::hyperliquid::DRIVER {
-                                        crate::hyperliquid::DEPOSIT_CONFIRM_WAIT
-                                    } else {
-                                        WITHDRAWAL_SEEN_WAIT
-                                    };
+                                    let wait = withdrawal_wait(&driver);
                                     let risen =
                                         risen_by(&evm.chain, evm.usd, station, before, units, wait)
                                             .await;
-                                    if risen.is_some_and(|risen| risen >= units) {
-                                        Ok(receipt)
-                                    } else {
-                                        in_flight = true;
-                                        let found = match risen {
-                                            Some(risen) => format!("the station's balance rose by {risen} millionths"),
-                                            None => "the station's balance can't be read, so what reached it can't be told".to_string(),
-                                        };
-                                        tracing::warn!(
-                                            station = %station,
-                                            amount,
-                                            "a withdrawal was asked of the venue and hasn't all reached the station"
-                                        );
-                                        Err(anyhow::Error::new(chain::NeverLanded).context(format!(
-                                            "the withdrawal of {amount} millionths was asked of the venue, and {found} within {} s: the rest may still arrive, or still be at the venue",
-                                            wait.as_secs()
-                                        )))
+                                    match withdrawal_seen(risen, units, amount, wait) {
+                                        Ok(()) => Ok(receipt),
+                                        Err(error) => {
+                                            in_flight = true;
+                                            tracing::warn!(
+                                                station = %station,
+                                                amount,
+                                                "a withdrawal was asked of the venue and hasn't all reached the station"
+                                            );
+                                            Err(error)
+                                        }
                                     }
                                 }
                                 Err(error) => Err(error),
@@ -1149,10 +1183,7 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
             if let Some((tally, error)) = failed {
                 accessor.with(|mut access| access.get().count(|c| c.submitted(tally)));
                 if in_flight {
-                    return Ok(match step {
-                        Step::Withdraw => Moved::Unknown(format!("{error:#}")),
-                        _ => left_for_the_venue(format!("{error:#}")),
-                    });
+                    return Ok(not_yet_arrived(step, format!("{error:#}")));
                 }
                 return Ok(stopped(reached, format!("{error:#}"), may_still_land));
             }
@@ -2385,6 +2416,48 @@ mod tests {
             matches!(&moved, Moved::Unknown(why) if why.contains("left the station")),
             "{moved:?}"
         );
+    }
+
+    /// A withdrawal through a venue other than Hyperliquid is looked for in
+    /// the station's balance for 6 seconds after its receipt, and through
+    /// Hyperliquid for 60. One not all seen by then, or not readable, is
+    /// reported to the agent as unknown, never as refused: a venue that pays
+    /// out in minutes may still pay.
+    #[test]
+    fn a_withdrawal_not_seen_at_the_station_within_its_wait_is_reported_unknown_never_refused() {
+        for driver in ["lighter", "robinhood", "local"] {
+            assert_eq!(withdrawal_wait(driver), std::time::Duration::from_secs(6));
+        }
+        assert_eq!(
+            withdrawal_wait(crate::hyperliquid::DRIVER),
+            std::time::Duration::from_secs(60)
+        );
+
+        let units = U256::from(250_000_000u64);
+        let wait = withdrawal_wait("lighter");
+        // All of it seen: done.
+        assert!(withdrawal_seen(Some(units), units, 250_000_000, wait).is_ok());
+        assert!(withdrawal_seen(Some(units + U256::from(1)), units, 250_000_000, wait).is_ok());
+        // Nothing, part of it, or a balance that can't be read: it may still
+        // land, and the agent hears unknown, whichever step it was.
+        for risen in [Some(U256::ZERO), Some(units - U256::from(1)), None] {
+            let error = withdrawal_seen(risen, units, 250_000_000, wait).unwrap_err();
+            assert!(chain::may_still_land(&error), "{error:#}");
+            assert!(format!("{error:#}").contains("within 6 s"), "{error:#}");
+            let moved = not_yet_arrived(Step::Withdraw, format!("{error:#}"));
+            assert!(matches!(moved, Moved::Unknown(_)), "{moved:?}");
+            // Had it been told as a step's plain failure, it would be unknown
+            // too, never refused.
+            assert!(matches!(
+                stopped(None, format!("{error:#}"), chain::may_still_land(&error)),
+                Moved::Unknown(_)
+            ));
+        }
+        // A deposit not yet credited is on its way to the venue.
+        assert!(matches!(
+            not_yet_arrived(Step::Deposit, "not credited".to_string()),
+            Moved::Unknown(why) if why.contains("left the station")
+        ));
     }
 
     #[test]
