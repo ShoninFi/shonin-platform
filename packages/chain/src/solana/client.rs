@@ -41,6 +41,8 @@ pub const LANDING_TIMEOUT: Duration = Duration::from_secs(90);
 /// How often an unconfirmed send is asked after, and sent again.
 const POLL: Duration = Duration::from_millis(400);
 const RESEND: Duration = Duration::from_secs(2);
+/// How long a landed transaction's record is read for.
+const RECORD_WITHIN: Duration = Duration::from_secs(20);
 /// How long to wait for a cluster to answer at all before giving up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a lookup table just grown is waited on to be usable.
@@ -134,6 +136,17 @@ impl std::fmt::Display for MayStillLand {
             self.signature
         )
     }
+}
+
+/// The seconds the cluster's clock sysvar holds.
+fn clock_seconds(clock: Option<&rpc::Account>) -> Result<u64> {
+    let clock = clock.ok_or_else(|| anyhow!("the cluster has no clock"))?;
+    let bytes: [u8; 8] = clock
+        .data
+        .get(32..40)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| anyhow!("the clock is not a clock"))?;
+    Ok(i64::from_le_bytes(bytes).max(0) as u64)
 }
 
 enum Watch {
@@ -416,14 +429,35 @@ impl SolanaClient {
         let clock = self
             .rpc
             .account_at(&anchor_lang::solana_program::sysvar::clock::ID, commitment)
-            .await?
-            .ok_or_else(|| anyhow!("the cluster has no clock"))?;
-        let bytes: [u8; 8] = clock
-            .data
-            .get(32..40)
-            .and_then(|bytes| bytes.try_into().ok())
-            .ok_or_else(|| anyhow!("the clock is not a clock"))?;
-        Ok(i64::from_le_bytes(bytes).max(0) as u64)
+            .await?;
+        clock_seconds(clock.as_ref())
+    }
+
+    /// The account at `address` and the cluster's clock, both at the
+    /// finalized commitment and read in one call, so as of one slot: the
+    /// time is never later than what the account says.
+    pub async fn load_finalized_with_time<T: AccountDeserialize>(
+        &self,
+        address: &Pubkey,
+    ) -> Result<(Option<T>, u64)> {
+        let read = self
+            .rpc
+            .accounts_at(
+                &[*address, anchor_lang::solana_program::sysvar::clock::ID],
+                rpc::FINALIZED,
+            )
+            .await?;
+        let [account, clock] = read.as_slice() else {
+            bail!("the node answered {} accounts for 2", read.len());
+        };
+        let now = clock_seconds(clock.as_ref())?;
+        let Some(account) = account.as_ref().filter(|account| !account.data.is_empty()) else {
+            return Ok((None, now));
+        };
+        let loaded = T::try_deserialize(&mut &account.data[..]).map_err(|error| {
+            anyhow!("the account at {address} is not what was expected: {error}")
+        })?;
+        Ok((Some(loaded), now))
     }
 
     pub async fn lamports(&self, address: &Pubkey) -> Result<u64> {
@@ -516,9 +550,11 @@ impl SolanaClient {
                 Ok(Watch::Waiting) => {}
                 // The node didn't answer: the send may still land, so it is
                 // watched until it does, its blockhash expires, or the
-                // node stays silent too long to say.
+                // node stays silent too long to say. Something may have been
+                // done, so the node's rate limit is kept out of the error
+                // (as text), which would say nothing was.
                 Err(error) if started.elapsed() > LANDING_TIMEOUT => {
-                    return Err(error.context(MayStillLand { signature }));
+                    return Err(anyhow!("{error:#}").context(MayStillLand { signature }));
                 }
                 Err(_) => {}
             }
@@ -586,15 +622,32 @@ impl SolanaClient {
     }
 
     /// A confirmed transaction's record, which the node may take a moment to
-    /// have after reporting its status.
+    /// have after reporting its status, read again through any error for
+    /// [`RECORD_WITHIN`]. A record never read is a send that landed all the
+    /// same: the error says it may have landed ([`MayStillLand`]), so its
+    /// cost is looked for later, and never that nothing was done (the node's
+    /// rate limit is kept out of it as text).
     async fn landed_record(&self, signature: &str) -> Result<TransactionRecord> {
-        for _ in 0..50 {
-            if let Some(record) = self.transaction(signature).await? {
-                return Ok(record);
+        let started = Instant::now();
+        let mut last = None;
+        loop {
+            match self.transaction(signature).await {
+                Ok(Some(record)) => return Ok(record),
+                Ok(None) => {}
+                Err(error) => last = Some(format!("{error:#}")),
+            }
+            if started.elapsed() > RECORD_WITHIN {
+                break;
             }
             tokio::time::sleep(POLL).await;
         }
-        bail!("transaction {signature} landed, and the node never gave its record")
+        let why = last.map_or_else(String::new, |last| format!(": {last}"));
+        Err(
+            anyhow!("transaction {signature} landed, and the node never gave its record{why}")
+                .context(MayStillLand {
+                    signature: signature.to_string(),
+                }),
+        )
     }
 
     /// How many bytes `ixs` take on the wire as one transaction `payer`

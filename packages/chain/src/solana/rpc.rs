@@ -125,6 +125,42 @@ fn says_rate_limited(error: &Value) -> bool {
             .is_some_and(|message| message.to_ascii_lowercase().contains("too many requests"))
 }
 
+/// How many times a read pinned to a slot is made while the node that
+/// takes it is behind that slot, and the pause between tries.
+const BEHIND_TRIES: u32 = 6;
+const BEHIND_PAUSE: Duration = Duration::from_millis(400);
+
+/// The node's code for a read whose `minContextSlot` it hasn't reached.
+const MIN_CONTEXT_SLOT_NOT_REACHED: i64 = -32016;
+
+/// Whether `error` is the node saying it hasn't reached the slot a read was
+/// pinned to: by the code a validator's RPC gives it, or by what it says
+/// (other nodes give it another code).
+fn behind(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RpcError>().is_some_and(|rpc| {
+        let message = rpc.message.to_ascii_lowercase();
+        rpc.code == MIN_CONTEXT_SLOT_NOT_REACHED
+            || message.contains("mincontextslot")
+            || message.contains("minimum context slot")
+    })
+}
+
+/// The slot an answer was read at.
+#[derive(Deserialize)]
+struct AnswerContext {
+    slot: u64,
+}
+
+/// `(offset, bytes)` filters as the node takes them.
+fn memcmp(filters: &[(usize, Vec<u8>)]) -> Vec<Value> {
+    filters
+        .iter()
+        .map(|(offset, bytes)| {
+            json!({"memcmp": {"offset": offset, "bytes": bs58::encode(bytes).into_string()}})
+        })
+        .collect()
+}
+
 /// An error the node answered with, as it said it.
 #[derive(Clone, Debug)]
 pub struct RpcError {
@@ -342,6 +378,16 @@ impl Rpc {
 
     /// Many accounts at once, in the order asked, a hundred a call.
     pub async fn accounts(&self, addresses: &[Pubkey]) -> Result<Vec<Option<Account>>> {
+        self.accounts_at(addresses, COMMITMENT).await
+    }
+
+    /// The same, as the node has them at `commitment`. Up to a hundred are
+    /// read in one call, so as of one slot.
+    pub async fn accounts_at(
+        &self,
+        addresses: &[Pubkey],
+        commitment: &str,
+    ) -> Result<Vec<Option<Account>>> {
         #[derive(Deserialize)]
         struct Answer {
             value: Vec<Option<RawAccount>>,
@@ -352,7 +398,7 @@ impl Rpc {
             let answer: Answer = self
                 .call(
                     "getMultipleAccounts",
-                    json!([keys, {"encoding": "base64", "commitment": COMMITMENT}]),
+                    json!([keys, {"encoding": "base64", "commitment": commitment}]),
                 )
                 .await?;
             for account in answer.value {
@@ -360,6 +406,108 @@ impl Rpc {
             }
         }
         Ok(out)
+    }
+
+    /// Many accounts at once, as [`Rpc::accounts`], each call answered as of
+    /// `at_least` or later, and every call after the first as of the first's
+    /// slot or later: a node behind is asked again rather than believed.
+    /// With the slot the first call was answered at, the lowest of them.
+    pub async fn accounts_since(
+        &self,
+        addresses: &[Pubkey],
+        at_least: u64,
+    ) -> Result<(u64, Vec<Option<Account>>)> {
+        #[derive(Deserialize)]
+        struct Answer {
+            context: AnswerContext,
+            value: Vec<Option<RawAccount>>,
+        }
+        let mut out = Vec::with_capacity(addresses.len());
+        let mut floor = at_least;
+        let mut first = None;
+        for chunk in addresses.chunks(100) {
+            let keys: Vec<String> = chunk.iter().map(ToString::to_string).collect();
+            let answer: Answer = self
+                .call_since(
+                    "getMultipleAccounts",
+                    json!([keys, {
+                        "encoding": "base64",
+                        "commitment": COMMITMENT,
+                        "minContextSlot": floor,
+                    }]),
+                )
+                .await?;
+            floor = floor.max(answer.context.slot);
+            first.get_or_insert(answer.context.slot);
+            for account in answer.value {
+                out.push(account.map(RawAccount::decode).transpose()?);
+            }
+        }
+        Ok((first.unwrap_or(at_least), out))
+    }
+
+    /// Every account `program` owns whose data holds each `(offset, bytes)`,
+    /// as [`Rpc::program_accounts`], answered as of `at_least` or later; with
+    /// the slot it was answered at.
+    pub async fn program_accounts_since(
+        &self,
+        program: &Pubkey,
+        filters: &[(usize, Vec<u8>)],
+        at_least: u64,
+    ) -> Result<(u64, Vec<(Pubkey, Account)>)> {
+        #[derive(Deserialize)]
+        struct Keyed {
+            pubkey: String,
+            account: RawAccount,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Answer {
+            Slotted {
+                context: AnswerContext,
+                value: Vec<Keyed>,
+            },
+            // A node that doesn't say its slot: answered as of the slot
+            // asked for or later, which is all that is known.
+            Bare(Vec<Keyed>),
+        }
+        let answer: Answer = self
+            .call_since(
+                "getProgramAccounts",
+                json!([program.to_string(), {
+                    "encoding": "base64",
+                    "commitment": COMMITMENT,
+                    "filters": memcmp(filters),
+                    "withContext": true,
+                    "minContextSlot": at_least,
+                }]),
+            )
+            .await?;
+        let (slot, value) = match answer {
+            Answer::Slotted { context, value } => (context.slot, value),
+            Answer::Bare(value) => (at_least, value),
+        };
+        let found = value
+            .into_iter()
+            .map(|keyed| Ok((parse_pubkey(&keyed.pubkey)?, keyed.account.decode()?)))
+            .collect::<Result<_>>()?;
+        Ok((slot, found))
+    }
+
+    /// One call carrying `minContextSlot`, made again a few times while the
+    /// node that takes it is behind that slot (a load-balanced endpoint's
+    /// next answer usually comes from another node).
+    async fn call_since<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
+        let mut tries = 0;
+        loop {
+            match self.call(method, params.clone()).await {
+                Err(error) if behind(&error) && tries + 1 < BEHIND_TRIES => {
+                    tries += 1;
+                    tokio::time::sleep(BEHIND_PAUSE).await;
+                }
+                done => return done,
+            }
+        }
     }
 
     /// Every account `program` owns whose data holds each `(offset, bytes)`.
@@ -373,12 +521,7 @@ impl Rpc {
             pubkey: String,
             account: RawAccount,
         }
-        let filters: Vec<Value> = filters
-            .iter()
-            .map(|(offset, bytes)| {
-                json!({"memcmp": {"offset": offset, "bytes": bs58::encode(bytes).into_string()}})
-            })
-            .collect();
+        let filters = memcmp(filters);
         let answer: Vec<Keyed> = self
             .call(
                 "getProgramAccounts",
@@ -604,6 +747,27 @@ pub fn parse_pubkey(text: &str) -> Result<Pubkey> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn a_node_behind_a_pinned_read_s_slot_is_known_by_its_code_or_its_words() {
+        let said = |code, message: &str| {
+            anyhow::Error::new(RpcError {
+                code,
+                message: message.into(),
+                data: Value::Null,
+            })
+        };
+        assert!(behind(&said(
+            -32016,
+            "Minimum context slot has not been reached"
+        )));
+        assert!(behind(&said(
+            -32603,
+            "Node's current slot 32 is less than requested minContextSlot 40"
+        )));
+        assert!(!behind(&said(-32603, "Internal error")));
+        assert!(!behind(&anyhow!("the node failed")));
+    }
 
     /// A node answering each request with the next of `replies` (the last
     /// again once they run out): an HTTP status and a body. Says how many

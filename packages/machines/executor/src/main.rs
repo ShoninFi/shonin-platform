@@ -266,6 +266,7 @@ async fn main() -> Result<()> {
                     args.clone(),
                     solana_totals.clone(),
                     attestation.clone(),
+                    served_chains.clone(),
                 ));
             }
             while clusters.join_next().await.is_some() {}

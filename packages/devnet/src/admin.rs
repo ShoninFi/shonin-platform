@@ -29,6 +29,24 @@ alloy::sol! {
 /// The trust root the development checker names (`DevAttestationVerifier`).
 pub const DEV_TRUST_ROOT: &str = "dev-local";
 
+/// The attestor a development checker trusts: the one the team mnemonic
+/// derives, which the admin signs beside, never an address a local file
+/// names. A deployment file that names another is refused, as one changed
+/// since the set-up.
+pub fn dev_checker_attestor<T: PartialEq + std::fmt::Display>(
+    of_mnemonic: T,
+    in_file: Option<T>,
+) -> Result<T> {
+    if let Some(named) = in_file
+        && named != of_mnemonic
+    {
+        bail!(
+            "the deployment names {named} as the attestor and the mnemonic's attestor is {of_mnemonic}: the development checker trusts the mnemonic's alone, so the deployment file is not the set-up's"
+        );
+    }
+    Ok(of_mnemonic)
+}
+
 /// The image kinds an operator may name on the command line.
 pub fn kind_named(name: &str) -> Result<ImageKind> {
     Ok(match name {
@@ -280,8 +298,13 @@ pub async fn allow_dev_checker(
         ));
     }
     let admin = client.account(Role::Admin)?;
+    let attestor = client.account(Role::Attestor)?;
+    client
+        .holds_key_for(attestor)
+        .context("the development checker's attestor comes from the team mnemonic")?;
+    let attestor = dev_checker_attestor(attestor, Some(deployments.roles.attestor))?;
     let mut bytecode = crate::deploy::creation_code(artifacts, "DevAttestationVerifier", &[])?;
-    bytecode.extend_from_slice(&(deployments.roles.attestor,).abi_encode_params());
+    bytecode.extend_from_slice(&(attestor,).abi_encode_params());
     let checker = client
         .deploy(admin, bytecode)
         .await
@@ -641,13 +664,17 @@ pub mod solana {
             });
         }
         let (platform, admin) = admin(client, deployments)?;
-        let attestor: Pubkey = deployments
+        let named = deployments
             .roles
             .as_ref()
-            .map(|roles| roles.attestor.as_str())
-            .unwrap_or_default()
-            .parse()
-            .map_err(|_| anyhow!("the deployment names no attestor"))?;
+            .map(|roles| {
+                roles
+                    .attestor
+                    .parse::<Pubkey>()
+                    .map_err(|_| anyhow!("the deployment's attestor is not an address"))
+            })
+            .transpose()?;
+        let attestor = super::dev_checker_attestor(client.keys()?.address(Role::Attestor), named)?;
         // A seed of its own, so the checker is one never proposed before.
         let now = client.now().await?;
         let seed = common::digest::keccak(&[b"shonin-dev-checker", &now.to_le_bytes()]);
@@ -672,6 +699,25 @@ pub mod solana {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_development_checker_trusts_the_mnemonic_s_attestor_and_never_another_the_file_names() {
+        let ours = Address::repeat_byte(1);
+        let other = Address::repeat_byte(2);
+        assert_eq!(dev_checker_attestor(ours, Some(ours)).unwrap(), ours);
+        assert_eq!(dev_checker_attestor(ours, None).unwrap(), ours);
+        let refused = dev_checker_attestor(ours, Some(other)).unwrap_err();
+        assert!(
+            refused.to_string().contains("not the set-up's"),
+            "{refused}"
+        );
+        let (ours, other) = (
+            chain::solana::Pubkey::new_unique(),
+            chain::solana::Pubkey::new_unique(),
+        );
+        assert_eq!(dev_checker_attestor(ours, Some(ours)).unwrap(), ours);
+        assert!(dev_checker_attestor(ours, Some(other)).is_err());
+    }
 
     #[test]
     fn an_image_digest_is_read_from_the_registry_s_spelling_and_nothing_else() {

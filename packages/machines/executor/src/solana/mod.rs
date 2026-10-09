@@ -38,7 +38,7 @@ use wasmtime::Engine;
 
 use crate::attestation::{Attestation, SolanaServed};
 use crate::handover;
-use crate::health::Holds;
+use crate::health::{Chains, Holds, MOST_SERVES_LIMITED};
 use crate::host::{Counters, Place};
 use crate::usage::SignedThrough;
 use crate::{AbortOnDrop, Args, Throttle};
@@ -49,6 +49,10 @@ pub use upkeep::Totals;
 
 /// How often the cluster's vaults are looked at.
 const SWEEP_EVERY: Duration = Duration::from_secs(2);
+
+/// How long a vault's serve must have run for the node's rate limit that
+/// ends it to count afresh rather than as one more in a row.
+const SERVED_A_WHILE: Duration = Duration::from_secs(60);
 
 /// What a vault's key is given to pay for its sends, on a development
 /// cluster and elsewhere, and below what it is topped back up.
@@ -96,6 +100,7 @@ pub async fn run(
     args: Arc<Args>,
     totals: Totals,
     attestation: Attestation,
+    health: Chains,
 ) {
     // A simulated blessing is paid for by the keeper, which sends it.
     let payer = served
@@ -125,6 +130,7 @@ pub async fn run(
         engine,
         args,
         totals,
+        health,
         stake: if served.client.cluster == "localnet" {
             STAKE_DEVELOPMENT
         } else {
@@ -135,13 +141,23 @@ pub async fn run(
     let mut book = Book::default();
     let mut unswept = Throttle::default();
     let mut slowed = 0u32;
+    // The sweep itself, named in the health as the vaults are.
+    let sweeping = format!("{}/sweep", served.key);
     loop {
         match cluster.sweep(&mut book).await {
             // A node that limits the rate failed at nothing: the next sweep
-            // waits longer, the longer it keeps asking.
+            // waits longer, the longer it keeps asking. A cluster no sweep
+            // gets through is served no new vault all the same: said at warn
+            // and named in the health from as many times in a row as a
+            // vault's serving.
             Err(error) if rate_limited(&error) => {
                 slowed = slowed.saturating_add(1);
-                tracing::debug!(chain = %served.key, error = format!("{error:#}"), "the node limits the rate; the next sweep waits");
+                cluster.health.limited(sweeping.clone(), slowed);
+                if slowed < MOST_SERVES_LIMITED {
+                    tracing::debug!(chain = %served.key, error = format!("{error:#}"), "the node limits the rate; the next sweep waits");
+                } else if unswept.due(Instant::now()) {
+                    tracing::warn!(chain = %served.key, times = slowed, error = format!("{error:#}"), "the node's rate limit keeps every sweep from finishing");
+                }
                 tokio::time::sleep(crate::backoff(slowed)).await;
                 continue;
             }
@@ -149,6 +165,9 @@ pub async fn run(
                 tracing::warn!(chain = %served.key, error = format!("{error:#}"), "could not look for work");
             }
             _ => {}
+        }
+        if slowed > 0 {
+            cluster.health.not_limited(&sweeping);
         }
         slowed = 0;
         tokio::time::sleep(SWEEP_EVERY).await;
@@ -168,6 +187,9 @@ struct Cluster {
     engine: Engine,
     args: Arc<Args>,
     totals: Totals,
+    /// The machine's health, which names a vault whose serving keeps ending
+    /// in the node's rate limit.
+    health: Chains,
     stake: u64,
 }
 
@@ -185,6 +207,9 @@ struct Book {
     replaced: HashSet<Pubkey>,
     /// The vaults found, the program listed only when its counts move.
     scan: Option<VaultScan>,
+    /// Vaults whose serving, or the look that would start it, has ended in
+    /// the node's rate limit, and how many times in a row.
+    limited: HashMap<Pubkey, u32>,
 }
 
 /// A vault key's leaf in the instance's attestation, taken out when the
@@ -211,6 +236,8 @@ struct Served {
     /// When the next serve may start, after one that failed.
     retry_at: Option<Instant>,
     failures: u32,
+    /// When the serve now running started.
+    serving_since: Option<Instant>,
     _upkeep: [AbortOnDrop; 2],
     _leaf: HeldLeaf,
     /// When the vault was let go (it closed, or another executor holds it)
@@ -331,20 +358,87 @@ fn approved_alone(keys: &[Pubkey], key: &Pubkey) -> bool {
     keys.first() == Some(key) && other_key(keys, Some(key)).is_none()
 }
 
+/// The vault's serving, or the look that would start it, ended in the
+/// node's rate limit once more. The node asking to be asked less often is
+/// no failure of the vault's, but a vault left serve after serve is not
+/// served all the same: from [`MOST_SERVES_LIMITED`] times in a row it is
+/// said at warn and named in the machine's health.
+fn limited(
+    health: &Chains,
+    chain_key: &str,
+    limited: &mut HashMap<Pubkey, u32>,
+    warned: &mut HashMap<Pubkey, Throttle>,
+    vault: Pubkey,
+    error: &anyhow::Error,
+) {
+    let times = limited.entry(vault).or_default();
+    *times = times.saturating_add(1);
+    let times = *times;
+    health.limited(format!("{chain_key}/{vault}"), times);
+    if times < MOST_SERVES_LIMITED {
+        tracing::debug!(%vault, error = format!("{error:#}"), "the node limits the rate; serving this vault again shortly");
+    } else if warned.entry(vault).or_default().due(Instant::now()) {
+        tracing::warn!(%vault, times, error = format!("{error:#}"), "the node's rate limit keeps this vault from being served");
+    }
+}
+
+/// The vault's serving no longer ends in the node's rate limit.
+fn not_limited(
+    health: &Chains,
+    chain_key: &str,
+    limited: &mut HashMap<Pubkey, u32>,
+    vault: Pubkey,
+) {
+    if let Some(times) = limited.remove(&vault) {
+        health.not_limited(&format!("{chain_key}/{vault}"));
+        if times >= MOST_SERVES_LIMITED {
+            tracing::info!(%vault, "the vault is served again");
+        }
+    }
+}
+
 impl Cluster {
     async fn sweep(&self, book: &mut Book) -> Result<()> {
         let scan = book
             .scan
             .get_or_insert_with(|| VaultScan::for_cluster(&self.client.cluster));
-        let vaults = scan.look(&self.client, &self.platform).await?.vaults;
+        let vaults = scan.look(&self.client).await?.vaults;
         let now = self.client.now().await?;
+        let listed: HashSet<Pubkey> = vaults.iter().map(|(address, _)| *address).collect();
         for (address, vault) in vaults {
-            if let Err(error) = self.sweep_one(book, address, &vault, now).await
-                && !rate_limited(&error)
-                && book.warned.entry(address).or_default().due(Instant::now())
-            {
-                tracing::warn!(vault = %address, error = format!("{error:#}"), "could not look at this vault");
+            match self.sweep_one(book, address, &vault, now).await {
+                Err(error) if rate_limited(&error) => {
+                    limited(
+                        &self.health,
+                        &self.chain_key,
+                        &mut book.limited,
+                        &mut book.warned,
+                        address,
+                        &error,
+                    );
+                }
+                Err(error) => {
+                    not_limited(&self.health, &self.chain_key, &mut book.limited, address);
+                    if book.warned.entry(address).or_default().due(Instant::now()) {
+                        tracing::warn!(vault = %address, error = format!("{error:#}"), "could not look at this vault");
+                    }
+                }
+                // A look that went through, at a vault not being served:
+                // nothing is held back by the node.
+                Ok(()) if !book.running.contains_key(&address) => {
+                    not_limited(&self.health, &self.chain_key, &mut book.limited, address);
+                }
+                Ok(()) => {}
             }
+        }
+        let gone: Vec<Pubkey> = book
+            .limited
+            .keys()
+            .filter(|vault| !listed.contains(vault))
+            .copied()
+            .collect();
+        for vault in gone {
+            not_limited(&self.health, &self.chain_key, &mut book.limited, vault);
         }
         Ok(())
     }
@@ -374,6 +468,7 @@ impl Cluster {
                 }
             }
             book.waiting_for_bundle.remove(&address);
+            not_limited(&self.health, &self.chain_key, &mut book.limited, address);
             return Ok(());
         }
         if let Some(served) = book.running.get_mut(&address) {
@@ -382,10 +477,40 @@ impl Cluster {
                 .as_ref()
                 .is_some_and(|task| !task.is_finished())
             {
+                // A serve that has run a while is serving the vault.
+                if served
+                    .serving_since
+                    .is_some_and(|since| since.elapsed() >= SERVED_A_WHILE)
+                {
+                    not_limited(&self.health, &self.chain_key, &mut book.limited, address);
+                }
                 return Ok(());
             }
             if let Some(task) = served.serving.take() {
-                match task.await {
+                let ended = task.await;
+                // A serve that ran a while before the node's rate limit ended
+                // it served the vault meanwhile: the count starts afresh.
+                let ran_a_while = served
+                    .serving_since
+                    .take()
+                    .is_some_and(|since| since.elapsed() >= SERVED_A_WHILE);
+                match &ended {
+                    Ok(Err(error)) if rate_limited(error) => {
+                        if ran_a_while {
+                            book.limited.remove(&address);
+                        }
+                        limited(
+                            &self.health,
+                            &self.chain_key,
+                            &mut book.limited,
+                            &mut book.warned,
+                            address,
+                            error,
+                        );
+                    }
+                    _ => not_limited(&self.health, &self.chain_key, &mut book.limited, address),
+                }
+                match ended {
                     Ok(Ok(Stop::Finished)) => {}
                     Ok(Ok(Stop::Replaced)) => {
                         tracing::info!(vault = %address, "another executor's key holds the station's approval; letting the vault go");
@@ -397,10 +522,10 @@ impl Cluster {
                         served.let_go();
                     }
                     // Cut short by a node that limits the rate: served again
-                    // after a pause, and not counted against the vault.
+                    // after a short pause, its backoff not grown, and counted
+                    // above as a serve the node kept from running.
                     Ok(Err(error)) if rate_limited(&error) => {
                         served.retry_at = Some(Instant::now() + crate::backoff(1));
-                        tracing::debug!(vault = %address, error = format!("{error:#}"), "the node limits the rate; serving this vault again shortly");
                     }
                     Ok(Err(error)) => {
                         served.failures += 1;
@@ -467,6 +592,7 @@ impl Cluster {
         let cluster = self.clone();
         let shared = served.shared.clone();
         let strategy_id = vault.strategy_id;
+        served.serving_since = Some(Instant::now());
         served.serving = Some(tokio::spawn(async move {
             cluster.serve(address, strategy_id, shared).await
         }));
@@ -633,6 +759,7 @@ impl Cluster {
             serving: None,
             retry_at: None,
             failures: 0,
+            serving_since: None,
             _upkeep: [AbortOnDrop(metering), AbortOnDrop(reports)],
             _leaf: leaf,
             letting_go: None,
@@ -1053,6 +1180,70 @@ pub(crate) fn devnet_platform() -> Platform {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_vault_whose_serving_keeps_ending_in_the_rate_limit_is_named_until_it_is_served() {
+        let health = Chains::new(vec![shared::Chain::Solana]);
+        health.connected(shared::Chain::Solana);
+        let mut times = HashMap::new();
+        let mut warned = HashMap::new();
+        let vault = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let error = anyhow::Error::new(chain::solana::RateLimited {
+            label: "stand-in node".into(),
+            method: "getAccountInfo".into(),
+        });
+        assert!(rate_limited(&error));
+        for _ in 1..MOST_SERVES_LIMITED {
+            limited(
+                &health,
+                "solana:devnet",
+                &mut times,
+                &mut warned,
+                vault,
+                &error,
+            );
+        }
+        limited(
+            &health,
+            "solana:devnet",
+            &mut times,
+            &mut warned,
+            other,
+            &error,
+        );
+        assert_eq!(health.answer().0, axum::http::StatusCode::OK);
+        limited(
+            &health,
+            "solana:devnet",
+            &mut times,
+            &mut warned,
+            vault,
+            &error,
+        );
+        let (status, said) = health.answer();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{said}"
+        );
+        assert!(said.contains(&format!("solana:devnet/{vault}")), "{said}");
+        assert!(!said.contains(&other.to_string()), "{said}");
+        // Served again: no longer named, and the next rate limit counts
+        // from one.
+        not_limited(&health, "solana:devnet", &mut times, vault);
+        assert_eq!(health.answer().0, axum::http::StatusCode::OK);
+        limited(
+            &health,
+            "solana:devnet",
+            &mut times,
+            &mut warned,
+            vault,
+            &error,
+        );
+        assert_eq!(times.get(&vault), Some(&1));
+        assert_eq!(health.answer().0, axum::http::StatusCode::OK);
+    }
+
     /// A vault let go because another key holds the station's approval, or
     /// because the key taken over from is heard from again, stops reporting
     /// at once, its key no longer counted as holding the approval, while its
@@ -1094,6 +1285,7 @@ mod tests {
             serving: None,
             retry_at: None,
             failures: 0,
+            serving_since: None,
             _upkeep: [never(), never()],
             _leaf: HeldLeaf {
                 attestation,

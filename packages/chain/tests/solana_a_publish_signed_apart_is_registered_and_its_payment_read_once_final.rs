@@ -224,7 +224,7 @@ async fn a_publish_signed_apart_is_registered_and_its_payment_read_once_final() 
 
     // The vault found by the scan, listed once, then read as it changes.
     let mut scan = VaultScan::new(Duration::from_secs(3_600));
-    assert!(scan.look(client, platform).await.unwrap().vaults.is_empty());
+    assert!(scan.look(client).await.unwrap().vaults.is_empty());
     let (_, statement) = platform
         .restricted_for(client, &author.pubkey(), id, &p.drivers)
         .await
@@ -247,7 +247,7 @@ async fn a_publish_signed_apart_is_registered_and_its_payment_read_once_final() 
     client.send(vec![activate], &[author]).await.unwrap();
     let v = platform.vault_accounts(id);
     // A new vault moves the factory's count: it is found at the next look.
-    let found = scan.look(client, platform).await.unwrap();
+    let found = scan.look(client).await.unwrap();
     assert_eq!(found.vaults.len(), 1);
     assert_eq!(found.vaults[0].0, v.vault);
     let tank = found.vaults[0].1.tank.balance;
@@ -259,7 +259,7 @@ async fn a_publish_signed_apart_is_registered_and_its_payment_read_once_final() 
         .await
         .unwrap();
     // Nothing counted moved: the vault is read again as it is now.
-    let found = scan.look(client, platform).await.unwrap();
+    let found = scan.look(client).await.unwrap();
     assert_eq!(found.vaults[0].1.tank.balance, tank + 1_000_000);
     client
         .send(

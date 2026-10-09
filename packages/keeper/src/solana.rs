@@ -43,7 +43,7 @@
 //! What the keeper remembers having done is remembered only once it landed
 //! and went through.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -584,7 +584,7 @@ impl Keeping {
     ) -> Result<()> {
         // Every vault and every claim of each, read once a round; the vault
         // program listed only when its counts say something new is there.
-        let found = scan.look(&self.client, &self.platform).await?;
+        let found = scan.look(&self.client).await?;
         let vaults = found.vaults;
         let addresses: Vec<Pubkey> = vaults.iter().map(|(address, _)| *address).collect();
         let mut claims: BTreeMap<Pubkey, Vec<Claim>> = BTreeMap::new();
@@ -604,12 +604,25 @@ impl Keeping {
                     }
                     if let Ok(mut troubles) = TROUBLES.lock() {
                         troubles.unkept.remove(address);
+                        troubles.limited.remove(address);
                     }
                 }
                 // The node asking to be asked less often is no failure of
-                // the vault's: its round is done again once the pause is over.
+                // the vault's, but a vault left round after round is not
+                // kept all the same: it counts as a round that didn't
+                // finish, said only once it has held as many rounds as a
+                // failure must to be in the health.
                 Err(error) if rate_limited(&error) => {
-                    tracing::debug!(vault = %address, error = format!("{error:#}"), "the node limits the rate; the vault's round is left to the next");
+                    remembered.rounds_failing += 1;
+                    if remembered.rounds_failing < MOST_VAULT_ROUNDS_FAILING {
+                        tracing::debug!(vault = %address, error = format!("{error:#}"), "the node limits the rate; the vault's round is left to the next");
+                    } else if let Some(times) = remembered.round_said.due(Instant::now()) {
+                        tracing::warn!(vault = %address, times, rounds = remembered.rounds_failing, error = format!("{error:#}"), "the node's rate limit keeps the vault's round from finishing");
+                    }
+                    if let Ok(mut troubles) = TROUBLES.lock() {
+                        troubles.unkept.insert(*address, remembered.rounds_failing);
+                        troubles.limited.insert(*address);
+                    }
                 }
                 Err(error) => {
                     remembered.rounds_failing += 1;
@@ -618,12 +631,14 @@ impl Keeping {
                     }
                     if let Ok(mut troubles) = TROUBLES.lock() {
                         troubles.unkept.insert(*address, remembered.rounds_failing);
+                        troubles.limited.remove(address);
                     }
                 }
             }
         }
         if let Ok(mut troubles) = TROUBLES.lock() {
             troubles.unkept.retain(|vault, _| addresses.contains(vault));
+            troubles.limited.retain(|vault| addresses.contains(vault));
             troubles
                 .bills_refused
                 .retain(|vault, _| addresses.contains(vault));
@@ -1918,6 +1933,9 @@ async fn fetch_total(cluster: &str, executor: &str, vault: &Pubkey) -> Result<As
 struct Troubles {
     /// Vaults whose rounds haven't finished, and how many in a row.
     unkept: HashMap<Pubkey, u64>,
+    /// Of those, the vaults whose latest round was cut short by the node's
+    /// rate limit.
+    limited: HashSet<Pubkey>,
     /// Vaults that refuse the `keep` carrying their bill, and for how many
     /// rounds.
     bills_refused: HashMap<Pubkey, u64>,
@@ -1938,7 +1956,14 @@ pub fn troubles(now: Instant) -> Vec<(String, String)> {
             .unkept
             .iter()
             .filter(|(_, failing)| **failing >= MOST_VAULT_ROUNDS_FAILING)
-            .map(|(vault, failing)| format!("solana/{vault} ({failing} rounds in a row)"))
+            .map(|(vault, failing)| {
+                let why = if troubles.limited.contains(vault) {
+                    ", the node's rate limit"
+                } else {
+                    ""
+                };
+                format!("solana/{vault} ({failing} rounds in a row{why})")
+            })
             .collect();
         if !unkept.is_empty() {
             unkept.sort_unstable();
@@ -2128,10 +2153,15 @@ mod tests {
     fn a_vault_whose_rounds_keep_failing_or_whose_send_does_not_go_out_is_in_the_health() {
         let vault = Pubkey::new_unique();
         let other = Pubkey::new_unique();
+        let limited = Pubkey::new_unique();
         {
             let mut troubles = TROUBLES.lock().unwrap();
             troubles.unkept.insert(vault, MOST_VAULT_ROUNDS_FAILING);
             troubles.unkept.insert(other, 1);
+            // A vault whose rounds the node's rate limit cuts short is said
+            // as one that fails, with why.
+            troubles.unkept.insert(limited, MOST_VAULT_ROUNDS_FAILING);
+            troubles.limited.insert(limited);
             troubles
                 .not_sent
                 .insert((vault, "keep"), (Instant::now(), Said::default()));
@@ -2147,6 +2177,12 @@ mod tests {
             unkept.contains(&vault.to_string()) && !unkept.contains(&other.to_string()),
             "{unkept}"
         );
+        assert!(
+            unkept.contains(&format!(
+                "solana/{limited} ({MOST_VAULT_ROUNDS_FAILING} rounds in a row, the node's rate limit)"
+            )),
+            "{unkept}"
+        );
         let (_, not_sent) = line("sends not going out").expect("the send is not said");
         assert!(not_sent.contains("keep"), "{not_sent}");
         // Once the same call goes out, it is no longer said.
@@ -2156,7 +2192,9 @@ mod tests {
                 .iter()
                 .all(|(_, detail)| !detail.contains(&format!("keep solana/{vault}")))
         );
-        TROUBLES.lock().unwrap().unkept.clear();
+        let mut troubles = TROUBLES.lock().unwrap();
+        troubles.unkept.clear();
+        troubles.limited.clear();
     }
 
     /// A vault priced a slot ago, paid this week, with every request priced.

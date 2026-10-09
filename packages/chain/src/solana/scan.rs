@@ -11,16 +11,23 @@
 //! (`getMultipleAccounts`), and lists the program again only when a count
 //! has moved, or after a while in any case. A local cluster is listed at
 //! every look, as before.
+//!
+//! A public endpoint answers each call from whichever of its nodes takes it,
+//! some a slot or two behind the others. So every read is pinned to the
+//! slot of the one before it (`minContextSlot`): the vaults are listed as of
+//! the factory's count or later, the claims as of the vaults' counts or
+//! later, and each later look as of the listing or later. No count is then
+//! trusted against a listing that is older than it, and a claim a node
+//! behind doesn't have yet is never taken as closed.
 
 use std::time::{Duration, Instant};
 
-use anchor_lang::AccountDeserialize;
+use anchor_lang::{AccountDeserialize, Discriminator};
 use anyhow::{Context, Result};
 use shonin_vault::state::{self as vs, Claim, Vault};
 
 use super::Pubkey;
 use super::client::SolanaClient;
-use super::platform::Platform;
 use super::rpc::Account;
 
 /// How long a public cluster's vault program goes unlisted at most, whatever
@@ -43,6 +50,9 @@ pub struct VaultScan {
     vaults: Vec<Pubkey>,
     claim_total: u64,
     claims: Vec<(Pubkey, Pubkey)>,
+    /// The latest slot a read was answered at: every read is answered as of
+    /// it or later.
+    slot: u64,
 }
 
 impl VaultScan {
@@ -56,6 +66,7 @@ impl VaultScan {
             vaults: Vec::new(),
             claim_total: 0,
             claims: Vec::new(),
+            slot: 0,
         }
     }
 
@@ -70,23 +81,69 @@ impl VaultScan {
     }
 
     /// Every vault and claim as they are now.
-    pub async fn look(&mut self, client: &SolanaClient, platform: &Platform) -> Result<Found> {
+    pub async fn look(&mut self, client: &SolanaClient) -> Result<Found> {
         if !listing_due(self.listed_at, self.every, Instant::now())
             && let Some(found) = self.read_known(client).await?
         {
             return Ok(found);
         }
-        self.list(client, platform).await
+        self.list(client).await
     }
 
     /// The program listed afresh. Each count is read before the listing it
-    /// stands for, so an account made in between moves it again at the next
-    /// look, and is listed then.
-    async fn list(&mut self, client: &SolanaClient, platform: &Platform) -> Result<Found> {
-        let factory = platform.factory(client).await?;
-        let vaults = platform.vaults(client).await?;
+    /// stands for, and the listing as of the count's slot or later, so the
+    /// listing holds everything the count does; an account made in between
+    /// moves the count again at the next look, and is listed then.
+    async fn list(&mut self, client: &SolanaClient) -> Result<Found> {
+        let (slot, factory) = client
+            .rpc
+            .accounts_since(&[vs::factory_address()], self.slot)
+            .await?;
+        let factory: vs::Factory = match factory.first() {
+            Some(Some(account)) => decode(account).context("the vault factory")?,
+            _ => anyhow::bail!("the vault factory is not set up"),
+        };
+        let (slot, found) = client
+            .rpc
+            .program_accounts_since(
+                &shonin_vault::ID,
+                &[(0, Vault::DISCRIMINATOR.to_vec())],
+                self.slot.max(slot),
+            )
+            .await?;
+        let mut vaults = Vec::with_capacity(found.len());
+        for (address, account) in found {
+            let vault: Vault = decode(&account)
+                .with_context(|| format!("the vault at {address} doesn't read as one"))?;
+            // Only an account at the vault's own address is the vault.
+            if vs::vault_address(vault.strategy_id).0 == address {
+                vaults.push((address, vault));
+            }
+        }
+        vaults.sort_by_key(|(_, vault)| vault.strategy_id);
         let addresses: Vec<Pubkey> = vaults.iter().map(|(address, _)| *address).collect();
-        let claims = platform.claims_of(client, &addresses).await?;
+        let (slot, found) = client
+            .rpc
+            .program_accounts_since(
+                &shonin_vault::ID,
+                &[(0, Claim::DISCRIMINATOR.to_vec())],
+                self.slot.max(slot),
+            )
+            .await?;
+        let mut claims = Vec::new();
+        for (address, account) in found {
+            let claim: Claim =
+                decode(&account).context("a claim account that doesn't read as one")?;
+            // A claim doesn't name its vault: it is matched by address.
+            if let Some(vault) = addresses
+                .iter()
+                .find(|vault| vs::claim_address(vault, claim.id).0 == address)
+            {
+                claims.push((*vault, address, claim));
+            }
+        }
+        claims.sort_by_key(|(vault, _, claim)| (*vault, claim.id));
+        self.slot = self.slot.max(slot);
         self.listed_at = Some(Instant::now());
         self.vault_count = factory.vault_count;
         self.vaults = addresses;
@@ -105,7 +162,8 @@ impl VaultScan {
         let mut addresses = vec![vs::factory_address()];
         addresses.extend(&self.vaults);
         addresses.extend(self.claims.iter().map(|(_, claim)| *claim));
-        let accounts = client.rpc.accounts(&addresses).await?;
+        let (slot, accounts) = client.rpc.accounts_since(&addresses, self.slot).await?;
+        self.slot = self.slot.max(slot);
         let (factory, rest) = accounts
             .split_first()
             .context("the node answered no account at all")?;
@@ -136,7 +194,8 @@ impl VaultScan {
         }
         let mut claims = Vec::with_capacity(self.claims.len());
         for ((vault, address), account) in self.claims.iter().zip(claim_accounts) {
-            // A claim closed for its rent is simply no longer there.
+            // A claim closed for its rent is simply no longer there: read as
+            // of the listing or later, one missing is closed, not unseen.
             let Some(account) = account else { continue };
             let claim: Claim = decode(account)
                 .with_context(|| format!("the claim at {address} doesn't read as one"))?;

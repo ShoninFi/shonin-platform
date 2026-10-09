@@ -1262,13 +1262,14 @@ impl Platform {
     }
 
     /// How many submissions publishing has taken, and the cluster's time, at
-    /// its finalized commitment.
+    /// its finalized commitment, both read as of one slot: every payment
+    /// finalized by that time is in the count.
     pub async fn finalized_count(&self, client: &SolanaClient) -> Result<(u64, u64)> {
-        let config: shonin_publishing::state::Config = client
-            .load_finalized(&publishing_config())
-            .await?
-            .ok_or_else(|| anyhow!("publishing is not set up"))?;
-        Ok((config.count, client.now_finalized().await?))
+        let (config, now) = client
+            .load_finalized_with_time::<shonin_publishing::state::Config>(&publishing_config())
+            .await?;
+        let config = config.ok_or_else(|| anyhow!("publishing is not set up"))?;
+        Ok((config.count, now))
     }
 
     pub async fn strategy(
