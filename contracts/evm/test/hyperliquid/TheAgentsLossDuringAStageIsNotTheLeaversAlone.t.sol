@@ -48,8 +48,12 @@ contract TheAgentsLossDuringAStageIsNotTheLeaversAloneTest is HyperliquidVault {
         // At most her share (a half) of the pool's $270 loss; fairly none of
         // it, since her positions were already being sold.
         // No more of the pool's $270 loss than the band on her own orders,
-        // about $900 here (1% of her 33.3 ETH at the stage's price).
-        assertGe(traded.fetched + 900e6, plain.fetched, "the leaver paid more than the band on her orders");
+        // about $990 here (1% and a fill's fee bound of 0.1% on her 33.3 ETH at the stage's price).
+        assertGe(
+            traded.fetched + 1000e6,
+            plain.fetched,
+            "the leaver paid more than the band and a fill's fee on her orders"
+        );
     }
 
     /// The other side: the same trade with a move the agent gains on is
@@ -93,8 +97,12 @@ contract TheAgentsLossDuringAStageIsNotTheLeaversAloneTest is HyperliquidVault {
         Stage memory traded = _measured(_agentSellsALotThenTheMarketRises);
         emit log_named_decimal_uint("fetched, no trade", plain.fetched, 6);
         emit log_named_decimal_uint("fetched, the agent's 100 ETH then +5%", traded.fetched, 6);
-        // The pool lost $13,500; the band on her orders is about $900 at the
+        // The pool lost $13,500; the band and a fill's fee on her orders are about $990 at the
         // stage's price, and the rise since is not hers to keep or pay.
-        assertGe(traded.fetched + 900e6, plain.fetched, "the leaver paid more than the band on her orders");
+        assertGe(
+            traded.fetched + 1000e6,
+            plain.fetched,
+            "the leaver paid more than the band and a fill's fee on her orders"
+        );
     }
 }

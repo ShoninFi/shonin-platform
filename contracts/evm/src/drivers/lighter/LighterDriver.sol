@@ -606,9 +606,16 @@ contract LighterDriver is IDriver, IDelayedDriver {
                 uint256 index = uint256(before[end + m]);
                 if (index == 0) index = uint256(before[n + 1 + m]);
                 orderedThen += uint256(_notional(m, int256(ordered), int256(index)));
+                // At the worse of the stage's index and the newest post's (its
+                // mark where it has no index): her order may have missed and
+                // the position shrunk since by a sale of the agent's.
+                uint256 indexNow = uint256(_priceOf(report, market).index);
+                if (indexNow == 0) indexNow = uint256(marks[m]);
                 worst += was > 0
-                    ? _notional(m, was, int256(index.mulDiv(BPS - band, BPS)))
-                    : _notional(m, was, int256(index.mulDiv(BPS + band, BPS, Math.Rounding.Ceil)));
+                    ? _notional(m, was, int256(Math.min(index, indexNow).mulDiv(BPS - band, BPS)))
+                    : _notional(
+                        m, was, int256(Math.max(index, indexNow).mulDiv(BPS + band, BPS, Math.Rounding.Ceil))
+                    );
             }
         }
         // Her part of the accounts as they were, every order filled at its
