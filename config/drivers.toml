@@ -68,7 +68,9 @@ valuation = "attested-read"
 [drivers.orca]
 label = "Orca"
 chain = "solana"
-networks = []
+# Locally Orca's own program, loaded by the devnet, and a stand-in for Pyth;
+# on devnet the pool the driver lists, which `solana-setup` creates.
+networks = ["local", "testnet"]
 restricted = ["SANCTIONED"]
 custody = "station"
 exit = "contract"

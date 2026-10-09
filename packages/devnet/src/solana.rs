@@ -26,7 +26,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chain::solana::keys::{self, RoleKeys};
 use chain::solana::platform::{Platform, image_digest, program_data_address, project_id};
 use chain::solana::programs::{
-    common, local_driver, local_venue, prices, registry, station, vault,
+    common, local_driver, local_venue, orca_driver, prices, registry, station, vault,
 };
 use chain::solana::{Keypair, Pubkey, Signer, SolanaClient, name};
 use chain::{ChainKey, Role, SolanaDeployments, SolanaRoles};
@@ -70,10 +70,11 @@ const STARTING_PRICE: u64 = crate::deploy::STARTING_PRICE;
 
 /// Every program a development cluster runs, by its library name, and
 /// whether it is deployed final.
-const PROGRAMS: [(&str, bool); 10] = [
+const PROGRAMS: [(&str, bool); 11] = [
     ("shonin_dev_verifier", true),
     ("shonin_cs_verifier", true),
     ("shonin_local_driver", true),
+    ("shonin_orca_driver", true),
     ("shonin_registry", false),
     ("shonin_publishing", false),
     ("shonin_prices", false),
@@ -309,6 +310,7 @@ pub async fn ensure(
     key: &ChainKey,
     rpc: &str,
     programs: &Path,
+    orca: &Path,
     file: &Path,
 ) -> Result<SolanaDeployments> {
     if let Ok(text) = std::fs::read_to_string(file)
@@ -336,6 +338,16 @@ pub async fn ensure(
     fund(client, keys, &settings.funding).await?;
     let ids = deploy_programs(client, rpc, programs, &deployer_file).await?;
     let (platform, checker) = set_up(client, keys, &settings).await?;
+    crate::solana_orca::set_up_local(
+        client,
+        &platform,
+        keys.get(Role::Admin),
+        keys.get(Role::Operator),
+        &keys.deployer,
+        orca,
+    )
+    .await
+    .context("setting Orca up")?;
 
     let deployments = SolanaDeployments {
         chain_key: key.to_string(),
@@ -388,6 +400,7 @@ pub async fn set_up_public(
     public_rpc: &str,
     file: &Path,
     settings: &Settings,
+    orca_seed: u64,
 ) -> Result<SolanaDeployments> {
     let keys = client.keys()?;
     let ids = programs_in_place(client).await?;
@@ -418,6 +431,16 @@ pub async fn set_up_public(
         );
     }
     let (platform, checker) = set_up(client, keys, settings).await?;
+    crate::solana_orca::set_up_devnet(
+        client,
+        &platform,
+        &keys.deployer,
+        keys.get(Role::Admin),
+        keys.get(Role::Operator),
+        orca_seed,
+    )
+    .await
+    .context("setting Orca's pool up")?;
 
     let deployments = SolanaDeployments {
         chain_key: key.to_string(),
@@ -888,8 +911,25 @@ async fn set_up(
             .await
             .context("proposing the stand-in driver")?;
     }
+    // Orca's driver, deployed final as the registry requires.
+    let orca_slot =
+        registry::read::approval_address(registry::state::ApprovalKind::Driver, &orca_driver::NAME);
+    if client.account(&orca_slot).await?.is_none() {
+        let ix = platform
+            .ix_propose(
+                client,
+                registry::state::ApprovalKind::Driver,
+                orca_driver::NAME,
+                orca_driver::ID,
+            )
+            .await?;
+        client
+            .send(vec![ix], &[admin])
+            .await
+            .context("proposing Orca's driver")?;
+    }
     debug_assert_ne!(program_data_address(&local_driver::ID), Pubkey::default());
-    tracing::info!("the images and the stand-in driver are proposed; the timelock is running");
+    tracing::info!("the images and the drivers are proposed; the timelock is running");
 
     // Money: every role's dollar account, and dollars for those who spend.
     let mut open = Vec::new();
@@ -950,6 +990,11 @@ pub async fn run_market(
         seconds_per_block = step,
         "the Solana clock is running; the venue is quoting"
     );
+    // Orca's pool follows the tape's moves from SOL's starting price, the
+    // operator trading it there, and Pyth's stand-in follows the pool.
+    let admin = client.role(Role::Admin)?;
+    let mut first_spot = None;
+    let steering = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     loop {
         // The clock only moves forward, and runs on at real pace between
         // jumps, so the next mark is always ahead of it.
@@ -957,10 +1002,49 @@ pub async fn run_market(
         while at <= now {
             at += step;
         }
+        // Published at the mark the clock jumps to, so the price is never
+        // older than the driver takes, however far the clock jumps.
+        if let Err(error) = chain::solana::orca::setup::price_follows_pool(client, at).await {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "Pyth's stand-in would not take the price"
+            );
+        }
         if let Err(error) = client.rpc.time_travel(at).await {
             tracing::warn!(error = format!("{error:#}"), "the clock would not move");
         }
         let tick = tape.step();
+        let first = *first_spot.get_or_insert(tick.spot);
+        if first > 0.0
+            && let Ok(turn) = steering.clone().try_lock_owned()
+        {
+            let target = (crate::solana_orca::LOCAL_START as f64 * tick.spot / first) as u128;
+            let (client, platform) = (client.clone(), platform.clone());
+            let (admin, operator) = (admin.insecure_clone(), operator.insecure_clone());
+            tokio::spawn(async move {
+                let _turn = turn;
+                let steered = async {
+                    if client
+                        .account(&chain::solana::orca::POOLS[0].address)
+                        .await?
+                        .is_none()
+                    {
+                        return Ok(());
+                    }
+                    chain::solana::orca::setup::steer(
+                        &client, &platform, &admin, &operator, target,
+                    )
+                    .await?;
+                    chain::solana::orca::setup::price_follows_pool(&client, at).await
+                };
+                if let Err(error) = steered.await {
+                    tracing::warn!(
+                        error = format!("{error:#}"),
+                        "Orca's pool would not follow the tape"
+                    );
+                }
+            });
+        }
         let ix = platform.ix_post(
             vec![quote(SPOT, tick.spot), quote(PERP, tick.perp)],
             vec![local_venue::Funding {
@@ -1162,6 +1246,22 @@ activation_usd = 2.0
         assert_eq!(settings.terms.minimum_deposit, 10_000_000);
         assert_eq!(settings.terms.timers.usage_freshness, 10 * MINUTE);
         assert_eq!(settings.terms.timers.freeze_after, 7 * DAY);
+    }
+
+    #[test]
+    #[cfg(not(any(feature = "devnet", feature = "mainnet")))]
+    fn the_local_dollar_is_the_one_orca_s_driver_lists_for_a_local_cluster() {
+        assert_eq!(
+            Settings::local().unwrap().mint.pubkey(),
+            chain::solana::orca::DOLLAR_MINT
+        );
+    }
+
+    #[test]
+    fn orca_s_driver_is_deployed_final_as_every_driver_is() {
+        assert!(deployed_final("shonin_orca_driver"));
+        assert!(deployed_final("shonin_local_driver"));
+        assert!(!deployed_final("shonin_station"));
     }
 
     #[test]

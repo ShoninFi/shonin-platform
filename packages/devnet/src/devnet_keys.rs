@@ -25,7 +25,7 @@ use chain::solana::Signer;
 use chain::solana::keys::{self, PROGRAM};
 
 /// Every program deployed to devnet, by its library name, and its index.
-pub const PROGRAM_KEYS: [(&str, u32); 10] = [
+pub const PROGRAM_KEYS: [(&str, u32); 11] = [
     ("shonin_registry", PROGRAM),
     ("shonin_publishing", 100),
     ("shonin_prices", 101),
@@ -37,6 +37,7 @@ pub const PROGRAM_KEYS: [(&str, u32); 10] = [
     ("shonin_local_driver", 107),
     // 108 is the dollar's mint.
     ("shonin_cs_verifier", 109),
+    ("shonin_orca_driver", 110),
 ];
 
 /// The stand-in dollar's mint account on devnet: not a program, and never
@@ -102,10 +103,11 @@ mod tests {
     fn the_dollar_s_mint_is_at_its_fixed_index_after_the_programs_before_it() {
         assert_eq!(DOLLAR_MINT, 108);
         // Every program deployed before the mint was given its index comes
-        // before it; the Confidential Space checker, added after, after.
+        // before it; those added after (the Confidential Space checker,
+        // Orca's driver), after.
         let before = PROGRAM_KEYS
             .iter()
-            .filter(|(name, _)| *name != "shonin_cs_verifier")
+            .filter(|(name, _)| !ADDED_AFTER_THE_MINT.contains(name))
             .map(|(_, index)| *index)
             .max()
             .unwrap();
@@ -113,6 +115,19 @@ mod tests {
         let last_role = keys::ROLE_BASE + chain::client::ROLE_COUNT as u32 - 1;
         assert!(![DEPLOYER, PROGRAM].contains(&DOLLAR_MINT));
         assert!(!(keys::ROLE_BASE..=last_role).contains(&DOLLAR_MINT));
+    }
+
+    /// The programs given an index after the dollar's mint was, in order.
+    const ADDED_AFTER_THE_MINT: [&str; 2] = ["shonin_cs_verifier", "shonin_orca_driver"];
+
+    #[test]
+    fn the_programs_added_after_the_mint_take_the_indices_after_it_in_order() {
+        for (k, added) in ADDED_AFTER_THE_MINT.iter().enumerate() {
+            assert_eq!(
+                PROGRAM_KEYS.iter().find(|(name, _)| name == added),
+                Some(&(*added, DOLLAR_MINT + 1 + k as u32))
+            );
+        }
     }
 
     #[test]

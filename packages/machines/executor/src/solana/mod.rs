@@ -17,6 +17,9 @@
 //! blessed, has the station approve it in the other's place. A key whose
 //! image was revoked, or whose blessing lapsed, no longer holds a vault.
 
+mod orca;
+#[cfg(test)]
+mod orca_on_a_cluster;
 mod trading;
 mod upkeep;
 
@@ -43,6 +46,7 @@ use crate::host::{Counters, Place};
 use crate::usage::SignedThrough;
 use crate::{AbortOnDrop, Args, Throttle};
 
+pub use orca::DRIVER as ORCA;
 use trading::Flights;
 pub use trading::{Trading, tally_of};
 pub use upkeep::Totals;
@@ -713,6 +717,17 @@ impl Cluster {
             B256::from(bundle),
             &self.args.chain_args.network.to_string(),
         )?;
+        // Which half serves a driver is told by its name in the recorded
+        // manifest, as on the EVM: the Orca half works under the name the
+        // station pinned it under, and refuses to start unless the station
+        // pinned the Orca driver this image lists under that name.
+        let orca = recorded.drivers.iter().any(|name| name == orca::DRIVER);
+        if orca {
+            shared
+                .trading
+                .take_up_orca(shared.account_events.sender())
+                .await?;
+        }
 
         loop {
             if replaced.load(Ordering::SeqCst) {
@@ -750,10 +765,17 @@ impl Cluster {
                 self.client.clone(),
                 self.platform.clone(),
                 vault,
+                !orca,
                 following.clone(),
                 shared.account_events.sender(),
                 shared.vault_events.sender(),
             )));
+            let _prices = orca.then(|| {
+                AbortOnDrop(tokio::spawn(orca::watch_prices(
+                    self.client.clone(),
+                    shared.account_events.sender(),
+                )))
+            });
             let halting_heard = Arc::new(AtomicBool::new(false));
             let instantiated = Arc::new(std::sync::OnceLock::new());
             let runner = crate::runner::Runner {

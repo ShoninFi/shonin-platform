@@ -534,6 +534,9 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
                         }),
                         crate::robinhood::LIGHTER,
                     ) => Some(half.submit(bytes).await),
+                    (Place::Solana(trading), crate::solana::ORCA) if trading.has_orca() => {
+                        Some(trading.orca_submit(bytes).await)
+                    }
                     _ => None,
                 };
                 let (verdict, tally) = match outcome {
@@ -648,6 +651,9 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
                 }),
                 crate::robinhood::LIGHTER,
             ) => Some(half.state().await),
+            (Place::Solana(trading), crate::solana::ORCA) if trading.has_orca() => {
+                Some(trading.orca_state().await)
+            }
             _ => None,
         };
         if let Some(state) = state {

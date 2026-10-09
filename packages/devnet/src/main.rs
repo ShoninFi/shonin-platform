@@ -25,6 +25,7 @@ mod publish;
 mod seed;
 mod smoke;
 mod solana;
+mod solana_orca;
 mod solana_seed;
 mod solana_testnet;
 
@@ -71,6 +72,14 @@ struct Args {
         default_value = "contracts/solana/target/deploy"
     )]
     solana_programs: PathBuf,
+    /// Orca's program, as `task contracts:solana:fixtures` fetches it from
+    /// mainnet: what a local cluster loads at Orca's own address.
+    #[arg(
+        long,
+        env = "SHONIN_ORCA_PROGRAM",
+        default_value = ".shonin/fixtures/orca_whirlpool.so"
+    )]
+    orca_program: PathBuf,
     /// What `fund` tops each testnet role up to.
     #[arg(long, default_value = "config/funding.toml")]
     funding: PathBuf,
@@ -109,6 +118,11 @@ enum Command {
         /// The operator's Google Cloud project id.
         #[arg(long)]
         project: String,
+        /// The SOL the market operator puts into Orca's pool, with the
+        /// dollars that go with it, when the pool has no depth yet: moved to
+        /// it from the deployer as it needs. Zero leaves the pool empty.
+        #[arg(long, default_value_t = 2.0)]
+        orca_seed_sol: f64,
     },
     /// The smoke check a deploy ends with, read-only: each EVM chain's
     /// deployment read back from the chain (or only `--vault-chain`'s), and
@@ -385,7 +399,10 @@ async fn main() -> Result<()> {
                 target.network
             )
         }
-        Some(Command::SolanaSetup { project }) => {
+        Some(Command::SolanaSetup {
+            project,
+            orca_seed_sol,
+        }) => {
             if target.network != NetworkName::Testnet {
                 bail!(
                     "solana-setup sets up Solana devnet (NETWORK=testnet): the local cluster is set up with the chains"
@@ -401,10 +418,17 @@ async fn main() -> Result<()> {
                 let settings = solana::Settings::testnet(&phrase, &project, &funding, &key)?;
                 let client = chain::connect_solana(target.network, &key, &config).await?;
                 let file = Deployments::file_in(&target.deployments_dir, &key);
-                let deployments =
-                    solana::set_up_public(&client, &key, &config.public_rpc, &file, &settings)
-                        .await
-                        .map_err(|error| for_this_build(target.network, error))?;
+                let seed = (orca_seed_sol.max(0.0) * 1e9) as u64;
+                let deployments = solana::set_up_public(
+                    &client,
+                    &key,
+                    &config.public_rpc,
+                    &file,
+                    &settings,
+                    seed,
+                )
+                .await
+                .map_err(|error| for_this_build(target.network, error))?;
                 println!(
                     "{} ({key}): set up; the dollar is {}, written to {}",
                     config.label,
@@ -460,8 +484,15 @@ async fn main() -> Result<()> {
                 for (key, config) in only(&target, one, solana_clusters(&target)) {
                     let client = chain::connect_solana(target.network, &key, &config).await?;
                     let file = Deployments::file_in(&target.deployments_dir, &key);
-                    solana::ensure(&client, &key, &config.rpc, &args.solana_programs, &file)
-                        .await?;
+                    solana::ensure(
+                        &client,
+                        &key,
+                        &config.rpc,
+                        &args.solana_programs,
+                        &args.orca_program,
+                        &file,
+                    )
+                    .await?;
                 }
             }
             Ok(())
@@ -1074,6 +1105,7 @@ async fn main() -> Result<()> {
                 }
                 for (key, config) in only(&target, one, solana_clusters(&target)) {
                     let programs = args.solana_programs.clone();
+                    let orca = args.orca_program.clone();
                     let file = Deployments::file_in(&target.deployments_dir, &key);
                     let seconds_per_block = args.seconds_per_block;
                     let network = target.network;
@@ -1083,8 +1115,15 @@ async fn main() -> Result<()> {
                         let driven = async {
                             let client = chain::connect_solana(network, &key, &config).await?;
                             let deployments =
-                                solana::ensure(&client, &key, &config.rpc, &programs, &file)
-                                    .await?;
+                                solana::ensure(
+                                    &client,
+                                    &key,
+                                    &config.rpc,
+                                    &programs,
+                                    &orca,
+                                    &file,
+                                )
+                                .await?;
                             tracing::info!(chain = %key, label = config.label, "the cluster is up");
                             solana::run_market(&client, &deployments, seconds_per_block).await
                         };
@@ -1651,14 +1690,17 @@ mod tests {
 
     #[test]
     fn the_solana_set_up_needs_the_operator_s_project() {
-        let Some(Command::SolanaSetup { project }) =
-            parse(&["solana-setup", "--project", "shonin-testnet"])
-                .unwrap()
-                .command
+        let Some(Command::SolanaSetup {
+            project,
+            orca_seed_sol,
+        }) = parse(&["solana-setup", "--project", "shonin-testnet"])
+            .unwrap()
+            .command
         else {
             panic!("not the set-up");
         };
         assert_eq!(project, "shonin-testnet");
+        assert_eq!(orca_seed_sol, 2.0);
         assert!(parse(&["solana-setup"]).is_err());
     }
 

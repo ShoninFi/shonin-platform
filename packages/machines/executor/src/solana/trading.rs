@@ -40,6 +40,9 @@ pub struct Trading {
     sending: tokio::sync::Mutex<()>,
     /// The agent's sends that may still land, and when the last settled.
     pub flights: Flights,
+    /// The Orca driver's half, for a vault whose agent trades there: taken
+    /// up once the manifest the builder recorded names it.
+    pub(super) orca: std::sync::OnceLock<super::orca::Orca>,
 }
 
 /// The agent's sends whose cost may still be added: started, and not yet
@@ -121,6 +124,7 @@ impl Trading {
             spent,
             sending: Default::default(),
             flights: Default::default(),
+            orca: Default::default(),
         }
     }
 
@@ -144,7 +148,7 @@ impl Trading {
     /// is stopped while it waits. One the node stopped answering about is
     /// watched on in a task of its own, still in flight, and billed if it
     /// lands (see [`landed_late`]); the agent is answered meanwhile.
-    async fn send(&self, ixs: Vec<Instruction>) -> Result<Landed> {
+    pub(super) async fn send(&self, ixs: Vec<Instruction>) -> Result<Landed> {
         let _turn = self.sending.lock().await;
         let (client, key, spent) = (self.client.clone(), self.key.clone(), self.spent.clone());
         let flights = self.flights.clone();
@@ -271,6 +275,14 @@ impl Trading {
                         .await?;
                     self.send(vec![ix]).await?;
                 }
+                // Orca's driver lends each call the dollars it needs and
+                // takes back what it didn't use: nothing waits at Orca.
+                Step::Deposit | Step::Withdraw if self.has_orca() => {
+                    return Err(anyhow!(
+                        "the {} driver holds no dollars at the venue between calls: an open, an add or a buy draws on the station's own",
+                        super::orca::DRIVER
+                    ));
+                }
                 Step::Deposit => {
                     let authority = self.authority().await?;
                     self.opened(&authority).await?;
@@ -304,9 +316,13 @@ impl Trading {
             .await
             .ok()
             .map(|station| station.idle);
-        let venue = match self.venue_value().await {
-            Ok((value, _)) => Some(value.clamp(0, u64::MAX as i128) as u64),
-            Err(_) => None,
+        let venue = if self.has_orca() {
+            self.orca_mark().await
+        } else {
+            match self.venue_value().await {
+                Ok((value, _)) => Some(value.clamp(0, u64::MAX as i128) as u64),
+                Err(_) => None,
+            }
         };
         (vault, station, venue)
     }
@@ -547,14 +563,16 @@ fn halting(reason: chain::solana::programs::vault::state::HaltReason) -> VaultEv
 const LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Follow one vault for its agent: the prices of each market it follows as
-/// the venue posts them, on the account stream, and the vault's halt, on the
-/// vault's. A market it doesn't follow is passed over, so its posts don't
-/// wake the agent. The halt is said once; a watcher started after it has
-/// passed says it first.
+/// the stand-in venue posts them, on the account stream (unless `venue` is
+/// false: an agent trading elsewhere hears its own venue's events), and the
+/// vault's halt, on the vault's. A market it doesn't follow is passed over,
+/// so its posts don't wake the agent. The halt is said once; a watcher
+/// started after it has passed says it first.
 pub async fn watch(
     client: SolanaClient,
     platform: Platform,
     vault: Pubkey,
+    venue: bool,
     following: crate::watch::Following,
     account_events: UnboundedSender<Vec<u8>>,
     vault_events: UnboundedSender<VaultEvent>,
@@ -563,7 +581,12 @@ pub async fn watch(
     let mut halt_said = false;
     let mut unread = crate::Throttle::default();
     loop {
-        match on_chain::venue_markets(&client).await {
+        let markets = if venue {
+            on_chain::venue_markets(&client).await
+        } else {
+            Ok(Vec::new())
+        };
+        match markets {
             Ok(markets) => {
                 for market in markets {
                     let changed = seen.get(&market.id).is_none_or(|before| {

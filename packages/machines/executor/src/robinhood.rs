@@ -317,6 +317,28 @@ impl LighterHalf {
         station: Address,
         driver: &str,
     ) -> Result<Arc<Self>> {
+        Self::connect_as(chain, key, station, driver, true).await
+    }
+
+    /// The half for posting alone, for a halted vault whose agent's grace is
+    /// over: it names no Lighter key on the board and registers none at the
+    /// exchange, since nothing will be traded.
+    pub async fn connect_to_post(
+        chain: &Client,
+        key: KeyClient,
+        station: Address,
+        driver: &str,
+    ) -> Result<Arc<Self>> {
+        Self::connect_as(chain, key, station, driver, false).await
+    }
+
+    async fn connect_as(
+        chain: &Client,
+        key: KeyClient,
+        station: Address,
+        driver: &str,
+        trading: bool,
+    ) -> Result<Arc<Self>> {
         let (api, explorer, chain_id) = match chain.chain_id {
             robinhood::listings::MAINNET => (
                 lighter::Api::new(lighter::api::MAINNET),
@@ -348,14 +370,16 @@ impl LighterHalf {
             }
         };
         let lighter_key = lighter::Key::generate();
-        key.send(
-            board,
-            lighter::report::ILighterBoard::setPubKeyCall {
-                pubKey: lighter_key.public().to_vec().into(),
-            },
-        )
-        .await
-        .context("naming this start's Lighter key on the board")?;
+        if trading {
+            key.send(
+                board,
+                lighter::report::ILighterBoard::setPubKeyCall {
+                    pubKey: lighter_key.public().to_vec().into(),
+                },
+            )
+            .await
+            .context("naming this start's Lighter key on the board")?;
+        }
         let half = Arc::new(Self {
             chain: chain.clone(),
             key,
@@ -375,7 +399,7 @@ impl LighterHalf {
             trader: Mutex::new(None),
         });
         // Best effort now; tried again before the first order.
-        if let Err(error) = half.trader().await {
+        if trading && let Err(error) = half.trader().await {
             tracing::info!(%station, error = %format!("{error:#}"), "no Lighter account to trade yet");
         }
         Ok(half)

@@ -1352,6 +1352,37 @@ async fn serve(
     )
     .await?;
 
+    // A halted vault past its agent's grace whose station trades on Lighter
+    // is served only to post its Lighter accounts: its station is stopped,
+    // or about to be, so nothing is approved and no agent runs.
+    if matches!(finished(&chain, vault).await, Ok(true))
+        && matches!(
+            station_trades_on(&chain, station, robinhood::LIGHTER).await,
+            Ok(true)
+        )
+    {
+        // The key's blessing is still asked for again when due: only a
+        // blessed key may post.
+        let _tracking = AbortOnDrop(tokio::spawn(track_blessing(
+            chain.clone(),
+            deployments.clone(),
+            attestation.clone(),
+            key.address,
+            vault,
+            bundle,
+            || {},
+        )));
+        let half = robinhood::LighterHalf::connect_to_post(
+            &chain,
+            key.clone(),
+            station,
+            robinhood::LIGHTER,
+        )
+        .await?;
+        let _posts = AbortOnDrop(half.report_loop());
+        return posted_until_closed(&chain, vault, &AtomicBool::new(false), true).await;
+    }
+
     // The station is the venue account's master and approves the key there.
     // Anyone may ask; it obeys only what the registry says. The venue holds
     // the key approved only until the blessing the station last copied to
@@ -1770,13 +1801,18 @@ async fn posts_for_lighter(client: &Client, book: &mut Book, vault: Address) -> 
             station
         }
     };
+    station_trades_on(client, station, robinhood::LIGHTER).await
+}
+
+/// Whether `station` declares the driver called `driver`.
+async fn station_trades_on(client: &Client, station: Address, driver: &str) -> Result<bool> {
     let spec = client
         .read(station, chain::bindings::station::IStation::specCall {})
         .await?;
     Ok(spec
         .drivers
         .iter()
-        .any(|driver| *driver == robinhood::name(robinhood::LIGHTER)))
+        .any(|declared| *declared == robinhood::name(driver)))
 }
 
 /// How often Hyperliquid's spot pairs are read again for their feed names.
@@ -2799,18 +2835,19 @@ fn recorded_in(
         .manifest
         .check(&catalogue, network)
         .map_err(|why| anyhow::anyhow!("this image won't run it: {why}"))?;
-    // This image carries four drivers' executor halves: the stand-in
-    // venue's, Hyperliquid's, and Robinhood Chain's two (its stock tokens
-    // and Lighter), which an agent may use together.
+    // This image carries five drivers' executor halves: the stand-in
+    // venue's, Hyperliquid's, Orca's, and Robinhood Chain's two (its stock
+    // tokens and Lighter), which an agent may use together.
     let drivers: Vec<String> = canonical.manifest.drivers.keys().cloned().collect();
     let robinhood_chain = |name: &str| name == robinhood::ROBINHOOD || name == robinhood::LIGHTER;
+    let alone = [host::LOCAL, hyperliquid::DRIVER, solana::ORCA];
     let carried = match drivers.as_slice() {
-        [only] if only.as_str() == host::LOCAL || only.as_str() == hyperliquid::DRIVER => true,
+        [only] if alone.contains(&only.as_str()) => true,
         some => !some.is_empty() && some.iter().all(|name| robinhood_chain(name)),
     };
     anyhow::ensure!(
         carried,
-        "this image carries the local or hyperliquid driver alone, or robinhood and lighter together, and the manifest names {drivers:?}"
+        "this image carries the local, hyperliquid or orca driver alone, or robinhood and lighter together, and the manifest names {drivers:?}"
     );
     Ok(Recorded {
         drivers,

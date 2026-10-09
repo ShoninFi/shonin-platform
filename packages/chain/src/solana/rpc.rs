@@ -582,6 +582,28 @@ impl Rpc {
         .await
     }
 
+    /// Write an account as given on a Surfpool cluster, whoever owns it: how
+    /// a development cluster gets a program or an account only its owner's
+    /// keys could make elsewhere (a third party's program at its own
+    /// address, an oracle's price).
+    pub async fn set_account(&self, address: &Pubkey, account: &Account) -> Result<()> {
+        let _: Value = self
+            .call(
+                "surfnet_setAccount",
+                json!([
+                    address.to_string(),
+                    {
+                        "lamports": account.lamports,
+                        "owner": account.owner.to_string(),
+                        "executable": account.executable,
+                        "data": alloy_primitives::hex::encode(&account.data),
+                    }
+                ]),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Move a Surfpool cluster's clock to `unix_seconds`. It only moves
     /// forward, and runs on at real pace from there.
     pub async fn time_travel(&self, unix_seconds: u64) -> Result<()> {

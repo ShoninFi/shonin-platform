@@ -1255,7 +1255,7 @@ impl Keeping {
         if !station.stopped {
             return Ok(());
         }
-        let ix = self
+        let full = self
             .platform
             .ix_unwind(
                 &self.client,
@@ -1263,24 +1263,32 @@ impl Keeping {
                 &self.keeper(),
                 chain::solana::programs::driver::WAD,
             )
-            .await?;
-        let simulated = self
-            .client
-            .simulate_reading(vec![ix.clone()], &self.keeper(), &[v.station])
             .await;
-        let brought = match simulated {
-            Ok(simulated) => simulated
-                .accounts
-                .first()
-                .cloned()
-                .flatten()
-                .and_then(|account| {
-                    station::state::Station::try_deserialize(&mut &account.data[..]).ok()
-                })
-                .map_or(0, |after| after.sent_home.saturating_sub(station.sent_home)),
+        let tried = match full {
+            Ok(ix) => self
+                .brings(v, &station, &ix)
+                .await
+                .map(|brought| (ix, brought)),
+            Err(error) => Err(error),
+        };
+        // A driver whose close fails fails the whole unwind: the others, and
+        // the counted dollars, then go home without it.
+        let (ix, brought) = match tried {
+            Ok(tried) => tried,
             Err(error) => {
-                tracing::debug!(vault = %address, error = format!("{error:#}"), "the unwind would not go through");
-                0
+                tracing::debug!(vault = %address, error = format!("{error:#}"), "the unwind would not go through; trying it without the drivers that fail");
+                match self.unwind_without_failing(v, &station).await {
+                    Some(tried) => tried,
+                    None => {
+                        memory.unwind_checks = Some(next_check(
+                            memory.unwind_checks,
+                            now,
+                            vault.timers.slot_interval,
+                        ));
+                        memory.unwind_idle = true;
+                        return Ok(());
+                    }
+                }
             }
         };
         if !worth_an_unwind(brought, vault.dust()) {
@@ -1299,6 +1307,62 @@ impl Keeping {
             tracing::info!(vault = %address, brought, "the stopped station was unwound");
         }
         Ok(())
+    }
+
+    /// What `ix`, an unwind of the stopped station, would send home, from a
+    /// simulation of it.
+    async fn brings(
+        &self,
+        v: &VaultAccounts,
+        station: &station::state::Station,
+        ix: &chain::solana::Instruction,
+    ) -> Result<u128> {
+        let simulated = self
+            .client
+            .simulate_reading(vec![ix.clone()], &self.keeper(), &[v.station])
+            .await?;
+        Ok(simulated
+            .accounts
+            .first()
+            .cloned()
+            .flatten()
+            .and_then(|account| {
+                station::state::Station::try_deserialize(&mut &account.data[..]).ok()
+            })
+            .map_or(0, |after| after.sent_home.saturating_sub(station.sent_home)))
+    }
+
+    /// The stopped station's unwind through every driver whose own unwind
+    /// would go through, leaving out those that would fail it, and what it
+    /// would send home; `None` if even that would not go through.
+    async fn unwind_without_failing(
+        &self,
+        v: &VaultAccounts,
+        station: &station::state::Station,
+    ) -> Option<(chain::solana::Instruction, u128)> {
+        let mut named = Vec::new();
+        for index in 0..station.drivers.len() as u8 {
+            let Ok(alone) = self
+                .platform
+                .ix_unwind_stopped(&self.client, v, &self.keeper(), &[index])
+                .await
+            else {
+                continue;
+            };
+            if self.brings(v, station, &alone).await.is_ok() {
+                named.push(index);
+            }
+        }
+        let ix = self
+            .platform
+            .ix_unwind_stopped(&self.client, v, &self.keeper(), &named)
+            .await
+            .ok()?;
+        let brought = self.brings(v, station, &ix).await.ok()?;
+        if named.len() < station.drivers.len() {
+            tracing::warn!(vault = %v.vault, named = ?named, "a driver's close fails: the stopped station is unwound without it");
+        }
+        Some((ix, brought))
     }
 
     // The bill --------------------------------------------------------------------------------
