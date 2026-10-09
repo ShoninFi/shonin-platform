@@ -23,7 +23,7 @@ use shared::ChainAddress;
 use shared::model::activity::{EventKind, Kill, VaultEvent};
 use shared::model::common::Chain;
 use shared::model::health::Health;
-use shared::model::registry::{Author, FeedEvent, FeedKind};
+use shared::model::registry::{Author, FeedEvent, FeedKind, Job, JobState};
 use shared::model::review::{Rating, Review};
 use shared::model::strategy::{Standing, Strategy};
 use shared::model::vault::{
@@ -189,6 +189,38 @@ fn author_of(key: &Pubkey, profile: Option<profiles::Profile>) -> Author {
             })
             .unwrap_or_default(),
     }
+}
+
+/// A queued build with the review and activation its cluster recorded.
+/// The queue's completion timeout and retry cache bound these reads exactly
+/// as they do an EVM job's reads.
+pub(crate) async fn job(served: &SolanaServed, store: &Store, mut job: Job) -> Result<Job> {
+    if let Ok(author) = job.author.parse::<Pubkey>()
+        && let Some(profile) = served.platform.profile(&served.client, &author).await?
+        && !profile.handle.is_empty()
+    {
+        job.author = profile.handle;
+    }
+    let Some(id) = job.strategy_id else {
+        return Ok(job);
+    };
+    job.review = served
+        .platform
+        .review(&served.client, id)
+        .await?
+        .filter(|review| review.reviewed_at != 0)
+        .map(|review| review_of(store, &review));
+    let accounts = served.platform.vault_accounts(id);
+    if served
+        .client
+        .load::<sv::state::Vault>(&accounts.vault)
+        .await?
+        .is_some()
+    {
+        job.state = JobState::Activated;
+        job.strategy_slug = Some(Strategy::slug_for(job.chain, id));
+    }
+    Ok(job)
 }
 
 async fn one(

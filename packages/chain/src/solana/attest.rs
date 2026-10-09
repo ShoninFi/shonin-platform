@@ -111,7 +111,62 @@ pub struct KeyLeaf {
     pub proof: Vec<[u8; 32]>,
 }
 
+/// Where a builder's or a reviewer's key stands on a cluster.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ServiceStanding {
+    /// Whether the registry counts the key blessed as the service's kind
+    /// now: its checker, image and project still allowed and its blessing
+    /// not run out.
+    pub blessed: bool,
+    /// When the key's blessing runs out; zero if it was never blessed.
+    pub until: u64,
+    /// The cluster's time.
+    pub now: u64,
+    /// How long a blessing lasts from the attestation it came from.
+    pub ttl: u64,
+}
+
 impl Platform {
+    /// Where `key` stands as a service of `kind` (a builder or a reviewer)
+    /// on the cluster, read as the publishing program reads it.
+    pub async fn service_standing(
+        &self,
+        client: &SolanaClient,
+        key: &Pubkey,
+        kind: shonin_registry::state::ImageKind,
+    ) -> Result<ServiceStanding> {
+        use shonin_registry::read as registry;
+        use shonin_registry::state::{ImageRecord, KeyInfo, ProjectRecord};
+        let config = self.registry_config(client).await?;
+        let now = client.now().await?;
+        let Some(info) = client.load::<KeyInfo>(&registry::key_address(key)).await? else {
+            return Ok(ServiceStanding {
+                now,
+                ttl: config.blessing_ttl,
+                ..ServiceStanding::default()
+            });
+        };
+        let image: Option<ImageRecord> = client
+            .load(&registry::image_address(&info.image_digest))
+            .await?;
+        let project: Option<ProjectRecord> = client
+            .load(&registry::project_address(&info.project_id))
+            .await?;
+        Ok(ServiceStanding {
+            blessed: shonin_registry::state::is_blessed_as(
+                &config,
+                &info,
+                image.as_ref(),
+                project.as_ref(),
+                kind,
+                now,
+            ),
+            until: info.blessed_until,
+            now,
+            ttl: config.blessing_ttl,
+        })
+    }
+
     /// The instructions blessing `leaf`'s key with `seal`, `payer` paying.
     pub fn bless_with(
         &self,

@@ -17,6 +17,10 @@ includes:
     flatten: true
 
 vars:
+  # The devnet binary's features for the seed and the demo: on a testnet's
+  # Solana cluster it sends to the programs, so it carries their committed
+  # devnet ids (see DEVNET_SOLANA).
+  SEED_FEATURES: '{{if and .VAULT_CHAIN (eq .NETWORK "testnet")}}{{if eq .VAULT_CHAIN "solana"}}--features devnet{{end}}{{end}}'
   # Every service takes the same arguments, so one variable carries them.
   SERVICE_ARGS: >-
     --network "{{.NETWORK}}"
@@ -50,7 +54,7 @@ tasks:
         --gcp-region "{{.GCP_REGION}}"
 
   seed:
-    desc: "Publish the reference work through the real flows (AGENT=name for just one; LIVE=1 then deposits and books and pays a claim on its vault; PUBLISH_ONLY=1 publishes AGENT and stops; STRATEGY=<id> runs the live part on a registered strategy; TAKE_ON_SECONDS=<s>, 180 by default; API_URL=<url> for a remote API)"
+    desc: "Publish the reference work through the real flows (AGENT=name for just one; LIVE=1 then deposits and books and pays a claim on its vault; PUBLISH_ONLY=1 publishes AGENT and stops; STRATEGY=<id> runs the live part on a registered strategy; TAKE_ON_SECONDS=<s>, 180 by default; API_URL=<url> for a remote API). VAULT_CHAIN=solana publishes on Solana: through the API and the services everywhere but the local cluster's full seed, an agent's own solana/ copy if it has one"
     vars:
       SEED_API: '{{.API_URL | default .URL_API_DEV}}'
       AGENT_ARG: >-
@@ -58,7 +62,7 @@ tasks:
         {{if .TAKE_ON_SECONDS}}--take-on-seconds {{.TAKE_ON_SECONDS}}{{end}}
     cmds:
       - >-
-        cargo run -q -p shonin-devnet --
+        cargo run -q -p shonin-devnet {{.SEED_FEATURES}} --
         {{.SERVICE_ARGS}}
         --artifacts "{{.PATH_ARTIFACTS}}"
         seed --api "{{.SEED_API}}" {{.AGENT_ARG}}
@@ -76,7 +80,7 @@ tasks:
         {{if .TAKE_ON_SECONDS}}--take-on-seconds {{.TAKE_ON_SECONDS}}{{end}}
     cmds:
       - >-
-        cargo run -q -p shonin-devnet --
+        cargo run -q -p shonin-devnet {{.SEED_FEATURES}} --
         {{.SERVICE_ARGS}}
         --artifacts "{{.PATH_ARTIFACTS}}"
         demo --api "{{.SEED_API}}" {{.DEMO_ARGS}}

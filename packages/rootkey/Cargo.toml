@@ -20,7 +20,7 @@ path = "src/bin/requester.rs"
 test-identity = []
 
 [dependencies]
-chain = { workspace = true, features = ["rpc"] }
+chain = { workspace = true, features = ["rpc", "solana"] }
 alloy.workspace = true
 anyhow.workspace = true
 axum.workspace = true

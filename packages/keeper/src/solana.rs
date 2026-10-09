@@ -43,7 +43,7 @@
 //! What the keeper remembers having done is remembered only once it landed
 //! and went through.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -51,6 +51,8 @@ use chain::SolanaServed;
 use chain::solana::platform::VaultAccounts;
 use chain::solana::programs::anchor_lang::AccountDeserialize;
 use chain::solana::programs::{station, vault as vp};
+use chain::solana::rate_limited;
+use chain::solana::scan::VaultScan;
 use chain::solana::upkeep::SignedUsage;
 use chain::solana::{
     Instruction, Keypair, Platform, Pubkey, Signer, SolanaClient, TransactionFailed,
@@ -85,7 +87,7 @@ const UNANSWERED_FOR: Duration = Duration::from_secs(15 * 60);
 const ASK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Keep one Solana vault chain, round after round, for good.
-pub async fn keep_chain(served: SolanaServed, executor: String) {
+pub async fn keep_chain(served: SolanaServed, executor: String, services: Vec<String>) {
     let chain = served.vault_chain;
     let keeper = match served.client.role(chain::Role::Keeper) {
         Ok(keeper) => keeper.insecure_clone(),
@@ -105,8 +107,23 @@ pub async fn keep_chain(served: SolanaServed, executor: String) {
         served.key.to_string(),
         keeper.insecure_clone(),
         executor.clone(),
+        false,
     ));
     let _keys = Aborting(keys);
+    // The builder's and the reviewer's Solana keys, each on its own cadence.
+    let _services: Vec<Aborting> = services
+        .into_iter()
+        .map(|service| {
+            Aborting(tokio::spawn(crate::solana_keys::keep_keys(
+                served.client.clone(),
+                served.platform.clone(),
+                served.key.to_string(),
+                keeper.insecure_clone(),
+                service,
+                true,
+            )))
+        })
+        .collect();
     let keeping = Keeping {
         client: served.client.clone(),
         platform: served.platform.clone(),
@@ -114,11 +131,26 @@ pub async fn keep_chain(served: SolanaServed, executor: String) {
         executor,
     };
     let mut memory: HashMap<Pubkey, Memory> = HashMap::new();
+    let mut scan = VaultScan::for_cluster(&served.client.cluster);
     let mut said = Said::default();
+    let mut slowed = 0u32;
     loop {
         let started = Instant::now();
-        let done = keeping.round(&mut memory).await;
+        let done = keeping.round(&mut scan, &mut memory).await;
         let now = Instant::now();
+        match &done {
+            // A round cut short by a node that limits the rate failed at
+            // nothing: it is not counted, and the next waits longer, the
+            // longer the node keeps asking.
+            Err(error) if rate_limited(error) => {
+                slowed = slowed.saturating_add(1);
+                let pause = slowed_pause(slowed);
+                tracing::debug!(chain = %served.key, seconds = pause.as_secs(), error = format!("{error:#}"), "the node limits the rate; the next round waits");
+                tokio::time::sleep(pause).await;
+                continue;
+            }
+            _ => slowed = 0,
+        }
         match done {
             Ok(()) => {
                 chain_kept(chain, |kept| {
@@ -139,6 +171,12 @@ pub async fn keep_chain(served: SolanaServed, executor: String) {
         }
         tokio::time::sleep(ROUND_PAUSE).await;
     }
+}
+
+/// How long the next round waits after `times` rounds in a row cut short by
+/// a node limiting the rate: five seconds, doubling, at most two minutes.
+fn slowed_pause(times: u32) -> Duration {
+    Duration::from_secs((5u64 << times.saturating_sub(1).min(5)).min(120))
 }
 
 /// Aborts the task when dropped.
@@ -539,12 +577,18 @@ impl Keeping {
         }
     }
 
-    async fn round(&self, memory: &mut HashMap<Pubkey, Memory>) -> Result<()> {
-        let vaults = self.platform.vaults(&self.client).await?;
+    async fn round(
+        &self,
+        scan: &mut VaultScan,
+        memory: &mut HashMap<Pubkey, Memory>,
+    ) -> Result<()> {
+        // Every vault and every claim of each, read once a round; the vault
+        // program listed only when its counts say something new is there.
+        let found = scan.look(&self.client).await?;
+        let vaults = found.vaults;
         let addresses: Vec<Pubkey> = vaults.iter().map(|(address, _)| *address).collect();
-        // Every claim of every vault, read once a round.
         let mut claims: BTreeMap<Pubkey, Vec<Claim>> = BTreeMap::new();
-        for (vault, _, claim) in self.platform.claims_of(&self.client, &addresses).await? {
+        for (vault, _, claim) in found.claims {
             claims.entry(vault).or_default().push(claim);
         }
         for (address, vault) in &vaults {
@@ -560,6 +604,24 @@ impl Keeping {
                     }
                     if let Ok(mut troubles) = TROUBLES.lock() {
                         troubles.unkept.remove(address);
+                        troubles.limited.remove(address);
+                    }
+                }
+                // The node asking to be asked less often is no failure of
+                // the vault's, but a vault left round after round is not
+                // kept all the same: it counts as a round that didn't
+                // finish, said only once it has held as many rounds as a
+                // failure must to be in the health.
+                Err(error) if rate_limited(&error) => {
+                    remembered.rounds_failing += 1;
+                    if remembered.rounds_failing < MOST_VAULT_ROUNDS_FAILING {
+                        tracing::debug!(vault = %address, error = format!("{error:#}"), "the node limits the rate; the vault's round is left to the next");
+                    } else if let Some(times) = remembered.round_said.due(Instant::now()) {
+                        tracing::warn!(vault = %address, times, rounds = remembered.rounds_failing, error = format!("{error:#}"), "the node's rate limit keeps the vault's round from finishing");
+                    }
+                    if let Ok(mut troubles) = TROUBLES.lock() {
+                        troubles.unkept.insert(*address, remembered.rounds_failing);
+                        troubles.limited.insert(*address);
                     }
                 }
                 Err(error) => {
@@ -569,12 +631,14 @@ impl Keeping {
                     }
                     if let Ok(mut troubles) = TROUBLES.lock() {
                         troubles.unkept.insert(*address, remembered.rounds_failing);
+                        troubles.limited.remove(address);
                     }
                 }
             }
         }
         if let Ok(mut troubles) = TROUBLES.lock() {
             troubles.unkept.retain(|vault, _| addresses.contains(vault));
+            troubles.limited.retain(|vault| addresses.contains(vault));
             troubles
                 .bills_refused
                 .retain(|vault, _| addresses.contains(vault));
@@ -1869,6 +1933,9 @@ async fn fetch_total(cluster: &str, executor: &str, vault: &Pubkey) -> Result<As
 struct Troubles {
     /// Vaults whose rounds haven't finished, and how many in a row.
     unkept: HashMap<Pubkey, u64>,
+    /// Of those, the vaults whose latest round was cut short by the node's
+    /// rate limit.
+    limited: HashSet<Pubkey>,
     /// Vaults that refuse the `keep` carrying their bill, and for how many
     /// rounds.
     bills_refused: HashMap<Pubkey, u64>,
@@ -1889,7 +1956,14 @@ pub fn troubles(now: Instant) -> Vec<(String, String)> {
             .unkept
             .iter()
             .filter(|(_, failing)| **failing >= MOST_VAULT_ROUNDS_FAILING)
-            .map(|(vault, failing)| format!("solana/{vault} ({failing} rounds in a row)"))
+            .map(|(vault, failing)| {
+                let why = if troubles.limited.contains(vault) {
+                    ", the node's rate limit"
+                } else {
+                    ""
+                };
+                format!("solana/{vault} ({failing} rounds in a row{why})")
+            })
             .collect();
         if !unkept.is_empty() {
             unkept.sort_unstable();
@@ -2079,10 +2153,15 @@ mod tests {
     fn a_vault_whose_rounds_keep_failing_or_whose_send_does_not_go_out_is_in_the_health() {
         let vault = Pubkey::new_unique();
         let other = Pubkey::new_unique();
+        let limited = Pubkey::new_unique();
         {
             let mut troubles = TROUBLES.lock().unwrap();
             troubles.unkept.insert(vault, MOST_VAULT_ROUNDS_FAILING);
             troubles.unkept.insert(other, 1);
+            // A vault whose rounds the node's rate limit cuts short is said
+            // as one that fails, with why.
+            troubles.unkept.insert(limited, MOST_VAULT_ROUNDS_FAILING);
+            troubles.limited.insert(limited);
             troubles
                 .not_sent
                 .insert((vault, "keep"), (Instant::now(), Said::default()));
@@ -2098,6 +2177,12 @@ mod tests {
             unkept.contains(&vault.to_string()) && !unkept.contains(&other.to_string()),
             "{unkept}"
         );
+        assert!(
+            unkept.contains(&format!(
+                "solana/{limited} ({MOST_VAULT_ROUNDS_FAILING} rounds in a row, the node's rate limit)"
+            )),
+            "{unkept}"
+        );
         let (_, not_sent) = line("sends not going out").expect("the send is not said");
         assert!(not_sent.contains("keep"), "{not_sent}");
         // Once the same call goes out, it is no longer said.
@@ -2107,7 +2192,9 @@ mod tests {
                 .iter()
                 .all(|(_, detail)| !detail.contains(&format!("keep solana/{vault}")))
         );
-        TROUBLES.lock().unwrap().unkept.clear();
+        let mut troubles = TROUBLES.lock().unwrap();
+        troubles.unkept.clear();
+        troubles.limited.clear();
     }
 
     /// A vault priced a slot ago, paid this week, with every request priced.

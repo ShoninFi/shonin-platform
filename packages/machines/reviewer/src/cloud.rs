@@ -544,6 +544,11 @@ impl std::error::Error for NotBlessed {}
 pub trait Attesting: Send + Sync {
     /// Get the key blessed on this chain too, and keep it blessed.
     fn serve_chain(&self, client: chain::Client, deployments: chain::Deployments);
+    /// Get the Solana key blessed on this Solana cluster (`solana:devnet`)
+    /// too, and keep it blessed.
+    fn serve_cluster(&self, cluster: String, served: shonin_rootkey::service::ClusterServed);
+    /// Whether the Solana key is blessed on the cluster, as last read.
+    fn ready_cluster(&self, cluster: &str) -> bool;
     /// Whether the key is blessed on the chain with this id, as last read.
     fn ready(&self, chain_id: u64) -> bool;
     /// When the blessing must next be renewed, on whichever chain is first.
@@ -563,6 +568,14 @@ impl Attesting for shonin_rootkey::service::ServiceAttestation {
         shonin_rootkey::service::ServiceAttestation::ready(self, chain_id)
     }
 
+    fn serve_cluster(&self, cluster: String, served: shonin_rootkey::service::ClusterServed) {
+        shonin_rootkey::service::ServiceAttestation::serve_cluster(self, cluster, served)
+    }
+
+    fn ready_cluster(&self, cluster: &str) -> bool {
+        shonin_rootkey::service::ServiceAttestation::ready_cluster(self, cluster)
+    }
+
     fn renew_at(&self) -> Option<u64> {
         shonin_rootkey::service::ServiceAttestation::renew_at(self)
     }
@@ -580,6 +593,8 @@ impl Attesting for shonin_rootkey::service::ServiceAttestation {
 /// signing key, its state's sealing, and its attestation.
 pub struct Launched {
     pub key: PrivateKeySigner,
+    /// Its Solana key, blessed on a Solana cluster as its kind.
+    pub solana: Arc<chain::solana::Keypair>,
     pub sealing: Arc<dyn Sealing>,
     pub attestation: Arc<dyn Attesting>,
 }
@@ -592,10 +607,15 @@ pub async fn launch(
     socket: &std::path::Path,
 ) -> Result<Launched> {
     let identity = shonin_rootkey::service::identity(holder, socket).await?;
-    let attestation = shonin_rootkey::service::ServiceAttestation::new(kind, identity.address())?;
+    let attestation = shonin_rootkey::service::ServiceAttestation::new(
+        kind,
+        identity.address(),
+        identity.solana_address(),
+    )?;
     tokio::spawn(attestation.clone().run(socket.to_path_buf()));
     Ok(Launched {
         key: identity.signer(),
+        solana: Arc::new(identity.solana()),
         sealing: Arc::new(identity),
         attestation: Arc::new(attestation),
     })

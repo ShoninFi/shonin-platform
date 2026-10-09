@@ -107,7 +107,7 @@ const PLAN: &[Plan] = &[
 /// How long, in seconds of the clock, the seed waits for the keeper or the
 /// agent to take each step: long enough for a real chain's blocks and a
 /// public endpoint's pace, not only the local chains'.
-const WAIT_SECONDS: u64 = 600;
+pub(crate) const WAIT_SECONDS: u64 = 600;
 
 /// How long, in seconds of the clock, the executor has to take a new vault
 /// on (its key blessed, stocked with gas by the keeper, and approved at the
@@ -119,15 +119,15 @@ pub const TAKE_ON_SECONDS: u64 = 180;
 /// When a wait of `seconds` begun now ends, by the clock: a step's reads take
 /// their own time on a slow or rate-limited endpoint, so turns of a loop are
 /// no measure.
-fn deadline(seconds: u64) -> tokio::time::Instant {
+pub(crate) fn deadline(seconds: u64) -> tokio::time::Instant {
     tokio::time::Instant::now() + std::time::Duration::from_secs(seconds)
 }
 
 /// What the seeded depositor puts into the live vault.
-const DEPOSIT: u64 = 25_000_000_000;
+pub(crate) const DEPOSIT: u64 = 25_000_000_000;
 /// What the author puts into the live vault once the depositor's claim is
 /// paid, so it keeps a depositor.
-const STAYING_DEPOSIT: u64 = 5_000_000_000;
+pub(crate) const STAYING_DEPOSIT: u64 = 5_000_000_000;
 
 /// Publish one project as it stands: what an author does from the web app,
 /// run from a checkout of their work. It is activated once it is ready.
@@ -716,17 +716,17 @@ async fn wait_taken_on(
 /// How often, while the seed waits for the agent to put money to work, it
 /// posts the stand-in venue's prices and funding again: each post is an
 /// event the agent wakes to.
-const NUDGE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+pub(crate) const NUDGE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// How long after the seeded withdrawal is read as done its claim is still
 /// looked for, before the withdrawal is taken as paid from cash.
-const CLAIM_SEEN_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const CLAIM_SEEN_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The funding rate the seed posts for the stand-in venue's perpetual while
 /// it waits, as a fraction of the mark a day: five times what
 /// `funding-basis` needs to start carrying (0.0002), and about what the local
 /// market's own walk averages.
-const NUDGED_FUNDING: (u64, u64) = (1, 1_000);
+pub(crate) const NUDGED_FUNDING: (u64, u64) = (1, 1_000);
 
 /// The depositor, once the agent has put part of the vault to work, asks for
 /// all of it back: more than the vault's cash, so a claim is booked and the
@@ -1010,7 +1010,7 @@ async fn killed(
 /// Copy the agent into a scratch tree, under the title a plan asks for.
 /// A copy of the agents with `project`'s manifest naming `vault_chain` as its
 /// vault's chain, when it names another; none when it already names it.
-fn on_vault_chain(
+pub(crate) fn on_vault_chain(
     agents: &Path,
     project: &Path,
     vault_chain: shared::Chain,
@@ -1134,7 +1134,7 @@ async fn say_who_the_author_is(
 }
 
 /// A sibling checkout, which is where they usually are.
-fn guess_agents() -> Option<PathBuf> {
+pub(crate) fn guess_agents() -> Option<PathBuf> {
     let here = std::env::current_dir().ok()?;
     let parent = here.parent()?;
     for name in ["SHONIN-AGENTS", "shonin-agents", "agents"] {

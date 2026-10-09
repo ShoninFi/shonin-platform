@@ -143,23 +143,37 @@ impl Reads for ChainReads {
 
     fn payments(&self) -> BoxFuture<'_, BTreeMap<String, u64>> {
         Box::pin(async move {
+            // Each chain under the name the build service's plan gives it: an
+            // EVM chain by its id, a Solana cluster by its chain key.
             let reads = Chain::ALL.into_iter().filter_map(|chain| {
-                let Lookup::Served(served) = self.indexer.lookup(chain) else {
+                let lookup = self.indexer.lookup(chain);
+                if !matches!(lookup, Lookup::Served(_) | Lookup::Solana(_)) {
                     return None;
-                };
+                }
                 Some(async move {
-                    let count = tokio::time::timeout(
-                        COUNT_TIMEOUT,
-                        served
-                            .client
-                            .read(served.deployments.publishing, IPublishing::countCall {}),
-                    )
+                    let count = tokio::time::timeout(COUNT_TIMEOUT, async {
+                        match lookup {
+                            Lookup::Served(served) => served
+                                .client
+                                .read(served.deployments.publishing, IPublishing::countCall {})
+                                .await
+                                .map(|count| {
+                                    (
+                                        served.client.chain_id.to_string(),
+                                        u64::try_from(count).unwrap_or(u64::MAX),
+                                    )
+                                }),
+                            Lookup::Solana(served) => served
+                                .platform
+                                .publishing_config(&served.client)
+                                .await
+                                .map(|config| (served.key.to_string(), config.count)),
+                            _ => Err(anyhow::anyhow!("not connected")),
+                        }
+                    })
                     .await;
                     match count {
-                        Ok(Ok(count)) => Some((
-                            served.client.chain_id.to_string(),
-                            u64::try_from(count).unwrap_or(u64::MAX),
-                        )),
+                        Ok(Ok(counted)) => Some(counted),
                         Ok(Err(error)) => {
                             tracing::debug!(%chain, error = format!("{error:#}"), "the payments taken could not be counted");
                             None

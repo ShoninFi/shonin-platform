@@ -26,6 +26,7 @@ mod seed;
 mod smoke;
 mod solana;
 mod solana_seed;
+mod solana_testnet;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -270,7 +271,9 @@ enum Command {
     /// an hour, funding about 10% a year with rare lulls), minting the venue
     /// whatever its accounts are owed beyond what it holds. It starts from
     /// the venue's prices as they stand, so it can be stopped and started
-    /// again. Every EVM chain of the network at once, or `--vault-chain`'s.
+    /// again. Every EVM chain of the network and its Solana cluster once set
+    /// up (the admin keeping the venue's reserves there) at once, or
+    /// `--vault-chain`'s.
     Market {
         #[arg(long, default_value_t = 10)]
         every_minutes: u64,
@@ -731,9 +734,51 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Some(Command::Seed { .. }) if target.key.kind == ChainKind::Solana => {
+        // The local cluster's full seed plays the services' parts itself;
+        // one agent, a registered strategy or any public cluster goes
+        // through the API and the services, as on an EVM chain.
+        Some(Command::Seed {
+            agent: None,
+            strategy: None,
+            ..
+        }) if target.key.kind == ChainKind::Solana && target.network == NetworkName::Local => {
             let served = target.serve_solana().await?;
             solana_seed::run(&served).await
+        }
+        Some(Command::Seed {
+            api,
+            agents,
+            agent,
+            live,
+            publish_only,
+            strategy,
+            take_on_seconds,
+        }) if target.key.kind == ChainKind::Solana => {
+            let served = target.serve_solana().await?;
+            let api = api.trim_end_matches('/').to_string();
+            if strategy.is_none() && api.is_empty() {
+                bail!("--api is needed to publish: where the API answers");
+            }
+            match (strategy, agent) {
+                (Some(strategy), _) => {
+                    solana_testnet::on_strategy(&served, strategy, take_on_seconds).await
+                }
+                (None, Some(name)) => {
+                    solana_testnet::one(
+                        &served,
+                        &api,
+                        agents.as_deref(),
+                        &name,
+                        live,
+                        publish_only,
+                        take_on_seconds,
+                    )
+                    .await
+                }
+                (None, None) => bail!(
+                    "on a public Solana cluster the seed publishes one agent: name it with --agent"
+                ),
+            }
         }
         Some(Command::Seed {
             api,
@@ -799,6 +844,48 @@ async fn main() -> Result<()> {
             }
             let every = std::time::Duration::from_secs(every_minutes.max(1) * 60);
             let mut running = tokio::task::JoinSet::new();
+            // Each Solana cluster set up, on its own as the EVM chains are.
+            for (key, config) in only(&target, one, solana_clusters(&target)) {
+                let file = Deployments::file_in(&target.deployments_dir, &key);
+                let set_up = std::fs::read_to_string(&file)
+                    .ok()
+                    .and_then(|text| chain::SolanaDeployments::from_json(&text).ok())
+                    .filter(|deployments| deployments.roles.is_some());
+                let Some(deployments) = set_up else {
+                    tracing::info!(chain = %key, "not set up yet: no market on it");
+                    continue;
+                };
+                let network = target.network;
+                running.spawn(async move {
+                    loop {
+                        let ran = async {
+                            let client = chain::connect_solana(network, &key, &config).await?;
+                            client.check_deployments(&deployments).await?;
+                            let served = chain::SolanaServed {
+                                vault_chain: shared::Chain::Solana,
+                                key: key.clone(),
+                                platform: chain::solana::Platform::from_deployments(&deployments)?,
+                                client,
+                                deployments: deployments.clone(),
+                                public_rpc: config.rpc.clone(),
+                            };
+                            solana_testnet::operate(&served, every).await
+                        }
+                        .await;
+                        let Err(error) = ran else { continue };
+                        let error =
+                            for_this_build(network, error).context(format!("the market on {key}"));
+                        if !market::worth_restarting(&error) {
+                            return Err::<(), _>(error);
+                        }
+                        tracing::warn!(
+                            error = format!("{error:#}"),
+                            "the market operator stopped on this cluster; it starts again shortly"
+                        );
+                        tokio::time::sleep(market::RESTART_AFTER).await;
+                    }
+                });
+            }
             for (key, config) in only(&target, one, evm_chains(&target)) {
                 let network = target.network;
                 let file = Deployments::file_in(&target.deployments_dir, &key);
@@ -849,6 +936,37 @@ async fn main() -> Result<()> {
                 failed.get_or_insert(error);
             }
             failed.map_or(Ok(()), Err)
+        }
+        Some(Command::Demo {
+            api,
+            agents,
+            agent,
+            strategy,
+            deposit,
+            tank_days,
+            take_on_seconds,
+            work_minutes,
+        }) if target.key.kind == ChainKind::Solana => {
+            let served = target.serve_solana().await?;
+            let api = api.trim_end_matches('/').to_string();
+            if strategy.is_none() && api.is_empty() {
+                bail!("--api is needed to publish: where the API answers");
+            }
+            solana_testnet::demo(
+                &served,
+                &seed::Demo {
+                    network: target.network.name(),
+                    api: &api,
+                    agents: agents.as_deref(),
+                    agent: &agent,
+                    strategy,
+                    deposit_dollars: deposit,
+                    tank_days,
+                    take_on: take_on_seconds,
+                    work_within: std::time::Duration::from_secs(work_minutes * 60),
+                },
+            )
+            .await
         }
         Some(Command::Demo {
             api,

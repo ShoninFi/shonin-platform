@@ -567,7 +567,14 @@ fn entries(
 pub struct Chains {
     expected: Vec<shared::Chain>,
     connected: Arc<Mutex<std::collections::HashSet<shared::Chain>>>,
+    /// Vaults whose serving keeps ending in a node's rate limit, by chain
+    /// and vault, with how many times in a row.
+    limited: Arc<Mutex<std::collections::BTreeMap<String, u32>>>,
 }
+
+/// Times in a row a vault's serving may end in a node's rate limit before
+/// the machine's health names it.
+pub const MOST_SERVES_LIMITED: u32 = 3;
 
 impl Chains {
     /// Every vault chain to be served, none connected yet.
@@ -575,7 +582,26 @@ impl Chains {
         Self {
             expected,
             connected: Default::default(),
+            limited: Default::default(),
         }
+    }
+
+    /// The serving of `vault` (`<chain>/<address>`) has ended in a node's
+    /// rate limit `times` in a row; from [`MOST_SERVES_LIMITED`] on, the
+    /// health names it.
+    pub fn limited(&self, vault: String, times: u32) {
+        self.limited
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(vault, times);
+    }
+
+    /// The serving of `vault` no longer ends in a node's rate limit.
+    pub fn not_limited(&self, vault: &str) {
+        self.limited
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(vault);
     }
 
     /// A vault chain has connected and is being served.
@@ -601,12 +627,27 @@ impl Chains {
                 lines.push(format!("{chain}: not connected"));
             }
         }
-        let first = match waiting.as_slice() {
-            [] => "executor".to_string(),
-            [one] => format!("executor: {one} not connected"),
-            many => format!("executor: {} chains not connected", many.len()),
+        let limited: Vec<String> = self
+            .limited
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, times)| **times >= MOST_SERVES_LIMITED)
+            .map(|(vault, times)| format!("{vault} ({times} times in a row)"))
+            .collect();
+        if !limited.is_empty() {
+            lines.push(format!(
+                "vaults not served, the node's rate limit: {}",
+                limited.join(", ")
+            ));
+        }
+        let first = match (waiting.as_slice(), limited.len()) {
+            ([], 0) => "executor".to_string(),
+            ([], n) => format!("executor: {n} vaults not served"),
+            ([one], _) => format!("executor: {one} not connected"),
+            (many, _) => format!("executor: {} chains not connected", many.len()),
         };
-        let status = if waiting.is_empty() {
+        let status = if waiting.is_empty() && limited.is_empty() {
             axum::http::StatusCode::OK
         } else {
             axum::http::StatusCode::SERVICE_UNAVAILABLE
@@ -657,6 +698,32 @@ mod tests {
         assert_eq!(status, axum::http::StatusCode::OK, "{said}");
         assert_eq!(said.lines().next(), Some("executor"));
         assert_eq!(said.lines().count(), 3, "{said}");
+    }
+
+    #[test]
+    fn a_vault_whose_serving_keeps_ending_in_the_rate_limit_is_named_in_the_health() {
+        use shared::Chain;
+
+        let chains = Chains::new(vec![Chain::Solana]);
+        chains.connected(Chain::Solana);
+        let vault = "solana:devnet/Vau1t".to_string();
+        chains.limited(vault.clone(), MOST_SERVES_LIMITED - 1);
+        let (status, said) = chains.answer();
+        assert_eq!(status, axum::http::StatusCode::OK, "{said}");
+
+        chains.limited(vault.clone(), MOST_SERVES_LIMITED);
+        let (status, said) = chains.answer();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{said}"
+        );
+        assert_eq!(said.lines().next(), Some("executor: 1 vaults not served"));
+        assert!(said.contains(&vault), "{said}");
+
+        chains.not_limited(&vault);
+        let (status, said) = chains.answer();
+        assert_eq!(status, axum::http::StatusCode::OK, "{said}");
     }
 
     fn at(restarts: u64, venue_errors: u64) -> Counters {

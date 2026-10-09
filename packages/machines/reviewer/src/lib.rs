@@ -8,4 +8,5 @@ pub mod battery;
 pub mod cloud;
 pub mod jev;
 pub mod messages;
+pub mod on_solana;
 pub mod source;

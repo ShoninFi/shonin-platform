@@ -9,6 +9,9 @@
 //! - the **signer**, a secp256k1 key the registry blesses as the service's
 //!   kind, which sends the service's transactions and signs its requests to
 //!   the platform's internal routes ([`request_digest`]);
+//! - the **Solana key**, an ed25519 key the Solana registry blesses as the
+//!   service's kind, which sends the service's transactions and signs what
+//!   it vouches for on a Solana cluster;
 //! - the **state key**, which seals what the service keeps off its machine
 //!   ([`Identity::seal_state`]): a blob sealed under one image's seed opens
 //!   under no other.
@@ -22,6 +25,7 @@
 //! | --- | --- |
 //! | a derived secret | HKDF-SHA256, salt `shonin:service:v1`, ikm the seed, info a label below |
 //! | the signer | info `shonin:service:v1:signer` ‖ a counter byte (0, then 1, ... until the 32 bytes are a valid scalar) |
+//! | the Solana key | info `shonin:service:v1:solana`, 32 bytes, the ed25519 secret |
 //! | the state key | info `shonin:service:v1:state`, 32 bytes |
 //! | the state key's id | info `shonin:service:v1:state-id`, 16 bytes |
 //! | a sealed blob | `01` ‖ state key's id (16) ‖ nonce (24) ‖ XChaCha20-Poly1305 ciphertext and tag; aad `01` ‖ state key's id ‖ the blob's name |
@@ -48,12 +52,17 @@ use crate::{Error, launcher};
 
 mod attestation;
 
-pub use attestation::{BindingView, LeafView, Mode, Refusal, SealPost, ServiceAttestation, Status};
+pub use attestation::{
+    BindingView, ClusterServed, LeafView, Mode, Refusal, SealPost, ServiceAttestation,
+    SolanaLeafView, SolanaView, Status, solana_service_leaf,
+};
 
 /// The salt every derivation from a service's seed is extracted under.
 pub const SALT: &[u8] = b"shonin:service:v1";
 /// The label the signer is expanded under, before its counter byte.
 pub const SIGNER_LABEL: &[u8] = b"shonin:service:v1:signer";
+/// The label the Solana key is expanded under.
+pub const SOLANA_LABEL: &[u8] = b"shonin:service:v1:solana";
 /// The label the state key is expanded under.
 pub const STATE_LABEL: &[u8] = b"shonin:service:v1:state";
 /// The label the state key's id is expanded under.
@@ -91,6 +100,7 @@ pub enum StateError {
 /// signer's address; the seed itself is not kept.
 pub struct Identity {
     signer: PrivateKeySigner,
+    solana: chain::solana::Keypair,
     state_key: Zeroizing<[u8; 32]>,
     state_id: [u8; STATE_ID_LEN],
 }
@@ -113,12 +123,16 @@ impl Identity {
                 PrivateKeySigner::from_bytes(&B256::from(*secret)).ok()
             })
             .expect("256 draws in a row outside the curve's order");
+        let mut solana_secret = Zeroizing::new([0u8; 32]);
+        expand(seed, &[SOLANA_LABEL], solana_secret.as_mut());
+        let solana = chain::solana::Keypair::new_from_array(*solana_secret);
         let mut state_key = Zeroizing::new([0u8; 32]);
         expand(seed, &[STATE_LABEL], state_key.as_mut());
         let mut state_id = [0u8; STATE_ID_LEN];
         expand(seed, &[STATE_ID_LABEL], &mut state_id);
         Identity {
             signer,
+            solana,
             state_key,
             state_id,
         }
@@ -146,6 +160,17 @@ impl Identity {
     /// The signer, to send transactions with (`Client::with_key`).
     pub fn signer(&self) -> PrivateKeySigner {
         self.signer.clone()
+    }
+
+    /// The Solana key's address: the key the Solana registry blesses.
+    pub fn solana_address(&self) -> chain::solana::Pubkey {
+        use chain::solana::Signer as _;
+        self.solana.pubkey()
+    }
+
+    /// The Solana key, to send transactions and sign with on a cluster.
+    pub fn solana(&self) -> chain::solana::Keypair {
+        self.solana.insecure_clone()
     }
 
     /// Sign a request to an internal route: the value of

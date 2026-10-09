@@ -1233,7 +1233,11 @@ impl Indexer {
     async fn complete_on(&self, chain: Chain, jobs: Vec<Job>) -> Vec<Job> {
         use futures::StreamExt;
 
-        let Some(served) = self.on(chain) else {
+        let Some(reader) = self
+            .readers()
+            .into_iter()
+            .find(|reader| reader.vault_chain == chain)
+        else {
             return jobs;
         };
         let mut unsettled: Vec<(Option<Instant>, Job)> = {
@@ -1253,7 +1257,16 @@ impl Indexer {
         let reads =
             futures::stream::iter(unsettled).for_each_concurrent(JOBS_AT_ONCE, |(_, job)| async {
                 let key = (job.chain, job.id.clone());
-                let read = read::job(&served.client, &served.deployments, &self.store, job);
+                let read = async {
+                    match &reader.source {
+                        Source::Evm { served, .. } => {
+                            read::job(&served.client, &served.deployments, &self.store, job).await
+                        }
+                        Source::Solana { served, .. } => {
+                            solana::job(served, &self.store, job).await
+                        }
+                    }
+                };
                 if let Ok(Ok(job)) = tokio::time::timeout(JOB_READ, read).await {
                     self.completions().insert(
                         key,
@@ -1265,7 +1278,7 @@ impl Indexer {
                 }
             });
         if tokio::time::timeout(JOB_READS, reads).await.is_err() {
-            tracing::debug!(chain = %served.key, "completed part of this chain's jobs, the rest next time");
+            tracing::debug!(chain = %reader.key, "completed part of this chain's jobs, the rest next time");
         }
         let completions = self.completions();
         jobs.into_iter()

@@ -8,6 +8,15 @@
 //! the nonce of the token it asks Confidential Space for, and one proof of
 //! that token blesses the key on every chain.
 //!
+//! On a Solana cluster the service holds its Solana key (its
+//! [`super::Identity`]'s ed25519 key), and the cluster gets a leaf naming
+//! that key and no vault, in the Solana registry's layout
+//! (`chain::solana::Platform::service_leaf`), after the EVM leaves. The
+//! instance's own Solana key is the token's Solana signer, and the same proof
+//! blesses the key there: the Solana registry reads it with the journal laid
+//! out its own way (`chain::solana::attest::SolanaSeal::from_evm`), published
+//! on the status port beside the leaves, in the executor's shape.
+//!
 //! As the executor does, the service never blesses anything itself: it
 //! publishes the leaves, the token and, once a prover has posted one, the
 //! seal on its status port (`GET /attestation`, in the executor's shape), and
@@ -34,6 +43,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use axum::http::StatusCode;
 use base64::Engine;
 use chain::bindings::attestation::IAttestationRegistry;
+use chain::solana::attest::{KeyLeaf, SolanaSeal};
+use chain::solana::{Keypair as SolanaKeypair, Platform, Pubkey, Signer as _, SolanaClient};
 use chain::{Client, Deployments};
 use serde::{Deserialize, Serialize};
 use shonin_attestation_core::Binding;
@@ -122,12 +133,33 @@ struct Sealed {
     issued_at: u64,
 }
 
+/// The service's leaf on one Solana cluster.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClusterLeaf {
+    /// What stands for the cluster in the leaf (`keccak256("solana:" +
+    /// name)`).
+    value: [u8; 32],
+    leaf: Leaf,
+}
+
 #[derive(Default)]
 struct Inner {
     /// By chain id, so the tree's order is the same at every look.
     leaves: BTreeMap<u64, Leaf>,
+    /// By the cluster's chain key (`solana:devnet`), after the EVM leaves.
+    clusters: BTreeMap<String, ClusterLeaf>,
     token: Option<Held>,
     sealed: Option<Sealed>,
+}
+
+/// A Solana cluster served: where the key's blessing is read and a `bless`
+/// simulated, with whoever relays it paying.
+#[derive(Clone)]
+pub struct ClusterServed {
+    pub client: SolanaClient,
+    pub platform: Platform,
+    /// Who pays for a `bless` there: the keeper, who sends it.
+    pub payer: Pubkey,
 }
 
 /// A builder's or a reviewer's attestation, shared by its run loop and its
@@ -136,13 +168,19 @@ struct Inner {
 pub struct ServiceAttestation {
     kind: ImageKind,
     key: Address,
+    /// The key blessed on a Solana cluster: the service's ed25519 key.
+    solana_key: Pubkey,
     mode: Mode,
     /// The key the journal names. It identifies the instance and signs
     /// nothing.
     instance: Address,
+    /// The instance's Solana key, the token's Solana signer: it identifies
+    /// the instance to a Solana registry, and signs nothing either.
+    solana_instance: Pubkey,
     inner: Arc<Mutex<Inner>>,
     changed: Arc<tokio::sync::Notify>,
     chains: Arc<Mutex<BTreeMap<u64, (Client, Deployments)>>>,
+    clusters: Arc<Mutex<BTreeMap<String, ClusterServed>>>,
 }
 
 fn unix_now() -> u64 {
@@ -162,6 +200,19 @@ pub fn service_leaf(chain_id: u64, key: Address) -> B256 {
         U256::from(chain_id),
         key,
     )
+}
+
+/// The leaf for the Solana key `key` on the cluster `cluster` stands for:
+/// no vault, no bundle, as the Solana registry's `bless` takes a builder's or
+/// a reviewer's (`chain::solana::Platform::service_leaf`).
+pub fn solana_service_leaf(cluster: &[u8; 32], key: &Pubkey) -> B256 {
+    B256::from(chain::solana::programs::common::digest::blessing_leaf(
+        &[0; 32],
+        &[0; 32],
+        &[0; 32],
+        cluster,
+        &key.to_bytes(),
+    ))
 }
 
 /// Whether a blessing that ends at `until` wants renewing at `now`: not
@@ -227,6 +278,9 @@ fn dated(head: u64) -> u64 {
 
 /// A chain to simulate a `bless` on, and its leaf's proof.
 type Simulate = (u64, Vec<B256>);
+
+/// A Solana cluster to simulate a `bless` on, and its leaf's proof.
+type SimulateCluster = (String, Vec<B256>);
 
 /// Why a seal posted to the status port was not taken.
 #[derive(Debug, PartialEq, Eq)]
@@ -364,6 +418,31 @@ pub struct Status {
     pub leaves: Vec<LeafView>,
     /// Always `null`: a service holds no root key.
     pub root: Option<serde_json::Value>,
+    /// Each Solana cluster's leaf, with the journal and seal its registry
+    /// takes, as the executor publishes its own.
+    pub solana: Vec<SolanaView>,
+}
+
+/// One Solana cluster's part of the status: the executor's shape.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct SolanaView {
+    /// The cluster's chain key.
+    pub cluster: String,
+    /// The Solana registry's journal (Borsh, hex), once a seal is held.
+    pub journal: Option<String>,
+    pub seal: Option<SolanaSeal>,
+    pub leaves: Vec<SolanaLeafView>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct SolanaLeafView {
+    /// The zero key: a service serves no vault.
+    pub vault: String,
+    pub strategy_hash: String,
+    pub key: String,
+    pub due: bool,
+    pub leaf: String,
+    pub proof: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -397,19 +476,26 @@ fn development_name(kind: ImageKind) -> &'static str {
 
 impl ServiceAttestation {
     /// The attestation of a service of `kind` (a builder or a reviewer)
-    /// whose key is `key`, in launcher mode, with a fresh instance key.
-    pub fn new(kind: ImageKind, key: Address) -> Result<ServiceAttestation> {
+    /// whose keys are `key` and, on Solana, `solana_key`, in launcher mode,
+    /// with fresh instance keys.
+    pub fn new(kind: ImageKind, key: Address, solana_key: Pubkey) -> Result<ServiceAttestation> {
         if !matches!(kind, ImageKind::Builder | ImageKind::Reviewer) {
             bail!("only a builder or a reviewer attests as a service, not {kind}");
         }
+        let mut secret = zeroize::Zeroizing::new([0u8; 32]);
+        getrandom::fill(secret.as_mut()).map_err(|_| anyhow!("no randomness for the instance"))?;
+        let solana_instance = SolanaKeypair::new_from_array(*secret).pubkey();
         Ok(ServiceAttestation {
             kind,
             key,
+            solana_key,
             mode: Mode::Launcher,
             instance: PrivateKeySigner::random().address(),
+            solana_instance,
             inner: Default::default(),
             changed: Default::default(),
             chains: Default::default(),
+            clusters: Default::default(),
         })
     }
 
@@ -436,6 +522,16 @@ impl ServiceAttestation {
     /// The key the journal names.
     pub fn instance(&self) -> Address {
         self.instance
+    }
+
+    /// The key blessed on a Solana cluster.
+    pub fn solana_key(&self) -> Pubkey {
+        self.solana_key
+    }
+
+    /// The instance's Solana key, the token's Solana signer.
+    pub fn solana_instance(&self) -> Pubkey {
+        self.solana_instance
     }
 
     fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -505,13 +601,92 @@ impl ServiceAttestation {
             .is_some_and(|leaf| leaf.read && leaf.blessed)
     }
 
+    /// A Solana cluster served, by its chain key (`solana:devnet`): its leaf
+    /// joins the tree, and the Solana key's blessing is read there and a
+    /// `bless` simulated there, `payer` paying, before a seal is kept.
+    pub fn serve_cluster(&self, cluster: String, served: ClusterServed) {
+        let value = served.platform.cluster;
+        if let Ok(mut clusters) = self.clusters.lock() {
+            clusters.insert(cluster.clone(), served);
+        }
+        self.serve_cluster_value(cluster, value);
+    }
+
+    /// A Solana cluster served, known by its chain key and the value that
+    /// stands for it alone: its leaf joins the tree, but nothing is read or
+    /// simulated there. For tests without a cluster, with
+    /// [`ServiceAttestation::note_cluster`] standing for the reads.
+    #[doc(hidden)]
+    pub fn serve_cluster_value(&self, cluster: String, value: [u8; 32]) {
+        let mut inner = self.inner();
+        if let std::collections::btree_map::Entry::Vacant(entry) = inner.clusters.entry(cluster) {
+            entry.insert(ClusterLeaf {
+                value,
+                leaf: Leaf {
+                    read: false,
+                    blessed: false,
+                    until: 0,
+                    chain_now: None,
+                    ttl: 0,
+                },
+            });
+            drop(inner);
+            self.changed.notify_one();
+        }
+    }
+
+    /// Note what the Solana cluster `cluster` says of the Solana key, as
+    /// [`ServiceAttestation::note`] does for an EVM chain.
+    pub fn note_cluster(
+        &self,
+        cluster: &str,
+        blessed: bool,
+        until: u64,
+        chain_now: Option<u64>,
+        ttl: u64,
+    ) {
+        let mut inner = self.inner();
+        if let Some(served) = inner.clusters.get_mut(cluster) {
+            let leaf = &mut served.leaf;
+            let was_due = leaf.due();
+            leaf.read = true;
+            leaf.chain_now = chain_now;
+            if chain_now.is_some() {
+                leaf.blessed = blessed;
+                leaf.until = until;
+                leaf.ttl = ttl;
+            }
+            if leaf.due() && !was_due {
+                drop(inner);
+                self.changed.notify_one();
+            }
+        }
+    }
+
+    /// Whether the Solana key is blessed as the service's kind on the
+    /// cluster `cluster`, as last read there: until then, no work is taken
+    /// on that cluster.
+    pub fn ready_cluster(&self, cluster: &str) -> bool {
+        self.inner()
+            .clusters
+            .get(cluster)
+            .is_some_and(|served| served.leaf.read && served.leaf.blessed)
+    }
+
+    /// Every leaf, EVM and Solana alike.
+    fn every_leaf(inner: &Inner) -> impl Iterator<Item = &Leaf> {
+        inner
+            .leaves
+            .values()
+            .chain(inner.clusters.values().map(|served| &served.leaf))
+    }
+
     /// When the service should next be running to renew its blessings: the
     /// soonest, over the chains served, that a blessing is down to a third
     /// of its length. `None` until some chain has said when its runs out.
     pub fn renew_at(&self) -> Option<u64> {
-        self.inner()
-            .leaves
-            .values()
+        let inner = self.inner();
+        Self::every_leaf(&inner)
             .filter(|leaf| leaf.until > 0)
             .map(|leaf| leaf.until.saturating_sub(leaf.ttl / 3))
             .min()
@@ -520,7 +695,7 @@ impl ServiceAttestation {
     /// Whether an attestation is in progress: some chain not yet read, or a
     /// leaf due and not yet renewed.
     pub fn busy(&self) -> bool {
-        self.inner().leaves.values().any(Leaf::due)
+        Self::every_leaf(&self.inner()).any(Leaf::due)
     }
 
     fn leaf_hashes(&self, inner: &Inner) -> Vec<(u64, B256)> {
@@ -531,11 +706,38 @@ impl ServiceAttestation {
             .collect()
     }
 
-    /// The tree's root over the leaves, and each leaf's proof, in chain
-    /// order.
-    fn tree(&self, inner: &Inner) -> (B256, Vec<(u64, B256, Vec<B256>)>) {
+    fn cluster_leaf_hashes(&self, inner: &Inner) -> Vec<(String, B256)> {
+        inner
+            .clusters
+            .iter()
+            .map(|(cluster, served)| {
+                (
+                    cluster.clone(),
+                    solana_service_leaf(&served.value, &self.solana_key),
+                )
+            })
+            .collect()
+    }
+
+    /// The tree's root over the leaves, the EVM chains' then the Solana
+    /// clusters', and each leaf's proof: the EVM chains' in chain order,
+    /// then the clusters' in theirs.
+    #[allow(clippy::type_complexity)]
+    fn tree(
+        &self,
+        inner: &Inner,
+    ) -> (
+        B256,
+        Vec<(u64, B256, Vec<B256>)>,
+        Vec<(String, B256, Vec<B256>)>,
+    ) {
         let leaves = self.leaf_hashes(inner);
-        let hashes: Vec<B256> = leaves.iter().map(|(_, hash)| *hash).collect();
+        let clusters = self.cluster_leaf_hashes(inner);
+        let hashes: Vec<B256> = leaves
+            .iter()
+            .map(|(_, hash)| *hash)
+            .chain(clusters.iter().map(|(_, hash)| *hash))
+            .collect();
         let top = chain::attest::merkle_root(&hashes);
         let proofs = leaves
             .iter()
@@ -548,13 +750,24 @@ impl ServiceAttestation {
                 )
             })
             .collect();
-        (top, proofs)
+        let cluster_proofs = clusters
+            .into_iter()
+            .enumerate()
+            .map(|(index, (cluster, hash))| {
+                (
+                    cluster,
+                    hash,
+                    chain::attest::merkle_proof(&hashes, leaves.len() + index),
+                )
+            })
+            .collect();
+        (top, proofs, cluster_proofs)
     }
 
     fn binding_of(&self, inner: &Inner) -> Binding {
         Binding {
             evm_signer: self.instance.into_array(),
-            solana_signer: [0; 32],
+            solana_signer: self.solana_instance.to_bytes(),
             vaults_root: self.tree(inner).0.0,
         }
     }
@@ -568,8 +781,8 @@ impl ServiceAttestation {
         let inner = self.inner();
         let binding = self.binding_of(&inner);
         let nonce = binding.nonce();
-        let (_, proofs) = self.tree(&inner);
-        let any_due = inner.leaves.values().any(Leaf::due);
+        let (_, proofs, cluster_proofs) = self.tree(&inner);
+        let any_due = Self::every_leaf(&inner).any(Leaf::due);
         let token = inner.token.as_ref().filter(|held| held.nonce == nonce);
         let sealed = inner.sealed.as_ref().filter(|sealed| sealed.nonce == nonce);
         let hex = |bytes: &[u8]| alloy::hex::encode_prefixed(bytes);
@@ -608,7 +821,55 @@ impl ServiceAttestation {
                 })
                 .collect(),
             root: None,
+            solana: self.solana_views(&inner, sealed, cluster_proofs),
         }
+    }
+
+    /// Each cluster's leaf, and the journal and seal its registry takes for
+    /// the current tree, rebuilt from the prover's seal. A seal naming
+    /// another Solana key than the instance's is no seal for a cluster.
+    fn solana_views(
+        &self,
+        inner: &Inner,
+        sealed: Option<&Sealed>,
+        proofs: Vec<(String, B256, Vec<B256>)>,
+    ) -> Vec<SolanaView> {
+        let hex = |bytes: &[u8]| alloy::hex::encode_prefixed(bytes);
+        let solana = match self.mode {
+            Mode::Launcher => sealed
+                .and_then(|sealed| SolanaSeal::from_evm(&sealed.journal, &sealed.seal))
+                .filter(|(journal, _)| journal.signer == self.solana_instance),
+            Mode::Development => None,
+        };
+        proofs
+            .into_iter()
+            .map(|(cluster, leaf, proof)| {
+                let due = inner
+                    .clusters
+                    .get(&cluster)
+                    .is_some_and(|served| served.leaf.due());
+                SolanaView {
+                    cluster,
+                    journal: solana.as_ref().map(|(journal, _)| {
+                        hex(
+                            &chain::solana::programs::anchor_lang::AnchorSerialize::try_to_vec(
+                                journal,
+                            )
+                            .unwrap_or_default(),
+                        )
+                    }),
+                    seal: solana.as_ref().map(|(_, seal)| seal.clone()),
+                    leaves: vec![SolanaLeafView {
+                        vault: Pubkey::default().to_string(),
+                        strategy_hash: hex(&[0; 32]),
+                        key: self.solana_key.to_string(),
+                        due,
+                        leaf: leaf.to_string(),
+                        proof: proof.iter().map(ToString::to_string).collect(),
+                    }],
+                }
+            })
+            .collect()
     }
 
     /// The image and project a journal must name: the development ones, or
@@ -632,9 +893,7 @@ impl ServiceAttestation {
     /// `wall_now` and each chain's own as last read.
     fn wanted(&self, wall_now: u64) -> bool {
         let inner = self.inner();
-        let wanting: Vec<Wanting> = inner
-            .leaves
-            .values()
+        let wanting: Vec<Wanting> = Self::every_leaf(&inner)
             .filter(|leaf| leaf.read && leaf.due())
             .map(|leaf| Wanting {
                 chain_now: leaf.chain_now,
@@ -682,7 +941,11 @@ impl ServiceAttestation {
     /// Check a posted seal against the current binding, without a chain:
     /// what is left is the simulated `bless` on each chain, with its leaf's
     /// proof.
-    fn check(&self, post: &SealPost) -> Result<(Sealed, Vec<Simulate>), Refusal> {
+    #[allow(clippy::type_complexity)]
+    fn check(
+        &self,
+        post: &SealPost,
+    ) -> Result<(Sealed, Vec<Simulate>, Vec<SimulateCluster>), Refusal> {
         let inner = self.inner();
         let binding = self.binding_of(&inner);
         let nonce = binding.nonce();
@@ -690,7 +953,7 @@ impl ServiceAttestation {
             return Err(Refusal::Nonce);
         }
         let refused = |why: &str| Refusal::Journal(why.to_string());
-        if inner.leaves.is_empty() {
+        if inner.leaves.is_empty() && inner.clusters.is_empty() {
             return Err(refused("the service serves no chain"));
         }
         let seal: Bytes = post
@@ -721,7 +984,16 @@ impl ServiceAttestation {
         if journal.image_digest != image || journal.project_id != project {
             return Err(refused("the journal names another image or project"));
         }
-        let (_, proofs) = self.tree(&inner);
+        // A Solana registry reads the same proof with the instance's Solana
+        // key after it: it has to be this instance's.
+        if self.mode == Mode::Launcher
+            && !inner.clusters.is_empty()
+            && SolanaSeal::from_evm(&journal_bytes, &seal)
+                .is_none_or(|(journal, _)| journal.signer != self.solana_instance)
+        {
+            return Err(refused("the seal names another Solana key"));
+        }
+        let (_, proofs, cluster_proofs) = self.tree(&inner);
         Ok((
             Sealed {
                 nonce,
@@ -733,6 +1005,10 @@ impl ServiceAttestation {
                 .into_iter()
                 .map(|(chain_id, _, proof)| (chain_id, proof))
                 .collect(),
+            cluster_proofs
+                .into_iter()
+                .map(|(cluster, _, proof)| (cluster, proof))
+                .collect(),
         ))
     }
 
@@ -740,8 +1016,35 @@ impl ServiceAttestation {
     /// `bless` of the key simulated on every chain served; kept only if each
     /// would land, so a chain whose checker refuses it doesn't wait on a seal
     /// that will never bless it there.
+    ///
+    /// A Solana cluster is asked through a far less reliable endpoint, and
+    /// allows images and checkers through an admin path of its own: one that
+    /// can't be asked, or refuses, holds back only its own blessing, which
+    /// the keeper simulates again before it relays it, as the executor's
+    /// does. The seal is refused over Solana only when it would bless the key
+    /// nowhere at all.
     pub async fn accept(&self, post: SealPost) -> Result<(), Refusal> {
-        let (sealed, simulate) = self.check(&post)?;
+        let (sealed, simulate, clusters) = self.check(&post)?;
+        let mut sealable = !simulate.is_empty();
+        let mut cluster_refused = None;
+        for (cluster, proof) in clusters {
+            match self.simulate_cluster(&sealed, &cluster, &proof).await {
+                Ok(()) => sealable = true,
+                Err(refusal) => {
+                    tracing::warn!(
+                        cluster,
+                        why = ?refusal,
+                        "a simulated bless on this cluster did not go through; the key waits there for the keeper's own simulation or a later seal"
+                    );
+                    cluster_refused.get_or_insert(refusal);
+                }
+            }
+        }
+        if let Some(refusal) = cluster_refused
+            && !sealable
+        {
+            return Err(refusal);
+        }
         for (chain_id, proof) in simulate {
             let chain = self
                 .chains
@@ -779,6 +1082,48 @@ impl ServiceAttestation {
             }
         }
         self.keep(sealed)
+    }
+
+    /// Simulate a `bless` of the Solana key on `cluster` with the seal, as
+    /// the keeper would send it there.
+    async fn simulate_cluster(
+        &self,
+        sealed: &Sealed,
+        cluster: &str,
+        proof: &[B256],
+    ) -> Result<(), Refusal> {
+        let served = self
+            .clusters
+            .lock()
+            .ok()
+            .and_then(|clusters| clusters.get(cluster).cloned())
+            .ok_or_else(|| Refusal::Unavailable(format!("{cluster} is not connected")))?;
+        let (journal, seal) =
+            SolanaSeal::from_evm(&sealed.journal, &sealed.seal).ok_or_else(|| {
+                Refusal::Journal("the seal is not one the Solana checker reads".into())
+            })?;
+        let leaf = KeyLeaf {
+            vault_chain: [0; 32],
+            vault: [0; 32],
+            strategy_hash: [0; 32],
+            key: self.solana_key,
+            proof: proof.iter().map(|hash| hash.0).collect(),
+        };
+        served
+            .platform
+            .simulate_bless(&served.client, &served.payer, &journal, &seal, &leaf)
+            .await
+            .map_err(|error| {
+                let why = format!("{error:#}");
+                if error
+                    .downcast_ref::<chain::solana::TransactionFailed>()
+                    .is_some()
+                {
+                    Refusal::Journal(format!("a simulated bless fails on {cluster}: {why}"))
+                } else {
+                    Refusal::Unavailable(why)
+                }
+            })
     }
 
     fn keep(&self, sealed: Sealed) -> Result<(), Refusal> {
@@ -848,6 +1193,39 @@ impl ServiceAttestation {
                     .collect()
             })
             .unwrap_or_default();
+        let clusters: Vec<(String, ClusterServed)> = self
+            .clusters
+            .lock()
+            .map(|clusters| {
+                clusters
+                    .iter()
+                    .map(|(cluster, served)| (cluster.clone(), served.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (cluster, served) in clusters {
+            match served
+                .platform
+                .service_standing(&served.client, &self.solana_key, self.kind.to_solana())
+                .await
+            {
+                Ok(standing) => self.note_cluster(
+                    &cluster,
+                    standing.blessed,
+                    standing.until,
+                    Some(standing.now),
+                    standing.ttl,
+                ),
+                Err(error) => {
+                    tracing::debug!(
+                        cluster,
+                        error = format!("{error:#}"),
+                        "could not read the service key's blessing"
+                    );
+                    self.note_cluster(&cluster, false, 0, None, 0);
+                }
+            }
+        }
         for (chain_id, client, deployments) in chains {
             match read_standing(&client, &deployments, self.key, self.kind).await {
                 Ok((blessed, until, now, ttl)) => {
@@ -1005,7 +1383,7 @@ pub(super) mod tests_support {
         attestation: &ServiceAttestation,
         post: &SealPost,
     ) -> Result<(), Refusal> {
-        let (sealed, _) = attestation.check(post)?;
+        let (sealed, _, _) = attestation.check(post)?;
         attestation.keep(sealed)
     }
 

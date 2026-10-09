@@ -273,9 +273,16 @@ pub struct ReviewAnswer {
     /// The source hash the reviewer computed and signed for.
     pub source_hash: String,
     pub report_hash: String,
-    /// The signed go-ahead `StrategyRegistry.register` needs, as `0x` hex.
-    /// None when the code was refused.
+    /// The signed go-ahead `StrategyRegistry.register` needs, as `0x` hex:
+    /// on an EVM chain the reviewer key's 65-byte signature, on Solana its
+    /// 64-byte ed25519 signature over the cluster's clearance digest. None
+    /// when the code was refused.
     pub clearance: Option<String>,
+    /// On Solana, the reviewer key that signed the go-ahead (base58), which
+    /// the registration names. None on an EVM chain, where the signature
+    /// names its signer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<String>,
 }
 
 /// A health report, as the executor signs and posts it.

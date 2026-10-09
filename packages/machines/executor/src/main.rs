@@ -266,6 +266,7 @@ async fn main() -> Result<()> {
                     args.clone(),
                     solana_totals.clone(),
                     attestation.clone(),
+                    served_chains.clone(),
                 ));
             }
             while clusters.join_next().await.is_some() {}
@@ -1095,7 +1096,42 @@ async fn fetch_bundle(
             },
         )
         .await?;
-    let manifest_hash = registered.manifestHash;
+    fetch_registered(store_dir, base, registered.manifestHash, bundle).await
+}
+
+/// A Solana vault's bundle read through from the public store, as an EVM
+/// vault's is: the manifest its strategy's record on the cluster names, then
+/// the component that manifest names, each checked against its hash. A
+/// vault's bundle is found here when the build service runs on another
+/// machine.
+pub(crate) async fn fetch_solana_bundle(
+    client: &chain::solana::SolanaClient,
+    platform: &chain::solana::Platform,
+    store_dir: &std::path::Path,
+    base: &str,
+    strategy_id: u64,
+    bundle: B256,
+) -> Result<bool> {
+    let Some(registered) = platform.strategy(client, strategy_id).await? else {
+        return Ok(false);
+    };
+    fetch_registered(
+        store_dir,
+        base,
+        B256::from(registered.manifest_hash),
+        bundle,
+    )
+    .await
+}
+
+/// The manifest at `manifest_hash`, then the component it names, read
+/// through into `store_dir`; refused unless the manifest is for `bundle`.
+async fn fetch_registered(
+    store_dir: &std::path::Path,
+    base: &str,
+    manifest_hash: B256,
+    bundle: B256,
+) -> Result<bool> {
     if !store::read_through(
         store_dir,
         Some(base),
@@ -6449,3 +6485,6 @@ mod key_driver_tests {
         assert_eq!(key_driver_of(&[]), None);
     }
 }
+
+#[cfg(test)]
+mod manifest_tests;

@@ -36,7 +36,7 @@ use chain::{Client, Deployments, Role};
 use crate::deploy::{PERP, SPOT, STARTING_PRICE, market_id};
 
 /// A day, in seconds: funding rates are quoted per day.
-const DAY: u64 = 86_400;
+pub(crate) const DAY: u64 = 86_400;
 
 /// How a tape walks. Each volatility is a standard deviation over an hour.
 #[derive(Clone, Copy, Debug)]
@@ -345,7 +345,7 @@ async fn set_clock(client: &Client, seconds_per_block: u64) -> Result<()> {
 
 /// The longest stretch one post accrues funding for. An operator stopped for
 /// longer starts again without paying out days at a rate nobody saw quoted.
-const LONGEST_ACCRUAL: u64 = DAY;
+pub(crate) const LONGEST_ACCRUAL: u64 = DAY;
 
 /// What one unit of a perpetual pays over `elapsed` seconds at `rate_per_day`
 /// (the market's funding rate, in the asset's units per unit a day), rounded
@@ -454,6 +454,9 @@ pub(crate) const RESTART_AFTER: Duration = Duration::from_secs(60);
 /// everything but a key that isn't the venue's operator.
 pub(crate) fn worth_restarting(error: &anyhow::Error) -> bool {
     error.downcast_ref::<WrongOperator>().is_none()
+        && error
+            .downcast_ref::<crate::solana_testnet::WrongOperator>()
+            .is_none()
 }
 
 /// Where a restarted operator's basis starts: the gap between the venue's

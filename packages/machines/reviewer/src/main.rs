@@ -25,6 +25,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use chain::bindings::reviews::{IReviewRegistry, Review as SignedReview};
 use chain::bindings::strategies::IStrategyRegistry;
+use chain::solana::programs::publishing::state::ReviewInput;
 use chain::{NetworkName, Served};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,7 @@ use shared::manifest::{Manifest, hash_bytes};
 use shared::model::review::{Finding, Rating, Report};
 use shared::{Chain, ReviewAnswer, ReviewRequest};
 use shonin_reviewer::battery::{Answer, Battery};
+use shonin_reviewer::on_solana::{self, OnSolana};
 use shonin_reviewer::{cloud, jev, messages, source};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -171,6 +173,11 @@ struct Reviewer {
     /// review asked for on one not yet connected is answered 503, which the
     /// build service takes for "ask again later".
     connected: std::sync::RwLock<BTreeMap<Chain, Arc<Served>>>,
+    /// The Solana cluster, once taken on: blessed there, and its key stocked
+    /// (see [`on_solana::take_on`]).
+    solana: std::sync::RwLock<Option<Arc<OnSolana>>>,
+    /// The reviewer's own Solana key, in the attested image.
+    solana_key: Option<Arc<chain::solana::Keypair>>,
     store: PathBuf,
     model: Option<String>,
     /// The pinned model's API, when the reviewer holds its key; otherwise
@@ -304,6 +311,39 @@ impl Reviewer {
             .is_none_or(|internal| internal.writable() && internal.settled())
     }
 
+    /// Whether a review on `chain` can be made now: it is served, and taken
+    /// on.
+    fn serving(&self, chain: Chain) -> Result<(), Unserved> {
+        if chain == Chain::Solana {
+            return self.on_solana().map(|_| ());
+        }
+        self.on(chain).map(|_| ())
+    }
+
+    /// The Solana cluster, once taken on.
+    fn on_solana(&self) -> Result<Arc<OnSolana>, Unserved> {
+        if !self.configured.contains(&Chain::Solana) {
+            return Err(Unserved::NotServed);
+        }
+        self.solana
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or(Unserved::NotConnected)
+    }
+
+    /// The canonical chain, where a build service's request is checked: the
+    /// registry there blesses the key it signs requests with.
+    fn canonical_served(&self) -> Option<Arc<Served>> {
+        let canonical = self.canonical?;
+        self.connected
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .find(|served| served.client.chain_id == canonical)
+            .cloned()
+    }
+
     fn on(&self, chain: Chain) -> Result<Arc<Served>, Unserved> {
         if !self.configured.contains(&chain) {
             return Err(Unserved::NotServed);
@@ -392,11 +432,18 @@ async fn main() -> Result<()> {
         }),
         None => None,
     };
-    let configured = targets.iter().map(|target| target.vault_chain).collect();
+    let mut configured: Vec<Chain> = targets.iter().map(|target| target.vault_chain).collect();
+    let solana_targets = args.chain_args.solana_targets()?;
+    configured.extend(solana_targets.iter().map(|target| target.vault_chain));
     // Each chain is taken on as soon as it connects: one out of reach (its
     // node down, its deployment missing) is tried again in the background,
     // and keeps the reviewer from no other.
     let mut connecting = args.chain_args.connect_each()?;
+    let mut clusters = if solana_targets.is_empty() {
+        tokio::sync::mpsc::unbounded_channel().1
+    } else {
+        args.chain_args.connect_each_solana()?
+    };
 
     let calibrator = jev::Client::configured(
         args.calibrator_key.clone(),
@@ -437,6 +484,8 @@ async fn main() -> Result<()> {
     let reviewer = Arc::new(Reviewer {
         configured,
         connected: Default::default(),
+        solana: Default::default(),
+        solana_key: launched.as_ref().map(|launched| launched.solana.clone()),
         store: args.store,
         model: args.model,
         api,
@@ -464,6 +513,12 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         while let Some(served) = connecting.recv().await {
             tokio::spawn(take_on(joining.clone(), served));
+        }
+    });
+    let joining = reviewer.clone();
+    tokio::spawn(async move {
+        while let Some(served) = clusters.recv().await {
+            tokio::spawn(take_on_solana(joining.clone(), served));
         }
     });
 
@@ -697,6 +752,35 @@ async fn take_on(reviewer: Arc<Reviewer>, served: Served) {
     tracing::info!(%chain, "reviewing on this chain");
 }
 
+/// Take the Solana cluster on once it is connected (see
+/// [`on_solana::take_on`]), trying again, waiting longer each time, if it
+/// can't be.
+async fn take_on_solana(reviewer: Arc<Reviewer>, served: chain::SolanaServed) {
+    let mut wait = Duration::from_secs(5);
+    loop {
+        match on_solana::take_on(
+            shonin_rootkey::ImageKind::Reviewer,
+            reviewer.attestation.clone(),
+            reviewer.solana_key.clone(),
+            served.clone(),
+            BLESSING_LOOKED_AT_EVERY,
+        )
+        .await
+        {
+            Ok(on) => {
+                tracing::info!(cluster = on.cluster(), key = %on.address(), "reviewing on this Solana cluster");
+                *reviewer.solana.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(on));
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(cluster = %served.key, error = format!("{error:#}"), seconds = wait.as_secs(), "the Solana cluster could not be taken on; trying again");
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_secs(300));
+            }
+        }
+    }
+}
+
 async fn review(
     State(reviewer): State<Arc<Reviewer>>,
     UrlPath(chain): UrlPath<Chain>,
@@ -716,8 +800,8 @@ async fn review(
     }
     // Asked about a chain not connected yet, the build service puts the job
     // back in its queue and asks again later.
-    match reviewer.on(chain) {
-        Ok(_) => {}
+    match reviewer.serving(chain) {
+        Ok(()) => {}
         Err(Unserved::NotConnected) => {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -733,10 +817,21 @@ async fn review(
     }
     // In the attested image, only a blessed build service may ask: a review
     // spends the model's key, and its go-ahead is what the registry takes.
+    // A request about a Solana strategy is checked on the canonical chain,
+    // whose registry blesses the key the build service signs requests with.
     if reviewer.key.is_some() {
-        let on = reviewer
-            .on(chain)
-            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+        let on = if chain == Chain::Solana {
+            reviewer.canonical_served().ok_or_else(|| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the canonical chain is not connected yet: ask again shortly".to_string(),
+                )
+            })?
+        } else {
+            reviewer
+                .on(chain)
+                .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?
+        };
         asked_by_the_builder(&reviewer.taken, &on, uri.path(), &headers, &body).await?;
     }
     let request: ReviewRequest = serde_json::from_slice(&body).map_err(|error| {
@@ -875,7 +970,7 @@ async fn review_one(
     chain: Chain,
     request: ReviewRequest,
 ) -> Result<ReviewAnswer> {
-    let on = reviewer.on(chain)?;
+    reviewer.serving(chain)?;
     let archive = shared::base64::decode(&request.archive_base64).map_err(unreadable)?;
     // The reviewer hashes what it received itself, and signs for that.
     let source_hash = hash_bytes(&archive);
@@ -982,6 +1077,27 @@ async fn review_one(
     let codes = ratings.map(Rating::code);
     let finding_count = report.findings.len() as u16;
 
+    if chain == Chain::Solana {
+        let on = reviewer.on_solana()?;
+        return solana_verdict(
+            reviewer,
+            &on,
+            &request,
+            ReviewInput {
+                bundle_hash: [0; 32],
+                source_hash: source_bytes.0,
+                model_id_hash: model_id_hash.0,
+                prompt_hash: prompt_hash().0,
+                report_hash: report_bytes.0,
+                ratings: codes,
+                finding_count,
+            },
+            refused,
+            (source_hash, report_hash),
+        )
+        .await;
+    }
+    let on = reviewer.on(chain)?;
     if refused {
         reviewer
             .send(
@@ -1006,6 +1122,7 @@ async fn review_one(
             source_hash,
             report_hash,
             clearance: None,
+            signer: None,
         });
     }
 
@@ -1053,6 +1170,80 @@ async fn review_one(
         source_hash,
         report_hash,
         clearance: Some(format!("{clearance}")),
+        signer: None,
+    })
+}
+
+/// The verdict on a Solana strategy: a refusal recorded on the cluster, or a
+/// go-ahead signed with the reviewer's Solana key over the cluster's
+/// clearance digest, its review kept to be posted once the build is
+/// registered.
+async fn solana_verdict(
+    reviewer: &Reviewer,
+    on: &OnSolana,
+    request: &ReviewRequest,
+    review: ReviewInput,
+    refused: bool,
+    (source_hash, report_hash): (String, String),
+) -> Result<ReviewAnswer> {
+    let platform = &on.served.platform;
+    let client = &on.served.client;
+    if refused {
+        let ix = platform
+            .ix_submit_refusal(
+                client,
+                &on.address(),
+                &on.address(),
+                request.strategy_id,
+                review,
+            )
+            .await?;
+        client
+            .send(vec![ix], &[&on.key])
+            .await
+            .context("the publishing program would not record the refusal")?;
+        tracing::info!(
+            cluster = on.cluster(),
+            id = request.strategy_id,
+            "refused as malicious"
+        );
+        return Ok(ReviewAnswer {
+            source_hash,
+            report_hash,
+            clearance: None,
+            signer: None,
+        });
+    }
+    use chain::solana::Signer as _;
+    let digest = platform.clearance_digest(request.strategy_id, &review.source_hash);
+    let clearance = on.key.sign_message(&digest);
+    let mut pending = reviewer.pending.lock().await;
+    pending.push(Pending {
+        chain: Chain::Solana,
+        strategy_id: request.strategy_id,
+        source_hash: B256::from(review.source_hash),
+        report_hash: B256::from(review.report_hash),
+        model_id_hash: B256::from(review.model_id_hash),
+        ratings: review.ratings,
+        finding_count: review.finding_count,
+        cleared_at: cloud::now(),
+    });
+    // A go-ahead whose review isn't written down would never be posted once
+    // the reviewer restarts: none is given until it is.
+    if let Err(error) = write_pending(reviewer, &pending).await {
+        pending.pop();
+        return Err(error);
+    }
+    tracing::info!(
+        cluster = on.cluster(),
+        id = request.strategy_id,
+        "read, and cleared to build"
+    );
+    Ok(ReviewAnswer {
+        source_hash,
+        report_hash,
+        clearance: Some(alloy::hex::encode_prefixed(clearance.as_ref())),
+        signer: Some(on.address().to_string()),
     })
 }
 
@@ -1093,6 +1284,10 @@ async fn post_pending(reviewer: &Reviewer) {
 /// Post one review if its build has been registered: whether it is done
 /// with (posted now, or already), or still waits for its build.
 async fn post_one(reviewer: &Reviewer, review: &Pending) -> Result<bool> {
+    if review.chain == Chain::Solana {
+        let on = reviewer.on_solana()?;
+        return post_one_on_solana(&on, review).await;
+    }
     let on = reviewer.on(review.chain)?;
     let id = U256::from(review.strategy_id);
     let reviews = on.deployments.reviews;
@@ -1137,6 +1332,70 @@ async fn post_one(reviewer: &Reviewer, review: &Pending) -> Result<bool> {
     Ok(true)
 }
 
+/// [`post_one`] on the Solana cluster.
+async fn post_one_on_solana(on: &OnSolana, review: &Pending) -> Result<bool> {
+    let platform = &on.served.platform;
+    let client = &on.served.client;
+    if platform
+        .review(client, review.strategy_id)
+        .await?
+        .is_some_and(|posted| posted.reviewed_at != 0)
+    {
+        return Ok(true);
+    }
+    // Not built yet, or never will be: a failed build has nothing to post
+    // against, and its review stays in the store.
+    let Some(strategy) = platform.strategy(client, review.strategy_id).await? else {
+        return Ok(false);
+    };
+    if strategy.source_hash != review.source_hash.0 {
+        bail!(
+            "strategy {} was registered from other source than the reviewer read",
+            review.strategy_id
+        );
+    }
+    let ix = platform
+        .ix_submit_review(
+            client,
+            &on.address(),
+            &on.address(),
+            review.strategy_id,
+            ReviewInput {
+                bundle_hash: strategy.bundle_hash,
+                source_hash: review.source_hash.0,
+                model_id_hash: review.model_id_hash.0,
+                prompt_hash: prompt_hash().0,
+                report_hash: review.report_hash.0,
+                ratings: review.ratings,
+                finding_count: review.finding_count,
+            },
+        )
+        .await?;
+    client
+        .send(vec![ix], &[&on.key])
+        .await
+        .context("the publishing program would not take the review")?;
+    tracing::info!(
+        cluster = on.cluster(),
+        id = review.strategy_id,
+        "review posted"
+    );
+    Ok(true)
+}
+
+/// What the model was asked, the shape it had to answer in, and the
+/// questions the ratings come from, together.
+fn prompt_hash() -> B256 {
+    keccak256(
+        [
+            PROMPT.as_bytes(),
+            SCHEMA.as_bytes(),
+            shonin_reviewer::battery::BATTERY.as_bytes(),
+        ]
+        .concat(),
+    )
+}
+
 fn signed(
     bundle: B256,
     source: B256,
@@ -1152,16 +1411,7 @@ fn signed(
         // the time it received this; what is sent here is only a courtesy.
         reviewerImage: chain::attest::image_digest("reviewer"),
         modelIdHash: model,
-        // What the model was asked, the shape it had to answer in, and the
-        // questions the ratings come from, together.
-        promptHash: keccak256(
-            [
-                PROMPT.as_bytes(),
-                SCHEMA.as_bytes(),
-                shonin_reviewer::battery::BATTERY.as_bytes(),
-            ]
-            .concat(),
-        ),
+        promptHash: prompt_hash(),
         reportHash: report,
         ratings,
         findingCount: findings,
@@ -1888,6 +2138,8 @@ mod tests {
             std::env::temp_dir().join(format!("shonin-reviewer-pending-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
         let reviewer = Reviewer {
+            solana: Default::default(),
+            solana_key: None,
             configured: vec![Chain::Base, Chain::Robinhood],
             connected: std::sync::RwLock::new(BTreeMap::from([
                 (
@@ -2050,6 +2302,8 @@ mod tests {
     #[tokio::test]
     async fn the_reviewer_is_idle_only_with_nothing_to_do() {
         let reviewer = Reviewer {
+            solana: Default::default(),
+            solana_key: None,
             configured: vec![Chain::Base],
             connected: Default::default(),
             store: PathBuf::new(),
@@ -2095,6 +2349,10 @@ mod tests {
 
     impl cloud::Attesting for Blessing {
         fn serve_chain(&self, _: chain::Client, _: chain::Deployments) {}
+        fn serve_cluster(&self, _: String, _: shonin_rootkey::service::ClusterServed) {}
+        fn ready_cluster(&self, _: &str) -> bool {
+            false
+        }
         fn ready(&self, _: u64) -> bool {
             self.0.load(Ordering::SeqCst)
         }
@@ -2149,6 +2407,8 @@ mod tests {
         let url = a_node_holding(balance.clone()).await;
         let blessing = Arc::new(Blessing::default());
         let reviewer = Arc::new(Reviewer {
+            solana: Default::default(),
+            solana_key: None,
             configured: vec![Chain::Base],
             connected: Default::default(),
             store: PathBuf::new(),

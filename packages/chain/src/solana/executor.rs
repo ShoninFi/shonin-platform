@@ -67,7 +67,9 @@ pub struct Blessed {
     /// When the blessing for this vault and bundle runs out; zero if there
     /// is none.
     pub until: u64,
-    /// Whether the key's record says it is an executor's.
+    /// Whether the key's record says it is of the kind the leaf blesses: an
+    /// executor's for this vault and bundle ([`Blessed::read`]), or a
+    /// builder's or a reviewer's ([`Blessed::read_service`]).
     pub executor: bool,
     /// Whether the registry counts the blessing now: it hasn't run out, and
     /// the checker it came through, the key's image and its project are all
@@ -122,6 +124,46 @@ impl Blessed {
                     && info.vault == vault.to_bytes()
                     && &info.strategy_hash == bundle
             }),
+            ttl: config.blessing_ttl,
+        })
+    }
+
+    /// Where a builder's or a reviewer's `key` stands: blessed for no vault,
+    /// as the service its record names, until its record's blessing runs
+    /// out.
+    pub async fn read_service(
+        client: &SolanaClient,
+        platform: &Platform,
+        key: &Pubkey,
+    ) -> Result<Self> {
+        let config = platform.registry_config(client).await?;
+        let info: Option<KeyInfo> = client.load(&registry::key_address(key)).await?;
+        let Some(info) = info else {
+            return Ok(Self {
+                ttl: config.blessing_ttl,
+                ..Self::default()
+            });
+        };
+        let service = matches!(info.kind, ImageKind::Builder | ImageKind::Reviewer);
+        let image: Option<ImageRecord> = client
+            .load(&registry::image_address(&info.image_digest))
+            .await?;
+        let project: Option<ProjectRecord> = client
+            .load(&registry::project_address(&info.project_id))
+            .await?;
+        let counts = service
+            && shonin_registry::state::is_blessed_as(
+                &config,
+                &info,
+                image.as_ref(),
+                project.as_ref(),
+                info.kind,
+                client.now().await?,
+            );
+        Ok(Self {
+            until: info.blessed_until,
+            executor: service,
+            counts,
             ttl: config.blessing_ttl,
         })
     }

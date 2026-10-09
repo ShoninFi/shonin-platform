@@ -1,4 +1,5 @@
-//! Blessings and lamports for the executor's keys on a Solana cluster.
+//! Blessings and lamports for the executor's keys on a Solana cluster, and
+//! for the builder's and the reviewer's.
 //!
 //! The executor publishes on its status port (`GET /attestation`), beside
 //! its EVM leaves, each Solana cluster's leaves, with the journal and seal
@@ -67,6 +68,14 @@ pub(crate) struct Read {
     pub proof: Vec<[u8; 32]>,
 }
 
+impl Read {
+    /// Whether the leaf is a builder's or a reviewer's: it names no vault and
+    /// no bundle.
+    pub fn is_service(&self) -> bool {
+        self.vault == Pubkey::default() && self.bundle == [0; 32]
+    }
+}
+
 fn word(text: &str) -> Result<[u8; 32]> {
     alloy::hex::decode(text)
         .context("not hex")?
@@ -118,10 +127,12 @@ pub(crate) trait Registry {
     async fn now(&self) -> Result<u64>;
     /// How long a blessing lasts from the attestation it came from.
     async fn ttl(&self) -> Result<u64>;
-    /// Where the leaf's key's blessing for its vault and bundle stands.
+    /// Where the leaf's key's blessing for its vault and bundle stands, or,
+    /// for a leaf naming no vault, its blessing as a builder or a reviewer.
     async fn blessed(&self, leaf: &Read) -> Result<Blessed>;
     /// Whether the cluster vouches for the key as the executor of a live
-    /// vault running the leaf's bundle.
+    /// vault running the leaf's bundle, or, for a leaf naming no vault, as a
+    /// builder or a reviewer.
     async fn vouches_for(&self, leaf: &Read) -> Result<bool>;
     async fn simulate_bless(&self, journal: &Journal, seal: &SolanaSeal, leaf: &Read)
     -> Result<()>;
@@ -269,7 +280,7 @@ pub(crate) async fn round(
             continue;
         }
         if let Err(error) = registry.simulate_bless(journal, seal, leaf).await {
-            tracing::debug!(vault = %leaf.vault, key = %leaf.key, error = format!("{error:#}"), "a blessing would not go through; not sent");
+            tracing::warn!(vault = %leaf.vault, key = %leaf.key, error = format!("{error:#}"), "a blessing would not go through; not sent");
             done.not_simulated.push(leaf.key);
             continue;
         }
@@ -335,13 +346,20 @@ pub(crate) struct OnCluster<'a> {
 
 impl OnCluster<'_> {
     fn key_leaf(&self, leaf: &Read) -> KeyLeaf {
-        KeyLeaf {
-            vault_chain: self.platform.cluster,
-            vault: leaf.vault.to_bytes(),
-            strategy_hash: leaf.bundle,
-            key: leaf.key,
-            proof: leaf.proof.clone(),
-        }
+        key_leaf(&self.platform.cluster, leaf)
+    }
+}
+
+/// The leaf the registry rebuilds for `leaf`: a vault key names this cluster,
+/// its vault and its bundle; a builder's or a reviewer's names none of them
+/// (the registry refuses a service key that names a vault chain).
+fn key_leaf(cluster: &[u8; 32], leaf: &Read) -> KeyLeaf {
+    KeyLeaf {
+        vault_chain: if leaf.is_service() { [0; 32] } else { *cluster },
+        vault: leaf.vault.to_bytes(),
+        strategy_hash: leaf.bundle,
+        key: leaf.key,
+        proof: leaf.proof.clone(),
     }
 }
 
@@ -359,6 +377,9 @@ impl Registry for OnCluster<'_> {
     }
 
     async fn blessed(&self, leaf: &Read) -> Result<Blessed> {
+        if leaf.is_service() {
+            return Blessed::read_service(self.client, self.platform, &leaf.key).await;
+        }
         Blessed::read(
             self.client,
             self.platform,
@@ -370,6 +391,10 @@ impl Registry for OnCluster<'_> {
     }
 
     async fn vouches_for(&self, leaf: &Read) -> Result<bool> {
+        if leaf.is_service() {
+            let blessed = self.blessed(leaf).await?;
+            return Ok(blessed.holds(self.client.now().await?));
+        }
         let vault = match self.platform.vault(self.client, &leaf.vault).await {
             Ok(vault) => vault,
             Err(_) => return Ok(false),
@@ -439,7 +464,7 @@ impl Registry for OnCluster<'_> {
             .await;
         match landed(sent) {
             Sent::Done => {
-                tracing::info!(%key, lamports = give, "a vault key was given its lamports");
+                tracing::info!(%key, lamports = give, "a key was given its lamports");
                 Ok(true)
             }
             Sent::MayStillLand => {
@@ -459,14 +484,17 @@ fn landed(sent: Result<chain::solana::Landed>) -> Sent {
     }
 }
 
-/// Relay the executor's blessings on one cluster and keep its blessed keys
-/// in lamports, for as long as the keeper runs.
+/// Relay the blessings `source` publishes (the executor, the builder or the
+/// reviewer) on one cluster and keep its blessed keys in lamports, for as
+/// long as the keeper runs. A builder or a reviewer is often off: that is
+/// said at debug only.
 pub(crate) async fn keep_keys(
     client: SolanaClient,
     platform: Platform,
     cluster: String,
     keeper: Keypair,
     executor: String,
+    service: bool,
 ) {
     let http = reqwest::Client::new();
     let mut memory = Memory::default();
@@ -487,18 +515,26 @@ pub(crate) async fn keep_keys(
                 }
                 Err(error) => {
                     memory.looked(at);
+                    if service {
+                        tracing::debug!(%cluster, source = executor, error = format!("{error:#}"), "the service does not answer");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
                     Err(error)
                 }
             };
             match looked {
                 Ok(()) => {
                     if said.over() {
-                        tracing::info!(%cluster, "the executor's Solana keys are looked after again");
+                        tracing::info!(%cluster, source = executor, "the Solana keys are looked after again");
                     }
+                }
+                Err(error) if chain::solana::rate_limited(&error) => {
+                    tracing::debug!(%cluster, error = format!("{error:#}"), "the node limits the rate; the Solana keys are looked after next time");
                 }
                 Err(error) => {
                     if let Some(times) = said.due(Instant::now()) {
-                        tracing::warn!(%cluster, times, error = format!("{error:#}"), "could not look after the executor's Solana keys");
+                        tracing::warn!(%cluster, source = executor, times, error = format!("{error:#}"), "could not look after the Solana keys");
                     }
                 }
             }
@@ -699,6 +735,107 @@ mod tests {
         memory.held.clear();
         one_round(&stand, &published, &mut memory).await;
         assert_eq!(*stand.sent.lock().unwrap(), vec![key(1)]);
+    }
+
+    /// A builder's Solana status, as the root key's service attestation
+    /// serves it: one leaf naming no vault and no bundle.
+    fn a_service_s_status(key: Pubkey) -> Published {
+        serde_json::from_value(serde_json::json!({
+            "mode": "launcher",
+            "leaves": [],
+            "root": null,
+            "solana": [{
+                "cluster": "solana:devnet",
+                "journal": journal(NOW),
+                "seal": {"kind": "proof", "seal": "0x00"},
+                "leaves": [{
+                    "vault": Pubkey::default().to_string(),
+                    "strategy_hash": alloy::hex::encode_prefixed([0u8; 32]),
+                    "key": key.to_string(),
+                    "due": true,
+                    "leaf": alloy::hex::encode_prefixed([9u8; 32]),
+                    "proof": [alloy::hex::encode_prefixed([8u8; 32])],
+                }],
+            }],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_service_key_s_leaf_names_no_vault_chain_and_a_vault_key_s_names_its_cluster() {
+        let cluster = [9u8; 32];
+        let service = Read {
+            vault: Pubkey::default(),
+            bundle: [0; 32],
+            key: key(5),
+            proof: vec![],
+        };
+        let built = key_leaf(&cluster, &service);
+        assert_eq!(built.vault_chain, [0; 32]);
+        assert_eq!(built.vault, [0; 32]);
+        assert_eq!(built.strategy_hash, [0; 32]);
+        let vault = Read {
+            vault: key(101),
+            bundle: [7; 32],
+            key: key(1),
+            proof: vec![],
+        };
+        assert_eq!(key_leaf(&cluster, &vault).vault_chain, cluster);
+    }
+
+    #[tokio::test]
+    async fn a_service_s_key_is_relayed_and_stocked_only_once_the_cluster_counts_it_as_a_service() {
+        let stand = Stand::new();
+        let mut memory = Memory::default();
+        let published = a_service_s_status(key(5));
+        let read = published.solana[0].leaves[0].read().unwrap();
+        assert!(read.is_service());
+        assert!(!leaf(1).read().unwrap().is_service());
+        let done = one_round(&stand, &published, &mut memory).await;
+        assert_eq!(done.sent, vec![key(5)]);
+        assert!(done.stocked.is_empty());
+        // Blessed as a service, and the cluster vouches for it: stocked.
+        stand.blessings.lock().unwrap().insert(
+            key(5),
+            Blessed {
+                until: NOW + TTL,
+                executor: true,
+                counts: true,
+                ttl: TTL,
+            },
+        );
+        stand.vouched.lock().unwrap().insert(key(5));
+        memory.held.clear();
+        let done = one_round(&stand, &published, &mut memory).await;
+        assert!(done.sent.is_empty());
+        assert_eq!(done.stocked, vec![key(5)]);
+    }
+
+    #[test]
+    fn a_service_blessing_holds_only_while_the_registry_counts_it() {
+        let counted = Blessed {
+            until: NOW + TTL,
+            executor: true,
+            counts: true,
+            ttl: TTL,
+        };
+        assert!(counted.holds(NOW));
+        // A revoked image's key, or a key of another kind, is no service's.
+        assert!(
+            !Blessed {
+                counts: false,
+                ..counted
+            }
+            .holds(NOW)
+        );
+        assert!(
+            !Blessed {
+                executor: false,
+                ..counted
+            }
+            .holds(NOW)
+        );
+        assert!(!counted.holds(NOW + TTL));
     }
 
     #[test]

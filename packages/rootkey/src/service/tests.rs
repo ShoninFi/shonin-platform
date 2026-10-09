@@ -13,6 +13,9 @@ const CHAIN_A: u64 = 84_532;
 const CHAIN_B: u64 = 998;
 const TTL: u64 = 72 * 3_600;
 const NOW: u64 = 1_800_000_000;
+const SOLANA_KEY: chain::solana::Pubkey = chain::solana::Pubkey::new_from_array([7; 32]);
+const DEVNET: &str = "solana:devnet";
+const DEVNET_VALUE: [u8; 32] = [0xD5; 32];
 
 fn seed(byte: u8) -> [u8; 32] {
     [byte; 32]
@@ -24,6 +27,25 @@ fn an_identity_is_the_same_for_the_same_seed_and_another_for_another() {
     assert_eq!(one.address(), Identity::from_seed(seed(1)).address());
     assert_ne!(one.address(), Identity::from_seed(seed(2)).address());
     assert_eq!(one.signer().address(), one.address());
+}
+
+#[test]
+fn a_service_s_solana_key_is_its_seed_s_alone_and_never_its_signer() {
+    let one = Identity::from_seed(seed(1));
+    assert_eq!(
+        one.solana_address(),
+        Identity::from_seed(seed(1)).solana_address()
+    );
+    assert_ne!(
+        one.solana_address(),
+        Identity::from_seed(seed(2)).solana_address()
+    );
+    use chain::solana::Signer as _;
+    assert_eq!(one.solana().pubkey(), one.solana_address());
+    // Neither the EVM signer's secret nor the state key: a label of its own.
+    let secret = one.solana().to_bytes();
+    assert_ne!(&secret[..32], one.signer().to_bytes().as_slice());
+    assert!(!format!("{one:?}").contains(&one.solana_address().to_string()));
 }
 
 #[test]
@@ -179,8 +201,13 @@ fn oz_verify(proof: &[B256], root: B256, leaf: B256) -> bool {
 }
 
 fn attestation(chains: &[u64]) -> ServiceAttestation {
-    let key = Identity::from_seed(seed(1)).address();
-    let attestation = ServiceAttestation::new(ImageKind::Builder, key).unwrap();
+    let identity = Identity::from_seed(seed(1));
+    let attestation = ServiceAttestation::new(
+        ImageKind::Builder,
+        identity.address(),
+        identity.solana_address(),
+    )
+    .unwrap();
     for chain in chains {
         attestation.serve_chain_id(*chain);
     }
@@ -190,9 +217,11 @@ fn attestation(chains: &[u64]) -> ServiceAttestation {
 #[test]
 fn only_a_builder_or_a_reviewer_attests_as_a_service() {
     for kind in [ImageKind::Executor, ImageKind::Unwinder, ImageKind::Holder] {
-        assert!(ServiceAttestation::new(kind, Address::repeat_byte(1)).is_err());
+        assert!(ServiceAttestation::new(kind, Address::repeat_byte(1), SOLANA_KEY).is_err());
     }
-    assert!(ServiceAttestation::new(ImageKind::Reviewer, Address::repeat_byte(1)).is_ok());
+    assert!(
+        ServiceAttestation::new(ImageKind::Reviewer, Address::repeat_byte(1), SOLANA_KEY).is_ok()
+    );
 }
 
 #[test]
@@ -257,6 +286,7 @@ fn the_status_is_in_the_executor_s_shape() {
             "root",
             "seal",
             "seal_wanted",
+            "solana",
             "token",
             "token_issued_at"
         ]
@@ -440,6 +470,164 @@ async fn a_posted_seal_is_not_kept_while_a_chain_cannot_simulate_it() {
         Err(Refusal::Unavailable(_))
     ));
     assert!(attestation.status().seal.is_none());
+}
+
+// Solana ---------------------------------------------------------------------
+
+fn on_devnet(chains: &[u64]) -> ServiceAttestation {
+    let attestation = attestation(chains);
+    attestation.serve_cluster_value(DEVNET.into(), DEVNET_VALUE);
+    attestation
+}
+
+#[test]
+fn a_solana_leaf_names_the_solana_key_on_its_cluster_alone_after_the_evm_leaves() {
+    let attestation = on_devnet(&[CHAIN_A, CHAIN_B]);
+    let status = attestation.status();
+    let root: B256 = status.binding.vaults_root.parse().unwrap();
+    // The instance's Solana key is the token's Solana signer: neither zero
+    // nor the key that is blessed.
+    let signer: B256 = status.binding.solana_signer.parse().unwrap();
+    assert_eq!(signer.0, attestation.solana_instance().to_bytes());
+    assert_ne!(signer, B256::ZERO);
+    assert_ne!(attestation.solana_instance(), attestation.solana_key());
+    // The EVM leaves are where they were, and still prove.
+    assert_eq!(status.leaves.len(), 2);
+    for view in &status.leaves {
+        let proof: Vec<B256> = view.proof.iter().map(|p| p.parse().unwrap()).collect();
+        assert!(oz_verify(&proof, root, view.leaf.parse().unwrap()));
+    }
+    let [cluster] = status.solana.as_slice() else {
+        panic!("one cluster");
+    };
+    assert_eq!(cluster.cluster, DEVNET);
+    assert!(cluster.journal.is_none() && cluster.seal.is_none());
+    let [leaf] = cluster.leaves.as_slice() else {
+        panic!("one leaf");
+    };
+    // The Solana registry's leaf for a key serving no vault, blessed on this
+    // cluster.
+    let expected = B256::from(chain::solana::programs::common::digest::blessing_leaf(
+        &[0; 32],
+        &[0; 32],
+        &[0; 32],
+        &DEVNET_VALUE,
+        &attestation.solana_key().to_bytes(),
+    ));
+    assert_eq!(leaf.leaf.parse::<B256>().unwrap(), expected);
+    assert_eq!(leaf.key, attestation.solana_key().to_string());
+    assert_eq!(leaf.vault, chain::solana::Pubkey::default().to_string());
+    assert_eq!(leaf.strategy_hash, format!("0x{}", "00".repeat(32)));
+    assert!(leaf.due);
+    let proof: Vec<B256> = leaf.proof.iter().map(|p| p.parse().unwrap()).collect();
+    assert!(oz_verify(&proof, root, expected));
+    // For no other cluster, and not for the instance's key.
+    assert!(!oz_verify(
+        &proof,
+        root,
+        solana_service_leaf(&[0xD6; 32], &attestation.solana_key())
+    ));
+    assert!(!oz_verify(
+        &proof,
+        root,
+        solana_service_leaf(&DEVNET_VALUE, &attestation.solana_instance())
+    ));
+}
+
+#[test]
+fn a_cluster_is_ready_once_it_says_the_solana_key_is_blessed_and_wants_renewal_as_a_chain_does() {
+    let attestation = on_devnet(&[CHAIN_A]);
+    attestation.note(CHAIN_A, true, NOW + TTL, Some(NOW), TTL);
+    // The cluster not read yet: busy, and not ready there.
+    assert!(attestation.busy());
+    assert!(!attestation.ready_cluster(DEVNET));
+    assert!(attestation.ready(CHAIN_A));
+    attestation.note_cluster(DEVNET, false, 0, Some(NOW), TTL);
+    assert!(tests_support::wanted(&attestation, NOW));
+    attestation.note_cluster(DEVNET, true, NOW + TTL - 50, Some(NOW), TTL);
+    assert!(attestation.ready_cluster(DEVNET));
+    assert!(!attestation.busy());
+    assert_eq!(attestation.renew_at(), Some(NOW + TTL - 50 - TTL / 3));
+    assert!(!attestation.ready_cluster("solana:mainnet"));
+    // Down to half on the cluster alone: busy again.
+    attestation.note_cluster(DEVNET, true, NOW + TTL / 2 - 1, Some(NOW), TTL);
+    assert!(attestation.busy());
+}
+
+/// A seal as the prover makes it for `attestation`'s current tree, with
+/// `solana_signer` in its tail.
+fn proved(attestation: &ServiceAttestation, digest: B256, solana_signer: [u8; 32]) -> SealPost {
+    let canonical = shonin_attestation_core::Journal {
+        image_digest: digest.0,
+        project_id: project().0,
+        vaults_root: attestation.binding().vaults_root,
+        issued_at: NOW,
+        evm_signer: attestation.instance().into_array(),
+        solana_signer,
+        key_hash: [5; 32],
+    };
+    let mut seal = vec![9u8; chain::solana::attest::GROTH16_SEAL_LENGTH];
+    seal.extend_from_slice(&canonical.evm_seal_tail());
+    SealPost {
+        nonce: attestation.binding().nonce(),
+        seal: alloy::hex::encode_prefixed(seal),
+        journal: alloy::hex::encode_prefixed(canonical.evm()),
+    }
+}
+
+#[test]
+fn a_seal_naming_another_solana_key_is_refused_and_one_naming_the_instance_s_is_published_for_the_cluster()
+ {
+    let attestation = on_devnet(&[CHAIN_A]);
+    let digest = B256::repeat_byte(0xB1);
+    let nonce = attestation.binding().nonce();
+    tests_support::hold(&attestation, token_for(&nonce, digest, NOW)).unwrap();
+    for other in [[0; 32], attestation.solana_key().to_bytes(), [3; 32]] {
+        assert!(
+            tests_support::accept_unsimulated(&attestation, &proved(&attestation, digest, other))
+                .is_err()
+        );
+    }
+    let instance = attestation.solana_instance().to_bytes();
+    tests_support::accept_unsimulated(&attestation, &proved(&attestation, digest, instance))
+        .unwrap();
+    let status = attestation.status();
+    let cluster = &status.solana[0];
+    let journal = alloy::hex::decode(cluster.journal.as_ref().unwrap()).unwrap();
+    // The Solana registry's own journal: the same instance, tree, image and
+    // time the EVM journal states.
+    let read = <chain::solana::programs::registry::state::Journal as
+        chain::solana::programs::anchor_lang::AnchorDeserialize>::deserialize(
+        &mut journal.as_slice(),
+    )
+    .unwrap();
+    assert_eq!(read.signer, attestation.solana_instance());
+    assert_eq!(read.vaults_root, attestation.binding().vaults_root);
+    assert_eq!(read.image_digest, digest.0);
+    assert_eq!(read.issued_at, NOW);
+    assert!(matches!(
+        cluster.seal,
+        Some(chain::solana::attest::SolanaSeal::Proof { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_seal_is_not_kept_for_a_cluster_alone_that_cannot_simulate_it() {
+    let attestation = attestation(&[]);
+    attestation.serve_cluster_value(DEVNET.into(), DEVNET_VALUE);
+    let digest = B256::repeat_byte(0xB1);
+    let nonce = attestation.binding().nonce();
+    tests_support::hold(&attestation, token_for(&nonce, digest, NOW)).unwrap();
+    let instance = attestation.solana_instance().to_bytes();
+    // Named by its value alone: nothing to simulate on, and no EVM chain
+    // that would take the seal, so it would bless the key nowhere.
+    assert!(matches!(
+        attestation
+            .accept(proved(&attestation, digest, instance))
+            .await,
+        Err(Refusal::Unavailable(_))
+    ));
+    assert!(attestation.status().solana[0].seal.is_none());
 }
 
 // Obtaining the seed by exchange -------------------------------------------
