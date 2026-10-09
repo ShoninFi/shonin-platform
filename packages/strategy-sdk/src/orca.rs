@@ -109,7 +109,9 @@ pub struct PoolState {
     pub token: String,
     /// The pool's own price now.
     pub price: Decimal,
-    /// The oracle's price, which the station values at.
+    /// The oracle's price, which the station values at; zero while the
+    /// station's driver wouldn't value with it (stale, not fully verified or
+    /// too uncertain).
     pub oracle_price: Decimal,
     /// When the oracle published it, in seconds.
     pub oracle_time: u64,
@@ -159,6 +161,12 @@ pub struct AccountState {
     pub pools: Vec<PoolState>,
     /// The most positions the driver lets the station hold at once.
     pub max_positions: u8,
+    /// Whether the station's valuation is outside the exit band now: the
+    /// oracle unfit, or a pool the station holds liquidity in too far from
+    /// it. Deposits and withdrawals then wait, and nothing should be put
+    /// into the pool.
+    #[serde(default)]
+    pub outside: bool,
 }
 
 impl AccountState {

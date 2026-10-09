@@ -436,6 +436,35 @@ fn next_check(before: Option<(u64, u64)>, now: u64, interval: u64) -> (u64, u64)
 
 /// Whether an unwind that brings home `brought` is worth paying for: a cent,
 /// or the vault's dust, whichever is larger.
+/// The drivers, of `count`, a stopped unwind names: grown from none a
+/// driver at a time in the station's order, each kept only if `goes` says
+/// the set with it goes through.
+async fn grown<F, Fut>(count: u8, mut goes: F) -> Vec<u8>
+where
+    F: FnMut(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut named = Vec::new();
+    for index in 0..count {
+        let mut with = named.clone();
+        with.push(index);
+        if goes(with.clone()).await {
+            named = with;
+        }
+    }
+    named
+}
+
+/// The most stopped unwinds of one vault the keeper sends in one slot.
+const UNWINDS_A_SLOT: u32 = 4;
+
+/// Whether, `done` unwinds of a stopped station sent in this slot, another
+/// that would bring `brought` home is sent: while it is worth an unwind and
+/// fewer than [`UNWINDS_A_SLOT`] went.
+fn unwind_again(done: u32, brought: u128, dust: u128) -> bool {
+    done < UNWINDS_A_SLOT && worth_an_unwind(brought, dust)
+}
+
 fn worth_an_unwind(brought: u128, dust: u128) -> bool {
     brought >= UNWIND_WORTH_AT_LEAST.max(dust)
 }
@@ -1255,41 +1284,14 @@ impl Keeping {
         if !station.stopped {
             return Ok(());
         }
-        let full = self
-            .platform
-            .ix_unwind(
-                &self.client,
-                v,
-                &self.keeper(),
-                chain::solana::programs::driver::WAD,
-            )
-            .await;
-        let tried = match full {
-            Ok(ix) => self
-                .brings(v, &station, &ix)
-                .await
-                .map(|brought| (ix, brought)),
-            Err(error) => Err(error),
-        };
-        // A driver whose close fails fails the whole unwind: the others, and
-        // the counted dollars, then go home without it.
-        let (ix, brought) = match tried {
-            Ok(tried) => tried,
-            Err(error) => {
-                tracing::debug!(vault = %address, error = format!("{error:#}"), "the unwind would not go through; trying it without the drivers that fail");
-                match self.unwind_without_failing(v, &station).await {
-                    Some(tried) => tried,
-                    None => {
-                        memory.unwind_checks = Some(next_check(
-                            memory.unwind_checks,
-                            now,
-                            vault.timers.slot_interval,
-                        ));
-                        memory.unwind_idle = true;
-                        return Ok(());
-                    }
-                }
-            }
+        let Some((ix, brought)) = self.next_unwind(v, address, &station).await else {
+            memory.unwind_checks = Some(next_check(
+                memory.unwind_checks,
+                now,
+                vault.timers.slot_interval,
+            ));
+            memory.unwind_idle = true;
+            return Ok(());
         };
         if !worth_an_unwind(brought, vault.dust()) {
             memory.unwind_checks = Some(next_check(
@@ -1302,11 +1304,69 @@ impl Keeping {
         }
         memory.unwind_checks = None;
         memory.unwind_idle = false;
-        if self.send(address, vec![ix], "unwind the station").await == Outcome::Done {
-            memory.unwound_in = Some(slot);
-            tracing::info!(vault = %address, brought, "the stopped station was unwound");
+        if self.send(address, vec![ix], "unwind the station").await != Outcome::Done {
+            return Ok(());
+        }
+        memory.unwound_in = Some(slot);
+        tracing::info!(vault = %address, brought, "the stopped station was unwound");
+        // A venue may close only part of a crowded holding in one unwind
+        // (Orca's sale stops at the ticks one transaction can cross): the
+        // rest is unwound again in the same slot while each one still brings
+        // something worth it home.
+        let mut done = 1;
+        loop {
+            let station = self.platform.station(&self.client, &v.station).await?;
+            let Some((ix, brought)) = self.next_unwind(v, address, &station).await else {
+                break;
+            };
+            if !unwind_again(done, brought, vault.dust()) {
+                break;
+            }
+            if self
+                .send(address, vec![ix], "unwind the station again")
+                .await
+                != Outcome::Done
+            {
+                break;
+            }
+            done += 1;
+            tracing::info!(vault = %address, brought, done, "the stopped station was unwound again");
         }
         Ok(())
+    }
+
+    /// The stopped station's full unwind as it stands now and what it would
+    /// send home, without the drivers that would fail it; `None` if nothing
+    /// would go through.
+    async fn next_unwind(
+        &self,
+        v: &VaultAccounts,
+        address: &Pubkey,
+        station: &station::state::Station,
+    ) -> Option<(chain::solana::Instruction, u128)> {
+        let full = self
+            .platform
+            .ix_unwind(
+                &self.client,
+                v,
+                &self.keeper(),
+                chain::solana::programs::driver::WAD,
+            )
+            .await;
+        let tried = match full {
+            Ok(ix) => self
+                .brings(v, station, &ix)
+                .await
+                .map(|brought| (ix, brought)),
+            Err(error) => Err(error),
+        };
+        match tried {
+            Ok(tried) => Some(tried),
+            Err(error) => {
+                tracing::debug!(vault = %address, error = format!("{error:#}"), "the unwind would not go through; trying it without the drivers that fail");
+                self.unwind_without_failing(v, station).await
+            }
+        }
     }
 
     /// What `ix`, an unwind of the stopped station, would send home, from a
@@ -1332,27 +1392,29 @@ impl Keeping {
             .map_or(0, |after| after.sent_home.saturating_sub(station.sent_home)))
     }
 
-    /// The stopped station's unwind through every driver whose own unwind
-    /// would go through, leaving out those that would fail it, and what it
-    /// would send home; `None` if even that would not go through.
+    /// The stopped station's unwind through as many of its drivers as go
+    /// through together, leaving out those that would fail it, and what it
+    /// would send home; `None` if even sending the counted dollars home
+    /// would not go through. The set is grown a driver at a time, each kept
+    /// only if the set with it still goes through, so a driver that fails
+    /// only beside another (the two too large for one transaction, say)
+    /// still leaves the rest to come home.
     async fn unwind_without_failing(
         &self,
         v: &VaultAccounts,
         station: &station::state::Station,
     ) -> Option<(chain::solana::Instruction, u128)> {
-        let mut named = Vec::new();
-        for index in 0..station.drivers.len() as u8 {
-            let Ok(alone) = self
+        let named = grown(station.drivers.len() as u8, |with| async move {
+            match self
                 .platform
-                .ix_unwind_stopped(&self.client, v, &self.keeper(), &[index])
+                .ix_unwind_stopped(&self.client, v, &self.keeper(), &with)
                 .await
-            else {
-                continue;
-            };
-            if self.brings(v, station, &alone).await.is_ok() {
-                named.push(index);
+            {
+                Ok(ix) => self.brings(v, station, &ix).await.is_ok(),
+                Err(_) => false,
             }
-        }
+        })
+        .await;
         let ix = self
             .platform
             .ix_unwind_stopped(&self.client, v, &self.keeper(), &named)
@@ -2064,6 +2126,33 @@ pub fn troubles(now: Instant) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_stopped_station_is_unwound_again_in_its_slot_while_each_brings_something_home() {
+        let dust = 10_000;
+        // A cent home after the first: again.
+        assert!(unwind_again(1, 10_000, dust));
+        // Nothing worth it home: no more.
+        assert!(!unwind_again(1, 0, dust));
+        assert!(!unwind_again(1, UNWIND_WORTH_AT_LEAST - 1, 0));
+        // At most a few in one slot, however much each brings.
+        assert!(unwind_again(UNWINDS_A_SLOT - 1, u128::MAX, dust));
+        assert!(!unwind_again(UNWINDS_A_SLOT, u128::MAX, dust));
+    }
+
+    #[tokio::test]
+    async fn a_stopped_unwind_names_every_driver_that_goes_through_beside_the_others() {
+        // Each goes alone; 0 and 1 together don't (too large for one
+        // transaction, say); 3 never goes.
+        let goes = |with: Vec<u8>| async move {
+            !with.contains(&3) && !(with.contains(&0) && with.contains(&1))
+        };
+        assert_eq!(grown(4, goes).await, vec![0, 2]);
+        assert_eq!(grown(0, goes).await, Vec::<u8>::new());
+        assert_eq!(grown(3, |_| async { false }).await, Vec::<u8>::new());
+        assert_eq!(grown(3, |_| async { true }).await, vec![0, 1, 2]);
+    }
+
     use super::*;
 
     fn a_tank(

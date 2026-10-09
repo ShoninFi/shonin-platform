@@ -25,7 +25,7 @@ pub const PRICE_ONE: u128 = 10u128.pow(venue::PRICE_DECIMALS);
 /// tier has it, and Orca's share of it (in basis points).
 pub const FEE_RATE: u16 = 2_000;
 pub const PROTOCOL_FEE_RATE: u16 = 300;
-const LAMPORTS: u64 = 1_000_000_000;
+pub const LAMPORTS: u64 = 1_000_000_000;
 /// What the operator keeps of its SOL for fees and rent, never wrapped.
 pub const OPERATOR_KEEPS: u64 = LAMPORTS / 2;
 /// How far the pool may stray from its target before the operator brings
@@ -288,9 +288,85 @@ pub fn ixs_wrap(who: &Pubkey, lamports: u64) -> Result<Vec<Instruction>> {
     ])
 }
 
-/// The operator's position across the pool's price, `half_width_bps`
-/// either side, of `sol` lamports and the dollars that go with them, the
-/// admin minting those.
+/// The depth the operator's seed must give, and how much SOL that takes.
+///
+/// A station's close sells its SOL into everyone else's liquidity no further
+/// than the exit band `b` from Pyth's price. The rule: what others' liquidity
+/// takes inside the band is at least three times the most SOL the station
+/// can hold, times `2R/b` (the agent's band of `±R` crosses the exit band
+/// `2R/b` times over, each time its whole SOL changing hands). A station of
+/// `deployed` dollars in a band of `±R` holds the most SOL at its band's
+/// foot: `deployed / (P(1 - R))`.
+///
+/// A position of `S` SOL and as many dollars between `P(1 - w)` and
+/// `P(1 + w)` takes, while the price falls by `b`, the share
+/// `(1/sqrt(1 - b) - 1) / (1 - sqrt(1 - w))` of its dollars' worth in SOL.
+///
+/// On devnet, with Pyth at about $110 (9 October 2026), a $100 demo deposit
+/// at 80% deployed in the agent's ±4% band (R = 0.04) and the 1% exit band:
+/// the most SOL is 80 / 106.2 = 0.75, the rule asks 3 × 0.75 × 8 = 18.1 SOL
+/// taken inside the band. At w = 2% a seed takes 0.501 of its SOL inside the
+/// band, so it needs 36.1 SOL: [`DEVNET_SEED_SOL`] is 40. No seed of 10 SOL
+/// meets it at any width that still holds the band (w >= b: at most 10.05
+/// SOL taken).
+pub fn in_band_share(half_width: f64, band: f64) -> f64 {
+    (1.0 / (1.0 - band).sqrt() - 1.0) / (1.0 - (1.0 - half_width).sqrt())
+}
+
+/// What others' liquidity must take inside the band, in SOL, for a station
+/// of `deployed` dollars in a band of `±range` at `price` (see
+/// [`in_band_share`]).
+pub fn depth_needed(deployed: f64, price: f64, range: f64, band: f64) -> f64 {
+    let most_sol = deployed / (price * (1.0 - range));
+    3.0 * most_sol * 2.0 * range / band
+}
+
+/// The SOL a seed `half_width` either side needs to meet [`depth_needed`].
+pub fn seed_sol_for(deployed: f64, price: f64, range: f64, band: f64, half_width: f64) -> f64 {
+    depth_needed(deployed, price, range, band) / in_band_share(half_width, band)
+}
+
+/// The operator's seed: this far either side of Pyth's price, in basis
+/// points (twice the exit band, so the band around Pyth stays inside it
+/// while Pyth stays inside its inner half, see [`needs_recentring`]).
+pub const SEED_HALF_WIDTH_BPS: u128 = 200;
+/// The SOL the devnet seed holds, with as many dollars (see
+/// [`in_band_share`]).
+pub const DEVNET_SEED_SOL: u64 = 40 * LAMPORTS;
+
+/// The mint of the operator's seed position: derived from the operator's
+/// own key, so only the operator can open it, and the set-up and the market
+/// operator always find the same one (Orca closes the mint with the
+/// position, so a seed re-centred opens at it again).
+pub fn seed_mint(operator: &Keypair) -> Keypair {
+    let digest = Sha256::digest([&operator.to_bytes()[..], b"shonin:orca-seed-position"].concat());
+    solana_keypair::keypair_from_seed(&digest).expect("a 32-byte seed makes a keypair")
+}
+
+/// The operator's seed position, if it is open.
+pub async fn seed_position(
+    client: &SolanaClient,
+    operator: &Keypair,
+) -> Result<Option<venue::Position>> {
+    let address = venue::position_address(&seed_mint(operator).pubkey());
+    match client.account(&address).await? {
+        Some(account) => Ok(Some(venue::read_position(&address, &account)?)),
+        None => Ok(None),
+    }
+}
+
+/// Whether Pyth's `price` has left the inner half of the seed's range (the
+/// middle half of its ticks), so the seed is to be set again around it.
+pub fn needs_recentring(seed: &venue::Position, price: u128) -> bool {
+    let quarter = (seed.tick_upper - seed.tick_lower) / 4;
+    let tick = venue::tick_at_or_below(venue::sqrt_of_price(price));
+    tick < seed.tick_lower + quarter || tick >= seed.tick_upper - quarter
+}
+
+/// The operator's seed opened across the pool's price, `half_width_bps`
+/// either side, of `sol` lamports and the dollars that go with them: its
+/// own wrapped SOL used first and only the rest wrapped, the dollars short
+/// minted by the admin. Nothing if the seed is open already.
 pub async fn seed(
     client: &SolanaClient,
     platform: &Platform,
@@ -299,6 +375,9 @@ pub async fn seed(
     sol: u64,
     half_width_bps: u128,
 ) -> Result<()> {
+    if seed_position(client, operator).await?.is_some() {
+        return Ok(());
+    }
     let pool = pool_now(client).await?;
     let price = venue::price_of_sqrt(pool.state.sqrt_price);
     let ticks = venue::ticks_between(
@@ -313,34 +392,31 @@ pub async fn seed(
         &[ticks.0, ticks.1].map(|tick| venue::array_start(tick, pool.state.tick_spacing)),
     )
     .await?;
+    let who = operator.pubkey();
     // As many dollars as the SOL is worth, and a tenth more.
     let dollars = (sol as u128 * price / PRICE_ONE / 1_000 * 11 / 10) as u64;
-    client
-        .send(ixs_wrap(&operator.pubkey(), sol)?, &[operator])
+    let wrapped = client
+        .token_balance(&venue::wsol_of(&who))
         .await
-        .context("wrapping the operator's SOL")?;
-    let short = dollars.saturating_sub(
+        .unwrap_or(0);
+    if wrapped < sol {
         client
-            .token_balance(&platform.dollars(&operator.pubkey()))
-            .await?,
-    );
+            .send(ixs_wrap(&who, sol - wrapped)?, &[operator])
+            .await
+            .context("wrapping the operator's SOL")?;
+    }
+    let short = dollars.saturating_sub(client.token_balance(&platform.dollars(&who)).await?);
     if short > 0 {
         client
             .send(
-                vec![platform.ix_mint_to(&admin.pubkey(), &operator.pubkey(), short)?],
+                vec![platform.ix_mint_to(&admin.pubkey(), &who, short)?],
                 &[admin],
             )
             .await
             .context("minting the operator's dollars")?;
     }
-    let mint = Keypair::new();
-    let open = venue::ix_open_position(
-        &operator.pubkey(),
-        &operator.pubkey(),
-        &mint.pubkey(),
-        &pool.address,
-        ticks,
-    );
+    let mint = seed_mint(operator);
+    let open = venue::ix_open_position(&who, &who, &mint.pubkey(), &pool.address, ticks);
     client
         .send(vec![open], &[operator, &mint])
         .await
@@ -370,11 +446,11 @@ pub async fn seed(
     };
     let add = venue::ix_modify(
         Change::Increase,
-        &operator.pubkey(),
+        &who,
         &pool,
         &position,
         &mint.pubkey(),
-        venue::owners(&operator.pubkey(), &platform.dollars(&operator.pubkey())),
+        venue::owners(&who, &platform.dollars(&who)),
         liquidity,
         (max_a, max_b),
     );
@@ -388,6 +464,107 @@ pub async fn seed(
         "the operator gave the pool its depth"
     );
     Ok(())
+}
+
+/// The operator's seed taken out whole, its fees collected and the position
+/// closed (its rent back to the operator). Nothing if it isn't open.
+pub async fn withdraw_seed(
+    client: &SolanaClient,
+    platform: &Platform,
+    operator: &Keypair,
+) -> Result<()> {
+    let Some(position) = seed_position(client, operator).await? else {
+        return Ok(());
+    };
+    let pool = pool_now(client).await?;
+    let who = operator.pubkey();
+    let mint = seed_mint(operator).pubkey();
+    let owners = venue::owners(&who, &platform.dollars(&who));
+    let mut ixs = vec![venue::ix_open_wsol(&who, &who)];
+    if position.liquidity > 0 {
+        ixs.push(venue::ix_modify(
+            Change::Decrease,
+            &who,
+            &pool,
+            &position,
+            &mint,
+            owners,
+            position.liquidity,
+            (0, 0),
+        ));
+    }
+    ixs.push(venue::ix_collect_fees(&who, &pool, &mint, owners));
+    ixs.push(venue::ix_close_position(&who, &who, &mint));
+    client
+        .send(ixs, &[operator])
+        .await
+        .context("taking the operator's seed out")?;
+    Ok(())
+}
+
+/// The SOL a seed holding `position` is set again with: half its worth at
+/// the pool's square-root price `sqrt_price` (`price` a price here), in SOL.
+pub fn seed_size(position: &venue::Position, sqrt_price: u128, price: u128) -> Result<u64> {
+    let (a, b) = venue::holds(position, sqrt_price)?;
+    let (sol, dollars) = if venue::asset_is_a() { (a, b) } else { (b, a) };
+    // Dollar-units to lamports at `price`: d * 10^3 * PRICE_ONE / price.
+    let as_sol = (dollars as u128 * 1_000 * PRICE_ONE)
+        .checked_div(price)
+        .unwrap_or(0);
+    Ok(((sol as u128 + as_sol) / 2).min(u64::MAX as u128) as u64)
+}
+
+/// The market operator's part at Orca: the pool brought to `target`, and
+/// the operator's seed set again around it once `target` has left the
+/// seed's inner half, with `sol` or, without, as much as it held; or opened
+/// with `sol` if it isn't open. Says the pool's price after.
+pub async fn keep_seed_at(
+    client: &SolanaClient,
+    platform: &Platform,
+    admin: &Keypair,
+    operator: &Keypair,
+    target: u128,
+    sol: Option<u64>,
+) -> Result<u128> {
+    // The pool first: a seed opens across the pool's own price.
+    let steered = steer(client, platform, admin, operator, target).await;
+    match seed_position(client, operator).await? {
+        Some(position) if !needs_recentring(&position, target) => {}
+        Some(position) => {
+            let pool = pool_now(client).await?;
+            let sol = match sol {
+                Some(sol) => sol,
+                None => seed_size(
+                    &position,
+                    pool.state.sqrt_price,
+                    venue::price_of_sqrt(pool.state.sqrt_price),
+                )?,
+            };
+            withdraw_seed(client, platform, operator).await?;
+            steer(client, platform, admin, operator, target).await?;
+            seed(client, platform, admin, operator, sol, SEED_HALF_WIDTH_BPS).await?;
+            tracing::info!(
+                target = target as f64 / PRICE_ONE as f64,
+                "the operator's seed is set again around the price"
+            );
+        }
+        None => {
+            let Some(sol) = sol else {
+                bail!("the operator has no seed to keep");
+            };
+            seed(client, platform, admin, operator, sol, SEED_HALF_WIDTH_BPS).await?;
+            // A pool nobody's liquidity could move is moved with the seed's,
+            // then the seed is set again around the price.
+            if steered.is_err() {
+                steer(client, platform, admin, operator, target).await?;
+                withdraw_seed(client, platform, operator).await?;
+                steer(client, platform, admin, operator, target).await?;
+                seed(client, platform, admin, operator, sol, SEED_HALF_WIDTH_BPS).await?;
+            }
+        }
+    }
+    let after = pool_now(client).await?;
+    Ok(venue::price_of_sqrt(after.state.sqrt_price))
 }
 
 /// The operator brings the pool's price to `target` (as the chain crate
@@ -500,6 +677,75 @@ pub async fn pyth_now(client: &SolanaClient) -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn position(tick_lower: i32, tick_upper: i32) -> venue::Position {
+        venue::Position {
+            whirlpool: venue::POOLS[0].address,
+            mint: Pubkey::new_unique(),
+            liquidity: 1,
+            tick_lower,
+            tick_upper,
+            checkpoint_a: 0,
+            fee_owed_a: 0,
+            checkpoint_b: 0,
+            fee_owed_b: 0,
+        }
+    }
+
+    #[test]
+    fn the_devnet_seed_gives_the_depth_a_demo_vault_s_closes_need() {
+        // A $100 deposit, 80% in the agent's ±4% band, SOL at $110.6, the
+        // 1% exit band.
+        let needed = depth_needed(80.0, 110.6, 0.04, 0.01);
+        assert!((18.0..18.2).contains(&needed), "{needed}");
+        let share = in_band_share(0.02, 0.01);
+        assert!((0.50..0.502).contains(&share), "{share}");
+        let sol = seed_sol_for(80.0, 110.6, 0.04, 0.01, 0.02);
+        assert!(sol < DEVNET_SEED_SOL as f64 / LAMPORTS as f64, "{sol}");
+        assert_eq!(SEED_HALF_WIDTH_BPS, 200);
+        // Ten SOL is short at any width that still holds the band.
+        assert!(10.0 * in_band_share(0.01, 0.01) < needed);
+        // A tenth of the price, ten times the depth.
+        assert!((depth_needed(80.0, 11.06, 0.04, 0.01) / needed - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_seed_is_set_again_once_the_price_leaves_its_inner_half() {
+        let price = 150 * PRICE_ONE;
+        let ticks = venue::ticks_between(price * 98 / 100, price * 102 / 100, 64).unwrap();
+        let seed = position(ticks.0, ticks.1);
+        assert!(!needs_recentring(&seed, price));
+        assert!(!needs_recentring(&seed, price * 1_005 / 1_000));
+        assert!(needs_recentring(&seed, price * 1_012 / 1_000));
+        assert!(needs_recentring(&seed, price * 988 / 1_000));
+        assert!(needs_recentring(&seed, price * 2));
+    }
+
+    #[test]
+    fn a_seed_set_again_holds_as_much_as_it_did() {
+        let price = 150 * PRICE_ONE;
+        let s = venue::sqrt_of_price(price);
+        let tick = venue::tick_at_or_below(s);
+        let ticks = venue::ticks_between(price * 98 / 100, price * 102 / 100, 64).unwrap();
+        // 40 SOL and $6,000.
+        let liquidity = venue::liquidity_for(tick, s, ticks, 40 * LAMPORTS, 6_000_000_000).unwrap();
+        let mut seed = position(ticks.0, ticks.1);
+        seed.liquidity = liquidity;
+        let size = seed_size(&seed, s, price).unwrap();
+        // Its worth, half of it in SOL: within the shave a liquidity takes.
+        assert!(size <= 40 * LAMPORTS && size > 39 * LAMPORTS, "{size}");
+    }
+
+    #[test]
+    fn the_seed_s_mint_is_the_operator_s_own_and_always_the_same() {
+        let operator = Keypair::new();
+        assert_eq!(seed_mint(&operator).pubkey(), seed_mint(&operator).pubkey());
+        assert_ne!(
+            seed_mint(&operator).pubkey(),
+            seed_mint(&Keypair::new()).pubkey()
+        );
+        assert_ne!(seed_mint(&operator).pubkey(), operator.pubkey());
+    }
 
     #[test]
     fn a_dumped_program_is_loaded_without_its_padding_and_nothing_of_its_own_is_cut() {

@@ -187,21 +187,35 @@ fn oracle_units(price: &chain::solana::programs::orca_driver::pyth::Price) -> Op
     }
 }
 
-/// Whether a pool's price is within `band_bps` of Pyth's, Pyth's price being
-/// fit to value with: fully verified, fresh and certain enough.
-fn agrees(holdings: &Holdings, pool: &PoolNow, band_bps: u16, now: u64) -> bool {
-    let Some(price) = holdings.price else {
-        return false;
-    };
+/// Pyth's price as the driver would value with it now (fully verified, no
+/// older than the driver takes, certain to within `band_bps`), or `None`.
+fn fit_oracle(holdings: &Holdings, band_bps: u16, now: u64) -> Option<u128> {
+    let price = holdings.price?;
     if !price.fit(now as i64, venue::MAX_AGE, band_bps) {
-        return false;
+        return None;
     }
-    let Some(oracle) = oracle_units(&price) else {
-        return false;
+    oracle_units(&price).filter(|price| *price > 0)
+}
+
+/// Pyth's price and the square-root prices at the edges of the band around
+/// it (see [`venue::band_roots`]), when Pyth's price is fit and the pool's
+/// own stands between those edges. Every call that puts the station's money
+/// into the pool is refused otherwise, so it never trades at a price the
+/// station's own valuation wouldn't take.
+fn priced(seen: &Seen, pool: &PoolNow) -> std::result::Result<(u128, (u128, u128)), Failed> {
+    let Some(oracle) = fit_oracle(seen.holdings, seen.band_bps, seen.now) else {
+        return refused(
+            "the oracle's price is unfit (stale, not fully verified or too uncertain): nothing is sent into the pool until it is",
+        );
     };
-    let pool_price = venue::price_of_sqrt(pool.state.sqrt_price);
-    let gap = pool_price.abs_diff(oracle);
-    U256::from(gap) * U256::from(driver_iface::BPS) <= U256::from(oracle) * U256::from(band_bps)
+    let roots = venue::band_roots(oracle, seen.band_bps);
+    let (low, high) = (roots.0.min(roots.1), roots.0.max(roots.1));
+    if !(low..=high).contains(&pool.state.sqrt_price) {
+        return refused(
+            "the pool's price is not within the exit band of the oracle's: nothing is sent into the pool until it is",
+        );
+    }
+    Ok((oracle, roots))
 }
 
 /// What the half knows when it translates an action: the station's driver,
@@ -262,11 +276,7 @@ fn translate(seen: &Seen, action: Action) -> std::result::Result<Translated, Fai
                 ));
             };
             let pool = &holdings.pools[p];
-            if !agrees(holdings, pool, seen.band_bps, seen.now) {
-                return refused(
-                    "the pool's price is not within the exit band of the oracle's, or the oracle's price is unfit: nothing is opened until it is",
-                );
-            }
+            let (_, roots) = priced(seen, pool)?;
             let ticks = venue::ticks_between(
                 price_units(lower_price)?,
                 price_units(upper_price)?,
@@ -285,7 +295,7 @@ fn translate(seen: &Seen, action: Action) -> std::result::Result<Translated, Fai
                 checkpoint_b: 0,
                 fee_owed_b: 0,
             };
-            let (liquidity, limits, fund) = liquidity(seen, pool, ticks, token, dollars)?;
+            let (liquidity, limits, fund) = liquidity(seen, roots, ticks, token, dollars)?;
             let open =
                 venue::ix_open_position(&seen.key, &half.authority, &mint, &pool.address, ticks);
             let increase = venue::ix_modify(
@@ -320,8 +330,9 @@ fn translate(seen: &Seen, action: Action) -> std::result::Result<Translated, Fai
         } => {
             let held = held(holdings, &position)?;
             let pool = &holdings.pools[held.pool];
+            let (_, roots) = priced(seen, pool)?;
             let ticks = (held.state.tick_lower, held.state.tick_upper);
-            let (liquidity, limits, fund) = liquidity(seen, pool, ticks, token, dollars)?;
+            let (liquidity, limits, fund) = liquidity(seen, roots, ticks, token, dollars)?;
             let increase = venue::ix_modify(
                 Change::Increase,
                 &half.authority,
@@ -352,8 +363,14 @@ fn translate(seen: &Seen, action: Action) -> std::result::Result<Translated, Fai
             // A decrease brings the position's fees up to date itself; with
             // nothing to decrease, an update does.
             if liquidity > 0 {
+                // Around Pyth's price when it is fit, so a pool pushed
+                // before the removal lands pays no less than the band
+                // allows; around the pool's own when it isn't, so a removal,
+                // an exit, never waits on the oracle.
+                let around = fit_oracle(holdings, seen.band_bps, seen.now)
+                    .map_or(pool.state.sqrt_price, venue::sqrt_of_price);
                 let minimums = venue::withdrawal_minimums(
-                    pool.state.sqrt_price,
+                    around,
                     (held.state.tick_lower, held.state.tick_upper),
                     liquidity,
                     seen.band_bps,
@@ -440,6 +457,7 @@ fn translate(seen: &Seen, action: Action) -> std::result::Result<Translated, Fai
                 return refused(format!("the {DRIVER} driver lists no pool {pool}"));
             };
             let pool = &holdings.pools[p];
+            let (oracle, roots) = priced(seen, pool)?;
             let buying = matches!(side, Side::Buy);
             let (amount, fund) = if buying {
                 let dollars = amount_units(amount, DOLLAR_DECIMALS)?;
@@ -472,13 +490,13 @@ fn translate(seen: &Seen, action: Action) -> std::result::Result<Translated, Fai
                 buying,
                 amount,
                 price_units(limit_price)?,
+                (oracle, roots, seen.band_bps),
             )?;
-            let a_to_b = buying != asset_is_a();
+            // Orca's swap takes the arrays it crosses whether or not they
+            // are there yet: none is made for it.
             Ok(Translated {
                 calls: vec![(swap, fund)],
-                arrays: venue::swap_starts(&pool.state, a_to_b)
-                    .map(|start| (p, start))
-                    .to_vec(),
+                arrays: Vec::new(),
                 answer: Answer::Moved,
             })
         }
@@ -490,13 +508,15 @@ fn decimal_of(units: u64, decimals: u32) -> std::result::Result<Decimal, Failed>
 }
 
 /// The liquidity `token` and `dollars` (each capped at what the station
-/// holds) pay for between `ticks` at the pool's price now, the most of A and
-/// B the pool may take for it, and the dollars lent to the call: the
-/// dollars allowed, of which the station takes back what the pool didn't
+/// holds) pay for between `ticks` wherever the pool's price stands within
+/// `roots` (the band around Pyth's), the most of A and B the pool may take
+/// for it there and no more (so a pool pushed outside the band before the
+/// call lands takes nothing: the increase fails), and the dollars lent to
+/// the call: that most, of which the station takes back what the pool didn't
 /// take.
 fn liquidity(
     seen: &Seen,
-    pool: &PoolNow,
+    roots: (u128, u128),
     ticks: (i32, i32),
     token: Decimal,
     dollars: Decimal,
@@ -504,20 +524,15 @@ fn liquidity(
     let sol = amount_units(token, SOL_DECIMALS)?.min(seen.holdings.asset);
     let dollars = amount_units(dollars, DOLLAR_DECIMALS)?.min(seen.idle);
     let (max_a, max_b) = a_and_b((sol, dollars));
-    let liquidity = venue::liquidity_for(
-        pool.state.tick_current,
-        pool.state.sqrt_price,
-        ticks,
-        max_a,
-        max_b,
-    )
-    .map_err(|error| Failed::Refused(format!("{error:#}")))?;
+    let (liquidity, limits) = venue::liquidity_within(ticks, roots, max_a, max_b)
+        .map_err(|error| Failed::Refused(format!("{error:#}")))?;
     if liquidity == 0 {
         return refused(format!(
-            "the station's {TOKEN} and dollars asked for buy no liquidity in that band at the pool's price"
+            "the station's {TOKEN} and dollars asked for buy no liquidity in that band around the oracle's price"
         ));
     }
-    Ok((liquidity, (max_a, max_b), dollars))
+    let (_, lent) = sol_and_dollars(limits);
+    Ok((liquidity, limits, lent))
 }
 
 impl Trading {
@@ -671,31 +686,38 @@ impl Trading {
     }
 
     /// The same, answered with what moved into the pool (positive) or out
-    /// of it (negative): the change in the station's SOL and idle dollars.
+    /// of it (negative): the change the transaction itself made to the
+    /// authority's wrapped SOL and to the station's main dollar account, read
+    /// from the node's record of it, so nothing another send did meanwhile
+    /// (a keeper's close, a move) is counted as the agent's.
     async fn moved(
         &self,
         half: &Orca,
         before: Vec<Instruction>,
         calls: Vec<(Instruction, u64)>,
     ) -> std::result::Result<Receipt, Failed> {
-        let wsol = venue::wsol_of(&half.authority);
-        let sol_before = self.client.token_balance(&wsol).await.unwrap_or(0) as i128;
-        let idle_before = self.idle().await? as i128;
-        self.through(half, before, calls).await?;
-        let sol_after = self.client.token_balance(&wsol).await.unwrap_or(0) as i128;
-        let idle_after = self.idle().await? as i128;
+        let landed = self.through(half, before, calls).await?;
+        let record = self
+            .client
+            .rpc
+            .transaction(landed.signature())
+            .await
+            .and_then(|found| found.ok_or_else(|| anyhow!("the node holds no record of it")))
+            .map_err(|error| {
+                Failed::Sent(error.context(
+                    "the call landed, and what it moved could not be read: read the account again",
+                ))
+            })?;
+        let changes = token_changes(&record, &landed.record.account_keys).map_err(|error| {
+            Failed::Sent(error.context(
+                "the call landed, and what it moved could not be read: read the account again",
+            ))
+        })?;
+        let change = |account: &Pubkey| changes.get(account).copied().unwrap_or(0);
         Ok(Receipt::Moved {
-            token: signed_decimal(sol_before - sol_after, SOL_DECIMALS)?,
-            dollars: signed_decimal(idle_before - idle_after, DOLLAR_DECIMALS)?,
+            token: signed_decimal(-change(&venue::wsol_of(&half.authority)), SOL_DECIMALS)?,
+            dollars: signed_decimal(-change(&self.accounts.station_dollars), DOLLAR_DECIMALS)?,
         })
-    }
-
-    async fn idle(&self) -> Result<u64> {
-        Ok(self
-            .platform
-            .station(&self.client, &self.accounts.station)
-            .await?
-            .idle)
     }
 
     /// The driver's valuation of the station's holdings at Orca now, at the
@@ -750,9 +772,56 @@ impl Trading {
             .orca_valuation(half, &holdings, station.exit_band_bps)
             .await
             .context("asking the Orca driver for its valuation")?;
-        let state = account_state(&holdings, idle, station.idle, valuation)?;
+        let now = self.client.now().await?;
+        let state = account_state(
+            &holdings,
+            idle,
+            station.idle,
+            valuation,
+            (now, station.exit_band_bps),
+        )?;
         Ok(strategy_sdk::to_payload(&state))
     }
+}
+
+/// How much each token account a landed transaction touched changed in it,
+/// from the node's record (`preTokenBalances` and `postTokenBalances`, by
+/// index into `keys`, its accounts as the record orders them): an account
+/// missing before (made by it) held nothing then, one missing after (closed
+/// by it) holds nothing after. A record without the balances is an error.
+fn token_changes(
+    record: &serde_json::Value,
+    keys: &[Pubkey],
+) -> Result<std::collections::HashMap<Pubkey, i128>> {
+    let meta = &record["meta"];
+    let read = |field: &str| -> Result<Vec<(Pubkey, i128)>> {
+        meta[field]
+            .as_array()
+            .ok_or_else(|| anyhow!("the node's record has no {field}"))?
+            .iter()
+            .map(|entry| {
+                let index = entry["accountIndex"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("a token balance with no account"))?;
+                let key = *keys.get(index as usize).ok_or_else(|| {
+                    anyhow!("a token balance of an account the record doesn't name")
+                })?;
+                let amount: i128 = entry["uiTokenAmount"]["amount"]
+                    .as_str()
+                    .and_then(|amount| amount.parse().ok())
+                    .ok_or_else(|| anyhow!("a token balance with no amount"))?;
+                Ok((key, amount))
+            })
+            .collect()
+    };
+    let mut changes = std::collections::HashMap::new();
+    for (key, amount) in read("preTokenBalances")? {
+        *changes.entry(key).or_insert(0) -= amount;
+    }
+    for (key, amount) in read("postTokenBalances")? {
+        *changes.entry(key).or_insert(0) += amount;
+    }
+    Ok(changes)
 }
 
 /// The position an agent names, if it is one the station holds at a slot.
@@ -780,14 +849,43 @@ fn swap_for(
     buying: bool,
     amount: u64,
     limit: u128,
+    (oracle, (at_lowest, at_highest), band_bps): (u128, (u128, u128), u16),
 ) -> std::result::Result<Instruction, Failed> {
     if limit == 0 {
         return refused("a swap's limit price is above zero");
     }
+    // A limit further from Pyth's price than the band is refused, as the
+    // trader of stock tokens refuses a minimum further from its feed: the
+    // station never buys dearer nor sells cheaper than its own valuation
+    // allows.
+    let band = U256::from(oracle) * U256::from(band_bps) / U256::from(driver_iface::BPS);
+    let band = band.to::<u128>();
+    let beyond = if buying {
+        limit > oracle.saturating_add(band)
+    } else {
+        limit < oracle.saturating_sub(band)
+    };
+    if beyond {
+        return refused(format!(
+            "a {} limit further than the exit band ({band_bps} bp) from the oracle's price is refused",
+            if buying { "buy's" } else { "sale's" }
+        ));
+    }
     // Buying SOL raises its price; whether that raises the pool's own
     // depends on which token it keeps as A.
     let a_to_b = buying != asset_is_a();
-    let root = venue::sqrt_of_price(limit);
+    // And no further than half the band from Pyth's square-root price, as
+    // the driver's own close sells: every unit of it then trades inside the
+    // band. Like the close's sale, the swap asks no least amount back, so
+    // what can't fill inside the limit simply doesn't, as an agent's swap
+    // promises.
+    let edge = if buying { at_highest } else { at_lowest };
+    let asked = venue::sqrt_of_price(limit);
+    let root = if a_to_b {
+        asked.max(edge)
+    } else {
+        asked.min(edge)
+    };
     let room = if a_to_b {
         root < pool.state.sqrt_price
     } else {
@@ -817,6 +915,7 @@ fn account_state(
     idle: u64,
     station_idle: u64,
     valuation: Valuation,
+    (now, band_bps): (u64, u16),
 ) -> Result<AccountState> {
     let dollars = |units: u64| to_decimal(U256::from(units), DOLLAR_DECIMALS);
     let sol = |units: u64| to_decimal(U256::from(units), SOL_DECIMALS);
@@ -841,6 +940,8 @@ fn account_state(
         });
     }
     let oracle = holdings.price.as_ref();
+    // A price the driver wouldn't value with is not given as the oracle's.
+    let fit = fit_oracle(holdings, band_bps, now).unwrap_or(0);
     let pools = holdings
         .pools
         .iter()
@@ -850,7 +951,7 @@ fn account_state(
                 pool: venue::pool_name(p),
                 token: TOKEN.to_string(),
                 price: price_decimal(venue::price_of_sqrt(pool.state.sqrt_price))?,
-                oracle_price: price_decimal(oracle.and_then(oracle_units).unwrap_or(0))?,
+                oracle_price: price_decimal(fit)?,
                 oracle_time: oracle.map_or(0, |price| price.publish_time.max(0) as u64),
                 fee: to_decimal(U256::from(pool.state.fee_rate), 6)?,
                 tick_spacing: pool.state.tick_spacing,
@@ -868,6 +969,7 @@ fn account_state(
         positions,
         pools,
         max_positions: venue::MAX_SLOTS,
+        outside: valuation.outside,
     })
 }
 
@@ -1094,14 +1196,18 @@ mod tests {
         let (owner_a, owner_b) = venue::owners(&half.authority, &half.dollars);
         assert_eq!(increase.accounts[5].pubkey, owner_a);
         assert_eq!(increase.accounts[6].pubkey, owner_b);
-        assert_eq!(u64_at(&increase.data, 24), SOL);
-        assert_eq!(u64_at(&increase.data, 32), 150 * DOLLAR);
-        assert_eq!(*fund, 150 * DOLLAR);
+        // The most it may take of each: what the liquidity takes at the
+        // band's edges around Pyth, within what was offered.
+        let (max_a, max_b) = (u64_at(&increase.data, 24), u64_at(&increase.data, 32));
+        assert!(max_a <= SOL && max_b <= 150 * DOLLAR && max_a > 0 && max_b > 0);
+        assert_eq!(*fund, max_b, "the dollars lent are the most it may take");
         let liquidity = u128_at(&increase.data, 8);
         let pool = &holdings.pools[0].state;
         let (a, b) = venue::deposit(pool.tick_current, pool.sqrt_price, ticks, liquidity).unwrap();
-        assert!(a <= SOL && b <= 150 * DOLLAR);
-        assert!(a > SOL * 99 / 100 || b > 149 * DOLLAR, "{a} {b}");
+        assert!(
+            a <= max_a && b <= max_b,
+            "no more than that at Pyth's price"
+        );
         // The arrays its ticks are in, and the answer.
         assert_eq!(
             done.arrays,
@@ -1125,9 +1231,9 @@ mod tests {
         let seen = seen(&half, &holdings, 40 * DOLLAR);
         let done = translated(translate(&seen, open("5", "1000")));
         let (increase, fund) = &done.calls[1];
-        assert_eq!(u64_at(&increase.data, 24), SOL / 2);
-        assert_eq!(u64_at(&increase.data, 32), 40 * DOLLAR);
-        assert_eq!(*fund, 40 * DOLLAR);
+        assert!(u64_at(&increase.data, 24) <= SOL / 2);
+        assert!(u64_at(&increase.data, 32) <= 40 * DOLLAR);
+        assert_eq!(*fund, u64_at(&increase.data, 32));
     }
 
     #[test]
@@ -1193,7 +1299,11 @@ mod tests {
         assert_eq!(u64_at(&swap.data, 8), 100 * DOLLAR);
         assert_eq!(u64_at(&swap.data, 16), 0);
         let limit = u128_at(&swap.data, 24);
-        assert_eq!(limit, venue::sqrt_of_price(price(151)));
+        assert_eq!(
+            limit,
+            venue::sqrt_of_price(price(151)),
+            "inside the band, the agent's own limit"
+        );
         // The amount is what goes in, and dollars for SOL is B for A.
         assert_eq!(swap.data[40..], [1, u8::from(!asset_is_a())]);
         assert_eq!(
@@ -1201,7 +1311,7 @@ mod tests {
             AccountMeta::new_readonly(half.authority, true)
         );
         let starts = venue::swap_starts(&holdings.pools[0].state, !asset_is_a());
-        assert_eq!(done.arrays, starts.map(|start| (0, start)).to_vec());
+        assert!(done.arrays.is_empty(), "a swap makes no tick array");
         assert_eq!(
             swap.accounts[7].pubkey,
             venue::tick_array_address(&holdings.pools[0].address, starts[0])
@@ -1347,6 +1457,7 @@ mod tests {
                 exit: 299 * DOLLAR,
                 outside: false,
             },
+            (NOW, 100),
         )
         .unwrap();
         assert_eq!(state.vault_value, decimal("450"));
@@ -1372,5 +1483,169 @@ mod tests {
         assert_eq!(pool.fee, decimal("0.002"));
         assert_eq!(pool.tick_spacing, 64);
         assert!(pool.price > decimal("149.99") && pool.price < decimal("150.01"));
+    }
+
+    // A swap is held to Pyth's price, fresh, and the band around it.
+    #[test]
+    fn a_buy_s_limit_further_from_pyth_than_the_band_is_refused() {
+        let half = half();
+        // Pool and Pyth agree at $150; the band is 1%.
+        let holdings = holdings(&half, 150, 150, 0);
+        let seen = seen(&half, &holdings, 1_000 * DOLLAR);
+        let buy = Action::Swap {
+            pool: "SOL/USD".into(),
+            side: Side::Buy,
+            amount: decimal("1000"),
+            limit_price: decimal("1000"),
+        };
+        match translate(&seen, buy) {
+            Err(Failed::Refused(_)) => {}
+            Ok(done) => panic!(
+                "every idle dollar is sent to buy SOL up to $1,000 a SOL (sqrt limit {}, threshold {}) with Pyth at $150 and a 1% band",
+                u128_at(&done.calls[0].0.data, 24),
+                u64_at(&done.calls[0].0.data, 16)
+            ),
+            Err(Failed::Sent(error)) => panic!("sent: {error:#}"),
+        }
+    }
+
+    #[test]
+    fn a_swap_in_a_pool_pushed_off_pyth_is_refused() {
+        let half = half();
+        // The pool pushed 2% over Pyth, twice the band: an open is refused
+        // here, a buy at the pushed price is not.
+        let pushed = holdings(&half, 153, 150, 0);
+        let seen = seen(&half, &pushed, 1_000 * DOLLAR);
+        let buy = Action::Swap {
+            pool: "SOL/USD".into(),
+            side: Side::Buy,
+            amount: decimal("1000"),
+            limit_price: decimal("154"),
+        };
+        assert!(
+            matches!(translate(&seen, buy), Err(Failed::Refused(_))),
+            "a buy in a pool 2% off Pyth (band 1%) was translated"
+        );
+    }
+
+    #[test]
+    fn a_swap_on_a_stale_pyth_price_is_refused() {
+        let half = half();
+        let mut stale = holdings(&half, 150, 150, 3 * SOL);
+        stale.price.as_mut().unwrap().publish_time = (NOW - venue::MAX_AGE - 1) as i64;
+        let seen = seen(&half, &stale, 0);
+        let sell = Action::Swap {
+            pool: "SOL/USD".into(),
+            side: Side::Sell,
+            amount: decimal("3"),
+            limit_price: decimal("1"),
+        };
+        assert!(
+            matches!(translate(&seen, sell), Err(Failed::Refused(_))),
+            "a sale of all the SOL down to $1 a SOL on a stale price was translated"
+        );
+    }
+
+    // An add is checked against Pyth as an open is.
+    #[test]
+    fn an_add_in_a_pool_pushed_off_pyth_is_refused_as_an_open_is() {
+        let half = half();
+        let (mut held, position) = holding(&half, 1_000_000_000, (0, 0));
+        let pushed = holdings(&half, 153, 150, SOL);
+        held.pools = pushed.pools;
+        held.asset = SOL;
+        let seen = seen(&half, &held, 1_000 * DOLLAR);
+        let add = Action::Add {
+            position: position.to_string(),
+            token: decimal("1"),
+            dollars: decimal("150"),
+        };
+        assert!(
+            matches!(translate(&seen, add), Err(Failed::Refused(_))),
+            "an add in a pool 2% off Pyth (band 1%) was translated"
+        );
+    }
+
+    // An increase's maxima are what its liquidity takes at the band's edges
+    // around Pyth, so a pool pushed before it lands takes nothing.
+    #[test]
+    fn an_open_s_increase_takes_nothing_at_a_price_outside_the_band() {
+        let half = half();
+        let holdings = holdings(&half, 150, 150, 10 * SOL);
+        let seen = seen(&half, &holdings, 1_000 * DOLLAR);
+        // "Up to 10 SOL and up to $150": the dollars bind.
+        let done = translated(translate(&seen, open("10", "150")));
+        let (increase, _) = &done.calls[1];
+        let liquidity = u128_at(&increase.data, 8);
+        let (max_a, max_b) = (u64_at(&increase.data, 24), u64_at(&increase.data, 32));
+        let ticks = venue::ticks_between(price(144), price(156), 64).unwrap();
+        let fair = &holdings.pools[0].state;
+        let (a0, b0) =
+            venue::deposit(fair.tick_current, fair.sqrt_price, ticks, liquidity).unwrap();
+        // The pool pushed to $144.5 in the block (4% under Pyth, band 1%).
+        let pushed = venue::sqrt_of_price(price(144) + price(1) / 2);
+        let tick = venue::tick_at_or_below(pushed);
+        let (a1, b1) = venue::deposit(tick, pushed, ticks, liquidity).unwrap();
+        let at_pyth = |a: u64, b: u64| a as f64 / 1e9 * 150.0 + b as f64 / 1e6;
+        assert!(
+            !(a1 <= max_a && b1 <= max_b),
+            "Orca takes {a1} lamports and {b1} dollar-units at $144.5 for the same liquidity it takes {a0} and {b0} for at $150 (maxima {max_a}, {max_b}): ${:.2} paid at Pyth's price for a position worth ${:.2} there",
+            at_pyth(a1, b1),
+            at_pyth(a0, b0)
+        );
+    }
+
+    // The agent's picture never names a stale price as the oracle's.
+    #[test]
+    fn the_account_state_gives_no_stale_price_as_the_oracle_s() {
+        let half = half();
+        let mut stale = holdings(&half, 150, 150, 0);
+        stale.price.as_mut().unwrap().publish_time = (NOW - 10 * venue::MAX_AGE) as i64;
+        let state = account_state(
+            &stale,
+            0,
+            0,
+            Valuation {
+                mark: 0,
+                exit: 0,
+                outside: true,
+            },
+            (NOW, 100),
+        )
+        .unwrap();
+        let pool = state.pool("SOL/USD").unwrap();
+        assert_eq!(
+            pool.oracle_price,
+            decimal("0"),
+            "a price {} s old (the driver takes {} s) is given as the oracle's, and the agent's only guard compares the pool with it",
+            10 * venue::MAX_AGE,
+            venue::MAX_AGE
+        );
+    }
+
+    #[test]
+    fn what_a_call_moved_is_read_from_its_own_record_of_token_balances() {
+        let (wsol, dollars, other) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let keys = vec![Pubkey::new_unique(), wsol, dollars, other];
+        let balance = |index: u64, amount: &str| serde_json::json!({"accountIndex": index, "uiTokenAmount": {"amount": amount}});
+        let record = serde_json::json!({"meta": {
+            // The wrapped-SOL account made by the call; another account,
+            // untouched, in both.
+            "preTokenBalances": [balance(2, "5000000"), balance(3, "7")],
+            "postTokenBalances": [balance(1, "13300000000"), balance(2, "3000000"), balance(3, "7")],
+        }});
+        let changes = token_changes(&record, &keys).unwrap();
+        assert_eq!(changes[&wsol], 13_300_000_000);
+        assert_eq!(changes[&dollars], -2_000_000);
+        assert_eq!(changes[&other], 0);
+        // A record without them can't say: an error, never nothing moved.
+        let bare = serde_json::json!({"meta": {}});
+        assert!(token_changes(&bare, &keys).is_err());
+        let beyond = serde_json::json!({"meta": {"preTokenBalances": [balance(9, "1")], "postTokenBalances": []}});
+        assert!(token_changes(&beyond, &keys).is_err());
     }
 }

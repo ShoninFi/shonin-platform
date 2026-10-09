@@ -710,6 +710,78 @@ pub fn liquidity_for(
     bail!("no liquidity between those ticks fits those amounts")
 }
 
+/// The square-root prices at the two edges of `band_bps` around `price` (a
+/// price here, Pyth's), each half the band from its root as the driver's
+/// close bounds a sale (a root moves about half as far as its price, and
+/// never less): the root at the band's lowest dollar price first, then at
+/// its highest, whichever way the pool keeps its prices.
+pub fn band_roots(price: u128, band_bps: u16) -> (u128, u128) {
+    let root = U256::from(sqrt_of_price(price));
+    let (two, band) = (U256::from(20_000u64), U256::from(band_bps as u64));
+    let clamp = |value: U256| -> u128 {
+        value
+            .min(U256::from(math::MAX_SQRT_PRICE))
+            .max(U256::from(math::MIN_SQRT_PRICE))
+            .low_u128()
+    };
+    let down = clamp(root * (two - band.min(two)) / two);
+    let up = clamp(root * (two + band) / two);
+    if asset_is_a() { (down, up) } else { (up, down) }
+}
+
+/// The most liquidity between two ticks that `max_a` of A and `max_b` of B
+/// pay for wherever the pool's square-root price stands between `roots`
+/// (either order), and the most of each it then takes: A is taken most at
+/// the lowest root, B at the highest. So an increase given these maxima
+/// takes nothing at a price outside them, however the pool is pushed before
+/// it lands. Zero if they pay for none.
+pub fn liquidity_within(
+    ticks: (i32, i32),
+    roots: (u128, u128),
+    max_a: u64,
+    max_b: u64,
+) -> Result<(u128, (u64, u64))> {
+    let (low, high) = (roots.0.min(roots.1), roots.0.max(roots.1));
+    let lower = math::sqrt_price_at(ticks.0).map_err(|_| anyhow!("tick out of range"))?;
+    let upper = math::sqrt_price_at(ticks.1).map_err(|_| anyhow!("tick out of range"))?;
+    // From A at the lowest root: L = a * s * upper / ((upper - s) * 2^64).
+    let from_a = if low >= upper {
+        U256::MAX
+    } else {
+        let s = low.max(lower);
+        (U256::from(max_a) * U256::from(s) * U256::from(upper)) / (U256::from(upper - s) << 64)
+    };
+    // From B at the highest: L = b * 2^64 / (s - lower).
+    let from_b = if high <= lower {
+        U256::MAX
+    } else {
+        let s = high.min(upper);
+        (U256::from(max_b) << 64) / U256::from(s - lower)
+    };
+    let estimate = from_a.min(from_b);
+    let mut liquidity = if estimate > U256::from(u128::MAX) {
+        u128::MAX
+    } else {
+        estimate.low_u128()
+    };
+    let takes = |liquidity: u128| -> Result<(u64, u64)> {
+        let a = deposit(tick_at_or_below(low), low, ticks, liquidity)?.0;
+        let b = deposit(tick_at_or_below(high), high, ticks, liquidity)?.1;
+        Ok((a, b))
+    };
+    // The pool rounds what it takes up: shave until both fit.
+    for _ in 0..64 {
+        if liquidity == 0 {
+            return Ok((0, (0, 0)));
+        }
+        match takes(liquidity) {
+            Ok((a, b)) if a <= max_a && b <= max_b => return Ok((liquidity, (a, b))),
+            _ => liquidity -= (liquidity / 1_000_000).max(1),
+        }
+    }
+    bail!("no liquidity between those ticks fits those amounts")
+}
+
 /// What a position holds of A and B at the square-root price `sqrt_price`,
 /// rounded down.
 pub fn holds(position: &Position, sqrt_price: u128) -> Result<(u64, u64)> {
@@ -1132,6 +1204,31 @@ mod tests {
         assert!(above > 0);
         assert_eq!(deposit(ticks.1, 0, ticks, above).unwrap().0, 0);
         assert_eq!(liquidity_for(tick, s, ticks, 0, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn liquidity_bought_within_a_band_takes_no_more_than_offered_anywhere_in_it_and_more_outside() {
+        let ticks = ticks_between(PRICE * 96 / 100, PRICE * 104 / 100, 64).unwrap();
+        let (low, high) = band_roots(PRICE, 100);
+        assert!(low < sqrt_of_price(PRICE) && sqrt_of_price(PRICE) < high);
+        // Half the band either way in the root: about the band in the price.
+        let (at_low, at_high) = (price_of_sqrt(low), price_of_sqrt(high));
+        assert!((PRICE * 9_899 / 10_000..=PRICE * 9_901 / 10_000).contains(&at_low));
+        assert!((PRICE * 10_099 / 10_000..=PRICE * 10_101 / 10_000).contains(&at_high));
+        let (max_a, max_b) = (10_000_000_000, 150_000_000);
+        let (liquidity, (a, b)) = liquidity_within(ticks, (low, high), max_a, max_b).unwrap();
+        assert!(liquidity > 0 && a <= max_a && b <= max_b);
+        for root in [low, sqrt_of_price(PRICE), high] {
+            let (took_a, took_b) = deposit(tick_at_or_below(root), root, ticks, liquidity).unwrap();
+            assert!(took_a <= a && took_b <= b, "{took_a} {took_b} at {root}");
+        }
+        // A pool pushed a percent past either edge takes more than allowed.
+        for (root, side) in [(low - low / 200, 0), (high + high / 200, 1)] {
+            let took = deposit(tick_at_or_below(root), root, ticks, liquidity).unwrap();
+            let (took, most) = if side == 0 { (took.0, a) } else { (took.1, b) };
+            assert!(took > most, "{took} against {most}");
+        }
+        assert_eq!(liquidity_within(ticks, (low, high), 0, 0).unwrap().0, 0);
     }
 
     #[test]

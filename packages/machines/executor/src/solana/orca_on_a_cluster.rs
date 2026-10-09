@@ -617,7 +617,7 @@ async fn an_orca_vault_trades_through_the_guard_is_valued_through_the_driver_and
         pool: "SOL/USD".into(),
         side: Side::Buy,
         amount: decimal("2000"),
-        limit_price: decimal("155"),
+        limit_price: decimal("151.4"),
     };
     let receipt = accepted(trading.orca_submit(&strategy_sdk::to_payload(&buy)).await);
     let Receipt::Moved { token, dollars } = receipt else {
@@ -659,11 +659,12 @@ async fn an_orca_vault_trades_through_the_guard_is_valued_through_the_driver_and
     assert_eq!(held.position, position);
     assert!(held.in_range && held.liquidity != "0");
     assert!(
-        opened.value > decimal("3900") && opened.value <= decimal("4001"),
+        opened.value > decimal("3500") && opened.value <= decimal("4001"),
         "{}",
         opened.value
     );
-    assert!(opened.exit_value <= opened.value && opened.exit_value > decimal("3800"));
+    assert!(opened.exit_value <= opened.value && opened.exit_value > decimal("3400"));
+    assert!(!opened.outside);
     assert_eq!(opened.max_positions, 1);
     // A second band is refused: the station has one slot.
     let refused = trading.orca_submit(&strategy_sdk::to_payload(&open)).await;

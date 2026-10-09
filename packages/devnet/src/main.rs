@@ -118,10 +118,11 @@ enum Command {
         /// The operator's Google Cloud project id.
         #[arg(long)]
         project: String,
-        /// The SOL the market operator puts into Orca's pool, with the
-        /// dollars that go with it, when the pool has no depth yet: moved to
-        /// it from the deployer as it needs. Zero leaves the pool empty.
-        #[arg(long, default_value_t = 2.0)]
+        /// The SOL the market operator's own seed in Orca's pool holds, with
+        /// as many dollars, centred on Pyth's price: moved to it from the
+        /// deployer as it needs. The default gives the depth a $100 demo
+        /// vault's closes need. Zero sets no seed up.
+        #[arg(long, default_value_t = 40.0)]
         orca_seed_sol: f64,
     },
     /// The smoke check a deploy ends with, read-only: each EVM chain's
@@ -1700,7 +1701,7 @@ mod tests {
             panic!("not the set-up");
         };
         assert_eq!(project, "shonin-testnet");
-        assert_eq!(orca_seed_sol, 2.0);
+        assert_eq!(orca_seed_sol, 40.0);
         assert!(parse(&["solana-setup"]).is_err());
     }
 

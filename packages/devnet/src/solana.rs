@@ -990,11 +990,16 @@ pub async fn run_market(
         seconds_per_block = step,
         "the Solana clock is running; the venue is quoting"
     );
-    // Orca's pool follows the tape's moves from SOL's starting price, the
-    // operator trading it there, and Pyth's stand-in follows the pool.
+    // Pyth's stand-in posts SOL's price from the tape's moves since SOL's
+    // starting price, as Pyth posts its own; the market operator then brings
+    // Orca's pool to it and keeps its seed around it.
     let admin = client.role(Role::Admin)?;
     let mut first_spot = None;
     let steering = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    let orca = client
+        .account(&chain::solana::orca::POOLS[0].address)
+        .await?
+        .is_some();
     loop {
         // The clock only moves forward, and runs on at real pace between
         // jumps, so the next mark is always ahead of it.
@@ -1002,9 +1007,12 @@ pub async fn run_market(
         while at <= now {
             at += step;
         }
+        let tick = tape.step();
+        let first = *first_spot.get_or_insert(tick.spot);
+        let sol = (crate::solana_orca::LOCAL_START as f64 * tick.spot / first.max(1.0)) as u128;
         // Published at the mark the clock jumps to, so the price is never
         // older than the driver takes, however far the clock jumps.
-        if let Err(error) = chain::solana::orca::setup::price_follows_pool(client, at).await {
+        if orca && let Err(error) = chain::solana::orca::setup::post_price(client, sol, at).await {
             tracing::warn!(
                 error = format!("{error:#}"),
                 "Pyth's stand-in would not take the price"
@@ -1013,34 +1021,19 @@ pub async fn run_market(
         if let Err(error) = client.rpc.time_travel(at).await {
             tracing::warn!(error = format!("{error:#}"), "the clock would not move");
         }
-        let tick = tape.step();
-        let first = *first_spot.get_or_insert(tick.spot);
-        if first > 0.0
-            && let Ok(turn) = steering.clone().try_lock_owned()
-        {
-            let target = (crate::solana_orca::LOCAL_START as f64 * tick.spot / first) as u128;
+        if orca && let Ok(turn) = steering.clone().try_lock_owned() {
             let (client, platform) = (client.clone(), platform.clone());
             let (admin, operator) = (admin.insecure_clone(), operator.insecure_clone());
             tokio::spawn(async move {
                 let _turn = turn;
-                let steered = async {
-                    if client
-                        .account(&chain::solana::orca::POOLS[0].address)
-                        .await?
-                        .is_none()
-                    {
-                        return Ok(());
-                    }
-                    chain::solana::orca::setup::steer(
-                        &client, &platform, &admin, &operator, target,
-                    )
-                    .await?;
-                    chain::solana::orca::setup::price_follows_pool(&client, at).await
-                };
-                if let Err(error) = steered.await {
+                let kept = chain::solana::orca::setup::keep_seed_at(
+                    &client, &platform, &admin, &operator, sol, None,
+                )
+                .await;
+                if let Err(error) = kept {
                     tracing::warn!(
                         error = format!("{error:#}"),
-                        "Orca's pool would not follow the tape"
+                        "Orca's pool would not follow Pyth's stand-in"
                     );
                 }
             });

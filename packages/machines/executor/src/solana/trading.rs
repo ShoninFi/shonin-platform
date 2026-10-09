@@ -258,7 +258,7 @@ impl Trading {
     /// Carry `amount` along `steps`: the vault's cash to its station or
     /// back, and the station's to the venue or back, each through the
     /// vault's or the station's own instruction.
-    pub async fn carry(&self, steps: &[Step], amount: u64) -> Result<()> {
+    pub async fn carry(&self, steps: &[Step], amount: u64, driver: &str) -> Result<()> {
         for step in steps {
             match step {
                 Step::Pull | Step::Push => {
@@ -277,7 +277,7 @@ impl Trading {
                 }
                 // Orca's driver lends each call the dollars it needs and
                 // takes back what it didn't use: nothing waits at Orca.
-                Step::Deposit | Step::Withdraw if self.has_orca() => {
+                Step::Deposit | Step::Withdraw if driver == super::orca::DRIVER => {
                     return Err(anyhow!(
                         "the {} driver holds no dollars at the venue between calls: an open, an add or a buy draws on the station's own",
                         super::orca::DRIVER

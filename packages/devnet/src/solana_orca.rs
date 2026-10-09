@@ -9,18 +9,19 @@
 //! loader as on every cluster; its settings account and the fee tier are
 //! written as Orca lays them out, its fee authorities the operator's (only
 //! Orca's own keys could create them on a public cluster); and Pyth's SOL/USD
-//! account is a stand-in at its sponsored address, written by the clock's
-//! driver at every jump to the pool's own price, published at the new time,
-//! as arbitrage would keep them. The pool itself, its tick arrays and the
-//! operator's position are made by Orca's program, and the market operator
-//! moves the pool along a tape so that a strategy has a market to follow.
+//! account is a stand-in at its sponsored address, posted by the clock's
+//! driver at every jump from a tape of its own and published at the new
+//! time, as Pyth posts SOL's price; the market operator then brings the pool
+//! to it, as arbitrage would. The pool itself, its tick arrays and the
+//! operator's seed are made by Orca's program.
 //!
 //! **On devnet** Orca's program, its settings and the fee tier are Orca's own,
 //! and Pyth posts the price: [`set_up_devnet`] creates the pool the driver
 //! lists at Pyth's price, its tick arrays around it, and seeds it from the
-//! operator, once; [`keep_with_pyth`] brings the pool back to Pyth's price
-//! whenever it has strayed, as the market operator's part of the testnet
-//! market. Every step looks at the cluster first, so each is safe to run
+//! operator at a position only the operator can open; [`keep_with_pyth`]
+//! brings the pool back to Pyth's price whenever it has strayed and sets the
+//! seed again around it once Pyth leaves its inner half, as the market
+//! operator's part of the testnet market. Every step looks at the cluster first, so each is safe to run
 //! again.
 
 use std::path::Path;
@@ -28,7 +29,8 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use chain::solana::orca::setup::{
     FEE_RATE, OPERATOR_KEEPS, PRICE_ONE, config_data, ensure_arrays_around, ensure_pool,
-    fee_tier_data, load_program, pool_now, post_price, program_there, put, pyth_now, seed, steer,
+    fee_tier_data, keep_seed_at, load_program, pool_now, post_price, program_there, put, pyth_now,
+    seed_position,
 };
 use chain::solana::orca::{self as venue};
 use chain::solana::platform::Platform;
@@ -43,11 +45,14 @@ const ORCA_FILE: &str = "orca_whirlpool.so";
 /// SOL's price on a local cluster at the start: $150, as the driver's tests
 /// price it.
 pub const LOCAL_START: u128 = 150 * PRICE_ONE;
-/// The operator's position: this far either side of the price, in basis
-/// points, and on a local cluster this much SOL.
-const SEED_HALF_WIDTH_BPS: u128 = 2_000;
-const LOCAL_SEED_SOL: u64 = 500 * LAMPORTS;
-const LAMPORTS: u64 = 1_000_000_000;
+pub use chain::solana::orca::setup::LAMPORTS;
+
+/// The operator's seed on a local cluster: the depth the default demo
+/// deposit's closes need (see `in_band_share` in the chain crate's Orca
+/// set-up): $25,000 at 80% deployed and $150 a SOL is at most 139 SOL held,
+/// so 3 × 139 × 8 = 3,333 SOL taken inside the band, which a seed ±2% wide
+/// gives with 6,650 SOL.
+const LOCAL_SEED_SOL: u64 = 8_000 * LAMPORTS;
 /// The tick arrays made either side of the price's own at the set-up.
 const LOCAL_ARRAYS_EACH_SIDE: i32 = 3;
 const DEVNET_ARRAYS_EACH_SIDE: i32 = 2;
@@ -98,29 +103,35 @@ pub async fn set_up_local(
         .await?;
     }
     let pool = ensure_pool(client, payer, LOCAL_START).await?;
-    post_price(
+    // The stand-in's own price: the market operator posts it from then on.
+    let price = match client.account(&venue::PRICE_ACCOUNT).await? {
+        Some(account) => venue::read_price(&account)
+            .ok()
+            .and_then(|price| {
+                let exponent = price.exponent + venue::PRICE_DECIMALS as i32;
+                (exponent <= 0).then(|| price.price as u128 / 10u128.pow(exponent.unsigned_abs()))
+            })
+            .unwrap_or(LOCAL_START),
+        None => LOCAL_START,
+    };
+    post_price(client, price, client.now().await?).await?;
+    ensure_arrays_around(client, payer, &pool, LOCAL_ARRAYS_EACH_SIDE).await?;
+    if seed_position(client, operator).await?.is_none()
+        && client.lamports(&operator.pubkey()).await? < LOCAL_SEED_SOL + 10 * LAMPORTS
+    {
+        client
+            .airdrop(&operator.pubkey(), LOCAL_SEED_SOL + 10 * LAMPORTS)
+            .await?;
+    }
+    keep_seed_at(
         client,
-        venue::price_of_sqrt(pool.state.sqrt_price),
-        client.now().await?,
+        platform,
+        admin,
+        operator,
+        price,
+        Some(LOCAL_SEED_SOL),
     )
     .await?;
-    ensure_arrays_around(client, payer, &pool, LOCAL_ARRAYS_EACH_SIDE).await?;
-    if pool.state.liquidity == 0 {
-        if client.lamports(&operator.pubkey()).await? < LOCAL_SEED_SOL + 10 * LAMPORTS {
-            client
-                .airdrop(&operator.pubkey(), LOCAL_SEED_SOL + 10 * LAMPORTS)
-                .await?;
-        }
-        seed(
-            client,
-            platform,
-            admin,
-            operator,
-            LOCAL_SEED_SOL,
-            SEED_HALF_WIDTH_BPS,
-        )
-        .await?;
-    }
     tracing::info!(pool = %pool.address, "Orca's pool is open, with the operator's depth");
     Ok(())
 }
@@ -200,10 +211,18 @@ pub async fn set_up_devnet(
     let oracle = pyth_now(client).await?;
     let pool = ensure_pool(client, deployer, oracle).await?;
     ensure_arrays_around(client, deployer, &pool, DEVNET_ARRAYS_EACH_SIDE).await?;
-    if pool.state.liquidity == 0 && seed_sol > 0 {
-        let need =
-            (seed_sol + OPERATOR_KEEPS).saturating_sub(client.lamports(&operator.pubkey()).await?);
-        if need > 0 {
+    // The operator's own seed, whatever anyone else holds in the pool:
+    // at Pyth's price (the pool steered there first), and set again around
+    // it if it has moved since.
+    if seed_sol > 0 {
+        let have = seed_position(client, operator).await?.is_some();
+        let wrapped = client
+            .token_balance(&venue::wsol_of(&operator.pubkey()))
+            .await
+            .unwrap_or(0);
+        let need = (seed_sol + OPERATOR_KEEPS)
+            .saturating_sub(client.lamports(&operator.pubkey()).await? + wrapped);
+        if need > 0 && !have {
             client
                 .send(
                     vec![chain::solana::executor::ix_fund(
@@ -216,15 +235,7 @@ pub async fn set_up_devnet(
                 .await
                 .context("giving the operator the SOL it seeds the pool with")?;
         }
-        seed(
-            client,
-            platform,
-            admin,
-            operator,
-            seed_sol,
-            SEED_HALF_WIDTH_BPS,
-        )
-        .await?;
+        keep_seed_at(client, platform, admin, operator, oracle, Some(seed_sol)).await?;
     }
     let after = pool_now(client).await?;
     tracing::info!(
@@ -237,18 +248,23 @@ pub async fn set_up_devnet(
 }
 
 /// The market operator's part at Orca on devnet: the pool brought back to
-/// Pyth's price when it has strayed. Nothing on a cluster without the pool.
+/// Pyth's price when it has strayed, and the operator's seed of `seed_sol`
+/// set again around it, as large as it was, once Pyth has left the seed's
+/// inner half. Nothing on a cluster without the pool, or with no seed set
+/// up.
 pub async fn keep_with_pyth(
     client: &SolanaClient,
     platform: &Platform,
     admin: &Keypair,
     operator: &Keypair,
 ) -> Result<()> {
-    if client.account(&venue::POOLS[0].address).await?.is_none() {
+    if client.account(&venue::POOLS[0].address).await?.is_none()
+        || seed_position(client, operator).await?.is_none()
+    {
         return Ok(());
     }
     let target = pyth_now(client).await?;
-    let price = steer(client, platform, admin, operator, target).await?;
+    let price = keep_seed_at(client, platform, admin, operator, target, None).await?;
     tracing::info!(
         pool = price as f64 / PRICE_ONE as f64,
         pyth = target as f64 / PRICE_ONE as f64,

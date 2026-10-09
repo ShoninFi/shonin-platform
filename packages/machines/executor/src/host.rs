@@ -1174,7 +1174,10 @@ impl shonin::agent::transfers::HostWithStore<Ctx> for HasSelf<Ctx> {
                     }
                 }
                 Place::Solana(trading) => {
-                    match trading.carry(std::slice::from_ref(&step), amount).await {
+                    match trading
+                        .carry(std::slice::from_ref(&step), amount, &driver)
+                        .await
+                    {
                         Ok(()) => (None, false),
                         Err(error) => {
                             let tally = crate::solana::tally_of(&error);
