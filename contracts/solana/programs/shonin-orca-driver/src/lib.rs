@@ -57,13 +57,22 @@
 //! selling pool or a pool where the station has liquidity is at or past
 //! where a close's sale may go, or when that sale can't take all the SOL
 //! before it gets there: nobody is paid at a value no sale inside the band
-//! reaches. With nothing of worth held at Orca (no position with liquidity
+//! reaches. A sale crosses no more than so many initialized ticks, and stops
+//! a unit short of the next: a valuation's as many as cover the widest band
+//! a station may have ([`sale::VALUE_CROSSINGS`]), a close's as many as one
+//! close can afford ([`sale::CLOSE_CROSSINGS`]). A valuation whose sale stops
+//! so short of all the SOL is outside; a claim's close whose sale does is
+//! refused as outside (the claim waits, the valuation standing); a stopped
+//! station's unwind sells up to where its sale stops, inside the band, its
+//! valuation what that sale fetches, and leaves the rest to the next
+//! unwind. With nothing of worth held at Orca (no position with liquidity
 //! or fees, and wrapped SOL worth under a dollar at Pyth's last price),
 //! the valuation is nothing, never outside, and a close leaves it. At the
 //! full band, a stopped station's last resort, nothing is outside: the sale
 //! goes a tick spacing short of the furthest three arrays from the pool's
-//! price reach, and what it can't take there counts for nothing until the
-//! next unwind sells on from there.
+//! price reach, or a unit short of the tick past its last crossing, and
+//! what it can't take there counts for nothing until the next unwind sells
+//! on from there.
 //!
 //! **Close.** For a fraction `f` of everything: each position's liquidity is
 //! decreased by `floor(f * L)`, its minimums what a withdrawal pays anywhere
@@ -82,11 +91,13 @@
 //! prepares nothing. A pool that can't take the sale inside the band leaves
 //! the close short, and the station refuses it whole.
 //!
-//! **Compute.** A close of a full slot, its sale crossing other providers'
-//! ticks, measures about 315,000 units with the vault's call around it
-//! (`orca_driver.rs`), inside `shonin_driver::COMPUTE_PER_DRIVER` with room
-//! for a sale crossing several more; each slot more costs about 85,000,
-//! which is why there is one.
+//! **Compute.** A claim's close of a full slot with its fees, its sale
+//! crossing as many initialized ticks as a close's may, measures at most
+//! about 367,000 units with the vault's call around it (`orca_driver.rs`),
+//! inside `shonin_driver::COMPUTE_PER_DRIVER`; each crossing more costs about
+//! 10,000 (worked out here, made by Orca, valued again after), and each slot
+//! more about 85,000, which is why there is one. A valuation costs about
+//! 29,000 units and 4,000 more a crossing.
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program::set_return_data;
@@ -211,8 +222,22 @@ pub mod shonin_orca_driver {
         band_bps: u16,
     ) -> Result<()> {
         let book = logic::read(&ctx.accounts.given(), ctx.remaining_accounts)?;
-        let (value, sale) = book.assess(band_bps)?;
+        let (value, sale) = book.assess(band_bps, logic::Asked::Close)?;
         let plan = book.close(fraction, band_bps, value.outside, sale)?;
+        answer(&Close { value, plan })
+    }
+
+    /// A stopped station's unwind of everything: as a close of it all, but
+    /// a sale that would cross more ticks than one close affords sells up to
+    /// where it stops, inside the band, and leaves the rest for the next
+    /// unwind; the valuation answered with it is what that sale fetches.
+    pub fn unwind<'info>(
+        ctx: Context<'_, '_, 'info, 'info, Read<'info>>,
+        band_bps: u16,
+    ) -> Result<()> {
+        let book = logic::read(&ctx.accounts.given(), ctx.remaining_accounts)?;
+        let (value, sale) = book.assess(band_bps, logic::Asked::Unwind)?;
+        let plan = book.close(WAD, band_bps, value.outside, sale)?;
         answer(&Close { value, plan })
     }
 
@@ -767,11 +792,12 @@ pub mod logic {
         /// for nothing. A pool pushed inside the band may lift `exit` above
         /// `mark`.
         pub fn valuation(&self, band_bps: u16) -> Result<Valuation> {
-            Ok(self.assess(band_bps)?.0)
+            Ok(self.assess(band_bps, Asked::Value)?.0)
         }
 
-        /// The valuation, and how the sale it works out ends.
-        pub fn assess(&self, band_bps: u16) -> Result<(Valuation, SaleEnd)> {
+        /// The valuation, as `asked` for it, and how the sale it works out
+        /// ends.
+        pub fn assess(&self, band_bps: u16, asked: Asked) -> Result<(Valuation, SaleEnd)> {
             let nothing = |outside| {
                 Ok((
                     Valuation {
@@ -807,8 +833,16 @@ pub mod logic {
                     SaleEnd::default(),
                 ));
             }
-            let (exit, sold_all, sale) = self.liquidation(band_bps)?;
-            let outside = !full && !sold_all;
+            let crossings = match asked {
+                Asked::Value => sale::VALUE_CROSSINGS,
+                Asked::Close | Asked::Unwind => sale::CLOSE_CROSSINGS,
+            };
+            let (exit, sold_all, sale) = self.liquidation(band_bps, crossings)?;
+            // A sale stopped short of a tick it may not cross sells up to
+            // there in an unwind, where nobody is paid at the valuation;
+            // anything else short of all of it is outside.
+            let stopped = asked == Asked::Unwind && sale.stop.is_some();
+            let outside = !full && !sold_all && !stopped;
             Ok((
                 Valuation {
                     mark: clamp(mark),
@@ -821,7 +855,7 @@ pub mod logic {
 
         /// What selling everything now fetches, as [`Self::valuation`]'s
         /// `exit` says, whether the sale takes all the SOL, and how it ends.
-        fn liquidation(&self, band_bps: u16) -> Result<(u128, bool, SaleEnd)> {
+        fn liquidation(&self, band_bps: u16, crossings: u32) -> Result<(u128, bool, SaleEnd)> {
             let (asset, dollars) = self.holdings(|p| self.pools[p].sqrt_price, true)?;
             let asset = clamp(asset);
             let pool = &self.pools[0];
@@ -847,6 +881,7 @@ pub mod logic {
                     asset,
                     network::asset_is_a(),
                     limit,
+                    crossings,
                 )?
             };
             let worth = dollars.saturating_add(sold.proceeds as u128);
@@ -951,8 +986,9 @@ pub mod logic {
         /// how its sale of everything ends: when it sells nothing through the
         /// given arrays, no swap is prepared, except at the full band, where
         /// Orca's walks the price on; when it stops short of a tick it may
-        /// not cross (only ever at the full band, as it is outside below),
-        /// the swap goes no further either.
+        /// not cross (only ever in a stopped station's unwind, or at the full
+        /// band, as it is outside otherwise), the swap goes no further
+        /// either.
         pub fn close(
             &self,
             fraction: u64,
@@ -1141,6 +1177,17 @@ pub mod logic {
                 orders: orders.min(MAX_MARKETS as u8),
             })
         }
+    }
+
+    /// What a valuation is asked for: to value (a valuation's sale may cross
+    /// as many ticks as [`sale::VALUE_CROSSINGS`]), for a claim's close, or
+    /// for a stopped station's unwind (as many as a close affords,
+    /// [`sale::CLOSE_CROSSINGS`]).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Asked {
+        Value,
+        Close,
+        Unwind,
     }
 
     /// How a sale of everything ends: whether it sells anything, and where

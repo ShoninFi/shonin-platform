@@ -1013,6 +1013,12 @@ fn unwind_fraction<'info>(
             &leg.accounts,
             shonin_driver::data(discriminator::VALUE, &band),
         )?;
+        // A part nobody can value is no part kept: an account the close
+        // left outside the band (its sale ending on the band's very edge)
+        // undoes the close rather than read the stayers' part as nothing.
+        if remains.outside {
+            return err!(StationError::ShortSweep);
+        }
         // A shortfall past the rounding is the leaver's own fill, never the
         // stayers' gain: proceeds that went to repay the account's margin
         // debt, so the account is left worth more than the stayers' share,
@@ -1066,10 +1072,8 @@ fn unwind_named<'info>(
         let accounts = driver_accounts(&station.drivers[*index], group)?;
         // The close comes with the account's valuation at the same band,
         // read from the same accounts: what its sale should bring home.
-        let Close { value, plan } = guard::ask(
-            &accounts,
-            shonin_driver::data(discriminator::CLOSE, &(WAD, band)),
-        )?;
+        let Close { value, plan } =
+            guard::ask(&accounts, shonin_driver::data(discriminator::UNWIND, &band))?;
         if plan.outside {
             blocked = true;
             continue;

@@ -1091,7 +1091,7 @@ fn a_sale_through_crowded_ticks_stops_short_of_the_one_past_its_crossings_as_orc
     println!("{value:?}, {compute} compute units");
     // Orca's swap of the same SOL, no further than a unit short of the
     // tick past the last crossing allowed.
-    let cap = shonin_orca_driver::sale::MAX_CROSSINGS as i32;
+    let cap = shonin_orca_driver::sale::VALUE_CROSSINGS as i32;
     let limit = orca_math::sqrt_price_at(top - cap * SPACING).unwrap() + 1;
     let usd =
         get_associated_token_address_with_program_id(&bob.pubkey(), &env.mint, &spl_token::ID);
@@ -1203,23 +1203,136 @@ fn crossed(from: i32, to: i32) -> i32 {
 }
 
 /// A pool crowded with slivers of liquidity on every tick inside the band
-/// would make a claim's close cross more ticks than its compute affords: the
-/// valuation is outside and the claim waits, never a transaction that runs
-/// out of compute. The same holding in the same pool uncrowded is valued.
+/// (anyone can place them for next to nothing) never voids a valuation: a
+/// valuation's sale crosses every one of them inside the band and the vault
+/// is valued. A claim's close whose sale would cross more of them than one
+/// close can afford is refused as outside, so the claim waits, rather than
+/// a transaction that runs out of compute.
 #[test]
-fn a_pool_crowded_with_ticks_inside_the_band_is_outside_and_its_claims_wait() {
+fn a_claim_whose_sale_crosses_more_ticks_than_a_close_affords_waits_and_the_valuation_stands() {
     let mut env = Env::with_orca();
     let home = env.orca_home_with_band("orca", 1_000);
     env.station_provides(&home, LOWER, UPPER, 10 * SOL);
     expect_ok(env.station_buys_sol(&home, 8_000_000_000));
     env.price_follows_pool();
-    assert!(!env.value(&home).outside);
     env.crowd_below(40);
-    assert!(env.value(&home).outside);
-    let tick = env.pool_state().tick;
+    let group = env.orca_group(&home.station);
+    let (value, compute) = ok(env.driver_value_metered(&group, 1_000));
+    println!("{value:?} in {compute} compute units");
+    assert!(!value.outside);
+    assert!(!env.value(&home).outside);
+    // What selling it all would cross: more than a close may.
+    let from = env.pool_state().tick;
     let (outcome, received, _) = ok(env.orca_unwind(&home, WAD / 2));
     assert!(outcome.blocked && received == 0);
-    assert_eq!(env.pool_state().tick, tick);
+    assert_eq!(env.pool_state().tick, from);
+    // And the valuation still stands.
+    assert!(!env.value(&home).outside);
+}
+
+/// A stopped station unwound in its fifth week (band 16%), holding about
+/// 105 SOL the pool takes moving its price about 8%, with slivers on every
+/// tick below the price: each unwind sells up to where its sale stops,
+/// crossing as many ticks as a close may, and the next goes on, until it is
+/// all sold. The slivers never hold the unwind up.
+#[test]
+fn slivers_on_every_tick_never_hold_up_a_stopped_station_s_unwind_inside_its_band() {
+    for with_slivers in [false, true] {
+        let (mut env, home) = world();
+        let bob = env.bob.insecure_clone();
+        env.svm.airdrop(&bob.pubkey(), 2_000 * SOL).unwrap();
+        env.wrap(&bob, 1_000 * SOL);
+        send_wsol(&mut env, &home, 105 * SOL);
+        if with_slivers {
+            env.crowd_below(40);
+        }
+        env.halt_and_stop(&home);
+        env.skip(4 * shonin_station::state::WIDEN_AFTER);
+        let payer = env.payer.insecure_clone();
+        let mut unwinds = 0;
+        while wsol(&env, &home) > 2 {
+            env.price_follows_pool();
+            assert_eq!(env.station(&home).stopped_band(env.now()), 1_600);
+            let (from, held) = (env.pool_state().tick, wsol(&env, &home));
+            let ix = env.ix_unwind_stopped(&home, &payer.pubkey(), &[0]);
+            let meta = expect_ok(env.send_fitting(vec![ix], &[&payer]));
+            let outcome = Outcome::try_from_slice(&meta.return_data.data).unwrap();
+            assert!(!outcome.blocked, "slivers held the unwind up");
+            assert!(wsol(&env, &home) < held);
+            if with_slivers {
+                let n = crossed(from, env.pool_state().tick) as u32;
+                assert!(n <= shonin_orca_driver::sale::CLOSE_CROSSINGS, "{n}");
+            }
+            unwinds += 1;
+            assert!(unwinds <= 10);
+        }
+        println!("with slivers {with_slivers}: {unwinds} unwinds");
+        assert!(unwinds == 1 || with_slivers);
+    }
+}
+
+/// A claim's close at its worst for compute: a position out of range below
+/// the price (all SOL, its fees earned while it was in range), so a
+/// fraction's sale goes through others' liquidity alone and crosses as many
+/// ticks as a close may, as the sale of everything does; the position is
+/// decreased and its fees collected, and the stayers' part valued again
+/// after. It fits the compute a driver may use.
+#[test]
+fn a_claim_s_close_at_its_worst_for_compute_fits_what_a_driver_may_use() {
+    let mut worst = (0u64, 0u64, 0u64, 0i32);
+    for extra in [30u64, 32, 34, 36, 38, 40] {
+        for fraction in [WAD / 100 * 99, WAD / 1000 * 999, WAD] {
+            let mut env = Env::with_orca();
+            let home = env.orca_home_with_band("orca", 1_000);
+            env.station_provides(&home, LOWER, UPPER, 10 * SOL);
+            for _ in 0..2 {
+                env.bob_swaps(20 * SOL, true);
+                env.bob_swaps(3_000_000_000, false);
+            }
+            // Bob sells the price below the range: the position is all SOL.
+            let bob = env.bob.insecure_clone();
+            env.svm.airdrop(&bob.pubkey(), 2_000 * SOL).unwrap();
+            env.wrap(&bob, 1_000 * SOL);
+            let limit = orca_math::sqrt_price_at(LOWER - 3 * SPACING).unwrap();
+            let usd = get_associated_token_address_with_program_id(
+                &bob.pubkey(),
+                &env.mint,
+                &spl_token::ID,
+            );
+            let ix = env.ix_swap(
+                &bob.pubkey(),
+                &env.wsol_of(&bob.pubkey()),
+                &usd,
+                500 * SOL,
+                limit,
+                true,
+            );
+            expect_ok(env.send(vec![ix], &[&bob]));
+            env.price_follows_pool();
+            send_wsol(&mut env, &home, extra * SOL);
+            env.crowd_below(40);
+            if env.value(&home).outside {
+                continue;
+            }
+            let from = env.pool_state().tick;
+            let (outcome, _, compute) = ok(env.orca_unwind(&home, fraction));
+            if outcome.blocked {
+                continue;
+            }
+            let n = crossed(from, env.pool_state().tick);
+            if compute > worst.0 {
+                worst = (compute, extra, fraction, n);
+            }
+        }
+    }
+    println!("worst: {worst:?}");
+    assert_eq!(
+        worst.3 as u32,
+        shonin_orca_driver::sale::CLOSE_CROSSINGS,
+        "{worst:?}"
+    );
+    assert!(worst.0 <= 370_000, "{worst:?}");
+    assert!(worst.0 < COMPUTE_PER_DRIVER);
 }
 
 /// A claim's close whose sale crosses as many initialized ticks as a sale
@@ -1244,7 +1357,7 @@ fn a_claim_s_close_crossing_as_many_ticks_as_a_sale_may_fits_the_compute() {
         let n = crossed(from, env.pool_state().tick);
         println!("a close of {fraction} crossed {n} ticks in {compute} compute units");
         if fraction == WAD {
-            assert_eq!(n as u32, shonin_orca_driver::sale::MAX_CROSSINGS);
+            assert_eq!(n as u32, shonin_orca_driver::sale::CLOSE_CROSSINGS);
         }
         worst = worst.max(compute);
     }
@@ -1274,7 +1387,7 @@ fn at_the_full_band_an_unwind_through_a_crowded_pool_sells_on_a_few_ticks_at_a_t
             "crossed {n} in {} compute units",
             meta.compute_units_consumed
         );
-        assert_eq!(n as u32, shonin_orca_driver::sale::MAX_CROSSINGS);
+        assert_eq!(n as u32, shonin_orca_driver::sale::CLOSE_CROSSINGS);
         assert!(wsol(&env, &home) < held);
     }
 }
@@ -1282,3 +1395,59 @@ fn at_the_full_band_an_unwind_through_a_crowded_pool_sells_on_a_few_ticks_at_a_t
 /// Dollars a station buys SOL with, on top of its position, for its whole
 /// holding to cross every tick a sale may in the crowded pool.
 const CAP_HOLDING: u64 = 7_500_000_000;
+
+/// The vault itself, on Orca: a claim whose close would cross more ticks
+/// than one close affords is tried, waits, and the vault's valuations go on
+/// being recorded and settled.
+#[test]
+fn the_vault_s_claim_whose_close_crosses_too_many_ticks_waits_and_the_vault_is_still_valued() {
+    use shonin_solana_tests::vault::{self as fixture, ClaimState};
+    let mut env = Env::new_with_mint(Some(shonin_orca_driver::network::DOLLAR_MINT));
+    env.set_up_stations_for(shonin_vault::ID);
+    env.set_up_orca();
+    // Orca's approval waited out a timelock: the builder's and reviewer's
+    // keys are blessed again, as their machines renew them.
+    let (builder, reviewer) = (env.builder.pubkey(), env.reviewer.pubkey());
+    env.bless_service_key(builder_image(), builder);
+    env.bless_service_key(reviewer_image(), reviewer);
+    let mut terms = fixture::terms();
+    terms.exit_band_bps = 1_000;
+    expect_ok(env.initialize_vaults(terms, Pubkey::default()));
+    let v = env.open(&[Declared {
+        name: orca(),
+        program: shonin_orca_driver::ID,
+    }]);
+    let (alice, bob) = (env.alice.insecure_clone(), env.bob.insecure_clone());
+    env.price_follows_pool();
+    let a = env.deposit_as(&v, &alice, 8_000_000_000);
+    env.deposit_as(&v, &bob, 8_000_000_000);
+    // The executor puts most of it in SOL at Orca.
+    env.approve_executor(&v.home);
+    expect_ok(env.to_station(&v, 15_000_000_000));
+    let executor = env.executor.insecure_clone();
+    let open = env.ix_open_wsol(&executor.pubkey(), &v.home.authority(0));
+    expect_ok(env.send(vec![open], &[&executor]));
+    expect_ok(env.station_buys_sol(&v.home, 14_000_000_000));
+    env.crowd_below(40);
+    env.price_follows_pool();
+    // Alice's whole stake: more than the cash, so a claim.
+    let id = env.redeem(&v, &alice, a);
+    env.price_follows_pool();
+    env.price(&v);
+    assert_eq!(env.claim(&v, id).unwrap().state, ClaimState::Pending);
+    env.price_follows_pool();
+    assert!(!env.value(&v.home).outside);
+    let held = wsol(&env, &v.home);
+    expect_ok(env.settle_claim(&v, id));
+    let claim = env.claim(&v, id).unwrap();
+    assert_eq!(claim.state, ClaimState::Waiting);
+    assert_eq!(claim.last_attempt_at, env.now());
+    assert_eq!(wsol(&env, &v.home), held);
+    // Valuations are still recorded and settled: a deposit is priced.
+    let carol = Keypair::new();
+    env.svm.airdrop(&carol.pubkey(), 1_000_000_000).unwrap();
+    env.give(&carol.pubkey(), 1_000_000_000);
+    env.price_follows_pool();
+    let shares = env.deposit_as(&v, &carol, 1_000_000_000);
+    assert!(shares > 0);
+}

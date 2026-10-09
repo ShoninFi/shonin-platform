@@ -174,6 +174,11 @@ pub mod discriminator {
     pub const CLOSE: [u8; 8] = [98, 165, 201, 177, 108, 65, 206, 96];
     /// `sweep(amount: u64)`, answered with a [`super::Plan`].
     pub const SWEEP: [u8; 8] = [40, 23, 234, 175, 14, 61, 154, 177];
+    /// `unwind(band_bps: u16)`, answered with a [`super::Close`]: a stopped
+    /// station's close of everything inside `band_bps`. A driver whose venue
+    /// can't sell it all in one transaction may plan less, its valuation
+    /// then what that plan fetches, and the next unwind goes on from there.
+    pub const UNWIND: [u8; 8] = [66, 99, 1, 75, 47, 72, 63, 85];
 }
 
 /// What a venue instruction may do, for when a driver is revoked: the

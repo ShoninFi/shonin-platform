@@ -52,6 +52,15 @@ pub mod shonin_local_driver_2 {
         answer(&logic::closing(&book, fraction, band_bps, 2)?)
     }
 
+    /// A stopped station's unwind of everything: the stand-in sells it all
+    /// in one transaction, so the same as a close of it all.
+    pub fn unwind<'info>(
+        ctx: Context<'_, '_, 'info, 'info, Read<'info>>,
+        band_bps: u16,
+    ) -> Result<()> {
+        close(ctx, shonin_driver::WAD, band_bps)
+    }
+
     pub fn sweep<'info>(
         ctx: Context<'_, '_, 'info, 'info, Read<'info>>,
         amount: u64,

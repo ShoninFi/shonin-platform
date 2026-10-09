@@ -577,6 +577,14 @@ fn the_interfaces_discriminators_are_the_programs_own() {
         d::SWEEP
     );
     assert_eq!(
+        shonin_local_driver::instruction::Unwind::DISCRIMINATOR,
+        d::UNWIND
+    );
+    assert_eq!(
+        shonin_orca_driver::instruction::Unwind::DISCRIMINATOR,
+        d::UNWIND
+    );
+    assert_eq!(
         shonin_test_vault::instruction::StationView::DISCRIMINATOR,
         shonin_station::state::vault::STATION_VIEW
     );

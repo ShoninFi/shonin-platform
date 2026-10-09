@@ -47,20 +47,27 @@ pub struct Sale {
 
 const FEE_ONE: u128 = 1_000_000;
 
-/// The most initialized ticks a sale may cross: what a claim's close can
-/// afford, its sale worked out here and made by Orca's swap, inside
-/// `shonin_driver::COMPUTE_PER_DRIVER` with room to spare. A sale that would
-/// cross more stops just short of the next, so that Orca's swap made to the
-/// same price crosses no more either. A claim's close crossing this many,
-/// from a position with fees, measures about 367,000 units; one more would
-/// take it past 370,000.
-pub const MAX_CROSSINGS: u32 = 7;
+/// The most initialized ticks a close's sale may cross: what a claim's
+/// close can afford, its sale worked out here and made by Orca's swap and the
+/// stayers' part valued again after, inside
+/// `shonin_driver::COMPUTE_PER_DRIVER` with room to spare. A claim's close
+/// at this many, from a position with fees, measures about 367,000 units;
+/// one more would take it past 370,000. A sale that would cross more stops
+/// just short of the next, so that Orca's swap made to the same price
+/// crosses no more either.
+pub const CLOSE_CROSSINGS: u32 = 7;
+
+/// The most a valuation's sale may cross: about 4,000 units each on a
+/// valuation's 29,000. From a pool at the top of the widest band a station
+/// may be created with (10%) to the sale's limit at its bottom is about 32
+/// spacings of 64 ticks; this covers that with room.
+pub const VALUE_CROSSINGS: u32 = 40;
 
 /// Sells `amount` of token A (`a_to_b`) or of token B in `pool`, no further
-/// than the square-root price `limit` nor across more than
-/// [`MAX_CROSSINGS`] initialized ticks, through the pool's liquidity less
-/// `own`, with the ticks of `arrays` (those a swap would be given, starting
-/// at `starts`).
+/// than the square-root price `limit` nor across more than `crossings`
+/// initialized ticks, through the pool's liquidity less `own`, with the
+/// ticks of `arrays` (those a swap would be given, starting at `starts`).
+#[allow(clippy::too_many_arguments)]
 pub fn sell(
     pool: &Whirlpool,
     arrays: &[TickArray],
@@ -69,6 +76,7 @@ pub fn sell(
     amount: u64,
     a_to_b: bool,
     limit: u128,
+    crossings: u32,
 ) -> Result<Sale> {
     let spacing = pool.tick_spacing as i32;
     let span = TICKS_PER_ARRAY * spacing;
@@ -94,7 +102,7 @@ pub fn sell(
     let mut stop = None;
     // Each step crosses an initialized tick or ends the sale (sold out, at
     // the limit, at the arrays' edge, at the last crossing allowed).
-    for _ in 0..MAX_CROSSINGS + 3 {
+    for _ in 0..crossings + 3 {
         if remaining == 0 || price == limit || stop.is_some() {
             break;
         }
@@ -109,7 +117,7 @@ pub fn sell(
             .map_err(math_error)?;
         // With every crossing allowed made, a unit short of the next
         // initialized tick: the sale stops there, crossing nothing more.
-        let last = initialized && crossed == MAX_CROSSINGS;
+        let last = initialized && crossed == crossings;
         let edge = match (last, a_to_b) {
             (false, _) => tick_price,
             (true, true) => tick_price + 1,
