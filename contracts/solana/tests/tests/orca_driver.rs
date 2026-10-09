@@ -1,0 +1,598 @@
+//! Orca's driver against Orca's real program: a station opens positions
+//! through its guard, the driver values them at Pyth's price with the fees
+//! they have earned, and a leaver's fraction is withdrawn, sold inside the
+//! band and sent home while the stayers keep theirs; and everything that
+//! should be refused is: a foreign destination or pool, a look-alike or
+//! unfit price, a pool pushed outside the band, a position left out, a
+//! delegate, a position at any mint but the authority's own slots, and a
+//! sale the pool can't fill inside the band.
+
+use anchor_lang::prelude::*;
+use anchor_spl::associated_token::get_associated_token_address_with_program_id;
+use anchor_spl::token::spl_token;
+use shonin_driver::COMPUTE_PER_DRIVER;
+use shonin_solana_tests::orca::*;
+use shonin_solana_tests::station::*;
+use shonin_solana_tests::*;
+use solana_keypair::Keypair;
+use solana_signer::Signer;
+
+/// The station's range around the pool's price ($150): about $129 to $175.
+const LOWER: i32 = -20_480;
+const UPPER: i32 = -17_408;
+
+fn world() -> (Env, Home) {
+    let mut env = Env::with_orca();
+    let home = env.orca_home("orca");
+    (env, home)
+}
+
+/// A station with about ten SOL's worth in a position at slot 0, Pyth's
+/// price where the pool's is.
+fn providing() -> (Env, Home) {
+    let (mut env, home) = world();
+    env.station_provides(&home, LOWER, UPPER, 10 * SOL);
+    env.price_follows_pool();
+    (env, home)
+}
+
+/// Bob trades back and forth, leaving the price about where it was and
+/// fees with every provider in range.
+fn trade_back_and_forth(env: &mut Env, rounds: usize) {
+    for _ in 0..rounds {
+        env.bob_swaps(20 * SOL, true);
+        env.bob_swaps(3_000_000_000, false);
+    }
+    env.price_follows_pool();
+}
+
+fn wsol(env: &Env, home: &Home) -> u64 {
+    env.token_amount(&env.wsol_of(&home.authority(0)))
+}
+
+#[test]
+fn a_position_opened_through_the_station_is_valued_at_pyth_s_price() {
+    let (mut env, home) = providing();
+    let mint = env.slot_mint(&home, 0);
+    let position = env.position_state(&mint).expect("the position is open");
+    assert!(position.liquidity > 0);
+    let value = env.value(&home);
+    assert!(!value.outside, "{value:?}");
+    // What the station holds is what it was sent, less the pool's fee on
+    // what it bought and the price its own purchase moved.
+    assert!(value.mark > FUNDS * 99 / 100, "{value:?}");
+    assert!(value.mark <= FUNDS + FUNDS / 1_000, "{value:?}");
+    // A sale would pay the pool's fee on the SOL, and no more than that.
+    assert!(value.exit <= value.mark, "{value:?}");
+    assert!(value.exit > value.mark - value.mark / 100, "{value:?}");
+}
+
+#[test]
+fn the_valuation_counts_fees_earned_exactly_as_orca_credits_them() {
+    let (mut env, home) = providing();
+    let before = env.value(&home);
+    trade_back_and_forth(&mut env, 3);
+    let earned = env.value(&home);
+    // Orca brings the position's fees up to date, which anyone may ask of
+    // it: the valuation counted every unit of them already.
+    let mint = env.slot_mint(&home, 0);
+    let payer = env.payer.insecure_clone();
+    let update = env.ix_update_fees(&mint);
+    expect_ok(env.send(vec![update], &[&payer]));
+    let position = env.position_state(&mint).unwrap();
+    assert!(
+        position.fee_owed_a > 0 && position.fee_owed_b > 0,
+        "{position:?}"
+    );
+    let updated = env.value(&home);
+    assert_eq!(earned, updated);
+    // And the fees are worth something.
+    assert!(earned.mark > before.mark, "{before:?} {earned:?}");
+}
+
+#[test]
+fn the_driver_works_out_a_withdrawal_to_the_unit() {
+    let (mut env, home) = providing();
+    let mint = env.slot_mint(&home, 0);
+    let position = env.position_state(&mint).unwrap();
+    let state = env.pool_state();
+    let take = position.liquidity / 3;
+    let (a, b) = orca_math::withdrawal(state.tick, state.sqrt_price, LOWER, UPPER, take).unwrap();
+    let (owner_a, owner_b) = env.owners(&home);
+    let (sol_before, idle_before) = (wsol(&env, &home), env.idle(&home));
+    let ix = env.ix_decrease(&home.authority(0), &mint, &owner_a, &owner_b, take, a, b);
+    expect_ok(env.execute(&home, ix));
+    // The SOL stays with the authority; the dollars come home to the
+    // station, counted.
+    assert_eq!(wsol(&env, &home) - sol_before, a);
+    assert_eq!(env.idle(&home) - idle_before, b);
+}
+
+#[test]
+fn a_leaver_s_fraction_is_withdrawn_sold_and_sent_home_the_stayers_keeping_theirs() {
+    let (mut env, home) = providing();
+    trade_back_and_forth(&mut env, 2);
+    let mint = env.slot_mint(&home, 0);
+    let liquidity = env.position_state(&mint).unwrap().liquidity;
+    let before = env.value(&home);
+    let quarter = WAD / 4;
+    let (outcome, received, _) = ok(env.orca_unwind(&home, quarter));
+    assert!(!outcome.blocked);
+    assert_eq!(outcome.sent_home, received);
+    // A quarter of what a sale would fetch, short at most the band.
+    let due = before.exit / 4;
+    assert!(received <= due, "{received} {due}");
+    assert!(
+        received >= due - due * EXIT_BAND as u64 / BPS,
+        "{received} {due}"
+    );
+    // A quarter of the liquidity came out, rounded against the leaver.
+    let left = env.position_state(&mint).unwrap();
+    assert_eq!(left.liquidity, liquidity - liquidity / 4);
+    // Every fee was collected: what is left is counted where it lies.
+    assert_eq!((left.fee_owed_a, left.fee_owed_b), (0, 0));
+    // The stayers keep three quarters of what it was worth, and lose nothing
+    // to the leaver's sale.
+    env.price_follows_pool();
+    let after = env.value(&home);
+    assert!(
+        after.mark + after.mark / 1_000 >= before.mark - before.mark / 4,
+        "{before:?} {after:?}"
+    );
+}
+
+#[test]
+fn a_full_close_leaves_only_an_empty_position_whose_slot_opens_again() {
+    let (mut env, home) = providing();
+    trade_back_and_forth(&mut env, 1);
+    let (outcome, received, _) = ok(env.orca_unwind(&home, WAD));
+    assert!(!outcome.blocked && received > 0);
+    let mint = env.slot_mint(&home, 0);
+    let left = env.position_state(&mint).unwrap();
+    assert_eq!(
+        (left.liquidity, left.fee_owed_a, left.fee_owed_b),
+        (0, 0, 0)
+    );
+    // The sale held back at most a lamport an instruction.
+    assert!(wsol(&env, &home) <= 4, "{}", wsol(&env, &home));
+    // Nothing is left at Orca; what the sale fetched past the close's
+    // worth stays counted at the station.
+    let value = env.value(&home);
+    assert!(value.mark - env.idle(&home) < 10, "{value:?}");
+
+    // The executor closes the empty position, its rent back to itself, and
+    // opens the slot again.
+    let executor = env.executor.pubkey();
+    let close = env.ix_close_position(&home.authority(0), &executor, &mint);
+    expect_ok(env.execute(&home, close));
+    assert!(env.position_state(&mint).is_none());
+    assert!(env.svm.get_account(&mint).is_none_or(|a| a.lamports == 0));
+    expect_ok(env.station_opens(&home, 0, LOWER, UPPER));
+    assert!(env.position_state(&mint).is_some());
+}
+
+/// With one slot, a range moves in one go: the executor empties the
+/// position, closes it and opens the slot again elsewhere, in one
+/// transaction.
+#[test]
+fn a_range_moves_in_one_transaction_through_its_one_slot() {
+    let (mut env, home) = providing();
+    let mint = env.slot_mint(&home, 0);
+    let position = env.position_state(&mint).unwrap();
+    let (owner_a, owner_b) = env.owners(&home);
+    let authority = home.authority(0);
+    let executor = env.executor.insecure_clone();
+    let key = executor.pubkey();
+    let decrease = env.ix_decrease(
+        &authority,
+        &mint,
+        &owner_a,
+        &owner_b,
+        position.liquidity,
+        0,
+        0,
+    );
+    let collect = env.ix_collect_fees(&authority, &mint, &owner_a, &owner_b);
+    let close = env.ix_close_position(&authority, &key, &mint);
+    let open = env.ix_open_position(&key, &authority, &mint, LOWER - 640, UPPER - 640);
+    let ixs = vec![
+        env.ix_execute(&home, &key, 0, decrease),
+        env.ix_execute(&home, &key, 0, collect),
+        env.ix_execute(&home, &key, 0, close),
+        env.ix_execute(&home, &key, 0, open),
+    ];
+    expect_ok(env.send_fitting(ixs, &[&executor]));
+    let moved = env.position_state(&mint).unwrap();
+    assert_eq!(
+        (moved.tick_lower, moved.tick_upper, moved.liquidity),
+        (LOWER - 640, UPPER - 640, 0)
+    );
+    assert!(!env.value(&home).outside);
+}
+
+/// Someone else's liquidity just around the price, so that a sale crosses
+/// ticks, as it does in a busy pool.
+fn crowd_the_price(env: &mut Env) {
+    let tick = env.pool_state().tick.div_euclid(SPACING) * SPACING;
+    let bob = env.bob.insecure_clone();
+    for offset in 1..4 {
+        let mint = Keypair::new();
+        // The first starts at the tick just below the price.
+        let (lower, upper) = (tick - (offset - 1) * SPACING, tick + offset * SPACING);
+        let open = env.ix_open_position(&bob.pubkey(), &bob.pubkey(), &mint.pubkey(), lower, upper);
+        expect_ok(env.send(vec![open], &[&bob, &mint]));
+        let liquidity = env.liquidity_for(lower, upper, SOL / 5, 30_000_000);
+        let add = env.ix_increase(
+            &bob.pubkey(),
+            &mint.pubkey(),
+            &env.wsol_of(&bob.pubkey()),
+            &get_associated_token_address_with_program_id(&bob.pubkey(), &env.mint, &spl_token::ID),
+            liquidity,
+            u64::MAX,
+            u64::MAX,
+        );
+        expect_ok(env.send(vec![add], &[&bob]));
+    }
+}
+
+/// The most a close may cost: every slot holding a narrow position around
+/// the price with fees owed, the authority holding SOL besides, and the sale
+/// crossing other providers' ticks.
+#[test]
+fn a_close_of_every_slot_fits_the_compute_a_driver_may_use() {
+    for fraction in [WAD / 2, WAD] {
+        let (mut env, home) = world();
+        let tick = env.pool_state().tick.div_euclid(SPACING) * SPACING;
+        for slot in 0..MAX_SLOTS {
+            let width = (slot as i32 + 10) * SPACING;
+            env.station_provides_at(&home, slot, tick - width, tick + width, 10 * SOL);
+            env.price_follows_pool();
+        }
+        trade_back_and_forth(&mut env, 2);
+        // The price just above a tick others provide from.
+        let floor = env.pool_state().tick.div_euclid(SPACING) * SPACING;
+        let bob = env.bob.insecure_clone();
+        let push = env.ix_swap(
+            &bob.pubkey(),
+            &env.wsol_of(&bob.pubkey()),
+            &get_associated_token_address_with_program_id(&bob.pubkey(), &env.mint, &spl_token::ID),
+            100 * SOL,
+            orca_math::sqrt_price_at(floor + 3).unwrap(),
+            true,
+        );
+        expect_ok(env.send(vec![push], &[&bob]));
+        crowd_the_price(&mut env);
+        env.price_follows_pool();
+        let before = env.pool_state().tick;
+        let (outcome, _, used) = ok(env.orca_unwind(&home, fraction));
+        assert!(!outcome.blocked && outcome.sent_home > 0);
+        // The sale crossed at least one initialized tick.
+        let crossed = before.div_euclid(SPACING) * SPACING;
+        assert!(
+            env.pool_state().tick < crossed,
+            "{before} {}",
+            env.pool_state().tick
+        );
+        println!(
+            "a close of {fraction} of {MAX_SLOTS} position at Orca, with fees, took {used} compute units"
+        );
+        assert!(used <= COMPUTE_PER_DRIVER, "{used}");
+    }
+}
+
+/// What a close of everything fetches is what the valuation said it would,
+/// to the unit: the driver works out the sale as Orca makes it.
+#[test]
+fn a_full_close_fetches_exactly_what_the_valuation_said() {
+    for with_position in [false, true] {
+        let (mut env, home) = world();
+        crowd_the_price(&mut env);
+        if with_position {
+            env.station_provides(&home, LOWER, UPPER, 10 * SOL);
+            trade_back_and_forth(&mut env, 1);
+        } else {
+            expect_ok(env.station_buys_sol(&home, 1_500_000_000));
+            env.price_follows_pool();
+        }
+        let value = env.value(&home);
+        let (outcome, received, _) = ok(env.orca_unwind(&home, WAD));
+        assert_eq!(outcome.sent_home, received);
+        // Everything the station counted comes home, the leftover of the
+        // valuation's allowance for a leaver's sale included.
+        assert!(received >= value.exit, "{received} {value:?}");
+        assert!(
+            received - value.exit < value.exit / 5_000,
+            "{received} {value:?}"
+        );
+    }
+}
+
+// Refusals -------------------------------------------------------------------
+
+#[test]
+fn tokens_withdrawn_to_an_account_not_the_authority_s_are_refused() {
+    let (mut env, home) = providing();
+    let mint = env.slot_mint(&home, 0);
+    let (_, owner_b) = env.owners(&home);
+    let bob = env.wsol_of(&env.bob.pubkey());
+    let ix = env.ix_decrease(&home.authority(0), &mint, &bob, &owner_b, 1_000, 0, 0);
+    expect_code(
+        env.execute(&home, ix),
+        station_error(StationError::ForeignAccount),
+    );
+}
+
+#[test]
+fn a_pool_nobody_listed_is_refused() {
+    let (mut env, home) = providing();
+    let (owner_a, owner_b) = env.owners(&home);
+    let mut ix = env.ix_swap(
+        &home.authority(0),
+        &owner_a,
+        &owner_b,
+        1_000,
+        orca_math::MAX_SQRT_PRICE,
+        false,
+    );
+    ix.accounts[2].pubkey = Pubkey::new_unique();
+    expect_code(
+        env.execute_funded(&home, ix, 1_000),
+        station_error(StationError::ForeignAccount),
+    );
+}
+
+#[test]
+fn a_look_alike_price_account_is_refused() {
+    let (mut env, home) = providing();
+    let group = env.orca_group(&home.station);
+    let at = Env::group_index(&group, &PRICE_ACCOUNT);
+    // A copy of the price at another address, owned by Pyth's receiver.
+    let copy = Pubkey::new_unique();
+    let price = env.sol_price();
+    let now = env.now() as i64;
+    env.set_price_account(copy, PYTH_RECEIVER, FEED_ID, price, 1, now, true);
+    let mut changed = group.clone();
+    changed[at].pubkey = copy;
+    expect_err(
+        env.try_value_with(&home, changed),
+        orca_error(OrcaError::WrongAccounts),
+    );
+    // The listed address, owned by anyone else.
+    env.set_price_account(
+        PRICE_ACCOUNT,
+        Pubkey::new_unique(),
+        FEED_ID,
+        price,
+        1,
+        now,
+        true,
+    );
+    expect_err(
+        env.try_value_with(&home, group.clone()),
+        orca_error(OrcaError::WrongAccounts),
+    );
+    // Another feed's price at the listed address.
+    env.set_price_account(PRICE_ACCOUNT, PYTH_RECEIVER, [7; 32], price, 1, now, true);
+    expect_err(
+        env.try_value_with(&home, group),
+        orca_error(OrcaError::WrongAccounts),
+    );
+}
+
+#[test]
+fn a_stale_partly_verified_or_uncertain_price_marks_the_valuation_outside_and_blocks_the_close() {
+    let (mut env, home) = providing();
+    let price = env.sol_price();
+    let unfit: [&dyn Fn(&mut Env); 3] = [
+        // Older than devnet's fifteen minutes.
+        &|env: &mut Env| env.skip(901),
+        &|env: &mut Env| env.set_price(price, price / 10_000, false),
+        // Less certain than the 1% band.
+        &|env: &mut Env| env.set_price(price, price / 50, true),
+    ];
+    for make_unfit in unfit {
+        env.set_price(price, price / 10_000, true);
+        assert!(!env.value(&home).outside);
+        make_unfit(&mut env);
+        assert!(env.value(&home).outside);
+        let liquidity = env
+            .position_state(&env.slot_mint(&home, 0))
+            .unwrap()
+            .liquidity;
+        let (outcome, received, _) = ok(env.orca_unwind(&home, WAD / 4));
+        assert!(outcome.blocked && received == 0);
+        let after = env
+            .position_state(&env.slot_mint(&home, 0))
+            .unwrap()
+            .liquidity;
+        assert_eq!(after, liquidity);
+    }
+}
+
+#[test]
+fn a_pool_pushed_outside_the_band_marks_the_valuation_outside_and_blocks_the_close() {
+    for down in [true, false] {
+        let (mut env, home) = providing();
+        // About 2% either way, Pyth's price staying where it was.
+        if down {
+            env.bob_swaps(60 * SOL, true);
+        } else {
+            env.bob_swaps(9_000_000_000, false);
+        }
+        let value = env.value(&home);
+        assert!(value.outside, "{value:?}");
+        let (outcome, received, _) = ok(env.orca_unwind(&home, WAD / 4));
+        assert!(outcome.blocked && received == 0);
+    }
+}
+
+#[test]
+fn a_position_left_out_of_a_valuation_is_refused() {
+    let (mut env, home) = providing();
+    let group = env.orca_group(&home.station);
+    let mint = env.slot_mint(&home, 0);
+    let at = Env::group_index(&group, &position_address(&mint));
+    // The slot passed as if it held nothing.
+    let mut empty = group.clone();
+    empty[at] = AccountMeta::new_readonly(mint, false);
+    expect_err(
+        env.try_value_with(&home, empty),
+        orca_error(OrcaError::WrongAccounts),
+    );
+    // Its token account left out.
+    let token =
+        get_associated_token_address_with_program_id(&home.authority(0), &mint, &TOKEN_2022);
+    let mut missing = group.clone();
+    missing.retain(|meta| meta.pubkey != token);
+    expect_err(
+        env.try_value_with(&home, missing),
+        orca_error(OrcaError::WrongAccounts),
+    );
+    // Its tick arrays left out.
+    let mut no_arrays = group;
+    let lower = tick_array_address(&pool(), array_start(LOWER));
+    let last = no_arrays
+        .iter()
+        .rposition(|meta| meta.pubkey == lower)
+        .unwrap();
+    no_arrays.remove(last);
+    expect_err(
+        env.try_value_with(&home, no_arrays),
+        orca_error(OrcaError::WrongAccounts),
+    );
+}
+
+#[test]
+fn a_delegate_on_a_position_s_token_is_refused_by_the_driver() {
+    let (mut env, home) = providing();
+    let mint = env.slot_mint(&home, 0);
+    let token =
+        get_associated_token_address_with_program_id(&home.authority(0), &mint, &TOKEN_2022);
+    let mut account = env.svm.get_account(&token).unwrap();
+    account.data[72..76].copy_from_slice(&[1, 0, 0, 0]);
+    account.data[76..108].copy_from_slice(env.bob.pubkey().as_ref());
+    account.data[121..129].copy_from_slice(&1u64.to_le_bytes());
+    env.svm.set_account(token, account).unwrap();
+    let group = env.orca_group(&home.station);
+    expect_err(
+        env.try_value_with(&home, group),
+        orca_error(OrcaError::WrongAccounts),
+    );
+}
+
+#[test]
+fn a_position_a_stranger_delegated_to_the_authority_is_refused() {
+    let (mut env, home) = providing();
+    // Bob opens a position and makes the station's authority its delegate,
+    // which Orca would honour.
+    let bob = env.bob.insecure_clone();
+    let mint = Keypair::new();
+    let open = env.ix_open_position(&bob.pubkey(), &bob.pubkey(), &mint.pubkey(), LOWER, UPPER);
+    expect_ok(env.send(vec![open], &[&bob, &mint]));
+    let bobs =
+        get_associated_token_address_with_program_id(&bob.pubkey(), &mint.pubkey(), &TOKEN_2022);
+    let approve = anchor_spl::token_2022::spl_token_2022::instruction::approve(
+        &TOKEN_2022,
+        &bobs,
+        &home.authority(0),
+        &bob.pubkey(),
+        &[],
+        1,
+    )
+    .unwrap();
+    expect_ok(env.send(vec![approve], &[&bob]));
+    // The executor can't put the station's money into it.
+    let (owner_a, owner_b) = env.owners(&home);
+    let mut ix = env.ix_increase(
+        &home.authority(0),
+        &mint.pubkey(),
+        &owner_a,
+        &owner_b,
+        1_000_000,
+        u64::MAX,
+        u64::MAX,
+    );
+    ix.accounts[4].pubkey = bobs;
+    expect_code(
+        env.execute_funded(&home, ix, 1_000_000),
+        station_error(StationError::ForeignAccount),
+    );
+}
+
+#[test]
+fn a_position_at_any_mint_but_the_authority_s_slots_is_refused() {
+    let (mut env, home) = world();
+    let executor = env.executor.pubkey();
+    // A fresh mint of the executor's choosing, signing for itself.
+    let mint = Keypair::new();
+    let ix = env.ix_open_position(&executor, &home.authority(0), &mint.pubkey(), LOWER, UPPER);
+    let call = env.ix_execute(&home, &executor, 0, ix);
+    let key = env.executor.insecure_clone();
+    expect_code(
+        env.send(vec![call], &[&key, &mint]),
+        station_error(StationError::ForeignAccount),
+    );
+    // The authority's mint at a slot past the driver's last.
+    let beyond = shonin_driver::position_mint(&shonin_station::ID, &home.authority(0), MAX_SLOTS).0;
+    let ix = env.ix_open_position(&executor, &home.authority(0), &beyond, LOWER, UPPER);
+    expect_code(
+        env.execute(&home, ix),
+        station_error(StationError::ForeignAccount),
+    );
+}
+
+#[test]
+fn a_sale_the_pool_cannot_fill_inside_the_band_sells_nothing() {
+    let (mut env, home) = world();
+    // Most of the station's money in SOL, far more than the pool can take
+    // back inside 1% of the price, Pyth agreeing with the pool.
+    expect_ok(env.station_buys_sol(&home, FUNDS * 9 / 10));
+    env.price_follows_pool();
+    let held = wsol(&env, &home);
+    let idle = env.idle(&home);
+    let result = env.orca_unwind(&home, WAD / 2);
+    expect_err(result, station_error(StationError::ShortSweep));
+    assert_eq!((wsol(&env, &home), env.idle(&home)), (held, idle));
+}
+
+#[test]
+fn a_station_s_wrapped_sol_and_dollars_are_never_left_with_a_delegate() {
+    let (mut env, home) = providing();
+    // The SPL token program is never a venue: approving a delegate over the
+    // authority's SOL through the station is refused outright.
+    let wsol_account = env.wsol_of(&home.authority(0));
+    let approve = spl_token::instruction::approve(
+        &spl_token::ID,
+        &wsol_account,
+        &env.bob.pubkey(),
+        &home.authority(0),
+        &[],
+        1,
+    )
+    .unwrap();
+    expect_code(
+        env.execute(&home, approve),
+        station_error(StationError::WrongProgram),
+    );
+}
+
+#[test]
+fn the_driver_names_the_cluster_s_own_token_programs() {
+    assert_eq!(shonin_orca_driver::TOKEN_PROGRAM, spl_token::ID);
+    assert_eq!(
+        shonin_orca_driver::TOKEN_2022_PROGRAM,
+        anchor_spl::token_2022::ID
+    );
+    assert_eq!(
+        shonin_orca_driver::ASSOCIATED_TOKEN_PROGRAM,
+        anchor_spl::associated_token::ID
+    );
+}
+
+#[test]
+fn orca_s_terms_restrict_sanctioned_persons_and_its_close_comes_home_by_contract() {
+    let description = shonin_orca_driver::logic::description();
+    assert_eq!(description.name, orca());
+    assert_eq!(description.custody, shonin_driver::Custody::Station);
+    assert_eq!(description.exit_path, shonin_driver::ExitPath::Contract);
+}

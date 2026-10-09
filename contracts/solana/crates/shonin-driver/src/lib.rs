@@ -22,8 +22,11 @@
 //!
 //! **What an allowlist must pin.** A rule can say an account must be the
 //! authority's own ([`Own::Station`], [`Own::StationDollars`],
-//! [`Own::StationToken`], [`Own::StationAddress`]) or one of a set of
-//! accounts the driver names when the station is created ([`Own::Fixed`]).
+//! [`Own::StationToken`], [`Own::StationAddress`], and for a venue that
+//! holds positions as tokens [`Own::StationMint`],
+//! [`Own::StationPositionToken`] and [`Own::StationPositionHeld`]) or one of
+//! a set of accounts the driver names when the station is created
+//! ([`Own::Fixed`]).
 //! Whatever a rule leaves unconstrained, the executor's key chooses. So a
 //! driver must pin every account through which the station's money could
 //! reach someone else: the venue's own settings and vaults, and on a venue
@@ -34,6 +37,18 @@
 //! stand-in venue does: what a market it lists after the station was
 //! created can do is that operator's power, which a station on that venue
 //! accepts with the venue.
+//!
+//! **Positions held as tokens.** A venue may record a position as a token
+//! the holder keeps (an NFT, as Orca does) and let whoever holds that token,
+//! or is its delegate, act on the position. Its allowlist then pins three
+//! things more: that a new position's mint is created at one of the
+//! authority's position mints ([`Own::StationMint`]), the token account the
+//! position's token lands in ([`Own::StationPositionToken`]), and, wherever
+//! the venue takes a token account as proof of a position, that the account
+//! is the authority's own and holds one of those mints
+//! ([`Own::StationPositionHeld`]). So the authority acts only on positions at
+//! its own slots, never on one a stranger delegated to it, and a driver
+//! finds every position the station holds by looking at each slot.
 //!
 //! Every instruction is laid out as an Anchor instruction: the discriminator
 //! below, then its arguments in Borsh. Each answer is Borsh, whole (trailing
@@ -127,6 +142,21 @@ pub const MAX_MARKETS: usize = 8;
 /// registry reads included), which leaves it about a tenth of this to
 /// spare.
 pub const COMPUTE_PER_DRIVER: u64 = 400_000;
+/// The most position mints ([`Own::StationMint`]) an allowlist gives the
+/// authority at one venue, and so the most positions it can hold there at
+/// once: a driver looks at every slot each time it values the station.
+pub const MAX_POSITION_MINTS: usize = 8;
+/// The first seed of a position mint's address under the station program.
+pub const POSITION_MINT_SEED: &[u8] = b"position-mint";
+
+/// The authority's position mint at `slot`, and its bump: the station
+/// program's address with seeds `[POSITION_MINT_SEED, authority, [slot]]`.
+pub fn position_mint(station_program: &Pubkey, authority: &Pubkey, slot: u8) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[POSITION_MINT_SEED, authority.as_ref(), &[slot]],
+        station_program,
+    )
+}
 
 /// Each instruction's first eight bytes, `sha256("global:<name>")[..8]`, as
 /// Anchor lays them out.
@@ -181,6 +211,29 @@ pub enum Own {
     /// settings or vault, a pool, a market, pinned when the station is
     /// created.
     Fixed(u8),
+    /// One of the authority's first `n` position mints (at most
+    /// [`MAX_POSITION_MINTS`]): the station program's addresses with seeds
+    /// `[POSITION_MINT_SEED, authority, [slot]]`, which the station works out
+    /// when it pins the allowlist. The station signs for the one standing
+    /// here, so that a venue which creates a position's mint at the address
+    /// of a signer (as Orca does) creates it at one of these, and a driver can
+    /// find every position the authority can ever hold by looking at each
+    /// slot. A mint the venue closes when its position closes frees its slot
+    /// for the next. Nothing is held at such an address: its signature lets a
+    /// venue create an account there and nothing else.
+    StationMint(u8),
+    /// The authority's associated token account, under either token
+    /// program, for the mint standing at this index of the same instruction,
+    /// which the rule must pin as a [`Own::StationMint`]: a position's token
+    /// account. Unlike the authority's other token accounts, the call may
+    /// create it or close it; if it is still there afterwards it must still
+    /// be the authority's alone.
+    StationPositionToken(u8),
+    /// A token account, under either token program, that the authority owns
+    /// and that holds one of its position mints: the proof a venue takes that
+    /// a position is the authority's. Never one a stranger made the authority
+    /// a delegate of, nor a position at an address no driver looks at.
+    StationPositionHeld,
 }
 
 /// One constrained position: the account at `index` must be `own`.

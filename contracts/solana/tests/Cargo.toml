@@ -26,6 +26,7 @@ shonin-local-venue-2 = { path = "../programs/shonin-local-venue-2", features = [
 shonin-local-venue-3 = { path = "../programs/shonin-local-venue-3", features = ["no-entrypoint"] }
 shonin-local-driver-2 = { path = "../programs/shonin-local-driver-2", features = ["no-entrypoint"] }
 shonin-local-driver-3 = { path = "../programs/shonin-local-driver-3", features = ["no-entrypoint"] }
+shonin-orca-driver = { path = "../programs/shonin-orca-driver", features = ["no-entrypoint"] }
 shonin-test-driver = { path = "../programs/shonin-test-driver", features = ["no-entrypoint"] }
 shonin-test-hostile-venue = { path = "../programs/shonin-test-hostile-venue", features = ["no-entrypoint"] }
 shonin-test-vault = { path = "../programs/shonin-test-vault", features = ["no-entrypoint"] }
@@ -40,6 +41,7 @@ solana-instruction = "2.3"
 solana-keypair = "2.2"
 solana-message = "2.4"
 solana-sdk-ids = { workspace = true }
+solana-sha256-hasher = { workspace = true }
 solana-signer = "2.2"
 solana-transaction = "2.2"
 solana-transaction-error = "2.2"

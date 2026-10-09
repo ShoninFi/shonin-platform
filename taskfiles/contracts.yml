@@ -58,10 +58,35 @@ tasks:
       # keypair that is missing before it compiles.
       - cd "{{.PATH_CONTRACTS_SOLANA}}" && anchor build
 
+  solana:fixtures:
+    desc: "Fetch the third-party programs the Solana tests load (Orca's, Pyth's receiver) from mainnet into .shonin/fixtures, each checked against the hash committed in contracts/solana/tests/fixtures/programs.txt"
+    cmds:
+      - |
+        set -e
+        mkdir -p "{{.PATH_FIXTURES}}"
+        grep -v '^#' "{{.PATH_CONTRACTS_SOLANA}}/tests/fixtures/programs.txt" | while read -r file id sha; do
+          [ -n "$file" ] || continue
+          path="{{.PATH_FIXTURES}}/$file"
+          if [ -f "$path" ] && [ "$(shasum -a 256 "$path" | cut -d' ' -f1)" = "$sha" ]; then
+            echo "$file is $id, as pinned"
+            continue
+          fi
+          solana program dump -u m "$id" "$path.new" < /dev/null >/dev/null
+          got=$(shasum -a 256 "$path.new" | cut -d' ' -f1)
+          if [ "$got" != "$sha" ]; then
+            rm -f "$path.new"
+            echo "$id on mainnet is $got, not the pinned $sha: it was upgraded. Run the tests against the new binary before pinning its hash."
+            exit 1
+          fi
+          mv "$path.new" "$path"
+          echo "$file is $id, fetched and checked"
+        done
+
   solana:test:
     desc: "Build the Solana programs and run their tests in-process (LiteSVM)"
     cmds:
       - task: solana:build
+      - task: solana:fixtures
       - cd "{{.PATH_CONTRACTS_SOLANA}}" && cargo test --workspace
 
   solana:test:deep:
@@ -71,6 +96,7 @@ tasks:
       SEEDS: '{{.SEEDS | default "1 2 3"}}'
     cmds:
       - task: solana:build
+      - task: solana:fixtures
       - |
         cd "{{.PATH_CONTRACTS_SOLANA}}"
         for seed in {{.SEEDS}}; do

@@ -48,6 +48,17 @@
 //! of the system program's with no data ([`authority_untouched`]), which a call
 //! that can't write it can't change; this is checked anyway, so that nothing
 //! rests on the writable check alone.
+//!
+//! One kind of token account is let go: a position's, at a venue that keeps
+//! positions as tokens. Such an account holds one of the authority's position
+//! mints, which the station never counts (drivers value positions; the
+//! station counts only dollars), and a rule may let a call create it, with
+//! the position, or close it, with the position: only at the position the
+//! rule names for it, and only if it is the authority's associated account
+//! for a position mint standing in the same call ([`positions_held`]). If it
+//! is still there after the call, it must be the authority's alone like any
+//! other. The station signs for a position mint only where a rule names one,
+//! so that the venue can create the mint there and nowhere else.
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{
@@ -56,8 +67,8 @@ use anchor_lang::solana_program::{
 };
 use anchor_spl::associated_token::get_associated_token_address_with_program_id;
 use shonin_driver::{
-    Allowlist, Class, Own, Prepared, Rule, MAX_DISCRIMINATOR, MAX_FIXED, MAX_POSITIONS, MAX_RULES,
-    MAX_SEED, MAX_STATION_ADDRESSES,
+    Allowlist, Class, Own, Prepared, Rule, MAX_DISCRIMINATOR, MAX_FIXED, MAX_POSITIONS,
+    MAX_POSITION_MINTS, MAX_RULES, MAX_SEED, MAX_STATION_ADDRESSES, POSITION_MINT_SEED,
 };
 use solana_sdk_ids::{
     bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, loader_v4, native_loader,
@@ -65,7 +76,7 @@ use solana_sdk_ids::{
 };
 
 use crate::error::StationError;
-use crate::state::{Pinned, StationAddress};
+use crate::state::{Pinned, PositionMint, StationAddress};
 
 /// Programs no allowlist may name, whatever a driver says: the station
 /// itself, the vault's program, Shonin's other programs, and the programs
@@ -155,6 +166,17 @@ pub fn validate(allowlist: &Allowlist, vault_program: &Pubkey) -> Result<()> {
             let fits = match &position.own {
                 Own::StationAddress(prefix) => prefix.len() <= MAX_SEED,
                 Own::Fixed(set) | Own::StationToken(Some(set)) => (*set as usize) < sets.len(),
+                Own::StationMint(count) => (1..=MAX_POSITION_MINTS).contains(&(*count as usize)),
+                // The mint it is the token account of stands in the same
+                // instruction, pinned as one of the authority's.
+                Own::StationPositionToken(mint) => {
+                    *mint != position.index
+                        && rule.positions.iter().any(|other| {
+                            other.index == *mint && matches!(other.own, Own::StationMint(_))
+                        })
+                }
+                // Some rule gives the authority position mints to hold.
+                Own::StationPositionHeld => position_mint_count(allowlist) > 0,
                 Own::Station | Own::StationDollars | Own::StationToken(None) => true,
             };
             require!(fits, StationError::BadAllowlist);
@@ -165,6 +187,114 @@ pub fn validate(allowlist: &Allowlist, vault_program: &Pubkey) -> Result<()> {
         StationError::BadAllowlist
     );
     Ok(())
+}
+
+/// How many position mints the allowlist gives the authority: the most any
+/// of its [`Own::StationMint`] positions names, none if none does.
+pub fn position_mint_count(allowlist: &Allowlist) -> u8 {
+    allowlist
+        .rules
+        .iter()
+        .flat_map(|rule| &rule.positions)
+        .filter_map(|position| match position.own {
+            Own::StationMint(count) => Some(count),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The authority's position mints the allowlist names, slot by slot, worked
+/// out once, for the station to pin.
+pub fn position_mints(allowlist: &Allowlist, authority: &Pubkey) -> Vec<PositionMint> {
+    (0..position_mint_count(allowlist))
+        .map(|slot| {
+            let (address, bump) = shonin_driver::position_mint(&crate::ID, authority, slot);
+            PositionMint { address, bump }
+        })
+        .collect()
+}
+
+/// The authority's associated token accounts under the classic token
+/// program for every mint of a set a `StationToken` position names, each
+/// once, worked out once for the station to pin.
+pub fn token_accounts(allowlist: &Allowlist, authority: &Pubkey) -> Vec<Pubkey> {
+    let mut sets: Vec<u8> = Vec::new();
+    for position in allowlist.rules.iter().flat_map(|rule| &rule.positions) {
+        if let Own::StationToken(Some(set)) = position.own {
+            if !sets.contains(&set) {
+                sets.push(set);
+            }
+        }
+    }
+    let mut accounts: Vec<Pubkey> = Vec::new();
+    for set in sets {
+        for mint in &allowlist.fixed[set as usize] {
+            let account = get_associated_token_address_with_program_id(
+                authority,
+                mint,
+                &anchor_spl::token::ID,
+            );
+            if !accounts.contains(&account) {
+                accounts.push(account);
+            }
+        }
+    }
+    accounts
+}
+
+/// What [`check`] found: the class of the rule the instruction falls under,
+/// the slots of the authority's position mints the station signs for, and
+/// the positions of the instruction (as indexes into its accounts) holding a
+/// position's token account, which the call may create or close and which
+/// [`positions_held`] checks after it.
+#[derive(Debug, Default)]
+pub struct Checked {
+    pub class: Option<Class>,
+    pub mints: Vec<u8>,
+    pub position_tokens: Vec<usize>,
+}
+
+impl Checked {
+    pub fn class(&self) -> Class {
+        self.class.unwrap_or(Class::Trade)
+    }
+
+    /// The instruction with the authority's position mints it names marked
+    /// as signers, as the station signs for them.
+    pub fn mark_signers(&self, ix: &mut Instruction, pinned: &Pinned) {
+        for slot in &self.mints {
+            let mint = &pinned.position_mints[*slot as usize].address;
+            for meta in ix.accounts.iter_mut() {
+                if &meta.pubkey == mint {
+                    meta.is_signer = true;
+                }
+            }
+        }
+    }
+
+    /// The seeds of each position mint the station signs for, beside the
+    /// authority's: `[POSITION_MINT_SEED, authority, [slot], [bump]]`.
+    pub fn mint_seeds(&self, pinned: &Pinned) -> Vec<([u8; 1], [u8; 1])> {
+        self.mints
+            .iter()
+            .map(|slot| ([*slot], [pinned.position_mints[*slot as usize].bump]))
+            .collect()
+    }
+}
+
+/// The signer seeds of a call: the venue authority's, then each position
+/// mint's from `mints` (as [`Checked::mint_seeds`] gives them).
+pub fn signer_seeds<'a>(
+    authority_seeds: [&'a [u8]; 4],
+    authority: &'a Pubkey,
+    mints: &'a [([u8; 1], [u8; 1])],
+) -> Vec<Vec<&'a [u8]>> {
+    let mut seeds = vec![authority_seeds.to_vec()];
+    for (slot, bump) in mints {
+        seeds.push(vec![POSITION_MINT_SEED, authority.as_ref(), slot, bump]);
+    }
+    seeds
 }
 
 /// Each seed prefix the allowlist's rules name for a venue address of the
@@ -215,7 +345,7 @@ pub fn check(
     station_dollars: &Pubkey,
     vault_program: &Pubkey,
     accounts: &[AccountInfo],
-) -> Result<Class> {
+) -> Result<Checked> {
     require_keys_eq!(ix.program_id, pinned.venue, StationError::WrongProgram);
     let rule = rule_for(&pinned.rules, &ix.data).ok_or(StationError::NotOnTheAllowlist)?;
     for position in &rule.positions {
@@ -225,6 +355,10 @@ pub fn check(
         );
     }
     let authority = &pinned.authority;
+    let mut checked = Checked {
+        class: Some(rule.class),
+        ..Checked::default()
+    };
     for (i, meta) in ix.accounts.iter().enumerate() {
         // No other venue the station pins, no driver program, and no program
         // a venue never needs, anywhere in the call. This only refuses what
@@ -267,27 +401,100 @@ pub fn check(
         let ours = match own {
             Own::Station => &meta.pubkey == authority,
             Own::StationDollars => meta.pubkey == pinned.dollars,
-            Own::StationToken(set) => station_token_mint(&meta.pubkey, authority, accounts)
+            Own::StationToken(set) => station_token_mint(&meta.pubkey, pinned, accounts)
                 .is_some_and(|mint| {
                     set.as_ref()
                         .is_none_or(|set| pinned_set(set).is_some_and(|set| set.contains(&mint)))
                 }),
             Own::StationAddress(prefix) => pinned.address(prefix) == Some(&meta.pubkey),
             Own::Fixed(set) => pinned_set(set).is_some_and(|set| set.contains(&meta.pubkey)),
+            Own::StationMint(count) => {
+                match pinned.position_mints[..(*count as usize).min(pinned.position_mints.len())]
+                    .iter()
+                    .position(|mint| mint.address == meta.pubkey)
+                {
+                    Some(slot) => {
+                        checked.mints.push(slot as u8);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            Own::StationPositionToken(mint) => {
+                let mint = &ix.accounts[*mint as usize].pubkey;
+                let ours = pinned.is_position_mint(mint)
+                    && [anchor_spl::token::ID, anchor_spl::token_2022::ID]
+                        .iter()
+                        .any(|program| {
+                            meta.pubkey
+                                == get_associated_token_address_with_program_id(
+                                    authority, mint, program,
+                                )
+                        });
+                if ours {
+                    checked.position_tokens.push(i);
+                }
+                ours
+            }
+            Own::StationPositionHeld => position_held(&meta.pubkey, pinned, accounts),
         };
         require!(ours, StationError::ForeignAccount);
     }
-    Ok(rule.class)
+    Ok(checked)
+}
+
+/// Whether `key` is a token account, under either token program, that the
+/// authority owns and that holds one of its position mints.
+fn position_held(key: &Pubkey, pinned: &Pinned, accounts: &[AccountInfo]) -> bool {
+    let Some(info) = accounts.iter().find(|info| info.key == key) else {
+        return false;
+    };
+    if !is_token_program(info.owner) {
+        return false;
+    }
+    let Ok(data) = info.try_borrow_data() else {
+        return false;
+    };
+    data.len() >= TOKEN_ACCOUNT_LEN
+        && data.get(OWNER) == Some(pinned.authority.as_ref())
+        && Pubkey::try_from(&data[0..32]).is_ok_and(|mint| pinned.is_position_mint(&mint))
+}
+
+/// After a call: each position's token account at `positions` of `ix` is
+/// either gone (the call closed it with its position) or still the
+/// authority's alone, with no delegate and no close authority, as every
+/// other token account of the authority's must be.
+pub fn positions_held(
+    ix: &Instruction,
+    positions: &[usize],
+    accounts: &[AccountInfo],
+    authority: &Pubkey,
+) -> Result<()> {
+    for at in positions {
+        let key = &ix.accounts[*at].pubkey;
+        let info = accounts
+            .iter()
+            .find(|info| info.key == key)
+            .ok_or(StationError::BadCall)?;
+        if info.lamports() == 0 {
+            continue;
+        }
+        let data = info.try_borrow_data()?;
+        let held = is_token_program(info.owner)
+            && data.len() >= TOKEN_ACCOUNT_LEN
+            && data.get(OWNER) == Some(authority.as_ref())
+            && data.get(DELEGATE_TAG) == Some(&[0; 4][..])
+            && data.get(CLOSE_AUTHORITY_TAG) == Some(&[0; 4][..]);
+        require!(held, StationError::LeftOpen);
+    }
+    Ok(())
 }
 
 /// The mint of `key` if it is `authority`'s associated token account for the
 /// mint the account holds, under the token program that owns it: never a
 /// look-alike someone created in the authority's name.
-fn station_token_mint(
-    key: &Pubkey,
-    authority: &Pubkey,
-    accounts: &[AccountInfo],
-) -> Option<Pubkey> {
+fn station_token_mint(key: &Pubkey, pinned: &Pinned, accounts: &[AccountInfo]) -> Option<Pubkey> {
+    let authority = &pinned.authority;
     let info = accounts.iter().find(|info| info.key == key)?;
     let program = *info.owner;
     if !is_token_program(&program) {
@@ -296,9 +503,18 @@ fn station_token_mint(
     let data = info.try_borrow_data().ok()?;
     let mint = Pubkey::try_from(data.get(0..32)?).ok()?;
     let owner = Pubkey::try_from(data.get(32..64)?).ok()?;
-    (owner == *authority
-        && *key == get_associated_token_address_with_program_id(authority, &mint, &program))
-    .then_some(mint)
+    if owner != *authority {
+        return None;
+    }
+    // The authority's dollar account, and its accounts for the pinned
+    // mints, were worked out when the station was created: associated
+    // accounts under the classic token program, each of which only that
+    // program can have made there, for its own mint.
+    if *key == pinned.dollars || pinned.token_accounts.contains(key) {
+        return (program == anchor_spl::token::ID).then_some(mint);
+    }
+    (*key == get_associated_token_address_with_program_id(authority, &mint, &program))
+        .then_some(mint)
 }
 
 fn is_token_program(program: &Pubkey) -> bool {
@@ -323,14 +539,22 @@ pub struct TokenAccounts<'a, 'info> {
 }
 
 impl<'a, 'info> TokenAccounts<'a, 'info> {
-    /// `accounts` holds every account `ix` names.
+    /// `accounts` holds every account `ix` names. The positions' token
+    /// accounts at `positions` (indexes into `ix`'s accounts) are left to
+    /// [`positions_held`]: a call may close one with its position.
     pub fn before(
         ix: &Instruction,
         accounts: &'a [AccountInfo<'info>],
         owners: &[&Pubkey],
+        positions: &[usize],
     ) -> Self {
         let mut held = Vec::new();
-        for meta in ix.accounts.iter().filter(|meta| meta.is_writable) {
+        for (_, meta) in ix
+            .accounts
+            .iter()
+            .enumerate()
+            .filter(|(i, meta)| meta.is_writable && !positions.contains(i))
+        {
             let Some(info) = accounts.iter().find(|info| info.key == &meta.pubkey) else {
                 continue;
             };

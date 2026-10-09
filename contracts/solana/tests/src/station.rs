@@ -74,7 +74,9 @@ pub const VENUES: [Pubkey; 3] = [
 
 /// The venue a driver program trades at.
 pub fn venue_of(driver: &Pubkey) -> Pubkey {
-    if *driver == shonin_local_driver_2::ID {
+    if *driver == shonin_orca_driver::ID {
+        shonin_orca_driver::network::WHIRLPOOL_PROGRAM
+    } else if *driver == shonin_local_driver_2::ID {
         shonin_local_venue_2::ID
     } else if *driver == shonin_local_driver_3::ID {
         shonin_local_venue_3::ID
@@ -1115,6 +1117,9 @@ impl Env {
     /// the stand-in driver's layout at that venue, behind the mode account for
     /// the test driver.
     pub fn driver_group(&self, station: &Pubkey, program: &Pubkey) -> Vec<AccountMeta> {
+        if *program == shonin_orca_driver::ID {
+            return self.orca_group(station);
+        }
         let venue = venue_of(program);
         let authority = authority_of(station, program);
         let mut group = vec![

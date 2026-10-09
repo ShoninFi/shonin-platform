@@ -93,6 +93,10 @@ vars:
   # Everything the local development chain and services write. Gitignored, and
   # safe to delete: `task dev` rebuilds all of it.
   PATH_LOCAL_STATE: '{{joinPath .PATH_ROOT ".shonin" "local"}}'
+  # Third-party program binaries the Solana tests load, dumped from mainnet
+  # (never committed; contracts/solana/tests/fixtures/programs.txt holds their
+  # ids and hashes). Outside .shonin/local, so a fresh local chain keeps them.
+  PATH_FIXTURES: '{{joinPath .PATH_ROOT ".shonin" "fixtures"}}'
   # Where the contracts' addresses are, one file per chain (evm-31337.json,
   # ...). Every service reads the one for its chain. Mainnet addresses are
   # committed under config/deployments/mainnet; local and testnet ones never

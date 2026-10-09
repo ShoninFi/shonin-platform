@@ -1,0 +1,10 @@
+# Third-party programs the tests run at their real addresses, as deployed on
+# Solana mainnet. Their binaries are never committed: `task
+# contracts:solana:fixtures` dumps each from mainnet into .shonin/fixtures/
+# and checks it against the hash here, and the tests check it again before
+# loading it. A hash that no longer matches means the program was upgraded on
+# mainnet: run the tests against the new binary before taking its hash.
+#
+# file                 program id                                      sha256
+orca_whirlpool.so      whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc     610b1e394973bd1b86de8afc983524bd21dea177e87bfae75ec289d4c350f9ae
+pyth_receiver.so       rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ     0d6bf9142c2eb1fdb8ead48054491369bed3a8d6846c5887e362844155599ab2
