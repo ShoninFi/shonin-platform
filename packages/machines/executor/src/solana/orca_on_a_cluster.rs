@@ -9,7 +9,8 @@
 //! half buys SOL and opens a band of liquidity through the station's guard,
 //! answering the agent as it would; the keeper values the vault through the
 //! driver; and a depositor's withdrawal larger than the vault's cash is
-//! booked as a claim and served by closing the leaver's share at Orca.
+//! booked as a claim and served in two parts, half then the rest, each by
+//! closing its share at Orca.
 //!
 //! Needs Surfpool 1.2.0 or later (`SHONIN_SURFPOOL`, or the one on the
 //! path), the programs built for the local cluster against the keypairs this
@@ -713,6 +714,9 @@ async fn an_orca_vault_trades_through_the_guard_is_valued_through_the_driver_and
         .await
         .unwrap();
     let started = Instant::now();
+    // Half of it first, as the keeper serves a claim that can't be served
+    // whole: that half paid, the rest left booked.
+    let mut halved = false;
     loop {
         setup::price_follows_pool(&client, now().await)
             .await
@@ -722,15 +726,35 @@ async fn an_orca_vault_trades_through_the_guard_is_valued_through_the_driver_and
             if claim.state == vault::state::ClaimState::Paid {
                 break;
             }
-            let ix = platform
-                .ix_settle_claim(&client, &v, &keeper.pubkey(), request)
-                .await
-                .unwrap();
-            let _ = client.send(vec![ix], &[keeper]).await;
+            let ix = if halved {
+                platform
+                    .ix_settle_claim(&client, &v, &keeper.pubkey(), request)
+                    .await
+                    .unwrap()
+            } else {
+                platform
+                    .ix_settle_claim_part(&client, &v, &keeper.pubkey(), request, claim.shares / 2)
+                    .await
+                    .unwrap()
+            };
+            if client.send(vec![ix], &[keeper]).await.is_ok() && !halved {
+                let after = platform
+                    .claim(&client, &v.vault, request)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if after.shares < claim.shares {
+                    assert_eq!(after.shares, claim.shares - claim.shares / 2);
+                    assert_eq!(after.state, vault::state::ClaimState::Pending);
+                    assert!(after.paid > 0, "the half was paid");
+                    halved = true;
+                }
+            }
         }
         assert!(started.elapsed() < PATIENCE, "the claim was never paid");
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    assert!(halved, "the claim was served in two parts");
     let dollars_after = client
         .token_balance(&platform.dollars(&viewer.pubkey()))
         .await

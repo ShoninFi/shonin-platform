@@ -1984,6 +1984,33 @@ impl Platform {
         caller: &Pubkey,
         claim_id: u64,
     ) -> Result<Instruction> {
+        self.ix_settle_claim_shares(client, v, caller, claim_id, None)
+            .await
+    }
+
+    /// A try serving only `shares` of a claim's shares (more than none,
+    /// fewer than all): that part closed and paid as a claim of them alone
+    /// would be, the rest left booked, its turn kept.
+    pub async fn ix_settle_claim_part(
+        &self,
+        client: &SolanaClient,
+        v: &VaultAccounts,
+        caller: &Pubkey,
+        claim_id: u64,
+        shares: u128,
+    ) -> Result<Instruction> {
+        self.ix_settle_claim_shares(client, v, caller, claim_id, Some(shares))
+            .await
+    }
+
+    async fn ix_settle_claim_shares(
+        &self,
+        client: &SolanaClient,
+        v: &VaultAccounts,
+        caller: &Pubkey,
+        claim_id: u64,
+        part: Option<u128>,
+    ) -> Result<Instruction> {
         let vault = self.vault(client, &v.vault).await?;
         let claim = self.claim(client, &v.vault, claim_id).await?;
         let owner = claim.as_ref().map_or(Pubkey::default(), |c| c.owner);
@@ -2016,11 +2043,19 @@ impl Platform {
         Ok(Instruction {
             program_id: shonin_vault::ID,
             accounts,
-            data: shonin_vault::instruction::SettleClaim {
-                claim_id,
-                groups: sizes,
-            }
-            .data(),
+            data: match part {
+                None => shonin_vault::instruction::SettleClaim {
+                    claim_id,
+                    groups: sizes,
+                }
+                .data(),
+                Some(shares) => shonin_vault::instruction::SettleClaimPart {
+                    claim_id,
+                    groups: sizes,
+                    shares,
+                }
+                .data(),
+            },
         })
     }
 
