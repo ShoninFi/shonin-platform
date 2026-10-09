@@ -561,6 +561,23 @@ impl Cluster {
             return Ok(());
         }
         let bundle = B256::from(vault.bundle_hash);
+        // The build service may run on another machine: the bundle is read
+        // through from the public store, checked by its hashes.
+        if !crate::bundle_path(&self.args.store, bundle).exists()
+            && let Some(base) = self.args.store_url.as_deref()
+            && let Err(error) = crate::fetch_solana_bundle(
+                &self.client,
+                &self.platform,
+                &self.args.store,
+                base,
+                vault.strategy_id,
+                bundle,
+            )
+            .await
+            && book.waiting_for_bundle.insert(address)
+        {
+            tracing::warn!(vault = %address, %bundle, error = format!("{error:#}"), "could not read the bundle through from the public store");
+        }
         if !crate::bundle_path(&self.args.store, bundle).exists() {
             if book.waiting_for_bundle.insert(address) {
                 tracing::info!(vault = %address, %bundle, "no bundle in the store yet; the vault waits for it");
