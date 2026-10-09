@@ -280,7 +280,7 @@ pub(crate) async fn round(
             continue;
         }
         if let Err(error) = registry.simulate_bless(journal, seal, leaf).await {
-            tracing::debug!(vault = %leaf.vault, key = %leaf.key, error = format!("{error:#}"), "a blessing would not go through; not sent");
+            tracing::warn!(vault = %leaf.vault, key = %leaf.key, error = format!("{error:#}"), "a blessing would not go through; not sent");
             done.not_simulated.push(leaf.key);
             continue;
         }
