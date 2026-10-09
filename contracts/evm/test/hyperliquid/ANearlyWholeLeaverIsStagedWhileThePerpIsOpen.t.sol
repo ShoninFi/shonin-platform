@@ -42,7 +42,9 @@ contract ANearlyWholeLeaverIsStagedWhileThePerpIsOpenTest is HyperliquidVault {
         assertLe(paid, worth, "never more than her shares were worth");
     }
 
-    function test_a_leaver_whose_stayers_part_could_not_cover_the_transfer_requirement_is_still_refused() public {
+    function test_a_leaver_whose_stayers_part_could_not_cover_the_transfer_requirement_is_still_refused()
+        public
+    {
         // Twelve times the account: what stays after any partial close can't
         // cover a tenth of what stays open, so nothing is sold.
         aliceShares_ = depositAs(vault, alice, 100_000e6);
