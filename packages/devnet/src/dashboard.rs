@@ -229,7 +229,8 @@ async fn rpc(dashboard: &Dashboard, url: &str, method: &str, params: Value) -> R
         .await
         .map_err(|error| anyhow!(short(&error)))?
         .json()
-        .await?;
+        .await
+        .map_err(|error| anyhow!(short(&error)))?;
     if let Some(error) = reply.get("error") {
         return Err(anyhow!("{method}: {error}"));
     }
@@ -546,14 +547,21 @@ fn format_time(timestamp: i64) -> String {
     }
 }
 
-/// The part of a connection error worth a table cell.
+/// The part of a connection error worth a table cell, never the URL: the
+/// endpoint read may be a keyed one from `.env`, and a cell is shown to
+/// whoever looks at the dashboard.
 fn short(error: &reqwest::Error) -> String {
     if error.is_timeout() {
         "timed out".to_string()
     } else if error.is_connect() {
         "refused".to_string()
+    } else if error.is_decode() {
+        "not a JSON-RPC answer".to_string()
     } else {
-        error.to_string()
+        match error.status() {
+            Some(status) => format!("answered {status}"),
+            None => "failed".to_string(),
+        }
     }
 }
 
@@ -607,5 +615,84 @@ mod tests {
         );
         assert_eq!(said_with("up".to_string(), "<!doctype html>"), "up");
         assert_eq!(said_with("answered 502".to_string(), ""), "answered 502");
+    }
+
+    /// The key a paid endpoint's URL carries, as the environment gives it.
+    const KEY: &str = "k3y-0f-a-pa1d-endp01nt";
+    /// The endpoint the chain file names, which anyone may see.
+    const PUBLIC: &str = "https://public.example/rpc";
+
+    /// A stand-in for a paid endpoint, at `/v2/<KEY>`: it answers as an EVM
+    /// chain, or, when `answers` is unset, with a page that is not JSON, as
+    /// a gateway does when it refuses a request.
+    async fn paid_endpoint(answers: bool) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(move |body: String| async move {
+            let request: Value = serde_json::from_str(&body).unwrap_or_default();
+            if !answers {
+                return "<html>forbidden</html>".to_string();
+            }
+            let result = match request["method"].as_str() {
+                Some("eth_chainId") => json!("0x7a69"),
+                _ => json!({"number": "0x10", "timestamp": "0x6553f100"}),
+            };
+            json!({"jsonrpc": "2.0", "id": request["id"], "result": result}).to_string()
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        format!("http://{address}/v2/{KEY}")
+    }
+
+    /// The dashboard of a network whose one chain the file names at
+    /// [`PUBLIC`], with the environment pointing it at `paid` instead.
+    fn dashboard_over(paid: &str) -> (Dashboard, ChainKey, ChainConfig) {
+        let text = format!(
+            "[chains.\"evm:31337\"]\nlabel = \"a chain\"\nrpc = \"{PUBLIC}\"\n\
+             dollar = \"USDC\"\n\n[networks.local]\nbase = \"evm:31337\"\n"
+        );
+        let paid = paid.to_string();
+        let configs = ChainConfigs::from_toml(&text, |name| {
+            (name == "SHONIN_RPC_EVM_31337").then(|| paid.clone())
+        })
+        .unwrap();
+        let key: ChainKey = "evm:31337".parse().unwrap();
+        let config = configs.get(&key).unwrap().clone();
+        assert_eq!(
+            config.rpc, paid,
+            "the environment's endpoint is the one used"
+        );
+        let dashboard = Dashboard::new(
+            NetworkName::Local,
+            configs,
+            PathBuf::from("/nowhere"),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        (dashboard, key, config)
+    }
+
+    /// A chain's row shows the endpoint the chain file names, never the one
+    /// the environment overrides it with, which may carry a key.
+    #[tokio::test]
+    async fn a_chain_s_row_shows_its_public_endpoint_never_the_keyed_one_it_reads() {
+        let paid = paid_endpoint(true).await;
+        let (dashboard, key, config) = dashboard_over(&paid);
+        let row = chain_row(&dashboard, Chain::Base, &key, &config).await;
+        assert!(row.contains(PUBLIC), "{row}");
+        assert!(row.contains("31337"), "the chain was not read: {row}");
+        assert!(!row.contains(KEY), "{row}");
+    }
+
+    /// The same when the keyed endpoint answers with something that is not
+    /// JSON: what the row says went wrong carries no key either.
+    #[tokio::test]
+    async fn a_chain_s_row_says_why_its_endpoint_is_not_answering_without_the_endpoint_s_key() {
+        let paid = paid_endpoint(false).await;
+        let (dashboard, key, config) = dashboard_over(&paid);
+        let row = chain_row(&dashboard, Chain::Base, &key, &config).await;
+        assert!(row.contains(PUBLIC), "{row}");
+        assert!(row.contains("not answering"), "{row}");
+        assert!(!row.contains(KEY), "{row}");
     }
 }

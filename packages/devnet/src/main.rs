@@ -431,7 +431,7 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 let client = connect_to(target.network, &key, &config).await?;
-                let keeps = deploy::still_there(&client, &file).await.is_some();
+                let keeps = deploy::still_there(&client, &file).await?.is_some();
                 if keeps {
                     kept.extend(deploy::Kept::read(&key, &file));
                 }

@@ -379,17 +379,23 @@ pub const PERP: &str = "BTC-PERP";
 pub const STARTING_PRICE: u64 = 60_000_000_000;
 
 /// The deployment `file` names, if its contracts are still on the chain: a
-/// deploy keeps it as it is.
-pub async fn still_there(client: &Client, file: &Path) -> Option<Deployments> {
+/// deploy keeps it as it is. A file that can't be read, or a chain that
+/// can't say whether the code is there, stops the deploy: taken as "not
+/// deployed", the file would be written afresh and the steps it records as
+/// done or sent forgotten, and a step sent but not yet landed sent again.
+pub async fn still_there(client: &Client, file: &Path) -> Result<Option<Deployments>> {
     if !file.exists() {
-        return None;
+        return Ok(None);
     }
-    let existing = client.deployments(file).await.ok()?;
-    client
+    let existing = client
+        .deployments(file)
+        .await
+        .with_context(|| format!("reading the deployment {}", file.display()))?;
+    let there = client
         .has_code(existing.factory)
         .await
-        .unwrap_or(false)
-        .then_some(existing)
+        .context("reading whether the deployment's factory is on the chain")?;
+    Ok(there.then_some(existing))
 }
 
 /// Deploy if nothing is there, under `generation`, and return what is.
@@ -402,7 +408,7 @@ pub async fn ensure(
     chains: &[(String, u64)],
     generation: u64,
 ) -> Result<Deployments> {
-    if let Some(existing) = still_there(client, file).await {
+    if let Some(existing) = still_there(client, file).await? {
         let recorded = std::fs::read_to_string(file)
             .ok()
             .and_then(|text| recorded_generation(&text));
@@ -2266,6 +2272,30 @@ mod tests {
     }
 
     async fn anvil() -> Option<(Anvil, Client)> {
+        let (anvil, url) = anvil_node()?;
+        let client = Client::connect(&config_at(url), Signing::Unlocked)
+            .await
+            .ok()?;
+        Some((anvil, client))
+    }
+
+    /// A local chain's config, served at `url`.
+    fn config_at(url: String) -> ChainConfig {
+        ChainConfig {
+            label: "anvil".to_string(),
+            rpc: url.clone(),
+            ws: None,
+            dollar: "USDC".to_string(),
+            native_usd: None,
+            confirmations: Some(0),
+            public_rpc: url,
+            logs_rpc: None,
+            log_range: None,
+        }
+    }
+
+    /// An anvil, and the URL it answers at.
+    fn anvil_node() -> Option<(Anvil, String)> {
         let port = free_port();
         let child = Command::new("anvil")
             .args([
@@ -2279,20 +2309,7 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .ok()?;
-        let anvil = Anvil(child);
-        let config = ChainConfig {
-            label: "anvil".to_string(),
-            rpc: format!("http://127.0.0.1:{port}"),
-            ws: None,
-            dollar: "USDC".to_string(),
-            native_usd: None,
-            confirmations: Some(0),
-            public_rpc: format!("http://127.0.0.1:{port}"),
-            logs_rpc: None,
-            log_range: None,
-        };
-        let client = Client::connect(&config, Signing::Unlocked).await.ok()?;
-        Some((anvil, client))
+        Some((Anvil(child), format!("http://127.0.0.1:{port}")))
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2748,6 +2765,238 @@ mod tests {
                     .unwrap(),
                 before,
                 "a second run sent something"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A step's earlier send, known by its hash, that the node doesn't know:
+    /// taken as never landed (so the step is sent again) only while its
+    /// sender has nothing waiting, its count of sends with the pool's no
+    /// higher than its count of landed ones. While the sender has a send
+    /// waiting, which may be that very one held in a pool this endpoint
+    /// doesn't see, the step stops rather than send it again. A send the
+    /// node does know is waited for until it lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_noted_send_the_node_does_not_know_is_sent_again_only_while_its_sender_has_nothing_waiting()
+     {
+        let Some((_anvil, client)) = anvil().await else {
+            eprintln!("anvil is not installed: skipping");
+            return;
+        };
+        let provider = client.provider();
+        let from = client.account(Role::Admin).unwrap();
+        let unknown = B256::repeat_byte(0x42);
+
+        // Nothing waiting: never landed, and that is known at once.
+        let started = tokio::time::Instant::now();
+        assert!(!landed_by_hash(&client, unknown, from).await.unwrap());
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+
+        // A send of the sender's waits in the node's pool.
+        let _: serde_json::Value = provider
+            .raw_request("evm_setAutomine".into(), (false,))
+            .await
+            .unwrap();
+        let waiting = *provider
+            .send_transaction(
+                TransactionRequest::default()
+                    .from(from)
+                    .to(Address::repeat_byte(0x01))
+                    .value(U256::from(1)),
+            )
+            .await
+            .unwrap()
+            .tx_hash();
+        let pending = provider
+            .get_transaction_count(from)
+            .pending()
+            .await
+            .unwrap();
+        let latest = provider.get_transaction_count(from).latest().await.unwrap();
+        assert!(
+            pending > latest,
+            "the node doesn't count the waiting send, so this shows nothing"
+        );
+        let error = landed_by_hash(&client, unknown, from)
+            .await
+            .expect_err("taken as never landed while its sender has a send waiting");
+        assert!(
+            format!("{error:#}").contains("has a send waiting"),
+            "{error:#}"
+        );
+
+        // The waiting send itself is known: waited for until it lands.
+        let mining = {
+            let provider = provider.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let _: String = provider.raw_request("evm_mine".into(), ()).await.unwrap();
+            })
+        };
+        assert!(landed_by_hash(&client, waiting, from).await.unwrap());
+        mining.await.unwrap();
+
+        // Nothing waiting once more: the unknown send never landed.
+        assert!(!landed_by_hash(&client, unknown, from).await.unwrap());
+    }
+
+    /// The node reached through a stand-in that forwards everything, but
+    /// fails every read of a contract's code while `code_fails` is set, and
+    /// counts the sends it is handed.
+    struct CodeReads {
+        node: String,
+        http: reqwest::Client,
+        code_fails: std::sync::atomic::AtomicBool,
+        sends: std::sync::atomic::AtomicUsize,
+    }
+
+    async fn forward(
+        axum::extract::State(stand_in): axum::extract::State<std::sync::Arc<CodeReads>>,
+        body: axum::body::Bytes,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        use std::sync::atomic::Ordering;
+        let request: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        let requests = match &request {
+            serde_json::Value::Array(requests) => requests.clone(),
+            one => vec![one.clone()],
+        };
+        let method = |request: &serde_json::Value| {
+            request["method"].as_str().unwrap_or_default().to_string()
+        };
+        for request in &requests {
+            if method(request).starts_with("eth_send") {
+                stand_in.sends.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        if stand_in.code_fails.load(Ordering::SeqCst)
+            && requests
+                .iter()
+                .any(|request| method(request) == "eth_getCode")
+        {
+            let failed = |request: &serde_json::Value| {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "error": {"code": -32603, "message": "internal error"},
+                })
+            };
+            let answer = match &request {
+                serde_json::Value::Array(requests) => {
+                    serde_json::Value::Array(requests.iter().map(failed).collect())
+                }
+                one => failed(one),
+            };
+            return axum::Json(answer).into_response();
+        }
+        let answer = stand_in
+            .http
+            .post(&stand_in.node)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        ([("content-type", "application/json")], answer).into_response()
+    }
+
+    /// A contract whose code can't be read is not taken for one missing: the
+    /// step stops with the failed read, and nothing is sent, so nothing
+    /// already on the chain is deployed again. Once the code reads again,
+    /// the same step creates what is missing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_read_of_a_contract_s_code_stops_the_deploy_step_and_sends_nothing() {
+        use std::sync::atomic::Ordering;
+        let Some(artifacts) = artifacts() else {
+            eprintln!("the contracts are not built: skipping");
+            return;
+        };
+        let Some((_anvil, node_url)) = anvil_node() else {
+            eprintln!("anvil is not installed: skipping");
+            return;
+        };
+        let Ok(node) = Client::connect(&config_at(node_url.clone()), Signing::Unlocked).await
+        else {
+            eprintln!("anvil did not start: skipping");
+            return;
+        };
+        let stand_in = std::sync::Arc::new(CodeReads {
+            node: node_url,
+            http: reqwest::Client::new(),
+            code_fails: Default::default(),
+            sends: Default::default(),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new()
+            .route("/", axum::routing::post(forward))
+            .with_state(stand_in.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let client = Client::connect(
+            &config_at(format!("http://127.0.0.1:{port}")),
+            Signing::Unlocked,
+        )
+        .await
+        .unwrap();
+
+        let dir = std::env::temp_dir().join(format!("shonin-code-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let admin = client.account(Role::Admin).unwrap();
+        let roles = Roles {
+            admin,
+            platform: client.account(Role::Platform).unwrap(),
+            attestor: client.account(Role::Attestor).unwrap(),
+            builder: client.account(Role::Builder).unwrap(),
+            reviewer: client.account(Role::Reviewer).unwrap(),
+            executor: client.account(Role::Executor).unwrap(),
+            keeper: client.account(Role::Keeper).unwrap(),
+            operator: client.account(Role::Operator).unwrap(),
+            author: client.account(Role::Author).unwrap(),
+            viewer: client.account(Role::Viewer).unwrap(),
+        };
+        let names = [("base".to_string(), 31337u64)];
+        let planned = plan(&artifacts, NetworkName::Testnet, &roles, &names, 0).unwrap();
+        let creations = &planned.creations[..2];
+        let file = dir.join("evm-31337.json");
+        let mut landed = Landed::load(&file, 0);
+        let sent_before = node.provider().get_transaction_count(admin).await.unwrap();
+
+        stand_in.code_fails.store(true, Ordering::SeqCst);
+        let error = create(&client, admin, &artifacts, creations, &mut landed)
+            .await
+            .expect_err("a contract whose code couldn't be read was taken for one missing");
+        assert!(
+            format!("{error:#}").contains("reading a contract's code"),
+            "{error:#}"
+        );
+        assert_eq!(
+            stand_in.sends.load(Ordering::SeqCst),
+            0,
+            "something was sent"
+        );
+        assert_eq!(
+            node.provider().get_transaction_count(admin).await.unwrap(),
+            sent_before,
+            "something was sent"
+        );
+        for creation in creations {
+            assert!(!node.has_code(creation.address).await.unwrap());
+        }
+
+        stand_in.code_fails.store(false, Ordering::SeqCst);
+        create(&client, admin, &artifacts, creations, &mut landed)
+            .await
+            .unwrap();
+        for creation in creations {
+            assert!(
+                node.has_code(creation.address).await.unwrap(),
+                "{} is not at {}",
+                creation.name,
+                creation.address
             );
         }
         let _ = std::fs::remove_dir_all(&dir);

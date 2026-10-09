@@ -50,10 +50,6 @@ struct StationLayout {
     uint256 arrived;
     uint256 seen;
     mapping(bytes32 => Flow) flows;
-    /// What the stage in progress sold, at venues that close in the
-    /// transaction, for less than its worth at the mark when it was placed:
-    /// the slippage of a sale made for the leaver alone.
-    uint256 stagedSold;
 }
 
 /// The station's storage, and the steps its own code and its closes share.

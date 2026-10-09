@@ -58,9 +58,7 @@ library StationCloses {
         IDriver[] memory drivers = new IDriver[](count);
         Call[][] memory closes = new Call[][](count);
         uint256[] memory freed = new uint256[](count);
-        // Each driver's worth at exit prices before the close, then, from
-        // `count` on, the fraction's worth at the mark.
-        uint256[] memory before = new uint256[](2 * count);
+        uint256[] memory before = new uint256[](count);
         bool[] memory skipped = new bool[](count);
         bool delayed;
         for (uint256 i = 0; i < count; i++) {
@@ -86,7 +84,6 @@ library StationCloses {
             }
             freed[i] = exitBefore.mulDiv(fraction, WAD, Math.Rounding.Floor);
             before[i] = exitBefore;
-            before[count + i] = markBefore.mulDiv(fraction, WAD, Math.Rounding.Ceil);
             // A fraction worth more than dust at the mark and nothing at exit
             // prices (an account under water at the bid) is never sold for
             // the leaver: it would bring them nothing and leave the loss with
@@ -109,10 +106,7 @@ library StationCloses {
         uint256 idleBefore = s.balance();
         uint256 brought;
         for (uint256 i = 0; i < count; i++) {
-            if (!skipped[i]) {
-                (uint256 counted,) = _closeOne(s, drivers[i], closes[i], freed[i], before[i]);
-                brought += counted;
-            }
+            if (!skipped[i]) brought += _closeOne(s, drivers[i], closes[i], freed[i], before[i]);
         }
         sentHome = brought + idleBefore.mulDiv(fraction, WAD, Math.Rounding.Floor);
         if (sentHome != 0) s.home(sentHome);
@@ -129,16 +123,15 @@ library StationCloses {
         }
     }
 
-    /// Close and sweep one venue whose closes settle in the transaction:
-    /// what of it counts as the fraction's, never more than its worth, and
-    /// what came home.
+    /// Close and sweep one venue whose closes settle in the transaction, and
+    /// what of it counts as the fraction's: never more than its worth.
     function _closeOne(
         StationLayout storage s,
         IDriver driver,
         Call[] memory calls,
         uint256 freed,
         uint256 exitBefore
-    ) private returns (uint256, uint256) {
+    ) private returns (uint256) {
         address[] memory targets = driver.targets();
         uint256 held = s.balance();
         s.run(calls, targets);
@@ -157,11 +150,11 @@ library StationCloses {
         if (swept < freed) {
             (, uint256 exitAfter) = driver.valueOf(address(this));
             if (exitAfter > exitBefore - freed + 1) revert IStation.ShortSweep();
-            return (swept, swept);
+            return swept;
         }
         // Never more than the fraction's worth: anything a venue sends
         // beyond it stays here, everyone's.
-        return (freed, swept);
+        return freed;
     }
 
     // A stopped station's unwind --------------------------------------------
@@ -276,22 +269,14 @@ library StationCloses {
             estimate += freed[i];
         }
         uint256 owed = s.balance().mulDiv(fraction, WAD, Math.Rounding.Floor);
-        uint256 sold;
         for (uint256 i = 0; i < drivers.length; i++) {
             if (skipped[i]) continue;
             if (drivers[i].exitPath() == ExitPath.Delayed) {
                 s.run(closes[i], drivers[i].targets());
             } else {
-                (uint256 counted, uint256 swept) = _closeOne(s, drivers[i], closes[i], freed[i], before[i]);
-                owed += counted;
-                // Sold now for the leaver, whatever part of the stage is
-                // then paid: below its worth at the mark is a cost of the
-                // sale, the leaver's on whatever part they aren't paid for.
-                uint256 mark = before[drivers.length + i];
-                if (mark > swept) sold += mark - swept;
+                owed += _closeOne(s, drivers[i], closes[i], freed[i], before[i]);
             }
         }
-        s.stagedSold = sold;
         s.stage = Stage({
             fraction: fraction,
             owed: owed,
@@ -333,15 +318,8 @@ library StationCloses {
             if ((!known || part < WAD) && !over) revert NotYet();
             if (!known) {
                 // Nothing the venue did after the stage can be read: nothing
-                // can be measured, and the stage ends with nothing paid,
-                // but for what it sold elsewhere for the leaver.
-                if (s.stagedSold != 0 && current.forVault) {
-                    current.part = 0;
-                    current.fetched = 0;
-                    _deliver(s, current, 0);
-                } else {
-                    _lapse(s);
-                }
+                // can be measured, and the stage ends with nothing paid.
+                _lapse(s);
                 return;
             }
             int256 measured = int256(arrived);
@@ -414,18 +392,14 @@ library StationCloses {
             ? current.part
             : current.part.mulDiv(landed, current.fetched, Math.Rounding.Ceil);
         uint256 amount = Math.min(landed + current.owed.mulDiv(part, WAD), s.balance());
-        // What the stage sold at once for the leaver and doesn't pay them
-        // for stays with everyone as dollars worth less than what was sold:
-        // that part of the sale's slippage is the leaver's too.
-        uint256 cost = current.cost + s.stagedSold.mulDiv(WAD - Math.min(part, WAD), WAD, Math.Rounding.Ceil);
         _clear(s);
         if (current.forVault) {
             s.asset().forceApprove(s.spec.vault, amount);
-            IStationVault(s.spec.vault).delivered(amount, part, cost, current.owed + current.estimate);
+            IStationVault(s.spec.vault).delivered(amount, part, current.cost, current.owed + current.estimate);
         } else if (amount != 0) {
             s.home(amount);
         }
-        emit IStation.CloseSettled(part, cost);
+        emit IStation.CloseSettled(part, current.cost);
         emit IStation.CloseDelivered(current.fraction, amount);
     }
 
@@ -463,6 +437,5 @@ library StationCloses {
             delete s.stagedLedger[name];
         }
         delete s.stage;
-        delete s.stagedSold;
     }
 }
