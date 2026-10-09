@@ -67,14 +67,14 @@ tasks:
       - "{{.DEVNET}} deploy"
 
   solana-setup:
-    desc: "Set Solana devnet up from the programs task contracts:solana:deploy NETWORK=testnet deployed: every role funded by transfer from the deployer (config/funding.toml), the dollar's mint at its fixed index of the team's mnemonic, the registry (no timelock, the development checker), the operator's project, the stand-in driver and the venue's markets, every role's dollar account, then deployments/solana-devnet.json with the roles. No image is proposed: propose the real digests with task chains:image. Safe to run again (NETWORK=testnet)"
+    desc: "Set Solana devnet up from the programs task contracts:solana:deploy NETWORK=testnet deployed: every role funded by transfer from the deployer (config/funding.toml), the dollar's mint at its fixed index of the team's mnemonic, the registry (no timelock, the development checker), the operator's project, the stand-in driver and the venue's markets, the orca driver and the pool it lists, created at Pyth's price and seeded with ORCA_SEED_SOL of SOL (2 by default) and matching dollars, every role's dollar account, then deployments/solana-devnet.json with the roles. No image is proposed: propose the real digests with task chains:image. Safe to run again (NETWORK=testnet)"
     preconditions:
       - sh: '[ "{{.NETWORK}}" = "testnet" ]'
         msg: "The Solana set-up is for devnet (NETWORK=testnet); the local cluster is set up with the chains (NETWORK={{.NETWORK}})."
       - sh: '[ -n "${SHONIN_TESTNET_SOLANA_MNEMONIC:-}" ]'
         msg: "SHONIN_TESTNET_SOLANA_MNEMONIC is empty in .env: the roles and the deployer are its keys."
     cmds:
-      - "{{.DEVNET_SOLANA}} --vault-chain solana solana-setup --project {{.GCP_PROJECT_TESTNET}}"
+      - "{{.DEVNET_SOLANA}} --vault-chain solana solana-setup --project {{.GCP_PROJECT_TESTNET}}{{if .ORCA_SEED_SOL}} --orca-seed-sol {{.ORCA_SEED_SOL}}{{end}}"
 
   accounts:
     desc: "Each role's account and gas on every EVM chain, the funders and what they need, and on Solana devnet the deployer (its funder), each role's SOL and what it is short, the dollar's mint and the programs (NETWORK=testnet)"
