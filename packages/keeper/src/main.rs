@@ -210,10 +210,20 @@ async fn main() -> Result<()> {
     if !solana_targets.is_empty() {
         let mut clusters = args.chain_args.connect_each_solana()?;
         let executor = args.executor_url.clone();
+        let services: Vec<String> = args
+            .service_attestation_urls
+            .iter()
+            .map(|url| url.trim().to_string())
+            .filter(|url| !url.is_empty())
+            .collect();
         chains.spawn(async move {
             let mut kept = tokio::task::JoinSet::new();
             while let Some(served) = clusters.recv().await {
-                kept.spawn(solana::keep_chain(served, executor.clone()));
+                kept.spawn(solana::keep_chain(
+                    served,
+                    executor.clone(),
+                    services.clone(),
+                ));
             }
             while kept.join_next().await.is_some() {}
         });

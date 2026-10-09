@@ -1121,6 +1121,156 @@ impl Platform {
         })
     }
 
+    /// The reviewer's refusal of a submitted strategy's source, `payer`
+    /// paying for its record.
+    pub async fn ix_submit_refusal(
+        &self,
+        client: &SolanaClient,
+        payer: &Pubkey,
+        reviewer: &Pubkey,
+        id: u64,
+        review: ReviewInput,
+    ) -> Result<Instruction> {
+        let [reviewer_key, reviewer_image, reviewer_project] =
+            self.records_of(client, reviewer).await?;
+        Ok(Instruction {
+            program_id: shonin_publishing::ID,
+            accounts: shonin_publishing::accounts::SubmitRefusal {
+                reviewer_accounts: shonin_publishing::accounts::ReviewerAccounts {
+                    reviewer: *reviewer,
+                    registry_config: registry::config_address(),
+                    reviewer_key,
+                    reviewer_image,
+                    reviewer_project,
+                },
+                payer: *payer,
+                review: review_address(id),
+                submission: submission_address(id),
+                strategy: shonin_publishing::state::strategy_address(id),
+                system_program: SYSTEM,
+            }
+            .to_account_metas(None),
+            data: shonin_publishing::instruction::SubmitRefusal {
+                strategy_id: id,
+                review,
+            }
+            .data(),
+        })
+    }
+
+    /// Stage a registration and register it with the builder's signature
+    /// over it and the reviewer's go-ahead, each carried by an Ed25519
+    /// instruction, as the build service does once both are signed.
+    /// `stager` (the builder's key) stages it, pays and sends both.
+    pub async fn register_signed(
+        &self,
+        client: &SolanaClient,
+        stager: &Keypair,
+        registration: &Registration,
+        reviewer: &Pubkey,
+        clearance: &[u8; 64],
+    ) -> Result<Landed> {
+        let digest = self.registration_digest(registration);
+        let builder_signature: [u8; 64] = stager
+            .sign_message(&digest)
+            .as_ref()
+            .try_into()
+            .expect("an ed25519 signature is 64 bytes");
+        let clearance_digest = self.clearance_digest(registration.id, &registration.source_hash);
+        let staged: Option<shonin_publishing::state::Draft> = client
+            .load(&draft_address(registration.id, &stager.pubkey()))
+            .await?;
+        match staged {
+            // A draft from a try that went no further is used as it is if it
+            // says the same, and given up otherwise.
+            Some(draft)
+                if draft.author == registration.author
+                    && draft.source_hash == registration.source_hash
+                    && draft.bundle_hash == registration.bundle_hash
+                    && draft.manifest_hash == registration.manifest_hash
+                    && draft.lists == registration.lists => {}
+            Some(_) => {
+                client
+                    .send(
+                        vec![self.ix_discard(&stager.pubkey(), registration.id)],
+                        &[stager],
+                    )
+                    .await
+                    .context("giving up a draft that says something else")?;
+                client
+                    .send(
+                        vec![self.ix_stage(&stager.pubkey(), registration)],
+                        &[stager],
+                    )
+                    .await
+                    .context("staging the registration")?;
+            }
+            None => {
+                client
+                    .send(
+                        vec![self.ix_stage(&stager.pubkey(), registration)],
+                        &[stager],
+                    )
+                    .await
+                    .context("staging the registration")?;
+            }
+        }
+        let ixs = vec![
+            solana_ed25519_program::new_ed25519_instruction_with_signature(
+                &digest,
+                &builder_signature,
+                &stager.pubkey().to_bytes(),
+            ),
+            solana_ed25519_program::new_ed25519_instruction_with_signature(
+                &clearance_digest,
+                clearance,
+                &reviewer.to_bytes(),
+            ),
+            self.ix_register(
+                client,
+                &stager.pubkey(),
+                registration.id,
+                &stager.pubkey(),
+                reviewer,
+            )
+            .await?,
+        ];
+        client.send(ixs, &[stager]).await
+    }
+
+    pub fn ix_discard(&self, stager: &Pubkey, id: u64) -> Instruction {
+        Instruction {
+            program_id: shonin_publishing::ID,
+            accounts: shonin_publishing::accounts::Discard {
+                stager: *stager,
+                draft: draft_address(id, stager),
+            }
+            .to_account_metas(None),
+            data: shonin_publishing::instruction::Discard { strategy_id: id }.data(),
+        }
+    }
+
+    /// The submission paying for strategy `id`, as the cluster has it at its
+    /// finalized commitment: a payment that could still be rolled back is
+    /// not read.
+    pub async fn finalized_submission(
+        &self,
+        client: &SolanaClient,
+        id: u64,
+    ) -> Result<Option<shonin_publishing::state::Submission>> {
+        client.load_finalized(&submission_address(id)).await
+    }
+
+    /// How many submissions publishing has taken, and the cluster's time, at
+    /// its finalized commitment.
+    pub async fn finalized_count(&self, client: &SolanaClient) -> Result<(u64, u64)> {
+        let config: shonin_publishing::state::Config = client
+            .load_finalized(&publishing_config())
+            .await?
+            .ok_or_else(|| anyhow!("publishing is not set up"))?;
+        Ok((config.count, client.now_finalized().await?))
+    }
+
     pub async fn strategy(
         &self,
         client: &SolanaClient,
@@ -1412,6 +1562,49 @@ impl Platform {
             }
             .data(),
         })
+    }
+
+    /// `funder` puts `assets` of its own dollars into the vault's tank.
+    pub fn ix_fund_tank(&self, funder: &Pubkey, vault: &Pubkey, assets: u64) -> Instruction {
+        Instruction {
+            program_id: shonin_vault::ID,
+            accounts: shonin_vault::accounts::FundTank {
+                funder: *funder,
+                vault: *vault,
+                from: self.dollars(funder),
+                vault_dollars: self.dollars(vault),
+                mint: self.mint,
+                token_program: spl_token::ID,
+            }
+            .to_account_metas(None),
+            data: shonin_vault::instruction::FundTank { assets }.data(),
+        }
+    }
+
+    /// The author keeps the tank at `assets` (auto-fill), from its fee
+    /// shares.
+    pub fn ix_set_tank_keep(&self, author: &Pubkey, vault: &Pubkey, assets: u64) -> Instruction {
+        self.ix_author(
+            author,
+            vault,
+            shonin_vault::instruction::SetTankKeep { assets }.data(),
+        )
+    }
+
+    /// What `allowances` cost a day at the price list in force now, in the
+    /// dollar's units: what the vault's tank pays for at most.
+    pub async fn daily_cost(&self, client: &SolanaClient, allowances: &Allowances) -> Result<u64> {
+        let address = shonin_prices::read::prices_address();
+        let account = client
+            .account(&address)
+            .await?
+            .ok_or_else(|| anyhow!("the price list is not set up"))?;
+        let now = client.now().await?;
+        let cost = shonin_prices::read::History::new(&address, &account.owner, &account.data)?
+            .daily_cost(allowances, now)?;
+        cost.to_string()
+            .parse()
+            .map_err(|_| anyhow!("a day's cost past what the dollar holds"))
     }
 
     pub fn ix_author(&self, author: &Pubkey, vault: &Pubkey, data: Vec<u8>) -> Instruction {

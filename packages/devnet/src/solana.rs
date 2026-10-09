@@ -57,7 +57,7 @@ const STARTING_DOLLARS: u64 = 1_000_000_000_000;
 const STARTING_LAMPORTS: u64 = 1_000 * LAMPORTS_PER_SOL;
 /// The venue's own reserves, as a real venue's other traders would be, so a
 /// gain can always be withdrawn.
-const VENUE_RESERVES: u64 = 10_000_000_000_000;
+pub(crate) const VENUE_RESERVES: u64 = 10_000_000_000_000;
 const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 
 const MINUTE: u64 = 60;

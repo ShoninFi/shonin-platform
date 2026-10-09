@@ -373,6 +373,7 @@ async fn review(
                 source_hash: shared::manifest::hash_bytes(&archive),
                 report_hash: "sha256:00".to_string(),
                 clearance: None,
+                signer: None,
             }),
         )
             .into_response();
@@ -387,6 +388,7 @@ async fn review(
             source_hash: shared::manifest::hash_bytes(&archive),
             report_hash: "sha256:00".to_string(),
             clearance: Some(format!("0x{}{}", "11".repeat(64), "1b")),
+            signer: None,
         })
         .into_response();
     }

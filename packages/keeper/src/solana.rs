@@ -51,6 +51,8 @@ use chain::SolanaServed;
 use chain::solana::platform::VaultAccounts;
 use chain::solana::programs::anchor_lang::AccountDeserialize;
 use chain::solana::programs::{station, vault as vp};
+use chain::solana::rate_limited;
+use chain::solana::scan::VaultScan;
 use chain::solana::upkeep::SignedUsage;
 use chain::solana::{
     Instruction, Keypair, Platform, Pubkey, Signer, SolanaClient, TransactionFailed,
@@ -85,7 +87,7 @@ const UNANSWERED_FOR: Duration = Duration::from_secs(15 * 60);
 const ASK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Keep one Solana vault chain, round after round, for good.
-pub async fn keep_chain(served: SolanaServed, executor: String) {
+pub async fn keep_chain(served: SolanaServed, executor: String, services: Vec<String>) {
     let chain = served.vault_chain;
     let keeper = match served.client.role(chain::Role::Keeper) {
         Ok(keeper) => keeper.insecure_clone(),
@@ -105,8 +107,23 @@ pub async fn keep_chain(served: SolanaServed, executor: String) {
         served.key.to_string(),
         keeper.insecure_clone(),
         executor.clone(),
+        false,
     ));
     let _keys = Aborting(keys);
+    // The builder's and the reviewer's Solana keys, each on its own cadence.
+    let _services: Vec<Aborting> = services
+        .into_iter()
+        .map(|service| {
+            Aborting(tokio::spawn(crate::solana_keys::keep_keys(
+                served.client.clone(),
+                served.platform.clone(),
+                served.key.to_string(),
+                keeper.insecure_clone(),
+                service,
+                true,
+            )))
+        })
+        .collect();
     let keeping = Keeping {
         client: served.client.clone(),
         platform: served.platform.clone(),
@@ -114,11 +131,26 @@ pub async fn keep_chain(served: SolanaServed, executor: String) {
         executor,
     };
     let mut memory: HashMap<Pubkey, Memory> = HashMap::new();
+    let mut scan = VaultScan::for_cluster(&served.client.cluster);
     let mut said = Said::default();
+    let mut slowed = 0u32;
     loop {
         let started = Instant::now();
-        let done = keeping.round(&mut memory).await;
+        let done = keeping.round(&mut scan, &mut memory).await;
         let now = Instant::now();
+        match &done {
+            // A round cut short by a node that limits the rate failed at
+            // nothing: it is not counted, and the next waits longer, the
+            // longer the node keeps asking.
+            Err(error) if rate_limited(error) => {
+                slowed = slowed.saturating_add(1);
+                let pause = slowed_pause(slowed);
+                tracing::debug!(chain = %served.key, seconds = pause.as_secs(), error = format!("{error:#}"), "the node limits the rate; the next round waits");
+                tokio::time::sleep(pause).await;
+                continue;
+            }
+            _ => slowed = 0,
+        }
         match done {
             Ok(()) => {
                 chain_kept(chain, |kept| {
@@ -139,6 +171,12 @@ pub async fn keep_chain(served: SolanaServed, executor: String) {
         }
         tokio::time::sleep(ROUND_PAUSE).await;
     }
+}
+
+/// How long the next round waits after `times` rounds in a row cut short by
+/// a node limiting the rate: five seconds, doubling, at most two minutes.
+fn slowed_pause(times: u32) -> Duration {
+    Duration::from_secs((5u64 << times.saturating_sub(1).min(5)).min(120))
 }
 
 /// Aborts the task when dropped.
@@ -539,12 +577,18 @@ impl Keeping {
         }
     }
 
-    async fn round(&self, memory: &mut HashMap<Pubkey, Memory>) -> Result<()> {
-        let vaults = self.platform.vaults(&self.client).await?;
+    async fn round(
+        &self,
+        scan: &mut VaultScan,
+        memory: &mut HashMap<Pubkey, Memory>,
+    ) -> Result<()> {
+        // Every vault and every claim of each, read once a round; the vault
+        // program listed only when its counts say something new is there.
+        let found = scan.look(&self.client, &self.platform).await?;
+        let vaults = found.vaults;
         let addresses: Vec<Pubkey> = vaults.iter().map(|(address, _)| *address).collect();
-        // Every claim of every vault, read once a round.
         let mut claims: BTreeMap<Pubkey, Vec<Claim>> = BTreeMap::new();
-        for (vault, _, claim) in self.platform.claims_of(&self.client, &addresses).await? {
+        for (vault, _, claim) in found.claims {
             claims.entry(vault).or_default().push(claim);
         }
         for (address, vault) in &vaults {
@@ -561,6 +605,11 @@ impl Keeping {
                     if let Ok(mut troubles) = TROUBLES.lock() {
                         troubles.unkept.remove(address);
                     }
+                }
+                // The node asking to be asked less often is no failure of
+                // the vault's: its round is done again once the pause is over.
+                Err(error) if rate_limited(&error) => {
+                    tracing::debug!(vault = %address, error = format!("{error:#}"), "the node limits the rate; the vault's round is left to the next");
                 }
                 Err(error) => {
                     remembered.rounds_failing += 1;

@@ -28,9 +28,11 @@ use std::time::{Duration, Instant};
 use alloy::primitives::B256;
 use anyhow::{Context, Result, anyhow};
 use chain::SolanaServed as Served_;
-use chain::solana::executor::{self as on_chain, Blessed};
+use chain::solana::executor::Blessed;
 use chain::solana::platform::VaultAccounts;
 use chain::solana::programs::vault::state::{Vault, VaultState};
+use chain::solana::rate_limited;
+use chain::solana::scan::VaultScan;
 use chain::solana::{Keypair, Platform, Pubkey, Signer, SolanaClient};
 use wasmtime::Engine;
 
@@ -132,12 +134,23 @@ pub async fn run(
     tracing::info!(cluster = %cluster.client.cluster, "serving the Solana vaults");
     let mut book = Book::default();
     let mut unswept = Throttle::default();
+    let mut slowed = 0u32;
     loop {
-        if let Err(error) = cluster.sweep(&mut book).await
-            && unswept.due(Instant::now())
-        {
-            tracing::warn!(chain = %served.key, error = format!("{error:#}"), "could not look for work");
+        match cluster.sweep(&mut book).await {
+            // A node that limits the rate failed at nothing: the next sweep
+            // waits longer, the longer it keeps asking.
+            Err(error) if rate_limited(&error) => {
+                slowed = slowed.saturating_add(1);
+                tracing::debug!(chain = %served.key, error = format!("{error:#}"), "the node limits the rate; the next sweep waits");
+                tokio::time::sleep(crate::backoff(slowed)).await;
+                continue;
+            }
+            Err(error) if unswept.due(Instant::now()) => {
+                tracing::warn!(chain = %served.key, error = format!("{error:#}"), "could not look for work");
+            }
+            _ => {}
         }
+        slowed = 0;
         tokio::time::sleep(SWEEP_EVERY).await;
     }
 }
@@ -170,6 +183,8 @@ struct Book {
     /// Vaults another executor took from this one: never taken back while
     /// the key that took them is counted.
     replaced: HashSet<Pubkey>,
+    /// The vaults found, the program listed only when its counts move.
+    scan: Option<VaultScan>,
 }
 
 /// A vault key's leaf in the instance's attestation, taken out when the
@@ -318,10 +333,14 @@ fn approved_alone(keys: &[Pubkey], key: &Pubkey) -> bool {
 
 impl Cluster {
     async fn sweep(&self, book: &mut Book) -> Result<()> {
-        let vaults = on_chain::vaults(&self.client).await?;
+        let scan = book
+            .scan
+            .get_or_insert_with(|| VaultScan::for_cluster(&self.client.cluster));
+        let vaults = scan.look(&self.client, &self.platform).await?.vaults;
         let now = self.client.now().await?;
         for (address, vault) in vaults {
             if let Err(error) = self.sweep_one(book, address, &vault, now).await
+                && !rate_limited(&error)
                 && book.warned.entry(address).or_default().due(Instant::now())
             {
                 tracing::warn!(vault = %address, error = format!("{error:#}"), "could not look at this vault");
@@ -376,6 +395,12 @@ impl Cluster {
                     Ok(Ok(Stop::Resumed)) => {
                         tracing::info!(vault = %address, "the key taken over from reported again; letting the vault go and watching it afresh");
                         served.let_go();
+                    }
+                    // Cut short by a node that limits the rate: served again
+                    // after a pause, and not counted against the vault.
+                    Ok(Err(error)) if rate_limited(&error) => {
+                        served.retry_at = Some(Instant::now() + crate::backoff(1));
+                        tracing::debug!(vault = %address, error = format!("{error:#}"), "the node limits the rate; serving this vault again shortly");
                     }
                     Ok(Err(error)) => {
                         served.failures += 1;

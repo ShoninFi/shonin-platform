@@ -79,6 +79,19 @@ impl ImageKind {
         }
     }
 
+    /// The kind as the Solana registry spells it, which has no holder: a
+    /// holder is no kind of key there.
+    pub fn to_solana(self) -> chain::solana::programs::registry::state::ImageKind {
+        use chain::solana::programs::registry::state::ImageKind as Solana;
+        match self {
+            ImageKind::Executor => Solana::Executor,
+            ImageKind::Unwinder => Solana::Unwinder,
+            ImageKind::Builder => Solana::Builder,
+            ImageKind::Reviewer => Solana::Reviewer,
+            ImageKind::Holder => Solana::None,
+        }
+    }
+
     fn from_chain(kind: ChainImageKind) -> Option<ImageKind> {
         match kind {
             ChainImageKind::Executor => Some(ImageKind::Executor),

@@ -135,9 +135,9 @@ tasks:
       - "{{.DEVNET}} clear-root-key"
 
   market:
-    desc: "On the testnets, play the stand-in venue's market in real time as its operator, signed from the mnemonic on this machine (never in the cloud): every EVERY_MINUTES (10 by default) one post per chain of both markets' prices and the funding accrued since the last, from a tape like bitcoin's (spot about 0.6% an hour; funding about 10% a year, near 0.000295 a day outside a lull, sinking towards nothing for 8 hours about once every 4 days), minting the venue whatever its accounts are owed beyond what it holds. Resumable: it starts from the venue's prices. Every EVM testnet, or VAULT_CHAIN=<name>; logs each post's gas and the coin a day it comes to (NETWORK=testnet)"
+    desc: "On the testnets, play the stand-in venue's market in real time as its operator, signed from the mnemonic on this machine (never in the cloud): every EVERY_MINUTES (10 by default) one post per chain of both markets' prices and the funding accrued since the last, from a tape like bitcoin's (spot about 0.6% an hour; funding about 10% a year, near 0.000295 a day outside a lull, sinking towards nothing for 8 hours about once every 4 days), minting the venue whatever its accounts are owed beyond what it holds (on Solana, the admin keeping the venue's reserves at what the set-up gave them). Resumable: it starts from the venue's prices. Every EVM testnet and the Solana cluster once set up, or VAULT_CHAIN=<name>; logs each post's gas and the coin a day it comes to (NETWORK=testnet)"
     cmds:
-      - "{{.DEVNET}} {{.VAULT_CHAIN_ARG}} market {{if .EVERY_MINUTES}}--every-minutes {{.EVERY_MINUTES}}{{end}}"
+      - "{{.DEVNET_SOLANA}} {{.VAULT_CHAIN_ARG}} market {{if .EVERY_MINUTES}}--every-minutes {{.EVERY_MINUTES}}{{end}}"
 
   smoke:
     desc: "The smoke check a deploy ends with, read-only: each EVM chain's deployment read back from the chain (or only VAULT_CHAIN=<name>'s), and with API=<url> the API's health, each of those chains served with a fresh reading, and a vault priced (ALLOW_NO_VAULT=1 before any is). Fails if any check does (local, or NETWORK=testnet)"

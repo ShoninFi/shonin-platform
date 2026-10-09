@@ -227,7 +227,11 @@ const FOLLOW_UNANSWERED: Duration = Duration::from_secs(15 * 60);
 /// it can sign anything, and one in the cloud may be off until the upload
 /// wakes it, so arriving early is ordinary rather than an error. The API's
 /// `Retry-After` is honoured.
-async fn upload(api: &str, chain: shared::Chain, upload: &Upload) -> Result<UploadAccepted> {
+pub(crate) async fn upload(
+    api: &str,
+    chain: shared::Chain,
+    upload: &Upload,
+) -> Result<UploadAccepted> {
     upload_within(api, chain, upload, UPLOAD_WINDOW).await
 }
 
@@ -303,7 +307,7 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 /// Watch a job until it finishes. The queue is public, so this is the same
 /// view anyone else has of it. A queue that doesn't answer for a while (the
 /// API restarting, the build service off between steps) is waited out.
-async fn follow(api: &str, job_id: &str) -> Result<Job> {
+pub(crate) async fn follow(api: &str, job_id: &str) -> Result<Job> {
     follow_within(
         api,
         job_id,
@@ -366,7 +370,7 @@ async fn ask_job(client: &reqwest::Client, api: &str, job_id: &str) -> Result<Jo
 }
 
 /// The cargo package a project is, from its `Cargo.toml`.
-fn package_of(project: &Path) -> Option<String> {
+pub(crate) fn package_of(project: &Path) -> Option<String> {
     let text = std::fs::read_to_string(project.join("Cargo.toml")).ok()?;
     text.lines().find_map(|line| {
         line.strip_prefix("name = ")

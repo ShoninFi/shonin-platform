@@ -4,9 +4,9 @@
 //! The URL may be a paid one carrying its key, so it never appears in an
 //! error or a log: a failure names the chain's label instead.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -23,12 +23,106 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// supermajority, which on a single local node is as soon as it lands.
 pub const COMMITMENT: &str = "confirmed";
 
+/// The commitment a payment is read at: rooted, so never rolled back.
+pub const FINALIZED: &str = "finalized";
+
+/// How many times one call is made while the node says it is asked too
+/// often, before the call gives up with [`RateLimited`].
+const RATE_LIMITED_TRIES: u32 = 4;
+
+/// The first pause after the node says it is asked too often, doubled at
+/// each time in a row it says so, up to [`MOST_RATE_PAUSE`].
+const FIRST_RATE_PAUSE: Duration = Duration::from_millis(500);
+const MOST_RATE_PAUSE: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
 pub struct Rpc {
     http: reqwest::Client,
     url: Arc<str>,
     label: Arc<str>,
     next: Arc<AtomicU64>,
+    /// When the node last asked to be asked less often: every call made
+    /// through this connection (its clones too) waits until then.
+    pace: Arc<Mutex<Pace>>,
+}
+
+/// The pause the node asked for, shared by every call to it.
+#[derive(Debug, Default)]
+struct Pace {
+    /// No call goes out before this.
+    until: Option<Instant>,
+    /// How many times in a row the node has said it is asked too often.
+    strikes: u32,
+}
+
+impl Pace {
+    /// The pause after one more refusal for rate, or the one the node asked
+    /// for (`Retry-After`) if it asked for longer.
+    fn strike(&mut self, asked: Option<Duration>, now: Instant) -> Duration {
+        self.strikes = self.strikes.saturating_add(1);
+        let doubled = FIRST_RATE_PAUSE.saturating_mul(1 << (self.strikes - 1).min(10));
+        let pause = doubled.max(asked.unwrap_or_default()).min(MOST_RATE_PAUSE);
+        let until = now + pause;
+        self.until = Some(self.until.map_or(until, |was| was.max(until)));
+        pause
+    }
+
+    fn eased(&mut self) {
+        self.strikes = 0;
+    }
+
+    /// How long a call must wait before it goes out.
+    fn wait(&self, now: Instant) -> Duration {
+        self.until
+            .map_or(Duration::ZERO, |until| until.saturating_duration_since(now))
+    }
+}
+
+/// The node said it is asked too often (HTTP 429, or the same as a JSON-RPC
+/// error), and kept saying so through every try of the call. Nothing was
+/// done: whoever made the call should slow down rather than count it as
+/// something that failed.
+#[derive(Clone, Debug)]
+pub struct RateLimited {
+    pub label: String,
+    pub method: String,
+}
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} asks to be asked less often (rate-limited on {})",
+            self.label, self.method
+        )
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
+/// Whether `error` is, or was caused by, the node limiting the rate of
+/// calls: nothing failed, the caller was only asked to slow down.
+pub fn rate_limited(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<RateLimited>().is_some())
+}
+
+/// What one try of a call came to.
+enum Tried {
+    Answered(Value),
+    /// The node asked to be asked less often, saying how long to wait if it
+    /// said.
+    Slow(Option<Duration>),
+}
+
+/// Whether a JSON-RPC error is the node limiting the rate: the code some
+/// nodes use for it (429), or the words.
+fn says_rate_limited(error: &Value) -> bool {
+    error["code"].as_i64() == Some(429)
+        || error["message"]
+            .as_str()
+            .is_some_and(|message| message.to_ascii_lowercase().contains("too many requests"))
 }
 
 /// An error the node answered with, as it said it.
@@ -120,6 +214,7 @@ impl Rpc {
             url: url.into(),
             label: label.into(),
             next: Arc::new(AtomicU64::new(1)),
+            pace: Arc::new(Mutex::new(Pace::default())),
         })
     }
 
@@ -127,11 +222,62 @@ impl Rpc {
         &self.label
     }
 
-    /// One call, its result read as `T`.
+    fn pace(&self) -> std::sync::MutexGuard<'_, Pace> {
+        self.pace
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// One call, its result read as `T`. While the node says it is asked
+    /// too often, the call waits and is made again, every other call through
+    /// this connection waiting with it, up to [`RATE_LIMITED_TRIES`] times;
+    /// then it fails with [`RateLimited`].
     pub async fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
+        for _ in 0..RATE_LIMITED_TRIES {
+            let wait = self.pace().wait(Instant::now());
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+            match self.try_call(method, &params).await? {
+                Tried::Answered(answer) => {
+                    self.pace().eased();
+                    if let Some(error) = answer.get("error") {
+                        return Err(RpcError {
+                            code: error["code"].as_i64().unwrap_or(0),
+                            message: error["message"].as_str().unwrap_or_default().to_string(),
+                            data: error.get("data").cloned().unwrap_or(Value::Null),
+                        }
+                        .into());
+                    }
+                    return serde_json::from_value(
+                        answer.get("result").cloned().unwrap_or(Value::Null),
+                    )
+                    .with_context(|| {
+                        format!("{} answered {method} in an unexpected shape", self.label)
+                    });
+                }
+                Tried::Slow(asked) => {
+                    let pause = self.pace().strike(asked, Instant::now());
+                    tracing::debug!(
+                        node = %self.label,
+                        method,
+                        millis = pause.as_millis() as u64,
+                        "the node asks to be asked less often; waiting"
+                    );
+                }
+            }
+        }
+        Err(RateLimited {
+            label: self.label.to_string(),
+            method: method.to_string(),
+        }
+        .into())
+    }
+
+    async fn try_call(&self, method: &str, params: &Value) -> Result<Tried> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let answer: Value = self
+        let reply = self
             .http
             .post(&*self.url)
             .json(&body)
@@ -143,26 +289,26 @@ impl Rpc {
                     self.label,
                     error.without_url()
                 )
-            })?
-            .json()
-            .await
-            .map_err(|error| {
-                anyhow!(
-                    "{} answered {method} with no JSON: {}",
-                    self.label,
-                    error.without_url()
-                )
             })?;
-        if let Some(error) = answer.get("error") {
-            return Err(RpcError {
-                code: error["code"].as_i64().unwrap_or(0),
-                message: error["message"].as_str().unwrap_or_default().to_string(),
-                data: error.get("data").cloned().unwrap_or(Value::Null),
-            }
-            .into());
+        let asked = reply
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
+        let limited = reply.status() == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        let answer: Option<Value> = reply.json().await.ok();
+        if limited
+            || answer
+                .as_ref()
+                .and_then(|answer| answer.get("error"))
+                .is_some_and(says_rate_limited)
+        {
+            return Ok(Tried::Slow(asked));
         }
-        serde_json::from_value(answer.get("result").cloned().unwrap_or(Value::Null))
-            .with_context(|| format!("{} answered {method} in an unexpected shape", self.label))
+        answer
+            .map(Tried::Answered)
+            .ok_or_else(|| anyhow!("{} answered {method} with no JSON", self.label))
     }
 
     pub async fn genesis_hash(&self) -> Result<String> {
@@ -175,6 +321,12 @@ impl Rpc {
     }
 
     pub async fn account(&self, address: &Pubkey) -> Result<Option<Account>> {
+        self.account_at(address, COMMITMENT).await
+    }
+
+    /// An account as the node has it at `commitment` (`confirmed`, or
+    /// `finalized` for what may never be rolled back).
+    pub async fn account_at(&self, address: &Pubkey, commitment: &str) -> Result<Option<Account>> {
         #[derive(Deserialize)]
         struct Answer {
             value: Option<RawAccount>,
@@ -182,7 +334,7 @@ impl Rpc {
         let answer: Answer = self
             .call(
                 "getAccountInfo",
-                json!([address.to_string(), {"encoding": "base64", "commitment": COMMITMENT}]),
+                json!([address.to_string(), {"encoding": "base64", "commitment": commitment}]),
             )
             .await?;
         answer.value.map(RawAccount::decode).transpose()
@@ -446,4 +598,93 @@ impl Rpc {
 pub fn parse_pubkey(text: &str) -> Result<Pubkey> {
     text.parse()
         .map_err(|_| anyhow!("{text:?} is not a Solana address"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A node answering each request with the next of `replies` (the last
+    /// again once they run out): an HTTP status and a body. Says how many
+    /// requests it was sent.
+    async fn a_node(replies: Vec<(u16, &'static str)>) -> (String, Arc<AtomicU64>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let asked = Arc::new(AtomicU64::new(0));
+        let counting = asked.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = counting.fetch_add(1, Ordering::SeqCst) as usize;
+                let (status, body) = replies[n.min(replies.len() - 1)];
+                let mut buffer = vec![0u8; 8192];
+                let _ = socket.read(&mut buffer).await;
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+            }
+        });
+        (url, asked)
+    }
+
+    const SLOT: &str = r#"{"jsonrpc":"2.0","id":1,"result":42}"#;
+    const LIMITED: &str = r#"{"jsonrpc":"2.0","error":{"code":429,"message":"Too many requests for a specific RPC call"}}"#;
+
+    #[tokio::test]
+    async fn a_node_asking_to_be_asked_less_often_is_waited_out_and_asked_again() {
+        let (url, asked) = a_node(vec![(429, LIMITED), (200, LIMITED), (200, SLOT)]).await;
+        let rpc = Rpc::new(&url, "a node").unwrap();
+        let started = Instant::now();
+        assert_eq!(rpc.slot().await.unwrap(), 42);
+        assert_eq!(asked.load(Ordering::SeqCst), 3);
+        // Half a second, then a second: the pause doubled.
+        assert!(started.elapsed() >= Duration::from_millis(1_400));
+        // Answered, the next call goes straight out.
+        let started = Instant::now();
+        assert_eq!(rpc.slot().await.unwrap(), 42);
+        assert!(started.elapsed() < Duration::from_millis(400));
+    }
+
+    #[tokio::test]
+    async fn a_node_that_keeps_limiting_the_rate_is_rate_limited_not_a_failure() {
+        let (url, asked) = a_node(vec![(429, "")]).await;
+        let rpc = Rpc::new(&url, "a node").unwrap();
+        let error = rpc.slot().await.unwrap_err();
+        assert!(rate_limited(&error), "{error:#}");
+        assert!(rate_limited(&error.context("a round")));
+        assert_eq!(asked.load(Ordering::SeqCst), u64::from(RATE_LIMITED_TRIES));
+        // Any other error the node answers is no rate limit.
+        let (url, _) = a_node(vec![(
+            200,
+            r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"bad"}}"#,
+        )])
+        .await;
+        let error = Rpc::new(&url, "a node").unwrap().slot().await.unwrap_err();
+        assert!(!rate_limited(&error));
+        assert!(error.downcast_ref::<RpcError>().is_some());
+    }
+
+    #[test]
+    fn the_pause_doubles_up_to_its_most_and_honours_a_longer_retry_after() {
+        let now = Instant::now();
+        let mut pace = Pace::default();
+        assert_eq!(pace.strike(None, now), Duration::from_millis(500));
+        assert_eq!(pace.strike(None, now), Duration::from_secs(1));
+        assert_eq!(
+            pace.strike(Some(Duration::from_secs(7)), now),
+            Duration::from_secs(7)
+        );
+        for _ in 0..20 {
+            pace.strike(None, now);
+        }
+        assert_eq!(pace.strike(None, now), MOST_RATE_PAUSE);
+        assert_eq!(pace.wait(now), MOST_RATE_PAUSE);
+        pace.eased();
+        assert_eq!(pace.strike(None, now), Duration::from_millis(500));
+    }
 }

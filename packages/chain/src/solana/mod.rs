@@ -34,6 +34,7 @@ pub mod keys;
 pub mod platform;
 pub mod pro_rata;
 pub mod rpc;
+pub mod scan;
 pub mod tables;
 pub mod upkeep;
 
@@ -42,6 +43,7 @@ pub use anchor_lang::solana_program::instruction::Instruction;
 pub use client::{Landed, MayStillLand, NeverLanded, SolanaClient, TransactionFailed};
 pub use events::{Called, TransactionRecord};
 pub use platform::Platform;
+pub use rpc::{RateLimited, rate_limited};
 pub use solana_keypair::Keypair;
 pub use solana_signer::Signer;
 

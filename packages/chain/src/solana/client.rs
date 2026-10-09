@@ -22,7 +22,7 @@ use solana_transaction::versioned::VersionedTransaction;
 
 use super::events::TransactionRecord;
 use super::keys::{RoleKeys, Signing};
-use super::rpc::{Account, Rpc, RpcError, Simulated};
+use super::rpc::{self, Account, Rpc, RpcError, Simulated};
 use super::tables::{self, Table};
 use super::{Keypair, Pubkey, Signer, programs};
 use crate::client::Role;
@@ -385,11 +385,37 @@ impl SolanaClient {
             .map_err(|error| anyhow!("the account at {address} is not what was expected: {error}"))
     }
 
+    /// An Anchor account of type `T` at `address` as the cluster has it at
+    /// its finalized commitment, if one is there then.
+    pub async fn load_finalized<T: AccountDeserialize>(
+        &self,
+        address: &Pubkey,
+    ) -> Result<Option<T>> {
+        let Some(account) = self.rpc.account_at(address, rpc::FINALIZED).await? else {
+            return Ok(None);
+        };
+        if account.data.is_empty() {
+            return Ok(None);
+        }
+        T::try_deserialize(&mut &account.data[..])
+            .map(Some)
+            .map_err(|error| anyhow!("the account at {address} is not what was expected: {error}"))
+    }
+
     /// The cluster's clock, in seconds: what every program reads time from.
     pub async fn now(&self) -> Result<u64> {
+        self.clock_at(rpc::COMMITMENT).await
+    }
+
+    /// The cluster's clock at its finalized commitment.
+    pub async fn now_finalized(&self) -> Result<u64> {
+        self.clock_at(rpc::FINALIZED).await
+    }
+
+    async fn clock_at(&self, commitment: &str) -> Result<u64> {
         let clock = self
             .rpc
-            .account(&anchor_lang::solana_program::sysvar::clock::ID)
+            .account_at(&anchor_lang::solana_program::sysvar::clock::ID, commitment)
             .await?
             .ok_or_else(|| anyhow!("the cluster has no clock"))?;
         let bytes: [u8; 8] = clock

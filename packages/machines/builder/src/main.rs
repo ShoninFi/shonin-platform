@@ -40,6 +40,10 @@ mod build;
 #[allow(dead_code)]
 mod cloud;
 mod isolation;
+// The same as the reviewer's: a service's key on a Solana cluster.
+#[path = "../../reviewer/src/on_solana.rs"]
+mod on_solana;
+mod solana;
 mod store;
 mod vendor;
 
@@ -158,6 +162,92 @@ const CONFIRMATIONS: u64 = 12;
 /// The first job id.
 const FIRST_ID: u64 = 8_800;
 
+/// The wallet an upload names, which alone may pay for it: an address on an
+/// EVM chain, an ed25519 key on Solana. Written as each chain writes its own
+/// (`0x` hex, or base58), so a queue written before Solana was served reads
+/// as it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Wallet {
+    Evm(Address),
+    Solana([u8; 32]),
+}
+
+impl Wallet {
+    /// An upload's author as `chain` names a wallet.
+    fn on(chain: Chain, text: &str) -> Result<Wallet, String> {
+        if chain == Chain::Solana {
+            text.trim()
+                .parse::<chain::solana::Pubkey>()
+                .map(|key| Wallet::Solana(key.to_bytes()))
+                .map_err(|_| "the author is not a Solana address".to_string())
+        } else {
+            text.trim()
+                .parse::<Address>()
+                .map(Wallet::Evm)
+                .map_err(|_| "the author is not an address".to_string())
+        }
+    }
+
+    /// The wallet's own bytes, as an upload's reference is worked from.
+    fn bytes(&self) -> Vec<u8> {
+        match self {
+            Wallet::Evm(address) => address.to_vec(),
+            Wallet::Solana(key) => key.to_vec(),
+        }
+    }
+
+    /// The EVM address, for a registration on an EVM chain.
+    fn evm(&self) -> Result<Address> {
+        match self {
+            Wallet::Evm(address) => Ok(*address),
+            Wallet::Solana(_) => bail!("a Solana wallet pays for nothing on an EVM chain"),
+        }
+    }
+
+    /// The Solana key, for a registration on Solana.
+    fn solana(&self) -> Result<chain::solana::Pubkey> {
+        match self {
+            Wallet::Solana(key) => Ok(chain::solana::Pubkey::new_from_array(*key)),
+            Wallet::Evm(_) => bail!("an EVM wallet pays for nothing on Solana"),
+        }
+    }
+}
+
+impl From<Address> for Wallet {
+    fn from(address: Address) -> Self {
+        Wallet::Evm(address)
+    }
+}
+
+impl std::fmt::Display for Wallet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Wallet::Evm(address) => write!(f, "{address:#x}"),
+            Wallet::Solana(key) => {
+                write!(f, "{}", chain::solana::Pubkey::new_from_array(*key))
+            }
+        }
+    }
+}
+
+impl serde::Serialize for Wallet {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Wallet {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        let chain = if text.starts_with("0x") {
+            Chain::Base
+        } else {
+            Chain::Solana
+        };
+        Wallet::on(chain, &text).map_err(serde::de::Error::custom)
+    }
+}
+
 struct Service {
     /// Every vault chain it builds for, connected yet or not: an agent is
     /// published on its vault chain.
@@ -165,6 +255,11 @@ struct Service {
     /// Those of them taken on so far (see [`take_on`]). A chain not yet taken
     /// on has its uploads turned away for now and its jobs left waiting.
     connected: std::sync::RwLock<BTreeMap<Chain, Arc<Served>>>,
+    /// The Solana cluster, once taken on: the key blessed and stocked there
+    /// (see [`solana::take_on`]).
+    solana: std::sync::RwLock<Option<Arc<on_solana::OnSolana>>>,
+    /// The build service's own Solana key, in the attested image.
+    solana_key: Option<Arc<chain::solana::Keypair>>,
     /// How many blocks deep a payment must be before it is read, on each of
     /// `chains`.
     confirmations: BTreeMap<Chain, u64>,
@@ -336,6 +431,27 @@ impl Service {
         }
     }
 
+    /// Whether `chain` is served and taken on: its uploads are taken and its
+    /// jobs built.
+    fn connected_to(&self, chain: Chain) -> bool {
+        if chain == Chain::Solana {
+            return self.on_solana().is_ok();
+        }
+        self.on(chain).is_ok()
+    }
+
+    /// The Solana cluster, once taken on.
+    fn on_solana(&self) -> Result<Arc<on_solana::OnSolana>> {
+        if !self.configured.contains(&Chain::Solana) {
+            return Err(anyhow!("this build service does not serve solana"));
+        }
+        self.solana
+            .read()
+            .ok()
+            .and_then(|solana| solana.clone())
+            .ok_or_else(|| anyhow!("solana is not taken on yet"))
+    }
+
     fn on(&self, chain: Chain) -> Result<Arc<Served>> {
         if !self.configured.contains(&chain) {
             return Err(anyhow!("this build service does not serve {chain}"));
@@ -423,7 +539,7 @@ struct Entry {
     /// The reference the author pays against.
     upload: B256,
     /// The wallet the upload named: only its payment starts the job.
-    author: Address,
+    author: Wallet,
     /// The project, base64, as a queue written before each archive had a
     /// file of its own held it: read once, moved to its file, and never
     /// written again.
@@ -463,7 +579,7 @@ struct Forgotten {
     /// The reference it was given to pay against.
     upload: B256,
     chain: Chain,
-    author: Address,
+    author: Wallet,
     source_hash: String,
     sealed: bool,
     manifest_path: String,
@@ -492,7 +608,7 @@ impl Forgotten {
     fn is(
         &self,
         chain: Chain,
-        author: Address,
+        author: Wallet,
         source_hash: &str,
         sealed: bool,
         manifest_path: &str,
@@ -674,11 +790,18 @@ async fn main() -> Result<()> {
             )
         })
         .collect();
-    let configured = targets.iter().map(|target| target.vault_chain).collect();
+    let mut configured: Vec<Chain> = targets.iter().map(|target| target.vault_chain).collect();
+    let solana_targets = args.chain_args.solana_targets()?;
+    configured.extend(solana_targets.iter().map(|target| target.vault_chain));
     // Each chain is taken on as soon as it connects: one out of reach (its
     // node down, its deployment missing) is tried again in the background,
     // and doesn't keep the build service from the others.
     let mut connecting = args.chain_args.connect_each()?;
+    let mut clusters = if solana_targets.is_empty() {
+        tokio::sync::mpsc::unbounded_channel().1
+    } else {
+        args.chain_args.connect_each_solana()?
+    };
 
     let moved = move_archives(&archives, &mut queue.jobs)?;
     let swept = sweep_archives(&archives, &queue.jobs);
@@ -686,6 +809,8 @@ async fn main() -> Result<()> {
     let service = Arc::new(Service {
         configured,
         connected: Default::default(),
+        solana: Default::default(),
+        solana_key: launched.as_ref().map(|launched| launched.solana.clone()),
         confirmations,
         network,
         catalogue: Catalogue::published(),
@@ -730,6 +855,12 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         while let Some(served) = connecting.recv().await {
             tokio::spawn(take_on(joining.clone(), Arc::new(served)));
+        }
+    });
+    let joining = service.clone();
+    tokio::spawn(async move {
+        while let Some(served) = clusters.recv().await {
+            tokio::spawn(solana::take_on(joining.clone(), served));
         }
     });
 
@@ -871,6 +1002,11 @@ async fn plan(service: &Service, busy: bool) -> cloud::WakePlan {
 /// read yet: its registry's count now is past the count at the last block
 /// read through. A chain whose count can't be read now holds nothing up.
 async fn unread_payments(service: &Service) -> bool {
+    if let Ok(on) = service.on_solana()
+        && solana::unread(service, &on).await
+    {
+        return true;
+    }
     let connected: Vec<Arc<Served>> = service
         .connected
         .read()
@@ -1496,7 +1632,7 @@ async fn upload(
                 .to_string(),
         ));
     }
-    if service.on(chain).is_err() {
+    if !service.connected_to(chain) {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             format!("{chain}'s node is not answering yet: try again shortly"),
@@ -1510,10 +1646,7 @@ async fn upload(
             "a sealed upload is refused in the cloud until the sealed path is built",
         ));
     }
-    let author: Address = upload
-        .author
-        .parse()
-        .map_err(|_| bad("the author is not an address"))?;
+    let author = Wallet::on(chain, &upload.author).map_err(bad)?;
     let archive = shared::base64::decode(&upload.archive_base64).map_err(bad)?;
     let source_hash = hash_bytes(&archive);
 
@@ -1655,7 +1788,7 @@ async fn upload(
     // own reference.
     let reference = keccak256(
         [
-            author.as_slice(),
+            author.bytes().as_slice(),
             &hash_to_bytes(&source_hash).unwrap_or_default(),
             id.as_bytes(),
         ]
@@ -1712,7 +1845,7 @@ async fn written_down(
 fn new_job(
     id: &str,
     chain: Chain,
-    author: Address,
+    author: Wallet,
     manifest: &Manifest,
     source_hash: String,
     sealed: bool,
@@ -1722,7 +1855,7 @@ fn new_job(
         chain,
         strategy_id: None,
         title: manifest.description.title.clone(),
-        author: format!("{author:#x}"),
+        author: author.to_string(),
         state: JobState::AwaitingPayment,
         submitted: now(),
         duration_seconds: 0,
@@ -1799,7 +1932,7 @@ fn forget_unpaid(
 /// the wallet an upload names, so turning a new upload away instead would let
 /// anyone lock a wallet, or everyone, out of publishing. Says whether
 /// anything was forgotten.
-fn bound_unpaid(queue: &mut Queue, author: Address, now: time::PrimitiveDateTime) -> bool {
+fn bound_unpaid(queue: &mut Queue, author: Wallet, now: time::PrimitiveDateTime) -> bool {
     let waiting = |entry: &Entry| entry.job.state == JobState::AwaitingPayment;
     let theirs = |entry: &Entry| waiting(entry) && entry.author == author;
     let mut forgot = false;
@@ -1828,7 +1961,7 @@ fn bound_unpaid(queue: &mut Queue, author: Address, now: time::PrimitiveDateTime
 fn waiting_for_payment<'a>(
     jobs: &'a [Entry],
     chain: Chain,
-    author: Address,
+    author: Wallet,
     source_hash: &str,
     sealed: bool,
     manifest_path: &str,
@@ -1979,8 +2112,7 @@ async fn admit_paid(
     on: &Served,
     logs: Vec<alloy::rpc::types::Log>,
 ) -> Result<()> {
-    let mut queue = service.queue.lock().await;
-    let mut changed = false;
+    let mut payments = Vec::new();
     for log in logs {
         let Ok(paid) = log.log_decode::<IPublishing::Submitted>() else {
             continue;
@@ -1990,8 +2122,36 @@ async fn admit_paid(
             .strategyId
             .try_into()
             .context("a strategy id past u64")?;
-        let names = |upload: B256, author: Address, chain: Chain| {
-            upload == paid.upload && author == paid.author && chain == on.vault_chain
+        payments.push(Payment {
+            strategy_id: id,
+            upload: paid.upload,
+            author: Wallet::Evm(paid.author),
+        });
+    }
+    admit_payments(service, on.vault_chain, payments).await
+}
+
+/// One payment to publish, as a chain records it: the id it took, the
+/// upload it names and the wallet it came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Payment {
+    strategy_id: u64,
+    upload: B256,
+    author: Wallet,
+}
+
+/// Queue the jobs these payments on `chain` pay for (see [`admit_paid`]).
+async fn admit_payments(
+    service: &Arc<Service>,
+    chain: Chain,
+    payments: Vec<Payment>,
+) -> Result<()> {
+    let mut queue = service.queue.lock().await;
+    let mut changed = false;
+    for paid in payments {
+        let id = paid.strategy_id;
+        let names = |upload: B256, author: Wallet, on: Chain| {
+            upload == paid.upload && author == paid.author && on == chain
         };
         if let Some(entry) = queue.jobs.iter_mut().find(|entry| {
             names(entry.upload, entry.author, entry.job.chain)
@@ -2005,13 +2165,14 @@ async fn admit_paid(
         }
         // A payment read before (pages are read again) has done all it will
         // do.
-        let already =
-            queue.jobs.iter().any(|entry| {
-                entry.job.chain == on.vault_chain && entry.job.strategy_id == Some(id)
-            }) || queue
+        let already = queue
+            .jobs
+            .iter()
+            .any(|entry| entry.job.chain == chain && entry.job.strategy_id == Some(id))
+            || queue
                 .credits
                 .iter()
-                .any(|credit| credit.paid_for.chain == on.vault_chain && credit.strategy_id == id);
+                .any(|credit| credit.paid_for.chain == chain && credit.strategy_id == id);
         if already {
             continue;
         }
@@ -2072,7 +2233,7 @@ async fn admit_paid(
             changed = true;
             continue;
         }
-        if queue.unmatched.insert((on.vault_chain, id)) {
+        if queue.unmatched.insert((chain, id)) {
             tracing::warn!(
                 id,
                 upload = %paid.upload,
@@ -2183,14 +2344,14 @@ async fn take_one(service: &Arc<Service>) -> Result<()> {
         }
         // First come, first served, and one job in flight per author: nobody
         // can fill the queue with their own work.
-        let busy: Vec<Address> = queue
+        let busy: Vec<Wallet> = queue
             .jobs
             .iter()
             .filter(|entry| matches!(entry.job.state, JobState::Reviewing | JobState::Building))
             // A job caught mid-way on a chain not connected is not being
             // worked: it is picked up again once its chain connects, and
             // holds none of its author's jobs elsewhere until then.
-            .filter(|entry| service.on(entry.job.chain).is_ok())
+            .filter(|entry| service.connected_to(entry.job.chain))
             .map(|entry| entry.author)
             .collect();
         // A job on a chain not yet connected waits for it, and one put back
@@ -2199,7 +2360,7 @@ async fn take_one(service: &Arc<Service>) -> Result<()> {
         let next = queue.jobs.iter_mut().find(|entry| {
             matches!(entry.job.state, JobState::Queued { .. })
                 && !busy.contains(&entry.author)
-                && service.on(entry.job.chain).is_ok()
+                && service.connected_to(entry.job.chain)
                 && entry.not_before.is_none_or(|not_before| not_before <= at)
         });
         // Counted before it starts, and written down with the state it is
@@ -2352,7 +2513,7 @@ async fn run(service: &Arc<Service>, entry: &Entry) -> Result<(JobState, Option<
     let answer: ReviewAnswer = serde_json::from_slice(&body).map_err(|error| {
         Requeue::ReviewerAway(format!("the reviewer's answer was not a verdict: {error}"))
     })?;
-    let Some(clearance) = answer.clearance else {
+    let Some(clearance) = answer.clearance.clone() else {
         tracing::info!(id = entry.job.id, "the reviewer refused it");
         return Ok((JobState::Refused, None));
     };
@@ -2431,16 +2592,29 @@ async fn run(service: &Arc<Service>, entry: &Entry) -> Result<(JobState, Option<
         }
     };
 
-    let bundle_hash = register(
-        service,
-        entry,
-        strategy_id,
-        &archive,
-        manifest,
-        built,
-        &clearance,
-    )
-    .await?;
+    let bundle_hash = if chain == Chain::Solana {
+        solana::register(
+            service,
+            entry,
+            strategy_id,
+            &archive,
+            manifest,
+            built,
+            &answer,
+        )
+        .await?
+    } else {
+        register(
+            service,
+            entry,
+            strategy_id,
+            &archive,
+            manifest,
+            built,
+            &clearance,
+        )
+        .await?
+    };
     Ok((JobState::Ready, Some(bundle_hash)))
 }
 
@@ -2573,26 +2747,8 @@ async fn register(
 ) -> Result<String> {
     let chain = entry.job.chain;
     let on = service.on(chain)?;
-
-    // The builder's image: in the attested image, the one the launcher
-    // attests it runs; on a development chain, the name standing for it.
-    let builder_image = service
-        .image
-        .unwrap_or_else(|| chain::attest::image_digest("builder"));
-    let canonical = Canonical {
-        strategy_id,
-        vault_chain: chain,
-        author: format!("{:#x}", entry.author),
-        bundle_hash: built.bundle_hash.clone(),
-        component_hash: built.component_hash.clone(),
-        source_hash: entry.job.source_hash.clone(),
-        sealed: entry.job.sealed,
-        world: build::WORLD.into(),
-        toolchain: build::TOOLCHAIN.into(),
-        builder_image: format!("{builder_image:#x}"),
-        manifest: manifest.clone(),
-    };
-    let manifest_hash = canonical.hash();
+    let author = entry.author.evm()?;
+    let (canonical, manifest_hash) = canonical_of(service, entry, strategy_id, &manifest, &built);
 
     let chains: Vec<ChainNeed> = manifest
         .chains(&service.catalogue)
@@ -2634,7 +2790,7 @@ async fn register(
         on.deployments.strategies,
         &chain::digest::Registration {
             strategy_id: strategy,
-            author: entry.author,
+            author,
             source_hash,
             bundle_hash,
             manifest_hash: manifest_bytes,
@@ -2649,7 +2805,7 @@ async fn register(
             on.deployments.strategies,
             IStrategyRegistry::registrationDigestCall {
                 strategyId: strategy,
-                author: entry.author,
+                author,
                 sourceHash: source_hash,
                 bundleHash: bundle_hash,
                 manifestHash: manifest_bytes,
@@ -2674,79 +2830,12 @@ async fn register(
         None => on.client.sign(on.deployments.roles.builder, digest).await?,
     };
 
-    // Everything a page shows about a build lives in the store, addressed by
-    // the hashes the chain holds, written before the registration so the
-    // registry never points at bytes nobody has.
-    store::put(
-        &service.store,
-        &built.bundle_hash,
-        "component.wasm",
-        &built.component,
-    )?;
-    store::put(
-        &service.store,
-        &built.bundle_hash,
-        "bundle.tar",
-        &built.bundle,
-    )?;
-    store::put_json(&service.store, &manifest_hash, "manifest.json", &canonical)?;
-    store::put_json(
-        &service.store,
-        &built.bundle_hash,
-        "hashes.json",
-        &serde_json::json!({
-            "component": built.component_hash,
-            "bundle": built.bundle_hash,
-            "manifest": manifest_hash,
-            "source": entry.job.source_hash,
-            "toolchain": build::TOOLCHAIN,
-            "seconds": built.seconds,
-        }),
-    )?;
-    // The source is kept either way, because a rebuild has to be possible
-    // for as long as the vault lives. A sealed one is kept under a name the
-    // public store refuses to serve.
-    store::put(
-        &service.store,
-        &entry.job.source_hash,
-        if entry.job.sealed {
-            "source.sealed.tar"
-        } else {
-            "source.tar"
-        },
-        archive,
-    )?;
-    // Off the machine, the API's store takes them, each checked against its
-    // hash there, before anything is registered: the registry never names
-    // bytes the API lacks. Sealed source never leaves.
-    if let Some(internal) = &service.internal {
-        let bundle_at = store::directory(Path::new(""), &built.bundle_hash);
-        let manifest_at = store::directory(Path::new(""), &manifest_hash);
-        let source_at = store::directory(Path::new(""), &entry.job.source_hash);
-        let mut pushes = vec![
-            (bundle_at.clone(), "hashes.json"),
-            (manifest_at, "manifest.json"),
-            (bundle_at.clone(), "bundle.tar"),
-            (bundle_at, "component.wasm"),
-        ];
-        if !entry.job.sealed {
-            pushes.push((source_at, "source.tar"));
-        }
-        for (at, name) in pushes {
-            let hash = at.to_string_lossy().to_string();
-            let bytes = std::fs::read(service.store.join(&at).join(name))
-                .with_context(|| format!("reading {hash}/{name} back"))?;
-            internal
-                .push_store(&hash, name, bytes)
-                .await
-                .map_err(|error| Requeue::StoreAway(format!("{error:#}")))?;
-        }
-    }
+    keep_built(service, entry, archive, &built, &canonical, &manifest_hash).await?;
 
     let clearance: Bytes = clearance.parse().context("the reviewer's go-ahead")?;
     let register = IStrategyRegistry::registerCall {
         strategyId: alloy::primitives::U256::from(strategy_id),
-        author: entry.author,
+        author,
         sourceHash: source_hash,
         bundleHash: bundle_hash,
         manifestHash: manifest_bytes,
@@ -2805,6 +2894,118 @@ async fn register(
         "built, signed and registered"
     );
     Ok(bundle_hash)
+}
+
+/// What a build is registered as: the canonical manifest, naming the
+/// builder's image (in the attested image, the one the launcher attests it
+/// runs; on a development chain, the name standing for it), and its hash.
+fn canonical_of(
+    service: &Service,
+    entry: &Entry,
+    strategy_id: u64,
+    manifest: &Manifest,
+    built: &build::Built,
+) -> (Canonical, String) {
+    let builder_image = service
+        .image
+        .unwrap_or_else(|| chain::attest::image_digest("builder"));
+    let canonical = Canonical {
+        strategy_id,
+        vault_chain: entry.job.chain,
+        author: entry.author.to_string(),
+        bundle_hash: built.bundle_hash.clone(),
+        component_hash: built.component_hash.clone(),
+        source_hash: entry.job.source_hash.clone(),
+        sealed: entry.job.sealed,
+        world: build::WORLD.into(),
+        toolchain: build::TOOLCHAIN.into(),
+        builder_image: format!("{builder_image:#x}"),
+        manifest: manifest.clone(),
+    };
+    let hash = canonical.hash();
+    (canonical, hash)
+}
+
+/// Put what was built into the store, and off the machine into the API's,
+/// before anything is registered.
+async fn keep_built(
+    service: &Service,
+    entry: &Entry,
+    archive: &[u8],
+    built: &build::Built,
+    canonical: &Canonical,
+    manifest_hash: &str,
+) -> Result<()> {
+    // Everything a page shows about a build lives in the store, addressed by
+    // the hashes the chain holds, written before the registration so the
+    // registry never points at bytes nobody has.
+    store::put(
+        &service.store,
+        &built.bundle_hash,
+        "component.wasm",
+        &built.component,
+    )?;
+    store::put(
+        &service.store,
+        &built.bundle_hash,
+        "bundle.tar",
+        &built.bundle,
+    )?;
+    store::put_json(&service.store, manifest_hash, "manifest.json", canonical)?;
+    store::put_json(
+        &service.store,
+        &built.bundle_hash,
+        "hashes.json",
+        &serde_json::json!({
+            "component": built.component_hash,
+            "bundle": built.bundle_hash,
+            "manifest": manifest_hash,
+            "source": entry.job.source_hash,
+            "toolchain": build::TOOLCHAIN,
+            "seconds": built.seconds,
+        }),
+    )?;
+    // The source is kept either way, because a rebuild has to be possible
+    // for as long as the vault lives. A sealed one is kept under a name the
+    // public store refuses to serve.
+    store::put(
+        &service.store,
+        &entry.job.source_hash,
+        if entry.job.sealed {
+            "source.sealed.tar"
+        } else {
+            "source.tar"
+        },
+        archive,
+    )?;
+    // Off the machine, the API's store takes them, each checked against its
+    // hash there, before anything is registered: the registry never names
+    // bytes the API lacks. Sealed source never leaves.
+    if let Some(internal) = &service.internal {
+        let bundle_at = store::directory(Path::new(""), &built.bundle_hash);
+        let manifest_at = store::directory(Path::new(""), manifest_hash);
+        let source_at = store::directory(Path::new(""), &entry.job.source_hash);
+        let mut pushes = vec![
+            (bundle_at.clone(), "hashes.json"),
+            (manifest_at, "manifest.json"),
+            (bundle_at.clone(), "bundle.tar"),
+            (bundle_at, "component.wasm"),
+        ];
+        if !entry.job.sealed {
+            pushes.push((source_at, "source.tar"));
+        }
+        for (at, name) in pushes {
+            let hash = at.to_string_lossy().to_string();
+            let bytes = std::fs::read(service.store.join(&at).join(name))
+                .with_context(|| format!("reading {hash}/{name} back"))?;
+            internal
+                .push_store(&hash, name, bytes)
+                .await
+                .map_err(|error| Requeue::StoreAway(format!("{error:#}")))?;
+        }
+    }
+
+    Ok(())
 }
 
 /// A short name as the chain stores it: the text, then zeros.
@@ -2895,6 +3096,8 @@ mod tests {
         Service {
             configured: vec![Chain::Base],
             connected: Default::default(),
+            solana: Default::default(),
+            solana_key: None,
             confirmations: BTreeMap::new(),
             network: "local".into(),
             catalogue: Catalogue::published(),
@@ -2948,6 +3151,10 @@ mod tests {
 
     impl cloud::Attesting for Blessing {
         fn serve_chain(&self, _: chain::Client, _: chain::Deployments) {}
+        fn serve_cluster(&self, _: String, _: shonin_rootkey::service::ClusterServed) {}
+        fn ready_cluster(&self, _: &str) -> bool {
+            false
+        }
         fn ready(&self, _: u64) -> bool {
             self.0.load(Ordering::SeqCst)
         }
@@ -3258,7 +3465,7 @@ mod tests {
                 strategy_slug: None,
             },
             upload: B256::repeat_byte(7),
-            author,
+            author: author.into(),
             archive: String::new(),
             manifest_path: "shonin.toml".to_string(),
             package: "agent".to_string(),
@@ -3294,11 +3501,11 @@ mod tests {
             an_entry(named, "sha256:04", JobState::AwaitingPayment),
         ]);
         let at = now();
-        assert!(!bound_unpaid(&mut queue, named, at));
+        assert!(!bound_unpaid(&mut queue, named.into(), at));
         queue
             .jobs
             .push(an_entry(named, "sha256:05", JobState::AwaitingPayment));
-        assert!(bound_unpaid(&mut queue, named, at));
+        assert!(bound_unpaid(&mut queue, named.into(), at));
         let kept: Vec<&str> = queue
             .jobs
             .iter()
@@ -3330,7 +3537,7 @@ mod tests {
         );
         assert!(bound_unpaid(
             &mut queue,
-            Address::with_last_byte(UNPAID_AT_ALL as u8),
+            Address::with_last_byte(UNPAID_AT_ALL as u8).into(),
             at
         ));
         assert_eq!(queue.jobs.len(), UNPAID_AT_ALL);
@@ -3554,7 +3761,7 @@ mod tests {
         let found = waiting_for_payment(
             &waiting,
             Chain::Base,
-            author,
+            author.into(),
             "sha256:01",
             false,
             "shonin.toml",
@@ -3562,8 +3769,17 @@ mod tests {
         );
         assert_eq!(found.map(|entry| entry.upload), Some(B256::repeat_byte(7)));
 
-        let again = |jobs: &[Entry], chain, author, hash: &str, sealed| {
-            waiting_for_payment(jobs, chain, author, hash, sealed, "shonin.toml", "agent").is_some()
+        let again = |jobs: &[Entry], chain, author: Address, hash: &str, sealed| {
+            waiting_for_payment(
+                jobs,
+                chain,
+                author.into(),
+                hash,
+                sealed,
+                "shonin.toml",
+                "agent",
+            )
+            .is_some()
         };
         assert!(!again(
             &waiting,
