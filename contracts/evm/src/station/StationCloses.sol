@@ -263,7 +263,7 @@ library StationCloses {
             IDelayedDriver driver = IDelayedDriver(address(drivers[i]));
             window = uint64(Math.max(window, driver.deliveryWindow()));
             delay = uint64(Math.max(delay, driver.settleDelay()));
-            s.stagedExposure[name] = driver.exposure(address(this));
+            s.stagedExposure[name] = driver.snapshot(address(this));
             s.stagedLedger[name] = driver.ledger(address(this));
             s.stagedFreed[name] = freed[i];
             estimate += freed[i];
@@ -322,11 +322,15 @@ library StationCloses {
                 _lapse(s);
                 return;
             }
+            // What came home since the stage and each venue's measure, which
+            // counts it out where the venue's figures do; against what the
+            // close fetched at the least, venue by venue.
             int256 measured = int256(arrived);
+            int256 least;
             for (uint256 i = 0; i < s.spec.drivers.length; i++) {
                 bytes32 name = s.spec.drivers[i];
                 if (s.stagedExposure[name].length == 0) continue;
-                int256 one = IDelayedDriver(s.pinned(name)).measure(
+                (int256 one, int256 floor) = IDelayedDriver(s.pinned(name)).measure(
                     address(this),
                     s.stagedLedger[name],
                     s.stagedExposure[name],
@@ -335,9 +339,13 @@ library StationCloses {
                     s.spec.exitBandBps
                 );
                 measured += one;
-                // What to ask this venue for: its own part, as measured.
-                s.stagedFreed[name] = one > 0 ? uint256(one) : 0;
+                least += floor;
+                // What to ask this venue for: its own part, as measured, or
+                // as it fetched at the least.
+                int256 ask = one > floor ? one : floor;
+                s.stagedFreed[name] = ask > 0 ? uint256(ask) : 0;
             }
+            if (measured < least) measured = least;
             current.part = part;
             if (measured < 0) {
                 current.cost = uint256(-measured);

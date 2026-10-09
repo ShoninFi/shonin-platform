@@ -112,6 +112,11 @@ interface IDelayedDriver {
     /// and `measure` reprices. A driver may add to it what it needs to read
     /// it again (when it was read, the prices it was read at).
     function exposure(address station) external view returns (int256[] memory);
+    /// What the station keeps of the account when it stages a close: its
+    /// `exposure`, and after it whatever else the driver needs to measure
+    /// the close later (the venue's own prices the close's orders were
+    /// limited by). `closedPart` and `measure` are given this.
+    function snapshot(address station) external view returns (int256[] memory);
     /// The station's dollars through the driver, signed (a perp ledger can
     /// be negative): with `exposure`, everything the account is worth.
     function ledger(address station) external view returns (int256);
@@ -129,17 +134,24 @@ interface IDelayedDriver {
         uint64 since
     ) external view returns (uint256 part, bool known);
     /// What a close of `fraction` placed when the account held `dollars`
-    /// (its `ledger`) and `before` (its `exposure`) fetched for `part` of
+    /// (its `ledger`) and `before` (its `snapshot`) fetched for `part` of
     /// it (1e18 is all), by the venue's prices now: what the account is
     /// worth now, less what the rest of the account as it was
     /// (1 - `fraction` x `part`) would be worth now, rounded against the
     /// leaver. A market move since cancels out, and so does a trade made
     /// since at the price now; every dollar of slippage of what the close
-    /// sold falls on it. Never below what the close's own orders could have
-    /// lost at their limits (`bandBps` of what they ordered, at the prices
-    /// now), so a loss nobody's close could have made isn't the leaver's.
-    /// It may be negative; the station adds what reached it from the venue
-    /// meanwhile.
+    /// sold falls on it. It may be negative.
+    ///
+    /// And `least`, what the close fetched at the least: her part of the
+    /// account as it was, every order filled at its limit (the venue's own
+    /// price at the stage, less or plus the band), never below what the
+    /// orders could lose at their limits at the prices now. A fill is never
+    /// worse than its limit, so a measure below it is a loss made after the
+    /// close was placed (the agent's trading, funding), which is the
+    /// stayers' as much as the leaver's; and being fixed at the stage, it
+    /// gives no leaver a price that moved after her orders filled. The
+    /// station adds what reached it from the venue meanwhile to the
+    /// measures, and takes the larger of that and the sum of the leasts.
     function measure(
         address station,
         int256 dollars,
@@ -147,7 +159,7 @@ interface IDelayedDriver {
         uint256 fraction,
         uint256 part,
         uint16 bandBps
-    ) external view returns (int256);
+    ) external view returns (int256 measured, int256 least);
     /// How long a close through the driver may take to be proved, and its
     /// dollars to reach the station once asked for.
     function deliveryWindow() external view returns (uint64);

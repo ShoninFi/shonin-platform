@@ -51,7 +51,7 @@ contract LighterClaimClosesTest is LighterVault {
         LighterReport memory r = _twoAccounts(master, sub, 10_000, -10_000);
         vm.prank(executor);
         board.post(address(station), r);
-        int256[] memory before = lighter.exposure(address(station));
+        int256[] memory before = lighter.snapshot(address(station));
         assertEq(before[0], 0, "netted, the market holds nothing");
 
         // Only the long's order filled.

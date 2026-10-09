@@ -528,6 +528,23 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         }
     }
 
+    /// The exposure, then each market's own price as the close's orders are
+    /// limited by it (a perp's oracle, a pair's spot price), in hundredths of
+    /// a millionth of a dollar per lot, as `measure` counts.
+    function snapshot(address station) external view returns (int256[] memory held) {
+        int256[] memory sizes = exposure(station);
+        uint256 n = sizes.length;
+        held = new int256[](2 * n);
+        for (uint256 i = 0; i < n; i++) {
+            held[i] = sizes[i];
+            held[n + i] = int256(
+                i < _perps.length
+                    ? uint256(HyperCore.oraclePx(_perps[i].index)) * 100
+                    : HyperCore.spotPx(_spots[i - _perps.length].pair)
+            );
+        }
+    }
+
     /// Not before `since`, when the close's own orders have run: then, for
     /// each market it ordered (a piece too small to have been ordered for
     /// sure asks nothing), the share of what it ordered that the position is
@@ -539,10 +556,11 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         uint64 since
     ) external view returns (uint256 part, bool known) {
         if (block.timestamp < since) return (0, false);
-        if (before.length != _perps.length + _spots.length) return (0, true);
+        uint256 n = _perps.length + _spots.length;
+        if (before.length != 2 * n) return (0, true);
         int256[] memory now_ = exposure(station);
         part = WAD;
-        for (uint256 i = 0; i < before.length; i++) {
+        for (uint256 i = 0; i < n; i++) {
             int256 was = before[i];
             int256 is_ = now_[i];
             // HYPE up to the reserve was never a holding, never ordered.
@@ -581,11 +599,12 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
     /// Each perp at its mark, each spot token at its spot price (HYPE up to
     /// the reserve, and a holding worth less than the smallest order, at
     /// nothing then, and as much of it at nothing now): the account's worth
-    /// now, less the rest of
-    /// its worth then (1 - `fraction` x `part`, rounded up) repriced at the
-    /// same prices, never below `bandBps` of what the close ordered. Figures
-    /// are kept in hundredths of a millionth until the end, which rounds
-    /// down.
+    /// now, less the rest of its worth then (1 - `fraction` x `part`,
+    /// rounded up) repriced at the same prices; and the least the close
+    /// fetched, her part of the account then with every order filled at its
+    /// limit from the stage's own prices, never below `bandBps` of what the
+    /// close ordered. Figures are kept in hundredths of a millionth until the
+    /// end, which rounds down.
     function measure(
         address station,
         int256 dollars,
@@ -593,12 +612,17 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         uint256 fraction,
         uint256 part,
         uint16 bandBps
-    ) external view returns (int256) {
+    ) external view returns (int256 measured, int256 least) {
         int256[] memory current = exposure(station);
+        uint256 n = current.length;
         int256 then = dollars * 100;
         int256 now_ = ledger(station) * 100;
+        // The account as it was, every order filled at its limit.
+        int256 worst = dollars * 100;
         uint256 ordered;
-        for (uint256 i = 0; i < current.length; i++) {
+        uint256 orderedThen;
+        uint256 band = Math.min(bandBps, BPS);
+        for (uint256 i = 0; i < n; i++) {
             int256 was = before[i];
             int256 is_ = current[i];
             uint256 px;
@@ -622,18 +646,32 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
             then += was * int256(px);
             now_ += is_ * int256(px);
             ordered += _part(uint256(was < 0 ? -was : was), fraction) * px;
+            // A long sold no lower than the stage's own price less the band,
+            // a short bought back no higher than it plus the band.
+            uint256 stagePx = uint256(before[n + i]);
+            orderedThen += _part(uint256(was < 0 ? -was : was), fraction) * stagePx;
+            worst += was > 0
+                ? was * int256(stagePx.mulDiv(BPS - band, BPS))
+                : was * int256(stagePx.mulDiv(BPS + band, BPS, Math.Rounding.Ceil));
         }
-        int256 measured = now_ - _keptPart(then, fraction.mulDiv(part, WAD));
-        int256 least = -int256(ordered.mulDiv(Math.min(bandBps, BPS), BPS, Math.Rounding.Ceil));
-        // The leaver's part of what the account held then, at the prices now,
-        // less the most her orders could lose: what the agent's own trading
-        // since the stage lost is the stayers' as much as hers, never hers
-        // alone, whoever chooses when the close is proved.
-        int256 floor = _share(then, fraction.mulDiv(part, WAD)) + least;
+        uint256 share = fraction.mulDiv(part, WAD);
+        measured = now_ - _keptPart(then, share);
+        least = -int256(ordered.mulDiv(band, BPS, Math.Rounding.Ceil));
+        // Her part of the account as it was with every order of the part
+        // closed filled at its limit: the least her close fetched. What the agent's trading or
+        // funding lost since the stage is the stayers' as much as hers, and
+        // a price that moved after her orders filled is nobody's to claim.
+        // What wasn't closed of what was ordered may have filled and been
+        // traded back since: no more than the band on it at the stage's
+        // prices is the leaver's to lose.
+        int256 floor = _share(worst, share)
+            - int256(
+                orderedThen.mulDiv(band, BPS, Math.Rounding.Ceil).mulDiv(WAD - part, WAD, Math.Rounding.Ceil)
+            );
         if (floor > least) least = floor;
-        if (measured < least) measured = least;
         // Down, toward minus infinity.
-        return measured >= 0 ? measured / 100 : -((-measured + 99) / 100);
+        measured = measured >= 0 ? measured / 100 : -((-measured + 99) / 100);
+        least = least >= 0 ? least / 100 : -((-least + 99) / 100);
     }
 
     /// Spot lots worth less than the smallest order at `px` (a hundredth of

@@ -514,6 +514,21 @@ contract LighterDriver is IDriver, IDelayedDriver {
         return _exposure(report);
     }
 
+    /// The exposure, then each market's index at the stage's post, which
+    /// the close's orders are limited by.
+    function snapshot(address station) external view returns (int256[] memory held) {
+        (LighterReport memory report,) = board.reportOf(station);
+        int256[] memory exposed = _exposure(report);
+        uint256 n = _markets.length;
+        held = new int256[](exposed.length + n);
+        for (uint256 i = 0; i < exposed.length; i++) {
+            held[i] = exposed[i];
+        }
+        for (uint256 m = 0; m < n; m++) {
+            held[exposed.length + m] = int256(uint256(_priceOf(report, _markets[m].index).index));
+        }
+    }
+
     function _exposure(LighterReport memory report) private view returns (int256[] memory held) {
         uint256 n = _markets.length;
         held = new int256[](2 * n + 1 + 2 * report.positions.length);
@@ -556,9 +571,11 @@ contract LighterDriver is IDriver, IDelayedDriver {
         uint256 fraction,
         uint256 part,
         uint16 bandBps
-    ) external view returns (int256) {
+    ) external view returns (int256 measured, int256 least) {
         (LighterReport memory report,) = board.reportOf(station);
         uint256 n = _markets.length;
+        // The positions, before the stage's indexes at the end.
+        uint256 end = before.length - n;
         int256 then = dollars;
         int256[] memory marks = new int256[](n);
         for (uint256 m = 0; m < n; m++) {
@@ -570,35 +587,46 @@ contract LighterDriver is IDriver, IDelayedDriver {
         uint256 kept = size.mulDiv(
             WAD - fraction.mulDiv(part, WAD), WAD, then < 0 ? Math.Rounding.Floor : Math.Rounding.Ceil
         );
-        int256 measured = _worth(station, report) - (then < 0 ? -int256(kept) : int256(kept));
+        measured = _worth(station, report) - (then < 0 ? -int256(kept) : int256(kept));
         // What the orders could have lost at their limits: `bandBps` of what
-        // they ordered, position by position.
-        int256 least;
-        for (uint256 k = 2 * n + 1; k + 1 < before.length; k += 2) {
+        // they ordered, position by position; and the accounts as they were,
+        // every position closed at its limit from the stage's index.
+        uint256 band = Math.min(bandBps, BPS);
+        int256 worst = dollars;
+        uint256 orderedThen;
+        for (uint256 k = 2 * n + 1; k + 1 < end; k += 2) {
             uint16 market = uint16(uint256(before[k]));
             for (uint256 m = 0; m < n; m++) {
                 if (_markets[m].index != market) continue;
                 int256 was = before[k + 1];
                 uint256 ordered = uint256(was < 0 ? -was : was).mulDiv(fraction, WAD, Math.Rounding.Ceil);
                 least -= int256(
-                    uint256(_notional(m, int256(ordered), marks[m])).mulDiv(
-                        Math.min(bandBps, BPS), BPS, Math.Rounding.Ceil
-                    )
+                    uint256(_notional(m, int256(ordered), marks[m])).mulDiv(band, BPS, Math.Rounding.Ceil)
                 );
+                uint256 index = uint256(before[end + m]);
+                if (index == 0) index = uint256(before[n + 1 + m]);
+                orderedThen += uint256(_notional(m, int256(ordered), int256(index)));
+                worst += was > 0
+                    ? _notional(m, was, int256(index.mulDiv(BPS - band, BPS)))
+                    : _notional(m, was, int256(index.mulDiv(BPS + band, BPS, Math.Rounding.Ceil)));
             }
         }
-        // The leaver's part of what the accounts held then, at the marks
-        // now, less the most her orders could lose: what the agent's own
-        // trading since the stage lost is the stayers' as much as hers,
-        // never hers alone, whoever chooses when the close is proved.
-        {
-            uint256 share = size.mulDiv(
-                fraction.mulDiv(part, WAD), WAD, then < 0 ? Math.Rounding.Ceil : Math.Rounding.Floor
+        // Her part of the accounts as they were, every order filled at its
+        // limit: the least her close fetched. What the agent's trading or
+        // funding lost since the stage is the stayers' as much as hers, and
+        // a price that moved after her orders filled is nobody's to claim.
+        uint256 worstSize = uint256(worst < 0 ? -worst : worst);
+        uint256 share = worstSize.mulDiv(
+            fraction.mulDiv(part, WAD), WAD, worst < 0 ? Math.Rounding.Ceil : Math.Rounding.Floor
+        );
+        // What wasn't closed of what was ordered may have filled and been
+        // traded back since: no more than the band on it at the stage's
+        // index is the leaver's to lose.
+        int256 floor = (worst < 0 ? -int256(share) : int256(share))
+            - int256(
+                orderedThen.mulDiv(band, BPS, Math.Rounding.Ceil).mulDiv(WAD - part, WAD, Math.Rounding.Ceil)
             );
-            int256 floor = (then < 0 ? -int256(share) : int256(share)) + least;
-            if (floor > least) least = floor;
-        }
-        return measured < least ? least : measured;
+        if (floor > least) least = floor;
     }
 
     /// `size` base units of market `m` at `price` ticks, in dollar units.
@@ -626,7 +654,9 @@ contract LighterDriver is IDriver, IDelayedDriver {
         part = WAD;
         known = true;
         uint256 n = _markets.length;
-        for (uint256 k = 2 * n + 1; k + 1 < before.length; k += 2) {
+        // The positions, before the stage's indexes at the end.
+        uint256 end = before.length - n;
+        for (uint256 k = 2 * n + 1; k + 1 < end; k += 2) {
             int256 was = before[k + 1];
             if (was == 0) continue;
             uint256 key = uint256(before[k]);
