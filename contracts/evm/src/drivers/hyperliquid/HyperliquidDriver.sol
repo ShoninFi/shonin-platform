@@ -49,9 +49,10 @@ import {Math} from "openzeppelin/utils/math/Math.sol";
 /// valuation always fits between two of them.
 ///
 /// A claim's close is refused before anything is sold when the account
-/// couldn't release the fraction's worth after it: what the account is
-/// worth less the venue's transfer requirement on what stays open, with a
-/// margin, and less what the close's orders could lose at their limits.
+/// couldn't release the fraction's worth after it: what stays, the rest of
+/// the account's worth, must cover the venue's transfer requirement on what
+/// stays open, with a margin. The close's slippage is the leaver's, taken
+/// off what is asked of the venue, so it never has to fit in what stays.
 contract HyperliquidDriver is IDriver, IDelayedDriver {
     using Math for uint256;
 
@@ -347,7 +348,7 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         if (fraction < WAD) {
             HyperCore.SpotBalance memory gas = HyperCore.spotBalance(station, _spots[_gas].token);
             if (uint256(gas.total) - uint256(gas.hold) < gasFloor) return (new Call[](0), true);
-            if (!priced(station) || !_releasable(station, fraction, bandBps)) return (new Call[](0), true);
+            if (!priced(station) || !_releasable(station, fraction)) return (new Call[](0), true);
         }
         calls = new Call[](_perps.length + _spots.length);
         uint256 count;
@@ -366,11 +367,13 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
     /// Whether the perp side could release `fraction` of its worth after a
     /// close of `fraction`: with `v` its worth, `n` its open notional and
     /// `r` the venue's transfer requirement, the larger of the initial
-    /// margin used and `TRANSFER_BPS` of `n`, what stays after the close,
-    /// `v - band x f x n` (the most the orders can lose at their limits)
-    /// less `(1 - f) r` grossed up by `SAFETY_BPS`, must cover `f v`. Spot
-    /// dollars and tokens sold for them are always free.
-    function _releasable(address station, uint256 fraction, uint16 bandBps) private view returns (bool) {
+    /// margin used and `TRANSFER_BPS` of `n`, what stays after the leaver's
+    /// part is taken, `v - f v`, must cover `(1 - f) r` grossed up by
+    /// `SAFETY_BPS`. What the close's orders lose to slippage is the
+    /// leaver's: the measure takes it off what is asked of the venue, so it
+    /// never comes out of what stays. Spot dollars and tokens sold for them
+    /// are always free.
+    function _releasable(address station, uint256 fraction) private view returns (bool) {
         HyperCore.MarginSummary memory summary = HyperCore.marginSummary(station);
         uint256 ntl = summary.ntlPos;
         if (ntl == 0) return true;
@@ -380,10 +383,7 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         uint256 kept = required.mulDiv(WAD - fraction, WAD, Math.Rounding.Ceil).mulDiv(
             BPS + SAFETY_BPS, BPS, Math.Rounding.Ceil
         );
-        uint256 loss = ntl.mulDiv(fraction, WAD, Math.Rounding.Ceil).mulDiv(
-            Math.min(bandBps, BPS), BPS, Math.Rounding.Ceil
-        );
-        return worth >= kept + loss + worth.mulDiv(fraction, WAD, Math.Rounding.Ceil);
+        return worth >= kept + worth.mulDiv(fraction, WAD, Math.Rounding.Ceil);
     }
 
     /// The order closing `fraction` of one perp position, if any.
