@@ -71,10 +71,9 @@ impl VaultScan {
 
     /// Every vault and claim as they are now.
     pub async fn look(&mut self, client: &SolanaClient, platform: &Platform) -> Result<Found> {
-        let due = self
-            .listed_at
-            .is_none_or(|at| at.elapsed() >= self.every || self.every.is_zero());
-        if !due && let Some(found) = self.read_known(client).await? {
+        if !listing_due(self.listed_at, self.every, Instant::now())
+            && let Some(found) = self.read_known(client).await?
+        {
             return Ok(found);
         }
         self.list(client, platform).await
@@ -115,7 +114,7 @@ impl VaultScan {
             Some(account) => decode(account).context("the vault factory")?,
             None => return Ok(None),
         };
-        if factory.vault_count != self.vault_count {
+        if !listing_stands((self.vault_count, 0), (factory.vault_count, 0)) {
             return Ok(None);
         }
         let mut vaults = Vec::with_capacity(self.vaults.len());
@@ -129,7 +128,10 @@ impl VaultScan {
                 .with_context(|| format!("the vault at {address} doesn't read as one"))?;
             vaults.push((*address, vault));
         }
-        if claim_total(&vaults) != self.claim_total {
+        if !listing_stands(
+            (self.vault_count, self.claim_total),
+            (factory.vault_count, claim_total(&vaults)),
+        ) {
             return Ok(None);
         }
         let mut claims = Vec::with_capacity(self.claims.len());
@@ -146,6 +148,18 @@ impl VaultScan {
             .collect();
         Ok(Some(Found { vaults, claims }))
     }
+}
+
+/// Whether the program is to be listed afresh at `now`: never listed yet, or
+/// listed `every` ago or longer (at every look when `every` is zero).
+fn listing_due(listed_at: Option<Instant>, every: Duration, now: Instant) -> bool {
+    listed_at.is_none_or(|at| every.is_zero() || now.saturating_duration_since(at) >= every)
+}
+
+/// Whether what was listed still stands: neither the factory's count of
+/// vaults nor the vaults' count of claims has moved since.
+fn listing_stands(listed: (u64, u64), now: (u64, u64)) -> bool {
+    listed == now
 }
 
 /// Every claim the vaults have booked, all told.
@@ -172,5 +186,19 @@ mod tests {
     fn a_local_cluster_is_listed_at_every_look_and_a_public_one_seldom() {
         assert!(VaultScan::for_cluster("localnet").every.is_zero());
         assert_eq!(VaultScan::for_cluster("devnet").every, LIST_AT_LEAST_EVERY);
+        let now = Instant::now();
+        let every = LIST_AT_LEAST_EVERY;
+        assert!(listing_due(None, every, now));
+        assert!(!listing_due(Some(now), every, now + every / 2));
+        assert!(listing_due(Some(now), every, now + every));
+        assert!(listing_due(Some(now), Duration::ZERO, now));
+    }
+
+    #[test]
+    fn a_new_vault_or_claim_has_the_program_listed_again_and_nothing_else_does() {
+        assert!(listing_stands((3, 5), (3, 5)));
+        // A vault activated, or a claim booked, since the listing.
+        assert!(!listing_stands((3, 5), (4, 5)));
+        assert!(!listing_stands((3, 5), (3, 6)));
     }
 }

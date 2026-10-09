@@ -3447,6 +3447,78 @@ mod tests {
         assert_eq!(bytes[12], 0);
     }
 
+    #[test]
+    fn a_wallet_reads_as_its_chain_writes_it_and_a_queue_written_before_reads_as_it_was() {
+        let evm = Address::repeat_byte(0xa1);
+        let key = chain::solana::Pubkey::new_from_array([0xb2; 32]);
+        let on_evm = Wallet::on(Chain::Base, &format!("{evm:#x}")).unwrap();
+        let on_solana = Wallet::on(Chain::Solana, &key.to_string()).unwrap();
+        assert_eq!(on_evm, Wallet::Evm(evm));
+        assert_eq!(on_solana, Wallet::Solana(key.to_bytes()));
+        // An address names no wallet on the other chain.
+        assert!(Wallet::on(Chain::Solana, &format!("{evm:#x}")).is_err());
+        assert!(Wallet::on(Chain::Base, &key.to_string()).is_err());
+        // Written as each chain writes it, and read back the same.
+        for wallet in [on_evm, on_solana] {
+            let text = serde_json::to_string(&wallet).unwrap();
+            assert_eq!(serde_json::from_str::<Wallet>(&text).unwrap(), wallet);
+        }
+        assert_eq!(on_solana.to_string(), key.to_string());
+        // A queue written before Solana was served, its authors checksummed.
+        let written = serde_json::json!(format!("{evm}"));
+        assert_eq!(serde_json::from_value::<Wallet>(written).unwrap(), on_evm);
+        // Each pays only on its own chain.
+        assert!(on_solana.evm().is_err() && on_evm.solana().is_err());
+        assert_eq!(on_solana.solana().unwrap(), key);
+    }
+
+    #[tokio::test]
+    async fn a_solana_payment_admits_only_the_upload_its_own_wallet_named() {
+        let dir = a_scratch("solana-payment");
+        let service = Arc::new(a_service(&dir, None));
+        let key = chain::solana::Pubkey::new_from_array([0xb2; 32]);
+        let mut entry = an_entry(Address::ZERO, "sha256:01", JobState::AwaitingPayment);
+        entry.job.chain = Chain::Solana;
+        entry.author = Wallet::Solana(key.to_bytes());
+        *service.queue.lock().await = a_queue(vec![entry]);
+        // The same upload paid from another wallet, or on another chain by
+        // the same bytes, admits nothing.
+        for (chain, author) in [
+            (Chain::Solana, Wallet::Solana([0xc3; 32])),
+            (Chain::Base, Wallet::Solana(key.to_bytes())),
+        ] {
+            admit_payments(
+                &service,
+                chain,
+                vec![Payment {
+                    strategy_id: 4,
+                    upload: B256::repeat_byte(7),
+                    author,
+                }],
+            )
+            .await
+            .unwrap();
+            let queue = service.queue.lock().await;
+            assert_eq!(queue.jobs[0].job.state, JobState::AwaitingPayment);
+        }
+        admit_payments(
+            &service,
+            Chain::Solana,
+            vec![Payment {
+                strategy_id: 5,
+                upload: B256::repeat_byte(7),
+                author: Wallet::Solana(key.to_bytes()),
+            }],
+        )
+        .await
+        .unwrap();
+        let queue = service.queue.lock().await;
+        assert_eq!(queue.jobs[0].job.strategy_id, Some(5));
+        assert!(matches!(queue.jobs[0].job.state, JobState::Queued { .. }));
+        drop(queue);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn an_entry(author: Address, source_hash: &str, state: JobState) -> Entry {
         Entry {
             job: Job {
