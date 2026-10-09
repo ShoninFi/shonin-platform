@@ -346,13 +346,20 @@ pub(crate) struct OnCluster<'a> {
 
 impl OnCluster<'_> {
     fn key_leaf(&self, leaf: &Read) -> KeyLeaf {
-        KeyLeaf {
-            vault_chain: self.platform.cluster,
-            vault: leaf.vault.to_bytes(),
-            strategy_hash: leaf.bundle,
-            key: leaf.key,
-            proof: leaf.proof.clone(),
-        }
+        key_leaf(&self.platform.cluster, leaf)
+    }
+}
+
+/// The leaf the registry rebuilds for `leaf`: a vault key names this cluster,
+/// its vault and its bundle; a builder's or a reviewer's names none of them
+/// (the registry refuses a service key that names a vault chain).
+fn key_leaf(cluster: &[u8; 32], leaf: &Read) -> KeyLeaf {
+    KeyLeaf {
+        vault_chain: if leaf.is_service() { [0; 32] } else { *cluster },
+        vault: leaf.vault.to_bytes(),
+        strategy_hash: leaf.bundle,
+        key: leaf.key,
+        proof: leaf.proof.clone(),
     }
 }
 
@@ -752,6 +759,28 @@ mod tests {
             }],
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_service_key_s_leaf_names_no_vault_chain_and_a_vault_key_s_names_its_cluster() {
+        let cluster = [9u8; 32];
+        let service = Read {
+            vault: Pubkey::default(),
+            bundle: [0; 32],
+            key: key(5),
+            proof: vec![],
+        };
+        let built = key_leaf(&cluster, &service);
+        assert_eq!(built.vault_chain, [0; 32]);
+        assert_eq!(built.vault, [0; 32]);
+        assert_eq!(built.strategy_hash, [0; 32]);
+        let vault = Read {
+            vault: key(101),
+            bundle: [7; 32],
+            key: key(1),
+            proof: vec![],
+        };
+        assert_eq!(key_leaf(&cluster, &vault).vault_chain, cluster);
     }
 
     #[tokio::test]
