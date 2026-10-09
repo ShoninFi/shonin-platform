@@ -203,7 +203,9 @@ fn venue_coin(coin: &str) -> Result<String, String> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(coin)
         .cloned()
-        .ok_or_else(|| format!("{coin:?} is not a spot pair the venue lists (or its pairs aren't read yet)"))
+        .ok_or_else(|| {
+            format!("{coin:?} is not a spot pair the venue lists (or its pairs aren't read yet)")
+        })
 }
 
 /// The executor's hub.

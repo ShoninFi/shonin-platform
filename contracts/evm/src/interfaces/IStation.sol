@@ -113,6 +113,8 @@ interface IStation {
     /// position was bought on still holds the proceeds at the venue. The
     /// whole unwind is undone.
     error ShortSweep();
+    /// A station's drivers all close in the transaction, or all after it.
+    error MixedExits();
 
     /// Let `key` trade through `driver`, replacing the key approved for it
     /// now. Anyone may call it; it obeys only the registry.

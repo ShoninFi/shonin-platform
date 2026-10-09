@@ -587,6 +587,17 @@ contract LighterDriver is IDriver, IDelayedDriver {
                 );
             }
         }
+        // The leaver's part of what the accounts held then, at the marks
+        // now, less the most her orders could lose: what the agent's own
+        // trading since the stage lost is the stayers' as much as hers,
+        // never hers alone, whoever chooses when the close is proved.
+        {
+            uint256 share = size.mulDiv(
+                fraction.mulDiv(part, WAD), WAD, then < 0 ? Math.Rounding.Ceil : Math.Rounding.Floor
+            );
+            int256 floor = (then < 0 ? -int256(share) : int256(share)) + least;
+            if (floor > least) least = floor;
+        }
         return measured < least ? least : measured;
     }
 

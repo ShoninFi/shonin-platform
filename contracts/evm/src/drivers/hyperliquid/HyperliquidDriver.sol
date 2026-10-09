@@ -625,6 +625,12 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         }
         int256 measured = now_ - _keptPart(then, fraction.mulDiv(part, WAD));
         int256 least = -int256(ordered.mulDiv(Math.min(bandBps, BPS), BPS, Math.Rounding.Ceil));
+        // The leaver's part of what the account held then, at the prices now,
+        // less the most her orders could lose: what the agent's own trading
+        // since the stage lost is the stayers' as much as hers, never hers
+        // alone, whoever chooses when the close is proved.
+        int256 floor = _share(then, fraction.mulDiv(part, WAD)) + least;
+        if (floor > least) least = floor;
         if (measured < least) measured = least;
         // Down, toward minus infinity.
         return measured >= 0 ? measured / 100 : -((-measured + 99) / 100);
@@ -634,6 +640,13 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
     /// a millionth per lot): nothing can sell them.
     function _sellable(int256 lots, uint256 px) private pure returns (int256) {
         return lots > 0 && uint256(lots) * px < MIN_ORDER * 100 ? int256(0) : lots;
+    }
+
+    /// `fraction` of `worth`, rounded down (toward minus infinity).
+    function _share(int256 worth, uint256 fraction) private pure returns (int256) {
+        uint256 size = uint256(worth < 0 ? -worth : worth);
+        uint256 part = size.mulDiv(fraction, WAD, worth < 0 ? Math.Rounding.Ceil : Math.Rounding.Floor);
+        return worth < 0 ? -int256(part) : int256(part);
     }
 
     /// (1 - `fraction`) of `worth`, rounded up.
