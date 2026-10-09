@@ -30,6 +30,7 @@ mod root;
 mod runner;
 mod scale;
 mod solana;
+mod staged;
 mod state;
 mod store;
 mod streams_rh;
@@ -1517,24 +1518,48 @@ async fn serve(
     // buying some on the pinned HYPE/USDC pair when it runs low, and keeps
     // looking for which markets the driver lists the venue doesn't list for
     // trading.
-    let (hyperliquid, _hyperliquid_events, _hyperliquid_hype, _hyperliquid_missing) =
-        if names(hyperliquid::DRIVER) {
-            let half = hyperliquid::Half::connect(
-                &chain,
-                vault,
-                station,
-                deployments.usd,
-                vault_key.signer(),
-                hyperliquid::DRIVER,
-            )
-            .await?;
-            let events = AbortOnDrop(half.forward_events(account_events.sender()));
-            let hype = AbortOnDrop(half.hype_loop());
-            let missing = AbortOnDrop(half.missing_loop());
-            (Some(half), Some(events), Some(hype), Some(missing))
-        } else {
-            (None, None, None, None)
-        };
+    //
+    // While a close staged at the station is being measured, the account's
+    // resting orders at its delayed venues are cancelled (see `staged`).
+    let (
+        hyperliquid,
+        _hyperliquid_events,
+        _hyperliquid_hype,
+        _hyperliquid_missing,
+        _hyperliquid_paused,
+    ) = if names(hyperliquid::DRIVER) {
+        let half = hyperliquid::Half::connect(
+            &chain,
+            vault,
+            station,
+            deployments.usd,
+            vault_key.signer(),
+            hyperliquid::DRIVER,
+        )
+        .await?;
+        let events = AbortOnDrop(half.forward_events(account_events.sender()));
+        let hype = AbortOnDrop(half.hype_loop());
+        let missing = AbortOnDrop(half.missing_loop());
+        let cancelling = half.clone();
+        let paused = AbortOnDrop(staged::cancel_loop(
+            chain.clone(),
+            station,
+            hyperliquid::DRIVER,
+            move || {
+                let half = cancelling.clone();
+                async move { half.cancel_resting().await }
+            },
+        ));
+        (
+            Some(half),
+            Some(events),
+            Some(hype),
+            Some(missing),
+            Some(paused),
+        )
+    } else {
+        (None, None, None, None, None)
+    };
     // A Robinhood Chain vault's Safe is traded by this vault's key through
     // the Safe's role; its Lighter account by a Lighter key made now, which
     // the station registers, and whose accounts this executor posts on the
@@ -1552,7 +1577,17 @@ async fn serve(
             robinhood::LighterHalf::connect(&chain, key.clone(), station, robinhood::LIGHTER)
                 .await?;
         let posts = AbortOnDrop(half.report_loop());
-        (Some(half), Some(posts))
+        let cancelling = half.clone();
+        let paused = AbortOnDrop(staged::cancel_loop(
+            chain.clone(),
+            station,
+            robinhood::LIGHTER,
+            move || {
+                let half = cancelling.clone();
+                async move { half.cancel_resting().await }
+            },
+        ));
+        (Some(half), Some((posts, paused)))
     } else {
         (None, None)
     };

@@ -512,7 +512,29 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
         let mut verdicts = Vec::with_capacity(actions.len());
         let mut tallies = Vec::with_capacity(actions.len());
         if driver != LOCAL {
+            // A close staged through a venue that acts after the
+            // transaction is measured from the account: until it is,
+            // nothing but cancels goes there (see `staged`). Read once for
+            // the batch, and only when something in it needs it.
+            let paused = match &place {
+                Place::Evm(evm)
+                    if crate::staged::delayed(&driver)
+                        && actions
+                            .iter()
+                            .any(|bytes| !crate::staged::only_cancels(&driver, bytes)) =>
+                {
+                    crate::staged::refusal(&evm.chain, evm.station).await
+                }
+                _ => None,
+            };
             for bytes in &actions {
+                if let Some(why) = &paused
+                    && !crate::staged::only_cancels(&driver, bytes)
+                {
+                    tallies.push(Tally::Refused);
+                    verdicts.push(within(Verdict::Rejected(why.clone())));
+                    continue;
+                }
                 let outcome = match (&place, driver.as_str()) {
                     (
                         Place::Evm(Evm {

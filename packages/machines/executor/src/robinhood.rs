@@ -471,6 +471,36 @@ impl LighterHalf {
                 return Outcome::Refused(format!("that is not a Lighter action: {error}"));
             }
         };
+        self.send(&action).await
+    }
+
+    /// Cancel every order resting on the account: one, once it is sent, or
+    /// none when the station has no account yet (nothing can rest).
+    pub async fn cancel_resting(&self) -> Result<usize> {
+        if self.trader.lock().await.is_none() {
+            let account = self
+                .chain
+                .read(
+                    self.exchange,
+                    IExchange::addressToAccountIndexCall {
+                        owner: self.station,
+                    },
+                )
+                .await?;
+            if account.is_zero() {
+                return Ok(0);
+            }
+        }
+        match self.send(&lighter::payload::Action::CancelAll).await {
+            Outcome::Accepted(_) => Ok(1),
+            Outcome::Refused(why) | Outcome::Unknown(why) => {
+                Err(anyhow!("cancelling the account's orders: {why}"))
+            }
+        }
+    }
+
+    /// Sign one action with this start's key and send it.
+    async fn send(&self, action: &lighter::payload::Action) -> Outcome<Vec<u8>> {
         let held = match self.trader().await {
             Ok(held) => held,
             Err(error) => return Outcome::Refused(format!("{error:#}")),
@@ -484,7 +514,7 @@ impl LighterHalf {
             Ok(nonce) => nonce,
             Err(error) => return Outcome::Refused(format!("{error:#}")),
         };
-        let signed = match trader.sign(&action, nonce, now_ms()) {
+        let signed = match trader.sign(action, nonce, now_ms()) {
             Ok(signed) => signed,
             Err(error) => return Outcome::Refused(format!("{error:#}")),
         };

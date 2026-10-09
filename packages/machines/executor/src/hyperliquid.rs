@@ -678,6 +678,44 @@ impl Half {
 }
 
 impl Half {
+    /// Cancel every order resting on the account, trigger orders among
+    /// them, as the venue lists them now: how many were cancelled. Each
+    /// is tried; any that fails makes the whole an error, to be tried
+    /// again.
+    pub async fn cancel_resting(&self) -> Result<usize> {
+        use hyperliquid::payload::{Action, OrderRef};
+        let answer = self
+            .api
+            .info(serde_json::json!({"type": "frontendOpenOrders", "user": self.station}))
+            .await
+            .context("reading the account's open orders")?;
+        let allowlist = self.trader.allowlist();
+        let mut cancelled = 0;
+        let mut failed = Vec::new();
+        for (coin, oid) in resting(&answer)? {
+            let market = allowlist
+                .markets
+                .by_coin(&coin)
+                .map(|market| market.name.clone())
+                .unwrap_or(coin);
+            match self
+                .trader
+                .submit(&Action::Cancel {
+                    market: market.clone(),
+                    order: OrderRef::Venue(oid),
+                })
+                .await
+            {
+                Ok(_) => cancelled += 1,
+                Err(error) => failed.push(format!("{market} {oid}: {error:#}")),
+            }
+        }
+        if !failed.is_empty() {
+            anyhow::bail!("not cancelled: {}", failed.join("; "));
+        }
+        Ok(cancelled)
+    }
+
     /// Whether a close is staged at the station now.
     async fn close_staged(&self) -> Result<bool> {
         let stage = self
@@ -690,6 +728,24 @@ impl Half {
             .context("reading whether a close is staged at the station")?;
         Ok(stage.stagedAt != 0)
     }
+}
+
+/// The orders resting on an account, as the venue's `frontendOpenOrders`
+/// lists them (trigger orders among them): each one's coin and the venue's
+/// id. An answer that isn't that list, or an entry without either, is an
+/// error: never fewer orders than the venue holds.
+pub fn resting(answer: &serde_json::Value) -> Result<Vec<(String, u64)>> {
+    let list = answer
+        .as_array()
+        .ok_or_else(|| anyhow!("the venue's open orders can't be read: {answer}"))?;
+    list.iter()
+        .map(
+            |order| match (order["coin"].as_str(), order["oid"].as_u64()) {
+                (Some(coin), Some(oid)) => Ok((coin.to_string(), oid)),
+                _ => Err(anyhow!("an open order can't be read: {order}")),
+            },
+        )
+        .collect()
 }
 
 /// Whether the account has less free HYPE than the driver needs to start a
@@ -964,6 +1020,22 @@ pub async fn look_for_missing(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_resting_order_the_venue_lists_is_read_trigger_orders_among_them() {
+        let answer = serde_json::json!([
+            {"coin": "ETH", "oid": 7, "isTrigger": false},
+            {"coin": "@107", "oid": 8, "isTrigger": true, "triggerPx": "20.0"},
+        ]);
+        assert_eq!(
+            resting(&answer).unwrap(),
+            vec![("ETH".to_string(), 7), ("@107".to_string(), 8)]
+        );
+        assert!(resting(&serde_json::json!([])).unwrap().is_empty());
+        // An answer that can't be read is never taken for no orders.
+        assert!(resting(&serde_json::json!({"error": "busy"})).is_err());
+        assert!(resting(&serde_json::json!([{"coin": "ETH"}])).is_err());
+    }
 
     #[test]
     fn the_driver_is_named_as_the_station_keys_it() {
