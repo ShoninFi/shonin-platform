@@ -179,6 +179,14 @@ const WAD: u64 = 1_000_000_000_000_000_000;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    chain::rpc_counts::start(
+        chain::rpc_counts::Component::Keeper,
+        format!(
+            "{}-{}",
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos(),
+            std::process::id()
+        ),
+    );
     tracing_subscriber::fmt()
         .with_env_filter(chain::log_filter())
         .with_target(false)
@@ -5373,58 +5381,63 @@ async fn send<C: alloy::sol_types::SolCall>(
 }
 
 async fn serve_status(address: SocketAddr) {
-    let app = axum::Router::new().route(
-        "/health",
-        axum::routing::get(|| async {
-            let now = std::time::Instant::now();
-            // Read before the rest is locked: the asks lock their own.
-            let unanswered = unanswered_asks(now);
-            let serving_none = executors_serving_none(now);
-            let solana = solana::troubles(now);
-            let (
-                Ok(mut not_sent),
-                Ok(chains),
-                Ok(unread),
-                Ok(unprobed),
-                Ok(refused),
-                Ok(calls_refused),
-                Ok(tanks_unread),
-            ) = (
-                NOT_SENT.lock(),
-                CHAINS.lock(),
-                UNREAD.lock(),
-                UNPROBED.lock(),
-                BILLS_REFUSED.lock(),
-                CALLS_REFUSED.lock(),
-                TANKS_UNREAD.lock(),
-            )
-            else {
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "keeper: health unreadable".to_string(),
-                );
-            };
-            not_sent.forget(now);
-            let troubles = Troubles {
-                not_sent: &not_sent,
-                unanswered: &unanswered,
-                chains: &chains,
-                unread: &unread,
-                unprobed: &unprobed,
-                refused: &refused,
-                calls_refused: &calls_refused,
-                tanks_unread: &tanks_unread,
-                serving_none,
-                solana: &solana,
-            };
-            // Anything failing is not "up": a dashboard or a supervisor that
-            // reads only the status still hears of it.
-            match health(&troubles, now) {
-                (true, said) => (axum::http::StatusCode::OK, said),
-                (false, said) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, said),
-            }
-        }),
-    );
+    let app = axum::Router::new()
+        .route(
+            "/health",
+            axum::routing::get(|| async {
+                let now = std::time::Instant::now();
+                // Read before the rest is locked: the asks lock their own.
+                let unanswered = unanswered_asks(now);
+                let serving_none = executors_serving_none(now);
+                let solana = solana::troubles(now);
+                let (
+                    Ok(mut not_sent),
+                    Ok(chains),
+                    Ok(unread),
+                    Ok(unprobed),
+                    Ok(refused),
+                    Ok(calls_refused),
+                    Ok(tanks_unread),
+                ) = (
+                    NOT_SENT.lock(),
+                    CHAINS.lock(),
+                    UNREAD.lock(),
+                    UNPROBED.lock(),
+                    BILLS_REFUSED.lock(),
+                    CALLS_REFUSED.lock(),
+                    TANKS_UNREAD.lock(),
+                )
+                else {
+                    return (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "keeper: health unreadable".to_string(),
+                    );
+                };
+                not_sent.forget(now);
+                let troubles = Troubles {
+                    not_sent: &not_sent,
+                    unanswered: &unanswered,
+                    chains: &chains,
+                    unread: &unread,
+                    unprobed: &unprobed,
+                    refused: &refused,
+                    calls_refused: &calls_refused,
+                    tanks_unread: &tanks_unread,
+                    serving_none,
+                    solana: &solana,
+                };
+                // Anything failing is not "up": a dashboard or a supervisor that
+                // reads only the status still hears of it.
+                match health(&troubles, now) {
+                    (true, said) => (axum::http::StatusCode::OK, said),
+                    (false, said) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, said),
+                }
+            }),
+        )
+        .route(
+            "/debug/rpc",
+            axum::routing::get(|| async { axum::Json(chain::rpc_counts::snapshot()) }),
+        );
     if let Ok(listener) = tokio::net::TcpListener::bind(address).await {
         let _ = axum::serve(listener, app).await;
     }

@@ -271,6 +271,7 @@ struct KeepUrlOut {
     /// The URL as configured and as the HTTP client writes it, everything
     /// after its host, and each part of that long enough to be a key.
     spellings: Arc<[String]>,
+    counted_chain: Option<u64>,
 }
 
 /// How long a path segment or query value must be before it is taken for a
@@ -320,7 +321,13 @@ impl KeepUrlOut {
         spellings.dedup();
         Self {
             spellings: spellings.into(),
+            counted_chain: None,
         }
+    }
+
+    fn counted_on(mut self, chain: Option<u64>) -> Self {
+        self.counted_chain = chain;
+        self
     }
 
     fn scrub(&self, text: &str) -> String {
@@ -480,13 +487,34 @@ where
     }
 
     fn call(&mut self, request: alloy::rpc::json_rpc::RequestPacket) -> Self::Future {
-        let answer = self.inner.call(request);
+        let methods: Vec<String> = request.method_names().map(str::to_owned).collect();
+        let mut inner = self.inner.clone();
         let keep = self.keep.clone();
         Box::pin(async move {
-            answer
-                .await
-                .map(|answer| keep.scrub_answer(answer))
-                .map_err(|error| keep.scrub_error(error))
+            tokio::time::timeout(REQUEST_TIMEOUT, async move {
+                for attempt in 0..=crate::http_retry::EXTRA_TRIES {
+                    for method in &methods {
+                        crate::rpc_counts::evm(keep.counted_chain, method);
+                    }
+                    let answer = inner.call(request.clone()).await;
+                    if let Err(error) = &answer
+                        && attempt < crate::http_retry::EXTRA_TRIES
+                        && crate::http_retry::unprocessed(error)
+                    {
+                        continue;
+                    }
+                    return answer
+                        .map(|answer| keep.scrub_answer(answer))
+                        .map_err(|error| keep.scrub_error(error));
+                }
+                unreachable!("the final attempt always returns")
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(alloy::transports::TransportErrorKind::custom_str(
+                    "the HTTP request timed out",
+                ))
+            })
         })
     }
 }
@@ -520,7 +548,7 @@ fn rpc_client(
     if urls.len() <= 1 {
         let url = parse_endpoint(rpc.trim(), setting)?;
         let is_local = alloy::transports::utils::guess_local_url(&url);
-        let keep = KeepUrlOut::new(rpc.trim(), &url);
+        let keep = KeepUrlOut::new(rpc.trim(), &url).counted_on(chain_id);
         let http = alloy::transports::http::Http::with_client(http, url);
         return Ok(alloy::rpc::client::ClientBuilder::default().transport(
             AskAgainWhenRateLimited {
@@ -531,7 +559,9 @@ fn rpc_client(
     }
     let mut transports = Vec::with_capacity(urls.len());
     for configured in urls {
-        transports.push(endpoint_transport(configured, setting, &http, chain_id)?);
+        transports.push(endpoint_transport(
+            configured, setting, &http, chain_id, chain_id,
+        )?);
     }
     // Every method the services use goes to one endpoint at a time, best
     // first, and on to the next when one refuses, so a request fails only
@@ -558,6 +588,11 @@ fn rpc_client(
 /// time.
 fn http_client() -> Result<alloy::transports::http::reqwest::Client> {
     alloy::transports::http::reqwest::Client::builder()
+        // Retry and failover live above the counted transport. Hidden HTTP
+        // protocol retries or redirects would evade both its accounting and the
+        // endpoint's chain check.
+        .retry(alloy::transports::http::reqwest::retry::never())
+        .redirect(alloy::transports::http::reqwest::redirect::Policy::none())
         .timeout(REQUEST_TIMEOUT)
         .build()
         .context("making the HTTP client")
@@ -576,6 +611,7 @@ fn endpoint_transport(
     setting: &str,
     http: &alloy::transports::http::reqwest::Client,
     chain_id: Option<u64>,
+    counted_chain: Option<u64>,
 ) -> Result<
     HeldToChain<
         UrlKeptOut<
@@ -586,7 +622,7 @@ fn endpoint_transport(
     >,
 > {
     let url = parse_endpoint(configured, setting)?;
-    let keep = KeepUrlOut::new(configured, &url);
+    let keep = KeepUrlOut::new(configured, &url).counted_on(counted_chain);
     let inner = alloy::transports::http::Http::with_client(http.clone(), url);
     Ok(HeldToChain {
         inner: tower::Layer::layer(&keep, TroubleIsAFailure { inner }),
@@ -847,13 +883,13 @@ struct Endpoints {
 impl Endpoints {
     /// Each endpoint held to chain `chain_id` when there is one
     /// ([`HeldToChain`]).
-    fn new(list: &str, setting: &str, chain_id: Option<u64>) -> Result<Self> {
+    fn new(list: &str, setting: &str, chain_id: Option<u64>, counted_chain: u64) -> Result<Self> {
         let http = http_client()?;
         let each = list
             .split_whitespace()
             .map(|configured| {
                 let client = alloy::rpc::client::ClientBuilder::default().transport(
-                    endpoint_transport(configured, setting, &http, chain_id)?,
+                    endpoint_transport(configured, setting, &http, chain_id, Some(counted_chain))?,
                     false,
                 );
                 Ok(Endpoint {
@@ -1563,7 +1599,7 @@ impl Client {
         // on every chain.
         // A lone endpoint is the one that just answered the chain id.
         let several = rpc_url.split_whitespace().count() > 1;
-        let endpoints = Endpoints::new(rpc_url, "rpc", several.then_some(chain_id))?
+        let endpoints = Endpoints::new(rpc_url, "rpc", several.then_some(chain_id), chain_id)?
             .checked(chain_id, &config.label, "rpc", true, true)
             .await?;
 
@@ -1619,7 +1655,7 @@ impl Client {
                 ProviderBuilder::default()
                     .connect_client(rpc_client(list, "logs_rpc", Some(chain_id))?)
                     .erased(),
-                Endpoints::new(list, "logs_rpc", Some(chain_id))?
+                Endpoints::new(list, "logs_rpc", Some(chain_id), chain_id)?
                     .checked(chain_id, &config.label, "logs_rpc", false, false)
                     .await?,
             ),
@@ -3529,6 +3565,93 @@ fn refused_as_not_there_yet(error: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn protocol_refusals_retry_identical_signed_bytes_and_count_each_attempt() {
+        use alloy::rpc::json_rpc::{Request, SerializedRequest};
+        use tower::Service;
+        for (case, refusals, reason, expected, succeeds) in [
+            (0, 1, h2::Reason::REFUSED_STREAM, 2, true),
+            (1, 100, h2::Reason::REFUSED_STREAM, 3, false),
+            (2, 1, h2::Reason::CANCEL, 1, false),
+        ] {
+            let (url, bodies, server) = crate::http_retry::refusing_server(refusals, reason).await;
+            let http = alloy::transports::http::reqwest::Client::builder()
+                .http2_prior_knowledge()
+                .retry(alloy::transports::http::reqwest::retry::never())
+                .redirect(alloy::transports::http::reqwest::redirect::Policy::none())
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .unwrap();
+            let chain = 9_876_544_000 + case;
+            let mut transport = endpoint_transport(&url, "rpc", &http, None, Some(chain)).unwrap();
+            let request: SerializedRequest =
+                Request::new("eth_sendRawTransaction", 1u64.into(), ("0x1234",))
+                    .try_into()
+                    .unwrap();
+            let answer = transport.call(request.into()).await;
+            assert_eq!(answer.is_ok(), succeeds, "case {case}: {answer:?}");
+            let bodies = bodies.lock().unwrap();
+            assert_eq!(bodies.len(), expected);
+            assert!(bodies.iter().all(|body| body == &bodies[0]));
+            let snapshot = crate::rpc_counts::snapshot();
+            let row = snapshot
+                .counters
+                .iter()
+                .find(|row| {
+                    row.chain == format!("evm:{chain}") && row.method == "eth_sendRawTransaction"
+                })
+                .unwrap();
+            assert_eq!(row.requests, expected as u64);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_single_endpoint_counts_its_chain_and_does_not_follow_a_redirect() {
+        use alloy::rpc::json_rpc::{Request, SerializedRequest};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tower::Service;
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let destination = format!("http://{}", target.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 8192];
+            let received = socket.read(&mut buffer).await.unwrap();
+            assert!(received > 0);
+            socket.write_all(format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {destination}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ).as_bytes()).await.unwrap();
+        });
+        let chain = 9_876_543_210;
+        let mut transport =
+            endpoint_transport(&url, "rpc", &http_client().unwrap(), None, Some(chain)).unwrap();
+        let packet = || {
+            let request: SerializedRequest = Request::new("eth_call", 1u64.into(), ())
+                .try_into()
+                .unwrap();
+            request.into()
+        };
+        // Constructing a future that is never polled dispatches nothing.
+        drop(transport.call(packet()));
+        assert!(transport.call(packet()).await.is_err());
+        server.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), target.accept())
+                .await
+                .is_err()
+        );
+        let snapshot = crate::rpc_counts::snapshot();
+        let row = snapshot
+            .counters
+            .iter()
+            .find(|row| row.chain == format!("evm:{chain}") && row.method == "eth_call")
+            .unwrap();
+        assert_eq!(row.requests, 1);
+    }
 
     #[test]
     fn only_a_send_that_was_broadcast_may_still_land() {

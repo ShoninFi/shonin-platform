@@ -19,8 +19,12 @@ pub mod client;
 pub mod config;
 pub mod deployments;
 pub mod digest;
+#[cfg(feature = "rpc")]
+mod http_retry;
 #[cfg(feature = "args")]
 pub mod logs;
+#[cfg(feature = "rpc")]
+pub mod rpc_counts;
 #[cfg(feature = "solana")]
 pub mod solana;
 

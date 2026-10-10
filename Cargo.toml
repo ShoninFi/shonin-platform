@@ -89,6 +89,7 @@ wasmtime-wasi = "48.0.2"
 wasmtime-wasi-http = { version = "48.0.2", default-features = false, features = ["p2"] }
 hyper = { version = "1.11.1", features = ["client", "http1"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
+h2 = "0.4.19"
 http = "1.5.0"
 http-body = "1.1.0"
 http-body-util = "0.1.5"

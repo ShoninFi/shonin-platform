@@ -243,7 +243,7 @@ impl SolanaClient {
         if key.kind != ChainKind::Solana {
             bail!("{key} is not a Solana cluster");
         }
-        let rpc = Rpc::new(&config.rpc, &config.label)?;
+        let rpc = Rpc::new(&config.rpc, &config.label)?.counted_on(&key.id);
         let started = Instant::now();
         let genesis_hash = loop {
             match rpc.genesis_hash().await {
