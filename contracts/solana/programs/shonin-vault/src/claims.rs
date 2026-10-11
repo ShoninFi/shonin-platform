@@ -38,8 +38,8 @@ pub fn hold_on_claim(vault: &mut Vault, claim: &mut Claim, assets: u64) -> Resul
 /// A try may serve only `part` of the claim's shares, where a venue can't
 /// bring the whole of it home in one transaction: that part is closed and
 /// paid exactly as a whole claim of it would be, its shares burned, and the
-/// rest stays booked, its turn kept, as a claim booked now: a try that paid
-/// something is progress, and the freeze counts from the last of them.
+/// rest stays booked with its original turn and deadline. Partial payment
+/// cannot postpone the protections for the unpaid remainder.
 pub fn settle_claim<'info>(
     ctx: Context<'_, '_, 'info, 'info, SettleClaim<'info>>,
     claim_id: u64,
@@ -198,9 +198,9 @@ pub fn settle_claim<'info>(
     let owned = cash_share.checked_add(home).ok_or(VaultError::Overflow)?;
     pay_claim(a, &mut claim, claim_id, shares, owned, &seeds, &mut said)?;
     if claim.shares != 0 {
-        // The rest stays booked.
+        // Keep the original booking: even many tiny payments cannot
+        // postpone the unpaid remainder's freeze or fallback.
         claim.state = ClaimState::Pending;
-        claim.booked_at = now;
         claim.last_attempt_at = now;
     }
     said.say(ClaimTried {

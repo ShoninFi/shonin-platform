@@ -215,14 +215,15 @@ pub async fn set_up_devnet(
     // at Pyth's price (the pool steered there first), and set again around
     // it if it has moved since.
     if seed_sol > 0 {
-        let have = seed_position(client, operator).await?.is_some();
+        let funded = seed_position(client, operator)
+            .await?
+            .is_some_and(|position| position.liquidity > 0);
         let wrapped = client
             .token_balance(&venue::wsol_of(&operator.pubkey()))
-            .await
-            .unwrap_or(0);
+            .await?;
         let need = (seed_sol + OPERATOR_KEEPS)
             .saturating_sub(client.lamports(&operator.pubkey()).await? + wrapped);
-        if need > 0 && !have {
+        if need > 0 && !funded {
             client
                 .send(
                     vec![chain::solana::executor::ix_fund(
@@ -250,18 +251,19 @@ pub async fn set_up_devnet(
 /// The market operator's part at Orca on devnet: the pool brought back to
 /// Pyth's price when it has strayed, and the operator's seed of `seed_sol`
 /// set again around it, as large as it was, once Pyth has left the seed's
-/// inner half. Nothing on a cluster without the pool, or with no seed set
-/// up.
+/// inner half. A cluster without the pool needs no upkeep; a listed pool
+/// without its operator seed requires setup to restore the configured depth.
 pub async fn keep_with_pyth(
     client: &SolanaClient,
     platform: &Platform,
     admin: &Keypair,
     operator: &Keypair,
 ) -> Result<()> {
-    if client.account(&venue::POOLS[0].address).await?.is_none()
-        || seed_position(client, operator).await?.is_none()
-    {
+    if client.account(&venue::POOLS[0].address).await?.is_none() {
         return Ok(());
+    }
+    if seed_position(client, operator).await?.is_none() {
+        bail!("Orca's pool has no operator seed: rerun setup to restore its configured depth");
     }
     let target = pyth_now(client).await?;
     let price = keep_seed_at(client, platform, admin, operator, target, None).await?;
@@ -279,6 +281,87 @@ mod tests {
     use chain::solana::Pubkey;
     use chain::solana::orca::setup::price_update;
     use chain::solana::rpc::Account;
+
+    #[tokio::test]
+    async fn upkeep_requires_seed_restoration_only_when_the_pool_exists() {
+        use axum::{Json, Router, routing::post};
+        use chain::config::{ChainConfig, ChainKey};
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+
+        for pool_exists in [false, true] {
+            let reads = Arc::new(Mutex::new(Vec::new()));
+            let captured = reads.clone();
+            let app = Router::new().route(
+                "/",
+                post(move |Json(request): Json<Value>| {
+                    let reads = captured.clone();
+                    async move {
+                        let method = request["method"].as_str().unwrap();
+                        let result = match method {
+                            "getGenesisHash" => json!("owned-local-cluster"),
+                            "getAccountInfo" => {
+                                let address = request["params"][0].as_str().unwrap();
+                                reads.lock().unwrap().push(address.to_string());
+                                let present =
+                                    pool_exists && address == venue::POOLS[0].address.to_string();
+                                let account = present.then(|| {
+                                    json!({
+                                        "lamports": 1, "owner": venue::WHIRLPOOL_PROGRAM.to_string(),
+                                        "executable": false, "data": ["", "base64"]
+                                    })
+                                });
+                                json!({"value": account})
+                            }
+                            _ => panic!("upkeep sent an unexpected RPC: {method}"),
+                        };
+                        Json(json!({"jsonrpc":"2.0", "id":request["id"], "result":result}))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let rpc = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let config: ChainConfig = serde_json::from_value(json!({
+                "label":"owned local cluster", "rpc":rpc, "dollar":"USD"
+            }))
+            .unwrap();
+            let key: ChainKey = "solana:localnet".parse().unwrap();
+            let client = SolanaClient::connect_with(&key, &config, None)
+                .await
+                .unwrap();
+            let admin = Keypair::new();
+            let operator = Keypair::new();
+            let platform = Platform {
+                cluster_name: "localnet".into(),
+                cluster: [0; 32],
+                mint: Pubkey::new_unique(),
+                admin: admin.pubkey(),
+                platform: Pubkey::new_unique(),
+                operator: operator.pubkey(),
+                checker: None,
+            };
+            let result = keep_with_pyth(&client, &platform, &admin, &operator).await;
+            if pool_exists {
+                assert!(format!("{:#}", result.unwrap_err()).contains("rerun setup"));
+                let seed = chain::solana::orca::setup::seed_mint(&operator).pubkey();
+                assert_eq!(
+                    *reads.lock().unwrap(),
+                    vec![
+                        venue::POOLS[0].address.to_string(),
+                        venue::position_address(&seed).to_string()
+                    ]
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    *reads.lock().unwrap(),
+                    vec![venue::POOLS[0].address.to_string()]
+                );
+            }
+            server.abort();
+        }
+    }
 
     #[test]
     fn the_local_settings_and_fee_tier_are_laid_out_as_orca_reads_them() {

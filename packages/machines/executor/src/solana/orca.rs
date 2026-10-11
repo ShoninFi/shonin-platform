@@ -208,7 +208,14 @@ fn priced(seen: &Seen, pool: &PoolNow) -> std::result::Result<(u128, (u128, u128
             "the oracle's price is unfit (stale, not fully verified or too uncertain): nothing is sent into the pool until it is",
         );
     };
-    let roots = venue::band_roots(oracle, seen.band_bps);
+    let Some(roots) = seen
+        .holdings
+        .price
+        .as_ref()
+        .and_then(|price| venue::trading_roots(price, seen.band_bps))
+    else {
+        return refused("the exit band has no tradable price");
+    };
     let (low, high) = (roots.0.min(roots.1), roots.0.max(roots.1));
     if !(low..=high).contains(&pool.state.sqrt_price) {
         return refused(
@@ -1507,6 +1514,84 @@ mod tests {
             ),
             Err(Failed::Sent(error)) => panic!("sent: {error:#}"),
         }
+    }
+
+    #[test]
+    fn trades_refuse_the_drivers_exact_boundaries_and_limits_stay_inside() {
+        let half = half();
+        let oracle = price(150);
+        let raw = venue::band_roots(oracle, 100);
+        let (low, high) = (raw.0.min(raw.1) + 1, raw.0.max(raw.1));
+        for root in [low - 1, low, high, high + 1] {
+            let mut h = holdings(&half, 150, 150, SOL);
+            h.pools[0].state.sqrt_price = root;
+            assert!(matches!(
+                priced(&seen(&half, &h, DOLLAR), &h.pools[0]),
+                Err(Failed::Refused(_))
+            ));
+        }
+        for root in [low + 1, high - 1] {
+            let mut h = holdings(&half, 150, 150, SOL);
+            h.pools[0].state.sqrt_price = root;
+            assert!(priced(&seen(&half, &h, DOLLAR), &h.pools[0]).is_ok());
+        }
+        let h = holdings(&half, 150, 150, SOL);
+        let seen = seen(&half, &h, 1_000 * DOLLAR);
+        let (_, roots) =
+            priced(&seen, &h.pools[0]).unwrap_or_else(|_| panic!("fair pool was refused"));
+        for buying in [false, true] {
+            let limit = if buying {
+                oracle * 101 / 100
+            } else {
+                oracle * 99 / 100
+            };
+            let ix = swap_for(
+                &seen.key,
+                &half.dollars,
+                &h.pools[0],
+                buying,
+                1,
+                limit,
+                (oracle, roots, 100),
+            )
+            .unwrap_or_else(|_| panic!("in-band swap was refused"));
+            let root = u128_at(&ix.data, 24);
+            assert!(
+                low < root && root < high,
+                "limit {root}, bounds {low} {high}"
+            );
+        }
+    }
+
+    #[test]
+    fn finer_oracle_precision_keeps_trades_inside_the_exact_driver_band() {
+        let half = half();
+        let mut h = holdings(&half, 150, 150, SOL);
+        let oracle = h.price.as_mut().unwrap();
+        oracle.price = 1_500_000_000_000_001;
+        oracle.exponent = -13;
+        let excluded_low = 7_108_671_292_628_134_247u128;
+        h.pools[0].state.sqrt_price = excluded_low;
+        assert!(matches!(
+            priced(&seen(&half, &h, DOLLAR), &h.pools[0]),
+            Err(Failed::Refused(_))
+        ));
+        h.pools[0].state.sqrt_price = excluded_low + 1;
+        let (_, roots) = priced(&seen(&half, &h, DOLLAR), &h.pools[0])
+            .unwrap_or_else(|_| panic!("first driver interior price was refused"));
+        assert_eq!(roots.0.min(roots.1), excluded_low + 1);
+        h.pools[0].state.sqrt_price = venue::sqrt_of_price(price(150));
+        let ix = swap_for(
+            &half.authority,
+            &half.dollars,
+            &h.pools[0],
+            false,
+            1,
+            price(149),
+            (price(150), roots, 100),
+        )
+        .unwrap_or_else(|_| panic!("in-band sale was refused"));
+        assert!(u128_at(&ix.data, 24) > excluded_low);
     }
 
     #[test]

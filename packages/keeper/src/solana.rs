@@ -476,19 +476,30 @@ fn halvings(shares: u128, next: Option<u128>) -> impl Iterator<Item = u128> {
 /// Whether a decoded claim proves payment progress. A settlement keeps the
 /// account until the separate rent duty closes it; a missing account is no
 /// evidence of a successful simulation.
-fn served(before: u128, after: Option<(ClaimState, u128)>) -> bool {
+fn served(before: u128, before_paid: u64, after: Option<(ClaimState, u128, u64)>) -> bool {
     match after {
-        Some((ClaimState::Paid, 0)) => before > 0,
-        Some((ClaimState::Pending, shares)) => shares > 0 && shares < before,
+        Some((ClaimState::Paid, 0, paid)) => before > 0 && paid > before_paid,
+        Some((ClaimState::Pending, shares, paid)) => {
+            shares > 0 && shares < before && paid > before_paid
+        }
         _ => false,
     }
 }
 
-/// A whole settlement can queue the claim against available cash; that
-/// ordinary path is progress too and must not be replaced by a venue close.
-fn settlement_progress(before: u128, after: (ClaimState, u128), whole: bool) -> bool {
-    (whole && matches!(after, (ClaimState::Queued, shares) if shares == before && before > 0))
-        || served(before, Some(after))
+/// A whole settlement can queue the claim against available cash or
+/// complete a dust claim; those ordinary paths must not become part closes.
+fn settlement_progress(
+    before: u128,
+    before_paid: u64,
+    after: (ClaimState, u128, u64),
+    whole: bool,
+) -> bool {
+    (whole
+        && before > 0
+        && after.2 >= before_paid
+        && (matches!(after, (ClaimState::Queued, shares, _) if shares == before)
+            || matches!(after, (ClaimState::Paid, shares, _) if shares <= before)))
+        || served(before, before_paid, Some(after))
 }
 
 /// The most stopped unwinds of one vault the keeper sends in one slot.
@@ -983,7 +994,11 @@ impl Keeping {
             if matches!(
                 state,
                 ClaimState::Pending | ClaimState::Waiting | ClaimState::Queued
-            ) && now >= claim.booked_at.saturating_add(vault.timers.freeze_after)
+            ) && now
+                >= after
+                    .as_ref()
+                    .map_or(claim.booked_at, |claim| claim.booked_at)
+                    .saturating_add(vault.timers.freeze_after)
                 && vault.live()
                 && !vault.halted()
                 && !vault.owed()
@@ -1044,7 +1059,12 @@ impl Keeping {
         if after.id != claim.id || after.owner != claim.owner || after.paid < claim.paid {
             return false;
         }
-        settlement_progress(claim.shares, (after.state, after.shares), part.is_none())
+        settlement_progress(
+            claim.shares,
+            claim.paid,
+            (after.state, after.shares, after.paid),
+            part.is_none(),
+        )
     }
 
     /// Claim `id` served in parts: halving its shares from half until a part
@@ -1085,7 +1105,11 @@ impl Keeping {
                         && after.id == claim.id
                         && after.owner == claim.owner
                         && after.paid >= claim.paid
-                        && served(claim.shares, Some((after.state, after.shares)))
+                        && served(
+                            claim.shares,
+                            claim.paid,
+                            Some((after.state, after.shares, after.paid)),
+                        )
                     {
                         paid += 1;
                     }
@@ -1124,7 +1148,11 @@ impl Keeping {
                     if after.id != claim.id
                         || after.owner != claim.owner
                         || after.paid < claim.paid
-                        || !served(claim.shares, Some((after.state, after.shares)))
+                        || !served(
+                            claim.shares,
+                            claim.paid,
+                            Some((after.state, after.shares, after.paid)),
+                        )
                     {
                         break;
                     }
@@ -2362,24 +2390,69 @@ mod tests {
     }
 
     #[test]
-    fn a_try_serves_a_claim_when_it_pays_some_of_it_and_a_blocked_one_doesn_t() {
-        assert!(!served(10, None));
-        assert!(served(10, Some((ClaimState::Paid, 0))));
-        assert!(served(10, Some((ClaimState::Pending, 5))));
-        assert!(!served(10, Some((ClaimState::Waiting, 10))));
-        assert!(!served(10, Some((ClaimState::Pending, 10))));
-        assert!(!served(10, Some((ClaimState::Paid, 10))));
-        assert!(!served(10, Some((ClaimState::Fallback, 0))));
-        assert!(!served(0, Some((ClaimState::Paid, 0))));
+    fn a_paid_part_requires_a_positive_cash_delta_and_fewer_shares() {
+        assert!(!served(10, 20, None));
+        assert!(served(10, 20, Some((ClaimState::Paid, 0, 21))));
+        assert!(served(10, 20, Some((ClaimState::Pending, 5, 21))));
+        for after in [
+            (ClaimState::Pending, 5, 20),
+            (ClaimState::Paid, 0, 20),
+            (ClaimState::Pending, 5, 19),
+            (ClaimState::Waiting, 10, 21),
+            (ClaimState::Pending, 10, 21),
+            (ClaimState::Paid, 10, 21),
+            (ClaimState::Fallback, 0, 21),
+        ] {
+            assert!(!served(10, 20, Some(after)));
+        }
+        assert!(!served(0, 20, Some((ClaimState::Paid, 0, 21))));
     }
 
     #[test]
-    fn a_whole_claim_queued_for_cash_does_not_need_partial_closes() {
-        assert!(settlement_progress(10, (ClaimState::Queued, 10), true));
-        assert!(!settlement_progress(10, (ClaimState::Queued, 10), false));
-        assert!(!settlement_progress(10, (ClaimState::Queued, 11), true));
-        assert!(!settlement_progress(10, (ClaimState::Waiting, 10), true));
-        assert!(settlement_progress(10, (ClaimState::Pending, 5), false));
+    fn a_whole_claim_keeps_ordinary_cash_queue_and_dust_completion() {
+        assert!(settlement_progress(
+            10,
+            20,
+            (ClaimState::Queued, 10, 20),
+            true
+        ));
+        assert!(!settlement_progress(
+            10,
+            20,
+            (ClaimState::Queued, 10, 20),
+            false
+        ));
+        assert!(!settlement_progress(
+            10,
+            20,
+            (ClaimState::Queued, 11, 20),
+            true
+        ));
+        assert!(!settlement_progress(
+            10,
+            20,
+            (ClaimState::Waiting, 10, 20),
+            true
+        ));
+        assert!(settlement_progress(
+            10,
+            20,
+            (ClaimState::Pending, 5, 21),
+            false
+        ));
+        assert!(settlement_progress(10, 20, (ClaimState::Paid, 0, 20), true));
+        assert!(settlement_progress(
+            10,
+            20,
+            (ClaimState::Paid, 10, 20),
+            true
+        ));
+        assert!(!settlement_progress(
+            10,
+            20,
+            (ClaimState::Paid, 0, 19),
+            true
+        ));
     }
 
     #[test]

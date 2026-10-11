@@ -403,9 +403,45 @@ async fn set_up(client: &SolanaClient) -> Platform {
     setup::ensure_arrays_around(client, deployer, &pool, 3)
         .await
         .unwrap();
+    // An interrupted setup can land the open without its liquidity increase.
+    // Resume that exact deterministic position rather than treating existence
+    // as completed funding.
+    let mint = setup::seed_mint(operator);
+    let ticks = venue::ticks_between(start * 9 / 10, start * 11 / 10, spacing).unwrap();
+    let open = venue::ix_open_position(
+        &operator.pubkey(),
+        &operator.pubkey(),
+        &mint.pubkey(),
+        &pool.address,
+        ticks,
+    );
+    client.send(vec![open], &[operator, &mint]).await.unwrap();
+    let empty = setup::seed_position(client, operator)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(empty.liquidity, 0);
     setup::seed(client, &platform, admin, operator, 2_000 * LAMPORTS, 1_000)
         .await
         .unwrap();
+    let funded = setup::seed_position(client, operator)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(funded.liquidity > 0);
+    assert_eq!((funded.tick_lower, funded.tick_upper), ticks);
+    setup::seed(client, &platform, admin, operator, 2_000 * LAMPORTS, 1_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        setup::seed_position(client, operator)
+            .await
+            .unwrap()
+            .unwrap()
+            .liquidity,
+        funded.liquidity,
+        "a completed seed is not funded twice"
+    );
     platform
 }
 
@@ -787,4 +823,52 @@ async fn an_orca_vault_trades_through_the_guard_is_valued_through_the_driver_and
         .await
         .unwrap();
     assert_eq!(unmoved, reached, "a pool already there is left alone");
+    // A centered position still needs a successful steer. Remove only the
+    // test operator's free SOL so a normal sale cannot be funded, keeping
+    // the seed and pool unchanged. Failed steering must reach its caller.
+    let pool = setup::pool_now(&client).await.unwrap();
+    let target = venue::price_of_sqrt(pool.state.sqrt_price) * 9_899 / 10_000;
+    let seed = setup::seed_position(&client, operator)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!setup::needs_recentring(&seed, target));
+    let roots = venue::band_roots(target, 100);
+    assert!(pool.state.sqrt_price > roots.0.max(roots.1));
+    let native = client
+        .rpc
+        .account(&operator.pubkey())
+        .await
+        .unwrap()
+        .unwrap();
+    let wrapped_at = venue::wsol_of(&operator.pubkey());
+    let wrapped = client.rpc.account(&wrapped_at).await.unwrap().unwrap();
+    let amount = u64::from_le_bytes(wrapped.data[64..72].try_into().unwrap());
+    let mut empty_native = native.clone();
+    empty_native.lamports = setup::OPERATOR_KEEPS;
+    let mut empty_wrapped = wrapped.clone();
+    empty_wrapped.data[64..72].copy_from_slice(&0u64.to_le_bytes());
+    empty_wrapped.lamports -= amount;
+    client
+        .rpc
+        .set_account(&operator.pubkey(), &empty_native)
+        .await
+        .unwrap();
+    client
+        .rpc
+        .set_account(&wrapped_at, &empty_wrapped)
+        .await
+        .unwrap();
+    let failed = setup::keep_seed_at(&client, &platform, admin, operator, target, None).await;
+    client
+        .rpc
+        .set_account(&operator.pubkey(), &native)
+        .await
+        .unwrap();
+    client.rpc.set_account(&wrapped_at, &wrapped).await.unwrap();
+    assert!(
+        failed.is_err(),
+        "failed steering was reported as successful upkeep"
+    );
+    assert!(format!("{:#}", failed.unwrap_err()).contains("nothing to move"));
 }

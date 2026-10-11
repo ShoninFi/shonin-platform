@@ -366,7 +366,8 @@ pub fn needs_recentring(seed: &venue::Position, price: u128) -> bool {
 /// The operator's seed opened across the pool's price, `half_width_bps`
 /// either side, of `sol` lamports and the dollars that go with them: its
 /// own wrapped SOL used first and only the rest wrapped, the dollars short
-/// minted by the admin. Nothing if the seed is open already.
+/// minted by the admin. A zero-liquidity position resumes its funding; a
+/// funded seed is left alone.
 pub async fn seed(
     client: &SolanaClient,
     platform: &Platform,
@@ -375,16 +376,24 @@ pub async fn seed(
     sol: u64,
     half_width_bps: u128,
 ) -> Result<()> {
-    if seed_position(client, operator).await?.is_some() {
+    let existing = seed_position(client, operator).await?;
+    if existing
+        .as_ref()
+        .is_some_and(|position| position.liquidity > 0)
+    {
         return Ok(());
     }
+    anyhow::ensure!(sol > 0, "the seed needs a positive SOL amount");
     let pool = pool_now(client).await?;
     let price = venue::price_of_sqrt(pool.state.sqrt_price);
-    let ticks = venue::ticks_between(
-        price * (10_000 - half_width_bps) / 10_000,
-        price * (10_000 + half_width_bps) / 10_000,
-        pool.state.tick_spacing,
-    )?;
+    let ticks = match &existing {
+        Some(position) => (position.tick_lower, position.tick_upper),
+        None => venue::ticks_between(
+            price * (10_000 - half_width_bps) / 10_000,
+            price * (10_000 + half_width_bps) / 10_000,
+            pool.state.tick_spacing,
+        )?,
+    };
     ensure_arrays(
         client,
         operator,
@@ -395,10 +404,7 @@ pub async fn seed(
     let who = operator.pubkey();
     // As many dollars as the SOL is worth, and a tenth more.
     let dollars = (sol as u128 * price / PRICE_ONE / 1_000 * 11 / 10) as u64;
-    let wrapped = client
-        .token_balance(&venue::wsol_of(&who))
-        .await
-        .unwrap_or(0);
+    let wrapped = client.token_balance(&venue::wsol_of(&who)).await?;
     if wrapped < sol {
         client
             .send(ixs_wrap(&who, sol - wrapped)?, &[operator])
@@ -416,11 +422,13 @@ pub async fn seed(
             .context("minting the operator's dollars")?;
     }
     let mint = seed_mint(operator);
-    let open = venue::ix_open_position(&who, &who, &mint.pubkey(), &pool.address, ticks);
-    client
-        .send(vec![open], &[operator, &mint])
-        .await
-        .context("opening the operator's position")?;
+    if existing.is_none() {
+        let open = venue::ix_open_position(&who, &who, &mint.pubkey(), &pool.address, ticks);
+        client
+            .send(vec![open], &[operator, &mint])
+            .await
+            .context("opening the operator's position")?;
+    }
     let (max_a, max_b) = if venue::asset_is_a() {
         (sol, dollars)
     } else {
@@ -433,7 +441,8 @@ pub async fn seed(
         max_a,
         max_b,
     )?;
-    let position = venue::Position {
+    anyhow::ensure!(liquidity > 0, "the offered seed buys no liquidity");
+    let position = existing.unwrap_or(venue::Position {
         whirlpool: pool.address,
         mint: mint.pubkey(),
         liquidity: 0,
@@ -443,7 +452,7 @@ pub async fn seed(
         fee_owed_a: 0,
         checkpoint_b: 0,
         fee_owed_b: 0,
-    };
+    });
     let add = venue::ix_modify(
         Change::Increase,
         &who,
@@ -529,7 +538,21 @@ pub async fn keep_seed_at(
     // The pool first: a seed opens across the pool's own price.
     let steered = steer(client, platform, admin, operator, target).await;
     match seed_position(client, operator).await? {
-        Some(position) if !needs_recentring(&position, target) => {}
+        Some(position) if position.liquidity == 0 => {
+            let Some(sol) = sol else {
+                bail!("the operator's seed is unfunded; run setup to restore its configured size");
+            };
+            seed(client, platform, admin, operator, sol, SEED_HALF_WIDTH_BPS).await?;
+            steer(client, platform, admin, operator, target).await?;
+            if needs_recentring(&position, target) {
+                withdraw_seed(client, platform, operator).await?;
+                steer(client, platform, admin, operator, target).await?;
+                seed(client, platform, admin, operator, sol, SEED_HALF_WIDTH_BPS).await?;
+            }
+        }
+        Some(position) if !needs_recentring(&position, target) => {
+            steered?;
+        }
         Some(position) => {
             let pool = pool_now(client).await?;
             let sol = match sol {
@@ -599,10 +622,7 @@ pub async fn steer(
         }
         want.max(have)
     } else {
-        let wrapped = client
-            .token_balance(&venue::wsol_of(&who))
-            .await
-            .unwrap_or(0);
+        let wrapped = client.token_balance(&venue::wsol_of(&who)).await?;
         let spare = client.lamports(&who).await?.saturating_sub(OPERATOR_KEEPS);
         if spare > 0 {
             ready.extend(ixs_wrap(&who, spare)?);

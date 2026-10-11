@@ -476,6 +476,23 @@ impl shonin::agent::inference::Host for Ctx {}
 
 // Drivers ---------------------------------------------------------------------
 
+/// Await each action's current refusal before dispatching it, including
+/// after the preceding venue call has finished.
+async fn checked_actions<'actions, T, R, D>(
+    actions: &'actions [Vec<u8>],
+    mut refusal: impl FnMut(&'actions [u8]) -> R,
+    mut dispatch: impl FnMut(&'actions [u8], Option<String>) -> D,
+    mut answer: impl FnMut(T),
+) where
+    R: std::future::Future<Output = Option<String>>,
+    D: std::future::Future<Output = T>,
+{
+    for bytes in actions {
+        let why = refusal(bytes).await;
+        answer(dispatch(bytes, why).await);
+    }
+}
+
 impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
     /// The one way out. Each action is decoded here, inside the measured
     /// image; anything that does not decode, or names an account this vault
@@ -512,70 +529,73 @@ impl shonin::agent::drivers::HostWithStore<Ctx> for HasSelf<Ctx> {
         let mut verdicts = Vec::with_capacity(actions.len());
         let mut tallies = Vec::with_capacity(actions.len());
         if driver != LOCAL {
-            // A close staged through a venue that acts after the
-            // transaction is measured from the account: until it is,
-            // nothing but cancels goes there (see `staged`). Read once for
-            // the batch, and only when something in it needs it.
-            let paused = match &place {
-                Place::Evm(evm)
-                    if crate::staged::delayed(&driver)
-                        && actions
-                            .iter()
-                            .any(|bytes| !crate::staged::only_cancels(&driver, bytes)) =>
-                {
-                    crate::staged::refusal(&evm.chain, evm.station).await
-                }
-                _ => None,
-            };
-            for bytes in &actions {
-                if let Some(why) = &paused
-                    && !crate::staged::only_cancels(&driver, bytes)
-                {
-                    tallies.push(Tally::Refused);
-                    verdicts.push(within(Verdict::Rejected(why.clone())));
-                    continue;
-                }
-                let outcome = match (&place, driver.as_str()) {
-                    (
-                        Place::Evm(Evm {
-                            hyperliquid: Some(half),
-                            ..
-                        }),
-                        crate::hyperliquid::DRIVER,
-                    ) => Some(half.submit(bytes).await),
-                    (
-                        Place::Evm(Evm {
-                            stocks: Some(half), ..
-                        }),
-                        crate::robinhood::ROBINHOOD,
-                    ) => Some(half.submit(bytes).await),
-                    (
-                        Place::Evm(Evm {
-                            lighter: Some(half),
-                            ..
-                        }),
-                        crate::robinhood::LIGHTER,
-                    ) => Some(half.submit(bytes).await),
-                    (Place::Solana(trading), crate::solana::ORCA) if trading.has_orca() => {
-                        Some(trading.orca_submit(bytes).await)
+            let place = &place;
+            let driver = &driver;
+            checked_actions(
+                &actions,
+                |bytes| async move {
+                    match place {
+                        Place::Evm(evm)
+                            if crate::staged::delayed(driver)
+                                && !crate::staged::only_cancels(driver, bytes) =>
+                        {
+                            crate::staged::refusal(&evm.chain, evm.station).await
+                        }
+                        _ => None,
                     }
-                    _ => None,
-                };
-                let (verdict, tally) = match outcome {
-                    Some(Outcome::Accepted(receipt)) => (Verdict::Accepted(receipt), Tally::Done),
-                    Some(Outcome::Refused(why)) => (Verdict::Rejected(why), Tally::Refused),
-                    Some(Outcome::Unknown(why)) => (Verdict::Unknown(why), Tally::Unanswered),
-                    None => (
-                        Verdict::Rejected(format!(
-                            "this vault has no {} account here",
-                            crate::runner::at_most(&driver, NAMED_MOST)
-                        )),
-                        Tally::Refused,
-                    ),
-                };
-                tallies.push(tally);
-                verdicts.push(within(verdict));
-            }
+                },
+                |bytes, paused| async move {
+                    if let Some(why) = paused {
+                        return (Verdict::Rejected(why), Tally::Refused);
+                    }
+                    let outcome = match (place, driver.as_str()) {
+                        (
+                            Place::Evm(Evm {
+                                hyperliquid: Some(half),
+                                ..
+                            }),
+                            crate::hyperliquid::DRIVER,
+                        ) => Some(half.submit(bytes).await),
+                        (
+                            Place::Evm(Evm {
+                                stocks: Some(half), ..
+                            }),
+                            crate::robinhood::ROBINHOOD,
+                        ) => Some(half.submit(bytes).await),
+                        (
+                            Place::Evm(Evm {
+                                lighter: Some(half),
+                                ..
+                            }),
+                            crate::robinhood::LIGHTER,
+                        ) => Some(half.submit(bytes).await),
+                        (Place::Solana(trading), crate::solana::ORCA) if trading.has_orca() => {
+                            Some(trading.orca_submit(bytes).await)
+                        }
+                        _ => None,
+                    };
+                    let (verdict, tally) = match outcome {
+                        Some(Outcome::Accepted(receipt)) => {
+                            (Verdict::Accepted(receipt), Tally::Done)
+                        }
+                        Some(Outcome::Refused(why)) => (Verdict::Rejected(why), Tally::Refused),
+                        Some(Outcome::Unknown(why)) => (Verdict::Unknown(why), Tally::Unanswered),
+                        None => (
+                            Verdict::Rejected(format!(
+                                "this vault has no {} account here",
+                                crate::runner::at_most(driver, NAMED_MOST)
+                            )),
+                            Tally::Refused,
+                        ),
+                    };
+                    (verdict, tally)
+                },
+                |(verdict, tally)| {
+                    tallies.push(tally);
+                    verdicts.push(within(verdict));
+                },
+            )
+            .await;
             accessor.with(|mut access| {
                 access.get().count(|counters| {
                     for tally in tallies {
@@ -2182,6 +2202,46 @@ pub fn market_name(id: alloy::primitives::FixedBytes<32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_stage_seen_after_a_venue_reply_blocks_the_remaining_new_actions() {
+        use std::cell::{Cell, RefCell};
+        let stage = Cell::new(false);
+        let reads = Cell::new(0);
+        let submitted = RefCell::new(Vec::new());
+        let refused = Cell::new(0);
+        let stage = &stage;
+        let reads = &reads;
+        let submitted = &submitted;
+        let refused = &refused;
+        // 0 cancels, 1 starts a normal venue call, and 2/3 place new orders.
+        checked_actions(
+            &[vec![1], vec![2], vec![0], vec![3]],
+            |bytes| async move {
+                if bytes == [0] {
+                    return None;
+                }
+                reads.set(reads.get() + 1);
+                stage.get().then(|| "a close is staged".to_owned())
+            },
+            |bytes, why| async move {
+                if why.is_some() {
+                    refused.set(refused.get() + 1);
+                    return;
+                }
+                submitted.borrow_mut().push(bytes[0]);
+                tokio::task::yield_now().await;
+                if bytes == [1] {
+                    stage.set(true);
+                }
+            },
+            |()| {},
+        )
+        .await;
+        assert_eq!(*submitted.borrow(), vec![1, 0]);
+        assert_eq!(refused.get(), 2);
+        assert_eq!(reads.get(), 3);
+    }
 
     /// A core module's instance in a store held to `mib` of allowance, as the
     /// runner holds a strategy's.

@@ -657,6 +657,58 @@ pub fn deposit(
     })
 }
 
+/// Integer roots strictly inside the driver's price band, in dollar-price
+/// order. Its raw lower boundary is rounded up by one and both boundaries
+/// are excluded. Using these roots for trades leaves valuation available
+/// even when a swap reaches its limit.
+pub fn trading_roots(price: &Price, band_bps: u16) -> Option<(u128, u128)> {
+    use shonin_orca_driver::wide::W;
+
+    // Keep Pyth's original precision and the driver's checked raw-price
+    // arithmetic. Converting first to a display price can move an endpoint.
+    let exponent = price
+        .exponent
+        .checked_add(DOLLAR_DECIMALS as i32)?
+        .checked_sub(ASSET_DECIMALS as i32)?;
+    let power = 10u64.checked_pow(exponent.unsigned_abs())?;
+    if price.price == 0 {
+        return None;
+    }
+    let one = W([0, 0, 1, 0]);
+    let raw = match (asset_is_a(), exponent >= 0) {
+        (true, true) => W::from_u128(price.price as u128)
+            .mul_word(power)
+            .and_then(|p| p.shl_words(2)),
+        (true, false) => W::from_u128(price.price as u128)
+            .shl_words(2)
+            .map(|p| p.div_word(power).0),
+        (false, true) => price.price.checked_mul(power).map(|p| one.div_word(p).0),
+        (false, false) => one.mul_word(power).map(|p| p.div_word(price.price).0),
+    }?;
+    if raw.is_zero() {
+        return None;
+    }
+    let root = U256::from(shonin_orca_driver::logic::sqrt_price_for(raw));
+    let two = U256::from(20_000u64);
+    let band = U256::from(band_bps as u64);
+    let clamp = |value: U256| {
+        value
+            .min(U256::from(math::MAX_SQRT_PRICE))
+            .max(U256::from(math::MIN_SQRT_PRICE))
+            .low_u128()
+    };
+    let low = clamp(root * (two - band.min(two)) / two).checked_add(2)?;
+    let high = clamp(root * (two + band) / two).checked_sub(1)?;
+    if low > high {
+        return None;
+    }
+    Some(if asset_is_a() {
+        (low, high)
+    } else {
+        (high, low)
+    })
+}
+
 /// The most liquidity between two ticks that `max_a` of A and `max_b` of B
 /// pay for at the pool's price now, as the pool takes it: never more of
 /// either than its maximum. Zero if they pay for none.

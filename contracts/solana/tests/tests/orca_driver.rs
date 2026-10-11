@@ -1533,8 +1533,8 @@ fn closes_unwinds_and_valuations_at_their_worst_fit_the_compute_with_fixed_and_d
     }
     println!("worst close {worst_close}");
     assert!(worst_close > 0);
-    // Measured at about 375,000 with dynamic arrays.
-    assert!(worst_close <= 380_000, "{worst_close}");
+    // Dynamic and fixed array cases must both fit the driver's budget.
+    assert!(worst_close <= COMPUTE_PER_DRIVER, "{worst_close}");
     assert!(worst_close < COMPUTE_PER_DRIVER);
 }
 
@@ -1780,4 +1780,23 @@ fn every_tick_of_the_sale_s_arrays_initialized_fits_the_compute_of_every_call() 
             assert!(compute < COMPUTE_PER_DRIVER, "{compute}");
         }
     }
+}
+
+#[test]
+fn an_orca_dust_part_preserves_the_unpaid_claims_booking() {
+    let (mut env, v, id) = orca_vault_with_a_claim(14_000_000_000, 2_000_000_000, 1_000, |_| {});
+    let before = env.claim(&v, id).unwrap();
+    env.skip(6 * DAY);
+    env.price_follows_pool();
+    expect_ok(env.settle_claim_part(&v, id, 1));
+    let after = env.claim(&v, id).unwrap();
+    println!(
+        "Orca one-share part: paid {}, remaining {}, booking {} -> {}",
+        after.paid - before.paid,
+        after.shares,
+        before.booked_at,
+        after.booked_at
+    );
+    assert_eq!(after.paid, before.paid);
+    assert_eq!(after.booked_at, before.booked_at);
 }
