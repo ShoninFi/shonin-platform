@@ -42,6 +42,7 @@ use crate::store::Store;
 /// What the indexer remembers between reads of a Solana chain.
 #[derive(Default)]
 pub struct History {
+    scan: Option<chain::solana::scan::VaultScan>,
     vaults: HashMap<Pubkey, VaultLog>,
     /// Each vault as last read whole, and the chain time it was.
     last_whole: HashMap<Pubkey, (Strategy, u64)>,
@@ -72,11 +73,6 @@ struct VaultLog {
 /// How many of a vault's transactions are listed per request.
 const SIGNATURE_PAGE: usize = 1_000;
 
-/// The most of one vault's transactions read in one refresh: a vault whose
-/// history is being rebuilt catches up a page at a time, and the rest of
-/// the record isn't held up meanwhile.
-const TRANSACTIONS_PER_REFRESH: usize = 64;
-
 /// How many of a vault's events the page shows.
 const SHOWN: usize = 60;
 
@@ -101,7 +97,12 @@ pub async fn read(
     now: u64,
 ) -> Result<ChainRead> {
     let client = &served.client;
-    let vaults = vaults(client).await?;
+    let scan = history.scan.get_or_insert_with(|| {
+        chain::solana::scan::VaultScan::vaults_only(std::time::Duration::from_millis(
+            client.rpc_policy().solana_rescan_ms,
+        ))
+    });
+    let vaults = scan.look(client).await?.vaults;
 
     let mut strategies = Vec::new();
     let mut authors: Vec<(ChainAddress, Author)> = Vec::new();
@@ -672,7 +673,7 @@ async fn requests(client: &SolanaClient, address: &Pubkey) -> Result<Vec<Request
 
 /// Read whatever is new in the vault's history: list the transactions that
 /// touched it since the last listing, then read them oldest first, at most
-/// [`TRANSACTIONS_PER_REFRESH`] a refresh. A transaction that can't be read
+/// the configured solana_history_transactions a refresh. A transaction that can't be read
 /// is read again next time, so nothing is passed over; one the node no
 /// longer holds is passed over, as there is nothing else to read it from.
 async fn read_history(client: &SolanaClient, vault: &Pubkey, log: &mut VaultLog) -> Result<()> {
@@ -706,7 +707,7 @@ async fn read_history(client: &SolanaClient, vault: &Pubkey, log: &mut VaultLog)
     }
 
     let mut read = 0;
-    while read < TRANSACTIONS_PER_REFRESH {
+    while read < client.rpc_policy().solana_history_transactions {
         let Some(signature) = log.queue.front().cloned() else {
             break;
         };

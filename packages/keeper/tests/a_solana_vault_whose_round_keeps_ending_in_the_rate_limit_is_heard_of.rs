@@ -303,6 +303,13 @@ async fn vault_named_not_kept(
     let mut vault: Vault = zeroed(Vault::INIT_SPACE);
     vault.strategy_id = strategy_id;
     vault.state = VaultState::Open;
+    vault.timers.slot_interval = 10;
+    vault.timers.slot_lead = 5;
+    vault.timers.slot_window = 3;
+    vault.timers.halt_grace = 60;
+    vault.timers.freeze_after = 60;
+    vault.timers.wind_down = 60;
+    vault.timers.tank_escape_delay = 60;
     let cluster = Arc::new(Cluster {
         factory: encode(&factory),
         vault: (vault_address, encode(&vault)),

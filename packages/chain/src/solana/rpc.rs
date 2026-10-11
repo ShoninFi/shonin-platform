@@ -271,6 +271,15 @@ impl Rpc {
         self
     }
 
+    /// Optional observations have their own rate-limit pacing. Cancelling
+    /// one cannot impose its Retry-After pause on ordinary work.
+    pub(crate) fn isolated(&self) -> Self {
+        Self {
+            pace: Arc::new(Mutex::new(Pace::default())),
+            ..self.clone()
+        }
+    }
+
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -883,6 +892,20 @@ mod tests {
         let started = Instant::now();
         assert_eq!(rpc.slot().await.unwrap(), 42);
         assert!(started.elapsed() < Duration::from_millis(400));
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_optional_read_does_not_pace_ordinary_calls() {
+        let (url, asked) = a_node(vec![(429, LIMITED), (200, SLOT)]).await;
+        let rpc = Rpc::new(&url, "a node").unwrap();
+        let optional = rpc.isolated();
+        let probe = tokio::time::timeout(Duration::from_millis(100), optional.slot()).await;
+        assert!(probe.is_err());
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        let started = Instant::now();
+        assert_eq!(rpc.slot().await.unwrap(), 42);
+        assert!(started.elapsed() < Duration::from_millis(300));
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

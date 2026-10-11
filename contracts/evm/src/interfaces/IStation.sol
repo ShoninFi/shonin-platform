@@ -188,6 +188,8 @@ interface IStation {
     function outsideBand() external view returns (bool);
 
     function spec() external view returns (StationSpec memory);
+    /// The factory whose registry and asset this station uses.
+    function factory() external view returns (IStationFactory);
     function isHome() external view returns (bool);
     function stopped() external view returns (bool);
     function approvedKey(bytes32 driver) external view returns (address);

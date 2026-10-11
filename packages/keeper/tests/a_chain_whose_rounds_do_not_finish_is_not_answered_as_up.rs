@@ -2,8 +2,8 @@
 //! the vault list fails: a rate-limited or broken RPC, a factory address
 //! that is wrong. The keeper keeps nothing on that chain, round after round,
 //! and sends nothing, so nothing is "not going out"; its health still
-//! answers that the chain is not kept. That the round did not finish is said
-//! once, not at every round.
+//! answers that startup is incomplete. The startup refusal is said once,
+//! then throttled while discovery continues to fail.
 
 mod process;
 
@@ -39,8 +39,14 @@ async fn a_chain_whose_rounds_do_not_finish_is_not_answered_as_up() {
         first.starts_with("keeper: ") && first.len() <= 60,
         "{said:?}"
     );
-    assert!(said.contains("rounds not finishing"), "{said:?}");
-    let failed = keeper.logged().matches("the round did not finish").count();
+    assert!(
+        said.contains("vault startup checks are not complete"),
+        "{said:?}"
+    );
+    let failed = keeper
+        .logged()
+        .matches("keeper startup policy refused")
+        .count();
     let rounds = called::<IVaultFactory::vaultsCall>(&node, FACTORY);
     assert_eq!(
         failed, 1,

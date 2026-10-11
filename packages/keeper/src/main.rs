@@ -308,8 +308,27 @@ async fn main() -> Result<()> {
                     attestation_http.clone(),
                 ));
             }
+            // Validate every initially discovered vault before starting this
+            // chain's vault rounds. Key loops and other chains are independent.
+            chain_kept(chain, |kept| kept.startup_incomplete = true);
+            let mut startup_said = Said::default();
+            loop {
+                match validate_known_timers(&served.client, served.deployments.factory).await {
+                    Ok(()) => break,
+                    Err(error) => {
+                        if let Some(times) = startup_said.due(std::time::Instant::now()) {
+                            tracing::warn!(chain = %served.key, times, error = format!("{error:#}"), "keeper startup policy refused; vault rounds not started on this chain");
+                        }
+                        tokio::time::sleep(Duration::from_millis(
+                            served.client.rpc_policy().head_poll_ms.min(served.client.rpc_policy().event_scan_ms),
+                        )).await;
+                    }
+                }
+            }
+            chain_kept(chain, |kept| kept.startup_incomplete = false);
             let mut memory = HashMap::new();
             let mut factories = Factories::default();
+            let mut schedule = schedule::Schedule::default();
             let mut said = Said::default();
             let mut closer = CloserAt::new(served.deployments.closer);
             let mut deployments = served.deployments.clone();
@@ -324,6 +343,7 @@ async fn main() -> Result<()> {
                     &executor,
                     &mut memory,
                     &mut factories,
+                    &mut schedule,
                 )
                 .await;
                 let now = std::time::Instant::now();
@@ -345,7 +365,9 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                tokio::time::sleep(ROUND_PAUSE).await;
+                schedule.wait(Duration::from_millis(
+                    served.client.rpc_policy().head_poll_ms.min(served.client.rpc_policy().event_scan_ms),
+                )).await;
             }
         });
     }
@@ -359,7 +381,7 @@ async fn main() -> Result<()> {
 }
 
 /// Relay the executor's blessings on one chain and keep its blessed keys in
-/// gas, every [`attest::EVERY`], for as long as the keeper runs; on the
+/// gas on the configured key cadence, for as long as the keeper runs; on the
 /// canonical chain, relay its root key's record too.
 async fn keep_keys(
     client: Client,
@@ -374,7 +396,7 @@ async fn keep_keys(
     let mut said = Said::default();
     loop {
         let at = std::time::Instant::now();
-        if blessings.due(at) {
+        if blessings.due(at, Duration::from_millis(client.rpc_policy().key_look_ms)) {
             let looked = match attest::published(&http, &executor).await {
                 Ok(published) => {
                     let registry = attest::OnChain {
@@ -410,12 +432,12 @@ async fn keep_keys(
                 }
             }
         }
-        tokio::time::sleep(ROUND_PAUSE).await;
+        tokio::time::sleep(Duration::from_millis(client.rpc_policy().key_poll_ms)).await;
     }
 }
 
 /// Relay a builder's or a reviewer's blessings on one chain and keep its
-/// blessed key in gas, every [`attest::EVERY`], for as long as the keeper
+/// blessed key in gas on the configured key cadence, for as long as the keeper
 /// runs. The service is often off: that is said at debug only. Nothing it
 /// publishes records the root key.
 async fn keep_service_keys(
@@ -430,7 +452,7 @@ async fn keep_service_keys(
     let mut said = Said::default();
     loop {
         let at = std::time::Instant::now();
-        if blessings.due(at) {
+        if blessings.due(at, Duration::from_millis(client.rpc_policy().key_look_ms)) {
             match attest::published(&http, &service).await {
                 Ok(published) => {
                     let registry = attest::OnChain {
@@ -466,16 +488,15 @@ async fn keep_service_keys(
                 }
             }
         }
-        tokio::time::sleep(ROUND_PAUSE).await;
+        tokio::time::sleep(Duration::from_millis(client.rpc_policy().key_poll_ms)).await;
     }
 }
-
-/// How long the keeper waits between one round of a chain and the next.
-const ROUND_PAUSE: Duration = Duration::from_secs(2);
 
 /// How each vault chain to be kept is doing, for the keeper's health.
 #[derive(Clone, Copy, Debug, Default)]
 struct Kept {
+    /// Vault startup discovery/timer checks have not yet passed.
+    startup_incomplete: bool,
     /// When it was connected, if it has been.
     connected: Option<std::time::Instant>,
     /// When its last round finished, and how long that round took.
@@ -514,6 +535,9 @@ impl Kept {
 
     /// Why the chain is not being kept, if it isn't.
     fn trouble(&self, now: std::time::Instant) -> Option<&'static str> {
+        if self.startup_incomplete {
+            return Some("vault startup checks are not complete");
+        }
         if self.no_keeper {
             return Some("no keeper account");
         }
@@ -901,6 +925,100 @@ fn send_again(before: Option<&SendAgain>, now: u64, interval: u64, round: u64) -
     }
 }
 
+/// None means uncertainty or outstanding asynchronous work: stay active.
+fn quiet_answer(executor: &str, chain: u64, vault: Address) -> Option<Option<std::time::Instant>> {
+    let service = executor_for(executor);
+    let asks = service.asks.lock().ok()?;
+    let key = (chain, vault);
+    if asks.in_flight.keys().any(|(on, at, _)| (*on, *at) == key)
+        || asks.unanswered.contains(&key)
+        || asks.not_served.contains(&key)
+    {
+        return None;
+    }
+    Some(asks.latest.get(&key).map(|(_, sent)| *sent))
+}
+
+fn quiet_input(chain: u64, vault: Address, memory: &Memory) -> Option<schedule::QuietInput> {
+    if memory.rounds_failing != 0
+        || memory.tank_unread != 0
+        || memory.probes_failing != 0
+        || memory.bill_refused != 0
+        || memory.keep_again.is_some()
+        || !memory.serve_again.is_empty()
+        || !memory.claims_tried.is_empty()
+        || !memory.holders.is_empty()
+        || !memory.skipped.is_empty()
+        || memory.ask_again.is_some()
+        || memory.close_held_since.is_some()
+        || memory.last_try_since.is_some()
+        || STEPS_FAILED.lock().map_or(true, |steps| {
+            steps.keys().any(|(on, at, _)| (*on, *at) == (chain, vault))
+        })
+    {
+        return None;
+    }
+    Some(schedule::QuietInput {
+        daily_at: memory.daily_at?,
+        logs_read_to: memory.holders_read_to.min(memory.skipped_read_to),
+    })
+}
+
+/// Check the configured observation margin against immutable timers. This
+/// arithmetic is a necessary check; it does not bound ordinary transaction
+/// preparation or establish an endpoint/landing latency guarantee.
+fn validate_timers(
+    client: &Client,
+    vault: Address,
+    timers: &chain::bindings::vault::Timers,
+) -> Result<()> {
+    validate_timer_policy(client.rpc_policy(), vault, timers)
+}
+
+async fn validate_known_timers(client: &Client, factory: Address) -> Result<()> {
+    let (vaults, unread) = every_vault(client, factory, &mut Factories::default()).await?;
+    if !unread.is_empty() {
+        anyhow::bail!(
+            "cannot validate keeper startup timers while factory discovery is incomplete"
+        );
+    }
+    for vault in vaults {
+        let timers = client.read(vault, IVault::timersCall {}).await?;
+        validate_timers(client, vault, &timers)?;
+    }
+    Ok(())
+}
+
+fn validate_timer_policy(
+    policy: &chain::rpc_policy::RpcPolicy,
+    vault: Address,
+    timers: &chain::bindings::vault::Timers,
+) -> Result<()> {
+    let lead = policy.head_poll_ms + policy.event_scan_ms + policy.read_budget_ms;
+    let active = policy.head_poll_ms.max(policy.event_scan_ms) + policy.read_budget_ms;
+    for (name, seconds, needed) in [
+        ("slotLead", timers.slotLead, lead),
+        ("slotWindow", timers.slotWindow, active),
+        ("postDeadline", timers.postDeadline, active),
+        ("haltGrace", timers.haltGrace, active),
+        ("freezeAfter", timers.freezeAfter, active),
+        ("windDown", timers.windDown, active),
+        ("activationWindow", timers.activationWindow, active),
+        ("tankEscapeDelay", timers.tankEscapeDelay, active),
+    ] {
+        if u128::from(seconds) * 1000 < u128::from(needed) {
+            anyhow::bail!(
+                "vault {vault}: RPC head_poll_ms={}, event_scan_ms={}, read_budget_ms={} require {needed}ms, but {name}={seconds}s; this vault's keeper policy is refused",
+                policy.head_poll_ms,
+                policy.event_scan_ms,
+                policy.read_budget_ms
+            );
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn tick(
     chain: Chain,
     client: &Client,
@@ -909,8 +1027,31 @@ async fn tick(
     executor: &str,
     memory: &mut HashMap<Address, Memory>,
     factories: &mut Factories,
+    schedule: &mut schedule::Schedule,
 ) -> Result<()> {
-    let (vaults, unread_factories) = every_vault(client, deployments.factory, factories).await?;
+    match schedule.poll(client) {
+        Ok(true) => {
+            // Terminal prefixes, log cursors and prior deadlines can all
+            // belong to the replaced branch. Rebuild every derived memory.
+            memory.clear();
+            *factories = Factories::default();
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::debug!(%chain, %error, "event observation unavailable; ordinary active rounds continue")
+        }
+    }
+    let (vaults, unread_factories) = if let Some(vaults) = schedule.vaults(client) {
+        (vaults, Vec::new())
+    } else {
+        let found = every_vault(client, deployments.factory, factories).await?;
+        let mut watched: Vec<_> = factories.vaults.keys().copied().collect();
+        watched.push(deployments.factory);
+        watched.sort_unstable();
+        watched.dedup();
+        schedule.listed(found.0.clone(), watched, found.1.is_empty());
+        found
+    };
     let factories_unread = !unread_factories.is_empty();
     chain_kept(chain, |kept| kept.factories_unread = factories_unread);
     if factories_unread {
@@ -922,7 +1063,47 @@ async fn tick(
     }
     for &vault in &vaults {
         let remembered = memory.entry(vault).or_default();
+        let answer = quiet_answer(executor, client.chain_id, vault);
+        if let Some(answered) = answer
+            && quiet_input(client.chain_id, vault, remembered).is_some()
+            && schedule.sleeping(client, vault, answered)
+        {
+            // Preserve the baseline logical round counters. Quiet proofs
+            // exclude outstanding retries and do not report a send as done.
+            remembered.rounds = remembered.rounds.saturating_add(1);
+            remembered.claim_rounds = remembered.claim_rounds.saturating_add(1);
+            // Approval removal has no request lead time. Preserve its live
+            // reads/tries even if an event arrived after the observed head.
+            match client.read(vault, IVault::homeStationCall {}).await {
+                Ok(station) => {
+                    revoke_keys(client, keeper, station).await;
+                    revoke_skipped(
+                        client,
+                        keeper,
+                        vault,
+                        station,
+                        deployments.deployed_block,
+                        remembered,
+                    )
+                    .await;
+                }
+                Err(error) => carry_on(
+                    client.chain_id,
+                    vault,
+                    "read the vault's home station",
+                    Err(error),
+                ),
+            }
+            steps_worked(client.chain_id, vault, true);
+            continue;
+        }
         let done = keep_one(client, keeper, deployments, executor, vault, remembered).await;
+        if done.is_ok()
+            && let Some(input) = quiet_input(client.chain_id, vault, remembered)
+            && let Some(answered) = quiet_answer(executor, client.chain_id, vault)
+        {
+            schedule.offer(client, deployments, vault, input, answered);
+        }
         steps_worked(client.chain_id, vault, done.is_ok());
         let unkept = (client.chain_id, vault);
         match done {
@@ -1160,6 +1341,9 @@ async fn keep_one(
         return Ok(());
     }
     let timers = client.read(vault, IVault::timersCall {}).await?;
+    if !matches!(state, VaultState::None) {
+        validate_timers(client, vault, &timers)?;
+    }
     let from_block = deployments.deployed_block;
 
     if matches!(
@@ -5445,6 +5629,7 @@ async fn serve_status(address: SocketAddr) {
 
 mod attest;
 mod delayed;
+mod schedule;
 mod solana;
 mod solana_keys;
 
@@ -5462,6 +5647,74 @@ mod tests {
     use alloy::sol_types::SolCall;
     use chain::bindings::station::StationSpec;
     use chain::bindings::vault::{Claim, Valuation};
+
+    #[test]
+    fn keeper_timer_margins_accept_the_boundary_and_name_unsafe_values() {
+        for head in [1, 1_000, 2_000] {
+            for event in [1, 1_000, 2_000] {
+                for budget in [1, 1_000, 30_000] {
+                    let policy = chain::rpc_policy::RpcPolicy {
+                        head_poll_ms: head,
+                        event_scan_ms: event,
+                        read_budget_ms: budget,
+                        due_lookahead_ms: head + event + budget,
+                        ..Default::default()
+                    };
+                    policy.validate("a keeper").unwrap();
+                    let active = (head.max(event) + budget).div_ceil(1000);
+                    let lead = (head + event + budget).div_ceil(1000);
+                    let mut terms = stand_in::timers();
+                    terms.slotLead = lead;
+                    terms.slotWindow = active;
+                    terms.postDeadline = active;
+                    terms.haltGrace = active;
+                    terms.freezeAfter = active;
+                    terms.windDown = active;
+                    terms.activationWindow = active;
+                    terms.tankEscapeDelay = active;
+                    validate_timer_policy(&policy, Address::ZERO, &terms).unwrap();
+                    for name in [
+                        "slotLead",
+                        "slotWindow",
+                        "postDeadline",
+                        "haltGrace",
+                        "freezeAfter",
+                        "windDown",
+                        "activationWindow",
+                        "tankEscapeDelay",
+                    ] {
+                        let mut outside = terms.clone();
+                        let value = match name {
+                            "slotLead" => &mut outside.slotLead,
+                            "slotWindow" => &mut outside.slotWindow,
+                            "postDeadline" => &mut outside.postDeadline,
+                            "haltGrace" => &mut outside.haltGrace,
+                            "freezeAfter" => &mut outside.freezeAfter,
+                            "windDown" => &mut outside.windDown,
+                            "activationWindow" => &mut outside.activationWindow,
+                            _ => &mut outside.tankEscapeDelay,
+                        };
+                        *value -= 1;
+                        let error = validate_timer_policy(&policy, Address::ZERO, &outside)
+                            .unwrap_err()
+                            .to_string();
+                        assert!(error.contains(name), "{error}");
+                        assert!(error.contains("head_poll_ms") && error.contains("read_budget_ms"));
+                    }
+                }
+            }
+        }
+        let mut boundary = chain::rpc_policy::RpcPolicy::default();
+        let terms = stand_in::timers();
+        validate_timer_policy(&boundary, Address::ZERO, &terms).unwrap();
+        boundary.read_budget_ms += 1;
+        assert!(
+            validate_timer_policy(&boundary, Address::ZERO, &terms)
+                .unwrap_err()
+                .to_string()
+                .contains("slotLead")
+        );
+    }
 
     #[test]
     fn units_a_staged_close_holds_off_are_never_frozen_for_meanwhile() {
@@ -7383,6 +7636,7 @@ mod tests {
             "http://127.0.0.1:1",
             &mut memory,
             &mut Factories::default(),
+            &mut schedule::Schedule::default(),
         )
         .await;
         assert_eq!(
@@ -7399,6 +7653,7 @@ mod tests {
             "http://127.0.0.1:1",
             &mut memory,
             &mut Factories::default(),
+            &mut schedule::Schedule::default(),
         )
         .await;
         assert!(!UNPROBED.lock().unwrap().contains_key(&key));
@@ -11725,9 +11980,510 @@ mod tests {
             "http://127.0.0.1:1",
             &mut HashMap::new(),
             &mut Factories::default(),
+            &mut schedule::Schedule::default(),
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_recent_negative_header_does_not_hide_a_new_vault() {
+        let now = BETWEEN_SLOTS;
+        let node = node(now);
+        let factory = deployments().factory;
+        answers(&node, factory, IVaultFactory::vaultsCall {}, vec![VAULT]);
+        answers(
+            &node,
+            factory,
+            IReplacesFactory::previousCall {},
+            Address::ZERO,
+        );
+        a_replaced_factorys_vault(&node, now);
+        stand_in::takes(&node, VAULT, IVault::cancelCall {});
+        let client = connect(&node).await;
+        let current = client.head_details().await.unwrap();
+        let head = client.header_at(current.number - 1).await.unwrap();
+        let mut schedule = schedule::Schedule::default();
+        schedule.remember_test_parent(client.header_at(head.number - 1).await.unwrap());
+        schedule.remember_test_hint(
+            VAULT,
+            head.clone(),
+            schedule::Hint {
+                head: (head.number, head.hash),
+                due: now + DAY,
+                addresses: vec![VAULT, factory],
+                answered: None,
+            },
+        );
+        schedule.listed(vec![], vec![factory], true);
+        let mut memory = HashMap::new();
+        tick(
+            Chain::Base,
+            &client,
+            &deployments(),
+            KEEPER,
+            "http://127.0.0.1:1",
+            &mut memory,
+            &mut Factories::default(),
+            &mut schedule,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sent::<IVault::cancelCall>(&node, VAULT),
+            1,
+            "current ordinary factory discovery must include the newly listed vault"
+        );
+        assert_eq!(memory[&VAULT].rounds, 1);
+    }
+    #[tokio::test]
+    async fn a_recent_previous_head_does_not_skip_due_valuations() {
+        for block_time in [12u64, 3600] {
+            for payday in [false, true] {
+                let slot = 1_700_438_400u64; // Monday 20 November 2023, aligned to hours.
+                let now = slot - block_time;
+                let node = node(now);
+                node.lock().unwrap().block_time = block_time;
+                let priced = if payday { slot - 3600 } else { slot - DAY };
+                an_open_vault(&node, a_tank(now, 0, now));
+                a_quiet_vault(&node, priced);
+                let payment = if payday { slot - 7 * DAY } else { slot };
+                answers(&node, VAULT, IVault::lastPaymentCall {}, payment);
+                answers(
+                    &node,
+                    STATION,
+                    IStation::stageCall {},
+                    chain::bindings::station::Stage {
+                        fraction: U256::ZERO,
+                        owed: U256::ZERO,
+                        estimate: U256::ZERO,
+                        fetched: U256::ZERO,
+                        cost: U256::ZERO,
+                        part: U256::ZERO,
+                        arrivedAt: U256::ZERO,
+                        stagedAt: 0,
+                        stagedBlock: 0,
+                        sweptAt: 0,
+                        sweptBlock: 0,
+                        window: 0,
+                        delay: 0,
+                        forVault: true,
+                    },
+                );
+                let mut terms = timers();
+                terms.slotInterval = 3600;
+                answers(&node, VAULT, IVault::timersCall {}, terms.clone());
+                keeps_the_window(&node, terms.slotInterval, terms.slotWindow);
+                let factory = deployments().factory;
+                answers(&node, factory, IVaultFactory::vaultsCall {}, vec![VAULT]);
+                answers(
+                    &node,
+                    factory,
+                    IReplacesFactory::previousCall {},
+                    Address::ZERO,
+                );
+                answers(&node, STATION, IStation::specCall {}, a_spec(vec![]));
+                let client = connect(&node).await;
+                client.rpc_policy().validate("valuation clock").unwrap();
+                validate_timers(&client, VAULT, &terms).unwrap();
+                assert_eq!(block_interval(&client).await.unwrap(), block_time);
+                let current = client.head_details().await.unwrap();
+                let head = client.header_at(current.number - 1).await.unwrap();
+                let input = schedule::QuietInput {
+                    daily_at: now,
+                    logs_read_to: head.number + 1,
+                };
+                // Exactly the candidate's min expression. No external event occurs.
+                let due = input
+                    .daily_at
+                    .saturating_add(DAY)
+                    .min(priced.saturating_add(HEARTBEAT))
+                    .min(next_monday(payment));
+                assert_eq!(due, slot);
+                let mut schedule = schedule::Schedule::default();
+                schedule.remember_test_parent(client.header_at(head.number - 1).await.unwrap());
+                schedule.remember_test_hint(
+                    VAULT,
+                    head.clone(),
+                    schedule::Hint {
+                        head: (head.number, head.hash),
+                        due,
+                        addresses: vec![VAULT, STATION],
+                        answered: None,
+                    },
+                );
+                assert!(!schedule.sleeping(&client, VAULT, None));
+                let mut memory = HashMap::from([(
+                    VAULT,
+                    Memory {
+                        daily_at: Some(now),
+                        ..Memory::default()
+                    },
+                )]);
+                tick(
+                    Chain::Base,
+                    &client,
+                    &deployments(),
+                    KEEPER,
+                    "http://127.0.0.1:1",
+                    &mut memory,
+                    &mut Factories::default(),
+                    &mut schedule,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    sent::<IVault::recordValuationCall>(&node, VAULT),
+                    1,
+                    "a previous head must not suppress the current valuation opportunity"
+                );
+                assert_eq!(
+                    landing_slot(now, terms.slotInterval, terms.slotWindow, block_time),
+                    Some(slot)
+                );
+                if block_time == 12 {
+                    node.lock().unwrap().timestamp = slot;
+                    price(
+                        &client,
+                        KEEPER,
+                        VAULT,
+                        &terms,
+                        block_time,
+                        true,
+                        Halt::Running,
+                        &mut Memory::default(),
+                    )
+                    .await;
+                    assert_eq!(
+                        sent::<IVault::recordValuationCall>(&node, VAULT),
+                        1,
+                        "next head cannot recover the skipped window"
+                    );
+                    assert_eq!(
+                        landing_slot(slot, terms.slotInterval, terms.slotWindow, block_time),
+                        None
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn quiet_vaults_wake_for_the_next_block_heartbeat_and_payday() {
+        for block_time in [12u64, 3600] {
+            for payday in [false, true] {
+                let slot = 1_700_438_400u64; // Monday 20 November 2023, aligned to hours.
+                let now = slot - block_time;
+                let node = node(now);
+                node.lock().unwrap().block_time = block_time;
+                let priced = if payday { slot - 3600 } else { slot - DAY };
+                an_open_vault(&node, a_tank(now, 0, now));
+                a_quiet_vault(&node, priced);
+                let payment = if payday { slot - 7 * DAY } else { slot };
+                answers(&node, VAULT, IVault::lastPaymentCall {}, payment);
+                answers(
+                    &node,
+                    STATION,
+                    IStation::stageCall {},
+                    chain::bindings::station::Stage {
+                        fraction: U256::ZERO,
+                        owed: U256::ZERO,
+                        estimate: U256::ZERO,
+                        fetched: U256::ZERO,
+                        cost: U256::ZERO,
+                        part: U256::ZERO,
+                        arrivedAt: U256::ZERO,
+                        stagedAt: 0,
+                        stagedBlock: 0,
+                        sweptAt: 0,
+                        sweptBlock: 0,
+                        window: 0,
+                        delay: 0,
+                        forVault: true,
+                    },
+                );
+                let mut terms = timers();
+                terms.slotInterval = 3600;
+                answers(&node, VAULT, IVault::timersCall {}, terms.clone());
+                keeps_the_window(&node, terms.slotInterval, terms.slotWindow);
+                let factory = deployments().factory;
+                answers(&node, factory, IVaultFactory::vaultsCall {}, vec![VAULT]);
+                answers(
+                    &node,
+                    factory,
+                    IReplacesFactory::previousCall {},
+                    Address::ZERO,
+                );
+                answers(&node, STATION, IStation::specCall {}, a_spec(vec![]));
+                let client = connect(&node).await;
+                client.rpc_policy().validate("valuation clock").unwrap();
+                validate_timers(&client, VAULT, &terms).unwrap();
+                assert_eq!(block_interval(&client).await.unwrap(), block_time);
+                let head = client.head_details().await.unwrap();
+                let input = schedule::QuietInput {
+                    daily_at: now,
+                    logs_read_to: head.number + 1,
+                };
+                // Exactly the candidate's min expression. No external event occurs.
+                let due = input
+                    .daily_at
+                    .saturating_add(DAY)
+                    .min(priced.saturating_add(HEARTBEAT))
+                    .min(next_monday(payment));
+                assert_eq!(due, slot);
+                let mut schedule = schedule::Schedule::default();
+                schedule.remember_test_parent(client.header_at(head.number - 1).await.unwrap());
+                schedule.remember_test_hint(
+                    VAULT,
+                    head.clone(),
+                    schedule::Hint {
+                        head: (head.number, head.hash),
+                        due,
+                        addresses: vec![VAULT, STATION],
+                        answered: None,
+                    },
+                );
+                assert!(!schedule.sleeping(&client, VAULT, None));
+                let mut memory = HashMap::from([(
+                    VAULT,
+                    Memory {
+                        daily_at: Some(now),
+                        ..Memory::default()
+                    },
+                )]);
+                tick(
+                    Chain::Base,
+                    &client,
+                    &deployments(),
+                    KEEPER,
+                    "http://127.0.0.1:1",
+                    &mut memory,
+                    &mut Factories::default(),
+                    &mut schedule,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    sent::<IVault::recordValuationCall>(&node, VAULT),
+                    1,
+                    "the due valuation must prepare before the slot: block_time={block_time}, payday={payday}"
+                );
+                assert_eq!(
+                    landing_slot(now, terms.slotInterval, terms.slotWindow, block_time),
+                    Some(slot)
+                );
+                if block_time == 12 {
+                    node.lock().unwrap().timestamp = slot;
+                    price(
+                        &client,
+                        KEEPER,
+                        VAULT,
+                        &terms,
+                        block_time,
+                        true,
+                        Halt::Running,
+                        &mut Memory::default(),
+                    )
+                    .await;
+                    assert_eq!(
+                        sent::<IVault::recordValuationCall>(&node, VAULT),
+                        1,
+                        "next head cannot recover the skipped window"
+                    );
+                    assert_eq!(
+                        landing_slot(slot, terms.slotInterval, terms.slotWindow, block_time),
+                        None
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn quiet_rounds_still_remove_a_newly_revoked_approved_key() {
+        let now = BETWEEN_SLOTS;
+        let node = node(now);
+        an_open_vault(&node, a_tank(now, 0, now));
+        a_quiet_vault(&node, now);
+        let factory = deployments().factory;
+        let driver = name("local");
+        let key = Address::repeat_byte(0x79);
+        answers(&node, factory, IVaultFactory::vaultsCall {}, vec![VAULT]);
+        answers(
+            &node,
+            factory,
+            IReplacesFactory::previousCall {},
+            Address::ZERO,
+        );
+        answers(&node, VAULT, IVault::homeStationCall {}, STATION);
+        answers(&node, STATION, IStation::specCall {}, a_spec(vec![driver]));
+        answers(&node, STATION, IStation::approvedKeyCall { driver }, key);
+        // While the key stands, the ordinary simulation refuses its removal.
+        refuses(&node, STATION, IStation::revokeKeyCall { driver, key });
+        let client = stand_in::connect(&node).await;
+        let head = client.head_details().await.unwrap();
+        let mut schedule = schedule::Schedule::default();
+        schedule.remember_test_parent(client.header_at(head.number - 1).await.unwrap());
+        // The helper's certificate construction is tested separately. Here
+        // inject a completed observation which cannot authorize a quiet skip.
+        schedule.remember_test_hint(
+            VAULT,
+            head.clone(),
+            schedule::Hint {
+                head: (head.number, head.hash),
+                due: now + DAY,
+                addresses: vec![VAULT, STATION],
+                answered: None,
+            },
+        );
+        let mut memory = HashMap::from([(
+            VAULT,
+            Memory {
+                daily_at: Some(now),
+                ..Memory::default()
+            },
+        )]);
+        // A registry change now allows removal, before the next header is
+        // consumed. The retained hint cannot suppress ordinary state reads.
+        stand_in::takes(&node, STATION, IStation::revokeKeyCall { driver, key });
+        tick(
+            Chain::Base,
+            &client,
+            &deployments(),
+            KEEPER,
+            "http://127.0.0.1:1",
+            &mut memory,
+            &mut Factories::default(),
+            &mut schedule,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent::<IStation::revokeKeyCall>(&node, STATION), 1);
+        assert_eq!(memory[&VAULT].rounds, 1);
+        assert_eq!(memory[&VAULT].claim_rounds, 1);
+    }
+
+    #[tokio::test]
+    async fn a_quiet_vault_read_failure_does_not_hold_up_the_next_vault() {
+        let now = BETWEEN_SLOTS;
+        let node = node(now);
+        an_open_vault(&node, a_tank(now, 0, now));
+        a_quiet_vault(&node, now);
+        let factory = deployments().factory;
+        let first = Address::repeat_byte(0x7a);
+        let driver = name("local");
+        let key = Address::repeat_byte(0x79);
+        answers(
+            &node,
+            factory,
+            IVaultFactory::vaultsCall {},
+            vec![first, VAULT],
+        );
+        answers(
+            &node,
+            factory,
+            IReplacesFactory::previousCall {},
+            Address::ZERO,
+        );
+        answers(&node, first, IVault::stateCall {}, VaultState::Open);
+        answers(&node, first, IVault::timersCall {}, timers());
+        refuses(&node, first, IVault::homeStationCall {});
+        answers(&node, VAULT, IVault::homeStationCall {}, STATION);
+        answers(&node, STATION, IStation::specCall {}, a_spec(vec![driver]));
+        answers(&node, STATION, IStation::approvedKeyCall { driver }, key);
+        stand_in::takes(&node, STATION, IStation::revokeKeyCall { driver, key });
+        let client = stand_in::connect(&node).await;
+        let head = client.head_details().await.unwrap();
+        let mut schedule = schedule::Schedule::default();
+        schedule.remember_test_parent(client.header_at(head.number - 1).await.unwrap());
+        let mut memory = HashMap::new();
+        for vault in [first, VAULT] {
+            schedule.remember_test_hint(
+                vault,
+                head.clone(),
+                schedule::Hint {
+                    head: (head.number, head.hash),
+                    due: now + DAY,
+                    addresses: vec![vault, STATION],
+                    answered: None,
+                },
+            );
+            memory.insert(
+                vault,
+                Memory {
+                    daily_at: Some(now),
+                    ..Memory::default()
+                },
+            );
+        }
+        tick(
+            Chain::Base,
+            &client,
+            &deployments(),
+            KEEPER,
+            "http://127.0.0.1:1",
+            &mut memory,
+            &mut Factories::default(),
+            &mut schedule,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent::<IStation::revokeKeyCall>(&node, STATION), 1);
+        assert_eq!(memory[&first].rounds, 1);
+        assert_eq!(memory[&VAULT].rounds, 1);
+        assert!(quiet_input(client.chain_id, first, &memory[&first]).is_none());
+        let step = (client.chain_id, first, "read the vault's home station");
+        assert!(!STEPS_FAILED.lock().unwrap().get(&step).unwrap().this_round);
+        // A successful ordinary round clears all previous step failures.
+        answers(&node, first, IVault::stateCall {}, VaultState::None);
+        tick(
+            Chain::Base,
+            &client,
+            &deployments(),
+            KEEPER,
+            "http://127.0.0.1:1",
+            &mut memory,
+            &mut Factories::default(),
+            &mut schedule,
+        )
+        .await
+        .unwrap();
+        assert_eq!(memory[&first].rounds_failing, 0);
+        assert!(!STEPS_FAILED.lock().unwrap().contains_key(&step));
+        assert!(quiet_input(client.chain_id, first, &memory[&first]).is_some());
+    }
+
+    #[tokio::test]
+    async fn startup_checks_every_discovered_vault_before_any_send() {
+        let node = node(BETWEEN_SLOTS);
+        let factory = deployments().factory;
+        let other = Address::repeat_byte(0x79);
+        answers(
+            &node,
+            factory,
+            IVaultFactory::vaultsCall {},
+            vec![VAULT, other],
+        );
+        answers(
+            &node,
+            factory,
+            IReplacesFactory::previousCall {},
+            Address::ZERO,
+        );
+        answers(&node, VAULT, IVault::timersCall {}, stand_in::timers());
+        let mut unsafe_timers = stand_in::timers();
+        unsafe_timers.slotWindow = 2;
+        answers(&node, other, IVault::timersCall {}, unsafe_timers);
+        let client = stand_in::connect(&node).await;
+        let error = validate_known_timers(&client, factory)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&other.to_string()) && error.contains("slotWindow=2s"));
+        assert!(everything_sent(&node).is_empty());
+        answers(&node, other, IVault::timersCall {}, stand_in::timers());
+        validate_known_timers(&client, factory).await.unwrap();
+        assert!(everything_sent(&node).is_empty());
     }
 
     #[tokio::test]

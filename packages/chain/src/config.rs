@@ -314,6 +314,7 @@ impl Network {
 pub struct ChainConfigs {
     chains: BTreeMap<ChainKey, ChainConfig>,
     networks: BTreeMap<NetworkName, Network>,
+    rpc: crate::rpc_policy::RpcPolicies,
 }
 
 /// The file, as written.
@@ -323,6 +324,8 @@ struct File {
     chains: BTreeMap<String, ChainConfig>,
     #[serde(default)]
     networks: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default)]
+    rpc: crate::rpc_policy::RpcPolicies,
 }
 
 impl ChainConfigs {
@@ -444,7 +447,25 @@ impl ChainConfigs {
             );
         }
 
-        Ok(Self { chains, networks })
+        file.rpc.defaults.validate("defaults")?;
+        for key in file.rpc.chains.keys() {
+            if !chains.contains_key(key) {
+                return Err(ConfigError::new(format!(
+                    "RPC settings name {key}, which has no chain configuration"
+                )));
+            }
+            file.rpc.for_chain(key).validate(&key.to_string())?;
+        }
+        Ok(Self {
+            chains,
+            networks,
+            rpc: file.rpc,
+        })
+    }
+
+    /// Reader defaults with only this chain's explicit overrides applied.
+    pub fn rpc_policy(&self, key: &ChainKey) -> crate::rpc_policy::RpcPolicy {
+        self.rpc.for_chain(key)
     }
 
     /// Read the file at `path`, with overrides from the process environment.
@@ -495,7 +516,7 @@ impl ChainConfigs {
 pub struct ConfigError(String);
 
 impl ConfigError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self(message.into())
     }
 }

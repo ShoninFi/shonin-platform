@@ -24,6 +24,15 @@ pub fn selector<C: SolCall>() -> String {
     format!("0x{}", alloy::hex::encode(C::SELECTOR))
 }
 
+/// The requested numbered header, or the current head for a dynamic tag.
+pub fn requested_block(request: &Value, head: u64) -> u64 {
+    request["params"][0]
+        .as_str()
+        .and_then(|tag| tag.strip_prefix("0x"))
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        .unwrap_or(head)
+}
+
 /// What a request asks for: the call's input, lowercased, for `eth_call`.
 pub fn input(request: &Value) -> String {
     request["params"][0]["input"]
@@ -35,9 +44,17 @@ pub fn input(request: &Value) -> String {
 
 /// Whether a log request is for the vault's own logs.
 pub fn asks_the_vault(request: &Value) -> bool {
-    request["params"][0]["address"]
+    let address = &request["params"][0]["address"];
+    address
         .as_str()
         .is_some_and(|address| address.to_lowercase().ends_with(VAULT))
+        || address.as_array().is_some_and(|addresses| {
+            addresses.iter().any(|address| {
+                address
+                    .as_str()
+                    .is_some_and(|address| address.to_lowercase().ends_with(VAULT))
+            })
+        })
 }
 
 /// A log of the vault's, in `block` at `index`.
@@ -88,7 +105,9 @@ pub async fn a_node(answer: Answer) -> String {
                                         alloy::rpc::types::Transaction,
                                     >::default(
                                     );
-                                    block.header.inner.number = 0x10;
+                                    let number = requested_block(&request, 0x10);
+                                    block.header.inner.number = number;
+                                    block.header.hash = B256::repeat_byte(number as u8);
                                     block.header.inner.timestamp = 1_790_000_000;
                                     ok(serde_json::to_value(block).unwrap())
                                 }
@@ -113,6 +132,19 @@ pub async fn a_node(answer: Answer) -> String {
                             }
                         }
                     };
+                    let mut reply = reply;
+                    if request["method"] == "eth_getLogs"
+                        && let Some(logs) = reply["result"].as_array_mut()
+                    {
+                        let filter: alloy::rpc::types::Filter =
+                            serde_json::from_value(request["params"][0].clone()).unwrap();
+                        logs.retain(|log| {
+                            filter.rpc_matches(
+                                &serde_json::from_value::<alloy::rpc::types::Log>(log.clone())
+                                    .unwrap(),
+                            )
+                        });
+                    }
                     axum::Json(reply)
                 }
             }),

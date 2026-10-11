@@ -188,9 +188,9 @@ pub(crate) struct Memory {
 }
 
 impl Memory {
-    pub fn due(&self, now: Instant) -> bool {
+    pub fn due(&self, now: Instant, every: Duration) -> bool {
         self.last
-            .is_none_or(|last| now.duration_since(last) >= crate::attest::EVERY)
+            .is_none_or(|last| now.duration_since(last) >= every)
     }
 
     pub fn looked(&mut self, at: Instant) {
@@ -501,7 +501,7 @@ pub(crate) async fn keep_keys(
     let mut said = crate::Said::default();
     loop {
         let at = Instant::now();
-        if memory.due(at) {
+        if memory.due(at, Duration::from_millis(client.rpc_policy().key_look_ms)) {
             let looked = match published(&http, &executor).await {
                 Ok(published) => {
                     let registry = OnCluster {
@@ -517,7 +517,8 @@ pub(crate) async fn keep_keys(
                     memory.looked(at);
                     if service {
                         tracing::debug!(%cluster, source = executor, error = format!("{error:#}"), "the service does not answer");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        tokio::time::sleep(Duration::from_millis(client.rpc_policy().key_poll_ms))
+                            .await;
                         continue;
                     }
                     Err(error)
@@ -539,12 +540,28 @@ pub(crate) async fn keep_keys(
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_millis(client.rpc_policy().key_poll_ms)).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configured_key_looks_are_due_at_the_boundary_and_rearm_after_a_look() {
+        for millis in [1, 1_000, 15_000] {
+            let every = std::time::Duration::from_millis(millis);
+            let start = std::time::Instant::now();
+            let mut memory = super::Memory::default();
+            assert!(memory.due(start, every));
+            memory.looked(start);
+            assert!(!memory.due(start + every - std::time::Duration::from_nanos(1), every));
+            assert!(memory.due(start + every, every));
+            memory.looked(start + every);
+            assert!(!memory.due(start + every, every));
+            assert!(memory.due(start + every * 2, every));
+        }
+    }
+
     use super::*;
     use std::sync::Mutex;
 

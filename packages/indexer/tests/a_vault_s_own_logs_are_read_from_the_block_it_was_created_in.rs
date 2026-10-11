@@ -9,6 +9,8 @@
 //! Here: the platform was deployed at block 1; the one vault was created at
 //! block 40,000, the head is 40,100.
 
+mod stand_in;
+
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -44,7 +46,7 @@ fn shares(count: u64) -> U256 {
 fn a_log(address: Address, data: LogData, block: u64, log_index: u64) -> Value {
     let log = alloy::rpc::types::Log {
         inner: Primitive { address, data },
-        block_hash: Some(B256::repeat_byte(1)),
+        block_hash: Some(B256::repeat_byte(block as u8)),
         block_number: Some(block),
         block_timestamp: Some(1_790_000_000 + block),
         transaction_hash: Some(B256::repeat_byte(2)),
@@ -168,7 +170,9 @@ async fn a_node(asked_from: Arc<Mutex<Vec<u64>>>) -> SocketAddr {
                     "eth_getBlockByNumber" => {
                         let mut block =
                             alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
-                        block.header.inner.number = HEAD;
+                        let number = stand_in::requested_block(&request, HEAD);
+                        block.header.inner.number = number;
+                        block.header.hash = B256::repeat_byte(number as u8);
                         block.header.inner.timestamp = 1_790_000_000 + HEAD;
                         answer(serde_json::to_value(block).unwrap())
                     }
@@ -213,6 +217,18 @@ async fn a_node(asked_from: Arc<Mutex<Vec<u64>>>) -> SocketAddr {
                     }
                     _ => answer(json!([])),
                 };
+                let mut reply = reply;
+                if method == "eth_getLogs"
+                    && let Some(logs) = reply["result"].as_array_mut()
+                {
+                    let filter: alloy::rpc::types::Filter =
+                        serde_json::from_value(request["params"][0].clone()).unwrap();
+                    logs.retain(|log| {
+                        filter.rpc_matches(
+                            &serde_json::from_value::<alloy::rpc::types::Log>(log.clone()).unwrap(),
+                        )
+                    });
+                }
                 axum::Json(reply)
             }
         }),

@@ -10,7 +10,7 @@ use axum::Router;
 use axum::http::StatusCode;
 use axum::routing::post;
 use chain::{ChainConfig, ChainKey, Client, Deployments, Served, Signing};
-use indexer::{HEALTH_LINE, Indexer, STALE_AFTER};
+use indexer::{HEALTH_LINE, Indexer, stale_after};
 
 /// A node that answers as chain `chain_id` at block 0x10, has no vaults and
 /// no logs.
@@ -165,7 +165,7 @@ async fn a_chain_read_lately_is_up_and_one_not_read_lately_is_not() {
     assert!(said.contains("base: read"), "{said}");
 
     // As it would read once the chain has gone unread past the limit.
-    let later = Instant::now() + STALE_AFTER + Duration::from_secs(60);
+    let later = Instant::now() + stale_after() + Duration::from_secs(60);
     let (up, said) = indexer.health_at("indexer", later);
     assert!(!up, "{said}");
     assert!(

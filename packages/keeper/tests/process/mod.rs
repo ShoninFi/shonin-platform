@@ -426,6 +426,15 @@ pub fn start_keeper(test: &str, rpc: &str, executor: &str) -> Keeper {
     start_keeper_on(test, &[("base", 31337, rpc)], executor)
 }
 
+pub fn start_keeper_with_service(test: &str, rpc: &str, executor: &str, service: &str) -> Keeper {
+    start(
+        test,
+        &[("base", 31337, rpc)],
+        executor,
+        &["--service-attestation-urls", service],
+    )
+}
+
 /// [`start_keeper`], with a halted vault's close held for its bill, and a
 /// closed vault's last bill waited for, `seconds` on the keeper's own clock
 /// rather than fifteen minutes: the chain's clock, which the test moves,

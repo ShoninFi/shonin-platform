@@ -380,6 +380,7 @@ impl Target {
             signing_with_roles(self.network, roles.as_ref())?,
         )
         .await
+        .map(|client| client.with_rpc_policy(self.configs.rpc_policy(&self.key)))
     }
 
     /// The role accounts this chain's deployment names, if it is to hand.
@@ -429,7 +430,9 @@ impl Target {
     /// Connect to this target's Solana cluster, waiting for it to answer,
     /// and check it is the cluster its key names.
     pub async fn connect_solana(&self) -> Result<SolanaClient> {
-        connect_solana(self.network, &self.key, &self.config).await
+        connect_solana(self.network, &self.key, &self.config)
+            .await
+            .map(|client| client.with_rpc_policy(self.configs.rpc_policy(&self.key)))
     }
 
     /// Connect to this Solana cluster and wait for its deployment, set up

@@ -25,6 +25,9 @@ mod http_retry;
 pub mod logs;
 #[cfg(feature = "rpc")]
 pub mod rpc_counts;
+pub mod rpc_policy;
+#[cfg(feature = "rpc")]
+pub mod sealed_views;
 #[cfg(feature = "solana")]
 pub mod solana;
 

@@ -9,6 +9,8 @@
 //! paid (the supply now 50); and one first read already paid, its payment
 //! in the vault's log, with deposits since bringing the supply to 150.
 
+mod stand_in;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,7 +50,7 @@ fn the_payment() -> Value {
             address: vault,
             data: event.encode_log_data(),
         },
-        block_hash: Some(B256::repeat_byte(1)),
+        block_hash: Some(B256::repeat_byte(PAID_IN as u8)),
         block_number: Some(PAID_IN),
         block_timestamp: Some(1_790_000_000),
         transaction_hash: Some(B256::repeat_byte(2)),
@@ -76,9 +78,7 @@ async fn a_node(paid: Arc<AtomicBool>, logged: bool) -> SocketAddr {
                     "eth_chainId" => answer(json!("0x7a69")),
                     "eth_blockNumber" => answer(json!(if logged { "0x10" } else { "0x1" })),
                     "eth_getLogs" => {
-                        let asks_the_vault = request["params"][0]["address"]
-                            .as_str()
-                            .is_some_and(|address| address.to_lowercase().ends_with(VAULT));
+                        let asks_the_vault = stand_in::asks_the_vault(&request);
                         answer(if logged && asks_the_vault {
                             json!([the_payment()])
                         } else {
@@ -88,7 +88,10 @@ async fn a_node(paid: Arc<AtomicBool>, logged: bool) -> SocketAddr {
                     "eth_getBlockByNumber" => {
                         let mut block =
                             alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
-                        block.header.inner.number = if logged { 0x10 } else { 1 };
+                        let number =
+                            stand_in::requested_block(&request, if logged { 0x10 } else { 1 });
+                        block.header.inner.number = number;
+                        block.header.hash = B256::repeat_byte(number as u8);
                         block.header.inner.timestamp = 1_790_000_000;
                         answer(serde_json::to_value(block).unwrap())
                     }
@@ -148,6 +151,18 @@ async fn a_node(paid: Arc<AtomicBool>, logged: bool) -> SocketAddr {
                     }
                     _ => answer(json!([])),
                 };
+                let mut reply = reply;
+                if method == "eth_getLogs"
+                    && let Some(logs) = reply["result"].as_array_mut()
+                {
+                    let filter: alloy::rpc::types::Filter =
+                        serde_json::from_value(request["params"][0].clone()).unwrap();
+                    logs.retain(|log| {
+                        filter.rpc_matches(
+                            &serde_json::from_value::<alloy::rpc::types::Log>(log.clone()).unwrap(),
+                        )
+                    });
+                }
                 axum::Json(reply)
             }
         }),

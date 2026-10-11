@@ -6,6 +6,8 @@
 //!
 //! Here: a node holding one fill of the vault's station.
 
+mod stand_in;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -93,7 +95,9 @@ async fn a_node() -> SocketAddr {
                 "eth_getBlockByNumber" => {
                     let mut block =
                         alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
-                    block.header.inner.number = 1;
+                    let number = stand_in::requested_block(&request, 1);
+                    block.header.inner.number = number;
+                    block.header.hash = B256::repeat_byte(number as u8);
                     block.header.inner.timestamp = 1_790_000_000;
                     answer(serde_json::to_value(block).unwrap())
                 }

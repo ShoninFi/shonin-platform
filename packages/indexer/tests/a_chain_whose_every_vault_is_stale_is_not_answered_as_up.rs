@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use chain::bindings::vault::IVault;
-use indexer::STALE_AFTER;
+use indexer::stale_after;
 use stand_in::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -49,7 +49,7 @@ async fn a_chain_whose_every_vault_is_stale_is_not_answered_as_up() {
     assert!(up, "a moment's stale vaults are no outage: {said}");
     // Past STALE_AFTER since the chain was last read whole, and not since it
     // was last asked.
-    let later = read_whole + STALE_AFTER + Duration::from_secs(1);
+    let later = read_whole + stale_after() + Duration::from_secs(1);
     let (up, said) = indexer.health_at("indexer", later);
     assert!(
         !up,

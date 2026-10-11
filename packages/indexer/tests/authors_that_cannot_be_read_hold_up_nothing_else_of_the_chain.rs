@@ -24,7 +24,9 @@ async fn authors_that_cannot_be_read_hold_up_nothing_else_of_the_chain() {
                 "eth_getBlockByNumber" => {
                     let mut block =
                         alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
-                    block.header.inner.number = head;
+                    let number = requested_block(request, head);
+                    block.header.inner.number = number;
+                    block.header.hash = alloy::primitives::B256::repeat_byte(number as u8);
                     block.header.inner.timestamp = 1_790_000_000 + head;
                     Some(Ok(serde_json::to_value(block).unwrap()))
                 }

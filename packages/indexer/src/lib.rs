@@ -1,9 +1,9 @@
 //! The reference indexer.
 //!
 //! It follows every vault chain and turns each vault's value per share into a
-//! record, holding one snapshot that carries everything a page renders, so
-//! every figure on the screen comes from the same moment. It needs no enclave and
-//! holds no key: anyone can run their own and compare.
+//! record, holding one snapshot that carries everything a page renders. Chain
+//! observations and authenticated executor reports retain their own dates. It
+//! needs no enclave and holds no key: anyone can run their own and compare.
 //!
 //! The binary in this crate only reads. The web app's API runs the same
 //! indexer in-process and serves what it holds.
@@ -199,6 +199,13 @@ enum Source {
 }
 
 impl Reader {
+    fn rpc_policy(&self) -> &chain::rpc_policy::RpcPolicy {
+        match &self.source {
+            Source::Evm { served, .. } => served.client.rpc_policy(),
+            Source::Solana { served, .. } => served.client.rpc_policy(),
+        }
+    }
+
     /// The EVM chain this reads, if it is one.
     pub fn evm(&self) -> Option<&Served> {
         match &self.source {
@@ -238,6 +245,36 @@ struct Read {
     /// Everyone who has published on it, by address.
     authors: Vec<(ChainAddress, Author)>,
     feed: Vec<FeedEvent>,
+}
+
+/// Compare chain-derived data, excluding the observation time/head and
+/// independently authenticated executor reports. A skipped interval never
+/// advances the date or health of the previous chain observation.
+fn same_record(a: &Read, b: &Read) -> bool {
+    let data = |read: &Read| {
+        let mut strategies = read.strategies.clone();
+        for strategy in &mut strategies {
+            strategy.health = None;
+        }
+        serde_json::to_vec(&(strategies, read.trades, &read.authors, &read.feed)).ok()
+    };
+    data(a).zip(data(b)).is_some_and(|(a, b)| a == b)
+}
+
+fn record_pause(
+    previous: Duration,
+    changed: bool,
+    policy: &chain::rpc_policy::RpcPolicy,
+) -> Duration {
+    let active = Duration::from_millis(policy.indexer_poll_ms);
+    if changed {
+        active
+    } else {
+        previous
+            .saturating_mul(policy.indexer_backoff_factor as u32)
+            .max(active)
+            .min(Duration::from_millis(policy.indexer_idle_max_ms))
+    }
 }
 
 /// The build queue as last read: the jobs the build service last gave, when
@@ -711,7 +748,19 @@ impl Indexer {
             .write()
             .await
             .insert((chain, vault), post.clone());
-        health.insert((chain, vault), post.report);
+        health.insert((chain, vault), post.report.clone());
+        // Publish the authenticated report independently of the chain read
+        // cadence, without advancing any chain observation date. Holding the
+        // report lock through publication also orders this against compose.
+        let mut snapshot = self.snapshot.write().await;
+        for strategy in &mut snapshot.strategies {
+            if strategy.vault.chain == chain
+                && strategy.vault.address.parse::<ChainAddress>().ok() == Some(vault)
+            {
+                strategy.health = Some(post.report.clone());
+            }
+        }
+        snapshot.version += 1;
         HealthVerdict::Taken
     }
 
@@ -720,7 +769,7 @@ impl Indexer {
         self.signed.read().await.get(&(chain, vault)).cloned()
     }
 
-    /// Keep reading, every couple of seconds, for as long as the process
+    /// Keep reading at each chain's configured active or idle interval, while the process
     /// runs: each chain, and the queue, on a loop of its own, so a slow one
     /// holds back no other. A chain is taken up as soon as it connects.
     pub async fn run(&self) {
@@ -739,9 +788,12 @@ impl Indexer {
             for reader in self.readers() {
                 if started.insert(reader.vault_chain) {
                     running.push(Box::pin(async move {
+                        let policy = reader.rpc_policy();
+                        let mut pause = Duration::from_millis(policy.indexer_poll_ms);
                         loop {
-                            self.refresh_chain(&reader).await;
-                            tokio::time::sleep(PAUSE).await;
+                            let changed = self.refresh_chain(&reader).await;
+                            pause = record_pause(pause, changed, policy);
+                            tokio::time::sleep(pause).await;
                         }
                     }));
                 }
@@ -771,10 +823,14 @@ impl Indexer {
     /// them) is put in place too, each vault marked, but is not taken for a
     /// read of the chain: its health says so once that has lasted (see
     /// [`Indexer::health_at`]).
-    async fn refresh_chain(&self, reader: &Reader) {
+    async fn refresh_chain(&self, reader: &Reader) -> bool {
         let health = self.health.read().await.clone();
         match self.read_one(reader, &health).await {
             Ok(read) => {
+                let any_vault_stale = read
+                    .strategies
+                    .iter()
+                    .any(|strategy| strategy.stale_as_of.is_some());
                 let every_vault_stale = !read.strategies.is_empty()
                     && read
                         .strategies
@@ -783,15 +839,22 @@ impl Indexer {
                 reader
                     .every_vault_stale
                     .store(every_vault_stale, std::sync::atomic::Ordering::SeqCst);
-                self.parts.write().await.insert(reader.vault_chain, read);
+                let mut parts = self.parts.write().await;
+                let changed = parts
+                    .get(&reader.vault_chain)
+                    .is_none_or(|previous| !same_record(previous, &read));
+                parts.insert(reader.vault_chain, read);
+                drop(parts);
                 if !every_vault_stale {
                     *reader.read_at.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some(Instant::now());
                 }
                 self.compose().await;
+                changed || any_vault_stale
             }
             Err(error) => {
                 tracing::warn!(chain = %reader.key, error = format!("{error:#}"), "could not read this chain");
+                true
             }
         }
     }
@@ -940,6 +1003,14 @@ impl Indexer {
             trades,
         };
 
+        // Retain this lock until snapshot publication: a newer accepted
+        // report must not be overwritten by an older concurrent compose.
+        let health = self.health.read().await;
+        for strategy in &mut strategies {
+            if let Ok(vault) = strategy.vault.address.parse::<ChainAddress>() {
+                strategy.health = health.get(&(strategy.vault.chain, vault)).cloned();
+            }
+        }
         let mut snapshot = self.snapshot.write().await;
         snapshot.version += 1;
         snapshot.as_of = read::moment(latest);
@@ -970,7 +1041,7 @@ impl Indexer {
             let read_at = *reader.read_at.lock().unwrap_or_else(|e| e.into_inner());
             let since = read_at.unwrap_or(reader.connected);
             let quiet = now.saturating_duration_since(since);
-            if quiet > STALE_AFTER {
+            if quiet > Duration::from_millis(reader.rpc_policy().indexer_stale_ms) {
                 let what = if reader
                     .every_vault_stale
                     .load(std::sync::atomic::Ordering::SeqCst)
@@ -1025,14 +1096,50 @@ impl Indexer {
             }
         };
         let chain = &served.client;
-        let (head, now) = chain.head_and_time().await?;
+        let mut history = history.write().await;
+        let (head, now, identity) = chain.head_observation().await?;
+        if let Some((number, hash)) = history.anchor
+            && (head < number || chain.block_identity(number).await? != hash)
+        {
+            // Every cursor and derived immutable record may belong to the
+            // replaced branch. Rebuild rather than keep any as current.
+            history.reset_branch();
+        }
+        let verified = chain.verifying_logs(head, identity);
+        let chain = &verified;
+        let observed = if let Some((number, _)) = history.anchor
+            && number < head
+        {
+            match chain
+                .capture_logs(
+                    history.log_addresses(&served.deployments),
+                    number + 1,
+                    head,
+                    identity,
+                )
+                .await
+            {
+                Ok(observed) => observed,
+                Err(error) => {
+                    tracing::debug!(chain = %reader.key, error = format!("{error:#}"),
+                        "shared log observation unavailable; reading streams independently");
+                    chain.clone()
+                }
+            }
+        } else {
+            chain.clone()
+        };
+        let chain = &observed;
+        // Even a partially failed pass may advance individual cursors. Keep
+        // its branch identity so the next pass validates those too; this is
+        // not a claim that the pass completed or may be published.
+        history.anchor = Some((head, identity));
         let health: HashMap<Address, Health> = health
             .iter()
             .filter(|((on, _), _)| *on == served.vault_chain)
             .filter_map(|((_, vault), report)| Some((Address::from(vault.evm()?), report.clone())))
             .collect();
 
-        let mut history = history.write().await;
         let strategies = read::strategies(
             chain,
             served.vault_chain,
@@ -1052,6 +1159,11 @@ impl Indexer {
                 .map(|(address, author)| (ChainAddress::Evm(address.0.0), author))
                 .collect(),
             Err(error) => {
+                if history.discard_previous {
+                    return Err(
+                        error.context("authors must be rebuilt after the observed branch changed")
+                    );
+                }
                 tracing::warn!(chain = %served.key, %error, "could not read the authors; kept them as last read");
                 self.parts
                     .read()
@@ -1074,6 +1186,18 @@ impl Indexer {
             .iter()
             .map(|strategy| read::trade_count(&history, strategy))
             .sum();
+        match chain.block_identity(head).await {
+            Ok(current) if current == identity => {
+                history.anchor = Some((head, identity));
+                history.discard_previous = false;
+            }
+            checked => {
+                history.reset_branch();
+                anyhow::bail!(
+                    "the record's observed head changed or could not be verified: {checked:?}"
+                );
+            }
+        }
         drop(history);
         Ok(Read {
             info: ChainInfo {
@@ -1463,7 +1587,9 @@ const PAUSE: Duration = Duration::from_secs(2);
 
 /// How long a chain may go unread before its health says so: well past a
 /// slow read, and far short of a record anyone would trust.
-pub const STALE_AFTER: Duration = Duration::from_secs(3 * 60);
+pub fn stale_after() -> Duration {
+    Duration::from_millis(chain::rpc_policy::RpcPolicy::default().indexer_stale_ms)
+}
 
 /// The longest first line a health route gives: a dashboard shows it in a
 /// row.
@@ -1504,6 +1630,72 @@ fn empty_snapshot() -> Snapshot {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn idle_record_backoff_is_bounded_and_any_change_restores_active_reads() {
+        for active in [1, 2_000, 60_000] {
+            for maximum in [active, active * 2, active * 4] {
+                for factor in [1, 2, 16] {
+                    let policy = chain::rpc_policy::RpcPolicy {
+                        indexer_poll_ms: active,
+                        indexer_idle_max_ms: maximum,
+                        indexer_stale_ms: maximum * 2,
+                        indexer_backoff_factor: factor,
+                        ..Default::default()
+                    };
+                    policy.validate("a record reader").unwrap();
+                    let mut pause = Duration::from_millis(active);
+                    for _ in 0..100 {
+                        pause = record_pause(pause, false, &policy);
+                        assert!(pause >= Duration::from_millis(active));
+                        assert!(pause <= Duration::from_millis(maximum));
+                    }
+                    assert_eq!(
+                        record_pause(pause, true, &policy),
+                        Duration::from_millis(active)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_later_observation_is_idle_only_when_its_displayed_record_is_unchanged() {
+        let a = Read {
+            info: ChainInfo {
+                chain: Chain::Base,
+                key: "evm:1".into(),
+                chain_id: Some(1),
+                block: 1,
+                as_of: None,
+            },
+            now: 1,
+            strategies: Vec::new(),
+            trades: 0,
+            authors: Vec::new(),
+            feed: Vec::new(),
+        };
+        let mut b = a.clone();
+        b.now = 100;
+        b.info.block = 100;
+        assert!(same_record(&a, &b));
+        b.trades = 1;
+        assert!(!same_record(&a, &b));
+        b.trades = 0;
+        b.strategies.push(read::placeholder(
+            Chain::Base,
+            1,
+            "author".into(),
+            "author".into(),
+            "vault".into(),
+        ));
+        assert!(!same_record(&a, &b));
+        let before = b.clone();
+        b.strategies[0].health = Some(a_post(1_800_000_100, "new").report);
+        assert!(same_record(&before, &b));
+        b.strategies[0].days_live += 1;
+        assert!(!same_record(&before, &b));
+    }
+
     use super::*;
 
     fn a_post(updated: u64, signature: &str) -> HealthPost {
@@ -1552,6 +1744,56 @@ mod tests {
                 .signed_health(Chain::Hyperliquid, vault)
                 .await
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_reports_publish_without_advancing_the_chain_observation() {
+        let indexer = Indexer::new(vec![Chain::Base], std::env::temp_dir(), None);
+        let vault = ChainAddress::Evm([0x11; 20]);
+        let strategy = read::placeholder(
+            Chain::Base,
+            1,
+            "author".into(),
+            "author".into(),
+            vault.to_string(),
+        );
+        let mut other_chain = strategy.clone();
+        other_chain.vault.chain = Chain::Hyperliquid;
+        let old_date = read::moment(1_800_000_000);
+        {
+            let mut snapshot = indexer.snapshot.write().await;
+            snapshot.as_of = old_date;
+            snapshot.strategies = vec![strategy, other_chain];
+        }
+        assert!(matches!(
+            indexer
+                .keep_health(Chain::Base, vault, a_post(1_800_000_100, "new"))
+                .await,
+            HealthVerdict::Taken
+        ));
+        {
+            let snapshot = indexer.snapshot.read().await;
+            assert_eq!(snapshot.as_of, old_date);
+            assert_eq!(
+                snapshot.strategies[0].health.as_ref().unwrap().at,
+                1_800_000_100
+            );
+            assert!(snapshot.strategies[1].health.is_none());
+        }
+        assert!(matches!(
+            indexer
+                .keep_health(Chain::Base, vault, a_post(1_800_000_050, "old"))
+                .await,
+            HealthVerdict::Stale
+        ));
+        assert_eq!(
+            indexer.snapshot.read().await.strategies[0]
+                .health
+                .as_ref()
+                .unwrap()
+                .at,
+            1_800_000_100
         );
     }
 

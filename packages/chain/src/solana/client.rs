@@ -139,7 +139,7 @@ impl std::fmt::Display for MayStillLand {
 }
 
 /// The seconds the cluster's clock sysvar holds.
-fn clock_seconds(clock: Option<&rpc::Account>) -> Result<u64> {
+pub(super) fn clock_seconds(clock: Option<&rpc::Account>) -> Result<u64> {
     let clock = clock.ok_or_else(|| anyhow!("the cluster has no clock"))?;
     let bytes: [u8; 8] = clock
         .data
@@ -196,6 +196,7 @@ impl Landed {
 /// A connection to one Solana cluster.
 #[derive(Clone)]
 pub struct SolanaClient {
+    policy: crate::rpc_policy::RpcPolicy,
     pub rpc: Rpc,
     pub key: ChainKey,
     /// The cluster's name: the chain key's id (`localnet`).
@@ -211,6 +212,27 @@ pub struct SolanaClient {
 type KeyTables = Arc<tokio::sync::Mutex<Option<Vec<Table>>>>;
 
 impl SolanaClient {
+    /// A read-only observer with independent rate-limit pacing. Its optional
+    /// failures never make the money connection wait, and it cannot sign.
+    pub fn optional_reader(&self) -> Self {
+        Self {
+            rpc: self.rpc.isolated(),
+            signing: Arc::new(Signing::ReadOnly),
+            ..self.clone()
+        }
+    }
+
+    /// Reader settings selected for this connection's chain.
+    pub fn rpc_policy(&self) -> &crate::rpc_policy::RpcPolicy {
+        &self.policy
+    }
+
+    /// Apply already validated chain configuration before handing out clones.
+    pub(crate) fn with_rpc_policy(mut self, policy: crate::rpc_policy::RpcPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
     /// Connect, waiting for the cluster to answer, and check it is the
     /// cluster `key` names. The keys are the network's
     /// ([`Signing::for_network`]): every role's locally and with the team's
@@ -260,6 +282,7 @@ impl SolanaClient {
         check_cluster(&key.id, &genesis_hash, &config.label)?;
         Ok(Self {
             rpc,
+            policy: crate::rpc_policy::RpcPolicy::default(),
             key: key.clone(),
             cluster: key.id.clone(),
             genesis_hash,

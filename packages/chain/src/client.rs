@@ -136,9 +136,33 @@ pub const ROLES: [Role; ROLE_COUNT] = [
     Role::Viewer,
 ];
 
+/// One canonical header observation, including its event-address bloom.
+#[derive(Clone, Debug)]
+pub struct HeadObservation {
+    pub number: u64,
+    pub timestamp: u64,
+    pub hash: B256,
+    pub parent_hash: B256,
+    pub logs_bloom: alloy::primitives::Bloom,
+}
+
+impl HeadObservation {
+    /// A negative address bloom proves that address emitted no log in this
+    /// block. Positive results may be false positives and require a log read.
+    pub fn may_have_logs(&self, addresses: &[Address]) -> bool {
+        addresses.iter().any(|address| {
+            self.logs_bloom
+                .contains_input(alloy::primitives::BloomInput::Raw(address.as_slice()))
+        })
+    }
+}
+
 /// A connection to the chain, and the addresses of everything on it.
 #[derive(Clone)]
 pub struct Client {
+    policy: crate::rpc_policy::RpcPolicy,
+    log_snapshot: Option<Arc<LogSnapshot>>,
+    log_verification: Option<Arc<LogVerification>>,
     provider: DynProvider,
     pub rpc_url: String,
     pub chain_id: u64,
@@ -171,6 +195,44 @@ pub struct Client {
     signing: Option<SigningProvider>,
     /// The chain's name, for errors and logs that can't name an endpoint.
     label: String,
+}
+
+struct LogVerification {
+    head: u64,
+    identities: tokio::sync::Mutex<HashMap<u64, (B256, Option<u64>)>>,
+}
+
+/// Only exact numbered ranges and explicitly covered addresses may be read
+/// from this observation; no current contract state is stored here.
+struct LogSnapshot {
+    from: u64,
+    to: u64,
+    addresses: Vec<Address>,
+    logs: Vec<Log>,
+}
+
+impl LogSnapshot {
+    fn read(&self, filter: &Filter) -> Option<Vec<Log>> {
+        let (from, to) = filter.get_from_block().zip(filter.get_to_block())?;
+        if from > to
+            || from < self.from
+            || to > self.to
+            || filter.address.is_empty()
+            || !filter
+                .address
+                .iter()
+                .all(|address| self.addresses.contains(address))
+        {
+            return None;
+        }
+        Some(
+            self.logs
+                .iter()
+                .filter(|log| filter.rpc_matches(log))
+                .cloned()
+                .collect(),
+        )
+    }
 }
 
 /// The nonce after each account's last send this client saw land.
@@ -1567,6 +1629,17 @@ async fn receipt_by(
 }
 
 impl Client {
+    /// Reader settings selected for this connection's chain.
+    pub fn rpc_policy(&self) -> &crate::rpc_policy::RpcPolicy {
+        &self.policy
+    }
+
+    /// Apply already validated chain configuration before handing out clones.
+    pub(crate) fn with_rpc_policy(mut self, policy: crate::rpc_policy::RpcPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
     /// Connect, waiting for the chain to answer: `task dev` starts everything
     /// at once, so a service usually arrives before the chain does.
     pub async fn connect(config: &ChainConfig, signing: Signing) -> Result<Self> {
@@ -1663,6 +1736,9 @@ impl Client {
         };
         Ok(Self {
             provider,
+            policy: crate::rpc_policy::RpcPolicy::default(),
+            log_snapshot: None,
+            log_verification: None,
             rpc_url: rpc_url.to_string(),
             chain_id,
             accounts,
@@ -1944,15 +2020,122 @@ impl Client {
         }
     }
 
-    /// When a past block was mined, in the chain's own time.
-    pub async fn block_timestamp_at(&self, block: u64) -> Result<u64> {
+    /// A numbered block's canonical identity, checked afresh on the node.
+    pub async fn block_identity(&self, number: u64) -> Result<B256> {
+        Ok(self.numbered_header(number).await?.0)
+    }
+
+    async fn numbered_header(&self, number: u64) -> Result<(B256, u64)> {
+        let header = self.header_at(number).await?;
+        Ok((header.hash, header.timestamp))
+    }
+
+    /// Fresh details of exactly the numbered canonical block requested.
+    pub async fn header_at(&self, number: u64) -> Result<HeadObservation> {
         let block = self
             .provider
-            .get_block(alloy::eips::BlockId::number(block))
+            .get_block(alloy::eips::BlockId::number(number))
             .await
-            .context("a past block")?
-            .ok_or_else(|| anyhow!("no such block"))?;
-        Ok(block.header.timestamp)
+            .context("a numbered block")?
+            .ok_or_else(|| anyhow!("no block {number}"))?;
+        if block.header.number != number {
+            bail!("the node answered another block instead of {number}");
+        }
+        Ok(HeadObservation {
+            number: block.header.number,
+            timestamp: block.header.timestamp,
+            hash: block.header.hash,
+            parent_hash: block.header.parent_hash,
+            logs_bloom: block.header.logs_bloom,
+        })
+    }
+
+    /// A clone sharing only this bounded, numbered observation of logs.
+    /// Uncovered ranges, addresses and dynamic block tags use ordinary reads.
+    /// The caller must recheck the end block before publishing derived state:
+    /// a reorg invalidates its accumulated history as well as this observation.
+    pub async fn capture_logs(
+        &self,
+        addresses: Vec<Address>,
+        from: u64,
+        to: u64,
+        expected: B256,
+    ) -> Result<Self> {
+        if from > to
+            || to - from >= self.policy.log_batch_blocks
+            || addresses.is_empty()
+            || addresses.len() > self.policy.log_batch_addresses as usize
+        {
+            bail!("the log observation exceeds its configured range or address bounds");
+        }
+        if self.block_identity(to).await? != expected {
+            bail!("the log observation's end block changed");
+        }
+        let filter = Filter::new()
+            .address(addresses.clone())
+            .from_block(from)
+            .to_block(to);
+        // Never build another observation from an earlier one.
+        let mut live = self.clone();
+        live.log_snapshot = None;
+        let logs = live.logs(&filter).await?;
+        if logs.len() > self.policy.log_batch_logs as usize {
+            bail!("the log observation exceeds its configured log bound");
+        }
+        let mut identities = HashMap::new();
+        for log in &logs {
+            if !filter.rpc_matches(log) || log.removed {
+                bail!("the node returned a removed or unmatched log");
+            }
+            let number = log.block_number.context("a log has no block number")?;
+            let hash = log.block_hash.context("a log has no block identity")?;
+            if let Some(previous) = identities.insert(number, hash)
+                && previous != hash
+            {
+                bail!("logs disagree on their block's identity");
+            }
+        }
+        for (number, hash) in identities {
+            if self.block_identity(number).await? != hash {
+                bail!("a log belongs to a replaced block");
+            }
+        }
+        if self.block_identity(to).await? != expected {
+            bail!("the log observation's end block changed while reading it");
+        }
+        live.log_snapshot = Some(Arc::new(LogSnapshot {
+            from,
+            to,
+            addresses,
+            logs,
+        }));
+        Ok(live)
+    }
+
+    /// When a past block was mined, in the chain's own time.
+    pub async fn block_timestamp_at(&self, number: u64) -> Result<u64> {
+        let Some(scope) = &self.log_verification else {
+            return Ok(self.numbered_header(number).await?.1);
+        };
+        if number > scope.head {
+            bail!("a block time is newer than the observed head");
+        }
+        let mut identities = scope.identities.lock().await;
+        if let Some((_, Some(time))) = identities.get(&number) {
+            return Ok(*time);
+        }
+        let (hash, time) = self.numbered_header(number).await?;
+        if let Some((expected, _)) = identities.get(&number)
+            && hash != *expected
+        {
+            bail!("a block time belongs to a replaced block");
+        }
+        if identities.contains_key(&number)
+            || identities.len() < self.policy.log_batch_blocks as usize
+        {
+            identities.insert(number, (hash, Some(time)));
+        }
+        Ok(time)
     }
 
     /// Send a call as `from`, and wait for it to land.
@@ -2306,6 +2489,58 @@ impl Client {
     /// and its logs may come from different ones: the check is exact per
     /// endpoint, not per node behind it.
     pub async fn logs(&self, filter: &Filter) -> Result<Vec<Log>> {
+        let logs = match self
+            .log_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.read(filter))
+        {
+            Some(logs) => logs,
+            None => self.logs_uncached(filter).await?,
+        };
+        if let Some(scope) = &self.log_verification {
+            let mut identities = scope.identities.lock().await;
+            for log in &logs {
+                if !filter.rpc_matches(log) || log.removed {
+                    bail!("the node returned a removed or unmatched log");
+                }
+                let number = log.block_number.context("a log has no block number")?;
+                let hash = log.block_hash.context("a log has no block identity")?;
+                if number > scope.head {
+                    bail!("a log is newer than the observed head");
+                }
+                let canonical = match identities.get(&number) {
+                    Some((hash, _)) => *hash,
+                    None => {
+                        let (hash, time) = self.numbered_header(number).await?;
+                        if identities.len() < self.policy.log_batch_blocks as usize {
+                            identities.insert(number, (hash, Some(time)));
+                        }
+                        hash
+                    }
+                };
+                if hash != canonical {
+                    bail!("a log belongs to a replaced block");
+                }
+            }
+        }
+        Ok(logs)
+    }
+
+    /// A refresh-local log verifier. Every direct, fallback and shared log
+    /// read checks its returned blocks against this canonical branch. The
+    /// caller must check this head again before publishing, then discard the
+    /// clone; the header cache must never survive that observation's scope.
+    pub fn verifying_logs(&self, head: u64, identity: B256) -> Self {
+        let mut client = self.clone();
+        client.log_snapshot = None;
+        client.log_verification = Some(Arc::new(LogVerification {
+            head,
+            identities: tokio::sync::Mutex::new(HashMap::from([(head, (identity, None))])),
+        }));
+        client
+    }
+
+    async fn logs_uncached(&self, filter: &Filter) -> Result<Vec<Log>> {
         use alloy::eips::BlockNumberOrTag;
         use alloy::rpc::types::FilterBlockOption;
         let from = filter.get_from_block();
@@ -2387,13 +2622,32 @@ impl Client {
     /// The head and its time, from one read of the head block: two reads
     /// could land either side of a new block.
     pub async fn head_and_time(&self) -> Result<(u64, u64)> {
+        let (number, timestamp, _) = self.head_observation().await?;
+        Ok((number, timestamp))
+    }
+
+    /// The head's number, time and identity from the same header.
+    pub async fn head_observation(&self) -> Result<(u64, u64, B256)> {
+        let head = self.head_details().await?;
+        Ok((head.number, head.timestamp, head.hash))
+    }
+
+    /// Fresh header details for numbered event observation. A bloom alone
+    /// never covers missing intermediate blocks or a replaced parent.
+    pub async fn head_details(&self) -> Result<HeadObservation> {
         let block = self
             .provider
             .get_block(alloy::eips::BlockId::latest())
             .await
             .context("the head block")?
             .ok_or_else(|| anyhow!("the chain has no blocks yet"))?;
-        Ok((block.header.number, block.header.timestamp))
+        Ok(HeadObservation {
+            number: block.header.number,
+            timestamp: block.header.timestamp,
+            hash: block.header.hash,
+            parent_hash: block.header.parent_hash,
+            logs_bloom: block.header.logs_bloom,
+        })
     }
 
     /// Whether anything is deployed at an address: how a deploy knows the
@@ -3564,6 +3818,71 @@ fn refused_as_not_there_yet(error: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn numbered_log_observations_match_direct_filters_only_within_their_coverage() {
+        use alloy::eips::BlockNumberOrTag;
+        let a = Address::repeat_byte(1);
+        let b = Address::repeat_byte(2);
+        let unknown = Address::repeat_byte(3);
+        let topic = B256::repeat_byte(7);
+        let logs: Vec<Log> = (10..=12)
+            .flat_map(|block| {
+                [a, b].map(|address| Log {
+                    inner: alloy::primitives::Log::new_unchecked(
+                        address,
+                        vec![topic],
+                        Bytes::new(),
+                    ),
+                    block_number: Some(block),
+                    block_hash: Some(B256::repeat_byte(block as u8)),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let snapshot = LogSnapshot {
+            from: 10,
+            to: 12,
+            addresses: vec![a, b],
+            logs: logs.clone(),
+        };
+        for from in 10..=12 {
+            for to in from..=12 {
+                for addresses in [vec![a], vec![b], vec![a, b]] {
+                    for topics in [vec![topic], vec![B256::ZERO], vec![]] {
+                        let filter = Filter::new()
+                            .address(addresses.clone())
+                            .from_block(from)
+                            .to_block(to)
+                            .event_signature(topics);
+                        let expected: Vec<_> = logs
+                            .iter()
+                            .filter(|log| filter.rpc_matches(log))
+                            .cloned()
+                            .collect();
+                        assert_eq!(snapshot.read(&filter).unwrap(), expected);
+                    }
+                }
+            }
+        }
+        for filter in [
+            Filter::new().address(a).from_block(9).to_block(12),
+            Filter::new().address(a).from_block(10).to_block(13),
+            Filter::new().address(a).from_block(12).to_block(10),
+            Filter::new()
+                .address(vec![a, unknown])
+                .from_block(10)
+                .to_block(12),
+            Filter::new().from_block(10).to_block(12),
+            Filter::new()
+                .address(a)
+                .from_block(10)
+                .to_block(BlockNumberOrTag::Latest),
+            Filter::new().address(a).at_block_hash(B256::ZERO),
+        ] {
+            assert!(snapshot.read(&filter).is_none(), "{filter:?}");
+        }
+    }
+
     use super::*;
 
     #[tokio::test]

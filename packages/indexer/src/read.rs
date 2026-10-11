@@ -45,12 +45,17 @@ use crate::store::Store;
 /// been read.
 #[derive(Default)]
 pub struct History {
+    pub(crate) anchor: Option<(u64, B256)>,
+    pub(crate) discard_previous: bool,
+    proofs: chain::sealed_views::Proofs,
     /// Each vault's readings, oldest first: hourly for the last
     /// [`HOURLY_FOR`], daily before that.
     samples: HashMap<Address, Vec<Sample>>,
     /// The block and time of each vault's last reading: where the next one
     /// is looked for from.
     sampled: HashMap<Address, Mark>,
+    /// An unfinished search, resumed within the next refresh's read budget.
+    searches: HashMap<Address, SampleSearch>,
     /// The block of each vault's reading that the vault hasn't answered, and
     /// how many refreshes in a row it hasn't.
     unanswered: HashMap<Address, (u64, u32)>,
@@ -83,6 +88,36 @@ pub struct History {
     /// Each station's fills: the vault never trades itself, its home station
     /// does.
     fills: HashMap<Address, Stream<Fills>>,
+}
+
+impl History {
+    pub(crate) fn reset_branch(&mut self) {
+        *self = Self {
+            discard_previous: true,
+            ..Self::default()
+        };
+    }
+
+    /// Addresses already discovered, plus the registries whose streams are
+    /// followed. A newly discovered address remains on ordinary log reads
+    /// until the next observation, so discovery never depends on this list.
+    pub(crate) fn log_addresses(&self, deployments: &Deployments) -> Vec<Address> {
+        let mut addresses = vec![
+            deployments.factory,
+            deployments.strategies,
+            deployments.attestation,
+            deployments.publishing,
+            deployments.reviews,
+            deployments.profiles,
+            deployments.station_factory,
+        ];
+        addresses.extend(self.vaults.keys().copied());
+        addresses.extend(self.blessings.keys().copied());
+        addresses.extend(self.fills.keys().copied());
+        addresses.sort_unstable();
+        addresses.dedup();
+        addresses
+    }
 }
 
 /// One stream of logs: what has been made of it, and how far it has been
@@ -120,10 +155,19 @@ impl<T> Stream<T> {
 }
 
 /// A block and its time.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Mark {
     block: u64,
     time: u64,
+}
+
+#[derive(Clone, Copy)]
+struct SampleSearch {
+    origin: Mark,
+    due: u64,
+    low: Mark,
+    high: Mark,
+    halve: bool,
 }
 
 /// One reading of a vault, dated by its block's time.
@@ -193,12 +237,6 @@ const DAY: u64 = 86_400;
 /// How long a vault's readings are kept hourly; older ones are kept one a
 /// day, which is all the record shows.
 const HOURLY_FOR: u64 = 90 * DAY;
-
-/// The most block headers asked of the chain for one vault's readings in
-/// one refresh: a vault whose readings are being rebuilt (a restart, or a
-/// vault seen for the first time) takes at most this many a refresh, and
-/// the rest of the record isn't held up while it catches up.
-const READS_PER_REFRESH: u32 = 48;
 
 /// A moment in chain time.
 pub fn moment(timestamp: u64) -> PrimitiveDateTime {
@@ -475,12 +513,30 @@ async fn one(
     head: u64,
     now: u64,
 ) -> Result<Strategy> {
-    let strategy_id = chain.read(address, IVault::strategyIdCall {}).await?;
+    let views = match history.anchor {
+        Some((head, hash)) => chain::sealed_views::SealedViews::observe(
+            chain,
+            address,
+            (head, now, hash),
+            &mut history.proofs,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            tracing::debug!(%address, error = format!("{error:#}"), "the storage observation is unavailable; views are read live");
+            Default::default()
+        }),
+        None => Default::default(),
+    };
+    let strategy_id = views
+        .read(chain, address, IVault::strategyIdCall {})
+        .await?;
     let id: u64 = strategy_id.try_into().unwrap_or_default();
-    let author = chain.read(address, IVault::authorCall {}).await?;
-    let created = chain.read(address, IVault::createdAtCall {}).await?;
-    let state = chain.read(address, IVault::stateCall {}).await?;
-    let bundle_hash = chain.read(address, IVault::bundleHashCall {}).await?;
+    let author = views.read(chain, address, IVault::authorCall {}).await?;
+    let created = views.read(chain, address, IVault::createdAtCall {}).await?;
+    let state = views.read(chain, address, IVault::stateCall {}).await?;
+    let bundle_hash = views
+        .read(chain, address, IVault::bundleHashCall {})
+        .await?;
     let registered = chain
         .read(
             deployments.strategies,
@@ -494,7 +550,7 @@ async fn one(
     let days_live = (now.saturating_sub(created as u64)) / 86_400;
 
     let events = read_events(chain, history, address, created_in, head).await;
-    let vault = read_vault(chain, vault_chain, history, address, &state).await?;
+    let vault = read_vault(chain, vault_chain, history, address, &state, &views).await?;
     let station: Address = vault.station.parse().unwrap_or_default();
     let (trades, trade_count) =
         read_trades(chain, deployments, history, station, created_in, head).await;
@@ -597,24 +653,43 @@ async fn read_vault(
     history: &mut History,
     address: Address,
     state: &ChainVaultState,
+    views: &chain::sealed_views::SealedViews,
 ) -> Result<Vault> {
-    let fees = chain.read(address, IVault::feesCall {}).await?;
-    let tank = chain.read(address, IVault::tankCall {}).await?;
-    let value = chain.read(address, IVault::totalValueCall {}).await?;
-    let cash = chain.read(address, IVault::cashCall {}).await?;
-    let escrow = chain.read(address, IVault::escrowCall {}).await?;
-    let share_price = chain.read(address, IVault::sharePriceCall {}).await?;
-    let mark = chain.read(address, IVault::markCall {}).await?;
-    let last_payment = chain.read(address, IVault::lastPaymentCall {}).await?;
-    let created = chain.read(address, IVault::createdAtCall {}).await?;
-    let timers = chain.read(address, IVault::timersCall {}).await?;
-    let exit_band = chain.read(address, IVault::exitBandBpsCall {}).await?;
-    let station = chain.read(address, IVault::homeStationCall {}).await?;
-    let floor = chain.read(address, IVault::idleFloorCall {}).await?;
-    let allowances = chain.read(address, IVault::allowancesCall {}).await?;
-    let restricted = chain.read(address, IVault::restrictedCall {}).await?;
-    let halted = chain.read(address, IStationVault::haltedAtCall {}).await?;
-    let supply = chain.read(address, IVault::totalSupplyCall {}).await?;
+    let fees = views.read(chain, address, IVault::feesCall {}).await?;
+    let tank = views.read(chain, address, IVault::tankCall {}).await?;
+    let value = views
+        .read(chain, address, IVault::totalValueCall {})
+        .await?;
+    let cash = views.read(chain, address, IVault::cashCall {}).await?;
+    let escrow = views.read(chain, address, IVault::escrowCall {}).await?;
+    let share_price = views
+        .read(chain, address, IVault::sharePriceCall {})
+        .await?;
+    let mark = views.read(chain, address, IVault::markCall {}).await?;
+    let last_payment = views
+        .read(chain, address, IVault::lastPaymentCall {})
+        .await?;
+    let created = views.read(chain, address, IVault::createdAtCall {}).await?;
+    let timers = views.read(chain, address, IVault::timersCall {}).await?;
+    let exit_band = views
+        .read(chain, address, IVault::exitBandBpsCall {})
+        .await?;
+    let station = views
+        .read(chain, address, IVault::homeStationCall {})
+        .await?;
+    let floor = views.read(chain, address, IVault::idleFloorCall {}).await?;
+    let allowances = views
+        .read(chain, address, IVault::allowancesCall {})
+        .await?;
+    let restricted = views
+        .read(chain, address, IVault::restrictedCall {})
+        .await?;
+    let halted = views
+        .read(chain, address, IStationVault::haltedAtCall {})
+        .await?;
+    let supply = views
+        .read(chain, address, IVault::totalSupplyCall {})
+        .await?;
 
     let mut claims = Vec::new();
     let count: u64 = chain
@@ -947,7 +1022,7 @@ fn shared_allowances(on_chain: &chain::bindings::prices::Allowances) -> shared::
 /// from the pace the chain kept between the two ends, and halved instead
 /// whenever a guess fails to halve what is left, so a chain whose pace
 /// changes is searched in as many reads as halving would take. A refresh
-/// asks for at most [`READS_PER_REFRESH`] block times, and the next carries
+/// asks for at most the configured history_page_reads block times, and the next carries
 /// on from where it stopped. A reading whose block's time can't be read, or
 /// that the vault doesn't answer, is not taken: it is asked for again at the
 /// next refresh, never dated by a guess. `created_in` is `None` while the
@@ -959,6 +1034,27 @@ async fn sample(
     history: &mut History,
     head: u64,
     now: u64,
+) {
+    sample_with_budget(
+        chain,
+        address,
+        created_in,
+        history,
+        head,
+        now,
+        chain.rpc_policy().history_page_reads,
+    )
+    .await;
+}
+
+async fn sample_with_budget(
+    chain: &Client,
+    address: Address,
+    created_in: Option<u64>,
+    history: &mut History,
+    head: u64,
+    now: u64,
+    limit: u64,
 ) {
     let mut reads = 0;
     let mut last = match history.sampled.get(&address) {
@@ -979,7 +1075,7 @@ async fn sample(
         }
     };
 
-    'readings: while reads < READS_PER_REFRESH {
+    'readings: while reads < limit {
         let spacing = if now.saturating_sub(last.time) > HOURLY_FOR {
             DAY
         } else {
@@ -991,14 +1087,32 @@ async fn sample(
         }
         // The first block at or after `due` lies past `low`, whose time is
         // before it, and no further than `high`, whose time is not.
-        let mut low = last;
-        let mut high = Mark {
-            block: head,
-            time: now,
-        };
-        let mut halve = false;
+        let search = history.searches.remove(&address).filter(|search| {
+            search.origin == last && search.due == due && search.high.block <= head
+        });
+        let (mut low, mut high, mut halve) = search.map_or(
+            (
+                last,
+                Mark {
+                    block: head,
+                    time: now,
+                },
+                false,
+            ),
+            |search| (search.low, search.high, search.halve),
+        );
         while high.block - low.block > 1 {
-            if reads >= READS_PER_REFRESH {
+            if reads >= limit {
+                history.searches.insert(
+                    address,
+                    SampleSearch {
+                        origin: last,
+                        due,
+                        low,
+                        high,
+                        halve,
+                    },
+                );
                 break 'readings;
             }
             let left = high.block - low.block;
@@ -1009,6 +1123,16 @@ async fn sample(
             };
             reads += 1;
             let Ok(time) = block_time(chain, low.block + ahead).await else {
+                history.searches.insert(
+                    address,
+                    SampleSearch {
+                        origin: last,
+                        due,
+                        low,
+                        high,
+                        halve,
+                    },
+                );
                 break 'readings;
             };
             let mark = Mark {
@@ -1020,11 +1144,23 @@ async fn sample(
             } else {
                 low = mark;
             }
-            halve = (high.block - low.block) * 2 > left;
+            halve = (high.block - low.block) > left / 2;
         }
         match take(chain, history, address, high).await {
             Some(taken) => last = taken,
-            None => break,
+            None => {
+                history.searches.insert(
+                    address,
+                    SampleSearch {
+                        origin: last,
+                        due,
+                        low,
+                        high,
+                        halve,
+                    },
+                );
+                break;
+            }
         }
     }
     prune(history.samples.entry(address).or_default(), now);
@@ -2056,5 +2192,75 @@ mod tests {
         assert_eq!(blocks_until(low, high, 1_001), 1);
         assert_eq!(blocks_until(low, high, 1_000), 1);
         assert_eq!(blocks_until(low, high, 9_999), 100);
+    }
+}
+
+#[cfg(test)]
+mod sample_budget_tests {
+    use super::*;
+    use axum::{Json, Router, routing::post};
+    use serde_json::{Value, json};
+
+    #[tokio::test]
+    async fn a_single_probe_per_refresh_eventually_finds_the_first_due_block() {
+        let times = [0, 100, 200, 300, 3_700, 8_000, 12_000, 16_000, 20_000];
+        let app = Router::new().route("/", post(move |Json(request): Json<Value>| async move {
+            let result = match request["method"].as_str().unwrap_or_default() {
+                "eth_chainId" => json!("0x7a69"),
+                "eth_blockNumber" => json!("0x8"),
+                "eth_getBlockByNumber" => {
+                    let number = request["params"][0].as_str()
+                        .and_then(|tag| tag.strip_prefix("0x"))
+                        .and_then(|hex| u64::from_str_radix(hex, 16).ok()).unwrap_or(8);
+                    let mut block = alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
+                    block.header.inner.number = number;
+                    block.header.inner.timestamp = times[number as usize];
+                    block.header.hash = B256::repeat_byte(number as u8);
+                    serde_json::to_value(block).unwrap()
+                }
+                "eth_call" => json!(B256::from(U256::from(1_000_000_000_000_000_000u64))),
+                _ => return Json(json!({"jsonrpc":"2.0", "id":request["id"], "error":{"code":-32601,"message":"unknown method"}})),
+            };
+            Json(json!({"jsonrpc":"2.0", "id":request["id"], "result":result}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = chain::ChainConfig {
+            label: "stand-in".into(),
+            rpc: url.clone(),
+            public_rpc: url,
+            ws: None,
+            dollar: "USDC".into(),
+            native_usd: None,
+            logs_rpc: None,
+            log_range: None,
+            confirmations: None,
+        };
+        let client = Client::connect(&config, chain::Signing::ReadOnly)
+            .await
+            .unwrap();
+        let address = Address::repeat_byte(1);
+        let mut history = History::default();
+        for _ in 0..12 {
+            sample_with_budget(&client, address, Some(1), &mut history, 8, 20_000, 1).await;
+            if history
+                .samples
+                .get(&address)
+                .is_some_and(|samples| samples.iter().any(|sample| sample.at == 3_700))
+            {
+                break;
+            }
+        }
+        let samples = &history.samples[&address];
+        assert_eq!(samples[0].at, 100);
+        assert_eq!(
+            samples[1].at, 3_700,
+            "the first due reading must finish despite the single-probe budget"
+        );
+        history.reset_branch();
+        assert!(history.searches.is_empty());
+        assert!(history.samples.is_empty());
+        server.abort();
     }
 }

@@ -62,8 +62,6 @@ use vp::state::{Claim, ClaimState, Holder, Request, Vault, VaultState};
 
 use crate::{DAY, MINUTE, Said, chain_kept, waited};
 
-/// How long the keeper waits between one round of a cluster and the next.
-const ROUND_PAUSE: Duration = Duration::from_secs(2);
 /// The most rounds a vault's requests go unread for their rent: they are
 /// read again sooner whenever settlement has moved.
 const RENT_EVERY: u64 = 30;
@@ -131,12 +129,21 @@ pub async fn keep_chain(served: SolanaServed, executor: String, services: Vec<St
         executor,
     };
     let mut memory: HashMap<Pubkey, Memory> = HashMap::new();
-    let mut scan = VaultScan::for_cluster(&served.client.cluster);
+    let mut scan = VaultScan::new(Duration::from_millis(
+        served.client.rpc_policy().solana_rescan_ms,
+    ));
     let mut said = Said::default();
     let mut slowed = 0u32;
+    let mut started_vaults = false;
+    chain_kept(chain, |kept| kept.startup_incomplete = true);
     loop {
         let started = Instant::now();
-        let done = keeping.round(&mut scan, &mut memory).await;
+        let done = keeping
+            .round(&mut scan, &mut memory, &mut started_vaults)
+            .await;
+        if started_vaults {
+            chain_kept(chain, |kept| kept.startup_incomplete = false);
+        }
         let now = Instant::now();
         match &done {
             // A round cut short by a node that limits the rate failed at
@@ -144,15 +151,16 @@ pub async fn keep_chain(served: SolanaServed, executor: String, services: Vec<St
             // longer the node keeps asking.
             Err(error) if rate_limited(error) => {
                 slowed = slowed.saturating_add(1);
-                let pause = slowed_pause(slowed);
+                let pause = slowed_pause(slowed, served.client.rpc_policy());
                 tracing::debug!(chain = %served.key, seconds = pause.as_secs(), error = format!("{error:#}"), "the node limits the rate; the next round waits");
                 tokio::time::sleep(pause).await;
                 continue;
             }
             _ => slowed = 0,
         }
+        let spent_pause = done.as_ref().copied().unwrap_or_default();
         match done {
-            Ok(()) => {
+            Ok(_) => {
                 chain_kept(chain, |kept| {
                     kept.finished = Some(now);
                     kept.took = now.duration_since(started);
@@ -169,14 +177,60 @@ pub async fn keep_chain(served: SolanaServed, executor: String, services: Vec<St
                 }
             }
         }
-        tokio::time::sleep(ROUND_PAUSE).await;
+        tokio::time::sleep(
+            Duration::from_millis(
+                served
+                    .client
+                    .rpc_policy()
+                    .head_poll_ms
+                    .min(served.client.rpc_policy().event_scan_ms),
+            )
+            .saturating_sub(spent_pause),
+        )
+        .await;
     }
 }
 
 /// How long the next round waits after `times` rounds in a row cut short by
 /// a node limiting the rate: five seconds, doubling, at most two minutes.
-fn slowed_pause(times: u32) -> Duration {
-    Duration::from_secs((5u64 << times.saturating_sub(1).min(5)).min(120))
+fn slowed_pause(times: u32, policy: &chain::rpc_policy::RpcPolicy) -> Duration {
+    let factor = policy
+        .keeper_rate_limit_backoff_factor
+        .saturating_pow(times.saturating_sub(1));
+    Duration::from_millis(
+        policy
+            .keeper_rate_limit_initial_ms
+            .saturating_mul(factor)
+            .min(policy.keeper_rate_limit_max_ms),
+    )
+}
+
+/// A necessary cadence check, not a bound on ordinary network/landing costs.
+fn validate_timers(
+    policy: &chain::rpc_policy::RpcPolicy,
+    address: &Pubkey,
+    timers: &vp::state::Timers,
+) -> Result<()> {
+    let lead = policy.head_poll_ms + policy.event_scan_ms + policy.read_budget_ms;
+    let active = policy.head_poll_ms.max(policy.event_scan_ms) + policy.read_budget_ms;
+    for (name, seconds, needed) in [
+        ("slot_lead", timers.slot_lead, lead),
+        ("slot_window", timers.slot_window, active),
+        ("halt_grace", timers.halt_grace, active),
+        ("freeze_after", timers.freeze_after, active),
+        ("wind_down", timers.wind_down, active),
+        ("tank_escape_delay", timers.tank_escape_delay, active),
+    ] {
+        if u128::from(seconds) * 1000 < u128::from(needed) {
+            anyhow::bail!(
+                "vault {address}: RPC head_poll_ms={}, event_scan_ms={}, read_budget_ms={} require {needed}ms, but {name}={seconds}s; this vault's keeper policy is refused",
+                policy.head_poll_ms,
+                policy.event_scan_ms,
+                policy.read_budget_ms
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Aborts the task when dropped.
@@ -241,6 +295,11 @@ struct Memory {
     tried_past_window: bool,
     /// The chain time a closed vault was last found with nothing to do.
     quiet_since: Option<u64>,
+    /// The existing quiet period whose Closed state was independently
+    /// established at finalized commitment; confirmed forks cannot reopen it.
+    quiet_finalized_at: Option<u64>,
+    quiet_proof: Option<(u64, tokio::task::JoinHandle<Result<bool>>)>,
+    quiet_probe_at: Option<Instant>,
     /// Each waiting claim's next try: the slot, and the wait in slots.
     claims_tried: HashMap<u64, (u64, u64)>,
     /// Each unit holder's next serve, by owner (see [`next_units_try`]).
@@ -581,21 +640,138 @@ impl Keeping {
         &self,
         scan: &mut VaultScan,
         memory: &mut HashMap<Pubkey, Memory>,
-    ) -> Result<()> {
-        // Every vault and every claim of each, read once a round; the vault
-        // program listed only when its counts say something new is there.
-        let found = scan.look(&self.client).await?;
+        started_vaults: &mut bool,
+    ) -> Result<Duration> {
+        // Active accounts are fresh each round. Finalized closed accounts
+        // need no reads during their existing action-free quiet period.
+        use futures::FutureExt;
+        let mut quiet = BTreeMap::new();
+        for (address, remembered) in memory.iter_mut() {
+            if remembered
+                .quiet_proof
+                .as_ref()
+                .is_some_and(|(_, task)| task.is_finished())
+            {
+                let (since, task) = remembered.quiet_proof.take().unwrap();
+                if matches!(task.now_or_never(), Some(Ok(Ok(true))))
+                    && remembered.quiet_since == Some(since)
+                {
+                    remembered.quiet_finalized_at = Some(since);
+                }
+            }
+            if let Some(since) = remembered.quiet_since
+                && remembered.quiet_finalized_at == Some(since)
+                && remembered.rounds_failing == 0
+                && !STEPS_FAILED
+                    .lock()
+                    .map(|failed| failed.keys().any(|(vault, _)| vault == address))
+                    .unwrap_or(true)
+            {
+                quiet.insert(*address, since.saturating_add(DAY));
+            }
+        }
+        let found = scan.look_near_due(&self.client, &quiet).await?;
         let vaults = found.vaults;
-        let addresses: Vec<Pubkey> = vaults.iter().map(|(address, _)| *address).collect();
+        if !*started_vaults {
+            for (address, vault) in &vaults {
+                validate_timers(self.client.rpc_policy(), address, &vault.timers)?;
+            }
+            *started_vaults = true;
+        }
+        let addresses = scan.known_vaults().to_vec();
+        for address in found.deferred {
+            // The baseline's closed quiet branch advances its logical round
+            // but performs no action; preserve that count while omitting reads.
+            let remembered = memory.entry(address).or_default();
+            remembered.rounds = remembered.rounds.saturating_add(1);
+        }
+        let waking = found.waking;
+        self.keep_found(&vaults, found.claims, memory).await;
+        // Spend only time the ordinary round would already sleep. The read
+        // has independent pacing and its failure cannot back off this chain.
+        // Failed wakes are included in the next ordinary fresh account batch.
+        let reader = self.client.optional_reader();
+        let allowance = Duration::from_millis(
+            self.client
+                .rpc_policy()
+                .head_poll_ms
+                .min(self.client.rpc_policy().event_scan_ms)
+                .min(self.client.rpc_policy().quiet_probe_budget_ms),
+        );
+        let read_started = Instant::now();
+        let woke = tokio::time::timeout(allowance, scan.read_waking(&reader, &waking)).await;
+        let spent_pause = read_started.elapsed();
+        match woke {
+            Ok(Ok(woke)) => self.keep_found(&woke.vaults, woke.claims, memory).await,
+            Ok(Err(error)) => {
+                tracing::debug!(vaults = waking.len(), error = %error, "closed account refresh waits for the next ordinary read");
+            }
+            Err(error) => {
+                tracing::debug!(vaults = waking.len(), error = %error, "closed account refresh waits for the next ordinary read");
+            }
+        }
+        if let Ok(mut troubles) = TROUBLES.lock() {
+            troubles.unkept.retain(|vault, _| addresses.contains(vault));
+            troubles.limited.retain(|vault| addresses.contains(vault));
+            troubles
+                .bills_refused
+                .retain(|vault, _| addresses.contains(vault));
+            troubles
+                .not_sent
+                .retain(|(vault, _), _| addresses.contains(vault));
+        }
+        if let Ok(mut failed) = STEPS_FAILED.lock() {
+            failed.retain(|(vault, _), _| addresses.contains(vault));
+        }
+        if let Ok(mut asks) = ASKS.lock() {
+            asks.unanswered.retain(|vault| addresses.contains(vault));
+            asks.not_wanted.retain(|vault, _| addresses.contains(vault));
+            asks.latest.retain(|vault, _| addresses.contains(vault));
+            asks.note_serving();
+        }
+        say_serving_none();
+        Ok(spent_pause)
+    }
+
+    async fn keep_found(
+        &self,
+        vaults: &[(Pubkey, Vault)],
+        found_claims: Vec<(Pubkey, Pubkey, Claim)>,
+        memory: &mut HashMap<Pubkey, Memory>,
+    ) {
         let mut claims: BTreeMap<Pubkey, Vec<Claim>> = BTreeMap::new();
-        for (vault, _, claim) in found.claims {
+        for (vault, _, claim) in found_claims {
             claims.entry(vault).or_default().push(claim);
         }
-        for (address, vault) in &vaults {
+        for (address, vault) in vaults {
             let remembered = memory.entry(*address).or_default();
             let theirs = claims.remove(address).unwrap_or_default();
             let done = self.keep_one(address, vault, &theirs, remembered).await;
             steps_worked(address, done.is_ok());
+            if done.is_ok()
+                && vault.state == VaultState::Closed
+                && let Some(since) = remembered.quiet_since
+                && remembered.quiet_finalized_at != Some(since)
+                && remembered.quiet_proof.is_none()
+                && remembered.quiet_probe_at.is_none_or(|at| {
+                    at.elapsed()
+                        >= Duration::from_millis(self.client.rpc_policy().quiet_probe_retry_ms)
+                })
+            {
+                let client = self.client.optional_reader();
+                let address = *address;
+                let budget = Duration::from_millis(client.rpc_policy().quiet_probe_budget_ms);
+                remembered.quiet_probe_at = Some(Instant::now());
+                remembered.quiet_proof = Some((
+                    since,
+                    tokio::spawn(async move {
+                        let vault =
+                            tokio::time::timeout(budget, client.load_finalized::<Vault>(&address))
+                                .await??;
+                        Ok(vault.is_some_and(|vault| vault.state == VaultState::Closed))
+                    }),
+                ));
+            }
             match done {
                 Ok(()) => {
                     remembered.rounds_failing = 0;
@@ -636,27 +812,6 @@ impl Keeping {
                 }
             }
         }
-        if let Ok(mut troubles) = TROUBLES.lock() {
-            troubles.unkept.retain(|vault, _| addresses.contains(vault));
-            troubles.limited.retain(|vault| addresses.contains(vault));
-            troubles
-                .bills_refused
-                .retain(|vault, _| addresses.contains(vault));
-            troubles
-                .not_sent
-                .retain(|(vault, _), _| addresses.contains(vault));
-        }
-        if let Ok(mut failed) = STEPS_FAILED.lock() {
-            failed.retain(|(vault, _), _| addresses.contains(vault));
-        }
-        if let Ok(mut asks) = ASKS.lock() {
-            asks.unanswered.retain(|vault| addresses.contains(vault));
-            asks.not_wanted.retain(|vault, _| addresses.contains(vault));
-            asks.latest.retain(|vault, _| addresses.contains(vault));
-            asks.note_serving();
-        }
-        say_serving_none();
-        Ok(())
     }
 
     /// Everything one vault might need this round.
@@ -668,6 +823,7 @@ impl Keeping {
         memory: &mut Memory,
     ) -> Result<()> {
         memory.rounds += 1;
+        validate_timers(self.client.rpc_policy(), address, &vault.timers)?;
         let now = self.client.now().await?;
         let v = self.platform.vault_accounts(vault.strategy_id);
         if vault.state == VaultState::Closed {
@@ -2026,6 +2182,116 @@ pub fn troubles(now: Instant) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_rate_limit_retries_keep_the_existing_defaults_and_bounds() {
+        let policy = chain::rpc_policy::RpcPolicy::default();
+        for (round, seconds) in [
+            (0, 5),
+            (1, 5),
+            (2, 10),
+            (3, 20),
+            (4, 40),
+            (5, 80),
+            (6, 120),
+            (u32::MAX, 120),
+        ] {
+            assert_eq!(slowed_pause(round, &policy), Duration::from_secs(seconds));
+        }
+        for initial in [1, 1000, 5000] {
+            for maximum in [5000, 60000, 120000] {
+                for factor in [1, 2] {
+                    let policy = chain::rpc_policy::RpcPolicy {
+                        keeper_rate_limit_initial_ms: initial,
+                        keeper_rate_limit_max_ms: maximum,
+                        keeper_rate_limit_backoff_factor: factor,
+                        ..Default::default()
+                    };
+                    policy.validate("a keeper").unwrap();
+                    let mut previous = Duration::ZERO;
+                    for round in [0, 1, 2, 31, u32::MAX] {
+                        let pause = slowed_pause(round, &policy);
+                        assert!(pause >= previous && pause <= Duration::from_millis(maximum));
+                        previous = pause;
+                    }
+                }
+            }
+        }
+        for (field, value) in [
+            ("keeper_rate_limit_initial_ms", 5001),
+            ("keeper_rate_limit_max_ms", 120001),
+            ("keeper_rate_limit_backoff_factor", 3),
+        ] {
+            let mut policy = chain::rpc_policy::RpcPolicy::default();
+            match field {
+                "keeper_rate_limit_initial_ms" => policy.keeper_rate_limit_initial_ms = value,
+                "keeper_rate_limit_max_ms" => policy.keeper_rate_limit_max_ms = value,
+                _ => policy.keeper_rate_limit_backoff_factor = value,
+            }
+            assert!(
+                policy
+                    .validate("a keeper")
+                    .unwrap_err()
+                    .to_string()
+                    .contains(field)
+            );
+        }
+    }
+
+    #[test]
+    fn solana_timer_checks_name_the_vault_and_incompatible_boundary() {
+        let address = Pubkey::new_unique();
+        for head in [1, 1000, 2000] {
+            for event in [1, 1000, 2000] {
+                for budget in [1, 1000, 30000] {
+                    let policy = chain::rpc_policy::RpcPolicy {
+                        head_poll_ms: head,
+                        event_scan_ms: event,
+                        read_budget_ms: budget,
+                        due_lookahead_ms: head + event + budget,
+                        ..Default::default()
+                    };
+                    policy.validate("a keeper").unwrap();
+                    let lead = (head + event + budget).div_ceil(1000);
+                    let active = (head.max(event) + budget).div_ceil(1000);
+                    let timers = vp::state::Timers {
+                        slot_interval: lead + active + 1,
+                        slot_lead: lead,
+                        slot_window: active,
+                        halt_grace: active,
+                        freeze_after: active,
+                        wind_down: active,
+                        tank_escape_delay: active,
+                        ..Default::default()
+                    };
+                    validate_timers(&policy, &address, &timers).unwrap();
+                    for field in [
+                        "slot_lead",
+                        "slot_window",
+                        "halt_grace",
+                        "freeze_after",
+                        "wind_down",
+                        "tank_escape_delay",
+                    ] {
+                        let mut outside = timers;
+                        let seconds = match field {
+                            "slot_lead" => &mut outside.slot_lead,
+                            "slot_window" => &mut outside.slot_window,
+                            "halt_grace" => &mut outside.halt_grace,
+                            "freeze_after" => &mut outside.freeze_after,
+                            "wind_down" => &mut outside.wind_down,
+                            _ => &mut outside.tank_escape_delay,
+                        };
+                        *seconds -= 1;
+                        let error = validate_timers(&policy, &address, &outside)
+                            .unwrap_err()
+                            .to_string();
+                        assert!(error.contains(field) && error.contains(&address.to_string()));
+                    }
+                }
+            }
+        }
+    }
 
     fn a_tank(
         balance: u64,

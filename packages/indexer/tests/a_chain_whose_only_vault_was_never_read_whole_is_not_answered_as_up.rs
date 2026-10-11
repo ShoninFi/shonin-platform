@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use chain::bindings::vault::IVault;
-use indexer::STALE_AFTER;
 use indexer::read::{NEVER_READ, never_read};
+use indexer::stale_after;
 use stand_in::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -62,7 +62,7 @@ async fn a_chain_whose_only_vault_was_never_read_whole_is_not_answered_as_up() {
 
     // Past STALE_AFTER since the first read, with its one vault never read
     // whole at any read: the chain has not been read.
-    let later = first + STALE_AFTER + Duration::from_secs(1);
+    let later = first + stale_after() + Duration::from_secs(1);
     let (up, said) = indexer.health_at("indexer", later);
     assert!(
         !up,

@@ -164,9 +164,6 @@ pub(crate) trait Registry {
 /// when they were sent.
 pub(crate) type Stakes = HashMap<Address, (B256, Instant)>;
 
-/// How often a chain's blessings and keys are looked at.
-pub(crate) const EVERY: Duration = Duration::from_secs(15);
-
 /// How long a `bless` that went through holds the next one for the same
 /// leaf back: long enough for any node the keeper asks to have its block.
 const DONE_HOLD: Duration = Duration::from_secs(90);
@@ -208,9 +205,9 @@ pub(crate) struct Memory {
 
 impl Memory {
     /// Whether the chain is due a look.
-    pub fn due(&self, now: Instant) -> bool {
+    pub fn due(&self, now: Instant, every: Duration) -> bool {
         self.last
-            .is_none_or(|last| now.duration_since(last) >= EVERY)
+            .is_none_or(|last| now.duration_since(last) >= every)
     }
 
     /// The chain was looked at, or would have been had the executor
@@ -926,6 +923,22 @@ async fn fund_gas(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configured_key_looks_are_due_at_the_boundary_and_rearm_after_a_look() {
+        for millis in [1, 1_000, 15_000] {
+            let every = std::time::Duration::from_millis(millis);
+            let start = std::time::Instant::now();
+            let mut memory = super::Memory::default();
+            assert!(memory.due(start, every));
+            memory.looked(start);
+            assert!(!memory.due(start + every - std::time::Duration::from_nanos(1), every));
+            assert!(memory.due(start + every, every));
+            memory.looked(start + every);
+            assert!(!memory.due(start + every, every));
+            assert!(memory.due(start + every * 2, every));
+        }
+    }
+
     use super::*;
     use std::sync::Mutex;
 
