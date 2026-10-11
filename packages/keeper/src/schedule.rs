@@ -380,15 +380,18 @@ impl Schedule {
         if self.observer.is_none() {
             let (sender, receiver) = tokio::sync::mpsc::channel(8);
             let client = client.clone();
+            let follow_events = self.quiet_time_is_bounded();
             self.observer = Some(tokio::spawn(async move {
                 let mut previous = None;
                 loop {
                     let budget = Duration::from_millis(client.rpc_policy().read_budget_ms);
-                    let result =
-                        tokio::time::timeout(budget, Self::fetch(&client, previous.as_ref()))
-                            .await
-                            .context("the event observation exceeded its read budget")
-                            .and_then(|result| result);
+                    let result = tokio::time::timeout(
+                        budget,
+                        Self::fetch(&client, previous.as_ref(), follow_events),
+                    )
+                    .await
+                    .context("the event observation exceeded its read budget")
+                    .and_then(|result| result);
                     if let Ok(observation) = &result {
                         previous = Some(observation.next.clone());
                     }
@@ -451,7 +454,7 @@ impl Schedule {
 
     #[cfg(test)]
     async fn observe(&mut self, client: &Client) -> Result<bool> {
-        match Self::fetch(client, self.head.as_ref()).await {
+        match Self::fetch(client, self.head.as_ref(), true).await {
             Ok(observation) => Ok(self.apply(client, observation)),
             Err(error) => {
                 self.invalidate();
@@ -460,9 +463,13 @@ impl Schedule {
         }
     }
 
-    /// Every intervening header must connect. A negative bloom at the head
-    /// never stands in for missing blocks of a polling gap.
-    async fn fetch(client: &Client, previous: Option<&HeadObservation>) -> Result<Observation> {
+    /// Quiet coverage requires every intervening header to connect. Active
+    /// rounds may prove ancestry in the head itself; they certify no events.
+    async fn fetch(
+        client: &Client,
+        previous: Option<&HeadObservation>,
+        follow_events: bool,
+    ) -> Result<Observation> {
         let started = Instant::now();
         let mut gap = false;
         let next = client.head_details().await?;
@@ -484,20 +491,34 @@ impl Schedule {
                 replaced = client.block_identity(previous.number).await? != previous.hash;
                 gap = true;
             } else {
-                let mut parent = previous.clone();
-                for number in previous.number + 1..=next.number {
-                    let header = if number == next.number {
-                        next.clone()
-                    } else {
-                        client.header_at(number).await?
-                    };
-                    if header.parent_hash != parent.hash || header.timestamp < parent.timestamp {
-                        replaced = true;
-                        break;
+                let linked = Self::link_headers(client, previous, &next);
+                let distance = next.number - previous.number;
+                let (changed, walked) = if !follow_events && (4..=256).contains(&distance) {
+                    // Both reads start together. A failed optional proof adds
+                    // no serial wait before the ordinary linkage walk.
+                    let ancestry = chain::header_read::ancestor(client, &next, previous.number);
+                    tokio::pin!(linked, ancestry);
+                    tokio::select! {
+                        answer = &mut ancestry => match answer {
+                            Ok(hash) => (hash != previous.hash, Vec::new()),
+                            Err(_) => linked.await?,
+                        },
+                        answer = &mut linked => match answer {
+                            Ok(linked) => linked,
+                            Err(error) => match ancestry.await {
+                                Ok(hash) => (hash != previous.hash, Vec::new()),
+                                Err(_) => return Err(error),
+                            },
+                        },
                     }
-                    parent = header.clone();
-                    added.push(header);
-                }
+                } else {
+                    linked.await?
+                };
+                replaced = changed;
+                added = walked;
+                // Active rounds never consume an interval certificate, even
+                // when the full walk won this race. Quiet authority stays off.
+                gap = !follow_events;
             }
         }
         Ok(Observation {
@@ -507,6 +528,29 @@ impl Schedule {
             gap,
             started,
         })
+    }
+
+    /// Preserve the original parent linkage as the fallback observation.
+    async fn link_headers(
+        client: &Client,
+        previous: &HeadObservation,
+        next: &HeadObservation,
+    ) -> Result<(bool, Vec<HeadObservation>)> {
+        let mut parent = previous.clone();
+        let mut added = Vec::new();
+        for number in previous.number + 1..=next.number {
+            let header = if number == next.number {
+                next.clone()
+            } else {
+                client.header_at(number).await?
+            };
+            if header.parent_hash != parent.hash || header.timestamp < parent.timestamp {
+                return Ok((true, added));
+            }
+            parent = header.clone();
+            added.push(header);
+        }
+        Ok((false, added))
     }
 
     fn apply(&mut self, client: &Client, observation: Observation) -> bool {
@@ -716,13 +760,27 @@ mod tests {
         current: Arc<Mutex<usize>>,
         delay: Duration,
     ) -> Client {
+        recording_node(headers, current, delay, Arc::default()).await
+    }
+
+    async fn recording_node(
+        headers: Arc<Mutex<Vec<HeadObservation>>>,
+        current: Arc<Mutex<usize>>,
+        delay: Duration,
+        reads: Arc<Mutex<Vec<String>>>,
+    ) -> Client {
         let app = Router::new().route(
             "/",
             post(move |Json(request): Json<Value>| {
                 let headers = headers.clone();
                 let current = current.clone();
+                let reads = reads.clone();
                 async move {
                     if request["method"] == "eth_getBlockByNumber" {
+                        reads
+                            .lock()
+                            .unwrap()
+                            .push(request["params"][0].as_str().unwrap().to_string());
                         tokio::time::sleep(delay).await;
                     }
                     let result = match request["method"].as_str().unwrap_or_default() {
@@ -754,6 +812,38 @@ mod tests {
                                 }
                                 None => Value::Null,
                             }
+                        }
+                        "eth_call" => {
+                            let headers = headers.lock().unwrap();
+                            let hash = request["params"][1]["blockHash"].as_str().unwrap();
+                            let block = headers
+                                .iter()
+                                .find(|h| format!("{:#x}", h.hash) == hash)
+                                .unwrap();
+                            let input = request["params"][0]["input"]
+                                .as_str()
+                                .or_else(|| request["params"][0]["data"].as_str())
+                                .unwrap();
+                            let raw = alloy::hex::decode(input).unwrap();
+                            let call =
+                                chain::header_read::HeaderRead::readCall::abi_decode(&raw).unwrap();
+                            let number: u64 = call.ancestorNumber.try_into().unwrap();
+                            reads.lock().unwrap().push("ancestor".into());
+                            let ancestor = headers.iter().find(|h| h.number == number).unwrap();
+                            let result = chain::header_read::HeaderRead::readReturn {
+                                number: U256::from(block.number),
+                                timestamp: U256::from(block.timestamp),
+                                parentHash: block.parent_hash,
+                                ancestorHash: ancestor.hash,
+                            };
+                            json!(format!(
+                                "0x{}",
+                                alloy::hex::encode(
+                                    chain::header_read::HeaderRead::readCall::abi_encode_returns(
+                                        &result
+                                    )
+                                )
+                            ))
                         }
                         _ => Value::Null,
                     };
@@ -789,6 +879,95 @@ mod tests {
             addresses: vec![watched],
             answered: None,
         }
+    }
+
+    #[tokio::test]
+    async fn an_active_adjacent_head_must_still_link_to_the_previous_anchor() {
+        let first = header(10, B256::repeat_byte(9), None);
+        let changed = header(11, B256::repeat_byte(80), None);
+        let client = node(
+            Arc::new(Mutex::new(vec![first.clone(), changed])),
+            Arc::new(Mutex::new(1)),
+        )
+        .await;
+        let observed = Schedule::fetch(&client, Some(&first), false).await.unwrap();
+        assert!(observed.replaced);
+        assert!(observed.gap);
+        assert!(observed.added.is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_round_observations_check_the_anchor_without_scanning_unused_headers() {
+        let first = header(10, B256::repeat_byte(9), None);
+        let later = header(20, B256::repeat_byte(19), None);
+        let headers = Arc::new(Mutex::new(vec![first.clone(), later.clone()]));
+        let current = Arc::new(Mutex::new(0));
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let client = recording_node(
+            headers.clone(),
+            current.clone(),
+            Duration::ZERO,
+            reads.clone(),
+        )
+        .await;
+        let mut schedule = Schedule::default();
+        let stop = Instant::now() + Duration::from_secs(6);
+        while schedule.head.as_ref().is_none_or(|h| h.number != 10) {
+            assert!(Instant::now() < stop, "first observation was not delivered");
+            schedule.poll(&client).unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        reads.lock().unwrap().clear();
+        *current.lock().unwrap() = 1;
+        while schedule.head.as_ref().is_none_or(|h| h.number != 20) {
+            assert!(
+                Instant::now() < stop,
+                "active observation fetched unavailable middle headers"
+            );
+            assert!(!schedule.poll(&client).unwrap());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let read = reads.lock().unwrap().clone();
+        assert_eq!(read.iter().filter(|r| r.as_str() == "latest").count(), 1);
+        assert_eq!(read.iter().filter(|r| r.as_str() == "ancestor").count(), 1);
+        assert!(
+            read.iter()
+                .all(|r| matches!(r.as_str(), "latest" | "ancestor" | "0xb"))
+        );
+        assert!(
+            read.len() <= 3,
+            "the losing walk may ask only its first middle header"
+        );
+        assert_eq!(
+            schedule.headers.len(),
+            1,
+            "unscanned interval must not be certified"
+        );
+        assert!(!schedule.sleeping(&client, Address::repeat_byte(7), None));
+        assert!(schedule.vaults(&client).is_none());
+
+        // A changed earlier anchor remains a branch replacement even though
+        // the current head is ahead and no intermediate headers are scanned.
+        headers.lock().unwrap()[0].hash = B256::repeat_byte(80);
+        let newest = header(30, B256::repeat_byte(29), None);
+        headers.lock().unwrap().push(newest);
+        *current.lock().unwrap() = 2;
+        let stop = Instant::now() + Duration::from_secs(5);
+        let mut replaced = false;
+        // The preceding anchor is20. Replace that exact canonical header.
+        headers.lock().unwrap()[1].hash = B256::repeat_byte(90);
+        while schedule.head.as_ref().is_none_or(|h| h.number != 30) {
+            assert!(
+                Instant::now() < stop,
+                "replacement observation was not delivered"
+            );
+            replaced |= schedule.poll(&client).unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            replaced,
+            "a replaced anchor must reset ordinary round memory"
+        );
     }
 
     #[tokio::test]

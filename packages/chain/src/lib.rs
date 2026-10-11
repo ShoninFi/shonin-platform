@@ -20,6 +20,8 @@ pub mod config;
 pub mod deployments;
 pub mod digest;
 #[cfg(feature = "rpc")]
+pub mod header_read;
+#[cfg(feature = "rpc")]
 mod http_retry;
 #[cfg(feature = "args")]
 pub mod logs;
