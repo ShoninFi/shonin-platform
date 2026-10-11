@@ -243,6 +243,9 @@ struct Memory {
     quiet_since: Option<u64>,
     /// Each waiting claim's next try: the slot, and the wait in slots.
     claims_tried: HashMap<u64, (u64, u64)>,
+    /// The unchanged share count and next bounded partial-payment probe.
+    /// Retained across rounds so a probe budget cannot starve small parts.
+    claim_parts_next: HashMap<u64, (u128, u128)>,
     /// Each unit holder's next serve, by owner (see [`next_units_try`]).
     units_tried: HashMap<Pubkey, UnitsTry>,
     /// The slot the station was last unwound in, and when an unwind found
@@ -463,18 +466,29 @@ const CLAIM_PART_TRIES_A_ROUND: u32 = 16;
 /// The parts of a claim of `shares` tried, in order: half of it, then half
 /// of that, down to a single share; never all of it (a whole try is
 /// `settle_claim`'s), never none.
-fn halvings(shares: u128) -> impl Iterator<Item = u128> {
-    std::iter::successors(Some(shares / 2), |part| Some(part / 2)).take_while(|part| *part > 0)
+fn halvings(shares: u128, next: Option<u128>) -> impl Iterator<Item = u128> {
+    let first = next
+        .filter(|part| *part > 0 && *part < shares)
+        .unwrap_or(shares / 2);
+    std::iter::successors(Some(first), |part| Some(part / 2)).take_while(|part| *part > 0)
 }
 
-/// Whether a try left a claim of `before` shares served: gone, paid, or
-/// fewer shares left; a blocked try leaves its shares as they were.
+/// Whether a decoded claim proves payment progress. A settlement keeps the
+/// account until the separate rent duty closes it; a missing account is no
+/// evidence of a successful simulation.
 fn served(before: u128, after: Option<(ClaimState, u128)>) -> bool {
     match after {
-        None => true,
-        Some((ClaimState::Paid, _)) => true,
-        Some((_, shares)) => shares < before,
+        Some((ClaimState::Paid, 0)) => before > 0,
+        Some((ClaimState::Pending, shares)) => shares > 0 && shares < before,
+        _ => false,
     }
+}
+
+/// A whole settlement can queue the claim against available cash; that
+/// ordinary path is progress too and must not be replaced by a venue close.
+fn settlement_progress(before: u128, after: (ClaimState, u128), whole: bool) -> bool {
+    (whole && matches!(after, (ClaimState::Queued, shares) if shares == before && before > 0))
+        || served(before, Some(after))
 }
 
 /// The most stopped unwinds of one vault the keeper sends in one slot.
@@ -914,6 +928,11 @@ impl Keeping {
         memory
             .claims_tried
             .retain(|id, _| claims.iter().any(|claim| claim.id == *id));
+        memory.claim_parts_next.retain(|id, _| {
+            claims.iter().any(|claim| {
+                claim.id == *id && matches!(claim.state, ClaimState::Pending | ClaimState::Waiting)
+            })
+        });
         for claim in claims {
             if !matches!(claim.state, ClaimState::Pending | ClaimState::Waiting) {
                 continue;
@@ -932,7 +951,7 @@ impl Keeping {
             let paid_parts = if self.claim_serves(v, address, claim, None).await {
                 0
             } else {
-                self.claim_in_parts(v, address, claim.id).await
+                self.claim_in_parts(v, address, claim.id, memory).await
             };
             let outcome = if paid_parts > 0 {
                 Outcome::Done
@@ -1013,23 +1032,32 @@ impl Keeping {
         else {
             return false;
         };
-        let after = simulated
-            .accounts
-            .first()
-            .cloned()
-            .flatten()
-            .and_then(|account| Claim::try_deserialize(&mut &account.data[..]).ok());
-        served(
-            claim.shares,
-            after.as_ref().map(|after| (after.state, after.shares)),
-        )
+        let [Some(account)] = simulated.accounts.as_slice() else {
+            return false;
+        };
+        if account.owner != vp::ID {
+            return false;
+        }
+        let Ok(after) = Claim::try_deserialize(&mut &account.data[..]) else {
+            return false;
+        };
+        if after.id != claim.id || after.owner != claim.owner || after.paid < claim.paid {
+            return false;
+        }
+        settlement_progress(claim.shares, (after.state, after.shares), part.is_none())
     }
 
     /// Claim `id` served in parts: halving its shares from half until a part
     /// would pay, that part sent, and again on what is left while each part
     /// is paid, at most [`CLAIM_PARTS_A_ROUND`] parts a round. Answers how
     /// many parts were paid.
-    async fn claim_in_parts(&self, v: &VaultAccounts, address: &Pubkey, id: u64) -> u32 {
+    async fn claim_in_parts(
+        &self,
+        v: &VaultAccounts,
+        address: &Pubkey,
+        id: u64,
+        memory: &mut Memory,
+    ) -> u32 {
         let mut paid = 0;
         let mut tried = 0;
         while paid < CLAIM_PARTS_A_ROUND && tried < CLAIM_PART_TRIES_A_ROUND {
@@ -1039,13 +1067,46 @@ impl Keeping {
             if !matches!(claim.state, ClaimState::Pending | ClaimState::Waiting) {
                 break;
             }
+            // What remains after a paid part may now fit a whole settlement.
+            if paid > 0 && self.claim_serves(v, address, &claim, None).await {
+                let Ok(ix) = self
+                    .platform
+                    .ix_settle_claim(&self.client, v, &self.keeper(), id)
+                    .await
+                else {
+                    break;
+                };
+                if self
+                    .send(address, vec![ix], "settle the rest of a claim")
+                    .await
+                    == Outcome::Done
+                {
+                    if let Ok(Some(after)) = self.platform.claim(&self.client, address, id).await
+                        && after.id == claim.id
+                        && after.owner == claim.owner
+                        && after.paid >= claim.paid
+                        && served(claim.shares, Some((after.state, after.shares)))
+                    {
+                        paid += 1;
+                    }
+                    memory.claim_parts_next.remove(&id);
+                }
+                break;
+            }
+            let next = memory
+                .claim_parts_next
+                .get(&id)
+                .filter(|(basis, _)| *basis == claim.shares)
+                .map(|(_, next)| *next);
             let mut sent = false;
-            for part in halvings(claim.shares) {
+            for part in halvings(claim.shares, next) {
                 if tried >= CLAIM_PART_TRIES_A_ROUND {
                     break;
                 }
                 tried += 1;
+                memory.claim_parts_next.insert(id, (claim.shares, part));
                 if !self.claim_serves(v, address, &claim, Some(part)).await {
+                    memory.claim_parts_next.insert(id, (claim.shares, part / 2));
                     continue;
                 }
                 let Ok(ix) = self
@@ -1056,6 +1117,18 @@ impl Keeping {
                     break;
                 };
                 if self.send(address, vec![ix], "settle part of a claim").await == Outcome::Done {
+                    let Ok(Some(after)) = self.platform.claim(&self.client, address, id).await
+                    else {
+                        break;
+                    };
+                    if after.id != claim.id
+                        || after.owner != claim.owner
+                        || after.paid < claim.paid
+                        || !served(claim.shares, Some((after.state, after.shares)))
+                    {
+                        break;
+                    }
+                    memory.claim_parts_next.remove(&id);
                     paid += 1;
                     sent = true;
                     tracing::info!(vault = %address, claim = id, shares = part, "part of the claim is paid");
@@ -2253,23 +2326,60 @@ mod tests {
 
     #[test]
     fn a_claim_that_can_t_be_served_whole_is_tried_in_halves_down_to_a_share() {
-        assert_eq!(halvings(100).collect::<Vec<_>>(), vec![50, 25, 12, 6, 3, 1]);
-        assert_eq!(halvings(2).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(
+            halvings(100, None).collect::<Vec<_>>(),
+            vec![50, 25, 12, 6, 3, 1]
+        );
+        assert_eq!(halvings(2, None).collect::<Vec<_>>(), vec![1]);
         // A claim of one share can only be served whole.
-        assert_eq!(halvings(1).count(), 0);
-        assert_eq!(halvings(0).count(), 0);
+        assert_eq!(halvings(1, None).count(), 0);
+        assert_eq!(halvings(0, None).count(), 0);
         // Never all of it, never none.
-        assert!(halvings(u128::MAX).all(|part| part > 0 && part < u128::MAX));
-        assert!(halvings(u128::MAX).count() <= 128);
+        assert!(halvings(u128::MAX, None).all(|part| part > 0 && part < u128::MAX));
+        assert!(halvings(u128::MAX, None).count() <= 128);
+    }
+
+    #[test]
+    fn bounded_partial_claim_probes_eventually_reach_one_share() {
+        let shares = u128::MAX;
+        let mut next = None;
+        let mut all = Vec::new();
+        for _ in 0..8 {
+            let round: Vec<_> = halvings(shares, next)
+                .take(CLAIM_PART_TRIES_A_ROUND as usize)
+                .collect();
+            assert!(round.len() <= CLAIM_PART_TRIES_A_ROUND as usize);
+            next = round.last().map(|part| part / 2);
+            all.extend(round);
+            if next == Some(0) {
+                break;
+            }
+        }
+        assert_eq!(all, halvings(shares, None).collect::<Vec<_>>());
+        assert_eq!(all.last(), Some(&1));
+        assert_eq!(halvings(100, Some(25)).next(), Some(25));
+        assert_eq!(halvings(10, Some(25)).next(), Some(5));
     }
 
     #[test]
     fn a_try_serves_a_claim_when_it_pays_some_of_it_and_a_blocked_one_doesn_t() {
-        assert!(served(10, None));
+        assert!(!served(10, None));
         assert!(served(10, Some((ClaimState::Paid, 0))));
         assert!(served(10, Some((ClaimState::Pending, 5))));
         assert!(!served(10, Some((ClaimState::Waiting, 10))));
         assert!(!served(10, Some((ClaimState::Pending, 10))));
+        assert!(!served(10, Some((ClaimState::Paid, 10))));
+        assert!(!served(10, Some((ClaimState::Fallback, 0))));
+        assert!(!served(0, Some((ClaimState::Paid, 0))));
+    }
+
+    #[test]
+    fn a_whole_claim_queued_for_cash_does_not_need_partial_closes() {
+        assert!(settlement_progress(10, (ClaimState::Queued, 10), true));
+        assert!(!settlement_progress(10, (ClaimState::Queued, 10), false));
+        assert!(!settlement_progress(10, (ClaimState::Queued, 11), true));
+        assert!(!settlement_progress(10, (ClaimState::Waiting, 10), true));
+        assert!(settlement_progress(10, (ClaimState::Pending, 5), false));
     }
 
     #[test]
