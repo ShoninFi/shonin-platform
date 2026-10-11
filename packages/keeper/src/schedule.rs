@@ -396,7 +396,7 @@ impl Schedule {
                         previous = Some(observation.next.clone());
                     }
                     // Backpressure preserves every observed branch change/event.
-                    // A later gap is checked in full after a slow money round.
+                    // Later heads require ancestry; event coverage requires full linkage.
                     if sender.send(result).await.is_err() {
                         break;
                     }
@@ -486,9 +486,10 @@ impl Schedule {
             } else if next.number <= previous.number {
                 replaced = true;
             } else if next.number - previous.number > client.rpc_policy().log_batch_blocks {
-                // Confidence is lost on an oversized gap, even when the old
-                // anchor is still canonical; refresh all ordinary state.
-                replaced = client.block_identity(previous.number).await? != previous.hash;
+                // No ancestry proof ties this head to the remembered branch.
+                // A numbered anchor from another endpoint cannot establish it.
+                // Reset ordinary money memories before adopting the new head.
+                replaced = true;
                 gap = true;
             } else {
                 let linked = Self::link_headers(client, previous, &next);
@@ -878,6 +879,56 @@ mod tests {
             due: 1000,
             addresses: vec![watched],
             answered: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unlinked_large_head_gap_resets_the_rounds_derived_state() {
+        for changed_anchor in [false, true] {
+            let previous = header(10, B256::repeat_byte(9), None);
+            let reads = Arc::new(Mutex::new(Vec::new()));
+            let current = Arc::new(Mutex::new(0));
+            let headers = Arc::new(Mutex::new(vec![previous.clone()]));
+            let client = recording_node(
+                headers.clone(),
+                current.clone(),
+                Duration::ZERO,
+                reads.clone(),
+            )
+            .await;
+            let next = header(
+                previous.number + client.rpc_policy().log_batch_blocks + 1,
+                B256::repeat_byte(70),
+                None,
+            );
+            if changed_anchor {
+                headers.lock().unwrap()[0].hash = B256::repeat_byte(80);
+            }
+            headers.lock().unwrap().push(next.clone());
+            *current.lock().unwrap() = 1;
+            reads.lock().unwrap().clear();
+            let observation = Schedule::fetch(&client, Some(&previous), false)
+                .await
+                .unwrap();
+            assert!(observation.replaced);
+            assert!(observation.gap);
+            assert!(observation.added.is_empty());
+            assert_eq!(
+                *reads.lock().unwrap(),
+                vec!["latest"],
+                "a separately numbered old header must not authorize keeping state"
+            );
+            let mut schedule = Schedule::default();
+            schedule.remember_test_hint(
+                Address::repeat_byte(7),
+                previous.clone(),
+                hint(&previous, Address::repeat_byte(7)),
+            );
+            schedule.ready.push_back(Ok(observation));
+            assert!(schedule.poll(&client).unwrap());
+            assert!(schedule.hints.is_empty());
+            assert!(schedule.listed.is_none());
+            assert_eq!(schedule.head.as_ref().unwrap().hash, next.hash);
         }
     }
 
