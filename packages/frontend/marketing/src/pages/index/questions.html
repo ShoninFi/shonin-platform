@@ -1,0 +1,108 @@
+
+<section class="sec sec--raised" id="questions" aria-labelledby="questions-title">
+  <div class="wrap questions">
+    <div class="sec-head sec-head--split">
+      <div class="sec-head__main sh-reveal" data-play>
+        <p class="sh-label">Before you trust an agent</p>
+        <h2 class="h2" id="questions-title">Smart contracts are public and auditable. Trading agents should be too.</h2>
+      </div>
+      <div class="sec-head__intro sh-reveal dl-120" data-play>
+        <p class="reading">There are five things you'd want to know before handing an automated strategy your money. On Shonin, every answer is one you can check yourself.</p>
+        <div class="actions actions--stack-phone">
+          <a class="sh-btn sh-btn-primary sh-btn-lg" href="{{docs}}/">Read the docs{{i:external:18}}</a>
+          <a class="link-strong" href="{{docs}}/basics/trading-agents/">How it fits together</a>
+        </div>
+      </div>
+    </div>
+
+    <ol class="qgrid">
+      <li class="sh-card qcard sh-reveal" data-play>
+        <span class="sh-label qcard__n">01</span>
+        <h3 class="qcard__q">What does it do?</h3>
+        <p class="qcard__a">An AI Reviewer reads all of the code before it's built and publishes a report. If the source is public, you can read it too.</p>
+        <p class="qcard__proof">{{i:code:18}}Rebuild it yourself and you get the fingerprint the chain holds.</p>
+      </li>
+      <li class="sh-card qcard sh-reveal dl-60" data-play>
+        <span class="sh-label qcard__n">02</span>
+        <h3 class="qcard__q">What risks does its strategy take?</h3>
+        <p class="qcard__a">The review rates its financial risk. Its page shows where it trades, and a record read straight from its own contract.</p>
+        <p class="qcard__proof">{{i:vault:18}}Every trade is public, and any number gives the same answer on-chain.</p>
+      </li>
+      <li class="sh-card qcard sh-reveal dl-120" data-play>
+        <span class="sh-label qcard__n">03</span>
+        <h3 class="qcard__q">Can somebody swap the code out from under my feet?</h3>
+        <p class="qcard__a">No. The agent runs in an attested machine, and only keys made inside one running this exact, reviewed build can trade for the vault.</p>
+        <p class="qcard__proof">{{i:seal:18}}Each key's attestation is recorded on the chain.</p>
+      </li>
+      <li class="sh-card qcard sh-reveal dl-180" data-play>
+        <span class="sh-label qcard__n">04</span>
+        <h3 class="qcard__q">Could anyone walk off with my money?</h3>
+        <p class="qcard__a">No. Its keys are trade-only: the venue lets them place and cancel orders, and nothing else. Money only moves between the vault and its own stations.</p>
+        <p class="qcard__proof">{{i:lock:18}}Enforced by blockchain tech and open-source contracts, not by the agent.</p>
+      </li>
+      <li class="sh-card qcard sh-reveal dl-240" data-play>
+        <span class="sh-label qcard__n">05</span>
+        <h3 class="qcard__q">Can I get out whenever I want?</h3>
+        <p class="qcard__a">Yes. You're paid from the vault's cash within seconds, or your withdrawal is booked and anyone can push it through.</p>
+        <p class="qcard__proof">{{i:exit:18}}On most vaults, it works even if everything we run goes dark.</p>
+      </li>
+      <li class="qgrid__link sh-reveal dl-300" data-play>
+        <a class="checklink sh-card-link" href="{{docs}}/verify/">
+          <span class="checklink__icon">{{i:seal:40:1.5}}</span>
+          <span class="checklink__text">
+            <span class="checklink__title">Check each answer yourself</span>
+            <span class="checklink__body">The docs walk through every check, say how strong each one is, and list what checking can't tell you.</span>
+            <span class="checklink__go">Read the verification guide{{i:arrow:18}}</span>
+          </span>
+        </a>
+      </li>
+    </ol>
+
+    <div class="qacc sh-card sh-reveal dl-120" data-play data-accordion>
+      <div class="qacc__item">
+        <h3 class="qacc__h"><button class="qacc__btn" type="button" id="qb1" aria-controls="qp1" aria-expanded="true"><span class="sh-label qacc__n">01</span><span class="qacc__q">What does it do?</span><span class="qacc__chev">{{i:chev-down:20}}</span></button></h3>
+        <div class="qacc__panel" id="qp1" role="region" aria-labelledby="qb1">
+          <p class="qacc__a">An AI Reviewer reads all of the code before it's built and publishes a report. If the source is public, you can read it too.</p>
+          <p class="qcard__proof">{{i:code:18}}Rebuild it yourself and you get the fingerprint the chain holds.</p>
+        </div>
+      </div>
+      <div class="qacc__item">
+        <h3 class="qacc__h"><button class="qacc__btn" type="button" id="qb2" aria-controls="qp2" aria-expanded="true"><span class="sh-label qacc__n">02</span><span class="qacc__q">What risks does its strategy take?</span><span class="qacc__chev">{{i:chev-down:20}}</span></button></h3>
+        <div class="qacc__panel" id="qp2" role="region" aria-labelledby="qb2">
+          <p class="qacc__a">The review rates its financial risk. Its page shows where it trades, and a record read straight from its own contract.</p>
+          <p class="qcard__proof">{{i:vault:18}}Every trade is public, and any number gives the same answer on-chain.</p>
+        </div>
+      </div>
+      <div class="qacc__item">
+        <h3 class="qacc__h"><button class="qacc__btn" type="button" id="qb3" aria-controls="qp3" aria-expanded="true"><span class="sh-label qacc__n">03</span><span class="qacc__q">Can somebody swap the code out from under my feet?</span><span class="qacc__chev">{{i:chev-down:20}}</span></button></h3>
+        <div class="qacc__panel" id="qp3" role="region" aria-labelledby="qb3">
+          <p class="qacc__a">No. The agent runs in an attested machine, and only keys made inside one running this exact, reviewed build can trade for the vault.</p>
+          <p class="qcard__proof">{{i:seal:18}}Each key's attestation is recorded on the chain.</p>
+        </div>
+      </div>
+      <div class="qacc__item">
+        <h3 class="qacc__h"><button class="qacc__btn" type="button" id="qb4" aria-controls="qp4" aria-expanded="true"><span class="sh-label qacc__n">04</span><span class="qacc__q">Could anyone walk off with my money?</span><span class="qacc__chev">{{i:chev-down:20}}</span></button></h3>
+        <div class="qacc__panel" id="qp4" role="region" aria-labelledby="qb4">
+          <p class="qacc__a">No. Its keys are trade-only: the venue lets them place and cancel orders, and nothing else. Money only moves between the vault and its own stations.</p>
+          <p class="qcard__proof">{{i:lock:18}}Enforced by blockchain tech and open-source contracts, not by the agent.</p>
+        </div>
+      </div>
+      <div class="qacc__item">
+        <h3 class="qacc__h"><button class="qacc__btn" type="button" id="qb5" aria-controls="qp5" aria-expanded="true"><span class="sh-label qacc__n">05</span><span class="qacc__q">Can I get out whenever I want?</span><span class="qacc__chev">{{i:chev-down:20}}</span></button></h3>
+        <div class="qacc__panel" id="qp5" role="region" aria-labelledby="qb5">
+          <p class="qacc__a">Yes. You're paid from the vault's cash within seconds, or your withdrawal is booked and anyone can push it through.</p>
+          <p class="qcard__proof">{{i:exit:18}}On most vaults, it works even if everything we run goes dark.</p>
+        </div>
+      </div>
+    </div>
+
+    <a class="checklink checklink--row sh-card-link qlink-phone sh-reveal dl-180" href="{{docs}}/verify/" data-play>
+      <span class="checklink__icon">{{i:seal:32:1.5}}</span>
+      <span class="checklink__text">
+        <span class="checklink__title">Check each answer yourself</span>
+        <span class="checklink__body">The docs walk through every check, say how strong each one is, and list what checking can't tell you.</span>
+        <span class="checklink__go">Read the verification guide{{i:arrow:18}}</span>
+      </span>
+    </a>
+  </div>
+</section>

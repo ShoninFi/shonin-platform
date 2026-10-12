@@ -1,0 +1,144 @@
+
+<section class="sec sec--raised publish" aria-labelledby="publish-title" data-steps data-active="2">
+  <div class="wrap publish__grid">
+    <div class="publish__head sh-reveal" data-play>
+      <p class="sh-label">For Authors · publishing</p>
+      <h2 class="h2" id="publish-title">Publishing is easy: four checked steps.</h2>
+    </div>
+
+    <div class="publish__steps">
+      <span class="publish__rail" aria-hidden="true"><span class="publish__fill"></span></span>
+      <ol class="publish__list" aria-label="Four steps to publish an agent">
+        <li class="pstep" data-step="1">
+          <span class="pstep__dot" aria-hidden="true"></span>
+          <p class="pstep__top" aria-hidden="true"><span class="sh-label">Step 1</span>{{i:code:24}}</p>
+          <h3 class="pstep__title">Write your agent</h3>
+          <p class="pstep__text">An ordinary Rust project, started from our template. It decides what to trade; it never holds a key.</p>
+        </li>
+        <li class="pstep" data-step="2">
+          <span class="pstep__dot" aria-hidden="true"></span>
+          <p class="pstep__top" aria-hidden="true"><span class="sh-label">Step 2</span>{{i:review:24}}</p>
+          <h3 class="pstep__title">Submit it for $1, and it's reviewed</h3>
+          <p class="pstep__text">An AI Reviewer reads every line first and rates it in six areas, including whether it does what you say. Code written to do harm is refused.</p>
+        </li>
+        <li class="pstep" data-step="3">
+          <span class="pstep__dot" aria-hidden="true"></span>
+          <p class="pstep__top" aria-hidden="true"><span class="sh-label">Step 3</span>{{i:seal:24}}</p>
+          <h3 class="pstep__title">It's built once, in an attested machine</h3>
+          <p class="pstep__text">The machine compiles it and signs what came out. The chain records which build may trade your vault.</p>
+        </li>
+        <li class="pstep" data-step="4">
+          <span class="pstep__dot" aria-hidden="true"></span>
+          <p class="pstep__top" aria-hidden="true"><span class="sh-label">Step 4</span>{{i:vault:24}}</p>
+          <h3 class="pstep__title">Activate it, and Depositors can back it</h3>
+          <p class="pstep__text">Choose its limits, fill its tank, and your vault opens on the chain you chose. You earn 10% of the new profit it makes.</p>
+        </li>
+      </ol>
+    </div>
+
+    <div class="publish__controls" hidden>
+      <div class="publish__where">
+        <span class="publish__dots" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+        <p class="publish__count" aria-live="polite">Step <span class="sh-num" data-step-now>1</span> of 4</p>
+      </div>
+      <div class="publish__buttons">
+        <button class="sh-iconbtn sh-iconbtn--line" type="button" data-step-prev aria-label="Previous step">{{i:chev-left:20}}</button>
+        <button class="sh-iconbtn sh-iconbtn--line" type="button" data-step-next aria-label="Next step">{{i:chev-right:20}}</button>
+      </div>
+    </div>
+
+    <div class="actions actions--stack-phone publish__actions sh-reveal" data-play>
+      <a class="sh-btn sh-btn-secondary" href="{{app}}/publish">Publish an agent</a>
+      <a class="link-strong" href="{{docs}}/writing/publishing/">Read the publishing guide</a>
+    </div>
+
+    <div class="publish__vis sh-reveal dl-120" data-play>
+      <figure class="pvis" data-panel="1">
+        <figcaption class="sh-label pvis__cap">Step 1 of 4 · The source</figcaption>
+        <ol class="pipe" aria-hidden="true">
+          <li class="pipe__tile is-now">{{i:code:24}}<span>Source</span></li>
+          <li class="pipe__tile is-todo">{{i:review:24}}<span>Review</span></li>
+          <li class="pipe__tile is-todo">{{i:seal:24}}<span>Attested build</span></li>
+          <li class="pipe__tile is-todo">{{i:vault:24}}<span>Vault</span></li>
+        </ol>
+        <div class="sh-card pvis__card">
+          <div class="pvis__cardhead"><p class="pvis__title">Source · Basis Harvester</p><p class="sh-mono pvis__hash">38 files of Rust</p></div>
+          <ul class="files">
+            <li><span class="sh-mono">shonin.toml</span><span>Name, description, claims, vault chain and drivers</span></li>
+            <li><span class="sh-mono">src/decide.rs</span><span>The strategy, as a pure function that's easy to test</span></li>
+            <li><span class="sh-mono">src/lib.rs</span><span>The long-lived program: watches the markets and hands orders on</span></li>
+            <li><span class="sh-mono">tests/</span><span>Tests for the strategy, run by cargo test</span></li>
+          </ul>
+          <p class="well-note">{{i:lock:16}}<span>It decides what to trade; it never holds a key.</span></p>
+        </div>
+        <p class="pvis__foot">The template is a working agent with tests. Change the strategy, keep the shape.</p>
+      </figure>
+
+      <figure class="pvis" data-panel="2">
+        <figcaption class="sh-label pvis__cap">Step 2 of 4 · The review</figcaption>
+        <ol class="pipe" aria-hidden="true">
+          <li class="pipe__tile is-done">{{i:code:24}}<span>Source</span></li>
+          <li class="pipe__tile is-now">{{i:review:24}}<span>Review</span></li>
+          <li class="pipe__tile is-todo">{{i:seal:24}}<span>Attested build</span></li>
+          <li class="pipe__tile is-todo">{{i:vault:24}}<span>Vault</span></li>
+        </ol>
+        <div class="sh-card pvis__card sh-sheet-up dl-300">
+          <div class="pvis__cardhead"><p class="pvis__title">AI Review · Basis Harvester</p><p class="sh-mono pvis__hash">source 0x9b2c…11fe</p></div>
+          <p class="quote">“Rebalances two perpetuals so the vault earns funding without holding a view.”</p>
+          <ul class="areas">
+            <li class="sh-fade-in dl-500"><span>Security</span><span class="sh-chip sh-chip-gain">{{i:check:14}}Looks fine</span></li>
+            <li class="sh-fade-in dl-580"><span>Financial risk</span><span class="sh-chip sh-chip-gain">{{i:check:14}}Looks fine</span></li>
+            <li class="sh-fade-in dl-660"><span>Reliability</span><span class="sh-chip sh-chip-caution">{{i:concern:14}}Some concerns</span></li>
+            <li class="sh-fade-in dl-740"><span>Reproducibility</span><span class="sh-chip sh-chip-gain">{{i:check:14}}Looks fine</span></li>
+            <li class="sh-fade-in dl-820"><span>Outside influence</span><span class="sh-chip sh-chip-gain">{{i:check:14}}Looks fine</span></li>
+            <li class="sh-fade-in dl-900"><span>Accurate description</span><span class="sh-chip sh-chip-gain">{{i:check:14}}Looks fine</span></li>
+          </ul>
+          <p class="well-note">{{i:info:16}}<span>The report is tied on the chain to the exact code that will run.</span></p>
+        </div>
+        <p class="pvis__foot">A review is advice, not a prediction. It never rates how much an agent might make.</p>
+      </figure>
+
+      <figure class="pvis" data-panel="3">
+        <figcaption class="sh-label pvis__cap">Step 3 of 4 · The attested build</figcaption>
+        <ol class="pipe" aria-hidden="true">
+          <li class="pipe__tile is-done">{{i:code:24}}<span>Source</span></li>
+          <li class="pipe__tile is-done">{{i:review:24}}<span>Review</span></li>
+          <li class="pipe__tile is-now">{{i:seal:24}}<span>Attested build</span></li>
+          <li class="pipe__tile is-todo">{{i:vault:24}}<span>Vault</span></li>
+        </ol>
+        <div class="sh-card pvis__card">
+          <div class="pvis__cardhead"><p class="pvis__title">Attested build · Basis Harvester</p><span class="sh-chip sh-chip-gain">{{i:check:14}}Signed</span></div>
+          <dl class="kv">
+            <div><dt>Source</dt><dd class="sh-mono">0x9b2c…11fe</dd></div>
+            <div><dt>Built by</dt><dd>An attested builder</dd></div>
+            <div><dt>Build</dt><dd class="sh-mono">0x4e1d…a90b</dd></div>
+            <div><dt>Recorded on</dt><dd>Hyperliquid</dd></div>
+          </dl>
+          <p class="well-note well-note--brand">{{i:seal:16}}<span>The chain records which build may trade your vault. Only that build ever can.</span></p>
+        </div>
+        <p class="pvis__foot">Rebuild it yourself and you get the fingerprint the chain holds.</p>
+      </figure>
+
+      <figure class="pvis" data-panel="4">
+        <figcaption class="sh-label pvis__cap">Step 4 of 4 · The vault</figcaption>
+        <ol class="pipe" aria-hidden="true">
+          <li class="pipe__tile is-done">{{i:code:24}}<span>Source</span></li>
+          <li class="pipe__tile is-done">{{i:review:24}}<span>Review</span></li>
+          <li class="pipe__tile is-done">{{i:seal:24}}<span>Attested build</span></li>
+          <li class="pipe__tile is-now">{{i:vault:24}}<span>Vault</span></li>
+        </ol>
+        <div class="sh-card pvis__card">
+          <div class="pvis__cardhead"><p class="pvis__title">Vault · Basis Harvester</p><p class="pvis__hash">on Hyperliquid</p></div>
+          <dl class="kv">
+            <div><dt>Allowances</dt><dd>Chosen by you</dd></div>
+            <div><dt>Idle floor</dt><dd>Kept as cash at home</dd></div>
+            <div><dt>Tank</dt><dd>At least $10 to start</dd></div>
+            <div><dt>You earn</dt><dd>10% of new profit</dd></div>
+          </dl>
+          <p class="well-note">{{i:vault:16}}<span>Depositors back it on the chain you chose.</span></p>
+        </div>
+        <p class="pvis__foot">The agent can lose money. Nothing here stops that.</p>
+      </figure>
+    </div>
+  </div>
+</section>

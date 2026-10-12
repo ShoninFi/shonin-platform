@@ -1,0 +1,93 @@
+<section class="hero hero--authors sh-hero is-in" aria-labelledby="hero-title" data-play data-loop>
+  <svg class="hexgrid" aria-hidden="true" focusable="false"><defs><pattern id="hexgrid-hero" width="56" height="97" patternUnits="userSpaceOnUse"><path d="M28 0 L56 16.2 L56 48.5 L28 64.7 L0 48.5 L0 16.2 Z M28 64.7 L28 97"/></pattern></defs><rect width="100%" height="100%" fill="url(#hexgrid-hero)"/></svg>
+  <div class="wrap hero__grid">
+    <div class="hero__copy">
+      <p class="sh-label hero__eyebrow sh-reveal">For Authors</p>
+      <h1 class="hero__title" id="hero-title"><span class="word sh-reveal dl-120">Turn</span> <span class="word sh-reveal dl-180">a</span> <span class="word sh-reveal dl-240">good</span> <span class="word sh-reveal dl-300">strategy</span> <span class="word sh-reveal dl-360">into</span> <span class="word sh-reveal dl-420">income.</span></h1>
+      <p class="hero__lede hero__lede--authors sh-reveal dl-540">Write a trading agent, publish it for a flat $1, and earn 10% of the new profit it makes on Depositors' money. You don't need anyone's permission.</p>
+      <div class="hero__actions sh-reveal dl-660">
+        <a class="sh-btn sh-btn-hero sh-btn-lg" href="{{app}}/publish">Publish an agent{{i:arrow:18}}</a>
+        <a class="sh-btn sh-btn-hero-2 sh-btn-lg" href="https://github.com/ShoninFi/shonin-agent-template">Start from the template{{i:external:18}}</a>
+      </div>
+      <p class="risk-line sh-reveal dl-780">{{i:concern:18}}<span>Your agent can lose money, and nothing here stops that. You're paid only on new profit. <a href="#earn">How earnings work</a></span></p>
+    </div>
+
+    <div class="editor">
+      <div class="hero__glow sh-glow-drift" aria-hidden="true"></div>
+      <figure class="editor__code sh-fade-in dl-200">
+        <figcaption class="editor__bar">
+          <ul class="editor__tabs" aria-label="Files in the template">
+            <li class="editor__tab is-current"><span class="vh">Showing </span>src/decide.rs</li>
+            <li class="editor__tab">src/lib.rs</li>
+            <li class="editor__tab">shonin.toml</li>
+          </ul>
+          <span class="editor__lang">Rust</span>
+        </figcaption>
+        <div class="editor__body" tabindex="0" role="region" aria-label="Example decide function in Rust">
+          <pre class="hx-code editor__lines" aria-hidden="true">1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21</pre>
+          <pre class="hx-code editor__src"><span class="hx-k">use</span> crate::config::<span class="hx-t">LIMITS</span>;
+<span class="hx-k">use</span> strategy_sdk::{hyperliquid <span class="hx-k">as</span> hl, <span class="hx-t">Decimal</span>};
+
+<span class="hx-c">/// Pure: the same account, the same orders.</span>
+<span class="hx-k">pub fn</span> <span class="hx-t">decide</span>(acct: &amp;hl::<span class="hx-t">AccountState</span>, bid: <span class="hx-t">Decimal</span>)
+    -&gt; <span class="hx-t">Vec</span>&lt;hl::<span class="hx-t">Action</span>&gt; {
+    <span class="hx-k">let</span> vault = acct.vault_value;
+    <span class="hx-k">let</span> size = vault * <span class="hx-t">LIMITS</span>.step / bid;
+    <span class="hx-c">// Never more than 2× leverage, as claimed.</span>
+    <span class="hx-k">let</span> held = acct.positions.iter()
+        .fold(<span class="hx-t">Decimal</span>::<span class="hx-t">ZERO</span>, |n, p| n + p.size.abs());
+    <span class="hx-k">let</span> cap = vault * <span class="hx-t">LIMITS</span>.max_leverage;
+    <span class="hx-k">if</span> (held + size) * bid &gt; cap {
+        <span class="hx-k">return</span> vec![];
+    }
+    vec![hl::<span class="hx-t">Action</span>::Place(hl::<span class="hx-t">Order</span> {
+        market: <span class="hx-s">"ETH"</span>.into(), side: hl::<span class="hx-t">Side</span>::Sell,
+        size, limit_price: bid, tif: hl::<span class="hx-t">Tif</span>::Ioc,
+        reduce_only: <span class="hx-k">false</span>, client_id: <span class="hx-t">None</span>,
+    })]
+}</pre>
+        </div>
+        <p class="editor__swipe" aria-hidden="true"><span class="editor__track"><span></span></span><span>Swipe for more{{i:arrow:14}}</span></p>
+      </figure>
+
+      <figure class="editor__toml hx-float">
+        <figcaption class="editor__tomlbar"><span class="editor__tomlname">shonin.toml</span><span class="editor__tomlnote">Fixed once published</span></figcaption>
+        <pre class="hx-code editor__tomlsrc"><span class="hx-k">[vault]</span>
+chain = <span class="hx-s">"hyperliquid"</span>
+
+<span class="hx-k">[description]</span>
+title = <span class="hx-s">"Basis Harvester"</span>
+claims = [
+  <span class="hx-s">"Never more than 2× leverage."</span>,
+]</pre>
+        <p class="editor__tomlfoot">{{i:review:16}}Every claim is checked against the code.</p>
+      </figure>
+    </div>
+
+    <ul class="proof">
+      <li class="proof__item sh-reveal dl-900">{{i:code:24}}<p><strong>One Rust project.</strong> It compiles to a single WebAssembly component, and it never holds a key.</p></li>
+      <li class="proof__item sh-reveal dl-960">{{i:review:24}}<p><strong>Read before it's built.</strong> The Reviewer's report is public, and it checks your claims against your code.</p></li>
+      <li class="proof__item sh-reveal dl-1020">{{i:vault:24}}<p><strong>Paid in shares.</strong> 10% of new profit, every Monday, as shares in your own vault.</p></li>
+    </ul>
+  </div>
+</section>

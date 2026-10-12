@@ -1,0 +1,97 @@
+<section class="legal-hero sh-hero is-in" aria-labelledby="legal-title" data-play>
+  <svg class="hexgrid" aria-hidden="true" focusable="false"><defs><pattern id="hexgrid-legal" width="56" height="97" patternUnits="userSpaceOnUse"><path d="M28 0 L56 16.2 L56 48.5 L28 64.7 L0 48.5 L0 16.2 Z M28 64.7 L28 97"/></pattern></defs><rect width="100%" height="100%" fill="url(#hexgrid-legal)"/></svg>
+  <div class="wrap legal-hero__inner">
+    <p class="sh-label hero__eyebrow sh-reveal">Terms of Use</p>
+    <h1 class="legal-hero__title sh-reveal dl-120" id="legal-title">The terms, in plain words.</h1>
+    <p class="legal-hero__lede sh-reveal dl-240">What Shonin is, who it isn't offered to, and what you take on when you use it. Last updated Oct 12, 2026.</p>
+  </div>
+</section>
+
+<div class="sec sec--paper legal">
+  <div class="wrap legal__grid">
+    <nav class="legal__toc" aria-label="On this page">
+      <p class="sh-label">On this page</p>
+      <ol>
+        <li><a href="#cover">What these terms cover</a></li>
+        <li><a href="#testnet">Test networks only</a></li>
+        <li><a href="#restricted">Who it isn't offered to</a></li>
+        <li><a href="#lose">The agent can lose money</a></li>
+        <li><a href="#advice">No investment advice</a></li>
+        <li><a href="#warranty">No warranty</a></li>
+        <li><a href="#yours">What's yours to look after</a></li>
+        <li><a href="#authors">If you publish an agent</a></li>
+        <li><a href="#changes">Changes to these terms</a></li>
+      </ol>
+    </nav>
+
+    <article class="prose">
+      <section aria-labelledby="cover">
+        <h2 id="cover">What these terms cover</h2>
+        <p>These terms are for shonin.fi, the app at app.shonin.fi, the docs at docs.shonin.fi, and the smart contracts and attested machines behind them. “We” and “us” means the people who build and run Shonin. “You” means anyone who uses any of it. By using Shonin you agree to these terms. If you don't agree, don't use it.</p>
+        <p>Shonin lets Authors publish trading agents and lets Depositors put money into an agent's vault. Every agent is written by its Author, not by us. We run the platform: the review, the build, the machines the agents run in and the contracts their vaults live in.</p>
+      </section>
+
+      <section aria-labelledby="testnet">
+        <h2 id="testnet">Test networks only</h2>
+        <p>Shonin runs on test networks today: Base Sepolia, Hyperliquid's testnet, Robinhood Chain's testnet and Solana's devnet. The dollars on them are test dollars with no value. Don't send real money to any address you find on Shonin.</p>
+        <p>Test networks are reset, slowed down and changed by the people who run them, and so is Shonin. Anything on them can disappear.</p>
+      </section>
+
+      <section aria-labelledby="restricted">
+        <h2 id="restricted">Who it isn't offered to</h2>
+        <p>Shonin isn't offered to restricted persons. Every vault has its own restricted list: US persons and sanctioned persons on every vault, plus everyone the terms of the venues it trades on exclude. An Author can add to a vault's list, and nobody can take anything off it.</p>
+        <p>Before your first deposit into a vault, your wallet signs this statement. The vault's contract checks the signature and records it, and refuses a deposit without one:</p>
+        <blockquote class="statement"><p>I am not a restricted person for this vault, and I am not acting for one.</p></blockquote>
+        <p>The statement you sign also carries the vault's whole restricted list, as the contract reads it: a comma-separated list of codes, such as <code>CA-ON,SANCTIONED,US</code> for a vault that trades on Hyperliquid. Each vault's page shows its list, and which venue each code comes from.</p>
+        <div class="legal-table sh-card">
+          <table class="sh-table">
+            <caption>The codes the contracts carry today</caption>
+            <thead><tr><th scope="col">Where it applies</th><th scope="col">Codes</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">Every vault</th><td><code>SANCTIONED</code>, <code>US</code></td></tr>
+              <tr><th scope="row">Vaults that trade on Hyperliquid</th><td><code>CA-ON</code>, <code>SANCTIONED</code>, <code>US</code></td></tr>
+              <tr><th scope="row">Vaults that trade on Lighter</th><td><code>CA</code>, <code>CN</code>, <code>GB</code>, <code>RU</code>, <code>SANCTIONED</code>, <code>UA</code>, <code>US</code></td></tr>
+              <tr><th scope="row">Vaults that trade stock tokens on Robinhood Chain</th><td><code>CA</code>, <code>CH</code>, <code>GB</code>, <code>SANCTIONED</code>, <code>US</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><code>US</code> means US persons and <code>SANCTIONED</code> means sanctioned persons. A two-letter code is a country (<code>CA</code> Canada, <code>CH</code> Switzerland, <code>CN</code> China, <code>GB</code> the United Kingdom, <code>RU</code> Russia, <code>UA</code> Ukraine), and <code>CA-ON</code> is the Canadian province of Ontario: each means the people in that place, as the venue's terms describe them.</p>
+        <p>If any of these describes you, or you'd be acting for someone it describes, don't deposit. The statement is yours: we don't check anyone's identity, and signing it falsely is on you. Withdrawals are never restricted. Anyone holding shares can always leave.</p>
+      </section>
+
+      <section aria-labelledby="lose">
+        <h2 id="lose">The agent can lose money</h2>
+        <p>The agent can lose money. Nothing here stops that. It could even lose it on purpose. A review isn't a prediction, and a track record isn't a promise. Before you deposit, read <a href="/#risks">what can still go wrong</a>: an agent can stop, a withdrawal can be delayed, an agent can be retired, a vault can be stopped, a venue, bridge or chain can fail, and our own code can have bugs.</p>
+      </section>
+
+      <section aria-labelledby="advice">
+        <h2 id="advice">No investment advice</h2>
+        <p>Nothing on Shonin is investment, financial, legal or tax advice, and nothing on it recommends any agent. The review rates an agent's code. It never rates how much an agent might make. The agents named on shonin.fi are illustrations.</p>
+      </section>
+
+      <section aria-labelledby="warranty">
+        <h2 id="warranty">No warranty</h2>
+        <p>Shonin is provided as it is, with no warranty of any kind, as far as the law allows. We don't promise that it works, that it's available, that it's free of bugs, or that an agent, a venue, a bridge or a chain does what anyone expects. As far as the law allows, we aren't liable for any loss that comes from using it.</p>
+      </section>
+
+      <section aria-labelledby="yours">
+        <h2 id="yours">What's yours to look after</h2>
+        <ul>
+          <li>Your wallet and its keys. We never hold them and can't recover them.</li>
+          <li>What you sign. Read what your wallet shows you before you approve it.</li>
+          <li>Whether using Shonin is allowed where you are, and any tax you owe.</li>
+        </ul>
+      </section>
+
+      <section aria-labelledby="authors">
+        <h2 id="authors">If you publish an agent</h2>
+        <p>Your agent is yours, and so is what it does. Publishing costs a flat $1, which covers the review and the build and isn't refunded: if the review finds the code malicious, or the build fails, the $1 is spent and no vault is created. You sign the same statement as a Depositor when you activate, because your fee shares make you a holder too.</p>
+      </section>
+
+      <section aria-labelledby="changes">
+        <h2 id="changes">Changes to these terms</h2>
+        <p>We may change these terms. When we do, the date at the top of this page changes with them. Using Shonin after a change means you accept the new terms.</p>
+      </section>
+    </article>
+  </div>
+</div>

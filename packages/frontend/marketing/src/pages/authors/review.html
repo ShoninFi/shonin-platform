@@ -1,0 +1,30 @@
+
+<section class="sec sec--paper" aria-labelledby="review-title">
+  <div class="wrap">
+    <div class="sec-head sec-head--split sec-head--half">
+      <div class="sec-head__main sh-reveal" data-play>
+        <p class="sh-label">The review</p>
+        <h2 class="h2" id="review-title">What the Reviewer checks</h2>
+      </div>
+      <p class="sec-head__intro reading sh-reveal dl-120" data-play>Before anything is built, an AI Reviewer reads all of your code and rates it in six areas. The report is public, and it's tied on the chain to the exact code that will run.</p>
+    </div>
+    <ol class="areasgrid">
+      <li class="sh-card sh-reveal" data-play><span class="sh-label areasgrid__n">01</span><div class="areasgrid__text"><h3>Security</h3><p>Whether the code tries to leak secrets, reach places it shouldn't, or harm the vault.</p></div></li>
+      <li class="sh-card sh-reveal dl-60" data-play><span class="sh-label areasgrid__n">02</span><div class="areasgrid__text"><h3>Financial risk</h3><p>How much the strategy could lose: leverage, position sizes, and what it does in a fast market.</p></div></li>
+      <li class="sh-card sh-reveal dl-120" data-play><span class="sh-label areasgrid__n">03</span><div class="areasgrid__text"><h3>Reliability</h3><p>Whether it keeps working through restarts, dropped connections and venue errors.</p></div></li>
+      <li class="sh-card sh-reveal dl-180" data-play><span class="sh-label areasgrid__n">04</span><div class="areasgrid__text"><h3>Reproducibility</h3><p>Whether the same source always builds the same program, so anyone can check the build.</p></div></li>
+      <li class="sh-card sh-reveal dl-240" data-play><span class="sh-label areasgrid__n">05</span><div class="areasgrid__text"><h3>Outside influence</h3><p>Whether anything outside the code, like a server, a data feed or a model, could steer its trades.</p></div></li>
+      <li class="sh-card sh-reveal dl-300" data-play><span class="sh-label areasgrid__n">06</span><div class="areasgrid__text"><h3>Accurate description</h3><p>It checks your description and every claimed limit against the code.</p></div></li>
+    </ol>
+    <div class="sh-card ratings sh-reveal" data-play>
+      <p class="ratings__title">Each area gets one of four ratings</p>
+      <ul class="ratings__list">
+        <li><span class="sh-chip sh-chip-gain">{{i:check:14}}Looks fine</span><span>Nothing in this area worried the Reviewer.</span></li>
+        <li><span class="sh-chip sh-chip-caution">{{i:concern:14}}Some concerns</span><span>Worth reading before depositing. The report says why.</span></li>
+        <li><span class="sh-chip sh-chip-loss">{{i:serious:14}}Serious concerns</span><span>A real problem. Depositors see it at the top of your page.</span></li>
+        <li><span class="sh-chip sh-chip-neutral">{{i:unknown:14}}Couldn't tell</span><span>The code alone wasn't enough to judge.</span></li>
+      </ul>
+      <p class="aside ratings__foot">{{i:info:20}}<span>Only malicious code is refused. Everything else is published with its ratings, good or bad. A review is advice, not a prediction: it never rates how much an agent might make.</span></p>
+    </div>
+  </div>
+</section>

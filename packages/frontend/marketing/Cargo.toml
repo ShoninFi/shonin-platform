@@ -1,11 +1,15 @@
 [package]
 name = "shonin-marketing"
-description = "The marketing site: static pages generated from Rust, no wasm"
+description = "The marketing site: static pages generated from Rust, no wasm, no data, no wallet"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[lib]
+name = "marketing"
+path = "src/lib.rs"
 
 [[bin]]
 name = "marketing"
@@ -16,8 +20,9 @@ ui.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
-tower-http = { workspace = true, features = ["fs"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
