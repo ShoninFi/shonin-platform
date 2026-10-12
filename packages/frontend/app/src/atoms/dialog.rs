@@ -120,21 +120,12 @@ fn render(dialog: Dialog) -> View {
     let panel = panel.hook(|dom| {
         let element = dom.__internal_element();
         let swipe = element.clone();
-        dom.after_inserted(|element: web_sys::Element| {
-            // The first control in the body or the buttons, else the title.
-            let first = crate::web::focusables(&element)
-                .into_iter()
-                .find(|control| !control.class_list().contains("sh-dialog__close"))
-                .or_else(|| {
-                    element
-                        .query_selector(".sh-dialog__title")
-                        .ok()
-                        .flatten()
-                        .and_then(|title| title.dyn_into::<web_sys::HtmlElement>().ok())
-                });
-            if let Some(first) = first {
-                crate::web::focus(&first);
-            }
+        let target = element.clone();
+        // Once the body's bound content has drawn (it arrives a tick after
+        // the dialog is inserted), so focus lands on what the reader sees first.
+        dom.future(async move {
+            gloo_timers::future::TimeoutFuture::new(0).await;
+            focus_first(&target);
         })
         .event(move |event: dominator::events::KeyDown| trap(&element, event))
         .apply(|dom| swipe_to_close(dom, swipe))
@@ -162,6 +153,28 @@ fn render(dialog: Dialog) -> View {
 }
 
 /// Keep Tab and Shift+Tab inside the dialog.
+/// Focus the dialog's first control in the body or the buttons (never the
+/// close button, and a tab row at its selected tab), else its title.
+fn focus_first(element: &web_sys::Element) {
+    let first = crate::web::focusables(element)
+        .into_iter()
+        .find(|control| {
+            !control.class_list().contains("sh-dialog__close")
+                && !(control.get_attribute("role").as_deref() == Some("tab")
+                    && control.get_attribute("aria-selected").as_deref() == Some("false"))
+        })
+        .or_else(|| {
+            element
+                .query_selector(".sh-dialog__title")
+                .ok()
+                .flatten()
+                .and_then(|title| title.dyn_into::<web_sys::HtmlElement>().ok())
+        });
+    if let Some(first) = first {
+        crate::web::focus(&first);
+    }
+}
+
 fn trap(element: &web_sys::Element, event: dominator::events::KeyDown) {
     if event.key() != "Tab" {
         return;

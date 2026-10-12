@@ -17,6 +17,7 @@ use crate::atoms::badge::{Tone, badge};
 use crate::atoms::button::on_click;
 use crate::atoms::icon;
 use crate::atoms::notice::{NoticeTone, notice};
+use crate::atoms::prose::prose;
 use crate::atoms::rating::{rating, rating_icon};
 use crate::format;
 use crate::route::DOCS;
@@ -94,7 +95,7 @@ fn summary(summary: &str) -> View {
             true,
             expanded.signal().map(|expanded| !expanded),
         )
-        .children(parts.into_iter().map(|part| el("p").text(part)))
+        .children(parts.into_iter().map(|part| el("p").children(prose(&part))))
         .hook({
             let expanded = expanded.clone();
             let overflows = overflows.clone();
@@ -210,7 +211,7 @@ fn found(strategy: &Strategy, review: &Review) -> El {
             el("p")
                 .class("ag-sealed-note")
                 .child(icon(Icon::Lock, 16))
-                .text("A sealed report gives ratings, a summary and findings by area and severity. It never names files, gives line numbers or quotes the code.")
+                .text("A sealed report gives ratings, a summary and findings by area and severity. It never names files, gives line numbers or quotes the code. The Reviewer's model provider can't train on the code or keep it.")
                 .into()
         })))
         .child(
@@ -238,11 +239,32 @@ fn area_anchor(area: Area) -> String {
     format!("area-{}", area.index() + 1)
 }
 
-fn one_line(review: &Review, area: Area) -> String {
+/// The report card's line for an area: its leading finding; with none, that
+/// there is nothing to report when it looks fine, or, when it is rated worse,
+/// that the Reviewer listed no finding for it.
+fn one_line(review: &Review, area: Area) -> View {
     match facts::lead_finding(review, area) {
-        Some(finding) => finding.summary.clone(),
-        None => "Nothing to report.".to_string(),
+        Some(finding) => View::Many(prose(&finding.summary)),
+        None if facts::rated_without_finding(review, area) => {
+            text(facts::no_finding_line(review.rating(area)))
+        }
+        None => text("Nothing to report."),
     }
+}
+
+/// A rating as recorded, with a plain note beside it when the area's
+/// findings are more severe than the rating says.
+fn rated(review: &Review, area: Area) -> El {
+    let note = facts::findings_outrank_rating(review, area).map(|severity| {
+        el("span")
+            .class("ag-rated__note")
+            .text(facts::outrank_line(severity))
+            .into()
+    });
+    el("span")
+        .class("ag-rated")
+        .child(rating(review.rating(area)))
+        .child(View::from(note))
 }
 
 /// The six areas and their ratings: the first thing the tab says.
@@ -334,11 +356,11 @@ fn report_card(strategy: &Strategy, review: &Review) -> El {
                                     .class("ag-report__area")
                                     .text(area.label()),
                             )
-                            .child(el("td").child(rating(rated)))
+                            .child(el("td").child(self::rated(review, area)))
                             .child(
                                 el("td")
                                     .class("ag-report__line")
-                                    .text(one_line(review, area)),
+                                    .child(one_line(review, area)),
                             )
                             .child(
                                 el("td").class("sh-r").child(
@@ -422,7 +444,7 @@ fn areas(strategy: &Strategy, review: &Review) -> El {
                                 )
                                 .text(area.label()),
                         )
-                        .child(rating(review.rating(area))),
+                        .child(rated(review, area)),
                 )
                 .child(
                     el("p")
@@ -431,7 +453,13 @@ fn areas(strategy: &Strategy, review: &Review) -> El {
                         .text(area.description()),
                 )
                 .child(if findings.is_empty() {
-                    el("p").class("ag-muted").text("No findings in this area.")
+                    el("p")
+                        .class("ag-muted")
+                        .text(if facts::rated_without_finding(review, area) {
+                            facts::no_finding_line(review.rating(area))
+                        } else {
+                            "No findings in this area.".to_string()
+                        })
                 } else {
                     el("ul")
                         .class("ag-findings")
@@ -455,12 +483,12 @@ fn areas(strategy: &Strategy, review: &Review) -> El {
                                         .child(
                                             el("p")
                                                 .class("ag-finding__summary")
-                                                .text(finding.summary.clone()),
+                                                .children(prose(&finding.summary)),
                                         )
                                         .child(
                                             el("p")
                                                 .class("ag-finding__detail")
-                                                .text(finding.detail.clone()),
+                                                .children(prose(&finding.detail)),
                                         )
                                         .child(View::from(
                                             (public && finding.file.is_some()).then(|| {
@@ -516,7 +544,6 @@ fn claims(strategy: &Strategy, review: &Review) -> View {
     if strategy.claims.is_empty() {
         return View::Empty;
     }
-    let accurate = review.rating(Area::AccurateDescription);
     card("ag-claims-title", "Claims checked against the code", None)
         .child(el("p").class("ag-muted").text(
             "The Author wrote these limits into shonin.toml. They're fixed once published. The Reviewer checked each one against what the code actually does, and rates them together under Accurate description.",
@@ -530,10 +557,15 @@ fn claims(strategy: &Strategy, review: &Review) -> View {
             el("p")
                 .class("ag-claims__verdict")
                 .text("Accurate description: ")
-                .child(rating(accurate))
+                .child(rated(review, Area::AccurateDescription))
                 .child(
-                    parts::in_page_link(area_anchor(Area::AccurateDescription))
-                        .text("See what it found"),
+                    parts::in_page_link(area_anchor(Area::AccurateDescription)).text(
+                        if review.findings_in(Area::AccurateDescription).next().is_some() {
+                            "See what it found"
+                        } else {
+                            "See the area"
+                        },
+                    ),
                 ),
         )
         .into()
@@ -554,7 +586,7 @@ fn limits(review: &Review) -> View {
                 review
                     .limits
                     .iter()
-                    .map(|limit| el("li").text(limit.clone())),
+                    .map(|limit| el("li").children(prose(limit))),
             ),
         )
         .into()
@@ -641,4 +673,110 @@ fn about(strategy: &Strategy) -> View {
         ))
         .child(more_in_app(format!("/agents/{}/verify", strategy.slug), "Check the whole chain"))
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared::Finding;
+
+    /// A reviewed agent from the recorded snapshot, with its findings
+    /// cleared and every area rated "Looks fine", to shape into each case.
+    fn reviewed() -> Strategy {
+        let snapshot: shared::Snapshot =
+            serde_json::from_str(include_str!("../../../tests/snapshot.json"))
+                .expect("the fixture decodes");
+        let mut strategy = snapshot
+            .strategies
+            .into_iter()
+            .find(|strategy| strategy.review.is_some())
+            .expect("the fixture has a reviewed agent");
+        let review = strategy.review.as_mut().expect("reviewed");
+        review.ratings = [Rating::LooksFine; 6];
+        review.findings.clear();
+        review.refused = false;
+        strategy
+    }
+
+    fn finding(area: Area, severity: Severity, summary: &str) -> Finding {
+        Finding {
+            area,
+            severity,
+            summary: summary.into(),
+            detail: "detail".into(),
+            file: None,
+            line: None,
+        }
+    }
+
+    fn page(strategy: &Strategy) -> String {
+        main(strategy).html()
+    }
+
+    #[test]
+    fn an_area_rated_with_concerns_but_no_finding_says_so_and_never_nothing_to_report() {
+        let mut strategy = reviewed();
+        let review = strategy.review.as_mut().expect("reviewed");
+        review.ratings[Area::OutsideInfluence.index()] = Rating::SeriousConcerns;
+        let html = page(&strategy);
+        let line = "The Reviewer rated this area serious concerns but listed no finding for it.";
+        // Once in the report card, once in the area's own card.
+        assert_eq!(html.matches(line).count(), 2, "{html}");
+        // The five areas that look fine and hold nothing still say so.
+        assert_eq!(html.matches("Nothing to report.").count(), 5);
+        assert_eq!(html.matches("No findings in this area.").count(), 5);
+        // The rating is shown exactly as recorded.
+        let row = &html[html
+            .find(">Outside influence</th>")
+            .expect("the row is drawn")..];
+        let row = &row[..row.find("</tr>").expect("the row closes")];
+        assert!(row.contains("Serious concerns"), "{row}");
+    }
+
+    #[test]
+    fn an_area_whose_findings_outrank_its_rating_keeps_the_rating_and_says_so() {
+        let mut strategy = reviewed();
+        let review = strategy.review.as_mut().expect("reviewed");
+        review.ratings[Area::Reliability.index()] = Rating::SomeConcerns;
+        review.findings.push(finding(
+            Area::Reliability,
+            Severity::Serious,
+            "The peak starts at zero",
+        ));
+        let html = page(&strategy);
+        let row = &html[html.find(">Reliability</th>").expect("the row is drawn")..];
+        let row = &row[..row.find("</tr>").expect("the row closes")];
+        assert!(row.contains("Some concerns"), "{row}");
+        assert!(
+            row.contains("Its findings include serious concerns."),
+            "{row}"
+        );
+        assert!(row.contains("The peak starts at zero"));
+        // A note under a fine rating never counts as outranking it.
+        let mut quiet = reviewed();
+        quiet
+            .review
+            .as_mut()
+            .expect("reviewed")
+            .findings
+            .push(finding(Area::Security, Severity::Note, "A note"));
+        assert!(!page(&quiet).contains("Its findings include"));
+    }
+
+    #[test]
+    fn reviewer_code_spans_render_as_inline_code_and_markup_stays_text() {
+        let mut strategy = reviewed();
+        let review = strategy.review.as_mut().expect("reviewed");
+        review.ratings[Area::Security.index()] = Rating::SomeConcerns;
+        review.findings.push(Finding {
+            detail: "It calls `<script>alert(1)</script>` from `decide.rs`.".into(),
+            ..finding(Area::Security, Severity::Concern, "`Mind.peak` starts low")
+        });
+        let html = page(&strategy);
+        assert!(html.contains("<code class=\"sh-code\">Mind.peak</code> starts low"));
+        assert!(
+            html.contains("<code class=\"sh-code\">&lt;script&gt;alert(1)&lt;/script&gt;</code>")
+        );
+        assert!(!html.contains("<script"));
+    }
 }

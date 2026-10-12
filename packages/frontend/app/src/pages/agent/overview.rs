@@ -15,6 +15,7 @@ use crate::atoms::badge::{Tone, badge};
 use crate::atoms::delta::{missing_figure, tone_class};
 use crate::atoms::icon;
 use crate::atoms::notice::{NoticeTone, notice};
+use crate::atoms::prose::prose;
 use crate::atoms::rating::rating;
 use crate::format;
 use crate::model::rating_word;
@@ -251,31 +252,40 @@ fn headline(review: &shared::Review) -> View {
             .filter(|(_, rated)| rating_weight(*rated) > rating_weight(review.rating(area)))
             .collect();
         let also = worse.first().map(|(_, worst)| {
-            let names: Vec<&str> = worse
+            let named: Vec<Area> = worse
                 .iter()
                 .filter(|(_, rated)| rated == worst)
-                .map(|(area, _)| area.label())
+                .map(|(area, _)| *area)
                 .collect();
+            let names: Vec<&str> = named.iter().map(|area| area.label()).collect();
             el("p")
                 .class("ag-note")
                 .text(format!(
-                    "Also rated {}: {}.",
+                    "Also rated {}: {}.{}",
                     rating_word(*worst).to_lowercase(),
-                    join_and(&names)
+                    join_and(&names),
+                    unlisted_words(review, &named)
                 ))
                 .into()
         });
+        let outrank = facts::findings_outrank_rating(review, area)
+            .map(|severity| format!(" {}", facts::outrank_line(severity)))
+            .unwrap_or_default();
         return View::Many(vec![
             block(
                 View::Many(vec![
                     el("strong")
                         .text(format!(
-                            "{}: {}.",
+                            "{}: {}.{outrank}",
                             area.label(),
                             rating_word(review.rating(area)).to_lowercase()
                         ))
                         .into(),
-                    text(format!(" {}.", finding.summary.trim_end_matches('.'))),
+                    text(" "),
+                    View::Many(prose(&format!(
+                        "{}.",
+                        finding.summary.trim_end_matches('.')
+                    ))),
                 ]),
                 tone,
                 glyph,
@@ -287,11 +297,12 @@ fn headline(review: &shared::Review) -> View {
     let Some((_, worst)) = concerns.first().copied() else {
         return View::Empty;
     };
-    let areas: Vec<&str> = concerns
+    let named: Vec<Area> = concerns
         .iter()
         .filter(|(_, rated)| *rated == worst)
-        .map(|(area, _)| area.label())
+        .map(|(area, _)| *area)
         .collect();
+    let areas: Vec<&str> = named.iter().map(|area| area.label()).collect();
     let (tone, glyph) = match worst {
         Rating::SeriousConcerns => (NoticeTone::Danger, Icon::Serious),
         _ => (NoticeTone::Caution, Icon::Concern),
@@ -305,11 +316,36 @@ fn headline(review: &shared::Review) -> View {
                     rating_word(worst).to_lowercase()
                 ))
                 .into(),
-            text(" Read the full review for what the Reviewer found."),
+            // With no finding anywhere, every area named here has none.
+            text(format!(
+                "{} Read the full review.",
+                unlisted_words(review, &named)
+            )),
         ]),
         tone,
         glyph,
     )
+}
+
+/// For areas rated with concerns: which of them the Reviewer listed no
+/// finding for, said plainly so the overview never promises findings the
+/// review tab doesn't hold. Empty when every one has a finding.
+pub fn unlisted_words(review: &shared::Review, areas: &[Area]) -> String {
+    let quiet: Vec<&str> = areas
+        .iter()
+        .filter(|area| facts::rated_without_finding(review, **area))
+        .map(|area| area.label())
+        .collect();
+    if quiet.is_empty() {
+        String::new()
+    } else if quiet.len() == areas.len() {
+        match areas.len() {
+            1 => " The Reviewer listed no finding for it.".to_string(),
+            _ => " The Reviewer listed no finding for any of them.".to_string(),
+        }
+    } else {
+        format!(" The Reviewer listed no finding for {}.", join_and(&quiet))
+    }
 }
 
 fn tone_of(severity: shared::Severity) -> (NoticeTone, Icon) {
@@ -893,4 +929,79 @@ fn recent(strategy: &Strategy) -> View {
                     .child(el("span").class("ag-amount").text(amount(row)))
             }));
     section.child(table).child(list).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared::{Finding, Review, Severity};
+
+    fn review() -> Review {
+        let snapshot: shared::Snapshot =
+            serde_json::from_str(include_str!("../../../tests/snapshot.json"))
+                .expect("the fixture decodes");
+        let mut review = snapshot
+            .strategies
+            .into_iter()
+            .find_map(|strategy| strategy.review)
+            .expect("the fixture has a review");
+        review.ratings = [Rating::LooksFine; 6];
+        review.findings.clear();
+        review
+    }
+
+    fn finding(area: Area, severity: Severity) -> Finding {
+        Finding {
+            area,
+            severity,
+            summary: "The peak starts at `zero`".into(),
+            detail: "d".into(),
+            file: None,
+            line: None,
+        }
+    }
+
+    #[test]
+    fn the_brief_never_promises_findings_for_an_area_rated_with_none() {
+        let mut review = review();
+        review.ratings[Area::OutsideInfluence.index()] = Rating::SeriousConcerns;
+        let html = headline(&review).html();
+        assert!(
+            html.contains("Outside influence: serious concerns."),
+            "{html}"
+        );
+        assert!(
+            html.contains("The Reviewer listed no finding for it."),
+            "{html}"
+        );
+        assert!(!html.contains("what the Reviewer found"), "{html}");
+        // With a finding elsewhere, the unlisted area is still named honestly.
+        review.ratings[Area::Reliability.index()] = Rating::SomeConcerns;
+        review
+            .findings
+            .push(finding(Area::Reliability, Severity::Concern));
+        let html = headline(&review).html();
+        assert!(
+            html.contains("Also rated serious concerns: Outside influence. The Reviewer listed no finding for it."),
+            "{html}"
+        );
+        assert!(
+            html.contains("<code class=\"sh-code\">zero</code>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn the_brief_says_when_the_headline_finding_outranks_its_area_rating() {
+        let mut review = review();
+        review.ratings[Area::Reliability.index()] = Rating::SomeConcerns;
+        review
+            .findings
+            .push(finding(Area::Reliability, Severity::Serious));
+        let html = headline(&review).html();
+        assert!(
+            html.contains("Reliability: some concerns. Its findings include serious concerns."),
+            "{html}"
+        );
+    }
 }

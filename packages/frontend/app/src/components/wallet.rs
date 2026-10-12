@@ -33,26 +33,43 @@ pub fn tile(name: &str) -> El {
 }
 
 /// The header's wallet control: "Connect wallet" signed out ("Connect" on
-/// phone); connected, the network chip (a browser wallet's chain) and the
-/// wallet button, which opens the wallet menu.
+/// phone). Connected, one account button whatever is connected (an EVM
+/// wallet, a Solana wallet or both), beside the network chip of a browser
+/// EVM wallet. The button opens the wallet sheet, which lists both kinds
+/// and offers to connect the one that isn't.
 pub fn header_control() -> View {
     let session = crate::wallet::get();
+    let solana = crate::wallet::solana::get();
+    let now = control(&session.connection.lock_ref(), solana.account());
     el("div")
         .class("sh-walletctl")
         .child_signal(
-            Some(connect_button().into()),
-            session.connection.signal_cloned().map(|connection| {
-                Some(match connection {
-                    Connection::Connected {
-                        account, chain_id, ..
-                    } => connected(account, chain_id),
-                    _ => connect_button().into(),
-                })
-            }),
+            Some(now),
+            futures_signals::map_ref! {
+                let evm = session.connection.signal_cloned(),
+                let solana = solana.connection.signal_cloned() => control(evm, solana.account())
+            }
+            .map(Some),
         )
-        // The Solana wallet's button, while one is connected.
-        .child(super::solana::wallet::header_button())
         .into()
+}
+
+/// What the header holds for a pair of connections.
+fn control(evm: &Connection, solana: Option<chain::solana_ix::Pubkey>) -> View {
+    let evm = match evm {
+        Connection::Connected {
+            account, chain_id, ..
+        } => Some((*account, *chain_id)),
+        _ => None,
+    };
+    match (evm, solana) {
+        (None, None) => connect_button().into(),
+        (Some((account, chain_id)), solana) => View::Many(vec![
+            network_chip(chain_id),
+            account_button(Some(account), solana).into(),
+        ]),
+        (None, Some(solana)) => account_button(None, Some(solana)).into(),
+    }
 }
 
 fn connect_button() -> El {
@@ -75,10 +92,10 @@ fn connect_button() -> El {
     )
 }
 
-fn connected(account: alloy_primitives::Address, chain_id: Option<u64>) -> View {
+/// The chain a browser EVM wallet is on; a local signer has none to show.
+fn network_chip(chain_id: Option<u64>) -> View {
     let session = crate::wallet::get();
-    let full = format!("{account:?}");
-    let chip = match chain_id.filter(|_| session.is_browser()) {
+    match chain_id.filter(|_| session.is_browser()) {
         Some(chain_id) => {
             let name = networks::chain_name(chain_id);
             el("span")
@@ -89,38 +106,78 @@ fn connected(account: alloy_primitives::Address, chain_id: Option<u64>) -> View 
                 .into()
         }
         None => View::Empty,
+    }
+}
+
+/// The one account button: the EVM address when there is one, else the
+/// Solana address; with both, a small Solana mark says the sheet holds two.
+fn account_button(
+    evm: Option<alloy_primitives::Address>,
+    solana: Option<chain::solana_ix::Pubkey>,
+) -> El {
+    let evm = evm.map(|account| format!("{account:?}"));
+    let solana = solana.map(|account| account.to_string());
+    let label = match (&evm, &solana) {
+        (Some(evm), Some(solana)) => format!("Your wallets: {evm}, and Solana {solana}"),
+        (Some(evm), None) => format!("Wallet {evm}"),
+        (None, Some(solana)) => format!("Solana wallet {solana}"),
+        (None, None) => "Your wallets".to_string(),
     };
-    let button = on_click(
+    let lead: View = match (&evm, &solana) {
+        (Some(evm), _) => View::Many(vec![
+            icon(Icon::Wallet, 16).into(),
+            el("span").class("sh-mono").text(short_hash(evm)).into(),
+        ]),
+        (None, Some(solana)) => View::Many(vec![
+            tile("S").into(),
+            el("span")
+                .class("sh-mono")
+                .text(super::solana::exit::short(solana))
+                .into(),
+        ]),
+        (None, None) => View::Empty,
+    };
+    let both = evm.is_some() && solana.is_some();
+    on_click(
         el("button")
             .attr("type", "button")
             .class("sh-btn sh-btn-secondary sh-btn-sm sh-walletbtn")
-            .attr("aria-label", format!("Wallet {full}"))
+            .attr("aria-label", label)
             .attr("aria-haspopup", "dialog")
-            .child(icon(Icon::Wallet, 16))
-            .child(el("span").class("sh-mono").text(short_hash(&full))),
-        move || wallet_menu(account),
-    );
-    View::Many(vec![chip, button.into()])
+            .child(lead)
+            .child(View::from(
+                both.then(|| tile("S").class("sh-walletbtn__also").into()),
+            )),
+        wallet_sheet,
+    )
 }
 
-/// The wallet menu: the full address, Portfolio, Disconnect.
-fn wallet_menu(account: alloy_primitives::Address) {
+/// The wallet sheet: each kind of wallet, its full address and Disconnect,
+/// or, for a kind that isn't connected, a button to connect one; then
+/// Portfolio. It follows the connections while open.
+fn wallet_sheet() {
     let session = crate::wallet::get();
-    let full = format!("{account:?}");
+    let solana = crate::wallet::solana::get();
+    // Drawn now as well, so the dialog's first focus lands in the first
+    // section rather than past it.
+    let now = sheet_body(&session.connection.lock_ref(), solana.account());
     let body = el("div")
         .class("sh-walletmenu")
-        .child(
-            el("p")
-                .class("sh-muted")
-                .text_from(&session.wallet_name, |name| {
-                    if name.is_empty() {
-                        "Connected".to_string()
-                    } else {
-                        format!("Connected with {name}")
-                    }
-                }),
+        .class("sh-walletsheet")
+        .child_signal(
+            Some(now),
+            futures_signals::map_ref! {
+                let evm = session.connection.signal_cloned(),
+                let solana = solana.connection.signal_cloned() => (evm.clone(), solana.account())
+            }
+            .map(|(evm, solana)| {
+                // Nothing left connected: the sheet has nothing to list.
+                if !matches!(evm, Connection::Connected { .. }) && solana.is_none() {
+                    dialog::close();
+                }
+                Some(sheet_body(&evm, solana))
+            }),
         )
-        .child(crate::atoms::hash::hash(&full, None, "address"))
         .child(
             crate::web::app_link("/portfolio")
                 .class("sh-link")
@@ -128,20 +185,97 @@ fn wallet_menu(account: alloy_primitives::Address) {
                 .hook(|dom| dom.event(|_: dominator::events::Click| dialog::close())),
         );
     dialog::open(Dialog {
-        title: "Your wallet".to_string(),
+        title: "Your wallets".to_string(),
         body: body.into(),
-        foot: Some(
-            on_click(
-                Button::new(Kind::Secondary, "Disconnect").build(),
-                move || {
-                    crate::wallet::get().disconnect();
-                    dialog::close();
-                },
-            )
-            .into(),
-        ),
+        foot: None,
         wide: false,
     });
+}
+
+/// The sheet's two sections, as the connections are now.
+fn sheet_body(evm: &Connection, solana: Option<chain::solana_ix::Pubkey>) -> View {
+    let session = crate::wallet::get();
+    let section = |title: &'static str, body: View| -> View {
+        el("section")
+            .class("sh-walletsheet__kind")
+            .child(el("h3").class("sh-label").text(title))
+            .child(body)
+            .into()
+    };
+    let disconnect = |what: &'static str, act: fn()| -> View {
+        on_click(
+            Button::new(Kind::Secondary, "Disconnect")
+                .size(Size::Small)
+                .build()
+                .attr("aria-label", format!("Disconnect the {what} wallet")),
+            act,
+        )
+        .into()
+    };
+    let add = |words: &'static str| -> View {
+        on_click(
+            Button::new(Kind::Secondary, words)
+                .size(Size::Small)
+                .build(),
+            || {
+                dialog::close();
+                open_connect();
+            },
+        )
+        .into()
+    };
+    let evm_part = match evm {
+        Connection::Connected { account, .. } => {
+            let name = session.wallet_name.get_cloned();
+            View::Many(vec![
+                el("p")
+                    .class("sh-muted")
+                    .text(if name.is_empty() {
+                        "Connected".to_string()
+                    } else {
+                        format!("Connected with {name}")
+                    })
+                    .into(),
+                crate::atoms::hash::hash(&format!("{account:?}"), None, "address").into(),
+                disconnect("EVM", || crate::wallet::get().disconnect()),
+            ])
+        }
+        _ => View::Many(vec![
+            el("p")
+                .class("sh-muted")
+                .text("For agents whose vault is on an EVM chain.")
+                .into(),
+            add("Connect an EVM wallet"),
+        ]),
+    };
+    let solana_part = match solana {
+        Some(account) => {
+            let name = crate::wallet::solana::get().wallet_name.get_cloned();
+            View::Many(vec![
+                el("p")
+                    .class("sh-muted")
+                    .text(if name.is_empty() {
+                        "Connected".to_string()
+                    } else {
+                        format!("Connected with {name}")
+                    })
+                    .into(),
+                crate::atoms::hash::hash(&account.to_string(), None, "address").into(),
+                disconnect("Solana", || crate::wallet::solana::get().disconnect()),
+            ])
+        }
+        None => View::Many(vec![
+            el("p")
+                .class("sh-muted")
+                .text("For agents whose vault is on Solana.")
+                .into(),
+            add("Connect a Solana wallet"),
+        ]),
+    };
+    View::Many(vec![
+        section("EVM wallet", evm_part),
+        section("Solana wallet", solana_part),
+    ])
 }
 
 /// Open the connect dialog (a sheet on phone).
@@ -175,17 +309,25 @@ pub fn open_connect() {
                     session.close();
                 }
             })
-            .future(
+            .future({
+                // Close once an EVM wallet connects; one connected before the
+                // dialog opened (adding a Solana wallet) doesn't close it.
+                let was = std::cell::Cell::new(matches!(
+                    *crate::wallet::get().connection.lock_ref(),
+                    Connection::Connected { .. }
+                ));
                 crate::wallet::get()
                     .connection
                     .signal_cloned()
-                    .for_each(|connection| {
-                        if matches!(connection, Connection::Connected { .. }) {
+                    .for_each(move |connection| {
+                        let now = matches!(connection, Connection::Connected { .. });
+                        if now && !was.get() {
                             dialog::close();
                         }
+                        was.set(now);
                         async {}
-                    }),
-            )
+                    })
+            })
         });
     dialog::open(Dialog {
         title: "Connect a wallet".to_string(),
@@ -300,14 +442,24 @@ fn problem(title: &str, line: String, action: Option<View>) -> View {
 
 fn choosing(phrase_mode: &Mutable<bool>) -> View {
     let session = crate::wallet::get();
-    let options = session.wallets.get_cloned();
+    // The list offers only what isn't connected yet: with an EVM wallet
+    // connected, the Solana wallets; with a Solana one, the EVM wallets.
+    let evm_connected = matches!(*session.connection.lock_ref(), Connection::Connected { .. });
+    let solana_connected = crate::wallet::solana::get().account().is_some();
+    let options = if evm_connected {
+        Vec::new()
+    } else {
+        session.wallets.get_cloned()
+    };
     let chains = evm_chains(&session.networks.lock_ref());
     let mut rows: Vec<View> = options
         .into_iter()
         .map(|option| wallet_row(option, &chains))
         .collect();
-    rows.extend(super::solana::wallet::rows());
-    if session.dev_available() {
+    if !solana_connected {
+        rows.extend(super::solana::wallet::rows());
+    }
+    if session.dev_available() && !evm_connected {
         rows.push(
             option_row(
                 tile("D").into(),
@@ -324,7 +476,7 @@ fn choosing(phrase_mode: &Mutable<bool>) -> View {
             .into(),
         );
     }
-    if dev::PHRASE_WALLET {
+    if dev::PHRASE_WALLET && !evm_connected {
         let phrase_mode = phrase_mode.clone();
         rows.push(
             option_row(
@@ -666,6 +818,66 @@ pub fn switch_button(chain_id: u64, size: Size) -> El {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wallet::solana::{SolConnection, SolWalletId};
+
+    /// The header's control with the given wallets connected, as HTML.
+    fn header_with(evm: bool, solana: bool) -> String {
+        let session = crate::wallet::get();
+        session.connection.set(if evm {
+            Connection::Connected {
+                wallet: WalletId::Dev,
+                account: alloy_primitives::Address::repeat_byte(0x7e),
+                chain_id: Some(84532),
+            }
+        } else {
+            Connection::SignedOut
+        });
+        crate::wallet::solana::get().connection.set(if solana {
+            SolConnection::Connected {
+                wallet: SolWalletId::Dev,
+                account: chain::solana_ix::Pubkey::new_from_array([7; 32]),
+            }
+        } else {
+            SolConnection::SignedOut
+        });
+        header_control().html()
+    }
+
+    #[test]
+    fn the_header_holds_one_account_button_whichever_wallets_are_connected() {
+        for (evm, solana) in [(true, false), (false, true), (true, true)] {
+            let html = header_with(evm, solana);
+            assert_eq!(
+                html.matches("sh-walletbtn\"").count() + html.matches("sh-walletbtn ").count(),
+                1,
+                "evm {evm}, solana {solana}: {html}"
+            );
+            assert!(
+                !html.contains("Connect"),
+                "connected, the header never offers Connect beside an address: {html}"
+            );
+        }
+        let both = header_with(true, true);
+        assert!(both.contains("aria-label=\"Your wallets: 0x7e7e"), "{both}");
+        assert!(both.contains("sh-walletbtn__also"), "{both}");
+        let solana = header_with(false, true);
+        assert!(solana.contains("aria-label=\"Solana wallet "), "{solana}");
+        let none = header_with(false, false);
+        assert!(none.contains("Connect wallet"), "{none}");
+        assert!(!none.contains("sh-walletbtn"), "{none}");
+    }
+
+    #[test]
+    fn the_wallet_sheet_lists_both_kinds_and_offers_the_one_not_connected() {
+        let html = View::Many(vec![sheet_body(
+            &Connection::SignedOut,
+            Some(chain::solana_ix::Pubkey::new_from_array([7; 32])),
+        )])
+        .html();
+        assert!(html.contains("Connect an EVM wallet"), "{html}");
+        assert!(html.contains("Disconnect the Solana wallet"), "{html}");
+        assert!(!html.contains("Connect a Solana wallet"), "{html}");
+    }
 
     #[test]
     fn the_recovery_phrase_field_is_never_offered_to_a_password_manager() {

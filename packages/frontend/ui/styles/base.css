@@ -34,6 +34,8 @@ a { color: var(--link); text-decoration-thickness: 1px; text-underline-offset: 3
 .sh-label { font: var(--type-label); letter-spacing: var(--track-label); text-transform: uppercase; color: var(--ink-muted); }
 .sh-mono { font: var(--type-mono); letter-spacing: 0; }
 .sh-mono-s { font: var(--type-mono-s); }
+/* Inline code inside running prose: the surrounding size, a mono face on a sunk ground, wrapping anywhere so a long name never pushes the line out. */
+.sh-code { font-family: var(--font-mono, ui-monospace, monospace); font-size: 0.9em; font-style: normal; padding: 0 0.25em; border-radius: var(--radius-s); background: var(--paper-sunk); overflow-wrap: anywhere; }
 .sh-num { font-variant-numeric: tabular-nums; }
 .sh-muted { color: var(--ink-muted); }
 .sh-gain { color: var(--gain); }

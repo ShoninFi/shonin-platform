@@ -13,6 +13,13 @@
 }
 .sh-netchip .sh-tile { width: 24px; height: 24px; font-size: 12px; line-height: 24px; border-radius: var(--radius-full); }
 .sh-walletbtn .sh-mono { font-size: 14px; }
+/* One account button, whatever is connected: a Solana-only wallet leads with
+   a small "S" mark, and with both kinds a second mark says the sheet lists two. */
+.sh-walletbtn { min-width: 0; white-space: nowrap; }
+.sh-walletbtn .sh-tile { width: 20px; height: 20px; font-size: 11px; line-height: 20px; border-radius: var(--radius-full); }
+.sh-walletbtn__also { margin-left: calc(-1 * var(--space-1)); }
+.sh-walletsheet__kind { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-2); padding-bottom: var(--space-3); border-bottom: var(--border-hairline) solid var(--line); }
+.sh-walletsheet__kind .sh-hash { max-width: 100%; }
 .sh-tile {
   flex: none; display: inline-flex; align-items: center; justify-content: center;
   width: 36px; height: 36px; border-radius: var(--radius-s);
