@@ -534,10 +534,16 @@ fn positions_table(rows: &[&Row], total: u128, paid: Option<u128>) -> View {
                     .child(
                         el("thead").child(el("tr").children(head.iter().enumerate().map(
                             |(i, label)| {
-                                el("th")
+                                let th = el("th")
                                     .attr("scope", "col")
-                                    .class_if((1..=5).contains(&i), "sh-r")
-                                    .text(*label)
+                                    .class_if((1..=5).contains(&i), "sh-r");
+                                // The actions column: named for a screen
+                                // reader, blank on screen.
+                                if label.is_empty() {
+                                    th.child(el("span").class("sh-vh").text("Actions"))
+                                } else {
+                                    th.text(*label)
+                                }
                             },
                         ))),
                     )
@@ -840,6 +846,11 @@ fn waiting_offer(
             "Nothing has priced it for a day, but the vault’s prices can still be read, so the next valuation can price it: it waits for that rather than going back. A deposit can be taken back only while nothing could price it."
                 .to_string(),
         ),
+        // A withdrawal priced or settled since this page last read it.
+        Some(Revert::Vault("NotAllowed")) => Offer::NotNow(
+            "It has been priced or settled since this page last looked, so the fallback isn’t open for it. Reload to see where it stands."
+                .to_string(),
+        ),
         Some(Revert::Vault("NotYet")) => Offer::NotNow(
             "Nothing has priced it for a day. The vault is settling a valuation just now, so the fallback isn’t open this moment; it may be priced instead."
                 .to_string(),
@@ -978,9 +989,16 @@ fn done_line(outcome: &Outcome, network: &Network) -> String {
             )
         ),
         Outcome::Claim {
-            state: ClaimState::Waiting | ClaimState::Pending,
+            state: ClaimState::Waiting,
             ..
         } => "The market was outside the exit band, so nothing closed. It can be tried again."
+            .to_string(),
+        // From its own request: the cash no longer covered it when it was
+        // tried, so it stays booked for a close.
+        Outcome::Claim {
+            state: ClaimState::Pending,
+            ..
+        } => "The cash at home no longer covers it, so it stays booked: settling closes your share of the positions."
             .to_string(),
         Outcome::Claim {
             state: ClaimState::Queued,
@@ -1362,6 +1380,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_claim_the_cash_no_longer_covered_is_never_said_to_be_outside_the_exit_band() {
+        let network = Network {
+            chain: shared::Chain::Base,
+            chain_id: 8453,
+            label: "Base".to_string(),
+            rpc: String::new(),
+            asset: alloy_primitives::Address::repeat_byte(0xdd),
+            asset_symbol: "USDC".to_string(),
+            asset_decimals: 6,
+            dev_account: None,
+        };
+        let claim = |state| Outcome::Claim {
+            claim: U256::from(1u8),
+            owner: alloy_primitives::Address::repeat_byte(0x42),
+            state,
+            paid: U256::ZERO,
+            hash: alloy_primitives::B256::ZERO,
+        };
+        let pending = done_line(&claim(ClaimState::Pending), &network);
+        assert!(!pending.contains("exit band"), "{pending}");
+        assert!(pending.contains("no longer covers"), "{pending}");
+        let waiting = done_line(&claim(ClaimState::Waiting), &network);
+        assert!(waiting.contains("exit band"), "{waiting}");
+    }
+
+    #[test]
     fn a_rows_value_is_rounded_down_to_the_cent_once_and_the_total_is_their_sum() {
         // $10,001.259999 and $5,001.581 in six-decimal units.
         let rows = [
@@ -1472,6 +1516,11 @@ mod tests {
             panic!("a refused fallback was offered");
         };
         assert!(why.contains("can still be read"), "{why}");
+        assert!(!why.contains("Only the owner"), "{why}");
+        // A withdrawal priced since the page looked: never "Only the owner".
+        let Offer::NotNow(why) = offer(K::Withdrawal, Some(Revert::Vault("NotAllowed"))) else {
+            panic!("a refused fallback was offered");
+        };
         assert!(!why.contains("Only the owner"), "{why}");
         // A valuation settling just now: not this moment.
         let Offer::NotNow(why) = offer(K::Withdrawal, Some(Revert::Vault("NotYet"))) else {

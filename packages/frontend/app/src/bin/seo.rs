@@ -15,6 +15,10 @@
 //!   same views the app draws, so it reads with JavaScript off. The app
 //!   replaces it with the live page when it boots. Pages that shouldn't be
 //!   listed still get a file, marked `noindex`.
+//! - one shared page per kind of address with an id (`_shells/claim.html`,
+//!   `_shells/job.html`, `_shells/activate.html`, `_shells/manage.html`),
+//!   marked `noindex`, which `_redirects` serves with status 200 at every
+//!   such address.
 //! - `sitemap.xml` and `robots.txt`.
 //! - `_headers` with its Content-Security-Policy filled in: `'self'`, the
 //!   API origin the app was built with, and the public RPC origins in
@@ -113,6 +117,20 @@ mod native {
             written.push(route.clone());
         }
 
+        // One shared page per kind of address with an id (a claim, a job,
+        // an activation, an Author's controls): `_redirects` serves it with
+        // status 200 at every such address, and the app draws the page from
+        // the address when it boots.
+        for route in Route::shell_kinds() {
+            let file = route.shell_file().expect("every shell kind has a file");
+            let target = args.dist.join(file);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&target, render_shell(&shell_html, base, &route))
+                .map_err(|e| format!("writing {}: {e}", target.display()))?;
+        }
+
         let urls: String = written
             .iter()
             .filter(|route| route.is_indexable())
@@ -174,6 +192,31 @@ mod native {
         let (before, rest) = shell_html.split_once(HEAD_START).expect("checked in main");
         let (_, after) = rest.split_once(HEAD_END).expect("checked in main");
         let body: app::view::View = shell(route, false).into();
+        format!("{before}{}{after}", head(base, route)).replacen(BODY, &body.html(), 1)
+    }
+
+    /// A shared page for every address of `route`'s kind: the frame, the
+    /// kind's heading and a placeholder where the page will be, since which
+    /// claim, job or agent it is is known only from the address.
+    fn render_shell(shell_html: &str, base: &str, route: &Route) -> String {
+        let (before, rest) = shell_html.split_once(HEAD_START).expect("checked in main");
+        let (_, after) = rest.split_once(HEAD_END).expect("checked in main");
+        let title = route.page().title;
+        let heading = title.trim_end_matches(" · Shonin").to_string();
+        let body = app::view::el("div")
+            .class("sh-author")
+            .attr("aria-busy", "true")
+            .child(app::view::el("h1").class("sh-author__title").text(heading))
+            .child(app::atoms::skeleton::skeleton_block("100%", 160))
+            .child(
+                app::view::el("noscript")
+                    .child(app::view::el("p").text("This page needs JavaScript.")),
+            );
+        let page = app::pages::Page {
+            top: None,
+            body: body.into(),
+        };
+        let body: app::view::View = app::shell::frame(route, page).into();
         format!("{before}{}{after}", head(base, route)).replacen(BODY, &body.html(), 1)
     }
 
@@ -350,6 +393,18 @@ mod native {
                     "wss://api.devnet.solana.com",
                 ]
             );
+        }
+
+        #[test]
+        fn a_shared_page_names_its_kind_once_and_is_never_indexed() {
+            let shell_html = format!("<head>{HEAD_START}{HEAD_END}</head><body>{BODY}</body>");
+            for route in Route::shell_kinds() {
+                let html = render_shell(&shell_html, "https://app.shonin.fi", &route);
+                assert_eq!(html.matches("<h1").count(), 1, "{html}");
+                assert!(html.contains("<meta name=\"robots\" content=\"noindex\" />"));
+                assert!(!html.contains("rel=\"canonical\""));
+                assert!(!html.contains(BODY));
+            }
         }
 
         #[test]

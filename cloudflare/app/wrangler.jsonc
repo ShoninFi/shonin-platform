@@ -16,8 +16,10 @@
   "assets": {
     // Must match PATH_DIST_APP in taskfiles/config.yml.
     "directory": "../../.trunk-dist/app",
-    // Every route has its own pre-rendered file (src/bin/seo.rs), so unknown
-    // paths get a real 404 status with 404.html, not a soft-404 index.html.
+    // Every route has its own pre-rendered file (src/bin/seo.rs), or, for an
+    // address with an id, a shared page `_redirects` serves with status 200;
+    // unknown paths get a real 404 status with 404.html, not a soft-404
+    // index.html.
     "not_found_handling": "404-page"
   }
 }

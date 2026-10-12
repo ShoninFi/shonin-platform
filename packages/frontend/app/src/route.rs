@@ -101,6 +101,9 @@ pub enum Route {
     Status,
     /// Every token, type style, icon and atom; dev builds only.
     Atoms,
+    /// The states today's data can't show, drawn from synthetic values; dev
+    /// builds only.
+    States,
     NotFound,
 }
 
@@ -173,6 +176,7 @@ impl Route {
             },
             ["status"] => Self::Status,
             ["_atoms"] if cfg!(feature = "dev") => Self::Atoms,
+            ["_states"] if cfg!(feature = "dev") => Self::States,
             _ => Self::NotFound,
         }
     }
@@ -217,6 +221,7 @@ impl Route {
             Self::Manage { slug } => format!("/you/agents/{slug}"),
             Self::Status => "/status".to_string(),
             Self::Atoms => "/_atoms".to_string(),
+            Self::States => "/_states".to_string(),
             Self::NotFound => return None,
         })
     }
@@ -231,6 +236,7 @@ impl Route {
             Self::NotFound => return Some("404.html".to_string()),
             Self::Home
             | Self::Atoms
+            | Self::States
             | Self::Agents { author: Some(_) }
             | Self::Claim { .. }
             | Self::Job { .. }
@@ -251,6 +257,38 @@ impl Route {
                     && segment.len() <= FILE_NAME_BYTES
             })
             .then(|| format!("{}.html", segments.join("/")))
+    }
+
+    /// The shared page a route with an id no pre-render can list (a claim,
+    /// a publishing job, an activation, an Author's controls) is served
+    /// from: one file per kind, which `_redirects` serves with status 200 at
+    /// every such address. The app reads the address itself when it boots.
+    pub fn shell_file(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::Claim { .. } => "_shells/claim.html",
+            Self::Job { .. } => "_shells/job.html",
+            Self::Activate { .. } => "_shells/activate.html",
+            Self::Manage { .. } => "_shells/manage.html",
+            _ => return None,
+        })
+    }
+
+    /// One route of each kind served from a shared page, as the pre-render
+    /// writes it: no id, so its title names the kind.
+    pub fn shell_kinds() -> [Route; 4] {
+        [
+            Route::Claim {
+                slug: String::new(),
+                id: 0,
+            },
+            Route::Job { id: String::new() },
+            Route::Activate {
+                slug: String::new(),
+            },
+            Route::Manage {
+                slug: String::new(),
+            },
+        ]
     }
 
     /// The section it sits under, for `aria-current` in the header.
@@ -294,6 +332,7 @@ impl Route {
             ),
             Self::Status => Some("Status".to_string()),
             Self::Atoms => Some("Atoms".to_string()),
+            Self::States => Some("States".to_string()),
             Self::NotFound => Some("Not found".to_string()),
         }
     }
@@ -363,6 +402,10 @@ impl Route {
                 "Publish an agent · Shonin".to_string(),
                 "Publish a trading agent for 1 USDC: reviewed, built in an attested machine, then yours to activate.",
             ),
+            Self::Job { id } if id.is_empty() => page(
+                "Publishing job · Shonin".to_string(),
+                "Where a publishing job is, live, and how it ended.",
+            ),
             Self::Job { id } => page(
                 format!("Publishing job {id} · Shonin"),
                 "Where a publishing job is, live, and how it ended.",
@@ -370,6 +413,10 @@ impl Route {
             Self::Activate { .. } => page(
                 "Activate agent · Shonin".to_string(),
                 "Set an agent's limits, fill its tank and open its vault.",
+            ),
+            Self::Manage { slug } if slug.is_empty() => page(
+                "Manage an agent · Shonin".to_string(),
+                "An agent's tank, allowances, idle floor and earnings, for its Author.",
             ),
             Self::Manage { slug } => {
                 let name = store::get()
@@ -388,6 +435,10 @@ impl Route {
             Self::Atoms => page(
                 "Atoms · Shonin".to_string(),
                 "Every token, type style, icon and atom.",
+            ),
+            Self::States => page(
+                "States · Shonin".to_string(),
+                "Every state today's data can't show, drawn from synthetic values.",
             ),
             Self::NotFound => page(
                 "Page not found · Shonin".to_string(),
@@ -537,6 +588,54 @@ mod tests {
     }
 
     #[test]
+    fn every_page_with_an_id_is_served_from_its_shell_with_status_200() {
+        // The rules in `_redirects` that serve a shell: (pattern, target).
+        let rules: Vec<(&str, &str)> = include_str!("../_redirects")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                match parts.as_slice() {
+                    [from, to, "200"] => Some((*from, *to)),
+                    _ => None,
+                }
+            })
+            .collect();
+        let example = |pattern: &str| {
+            pattern
+                .split('/')
+                .map(|part| match part {
+                    ":id" => "base-7-3",
+                    part if part.starts_with(':') => "base-7",
+                    part => part,
+                })
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+        for kind in Route::shell_kinds() {
+            let file = kind.shell_file().expect("a shell kind has a shell");
+            let target = format!("/{}", file.trim_end_matches(".html"));
+            let served: Vec<Route> = rules
+                .iter()
+                .filter(|(_, to)| *to == target)
+                .map(|(from, _)| Route::from_url(&example(from), ""))
+                .collect();
+            assert_eq!(served.len(), 1, "one rule serves {file}: {rules:?}");
+            assert_eq!(
+                std::mem::discriminant(&served[0]),
+                std::mem::discriminant(&kind),
+                "{file} serves {:?}",
+                served[0]
+            );
+            assert!(!kind.is_indexable());
+            assert_eq!(kind.file(), None);
+            assert!(!kind.page().title.contains("  "));
+        }
+        assert_eq!(Route::Portfolio.shell_file(), None);
+        assert_eq!(Route::NotFound.shell_file(), None);
+    }
+
+    #[test]
     fn an_unknown_path_is_not_found() {
         assert_eq!(Route::from_url("/strategies", ""), Route::NotFound);
         assert_eq!(Route::from_url("/agents/base-1/code", ""), Route::NotFound);
@@ -553,6 +652,13 @@ mod tests {
             assert_eq!(atoms, Route::NotFound);
         }
         assert_eq!(Route::Atoms.file(), None);
+        let states = Route::from_url("/_states", "");
+        if cfg!(feature = "dev") {
+            assert_eq!(states, Route::States);
+        } else {
+            assert_eq!(states, Route::NotFound);
+        }
+        assert_eq!(Route::States.file(), None);
     }
 
     #[test]

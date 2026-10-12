@@ -86,6 +86,34 @@ struct Panel {
 }
 
 impl Panel {
+    fn new(slug: &str, tab: Tab, in_sheet: bool) -> Self {
+        Self {
+            slug: slug.to_string(),
+            vault: Mutable::new(None),
+            missing: Mutable::new(false),
+            network: Mutable::new(None),
+            figures: Mutable::new(None),
+            holdings: Mutable::new(None),
+            tab: Mutable::new(tab),
+            deposit_text: Mutable::new(String::new()),
+            withdraw_text: Mutable::new(String::new()),
+            unit: Mutable::new(Unit::Shares),
+            stage: Mutable::new(Stage::Form),
+            ack: Mutable::new(false),
+            in_sheet,
+        }
+    }
+
+    /// The empty form: nothing typed, no review, nothing acknowledged. A
+    /// flow starting takes what was typed with it, and another account
+    /// never sees what this one typed or reviewed.
+    fn clear_form(&self) {
+        self.stage.set(Stage::Form);
+        self.deposit_text.set(String::new());
+        self.withdraw_text.set(String::new());
+        self.ack.set(false);
+    }
+
     /// The flow this vault's panel shows for the connected account: kept by
     /// the session, so a panel or sheet built while it runs shows it too.
     fn running(&self) -> Option<Running> {
@@ -124,21 +152,7 @@ pub fn open_sheet(slug: &str, tab: Tab) {
 }
 
 fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
-    let panel = Rc::new(Panel {
-        slug: slug.to_string(),
-        vault: Mutable::new(None),
-        missing: Mutable::new(false),
-        network: Mutable::new(None),
-        figures: Mutable::new(None),
-        holdings: Mutable::new(None),
-        tab: Mutable::new(tab),
-        deposit_text: Mutable::new(String::new()),
-        withdraw_text: Mutable::new(String::new()),
-        unit: Mutable::new(Unit::Shares),
-        stage: Mutable::new(Stage::Form),
-        ack: Mutable::new(false),
-        in_sheet,
-    });
+    let panel = Rc::new(Panel::new(slug, tab, in_sheet));
     let session = crate::wallet::get();
     let mode = {
         let panel = panel.clone();
@@ -162,6 +176,21 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
     };
     let tabs = tabs(&panel);
     let loader = panel.clone();
+    // Another account (or none) gets the empty form.
+    let account_change = {
+        let panel = panel.clone();
+        let mut seen = None;
+        session
+            .connection
+            .signal_ref(Connection::account)
+            .dedupe()
+            .for_each(move |account| {
+                if account_moved(&mut seen, account) {
+                    panel.clear_form();
+                }
+                async {}
+            })
+    };
     el("section")
         .class("sh-exit")
         .class_if(in_sheet, "sh-exit--sheet")
@@ -173,8 +202,17 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
                 .class("sh-exit__risk")
                 .text("The agent can lose money. Nothing here stops that."),
         )
-        .hook(move |dom| dom.future(follow(loader)))
+        .hook(move |dom| dom.future(follow(loader)).future(account_change))
         .into()
+}
+
+/// Whether the connected account (or none) is another than the one the
+/// panel last saw; the first look moves nothing.
+fn account_moved(
+    seen: &mut Option<Option<alloy_primitives::Address>>,
+    now: Option<alloy_primitives::Address>,
+) -> bool {
+    seen.replace(now).is_some_and(|before| before != now)
 }
 
 fn mode_of(
@@ -702,18 +740,18 @@ fn deposit_form(panel: &Rc<Panel>, connected: bool) -> View {
                 .child(
                     el("div")
                         .class("sh-exit__fieldhead")
-                        .child(el("label").class("sh-field__label").attr("for", "sh-deposit-amount").text("Amount"))
+                        .child(el("label").class("sh-field__label").attr("for", field_id("sh-deposit-amount", panel.in_sheet)).text("Amount"))
                         .child(el("span").class("sh-exit__balance").text_signal("", balance)),
                 )
                 .child(amount_input(
-                    "sh-deposit-amount",
+                    field_id("sh-deposit-amount", panel.in_sheet),
                     &panel.deposit_text,
                     text(symbol_unit),
                     check.signal_cloned().map(|(check, _)| {
                         matches!(check, Check::Invalid(_) | Check::Over { .. } | Check::Below(_))
                     }),
                 ))
-                .child(hint("sh-deposit-amount-hint", check.signal_cloned().map(|(check, _)| check), &panel.deposit_text, "The smallest deposit is $10.")),
+                .child(hint(field_id("sh-deposit-amount-hint", panel.in_sheet), check.signal_cloned().map(|(check, _)| check), &panel.deposit_text, "The smallest deposit is $10.")),
         )
         .child(quick)
         .child(
@@ -755,6 +793,19 @@ pub(crate) fn row_dyn(
 }
 
 /// The line under a field: the hint, or the error with its one-tap fix.
+/// A field's id: the phone sheet's copy of the panel sits in the same page
+/// as the panel itself, so each takes its own id and its label and hint
+/// stay tied to it.
+pub(crate) fn field_id(base: &'static str, in_sheet: bool) -> &'static str {
+    match (base, in_sheet) {
+        ("sh-deposit-amount", true) => "sh-deposit-amount-sheet",
+        ("sh-deposit-amount-hint", true) => "sh-deposit-amount-sheet-hint",
+        ("sh-withdraw-amount", true) => "sh-withdraw-amount-sheet",
+        ("sh-withdraw-amount-hint", true) => "sh-withdraw-amount-sheet-hint",
+        (base, _) => base,
+    }
+}
+
 pub(crate) fn hint(
     id: &'static str,
     check: impl Signal<Item = Check> + 'static,
@@ -993,7 +1044,7 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool) -> View {
                         .child(
                             el("label")
                                 .class("sh-field__label")
-                                .attr("for", "sh-withdraw-amount")
+                                .attr("for", field_id("sh-withdraw-amount", panel.in_sheet))
                                 .text("Amount"),
                         )
                         .child(segmented(
@@ -1003,7 +1054,7 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool) -> View {
                         )),
                 )
                 .child(amount_input(
-                    "sh-withdraw-amount",
+                    field_id("sh-withdraw-amount", panel.in_sheet),
                     &panel.withdraw_text,
                     el("span").text_signal("shares", unit_label).into(),
                     check
@@ -1011,7 +1062,7 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool) -> View {
                         .map(|(check, _)| matches!(check, Check::Invalid(_) | Check::Over { .. })),
                 ))
                 .child(hint(
-                    "sh-withdraw-amount-hint",
+                    field_id("sh-withdraw-amount-hint", panel.in_sheet),
                     check.signal_cloned().map(|(check, _)| check),
                     &panel.withdraw_text,
                     "",
@@ -1200,6 +1251,9 @@ fn start(panel: &Rc<Panel>, action: Action) {
     if !crate::wallet::get().begin(&panel.slug, &running) {
         return;
     }
+    // The flow carries its amount; the form behind it starts empty, so no
+    // review is left standing for whoever comes back to it.
+    panel.clear_form();
     crate::wallet::run::start(&vault, action, &running);
 }
 
@@ -1416,7 +1470,7 @@ fn step_view(panel: &Rc<Panel>, running: &Running, step: &Step) -> View {
             let (title, line) = prompt_words(prompt, &wallet, &vault_title, &symbol, decimals);
             let running = running.clone();
             // The second step settles a request already on the chain: there
-            // is nothing to cancel, and declining it is fine.
+            // is nothing to cancel, and declining or skipping it is fine.
             let second = *prompt == Prompt::Finish;
             el("div")
                 .class("sh-exit__wait")
@@ -1424,14 +1478,21 @@ fn step_view(panel: &Rc<Panel>, running: &Running, step: &Step) -> View {
                 .child(el("p").class("sh-exit__title").text(title.clone()))
                 .child(el("p").text(line))
                 .child(el("p").class("sh-muted sh-exit__small").text(if second {
-                    format!("Don’t see it? Open {wallet}.")
+                    format!(
+                        "Don’t see it? Open {wallet}, or skip it: your request stands either way."
+                    )
                 } else {
                     format!(
                         "Don’t see it? Open {wallet}. Once you approve, the request can’t be cancelled."
                     )
                 }))
                 .child(if second {
-                    View::Empty
+                    // Lets only this step go; the flow keeps watching the
+                    // request, and "Settle now" asks for it again.
+                    View::from(on_click(
+                        Button::new(Kind::Secondary, "Skip").build(),
+                        move || running.skip_second.nudge(),
+                    ))
                 } else {
                     on_click(Button::new(Kind::Secondary, "Cancel").build(), move || {
                         // Nothing further is sent; a prompt already open in the
@@ -2004,4 +2065,66 @@ pub(crate) fn seal() -> El {
         .class("sh-seal sh-seal-in")
         .attr("aria-hidden", "true")
         .child(icon(Icon::Check, 28))
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::Address;
+
+    use super::*;
+    use crate::wallet::machine::WalletId;
+
+    fn network() -> Network {
+        Network {
+            chain: shared::Chain::Base,
+            chain_id: 8453,
+            label: "Base".to_string(),
+            rpc: String::new(),
+            asset: Address::repeat_byte(0xdd),
+            asset_symbol: "USDC".to_string(),
+            asset_decimals: 6,
+            dev_account: None,
+        }
+    }
+
+    fn connected(account: Address) -> Connection {
+        Connection::Connected {
+            wallet: WalletId::Injected,
+            account,
+            chain_id: Some(8453),
+        }
+    }
+
+    #[test]
+    fn another_account_sees_the_empty_form_never_the_previous_accounts_review() {
+        let first = Address::repeat_byte(0xa0);
+        let second = Address::repeat_byte(0x23);
+        let panel = Panel::new("base-1", Tab::Deposit, false);
+        let mut seen = None;
+        assert!(!account_moved(&mut seen, Some(first)), "the first look");
+        // The first account typed an amount and reached its review.
+        panel.deposit_text.set("11".to_string());
+        panel.withdraw_text.set("3".to_string());
+        panel.ack.set(true);
+        panel.stage.set(Stage::Review);
+        assert!(!account_moved(&mut seen, Some(first)));
+        // The wallet moves to another account.
+        if account_moved(&mut seen, Some(second)) {
+            panel.clear_form();
+        }
+        let mode = mode_of(
+            &connected(second),
+            Some(&network()),
+            true,
+            panel.tab.get(),
+            panel.stage.get(),
+            None,
+        );
+        assert_eq!(mode, Mode::Form(Tab::Deposit));
+        assert!(panel.deposit_text.get_cloned().is_empty());
+        assert!(panel.withdraw_text.get_cloned().is_empty());
+        assert!(!panel.ack.get());
+        // Disconnecting is a change too.
+        assert!(account_moved(&mut seen, None));
+    }
 }

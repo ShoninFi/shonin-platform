@@ -290,7 +290,7 @@ fn chip(state: &JobState) -> El {
     }
 }
 
-fn job_view(job: &Job, paid: Option<PaymentRecord>) -> View {
+pub(crate) fn job_view(job: &Job, paid: Option<PaymentRecord>) -> View {
     let title = if job.title.trim().is_empty() {
         format!("Job {}", job.id)
     } else {
@@ -525,6 +525,7 @@ fn outcome_card(job: &Job) -> View {
                     el("p").text("To see why, run the same build yourself:").into(),
                     el("code")
                         .class("sh-publish__code")
+                        .attr("tabindex", "0")
                         .text("cargo build --release --locked --target wasm32-wasip2")
                         .into(),
                     el("p").class("sh-muted").text(

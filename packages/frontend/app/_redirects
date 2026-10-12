@@ -2,16 +2,27 @@
 # leaderboard. An Author's page is now the leaderboard filtered by Author
 # (/agents?author=<chain>:<address>); the old pages were keyed by a display
 # name that can't be turned into an address here, so they go to the full list.
+# Rules without placeholders or splats come first, as Workers static assets
+# match them fastest; the first rule that matches applies.
 /                       /agents                   302
 /strategies             /agents                   301
+/queue                  /publish                  301
+/verify                 /status                   301
+/about                  https://shonin.fi/        301
+/authors                /agents                   301
 /strategies/:slug       /agents/:slug             301
 /strategies/:slug/*     /agents/:slug             301
 /agents/:slug/record    /agents/:slug             301
 /agents/:slug/health    /agents/:slug             301
 /agents/:slug/code      /agents/:slug/verify      301
-/queue                  /publish                  301
 /queue/:id              /publish/jobs/:id         301
-/verify                 /status                   301
-/about                  https://shonin.fi/        301
-/authors                /agents                   301
 /authors/*              /agents                   301
+
+# Pages whose address carries an id the pre-render can't list are served
+# with status 200 from one shared page per kind (written by the pre-render);
+# the app reads the address itself when it boots. Placeholders match one
+# path segment, so a deeper path still gets the 404 page.
+/portfolio/claims/:id   /_shells/claim            200
+/publish/jobs/:id       /_shells/job              200
+/publish/:slug/activate /_shells/activate         200
+/you/agents/:slug       /_shells/manage           200

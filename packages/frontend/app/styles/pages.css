@@ -386,6 +386,7 @@
 .at-h2 { font: var(--type-display-m); letter-spacing: var(--track-display-m); }
 .at-row { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: var(--space-4); align-items: start; }
 .at-row__label { font: var(--type-label); letter-spacing: var(--track-label); text-transform: uppercase; color: var(--ink-muted); padding-top: 10px; }
+.st-state { display: flex; flex-direction: column; gap: var(--space-2); }
 .at-row__items { display: flex; flex-wrap: wrap; gap: var(--space-3); align-items: center; min-width: 0; }
 .at-swatches { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: var(--space-3); width: 100%; }
 .at-swatch { display: grid; grid-template-columns: 40px minmax(0, 1fr); column-gap: var(--space-3); align-items: center; }
@@ -412,3 +413,31 @@
 
 /* The layout picker needs scripts; without them the table is the page. */
 @media (scripting: none) { .lb-layout { display: none; } }
+
+/* Touch targets on phone and tablet: every control a finger aims at takes at
+   least 44 × 44px. Small links and chips keep their look and take the bigger
+   target through an invisible layer centred on them, as small buttons do;
+   the footer's stacked links get the height itself, so neighbours never
+   overlap. */
+@media (max-width: 1023px) {
+  .sh-link, .sh-notice__actions a, .sh-notice__body > a, .st-event__link, .ag-quote__source,
+  .sh-claim__crumbs a, .ag-by a, .ag-chip-link, .ag-more, .ag-chart__table-toggle,
+  .ag-report__go, .ag-record__read, .sh-seg button, .st-filter, .sh-nav, .lb-howto,
+  .sh-appheader .sh-logo, .sh-walletbtn, .ag-crumb a, .ag-tank__about a, .ag-source-line a,
+  .sh-footer__brand .sh-logo, .sh-strip .sh-iconbtn, .sh-table th a {
+    position: relative;
+  }
+  .sh-link::after, .sh-notice__actions a::after, .sh-notice__body > a::after, .st-event__link::after,
+  .ag-quote__source::after, .sh-claim__crumbs a::after, .ag-by a::after, .ag-chip-link::after,
+  .ag-more::after, .ag-chart__table-toggle::after, .ag-report__go::after, .ag-record__read::after,
+  .sh-seg button::after, .st-filter::after, .sh-nav::after, .lb-howto::after,
+  .sh-appheader .sh-logo::after, .sh-walletbtn::after, .ag-crumb a::after,
+  .ag-tank__about a::after, .ag-source-line a::after, .sh-footer__brand .sh-logo::after,
+  .sh-strip .sh-iconbtn::after, .sh-table th a::after {
+    content: ""; position: absolute; left: 50%; top: 50%;
+    width: max(100%, 44px); height: max(100%, 44px); transform: translate(-50%, -50%);
+  }
+  .sh-footer__col { gap: 0; }
+  .ag-src__link { min-height: 44px; }
+  .sh-footer__col a { display: flex; align-items: center; min-height: 44px; }
+}

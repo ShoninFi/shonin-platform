@@ -161,7 +161,8 @@ fn render(toast: &Rc<Toast>) -> View {
 pub fn region() -> El {
     el("div")
         .class("sh-toasts")
+        // A live region, not a landmark: a name on a plain container isn't
+        // allowed, and an empty landmark on every page helps nobody.
         .attr("aria-live", "polite")
-        .attr("aria-label", "Notifications")
         .children_from(&toasts(), render)
 }

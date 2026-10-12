@@ -552,26 +552,25 @@ pub fn wrong_network_bar(vault_chain_id: Mutable<Option<u64>>, what: String) -> 
                 if on == want || !crate::wallet::get().is_browser() {
                     return None;
                 }
-                let target = networks::chain_name(want);
-                Some(
-                    el("div")
-                        .class("sh-wrongnet")
-                        .attr("role", "status")
-                        .child(
-                            el("div")
-                                .class("sh-container sh-wrongnet__inner")
-                                .child(icon(Icon::Concern, 18))
-                                .child(el("p").text(format!(
-                                    "Your wallet is on {}. {what} on {target}.",
-                                    networks::chain_name(on)
-                                )))
-                                .child(switch_button(want, Size::Small)),
-                        )
-                        .into(),
-                )
+                Some(wrong_network(on, want, &what).into())
             }),
         )
         .into()
+}
+
+/// The bar itself: the wallet is on `on`, and `what` needs `want`.
+pub(crate) fn wrong_network(on: u64, want: u64, what: &str) -> El {
+    el("div").class("sh-wrongnet").attr("role", "status").child(
+        el("div")
+            .class("sh-container sh-wrongnet__inner")
+            .child(icon(Icon::Concern, 18))
+            .child(el("p").text(format!(
+                "Your wallet is on {}. {what} on {}.",
+                networks::chain_name(on),
+                networks::chain_name(want)
+            )))
+            .child(switch_button(want, Size::Small)),
+    )
 }
 
 /// "Switch to Hyperliquid": asks the wallet to switch, adding the chain if it

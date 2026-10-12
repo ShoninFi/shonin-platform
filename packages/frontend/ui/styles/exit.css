@@ -49,7 +49,8 @@
   display: inline-flex; align-items: center; justify-content: center; width: 48px; height: 48px;
   border-radius: var(--radius-full); background: var(--gain-soft); color: var(--gain);
 }
-@media (prefers-reduced-motion: reduce) { .sh-countdown__fill { transition: none; } }
+/* Reduced motion: no ring at all; the "in 7 s" beside the time still counts. */
+@media (prefers-reduced-motion: reduce) { .sh-countdown { display: none; } }
 @media (min-width: 600px) and (max-width: 899px) {
   .sh-exit:not(.sh-exit--sheet) .sh-exit__form { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: var(--space-6); }
   .sh-exit:not(.sh-exit--sheet) .sh-exit__form > * { grid-column: 1; }

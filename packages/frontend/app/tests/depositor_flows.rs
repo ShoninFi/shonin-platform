@@ -43,6 +43,9 @@ enum Wallet {
     SwitchesChainAfterRequest,
     /// Signs the statement with the parity byte as 0 or 1, not 27 or 28.
     SignsWithParityByte,
+    /// Never answers the second step (`settle`): a wallet session gone
+    /// quiet. Meanwhile the keeper settles the request.
+    NeverAnswersSettle,
 }
 
 /// What becomes of the app's own `settle` (the second step) once the wallet
@@ -103,6 +106,8 @@ struct Chain {
     looks_since_settle: Option<u32>,
     /// The receipt look at which the keeper settled, if it did.
     keeper_settled_at_look: Option<u32>,
+    /// The person presses "Skip" on the second step's wallet prompt.
+    skips_second: bool,
 }
 
 type Sim = Rc<RefCell<Chain>>;
@@ -158,6 +163,7 @@ impl World {
             receipt_looks: 0,
             looks_since_settle: None,
             keeper_settled_at_look: None,
+            skips_second: false,
         };
         Self {
             sim: Rc::new(RefCell::new(chain)),
@@ -183,7 +189,13 @@ impl World {
         >,
     ) -> (Result<Outcome, TxError>, Vec<Step>) {
         let steps = RefCell::new(Vec::new());
-        let on_step = |step: Step| steps.borrow_mut().push(step);
+        let skip_second = Nudge::new();
+        let on_step = |step: Step| {
+            if self.sim.borrow().skips_second && step == Step::Signing(Prompt::Finish) {
+                skip_second.nudge();
+            }
+            steps.borrow_mut().push(step);
+        };
         let reader = SimReader(self.sim.clone());
         let wallet = SimWallet {
             sim: self.sim.clone(),
@@ -199,6 +211,7 @@ impl World {
             account: self.account(),
             cancel: Cancel::new(),
             settle_now: Nudge::new(),
+            skip_second: skip_second.clone(),
             pace: Pace::FAST,
             on_step: &on_step,
         };
@@ -726,8 +739,23 @@ impl Signer for SimWallet {
         Ok(Bytes::from(bytes))
     }
     async fn send(&self, request: &TxRequest) -> Result<B256, TxError> {
-        let mut sim = self.sim.borrow_mut();
         let selector: [u8; 4] = request.data[..4].try_into().unwrap();
+        if selector == IVault::settleCall::SELECTOR {
+            let hangs = {
+                let mut sim = self.sim.borrow_mut();
+                let hangs = sim.wallet == Wallet::NeverAnswersSettle;
+                if hangs {
+                    // The prompt stays open in the wallet; the keeper
+                    // settles the request meanwhile.
+                    sim.keeper_settles();
+                }
+                hangs
+            };
+            if hangs {
+                futures::future::pending::<()>().await;
+            }
+        }
+        let mut sim = self.sim.borrow_mut();
         if sim.wallet == Wallet::DeclinesSettle && selector == IVault::settleCall::SELECTOR {
             return Err(TxError::Rejected);
         }
@@ -1184,5 +1212,49 @@ fn a_booked_withdrawal_is_matched_to_its_own_claim_when_an_earlier_twin_is_booke
     assert!(
         matches!(result, Ok(Outcome::Booked { claim, .. }) if claim == U256::from(2u8)),
         "the flow's withdrawal was request 2, booked as claim 2, but it reports: {result:?}"
+    );
+}
+
+/// The wallet is asked for the optional second step and never answers (a
+/// session gone quiet, a hardware wallet unplugged); meanwhile the keeper
+/// settles the deposit. The flow reads the request while the wallet is
+/// asked and ends done, rather than holding the panel on the wallet's
+/// prompt.
+#[test]
+fn a_deposit_the_vault_settled_ends_done_while_the_wallet_still_hasnt_answered_the_second_step() {
+    let world = World::new(Wallet::NeverAnswersSettle);
+    let (result, steps) = deposit(&world, 100);
+    assert!(
+        steps.contains(&Step::Signing(Prompt::Finish)),
+        "the wallet was asked for the second step: {steps:?}"
+    );
+    assert!(world.sim.borrow().requests[0].3, "the keeper settled it");
+    assert!(
+        matches!(result, Ok(Outcome::Deposited { .. })),
+        "{result:?}; steps {steps:?}"
+    );
+}
+
+/// "Skip" on the second step's prompt lets only that step go: the flow
+/// says it wasn't sent, keeps watching the request, and ends done when the
+/// vault settles it.
+#[test]
+fn skipping_the_second_step_lets_only_that_step_go_and_the_deposit_still_ends_done() {
+    let world = World::new(Wallet::NeverAnswersSettle);
+    world.with(|chain| chain.skips_second = true);
+    let (result, steps) = deposit(&world, 100);
+    assert!(
+        steps.iter().any(|step| matches!(
+            step,
+            Step::Priced {
+                unsent: Some(TxError::Cancelled),
+                ..
+            }
+        )),
+        "the skipped step is said as not sent: {steps:?}"
+    );
+    assert!(
+        matches!(result, Ok(Outcome::Deposited { .. })),
+        "{result:?}; steps {steps:?}"
     );
 }

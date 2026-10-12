@@ -114,6 +114,16 @@ pub fn chip(full: &str, what: &'static str) -> El {
 }
 
 /// The line that always sits by a money action.
+/// A table that may scroll sideways on a narrow screen: a named region the
+/// keyboard can reach and scroll.
+pub fn scroll(label: &'static str) -> El {
+    el("div")
+        .class("ag-scroll")
+        .attr("role", "region")
+        .attr("aria-label", label)
+        .attr("tabindex", "0")
+}
+
 pub fn risk_line() -> El {
     el("p")
         .class("ag-risk")

@@ -8,6 +8,8 @@ pub mod not_found;
 pub mod portfolio;
 pub mod publish;
 pub mod soon;
+#[cfg(any(feature = "dev", test))]
+pub mod states;
 pub mod status;
 pub mod you;
 
@@ -37,8 +39,10 @@ pub fn page(route: &Route, strip_dismissed: bool) -> Page {
         Route::Status => status::page(),
         #[cfg(feature = "dev")]
         Route::Atoms => atoms::page(),
+        #[cfg(feature = "dev")]
+        Route::States => states::page(),
         #[cfg(not(feature = "dev"))]
-        Route::Atoms => not_found::page(),
+        Route::Atoms | Route::States => not_found::page(),
         Route::NotFound => not_found::page(),
     }
 }

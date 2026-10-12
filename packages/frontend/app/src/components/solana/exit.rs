@@ -658,19 +658,19 @@ fn deposit_form(panel: &Rc<Panel>, connected: bool) -> View {
                         .child(
                             el("label")
                                 .class("sh-field__label")
-                                .attr("for", "sh-deposit-amount")
+                                .attr("for", crate::components::exit::field_id("sh-deposit-amount", panel.in_sheet))
                                 .text("Amount"),
                         )
                         .child(el("span").class("sh-exit__balance").text_signal("", balance)),
                 )
                 .child(amount_input(
-                    "sh-deposit-amount",
+                    crate::components::exit::field_id("sh-deposit-amount", panel.in_sheet),
                     &panel.deposit_text,
                     text(symbol(panel)),
                     check.signal_ref(invalid),
                 ))
                 .child(hint(
-                    "sh-deposit-amount-hint",
+                    crate::components::exit::field_id("sh-deposit-amount-hint", panel.in_sheet),
                     check.signal_cloned().map(|(check, _)| check),
                     &panel.deposit_text,
                     "The smallest deposit is $10.",
@@ -864,7 +864,13 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool) -> View {
                         .child(
                             el("label")
                                 .class("sh-field__label")
-                                .attr("for", "sh-withdraw-amount")
+                                .attr(
+                                    "for",
+                                    crate::components::exit::field_id(
+                                        "sh-withdraw-amount",
+                                        panel.in_sheet,
+                                    ),
+                                )
                                 .text("Amount"),
                         )
                         .child(segmented(
@@ -874,13 +880,13 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool) -> View {
                         )),
                 )
                 .child(amount_input(
-                    "sh-withdraw-amount",
+                    crate::components::exit::field_id("sh-withdraw-amount", panel.in_sheet),
                     &panel.withdraw_text,
                     el("span").text_signal("shares", unit_label).into(),
                     check.signal_ref(invalid),
                 ))
                 .child(hint(
-                    "sh-withdraw-amount-hint",
+                    crate::components::exit::field_id("sh-withdraw-amount-hint", panel.in_sheet),
                     check.signal_cloned().map(|(check, _)| check),
                     &panel.withdraw_text,
                     "",

@@ -8,9 +8,13 @@ use crate::view::{El, View, el};
 
 /// The whole page for a route, as one element: `#app`.
 pub fn shell(route: &Route, strip_dismissed: bool) -> El {
-    let page = pages::page(route, strip_dismissed);
+    frame(route, pages::page(route, strip_dismissed))
+}
+
+/// The frame around `page`, as it sits under `route`.
+pub fn frame(route: &Route, page: pages::Page) -> El {
     let full_bleed = matches!(route, Route::NotFound)
-        || (matches!(route, Route::Atoms) && !cfg!(feature = "dev"));
+        || (matches!(route, Route::Atoms | Route::States) && !cfg!(feature = "dev"));
     let main = el("main")
         .attr("id", "content")
         .attr("tabindex", "-1")

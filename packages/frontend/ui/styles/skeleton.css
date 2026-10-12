@@ -1,7 +1,7 @@
 /* Skeletons match the final layout exactly. No spinners. The shimmer stops
    under reduced motion; the shape stays. */
 .sh-skel {
-  display: block; border-radius: var(--radius-s);
+  display: block; max-width: 100%; border-radius: var(--radius-s);
   background: linear-gradient(90deg, var(--paper-sunk) 0%, var(--skeleton-shine) 50%, var(--paper-sunk) 100%);
   background-size: 200% 100%;
   animation: sh-shimmer 1.4s linear infinite;

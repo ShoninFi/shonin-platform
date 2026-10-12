@@ -48,7 +48,7 @@
 
 /* Small buttons stay 36px to look at but take a 44px touch target. */
 @media (max-width: 1023px) {
-  .sh-btn-sm::after { content: ""; position: absolute; inset: -4px -2px; }
+  .sh-btn-sm::after { content: ""; position: absolute; inset: -6px -2px; }
 }
 
 /* Icon buttons: only for universally understood icons; aria-label required. */
