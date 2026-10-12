@@ -63,3 +63,12 @@ pub struct Unwound {
 pub struct Stopped {
     pub halted_at: u64,
 }
+
+/// A station the first programs wrote, rewritten in the current layout with
+/// every value unchanged.
+#[event]
+pub struct StationMigrated {
+    pub station: Pubkey,
+    pub size_before: u32,
+    pub size_after: u32,
+}

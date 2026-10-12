@@ -10,7 +10,7 @@ use shonin_vault::state as vs;
 use super::Pubkey;
 use super::accounts::{
     self, Claim, ClaimState, Event, HaltReason, Holder, MarginAccount, Request, RequestKind,
-    Station, Vault, VaultState, discriminator as d, events_in, token_amount,
+    Station, StationLayout, Vault, VaultState, discriminator as d, events_in, token_amount,
 };
 
 fn key(n: u8) -> Pubkey {
@@ -497,11 +497,51 @@ fn a_claim_reads_back_every_field_and_its_owner_offset_holds() {
     }
 }
 
-#[test]
-fn a_station_reads_back_each_pinned_driver_in_order_past_its_rules() {
+/// A driver's rules with a position of every kind the first programs knew.
+fn first_rules(n: u8) -> Vec<shonin_driver::Rule> {
     use shonin_driver::{Class, Own, Position, Rule};
-    use shonin_station::state::{Pinned, Station as TheirStation, StationAddress};
-    let pinned = |n: u8| Pinned {
+    vec![
+        Rule {
+            discriminator: vec![n, n, n],
+            class: Class::Exit,
+            positions: vec![
+                Position {
+                    index: 1,
+                    own: Own::StationToken(Some(2)),
+                },
+                Position {
+                    index: 3,
+                    own: Own::StationAddress(vec![4, 5]),
+                },
+                Position {
+                    index: 6,
+                    own: Own::Fixed(7),
+                },
+            ],
+        },
+        Rule {
+            discriminator: vec![],
+            class: Class::Trade,
+            positions: vec![
+                Position {
+                    index: 0,
+                    own: Own::StationToken(None),
+                },
+                Position {
+                    index: 1,
+                    own: Own::Station,
+                },
+                Position {
+                    index: 2,
+                    own: Own::StationDollars,
+                },
+            ],
+        },
+    ]
+}
+
+fn first_pinned(n: u8) -> shonin_station::state::first::Pinned {
+    shonin_station::state::first::Pinned {
         name: [n; 32],
         program: key(n + 1),
         venue: key(n + 2),
@@ -509,41 +549,17 @@ fn a_station_reads_back_each_pinned_driver_in_order_past_its_rules() {
         authority_bump: n + 4,
         dollars: key(n + 5),
         key: key(n + 6),
-        rules: vec![
-            Rule {
-                discriminator: vec![n, n, n],
-                class: Class::Exit,
-                positions: vec![
-                    Position {
-                        index: 1,
-                        own: Own::StationToken(Some(2)),
-                    },
-                    Position {
-                        index: 3,
-                        own: Own::StationAddress(vec![4, 5]),
-                    },
-                    Position {
-                        index: 6,
-                        own: Own::Fixed(7),
-                    },
-                ],
-            },
-            Rule {
-                discriminator: vec![],
-                class: Class::Trade,
-                positions: vec![Position {
-                    index: 0,
-                    own: Own::StationToken(None),
-                }],
-            },
-        ],
+        rules: first_rules(n),
         fixed: vec![vec![key(n + 7)], vec![key(n + 8), key(n + 9)]],
-        addresses: vec![StationAddress {
+        addresses: vec![shonin_station::state::StationAddress {
             prefix: b"account".to_vec(),
             address: key(n + 10),
         }],
-    };
-    let station = TheirStation {
+    }
+}
+
+fn first_station(drivers: &[u8]) -> shonin_station::state::first::Station {
+    shonin_station::state::first::Station {
         vault: key(1),
         vault_program: key(2),
         vault_dollars: key(3),
@@ -558,19 +574,185 @@ fn a_station_reads_back_each_pinned_driver_in_order_past_its_rules() {
         stopped_at: 11,
         payer: key(12),
         bump: 13,
-        drivers: vec![pinned(20), pinned(40)],
-    };
-    let ours = Station::read(&written(&station)).unwrap();
+        drivers: drivers.iter().map(|n| first_pinned(*n)).collect(),
+    }
+}
+
+/// A station in the current layout with every driver's new lists filled,
+/// and a rule naming each kind of position the current programs added.
+fn current_station(drivers: &[u8]) -> shonin_station::state::Station {
+    use shonin_driver::{Class, Own, Position, Rule};
+    use shonin_station::state::{PositionMint, Station as TheirStation};
+    let mut station = TheirStation::from(first_station(drivers));
+    for (i, driver) in station.drivers.iter_mut().enumerate() {
+        let n = drivers[i];
+        driver.rules.push(Rule {
+            discriminator: vec![n, 1],
+            class: Class::Trade,
+            positions: vec![
+                Position {
+                    index: 0,
+                    own: Own::StationMint(2),
+                },
+                Position {
+                    index: 1,
+                    own: Own::StationPositionToken(0),
+                },
+                Position {
+                    index: 2,
+                    own: Own::StationPositionHeld,
+                },
+            ],
+        });
+        driver.position_mints = (0..=i as u8)
+            .map(|slot| PositionMint {
+                address: key(n + 11 + slot),
+                bump: slot,
+            })
+            .collect();
+        driver.token_accounts = vec![key(n + 15), key(n + 16)];
+    }
+    station
+}
+
+/// An account's bytes exactly as the program writes them: a station is made
+/// at its size, with no room past its record.
+fn exact<T: AccountSerialize>(account: &T) -> Vec<u8> {
+    let mut out = Vec::new();
+    account.try_serialize(&mut out).unwrap();
+    out
+}
+
+/// The first layout's bytes: the station's discriminator, then Borsh.
+fn first_written(station: &shonin_station::state::first::Station) -> Vec<u8> {
+    use anchor_lang::AnchorSerialize;
+    let mut out = shonin_station::state::Station::DISCRIMINATOR.to_vec();
+    station.serialize(&mut out).unwrap();
+    out
+}
+
+fn assert_groups(ours: &Station, drivers: &[u8]) {
     assert_eq!(ours.vault, key(1));
     assert!(ours.stopped);
-    assert_eq!(ours.drivers.len(), 2);
-    for (driver, n) in ours.drivers.iter().zip([20u8, 40]) {
+    assert_eq!(ours.drivers.len(), drivers.len());
+    for (driver, n) in ours.drivers.iter().zip(drivers.iter().copied()) {
         assert_eq!(driver.name, [n; 32]);
         assert_eq!(driver.pinned.program, key(n + 1));
         assert_eq!(driver.pinned.venue, key(n + 2));
         assert_eq!(driver.pinned.authority, key(n + 3));
         assert_eq!(driver.pinned.dollars, key(n + 5));
     }
+}
+
+#[test]
+fn a_station_reads_back_each_pinned_driver_in_order_past_its_rules() {
+    for drivers in [&[20u8][..], &[20, 40], &[20, 40, 60]] {
+        let station = current_station(drivers);
+        assert!(station.drivers.iter().all(|d| !d.position_mints.is_empty()));
+        let (ours, layout) = Station::read_with_layout(&exact(&station)).unwrap();
+        assert_eq!(layout, StationLayout::Current);
+        assert_groups(&ours, drivers);
+    }
+}
+
+#[test]
+fn a_first_layout_station_reads_back_the_driver_groups_its_migrated_form_does() {
+    use shonin_station::state::Station as TheirStation;
+    for drivers in [&[20u8][..], &[20, 40], &[20, 40, 60]] {
+        let old = first_station(drivers);
+        let (ours, layout) = Station::read_with_layout(&first_written(&old)).unwrap();
+        assert_eq!(layout, StationLayout::First);
+        assert_groups(&ours, drivers);
+        // What `migrate_station` writes: the same values, the new lists empty.
+        let migrated = exact(&TheirStation::from(old));
+        let (after, layout) = Station::read_with_layout(&migrated).unwrap();
+        assert_eq!(layout, StationLayout::Current);
+        assert_eq!(after, ours);
+    }
+}
+
+#[test]
+fn a_station_with_bytes_past_its_record_is_not_read() {
+    for drivers in [&[20u8][..], &[20, 40]] {
+        for data in [
+            first_written(&first_station(drivers)),
+            exact(&current_station(drivers)),
+        ] {
+            assert!(Station::read(&data).is_some());
+            for extra in [&[1u8][..], &[0], &[0; 64], &[0, 0, 0, 7]] {
+                let mut longer = data.clone();
+                longer.extend_from_slice(extra);
+                assert_eq!(Station::read(&longer), None, "{extra:?} past the record");
+            }
+        }
+    }
+}
+
+/// Every account the decoders are shown, read by the app's decoder and by
+/// the station program's own rule, must come out the same: the same layout,
+/// the same driver groups, or refused by both.
+#[test]
+fn the_app_reads_every_station_as_the_station_program_does() {
+    use shonin_station::state::{Layout, Station as TheirStation};
+    let mut cases = Vec::new();
+    for drivers in [&[][..], &[20u8], &[20, 40], &[20, 40, 60]] {
+        let old = first_written(&first_station(drivers));
+        let new = exact(&current_station(drivers));
+        let migrated = exact(&TheirStation::from(first_station(drivers)));
+        for data in [old, new, migrated] {
+            for cut in 1..=9.min(data.len() - 8) {
+                cases.push(data[..data.len() - cut].to_vec());
+            }
+            for extra in [0u8, 1, 0xff] {
+                let mut longer = data.clone();
+                longer.push(extra);
+                cases.push(longer);
+            }
+            let mut other = data.clone();
+            other[3] ^= 0x10;
+            cases.push(other);
+            cases.push(data);
+        }
+    }
+    cases.push(Vec::new());
+    cases.push(d::STATION.to_vec());
+    cases.push(vec![0xab; 803]);
+    let mut read = 0;
+    for data in &cases {
+        let ours = Station::read_with_layout(data);
+        let theirs = TheirStation::read_any(data);
+        match (&ours, &theirs) {
+            (None, None) => {}
+            (Some((ours, our_layout)), Some((theirs, their_layout))) => {
+                read += 1;
+                let same_layout = matches!(
+                    (our_layout, their_layout),
+                    (StationLayout::Current, Layout::Current)
+                        | (StationLayout::First, Layout::First)
+                );
+                assert!(same_layout, "{our_layout:?} against {their_layout:?}");
+                assert_eq!(ours.vault, theirs.vault);
+                assert_eq!(ours.stopped, theirs.stopped);
+                let names: Vec<_> = theirs.drivers.iter().map(|d| d.name).collect();
+                assert_eq!(
+                    ours.drivers.iter().map(|d| d.name).collect::<Vec<_>>(),
+                    names
+                );
+                for (o, t) in ours.drivers.iter().zip(&theirs.drivers) {
+                    assert_eq!(o.pinned.program, t.program);
+                    assert_eq!(o.pinned.venue, t.venue);
+                    assert_eq!(o.pinned.authority, t.authority);
+                    assert_eq!(o.pinned.dollars, t.dollars);
+                }
+            }
+            _ => panic!(
+                "the app read {:?} where the program read {:?}",
+                ours.map(|(_, l)| l),
+                theirs.map(|(_, l)| l)
+            ),
+        }
+    }
+    assert!(read >= 12, "only {read} read");
 }
 
 #[test]

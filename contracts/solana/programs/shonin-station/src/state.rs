@@ -146,6 +146,7 @@ impl Pinned {
 
 /// A vault's station.
 #[account]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Station {
     /// The vault: the program-derived address that signs for it.
     pub vault: Pubkey,
@@ -208,6 +209,241 @@ impl Station {
         }
         let band = band.max(1) << doublings;
         band.min(BPS) as u16
+    }
+}
+
+/// Which layout a station's account is written in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    /// Today's: every driver ends with its position mints and its token
+    /// accounts.
+    Current,
+    /// The first programs': every driver ends at its `addresses`
+    /// ([`first`]). `migrate_station` rewrites such a station in the current
+    /// layout.
+    First,
+}
+
+impl Station {
+    /// A station's account in either layout, and which: the account must
+    /// carry the station's discriminator and its body must decode whole, with
+    /// no byte left over, as the current layout, or failing that as the
+    /// first. A station is made at exactly its size and its size never
+    /// changes, in either layout (`migrate_station` resizes it to exactly the
+    /// current layout's), so no account a program wrote has bytes past its
+    /// record, zero or not. A station read in the first layout comes back
+    /// with every driver's `position_mints` and `token_accounts` empty, as
+    /// `migrate_station` writes it.
+    ///
+    /// Each layout is first walked over without allocating
+    /// ([`walk::fills`]), every length checked against the bytes left, and
+    /// decoded only if it fills the body exactly: decoding bytes in the wrong
+    /// layout would otherwise read a length out of some other field and
+    /// reserve room for it (a megabyte, for a list of bytes) before finding
+    /// the bytes aren't there, which a program's heap can't hold.
+    pub fn read_any(data: &[u8]) -> Option<(Station, Layout)> {
+        let body = data.strip_prefix(Station::DISCRIMINATOR)?;
+        if walk::fills(body, Layout::Current) {
+            if let Some(station) = whole::<Station>(body) {
+                return Some((station, Layout::Current));
+            }
+        }
+        if !walk::fills(body, Layout::First) {
+            return None;
+        }
+        whole::<first::Station>(body).map(|station| (station.into(), Layout::First))
+    }
+}
+
+/// `T` decoded from all of `body`, or nothing if it doesn't decode or leaves
+/// bytes over.
+fn whole<T: AnchorDeserialize>(mut body: &[u8]) -> Option<T> {
+    let value = T::deserialize(&mut body).ok()?;
+    body.is_empty().then_some(value)
+}
+
+/// A station's body walked field by field in one layout, as Borsh lays it
+/// out, without decoding or allocating anything: each list's length must fit
+/// in the bytes left, each element taking at least one.
+pub mod walk {
+    use super::Layout;
+
+    struct Cursor<'a>(&'a [u8]);
+
+    impl Cursor<'_> {
+        fn skip(&mut self, n: usize) -> Option<()> {
+            self.0 = self.0.get(n..)?;
+            Some(())
+        }
+
+        fn byte(&mut self) -> Option<u8> {
+            let (first, rest) = self.0.split_first()?;
+            self.0 = rest;
+            Some(*first)
+        }
+
+        fn length(&mut self) -> Option<usize> {
+            let bytes: [u8; 4] = self.0.get(..4)?.try_into().ok()?;
+            self.0 = &self.0[4..];
+            let n = u32::from_le_bytes(bytes) as usize;
+            (n <= self.0.len()).then_some(n)
+        }
+
+        fn list(&mut self, each: impl Fn(&mut Self) -> Option<()>) -> Option<()> {
+            for _ in 0..self.length()? {
+                each(self)?;
+            }
+            Some(())
+        }
+
+        fn bytes(&mut self) -> Option<()> {
+            let n = self.length()?;
+            self.skip(n)
+        }
+    }
+
+    /// `shonin_driver::Own`, every variant either layout may hold.
+    fn own(c: &mut Cursor) -> Option<()> {
+        match c.byte()? {
+            // Station, StationDollars, StationPositionHeld.
+            0 | 1 | 7 => Some(()),
+            // StationToken(Option<u8>).
+            2 => match c.byte()? {
+                0 => Some(()),
+                1 => c.skip(1),
+                _ => None,
+            },
+            // StationAddress(Vec<u8>).
+            3 => c.bytes(),
+            // Fixed(u8), StationMint(u8), StationPositionToken(u8).
+            4..=6 => c.skip(1),
+            _ => None,
+        }
+    }
+
+    fn rule(c: &mut Cursor) -> Option<()> {
+        c.bytes()?;
+        c.skip(1)?;
+        c.list(|c| {
+            c.skip(1)?;
+            own(c)
+        })
+    }
+
+    fn pinned(c: &mut Cursor, layout: Layout) -> Option<()> {
+        // name, program, venue, authority, authority_bump, dollars, key.
+        c.skip(32 * 6 + 1)?;
+        c.list(rule)?;
+        c.list(|c| c.list(|c| c.skip(32)))?;
+        c.list(|c| {
+            c.bytes()?;
+            c.skip(32)
+        })?;
+        if layout == Layout::Current {
+            c.list(|c| c.skip(33))?;
+            c.list(|c| c.skip(32))?;
+        }
+        Some(())
+    }
+
+    /// Whether `body` (a station's account past its discriminator) walks
+    /// through to its very end in `layout`.
+    pub fn fills(body: &[u8], layout: Layout) -> bool {
+        let mut c = Cursor(body);
+        // vault, vault_program, vault_dollars, dollars, mint, bundle_hash,
+        // cluster, exit_band_bps, idle, sent_home, stopped, stopped_at,
+        // payer, bump.
+        let walked = c
+            .skip(32 * 7 + 2 + 8 + 16 + 1 + 8 + 32 + 1)
+            .and_then(|()| c.list(|c| pinned(c, layout)));
+        walked.is_some() && c.0.is_empty()
+    }
+}
+
+/// The station's record as the first programs wrote it: the same fields in
+/// the same order, every driver ending at its `addresses`. Their rules are
+/// read with today's [`Rule`], whose [`shonin_driver::Own`] only gained
+/// variants after the first ones, so the first rules decode unchanged.
+pub mod first {
+    use super::{Rule, StationAddress};
+    use anchor_lang::prelude::*;
+
+    #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, PartialEq, Eq)]
+    pub struct Pinned {
+        pub name: [u8; 32],
+        pub program: Pubkey,
+        pub venue: Pubkey,
+        pub authority: Pubkey,
+        pub authority_bump: u8,
+        pub dollars: Pubkey,
+        pub key: Pubkey,
+        pub rules: Vec<Rule>,
+        pub fixed: Vec<Vec<Pubkey>>,
+        pub addresses: Vec<StationAddress>,
+    }
+
+    #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, PartialEq, Eq)]
+    pub struct Station {
+        pub vault: Pubkey,
+        pub vault_program: Pubkey,
+        pub vault_dollars: Pubkey,
+        pub dollars: Pubkey,
+        pub mint: Pubkey,
+        pub bundle_hash: [u8; 32],
+        pub cluster: [u8; 32],
+        pub exit_band_bps: u16,
+        pub idle: u64,
+        pub sent_home: u128,
+        pub stopped: bool,
+        pub stopped_at: u64,
+        pub payer: Pubkey,
+        pub bump: u8,
+        pub drivers: Vec<Pinned>,
+    }
+
+    impl From<Pinned> for super::Pinned {
+        fn from(p: Pinned) -> Self {
+            Self {
+                name: p.name,
+                program: p.program,
+                venue: p.venue,
+                authority: p.authority,
+                authority_bump: p.authority_bump,
+                dollars: p.dollars,
+                key: p.key,
+                rules: p.rules,
+                fixed: p.fixed,
+                addresses: p.addresses,
+                // A first-layout station's rules hold no position mints. Its
+                // token accounts are left unpinned: the guard derives an
+                // unpinned station token account itself, as the first
+                // layout's guard did, so the station is guarded as before.
+                position_mints: Vec::new(),
+                token_accounts: Vec::new(),
+            }
+        }
+    }
+
+    impl From<Station> for super::Station {
+        fn from(s: Station) -> Self {
+            Self {
+                vault: s.vault,
+                vault_program: s.vault_program,
+                vault_dollars: s.vault_dollars,
+                dollars: s.dollars,
+                mint: s.mint,
+                bundle_hash: s.bundle_hash,
+                cluster: s.cluster,
+                exit_band_bps: s.exit_band_bps,
+                idle: s.idle,
+                sent_home: s.sent_home,
+                stopped: s.stopped,
+                stopped_at: s.stopped_at,
+                payer: s.payer,
+                bump: s.bump,
+                drivers: s.drivers.into_iter().map(Into::into).collect(),
+            }
+        }
     }
 }
 
@@ -319,6 +555,248 @@ mod tests {
         let mut bytes = Vec::new();
         s.try_serialize(&mut bytes).unwrap();
         assert!(bytes.len() <= MAX_CREATED, "{} bytes", bytes.len());
+    }
+
+    /// A driver as the first programs pinned it, its rules using every
+    /// position kind they knew.
+    fn first_pinned(seed: u8) -> first::Pinned {
+        use shonin_driver::*;
+        let key = |i: u8| Pubkey::new_from_array([seed.wrapping_add(i); 32]);
+        first::Pinned {
+            name: [b'a' + seed; 32],
+            program: key(1),
+            venue: key(2),
+            authority: key(3),
+            authority_bump: seed,
+            dollars: key(4),
+            key: key(5),
+            rules: vec![
+                Rule {
+                    discriminator: vec![seed, 1, 2],
+                    class: Class::Trade,
+                    positions: vec![
+                        Position {
+                            index: 0,
+                            own: Own::Station,
+                        },
+                        Position {
+                            index: 1,
+                            own: Own::StationDollars,
+                        },
+                        Position {
+                            index: 2,
+                            own: Own::StationToken(None),
+                        },
+                        Position {
+                            index: 3,
+                            own: Own::StationToken(Some(0)),
+                        },
+                    ],
+                },
+                Rule {
+                    discriminator: vec![seed, 9],
+                    class: Class::Exit,
+                    positions: vec![
+                        Position {
+                            index: 0,
+                            own: Own::StationAddress(b"margin".to_vec()),
+                        },
+                        Position {
+                            index: 1,
+                            own: Own::Fixed(0),
+                        },
+                    ],
+                },
+            ],
+            fixed: vec![vec![key(6), key(7)]],
+            addresses: vec![StationAddress {
+                prefix: b"margin".to_vec(),
+                address: key(8),
+            }],
+        }
+    }
+
+    fn first_station(drivers: usize) -> first::Station {
+        first::Station {
+            vault: Pubkey::new_from_array([11; 32]),
+            vault_program: Pubkey::new_from_array([12; 32]),
+            vault_dollars: Pubkey::new_from_array([13; 32]),
+            dollars: Pubkey::new_from_array([14; 32]),
+            mint: Pubkey::new_from_array([15; 32]),
+            bundle_hash: [16; 32],
+            cluster: [17; 32],
+            exit_band_bps: 0x1819,
+            idle: 0x2021_2223_2425_2627,
+            sent_home: 0x3031_3233_3435_3637_3839_3a3b_3c3d_3e3f,
+            stopped: true,
+            stopped_at: 0x4041_4243,
+            payer: Pubkey::new_from_array([18; 32]),
+            bump: 254,
+            drivers: (0..drivers as u8).map(first_pinned).collect(),
+        }
+    }
+
+    fn account(body: &impl AnchorSerialize) -> Vec<u8> {
+        let mut data = Station::DISCRIMINATOR.to_vec();
+        body.serialize(&mut data).unwrap();
+        data
+    }
+
+    #[test]
+    fn a_first_layout_station_reads_whole_with_its_new_lists_empty() {
+        for drivers in 1..=MAX_DRIVERS {
+            let old = first_station(drivers);
+            let (read, layout) = Station::read_any(&account(&old)).unwrap();
+            assert_eq!(layout, Layout::First);
+            assert_eq!(read, Station::from(old.clone()));
+            assert_eq!(read.drivers.len(), drivers);
+            assert!(read
+                .drivers
+                .iter()
+                .all(|d| d.position_mints.is_empty() && d.token_accounts.is_empty()));
+            // Every value carried over: written back in the first layout it
+            // is the same bytes.
+            let back = first::Station {
+                drivers: read
+                    .drivers
+                    .iter()
+                    .map(|d| first::Pinned {
+                        name: d.name,
+                        program: d.program,
+                        venue: d.venue,
+                        authority: d.authority,
+                        authority_bump: d.authority_bump,
+                        dollars: d.dollars,
+                        key: d.key,
+                        rules: d.rules.clone(),
+                        fixed: d.fixed.clone(),
+                        addresses: d.addresses.clone(),
+                    })
+                    .collect(),
+                ..old.clone()
+            };
+            assert_eq!(account(&back), account(&old));
+        }
+    }
+
+    #[test]
+    fn a_current_station_reads_as_the_current_layout() {
+        for drivers in 0..=MAX_DRIVERS {
+            let mut current = Station::from(first_station(drivers));
+            for (i, driver) in current.drivers.iter_mut().enumerate() {
+                driver.position_mints = vec![
+                    PositionMint {
+                        address: Pubkey::new_from_array([90 + i as u8; 32]),
+                        bump: 7,
+                    };
+                    i
+                ];
+                driver.token_accounts = vec![Pubkey::new_from_array([80; 32]); i + 1];
+            }
+            let mut data = Vec::new();
+            current.try_serialize(&mut data).unwrap();
+            assert_eq!(
+                Station::read_any(&data),
+                Some((current.clone(), Layout::Current))
+            );
+        }
+        // Empty new lists too: what a migrated station holds.
+        let migrated = Station::from(first_station(2));
+        let mut data = Vec::new();
+        migrated.try_serialize(&mut data).unwrap();
+        assert_eq!(Station::read_any(&data), Some((migrated, Layout::Current)));
+    }
+
+    #[test]
+    fn a_station_with_bytes_past_its_record_or_cut_short_is_not_read() {
+        for drivers in 1..=MAX_DRIVERS {
+            let old = account(&first_station(drivers));
+            let mut current = Vec::new();
+            Station::from(first_station(drivers))
+                .try_serialize(&mut current)
+                .unwrap();
+            for data in [old, current] {
+                for extra in [0u8, 1, 0xff] {
+                    let mut longer = data.clone();
+                    longer.push(extra);
+                    assert_eq!(Station::read_any(&longer), None, "{extra} past the end");
+                }
+                for cut in [1, 5, data.len() - 9] {
+                    assert_eq!(Station::read_any(&data[..data.len() - cut]), None);
+                }
+                let mut other = data.clone();
+                other[0] ^= 1;
+                assert_eq!(Station::read_any(&other), None, "another discriminator");
+            }
+        }
+    }
+
+    fn current_bytes(station: &Station) -> Vec<u8> {
+        let mut data = Vec::new();
+        station.try_serialize(&mut data).unwrap();
+        data
+    }
+
+    /// Every body either layout decodes whole is one the walk goes through,
+    /// so the walk never turns a readable station away; checked over the
+    /// stations above and every one-byte change to each.
+    #[test]
+    fn whatever_decodes_whole_in_a_layout_walks_through_in_it() {
+        let mut bodies = Vec::new();
+        for drivers in 0..=MAX_DRIVERS {
+            let old = first_station(drivers);
+            bodies.push(account(&old)[8..].to_vec());
+            let mut current = Station::from(old);
+            for driver in current.drivers.iter_mut() {
+                driver.position_mints = vec![
+                    PositionMint {
+                        address: Pubkey::new_from_array([3; 32]),
+                        bump: 1,
+                    };
+                    2
+                ];
+                driver.token_accounts = vec![Pubkey::new_from_array([4; 32])];
+            }
+            bodies.push(current_bytes(&current)[8..].to_vec());
+        }
+        let mut checked = 0;
+        for body in bodies {
+            for at in 0..body.len() {
+                for value in [0u8, 1, 2, 3, 7, 8, 33, 0xff] {
+                    let mut changed = body.clone();
+                    changed[at] = value;
+                    if whole::<Station>(&changed).is_some() {
+                        assert!(walk::fills(&changed, Layout::Current), "at {at}");
+                        checked += 1;
+                    }
+                    if whole::<first::Station>(&changed).is_some() {
+                        assert!(walk::fills(&changed, Layout::First), "at {at}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 1_000, "{checked}");
+    }
+
+    /// A first-layout station whose second driver's name is one character
+    /// starts, read in the current layout, with a short list's length: the
+    /// walk refuses it there without reserving anything, and it reads in the
+    /// first layout.
+    #[test]
+    fn a_first_layout_station_with_a_one_letter_driver_reads_in_the_first_layout() {
+        for drivers in 2..=MAX_DRIVERS {
+            let mut old = first_station(drivers);
+            for (i, driver) in old.drivers.iter_mut().enumerate() {
+                driver.name = [0; 32];
+                driver.name[0] = b'a' + i as u8;
+            }
+            let data = account(&old);
+            assert!(!walk::fills(&data[8..], Layout::Current));
+            let (read, layout) = Station::read_any(&data).unwrap();
+            assert_eq!(layout, Layout::First);
+            assert_eq!(read, Station::from(old));
+        }
     }
 
     #[test]

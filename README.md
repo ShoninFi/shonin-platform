@@ -87,6 +87,7 @@ task chains:accounts NETWORK=testnet          # every role's address and gas: fu
 task chains:deploy NETWORK=testnet            # deploy to every EVM testnet
 task contracts:solana:deploy NETWORK=testnet  # deploy the programs to Solana devnet
 task chains:solana-setup NETWORK=testnet      # set them up: roles funded from the deployer, the dollar, markets, project
+task chains:solana-migrate-stations NETWORK=testnet  # after upgrading the station program: rewrite older stations (DRY_RUN=1 lists them)
 NETWORK=testnet task dev:services             # run everything here, against them
 task chains:market NETWORK=testnet            # post the stand-in venues' prices and funding, Solana's too
 task services:seed NETWORK=testnet VAULT_CHAIN=solana AGENT=funding-basis PUBLISH_ONLY=1 API_URL=<api>

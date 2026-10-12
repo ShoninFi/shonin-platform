@@ -77,6 +77,16 @@ tasks:
     cmds:
       - "{{.DEVNET_SOLANA}} --vault-chain solana solana-setup --project {{.GCP_PROJECT_TESTNET}}{{if .ORCA_SEED_SOL}} --orca-seed-sol {{.ORCA_SEED_SOL}}{{end}}"
 
+  solana-migrate-stations:
+    desc: "After task contracts:solana:deploy NETWORK=testnet upgrades the station program in place, rewrite every station the first station program wrote in the current layout: one migrate_station each, paid by the deployer, each read back with every value unchanged; sends nothing when none needs it, and DRY_RUN=1 only lists them. Safe to run again (NETWORK=testnet)"
+    preconditions:
+      - sh: '[ "{{.NETWORK}}" = "testnet" ]'
+        msg: "Rewriting the stations is for devnet (NETWORK=testnet); a local cluster is deployed fresh (NETWORK={{.NETWORK}})."
+      - sh: '[ -n "${SHONIN_TESTNET_SOLANA_MNEMONIC:-}" ]'
+        msg: "SHONIN_TESTNET_SOLANA_MNEMONIC is empty in .env: the deployer, who pays, is its key."
+    cmds:
+      - "{{.DEVNET_SOLANA}} --vault-chain solana migrate-stations{{if .DRY_RUN}} --dry-run{{end}}"
+
   accounts:
     desc: "Each role's account and gas on every EVM chain, the funders and what they need, and on Solana devnet the deployer (its funder), each role's SOL and what it is short, the dollar's mint and the programs (NETWORK=testnet)"
     cmds:

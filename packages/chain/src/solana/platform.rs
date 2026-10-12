@@ -1380,15 +1380,32 @@ impl Platform {
         client.load(&vs::claim_address(vault, id).0).await
     }
 
+    /// The station at `station`, in whichever layout it is written: one the
+    /// first programs wrote reads with every driver's position mints and
+    /// token accounts empty, as `migrate_station` would write it.
     pub async fn station(
         &self,
         client: &SolanaClient,
         station: &Pubkey,
     ) -> Result<shonin_station::state::Station> {
-        client
-            .load(station)
+        Ok(self.station_with_layout(client, station).await?.0)
+    }
+
+    /// The station at `station` and the layout it is written in.
+    pub async fn station_with_layout(
+        &self,
+        client: &SolanaClient,
+        station: &Pubkey,
+    ) -> Result<(
+        shonin_station::state::Station,
+        shonin_station::state::Layout,
+    )> {
+        let account = client
+            .account(station)
             .await?
-            .ok_or_else(|| anyhow!("no station at {station}"))
+            .filter(|account| !account.data.is_empty())
+            .ok_or_else(|| anyhow!("no station at {station}"))?;
+        read_station(station, &account)
     }
 
     /// The vault's request `id`, wherever its maker put it: found among the
@@ -2453,6 +2470,41 @@ impl Platform {
     }
 }
 
+/// The station `account`, at `address`, in whichever layout it is written:
+/// the station program's own, whole in one layout or the other
+/// (`shonin_station::state::Station::read_any`).
+pub fn read_station(
+    address: &Pubkey,
+    account: &super::rpc::Account,
+) -> Result<(
+    shonin_station::state::Station,
+    shonin_station::state::Layout,
+)> {
+    if account.owner != shonin_station::ID {
+        bail!(
+            "the account at {address} belongs to {}, not the station program",
+            account.owner
+        );
+    }
+    shonin_station::state::Station::read_any(&account.data)
+        .ok_or_else(|| anyhow!("the account at {address} is not a station in a layout this reads"))
+}
+
+/// Rewrites a station the first programs wrote in the current layout, paid
+/// for by `payer`; a station already current is left as it is.
+pub fn ix_migrate_station(payer: &Pubkey, station: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: shonin_station::ID,
+        accounts: shonin_station::accounts::MigrateStation {
+            payer: *payer,
+            station: *station,
+            system_program: SYSTEM,
+        }
+        .to_account_metas(None),
+        data: shonin_station::instruction::MigrateStation {}.data(),
+    }
+}
+
 /// The station's signing authority at `venue`.
 pub fn venue_authority(station: &Pubkey, venue: &Pubkey) -> Pubkey {
     shonin_station::venue_authority(station, venue).0
@@ -2515,4 +2567,100 @@ pub fn profile_address(author: &Pubkey) -> Pubkey {
         &shonin_profiles::ID,
     )
     .0
+}
+
+#[cfg(test)]
+mod station_reading {
+    use super::*;
+    use anchor_lang::{AccountSerialize, AnchorSerialize};
+    use shonin_station::state::{Layout, PositionMint, Station, first};
+
+    fn key(n: u8) -> Pubkey {
+        Pubkey::new_from_array([n; 32])
+    }
+
+    fn first_station(drivers: u8) -> first::Station {
+        first::Station {
+            vault: key(1),
+            vault_program: key(2),
+            vault_dollars: key(3),
+            dollars: key(4),
+            mint: key(5),
+            bundle_hash: [6; 32],
+            cluster: [7; 32],
+            exit_band_bps: 8,
+            idle: 9,
+            sent_home: 10,
+            stopped: false,
+            stopped_at: 0,
+            payer: key(12),
+            bump: 13,
+            drivers: (0..drivers)
+                .map(|n| first::Pinned {
+                    name: [b'a' + n; 32],
+                    program: key(20 + n),
+                    venue: key(30 + n),
+                    authority: key(40 + n),
+                    authority_bump: n,
+                    dollars: key(50 + n),
+                    key: key(60 + n),
+                    rules: Vec::new(),
+                    fixed: vec![vec![key(70 + n)]],
+                    addresses: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn first_bytes(station: &first::Station) -> Vec<u8> {
+        let mut data = Station::DISCRIMINATOR.to_vec();
+        station.serialize(&mut data).unwrap();
+        data
+    }
+
+    fn account(data: Vec<u8>, owner: Pubkey) -> crate::solana::rpc::Account {
+        crate::solana::rpc::Account {
+            lamports: 1,
+            owner,
+            executable: false,
+            data,
+        }
+    }
+
+    #[test]
+    fn a_station_reads_in_either_layout_and_only_whole() {
+        for drivers in 1..=3 {
+            let old = first_station(drivers);
+            let (read, layout) =
+                read_station(&key(9), &account(first_bytes(&old), shonin_station::ID)).unwrap();
+            assert_eq!(layout, Layout::First);
+            assert_eq!(read, Station::from(old.clone()));
+
+            let mut current = Station::from(old);
+            current.drivers[0].position_mints = vec![PositionMint {
+                address: key(90),
+                bump: 1,
+            }];
+            current.drivers[0].token_accounts = vec![key(91)];
+            let mut data = Vec::new();
+            current.try_serialize(&mut data).unwrap();
+            let (read, layout) =
+                read_station(&key(9), &account(data.clone(), shonin_station::ID)).unwrap();
+            assert_eq!(layout, Layout::Current);
+            assert_eq!(read, current);
+
+            data.push(1);
+            assert!(read_station(&key(9), &account(data, shonin_station::ID)).is_err());
+            let mut old = first_bytes(&first_station(drivers));
+            old.push(1);
+            assert!(read_station(&key(9), &account(old, shonin_station::ID)).is_err());
+        }
+    }
+
+    #[test]
+    fn a_station_record_held_by_another_program_is_not_read() {
+        let data = first_bytes(&first_station(1));
+        assert!(read_station(&key(9), &account(data.clone(), shonin_station::ID)).is_ok());
+        assert!(read_station(&key(9), &account(data, shonin_vault::ID)).is_err());
+    }
 }
