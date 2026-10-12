@@ -1,5 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Shonin">
-  <rect width="64" height="64" rx="14" fill="#2dd4bf"/>
-  <path d="M13 45 L25 31 L34 39 L50 19" stroke="#1e1b4b" stroke-width="6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="50" cy="19" r="5" fill="#1e1b4b"/>
-</svg>
