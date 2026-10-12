@@ -10,7 +10,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -18,11 +18,23 @@ use axum::routing::post;
 
 const VAULT: &str = "00000000000000000000000000000000000000be";
 
-async fn a_node(slow: Arc<AtomicBool>) -> SocketAddr {
+fn block_hash(number: u64) -> alloy::primitives::B256 {
+    let mut hash = [0x44; 32];
+    hash[24..].copy_from_slice(&number.to_be_bytes());
+    alloy::primitives::B256::from(hash)
+}
+
+async fn a_node(
+    slow: Arc<AtomicBool>,
+    started_reads: Arc<AtomicU64>,
+    finished_reads: Arc<AtomicU64>,
+) -> SocketAddr {
     let app = Router::new().route(
         "/",
         post(move |body: String| {
             let slow = slow.clone();
+            let started_reads = started_reads.clone();
+            let finished_reads = finished_reads.clone();
             async move {
                 let id = body
                     .split("\"id\":")
@@ -39,19 +51,46 @@ async fn a_node(slow: Arc<AtomicBool>) -> SocketAddr {
                     && lower.contains("\"eth_call\"")
                     && lower.contains(VAULT)
                     && lower.contains("70a08231")
+                    && lower.contains("00000000000000000000000000000000000000a1")
                 {
+                    started_reads.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(Duration::from_secs(10)).await;
+                    finished_reads.fetch_add(1, Ordering::SeqCst);
                 }
                 let result = if body.contains("\"eth_chainId\"") {
                     "\"0x7a69\"".to_string()
                 } else if body.contains("\"eth_blockNumber\"") {
                     "\"0x10\"".to_string()
-                } else if body.contains("\"eth_getBlockByNumber\"") {
+                } else if body.contains("\"eth_getBlockByNumber\"")
+                    || body.contains("\"eth_getBlockByHash\"")
+                {
+                    let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    let tag = request["params"][0].as_str().unwrap();
+                    let number = if body.contains("\"eth_getBlockByHash\"") {
+                        let hash: alloy::primitives::B256 = tag.parse().unwrap();
+                        u64::from_be_bytes(hash.as_slice()[24..].try_into().unwrap())
+                    } else if matches!(tag, "latest" | "pending") {
+                        16
+                    } else {
+                        u64::from_str_radix(tag.trim_start_matches("0x"), 16).unwrap()
+                    };
                     let mut block =
                         alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
-                    block.header.inner.number = 16;
+                    block.header.inner.number = number;
                     block.header.inner.timestamp = 1_700_000_000;
-                    serde_json::to_string(&block).unwrap()
+                    block.header.hash = block_hash(number);
+                    block.header.inner.parent_hash = if number == 0 {
+                        alloy::primitives::B256::ZERO
+                    } else {
+                        block_hash(number - 1)
+                    };
+                    if body.contains("\"eth_getBlockByHash\"")
+                        && tag != format!("{:#x}", block.header.hash)
+                    {
+                        "null".to_string()
+                    } else {
+                        serde_json::to_string(&block).unwrap()
+                    }
                 } else if body.contains("\"eth_call\"") {
                     // `vaults()` (any call whose input is the bare selector of
                     // `vaults()`) names the one vault; anything else is zeros.
@@ -151,7 +190,9 @@ async fn a_slow_portfolio_read_does_not_hold_up_the_snapshot() {
     std::fs::create_dir_all(&deployments_dir).unwrap();
     std::fs::create_dir_all(dir.join("store")).unwrap();
     let slow = Arc::new(AtomicBool::new(false));
-    let base = a_node(slow.clone()).await;
+    let started_reads = Arc::new(AtomicU64::new(0));
+    let finished_reads = Arc::new(AtomicU64::new(0));
+    let base = a_node(slow.clone(), started_reads.clone(), finished_reads.clone()).await;
     std::fs::write(
         dir.join("chains.toml"),
         format!(
@@ -235,16 +276,33 @@ async fn a_slow_portfolio_read_does_not_hold_up_the_snapshot() {
         "http://127.0.0.1:{port}/api/base/portfolio/0x00000000000000000000000000000000000000a1"
     );
     let asking = http.clone();
-    tokio::spawn(async move {
-        let _ = asking.get(portfolio).send().await;
-    });
+    let portfolio_reply = tokio::spawn(async move { asking.get(portfolio).send().await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while started_reads.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the portfolio must actually enter its delayed balance read");
     tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        started_reads.load(Ordering::SeqCst) > finished_reads.load(Ordering::SeqCst),
+        "the delayed balance read must still be in flight"
+    );
 
     // The record is in memory: it is answered at once.
     let asked = Instant::now();
     let reply = http.get(&snapshot_url).send().await.unwrap();
     let took = asked.elapsed();
     assert!(reply.status().is_success());
+    assert!(
+        portfolio_reply
+            .await
+            .unwrap()
+            .unwrap()
+            .status()
+            .is_success()
+    );
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         took < Duration::from_secs(2),
