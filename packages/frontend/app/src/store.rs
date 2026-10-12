@@ -52,6 +52,10 @@ pub struct Agent {
     /// When a retiring agent stops for good.
     pub wind_down_ends: Mutable<Option<PrimitiveDateTime>>,
     pub registered: Mutable<Date>,
+    /// The whole record, for the agent page's detail (its review, venues,
+    /// chart and activity). Replaced with each snapshot; pages derive what
+    /// they show from it and redraw only what changed.
+    pub strategy: Mutable<Rc<Strategy>>,
 }
 
 impl Agent {
@@ -79,6 +83,7 @@ impl Agent {
             stale_as_of: Mutable::new(None),
             wind_down_ends: Mutable::new(None),
             registered: Mutable::new(strategy.registered),
+            strategy: Mutable::new(Rc::new(strategy.clone())),
         };
         agent.update(strategy);
         agent
@@ -108,6 +113,7 @@ impl Agent {
         self.stale_as_of.set_neq(strategy.stale_as_of);
         self.wind_down_ends.set_neq(model::wind_down_ends(strategy));
         self.registered.set_neq(strategy.registered);
+        self.strategy.set(Rc::new(strategy.clone()));
 
         let group = Group::of(strategy.standing, strategy.vault.state);
         let moved = self.group.get() != group;
@@ -149,6 +155,8 @@ impl From<&FeedEvent> for FeedItem {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChainRead {
     pub chain: Chain,
+    /// Which network it is: `evm:84532`, `solana:devnet`.
+    pub key: String,
     pub block: u64,
     pub as_of: Option<PrimitiveDateTime>,
 }
@@ -210,6 +218,7 @@ impl Store {
                 .iter()
                 .map(|info| ChainRead {
                     chain: info.chain,
+                    key: info.key.clone(),
                     block: info.block,
                     as_of: info.as_of,
                 })

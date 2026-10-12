@@ -374,34 +374,6 @@
   .nf-actions .sh-btn { flex: 1 1 auto; }
 }
 
-/* ---- An agent (until its full page lands) ------------------------------ */
-.ag { display: flex; flex-direction: column; gap: var(--space-5); }
-.ag-head { display: flex; flex-direction: column; gap: var(--space-2); }
-.ag-name { font: var(--type-display-l); letter-spacing: var(--track-display-l); overflow-wrap: anywhere; }
-.ag-meta { font: var(--type-body); color: var(--ink-muted); }
-.ag-tabs { gap: var(--space-5); }
-.ag-loading { display: grid; grid-template-columns: minmax(0, 1fr) 376px; gap: var(--space-6); align-items: start; }
-.ag-main { display: flex; flex-direction: column; gap: var(--space-5); min-width: 0; }
-.ag-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--space-4); padding: var(--space-4) 0; border-top: var(--border-hairline) solid var(--line); border-bottom: var(--border-hairline) solid var(--line); }
-.ag-stat { display: flex; flex-direction: column; gap: 6px; }
-.ag-chart { display: flex; flex-direction: column; gap: var(--space-4); }
-.ag-chart__head { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--space-4); }
-.ag-side { position: sticky; top: 88px; overflow: hidden; }
-.ag-side__tabs { padding: 0 var(--space-5); gap: var(--space-5); }
-.ag-side__body { display: flex; flex-direction: column; gap: var(--space-4); padding: 20px var(--space-5) var(--space-5); }
-.ag-side__label { font: 600 14px/20px var(--font-sans); }
-.ag-side__tank { display: flex; flex-direction: column; gap: 10px; padding: var(--space-4) var(--space-5); border-top: var(--border-hairline) solid var(--line); }
-.ag-side__tank-title { font: 650 15px/20px var(--font-sans); }
-.ag-risk { font: var(--type-body-s); color: var(--ink); text-align: center; }
-@media (max-width: 899px) {
-  .ag-loading { grid-template-columns: minmax(0, 1fr); }
-  .ag-side { position: static; order: -1; }
-}
-@media (max-width: 599px) {
-  .ag-name { font: var(--type-display-m); letter-spacing: var(--track-display-m); }
-  .ag-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
-
 /* ---- Pages still being built ------------------------------------------- */
 .soon { display: flex; flex-direction: column; gap: var(--space-5); max-width: 720px; }
 .soon-head { display: flex; flex-direction: column; gap: var(--space-3); }
