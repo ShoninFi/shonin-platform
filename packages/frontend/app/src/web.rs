@@ -107,7 +107,10 @@ pub fn internal_link(el: crate::view::El, href: String) -> crate::view::El {
                     && !event.alt_key()
                 {
                     event.prevent_default();
-                    dominator::routing::go_to_url(&href);
+                    let link = event
+                        .dyn_target::<web_sys::Element>()
+                        .and_then(|target| target.closest("a[href]").ok().flatten());
+                    navigate(&href, link.as_ref());
                 }
             },
         )
@@ -118,4 +121,51 @@ pub fn internal_link(el: crate::view::El, href: String) -> crate::view::El {
 pub fn app_link(href: impl Into<String>) -> crate::view::El {
     let href = href.into();
     internal_link(crate::view::el("a").attr("href", href.clone()), href)
+}
+
+/// Go to a page of this app. From a leaderboard row to its agent, the
+/// agent's name and sparkline morph into the page's name and chart (Motion
+/// M5) where the browser can; elsewhere, and under reduced motion (the
+/// stylesheet turns the animation off), it is a plain swap.
+pub fn navigate(href: &str, link: Option<&web_sys::Element>) {
+    use wasm_bindgen::closure::Closure;
+    let Some(document) = document() else {
+        dominator::routing::go_to_url(href);
+        return;
+    };
+    let start = js_sys::Reflect::get(&document, &"startViewTransition".into())
+        .ok()
+        .and_then(|start| start.dyn_into::<js_sys::Function>().ok());
+    let slug = href
+        .strip_prefix("/agents/")
+        .filter(|rest| !rest.is_empty() && !rest.contains('/'))
+        .map(str::to_string);
+    let (Some(start), Some(slug), Some(link)) = (start, slug, link) else {
+        dominator::routing::go_to_url(href);
+        return;
+    };
+    for (selector, part) in [(".lb-name__title", "name"), (".lb-spark", "spark")] {
+        if let Some(element) = link
+            .query_selector(selector)
+            .ok()
+            .flatten()
+            .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
+        {
+            let _ = element
+                .style()
+                .set_property("view-transition-name", &format!("agent-{slug}-{part}"));
+        }
+    }
+    let href = href.to_string();
+    let update = Closure::once_into_js(move || {
+        js_sys::Promise::new(&mut |resolve, _| {
+            dominator::routing::go_to_url(&href);
+            // The new page is drawn in the tasks the route change queued;
+            // the next frame comes after them.
+            if let Some(window) = window() {
+                let _ = window.request_animation_frame(&resolve);
+            }
+        })
+    });
+    let _ = start.call1(&document, &update);
 }

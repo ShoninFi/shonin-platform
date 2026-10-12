@@ -26,7 +26,7 @@ flowchart LR
 
 ## The Reviewer
 
-**Given** an Author's upload, once its $1 is paid. If it's sealed, it decrypts it inside.
+**Given** an Author's upload, once its 1 USDC is paid. If it's sealed, it decrypts it inside.
 
 **Does:**
 

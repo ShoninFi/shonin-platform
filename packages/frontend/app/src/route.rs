@@ -76,7 +76,24 @@ pub enum Route {
         tab: AgentTab,
     },
     Portfolio,
+    /// `/portfolio/claims/<slug>-<id>`: one booked withdrawal.
+    Claim {
+        slug: String,
+        id: u64,
+    },
     Publish,
+    /// `/publish/jobs/<id>`: one publishing job, live.
+    Job {
+        id: String,
+    },
+    /// `/publish/<slug>/activate`: activating a reviewed and built agent.
+    Activate {
+        slug: String,
+    },
+    /// `/you/agents/<slug>`: an agent's controls, for its Author.
+    Manage {
+        slug: String,
+    },
     Status,
     /// Every token, type style, icon and atom; dev builds only.
     Atoms,
@@ -136,10 +153,36 @@ impl Route {
                 None => Self::NotFound,
             },
             ["portfolio"] => Self::Portfolio,
+            ["portfolio", "claims", key] => Self::claim(key),
             ["publish"] => Self::Publish,
+            ["publish", "jobs", id] => match decode(id) {
+                Some(id) if is_slug(&id) => Self::Job { id },
+                _ => Self::NotFound,
+            },
+            ["publish", slug, "activate"] => match decode(slug) {
+                Some(slug) if is_slug(&slug) => Self::Activate { slug },
+                _ => Self::NotFound,
+            },
+            ["you", "agents", slug] => match decode(slug) {
+                Some(slug) if is_slug(&slug) => Self::Manage { slug },
+                _ => Self::NotFound,
+            },
             ["status"] => Self::Status,
             ["_atoms"] if cfg!(feature = "dev") => Self::Atoms,
             _ => Self::NotFound,
+        }
+    }
+
+    /// A claim's key: the vault's slug, a dash and the claim's number.
+    fn claim(key: &str) -> Self {
+        let parsed = decode(key).and_then(|key| {
+            let (slug, id) = key.rsplit_once('-')?;
+            let id: u64 = id.parse().ok()?;
+            (is_slug(slug) && id > 0).then(|| (slug.to_string(), id))
+        });
+        match parsed {
+            Some((slug, id)) => Self::Claim { slug, id },
+            None => Self::NotFound,
         }
     }
 
@@ -163,7 +206,11 @@ impl Route {
                 None => format!("/agents/{slug}"),
             },
             Self::Portfolio => "/portfolio".to_string(),
+            Self::Claim { slug, id } => format!("/portfolio/claims/{slug}-{id}"),
             Self::Publish => "/publish".to_string(),
+            Self::Job { id } => format!("/publish/jobs/{id}"),
+            Self::Activate { slug } => format!("/publish/{slug}/activate"),
+            Self::Manage { slug } => format!("/you/agents/{slug}"),
             Self::Status => "/status".to_string(),
             Self::Atoms => "/_atoms".to_string(),
             Self::NotFound => return None,
@@ -178,7 +225,15 @@ impl Route {
     pub fn file(&self) -> Option<String> {
         match self {
             Self::NotFound => return Some("404.html".to_string()),
-            Self::Home | Self::Atoms | Self::Agents { author: Some(_) } => return None,
+            Self::Home
+            | Self::Atoms
+            | Self::Agents { author: Some(_) }
+            | Self::Claim { .. }
+            | Self::Job { .. }
+            | Self::Activate { .. }
+            | Self::Manage { .. } => {
+                return None;
+            }
             _ => {}
         }
         let path = self.path()?;
@@ -198,8 +253,10 @@ impl Route {
     pub fn section(&self) -> Option<Section> {
         match self {
             Self::Agents { .. } | Self::Agent { .. } => Some(Section::Agents),
-            Self::Portfolio => Some(Section::Portfolio),
-            Self::Publish => Some(Section::Publish),
+            Self::Portfolio | Self::Claim { .. } => Some(Section::Portfolio),
+            Self::Publish | Self::Job { .. } | Self::Activate { .. } | Self::Manage { .. } => {
+                Some(Section::Publish)
+            }
             _ => None,
         }
     }
@@ -221,7 +278,16 @@ impl Route {
                     .unwrap_or_else(|| "Agent".to_string()),
             ),
             Self::Portfolio => Some("Portfolio".to_string()),
+            Self::Claim { .. } => Some("Claim".to_string()),
             Self::Publish => Some("Publish".to_string()),
+            Self::Job { .. } => Some("Publishing job".to_string()),
+            Self::Activate { .. } => Some("Activate".to_string()),
+            Self::Manage { slug } => Some(
+                store::get()
+                    .agent(slug)
+                    .map(|agent| agent.title.get_cloned())
+                    .unwrap_or_else(|| "Your agent".to_string()),
+            ),
             Self::Status => Some("Status".to_string()),
             Self::Atoms => Some("Atoms".to_string()),
             Self::NotFound => Some("Not found".to_string()),
@@ -285,10 +351,32 @@ impl Route {
                 "Portfolio · Shonin".to_string(),
                 "Your shares, what they're worth and any booked withdrawals.",
             ),
+            Self::Claim { .. } => page(
+                "Claim · Shonin".to_string(),
+                "A booked withdrawal: where it is, and how to push it through.",
+            ),
             Self::Publish => page(
                 "Publish an agent · Shonin".to_string(),
-                "Publish a trading agent for $1: reviewed, built in an attested machine, then yours to activate.",
+                "Publish a trading agent for 1 USDC: reviewed, built in an attested machine, then yours to activate.",
             ),
+            Self::Job { id } => page(
+                format!("Publishing job {id} · Shonin"),
+                "Where a publishing job is, live, and how it ended.",
+            ),
+            Self::Activate { .. } => page(
+                "Activate agent · Shonin".to_string(),
+                "Set an agent's limits, fill its tank and open its vault.",
+            ),
+            Self::Manage { slug } => {
+                let name = store::get()
+                    .agent(slug)
+                    .map(|agent| agent.title.get_cloned())
+                    .unwrap_or_else(|| slug.clone());
+                page(
+                    format!("Manage {name} · Shonin"),
+                    "An agent's tank, allowances, idle floor and earnings, for its Author.",
+                )
+            }
             Self::Status => page(
                 "Status · Shonin".to_string(),
                 "Every kill, freeze and allowlist change, as it happens.",
@@ -360,6 +448,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_claims_address_names_its_vault_and_number() {
+        assert_eq!(
+            Route::from_url("/portfolio/claims/base-12-3", ""),
+            Route::Claim {
+                slug: "base-12".to_string(),
+                id: 3
+            }
+        );
+        assert_eq!(
+            Route::Claim {
+                slug: "base-12".to_string(),
+                id: 3
+            }
+            .path()
+            .as_deref(),
+            Some("/portfolio/claims/base-12-3")
+        );
+        for bad in [
+            "/portfolio/claims/base-12-0",
+            "/portfolio/claims/-3",
+            "/portfolio/claims/a b-3",
+        ] {
+            assert_eq!(Route::from_url(bad, ""), Route::NotFound, "{bad}");
+        }
+    }
+
+    #[test]
     fn paths_read_back_as_the_routes_that_wrote_them() {
         for route in [
             Route::Agents { author: None },
@@ -376,12 +491,41 @@ mod tests {
             },
             Route::Portfolio,
             Route::Publish,
+            Route::Job {
+                id: "8800".to_string(),
+            },
+            Route::Activate {
+                slug: "base-7".to_string(),
+            },
+            Route::Manage {
+                slug: "base-7".to_string(),
+            },
             Route::Status,
         ] {
             let path = route.path().unwrap();
             let (path, query) = path.split_once('?').unwrap_or((&path, ""));
             assert_eq!(Route::from_url(path, query), route, "{path}?{query}");
         }
+    }
+
+    #[test]
+    fn the_authors_pages_are_never_indexed_and_have_no_prerendered_file() {
+        for route in [
+            Route::from_url("/publish/jobs/8800", ""),
+            Route::from_url("/publish/base-7/activate", ""),
+            Route::from_url("/you/agents/base-7", ""),
+        ] {
+            assert_ne!(route, Route::NotFound);
+            assert!(!route.is_indexable());
+            assert_eq!(route.file(), None);
+            assert_eq!(route.section(), Some(Section::Publish));
+        }
+        assert_eq!(Route::from_url("/publish/jobs/a%20b", ""), Route::NotFound);
+        assert_eq!(Route::from_url("/you/agents", ""), Route::NotFound);
+        assert_eq!(
+            Route::from_url("/publish/base-7/manage", ""),
+            Route::NotFound
+        );
     }
 
     #[test]

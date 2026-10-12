@@ -1,0 +1,54 @@
+/* The wallet in the header and the connect dialog (Wallet-*, States-System
+   "Wallet"). Network chip: an initial tile and the chain's name. Wallet
+   button: the short address in mono, the full one in its label. The
+   dialog lists wallets as 56px rows (36px tile, name, "Detected", chevron);
+   connecting draws the traced hexagon. The wrong-network bar sits under the
+   header, caution-soft, 48px. */
+.sh-walletctl { display: flex; align-items: center; gap: var(--space-2); }
+.sh-netchip {
+  display: inline-flex; align-items: center; gap: var(--space-2);
+  height: 36px; padding: 0 var(--space-3) 0 6px; border-radius: var(--radius-full);
+  border: var(--border-hairline) solid var(--line); background: var(--paper);
+  font: 600 14px/20px var(--font-sans); white-space: nowrap;
+}
+.sh-netchip .sh-tile { width: 24px; height: 24px; font-size: 12px; line-height: 24px; border-radius: var(--radius-full); }
+.sh-walletbtn .sh-mono { font-size: 14px; }
+.sh-tile {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 36px; height: 36px; border-radius: var(--radius-s);
+  background: var(--neutral-soft); color: var(--ink-muted); font: 700 15px/36px var(--font-sans);
+}
+.sh-tile--img { object-fit: contain; background: var(--paper); }
+.sh-walletmenu { display: flex; flex-direction: column; gap: var(--space-3); }
+
+.sh-connect { display: flex; flex-direction: column; gap: 20px; }
+.sh-connect__list { display: flex; flex-direction: column; gap: var(--space-2); margin: var(--space-4) 0 0; padding: 0; list-style: none; }
+.sh-walletopt {
+  display: flex; align-items: center; gap: var(--space-3); width: 100%; min-height: 56px;
+  padding: 10px var(--space-3); border: var(--border-hairline) solid var(--line); border-radius: var(--radius-m);
+  background: var(--paper-raised); color: var(--ink); text-align: left; cursor: pointer; font: inherit;
+}
+.sh-walletopt > .sh-icon:last-child { color: var(--ink-muted); }
+.sh-walletopt__text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.sh-walletopt__name { font: 600 15px/20px var(--font-sans); }
+.sh-walletopt__detail { font: 400 13px/18px var(--font-sans); color: var(--ink-muted); }
+@media (hover: hover) { .sh-walletopt:hover { background: var(--row-hover); } }
+.sh-connect__foot { display: flex; flex-direction: column; gap: var(--space-2); margin-top: 20px; padding-top: var(--space-4); border-top: var(--border-hairline) solid var(--line); font: var(--type-body-s); color: var(--ink-muted); }
+.sh-connect__terms { font-size: 12px; line-height: 18px; }
+.sh-connect__state { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-3); }
+.sh-connect__title { font: var(--type-heading); letter-spacing: var(--track-heading); }
+.sh-connect__actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.sh-connect__phrase { display: flex; flex-direction: column; gap: var(--space-4); }
+.sh-hexring { display: inline-flex; color: var(--brand); }
+.sh-hexring .sh-btn__hex { width: 48px; height: 48px; }
+
+.sh-wrongnet { background: var(--caution-soft); border-bottom: var(--border-hairline) solid var(--line); }
+.sh-wrongnet__inner { display: flex; align-items: center; gap: var(--space-3); min-height: 48px; padding: 6px 0; font: var(--type-body); }
+.sh-wrongnet__inner > .sh-icon { color: var(--caution); flex: none; }
+.sh-wrongnet__inner p { flex: 1; min-width: 0; }
+
+@media (max-width: 599px) {
+  .sh-netchip__name { display: none; }
+  .sh-netchip { padding: 0 6px; }
+  .sh-wrongnet__inner { flex-wrap: wrap; }
+}

@@ -1,6 +1,6 @@
 # Publishing
 
-Publishing takes two steps in the web app: **submit** your agent, for $1, and once it's been reviewed and built, **activate** it.
+Publishing takes two steps in the web app: **submit** your agent, for 1 USDC, and once it's been reviewed and built, **activate** it.
 
 ## Sanity check
 
@@ -30,7 +30,7 @@ This works the same on every system, and packs exactly what you committed: nothi
 
 ## Submit it
 
-In the web app, connect your wallet, choose `agent.zip`, and pay the $1. It's one transaction, on the chain your agent's [vault will live on](configuration.md#vault). The $1 covers the review and the build, and your agent is given its id. Only a payment from the wallet that uploaded the archive starts the job, so nobody else can claim your code.
+In the web app, connect your wallet, choose `agent.zip`, and pay the 1 USDC. It's one transaction, on the chain your agent's [vault will live on](configuration.md#vault). The 1 USDC covers the review and the build, and your agent is given its id. Only a payment from the wallet that uploaded the archive starts the job, so nobody else can claim your code.
 
 Choose here whether to **seal** it. Your browser encrypts sealed source before it leaves your machine, so only our attested machines, and the AI model the Reviewer consults, can read it. [Keeping your code private](../authors.md#keeping-your-code-private) explains what that means for Depositors.
 
@@ -46,7 +46,7 @@ It ends one of three ways:
 - **Refused as malicious.** The report says why, and nothing is built.
 - **The build fails.** To see why, run the same build yourself, as in the [sanity check](#sanity-check).
 
-Whichever way it ends, the $1 is spent. After a refusal or a failed build, you try again by publishing a new agent.
+Whichever way it ends, the 1 USDC is spent. After a refusal or a failed build, you try again by publishing a new agent.
 
 ## Activate it
 

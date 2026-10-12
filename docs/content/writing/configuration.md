@@ -51,7 +51,7 @@ Optional. What your agent may use beyond its drivers. Today there is one, `netwo
 
 ### `[vault]`
 
-**`chain`**: the chain your vault lives on. It's where Depositors put money in and take it out, in that chain's dollar, and where you pay the $1 to publish.
+**`chain`**: the chain your vault lives on. It's where Depositors put money in and take it out, in that chain's dollar, and where you pay the 1 USDC to publish.
 
 | Chain | Name | Its dollar |
 | --- | --- | --- |

@@ -5,13 +5,10 @@
 
 use ui::icons::Icon;
 
-use crate::atoms::button::{Button, Kind, Size};
-use crate::atoms::dialog::{self, Dialog};
 use crate::atoms::icon;
 use crate::atoms::logo::{Logo, home};
-use crate::atoms::notice::{NoticeTone, notice};
 use crate::route::{DOCS, Route, Section};
-use crate::view::{View, el, text};
+use crate::view::{View, el};
 use crate::web::app_link;
 
 pub fn header(route: &Route) -> View {
@@ -56,52 +53,8 @@ pub fn header(route: &Route) -> View {
             inner.child(nav).child(
                 el("div")
                     .class("sh-appheader__tools")
-                    .child(connect_button()),
+                    .child(super::wallet::header_control()),
             ),
         )
         .into()
-}
-
-/// "Connect wallet" ("Connect" on phone). The wallet arrives in a later
-/// update; until then it says so, plainly, in a dialog.
-fn connect_button() -> crate::view::El {
-    let label = View::Many(vec![
-        el("span")
-            .class("sh-appheader__long")
-            .text("Connect wallet")
-            .into(),
-        el("span")
-            .class("sh-appheader__short")
-            .text("Connect")
-            .into(),
-    ]);
-    crate::atoms::button::on_click(
-        Button::new(Kind::Primary, label)
-            .size(Size::Small)
-            .build()
-            .attr("aria-haspopup", "dialog"),
-        || {
-            dialog::open(Dialog {
-                title: "Connect wallet".to_string(),
-                body: View::Many(vec![
-                    el("p")
-                        .text("Shonin never holds your money or your keys. Connecting lets you see your shares and send deposits and withdrawals yourself.")
-                        .into(),
-                    notice(
-                        NoticeTone::Info,
-                        text("Wallet connections arrive in the next update of this app. Every page reads without one."),
-                    )
-                    .into(),
-                ]),
-                foot: Some(
-                    crate::atoms::button::on_click(
-                        Button::new(Kind::Secondary, "Close").build(),
-                        dialog::close,
-                    )
-                    .into(),
-                ),
-                wide: false,
-            });
-        },
-    )
 }

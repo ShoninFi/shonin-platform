@@ -1,0 +1,50 @@
+/* /portfolio and /portfolio/claims/:id (Portfolio-*, Claim-Desktop): the
+   heading, the stat tiles (four on desktop, two by two on tablet, stacked on
+   phone), the positions table with its total row, booked withdrawals and
+   waiting items as cards, each with its action and its status line. */
+.sh-portfolio { display: flex; flex-direction: column; gap: var(--space-6); }
+.sh-portfolio__head { display: flex; flex-direction: column; gap: var(--space-2); }
+.sh-portfolio__title { font: var(--type-display-l); letter-spacing: var(--track-display-l); }
+.sh-portfolio__body { display: flex; flex-direction: column; gap: var(--space-7); }
+.sh-portfolio__tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--space-4); }
+.sh-portfolio__section { display: flex; flex-direction: column; gap: var(--space-3); }
+.sh-portfolio__h2 { font: var(--type-heading); letter-spacing: var(--track-heading); }
+.sh-portfolio__chain { display: flex; align-items: center; gap: 6px; font: var(--type-body-s); color: var(--ink-muted); }
+.sh-portfolio__chain .sh-tile { width: 20px; height: 20px; font-size: 11px; line-height: 20px; border-radius: var(--radius-full); }
+.sh-portfolio__cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--space-4); margin: 0; padding: 0; list-style: none; }
+.sh-portfolio__claim { display: flex; flex-direction: column; gap: var(--space-2); }
+.sh-portfolio__claimtitle { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); font: 600 16px/24px var(--font-sans); }
+.sh-portfolio__empty, .sh-portfolio__loading { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-3); }
+.sh-portfolio__emptytitle { font: var(--type-heading); }
+.sh-portfolio__risk { font: var(--type-body-s); }
+.sh-act { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-2); }
+.sh-act__status { font: var(--type-body-s); }
+.sh-act__error { font-weight: 650; color: var(--loss); }
+
+.sh-claim__crumbs { font: var(--type-body-s); color: var(--ink-muted); }
+.sh-claim__grid { display: grid; grid-template-columns: minmax(0, 1fr) 376px; gap: var(--space-7); align-items: start; }
+.sh-claim__main, .sh-claim__actions { display: flex; flex-direction: column; gap: var(--space-4); }
+.sh-claim__facts { display: flex; flex-direction: column; gap: var(--space-3); }
+
+@media (max-width: 1023px) {
+  .sh-portfolio__tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .sh-claim__grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 599px) {
+  .sh-portfolio__tiles { grid-template-columns: minmax(0, 1fr); }
+  .sh-portfolio__title { font: var(--type-display-m); letter-spacing: var(--track-display-m); }
+}
+.sh-portfolio__chain { white-space: nowrap; }
+
+/* Phone: each position is a card (Portfolio-Mobile): the agent, then each
+   figure as a labelled row, the action last. */
+@media (max-width: 599px) {
+  .sh-portfolio .sh-table thead { display: none; }
+  .sh-portfolio .sh-table, .sh-portfolio .sh-table tbody, .sh-portfolio .sh-table tfoot { display: block; }
+  .sh-portfolio .sh-table tr { display: flex; flex-direction: column; gap: 6px; padding: var(--space-4); border-bottom: var(--border-hairline) solid var(--line); }
+  .sh-portfolio .sh-table th, .sh-portfolio .sh-table td { display: flex; justify-content: space-between; gap: var(--space-3); padding: 0; border: 0; text-align: left; }
+  .sh-portfolio .sh-table th[scope="row"] { flex-direction: column; }
+  .sh-portfolio .sh-table td[data-label]::before { content: attr(data-label); color: var(--ink-muted); font: var(--type-body-s); }
+  .sh-portfolio .sh-table td:empty { display: none; }
+  .sh-portfolio .sh-table td .sh-btn { width: 100%; }
+}

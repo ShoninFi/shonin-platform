@@ -25,6 +25,11 @@ path = "src/bin/seo.rs"
 # Dev-only pages (/_atoms). Only `task frontend:app:dev` turns it on; release
 # builds never include them.
 dev = []
+# The development wallet: compiles in the test wallet's recovery phrase
+# (`SHONIN_DEV_WALLET_MNEMONIC`, read at build time). Only
+# `task frontend:app:dev` turns it on; release builds never read the phrase,
+# whatever the environment holds, and the build task refuses a dist with it.
+dev-wallet = []
 
 [dependencies]
 shared.workspace = true
@@ -40,6 +45,15 @@ gloo-timers.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
+# Wallets and money: the contracts' own bindings, exact integers, and the
+# recovery-phrase wallet's local signer.
+chain.workspace = true
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+alloy-signer.workspace = true
+alloy-signer-local.workspace = true
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
 web-sys = { workspace = true, features = [
     "Window",
     "Document",
@@ -68,6 +82,11 @@ web-sys = { workspace = true, features = [
 # The pre-render runs natively at build time: it reads a snapshot over HTTP,
 # hashes the loader it moves out of index.html and reads the chains' public
 # endpoints for the policy.
+# The signer's crates draw randomness through getrandom, which needs the
+# browser's crypto API named on wasm32-unknown-unknown.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["js"] }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 reqwest = { workspace = true, features = ["blocking", "json"] }
 sha2.workspace = true
