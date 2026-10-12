@@ -180,7 +180,7 @@ flowchart LR
 | Station | One per chain the agent trades on, the vault's own included | Owns the agent's accounts on that chain, and reports what they're worth to the vault |
 | Driver | One for each venue, plugged into the station on its chain | Knows how to work with that venue: lets the vault's trade-only keys trade there, works out what the station holds there, and closes positions when someone withdraws |
 | Registries | Every chain we support | The approved machine images and the keys they've blessed, the published agents and their builds, and their reviews; shared by every vault |
-| Publishing | Every chain a vault can live on | Takes the $1 to publish, and gives each agent its id |
+| Publishing | Every chain a vault can live on | Takes the 1 USDC to publish, and gives each agent its id |
 | Factories | Every chain we support | Create a vault, and its station on the same chain, when the Author activates it; stations on other chains are created by its executor |
 
 ## Real markets, messy data

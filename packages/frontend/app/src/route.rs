@@ -357,7 +357,7 @@ impl Route {
             ),
             Self::Publish => page(
                 "Publish an agent · Shonin".to_string(),
-                "Publish a trading agent for $1: reviewed, built in an attested machine, then yours to activate.",
+                "Publish a trading agent for 1 USDC: reviewed, built in an attested machine, then yours to activate.",
             ),
             Self::Job { id } => page(
                 format!("Publishing job {id} · Shonin"),

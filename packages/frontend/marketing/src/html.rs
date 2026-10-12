@@ -230,7 +230,7 @@ pub(crate) const MENU: &str = r#"<div class="menu sh-hero sh-sheet-up" id="menu"
     <ul>
       <li class="sh-reveal dl-80"><a class="menu__link" href="/#how"><span class="menu__text"><span class="menu__title">How it works</span><span class="menu__sub">Attested machines and trade-only keys</span></span><span class="menu__go">{{i:chev-right:24}}</span></a></li>
       <li class="sh-reveal dl-130"><a class="menu__link" href="/#traders"><span class="menu__text"><span class="menu__title">For Traders</span><span class="menu__sub">Know what an agent will do before you back it</span></span><span class="menu__go">{{i:chev-right:24}}</span></a></li>
-      <li class="sh-reveal dl-180"><a class="menu__link" href="/authors"><span class="menu__text"><span class="menu__title">For Authors</span><span class="menu__sub">Publish an agent for $1</span></span><span class="menu__go">{{i:chev-right:24}}</span></a></li>
+      <li class="sh-reveal dl-180"><a class="menu__link" href="/authors"><span class="menu__text"><span class="menu__title">For Authors</span><span class="menu__sub">Publish an agent for 1 USDC</span></span><span class="menu__go">{{i:chev-right:24}}</span></a></li>
       <li class="sh-reveal dl-230"><a class="menu__link" href="/#fees"><span class="menu__text"><span class="menu__title">Fees</span><span class="menu__sub">Paid on new profit, never twice for the same gain</span></span><span class="menu__go">{{i:chev-right:24}}</span></a></li>
       <li class="sh-reveal dl-280"><a class="menu__link" href="{{docs}}/"><span class="menu__text"><span class="menu__title">Docs</span><span class="menu__sub sh-mono">docs.shonin.fi</span></span><span class="menu__go">{{i:external:22}}<span class="vh">(opens the docs site)</span></span></a></li>
     </ul>

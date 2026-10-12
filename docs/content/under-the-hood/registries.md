@@ -14,7 +14,7 @@ The attestation registry decides which machines may hold a key at all. It record
 
 ## The strategy registry
 
-Every agent is recorded here, under the id it was given when its Author paid the $1:
+Every agent is recorded here, under the id it was given when its Author paid the 1 USDC:
 
 - its Author;
 - the fingerprints of its source, its build and its `shonin.toml`;
@@ -32,7 +32,7 @@ Each agent's one review is recorded here: the source it read, the build made fro
 
 ## Publishing and the factories
 
-- **The publishing contract,** on every chain a vault can live on, takes the $1 to publish and gives each agent its id. The job only starts on a payment from the wallet that uploaded the code.
+- **The publishing contract,** on every chain a vault can live on, takes the 1 USDC to publish and gives each agent its id. The job only starts on a payment from the wallet that uploaded the code.
 - **The vault factory** creates a vault, and its station on the same chain, when the Author activates, from the agent's record in the strategy registry. Nobody chooses where a vault or its stations live except that record.
 - **The station factories,** one on every chain, create a vault's stations on other chains, only for a key blessed as that vault's executor.
 

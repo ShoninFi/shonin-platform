@@ -42,7 +42,7 @@ pub fn portfolio() -> Page {
 pub fn publish() -> Page {
     page(
         "Publish an agent",
-        "Write an agent in Rust and publish it for a flat $1: reviewed, built in an attested machine, then yours to activate.",
+        "Write an agent in Rust and publish it for a flat 1 USDC: reviewed, built in an attested machine, then yours to activate.",
         View::Many(vec![
             text(
                 "Publishing from this app arrives in its next update. Until then, the docs explain how an agent is packaged and published. ",

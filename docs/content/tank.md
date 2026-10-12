@@ -93,7 +93,7 @@ Every vault's page shows how full its tank is and its recent charges. The Author
 
 ## Filling it
 
-Publishing costs $1, which covers the review and the build, and nothing goes in the tank until the Author activates their agent. They have to put something in, since an agent with an empty tank doesn't run, and about a week of running is a wise start.
+Publishing costs 1 USDC, which covers the review and the build, and nothing goes in the tank until the Author activates their agent. They have to put something in, since an agent with an empty tank doesn't run, and about a week of running is a wise start.
 
 After that, a successful agent can pay its own way. The Author can top the tank up from their earnings with one click, or switch on **auto-fill** and pick a number, "keep my tank at $X", and it tops itself up every day: the daily `keep` call collects the signed bill, then cashes in just enough of the Author's shares to bring the tank back to that level. Those shares are priced like any withdrawal, at the next valuation and from cash at home. The [Money flow](flow.md) page shows how that plays out.
 
