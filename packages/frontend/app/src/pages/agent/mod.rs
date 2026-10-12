@@ -17,7 +17,7 @@ mod verify;
 use std::rc::Rc;
 
 use futures_signals::map_ref;
-use futures_signals::signal::SignalExt;
+use futures_signals::signal::{Mutable, SignalExt};
 use shared::{Rating, Strategy};
 use ui::icons::Icon;
 
@@ -282,22 +282,126 @@ fn header(agent: &Rc<Agent>, tab: AgentTab) -> El {
                 }))
                 .child(opened),
         );
-    let main = if tab == AgentTab::Overview {
-        main.child(
-            el("p")
-                .class("ag-tagline")
-                .text_from(&agent.strategy, |strategy| strategy.description.clone()),
+    let head = el("div")
+        .class("ag-head")
+        .child(main)
+        .child(price(agent, tab));
+    if tab == AgentTab::Overview {
+        head.child(about(agent))
+    } else {
+        head
+    }
+}
+
+/// The Author's description, held to three lines with a button that opens
+/// the rest, and what the Reviewer made of it. The whole text is always in
+/// the page: the clamp is drawn only where scripts run (CSS `scripting`), and
+/// the button shows only when the app has measured that the text is longer
+/// than its three lines.
+fn about(agent: &Rc<Agent>) -> El {
+    const ID: &str = "ag-description";
+    let expanded = Mutable::new(false);
+    let overflows = Mutable::new(false);
+    let paragraph = el("p")
+        .class("ag-tagline")
+        .attr("id", ID)
+        .class_signal(
+            "ag-tagline--clamp",
+            true,
+            expanded.signal().map(|expanded| !expanded),
         )
+        .text_from(&agent.strategy, |strategy| strategy.description.clone())
+        .hook({
+            let expanded = expanded.clone();
+            let overflows = overflows.clone();
+            let description = agent
+                .strategy
+                .signal_ref(|strategy| strategy.description.clone())
+                .dedupe_cloned();
+            move |dom| {
+                dominator::with_node!(dom, element => {
+                    .future(measure_clamp(element, description, expanded, overflows))
+                })
+            }
+        });
+    let label = |expanded: bool| if expanded { "Show less" } else { "Read more" };
+    let toggle = el("button")
+        .attr("type", "button")
+        .class("ag-more")
+        .attr("aria-controls", ID)
+        .attr_signal(
+            "hidden",
+            Some(String::new()),
+            map_ref! {
+                let overflows = overflows.signal(),
+                let expanded = expanded.signal() => (!*overflows && !*expanded).then(String::new)
+            },
+        )
+        .attr_signal(
+            "aria-expanded",
+            Some("false".to_string()),
+            expanded.signal().map(|expanded| Some(expanded.to_string())),
+        )
+        .child(
+            el("span").text_signal(
+                label(false),
+                expanded
+                    .signal()
+                    .map(move |expanded| label(expanded).to_string()),
+            ),
+        )
+        .child(icon(Icon::ChevronDown, 16));
+    let toggle = on_click(toggle, {
+        let expanded = expanded.clone();
+        move || {
+            expanded.replace_with(|expanded| !*expanded);
+        }
+    });
+    el("div")
+        .class("ag-about")
+        .child(paragraph)
+        .child(toggle)
         .child(live(agent, accuracy))
-    } else {
-        main
+}
+
+/// Whether the description runs past its three lines, measured again when
+/// the window changes size, the web fonts arrive or the text changes, and
+/// only while it is held to three lines.
+async fn measure_clamp(
+    element: web_sys::Element,
+    description: impl futures_signals::signal::Signal<Item = String>,
+    expanded: Mutable<bool>,
+    overflows: Mutable<bool>,
+) {
+    let fonts = async {
+        let ready = crate::web::document()
+            .and_then(|document| js_sys::Reflect::get(&document, &"fonts".into()).ok())
+            .and_then(|fonts| js_sys::Reflect::get(&fonts, &"ready".into()).ok())
+            .and_then(|ready| wasm_bindgen::JsCast::dyn_into::<js_sys::Promise>(ready).ok());
+        if let Some(ready) = ready {
+            let _ = wasm_bindgen_futures::JsFuture::from(ready).await;
+        }
     };
-    let aside = if tab == AgentTab::Overview {
-        read_from(agent)
-    } else {
-        head_figures(agent)
+    let changes = map_ref! {
+        let _size = dominator::window_size(),
+        let _text = description,
+        let _fonts = futures_signals::signal::from_future(Box::pin(fonts)),
+        let expanded = expanded.signal() => *expanded
     };
-    el("div").class("ag-head").child(main).child(aside)
+    changes
+        .for_each(move |expanded| {
+            let element = element.clone();
+            let overflows = overflows.clone();
+            async move {
+                if expanded {
+                    return;
+                }
+                // Once the text and the clamp are in place.
+                gloo_timers::future::TimeoutFuture::new(0).await;
+                overflows.set_neq(element.scroll_height() > element.client_height() + 1);
+            }
+        })
+        .await;
 }
 
 /// The line under the author's description: what the reviewer made of it.
@@ -377,54 +481,66 @@ fn day_time(at: time::PrimitiveDateTime) -> String {
     format!("{}, {}", facts::full_day(at.date()), format::time_short(at))
 }
 
-/// On the other tabs the header carries the share price and the money in
-/// the vault, each with its period.
-fn head_figures(agent: &Rc<Agent>) -> El {
-    el("dl")
-        .class("ag-head__figures")
-        .child(
-            el("div")
-                .child(el("dt").class("sh-label").text("Share price"))
-                .child(
-                    el("dd")
-                        .class("ag-head__figure")
-                        .child(live(agent, |strategy| {
-                            text(format::price(strategy.vault.share_price))
-                        })),
-                )
-                .child(
-                    el("dd")
-                        .class("ag-head__period")
-                        .child(live(agent, |strategy| {
-                            match crate::model::figures(strategy).since_opening {
-                                Some(since) => el("span")
-                                    .class_if(
-                                        !crate::atoms::delta::tone_class(since).is_empty(),
-                                        crate::atoms::delta::tone_class(since),
-                                    )
-                                    .text(format!("{} since opening", format::ret(since)))
-                                    .into(),
-                                None => text("No record yet"),
-                            }
-                        })),
-                ),
-        )
-        .child(
-            el("div")
-                .child(el("dt").class("sh-label").text("In vault"))
-                .child(
-                    el("dd")
-                        .class("ag-head__figure")
-                        .text_from(&agent.in_vault, |value| format::money_whole(*value)),
-                )
-                .child(
-                    el("dd")
-                        .class("ag-head__period")
-                        .text_from(&agent.figures, |figures| {
-                            format!("{} open", format::days(figures.days))
-                        }),
-                ),
-        )
+/// The header's figures, in the same column as the Exit panel below them:
+/// the share price as the page's headline number, its change since opening,
+/// the high-water mark (and on the tabs without the record's four figures,
+/// the money in the vault), and when they were read from the contracts.
+fn price(agent: &Rc<Agent>, tab: AgentTab) -> El {
+    let row = |label: &'static str, value: View| -> View {
+        el("div")
+            .class("ag-price__row")
+            .child(el("dt").text(label))
+            .child(el("dd").child(value))
+            .into()
+    };
+    let figures = el("dl").class("ag-price__figures").child(
+        el("div")
+            .class("ag-price__main")
+            .child(el("dt").class("sh-label").text("Share price"))
+            .child(
+                el("dd")
+                    .class("ag-price__value")
+                    .child(live(agent, |strategy| {
+                        text(format::price(strategy.vault.share_price))
+                    })),
+            )
+            .child(
+                el("dd")
+                    .class("ag-price__change")
+                    .child(live(agent, |strategy| {
+                        match crate::model::figures(strategy).since_opening {
+                            Some(since) => chart::since_opening(since).into(),
+                            None => el("span")
+                                .class("ag-price__none")
+                                .text("No record yet")
+                                .into(),
+                        }
+                    })),
+            ),
+    );
+    let facts = live(agent, move |strategy| {
+        let mark = strategy.vault.high_water_mark;
+        let mut rows = Vec::new();
+        if mark > 0.0 {
+            rows.push(row("High-water mark", text(format::price(mark))));
+        }
+        if tab != AgentTab::Overview {
+            rows.push(row(
+                "In vault",
+                text(format::money_whole(strategy.vault.value)),
+            ));
+        }
+        if rows.is_empty() {
+            View::Empty
+        } else {
+            el("dl").class("ag-price__facts").children(rows).into()
+        }
+    });
+    el("div")
+        .class("ag-price")
+        .child(figures)
+        .child(facts)
+        .child(read_from(agent))
 }
 
 /// The name of the element that morphs between the leaderboard and this
@@ -773,17 +889,28 @@ fn loading(slug: &str, tab: AgentTab) -> El {
         .class("ag")
         .attr("aria-busy", "true")
         .child(
-            el("div").class("ag-head").child(
-                el("div")
-                    .class("ag-head__main")
-                    .child(
-                        el("h1")
-                            .class("ag-name")
-                            .child(skeleton("300", 44))
-                            .child(el("span").class("sh-vh").text("Loading agent")),
-                    )
-                    .child(skeleton("420", 16)),
-            ),
+            el("div")
+                .class("ag-head")
+                .child(
+                    el("div")
+                        .class("ag-head__main")
+                        .child(
+                            el("h1")
+                                .class("ag-name")
+                                .child(skeleton("300", 44))
+                                .child(el("span").class("sh-vh").text("Loading agent")),
+                        )
+                        .child(skeleton("420", 16)),
+                )
+                .child(
+                    el("div").class("ag-price").child(
+                        el("div")
+                            .class("ag-price__figures")
+                            .child(skeleton("90", 12))
+                            .child(skeleton("150", 40))
+                            .child(skeleton("180", 14)),
+                    ),
+                ),
         )
         .child(tabs(slug, tab))
         .child(
@@ -825,4 +952,72 @@ fn loading(slug: &str, tab: AgentTab) -> El {
                         ),
                 ),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent(slug: &str) -> Rc<Agent> {
+        let snapshot: shared::Snapshot =
+            serde_json::from_str(include_str!("../../../tests/snapshot.json"))
+                .expect("the captured snapshot decodes");
+        let store = store::get();
+        store.apply(&snapshot);
+        store.agent(slug).expect("the snapshot has the agent")
+    }
+
+    fn header_html(slug: &str, tab: AgentTab) -> String {
+        View::from(header(&agent(slug), tab)).html()
+    }
+
+    #[test]
+    fn the_prerendered_header_carries_the_whole_description_and_a_hidden_toggle() {
+        let agent = agent("base-1");
+        let description = agent.strategy.lock_ref().description.clone();
+        assert!(description.len() > 300, "a paragraph, not a line");
+        let html = header_html("base-1", AgentTab::Overview);
+        assert!(html.contains(&crate::view::escape(&description)));
+        let toggle = &html[html.find("class=\"ag-more\"").expect("the toggle is drawn")..];
+        let toggle = &toggle[..toggle.find('>').expect("the tag closes")];
+        assert!(
+            toggle.contains("hidden=\"\""),
+            "hidden until the app has measured"
+        );
+        assert!(toggle.contains("aria-expanded=\"false\""));
+        assert!(toggle.contains("aria-controls=\"ag-description\""));
+    }
+
+    #[test]
+    fn the_header_leads_with_the_share_price_its_change_and_high_water_mark() {
+        let html = header_html("base-1", AgentTab::Overview);
+        let price = &html[html
+            .find("class=\"ag-price\"")
+            .expect("the price block is drawn")..];
+        assert!(price.contains("Share price"));
+        // A share price, whatever the fixture holds: dollars to four decimals.
+        let figure = price.split('$').skip(1).find_map(|rest| {
+            let digits: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == ',' || *c == '.')
+                .collect();
+            let (_, decimals) = digits.rsplit_once('.')?;
+            (decimals.len() == 4 && decimals.chars().all(|c| c.is_ascii_digit())).then_some(digits)
+        });
+        assert!(
+            figure.is_some(),
+            "no share price to four decimals in {price}"
+        );
+        assert!(price.contains("since opening"));
+        assert!(price.contains("High-water mark"));
+        assert!(price.contains("Read from its contracts"));
+        assert!(!price.contains("In vault"), "the overview's record says it");
+    }
+
+    #[test]
+    fn the_other_tabs_add_the_money_in_the_vault_and_leave_out_the_description() {
+        let html = header_html("base-1", AgentTab::Review);
+        assert!(html.contains("In vault"));
+        assert!(!html.contains("ag-description"));
+    }
 }

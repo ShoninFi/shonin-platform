@@ -167,21 +167,22 @@ fn headline(agent: &Agent, state: &ChartState) -> El {
                 .class("ag-chart__figure")
                 .child(el("span").class("ag-chart__value").text_signal(now, signal))
                 .child_from(&agent.figures, |figures| {
-                    figures.since_opening.map(|since| {
-                        let tone = match format::direction(since) {
-                            format::Direction::Up => Tone::Gain,
-                            format::Direction::Down => Tone::Loss,
-                            format::Direction::Flat => Tone::Neutral,
-                        };
-                        let glyph = match format::direction(since) {
-                            format::Direction::Up => Some(Icon::Up),
-                            format::Direction::Down => Some(Icon::Down),
-                            format::Direction::Flat => None,
-                        };
-                        badge(tone, glyph, format!("{} since opening", format::ret(since))).into()
-                    })
+                    figures
+                        .since_opening
+                        .map(|since| since_opening(since).into())
                 }),
         )
+}
+
+/// The share price's change since the vault opened, as a chip with its sign,
+/// its arrow and its period.
+pub(super) fn since_opening(since: f64) -> El {
+    let (tone, glyph) = match format::direction(since) {
+        format::Direction::Up => (Tone::Gain, Some(Icon::Up)),
+        format::Direction::Down => (Tone::Loss, Some(Icon::Down)),
+        format::Direction::Flat => (Tone::Neutral, None),
+    };
+    badge(tone, glyph, format!("{} since opening", format::ret(since)))
 }
 
 /// The chart card.
