@@ -87,6 +87,14 @@ pub trait Reader {
     /// What a unit of gas costs at most, about now (the max fee).
     async fn gas_price(&self) -> Result<U256, TxError>;
     async fn receipt(&self, hash: B256) -> Result<Option<Receipt>, TxError>;
+    /// Whether the endpoint has any receipt for `hash`, sealed or not: a
+    /// chain that confirms ahead of its blocks hands out one before the block
+    /// is sealed, which [`Reader::receipt`] doesn't count as mined yet but
+    /// which proves the transaction landed. Only a transaction with no
+    /// receipt at all can have been replaced.
+    async fn receipt_seen(&self, hash: B256) -> Result<bool, TxError> {
+        Ok(self.receipt(hash).await?.is_some())
+    }
     async fn pending(&self, hash: B256) -> Result<Pending, TxError>;
     /// The next nonce of an account, counting only mined transactions.
     async fn mined_nonce(&self, who: Address) -> Result<u64, TxError>;

@@ -378,10 +378,13 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
                 }
                 Ok(Pending::Unknown) => {
                     unknown_polls += 1;
-                    // Known once, gone now, and its nonce used by another.
+                    // Known once, gone now, and its nonce used by another:
+                    // never while the endpoint has any receipt for it, even
+                    // one whose block isn't sealed yet (a chain confirming
+                    // ahead of its blocks counts it in the nonce already).
                     if let Some(nonce) = known
                         && matches!(self.reader.mined_nonce(self.account).await, Ok(mined) if mined > nonce)
-                        && matches!(self.reader.receipt(hash).await, Ok(None))
+                        && matches!(self.reader.receipt_seen(hash).await, Ok(false))
                     {
                         return Err(TxError::Replaced { hash });
                     }
@@ -411,7 +414,8 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
     /// so the next read or simulation sees what was just mined (a pool of
     /// nodes can answer a receipt from one node and a call from another a
     /// block behind). Gives up after a few looks: the receipt stands either
-    /// way, and a read that still misses it is one more look later.
+    /// way, and a read that still misses it is one more look later: the
+    /// wait is best effort.
     async fn reached(&self, block: u64) {
         for _ in 0..self.pace.dropped_after.clamp(1, 30) {
             match self.reader.block_number().await {
