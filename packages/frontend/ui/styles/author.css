@@ -88,6 +88,20 @@
 .sh-publish__claims { margin: 0; padding-left: 1.25em; }
 .sh-publish__choice { display: flex; flex-direction: column; padding: var(--space-2) 0; }
 .sh-publish__choiceline { padding-left: 32px; font: var(--type-body-s); }
+/* Seal: two option cards side by side; the chosen one ringed in brand. */
+.sh-publish__options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4); margin-top: var(--space-2); }
+.sh-publish__option {
+  display: flex; flex-direction: column; gap: var(--space-3); padding: 20px; cursor: pointer;
+  border: var(--border-hairline) solid var(--line-control); border-radius: var(--radius-m); background: var(--paper-raised);
+}
+.sh-publish__option:has(input:checked) { border-color: var(--brand); box-shadow: 0 0 0 0.5px var(--brand); }
+.sh-publish__optionhead { align-items: center; min-height: 0; padding: 0; }
+.sh-publish__optionhead > .sh-icon { flex: none; color: var(--ink-muted); }
+.sh-publish__optionname { font: 650 16px/24px var(--font-sans); }
+.sh-publish__optionchip { align-self: flex-start; }
+.sh-publish__optionlead { font: 400 15px/24px var(--font-sans); }
+.sh-publish__optiondetail { font: 400 13px/20px var(--font-sans); }
+@media (max-width: 599px) { .sh-publish__options { grid-template-columns: minmax(0, 1fr); } }
 .sh-publish__agents { display: flex; flex-direction: column; }
 .sh-publish__pay { display: flex; flex-direction: column; gap: var(--space-4); }
 .sh-publish__payaction, .sh-publish__payactions { display: flex; flex-direction: column; gap: var(--space-3); }

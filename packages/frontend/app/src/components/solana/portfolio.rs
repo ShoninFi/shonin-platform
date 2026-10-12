@@ -860,7 +860,15 @@ pub fn claim(slug: &str, id: u64) -> Page {
                 .attr("aria-label", "Breadcrumb")
                 .child(app_link("/portfolio").text("Portfolio"))
                 .text(" / ")
-                .child(el("span").attr("aria-current", "page").text("Claim")),
+                .child(
+                    el("span").attr("aria-current", "page").text_from(
+                        &loaded,
+                        |loaded| match loaded {
+                            Some(Ok(view)) => format!("Claim on {}", view.vault.title),
+                            _ => "Claim".to_string(),
+                        },
+                    ),
+                ),
         )
         .child_from(&loaded, |loaded| {
             Some(match loaded {
@@ -1075,6 +1083,14 @@ fn claim_view(view: &ClaimView) -> View {
                 "Collect",
                 Kind::Primary,
             ));
+    }
+    // Nothing left to do here once it's paid or taken: back to the rest.
+    if matches!(state, ClaimState::Paid | ClaimState::Fallback) {
+        actions = actions.child(
+            app_link("/portfolio")
+                .class("sh-btn sh-btn-primary sh-claim__back")
+                .text("View in portfolio"),
+        );
     }
     let fact = |label: &'static str, value: String| {
         el("div")

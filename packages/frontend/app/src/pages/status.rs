@@ -331,9 +331,30 @@ fn timeline(
     months: u32,
     now: Option<PrimitiveDateTime>,
     timelock: Option<f64>,
+    failing: bool,
 ) -> View {
     let newest = feed.first().map(|item| item.at.date());
     let (groups, _) = shown_days(feed, filter, months);
+    if now.is_none() && failing {
+        // Nothing has arrived and the API isn't answering: say so, never an
+        // endless shimmer.
+        return el("div")
+            .class("st-offline")
+            .attr("role", "status")
+            .child(icon(Icon::Concern, 20))
+            .child(
+                el("p")
+                    .child(el("strong").text("Events can’t be shown right now."))
+                    .text(" We can’t reach the indexer. We’ll keep trying."),
+            )
+            .child(on_click(
+                Button::new(Kind::Secondary, "Try again").build(),
+                || {
+                    store::get().sync.retry.replace_with(|n| n.wrapping_add(1));
+                },
+            ))
+            .into();
+    }
     if now.is_none() {
         // Nothing has arrived yet: the shape of an event, shimmering.
         return el("div")
@@ -407,9 +428,10 @@ fn system(freshness: Freshness, chains: &[ChainRead], now: Option<PrimitiveDateT
         Freshness::Behind { .. } => (false, "Figures are behind"),
         Freshness::Unreachable { .. } => (false, "We can’t reach the indexer"),
     };
-    let checked = match now {
-        Some(now) => format!("Checked {}", format::day_time(now, now.year())),
-        None => "Not checked yet".to_string(),
+    let checked = match (now, freshness) {
+        (Some(now), _) => format!("Checked {}", format::day_time(now, now.year())),
+        (None, Freshness::Unreachable { .. }) => "No answer since this page opened".to_string(),
+        (None, _) => "Not checked yet".to_string(),
     };
     let indexer_chip = match freshness {
         Freshness::Fresh => badge(Tone::Gain, Some(Icon::Check), "Normal"),
@@ -510,14 +532,16 @@ pub fn page() -> Page {
         months.get(),
         store.as_of.get(),
         store.image_timelock_days.get(),
+        store.sync.failing.get(),
     );
     let timeline_signal = map_ref! {
         let feed = store.feed.signal_vec_cloned().to_signal_cloned(),
         let filter = filter.signal(),
         let months = months.signal(),
         let now = store.as_of.signal(),
-        let timelock = store.image_timelock_days.signal() =>
-        Some(timeline(feed, *filter, *months, *now, *timelock))
+        let timelock = store.image_timelock_days.signal(),
+        let failing = store.sync.failing.signal() =>
+        Some(timeline(feed, *filter, *months, *now, *timelock, *failing))
     };
 
     let system_now = system(
@@ -562,7 +586,14 @@ pub fn page() -> Page {
                 .hook(move |dom| dom.event(move |_: dominator::events::Click| pick.set_neq(option)))
         }));
 
-    let pending = |feed: &[Rc<FeedItem>], now: Option<PrimitiveDateTime>, timelock: Option<f64>| {
+    let pending = |feed: &[Rc<FeedItem>],
+                   now: Option<PrimitiveDateTime>,
+                   timelock: Option<f64>|
+     -> View {
+        // Nothing read yet: nothing to say about what's waiting.
+        if now.is_none() {
+            return View::Empty;
+        }
         let waiting = feed
             .iter()
             .filter(|item| {

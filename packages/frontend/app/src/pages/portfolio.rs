@@ -1133,7 +1133,15 @@ pub fn claim(slug: &str, id: u64) -> Page {
                 .attr("aria-label", "Breadcrumb")
                 .child(app_link("/portfolio").text("Portfolio"))
                 .text(" / ")
-                .child(el("span").attr("aria-current", "page").text("Claim")),
+                .child(
+                    el("span").attr("aria-current", "page").text_from(
+                        &loaded,
+                        |loaded| match loaded {
+                            Some(Ok(view)) => format!("Claim on {}", view.vault.title),
+                            _ => "Claim".to_string(),
+                        },
+                    ),
+                ),
         )
         .child_from(&loaded, |loaded| {
             Some(match loaded {
@@ -1334,6 +1342,14 @@ fn claim_view(view: &ClaimView) -> View {
             )),
         ));
     }
+    // Nothing left to do here once it's paid or taken: back to the rest.
+    if matches!(state, ClaimState::Paid | ClaimState::Fallback) {
+        actions = actions.child(
+            app_link("/portfolio")
+                .class("sh-btn sh-btn-primary sh-claim__back")
+                .text("View in portfolio"),
+        );
+    }
     let fact = |label: &'static str, value: String| {
         el("div")
             .class("sh-exit__row")
@@ -1346,7 +1362,21 @@ fn claim_view(view: &ClaimView) -> View {
             el("div")
                 .class("sh-claim__main")
                 .child(el("p").attr("aria-live", "polite").child(claim_badge(state)))
-                .child(el("h1").class("sh-portfolio__title").text(headline))
+                .child(match (state, viewer == Some(claim.owner)) {
+                    // An address keeps its mono face, even in a headline.
+                    (ClaimState::Paid, false) => el("h1")
+                        .class("sh-portfolio__title")
+                        .text(format!(
+                            "{} was paid to ",
+                            money::dollars(claim.paid, decimals, Rounding::Down)
+                        ))
+                        .child(
+                            el("span")
+                                .class("sh-mono")
+                                .text(crate::format::short_hash(&format!("{:?}", claim.owner))),
+                        ),
+                    _ => el("h1").class("sh-portfolio__title").text(headline),
+                })
                 .child(el("p").text(explain))
                 .child(match (estimate, open) {
                     (Some(estimate), true) => el("p").class("sh-muted").text(format!(

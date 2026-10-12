@@ -26,7 +26,7 @@ pub fn frame(route: &Route, page: pages::Page) -> El {
             el("div")
                 .class("sh-container")
                 .class("sh-page")
-                .child(freshness::card())
+                .child(freshness::card(!matches!(route, Route::Status)))
                 .child(page.body),
         )
     };

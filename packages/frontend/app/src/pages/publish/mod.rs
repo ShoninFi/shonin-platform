@@ -676,15 +676,51 @@ fn manifest_list(manifest: &shared::Manifest) -> View {
 // 3 · Seal -------------------------------------------------------------------------
 
 fn seal_section(draft: &Rc<Draft>) -> El {
-    let choice = |value: Source, id: &str, label: &str, lines: &[&str]| {
-        el("div")
-            .class("sh-publish__choice")
-            .child(radio("source", id.to_string(), label, value, &draft.source))
-            .children(lines.iter().map(|line| {
-                el("p")
-                    .class("sh-muted sh-publish__choiceline")
-                    .text(line.to_string())
-            }))
+    // An option card: the radio, its icon and name, then what it means.
+    let choice = |value: Source,
+                  id: &str,
+                  glyph: Icon,
+                  label: &str,
+                  chip: Option<&str>,
+                  lead: &str,
+                  detail: &str| {
+        el("label")
+            .class("sh-publish__option")
+            .attr("for", id.to_string())
+            .child(
+                el("span")
+                    .class("sh-check sh-check--radio sh-publish__optionhead")
+                    .child(crate::atoms::check::radio_input(
+                        "source",
+                        id.to_string(),
+                        value,
+                        &draft.source,
+                    ))
+                    .child(el("span").class("sh-check__box"))
+                    .child(icon(glyph, 20))
+                    .child(
+                        el("span")
+                            .class("sh-publish__optionname")
+                            .text(label.to_string()),
+                    ),
+            )
+            .child(match chip {
+                Some(chip) => el("span")
+                    .class("sh-chip sh-chip-neutral sh-publish__optionchip")
+                    .text(chip.to_string())
+                    .into(),
+                None => View::Empty,
+            })
+            .child(
+                el("span")
+                    .class("sh-publish__optionlead")
+                    .text(lead.to_string()),
+            )
+            .child(
+                el("span")
+                    .class("sh-muted sh-publish__optiondetail")
+                    .text(detail.to_string()),
+            )
     };
     el("section")
         .class("sh-publish__section")
@@ -706,24 +742,28 @@ fn seal_section(draft: &Rc<Draft>) -> El {
             el("fieldset")
                 .class("sh-fieldset sh-publish__seal")
                 .child(el("legend").text("Who can read your source code?"))
-                .child(choice(
-                    Source::Public,
-                    "source-public",
-                    "Public source · recommended for trust",
-                    &[
-                        "Anyone can read it and rebuild it to check.",
-                        "Depositors can compare your code with what the Reviewer said about it.",
-                    ],
-                ))
-                .child(choice(
-                    Source::Sealed,
-                    "source-sealed",
-                    "Sealed",
-                    &[
-                        "Only our attested machines and the Reviewer's model can read it. Depositors rely on the review instead, and your page says so.",
-                        "It's still reviewed and built the same way; it's just never published.",
-                    ],
-                )),
+                .child(
+                    el("div")
+                        .class("sh-publish__options")
+                        .child(choice(
+                            Source::Public,
+                            "source-public",
+                            Icon::Code,
+                            "Public source",
+                            Some("Recommended for trust"),
+                            "Anyone can read it and rebuild it to check.",
+                            "Depositors can compare your code with what the Reviewer said about it.",
+                        ))
+                        .child(choice(
+                            Source::Sealed,
+                            "source-sealed",
+                            Icon::Lock,
+                            "Sealed",
+                            None,
+                            "Only our attested machines and the Reviewer's model can read it. Depositors rely on the review instead, and your page says so.",
+                            "It's still reviewed and built the same way; it's just never published.",
+                        )),
+                ),
         )
 }
 
@@ -797,14 +837,19 @@ fn pay_body(
                 Sending::Uploaded { account, .. } => Some(*account),
                 _ => connection.account(),
             };
-            account
-                .map(|account| crate::format::short_hash(&format!("{account:?}")))
-                .unwrap_or_else(|| "your wallet".to_string())
+            account.map(|account| crate::format::short_hash(&format!("{account:?}")))
         }
-    };
+    }
+    .broadcast();
+    // An address is mono; the words "your wallet" are not.
     let from = el("span")
-        .class("sh-mono")
-        .text_signal("your wallet", payer);
+        .class_signal("sh-mono", false, payer.signal_ref(Option::is_some))
+        .text_signal(
+            "your wallet",
+            payer
+                .signal_cloned()
+                .map(|payer| payer.unwrap_or_else(|| "your wallet".to_string())),
+        );
     // The fee as the publishing contract on this chain has it, once read.
     let fee: Mutable<Option<String>> = Mutable::new(None);
     let fee_text = fee
@@ -1082,10 +1127,44 @@ fn aside() -> El {
             el("div")
                 .class("sh-card sh-card--pad sh-publish__asidecard")
                 .child(el("h2").class("sh-publish__h2").text("Once it's live"))
-                .child(el("p").class("sh-muted").text(
-                    "You earn a share of the new profit it makes, paid every Monday as shares. A tank you fill pays for its computing and gas.",
-                )),
+                .child(el("p").class("sh-muted").text_signal(
+                    once_live(author_share()),
+                    crate::store::get()
+                        .loaded
+                        .signal()
+                        .map(|_| once_live(author_share())),
+                ))
+                .child(
+                    el("a")
+                        .class("sh-link")
+                        .attr("href", format!("{DOCS}authors/"))
+                        .attr("target", "_blank")
+                        .attr("rel", "noopener")
+                        .text("How Authors are paid")
+                        .child(icon(Icon::ArrowRight, 16)),
+                ),
         )
+}
+
+/// The Author's share of new profit, as every vault the snapshot holds was
+/// created with it; none when the vaults disagree or there are none yet.
+fn author_share() -> Option<u32> {
+    let mut shares = crate::store::get()
+        .all()
+        .into_iter()
+        .map(|agent| agent.strategy.lock_ref().vault.fees.author_bps);
+    let first = shares.next()?;
+    shares.all(|bps| bps == first).then_some(first)
+}
+
+fn once_live(author_bps: Option<u32>) -> String {
+    let share = match author_bps {
+        Some(bps) => format!("{} of", crate::format::bps(bps)),
+        None => "a share of".to_string(),
+    };
+    format!(
+        "You earn {share} the new profit it makes, paid every Monday as shares. A tank you fill pays for its computing and gas."
+    )
 }
 
 // The browser: reading the file, uploading, paying ----------------------------------------

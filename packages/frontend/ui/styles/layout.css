@@ -6,6 +6,11 @@
 
 .sh-container { width: min(1200px, 100% - 2 * var(--gutter)); margin-inline: auto; }
 
+/* The app's frame fills the window, so a short page still ends on the
+   footer, never on a band of page under it. */
+.sh-app { display: flex; flex-direction: column; min-height: 100vh; min-height: 100dvh; }
+.sh-app > .sh-main { flex: 1 0 auto; }
+
 .sh-grid-12 { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: var(--space-5); }
 @media (max-width: 1023px) { .sh-grid-12 { grid-template-columns: repeat(8, minmax(0, 1fr)); } }
 @media (max-width: 599px) { .sh-grid-12 { grid-template-columns: repeat(4, minmax(0, 1fr)); column-gap: var(--space-4); } }

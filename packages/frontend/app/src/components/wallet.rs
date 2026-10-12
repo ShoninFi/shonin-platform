@@ -301,7 +301,11 @@ fn problem(title: &str, line: String, action: Option<View>) -> View {
 fn choosing(phrase_mode: &Mutable<bool>) -> View {
     let session = crate::wallet::get();
     let options = session.wallets.get_cloned();
-    let mut rows: Vec<View> = options.into_iter().map(wallet_row).collect();
+    let chains = evm_chains(&session.networks.lock_ref());
+    let mut rows: Vec<View> = options
+        .into_iter()
+        .map(|option| wallet_row(option, &chains))
+        .collect();
     rows.extend(super::solana::wallet::rows());
     if session.dev_available() {
         rows.push(
@@ -410,7 +414,24 @@ fn option_row(mark: View, name: &str, detail: Option<&str>, detected: bool) -> E
         .child(icon(Icon::ChevronRight, 18))
 }
 
-fn wallet_row(option: WalletOption) -> View {
+/// What an EVM wallet's row says it connects to: the vault chains the app
+/// reads, by name, so a wallet that is on the list twice (Phantom announces
+/// an EVM side and a Solana side) reads as two different things.
+fn evm_chains(
+    networks: &std::collections::BTreeMap<shared::Chain, Rc<crate::wallet::Network>>,
+) -> String {
+    let labels: Vec<&str> = networks
+        .values()
+        .map(|network| network.label.as_str())
+        .collect();
+    if labels.is_empty() {
+        "EVM chains".to_string()
+    } else {
+        labels.join(", ")
+    }
+}
+
+fn wallet_row(option: WalletOption, chains: &str) -> View {
     let mark: View = match &option.icon {
         Some(src) => el("img")
             .class("sh-tile sh-tile--img")
@@ -422,7 +443,7 @@ fn wallet_row(option: WalletOption) -> View {
         None => tile(&option.name).into(),
     };
     let id = option.id.clone();
-    option_row(mark, &option.name, None, option.detected)
+    option_row(mark, &option.name, Some(chains), option.detected)
         .hook(move |dom| {
             dom.event(move |_: dominator::events::Click| {
                 let id = id.clone();

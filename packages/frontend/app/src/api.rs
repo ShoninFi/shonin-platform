@@ -74,6 +74,7 @@ mod browser {
                     Ok(snapshot) => {
                         failures = 0;
                         store.apply(&snapshot);
+                        crate::wallet::get().take_snapshot(&snapshot);
                         store.sync.last_ok.set(Some(js_sys::Date::now()));
                         store.sync.failing.set_neq(false);
                         store.sync.error.set_neq(None);
@@ -97,7 +98,14 @@ mod browser {
                         store.sync.error.set_neq(Some(why));
                     }
                 }
-                TimeoutFuture::new(next_delay(failures)).await;
+                // Wait out the delay, or less if a reader asks to try again.
+                let asked = store.sync.retry.get();
+                let mut waited = 0;
+                let delay = next_delay(failures);
+                while waited < delay && store.sync.retry.get() == asked {
+                    TimeoutFuture::new(250).await;
+                    waited += 250;
+                }
             }
         });
     }
