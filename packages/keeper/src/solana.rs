@@ -580,6 +580,27 @@ fn freeze_for_units_due(holder: &Holder, vault: &Vault, now: u64) -> bool {
         && !vault.owed()
 }
 
+/// Whether the keeper tries a claim in `state` this round: one pending or
+/// waiting is tried; one the cash covered (queued) waits for the next
+/// valuation to pay it, and is only looked at for its freeze.
+fn claim_tried(state: ClaimState) -> bool {
+    matches!(state, ClaimState::Pending | ClaimState::Waiting)
+}
+
+/// Whether a vault may be frozen for a claim in `state` booked at
+/// `booked_at`: it is still unpaid (pending, waiting or queued) a freeze
+/// period after its booking, the vault is live and hasn't halted, and no
+/// valuation's settlement is owed, which may pay it.
+fn freeze_for_claim_due(state: ClaimState, booked_at: u64, vault: &Vault, now: u64) -> bool {
+    matches!(
+        state,
+        ClaimState::Pending | ClaimState::Waiting | ClaimState::Queued
+    ) && now >= booked_at.saturating_add(vault.timers.freeze_after)
+        && vault.live()
+        && !vault.halted()
+        && !vault.owed()
+}
+
 /// Whether a vault's restricted list is read again in its daily round: while
 /// it is open and hasn't halted, as on the EVM.
 fn refresh_wanted(vault: &Vault) -> bool {
@@ -812,7 +833,7 @@ impl Keeping {
         carry_on(
             address,
             "claims",
-            self.claims(&v, address, claims, memory).await,
+            self.claims(&v, address, claims, memory, (vault, now)).await,
         );
         carry_on(
             address,
@@ -935,17 +956,43 @@ impl Keeping {
         address: &Pubkey,
         claims: &[Claim],
         memory: &mut Memory,
+        round: (&Vault, u64),
     ) -> Result<()> {
         memory
             .claims_tried
             .retain(|id, _| claims.iter().any(|claim| claim.id == *id));
         memory.claim_parts_next.retain(|id, _| {
-            claims.iter().any(|claim| {
-                claim.id == *id && matches!(claim.state, ClaimState::Pending | ClaimState::Waiting)
-            })
+            claims
+                .iter()
+                .any(|claim| claim.id == *id && claim_tried(claim.state))
         });
         for claim in claims {
-            if !matches!(claim.state, ClaimState::Pending | ClaimState::Waiting) {
+            let tried = claim_tried(claim.state);
+            if !tried && claim.state != ClaimState::Queued {
+                continue;
+            }
+            if !tried {
+                // The cash covered it: the next valuation pays it, so it is
+                // not tried again. Still unpaid past the freeze period, it
+                // freezes the vault as any other unpaid claim does: checked
+                // first against this round's reads, then read afresh, since
+                // the round's own settle may have paid it since.
+                if !freeze_for_claim_due(claim.state, claim.booked_at, round.0, round.1) {
+                    continue;
+                }
+                let now = self.client.now().await?;
+                let vault = self.platform.vault(&self.client, address).await?;
+                if let Some(fresh) = self.platform.claim(&self.client, address, claim.id).await? {
+                    self.freeze_if_overdue(
+                        address,
+                        claim.id,
+                        fresh.state,
+                        fresh.booked_at,
+                        &vault,
+                        now,
+                    )
+                    .await;
+                }
                 continue;
             }
             let now = self.client.now().await?;
@@ -991,27 +1038,33 @@ impl Keeping {
             }
             // Tried and still unpaid past the freeze period: the vault is
             // frozen, never while a valuation's settlement is owed.
-            if matches!(
-                state,
-                ClaimState::Pending | ClaimState::Waiting | ClaimState::Queued
-            ) && now
-                >= after
-                    .as_ref()
-                    .map_or(claim.booked_at, |claim| claim.booked_at)
-                    .saturating_add(vault.timers.freeze_after)
-                && vault.live()
-                && !vault.halted()
-                && !vault.owed()
-            {
-                self.send(
-                    address,
-                    vec![self.platform.ix_freeze(address, claim.id)],
-                    "freeze",
-                )
+            let booked_at = after
+                .as_ref()
+                .map_or(claim.booked_at, |claim| claim.booked_at);
+            self.freeze_if_overdue(address, claim.id, state, booked_at, &vault, now)
                 .await;
-            }
         }
         Ok(())
+    }
+
+    /// Freeze the vault for claim `id` (see [`freeze_for_claim_due`]).
+    async fn freeze_if_overdue(
+        &self,
+        address: &Pubkey,
+        id: u64,
+        state: ClaimState,
+        booked_at: u64,
+        vault: &Vault,
+        now: u64,
+    ) {
+        if freeze_for_claim_due(state, booked_at, vault, now) {
+            self.send(
+                address,
+                vec![self.platform.ix_freeze(address, id)],
+                "freeze",
+            )
+            .await;
+        }
     }
 
     /// Whether a try of claim `claim` (whole, or `part` of its shares) would
@@ -2830,6 +2883,52 @@ mod tests {
         assert_eq!(
             next_units_try(Some(waited), Some(Outcome::Reverted), 7, 2 * 60 * MINUTE, 2).wait,
             1
+        );
+    }
+
+    #[test]
+    fn a_queued_claim_is_not_tried_again_but_still_freezes_the_vault_a_freeze_period_after_booking()
+    {
+        assert!(claim_tried(ClaimState::Pending));
+        assert!(claim_tried(ClaimState::Waiting));
+        assert!(
+            !claim_tried(ClaimState::Queued),
+            "the next valuation pays it"
+        );
+        let vault = a_vault();
+        // Booked at 100 with a freeze period of 1,000.
+        for state in [ClaimState::Pending, ClaimState::Waiting, ClaimState::Queued] {
+            assert!(
+                !freeze_for_claim_due(state, 100, &vault, 1_099),
+                "{state:?} too early"
+            );
+            assert!(freeze_for_claim_due(state, 100, &vault, 1_100), "{state:?}");
+        }
+        for state in [ClaimState::Paid, ClaimState::Fallback] {
+            assert!(
+                !freeze_for_claim_due(state, 100, &vault, 5_000),
+                "{state:?}"
+            );
+        }
+        let mut halted = a_vault();
+        halted.halted_at = 50;
+        assert!(
+            !freeze_for_claim_due(ClaimState::Queued, 100, &halted, 5_000),
+            "halted"
+        );
+        let mut closed = a_vault();
+        closed.state = VaultState::Closed;
+        assert!(
+            !freeze_for_claim_due(ClaimState::Queued, 100, &closed, 5_000),
+            "closed"
+        );
+        let mut owed = a_vault();
+        owed.priced = true;
+        owed.priced_through = 3;
+        owed.request_cursor = 1;
+        assert!(
+            !freeze_for_claim_due(ClaimState::Queued, 100, &owed, 5_000),
+            "a valuation's settlement is owed"
         );
     }
 
