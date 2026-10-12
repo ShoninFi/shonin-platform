@@ -617,6 +617,8 @@ html.menu-open { overflow: hidden; }
   .art-name { font-size: 14px; }
   .art-sub { font-size: 12px; }
   .hero--authors .hero__title { font: var(--type-display-xl); letter-spacing: var(--track-display-xl); }
+  /* Two sentences, one line each: at 72px the second runs past the copy column. */
+  .hero--home .hero__title { font: 800 clamp(48px, 4.45vw, 64px)/1.0625 var(--font-display); letter-spacing: var(--track-display-xl); }
   .hero--authors .hero__grid { grid-template-columns: minmax(0, 1fr) clamp(400px, 44vw, 600px); }
   .hero--authors .hero__copy { gap: 28px; padding-top: 108px; max-width: 590px; }
 }

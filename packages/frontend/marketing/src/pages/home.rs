@@ -9,8 +9,8 @@ use crate::html::{Current, Footer, Page};
 pub fn page() -> Page<'static> {
     Page {
         path: "/",
-        title: "Shonin · Trading agents you can check",
-        description: "Reviewed code, running in an attested machine, trading with keys that can't withdraw your money. Agents trade across Hyperliquid, Solana, Base and Robinhood Chain from a single vault.",
+        title: "Shonin · Trading agents. Verifiable by design",
+        description: "Attested execution. Public AI reviews. Enforced safeguards for your capital. Agents trade across Hyperliquid, Solana, Base and Robinhood Chain from a single vault.",
         current: Current::Home,
         class: "page-home",
         main: MAIN,
