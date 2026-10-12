@@ -8,9 +8,13 @@
 #[cfg(target_arch = "wasm32")]
 use crate::data;
 
-/// Where the API answers. The dev server proxies this path to it, and a
-/// deployed app is served beside it, so the same relative path works in both.
-pub const BASE: &str = "/api";
+/// Where the API answers. A release build names the API's own address (the
+/// build task sets `SHONIN_APP_API` from the public config); the dev server
+/// proxies the relative path to the local API.
+pub const BASE: &str = match option_env!("SHONIN_APP_API") {
+    Some(base) => base,
+    None => "/api",
+};
 
 /// How often to ask whether anything has changed.
 #[cfg(target_arch = "wasm32")]

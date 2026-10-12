@@ -33,14 +33,14 @@ tasks:
   # The app ------------------------------------------------------------------
 
   app:dev:
-    desc: "The app: Trunk dev server with live reload, proxying /api to the local API"
+    desc: "The app: Trunk dev server with live reload, proxying /api to the local API (API=<url> to proxy another, e.g. the testnet API)"
     deps: [tokens]
     cmds:
       - >-
         cd "{{.PATH_PACKAGE_APP}}" && NO_COLOR=true trunk serve
         --port {{.PORT_APP_DEV}}
         --dist "{{.PATH_DIST_APP_DEV}}"
-        --proxy-backend "{{.URL_API_DEV}}/api/"
+        --proxy-backend "{{.API | default .URL_API_DEV}}/api/"
         --watch "{{.PATH_ROOT_CARGO_TOML}}"
         --watch "{{.PATH_PACKAGE_SHARED}}"
         --watch "{{.PATH_PACKAGE_CHAIN}}"
@@ -48,18 +48,22 @@ tasks:
         --watch .
 
   app:build:
-    desc: "The app: release build into .trunk-dist/app"
+    desc: "The app: release build into .trunk-dist/app, pre-rendered from the testnet API (API=<api base, ending /api> to pre-render from another)"
     # Once per run, so `task deploy` builds the dist both Workers serve once.
     run: once
     deps: [tokens]
     vars:
+      API: '{{.API | default (printf "%s/api" .URL_API_TESTNET)}}'
       SEO_API_ARG: '{{if .API}}--api "{{.API}}"{{end}}'
+    env:
+      # The API's address, compiled into the app (public config, not a secret).
+      SHONIN_APP_API: "{{.URL_API_TESTNET}}/api"
     cmds:
       - cd "{{.PATH_PACKAGE_APP}}" && NO_COLOR=true trunk clean --dist "{{.PATH_DIST_APP}}"
       - cd "{{.PATH_PACKAGE_APP}}" && NO_COLOR=true trunk build --release --dist "{{.PATH_DIST_APP}}"
       # Per-route HTML (with 404.html), sitemap.xml and robots.txt, from src/route.rs.
       # Pass API=<url> to pre-render the pages that need data from a running API.
-      - cargo run -q -p shonin-app --bin seo -- --dist "{{.PATH_DIST_APP}}" --base-url "{{.URL_SITE_PROD}}" {{.SEO_API_ARG}}
+      - cargo run -q -p shonin-app --bin seo -- --dist "{{.PATH_DIST_APP}}" --base-url "{{.URL_APP_PROD}}" {{.SEO_API_ARG}}
 
   app:deploy:
     desc: "Build the app and deploy it as shonin-app, at app.shonin.fi"
