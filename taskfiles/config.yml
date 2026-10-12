@@ -179,12 +179,15 @@ vars:
   PORT_SOLANA_RPC: "{{add (atoi .SHONIN_START_PORT_DEV) 30}}"
   PORT_SOLANA_WS: "{{add (atoi .SHONIN_START_PORT_DEV) 31}}"
   PORT_SOLANA_FAUCET: "{{add (atoi .SHONIN_START_PORT_DEV) 32}}"
+  # Surfpool's explorer and subgraph server, which it starts even without
+  # its Studio: on its own fixed port it would collide with a second stack.
+  PORT_SOLANA_STUDIO: "{{add (atoi .SHONIN_START_PORT_DEV) 33}}"
   # Every port a local run listens on, for `task down`.
   PORTS_DEV: >-
     {{.PORT_APP_DEV}} {{.PORT_API}} {{.PORT_MARKETING_DEV}} {{.PORT_API_INTERNAL}} {{.PORT_BUILDER}} {{.PORT_EXECUTOR}}
     {{.PORT_REVIEWER}} {{.PORT_KEEPER}} {{.PORT_DEVNET}} {{.PORT_UNWINDER}} {{.PORT_INDEXER}}
     {{.PORT_EVM_BASE}} {{.PORT_EVM_HYPERLIQUID}} {{.PORT_EVM_ROBINHOOD}}
-    {{.PORT_SOLANA_RPC}} {{.PORT_SOLANA_WS}} {{.PORT_SOLANA_FAUCET}}
+    {{.PORT_SOLANA_RPC}} {{.PORT_SOLANA_WS}} {{.PORT_SOLANA_FAUCET}} {{.PORT_SOLANA_STUDIO}}
 
   # URLs
   URL_APP_DEV: "http://localhost:{{.PORT_APP_DEV}}"

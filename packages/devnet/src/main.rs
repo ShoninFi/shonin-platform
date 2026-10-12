@@ -19,6 +19,7 @@ mod deploy;
 mod devnet_keys;
 mod economics;
 mod fund;
+mod fund_wallet;
 mod hyperliquid_vaults;
 mod market;
 mod publish;
@@ -182,6 +183,22 @@ enum Command {
     /// in the funding file; buys HYPE on HyperCore for HyperEVM. Safe to run
     /// again; testnet only.
     Fund,
+    /// Top a person's own wallet up on the testnets, to try the app's money
+    /// flows with it: the stand-in dollar (minted by the funder on an EVM
+    /// chain, by the admin on Solana, into the wallet's dollar account), and
+    /// with `--gas` the chain's coin up to the funding file's `default`,
+    /// from the chain's funder and never past its reserve. An EVM address is
+    /// funded on every EVM chain of the network, a Solana one on its
+    /// cluster, or only `--vault-chain`'s. Safe to run again; testnet only.
+    FundWallet {
+        #[arg(long)]
+        address: String,
+        /// The dollars it is topped up to, in whole dollars.
+        #[arg(long, default_value_t = 0)]
+        dollars: u64,
+        #[arg(long)]
+        gas: bool,
+    },
     /// Print the vault chain's public RPC (the file's, never an override,
     /// which may carry a key) and its deployment file, one per line, for
     /// the tasks that shell out to other tools.
@@ -362,6 +379,7 @@ async fn main() -> Result<()> {
                 | Command::Seed { .. }
                 | Command::Accounts
                 | Command::Fund
+                | Command::FundWallet { .. }
                 | Command::ProposeChecker
                 | Command::ProposeImage { .. }
                 | Command::RevokeImage { .. }
@@ -611,6 +629,27 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Some(Command::FundWallet {
+            address,
+            dollars,
+            gas,
+        }) => {
+            let wallet = fund_wallet::Wallet::parse(&address)?;
+            let chains = match wallet {
+                fund_wallet::Wallet::Evm(_) => evm_chains(&target),
+                fund_wallet::Wallet::Solana(_) => solana_clusters(&target),
+            };
+            fund_wallet::run(
+                target.network,
+                &target.deployments_dir,
+                only(&target, one, chains),
+                &args.funding,
+                wallet,
+                &fund_wallet::Amounts { dollars, gas },
+            )
+            .await
+            .map_err(|error| for_this_build(target.network, error))
+        }
         Some(Command::DeploymentEnv { prefix }) => {
             match target.network {
                 NetworkName::Mainnet => {}
@@ -734,16 +773,37 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        // The local cluster's full seed plays the services' parts itself;
-        // one agent, a registered strategy or any public cluster goes
-        // through the API and the services, as on an EVM chain.
+        // The local cluster's full seed plays the services' parts itself,
+        // with stand-in hashes for what it registers; it then publishes the
+        // reference agent through the API and the services, so the cluster
+        // also holds a strategy with a real manifest, bundle and review, used
+        // live as the EVM seed's live vault is. One agent, a registered
+        // strategy or any public cluster goes through the API and the
+        // services alone, as on an EVM chain.
         Some(Command::Seed {
+            api,
+            agents,
             agent: None,
             strategy: None,
+            take_on_seconds,
             ..
         }) if target.key.kind == ChainKind::Solana && target.network == NetworkName::Local => {
             let served = target.serve_solana().await?;
-            solana_seed::run(&served).await
+            solana_seed::run(&served).await?;
+            let api = api.trim_end_matches('/');
+            if api.is_empty() {
+                bail!("--api is needed to publish: where the API answers");
+            }
+            solana_testnet::one(
+                &served,
+                api,
+                agents.as_deref(),
+                "funding-basis",
+                true,
+                false,
+                take_on_seconds,
+            )
+            .await
         }
         Some(Command::Seed {
             api,
@@ -1545,6 +1605,31 @@ mod tests {
         // Publishing only and running live on a strategy don't mix.
         assert!(parse(&["seed", "--agent", "x", "--publish-only", "--live"]).is_err());
         assert!(parse(&["seed", "--strategy", "7", "--agent", "x"]).is_err());
+    }
+
+    #[test]
+    fn fund_wallet_takes_an_address_whole_dollars_and_an_optional_gas_top_up() {
+        let Some(Command::FundWallet {
+            address,
+            dollars,
+            gas,
+        }) = parse(&["fund-wallet", "--address", "0xabc", "--dollars", "5000"])
+            .unwrap()
+            .command
+        else {
+            panic!("not fund-wallet");
+        };
+        assert_eq!((address.as_str(), dollars, gas), ("0xabc", 5000, false));
+        let Some(Command::FundWallet { dollars, gas, .. }) =
+            parse(&["fund-wallet", "--address", "x", "--gas"])
+                .unwrap()
+                .command
+        else {
+            panic!("not fund-wallet");
+        };
+        assert_eq!((dollars, gas), (0, true));
+        assert!(parse(&["fund-wallet", "--dollars", "5"]).is_err());
+        assert!(parse(&["fund-wallet", "--address", "x", "--dollars", "1.5"]).is_err());
     }
 
     #[test]

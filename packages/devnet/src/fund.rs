@@ -98,6 +98,20 @@ impl Funding {
         coin(amount).ok()
     }
 
+    /// What a person's own wallet is topped up to on an EVM chain
+    /// (`fund-wallet --gas`): the chain's `default`, if it is listed.
+    pub fn wallet_coin(&self, chain: &ChainKey) -> Option<U256> {
+        coin(self.testnet.get(&chain.to_string())?.default).ok()
+    }
+
+    /// The same on a Solana cluster, in lamports.
+    pub fn wallet_lamports(&self, cluster: &ChainKey) -> Result<Option<u64>> {
+        self.testnet
+            .get(&cluster.to_string())
+            .map(|amounts| lamports(amounts.default))
+            .transpose()
+    }
+
     /// What the funder keeps for itself on a chain.
     pub fn reserve(&self, chain: &ChainKey) -> Option<U256> {
         coin(self.testnet.get(&chain.to_string())?.reserve).ok()
@@ -577,6 +591,28 @@ activation_usd = 2.0
         );
         let other: ChainKey = "evm:1".parse().unwrap();
         assert_eq!(funding.target(&other, Role::Admin), None);
+    }
+
+    #[test]
+    fn a_wallet_is_topped_up_to_its_chain_s_default_and_an_unlisted_chain_gives_nothing() {
+        let funding: Funding = toml::from_str(FILE).unwrap();
+        let key: ChainKey = "evm:84532".parse().unwrap();
+        assert_eq!(
+            funding.wallet_coin(&key),
+            Some(parse_ether("0.004").unwrap())
+        );
+        let other: ChainKey = "evm:1".parse().unwrap();
+        assert_eq!(funding.wallet_coin(&other), None);
+        let cluster: ChainKey = "solana:devnet".parse().unwrap();
+        assert_eq!(funding.wallet_lamports(&cluster).unwrap(), None);
+        let with_cluster: Funding = toml::from_str(&format!(
+            "{FILE}\n[testnet.\"solana:devnet\"]\nreserve = 1\ndefault = 0.2\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            with_cluster.wallet_lamports(&cluster).unwrap(),
+            Some(200_000_000)
+        );
     }
 
     #[test]

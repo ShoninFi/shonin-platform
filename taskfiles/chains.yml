@@ -58,6 +58,7 @@ tasks:
         cd "{{.PATH_SOLANA_LEDGER}}"
         exec "{{.SURFPOOL}}" start --offline --no-tui --no-studio --no-deploy -y \
           --host 127.0.0.1 --port {{.PORT_SOLANA_RPC}} --ws-port {{.PORT_SOLANA_WS}} \
+          --studio-port {{.PORT_SOLANA_STUDIO}} \
           --log-path ./logs --log-level warn
 
   deploy:
@@ -123,6 +124,13 @@ tasks:
     desc: "Top every role up on every EVM testnet from the funder, buying HYPE on HyperCore for HyperEVM; safe to run again (NETWORK=testnet only)"
     cmds:
       - "{{.DEVNET}} fund"
+
+  fund-wallet:
+    desc: "Top a person's own wallet up on the testnets to try the app's money flows: DOLLARS of the stand-in dollar (minted on each EVM chain for a 0x address, on Solana devnet for a Solana one), and with GAS=1 the chain's coin up to the funding file's default, from the funder and never past its reserve; VAULT_CHAIN=<name> for one chain. Safe to run again (ADDRESS=<address> DOLLARS=<n> [GAS=1]; NETWORK=testnet only)"
+    requires:
+      vars: [ADDRESS]
+    cmds:
+      - "{{.DEVNET_SOLANA}} {{.VAULT_CHAIN_ARG}} fund-wallet --address {{shellQuote .ADDRESS}} --dollars {{.DOLLARS | default 0}} {{if .GAS}}--gas{{end}}"
 
   root-key:
     desc: "Print the root key's record on the network's canonical chain (`root` in config/chains.toml): its signer, when and through which checker it was recorded, its image and project, and whether it is live (local, or NETWORK=testnet)"
