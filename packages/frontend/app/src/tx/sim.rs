@@ -103,6 +103,9 @@ struct Chain {
     receipt_looks: u32,
     /// Look-ups of a request's state, so a test can see the flow watched.
     request_looks: u32,
+    /// The endpoint refuses to simulate a deposit request, for no reason it
+    /// gives (as one that hasn't seen a just-mined approval yet would).
+    refuses_deposit: bool,
 }
 
 type Sim = Rc<RefCell<Chain>>;
@@ -167,6 +170,7 @@ impl World {
             unseen: Vec::new(),
             receipt_looks: 0,
             request_looks: 0,
+            refuses_deposit: false,
         };
         Self {
             sim: Rc::new(RefCell::new(chain)),
@@ -706,6 +710,11 @@ impl Reader for SimReader {
         // The vault refuses a deposit without a statement for its list.
         let sim = self.0.borrow();
         if request.data[..4] == IVault::requestDepositCall::SELECTOR {
+            if sim.refuses_deposit {
+                return Err(TxError::WouldRevert {
+                    reason: Revert::Unknown,
+                });
+            }
             let call = IVault::requestDepositCall::abi_decode(&request.data).unwrap();
             let hash = keccak256(sim.restricted.abi_encode());
             if call.statement.is_empty() && sim.statement_of.get(&call.receiver) != Some(&hash) {
@@ -881,6 +890,71 @@ fn a_first_deposit_signs_the_statement_approves_exactly_the_amount_then_requests
             .iter()
             .all(|sent| sent.chain_id == CHAIN && sent.from == world.account())
     );
+}
+
+#[test]
+fn a_deposit_refused_after_its_approval_was_mined_says_the_approval_stands_and_reuses_it() {
+    let world = World::new();
+    world.with(|chain| chain.refuses_deposit = true);
+    let (result, steps) = deposit(&world, 1_000);
+    let Err(error) = result else {
+        panic!("{result:?}");
+    };
+    assert_eq!(
+        error,
+        TxError::ApprovalStands {
+            amount: amount(1_000),
+            then: Box::new(TxError::WouldRevert {
+                reason: Revert::Unknown
+            }),
+        }
+    );
+    // Only the approval was sent.
+    assert_eq!(world.sent_selectors(), vec![IERC20::approveCall::SELECTOR]);
+    assert!(!prompts(&steps).contains(&Prompt::Deposit {
+        amount: amount(1_000)
+    }));
+    let words = said(&error);
+    assert!(!words.contains("Nothing was sent"), "{words}");
+    assert!(!words.contains("Nothing moved"), "{words}");
+    assert!(words.contains("your approval stands"), "{words}");
+    assert!(
+        words.contains("Your approval of $1,000.00 to the vault went through"),
+        "{words}"
+    );
+    // Sent, but nothing moved: the panel offers to try again.
+    assert!(error.after_send());
+    assert!(!error.may_have_moved());
+
+    // Trying again with the same amount uses the standing approval.
+    world.with(|chain| chain.refuses_deposit = false);
+    let (result, steps) = deposit(&world, 1_000);
+    assert!(
+        matches!(result, Ok(Outcome::Deposited { .. })),
+        "{result:?}"
+    );
+    assert!(
+        !prompts(&steps)
+            .iter()
+            .any(|prompt| matches!(prompt, Prompt::Approve { .. }))
+    );
+}
+
+#[test]
+fn a_deposit_refused_with_no_approval_of_its_own_says_nothing_was_sent() {
+    let world = World::new();
+    let account = world.account();
+    world.with(|chain| {
+        chain.allowance.insert((account, vault()), amount(5_000));
+        chain.refuses_deposit = true;
+    });
+    let (result, _) = deposit(&world, 1_000);
+    let Err(error) = result else {
+        panic!("{result:?}");
+    };
+    assert!(matches!(error, TxError::WouldRevert { .. }), "{error:?}");
+    assert!(said(&error).contains("Nothing was sent"));
+    assert!(world.sent_selectors().is_empty());
 }
 
 #[test]

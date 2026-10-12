@@ -89,7 +89,9 @@ fn auto_fill(strategy: &Strategy) -> View {
     }
 }
 
-/// "Verified build": the one build the chain lets trade this vault.
+/// "Verified build": the one build the chain lets trade this vault, by the
+/// hash the chain holds for it (the bundle's, which the job page names too).
+/// The component's own hash is named apart, where the page checks it.
 pub fn verified_build(agent: &Rc<Agent>) -> El {
     let slug = agent.slug.clone();
     el("section")
@@ -104,7 +106,7 @@ pub fn verified_build(agent: &Rc<Agent>) -> El {
                 .text("Verified build"),
         )
         .child(live(agent, move |strategy| {
-            let build = &strategy.bundle.component_hash;
+            let build = &strategy.bundle.bundle_hash;
             View::Many(vec![
                 el("p")
                     .class("ag-built__text")
@@ -374,7 +376,8 @@ pub fn facts_hashes(strategy: &Strategy) -> Vec<(&'static str, String)> {
     if let Some(review) = &strategy.review {
         rows.push(("Review", review.report_hash.clone()));
     }
-    rows.push(("Build", strategy.bundle.component_hash.clone()));
+    rows.push(("Build", strategy.bundle.bundle_hash.clone()));
+    rows.push(("Component", strategy.bundle.component_hash.clone()));
     if let Some(attestation) = &strategy.attestation {
         rows.push(("Executor image", attestation.image.digest.clone()));
     }

@@ -85,7 +85,7 @@ struct Controls {
     allowance_text: [Mutable<String>; 7],
     tank: Mutable<Option<Running>>,
     autofill: Mutable<Option<Running>>,
-    earnings: Mutable<Option<Running>>,
+    shares_flow: Mutable<Option<Running>>,
     allowances: Mutable<Option<Running>>,
     idle: Mutable<Option<Running>>,
     escape: Mutable<Option<Running>>,
@@ -107,7 +107,7 @@ impl Controls {
             allowance_text: Default::default(),
             tank: Mutable::new(None),
             autofill: Mutable::new(None),
-            earnings: Mutable::new(None),
+            shares_flow: Mutable::new(None),
             allowances: Mutable::new(None),
             idle: Mutable::new(None),
             escape: Mutable::new(None),
@@ -413,7 +413,7 @@ fn manage(slug: &str, read: &Rc<Read>, controls: &Rc<Controls>) -> View {
                 .child(
                     el("div")
                         .class("sh-manage__side")
-                        .child(earnings_card(slug, read, controls, &names))
+                        .child(shares_card(slug, read, controls, &names))
                         .child(floor_card(read, controls, &names))
                         .child(vault)
                         .child(retire_card(read, controls, &names)),
@@ -744,7 +744,14 @@ fn escape_box(read: &Rc<Read>, controls: &Rc<Controls>, names: &Rc<Names>) -> El
         .child(status_slot(&controls.escape, names))
 }
 
-fn earnings_card(slug: &str, read: &Rc<Read>, controls: &Rc<Controls>, names: &Rc<Names>) -> El {
+/// What the shares card says of where the author's shares come from: their
+/// profit fee is paid as new shares, which join any they deposited for.
+const SHARES_NOTE: &str = "Your share of new profit is paid every Monday as new shares, and they join these. Any shares you deposited for count here too: the vault doesn't keep the two apart.";
+
+/// Every share the author holds. The vault keeps no count of which came as
+/// their profit fee and which they bought with a deposit, so neither part is
+/// shown, and none of it is called earnings.
+fn shares_card(slug: &str, read: &Rc<Read>, controls: &Rc<Controls>, names: &Rc<Names>) -> El {
     let decimals = read.network.asset_decimals;
     let shares = read.at.shares;
     let worth = mul_div(shares, read.at.share_price, pow10(18)).unwrap_or_default();
@@ -753,12 +760,12 @@ fn earnings_card(slug: &str, read: &Rc<Read>, controls: &Rc<Controls>, names: &R
     let fill_controls = controls.clone();
     el("section")
         .class("sh-card sh-card--pad sh-manage__card")
-        .attr("aria-labelledby", "m-earnings")
+        .attr("aria-labelledby", "m-own-shares")
         .child(
             el("h2")
-                .attr("id", "m-earnings")
+                .attr("id", "m-own-shares")
                 .class("sh-publish__h2")
-                .text("Earnings"),
+                .text("Your shares"),
         )
         .child(
             el("p")
@@ -774,11 +781,7 @@ fn earnings_card(slug: &str, read: &Rc<Read>, controls: &Rc<Controls>, names: &R
             "Your share",
             parts::words(format!("{pct} of new profit")),
         )))
-        .child(
-            el("p")
-                .class("sh-muted sh-author__small")
-                .text("Paid every Monday as shares, only on new profit."),
-        )
+        .child(el("p").class("sh-muted sh-author__small").text(SHARES_NOTE))
         .child(action_row(
             field(
                 "m-shares",
@@ -795,17 +798,17 @@ fn earnings_card(slug: &str, read: &Rc<Read>, controls: &Rc<Controls>, names: &R
                 {
                     Ok(shares) => start(
                         &fill_read,
-                        &fill_controls.earnings,
+                        &fill_controls.shares_flow,
                         Action::TopUpFromShares {
                             vault: fill_read.vault,
                             shares,
                         },
                     ),
-                    Err(why) => refuse(&fill_controls.earnings, why),
+                    Err(why) => refuse(&fill_controls.shares_flow, why),
                 },
             ),
         ))
-        .child(status_slot(&controls.earnings, names))
+        .child(status_slot(&controls.shares_flow, names))
         .child(
             app_link(format!("/agents/{slug}"))
                 .class("sh-link")
@@ -1124,4 +1127,61 @@ fn retire_card(read: &Rc<Read>, controls: &Rc<Controls>, names: &Rc<Names>) -> V
             .attr("aria-haspopup", "dialog"),
         )
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tx::author::read::{Floor, Tank};
+
+    #[test]
+    fn the_authors_shares_are_never_called_earnings() {
+        let network = Rc::new(Network {
+            chain: Chain::Base,
+            chain_id: 8453,
+            label: "Base".to_string(),
+            rpc: String::new(),
+            asset: Address::repeat_byte(0xdd),
+            asset_symbol: "USDC".to_string(),
+            asset_decimals: 6,
+            dev_account: None,
+        });
+        let read = Rc::new(Read {
+            vault: Address::repeat_byte(0x11),
+            chain: Chain::Base,
+            title: "Funding basis".to_string(),
+            network: network.clone(),
+            at: AuthorVault {
+                state: State::Open,
+                author: Address::repeat_byte(0x7e),
+                tank: Tank::default(),
+                allowances: Allowances::default(),
+                floor: Floor::default(),
+                // Shares bought with a deposit and shares paid as a fee
+                // look the same on the chain.
+                shares: U256::from(29_952_002_564_591_237_459u128),
+                share_price: U256::from(1_000_850u64),
+                cash: U256::ZERO,
+                author_bps: 1_000,
+                escape_delay: 0,
+                usage_freshness: 0,
+                wind_down: 0,
+                ready_to_close: false,
+                now: 0,
+            },
+            daily: None,
+        });
+        let names = Rc::new(Names::of(&network));
+        let html = View::from(shares_card(
+            "base-3",
+            &read,
+            &Rc::new(Controls::new()),
+            &names,
+        ))
+        .html();
+        assert!(html.contains("Your shares"), "{html}");
+        assert!(html.contains("29.9 shares"), "{html}");
+        assert!(html.contains("keep the two apart"), "{html}");
+        assert!(!html.to_lowercase().contains("earning"), "{html}");
+    }
 }

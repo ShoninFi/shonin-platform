@@ -89,8 +89,10 @@ enum Source {
 
 struct Draft {
     picked: Mutable<Option<Picked>>,
-    /// Which of the project's agents, when it holds several.
-    agent: Mutable<usize>,
+    /// Which of the project's agents the author chose, when it holds
+    /// several. None until they choose: nothing is chosen for them, so no
+    /// fee is offered on a chain they didn't pick.
+    agent: Mutable<Option<usize>>,
     source: Mutable<Source>,
     checks: Vec<Mutable<bool>>,
     checks_open: Mutable<bool>,
@@ -116,7 +118,7 @@ impl Draft {
     fn new() -> Rc<Self> {
         Rc::new(Draft {
             picked: Mutable::new(None),
-            agent: Mutable::new(0),
+            agent: Mutable::new(None),
             source: Mutable::new(Source::Public),
             checks: CHECKS.iter().map(|_| Mutable::new(false)).collect(),
             checks_open: Mutable::new(false),
@@ -346,14 +348,17 @@ fn section_mark(n: u8) -> El {
 // 2 · Upload ---------------------------------------------------------------------
 
 /// The agent the author is publishing: the one the project holds, or the
-/// one they chose.
-fn chosen(picked: &Picked, index: usize) -> Option<&archive::Agent> {
+/// one they chose. A project holding several has none until they choose.
+fn chosen(picked: &Picked, index: Option<usize>) -> Option<&archive::Agent> {
     let summary = picked.summary.as_ref().ok()?;
-    summary.agents.get(index).or_else(|| summary.agents.first())
+    match summary.agents.as_slice() {
+        [only] => Some(only),
+        agents => agents.get(index?),
+    }
 }
 
 /// What stops this project being published as it is, in words.
-fn problem(picked: &Picked, index: usize) -> Option<String> {
+fn problem(picked: &Picked, index: Option<usize>) -> Option<String> {
     let summary = picked.summary.as_ref().ok()?;
     let agent = chosen(picked, index)?;
     if summary.agents.len() > 1 && agent.package.is_none() {
@@ -533,7 +538,7 @@ fn dropzone(draft: &Rc<Draft>, refused: Option<(&str, &Refusal)>) -> View {
 }
 
 /// The chosen file and what its `shonin.toml` says, read-only.
-fn read_back(draft: &Rc<Draft>, picked: &Picked, summary: &Summary, index: usize) -> View {
+fn read_back(draft: &Rc<Draft>, picked: &Picked, summary: &Summary, index: Option<usize>) -> View {
     let replace = draft.clone();
     let agent = chosen(picked, index);
     let file = el("div")
@@ -589,7 +594,13 @@ fn read_back(draft: &Rc<Draft>, picked: &Picked, summary: &Summary, index: usize
                     Some(package) => format!("{package} · {title}"),
                     None => format!("{} · {title}", agent.path),
                 };
-                radio("agent", format!("agent-{at}"), label, at, &draft.agent)
+                radio(
+                    "agent",
+                    format!("agent-{at}"),
+                    label,
+                    Some(at),
+                    &draft.agent,
+                )
             }))
             .into()
     } else {
@@ -871,6 +882,13 @@ fn pay_body(
             View::Many(vec![text(format!("{chain_label} from ")), from.into()]),
         ));
     let action: View = match target {
+        None if unchosen(draft) => View::Many(vec![
+            submit_button(FEE).disabled(true).build().into(),
+            el("p")
+                .class("sh-publish__note")
+                .text("Choose which agent you're publishing first: the fee is paid on its vault's chain.")
+                .into(),
+        ]),
         None => submit_button(FEE).disabled(true).build().into(),
         Some((_, None)) => notice(
             NoticeTone::Caution,
@@ -960,6 +978,17 @@ fn pay_body(
             "One transaction on the chain your vault will live on, or two if your wallet hasn't allowed the fee yet. Only a payment from the wallet that uploaded the project starts the job, so the payment is only ever sent from that wallet. You never compute a hash.",
         ))
         .into()
+}
+
+/// A project holding several agents, none of them chosen yet.
+fn unchosen(draft: &Draft) -> bool {
+    draft.agent.get().is_none()
+        && draft
+            .picked
+            .lock_ref()
+            .as_ref()
+            .and_then(|picked| picked.summary.as_ref().ok())
+            .is_some_and(|summary| summary.agents.len() > 1)
 }
 
 fn submit_button(fee: &str) -> Button {
@@ -1221,7 +1250,7 @@ mod browser {
                 return;
             };
             let summary = archive::summarise(&bytes);
-            draft.agent.set(0);
+            draft.agent.set(None);
             draft.sending.set(Sending::Idle);
             draft.running.set(None);
             draft.checked.set(None);
@@ -1501,6 +1530,64 @@ mod tests {
             let source = source.split("#[cfg(test)]").next().unwrap_or_default();
             assert_eq!(dollar_fee(source), None, "{name}");
         }
+    }
+
+    /// A project as the page reads it, holding one agent per vault chain
+    /// named.
+    fn project(chains: &[&str]) -> Picked {
+        let agents = chains
+            .iter()
+            .enumerate()
+            .map(|(at, chain)| archive::Agent {
+                path: format!("agents/{at}/shonin.toml"),
+                package: Some(format!("agent-{at}")),
+                manifest: shared::Manifest::from_toml(&format!(
+                    "[vault]\nchain = \"{chain}\"\n[description]\ntitle = \"Agent {at}\"\ntext = \"t\"\n[drivers.local]\n"
+                )),
+            })
+            .collect();
+        Picked {
+            name: "agent.tar".to_string(),
+            bytes: Rc::new(Vec::new()),
+            summary: Ok(Summary {
+                bytes: 0,
+                files: 0,
+                unpacked: 0,
+                agents,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_project_holding_several_agents_offers_no_payment_until_the_author_chooses_one() {
+        let draft = Draft::new();
+        draft.picked.set(Some(project(&["robinhood", "base"])));
+        assert_eq!(draft.agent.get(), None);
+        assert_eq!(target(&draft), None);
+        let html = pay_body(&draft, None).html();
+        assert!(html.contains("disabled"), "{html}");
+        assert!(html.contains("Choose which agent"), "{html}");
+        assert!(!html.contains("Robinhood"), "{html}");
+        let html = read_back(
+            &draft,
+            &draft.picked.get_cloned().unwrap(),
+            draft.picked.get_cloned().unwrap().summary.as_ref().unwrap(),
+            None,
+        )
+        .html();
+        assert!(!html.contains("checked"), "{html}");
+        // The author's own choice is what's paid for, on its chain.
+        draft.agent.set(Some(1));
+        assert_eq!(target(&draft), Some(Chain::Base));
+        assert!(!unchosen(&draft));
+    }
+
+    #[test]
+    fn a_project_holding_one_agent_needs_no_choice() {
+        let draft = Draft::new();
+        draft.picked.set(Some(project(&["base"])));
+        assert_eq!(target(&draft), Some(Chain::Base));
+        assert!(!unchosen(&draft));
     }
 
     #[test]

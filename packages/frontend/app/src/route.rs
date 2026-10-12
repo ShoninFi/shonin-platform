@@ -416,7 +416,7 @@ impl Route {
             ),
             Self::Manage { slug } if slug.is_empty() => page(
                 "Manage an agent · Shonin".to_string(),
-                "An agent's tank, allowances, idle floor and earnings, for its Author.",
+                "An agent's tank, allowances, idle floor and shares, for its Author.",
             ),
             Self::Manage { slug } => {
                 let name = store::get()
@@ -425,7 +425,7 @@ impl Route {
                     .unwrap_or_else(|| slug.clone());
                 page(
                     format!("Manage {name} · Shonin"),
-                    "An agent's tank, allowances, idle floor and earnings, for its Author.",
+                    "An agent's tank, allowances, idle floor and shares, for its Author.",
                 )
             }
             Self::Status => page(

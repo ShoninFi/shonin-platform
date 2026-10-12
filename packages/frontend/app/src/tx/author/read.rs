@@ -243,7 +243,9 @@ pub struct AuthorVault {
     pub tank: Tank,
     pub allowances: Allowances,
     pub floor: Floor,
-    /// The author's own shares: their earnings, paid as shares.
+    /// Every share the author holds: the profit fee paid to them as new
+    /// shares and any they deposited for. The vault keeps no count of which
+    /// is which.
     pub shares: U256,
     pub share_price: U256,
     pub cash: U256,

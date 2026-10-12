@@ -123,6 +123,14 @@ pub fn get() -> Rc<Session> {
 
 const REMEMBERED: &str = "wallet";
 
+/// Whether this session reads `chain`'s config: an EVM wallet has no use
+/// for the Solana cluster's, so a slow answer for it never holds up
+/// reconnecting a remembered wallet.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn reads_config_of(chain: Chain) -> bool {
+    chain != Chain::Solana
+}
+
 /// Keep the wallet's id (never anything else) for a silent reconnect.
 fn remember(id: &str) {
     #[cfg(target_arch = "wasm32")]
@@ -553,7 +561,7 @@ impl Session {
         self.vaults.set(super::run::directory(&snapshot));
         self.vaults_at.set(js_sys::Date::now());
         for info in snapshot.chains {
-            if self.networks.lock_ref().contains_key(&info.chain) {
+            if !reads_config_of(info.chain) || self.networks.lock_ref().contains_key(&info.chain) {
                 continue;
             }
             if let Ok(config) = fetch::<shared::Config>(&format!("{}/config", info.chain)).await
@@ -921,6 +929,14 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnecting_an_evm_wallet_never_waits_on_the_solana_clusters_config() {
+        assert!(!reads_config_of(Chain::Solana));
+        for chain in [Chain::Base, Chain::Robinhood] {
+            assert!(reads_config_of(chain), "{chain:?}");
+        }
+    }
 
     #[test]
     fn the_first_account_a_wallet_offers_is_the_one_used() {

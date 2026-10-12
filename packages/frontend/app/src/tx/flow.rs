@@ -378,12 +378,17 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
                 }
                 Ok(Pending::Unknown) => {
                     unknown_polls += 1;
-                    // Known once, gone now, and its nonce used by another:
-                    // never while the endpoint has any receipt for it, even
-                    // one whose block isn't sealed yet (a chain confirming
-                    // ahead of its blocks counts it in the nonce already).
+                    // Known once, gone now on two looks running, and its
+                    // nonce used by another: never while the endpoint has
+                    // any receipt for it, even one whose block isn't sealed
+                    // yet (a chain confirming ahead of its blocks counts it
+                    // in the nonce already), asked twice, since a pool of
+                    // nodes can answer one read from a node that hasn't had
+                    // it yet.
                     if let Some(nonce) = known
+                        && unknown_polls >= 2
                         && matches!(self.reader.mined_nonce(self.account).await, Ok(mined) if mined > nonce)
+                        && matches!(self.reader.receipt_seen(hash).await, Ok(false))
                         && matches!(self.reader.receipt_seen(hash).await, Ok(false))
                     {
                         return Err(TxError::Replaced { hash });
@@ -511,7 +516,8 @@ pub async fn deposit<R: Reader, S: Signer, C: Clock>(
 
     // Exactly the amount, and only if needed.
     let allowed = read::allowance(ctx.reader, ctx.asset, ctx.account, ctx.vault).await?;
-    if allowed < amount {
+    let approving = allowed < amount;
+    if approving {
         ctx.transact(
             Prompt::Approve { amount },
             ctx.asset,
@@ -535,7 +541,23 @@ pub async fn deposit<R: Reader, S: Signer, C: Clock>(
             }
             .abi_encode(),
         )
-        .await?;
+        .await
+        .map_err(|then| {
+            // The approval was mined and the deposit stopped before it was
+            // sent: the approval stands, and depositing again uses it. Not
+            // said when the wallet left the account that approved: the
+            // approval is that account's, and the one now connected would
+            // be asked for its own.
+            let left = matches!(then, TxError::AccountChanged | TxError::NotConnected);
+            if approving && !then.may_have_moved() && !left {
+                TxError::ApprovalStands {
+                    amount,
+                    then: Box::new(then),
+                }
+            } else {
+                then
+            }
+        })?;
     follow(ctx, &receipt, RequestKind::Deposit, amount, &figures.timers).await
 }
 

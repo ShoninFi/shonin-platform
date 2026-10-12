@@ -1188,6 +1188,35 @@ mod tests {
     }
 
     #[test]
+    fn what_the_page_calls_the_build_is_the_hash_the_chain_holds_and_the_component_is_named_apart()
+    {
+        let agent = agent("base-1");
+        let bundle = agent.strategy.lock_ref().bundle.clone();
+        assert_ne!(bundle.bundle_hash, bundle.component_hash);
+        let short = |hash: &str| crate::format::short_hash(hash);
+        let html = tab_html("base-1", AgentTab::Overview);
+        let card = &html[html.find("ag-o-build").expect("the build card is drawn")..];
+        let card = &card[..card.find("</section>").unwrap()];
+        assert!(card.contains(&short(&bundle.bundle_hash)), "{card}");
+        assert!(!card.contains(&short(&bundle.component_hash)), "{card}");
+        let rows = side::facts_hashes(&agent.strategy.lock_ref());
+        assert!(rows.contains(&("Build", bundle.bundle_hash.clone())));
+        assert!(rows.contains(&("Component", bundle.component_hash.clone())));
+        let html = tab_html("base-1", AgentTab::Verify);
+        let on_chain = &html[html
+            .find("Build on chain")
+            .expect("the build on chain is named")..];
+        assert!(on_chain[..400.min(on_chain.len())].contains(&short(&bundle.bundle_hash)));
+        assert!(
+            !html.contains("The chain holds"),
+            "the chain holds the build, not the component"
+        );
+        assert!(
+            html.contains("The build&#39;s component") || html.contains("The build's component")
+        );
+    }
+
+    #[test]
     fn the_verify_tab_checks_the_source_and_build_with_real_commands() {
         let agent = agent("base-1");
         let bundle = agent.strategy.lock_ref().bundle.clone();
