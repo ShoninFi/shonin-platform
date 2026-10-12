@@ -130,6 +130,35 @@ lighters = { version = "0.1.1", default-features = false }
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-rustls", "copy-dylibs"] }
 ed25519-dalek = "3.0.0"
 bs58 = "0.5.1"
+# Account data and transactions travel in base64 between the web app and a
+# Solana node.
+base64 = "0.22.1"
+# Solana instructions built on every target, the browser's included: the
+# pieces of the Solana SDK an instruction and a transaction are made of
+# (`curve25519` derives program addresses off-chain), and Borsh for the
+# programs' arguments. Versions as the programs' own crates resolve them.
+solana-pubkey = { version = "2.4.0", features = ["curve25519"] }
+solana-instruction = "2.3.3"
+borsh = { version = "1.8.1", features = ["derive"] }
+# Decides a Solana program's address at build time, as the programs do.
+shonin-program-id = { path = "contracts/solana/crates/shonin-program-id" }
+# What those builders are checked against in `chain`'s tests: the programs'
+# own crates, built for the host without their entry points, and the Solana
+# SDK's own builders.
+anchor-lang = "0.32.1"
+anchor-spl = { version = "0.32.1", default-features = false, features = ["token", "associated_token"] }
+shonin-registry = { path = "contracts/solana/programs/shonin-registry", features = ["no-entrypoint"] }
+shonin-publishing = { path = "contracts/solana/programs/shonin-publishing", features = ["no-entrypoint"] }
+shonin-prices = { path = "contracts/solana/programs/shonin-prices", features = ["no-entrypoint"] }
+shonin-station = { path = "contracts/solana/programs/shonin-station", features = ["no-entrypoint"] }
+shonin-vault = { path = "contracts/solana/programs/shonin-vault", features = ["no-entrypoint"] }
+shonin-local-venue = { path = "contracts/solana/programs/shonin-local-venue", features = ["no-entrypoint"] }
+shonin-local-driver = { path = "contracts/solana/programs/shonin-local-driver", features = ["no-entrypoint"] }
+solana-transaction = { version = "2.2", features = ["bincode"] }
+solana-compute-budget-interface = { version = "2.2", features = ["borsh"] }
+solana-ed25519-program = "2.2"
+shonin-common = { path = "contracts/solana/crates/shonin-common" }
+bincode = "1.3"
 
 # Frontend (wasm32-unknown-unknown via Trunk).
 # The wasm-bindgen family is pinned EXACTLY: Trunk downloads the wasm-bindgen CLI
