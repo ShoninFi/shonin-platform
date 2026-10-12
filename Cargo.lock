@@ -7143,10 +7143,9 @@ dependencies = [
 name = "shonin-app"
 version = "0.1.0"
 dependencies = [
- "alloy-primitives",
- "alloy-sol-types",
  "console_error_panic_hook",
  "dominator",
+ "futures",
  "futures-signals",
  "gloo-net",
  "gloo-timers",
@@ -7154,9 +7153,11 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "shonin-chain",
+ "sha2 0.11.0",
  "shonin-shared",
+ "shonin-ui",
  "time",
+ "toml 1.1.6+spec-1.1.0",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

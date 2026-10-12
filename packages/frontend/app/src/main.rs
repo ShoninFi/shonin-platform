@@ -1,124 +1,83 @@
-//! The Shonin web app. Routes, data and copy live in the library, shared with
-//! the build-time pre-render (`src/bin/seo.rs`).
+//! The Shonin web app, in the browser.
 
-use app::{
-    api, data, pages,
-    route::Route,
-    state,
-    ui::{overlay, shell},
-};
-use dominator::{Dom, html, routing};
-use futures_signals::map_ref;
+use app::atoms::{dialog, toast};
+use app::route::Route;
+use app::{api, clock, components, shell, web};
 use futures_signals::signal::SignalExt;
 
 fn main() {
     console_error_panic_hook::set_once();
 
-    // The build writes each route's content into #prerender, so the page has
-    // real content before any of this runs. The app renders the same data,
-    // so replace it rather than leaving two copies.
-    if let Some(prerender) = document().get_element_by_id("prerender") {
+    // The build wrote each route's page into #prerender, so there was real
+    // content before any of this ran. The app draws the same page, live.
+    let document = web::document().expect("running in a browser");
+    if let Some(prerender) = document.get_element_by_id("prerender") {
         prerender.remove();
     }
 
-    state::apply_theme(state::get().theme.get());
-    // Everything on the screen comes from here, and keeps coming: the app
-    // asks the platform for a newer snapshot every couple of seconds and
-    // re-renders when it gets one.
+    clock::start();
     api::follow();
-    dominator::append_dom(&dominator::body(), app());
-}
 
-fn app() -> Dom {
-    let address = routing::url().signal_cloned();
-    let snapshots = data::changes();
-    let reaching_it = data::loading();
-
-    // The page is rendered again when the viewer navigates, when a newer
-    // snapshot arrives, or when the app's view of the platform changes.
-    let pages = map_ref! {
-        let url = address,
-        let version = snapshots,
-        let loading = reaching_it => (url.clone(), loading.clone(), *version)
-    }
-    .map(|(url, loading, _version)| {
-        let route = Route::from_path(&path_of(&url));
-        let page = route.page();
-        document().set_title(&page.title);
-        scroll_to_top_of(&url);
-        vec![
-            shell::skip_link(),
-            shell::masthead(&route),
-            html!("main", {
-                .class("app__main")
-                .attr("id", "main")
-                .child(html!("div", {
-                    .class(["page", "stack-lg"])
-                    .child(match (&loading, data::current().is_some()) {
-                        // Nothing has arrived yet, so there is nothing honest
-                        // to render.
-                        (data::Loading::Waiting, false) => reaching(),
-                        (data::Loading::Failed(why), false) => unreachable(why),
-                        _ => pages::render(&route),
-                    })
-                }))
-            }),
-            shell::colophon(),
-            overlay::toast_host(&state::get().toasts),
-        ]
-    })
-    .to_signal_vec();
-
-    html!("div", {
-        .class("app")
-        .children_signal_vec(pages)
-    })
-}
-
-/// Before the first snapshot lands.
-fn reaching() -> Dom {
-    app::ui::primitives::empty("Reading the chain…")
-}
-
-/// When the platform cannot be reached at all. The app says what it tried,
-/// because a page that is simply blank tells a reader nothing.
-fn unreachable(why: &str) -> Dom {
-    app::ui::primitives::notice(
-        app::ui::primitives::Tone::Warn,
-        "The platform is not answering",
-        &format!(
-            "{why}. Nothing on this page would be true, so none of it is shown. It appears as \
-             soon as the platform answers."
-        ),
-    )
-}
-
-/// Following a link should start at the top of the new page, the way loading
-/// one does. A newer snapshot redraws the same page where the reader is.
-fn scroll_to_top_of(url: &str) {
-    thread_local! {
-        static SHOWN: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
-    }
-    let moved = SHOWN.with(|shown| {
-        let moved = *shown.borrow() != url;
-        if moved {
-            *shown.borrow_mut() = url.to_string();
+    let strip_dismissed = components::strip::dismissed();
+    let first = std::cell::Cell::new(true);
+    let pages = dominator::routing::url().signal_cloned().map(move |url| {
+        let (path, query) = path_and_query(&url);
+        let mut route = Route::from_url(&path, &query);
+        if route == Route::Home {
+            // The root is the leaderboard; say so in the address bar too.
+            if let Some(history) = web::window().and_then(|window| window.history().ok()) {
+                let _ = history.replace_state_with_url(
+                    &wasm_bindgen::JsValue::NULL,
+                    "",
+                    Some("/agents"),
+                );
+            }
+            route = Route::Agents { author: None };
         }
-        moved
+        if let Some(document) = web::document() {
+            document.set_title(&route.page().title);
+        }
+        if dialog::is_open() {
+            dialog::close();
+        }
+        // Following a link starts at the top of the new page, with focus on
+        // its content; the first page leaves focus where the browser puts it.
+        if !first.replace(false) {
+            if let Some(window) = web::window() {
+                window.scroll_to_with_x_and_y(0.0, 0.0);
+            }
+            focus_content();
+        }
+        Some(shell::shell(&route, strip_dismissed).into_dom())
     });
-    if moved && let Some(window) = web_sys::window() {
-        window.scroll_to_with_x_and_y(0.0, 0.0);
-    }
+
+    let body = dominator::body();
+    dominator::append_dom(
+        &body,
+        dominator::html!("div", {
+            .class("sh-contents")
+            .child_signal(pages)
+        }),
+    );
+    dominator::append_dom(&body, dialog::layer().into_dom());
+    dominator::append_dom(&body, toast::region().into_dom());
 }
 
-fn path_of(url: &str) -> String {
+fn focus_content() {
+    wasm_bindgen_futures::spawn_local(async {
+        // After the new page is in place.
+        gloo_timers::future::TimeoutFuture::new(0).await;
+        if let Some(main) = web::document()
+            .and_then(|document| document.get_element_by_id("content"))
+            .and_then(|main| wasm_bindgen::JsCast::dyn_into::<web_sys::HtmlElement>(main).ok())
+        {
+            web::focus(&main);
+        }
+    });
+}
+
+fn path_and_query(url: &str) -> (String, String) {
     web_sys::Url::new(url)
-        .map(|url| url.pathname())
+        .map(|url| (url.pathname(), url.search()))
         .unwrap_or_default()
-}
-
-fn document() -> web_sys::Document {
-    web_sys::window()
-        .and_then(|window| window.document())
-        .expect("running in a browser")
 }

@@ -20,25 +20,31 @@ includes:
 
 tasks:
   tokens:
-    desc: "Write the design tokens as CSS (packages/frontend/ui/dist/tokens.css)"
+    desc: "Write the design system for both sites: tokens, fonts, the sh-* stylesheets and the logos (packages/frontend/ui/dist)"
     sources:
       - "{{.PATH_PACKAGE_UI}}/tokens.json"
       - "{{.PATH_PACKAGE_UI}}/src/**/*.rs"
+      - "{{.PATH_PACKAGE_UI}}/styles/*.css"
+      - "{{.PATH_PACKAGE_UI}}/fonts/*"
+      - "{{.PATH_PACKAGE_UI}}/logos/*.svg"
     generates:
       - "{{.PATH_TOKENS_CSS}}"
+      - "{{.PATH_PACKAGE_UI}}/dist/fonts.css"
+      - "{{.PATH_PACKAGE_UI}}/dist/sh.css"
     cmds:
-      - cargo run -q -p shonin-ui --bin tokens -- --out "{{.PATH_TOKENS_CSS}}"
+      - cargo run -q -p shonin-ui --bin tokens -- --out "{{.PATH_PACKAGE_UI}}/dist"
 
   # The app ------------------------------------------------------------------
 
   app:dev:
-    desc: "The app: Trunk dev server with live reload, proxying /api to the local API (API=<url> to proxy another, e.g. the testnet API)"
+    desc: "The app: Trunk dev server with live reload and the dev-only pages (/_atoms), proxying /api to the local API (API=<url> to proxy another, e.g. the testnet API)"
     deps: [tokens]
     cmds:
       - >-
         cd "{{.PATH_PACKAGE_APP}}" && NO_COLOR=true trunk serve
         --port {{.PORT_APP_DEV}}
         --dist "{{.PATH_DIST_APP_DEV}}"
+        --features dev
         --proxy-backend "{{.API | default .URL_API_DEV}}/api/"
         --watch "{{.PATH_ROOT_CARGO_TOML}}"
         --watch "{{.PATH_PACKAGE_SHARED}}"
@@ -61,8 +67,41 @@ tasks:
       - cd "{{.PATH_PACKAGE_APP}}" && NO_COLOR=true trunk clean --dist "{{.PATH_DIST_APP}}"
       - cd "{{.PATH_PACKAGE_APP}}" && NO_COLOR=true trunk build --release --dist "{{.PATH_DIST_APP}}"
       # Per-route HTML (with 404.html), sitemap.xml and robots.txt, from src/route.rs.
-      # Pass API=<url> to pre-render the pages that need data from a running API.
-      - cargo run -q -p shonin-app --bin seo -- --dist "{{.PATH_DIST_APP}}" --base-url "{{.URL_APP_PROD}}" {{.SEO_API_ARG}}
+      # Pass API=<url> to pre-render the pages that need data from another API.
+      # It also moves Trunk's inline loader into a file and writes _headers'
+      # Content-Security-Policy, naming the compiled-in API origin and the
+      # public RPC origins from config/chains.toml.
+      - >-
+        cargo run -q -p shonin-app --bin seo --
+        --dist "{{.PATH_DIST_APP}}"
+        --base-url "{{.URL_APP_PROD}}"
+        --app-api "{{.URL_API_TESTNET}}/api"
+        --chains "{{.PATH_CHAINS}}"
+        {{.SEO_API_ARG}}
+      # The development wallet's phrase must never reach a release build:
+      # refuse a dist that carries it whole, or any two of its words in a row.
+      # Binary-safe, so the wasm is read too. Prints only pass or fail, never
+      # a word.
+      - cmd: |
+          phrase="${SHONIN_DEV_WALLET_MNEMONIC:-}"
+          if [ -z "$phrase" ] && [ -f "{{.PATH_ROOT}}/.env" ]; then
+            phrase="$(grep -E '^SHONIN_DEV_WALLET_MNEMONIC=' "{{.PATH_ROOT}}/.env" | head -n 1 | cut -d= -f2- | tr -d "\"'")"
+          fi
+          found=0
+          if [ -n "$phrase" ]; then
+            if grep -r -a -F -q -- "$phrase" "{{.PATH_DIST_APP}}"; then found=1; fi
+            previous=""
+            for word in $phrase; do
+              if [ -n "$previous" ] && grep -r -a -F -q -- "$previous $word" "{{.PATH_DIST_APP}}"; then found=1; fi
+              previous="$word"
+            done
+          fi
+          if [ "$found" -ne 0 ]; then
+            echo "app dist phrase check: FAIL"
+            exit 1
+          fi
+          echo "app dist phrase check: pass"
+        silent: true
 
   app:deploy:
     desc: "Build the app and deploy it as shonin-app, at app.shonin.fi"

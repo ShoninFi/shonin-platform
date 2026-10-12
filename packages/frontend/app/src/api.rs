@@ -1,152 +1,142 @@
 //! Talking to the platform's API.
 //!
-//! The app asks for a snapshot, renders it, and asks again. It never holds a
-//! second copy of anything. Chain figures carry their observation dates and
-//! follow the indexer's configured active or idle cadence; authenticated executor
-//! reports update independently.
-
-#[cfg(target_arch = "wasm32")]
-use crate::data;
+//! The app asks for a snapshot every 5 seconds while the tab is visible,
+//! pauses while it is hidden, and backs off when the API doesn't answer. Each
+//! snapshot is diffed into the store ([`crate::store`]), so only what changed
+//! is redrawn. The build-time pre-render reads one snapshot the same way,
+//! natively.
 
 /// Where the API answers. A release build names the API's own address (the
 /// build task sets `SHONIN_APP_API` from the public config); the dev server
-/// proxies the relative path to the local API.
+/// proxies the relative path to the API it was started with.
 pub const BASE: &str = match option_env!("SHONIN_APP_API") {
     Some(base) => base,
     None => "/api",
 };
 
-/// How often to ask whether anything has changed.
-#[cfg(target_arch = "wasm32")]
-const EVERY_MILLIS: u32 = 2_000;
+/// How often to ask for a newer snapshot while the page is visible.
+pub const EVERY_MILLIS: u32 = 5_000;
+/// The longest wait between asks while the API isn't answering.
+pub const MAX_BACKOFF_MILLIS: u32 = 60_000;
 
-/// Keep fetching snapshots, and fetch each vault chain's configuration the
-/// first time the snapshot lists it.
-#[cfg(target_arch = "wasm32")]
-pub fn follow() {
-    wasm_bindgen_futures::spawn_local(async {
-        let mut resumed = false;
-        loop {
-            match fetch::<shared::Snapshot>("snapshot").await {
-                Ok(snapshot) => {
-                    for info in &snapshot.chains {
-                        if data::config(info.chain).is_none() {
-                            match fetch::<shared::Config>(&format!("{}/config", info.chain)).await {
-                                Ok(config) => data::set_config(config),
-                                Err(why) => data::set_failed(why),
-                            }
-                        }
-                    }
-                    // Only a newer snapshot is worth re-rendering for.
-                    let held = data::current().map(|dataset| dataset.version).unwrap_or(0);
-                    if snapshot.version != held {
-                        data::set(snapshot);
-                    }
-                    // Following a link should not disconnect anyone.
-                    if !resumed {
-                        resumed = true;
-                        crate::wallet::resume().await;
-                    }
-                }
-                Err(why) => data::set_failed(why),
-            }
-            gloo_timers::future::TimeoutFuture::new(EVERY_MILLIS).await;
-        }
-    });
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn fetch<T: serde::de::DeserializeOwned>(what: &str) -> Result<T, String> {
-    let reply = gloo_net::http::Request::get(&format!("{BASE}/{what}"))
-        .send()
-        .await
-        .map_err(|error| format!("the API did not answer: {error}"))?;
-    if !reply.ok() {
-        return Err(format!("the API answered {}", reply.status()));
+/// How long to wait before the next ask, after `failures` failed asks in a
+/// row: 5 s, then 10, 20, 40, and never more than a minute.
+pub fn next_delay(failures: u32) -> u32 {
+    if failures == 0 {
+        return EVERY_MILLIS;
     }
-    reply
-        .json()
-        .await
-        .map_err(|error| format!("the API said something unexpected: {error}"))
+    EVERY_MILLIS
+        .saturating_mul(1u32 << failures.min(8))
+        .min(MAX_BACKOFF_MILLIS)
 }
 
-/// A vault's running usage total, as its executor signed it.
-#[derive(Clone, Debug, serde::Deserialize)]
-pub struct UsageTotal {
-    pub total: String,
-    pub as_of: u64,
-    pub signature: String,
+/// The origin (scheme, host and port) of an absolute URL, or `None` for a
+/// relative one.
+pub fn origin(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let host = rest.split(['/', '?', '#']).next()?;
+    (!host.is_empty()).then(|| format!("{scheme}://{host}"))
 }
 
-/// The executor's latest signed total for a vault: what an author settles
-/// before taking money out of the tank.
 #[cfg(target_arch = "wasm32")]
-pub async fn usage(chain: shared::Chain, vault: &str) -> Result<UsageTotal, String> {
-    let reply = gloo_net::http::Request::get(&format!("{BASE}/{chain}/usage/{vault}"))
-        .send()
-        .await
-        .map_err(|error| format!("the API did not answer: {error}"))?;
-    if !reply.ok() {
-        return Err(no_usage_total(reply.status()));
-    }
-    reply
-        .json()
-        .await
-        .map_err(|error| format!("the API said something unexpected: {error}"))
-}
+pub use browser::follow;
 
-/// Why there is no signed total to settle with, from the API's status: the
-/// executor serves none for the vault, or it can't be reached just now.
-pub fn no_usage_total(status: u16) -> String {
-    match status {
-        404 => "the executor has no total for this vault yet".to_string(),
-        502..=504 => "the executor is unavailable just now; try again in a minute".to_string(),
-        other => format!("the API answered {other}"),
-    }
-}
-
-/// What one address holds on one vault chain, read when a page needs it.
-#[cfg(target_arch = "wasm32")]
-pub async fn portfolio(chain: shared::Chain, address: &str) -> Result<shared::Portfolio, String> {
-    fetch(&format!("{chain}/portfolio/{address}")).await
-}
-
-/// Upload an agent's source to the build service, for a vault on this chain.
-#[cfg(target_arch = "wasm32")]
-pub async fn upload(
-    chain: shared::Chain,
-    upload: &shared::Upload,
-) -> Result<shared::UploadAccepted, String> {
-    let reply = gloo_net::http::Request::post(&format!("{BASE}/{chain}/uploads"))
-        .json(upload)
-        .map_err(|error| error.to_string())?
-        .send()
-        .await
-        .map_err(|error| format!("the API did not answer: {error}"))?;
-    if !reply.ok() {
-        let said: shared::ApiError = reply.json().await.unwrap_or(shared::ApiError {
-            message: "the build service refused it".to_string(),
-        });
-        return Err(said.message);
-    }
-    reply.json().await.map_err(|error| error.to_string())
-}
-
-/// Nothing to follow without a browser: the pre-render reads one snapshot and
-/// writes its pages from that.
+/// Nothing to follow without a browser: the pre-render reads one snapshot.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn follow() {}
 
-/// The pre-render is a native tool, and the browser has its own way to fetch,
-/// so these are only ever called from the one that has it.
 #[cfg(target_arch = "wasm32")]
-pub fn fetch_snapshot(_api: &str) -> Result<shared::Snapshot, String> {
-    Err("the pre-render runs natively".to_string())
-}
+mod browser {
+    use std::collections::BTreeSet;
 
-#[cfg(target_arch = "wasm32")]
-pub fn fetch_config(_api: &str, _chain: shared::Chain) -> Result<shared::Config, String> {
-    Err("the pre-render runs natively".to_string())
+    use futures_signals::signal::{Mutable, SignalExt};
+    use gloo_timers::future::TimeoutFuture;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen::closure::Closure;
+
+    use super::{BASE, next_delay};
+    use crate::store;
+
+    /// Keep the store up to date for as long as the page is open.
+    pub fn follow() {
+        let visible = Mutable::new(is_visible());
+        watch_visibility(visible.clone());
+        let store = store::get();
+        store.sync.started.set(js_sys::Date::now());
+
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut failures = 0u32;
+            let mut configured = BTreeSet::new();
+            loop {
+                // Nothing is fetched while nobody can see the page.
+                visible.signal().wait_for(true).await;
+                match fetch::<shared::Snapshot>("snapshot").await {
+                    Ok(snapshot) => {
+                        failures = 0;
+                        store.apply(&snapshot);
+                        store.sync.last_ok.set(Some(js_sys::Date::now()));
+                        store.sync.failing.set_neq(false);
+                        store.sync.error.set_neq(None);
+                        for info in &snapshot.chains {
+                            if configured.insert(info.chain) {
+                                let store = store.clone();
+                                let chain = info.chain;
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    if let Ok(config) =
+                                        fetch::<shared::Config>(&format!("{chain}/config")).await
+                                    {
+                                        store.apply_config(&config);
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    Err(why) => {
+                        failures = failures.saturating_add(1);
+                        store.sync.failing.set_neq(true);
+                        store.sync.error.set_neq(Some(why));
+                    }
+                }
+                TimeoutFuture::new(next_delay(failures)).await;
+            }
+        });
+    }
+
+    fn document() -> Option<web_sys::Document> {
+        web_sys::window()?.document()
+    }
+
+    fn is_visible() -> bool {
+        document()
+            .is_none_or(|document| document.visibility_state() == web_sys::VisibilityState::Visible)
+    }
+
+    fn watch_visibility(visible: Mutable<bool>) {
+        let Some(document) = document() else {
+            return;
+        };
+        let listener = Closure::<dyn FnMut()>::new(move || visible.set_neq(is_visible()));
+        let _ = document.add_event_listener_with_callback(
+            "visibilitychange",
+            listener.as_ref().unchecked_ref(),
+        );
+        // The page listens for as long as it is open.
+        listener.forget();
+    }
+
+    async fn fetch<T: serde::de::DeserializeOwned>(what: &str) -> Result<T, String> {
+        let reply = gloo_net::http::Request::get(&format!("{BASE}/{what}"))
+            .send()
+            .await
+            .map_err(|error| format!("the API did not answer: {error}"))?;
+        if !reply.ok() {
+            return Err(format!("the API answered {}", reply.status()));
+        }
+        reply
+            .json()
+            .await
+            .map_err(|error| format!("the API said something unexpected: {error}"))
+    }
 }
 
 /// Read a snapshot without a browser, for the build-time pre-render.
@@ -155,9 +145,7 @@ pub fn fetch_snapshot(api: &str) -> Result<shared::Snapshot, String> {
     blocking(api, "snapshot")
 }
 
-/// The platform's own terms, for the same pre-render: a written page states
-/// the fees and the bands the chain is running under, not the ones this app
-/// was built with.
+/// A chain's configuration, for the same pre-render.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn fetch_config(api: &str, chain: shared::Chain) -> Result<shared::Config, String> {
     blocking(api, &format!("{chain}/config"))
@@ -181,11 +169,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_executor_that_is_unavailable_is_not_said_to_have_no_total() {
-        for status in [502, 503] {
-            let said = no_usage_total(status);
-            assert!(said.contains("unavailable"), "{status}: {said}");
-        }
-        assert!(no_usage_total(404).contains("no total"));
+    fn asking_backs_off_while_the_api_is_down_and_never_waits_more_than_a_minute() {
+        assert_eq!(next_delay(0), 5_000);
+        assert_eq!(next_delay(1), 10_000);
+        assert_eq!(next_delay(2), 20_000);
+        assert_eq!(next_delay(3), 40_000);
+        assert_eq!(next_delay(4), 60_000);
+        assert_eq!(next_delay(40), 60_000);
+    }
+
+    #[test]
+    fn an_origin_is_the_scheme_and_host_only() {
+        assert_eq!(
+            origin("https://testnet-api.shonin.fi/api").as_deref(),
+            Some("https://testnet-api.shonin.fi")
+        );
+        assert_eq!(
+            origin("http://localhost:19201/api/").as_deref(),
+            Some("http://localhost:19201")
+        );
+        assert_eq!(origin("/api"), None);
     }
 }
