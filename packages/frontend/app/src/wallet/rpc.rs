@@ -154,6 +154,21 @@ pub fn parse_log(value: &Value) -> Result<Log, TxError> {
     })
 }
 
+/// Whether a receipt's block is sealed: only a block hash of all zeros (a
+/// receipt handed out ahead of its block) says it isn't; a node that leaves
+/// the field out is taken at its block number.
+fn sealed(receipt: &Value) -> bool {
+    match receipt.get("blockHash").and_then(Value::as_str) {
+        Some(hash) => !hash.trim_start_matches("0x").chars().all(|c| c == '0'),
+        None => true,
+    }
+}
+
+/// Whether a receipt answer is a receipt at all, sealed or not.
+pub fn receipt_exists(value: &Value) -> bool {
+    !value.is_null() && !value.get("blockNumber").is_none_or(Value::is_null)
+}
+
 /// A receipt, or `None` while it isn't mined.
 pub fn parse_receipt(value: &Value) -> Result<Option<Receipt>, TxError> {
     if value.is_null() {
@@ -167,12 +182,8 @@ pub fn parse_receipt(value: &Value) -> Result<Option<Receipt>, TxError> {
     if value.get("blockNumber").is_none_or(Value::is_null) {
         return Ok(None);
     }
-    match value.get("blockHash").and_then(Value::as_str) {
-        None => return Ok(None),
-        Some(hash) if hash.trim_start_matches("0x").chars().all(|c| c == '0') => {
-            return Ok(None);
-        }
-        Some(_) => {}
+    if !sealed(value) {
+        return Ok(None);
     }
     let logs = value
         .get("logs")
@@ -302,6 +313,14 @@ impl<T: Transport> Reader for RpcReader<T> {
                 .ask("eth_getTransactionReceipt", json!([format!("{hash:?}")]))
                 .await?,
         )
+    }
+
+    async fn receipt_seen(&self, hash: B256) -> Result<bool, TxError> {
+        Ok(receipt_exists(
+            &self
+                .ask("eth_getTransactionReceipt", json!([format!("{hash:?}")]))
+                .await?,
+        ))
     }
 
     async fn pending(&self, hash: B256) -> Result<Pending, TxError> {
@@ -527,13 +546,16 @@ mod tests {
             "logs": [],
         });
         assert_eq!(parse_receipt(&preconfirmed).unwrap(), None);
+        assert!(receipt_exists(&preconfirmed));
+        // A node that leaves the hash out is taken at its block number.
         let no_hash = json!({
             "transactionHash": format!("0x{}", "11".repeat(32)),
             "status": "0x1",
             "blockNumber": "0x2a",
             "logs": [],
         });
-        assert_eq!(parse_receipt(&no_hash).unwrap(), None);
+        assert_eq!(parse_receipt(&no_hash).unwrap().unwrap().block, 42);
+        assert!(!receipt_exists(&Value::Null));
     }
 
     #[test]
