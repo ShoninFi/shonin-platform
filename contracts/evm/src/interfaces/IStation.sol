@@ -103,9 +103,12 @@ interface IStation {
     /// the venue; or, a delivery window on, asked for again.
     event CloseSwept(uint256 fraction, uint256 fetched, uint256 asked);
     /// A staged close nothing could be measured for by the end of its
-    /// window (no reading of the venue after it), or one a stopped
-    /// station's full unwind took the place of: whatever it sold stays at
-    /// the station, everyone's.
+    /// window (no reading of the venue after it, or a position the venue
+    /// changed by more than her orders could have), one measured below what
+    /// her orders could have fetched at their limits, one not proved by its
+    /// deadline, or one a stopped station's full unwind took the place of:
+    /// nothing is paid from it, and whatever it sold stays at the station,
+    /// everyone's.
     event CloseLapsed(uint256 fraction);
     event CloseDelivered(uint256 fraction, uint256 amount);
     /// How a staged close ended: `part` of it delivered (1e18 is all), and

@@ -126,7 +126,11 @@ interface IDelayedDriver {
     /// now, on the same side; the smallest of those, and 1e18 where nothing
     /// needed ordering. `known` is false while the driver can't yet tell
     /// from what the venue did after `since` (the stage plus its settle
-    /// delay): a reading made before then says nothing about the close.
+    /// delay): a reading made before then says nothing about the close. It
+    /// is false too where a position is smaller than the close's own order
+    /// could have made it, has crossed to the other side, or, where it was
+    /// ordered, is larger: the venue changed it some other way (a forced
+    /// reduction), and nothing read there says which part was hers.
     function closedPart(
         address station,
         int256[] calldata before,
@@ -146,16 +150,15 @@ interface IDelayedDriver {
     /// account as it was, every order filled at its limit (the venue's own
     /// price at the stage, less or plus the band) and paying the venue's
     /// taker fee at most, never below what the orders could lose at their
-    /// limits at the prices now. It reads the stage's prices only: from the
-    /// stage until the proof the attested executor trades nothing at the
-    /// venue, so a position smaller since is her fill, never worse than its
-    /// limit, and a measure below the least is a loss her orders could not
-    /// have made (funding, an order resting before the stage that filled
-    /// before it was cancelled), which is the stayers' as much as the
-    /// leaver's. A price that moved after her orders filled changes neither
-    /// figure. The station adds what reached it from the venue meanwhile to
-    /// the measures, and takes the larger of that and the sum of the
-    /// leasts.
+    /// limits at the prices now. It reads the stage's prices only: her own
+    /// orders never fill worse than their limits, so a measure below the
+    /// least is a loss her orders could not have made (a reduction the
+    /// venue forced, funding, an order resting before the stage that filled
+    /// before it was cancelled), which is the whole pool's. A price that
+    /// moved after her orders filled changes neither figure. The station
+    /// adds what reached it from the venue meanwhile to the measures; where
+    /// that is below the sum of the leasts, it lapses the stage, paying and
+    /// charging nothing.
     function measure(
         address station,
         int256 dollars,

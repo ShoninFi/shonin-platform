@@ -2,29 +2,33 @@
 pragma solidity ^0.8.30;
 
 import {Stage} from "../../src/interfaces/IStation.sol";
+import {ClaimState} from "../../src/interfaces/IVault.sol";
 import {HyperliquidVault} from "./HyperliquidVault.sol";
 
 /// The measure reprices what the account held at the stage, so a market
 /// move on it cancels. From the stage until its proof the attested executor
 /// trades nothing at the venue, but a fill can still reach the account that
 /// isn't hers (an order resting before the stage, filled before the
-/// executor cancelled it), and the account can't tell it from her own. So
-/// each driver's measure is floored at what her close fetched at the least:
-/// her part of the account with every order filled at its limit from the
-/// stage's own prices, less a fill's fee. Such a loss costs her no more than
-/// the band and fee on her own orders, whoever chooses when the close is
-/// proved.
+/// executor cancelled it, or a reduction the venue forces), and the account
+/// can't tell it from her own. A position smaller than her orders could
+/// have made it is not hers to be paid or charged: the stage lapses, the
+/// leaver is paid nothing and charged nothing, and her claim waits for a
+/// later stage. Neither the pool's loss nor its gain on that fill is hers.
 contract ALossTheAccountTakesDuringAStageIsNotTheLeaversAloneTest is HyperliquidVault {
-    function _measured(function() internal between) internal returns (Stage memory) {
+    /// Staged and filled; proved once its window is over, after `between`
+    /// has run. What it was measured at, and her claim's shares at the
+    /// stage.
+    function _measured(function() internal between) internal returns (Stage memory, uint256 claimed) {
         uint256 aliceShares = _fundAndTrade();
         _stockGas();
         _aliceClaims(aliceShares);
         vault.settleClaim(1);
+        claimed = vault.claimAt(1).shares;
         _nextBlock();
         between();
-        skip(hl.SETTLE_DELAY());
+        skip(station.stage().window);
         station.settleClose();
-        return station.stage();
+        return (station.stage(), claimed);
     }
 
     function _nothingButAMove() internal {
@@ -34,38 +38,6 @@ contract ALossTheAccountTakesDuringAStageIsNotTheLeaversAloneTest is Hyperliquid
     function _aFillSellsThenTheMarketRises() internal {
         core.trade(address(station), ETH, -100_000, ETH_PX);
         _spread(ETH_PX * 101 / 100, 10);
-    }
-
-    function test_a_loss_after_the_stage_costs_the_leaver_no_more_than_the_band_on_her_orders() public {
-        uint256 start = vm.snapshotState();
-        Stage memory plain = _measured(_nothingButAMove);
-        vm.revertToState(start);
-        Stage memory traded = _measured(_aFillSellsThenTheMarketRises);
-        emit log_named_decimal_uint("fetched, no trade", plain.fetched, 6);
-        emit log_named_decimal_uint("fetched, a fill's 10 ETH then +1%", traded.fetched, 6);
-        emit log_named_decimal_uint("part, no trade", plain.part, 18);
-        emit log_named_decimal_uint("part, traded", traded.part, 18);
-        // No more of the pool's $270 loss than the band on her own orders,
-        // about $990 here (1% and a fill's fee bound of 0.1% on her 33.3 ETH at the stage's price).
-        assertGe(
-            traded.fetched + 1000e6,
-            plain.fetched,
-            "the leaver paid more than the band and a fill's fee on her orders"
-        );
-    }
-
-    /// The other side: the same trade with a move the account gains on is
-    /// cut off at the estimate, so the leaver never gets it.
-    function test_and_the_matching_gain_is_not_hers() public {
-        uint256 start = vm.snapshotState();
-        Stage memory plain = _measured(_nothingButAMove);
-        vm.revertToState(start);
-        Stage memory gained = _measured(_aFillSellsThenTheMarketFallsBack);
-        emit log_named_decimal_uint("fetched, no trade", plain.fetched, 6);
-        emit log_named_decimal_uint("fetched, a fill's 10 ETH then -1%", gained.fetched, 6);
-        emit log_named_decimal_uint("estimate", gained.estimate, 6);
-        // Shown, not asserted: the gain stops at the estimate.
-        assertLe(gained.fetched, gained.estimate);
     }
 
     function _aFillSellsThenTheMarketFallsBack() internal {
@@ -80,27 +52,37 @@ contract ALossTheAccountTakesDuringAStageIsNotTheLeaversAloneTest is Hyperliquid
         _spread(ETH_PX * 105 / 100, 10);
     }
 
-    function _nothingButABigMove() internal {
-        _spread(ETH_PX * 105 / 100, 10);
+    /// The stage ended with nothing paid or charged, and her claim waits
+    /// whole.
+    function _assertLapsed(uint256 claimed) internal view {
+        assertEq(station.stage().stagedAt, 0, "the stage has ended");
+        assertEq(usd.balanceOf(alice), 0, "nothing paid");
+        assertTrue(vault.claimAt(1).state == ClaimState.Waiting, "her claim waits");
+        assertEq(vault.claimAt(1).shares, claimed, "with all its shares: nothing charged");
+        assertEq(core.queued(), 0, "nothing asked of the venue");
     }
 
-    /// However large the pool's loss on a fill after the stage,
-    /// the leaver bears no more of it than the band on her own orders.
-    function test_a_large_loss_after_the_stage_costs_the_leaver_no_more_than_the_band_on_her_orders()
-        public
-    {
+    function test_a_loss_after_the_stage_on_a_fill_beyond_her_orders_is_not_hers() public {
         uint256 start = vm.snapshotState();
-        Stage memory plain = _measured(_nothingButABigMove);
+        (Stage memory plain,) = _measured(_nothingButAMove);
+        assertEq(plain.part, 1e18, "without the fill, her close is proved whole");
+        assertGt(plain.fetched, 0);
         vm.revertToState(start);
-        Stage memory traded = _measured(_aFillSellsALotThenTheMarketRises);
-        emit log_named_decimal_uint("fetched, no trade", plain.fetched, 6);
-        emit log_named_decimal_uint("fetched, a fill's 100 ETH then +5%", traded.fetched, 6);
-        // The pool lost $13,500; the band and a fill's fee on her orders are about $990 at the
-        // stage's price, and the rise since is not hers to keep or pay.
-        assertGe(
-            traded.fetched + 1000e6,
-            plain.fetched,
-            "the leaver paid more than the band and a fill's fee on her orders"
-        );
+        (, uint256 claimed) = _measured(_aFillSellsThenTheMarketRises);
+        _assertLapsed(claimed);
+    }
+
+    /// The other side: the same fill with a move the account gains on is
+    /// not hers either.
+    function test_and_the_matching_gain_is_not_hers() public {
+        (, uint256 claimed) = _measured(_aFillSellsThenTheMarketFallsBack);
+        _assertLapsed(claimed);
+    }
+
+    /// However large the pool's loss on a fill after the stage, the leaver
+    /// bears none of it, and none of it is paid out of the pool.
+    function test_a_large_loss_after_the_stage_is_not_hers() public {
+        (, uint256 claimed) = _measured(_aFillSellsALotThenTheMarketRises);
+        _assertLapsed(claimed);
     }
 }

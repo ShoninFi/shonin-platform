@@ -613,9 +613,8 @@ contract LighterDriver is IDriver, IDelayedDriver {
                 if (index == 0) index = uint256(before[n + 1 + m]);
                 orderedThen += uint256(_notional(m, int256(ordered), int256(index)));
                 // At the limit her order was placed at, from the stage's index
-                // alone, less what a fill pays the exchange: nothing but her
-                // orders trades the accounts until the proof, so a position
-                // smaller since is her fill, at its limit or better.
+                // alone, less what a fill pays the exchange: her own orders
+                // can't have filled worse than their limits.
                 worst += was > 0
                     ? _notional(m, was, int256(index.mulDiv(BPS - band - FEE_BOUND_BPS, BPS)))
                     : _notional(m, was, int256(index.mulDiv(BPS + band + FEE_BOUND_BPS, BPS, Math.Rounding.Ceil)));
@@ -623,11 +622,12 @@ contract LighterDriver is IDriver, IDelayedDriver {
         }
         // Her part of the accounts as they were, every order filled at its
         // limit: the least her close fetched. A measure below it is a loss
-        // her orders could not have made (funding, an order resting before
-        // the stage that filled before the executor cancelled it), the
-        // stayers' as much as hers. A price that moved after her orders
-        // filled changes neither figure: her part was sold, and the rest is
-        // repriced on both sides.
+        // her orders could not have made (a reduction the exchange forced,
+        // funding, an order resting before the stage that filled before the
+        // executor cancelled it), which the whole pool shares: the station
+        // lapses the stage rather than pay or charge it. A price that moved
+        // after her orders filled changes neither figure: her part was
+        // sold, and the rest is repriced on both sides.
         uint256 worstSize = uint256(worst < 0 ? -worst : worst);
         uint256 share = worstSize.mulDiv(
             fraction.mulDiv(part, WAD), WAD, worst < 0 ? Math.Rounding.Ceil : Math.Rounding.Floor
@@ -656,6 +656,13 @@ contract LighterDriver is IDriver, IDelayedDriver {
     /// ordered (a piece under the exchange's smallest order, at the stage's
     /// mark, was not), the share of what was ordered that it is smaller by,
     /// on the same side or flat, rounded down; the smallest of them.
+    ///
+    /// A post names positions, not whose trades made them: a reduction the
+    /// exchange forces (a liquidation, a deleveraging) reads as a fill. So a
+    /// position smaller by more than what was ordered of it, on the other
+    /// side, or, where it was ordered, larger, holds something that isn't
+    /// hers, and nothing is known: the stage can't be measured, and lapses
+    /// with nothing paid.
     function closedPart(
         address station,
         int256[] calldata before,
@@ -681,11 +688,15 @@ contract LighterDriver is IDriver, IDelayedDriver {
             uint256 open = uint256(was > 0 ? was : -was);
             uint256 ordered = open.mulDiv(fraction, WAD, Math.Rounding.Ceil);
             if (ordered > open) ordered = open;
+            // Crossed, or smaller by more than her order could fill: not
+            // hers, whether or not this piece was ordered.
+            int256 done = was > 0 ? was - is_ : is_ - was;
+            if ((is_ != 0 && (was > 0) != (is_ > 0)) || done > int256(ordered)) return (0, false);
             if (ordered == 0 || !_orderable(uint16(key), ordered, _markAt(before, uint16(key)))) continue;
-            // Crossed to the other side: more than closed, by its own trade.
-            int256 done =
-                (was > 0) == (is_ > 0) || is_ == 0 ? (was > 0 ? was - is_ : is_ - was) : was > 0 ? was : -was;
-            if (done <= 0) return (0, true);
+            // Larger than before: not hers either.
+            if (done < 0) return (0, false);
+            // Her order missed: nothing of it closed, and the rest is still
+            // read for anything that isn't hers.
             uint256 share = uint256(done) >= ordered ? WAD : uint256(done).mulDiv(WAD, ordered);
             if (share < part) part = share;
         }

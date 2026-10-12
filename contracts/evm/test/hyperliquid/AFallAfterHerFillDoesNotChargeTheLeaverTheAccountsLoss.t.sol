@@ -6,13 +6,14 @@ import {ClaimState} from "../../src/interfaces/IVault.sol";
 import {HyperliquidVault} from "./HyperliquidVault.sol";
 
 /// From the stage until its proof the attested executor trades nothing at
-/// the venue, so the account changes only by her orders and by what was set
+/// the venue, so the account changes only by her orders, by what was set
 /// going before the stage (a resting order that fills before the executor
-/// cancels it, funding). Her least is her part at her orders' limits from
-/// the stage's prices alone, less a fill's fee: a fall after her fill
-/// neither lowers it nor reaches her payout, and a loss the account takes
-/// after the stage costs her no more than the band and fee on her orders,
-/// whatever the price at the proof.
+/// cancels it, funding) and by what the venue does by itself. Her least is
+/// her part at her orders' limits from the stage's prices alone, less a
+/// fill's fee: a fall after her fill neither lowers it nor reaches her
+/// payout, and a loss the account takes after the stage that leaves it
+/// below that least is the whole pool's: the stage lapses, charging her
+/// nothing and paying her nothing, and her claim waits for a later stage.
 contract AFallAfterHerFillDoesNotChargeTheLeaverTheAccountsLossTest is HyperliquidVault {
     function _measured(function() internal between) internal returns (Stage memory) {
         uint256 aliceShares = _fundAndTrade();
@@ -63,17 +64,17 @@ contract AFallAfterHerFillDoesNotChargeTheLeaverTheAccountsLossTest is Hyperliqu
     function test_a_fall_after_her_fill_does_not_charge_the_leaver_the_accounts_loss() public {
         uint256 start = vm.snapshotState();
         Stage memory plain = _measured(_aFall);
+        uint256 claimed = vault.claimAt(1).shares;
         vm.revertToState(start);
         Stage memory lost = _measured(_aLossThenAFall);
         emit log_named_decimal_uint("fetched, ETH -5%", plain.fetched, 6);
-        emit log_named_decimal_uint("fetched, the account loses $5,400, then -5%", lost.fetched, 6);
-        assertEq(lost.part, 1e18, "her whole close");
-        // The band and a fill's fee on her 33.3 ETH at the stage's price
-        // are about $990: none of the fall, and no more of the loss.
-        assertGe(
-            lost.fetched + 1000e6,
-            plain.fetched,
-            "the leaver paid the account's loss beyond her orders' limits"
-        );
+        assertEq(plain.part, 1e18, "her whole close, measured");
+        // The $5,400 loss is far beyond the band and a fill's fee on her
+        // orders: not hers. The stage lapses with nothing paid or charged.
+        assertEq(lost.stagedAt, 0, "the stage has ended");
+        assertEq(usd.balanceOf(alice), 0, "nothing paid");
+        assertTrue(vault.claimAt(1).state == ClaimState.Waiting, "her claim waits");
+        assertEq(vault.claimAt(1).shares, claimed, "with all its shares: nothing charged");
+        assertEq(core.queued(), 0, "nothing asked of the venue");
     }
 }

@@ -12,8 +12,9 @@ import {StdStorage, stdStorage} from "forge-std/Test.sol";
 /// figures were read, and lands some blocks later, so a post read before
 /// the close was placed, landing after it, says nothing about the close,
 /// even when the strategy's own sale between the two readings makes it look
-/// closed. The close is measured only once the exchange has carried its
-/// order out, and that order's fill is the leaver's.
+/// closed. The close is measured only by a post read after it, and one
+/// that shows the position smaller than her order could have made it is
+/// never paid as hers.
 contract CloseIsProvedOnlyByAPostReadAfterItTest is LighterVault {
     using stdStorage for StdStorage;
 
@@ -62,34 +63,57 @@ contract CloseIsProvedOnlyByAPostReadAfterItTest is LighterVault {
         station.settleClose();
     }
 
-    function test_a_claims_own_fill_is_the_leavers_even_when_an_early_post_looks_like_a_proof() public {
+    /// The early post proves nothing. Once the exchange carries her order
+    /// out, the next post shows the position smaller than her order could
+    /// have made it: the strategy's own sale before the stage, which the
+    /// stage's post didn't show, can't be told from a reduction the exchange
+    /// forced, so nothing of it is paid as hers. The stage lapses, and her
+    /// claim is closed by a later stage from the accounts as they are then.
+    function test_a_claims_close_the_strategys_unseen_sale_makes_look_overfilled_lapses_and_is_closed_again()
+        public
+    {
         uint256 bobBefore = _stagedBetweenAReadingAndItsPost();
-        // The early post proves nothing.
         try station.settleClose() {} catch {}
 
         // Now the exchange carries her order out, 0.9% under the index the
-        // stage's post carried (inside the band): 19 ETH sold $462 under
-        // their mark. Whether the close is proved before or after, that fill
-        // is hers.
+        // stage's post carried (inside the band): the 19 ETH left are sold
+        // $462 under their mark.
         exchange.setMark(ETH, ETH_PX * 991 / 1000);
         exchange.process();
         exchange.setMark(ETH, ETH_PX);
-        _collect();
-        for (uint256 i = 0; i < 3 && vault.claimAt(1).state != ClaimState.Paid; i++) {
-            _nextBlock();
-            skip(lighter.SETTLE_DELAY());
+        assertEq(exchange.size(_master(), ETH), 0, "the whole position is gone");
+        _nextBlock();
+        skip(lighter.SETTLE_DELAY());
+        _post();
+        vm.expectRevert(Station.NotYet.selector);
+        station.settleClose();
+        skip(lighter.DELIVERY_WINDOW());
+        _post();
+        station.settleClose();
+        assertEq(station.stage().stagedAt, 0, "the stage lapsed");
+        assertTrue(vault.claimAt(1).state == ClaimState.Waiting, "nothing paid on it: her claim waits");
+        assertEq(usd.balanceOf(alice), 0);
+        assertEq(exchange.withdrawalCount(), 0, "nothing asked of the exchange");
+
+        // A later stage closes her claim from the accounts as they are.
+        value(vault);
+        _post();
+        vault.settleClaim(1);
+        if (vault.claimAt(1).state == ClaimState.Closing) _settleStaged();
+        if (vault.claimAt(1).state == ClaimState.Queued) {
+            skip(1 minutes);
             _post();
-            try station.settleClose() {} catch {}
-            exchange.process();
-            _collect();
+            value(vault);
         }
-        assertTrue(vault.claimAt(1).state == ClaimState.Paid, "her claim is paid from its delivery");
+        assertTrue(vault.claimAt(1).state == ClaimState.Paid, "her claim is paid by a later stage");
 
         _nextBlock();
         _post();
         value(vault);
-        // Alice's transaction fee (about $100) stays with Bob; her order's
-        // fill must not be his to pay.
-        assertGe(_worthOf(bob) + 1e6, bobBefore, "the stayer must not pay for the leaver's fill");
+        // The lapsed stage's fill stays the pool's, so its $462 is shared
+        // by both holders: Bob bears no more than his half of it.
+        uint256 bobAfter = _worthOf(bob);
+        emit log_named_decimal_uint("Bob's loss", bobBefore > bobAfter ? bobBefore - bobAfter : 0, 6);
+        assertGe(bobAfter + 240e6, bobBefore, "the stayer bore more than his part of the pool's loss");
     }
 }

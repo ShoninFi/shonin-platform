@@ -29,11 +29,19 @@ import {Math} from "openzeppelin/utils/math/Math.sol";
 /// the proof has a fixed span: from the stage until it is proved, or until
 /// `PROOF_WINDOWS` windows after it was placed, the attested executor
 /// trades nothing at its venues (it cancels the account's resting orders
-/// and refuses the agent's orders and moves there), and what the account
-/// did meanwhile is the stage's own. A stage not proved by then can no
-/// longer be: it lapses with nothing paid, as does one nothing at all
-/// could be measured for by the end of its window (no reading of the venue
-/// after it), and the claim can be staged again.
+/// and refuses the agent's orders and moves there). The venue can still
+/// act on the account meanwhile (a liquidation, a deleveraging, funding),
+/// and nothing read there says whose a reduction was, so a stage is paid
+/// only on evidence that can all be hers: where a position is smaller than
+/// her orders could have made it, on the other side, or larger, the driver
+/// can't tell, and where the account is worth less than her orders could
+/// have fetched at their limits, the loss is the whole pool's. Either way
+/// the stage lapses: nothing is paid from it or charged to her, what it
+/// sold stays the pool's, and her claim is staged again later, measured
+/// from the account as it is then. A stage not proved by its deadline can
+/// no longer be, and lapses the same way, as does one nothing at all could
+/// be measured for by the end of its window (no reading of the venue after
+/// it).
 library StationCloses {
     using StationStorage for StationLayout;
     using SafeERC20 for IERC20;
@@ -339,8 +347,9 @@ library StationCloses {
             // window, and is then measured for the part that closed.
             if ((!known || part < WAD) && !over) revert NotYet();
             if (!known) {
-                // Nothing the venue did after the stage can be read: nothing
-                // can be measured, and the stage ends with nothing paid.
+                // Nothing the venue did after the stage can be read, or what
+                // it did isn't all hers: nothing can be measured, and the
+                // stage ends with nothing paid.
                 _lapse(s);
                 return;
             }
@@ -367,7 +376,15 @@ library StationCloses {
                 int256 ask = one > floor ? one : floor;
                 s.stagedFreed[name] = ask > 0 ? uint256(ask) : 0;
             }
-            if (measured < least) measured = least;
+            // Less than her orders could have fetched at their limits: the
+            // account lost what her orders could not have (a reduction the
+            // venue forced, funding), which is the whole pool's. Neither
+            // paying her the least nor charging her the loss would be hers:
+            // the stage lapses.
+            if (measured < least) {
+                _lapse(s);
+                return;
+            }
             current.part = part;
             if (measured < 0) {
                 current.cost = uint256(-measured);

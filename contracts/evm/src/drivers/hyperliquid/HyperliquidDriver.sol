@@ -553,6 +553,14 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
     /// each market it ordered (a piece too small to have been ordered for
     /// sure asks nothing), the share of what it ordered that the position is
     /// smaller by, on the same side, rounded down; the smallest of them.
+    ///
+    /// The venue's reads can't tell her fills from a reduction the venue
+    /// forces (a liquidation, a deleveraging): only the position's size is
+    /// read. So a position smaller by more than her order there (the size
+    /// the close ordered, in the venue's own lots), on the other side, or,
+    /// where she ordered, larger, holds something that isn't hers, and
+    /// nothing is known: the stage can't be measured, and lapses with
+    /// nothing paid.
     function closedPart(
         address station,
         int256[] calldata before,
@@ -573,13 +581,19 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
             bool isLong = was > 0;
             uint256 open = uint256(isLong ? was : -was);
             uint256 size = _part(open, fraction);
+            // Crossed, or smaller by more than her order could fill: not
+            // hers, whether or not this piece was ordered.
+            int256 done = isLong ? was - is_ : is_ - was;
+            if ((isLong ? is_ < 0 : is_ > 0) || done > int256(size)) return (0, false);
             // Millionths of a dollar, times a hundred.
             uint256 price = i < _perps.length
                 ? uint256(HyperCore.markPx(_perps[i].index)) * 100
                 : HyperCore.spotPx(_spots[i - _perps.length].pair);
             if (size * price < 2 * MIN_ORDER * 100) continue;
-            int256 done = isLong ? was - is_ : is_ - was;
-            if (done <= 0) return (0, true);
+            // Larger than before: not hers either.
+            if (done < 0) return (0, false);
+            // Her order missed: nothing of it closed, and the rest is still
+            // read for anything that isn't hers.
             uint256 share = uint256(done) >= size ? WAD : uint256(done).mulDiv(WAD, size);
             if (share < part) part = share;
         }
@@ -653,9 +667,8 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
             // A long sold no lower than the stage's own price less the band,
             // a short bought back no higher than it plus the band: the
             // limits her orders were placed at, less what a fill pays the
-            // venue. Only the stage's prices: nothing but her orders trades
-            // the account until the proof, so a position smaller since is
-            // her fill, at its limit or better.
+            // venue. Only the stage's prices: her own orders can't have
+            // filled worse than their limits.
             uint256 stagePx = uint256(before[n + i]);
             orderedThen += _part(uint256(was < 0 ? -was : was), fraction) * stagePx;
             worst += was > 0
@@ -667,11 +680,13 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         least = -int256(ordered.mulDiv(band, BPS, Math.Rounding.Ceil));
         // Her part of the account as it was with every order of the part
         // closed filled at its limit: the least her close fetched. A
-        // measure below it is a loss her orders could not have made
-        // (funding, an order resting before the stage that filled before the
-        // executor cancelled it), the stayers' as much as hers. A price that
-        // moved after her orders filled changes neither figure: her part
-        // was sold, and the rest is repriced on both sides.
+        // measure below it is a loss her orders could not have made (a
+        // reduction the venue forced, funding, an order resting before the
+        // stage that filled before the executor cancelled it), which the
+        // whole pool shares: the station lapses the stage rather than pay
+        // or charge it. A price that moved after her orders filled changes
+        // neither figure: her part was sold, and the rest is repriced on
+        // both sides.
         // What wasn't closed of what was ordered may have filled and been
         // traded back since: no more than the band on it at the stage's
         // prices is the leaver's to lose.

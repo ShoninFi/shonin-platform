@@ -31,8 +31,11 @@ contract StagedCloseIsMeasuredTest is HyperliquidVault {
 
     function _agentSells() internal {
         // The agent sells 10 ETH at the mark, after the leaver's close and
-        // before its proof.
+        // before its proof, and buys them back at the mark. (One that left
+        // the position smaller than her order could have made it isn't
+        // hers, and lapses the stage: `AForcedReductionIsNeverPaidAsTheLeaversFill`.)
         core.trade(address(station), ETH, -100_000, ETH_PX);
+        core.trade(address(station), ETH, 100_000, ETH_PX);
     }
 
     function _marketRises() internal {
