@@ -148,9 +148,13 @@ tasks:
         --docs-url "{{.URL_DOCS_PROD}}"
         --site-url "{{.URL_SITE_PROD}}"
       # shonin.fi is static: no wallet code and no API calls. Binary-safe, so
-      # the fonts and logos are read too.
+      # the fonts and logos are read too. The lowercase "solana" may appear
+      # only as the address of Solana's mark (/assets/chains/solana.<hash>.svg);
+      # any other use (window.solana, @solana/, a solana: URI) fails.
       - cmd: |
-          if grep -r -a -q -E 'ethereum|solana|wallet_|testnet-api' "{{.PATH_DIST_MARKETING}}"; then
+          mark='/assets/chains/solana\.[0-9a-f]{10}\.svg'
+          found=$(grep -r -a -o -h -E "$mark|solana|ethereum|phantom|wallet_|testnet-api" "{{.PATH_DIST_MARKETING}}" | grep -v -x -E "$mark" || true)
+          if [ -n "$found" ]; then
             echo "marketing dist check: FAIL (wallet or API code found)"
             exit 1
           fi

@@ -111,6 +111,36 @@ const ASSETS: &[Asset] = &[
         ext: "svg",
         bytes: include_bytes!("../assets/logos/shonin-lockup-tagline-reversed.svg"),
     },
+    // The four chains' own marks, from their official brand kits (see
+    // assets/chains/SOURCES.md), in the variant each allows on navy.
+    Asset {
+        key: "chain-hyperliquid",
+        dir: "chains",
+        stem: "hyperliquid",
+        ext: "svg",
+        bytes: include_bytes!("../assets/chains/hyperliquid.svg"),
+    },
+    Asset {
+        key: "chain-solana",
+        dir: "chains",
+        stem: "solana",
+        ext: "svg",
+        bytes: include_bytes!("../assets/chains/solana.svg"),
+    },
+    Asset {
+        key: "chain-base",
+        dir: "chains",
+        stem: "base",
+        ext: "svg",
+        bytes: include_bytes!("../assets/chains/base.svg"),
+    },
+    Asset {
+        key: "chain-robinhood-chain",
+        dir: "chains",
+        stem: "robinhood-chain",
+        ext: "svg",
+        bytes: include_bytes!("../assets/chains/robinhood-chain.svg"),
+    },
 ];
 
 /// Every file the site serves.
@@ -293,17 +323,25 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// Where Cloudflare Web Analytics loads its beacon from. Cloudflare adds the
+/// script to every page at the edge (it is never in the build); it is
+/// cookieless and reports aggregate page views and load times.
+pub const ANALYTICS_SCRIPT: &str = "https://static.cloudflareinsights.com";
+/// Where the beacon reports, and the only place a page may send anything.
+pub const ANALYTICS_REPORT: &str = "https://cloudflareinsights.com/cdn-cgi/rum";
+
 /// Workers static assets read these from the output root. The policy allows
-/// only this origin, plus the hashed boot script: no inline styles, no other
-/// hosts, no frames, no forms.
+/// only this origin, plus the hashed boot script and Cloudflare Web
+/// Analytics (its script's host, and its one reporting endpoint): no inline
+/// styles, no other hosts, no frames, no forms.
 fn headers() -> String {
     let csp = [
         "default-src 'none'".to_string(),
-        format!("script-src 'self' {}", boot_hash()),
+        format!("script-src 'self' {} {ANALYTICS_SCRIPT}", boot_hash()),
         "style-src 'self'".into(),
         "img-src 'self'".into(),
         "font-src 'self'".into(),
-        "connect-src 'none'".into(),
+        format!("connect-src {ANALYTICS_REPORT}"),
         "manifest-src 'self'".into(),
         "base-uri 'none'".into(),
         "form-action 'none'".into(),
@@ -325,14 +363,46 @@ fn headers() -> String {
     )
 }
 
-/// shonin.fi used to serve the app, so links into the app's routes on this
-/// hostname go to their home at the app's origin.
+/// shonin.fi used to serve the app, so its old addresses go, permanently, to
+/// their home at the app's origin: the app's current routes as they are, and
+/// the routes it has since renamed straight to their new names (one hop, not
+/// two). An old Author page was keyed by a display name that can't become an
+/// address here, so it goes to the full list. `/authors` itself is this
+/// site's For Authors page, and anything else that isn't a file is the 404.
+///
+/// Workers read the first rule that matches, so the rules for single
+/// addresses come first, then the deeper ones, each before its catch-all.
 fn redirects(links: &Links) -> String {
     let app = &links.app;
+    let rules: &[(&str, String)] = &[
+        // Single addresses.
+        ("/agents", format!("{app}/agents")),
+        ("/portfolio", format!("{app}/portfolio")),
+        ("/publish", format!("{app}/publish")),
+        ("/status", format!("{app}/status")),
+        ("/you", format!("{app}/you")),
+        ("/strategies", format!("{app}/agents")),
+        ("/queue", format!("{app}/publish")),
+        ("/verify", format!("{app}/status")),
+        // The old About page is this site's home.
+        ("/about", "/".into()),
+        // Renamed pages under an agent, then the rest of the app's routes.
+        ("/strategies/:slug/*", format!("{app}/agents/:slug")),
+        ("/strategies/:slug", format!("{app}/agents/:slug")),
+        ("/agents/:slug/code", format!("{app}/agents/:slug/verify")),
+        ("/agents/:slug/record", format!("{app}/agents/:slug")),
+        ("/agents/:slug/health", format!("{app}/agents/:slug")),
+        ("/agents/*", format!("{app}/agents/:splat")),
+        ("/portfolio/*", format!("{app}/portfolio/:splat")),
+        ("/publish/*", format!("{app}/publish/:splat")),
+        ("/you/*", format!("{app}/you/:splat")),
+        ("/queue/:id", format!("{app}/publish/jobs/:id")),
+        ("/authors/:handle/*", format!("{app}/agents")),
+        ("/authors/:handle", format!("{app}/agents")),
+    ];
     let mut out = String::new();
-    for route in ["agents", "portfolio", "publish", "status", "you"] {
-        let _ = writeln!(out, "/{route} {app}/{route} 301");
-        let _ = writeln!(out, "/{route}/* {app}/{route}/:splat 301");
+    for (from, to) in rules {
+        let _ = writeln!(out, "{from} {to} 301");
     }
     out
 }
