@@ -1,7 +1,9 @@
 //! The depositor flows on the EVM chains, through their public ports, over a
 //! small simulated vault chain and wallet: what happens after the money has
-//! moved, the fallback on a deposit, a claim on a closed vault, and the
-//! statement's signature in the form the vault takes.
+//! moved, the app's own optional second step when it goes astray or the
+//! keeper gets there first, "Settle now" from the portfolio, which claim a
+//! booked withdrawal is, the fallback on a deposit, a claim on a closed
+//! vault, and the statement's signature in the form the vault takes.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -12,7 +14,7 @@ use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolEvent, SolValue};
 use app::tx::error::{Context, TxError};
-use app::tx::flow::{self, Cancel, Ctx, Fallback, Nudge, Outcome, Pace, Step};
+use app::tx::flow::{self, Cancel, Ctx, Fallback, Nudge, Outcome, Pace, Prompt, Step};
 use app::tx::port::{Clock, Log, Pending, Reader, Receipt, Signer, StatementRequest, TxRequest};
 use app::tx::read::ClaimState;
 use chain::bindings::vault::{self as b, IVault};
@@ -43,6 +45,28 @@ enum Wallet {
     SignsWithParityByte,
 }
 
+/// What becomes of the app's own `settle` (the second step) once the wallet
+/// has handed it on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SecondStep {
+    /// Mined at once, like any other send.
+    Mined,
+    /// The endpoint the app reads through never sees it; the keeper settles
+    /// the request this many looks (at the request or the step's receipt)
+    /// after it was sent.
+    NeverSeenKeeperSettlesAfter(u32),
+    /// The keeper settles the request in the block before the app's own
+    /// `settle` is mined, so the app's lands as a no-op.
+    KeeperBeatsItByOneBlock,
+}
+
+/// How a withdrawal settles.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Exit {
+    Cash,
+    Booked,
+}
+
 struct Chain {
     time: u64,
     block: u64,
@@ -66,6 +90,19 @@ struct Chain {
     wallet_chain: u64,
     wallet_account: Address,
     wallet: Wallet,
+    exit: Exit,
+    second_step: SecondStep,
+    /// A withdrawal of the same shares the same owner sends from another
+    /// tab, as soon as the flow's own request has landed.
+    twin_withdrawal: bool,
+    /// A claim's own request (kind 2), by request index: its claim's id.
+    refs: HashMap<usize, U256>,
+    receipt_looks: u32,
+    /// Looks at the chain (a request, or a receipt) since the app's own
+    /// `settle` was sent, if it was.
+    looks_since_settle: Option<u32>,
+    /// The receipt look at which the keeper settled, if it did.
+    keeper_settled_at_look: Option<u32>,
 }
 
 type Sim = Rc<RefCell<Chain>>;
@@ -114,6 +151,13 @@ impl World {
             wallet_chain: CHAIN,
             wallet_account: account,
             wallet,
+            exit: Exit::Cash,
+            second_step: SecondStep::Mined,
+            twin_withdrawal: false,
+            refs: HashMap::new(),
+            receipt_looks: 0,
+            looks_since_settle: None,
+            keeper_settled_at_look: None,
         };
         Self {
             sim: Rc::new(RefCell::new(chain)),
@@ -215,6 +259,101 @@ impl Chain {
         }
     }
 
+    /// One look at the chain: the keeper settles when the scenario says.
+    fn look(&mut self) {
+        if let (SecondStep::NeverSeenKeeperSettlesAfter(after), Some(looks)) =
+            (self.second_step, self.looks_since_settle.as_mut())
+        {
+            *looks += 1;
+            if *looks >= after && self.requests.iter().any(|r| !r.3) {
+                self.keeper_settles();
+            }
+        }
+    }
+
+    /// The keeper (or anyone) settles everything waiting, in its own block.
+    fn keeper_settles(&mut self) {
+        self.block += 1;
+        self.keeper_settled_at_look = Some(self.receipt_looks);
+        self.settle_all();
+    }
+
+    /// Settle every waiting request at a dollar a share, in request order:
+    /// a deposit buys shares, a withdrawal is paid from cash or booked, a
+    /// claim's own request pays its claim.
+    fn settle_all(&mut self) {
+        let waiting: Vec<usize> = (0..self.requests.len())
+            .filter(|&i| !self.requests[i].3)
+            .collect();
+        for i in waiting {
+            self.requests[i].3 = true;
+            let (owner, kind, _, _, amount) = self.requests[i];
+            let id = U256::from(i + 1);
+            let assets = amount / U256::from(1_000_000_000_000u64);
+            if kind == 0 {
+                self.log(
+                    vault(),
+                    IVault::Deposited {
+                        requestId: id,
+                        owner,
+                        assets: amount,
+                        shares: amount * U256::from(1_000_000_000_000u64),
+                    },
+                );
+            } else if kind == 2 {
+                let claim_id = self.refs[&i];
+                let claim = &mut self.claims[usize::try_from(claim_id).unwrap() - 1];
+                claim.state = b::ClaimState::Paid;
+                claim.paid = assets;
+                self.log(
+                    vault(),
+                    IVault::Withdrawn {
+                        requestId: id,
+                        owner,
+                        shares: amount,
+                        assets,
+                        feeShares: U256::ZERO,
+                    },
+                );
+                self.log(
+                    vault(),
+                    IVault::ClaimPaid {
+                        claimId: claim_id,
+                        assets,
+                    },
+                );
+            } else if self.exit == Exit::Cash {
+                self.log(
+                    vault(),
+                    IVault::Withdrawn {
+                        requestId: id,
+                        owner,
+                        shares: amount,
+                        assets,
+                        feeShares: U256::ZERO,
+                    },
+                );
+            } else {
+                self.claims.push(b::Claim {
+                    owner,
+                    shares: amount,
+                    bookedAt: self.time,
+                    lastAttemptAt: 0,
+                    state: b::ClaimState::Pending,
+                    paid: U256::ZERO,
+                });
+                self.log(
+                    vault(),
+                    IVault::ClaimBooked {
+                        claimId: U256::from(self.claims.len()),
+                        owner,
+                        shares: amount,
+                    },
+                );
+            }
+        }
+    }
+
     fn log<E: SolEvent>(&mut self, address: Address, event: E) {
         let data = event.encode_log_data();
         self.logs.push((
@@ -223,6 +362,7 @@ impl Chain {
                 address,
                 topics: data.topics().to_vec(),
                 data: data.data.clone(),
+                transaction: None,
             },
         ));
     }
@@ -304,23 +444,26 @@ impl Chain {
                 ))
             }
             IVault::requestAtCall::SELECTOR => {
+                self.look();
                 self.tick();
                 let call = IVault::requestAtCall::abi_decode(data).unwrap();
-                let (owner, kind, earliest, done, amount) =
-                    self.requests[usize::try_from(call.requestId).unwrap() - 1];
+                let index = usize::try_from(call.requestId).unwrap() - 1;
+                let (owner, kind, earliest, done, amount) = self.requests[index];
                 ok(b::Request {
                     owner,
-                    kind: if kind == 0 {
-                        b::RequestKind::Deposit
-                    } else {
-                        b::RequestKind::Redeem
+                    kind: match kind {
+                        0 => b::RequestKind::Deposit,
+                        1 => b::RequestKind::Redeem,
+                        _ => b::RequestKind::Claim,
                     },
                     earliest,
                     done,
                     amount,
-                    r#ref: U256::ZERO,
+                    r#ref: self.refs.get(&index).copied().unwrap_or_default(),
                 })
             }
+            IVault::requestCountCall::SELECTOR => ok(U256::from(self.requests.len())),
+            IVault::openedBlockCall::SELECTOR => ok(0u64),
             IVault::claimAtCall::SELECTOR => {
                 let call = IVault::claimAtCall::abi_decode(data).unwrap();
                 ok(self.claims[usize::try_from(call.claimId).unwrap() - 1].clone())
@@ -414,43 +557,17 @@ impl Chain {
                 let call = IVault::requestRedeemCall::abi_decode(data).unwrap();
                 *self.shares.get_mut(&from).unwrap() -= call.shares;
                 self.request(call.receiver, 1, call.shares);
+                if self.twin_withdrawal {
+                    // The same person, from another tab, a moment later:
+                    // the same shares again, in the same slot.
+                    *self.shares.get_mut(&from).unwrap() -= call.shares;
+                    self.request(call.receiver, 1, call.shares);
+                }
                 if self.wallet == Wallet::SwitchesChainAfterRequest {
                     self.wallet_chain = OTHER_CHAIN;
                 }
             }
-            IVault::settleCall::SELECTOR => {
-                // Every waiting request settles at a dollar a share.
-                let waiting: Vec<usize> = (0..self.requests.len())
-                    .filter(|&i| !self.requests[i].3)
-                    .collect();
-                for i in waiting {
-                    self.requests[i].3 = true;
-                    let (owner, kind, _, _, amount) = self.requests[i];
-                    let id = U256::from(i + 1);
-                    if kind == 0 {
-                        self.log(
-                            vault(),
-                            IVault::Deposited {
-                                requestId: id,
-                                owner,
-                                assets: amount,
-                                shares: amount * U256::from(1_000_000_000_000u64),
-                            },
-                        );
-                    } else {
-                        self.log(
-                            vault(),
-                            IVault::Withdrawn {
-                                requestId: id,
-                                owner,
-                                shares: amount,
-                                assets: amount / U256::from(1_000_000_000_000u64),
-                                feeShares: U256::ZERO,
-                            },
-                        );
-                    }
-                }
-            }
+            IVault::settleCall::SELECTOR => self.settle_all(),
             IVault::takeProRataCall::SELECTOR => {
                 let call = IVault::takeProRataCall::abi_decode(data).unwrap();
                 let index = usize::try_from(call.requestId).unwrap() - 1;
@@ -543,7 +660,10 @@ impl Reader for SimReader {
         Ok(U256::from(1_000_000_000u64))
     }
     async fn receipt(&self, hash: B256) -> Result<Option<Receipt>, TxError> {
-        Ok(self.0.borrow().receipts.get(&hash).cloned())
+        let mut sim = self.0.borrow_mut();
+        sim.receipt_looks += 1;
+        sim.look();
+        Ok(sim.receipts.get(&hash).cloned())
     }
     async fn pending(&self, _hash: B256) -> Result<Pending, TxError> {
         Ok(Pending::Unknown)
@@ -617,6 +737,16 @@ impl Signer for SimWallet {
         );
         sim.sent.push(request.clone());
         let hash = keccak256(sim.sent.len().to_be_bytes());
+        if selector == IVault::settleCall::SELECTOR {
+            sim.looks_since_settle = Some(0);
+            match sim.second_step {
+                SecondStep::Mined => {}
+                // Handed to the wallet, which answered with a hash; the
+                // endpoint the app reads never hears of it.
+                SecondStep::NeverSeenKeeperSettlesAfter(_) => return Ok(hash),
+                SecondStep::KeeperBeatsItByOneBlock => sim.keeper_settles(),
+            }
+        }
         sim.block += 1;
         let first = sim.logs.len();
         let success = sim.simulate(request).is_ok();
@@ -827,4 +957,232 @@ fn a_statement_signed_with_a_parity_byte_of_zero_or_one_is_sent_as_the_vault_tak
         call.statement[64]
     );
     assert!(result.is_ok(), "{result:?}");
+}
+
+fn deposit(world: &World, dollars: u64) -> (Result<Outcome, TxError>, Vec<Step>) {
+    world.run(|ctx| Box::pin(flow::deposit(ctx, U256::from(dollars * USD))))
+}
+
+fn withdraw(world: &World, shares: u128) -> (Result<Outcome, TxError>, Vec<Step>) {
+    world.run(|ctx| Box::pin(flow::withdraw(ctx, U256::from(shares * WAD))))
+}
+
+/// The app's own second step is optional and the keeper settles the
+/// request anyway: once it has, the deposit is done, and the flow says so
+/// within a few looks rather than after the long wait on its own unseen
+/// transaction. While the step is watched, the panel is drawn as the priced
+/// request, never as a bare "Sent".
+#[test]
+fn once_the_keeper_settles_a_deposit_the_flow_ends_done_without_waiting_out_its_own_unseen_second_step()
+ {
+    let world = World::new(Wallet::Approves);
+    // The keeper prices the slot and settles nothing until later; the app
+    // sends its own `settle`, which the endpoint never sees; the keeper
+    // settles the request three looks after that.
+    world.with(|chain| chain.second_step = SecondStep::NeverSeenKeeperSettlesAfter(3));
+    let (result, steps) = deposit(&world, 100);
+    let sim = world.sim.borrow();
+    assert!(sim.requests[0].3, "the keeper settled the request");
+    let settled_at = sim.keeper_settled_at_look.expect("the keeper settled it");
+    let looks_after_settlement = sim.receipt_looks.saturating_sub(settled_at);
+    drop(sim);
+    assert!(
+        matches!(result, Ok(Outcome::Deposited { .. })),
+        "{result:?}"
+    );
+    assert!(
+        looks_after_settlement < Pace::FAST.give_up_after / 4,
+        "the deposit was settled, but the flow kept watching its own optional second step for \
+         {looks_after_settlement} more looks (the long wait is {}): steps {steps:?}",
+        Pace::FAST.give_up_after
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|step| matches!(step, Step::Priced { sent: Some(_), .. })),
+        "the sent second step is shown on the priced request: {steps:?}"
+    );
+    assert!(
+        !steps.iter().any(|step| matches!(
+            step,
+            Step::Sent {
+                prompt: Prompt::Finish,
+                ..
+            }
+        )),
+        "the priced request's view gave way to a bare \"Sent\": {steps:?}"
+    );
+}
+
+/// A second step the network never shows mined is watched only briefly: the
+/// priced step then says it hasn't been seen (it may still land), and the
+/// flow goes on watching the request, ending done when the keeper settles
+/// it. Nothing says the deposit failed or wasn't sent.
+#[test]
+fn a_second_step_not_seen_in_its_short_watch_is_said_so_and_the_deposit_still_ends_done() {
+    let world = World::new(Wallet::Approves);
+    let watch = Pace::FAST.finish_watch;
+    world.with(|chain| chain.second_step = SecondStep::NeverSeenKeeperSettlesAfter(3 * watch + 10));
+    let (result, steps) = deposit(&world, 100);
+    assert!(
+        matches!(result, Ok(Outcome::Deposited { .. })),
+        "{result:?}"
+    );
+    let unseen = steps.iter().position(|step| {
+        matches!(
+            step,
+            Step::Priced {
+                unsent: Some(TxError::Dropped { .. }),
+                sent: None,
+                ..
+            }
+        )
+    });
+    assert!(unseen.is_some(), "{steps:?}");
+    assert!(!steps.iter().any(|step| matches!(step, Step::Failed(_))));
+    // The second step was sent once: a step that may still land isn't sent
+    // again on the app's own.
+    let settles = world
+        .sent_selectors()
+        .into_iter()
+        .filter(|selector| *selector == IVault::settleCall::SELECTOR)
+        .count();
+    assert_eq!(settles, 1);
+}
+
+/// "Settle now" from the portfolio, when the keeper settles the request in
+/// the block before the app's own `settle` lands: the request is settled,
+/// and the page reads how (the deposit bought shares) from the request's
+/// own events, not a request that stands with a record it couldn't read.
+#[test]
+fn settle_now_reads_how_the_request_settled_when_the_keeper_settled_it_a_block_before() {
+    let world = World::new(Wallet::Approves);
+    let account = world.account();
+    world.with(|chain| {
+        chain.second_step = SecondStep::KeeperBeatsItByOneBlock;
+        chain
+            .requests
+            .push((account, 0, 1_000, false, U256::from(500 * USD)));
+        chain.priced = Some(1_000);
+        chain.time = 1_001;
+    });
+    let (result, _) = world.run(|ctx| Box::pin(flow::settle_request(ctx, U256::from(1u8))));
+    assert!(world.sim.borrow().requests[0].3, "the request is settled");
+    assert!(
+        matches!(result, Ok(Outcome::Deposited { assets, .. }) if assets == U256::from(500 * USD)),
+        "the request was settled (by the keeper, a block before the app's own send), but the flow ends: {result:?}"
+    );
+}
+
+/// "Settle now" on a request someone else has already settled asks the
+/// wallet nothing and says how it settled; it is not a failure.
+#[test]
+fn settle_now_on_a_request_already_settled_sends_nothing_and_says_how_it_settled() {
+    let world = World::new(Wallet::Approves);
+    let account = world.account();
+    world.with(|chain| {
+        chain
+            .requests
+            .push((account, 0, 1_000, false, U256::from(500 * USD)));
+        chain.priced = Some(1_000);
+        chain.time = 1_001;
+        chain.keeper_settles();
+    });
+    let (result, steps) = world.run(|ctx| Box::pin(flow::settle_request(ctx, U256::from(1u8))));
+    assert!(world.sim.borrow().sent.is_empty(), "nothing was sent");
+    assert!(!steps.iter().any(|step| matches!(step, Step::Signing(_))));
+    let Ok(Outcome::SettledBefore(how)) = &result else {
+        panic!("{result:?}");
+    };
+    assert!(
+        matches!(**how, Outcome::Deposited { assets, .. } if assets == U256::from(500 * USD)),
+        "{how:?}"
+    );
+}
+
+/// A queued claim's own request, priced: "Settle now" settles it, and the
+/// flow reads that it paid the claim.
+#[test]
+fn settle_now_on_a_queued_claims_own_request_pays_the_claim_and_says_so() {
+    let world = World::new(Wallet::Approves);
+    let account = world.account();
+    world.with(|chain| {
+        chain.claims.push(b::Claim {
+            owner: account,
+            shares: U256::from(1_000u128 * WAD),
+            bookedAt: 500,
+            lastAttemptAt: 900,
+            state: b::ClaimState::Queued,
+            paid: U256::ZERO,
+        });
+        chain
+            .requests
+            .push((account, 2, 1_000, false, U256::from(1_000u128 * WAD)));
+        chain.refs.insert(0, U256::from(1u8));
+        chain.priced = Some(1_000);
+        chain.time = 1_001;
+    });
+    let (result, _) = world.run(|ctx| Box::pin(flow::settle_request(ctx, U256::from(1u8))));
+    assert_eq!(
+        world.sent_selectors(),
+        vec![IVault::settleCall::SELECTOR],
+        "{result:?}"
+    );
+    assert!(
+        matches!(
+            result,
+            Ok(Outcome::Claim {
+                claim,
+                state: ClaimState::Paid,
+                ..
+            }) if claim == U256::from(1u8)
+        ),
+        "{result:?}"
+    );
+}
+
+/// A withdrawal booked as a claim is matched to its own claim. When the same
+/// owner books a second withdrawal of the same shares in the same slot, the
+/// first flow must not point at the second's claim.
+#[test]
+fn a_booked_withdrawal_is_matched_to_its_own_claim_when_a_twin_is_booked_after_it() {
+    let world = World::new(Wallet::Approves);
+    let account = world.account();
+    world.with(|chain| {
+        chain.exit = Exit::Booked;
+        chain.twin_withdrawal = true;
+    });
+    let (result, _) = withdraw(&world, 1_000);
+    let sim = world.sim.borrow();
+    assert_eq!(sim.requests.len(), 2, "two withdrawals landed");
+    assert_eq!(sim.claims.len(), 2, "both were booked, in request order");
+    assert!(sim.claims.iter().all(|claim| claim.owner == account));
+    drop(sim);
+    // The flow's own request was the first, so its claim is the first.
+    assert!(
+        matches!(result, Ok(Outcome::Booked { claim, .. }) if claim == U256::from(1u8)),
+        "the flow's withdrawal was request 1, booked as claim 1, but it reports: {result:?}"
+    );
+}
+
+/// The same, the other way round: a twin requested before the flow's own,
+/// booked in the same settlement, keeps its claim; the flow's is the next.
+#[test]
+fn a_booked_withdrawal_is_matched_to_its_own_claim_when_an_earlier_twin_is_booked_with_it() {
+    let world = World::new(Wallet::Approves);
+    let account = world.account();
+    world.with(|chain| {
+        chain.exit = Exit::Booked;
+        // From another tab, a moment before: the same shares, waiting.
+        chain
+            .requests
+            .push((account, 1, 1_010, false, U256::from(1_000u128 * WAD)));
+        *chain.shares.get_mut(&account).unwrap() -= U256::from(1_000u128 * WAD);
+    });
+    let (result, _) = withdraw(&world, 1_000);
+    assert_eq!(world.sim.borrow().claims.len(), 2);
+    assert!(
+        matches!(result, Ok(Outcome::Booked { claim, .. }) if claim == U256::from(2u8)),
+        "the flow's withdrawal was request 2, booked as claim 2, but it reports: {result:?}"
+    );
 }

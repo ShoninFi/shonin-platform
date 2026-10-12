@@ -296,6 +296,8 @@ pub struct Request {
     pub earliest: u64,
     pub done: bool,
     pub amount: U256,
+    /// What it refers to: for a claim's own request, the claim's id.
+    pub reference: U256,
 }
 
 pub async fn request<R: Reader>(reader: &R, vault: Address, id: U256) -> Result<Request, TxError> {
@@ -313,6 +315,7 @@ pub async fn request<R: Reader>(reader: &R, vault: Address, id: U256) -> Result<
         earliest: request.earliest,
         done: request.done,
         amount: request.amount,
+        reference: request.r#ref,
     })
 }
 

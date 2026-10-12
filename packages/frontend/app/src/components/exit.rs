@@ -8,7 +8,6 @@
 //! valuation countdown, the price, done; or the error, in words, in place.
 //! The status line is a polite live region; errors are alerts.
 
-use std::cell::Cell;
 use std::rc::Rc;
 
 use alloy_primitives::U256;
@@ -30,6 +29,7 @@ use crate::tx::flow::{Outcome, Prompt, Step};
 use crate::tx::read::{ClaimState, Holdings, State, VaultFigures};
 use crate::view::{El, View, el, text};
 use crate::wallet::machine::Connection;
+use crate::wallet::run::EXIT;
 use crate::wallet::{Action, Network, Running, VaultRef, networks};
 
 /// Which way the money goes.
@@ -61,7 +61,9 @@ enum Mode {
     WrongNetwork(u64),
     Form(Tab),
     Review,
-    Flow,
+    /// A flow for this vault and account, by its id: another account's or
+    /// another flow redraws.
+    Flow(u64),
 }
 
 /// Everything one panel holds.
@@ -79,12 +81,16 @@ struct Panel {
     unit: Mutable<Unit>,
     stage: Mutable<Stage>,
     ack: Mutable<bool>,
-    running: Mutable<Option<Running>>,
-    /// When the countdown started on the reader's clock, for the seconds
-    /// left; set once per request.
-    requested_local: Rc<Cell<Option<(f64, u64)>>>,
     /// Whether the panel is in the phone sheet (locked while signing).
     in_sheet: bool,
+}
+
+impl Panel {
+    /// The flow this vault's panel shows for the connected account: kept by
+    /// the session, so a panel or sheet built while it runs shows it too.
+    fn running(&self) -> Option<Running> {
+        crate::wallet::get().flow(&self.slug, EXIT)
+    }
 }
 
 /// The Exit panel for an agent, for the agent page's right column.
@@ -124,8 +130,6 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
         unit: Mutable::new(Unit::Shares),
         stage: Mutable::new(Stage::Form),
         ack: Mutable::new(false),
-        running: Mutable::new(None),
-        requested_local: Rc::new(Cell::new(None)),
         in_sheet,
     });
     let session = crate::wallet::get();
@@ -137,7 +141,7 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
             let figures = panel.figures.signal_ref(Option::is_some),
             let tab = panel.tab.signal(),
             let stage = panel.stage.signal(),
-            let running = panel.running.signal_ref(Option::is_some),
+            let running = session.flow_signal(slug, EXIT).map(|running| running.map(|running| running.id)),
             let missing = panel.missing.signal() =>
             if *missing { Mode::Unavailable } else {
                 mode_of(connection, network.as_deref(), *figures, *tab, *stage, *running)
@@ -172,10 +176,10 @@ fn mode_of(
     figures: bool,
     tab: Tab,
     stage: Stage,
-    running: bool,
+    running: Option<u64>,
 ) -> Mode {
-    if running {
-        return Mode::Flow;
+    if let Some(id) = running {
+        return Mode::Flow(id);
     }
     let Some(network) = network else {
         return Mode::Loading;
@@ -275,7 +279,7 @@ fn tabs(panel: &Rc<Panel>) -> El {
             .hook(move |dom| {
                 dom.event(move |_: dominator::events::Click| {
                     // Not while a flow is under way.
-                    if panel.running.lock_ref().is_none() {
+                    if panel.running().is_none() {
                         panel.tab.set_neq(which);
                         panel.stage.set_neq(Stage::Form);
                     }
@@ -346,7 +350,7 @@ fn render(panel: &Rc<Panel>, mode: Mode) -> View {
         }
         Mode::Form(tab) => body.child(form(panel, tab, true)).into(),
         Mode::Review => review(panel),
-        Mode::Flow => flow_view(panel),
+        Mode::Flow(_) => flow_view(panel),
     }
 }
 
@@ -1183,13 +1187,12 @@ fn start(panel: &Rc<Panel>, action: Action) {
     let Some(vault) = panel.vault.get_cloned() else {
         return;
     };
-    // One flow at a time: a second click while one runs starts nothing.
-    if panel.running.lock_ref().is_some() {
+    // One flow at a time per vault and account: a second click, or another
+    // panel for the same vault, starts nothing while one is shown.
+    let running = Running::new(action.clone());
+    if !crate::wallet::get().begin(&panel.slug, &running) {
         return;
     }
-    let running = Running::new();
-    panel.requested_local.set(None);
-    panel.running.set(Some(running.clone()));
     crate::wallet::run::start(&vault, action, &running);
 }
 
@@ -1235,10 +1238,16 @@ pub fn error_words(
 }
 
 fn flow_view(panel: &Rc<Panel>) -> View {
-    let Some(running) = panel.running.get_cloned() else {
+    let Some(running) = panel.running() else {
         return placeholder();
     };
+    // A panel built while a flow runs shows it on its own tab.
+    panel.tab.set_neq(match running.action {
+        Action::Withdraw(_) => Tab::Withdraw,
+        _ => Tab::Deposit,
+    });
     let panel = panel.clone();
+    let shown = running.clone();
     el("div")
         .class("sh-exit__body sh-exit__flow")
         .child_signal(
@@ -1249,7 +1258,7 @@ fn flow_view(panel: &Rc<Panel>) -> View {
                 if panel.in_sheet {
                     crate::atoms::dialog::lock(matches!(step, Step::Signing(_)));
                 }
-                Some(step_view(&panel, &step))
+                Some(step_view(&panel, &shown, &step))
             }),
         )
         .into()
@@ -1327,7 +1336,7 @@ fn prompt_words(
             ),
         ),
         Prompt::Finish => (
-            format!("Approve the second step in {wallet}"),
+            format!("Approve the optional second step in {wallet}"),
             "Your request is priced. This settles it at that price; anyone may send it, and nobody had yet. It’s optional: your request stands either way, and the keeper settles it if you don’t."
                 .to_string(),
         ),
@@ -1337,7 +1346,7 @@ fn prompt_words(
         ),
         Prompt::TakeCash => (
             format!("Approve taking your cash share in {wallet}"),
-            "Your exact share of the vault’s cash now, and units for the rest.".to_string(),
+            "Your share of the vault’s cash now, less the profit fee your shares owed at the last price and the transaction fee, and units for the rest.".to_string(),
         ),
         Prompt::TakeBack { amount } => (
             format!("Approve taking your deposit back in {wallet}"),
@@ -1365,7 +1374,7 @@ fn prompt_words(
     }
 }
 
-fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
+fn step_view(panel: &Rc<Panel>, running: &Running, step: &Step) -> View {
     let (wallet, chain_name, wallet_chain, symbol, native) = context_names(panel);
     let decimals = decimals(panel);
     let vault_title = panel
@@ -1398,7 +1407,7 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
             .into(),
         Step::Signing(prompt) => {
             let (title, line) = prompt_words(prompt, &wallet, &vault_title, &symbol, decimals);
-            let running = panel.running.get_cloned();
+            let running = running.clone();
             // The second step settles a request already on the chain: there
             // is nothing to cancel, and declining it is fine.
             let second = *prompt == Prompt::Finish;
@@ -1420,9 +1429,7 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
                     on_click(Button::new(Kind::Secondary, "Cancel").build(), move || {
                         // Nothing further is sent; a prompt already open in the
                         // wallet is answered there.
-                        if let Some(running) = &running {
-                            running.cancel.cancel();
-                        }
+                        running.cancel.cancel();
                     })
                     .into()
                 })
@@ -1455,24 +1462,37 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
         }
         Step::Requested(countdown) | Step::Priced { countdown, .. } => {
             let priced = matches!(step, Step::Priced { .. });
-            let unsent = match step {
-                Step::Priced {
-                    unsent: Some(why), ..
-                } => Some(why.unsent_words(&Context {
-                    wallet: &wallet,
-                    chain: &chain_name,
-                    wallet_chain: wallet_chain.as_deref(),
-                    symbol: &symbol,
-                    decimals,
-                    native: &native,
-                })),
-                _ => None,
+            // The app's own second step: why it didn't go through (and
+            // whether it may still land), or the one sent and being watched.
+            let (unsent, may_land, sent) = match step {
+                Step::Priced { unsent, sent, .. } => (
+                    unsent.as_ref().map(|why| {
+                        if why.may_have_moved() {
+                            "The app’s own second step hasn’t been seen mined yet; it may still land.".to_string()
+                        } else {
+                            format!(
+                                "The app’s own second step didn’t go through: {}.",
+                                why.unsent_words(&Context {
+                                    wallet: &wallet,
+                                    chain: &chain_name,
+                                    wallet_chain: wallet_chain.as_deref(),
+                                    symbol: &symbol,
+                                    decimals,
+                                    native: &native,
+                                })
+                            )
+                        }
+                    }),
+                    unsent.as_ref().is_some_and(TxError::may_have_moved),
+                    *sent,
+                ),
+                _ => (None, false, None),
             };
-            let started = match panel.requested_local.get() {
+            let started = match running.requested_local.get() {
                 Some(started) => started,
                 None => {
                     let started = (crate::clock::now().get(), countdown.asked_at);
-                    panel.requested_local.set(Some(started));
+                    running.requested_local.set(Some(started));
                     started
                 }
             };
@@ -1534,7 +1554,7 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
                             }),
                         ),
                 );
-            let is_deposit = panel.tab.get() == Tab::Deposit;
+            let is_deposit = matches!(running.action, Action::Deposit(_));
             let when = if priced {
                 el("p")
                     .class("sh-exit__title")
@@ -1569,7 +1589,12 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
             });
             let announce = if let Some(why) = &unsent {
                 format!(
-                    "Priced at {}. Your request stands and is settled at this price. The app’s own second step wasn’t sent: {why}.",
+                    "Priced at {}. Your request stands and is settled at this price. {why}",
+                    utc(slot)
+                )
+            } else if sent.is_some() {
+                format!(
+                    "Priced at {}. The app’s optional second step is sent; waiting to see your request settled.",
                     utc(slot)
                 )
             } else if priced {
@@ -1592,9 +1617,16 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
                 .child(el("p").class("sh-label").text(if priced { "Priced" } else { "Request sent" }))
                 .child(when)
                 .child(moved.map(View::from).unwrap_or(View::Empty))
-                .child(match &unsent {
-                    Some(why) => settle_now(panel, why),
-                    None => el("p")
+                .child(match (&unsent, sent) {
+                    (Some(why), _) => settle_now(running, why, may_land),
+                    (None, Some(hash)) => el("div")
+                        .class("sh-exit__settle")
+                        .child(el("p").text(
+                            "The app’s second step is sent. It’s optional: your request is settled at this price either way, by the keeper or by anyone. Waiting to see it settled.",
+                        ))
+                        .child(tx_link(chain_id, hash, "Second step"))
+                        .into(),
+                    (None, None) => el("p")
                         .class("sh-muted")
                         .text(if priced {
                             "The app sends the second step for you if the keeper hasn’t."
@@ -1612,7 +1644,7 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
                                 .child(el("dt").text("You asked at"))
                                 .child(el("dd").class("sh-num").text(utc(countdown.asked_at))),
                         )
-                        .child(request_amount_row(panel, is_deposit, decimals, &symbol)),
+                        .child(request_amount_row(&running.action, decimals, &symbol)),
                 )
                 .child(tx_link(chain_id, countdown.hash, "Request"))
                 .child(el("p").class("sh-muted sh-exit__small").text(if is_deposit {
@@ -1623,7 +1655,7 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
                 .child(live(announce))
                 .into()
         }
-        Step::Done(outcome) => done_view(panel, outcome, chain_id, decimals),
+        Step::Done(outcome) => done_view(panel, running, outcome, chain_id, decimals),
         Step::Failed(error) => {
             let words = error_words(
                 error,
@@ -1637,8 +1669,9 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
             let moved = error.may_have_moved();
             let back = {
                 let panel = panel.clone();
+                let running = running.clone();
                 move || {
-                    panel.running.set(None);
+                    crate::wallet::get().dismiss(&running);
                     if moved {
                         // What was typed was sent, or may still land: the
                         // form starts empty rather than offer it again.
@@ -1682,48 +1715,38 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
     }
 }
 
-/// The second step, offered again after the app's own try wasn't sent: the
-/// request stands either way, and the keeper settles it at this price.
-fn settle_now(panel: &Rc<Panel>, why: &str) -> View {
-    let running = panel.running.get_cloned();
+/// The second step, after the app's own try didn't go through: the request
+/// stands either way, and the keeper settles it at this price. Offered again
+/// unless the one sent may still land.
+fn settle_now(running: &Running, why: &str, may_land: bool) -> View {
+    let running = running.clone();
+    let line = format!(
+        "Your request stands and is settled at this price by the keeper, or by anyone. {why} It’s optional."
+    );
     el("div")
         .class("sh-exit__settle")
-        .child(el("p").text(format!(
-            "Your request stands and is settled at this price by the keeper, or by anyone. The app’s own second step wasn’t sent: {why}. It’s optional."
-        )))
-        .child(on_click(
-            Button::new(Kind::Secondary, "Settle now").build(),
-            move || {
-                if let Some(running) = &running {
-                    running.settle_now.nudge();
-                }
-            },
-        ))
+        .child(el("p").text(line))
+        .child(if may_land {
+            View::Empty
+        } else {
+            on_click(
+                Button::new(Kind::Secondary, "Settle now").build(),
+                move || running.settle_now.nudge(),
+            )
+            .into()
+        })
         .into()
 }
 
-fn request_amount_row(panel: &Rc<Panel>, is_deposit: bool, decimals: u8, symbol: &str) -> El {
-    let (label, figure) = if is_deposit {
-        let (_, amount) = deposit_check(panel, &panel.deposit_text.get_cloned(), true);
-        (
-            "You paid in",
-            amount
-                .map(|a| money::token_exact(a, decimals, symbol))
-                .unwrap_or_default(),
-        )
-    } else {
-        let (_, shares) = withdraw_check(
-            panel,
-            &panel.withdraw_text.get_cloned(),
-            panel.unit.get(),
-            true,
-        );
-        (
+/// What the request is for, exactly as it was sent.
+fn request_amount_row(action: &Action, decimals: u8, symbol: &str) -> El {
+    let (label, figure) = match action {
+        Action::Deposit(amount) => ("You paid in", money::token_exact(*amount, decimals, symbol)),
+        Action::Withdraw(shares) => (
             "Shares",
-            shares
-                .map(|s| format!("{} marked pending", money::shares(s, Rounding::Down)))
-                .unwrap_or_default(),
-        )
+            format!("{} marked pending", money::shares(*shares, Rounding::Down)),
+        ),
+        _ => ("", String::new()),
     };
     el("div")
         .class("sh-exit__row")
@@ -1731,11 +1754,18 @@ fn request_amount_row(panel: &Rc<Panel>, is_deposit: bool, decimals: u8, symbol:
         .child(el("dd").class("sh-num").text(figure))
 }
 
-fn done_view(panel: &Rc<Panel>, outcome: &Outcome, chain_id: u64, decimals: u8) -> View {
+fn done_view(
+    panel: &Rc<Panel>,
+    running: &Running,
+    outcome: &Outcome,
+    chain_id: u64,
+    decimals: u8,
+) -> View {
     let reset = {
         let panel = panel.clone();
+        let running = running.clone();
         move || {
-            panel.running.set(None);
+            crate::wallet::get().dismiss(&running);
             panel.stage.set(Stage::Form);
             panel.deposit_text.set(String::new());
             panel.withdraw_text.set(String::new());
@@ -1937,7 +1967,10 @@ fn done_view(panel: &Rc<Panel>, outcome: &Outcome, chain_id: u64, decimals: u8) 
                 "{} is in your wallet",
                 money::dollars(*assets, decimals, Rounding::Down)
             ),
-            vec![("Units for the rest".to_string(), units.to_string())],
+            vec![(
+                "Units for the rest".to_string(),
+                format!("{} of what the stations hold", money::units_share(*units)),
+            )],
             *hash,
             again.into(),
         ),
@@ -1953,6 +1986,8 @@ fn done_view(panel: &Rc<Panel>, outcome: &Outcome, chain_id: u64, decimals: u8) 
             *hash,
             again.into(),
         ),
+        // Someone else settled it before anything was asked: how it settled.
+        Outcome::SettledBefore(how) => done_view(panel, running, how, chain_id, decimals),
     }
 }
 

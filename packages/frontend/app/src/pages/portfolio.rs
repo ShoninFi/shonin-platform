@@ -21,7 +21,8 @@ use crate::components::exit::error_words;
 use crate::components::wallet::{open_connect, switch_button, tile};
 use crate::money::format as money;
 use crate::money::{Rounding, units::pow10};
-use crate::tx::flow::{Fallback, Outcome, Step, claim_door_open, claim_fallback_open};
+use crate::tx::error::Revert;
+use crate::tx::flow::{Fallback, Outcome, Prompt, Step, claim_door_open, claim_fallback_open};
 use crate::tx::read::{ClaimState, Holdings, State, VaultFigures};
 use crate::view::{El, View, el, text};
 use crate::wallet::machine::Connection;
@@ -41,6 +42,10 @@ struct Row {
     paid_cents: Option<u128>,
     /// Requests of this wallet still waiting for a price.
     waiting: Vec<shared::Request>,
+    /// For a waiting request whose day has passed, whether the vault would
+    /// take its fallback from this wallet now: the chain's own answer
+    /// (`eth_estimateGas`), by request id; `Err` with why not.
+    fallbacks: Vec<(u64, Result<(), Revert>)>,
     /// The chain's clock when read, for the fallback's day.
     now: u64,
 }
@@ -230,6 +235,46 @@ async fn read(account: alloy_primitives::Address) -> Loaded {
             let Ok(figures) = read::figures(&reader, vault.address).await else {
                 continue;
             };
+            // The fallback's conditions are the contract's (a deposit goes
+            // back only while nothing could price it): ask the chain whether
+            // it would take it, for each request whose day has passed.
+            let mut fallbacks = Vec::new();
+            for request in &waiting {
+                let earliest = request.earliest.assume_utc().unix_timestamp().max(0) as u64;
+                let priced = figures
+                    .last
+                    .as_ref()
+                    .is_some_and(|last| last.time >= earliest);
+                if priced
+                    || figures.state == State::Closed
+                    || now < earliest.saturating_add(figures.timers.fallback_after)
+                    || !matches!(
+                        request.kind,
+                        shared::RequestKind::Deposit | shared::RequestKind::Withdrawal
+                    )
+                {
+                    continue;
+                }
+                let attempt = crate::tx::port::TxRequest {
+                    chain_id: network.chain_id,
+                    from: account,
+                    to: vault.address,
+                    data: alloy_sol_types::SolCall::abi_encode(
+                        &chain::bindings::vault::IVault::takeProRataCall {
+                            requestId: U256::from(request.id),
+                        },
+                    )
+                    .into(),
+                    gas: None,
+                };
+                let answer = match reader.estimate_gas(&attempt).await {
+                    Ok(_) => Ok(()),
+                    Err(crate::tx::TxError::WouldRevert { reason }) => Err(reason),
+                    // Unread: offered, and the flow's own estimate decides.
+                    Err(_) => Ok(()),
+                };
+                fallbacks.push((request.id, answer));
+            }
             let value = figures
                 .share_price()
                 .and_then(|price| crate::money::quote::value_of(held.shares, price))
@@ -247,6 +292,7 @@ async fn read(account: alloy_primitives::Address) -> Loaded {
                 held,
                 paid_cents,
                 waiting,
+                fallbacks,
                 now,
             });
         }
@@ -654,6 +700,11 @@ fn extra_card(row: &Row) -> El {
     for request in &row.waiting {
         let earliest = request.earliest.assume_utc().unix_timestamp().max(0) as u64;
         let id = U256::from(request.id);
+        let refused = row
+            .fallbacks
+            .iter()
+            .find(|(id, _)| *id == request.id)
+            .and_then(|(_, answer)| answer.as_ref().err());
         let offer = waiting_offer(
             request.kind,
             earliest,
@@ -662,8 +713,10 @@ fn extra_card(row: &Row) -> El {
             row.figures.last.as_ref().map(|last| last.time),
             row.figures.timers.fallback_after,
             row.now,
+            refused,
         );
-        card = card.child(el("p").text(waiting_words(request, offer)));
+        let fee_bps = row.figures.fees.transaction_bps;
+        card = card.child(el("p").text(waiting_words(request, &offer)));
         let vault = &row.vault;
         let network = &row.network;
         card = match offer {
@@ -681,9 +734,10 @@ fn extra_card(row: &Row) -> El {
                 .child(el("p").class("sh-muted").text("Nothing has priced it for a day. You can take your deposit back: it returns to the wallet that paid it in, and nothing is bought."))
                 .child(act(vault, network, Action::TakeCash(Fallback::Request(id)), "Take your deposit back", Kind::Primary)),
             Offer::ProRata => card
-                .child(el("p").class("sh-muted").text("Nothing has priced it for a day. You can take your exact share of the vault’s cash now; the rest becomes units, paid as the money comes home."))
+                .child(el("p").class("sh-muted").text(format!("Nothing has priced it for a day. {}", cash_share_words(fee_bps))))
                 .child(act(vault, network, Action::TakeCash(Fallback::Request(id)), "Take cash share now", Kind::Primary))
                 .child(act(vault, network, Action::ClaimInstead(id), "Make it a claim instead", Kind::Secondary)),
+            Offer::NotNow(why) => card.child(el("p").class("sh-muted").text(why)),
         };
     }
     if !row.held.units.is_zero() || !row.held.units_claimable.is_zero() {
@@ -714,7 +768,7 @@ fn extra_card(row: &Row) -> El {
 
 /// What the portfolio offers for one waiting request, as the contract
 /// takes it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Offer {
     Nothing,
     /// Priced and not yet settled: the second step (`settle`), anyone's.
@@ -730,12 +784,19 @@ enum Offer {
     /// Nothing priced for a day: a withdrawal takes the cash share or
     /// becomes a claim (`takeProRata`, `claimInstead`).
     ProRata,
+    /// The day has passed, but the vault wouldn't take the fallback now:
+    /// why, in words.
+    NotNow(String),
 }
 
 /// The one door the contract opens for a waiting request of this kind on a
-/// vault in this state. A claim's own request is collected through its claim
-/// and a tank fill isn't a depositor's, so neither is offered anything here
-/// but settling once priced.
+/// vault in this state. Settling once priced is open for a deposit, a
+/// withdrawal and a claim's own request (which pays its claim); a tank fill
+/// is the author's, settled with the vault's own. The fallback a day after
+/// the request's slot is offered only when the chain says it would take it
+/// (`refused` is its refusal): a deposit goes back only while nothing could
+/// price it, so a vault whose prices can still be read keeps it waiting.
+#[allow(clippy::too_many_arguments)]
 fn waiting_offer(
     kind: shared::RequestKind,
     earliest: u64,
@@ -744,6 +805,7 @@ fn waiting_offer(
     last_priced: Option<u64>,
     fallback_after: u64,
     now: u64,
+    refused: Option<&Revert>,
 ) -> Offer {
     use shared::RequestKind as K;
     let priced = last_priced.is_some_and(|time| time >= earliest);
@@ -755,22 +817,50 @@ fn waiting_offer(
         };
     }
     if priced {
-        return Offer::SettleNow;
+        return match kind {
+            K::Deposit | K::Withdrawal | K::Claim => Offer::SettleNow,
+            K::TankFill => Offer::Nothing,
+        };
     }
     if now < earliest.saturating_add(fallback_after)
         || matches!(state, State::Cancelled | State::None)
     {
         return Offer::Nothing;
     }
-    match kind {
+    let offer = match kind {
         K::Deposit => Offer::TakeBack,
         K::Withdrawal if !ready_to_close => Offer::ProRata,
-        _ => Offer::Nothing,
+        _ => return Offer::Nothing,
+    };
+    match refused {
+        None => offer,
+        Some(Revert::Vault("NotAllowed")) if kind == K::Deposit => Offer::NotNow(
+            "Nothing has priced it for a day, but the vault’s prices can still be read, so the next valuation can price it: it waits for that rather than going back. A deposit can be taken back only while nothing could price it."
+                .to_string(),
+        ),
+        Some(Revert::Vault("NotYet")) => Offer::NotNow(
+            "Nothing has priced it for a day. The vault is settling a valuation just now, so the fallback isn’t open this moment; it may be priced instead."
+                .to_string(),
+        ),
+        Some(reason) => Offer::NotNow(format!(
+            "Nothing has priced it for a day, but the vault won’t take the fallback now: {}",
+            reason.words()
+        )),
     }
 }
 
+/// The fallback on a withdrawal or a claim, with the fees the contract
+/// takes from it: the profit fee the shares owed at the last priced
+/// valuation (as a slice of them) and the transaction fee on the cash paid.
+fn cash_share_words(transaction_bps: u16) -> String {
+    format!(
+        "You can take your share of the vault’s cash now, less the profit fee your shares owed at the last price and the {} transaction fee. The rest becomes units on what the stations hold, paid as the money comes home.",
+        crate::format::bps(u32::from(transaction_bps))
+    )
+}
+
 /// A waiting request in words.
-fn waiting_words(request: &shared::Request, offer: Offer) -> String {
+fn waiting_words(request: &shared::Request, offer: &Offer) -> String {
     let what = match request.kind {
         shared::RequestKind::Deposit => {
             format!("Deposit of {}", crate::format::money(request.amount))
@@ -785,7 +875,7 @@ fn waiting_words(request: &shared::Request, offer: Offer) -> String {
         ),
         shared::RequestKind::TankFill => "Tank fill".to_string(),
     };
-    if offer == Offer::SettleNow {
+    if *offer == Offer::SettleNow {
         format!("{what}, priced and waiting to be settled")
     } else {
         format!("{what} waiting for a price")
@@ -811,7 +901,9 @@ pub fn paid_headline(
 
 /// A button that runs one flow, with its status line in place: the wallet
 /// step, then done or the error in words. Switches the wallet's chain first
-/// where needed.
+/// where needed. The flow is kept by the session per vault, account and
+/// action, so the card shows it again when the page is redrawn while it
+/// runs, and never offers to start it twice.
 fn act(
     vault: &Rc<VaultRef>,
     network: &Rc<Network>,
@@ -819,16 +911,16 @@ fn act(
     label: &'static str,
     kind: Kind,
 ) -> El {
-    let running: Mutable<Option<Running>> = Mutable::new(None);
     let session = crate::wallet::get();
     let vault = vault.clone();
     let network = network.clone();
     let chain_id = network.chain_id;
+    let slot = action.slot();
     el("div").class("sh-act").child_signal(
         None,
         futures_signals::map_ref! {
             let connection = session.connection.signal_cloned(),
-            let current = running.signal_cloned() => (connection.clone(), current.clone())
+            let current = session.flow_signal(&vault.slug, &slot) => (connection.clone(), current.clone())
         }
         .map(move |(connection, current)| {
             let wrong = matches!(connection, Connection::Connected { chain_id: Some(on), .. } if on != chain_id)
@@ -837,23 +929,21 @@ fn act(
                 return Some(on_click(Button::new(kind, "Connect wallet").size(Size::Small).build(), open_connect).into());
             }
             if let Some(current) = current {
-                return Some(status(&current, &network, &running));
+                return Some(status(&current, &network));
             }
             if wrong {
                 return Some(switch_button(chain_id, Size::Small).into());
             }
-            let running = running.clone();
             let vault = vault.clone();
             let action = action.clone();
             Some(
                 on_click(Button::new(kind, label).size(Size::Small).build(), move || {
-                    // One flow at a time: a second click starts nothing.
-                    if running.lock_ref().is_some() {
-                        return;
+                    // One flow at a time per action: a second click starts
+                    // nothing.
+                    let flow = Running::new(action.clone());
+                    if crate::wallet::get().begin(&vault.slug, &flow) {
+                        crate::wallet::run::start(&vault, action.clone(), &flow);
                     }
-                    let flow = Running::new();
-                    running.set(Some(flow.clone()));
-                    crate::wallet::run::start(&vault, action.clone(), &flow);
                 })
                 .into(),
             )
@@ -861,9 +951,72 @@ fn act(
     )
 }
 
-fn status(current: &Running, network: &Rc<Network>, running: &Mutable<Option<Running>>) -> View {
+/// What a flow from the portfolio ended as, in a line.
+fn done_line(outcome: &Outcome, network: &Network) -> String {
+    let session = crate::wallet::get();
+    let decimals = network.asset_decimals;
+    match outcome {
+        Outcome::Collected { assets, .. } | Outcome::TookCash { assets, .. } => {
+            format!(
+                "{} is in your wallet.",
+                money::dollars(*assets, decimals, Rounding::Down)
+            )
+        }
+        Outcome::Claim {
+            state: ClaimState::Paid,
+            paid,
+            owner,
+            ..
+        } => format!(
+            "Paid: {}.",
+            paid_headline(
+                &money::dollars(*paid, decimals, Rounding::Down),
+                *owner,
+                session.account()
+            )
+        ),
+        Outcome::Claim {
+            state: ClaimState::Waiting | ClaimState::Pending,
+            ..
+        } => "The market was outside the exit band, so nothing closed. It can be tried again."
+            .to_string(),
+        Outcome::Claim {
+            state: ClaimState::Queued,
+            ..
+        } => "The cash covers it: it’s priced at the next valuation.".to_string(),
+        Outcome::ClaimMade { claim, .. } => format!("Claim {claim} booked."),
+        Outcome::Refunded { assets, to, .. } => {
+            let assets = money::dollars(*assets, decimals, Rounding::Down);
+            if session.account() == Some(*to) {
+                format!("Your deposit is back: {assets} is in your wallet.")
+            } else {
+                format!("Your deposit went back: {assets} to the wallet that paid it in.")
+            }
+        }
+        Outcome::Deposited { shares, .. } => {
+            format!(
+                "Settled: you now hold {} more shares.",
+                money::shares(*shares, Rounding::Down)
+            )
+        }
+        Outcome::Booked { claim, .. } => format!("Settled: booked as claim {claim}."),
+        Outcome::Paid { assets, .. } => {
+            format!(
+                "{} is in your wallet.",
+                money::dollars(*assets, decimals, Rounding::Down)
+            )
+        }
+        Outcome::SettledBefore(how) => format!(
+            "It was already settled, so nothing was sent. {}",
+            done_line(how, network)
+        ),
+        _ => "Done.".to_string(),
+    }
+}
+
+fn status(current: &Running, network: &Rc<Network>) -> View {
     let network = network.clone();
-    let running = running.clone();
+    let shown = current.clone();
     el("div")
         .class("sh-act__status")
         .child_signal(
@@ -871,9 +1024,20 @@ fn status(current: &Running, network: &Rc<Network>, running: &Mutable<Option<Run
             current.step.signal_cloned().map(move |step| {
                 let session = crate::wallet::get();
                 let wallet = session.wallet_name.get_cloned();
+                let dismiss = |label: &'static str| {
+                    let shown = shown.clone();
+                    on_click(
+                        el("button").attr("type", "button").class("sh-link").text(label),
+                        move || crate::wallet::get().dismiss(&shown),
+                    )
+                };
                 Some(match step? {
                     Step::Checking => el("p").attr("aria-live", "polite").text("Checking…").into(),
                     Step::Signing(_) => el("p").attr("aria-live", "polite").text(format!("Approve in {wallet}…")).into(),
+                    Step::Sent { prompt: Prompt::Finish, .. } => el("p")
+                        .attr("aria-live", "polite")
+                        .text("Second step sent. It’s optional: the request is settled at its price either way. Watching for it…")
+                        .into(),
                     Step::Sent { unseen: true, .. } => el("p")
                         .attr("aria-live", "polite")
                         .text(format!("Sent. Not seen by the network yet; it may still go through. Check {wallet}’s activity before sending anything again."))
@@ -881,47 +1045,16 @@ fn status(current: &Running, network: &Rc<Network>, running: &Mutable<Option<Run
                     Step::Sent { .. } | Step::Requested(_) | Step::Priced { .. } => {
                         el("p").attr("aria-live", "polite").text("Sent. Waiting for the network…").into()
                     }
-                    Step::Done(outcome) => {
-                        let line = match outcome {
-                            Outcome::Collected { assets, .. } | Outcome::TookCash { assets, .. } => {
-                                format!("{} is in your wallet.", money::dollars(assets, network.asset_decimals, Rounding::Down))
-                            }
-                            Outcome::Claim { state: ClaimState::Paid, paid, owner, .. } => {
-                                format!(
-                                    "Paid: {}.",
-                                    paid_headline(
-                                        &money::dollars(paid, network.asset_decimals, Rounding::Down),
-                                        owner,
-                                        session.account(),
-                                    )
-                                )
-                            }
-                            Outcome::Claim { state: ClaimState::Waiting, .. } => {
-                                "The market was outside the exit band, so nothing closed. It can be tried again.".to_string()
-                            }
-                            Outcome::Claim { state: ClaimState::Queued, .. } => {
-                                "The cash covers it: it’s priced at the next valuation.".to_string()
-                            }
-                            Outcome::ClaimMade { claim, .. } => format!("Claim {claim} booked."),
-                            Outcome::Refunded { assets, to, .. } => {
-                                let assets = money::dollars(assets, network.asset_decimals, Rounding::Down);
-                                if session.account() == Some(to) {
-                                    format!("Your deposit is back: {assets} is in your wallet.")
-                                } else {
-                                    format!("Your deposit went back: {assets} to the wallet that paid it in.")
-                                }
-                            }
-                            Outcome::Deposited { shares, .. } => {
-                                format!("Settled: you now hold {} more shares.", money::shares(shares, Rounding::Down))
-                            }
-                            Outcome::Booked { claim, .. } => format!("Settled: booked as claim {claim}."),
-                            Outcome::Paid { assets, .. } => {
-                                format!("{} is in your wallet.", money::dollars(assets, network.asset_decimals, Rounding::Down))
-                            }
-                            _ => "Done.".to_string(),
-                        };
-                        el("p").attr("role", "status").class("sh-gain").child(icon(Icon::Check, 16)).text(format!(" {line}")).into()
-                    }
+                    Step::Done(outcome) => el("div")
+                        .attr("role", "status")
+                        .child(
+                            el("p")
+                                .class("sh-gain")
+                                .child(icon(Icon::Check, 16))
+                                .text(format!(" {}", done_line(&outcome, &network))),
+                        )
+                        .child(dismiss("Done"))
+                        .into(),
                     Step::Failed(error) => {
                         let words = error_words(
                             &error,
@@ -932,7 +1065,6 @@ fn status(current: &Running, network: &Rc<Network>, running: &Mutable<Option<Run
                             network.asset_decimals,
                             network.coin(),
                         );
-                        let running = running.clone();
                         // Money that moved, or may still, is never offered
                         // again from here: the page reads where it stands.
                         let again = if error.may_have_moved() { "Dismiss" } else { "Try again" };
@@ -944,10 +1076,7 @@ fn status(current: &Running, network: &Rc<Network>, running: &Mutable<Option<Run
                             .child(el("p").class("sh-act__error").text(words.title))
                             .child(el("p").class("sh-muted").text(words.text))
                             .child(hash.map(View::from).unwrap_or(View::Empty))
-                            .child(on_click(
-                                el("button").attr("type", "button").class("sh-link").text(again),
-                                move || running.set(None),
-                            ))
+                            .child(dismiss(again))
                             .into()
                     }
                 })
@@ -1133,7 +1262,7 @@ fn claim_view(view: &ClaimView) -> View {
             claim,
             view.figures.state,
             view.figures.ready_to_close,
-            view.figures.timers.fallback_after,
+            &view.figures.timers,
             view.now,
         );
     let mut actions = el("div").class("sh-claim__actions");
@@ -1158,9 +1287,19 @@ fn claim_view(view: &ClaimView) -> View {
         }
         if fallback {
             actions = actions
-                .child(el("h2").class("sh-portfolio__h2").text("No price for 24 hours"))
-                .child(el("p").text("You can take your exact share of the vault’s cash at once. The rest becomes units on each station’s holdings, paid as the money comes home."))
-                .child(act(&view.vault, &view.network, Action::TakeCash(Fallback::Claim(U256::from(view.id))), "Take cash share now", Kind::Primary));
+                .child(
+                    el("h2")
+                        .class("sh-portfolio__h2")
+                        .text("No price for 24 hours"),
+                )
+                .child(el("p").text(cash_share_words(view.figures.fees.transaction_bps)))
+                .child(act(
+                    &view.vault,
+                    &view.network,
+                    Action::TakeCash(Fallback::Claim(U256::from(view.id))),
+                    "Take cash share now",
+                    Kind::Primary,
+                ));
         }
     }
     if view.vault.served && open {
@@ -1236,18 +1375,24 @@ mod tests {
         use shared::RequestKind as K;
         let day = 86_400;
         let offer = |kind, state, ready, priced, now| {
-            waiting_offer(kind, 1_000, state, ready, priced, day, now)
+            waiting_offer(kind, 1_000, state, ready, priced, day, now, None)
         };
-        // Priced and not yet settled: the second step, for any kind.
-        for kind in [K::Deposit, K::Withdrawal, K::Claim, K::TankFill] {
+        // Priced and not yet settled: the second step, for a deposit, a
+        // withdrawal and a claim's own request (it pays the claim); a tank
+        // fill is the author's.
+        for kind in [K::Deposit, K::Withdrawal, K::Claim] {
             assert_eq!(
                 offer(kind, State::Open, false, Some(1_000), 1_001),
                 Offer::SettleNow
             );
         }
-        // Nothing priced for a day: a deposit goes back, a withdrawal takes
-        // its cash share or becomes a claim; a claim's own request and a
-        // tank fill are offered nothing.
+        assert_eq!(
+            offer(K::TankFill, State::Open, false, Some(1_000), 1_001),
+            Offer::Nothing
+        );
+        // Nothing priced for a day, and the chain would take the fallback:
+        // a deposit goes back, a withdrawal takes its cash share or becomes
+        // a claim; a claim's own request and a tank fill are offered nothing.
         let late = 1_000 + day;
         assert_eq!(
             offer(K::Deposit, State::Open, false, None, late),
@@ -1298,6 +1443,41 @@ mod tests {
     }
 
     #[test]
+    fn a_deposit_is_offered_back_only_when_the_chain_would_take_it_and_says_why_not_otherwise() {
+        use shared::RequestKind as K;
+        let day = 86_400;
+        let late = 1_000 + day;
+        let offer = |kind, refused: Option<Revert>| {
+            waiting_offer(
+                kind,
+                1_000,
+                State::Open,
+                false,
+                None,
+                day,
+                late,
+                refused.as_ref(),
+            )
+        };
+        // The day passed only because nobody recorded a valuation: the
+        // vault's prices can still be read, so it refuses to send the
+        // deposit back. Nothing is offered; the card says why, and never
+        // that the owner isn't the owner.
+        let Offer::NotNow(why) = offer(K::Deposit, Some(Revert::Vault("NotAllowed"))) else {
+            panic!("a refused fallback was offered");
+        };
+        assert!(why.contains("can still be read"), "{why}");
+        assert!(!why.contains("Only the owner"), "{why}");
+        // A valuation settling just now: not this moment.
+        let Offer::NotNow(why) = offer(K::Withdrawal, Some(Revert::Vault("NotYet"))) else {
+            panic!("a refused fallback was offered");
+        };
+        assert!(why.contains("settling a valuation"), "{why}");
+        // The chain would take it: offered.
+        assert_eq!(offer(K::Deposit, None), Offer::TakeBack);
+    }
+
+    #[test]
     fn a_paid_claim_is_said_to_be_in_your_wallet_only_to_the_wallet_it_was_paid_to() {
         let owner = alloy_primitives::Address::repeat_byte(0x11);
         let other = alloy_primitives::Address::repeat_byte(0x22);
@@ -1310,6 +1490,14 @@ mod tests {
             assert!(!said.contains("your wallet"), "{said}");
             assert!(said.starts_with("$24,968.05 was paid to "), "{said}");
         }
+    }
+
+    #[test]
+    fn the_cash_share_fallback_names_the_fees_the_contract_takes() {
+        let said = cash_share_words(10);
+        assert!(said.contains("profit fee"), "{said}");
+        assert!(said.contains("0.1% transaction fee"), "{said}");
+        assert!(!said.contains("exact share"), "{said}");
     }
 
     #[test]

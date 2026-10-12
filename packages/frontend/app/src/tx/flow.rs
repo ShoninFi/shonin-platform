@@ -107,13 +107,16 @@ pub enum Step {
     /// The request is on the chain; it is priced at `slot`.
     Requested(Countdown),
     /// Priced, waiting to be settled at that price: the keeper does it, or
-    /// the app sends the second step after a few seconds. `unsent` says why
-    /// the app's own second step wasn't sent; the request stands either way,
-    /// and the person may ask for it again ([`Ctx::settle_now`]).
+    /// the app sends the second step after a few seconds. `sent` is the
+    /// app's own second step while it is watched (briefly: it is optional);
+    /// `unsent` says why it wasn't sent, or wasn't seen mined. The request
+    /// stands either way, and the person may ask for it again
+    /// ([`Ctx::settle_now`]).
     Priced {
         countdown: Countdown,
         at: u64,
         unsent: Option<TxError>,
+        sent: Option<B256>,
     },
     Done(Outcome),
     Failed(TxError),
@@ -150,6 +153,9 @@ pub enum Outcome {
         shares: U256,
         hash: B256,
     },
+    /// A request someone else had settled before the app asked anything:
+    /// nothing was sent, and this is how it settled.
+    SettledBefore(Box<Outcome>),
     /// A claim settled: it pays `owner`, whoever sent it.
     Claim {
         claim: U256,
@@ -179,6 +185,9 @@ pub struct Pace {
     pub dropped_after: u32,
     /// Polls after the price before the app sends the second step itself.
     pub finish_after: u32,
+    /// Polls the app's own second step is watched for once sent: briefly,
+    /// since it is optional and the keeper settles the request anyway.
+    pub finish_watch: u32,
     /// Polls before the flow stops watching (the request still stands).
     pub give_up_after: u32,
 }
@@ -188,12 +197,14 @@ impl Pace {
         poll_millis: 1_000,
         dropped_after: 180,
         finish_after: 8,
+        finish_watch: 60,
         give_up_after: 30 * 60,
     };
     pub const FAST: Self = Self {
         poll_millis: 0,
         dropped_after: 5,
         finish_after: 2,
+        finish_watch: 8,
         give_up_after: 200,
     };
 }
@@ -279,17 +290,38 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
         Ok(())
     }
 
-    /// The one path that sends money: simulate (`eth_estimateGas`, so a
-    /// send that would revert is refused before the wallet is asked), check
-    /// the network fee against the coin held, [`Self::guard`] again, ask the
-    /// wallet, then wait for the receipt and fail on a revert. Success is
-    /// only ever a mined, successful receipt.
+    /// The one path that sends money: [`Self::send`], then wait for the
+    /// receipt and fail on a revert. Success is only ever a mined, successful
+    /// receipt.
     pub(crate) async fn transact(
         &self,
         prompt: Prompt,
         to: Address,
         data: Vec<u8>,
     ) -> Result<Receipt, TxError> {
+        let hash = self.send(prompt.clone(), to, data).await?;
+        self.step(Step::Sent {
+            prompt: prompt.clone(),
+            hash,
+            unseen: false,
+        });
+        let receipt = self.mined(hash, &prompt).await?;
+        if !receipt.success {
+            return Err(TxError::Reverted { hash, reason: None });
+        }
+        Ok(receipt)
+    }
+
+    /// Hand a transaction to the wallet: simulate (`eth_estimateGas`, so a
+    /// send that would revert is refused before the wallet is asked), check
+    /// the network fee against the coin held, [`Self::guard`] again, then
+    /// ask the wallet. Its hash, once the wallet has handed it on.
+    pub(crate) async fn send(
+        &self,
+        prompt: Prompt,
+        to: Address,
+        data: Vec<u8>,
+    ) -> Result<B256, TxError> {
         let mut request = TxRequest {
             chain_id: self.chain_id,
             from: self.account,
@@ -309,18 +341,8 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
         request.gas = Some(gas);
 
         self.guard().await?;
-        self.step(Step::Signing(prompt.clone()));
-        let hash = self.signer.send(&request).await?;
-        self.step(Step::Sent {
-            prompt: prompt.clone(),
-            hash,
-            unseen: false,
-        });
-        let receipt = self.mined(hash, &prompt).await?;
-        if !receipt.success {
-            return Err(TxError::Reverted { hash, reason: None });
-        }
-        Ok(receipt)
+        self.step(Step::Signing(prompt));
+        self.signer.send(&request).await
     }
 
     /// Wait for a sent transaction to be mined, or say what became of it:
@@ -508,99 +530,219 @@ async fn follow<R: Reader, S: Signer, C: Clock>(
         .map_err(landed(receipt.hash, None))?;
     let landed = landed(countdown.hash, Some(countdown.request));
     let at = priced(ctx, countdown, timers).await.map_err(&landed)?;
+    let request = read::Request {
+        owner: ctx.account,
+        kind,
+        earliest: countdown.slot,
+        done: true,
+        amount,
+        reference: U256::ZERO,
+    };
     settled(
         ctx,
         countdown.request,
-        kind,
-        ctx.account,
-        amount,
+        &request,
         receipt.block,
         at,
-        countdown.hash,
+        Some(countdown.hash),
     )
     .await
     .map_err(&landed)
 }
 
-/// How a settled request ended, from the vault's own events for it: a
-/// deposit bought shares or was sent back; a withdrawal was paid or booked
-/// as a claim (for exactly its shares, in its owner's name).
-#[allow(clippy::too_many_arguments)]
+/// How a settled request ended, from the vault's own events for that
+/// request, wherever and by whomever it was settled (`from_block` is any
+/// block at or before its settlement): a deposit bought shares or was sent
+/// back; a withdrawal was paid or booked as a claim; a claim's own request
+/// paid its claim, or left it waiting. `hash` is the transaction the
+/// outcome links to; `None` links the one that settled it.
 async fn settled<R: Reader, S: Signer, C: Clock>(
     ctx: &Ctx<'_, R, S, C>,
-    request: U256,
-    kind: RequestKind,
-    owner: Address,
-    amount: U256,
+    id: U256,
+    request: &read::Request,
     from_block: u64,
     at: u64,
-    hash: B256,
+    hash: Option<B256>,
 ) -> Result<Outcome, TxError> {
-    let id = B256::from(request);
-    let logs = |topic: B256, by_id: bool| {
-        ctx.reader
-            .logs(ctx.vault, topic, by_id.then_some(id), from_block)
-    };
-    match kind {
+    let topic = B256::from(id);
+    let by_id = |event: B256| ctx.reader.logs(ctx.vault, event, Some(topic), from_block);
+    let link = |log: &Log| hash.or(log.transaction).unwrap_or_default();
+    match request.kind {
         RequestKind::Deposit => {
-            let deposited = logs(IVault::Deposited::SIGNATURE_HASH, true).await?;
-            if let Some(event) = decode::<IVault::Deposited>(ctx.vault, &deposited)
-                .into_iter()
-                .next()
-            {
+            let logs = by_id(IVault::Deposited::SIGNATURE_HASH).await?;
+            if let Some((event, log)) = first::<IVault::Deposited>(ctx.vault, &logs) {
                 return Ok(Outcome::Deposited {
                     assets: event.assets,
                     shares: event.shares,
                     at,
-                    hash,
+                    hash: link(log),
                 });
             }
-            let refunded = logs(IVault::Refunded::SIGNATURE_HASH, true).await?;
-            if let Some(event) = decode::<IVault::Refunded>(ctx.vault, &refunded)
-                .into_iter()
-                .next()
-            {
+            let logs = by_id(IVault::Refunded::SIGNATURE_HASH).await?;
+            if let Some((event, log)) = first::<IVault::Refunded>(ctx.vault, &logs) {
                 return Ok(Outcome::Refunded {
                     assets: event.assets,
                     to: event.to,
-                    hash,
+                    hash: link(log),
                 });
             }
         }
         RequestKind::Redeem => {
-            let withdrawn = logs(IVault::Withdrawn::SIGNATURE_HASH, true).await?;
-            if let Some(event) = decode::<IVault::Withdrawn>(ctx.vault, &withdrawn)
-                .into_iter()
-                .next()
-            {
+            let logs = by_id(IVault::Withdrawn::SIGNATURE_HASH).await?;
+            if let Some((event, log)) = first::<IVault::Withdrawn>(ctx.vault, &logs) {
                 return Ok(Outcome::Paid {
                     shares: event.shares,
                     assets: event.assets,
                     at: Some(at),
-                    hash,
+                    hash: link(log),
                 });
             }
-            // Not paid: booked as a claim, for exactly these shares, in the
-            // owner's name, after the request.
-            let booked = logs(IVault::ClaimBooked::SIGNATURE_HASH, false).await?;
-            if let Some(claim) = decode::<IVault::ClaimBooked>(ctx.vault, &booked)
-                .into_iter()
-                .filter(|event| event.owner == owner && event.shares == amount)
-                .map(|event| event.claimId)
-                .max()
+            if let Some((claim, transaction)) =
+                booked_claim(ctx, id, request.owner, request.amount, from_block).await?
             {
                 return Ok(Outcome::Booked {
                     claim,
-                    shares: amount,
-                    hash,
+                    shares: request.amount,
+                    hash: hash.or(transaction).unwrap_or_default(),
                 });
             }
         }
-        RequestKind::Claim | RequestKind::TankFill => {}
+        RequestKind::Claim => {
+            // Paid with a `Withdrawn` for this request, or, if the cash no
+            // longer covered it, left waiting to be tried again.
+            let logs = by_id(IVault::Withdrawn::SIGNATURE_HASH).await?;
+            let paid = first::<IVault::Withdrawn>(ctx.vault, &logs).map(|(_, log)| link(log));
+            let claim = read::claim(ctx.reader, ctx.vault, request.reference).await?;
+            return Ok(Outcome::Claim {
+                claim: request.reference,
+                owner: claim.owner,
+                state: claim.state,
+                paid: claim.paid,
+                hash: paid.or(hash).unwrap_or_default(),
+            });
+        }
+        RequestKind::TankFill => {}
     }
     Err(TxError::Network(
         "it settled, but its record couldn't be read".to_string(),
     ))
+}
+
+/// The first log of `E` from `address`, with the log it came from.
+fn first<E: SolEvent>(address: Address, logs: &[Log]) -> Option<(E, &Log)> {
+    logs.iter()
+        .filter(|log| log.address == address)
+        .filter(|log| log.topics.first() == Some(&E::SIGNATURE_HASH))
+        .find_map(|log| {
+            E::decode_raw_log(log.topics.iter().copied(), &log.data)
+                .ok()
+                .map(|event| (event, log))
+        })
+}
+
+/// The most later requests read to match a booked withdrawal to its claim.
+const MATCH_READS: u64 = 256;
+
+/// The claim a settled withdrawal (`id`) was booked as, and the transaction
+/// that booked it. The vault's `ClaimBooked` names no request, so the claim
+/// is found by order: it settles withdrawals in request order, so the
+/// claims of the same owner for the same shares (twins) are booked in their
+/// requests' order, and every twin requested after this one was booked
+/// after it. Its claim is the one followed by exactly as many twin claims as
+/// there are later twin requests booked (done, and not paid by id). `None`
+/// when the claims read don't account for it.
+async fn booked_claim<R: Reader, S: Signer, C: Clock>(
+    ctx: &Ctx<'_, R, S, C>,
+    id: U256,
+    owner: Address,
+    shares: U256,
+    from_block: u64,
+) -> Result<Option<(U256, Option<B256>)>, TxError> {
+    // A twin booked between reading the requests and reading the claims
+    // would shift the count: read until both agree.
+    for _ in 0..3 {
+        let later = later_twins_booked(ctx, id, owner, shares, from_block).await?;
+        let logs = ctx
+            .reader
+            .logs(
+                ctx.vault,
+                IVault::ClaimBooked::SIGNATURE_HASH,
+                None,
+                from_block,
+            )
+            .await?;
+        let mut claims: Vec<(U256, Option<B256>)> = logs
+            .iter()
+            .filter(|log| log.address == ctx.vault)
+            .filter_map(|log| {
+                IVault::ClaimBooked::decode_raw_log(log.topics.iter().copied(), &log.data)
+                    .ok()
+                    .filter(|event| event.owner == owner && event.shares == shares)
+                    .map(|event| (event.claimId, log.transaction))
+            })
+            .collect();
+        claims.sort_by_key(|(claim, _)| *claim);
+        claims.dedup_by_key(|(claim, _)| *claim);
+        if later_twins_booked(ctx, id, owner, shares, from_block).await? != later {
+            continue;
+        }
+        return Ok(claims
+            .len()
+            .checked_sub(later + 1)
+            .map(|index| claims[index]));
+    }
+    Err(TxError::Network(
+        "its claim couldn't be told from its twins".to_string(),
+    ))
+}
+
+/// How many withdrawals made after `id`, by the same owner for the same
+/// shares, have been booked as claims: settled, and not paid by id.
+async fn later_twins_booked<R: Reader, S: Signer, C: Clock>(
+    ctx: &Ctx<'_, R, S, C>,
+    id: U256,
+    owner: Address,
+    shares: U256,
+    from_block: u64,
+) -> Result<usize, TxError> {
+    let count = read::read(ctx.reader, ctx.vault, IVault::requestCountCall {}).await?;
+    if count <= id {
+        return Ok(0);
+    }
+    if count - id > U256::from(MATCH_READS) {
+        return Err(TxError::Network(
+            "too many requests since to match its claim".to_string(),
+        ));
+    }
+    let paid: Vec<U256> = decode::<IVault::Withdrawn>(
+        ctx.vault,
+        &ctx.reader
+            .logs(
+                ctx.vault,
+                IVault::Withdrawn::SIGNATURE_HASH,
+                None,
+                from_block,
+            )
+            .await?,
+    )
+    .into_iter()
+    .map(|event| event.requestId)
+    .collect();
+    let mut booked = 0;
+    let mut later = id + U256::from(1u8);
+    while later <= count {
+        let request = read::request(ctx.reader, ctx.vault, later).await?;
+        if request.owner == owner
+            && request.kind == RequestKind::Redeem
+            && request.amount == shares
+            && request.done
+            && !paid.contains(&later)
+        {
+            booked += 1;
+        }
+        later += U256::from(1u8);
+    }
+    Ok(booked)
 }
 
 /// The endpoint we read through answers for the vault's chain.
@@ -696,10 +838,12 @@ async fn requested<R: Reader, S: Signer, C: Clock>(
 ///
 /// The second step is optional: the keeper settles with the valuation, and
 /// anyone may. If the app's own try isn't sent (declined, another chain, no
-/// fee, reverted, never mined), that is reported on the priced step and the
-/// flow keeps watching; the person may ask for it again ("Settle now"). A
-/// read that fails is one more look. When the long wait runs out the request
-/// still stands: [`TxError::Landed`] with nothing that stopped it.
+/// fee, reverted, not seen mined in a short watch), that is reported on the
+/// priced step and the flow keeps watching the request; the person may ask
+/// for it again ("Settle now"). Whatever becomes of it, the flow ends as soon
+/// as the vault reports the request settled, by anyone. A read that fails
+/// is one more look. When the long wait runs out the request still stands:
+/// [`TxError::Landed`] with nothing that stopped it.
 async fn priced<R: Reader, S: Signer, C: Clock>(
     ctx: &Ctx<'_, R, S, C>,
     mut countdown: Countdown,
@@ -716,7 +860,7 @@ async fn priced<R: Reader, S: Signer, C: Clock>(
             let last = read::last_priced(ctx.reader, ctx.vault).await?;
             let newly = match last.filter(|last| last.time >= earliest) {
                 Some(last) if priced_at.is_none() => {
-                    Some(pricing_time(ctx, &last, earliest).await?)
+                    Some(pricing_time(ctx, &last, earliest).await?.time)
                 }
                 _ => None,
             };
@@ -748,6 +892,7 @@ async fn priced<R: Reader, S: Signer, C: Clock>(
                 countdown,
                 at,
                 unsent: None,
+                sent: None,
             });
         }
         if request.done {
@@ -762,22 +907,18 @@ async fn priced<R: Reader, S: Signer, C: Clock>(
                 let asked = ctx.settle_now.take();
                 if asked || (!tried && since_priced >= ctx.pace.finish_after) {
                     tried = true;
-                    let unsent = ctx
-                        .transact(
-                            Prompt::Finish,
-                            ctx.vault,
-                            IVault::settleCall {
-                                max: U256::from(256u32),
-                            }
-                            .abi_encode(),
-                        )
-                        .await
-                        .err();
-                    ctx.step(Step::Priced {
-                        countdown,
-                        at,
-                        unsent,
-                    });
+                    let report = |unsent: Option<TxError>, sent: Option<B256>| {
+                        ctx.step(Step::Priced {
+                            countdown,
+                            at,
+                            unsent,
+                            sent,
+                        })
+                    };
+                    match second_step(ctx, countdown.request, &report).await {
+                        Second::Settled => return Ok(at),
+                        Second::Open(unsent) => report(unsent, None),
+                    }
                 }
             }
             None => {
@@ -800,16 +941,115 @@ async fn priced<R: Reader, S: Signer, C: Clock>(
     })
 }
 
-/// The time of the valuation that priced a request with this `earliest`:
-/// the first priced one at or after it. The newest priced valuation may be a
-/// later one (on a fast chain, several can pass between two looks), so walk
-/// back from it while valuations are still at or after `earliest`.
+/// Where the app's own second step left a priced request.
+enum Second {
+    /// The vault reports it settled, by anyone.
+    Settled,
+    /// Not settled yet; why the app's own step wasn't sent or seen mined,
+    /// if it wasn't.
+    Open(Option<TxError>),
+}
+
+/// The settling call the second step sends: open to anyone.
+fn settle_call() -> Vec<u8> {
+    IVault::settleCall {
+        max: U256::from(256u32),
+    }
+    .abi_encode()
+}
+
+/// The app's own second step for a priced request: not asked for at all if
+/// the request is already settled; once sent (`report`ed with its hash),
+/// watched briefly while the request is read too, ending as soon as either
+/// says it is settled.
+async fn second_step<R: Reader, S: Signer, C: Clock>(
+    ctx: &Ctx<'_, R, S, C>,
+    id: U256,
+    report: &dyn Fn(Option<TxError>, Option<B256>),
+) -> Second {
+    if matches!(read::request(ctx.reader, ctx.vault, id).await, Ok(request) if request.done) {
+        return Second::Settled;
+    }
+    let hash = match ctx.send(Prompt::Finish, ctx.vault, settle_call()).await {
+        Ok(hash) => hash,
+        Err(why) => return Second::Open(Some(why)),
+    };
+    report(None, Some(hash));
+    match watch_second(ctx, id, hash).await {
+        Watched::Settled => Second::Settled,
+        // Mined, and the request not among those it settled: the keeper
+        // settles it.
+        Watched::Mined => Second::Open(None),
+        Watched::Reverted => Second::Open(Some(TxError::Reverted { hash, reason: None })),
+        Watched::NotSeen(why) => Second::Open(Some(why)),
+    }
+}
+
+/// What a short watch of the second step saw.
+enum Watched {
+    /// The request is settled (by this transaction or anyone's).
+    Settled,
+    /// Mined and successful, the request not settled by it.
+    Mined,
+    Reverted,
+    /// Not seen mined within the watch: it may still land.
+    NotSeen(TxError),
+}
+
+/// Watch the second step (`hash`) for [`Pace::finish_watch`] looks, reading
+/// the request at every look: it ends as soon as the request is settled,
+/// whoever settled it, or the step is mined.
+async fn watch_second<R: Reader, S: Signer, C: Clock>(
+    ctx: &Ctx<'_, R, S, C>,
+    id: U256,
+    hash: B256,
+) -> Watched {
+    let mut known = false;
+    for _ in 0..ctx.pace.finish_watch.max(1) {
+        if matches!(read::request(ctx.reader, ctx.vault, id).await, Ok(request) if request.done) {
+            return Watched::Settled;
+        }
+        if let Ok(Some(receipt)) = ctx.reader.receipt(hash).await {
+            if !receipt.success {
+                return Watched::Reverted;
+            }
+            return match read::request(ctx.reader, ctx.vault, id).await {
+                Ok(request) if !request.done => Watched::Mined,
+                _ => Watched::Settled,
+            };
+        }
+        if matches!(ctx.reader.pending(hash).await, Ok(Pending::Known { .. })) {
+            known = true;
+        }
+        ctx.clock.sleep(ctx.pace.poll_millis).await;
+    }
+    Watched::NotSeen(if known {
+        TxError::Stuck { hash }
+    } else {
+        TxError::Dropped { hash }
+    })
+}
+
+/// The valuation that priced a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PricedBy {
+    time: u64,
+    index: U256,
+}
+
+/// The valuation that priced a request with this `earliest`: the first
+/// priced one at or after it. The newest priced valuation may be a later
+/// one (on a fast chain, several can pass between two looks), so walk back
+/// from it while valuations are still at or after `earliest`.
 async fn pricing_time<R: Reader, S: Signer, C: Clock>(
     ctx: &Ctx<'_, R, S, C>,
     last: &read::Priced,
     earliest: u64,
-) -> Result<u64, TxError> {
-    let mut time = last.time;
+) -> Result<PricedBy, TxError> {
+    let mut by = PricedBy {
+        time: last.time,
+        index: last.index,
+    };
     let mut index = last.index;
     for _ in 0..64 {
         if index.is_zero() {
@@ -829,11 +1069,14 @@ async fn pricing_time<R: Reader, S: Signer, C: Clock>(
             valuation.status,
             chain::bindings::vault::ValuationStatus::Priced
         ) {
-            time = valuation.time;
+            by = PricedBy {
+                time: valuation.time,
+                index: previous,
+            };
         }
         index = previous;
     }
-    Ok(time)
+    Ok(by)
 }
 
 // Withdraw -----------------------------------------------------------------
@@ -914,7 +1157,13 @@ async fn redeem_closed<R: Reader, S: Signer, C: Clock>(
 // Settling a request now ---------------------------------------------------
 
 /// The second step on its own ("Settle now"), for a request already priced
-/// and not yet settled: anyone may send it. It ends as the request settled.
+/// and not yet settled: anyone may send it. A deposit, a withdrawal, or a
+/// claim's own request (which pays its claim); a tank fill is the author's.
+/// It ends as the request settled, read from the vault's events for it
+/// wherever it was settled: if someone else settled it first, before the
+/// wallet was asked, nothing is sent and that is said
+/// ([`Outcome::SettledBefore`]). The step is watched briefly: it is
+/// optional, and the keeper settles the request anyway.
 pub async fn settle_request<R: Reader, S: Signer, C: Clock>(
     ctx: &Ctx<'_, R, S, C>,
     id: U256,
@@ -922,7 +1171,10 @@ pub async fn settle_request<R: Reader, S: Signer, C: Clock>(
     ctx.step(Step::Checking);
     check_endpoint(ctx).await?;
     let request = read::request(ctx.reader, ctx.vault, id).await?;
-    if request.done || !matches!(request.kind, RequestKind::Deposit | RequestKind::Redeem) {
+    if !matches!(
+        request.kind,
+        RequestKind::Deposit | RequestKind::Redeem | RequestKind::Claim
+    ) {
         return Err(TxError::WrongState);
     }
     let last = read::last_priced(ctx.reader, ctx.vault)
@@ -931,42 +1183,39 @@ pub async fn settle_request<R: Reader, S: Signer, C: Clock>(
         .ok_or(TxError::WouldRevert {
             reason: Revert::Vault("NotYet"),
         })?;
-    let at = pricing_time(ctx, &last, request.earliest).await?;
-    let receipt = ctx
-        .transact(
-            Prompt::Finish,
-            ctx.vault,
-            IVault::settleCall {
-                max: U256::from(256u32),
-            }
-            .abi_encode(),
-        )
-        .await?;
-    let landed = landed(receipt.hash, Some(id));
-    let after = read::request(ctx.reader, ctx.vault, id)
-        .await
-        .map_err(&landed)?;
-    if !after.done {
+    let by = pricing_time(ctx, &last, request.earliest).await?;
+    // Every settlement of the request comes after the valuation that priced
+    // it was opened: its events are read from there.
+    let from = read::read(
+        ctx.reader,
+        ctx.vault,
+        IVault::openedBlockCall { index: by.index },
+    )
+    .await?;
+    let outcome = |hash: Option<B256>| settled(ctx, id, &request, from, by.time, hash);
+    if read::request(ctx.reader, ctx.vault, id).await?.done {
+        return Ok(Outcome::SettledBefore(Box::new(outcome(None).await?)));
+    }
+    let hash = ctx.send(Prompt::Finish, ctx.vault, settle_call()).await?;
+    ctx.step(Step::Sent {
+        prompt: Prompt::Finish,
+        hash,
+        unseen: false,
+    });
+    let landed = landed(hash, Some(id));
+    match watch_second(ctx, id, hash).await {
+        // Whoever settled it, its events say how.
+        Watched::Settled => outcome(None).await.map_err(&landed),
         // Mined, and this request not among those it settled: it still
         // stands, and the keeper settles it.
-        return Err(TxError::Landed {
-            hash: receipt.hash,
+        Watched::Mined => Err(TxError::Landed {
+            hash,
             request: Some(id),
             then: None,
-        });
+        }),
+        Watched::Reverted => Err(TxError::Reverted { hash, reason: None }),
+        Watched::NotSeen(why) => Err(why),
     }
-    settled(
-        ctx,
-        id,
-        request.kind,
-        request.owner,
-        request.amount,
-        receipt.block,
-        at,
-        receipt.hash,
-    )
-    .await
-    .map_err(&landed)
 }
 
 // Claims, the fallback, collecting ------------------------------------------
@@ -1032,24 +1281,27 @@ pub fn claim_door_open(claim: ClaimState, vault: State, ready_to_close: bool) ->
 
 /// Whether the claim fallback (`takeProRataClaim`) is open to its owner:
 /// a claim pending, waiting or queued, on a vault neither closed, cancelled
-/// nor ready to close, a day after it was booked (a queued claim also a day
-/// after it was queued). Whether the cash would cover it is left to the
-/// chain's own estimate.
+/// nor ready to close, a day after it was booked; a queued claim also a day
+/// after the slot its own request was queued for (the vault queues it, at
+/// its last attempt, for the next slot). Whether the cash would cover it is
+/// left to the chain's own estimate.
 pub fn claim_fallback_open(
     claim: &read::Claim,
     vault: State,
     ready_to_close: bool,
-    fallback_after: u64,
+    timers: &Timers,
     now: u64,
 ) -> bool {
     let from = match claim.state {
         ClaimState::Pending | ClaimState::Waiting => claim.booked_at,
-        ClaimState::Queued => claim.booked_at.max(claim.last_attempt_at),
+        ClaimState::Queued => claim
+            .booked_at
+            .max(read::next_slot(claim.last_attempt_at, timers)),
         _ => return false,
     };
     !matches!(vault, State::Closed | State::Cancelled | State::None)
         && !ready_to_close
-        && now >= from.saturating_add(fallback_after)
+        && now >= from.saturating_add(timers.fallback_after)
 }
 
 /// What the fallback is taken for: a waiting request, or a claim.

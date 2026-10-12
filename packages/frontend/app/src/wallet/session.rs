@@ -28,6 +28,7 @@ use super::machine::{self, Connection, Event, Refusal, WalletId};
 use super::network::Network;
 use super::phrase::{BadPhrase, Fees, LocalKey, Unsigned};
 use super::rpc::{Endpoint, RpcReader, transaction_json};
+use super::run::{FlowKey, Running};
 #[cfg(target_arch = "wasm32")]
 use super::{
     networks,
@@ -89,6 +90,10 @@ pub struct Session {
     pub vaults: Mutable<BTreeMap<String, Rc<super::run::VaultRef>>>,
     /// Rises when a flow lands, so pages read the chain again.
     pub changed: Mutable<u64>,
+    /// Every flow started on this page, per vault, account and slot, until
+    /// it is dismissed: a panel or card built while one runs shows it, and
+    /// shows only the connected account's.
+    pub running: Mutable<BTreeMap<FlowKey, Running>>,
     /// When the vaults were last read, on the reader's clock.
     vaults_at: std::cell::Cell<f64>,
     active: RefCell<Option<Active>>,
@@ -104,6 +109,7 @@ thread_local! {
         networks: Mutable::new(BTreeMap::new()),
         vaults: Mutable::new(BTreeMap::new()),
         changed: Mutable::new(0),
+        running: Mutable::new(BTreeMap::new()),
         vaults_at: std::cell::Cell::new(f64::NEG_INFINITY),
         active: RefCell::new(None),
         flows: RefCell::new(Vec::new()),
@@ -172,6 +178,71 @@ impl Session {
             .map(Active::DevPhrase)
     }
 
+    /// The flow shown for `slug` and `slot`, for the connected account.
+    pub fn flow(&self, slug: &str, slot: &str) -> Option<Running> {
+        let account = self.account()?;
+        self.running
+            .lock_ref()
+            .get(&FlowKey {
+                slug: slug.to_string(),
+                account,
+                slot: slot.to_string(),
+            })
+            .cloned()
+    }
+
+    /// The same, as it changes: with the flows, and with the account.
+    pub fn flow_signal(
+        self: &Rc<Self>,
+        slug: &str,
+        slot: &str,
+    ) -> impl futures_signals::signal::Signal<Item = Option<Running>> + use<> {
+        use futures_signals::signal::SignalExt;
+        let slug = slug.to_string();
+        let slot = slot.to_string();
+        futures_signals::map_ref! {
+            let account = self.connection.signal_ref(Connection::account),
+            let running = self.running.signal_cloned() =>
+            account.and_then(|account| {
+                running
+                    .get(&FlowKey { slug: slug.clone(), account, slot: slot.clone() })
+                    .cloned()
+            })
+        }
+        .dedupe_cloned()
+    }
+
+    /// Show `running` for `slug` and its slot for the connected account,
+    /// unless a flow is already shown there. Whether it was taken.
+    pub fn begin(&self, slug: &str, running: &Running) -> bool {
+        let Some(account) = self.account() else {
+            return false;
+        };
+        let key = FlowKey {
+            slug: slug.to_string(),
+            account,
+            slot: running.action.slot(),
+        };
+        let mut flows = self.running.lock_mut();
+        if flows.contains_key(&key) {
+            return false;
+        }
+        flows.insert(key, running.clone());
+        true
+    }
+
+    /// Stop showing a flow (dismissed, or ended and acknowledged).
+    pub fn dismiss(&self, running: &Running) {
+        let mut flows = self.running.lock_mut();
+        let key = flows
+            .iter()
+            .find(|(_, shown)| shown.id == running.id)
+            .map(|(key, _)| key.clone());
+        if let Some(key) = key {
+            flows.remove(&key);
+        }
+    }
+
     /// Keep a flow's cancel, so an account change stops it.
     pub fn track(&self, cancel: Cancel) {
         let mut flows = self.flows.borrow_mut();
@@ -208,6 +279,11 @@ impl Session {
         self.wallet_name.set_neq(String::new());
     }
 
+    /// Whether the connection is waiting on `wallet`.
+    fn is_connecting(&self, wallet: &WalletId) -> bool {
+        matches!(&*self.connection.lock_ref(), Connection::Connecting { wallet: chosen } if chosen == wallet)
+    }
+
     /// Connect with a recovery phrase, held in memory only.
     pub fn connect_phrase(&self, phrase: &str) -> Result<(), BadPhrase> {
         if !dev::PHRASE_WALLET {
@@ -216,6 +292,11 @@ impl Session {
         let key = LocalKey::from_phrase(phrase)?;
         let account = key.address();
         self.apply(Event::Choose(WalletId::Phrase));
+        // Only if the connection took it: a wallet already connected keeps
+        // its own signer, so the header and the signer never disagree.
+        if !self.is_connecting(&WalletId::Phrase) {
+            return Err(BadPhrase);
+        }
         self.active.replace(Some(Active::Phrase(key)));
         self.wallet_name
             .set_neq("your recovery phrase wallet".to_string());
@@ -237,6 +318,9 @@ impl Session {
             _ => return false,
         };
         self.apply(Event::Choose(WalletId::Dev));
+        if !self.is_connecting(&WalletId::Dev) {
+            return false;
+        }
         self.active.replace(Some(active));
         self.wallet_name
             .set_neq("the development wallet".to_string());
@@ -860,5 +944,67 @@ mod tests {
         session.disconnect();
         assert_eq!(*session.connection.lock_ref(), Connection::SignedOut);
         assert!(session.connect_phrase("not a phrase").is_err());
+    }
+
+    #[test]
+    fn a_wallet_already_connected_keeps_its_account_and_signer_when_another_is_chosen() {
+        let session = get();
+        let connected = Connection::Connected {
+            wallet: WalletId::Dev,
+            account: Address::repeat_byte(0x33),
+            chain_id: None,
+        };
+        session.connection.set(connected.clone());
+        // A phrase while another wallet is connected is refused before the
+        // signer is touched: the header and the signer never disagree.
+        assert!(
+            session
+                .connect_phrase("test test test test test test test test test test test junk")
+                .is_err()
+        );
+        assert_eq!(*session.connection.lock_ref(), connected);
+        assert!(session.active.borrow().is_none());
+    }
+
+    #[test]
+    fn a_flow_is_shown_to_every_panel_for_its_vault_and_account_and_never_to_another_account() {
+        use super::super::run::{Action, EXIT};
+        use alloy_primitives::U256;
+        let session = get();
+        let one = Address::repeat_byte(0x11);
+        let other = Address::repeat_byte(0x22);
+        let connect = |account| {
+            session.connection.set(Connection::Connected {
+                wallet: WalletId::Dev,
+                account,
+                chain_id: None,
+            })
+        };
+        connect(one);
+        let deposit = Running::new(Action::Deposit(U256::from(15u8)));
+        assert!(session.begin("base-1", &deposit));
+        // A panel or sheet built while it runs finds it, rather than a
+        // fresh form.
+        assert_eq!(session.flow("base-1", EXIT), Some(deposit.clone()));
+        // Another panel for the same vault can't start a second one.
+        let again = Running::new(Action::Deposit(U256::from(15u8)));
+        assert!(!session.begin("base-1", &again));
+        // Another vault, and the portfolio's own buttons, are their own.
+        assert_eq!(session.flow("base-2", EXIT), None);
+        let settle = Running::new(Action::Settle(U256::from(3u8)));
+        assert!(session.begin("base-1", &settle));
+        assert_eq!(
+            session.flow("base-1", &Action::Settle(U256::from(3u8)).slot()),
+            Some(settle)
+        );
+        // Another account sees none of the first one's flows; back on the
+        // first, its flow is where it was.
+        connect(other);
+        assert_eq!(session.flow("base-1", EXIT), None);
+        connect(one);
+        assert_eq!(session.flow("base-1", EXIT), Some(deposit.clone()));
+        // Dismissed, the panel shows the form again.
+        session.dismiss(&deposit);
+        assert_eq!(session.flow("base-1", EXIT), None);
     }
 }
