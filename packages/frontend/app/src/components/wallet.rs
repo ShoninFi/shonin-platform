@@ -472,10 +472,20 @@ fn phrase_entry(phrase_mode: &Mutable<bool>) -> View {
                 )
                 .child(
                     el("div").class("sh-input").child(
+                        // A text field shown as dots, not a password field:
+                        // password managers offer to save a password field
+                        // whatever it asks, and the phrase lives only in
+                        // memory.
                         el("input")
                             .attr("id", "sh-phrase")
-                            .attr("type", "password")
+                            .class("sh-input__secret")
+                            .attr("type", "text")
                             .attr("autocomplete", "off")
+                            .attr("autocorrect", "off")
+                            .attr("data-1p-ignore", "true")
+                            .attr("data-lpignore", "true")
+                            .attr("data-bwignore", "true")
+                            .attr("data-form-type", "other")
                             .attr("autocapitalize", "off")
                             .attr("spellcheck", "false")
                             .attr("aria-describedby", "sh-phrase-hint")
@@ -630,4 +640,22 @@ pub fn switch_button(chain_id: u64, size: Size) -> El {
             busy.set(false);
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_recovery_phrase_field_is_never_offered_to_a_password_manager() {
+        let html = phrase_entry(&Mutable::new(true)).html();
+        let start = html.find("id=\"sh-phrase\"").expect("the phrase field");
+        let open = html[..start].rfind('<').expect("its tag");
+        let tag = &html[open..open + html[open..].find('>').expect("its tag's end")];
+        assert!(!tag.contains("type=\"password\""), "{tag}");
+        assert!(tag.contains("type=\"text\""), "{tag}");
+        assert!(tag.contains("sh-input__secret"), "{tag}");
+        assert!(tag.contains("autocomplete=\"off\""), "{tag}");
+        assert!(tag.contains("data-1p-ignore"), "{tag}");
+    }
 }
