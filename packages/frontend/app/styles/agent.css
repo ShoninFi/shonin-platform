@@ -336,6 +336,30 @@
 .ag-report__row--some { background: var(--caution-soft); }
 .ag-report__row--serious { background: var(--loss-soft); }
 .ag-report__go { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: var(--radius-s); color: var(--ink-muted); }
+/* A rating as recorded, with a note when the area's findings are more severe than it. */
+.ag-rated { display: inline-flex; flex-direction: column; align-items: flex-start; gap: var(--space-1); }
+.ag-rated__note { font: var(--type-body-s); color: var(--ink-muted); }
+.ag-card__head .ag-rated { align-items: flex-end; text-align: right; }
+/* Phone: the report card is a stacked list, area and rating on one line and
+   the leading finding under them, never a table that scrolls sideways. */
+@media (max-width: 599px) {
+  .ag-card.ag-report-card { padding: 0; }
+  .ag-report-card__head { padding: var(--space-4); }
+  .ag-report-card .ag-scroll { overflow: visible; margin: 0; }
+  .ag-report-card .ag-scroll .sh-table { min-width: 0; }
+  .ag-report, .ag-report tbody { display: block; }
+  .ag-report thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+  .ag-report tr { display: grid; grid-template-columns: minmax(0, 1fr) auto 32px; align-items: center; column-gap: var(--space-2); row-gap: var(--space-1); padding: 12px var(--space-2) 12px var(--space-4); border-bottom: var(--border-hairline) solid var(--line); }
+  .ag-report tbody tr:last-child { border-bottom: 0; }
+  .ag-report th, .ag-report td { display: block; padding: 0 !important; border: 0 !important; }
+  .ag-report .ag-report__area { grid-column: 1; grid-row: 1; white-space: normal; }
+  /* The rating's badge sits beside the area; its note, if any, under both. */
+  .ag-report td:nth-child(2), .ag-report .ag-rated { display: contents; }
+  .ag-report .ag-rated > .sh-chip { grid-column: 2; grid-row: 1; justify-self: end; }
+  .ag-report .ag-rated__note { grid-column: 1 / 3; grid-row: 2; }
+  .ag-report .ag-report__line { grid-column: 1 / 3; grid-row: 3; font: var(--type-body-s); color: var(--ink-muted); }
+  .ag-report td:last-child { grid-column: 3; grid-row: 1 / 4; align-self: center; }
+}
 .ag-legend { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); padding: var(--space-3) var(--space-5); border-top: var(--border-hairline) solid var(--line); background: var(--paper); }
 .ag-areas { display: flex; flex-direction: column; gap: var(--space-4); }
 .ag-areas__head { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: var(--space-2); }
@@ -483,6 +507,9 @@
   .ag--overview .ag-price__figures, .ag--overview .ag-price > .sh-contents { display: none; }
   .ag--overview .ag-price { order: 1; }
   .ag-tabs { gap: 20px; margin: 0 calc(-1 * var(--gutter)); padding: 0 var(--gutter); }
+  /* A cue that the row scrolls: a fade pinned to the right edge over the
+     tabs; scrolled to the end, it rests past the last tab, over the gutter. */
+  .ag-tabs::after { content: ""; position: sticky; right: 0; flex: none; width: 40px; margin-left: -20px; background: linear-gradient(to right, transparent, var(--paper) 70%); pointer-events: none; }
   .ag-layout { display: flex; flex-direction: column; gap: var(--space-4); }
   .ag-layout--overview .ag-main, .ag-layout--overview .ag-side { display: contents; }
   .ag-o-chart { order: 1; } .ag-o-stats { order: 2; } .ag-o-review { order: 4; } .ag-o-risks { order: 5; }
@@ -543,8 +570,11 @@
   .sh-app:has(.ag-actionbar) { padding-bottom: calc(118px + env(safe-area-inset-bottom)); }
 }
 
-.ag-record .sh-hash { height: auto; min-height: 28px; padding-top: 4px; padding-bottom: 4px; }
-.ag-record .sh-hash__value { overflow-wrap: anywhere; min-width: 0; }
+/* A record's hash is already shortened in the middle; it never wraps, and
+   only if its box is narrower still does the end give way. */
+.ag-record .sh-hash__value { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.ag-verify-page { display: flex; flex-direction: column; gap: var(--space-5); }
+@media (min-width: 900px) { .ag-verify-page { gap: var(--space-6); margin-top: var(--space-2); } .ag-verify-page > .ag-layout { margin-top: 0; } }
 
 /* Motion M5: from a leaderboard row to its agent, the name and sparkline
    morph into the page's name and chart; the rest crossfades. The names are

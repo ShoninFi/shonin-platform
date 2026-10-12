@@ -373,7 +373,10 @@ fn holdings_view(loaded: &Loaded) -> View {
         ));
         tiles = tiles.child(tile_stat(
             "Gain",
-            signed_cents(total, paid),
+            match gain_percent(total, paid) {
+                Some(percent) => format!("{} · {percent}", signed_cents(total, paid)),
+                None => signed_cents(total, paid),
+            },
             "since you joined, after fees".to_string(),
         ));
     }
@@ -395,10 +398,14 @@ fn holdings_view(loaded: &Loaded) -> View {
     el("div")
         .class("sh-portfolio__body")
         .child(tiles)
+        .child(tank_warnings(&positions))
         .child(if positions.is_empty() {
             View::Empty
         } else {
-            positions_table(&positions, total, paid)
+            View::Many(vec![
+                positions_table(&positions, total, paid),
+                positions_cards(&positions),
+            ])
         })
         .child(if open_claims.is_empty() {
             View::Empty
@@ -419,6 +426,160 @@ fn signed_cents(value: u128, paid: u128) -> String {
         format!("+{}", dollars_from_cents(value - paid))
     } else {
         format!("{}{}", money::MINUS, dollars_from_cents(paid - value))
+    }
+}
+
+/// Gain as a share of what was paid in: "+4.2%".
+fn gain_percent(value: u128, paid: u128) -> Option<String> {
+    (paid > 0).then(|| crate::format::ret((value as f64 - paid as f64) / paid as f64))
+}
+
+/// For each held agent still running whose tank is low, the plain warning:
+/// read from the agent's own record, as its page reads it.
+fn tank_warnings(rows: &[&Row]) -> View {
+    let store = crate::store::get();
+    let notices: Vec<View> = rows
+        .iter()
+        .filter(|row| matches!(row.figures.state, State::Open | State::WindingDown))
+        .filter_map(|row| {
+            let agent = store.agent(&row.vault.slug)?;
+            let tank = crate::model::TankState::of(&agent.strategy.get_cloned());
+            tank.is_low().then(|| {
+                let left = if tank.days < 1.0 {
+                    "less than a day".to_string()
+                } else {
+                    format!("about {}", crate::format::days(tank.days.floor() as u32))
+                };
+                notice(
+                    NoticeTone::Caution,
+                    text(format!(
+                        "{}'s tank has {left} left. If it runs dry, the agent stops and its positions sit unmanaged. You can still leave whenever you like.",
+                        row.vault.title
+                    )),
+                )
+                .into()
+            })
+        })
+        .collect();
+    View::Many(notices)
+}
+
+/// Phone: each position as a card (Portfolio-Mobile): the agent, its chain
+/// and status; Value and Gain first, then Shares and Share price; what was
+/// paid in as a footnote; Deposit and Withdraw, each opening its sheet.
+fn positions_cards(rows: &[&Row]) -> View {
+    let cards = rows.iter().map(|row| {
+        let decimals = row.network.asset_decimals;
+        let price = row.figures.share_price();
+        let open = row.figures.state == State::Open;
+        let figure = |label: &'static str, value: String| {
+            el("div")
+                .child(el("dt").class("sh-label").text(label))
+                .child(el("dd").class("sh-num").text(value))
+        };
+        let gain = row
+            .paid_cents
+            .map(|paid| {
+                let amount = signed_cents(row.value_cents, paid);
+                match gain_percent(row.value_cents, paid) {
+                    Some(percent) => format!("{amount} · {percent}"),
+                    None => amount,
+                }
+            })
+            .unwrap_or_else(|| "—".to_string());
+        let slug = row.vault.slug.clone();
+        let deposit = {
+            let slug = slug.clone();
+            on_click(
+                Button::new(Kind::Secondary, "Deposit")
+                    .size(Size::Small)
+                    .build(),
+                move || {
+                    crate::components::exit::open_sheet(
+                        &slug,
+                        crate::components::exit::Tab::Deposit,
+                    )
+                },
+            )
+        };
+        let withdraw = on_click(
+            Button::new(Kind::Secondary, "Withdraw")
+                .size(Size::Small)
+                .build(),
+            move || {
+                crate::components::exit::open_sheet(&slug, crate::components::exit::Tab::Withdraw)
+            },
+        );
+        el("li")
+            .class("sh-card sh-poscard")
+            .child(
+                el("div")
+                    .class("sh-poscard__head")
+                    .child(
+                        el("div")
+                            .child(
+                                el("h3").class("sh-poscard__name").child(
+                                    app_link(format!("/agents/{}", row.vault.slug))
+                                        .text(row.vault.title.clone()),
+                                ),
+                            )
+                            .child(
+                                el("p")
+                                    .class("sh-portfolio__chain sh-muted")
+                                    .child(tile(&row.network.label))
+                                    .text(format!(
+                                        " {} · {}",
+                                        row.network.label,
+                                        if row.vault.served { "Served" } else { "Direct" }
+                                    )),
+                            ),
+                    )
+                    .child(status_badge(row.figures.state)),
+            )
+            .child(
+                el("dl")
+                    .class("sh-poscard__figures")
+                    .child(figure("Value", dollars_from_cents(row.value_cents)))
+                    .child(figure("Gain", gain))
+                    .child(figure(
+                        "Shares",
+                        money::shares(row.held.shares, Rounding::Down),
+                    ))
+                    .child(figure(
+                        "Share price",
+                        price
+                            .map(|p| money::price(p, decimals))
+                            .unwrap_or_else(|| "—".to_string()),
+                    )),
+            )
+            .child(View::from(row.paid_cents.map(|paid| {
+                el("p")
+                    .class("sh-poscard__paid sh-muted")
+                    .text(format!("Paid in {}", dollars_from_cents(paid)))
+                    .into()
+            })))
+            .child(
+                el("div")
+                    .class("sh-poscard__actions")
+                    .child(View::from(open.then(|| deposit.into())))
+                    .child(withdraw),
+            )
+    });
+    el("ul")
+        .class("sh-poscards")
+        .attr("aria-label", "Your positions")
+        .children(cards)
+        .into()
+}
+
+fn status_badge(state: State) -> El {
+    match state {
+        State::Open => badge(Tone::Gain, None, "Live"),
+        State::WindingDown => badge(Tone::Caution, None, "Winding down"),
+        State::Frozen => badge(Tone::Caution, None, "Frozen"),
+        State::Killed => badge(Tone::Loss, None, "Killed"),
+        State::Closed => badge(Tone::Neutral, None, "Closed"),
+        _ => badge(Tone::Neutral, None, "Not open"),
     }
 }
 
@@ -444,14 +605,7 @@ fn positions_table(rows: &[&Row], total: u128, paid: Option<u128>) -> View {
     let body = rows.iter().map(|row| {
         let decimals = row.network.asset_decimals;
         let price = row.figures.share_price();
-        let status = match row.figures.state {
-            State::Open => badge(Tone::Gain, None, "Live"),
-            State::WindingDown => badge(Tone::Caution, None, "Winding down"),
-            State::Frozen => badge(Tone::Caution, None, "Frozen"),
-            State::Killed => badge(Tone::Loss, None, "Killed"),
-            State::Closed => badge(Tone::Neutral, None, "Closed"),
-            _ => badge(Tone::Neutral, None, "Not open"),
-        };
+        let status = status_badge(row.figures.state);
         el("tr")
             .class("sh-row")
             .child(
@@ -506,7 +660,12 @@ fn positions_table(rows: &[&Row], total: u128, paid: Option<u128>) -> View {
                     .class("sh-r sh-num")
                     .text(
                         row.paid_cents
-                            .map(|paid| signed_cents(row.value_cents, paid))
+                            .map(|paid| match gain_percent(row.value_cents, paid) {
+                                Some(percent) => {
+                                    format!("{} · {percent}", signed_cents(row.value_cents, paid))
+                                }
+                                None => signed_cents(row.value_cents, paid),
+                            })
                             .unwrap_or_else(|| "—".to_string()),
                     ),
             )
@@ -1408,6 +1567,20 @@ fn claim_view(view: &ClaimView) -> View {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gain_reads_as_a_share_of_what_was_paid_in() {
+        assert_eq!(gain_percent(104_200, 100_000).as_deref(), Some("+4.2%"));
+        assert_eq!(
+            gain_percent(99_000, 100_000).as_deref(),
+            Some("\u{2212}1.0%")
+        );
+        assert_eq!(
+            gain_percent(500, 0),
+            None,
+            "nothing paid in has no percentage"
+        );
+    }
 
     #[test]
     fn a_claim_the_cash_no_longer_covered_is_never_said_to_be_outside_the_exit_band() {

@@ -13,8 +13,6 @@ use crate::components::wallet::{hex_ring, tile};
 use crate::view::{El, View, el};
 use crate::wallet::solana::{SolConnection, SolWalletId, SolWalletOption};
 
-use super::exit::short;
-
 /// Ask Solana wallets to register again (the connect dialog opening).
 pub fn discover() {
     #[cfg(target_arch = "wasm32")]
@@ -23,7 +21,8 @@ pub fn discover() {
 
 /// The Solana rows of the connect dialog's list: every Solana wallet this
 /// browser has, the popular ones named either way, and the development
-/// wallet on its own when the EVM side offers none.
+/// wallet on its own when the EVM side doesn't offer it (it offers none, or
+/// an EVM wallet is already connected, so the list shows only Solana).
 pub fn rows() -> Vec<View> {
     let session = crate::wallet::solana::get();
     let mut rows: Vec<View> = session
@@ -32,7 +31,12 @@ pub fn rows() -> Vec<View> {
         .into_iter()
         .map(wallet_row)
         .collect();
-    if session.dev_available() && !crate::wallet::get().dev_available() {
+    let evm = crate::wallet::get();
+    let evm_connected = matches!(
+        *evm.connection.lock_ref(),
+        crate::wallet::machine::Connection::Connected { .. }
+    );
+    if session.dev_available() && (!evm.dev_available() || evm_connected) {
         rows.push(
             option_row(
                 tile("D").into(),
@@ -251,77 +255,4 @@ fn state_view(connection: &SolConnection) -> View {
         }
         SolConnection::SignedOut | SolConnection::Connected { .. } => View::Empty,
     }
-}
-
-/// The header's Solana wallet button, while a Solana wallet is connected:
-/// opens its menu.
-pub fn header_button() -> View {
-    let session = crate::wallet::solana::get();
-    el("span")
-        .class("sh-walletctl__solana")
-        .child_signal(
-            None,
-            session.connection.signal_cloned().map(|connection| {
-                let account = connection.account()?;
-                let full = account.to_string();
-                Some(
-                    on_click(
-                        el("button")
-                            .attr("type", "button")
-                            .class("sh-btn sh-btn-secondary sh-btn-sm sh-walletbtn")
-                            .attr("aria-label", format!("Solana wallet {full}"))
-                            .attr("aria-haspopup", "dialog")
-                            .child(tile("S"))
-                            .child(el("span").class("sh-mono").text(short(&full))),
-                        menu,
-                    )
-                    .into(),
-                )
-            }),
-        )
-        .into()
-}
-
-/// The Solana wallet's menu: the full address, Portfolio, Disconnect.
-fn menu() {
-    let session = crate::wallet::solana::get();
-    let Some(account) = session.account() else {
-        return;
-    };
-    let body = el("div")
-        .class("sh-walletmenu")
-        .child(
-            el("p")
-                .class("sh-muted")
-                .text_from(&session.wallet_name, |name| {
-                    if name.is_empty() {
-                        "Connected on Solana".to_string()
-                    } else {
-                        format!("Connected on Solana with {name}")
-                    }
-                }),
-        )
-        .child(crate::atoms::hash::hash(
-            &account.to_string(),
-            None,
-            "address",
-        ))
-        .child(
-            crate::web::app_link("/portfolio")
-                .class("sh-link")
-                .text("View your portfolio")
-                .hook(|dom| dom.event(|_: dominator::events::Click| dialog::close())),
-        );
-    dialog::open(Dialog {
-        title: "Your Solana wallet".to_string(),
-        body: body.into(),
-        foot: Some(
-            on_click(Button::new(Kind::Secondary, "Disconnect").build(), || {
-                crate::wallet::solana::get().disconnect();
-                dialog::close();
-            })
-            .into(),
-        ),
-        wide: false,
-    });
 }

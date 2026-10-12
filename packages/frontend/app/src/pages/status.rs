@@ -422,7 +422,11 @@ fn timeline(
 
 /// The overall line and one tile per thing that can fall behind.
 fn system(freshness: Freshness, chains: &[ChainRead], now: Option<PrimitiveDateTime>) -> View {
+    let chains_tile = chains_state(chains);
+    let chains_behind = chains_tile.as_ref().is_some_and(|(normal, _)| !normal);
     let (ok, headline) = match freshness {
+        // The summary never says normal while a tile under it doesn't.
+        Freshness::Fresh if chains_behind => (false, "A vault chain is behind"),
         Freshness::Fresh => (true, "All systems normal"),
         Freshness::Loading => (true, "Checking"),
         Freshness::Behind { .. } => (false, "Figures are behind"),
@@ -484,27 +488,8 @@ fn system(freshness: Freshness, chains: &[ChainRead], now: Option<PrimitiveDateT
             indexer_chip,
             "Reads the chain so these pages load quickly.".to_string(),
         ));
-    if !chains.is_empty() {
-        let latest = chains.iter().filter_map(|read| read.as_of).max();
-        let behind: Vec<&str> = chains
-            .iter()
-            .filter(|read| match (read.as_of, latest) {
-                (Some(at), Some(latest)) => (latest - at).whole_seconds() > 60,
-                _ => true,
-            })
-            .map(|read| read.chain.label())
-            .collect();
-        let names: Vec<&str> = chains.iter().map(|read| read.chain.label()).collect();
-        let words = match latest {
-            Some(at) if behind.is_empty() => format!(
-                "{}: each read at {}.",
-                names.join(", "),
-                format::time_short(at)
-            ),
-            Some(_) => format!("{} behind the others.", behind.join(", ")),
-            None => "Not read yet.".to_string(),
-        };
-        let chip = if latest.is_some() && behind.is_empty() {
+    if let Some((normal, words)) = chains_tile {
+        let chip = if normal {
             badge(Tone::Gain, Some(Icon::Check), "Normal")
         } else {
             badge(Tone::Caution, Some(Icon::Clock), "Behind")
@@ -518,6 +503,34 @@ fn system(freshness: Freshness, chains: &[ChainRead], now: Option<PrimitiveDateT
             "This site.".to_string(),
         ))
         .into()
+}
+
+/// The vault chains' tile: whether every chain was read within a minute of
+/// the latest, and its words; none when no chain is listed.
+fn chains_state(chains: &[ChainRead]) -> Option<(bool, String)> {
+    if chains.is_empty() {
+        return None;
+    }
+    let latest = chains.iter().filter_map(|read| read.as_of).max();
+    let behind: Vec<&str> = chains
+        .iter()
+        .filter(|read| match (read.as_of, latest) {
+            (Some(at), Some(latest)) => (latest - at).whole_seconds() > 60,
+            _ => true,
+        })
+        .map(|read| read.chain.label())
+        .collect();
+    let names: Vec<&str> = chains.iter().map(|read| read.chain.label()).collect();
+    let words = match latest {
+        Some(at) if behind.is_empty() => format!(
+            "{}: each read at {}.",
+            names.join(", "),
+            format::time_short(at)
+        ),
+        Some(_) => format!("{} behind the others.", behind.join(", ")),
+        None => "Not read yet.".to_string(),
+    };
+    Some((latest.is_some() && behind.is_empty(), words))
 }
 
 pub fn page() -> Page {
@@ -783,4 +796,36 @@ fn more_view(line: Option<(String, Option<String>)>, older: &Mutable<u32>) -> Op
         }
         None => row.into(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read(chain: shared::Chain, at: PrimitiveDateTime) -> ChainRead {
+        ChainRead {
+            chain,
+            key: String::new(),
+            block: 1,
+            as_of: Some(at),
+        }
+    }
+
+    #[test]
+    fn the_summary_never_says_normal_while_a_vault_chain_is_behind() {
+        let now = time::macros::datetime!(2026-10-12 22:00);
+        let behind = [
+            read(shared::Chain::Base, now),
+            read(shared::Chain::Solana, now - Duration::minutes(5)),
+        ];
+        let html = system(Freshness::Fresh, &behind, Some(now)).html();
+        assert!(!html.contains("All systems normal"), "{html}");
+        assert!(html.contains("A vault chain is behind"), "{html}");
+        let level = [
+            read(shared::Chain::Base, now),
+            read(shared::Chain::Solana, now),
+        ];
+        let html = system(Freshness::Fresh, &level, Some(now)).html();
+        assert!(html.contains("All systems normal"), "{html}");
+    }
 }

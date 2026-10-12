@@ -353,8 +353,11 @@ pub enum Banner {
     Cancelled,
     Activating,
     TankEmpty,
+    /// The areas rated serious concerns, and those of them under which the
+    /// Reviewer listed no finding.
     Serious {
         areas: Vec<Area>,
+        unlisted: Vec<Area>,
         refused: bool,
     },
     Retiring {
@@ -384,8 +387,8 @@ impl Banner {
             Banner::Serious { .. } => 6,
             Banner::Retiring { .. } => 7,
             Banner::TankLow { .. } => 8,
-            Banner::New { .. } => 9,
-            Banner::Sealed => 10,
+            Banner::Sealed => 9,
+            Banner::New { .. } => 10,
             Banner::Served => 11,
         }
     }
@@ -446,11 +449,17 @@ pub fn all_banners(strategy: &Strategy) -> Vec<Banner> {
         && state != VaultState::Cancelled
         && (review.refused || review.ratings.contains(&Rating::SeriousConcerns))
     {
+        let areas: Vec<Area> = Area::ALL
+            .into_iter()
+            .filter(|area| review.rating(*area) == Rating::SeriousConcerns)
+            .collect();
         out.push(Banner::Serious {
-            areas: Area::ALL
-                .into_iter()
-                .filter(|area| review.rating(*area) == Rating::SeriousConcerns)
+            unlisted: areas
+                .iter()
+                .copied()
+                .filter(|area| rated_without_finding(review, *area))
                 .collect(),
+            areas,
             refused: review.refused,
         });
     }
@@ -475,10 +484,19 @@ pub fn all_banners(strategy: &Strategy) -> Vec<Banner> {
     out
 }
 
-/// The banners a page shows: the most serious two.
+/// The banners a page shows: the most serious two. A sealed agent's notice
+/// always shows, as the page's framing: when two more serious banners apply,
+/// it takes the second place.
 pub fn banners(strategy: &Strategy) -> Vec<Banner> {
     let mut all = all_banners(strategy);
+    let sealed = all.iter().position(|banner| *banner == Banner::Sealed);
     all.truncate(MAX_BANNERS);
+    if let Some(at) = sealed
+        && at >= MAX_BANNERS
+        && let Some(last) = all.last_mut()
+    {
+        *last = Banner::Sealed;
+    }
     all
 }
 
@@ -532,6 +550,55 @@ pub fn lead_finding(review: &Review, area: Area) -> Option<&Finding> {
             .cmp(&b.severity)
             .then(std::cmp::Ordering::Greater)
     })
+}
+
+/// Whether an area is rated something other than "Looks fine" yet the
+/// Reviewer listed no finding under it. The rating is shown as recorded;
+/// the page says plainly that nothing was listed, never "nothing to report".
+pub fn rated_without_finding(review: &Review, area: Area) -> bool {
+    review.rating(area) != Rating::LooksFine && review.findings_in(area).next().is_none()
+}
+
+/// The honest line for an area rated worse than "Looks fine" with no
+/// finding listed under it.
+pub fn no_finding_line(rated: Rating) -> String {
+    match rated {
+        Rating::CouldntTell => {
+            "The Reviewer couldn't tell for this area, and listed no finding for it.".to_string()
+        }
+        other => format!(
+            "The Reviewer rated this area {} but listed no finding for it.",
+            crate::model::rating_word(other).to_lowercase()
+        ),
+    }
+}
+
+/// How severe a rating says an area is, on the findings' own scale.
+fn rating_severity(rated: Rating) -> Option<Severity> {
+    match rated {
+        Rating::SeriousConcerns => Some(Severity::Serious),
+        Rating::SomeConcerns => Some(Severity::Concern),
+        Rating::LooksFine | Rating::CouldntTell => None,
+    }
+}
+
+/// The most severe finding in an area when it is more severe than the
+/// area's rating says: a serious finding under "Some concerns", or any
+/// concern under "Looks fine". Notes never count.
+pub fn findings_outrank_rating(review: &Review, area: Area) -> Option<Severity> {
+    let worst = review
+        .findings_in(area)
+        .map(|finding| finding.severity)
+        .max()?;
+    (worst != Severity::Note && Some(worst) > rating_severity(review.rating(area))).then_some(worst)
+}
+
+/// What to say beside a rating whose findings are more severe than it.
+pub fn outrank_line(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Serious => "Its findings include serious concerns.",
+        Severity::Concern | Severity::Note => "Its findings include concerns.",
+    }
 }
 
 /// The areas whose rating needs saying out loud on the overview, most severe
@@ -880,6 +947,16 @@ mod tests {
     }
 
     #[test]
+    fn a_new_sealed_agent_shows_the_sealed_notice_first() {
+        let mut strategy = quiet();
+        strategy.standing = Standing::New;
+        strategy.bundle.source = Source::Sealed;
+        let shown = banners(&strategy);
+        assert_eq!(shown[0], Banner::Sealed);
+        assert!(matches!(shown[1], Banner::New { .. }));
+    }
+
+    #[test]
     fn at_most_two_banners_show_and_the_most_serious_come_first() {
         let mut strategy = quiet();
         strategy.standing = Standing::New;
@@ -892,16 +969,22 @@ mod tests {
         let all = all_banners(&strategy);
         assert!(matches!(all[0], Banner::Serious { .. }));
         assert!(matches!(all[1], Banner::TankLow { days: 3 }));
-        assert!(matches!(all[2], Banner::New { .. }));
-        assert_eq!(all[3], Banner::Sealed);
+        assert_eq!(all[2], Banner::Sealed);
+        assert!(matches!(all[3], Banner::New { .. }));
         assert_eq!(all[4], Banner::Served);
         let shown = banners(&strategy);
         assert_eq!(shown.len(), MAX_BANNERS);
-        assert_eq!(shown, all[..2]);
+        // The sealed notice always shows, in the second place.
+        assert_eq!(shown, vec![all[0].clone(), Banner::Sealed]);
+        strategy.bundle.source = Source::Published {
+            repo: "r".into(),
+            commit: "c".into(),
+        };
+        assert_eq!(banners(&strategy), all_banners(&strategy)[..2]);
     }
 
     #[test]
-    fn the_order_is_kill_freeze_tank_empty_serious_retiring_tank_low_new_sealed_served() {
+    fn the_order_is_kill_freeze_tank_empty_serious_retiring_tank_low_sealed_new_served() {
         let order = [
             Banner::Killed {
                 at: None,
@@ -913,6 +996,7 @@ mod tests {
             Banner::TankEmpty,
             Banner::Serious {
                 areas: vec![],
+                unlisted: vec![],
                 refused: false,
             },
             Banner::Retiring {
@@ -920,12 +1004,98 @@ mod tests {
                 ends: None,
             },
             Banner::TankLow { days: 1 },
-            Banner::New { days: 1 },
             Banner::Sealed,
+            Banner::New { days: 1 },
             Banner::Served,
         ];
         let ranks = ranks(&order);
         assert!(ranks.windows(2).all(|pair| pair[0] < pair[1]), "{ranks:?}");
+    }
+
+    #[test]
+    fn the_serious_banner_names_the_areas_rated_serious_that_hold_no_finding() {
+        let mut strategy = quiet();
+        if let Some(review) = strategy.review.as_mut() {
+            review.findings.clear();
+            review.ratings[Area::OutsideInfluence.index()] = Rating::SeriousConcerns;
+            review.ratings[Area::Security.index()] = Rating::SeriousConcerns;
+            review.findings.push(Finding {
+                area: Area::Security,
+                severity: Severity::Serious,
+                summary: "s".into(),
+                detail: "d".into(),
+                file: None,
+                line: None,
+            });
+        }
+        let shown = banners(&strategy);
+        assert_eq!(
+            shown[0],
+            Banner::Serious {
+                areas: vec![Area::Security, Area::OutsideInfluence],
+                unlisted: vec![Area::OutsideInfluence],
+                refused: false,
+            }
+        );
+        let (lead, rest) = super::super::serious_words(
+            &[Area::Security, Area::OutsideInfluence],
+            &[Area::OutsideInfluence],
+            false,
+        );
+        assert_eq!(
+            lead,
+            "The Reviewer rated 2 areas serious concerns: Security and Outside influence."
+        );
+        assert!(
+            rest.starts_with(" It listed no finding for Outside influence."),
+            "{rest}"
+        );
+        let (_, rest) = super::super::serious_words(
+            &[Area::OutsideInfluence],
+            &[Area::OutsideInfluence],
+            false,
+        );
+        assert!(
+            rest.starts_with(" It listed no finding for that area."),
+            "{rest}"
+        );
+        let (_, rest) = super::super::serious_words(&[Area::Security], &[], false);
+        assert!(!rest.contains("no finding"), "{rest}");
+    }
+
+    #[test]
+    fn a_finding_outranks_its_rating_only_when_it_is_more_severe_than_the_rating_says() {
+        let mut review = quiet().review.expect("reviewed");
+        review.findings.clear();
+        let push = |review: &mut Review, area: Area, severity: Severity| {
+            review.findings.push(Finding {
+                area,
+                severity,
+                summary: "s".into(),
+                detail: "d".into(),
+                file: None,
+                line: None,
+            })
+        };
+        review.ratings[Area::Reliability.index()] = Rating::SomeConcerns;
+        push(&mut review, Area::Reliability, Severity::Serious);
+        assert_eq!(
+            findings_outrank_rating(&review, Area::Reliability),
+            Some(Severity::Serious)
+        );
+        push(&mut review, Area::Security, Severity::Concern);
+        assert_eq!(
+            findings_outrank_rating(&review, Area::Security),
+            Some(Severity::Concern)
+        );
+        push(&mut review, Area::FinancialRisk, Severity::Note);
+        assert_eq!(findings_outrank_rating(&review, Area::FinancialRisk), None);
+        review.ratings[Area::Security.index()] = Rating::SeriousConcerns;
+        assert_eq!(findings_outrank_rating(&review, Area::Security), None);
+        assert!(!rated_without_finding(&review, Area::Security));
+        review.ratings[Area::OutsideInfluence.index()] = Rating::SomeConcerns;
+        assert!(rated_without_finding(&review, Area::OutsideInfluence));
+        assert!(!rated_without_finding(&review, Area::AccurateDescription));
     }
 
     #[test]

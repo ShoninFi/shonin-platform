@@ -165,8 +165,10 @@ pub(crate) fn open(read: &Rc<Read>, slot: &Mutable<Option<Running>>, names: &Rc<
         .hook(|dom| {
             dom.event(|_: dominator::events::Click| dialog::close())
                 .after_inserted(|element| {
-                    // After the dialog has placed focus on its first field.
+                    // After the dialog has placed focus on its first field
+                    // (which it does a tick after it is inserted).
                     wasm_bindgen_futures::spawn_local(async move {
+                        gloo_timers::future::TimeoutFuture::new(0).await;
                         gloo_timers::future::TimeoutFuture::new(0).await;
                         if let Some(element) =
                             wasm_bindgen::JsCast::dyn_ref::<web_sys::HtmlElement>(&element)

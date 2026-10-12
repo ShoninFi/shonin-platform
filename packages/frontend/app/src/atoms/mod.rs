@@ -14,6 +14,7 @@ pub mod hash;
 pub mod icon;
 pub mod logo;
 pub mod notice;
+pub mod prose;
 pub mod rating;
 pub mod segmented;
 pub mod skeleton;

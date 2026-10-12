@@ -16,14 +16,22 @@ use crate::route::DOCS;
 use crate::store::{self, Agent};
 use crate::view::{El, View, el, svg, text};
 
+/// The chain of records spans the page, as the panel the tab is about; the
+/// checks and the way out sit in two columns under it.
 pub fn body(agent: &Rc<Agent>) -> El {
+    el("div")
+        .class("ag-verify-page")
+        .child(live(agent, chain_of_records))
+        .child(layout(agent))
+}
+
+fn layout(agent: &Rc<Agent>) -> El {
     el("div")
         .class("ag-layout")
         .class("ag-layout--tab")
         .child(
             el("div")
                 .class("ag-main")
-                .child(live(agent, chain_of_records))
                 .child(live(agent, rebuild))
                 .child(live(agent, keys))
                 .child(live(agent, images))

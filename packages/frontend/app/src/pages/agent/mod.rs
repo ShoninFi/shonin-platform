@@ -19,7 +19,7 @@ use std::rc::Rc;
 
 use futures_signals::map_ref;
 use futures_signals::signal::{Mutable, SignalExt};
-use shared::{Rating, Strategy};
+use shared::{Area, Rating, Strategy};
 use ui::icons::Icon;
 
 use self::facts::{Banner, ChipTone};
@@ -676,25 +676,13 @@ pub(crate) fn banner(banner: &Banner, strategy: &Strategy, this_year: i32) -> El
         )
         .class("ag-banner")
         .class("ag-banner--loud"),
-        Banner::Serious { areas, refused } => {
-            let words = if *refused {
-                "The Reviewer refused this agent's code as written to do harm.".to_string()
-            } else {
-                let names: Vec<&str> = areas.iter().map(|area| area.label()).collect();
-                match areas.len() {
-                    6 => "The review found serious concerns in all six areas.".to_string(),
-                    count => format!(
-                        "The review found serious concerns in {}: {}.",
-                        if count == 1 { "1 area".to_string() } else { format!("{count} areas") },
-                        join_and(&names)
-                    ),
-                }
-            };
+        Banner::Serious { areas, unlisted, refused } => {
+            let (words, rest) = serious_words(areas, unlisted, *refused);
             notice(
                 NoticeTone::Danger,
                 View::Many(vec![
                     el("strong").text(words).into(),
-                    text(" You can still deposit, but read what the Reviewer found first. A review isn't a prediction either way."),
+                    text(rest),
                     el("span")
                         .class("sh-notice__actions")
                         .child(app_link(format!("/agents/{}/review", strategy.slug)).text("Read the review"))
@@ -754,10 +742,10 @@ pub(crate) fn banner(banner: &Banner, strategy: &Strategy, this_year: i32) -> El
             Icon::Lock,
             View::Many(vec![
                 el("strong").text("Source sealed.").into(),
-                text(" Only the Reviewer and the build machine have seen this agent's code. You can check that what runs is what was reviewed, but you can't read the code yourself."),
+                text(" You can't read this agent's code. The Reviewer did, and the chain records that it read the same source the running build came from. You're relying on its reading."),
                 el("span")
                     .class("sh-notice__actions")
-                    .child(app_link(format!("/agents/{}/verify", strategy.slug)).text("How sealed agents are checked"))
+                    .child(link_out(docs("verify/#what-does-it-do"), "What sealed means"))
                     .into(),
             ]),
         ),
@@ -776,6 +764,41 @@ pub(crate) fn banner(banner: &Banner, strategy: &Strategy, this_year: i32) -> El
             ]),
         ),
     }
+}
+
+/// The serious-concerns banner's words: the ratings as recorded, and, for
+/// an area rated serious with no finding under it, that nothing was listed,
+/// so the banner never promises findings the review tab doesn't hold.
+pub(crate) fn serious_words(areas: &[Area], unlisted: &[Area], refused: bool) -> (String, String) {
+    if refused {
+        return (
+            "The Reviewer refused this agent's code as written to do harm.".to_string(),
+            " You can still deposit, but read what the Reviewer found first. A review isn't a prediction either way.".to_string(),
+        );
+    }
+    let names: Vec<&str> = areas.iter().map(|area| area.label()).collect();
+    let lead = match areas.len() {
+        6 => "The Reviewer rated all six areas serious concerns.".to_string(),
+        1 => format!("The Reviewer rated 1 area serious concerns: {}.", names[0]),
+        count => format!(
+            "The Reviewer rated {count} areas serious concerns: {}.",
+            join_and(&names)
+        ),
+    };
+    let mut rest = String::new();
+    if !unlisted.is_empty() {
+        let quiet: Vec<&str> = unlisted.iter().map(|area| area.label()).collect();
+        rest.push_str(&if unlisted.len() == areas.len() {
+            match areas.len() {
+                1 => " It listed no finding for that area.".to_string(),
+                _ => " It listed no finding for any of them.".to_string(),
+            }
+        } else {
+            format!(" It listed no finding for {}.", join_and(&quiet))
+        });
+    }
+    rest.push_str(" You can still deposit, but read the review first. A review isn't a prediction either way.");
+    (lead, rest)
 }
 
 fn notice_with_icon(glyph: Icon, body: View) -> El {

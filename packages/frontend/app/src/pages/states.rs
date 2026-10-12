@@ -65,6 +65,7 @@ pub fn banners(strategy: &Strategy) -> View {
             "Serious concerns",
             Banner::Serious {
                 areas: vec![Area::ALL[0], Area::ALL[4]],
+                unlisted: vec![],
                 refused: false,
             },
         ),
