@@ -1183,13 +1183,14 @@ fn start(panel: &Rc<Panel>, action: Action) {
     let Some(vault) = panel.vault.get_cloned() else {
         return;
     };
+    // One flow at a time: a second click while one runs starts nothing.
+    if panel.running.lock_ref().is_some() {
+        return;
+    }
     let running = Running::new();
     panel.requested_local.set(None);
-    if panel.in_sheet {
-        crate::atoms::dialog::lock(true);
-    }
+    panel.running.set(Some(running.clone()));
     crate::wallet::run::start(&vault, action, &running);
-    panel.running.set(Some(running));
 }
 
 fn context_names(panel: &Panel) -> (String, String, Option<String>, String, String) {
@@ -1244,12 +1245,9 @@ fn flow_view(panel: &Rc<Panel>) -> View {
             None,
             running.step.signal_cloned().map(move |step| {
                 let step = step?;
-                let unlocked = matches!(
-                    step,
-                    Step::Done(_) | Step::Failed(_) | Step::Requested(_) | Step::Priced { .. }
-                );
-                if panel.in_sheet && unlocked {
-                    crate::atoms::dialog::lock(false);
+                // The sheet stays open only while the wallet is being asked.
+                if panel.in_sheet {
+                    crate::atoms::dialog::lock(matches!(step, Step::Signing(_)));
                 }
                 Some(step_view(&panel, &step))
             }),
@@ -1330,7 +1328,7 @@ fn prompt_words(
         ),
         Prompt::Finish => (
             format!("Approve the second step in {wallet}"),
-            "Your request is priced. This settles it; anyone may send it, and nobody had yet."
+            "Your request is priced. This settles it at that price; anyone may send it, and nobody had yet. It’s optional: your request stands either way, and the keeper settles it if you don’t."
                 .to_string(),
         ),
         Prompt::SettleClaim { .. } => (
@@ -1340,6 +1338,13 @@ fn prompt_words(
         Prompt::TakeCash => (
             format!("Approve taking your cash share in {wallet}"),
             "Your exact share of the vault’s cash now, and units for the rest.".to_string(),
+        ),
+        Prompt::TakeBack { amount } => (
+            format!("Approve taking your deposit back in {wallet}"),
+            format!(
+                "Nothing has priced it for a day: {} goes back to the wallet that paid it in, and nothing is bought.",
+                money::token_exact(*amount, decimals, symbol)
+            ),
         ),
         Prompt::ClaimInstead => (
             format!("Approve booking a claim in {wallet}"),
@@ -1394,40 +1399,75 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
         Step::Signing(prompt) => {
             let (title, line) = prompt_words(prompt, &wallet, &vault_title, &symbol, decimals);
             let running = panel.running.get_cloned();
+            // The second step settles a request already on the chain: there
+            // is nothing to cancel, and declining it is fine.
+            let second = *prompt == Prompt::Finish;
             el("div")
                 .class("sh-exit__wait")
                 .child(hex_ring())
                 .child(el("p").class("sh-exit__title").text(title.clone()))
                 .child(el("p").text(line))
-                .child(el("p").class("sh-muted sh-exit__small").text(format!(
-                    "Don’t see it? Open {wallet}. Once you approve, the request can’t be cancelled."
-                )))
-                .child(on_click(
-                    Button::new(Kind::Secondary, "Cancel").build(),
-                    move || {
+                .child(el("p").class("sh-muted sh-exit__small").text(if second {
+                    format!("Don’t see it? Open {wallet}.")
+                } else {
+                    format!(
+                        "Don’t see it? Open {wallet}. Once you approve, the request can’t be cancelled."
+                    )
+                }))
+                .child(if second {
+                    View::Empty
+                } else {
+                    on_click(Button::new(Kind::Secondary, "Cancel").build(), move || {
                         // Nothing further is sent; a prompt already open in the
                         // wallet is answered there.
                         if let Some(running) = &running {
                             running.cancel.cancel();
                         }
-                    },
-                ))
+                    })
+                    .into()
+                })
                 .child(live(title))
                 .into()
         }
-        Step::Sent { hash, .. } => el("div")
-            .class("sh-exit__wait")
-            .child(hex_ring())
-            .child(
-                el("p")
-                    .class("sh-exit__title")
-                    .text("Sent. Waiting for the network"),
-            )
-            .child(tx_link(chain_id, *hash, "Transaction"))
-            .child(live("Sent. Waiting for the network.".to_string()))
-            .into(),
+        Step::Sent { hash, unseen, .. } => {
+            let (title, line) = if *unseen {
+                (
+                    "Sent. Not seen by the network yet",
+                    format!(
+                        "It may still go through: the app keeps watching. Check {wallet}’s activity before sending anything again."
+                    ),
+                )
+            } else {
+                ("Sent. Waiting for the network", String::new())
+            };
+            el("div")
+                .class("sh-exit__wait")
+                .child(hex_ring())
+                .child(el("p").class("sh-exit__title").text(title))
+                .child(if line.is_empty() {
+                    View::Empty
+                } else {
+                    el("p").class("sh-muted").text(line).into()
+                })
+                .child(tx_link(chain_id, *hash, "Transaction"))
+                .child(live(format!("{title}.")))
+                .into()
+        }
         Step::Requested(countdown) | Step::Priced { countdown, .. } => {
             let priced = matches!(step, Step::Priced { .. });
+            let unsent = match step {
+                Step::Priced {
+                    unsent: Some(why), ..
+                } => Some(why.unsent_words(&Context {
+                    wallet: &wallet,
+                    chain: &chain_name,
+                    wallet_chain: wallet_chain.as_deref(),
+                    symbol: &symbol,
+                    decimals,
+                    native: &native,
+                })),
+                _ => None,
+            };
             let started = match panel.requested_local.get() {
                 Some(started) => started,
                 None => {
@@ -1527,7 +1567,12 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
                     ),
                 )
             });
-            let announce = if priced {
+            let announce = if let Some(why) = &unsent {
+                format!(
+                    "Priced at {}. Your request stands and is settled at this price. The app’s own second step wasn’t sent: {why}.",
+                    utc(slot)
+                )
+            } else if priced {
                 format!(
                     "Priced at {}. The app sends the second step for you.",
                     utc(slot)
@@ -1547,11 +1592,17 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
                 .child(el("p").class("sh-label").text(if priced { "Priced" } else { "Request sent" }))
                 .child(when)
                 .child(moved.map(View::from).unwrap_or(View::Empty))
-                .child(el("p").class("sh-muted").text(if priced {
-                    "The app sends the second step for you."
-                } else {
-                    "Nobody, including you, can see this price yet. That’s what keeps anyone from racing the vault."
-                }))
+                .child(match &unsent {
+                    Some(why) => settle_now(panel, why),
+                    None => el("p")
+                        .class("sh-muted")
+                        .text(if priced {
+                            "The app sends the second step for you if the keeper hasn’t."
+                        } else {
+                            "Nobody, including you, can see this price yet. That’s what keeps anyone from racing the vault."
+                        })
+                        .into(),
+                })
                 .child(
                     el("dl")
                         .class("sh-exit__rows")
@@ -1583,10 +1634,19 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
                 decimals,
                 &native,
             );
+            let moved = error.may_have_moved();
             let back = {
                 let panel = panel.clone();
                 move || {
                     panel.running.set(None);
+                    if moved {
+                        // What was typed was sent, or may still land: the
+                        // form starts empty rather than offer it again.
+                        panel.stage.set(Stage::Form);
+                        panel.deposit_text.set(String::new());
+                        panel.withdraw_text.set(String::new());
+                        panel.ack.set(false);
+                    }
                 }
             };
             let mut card = el("div")
@@ -1597,13 +1657,49 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
             if let Some(hash) = error.hash() {
                 card = card.child(tx_link(chain_id, hash, "Transaction"));
             }
-            card.child(on_click(
-                Button::new(Kind::Primary, "Try again").block().build(),
-                back,
-            ))
-            .into()
+            if moved {
+                card.child(
+                    crate::web::app_link("/portfolio")
+                        .class("sh-btn sh-btn-primary sh-btn-block")
+                        .text("View in portfolio"),
+                )
+                .child(on_click(
+                    el("button")
+                        .attr("type", "button")
+                        .class("sh-exit__edit")
+                        .text("Done"),
+                    back,
+                ))
+                .into()
+            } else {
+                card.child(on_click(
+                    Button::new(Kind::Primary, "Try again").block().build(),
+                    back,
+                ))
+                .into()
+            }
         }
     }
+}
+
+/// The second step, offered again after the app's own try wasn't sent: the
+/// request stands either way, and the keeper settles it at this price.
+fn settle_now(panel: &Rc<Panel>, why: &str) -> View {
+    let running = panel.running.get_cloned();
+    el("div")
+        .class("sh-exit__settle")
+        .child(el("p").text(format!(
+            "Your request stands and is settled at this price by the keeper, or by anyone. The app’s own second step wasn’t sent: {why}. It’s optional."
+        )))
+        .child(on_click(
+            Button::new(Kind::Secondary, "Settle now").build(),
+            move || {
+                if let Some(running) = &running {
+                    running.settle_now.nudge();
+                }
+            },
+        ))
+        .into()
 }
 
 fn request_amount_row(panel: &Rc<Panel>, is_deposit: bool, decimals: u8, symbol: &str) -> El {
@@ -1700,7 +1796,12 @@ fn done_view(panel: &Rc<Panel>, outcome: &Outcome, chain_id: u64, decimals: u8) 
             .into()
     };
     match outcome {
-        Outcome::Deposited { assets, shares, at, hash } => {
+        Outcome::Deposited {
+            assets,
+            shares,
+            at,
+            hash,
+        } => {
             let fee = panel
                 .figures
                 .lock_ref()
@@ -1709,37 +1810,84 @@ fn done_view(panel: &Rc<Panel>, outcome: &Outcome, chain_id: u64, decimals: u8) 
                 .map(|quote| quote.fee);
             let mut rows = vec![("Priced at".to_string(), utc(*at))];
             if let Some(fee) = fee {
-                rows.push(("Deposit fee".to_string(), format!("{} stays in the vault", money::dollars(fee, decimals, Rounding::Up))));
+                rows.push((
+                    "Deposit fee".to_string(),
+                    format!(
+                        "{} stays in the vault",
+                        money::dollars(fee, decimals, Rounding::Up)
+                    ),
+                ));
             }
             card(
-                format!("You now hold {} more shares", money::shares(*shares, Rounding::Down)),
+                format!(
+                    "You now hold {} more shares",
+                    money::shares(*shares, Rounding::Down)
+                ),
                 rows,
                 *hash,
-                View::Many(vec![position("Your position"), portfolio.into(), again.into()]),
+                View::Many(vec![
+                    position("Your position"),
+                    portfolio.into(),
+                    again.into(),
+                ]),
             )
         }
-        Outcome::Refunded { assets, hash } => card(
-            "Your deposit was sent back".to_string(),
-            vec![("Returned".to_string(), money::dollars_exact(*assets, decimals))],
-            *hash,
-            View::Many(vec![
-                el("p").class("sh-muted").text("The vault stopped taking deposits, or its list changed, before your request was priced. Nothing was bought.").into(),
-                again.into(),
-            ]),
-        ),
-        Outcome::Paid { shares, assets, at, hash } => {
+        Outcome::Refunded { assets, to, hash } => {
+            let yours = crate::wallet::get().account() == Some(*to);
+            card(
+                "Your deposit was sent back".to_string(),
+                vec![(
+                    "Returned".to_string(),
+                    if yours {
+                        format!("{} to your wallet", money::dollars_exact(*assets, decimals))
+                    } else {
+                        format!(
+                            "{} to {}, the wallet that paid it in",
+                            money::dollars_exact(*assets, decimals),
+                            crate::format::short_hash(&format!("{to:?}"))
+                        )
+                    },
+                )],
+                *hash,
+                View::Many(vec![
+                    el("p").class("sh-muted").text("Nothing was bought.").into(),
+                    again.into(),
+                ]),
+            )
+        }
+        Outcome::Paid {
+            shares,
+            assets,
+            at,
+            hash,
+        } => {
             let rows = vec![(
-                format!("{} shares valued at", money::shares(*shares, Rounding::Down)),
-                at.map(|at| format!("exit-side marks, {}", utc(at))).unwrap_or_else(|| "the closed vault’s cash".to_string()),
+                format!(
+                    "{} shares valued at",
+                    money::shares(*shares, Rounding::Down)
+                ),
+                at.map(|at| format!("exit-side marks, {}", utc(at)))
+                    .unwrap_or_else(|| "the closed vault’s cash".to_string()),
             )];
             card(
-                format!("{} is in your wallet", money::dollars(*assets, decimals, Rounding::Down)),
+                format!(
+                    "{} is in your wallet",
+                    money::dollars(*assets, decimals, Rounding::Down)
+                ),
                 rows,
                 *hash,
-                View::Many(vec![position("You still hold"), portfolio.into(), again.into()]),
+                View::Many(vec![
+                    position("You still hold"),
+                    portfolio.into(),
+                    again.into(),
+                ]),
             )
         }
-        Outcome::Booked { claim, shares, hash } => {
+        Outcome::Booked {
+            claim,
+            shares,
+            hash,
+        } => {
             let slug = panel.slug.clone();
             card(
                 "Claim booked".to_string(),
@@ -1759,9 +1907,19 @@ fn done_view(panel: &Rc<Panel>, outcome: &Outcome, chain_id: u64, decimals: u8) 
                 ]),
             )
         }
-        Outcome::Claim { state, paid, hash, .. } => card(
+        Outcome::Claim {
+            state,
+            paid,
+            hash,
+            owner,
+            ..
+        } => card(
             match state {
-                ClaimState::Paid => format!("{} is in your wallet", money::dollars(*paid, decimals, Rounding::Down)),
+                ClaimState::Paid => crate::pages::portfolio::paid_headline(
+                    &money::dollars(*paid, decimals, Rounding::Down),
+                    *owner,
+                    crate::wallet::get().account(),
+                ),
                 ClaimState::Queued => "Queued for the next valuation".to_string(),
                 ClaimState::Closing => "Closing at the venue".to_string(),
                 _ => "Still waiting".to_string(),
@@ -1770,20 +1928,27 @@ fn done_view(panel: &Rc<Panel>, outcome: &Outcome, chain_id: u64, decimals: u8) 
             *hash,
             again.into(),
         ),
-        Outcome::TookCash { assets, units, hash } => card(
-            format!("{} is in your wallet", money::dollars(*assets, decimals, Rounding::Down)),
+        Outcome::TookCash {
+            assets,
+            units,
+            hash,
+        } => card(
+            format!(
+                "{} is in your wallet",
+                money::dollars(*assets, decimals, Rounding::Down)
+            ),
             vec![("Units for the rest".to_string(), units.to_string())],
             *hash,
             again.into(),
         ),
-        Outcome::ClaimMade { claim, hash } => card(
-            format!("Claim {claim} booked"),
-            vec![],
-            *hash,
-            again.into(),
-        ),
+        Outcome::ClaimMade { claim, hash } => {
+            card(format!("Claim {claim} booked"), vec![], *hash, again.into())
+        }
         Outcome::Collected { assets, hash } => card(
-            format!("{} is in your wallet", money::dollars(*assets, decimals, Rounding::Down)),
+            format!(
+                "{} is in your wallet",
+                money::dollars(*assets, decimals, Rounding::Down)
+            ),
             vec![],
             *hash,
             again.into(),

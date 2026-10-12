@@ -16,12 +16,22 @@ pub const PHRASE: Option<&str> = option_env!("SHONIN_DEV_WALLET_MNEMONIC");
 #[cfg(not(feature = "dev-wallet"))]
 pub const PHRASE: Option<&str> = None;
 
-/// Whether this build offers the recovery-phrase wallet: every build but a
-/// mainnet one (`SHONIN_APP_NETWORK=mainnet` at build time).
-pub const PHRASE_WALLET: bool = !matches!(
-    option_env!("SHONIN_APP_NETWORK"),
-    Some(network) if network.eq_ignore_ascii_case("mainnet")
-);
+/// Whether this build offers the recovery-phrase wallet: only a build that
+/// names a test network (`SHONIN_APP_NETWORK=testnet` or `local` at build
+/// time), a development build, and the crate's own tests. Any other build,
+/// a mainnet one or one that names nothing, leaves it out.
+pub const PHRASE_WALLET: bool =
+    cfg!(any(test, feature = "dev-wallet")) || phrase_wallet_for(option_env!("SHONIN_APP_NETWORK"));
+
+/// Whether a build naming `network` offers the recovery-phrase wallet.
+pub const fn phrase_wallet_for(network: Option<&str>) -> bool {
+    match network {
+        Some(network) => {
+            network.eq_ignore_ascii_case("testnet") || network.eq_ignore_ascii_case("local")
+        }
+        None => false,
+    }
+}
 
 /// The local chains' endpoints as this machine runs them: a development
 /// build reads the `SHONIN_RPC_EVM_<id>` the dev task was started with, so
@@ -43,4 +53,18 @@ pub fn local_rpc(chain_id: u64) -> Option<&'static str> {
 #[cfg(not(feature = "dev-wallet"))]
 pub fn local_rpc(_chain_id: u64) -> Option<&'static str> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_phrase_wallet_is_offered_only_by_a_build_that_names_a_test_network() {
+        assert!(phrase_wallet_for(Some("testnet")));
+        assert!(phrase_wallet_for(Some("local")));
+        assert!(!phrase_wallet_for(Some("mainnet")));
+        assert!(!phrase_wallet_for(Some("")));
+        assert!(!phrase_wallet_for(None));
+    }
 }

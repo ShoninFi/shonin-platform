@@ -46,6 +46,13 @@ pub fn open(dialog: Dialog) {
     crate::web::set_inert(true);
 }
 
+/// Close the open dialog whatever its lock: the page under it is going
+/// away (a route change). A flow it was running carries on.
+pub fn close_for_navigation() {
+    lock(false);
+    close();
+}
+
 /// Close the open dialog and give focus back.
 pub fn close() {
     if LOCKED.with(Cell::get) {

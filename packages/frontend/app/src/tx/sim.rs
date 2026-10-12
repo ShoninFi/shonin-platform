@@ -15,9 +15,9 @@ use chain::bindings::vault::{self as b, IVault};
 use futures::executor::block_on;
 
 use super::error::{Revert, TxError};
-use super::flow::{self, Cancel, Ctx, Fallback, Outcome, Pace, Prompt, Step};
+use super::flow::{self, Cancel, Ctx, Fallback, Nudge, Outcome, Pace, Prompt, Step};
 use super::port::{Clock, Log, Pending, Reader, Receipt, Signer, StatementRequest, TxRequest};
-use super::read::ClaimState;
+use super::read::{ClaimState, State};
 
 const CHAIN: u64 = 31337;
 const USD: u64 = 1_000_000;
@@ -39,6 +39,8 @@ enum Keeper {
     PricesOnly,
     /// Misses this many slots first, then prices and settles.
     MissesSlots(u32),
+    /// Prices at once, and settles only this many looks later.
+    SettlesLate(u32),
 }
 
 /// How a withdrawal settles.
@@ -90,6 +92,17 @@ struct Chain {
     held: U256,
     units_claimable: U256,
     polls: u32,
+    /// Declines this many second-step prompts (`settle`), then approves.
+    declines_settle: u32,
+    /// Every read of the vault fails once a request is on the chain.
+    reads_fail_after_request: bool,
+    /// A sent transaction the endpoint doesn't see until this many looks
+    /// for its receipt, then mined.
+    lands_after_looks: Option<u32>,
+    unseen: Vec<(B256, TxRequest)>,
+    receipt_looks: u32,
+    /// Look-ups of a request's state, so a test can see the flow watched.
+    request_looks: u32,
 }
 
 type Sim = Rc<RefCell<Chain>>;
@@ -97,6 +110,8 @@ type Sim = Rc<RefCell<Chain>>;
 struct World {
     sim: Sim,
     key: PrivateKeySigner,
+    /// The person presses "Settle now" whenever the page offers it.
+    presses_settle_now: bool,
 }
 
 impl World {
@@ -146,10 +161,17 @@ impl World {
             held: U256::ZERO,
             units_claimable: U256::ZERO,
             polls: 0,
+            declines_settle: 0,
+            reads_fail_after_request: false,
+            lands_after_looks: None,
+            unseen: Vec::new(),
+            receipt_looks: 0,
+            request_looks: 0,
         };
         Self {
             sim: Rc::new(RefCell::new(chain)),
             key,
+            presses_settle_now: false,
         }
     }
 
@@ -172,7 +194,21 @@ impl World {
         >,
     ) -> (Result<Outcome, TxError>, Vec<Step>) {
         let steps = RefCell::new(Vec::new());
-        let on_step = |step: Step| steps.borrow_mut().push(step);
+        let settle_now = Nudge::new();
+        let on_step = |step: Step| {
+            if self.presses_settle_now
+                && matches!(
+                    step,
+                    Step::Priced {
+                        unsent: Some(_),
+                        ..
+                    }
+                )
+            {
+                settle_now.nudge();
+            }
+            steps.borrow_mut().push(step);
+        };
         let reader = SimReader(self.sim.clone());
         let wallet = SimWallet {
             sim: self.sim.clone(),
@@ -187,6 +223,7 @@ impl World {
             asset: asset(),
             account: self.account(),
             cancel: Cancel::new(),
+            settle_now: settle_now.clone(),
             pace: Pace::FAST,
             on_step: &on_step,
         };
@@ -228,8 +265,16 @@ impl Chain {
         }
         self.time = self.time.max(earliest + 1);
         self.priced = Some(earliest + u64::from(self.misses) * 10);
-        if self.keeper != Keeper::PricesOnly {
-            self.settle_all();
+        match self.keeper {
+            Keeper::PricesOnly => {}
+            Keeper::SettlesLate(looks) => {
+                if self.misses >= looks {
+                    self.settle_all();
+                }
+                self.misses += 1;
+                self.priced = Some(earliest);
+            }
+            _ => self.settle_all(),
         }
     }
 
@@ -244,6 +289,10 @@ impl Chain {
         for (i, (owner, kind, _, _, amount)) in account_events {
             self.requests[i].3 = true;
             let id = U256::from(i + 1);
+            if kind == 2 {
+                // A claim's own request: paid with its claim, elsewhere.
+                continue;
+            }
             if kind == 0 {
                 // A dollar a share, less the 0.1% fee.
                 let shares =
@@ -297,6 +346,11 @@ impl Chain {
 
     fn call(&mut self, to: Address, data: &[u8]) -> Result<Bytes, TxError> {
         let selector: [u8; 4] = data[..4].try_into().unwrap();
+        if self.reads_fail_after_request && !self.requests.is_empty() {
+            return Err(TxError::Network(
+                "the chain answered a read with nothing".to_string(),
+            ));
+        }
         if to == asset() {
             return match selector {
                 IERC20::balanceOfCall::SELECTOR => {
@@ -380,17 +434,14 @@ impl Chain {
                 ok(digest)
             }
             IVault::requestAtCall::SELECTOR => {
+                self.request_looks += 1;
                 self.tick();
                 let call = IVault::requestAtCall::abi_decode(data).unwrap();
                 let (owner, kind, earliest, done, amount) =
                     self.requests[usize::try_from(call.requestId).unwrap() - 1];
                 ok(b::Request {
                     owner,
-                    kind: if kind == 0 {
-                        b::RequestKind::Deposit
-                    } else {
-                        b::RequestKind::Redeem
-                    },
+                    kind: kind_of(kind),
                     earliest,
                     done,
                     amount,
@@ -449,7 +500,12 @@ impl Chain {
                 *self.shares.get_mut(&from).unwrap() -= call.shares;
                 self.request(call.receiver, 1, call.shares);
             }
-            IVault::settleCall::SELECTOR => self.settle_all(),
+            IVault::settleCall::SELECTOR => {
+                // Settling prices nothing: only what a valuation priced.
+                if self.priced.is_some() {
+                    self.settle_all();
+                }
+            }
             IVault::settleClaimCall::SELECTOR => {
                 let call = IVault::settleClaimCall::abi_decode(data).unwrap();
                 let claim = &mut self.claims[usize::try_from(call.claimId).unwrap() - 1];
@@ -461,6 +517,52 @@ impl Chain {
                 let claim = &mut self.claims[usize::try_from(call.claimId).unwrap() - 1];
                 claim.state = b::ClaimState::Paid;
                 claim.paid = U256::from(900u64 * USD);
+            }
+            IVault::takeProRataCall::SELECTOR
+                if self
+                    .requests
+                    .get(
+                        usize::try_from(
+                            IVault::takeProRataCall::abi_decode(data).unwrap().requestId,
+                        )
+                        .unwrap()
+                            - 1,
+                    )
+                    .is_some_and(|request| request.1 == 0) =>
+            {
+                // On a deposit the fallback sends the money back, to the
+                // wallet that paid it in, and records a refund.
+                let call = IVault::takeProRataCall::abi_decode(data).unwrap();
+                let index = usize::try_from(call.requestId).unwrap() - 1;
+                let (owner, _, _, _, assets) = self.requests[index];
+                self.requests[index].3 = true;
+                *self.usd.entry(owner).or_default() += assets;
+                self.log(IVault::Refunded {
+                    requestId: call.requestId,
+                    to: owner,
+                    assets,
+                });
+            }
+            IVault::settleClosedCall::SELECTOR => {
+                let call = IVault::settleClosedCall::abi_decode(data).unwrap();
+                let index = usize::try_from(call.requestId).unwrap() - 1;
+                let (owner, kind, _, _, amount) = self.requests[index];
+                self.requests[index].3 = true;
+                if kind == 0 {
+                    self.log(IVault::Refunded {
+                        requestId: call.requestId,
+                        to: owner,
+                        assets: amount,
+                    });
+                } else {
+                    self.log(IVault::Withdrawn {
+                        requestId: call.requestId,
+                        owner,
+                        shares: amount,
+                        assets: U256::from(1_234u64 * USD),
+                        feeShares: U256::ZERO,
+                    });
+                }
             }
             IVault::takeProRataCall::SELECTOR | IVault::takeProRataClaimCall::SELECTOR => {
                 self.log(IVault::ProRataTaken {
@@ -532,14 +634,50 @@ impl Chain {
         self.log(IVault::Requested {
             requestId: U256::from(self.requests.len()),
             owner,
-            kind: if kind == 0 {
-                b::RequestKind::Deposit
-            } else {
-                b::RequestKind::Redeem
-            },
+            kind: kind_of(kind),
             earliest,
             amount,
         });
+    }
+}
+
+/// The sim's kinds: 0 a deposit, 1 a withdrawal, 2 a claim's own request,
+/// 3 a tank fill.
+fn kind_of(kind: u8) -> b::RequestKind {
+    match kind {
+        0 => b::RequestKind::Deposit,
+        1 => b::RequestKind::Redeem,
+        2 => b::RequestKind::Claim,
+        _ => b::RequestKind::TankFill,
+    }
+}
+
+impl Chain {
+    /// Mine a sent transaction: run it and keep its receipt.
+    fn mine(&mut self, hash: B256, request: &TxRequest) {
+        self.block += 1;
+        let first = self.logs.len();
+        let success = self.execute(request);
+        let logs = if success {
+            self.logs[first..]
+                .iter()
+                .map(|(_, log)| log.clone())
+                .collect()
+        } else {
+            self.logs.truncate(first);
+            Vec::new()
+        };
+        let block = self.block;
+        *self.nonce.entry(request.from).or_default() += 1;
+        self.receipts.insert(
+            hash,
+            Receipt {
+                hash,
+                success,
+                block,
+                logs,
+            },
+        );
     }
 }
 
@@ -577,7 +715,16 @@ impl Reader for SimReader {
         Ok(U256::from(1_000_000_000u64))
     }
     async fn receipt(&self, hash: B256) -> Result<Option<Receipt>, TxError> {
-        Ok(self.0.borrow().receipts.get(&hash).cloned())
+        let mut sim = self.0.borrow_mut();
+        sim.receipt_looks += 1;
+        if let Some(after) = sim.lands_after_looks
+            && sim.receipt_looks >= after
+        {
+            for (hash, request) in std::mem::take(&mut sim.unseen) {
+                sim.mine(hash, &request);
+            }
+        }
+        Ok(sim.receipts.get(&hash).cloned())
     }
     async fn pending(&self, _hash: B256) -> Result<Pending, TxError> {
         Ok(Pending::Unknown)
@@ -647,6 +794,10 @@ impl Signer for SimWallet {
         if sim.wallet_rejects {
             return Err(TxError::Rejected);
         }
+        if request.data[..4] == IVault::settleCall::SELECTOR && sim.declines_settle > 0 {
+            sim.declines_settle -= 1;
+            return Err(TxError::Rejected);
+        }
         assert_eq!(
             request.chain_id, sim.wallet_chain,
             "sent on the wrong chain"
@@ -656,29 +807,11 @@ impl Signer for SimWallet {
         if sim.drops {
             return Ok(hash);
         }
-        sim.block += 1;
-        let first = sim.logs.len();
-        let success = sim.execute(request);
-        let logs = if success {
-            sim.logs[first..]
-                .iter()
-                .map(|(_, log)| log.clone())
-                .collect()
-        } else {
-            sim.logs.truncate(first);
-            Vec::new()
-        };
-        let block = sim.block;
-        *sim.nonce.entry(request.from).or_default() += 1;
-        sim.receipts.insert(
-            hash,
-            Receipt {
-                hash,
-                success,
-                block,
-                logs,
-            },
-        );
+        if sim.lands_after_looks.is_some() {
+            sim.unseen.push((hash, request.clone()));
+            return Ok(hash);
+        }
+        sim.mine(hash, request);
         Ok(hash)
     }
 }
@@ -1130,6 +1263,15 @@ fn a_closed_vault_pays_a_claim_from_its_cash() {
 #[test]
 fn the_fallback_takes_the_cash_share_and_reports_the_units() {
     let world = World::new();
+    let account = world.account();
+    world.with(|chain| {
+        chain.keeper = Keeper::PricesOnly;
+        for _ in 0..3 {
+            chain
+                .requests
+                .push((account, 1, 1_000, false, U256::from(WAD)));
+        }
+    });
     let (result, steps) =
         world.run(|ctx| Box::pin(flow::take_cash(ctx, Fallback::Request(U256::from(3u8)))));
     assert_eq!(
@@ -1200,10 +1342,386 @@ fn a_cancelled_flow_sends_nothing() {
         asset: asset(),
         account: world.account(),
         cancel,
+        settle_now: Nudge::new(),
         pace: Pace::FAST,
         on_step: &on_step,
     };
     let result = block_on(flow::deposit(&ctx, amount(1_000)));
     assert_eq!(result, Err(TxError::Cancelled));
     assert!(world.sim.borrow().sent.is_empty());
+}
+
+fn context() -> super::error::Context<'static> {
+    super::error::Context {
+        wallet: "MetaMask",
+        chain: "Base",
+        wallet_chain: Some("Hyperliquid"),
+        symbol: "USDC",
+        decimals: 6,
+        native: "ETH",
+    }
+}
+
+fn said(error: &TxError) -> String {
+    let words = error.words(&context());
+    format!("{} {}", words.title, words.text)
+}
+
+#[test]
+fn declining_the_second_step_leaves_the_request_standing_and_the_flow_watching_until_the_keeper_settles_it()
+ {
+    let world = World::new();
+    world.with(|chain| {
+        chain.keeper = Keeper::SettlesLate(6);
+        chain.declines_settle = 1;
+    });
+    let (result, steps) = deposit(&world, 1_000);
+    assert!(
+        matches!(result, Ok(Outcome::Deposited { .. })),
+        "{result:?}"
+    );
+    assert!(steps.iter().any(|step| matches!(
+        step,
+        Step::Priced {
+            unsent: Some(TxError::Rejected),
+            ..
+        }
+    )));
+    assert!(!steps.iter().any(|step| matches!(step, Step::Failed(_))));
+    assert!(
+        !world
+            .sent_selectors()
+            .contains(&IVault::settleCall::SELECTOR)
+    );
+}
+
+#[test]
+fn settle_now_after_a_declined_second_step_sends_it_again_and_ends_settled() {
+    let mut world = World::new();
+    world.presses_settle_now = true;
+    world.with(|chain| {
+        chain.keeper = Keeper::PricesOnly;
+        chain.declines_settle = 1;
+    });
+    let (result, steps) = deposit(&world, 1_000);
+    assert!(
+        matches!(result, Ok(Outcome::Deposited { .. })),
+        "{result:?}"
+    );
+    let finishes = prompts(&steps)
+        .into_iter()
+        .filter(|prompt| *prompt == Prompt::Finish)
+        .count();
+    assert_eq!(finishes, 2);
+    assert_eq!(
+        world.sent_selectors().last(),
+        Some(&IVault::settleCall::SELECTOR)
+    );
+}
+
+#[test]
+fn reads_that_fail_once_the_request_is_mined_end_as_a_request_that_stands_never_as_nothing_sent() {
+    let world = World::new();
+    world.with(|chain| chain.reads_fail_after_request = true);
+    let (result, steps) =
+        world.run(|ctx| Box::pin(flow::withdraw(ctx, U256::from(1_000u128 * WAD))));
+    let Err(
+        error @ TxError::Landed {
+            request: Some(_),
+            then: Some(_),
+            ..
+        },
+    ) = &result
+    else {
+        panic!("{result:?}");
+    };
+    assert!(steps.iter().any(|step| matches!(step, Step::Requested(_))));
+    assert!(error.after_send() && error.may_have_moved());
+    let said = said(error);
+    assert!(
+        !said.contains("Nothing was sent") && !said.contains("try again"),
+        "{said}"
+    );
+}
+
+#[test]
+fn a_request_nobody_settles_before_the_long_wait_ends_is_said_to_stand() {
+    let world = World::new();
+    world.with(|chain| {
+        chain.keeper = Keeper::PricesOnly;
+        chain.declines_settle = u32::MAX;
+    });
+    let (result, _) = deposit(&world, 1_000);
+    let Err(
+        error @ TxError::Landed {
+            request: Some(request),
+            then: None,
+            ..
+        },
+    ) = &result
+    else {
+        panic!("{result:?}");
+    };
+    assert_eq!(*request, U256::from(1u8));
+    assert!(!world.sim.borrow().requests[0].3, "it still stands");
+    assert!(said(error).starts_with("Your request stands"));
+}
+
+#[test]
+fn a_transaction_the_endpoint_never_saw_is_watched_to_the_end_and_said_as_not_seen_yet() {
+    let world = World::new();
+    world.with(|chain| chain.drops = true);
+    let (result, steps) = deposit(&world, 1_000);
+    let Err(error @ TxError::Dropped { .. }) = &result else {
+        panic!("{result:?}");
+    };
+    assert!(
+        steps
+            .iter()
+            .any(|step| matches!(step, Step::Sent { unseen: true, .. }))
+    );
+    assert!(world.sim.borrow().receipt_looks >= Pace::FAST.give_up_after);
+    let said = said(error);
+    assert!(said.starts_with("Not seen by the network yet"), "{said}");
+    assert!(!said.contains("nothing moved") && !said.contains("You can try again"));
+}
+
+#[test]
+fn a_transaction_not_seen_for_a_while_that_then_lands_is_followed_to_its_outcome() {
+    let world = World::new();
+    world.with(|chain| chain.lands_after_looks = Some(10));
+    let (result, steps) = deposit(&world, 1_000);
+    assert!(
+        matches!(result, Ok(Outcome::Deposited { .. })),
+        "{result:?}"
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|step| matches!(step, Step::Sent { unseen: true, .. }))
+    );
+}
+
+#[test]
+fn the_fallback_on_a_deposit_asks_to_take_it_back_and_ends_refunded_to_the_wallet_that_paid() {
+    let world = World::new();
+    let account = world.account();
+    world.with(|chain| {
+        chain.keeper = Keeper::PricesOnly;
+        chain.requests.push((account, 0, 1_000, false, amount(250)));
+    });
+    let before = world.sim.borrow().usd[&account];
+    let (result, steps) =
+        world.run(|ctx| Box::pin(flow::take_cash(ctx, Fallback::Request(U256::from(1u8)))));
+    assert_eq!(
+        result.map(|outcome| match outcome {
+            Outcome::Refunded { assets, to, .. } => (assets, to),
+            other => panic!("{other:?}"),
+        }),
+        Ok((amount(250), account))
+    );
+    assert_eq!(
+        prompts(&steps),
+        vec![Prompt::TakeBack {
+            amount: amount(250)
+        }]
+    );
+    assert_eq!(world.sim.borrow().usd[&account], before + amount(250));
+}
+
+#[test]
+fn the_fallback_is_never_asked_for_on_someone_elses_a_settled_or_a_claims_own_request() {
+    let world = World::new();
+    let account = world.account();
+    world.with(|chain| {
+        chain.keeper = Keeper::PricesOnly;
+        chain
+            .requests
+            .push((Address::repeat_byte(9), 0, 1_000, false, amount(250)));
+        chain
+            .requests
+            .push((account, 1, 1_000, true, U256::from(WAD)));
+        chain
+            .requests
+            .push((account, 2, 1_000, false, U256::from(WAD)));
+    });
+    for id in 1u8..=3 {
+        let (result, steps) =
+            world.run(|ctx| Box::pin(flow::take_cash(ctx, Fallback::Request(U256::from(id)))));
+        assert!(
+            matches!(result, Err(TxError::WouldRevert { .. })),
+            "{id}: {result:?}"
+        );
+        assert!(prompts(&steps).is_empty());
+    }
+    assert!(world.sim.borrow().sent.is_empty());
+}
+
+#[test]
+fn a_queued_claim_on_an_open_vault_is_not_pushed_again() {
+    let world = World::new();
+    let account = world.account();
+    world.with(|chain| {
+        chain.claims.push(b::Claim {
+            owner: account,
+            shares: U256::from(WAD),
+            bookedAt: 1,
+            lastAttemptAt: 2,
+            state: b::ClaimState::Queued,
+            paid: U256::ZERO,
+        })
+    });
+    let (result, _) = world.run(|ctx| Box::pin(flow::settle_claim(ctx, U256::from(1u8))));
+    assert_eq!(result, Err(TxError::WrongState));
+    assert!(world.sim.borrow().sent.is_empty());
+}
+
+#[test]
+fn a_claim_is_offered_only_the_doors_the_contract_opens_for_its_state() {
+    use flow::claim_door_open as door;
+    let claims = [
+        ClaimState::None,
+        ClaimState::Pending,
+        ClaimState::Waiting,
+        ClaimState::Queued,
+        ClaimState::Paid,
+        ClaimState::Fallback,
+        ClaimState::Closing,
+    ];
+    for claim in claims {
+        // A closed vault pays pending, waiting and queued claims.
+        assert_eq!(
+            door(claim, State::Closed, false),
+            matches!(
+                claim,
+                ClaimState::Pending | ClaimState::Waiting | ClaimState::Queued
+            ),
+            "{claim:?}"
+        );
+        // An open one tries pending and waiting claims, until it is ready
+        // to close.
+        for open in [
+            State::Open,
+            State::WindingDown,
+            State::Frozen,
+            State::Killed,
+        ] {
+            assert_eq!(
+                door(claim, open, false),
+                matches!(claim, ClaimState::Pending | ClaimState::Waiting),
+                "{claim:?} {open:?}"
+            );
+            assert!(!door(claim, open, true));
+        }
+        assert!(!door(claim, State::Cancelled, false));
+    }
+}
+
+#[test]
+fn the_claim_fallback_opens_a_day_after_booking_and_a_queued_claim_a_day_after_it_was_queued() {
+    let claim = |state, booked_at, last_attempt_at| super::read::Claim {
+        owner: Address::ZERO,
+        shares: U256::from(WAD),
+        booked_at,
+        last_attempt_at,
+        state,
+        paid: U256::ZERO,
+    };
+    let day = 86_400;
+    let open =
+        |c: &super::read::Claim, now| flow::claim_fallback_open(c, State::Open, false, day, now);
+    let waiting = claim(ClaimState::Waiting, 100, 0);
+    assert!(!open(&waiting, 100 + day - 1));
+    assert!(open(&waiting, 100 + day));
+    let queued = claim(ClaimState::Queued, 100, 5_000);
+    assert!(!open(&queued, 100 + day));
+    assert!(open(&queued, 5_000 + day));
+    assert!(!open(&claim(ClaimState::Paid, 100, 0), 10 * day));
+    assert!(!flow::claim_fallback_open(
+        &waiting,
+        State::Closed,
+        false,
+        day,
+        10 * day
+    ));
+    assert!(!flow::claim_fallback_open(
+        &waiting,
+        State::Open,
+        true,
+        day,
+        10 * day
+    ));
+}
+
+#[test]
+fn settle_now_on_a_priced_request_settles_it_and_reads_how_it_ended() {
+    let world = World::new();
+    let account = world.account();
+    world.with(|chain| {
+        chain.keeper = Keeper::PricesOnly;
+        chain.requests.push((account, 0, 1_000, false, amount(500)));
+    });
+    let (result, steps) = world.run(|ctx| Box::pin(flow::settle_request(ctx, U256::from(1u8))));
+    assert!(
+        matches!(result, Ok(Outcome::Deposited { assets, .. }) if assets == amount(500)),
+        "{result:?}"
+    );
+    assert_eq!(prompts(&steps), vec![Prompt::Finish]);
+}
+
+#[test]
+fn settle_now_on_a_request_not_yet_priced_sends_nothing() {
+    let world = World::new();
+    let account = world.account();
+    world.with(|chain| {
+        chain.keeper = Keeper::MissesSlots(50);
+        chain.requests.push((account, 0, 1_000, false, amount(500)));
+    });
+    let (result, _) = world.run(|ctx| Box::pin(flow::settle_request(ctx, U256::from(1u8))));
+    assert!(
+        matches!(result, Err(TxError::WouldRevert { .. })),
+        "{result:?}"
+    );
+    assert!(world.sim.borrow().sent.is_empty());
+}
+
+#[test]
+fn a_closed_vault_settles_a_waiting_deposit_as_a_refund_and_never_a_claims_own_request() {
+    let world = World::new();
+    let account = world.account();
+    world.with(|chain| {
+        chain.state = b::VaultState::Closed;
+        chain.keeper = Keeper::PricesOnly;
+        chain.requests.push((account, 0, 1_000, false, amount(300)));
+        chain
+            .requests
+            .push((account, 2, 1_000, false, U256::from(WAD)));
+    });
+    let (result, _) = world.run(|ctx| Box::pin(flow::settle_closed(ctx, U256::from(1u8))));
+    assert!(
+        matches!(result, Ok(Outcome::Refunded { assets, to, .. }) if assets == amount(300) && to == account),
+        "{result:?}"
+    );
+    let (result, _) = world.run(|ctx| Box::pin(flow::settle_closed(ctx, U256::from(2u8))));
+    assert_eq!(result, Err(TxError::WrongState));
+    assert_eq!(
+        world.sent_selectors(),
+        vec![IVault::settleClosedCall::SELECTOR]
+    );
+}
+
+#[test]
+fn a_signature_ending_in_its_recovery_id_is_sent_with_the_parity_the_vault_takes() {
+    let key = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x42)).unwrap();
+    let digest = keccak256(b"statement");
+    let signature = key.sign_hash_sync(&digest).unwrap().as_bytes();
+    let mut raw = signature;
+    raw[64] -= 27;
+    for given in [raw, signature] {
+        let sent = flow::as_the_vault_takes_it(&given).unwrap();
+        assert_eq!(sent.as_ref(), signature.as_slice());
+        assert!(sent[64] == 27 || sent[64] == 28);
+        assert!(flow::recovers_to(&sent, digest, key.address()));
+    }
+    assert_eq!(flow::as_the_vault_takes_it(&[0u8; 12]), None);
 }

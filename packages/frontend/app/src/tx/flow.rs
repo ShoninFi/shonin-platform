@@ -23,6 +23,10 @@
 //!   recover to the account before it is sent.
 //! - Success is reported only from a mined receipt and the vault's own
 //!   events, never before.
+//! - Once the transaction that moves the money is mined, nothing after it
+//!   is reported as a flow that never happened: a request stands and is
+//!   settled at its price by the keeper, or by anyone, whatever becomes of
+//!   the app's own optional second step ([`TxError::Landed`]).
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -34,7 +38,7 @@ use chain::bindings::vault::IVault;
 
 use super::error::{Revert, TxError};
 use super::port::{Clock, Log, Pending, Reader, Receipt, Signer, StatementRequest, TxRequest};
-use super::read::{self, ClaimState, State, Timers};
+use super::read::{self, ClaimState, RequestKind, State, Timers};
 
 /// What the wallet is being asked for, for the panel's wallet step.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,13 +55,19 @@ pub enum Prompt {
     Withdraw {
         shares: U256,
     },
-    /// The second step: settle what the valuation priced.
+    /// The second step: settle what the valuation priced. Optional: the
+    /// keeper sends it with the valuation, and anyone may.
     Finish,
     SettleClaim {
         claim: U256,
     },
-    /// The fallback: the cash share now, units for the rest.
+    /// The fallback on a withdrawal or a claim: the cash share now, units
+    /// for the rest.
     TakeCash,
+    /// The fallback on a deposit: the money back, nothing bought.
+    TakeBack {
+        amount: U256,
+    },
     ClaimInstead,
     CollectUnits,
     CollectHeld,
@@ -86,17 +96,24 @@ pub enum Step {
     Checking,
     /// Waiting for the person to approve in their wallet.
     Signing(Prompt),
-    /// Handed to the network; waiting for it to be mined.
+    /// Handed to the network; waiting for it to be mined. `unseen` once
+    /// the network we read through hasn't seen it for a while: it may still
+    /// land, and the app keeps watching.
     Sent {
         prompt: Prompt,
         hash: B256,
+        unseen: bool,
     },
     /// The request is on the chain; it is priced at `slot`.
     Requested(Countdown),
-    /// Priced; the second step follows.
+    /// Priced, waiting to be settled at that price: the keeper does it, or
+    /// the app sends the second step after a few seconds. `unsent` says why
+    /// the app's own second step wasn't sent; the request stands either way,
+    /// and the person may ask for it again ([`Ctx::settle_now`]).
     Priced {
         countdown: Countdown,
         at: u64,
+        unsent: Option<TxError>,
     },
     Done(Outcome),
     Failed(TxError),
@@ -112,9 +129,14 @@ pub enum Outcome {
         at: u64,
         hash: B256,
     },
-    /// A deposit sent back (the vault stopped taking deposits, or its list
-    /// changed, between the request and its price).
-    Refunded { assets: U256, hash: B256 },
+    /// A deposit sent back, nothing bought, to the wallet that paid it in
+    /// (`to`): the vault stopped taking deposits or its list changed before
+    /// the price, the vault closed, or the fallback.
+    Refunded {
+        assets: U256,
+        to: Address,
+        hash: B256,
+    },
     /// A withdrawal paid from cash.
     Paid {
         shares: U256,
@@ -128,9 +150,10 @@ pub enum Outcome {
         shares: U256,
         hash: B256,
     },
-    /// A claim settled.
+    /// A claim settled: it pays `owner`, whoever sent it.
     Claim {
         claim: U256,
+        owner: Address,
         state: ClaimState,
         paid: U256,
         hash: B256,
@@ -175,6 +198,24 @@ impl Pace {
     };
 }
 
+/// The person asking, from the page, for the second step now ("Settle
+/// now"), after the app's own try wasn't sent.
+#[derive(Clone, Default)]
+pub struct Nudge(Rc<Cell<bool>>);
+
+impl Nudge {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn nudge(&self) {
+        self.0.set(true);
+    }
+    /// Whether it was asked for since the last look; clears it.
+    pub fn take(&self) -> bool {
+        self.0.replace(false)
+    }
+}
+
 /// Stops a flow before its next signature or send.
 #[derive(Clone, Default)]
 pub struct Cancel(Rc<Cell<bool>>);
@@ -203,6 +244,8 @@ pub struct Ctx<'a, R, S, C> {
     /// The account the flow was built for.
     pub account: Address,
     pub cancel: Cancel,
+    /// "Settle now", pressed on the page.
+    pub settle_now: Nudge,
     pub pace: Pace,
     pub on_step: &'a dyn Fn(Step),
 }
@@ -268,8 +311,12 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
         self.guard().await?;
         self.step(Step::Signing(prompt.clone()));
         let hash = self.signer.send(&request).await?;
-        self.step(Step::Sent { prompt, hash });
-        let receipt = self.mined(hash).await?;
+        self.step(Step::Sent {
+            prompt: prompt.clone(),
+            hash,
+            unseen: false,
+        });
+        let receipt = self.mined(hash, &prompt).await?;
         if !receipt.success {
             return Err(TxError::Reverted { hash, reason: None });
         }
@@ -277,38 +324,61 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
     }
 
     /// Wait for a sent transaction to be mined, or say what became of it:
-    /// replaced, dropped, or still pending after a long wait.
-    pub(crate) async fn mined(&self, hash: B256) -> Result<Receipt, TxError> {
+    /// replaced, or not mined by the end of a long wait (seen by the network
+    /// or not). One endpoint not knowing a transaction proves nothing (the
+    /// wallet may have sent it through another), so that is said as "not
+    /// seen yet" and watched to the end; and a read that fails is one more
+    /// look, never the end of a transaction that may still land.
+    pub(crate) async fn mined(&self, hash: B256, prompt: &Prompt) -> Result<Receipt, TxError> {
         let mut known: Option<u64> = None;
         let mut unknown_polls = 0u32;
+        let mut unseen = false;
         for _ in 0..self.pace.give_up_after {
-            if let Some(receipt) = self.reader.receipt(hash).await? {
+            if let Ok(Some(receipt)) = self.reader.receipt(hash).await {
                 return Ok(receipt);
             }
-            match self.reader.pending(hash).await? {
-                Pending::Known { nonce } => {
+            match self.reader.pending(hash).await {
+                Ok(Pending::Known { nonce }) => {
                     known = Some(nonce);
                     unknown_polls = 0;
+                    if unseen {
+                        unseen = false;
+                        self.step(Step::Sent {
+                            prompt: prompt.clone(),
+                            hash,
+                            unseen,
+                        });
+                    }
                 }
-                Pending::Unknown => {
+                Ok(Pending::Unknown) => {
                     unknown_polls += 1;
                     // Known once, gone now, and its nonce used by another.
                     if let Some(nonce) = known
-                        && self.reader.mined_nonce(self.account).await? > nonce
-                        && self.reader.receipt(hash).await?.is_none()
+                        && matches!(self.reader.mined_nonce(self.account).await, Ok(mined) if mined > nonce)
+                        && matches!(self.reader.receipt(hash).await, Ok(None))
                     {
                         return Err(TxError::Replaced { hash });
                     }
-                    if unknown_polls > self.pace.dropped_after {
-                        return Err(TxError::Dropped { hash });
+                    if unknown_polls > self.pace.dropped_after && !unseen {
+                        unseen = true;
+                        self.step(Step::Sent {
+                            prompt: prompt.clone(),
+                            hash,
+                            unseen,
+                        });
                     }
                 }
+                Err(_) => {}
             }
             self.clock.sleep(self.pace.poll_millis).await;
         }
-        // Known to the network all this while and never mined: a fee too
-        // low, most likely. It may still land, so this isn't a failure.
-        Err(TxError::Stuck { hash })
+        // Not mined after a long wait. Known to the network all this while:
+        // a fee too low, most likely. Either way it may still land.
+        if known.is_some() && !unseen {
+            Err(TxError::Stuck { hash })
+        } else {
+            Err(TxError::Dropped { hash })
+        }
     }
 
     /// The vault's own events in a receipt.
@@ -324,6 +394,19 @@ pub fn decode<E: SolEvent>(address: Address, logs: &[Log]) -> Vec<E> {
         .filter(|log| log.topics.first() == Some(&E::SIGNATURE_HASH))
         .filter_map(|log| E::decode_raw_log(log.topics.iter().copied(), &log.data).ok())
         .collect()
+}
+
+/// What an error after `hash` was mined becomes: the money moved, so it is
+/// [`TxError::Landed`], with what stopped the app.
+fn landed(hash: B256, request: Option<U256>) -> impl Fn(TxError) -> TxError {
+    move |then| match then {
+        TxError::Landed { .. } => then,
+        then => TxError::Landed {
+            hash,
+            request,
+            then: Some(Box::new(then)),
+        },
+    }
 }
 
 /// Run a flow, reporting where it ends: done, or failed with its reason.
@@ -407,51 +490,116 @@ pub async fn deposit<R: Reader, S: Signer, C: Clock>(
             .abi_encode(),
         )
         .await?;
-    let countdown = requested(ctx, &receipt).await?;
-    let at = priced(ctx, countdown, &figures.timers).await?;
+    follow(ctx, &receipt, RequestKind::Deposit, amount, &figures.timers).await
+}
 
-    // How it settled, from the vault's own events for this request.
-    let id = B256::from(countdown.request);
-    let deposited = ctx
-        .reader
-        .logs(
-            ctx.vault,
-            IVault::Deposited::SIGNATURE_HASH,
-            Some(id),
-            receipt.block,
-        )
-        .await?;
-    if let Some(event) = decode::<IVault::Deposited>(ctx.vault, &deposited)
-        .into_iter()
-        .next()
-    {
-        return Ok(Outcome::Deposited {
-            assets: event.assets,
-            shares: event.shares,
-            at,
-            hash: countdown.hash,
-        });
-    }
-    let refunded = ctx
-        .reader
-        .logs(
-            ctx.vault,
-            IVault::Refunded::SIGNATURE_HASH,
-            Some(id),
-            receipt.block,
-        )
-        .await?;
-    if let Some(event) = decode::<IVault::Refunded>(ctx.vault, &refunded)
-        .into_iter()
-        .next()
-    {
-        return Ok(Outcome::Refunded {
-            assets: event.assets,
-            hash: countdown.hash,
-        });
+/// After the request's transaction is mined: its countdown, its price, the
+/// second step if nobody else sends it, and how it settled. Every error from
+/// here on is [`TxError::Landed`]: the money is in the vault.
+async fn follow<R: Reader, S: Signer, C: Clock>(
+    ctx: &Ctx<'_, R, S, C>,
+    receipt: &Receipt,
+    kind: RequestKind,
+    amount: U256,
+    timers: &Timers,
+) -> Result<Outcome, TxError> {
+    let countdown = requested(ctx, receipt)
+        .await
+        .map_err(landed(receipt.hash, None))?;
+    let landed = landed(countdown.hash, Some(countdown.request));
+    let at = priced(ctx, countdown, timers).await.map_err(&landed)?;
+    settled(
+        ctx,
+        countdown.request,
+        kind,
+        ctx.account,
+        amount,
+        receipt.block,
+        at,
+        countdown.hash,
+    )
+    .await
+    .map_err(&landed)
+}
+
+/// How a settled request ended, from the vault's own events for it: a
+/// deposit bought shares or was sent back; a withdrawal was paid or booked
+/// as a claim (for exactly its shares, in its owner's name).
+#[allow(clippy::too_many_arguments)]
+async fn settled<R: Reader, S: Signer, C: Clock>(
+    ctx: &Ctx<'_, R, S, C>,
+    request: U256,
+    kind: RequestKind,
+    owner: Address,
+    amount: U256,
+    from_block: u64,
+    at: u64,
+    hash: B256,
+) -> Result<Outcome, TxError> {
+    let id = B256::from(request);
+    let logs = |topic: B256, by_id: bool| {
+        ctx.reader
+            .logs(ctx.vault, topic, by_id.then_some(id), from_block)
+    };
+    match kind {
+        RequestKind::Deposit => {
+            let deposited = logs(IVault::Deposited::SIGNATURE_HASH, true).await?;
+            if let Some(event) = decode::<IVault::Deposited>(ctx.vault, &deposited)
+                .into_iter()
+                .next()
+            {
+                return Ok(Outcome::Deposited {
+                    assets: event.assets,
+                    shares: event.shares,
+                    at,
+                    hash,
+                });
+            }
+            let refunded = logs(IVault::Refunded::SIGNATURE_HASH, true).await?;
+            if let Some(event) = decode::<IVault::Refunded>(ctx.vault, &refunded)
+                .into_iter()
+                .next()
+            {
+                return Ok(Outcome::Refunded {
+                    assets: event.assets,
+                    to: event.to,
+                    hash,
+                });
+            }
+        }
+        RequestKind::Redeem => {
+            let withdrawn = logs(IVault::Withdrawn::SIGNATURE_HASH, true).await?;
+            if let Some(event) = decode::<IVault::Withdrawn>(ctx.vault, &withdrawn)
+                .into_iter()
+                .next()
+            {
+                return Ok(Outcome::Paid {
+                    shares: event.shares,
+                    assets: event.assets,
+                    at: Some(at),
+                    hash,
+                });
+            }
+            // Not paid: booked as a claim, for exactly these shares, in the
+            // owner's name, after the request.
+            let booked = logs(IVault::ClaimBooked::SIGNATURE_HASH, false).await?;
+            if let Some(claim) = decode::<IVault::ClaimBooked>(ctx.vault, &booked)
+                .into_iter()
+                .filter(|event| event.owner == owner && event.shares == amount)
+                .map(|event| event.claimId)
+                .max()
+            {
+                return Ok(Outcome::Booked {
+                    claim,
+                    shares: amount,
+                    hash,
+                });
+            }
+        }
+        RequestKind::Claim | RequestKind::TankFill => {}
     }
     Err(TxError::Network(
-        "the deposit settled, but its record couldn't be read; your portfolio shows it".to_string(),
+        "it settled, but its record couldn't be read".to_string(),
     ))
 }
 
@@ -499,7 +647,7 @@ async fn sign_statement<R: Reader, S: Signer, C: Clock>(
     if !recovers_to(&signature, digest, ctx.account) {
         return Err(TxError::BadSignature);
     }
-    Ok(signature)
+    as_the_vault_takes_it(&signature).ok_or(TxError::BadSignature)
 }
 
 /// Whether a 65-byte signature over `digest` is `account`'s.
@@ -508,6 +656,14 @@ pub fn recovers_to(signature: &[u8], digest: B256, account: Address) -> bool {
         .ok()
         .and_then(|signature| signature.recover_address_from_prehash(&digest).ok())
         == Some(account)
+}
+
+/// A 65-byte signature in the form the vault's check takes: `r`, `s`, then
+/// `v` as 27 or 28. Some wallets end it with the recovery id itself (0 or
+/// 1), which the vault refuses; the signature is the same.
+pub fn as_the_vault_takes_it(signature: &[u8]) -> Option<Bytes> {
+    let parsed = Signature::try_from(signature).ok()?;
+    Some(Bytes::from(parsed.as_bytes().to_vec()))
 }
 
 /// The request a receipt made, and when.
@@ -537,6 +693,13 @@ async fn requested<R: Reader, S: Signer, C: Clock>(
 /// Wait for the request to be priced and settled, moving its slot on when a
 /// valuation isn't recorded in time, and sending the second step if nobody
 /// else has a few seconds after the price. The time it was priced at.
+///
+/// The second step is optional: the keeper settles with the valuation, and
+/// anyone may. If the app's own try isn't sent (declined, another chain, no
+/// fee, reverted, never mined), that is reported on the priced step and the
+/// flow keeps watching; the person may ask for it again ("Settle now"). A
+/// read that fails is one more look. When the long wait runs out the request
+/// still stands: [`TxError::Landed`] with nothing that stopped it.
 async fn priced<R: Reader, S: Signer, C: Clock>(
     ctx: &Ctx<'_, R, S, C>,
     mut countdown: Countdown,
@@ -545,55 +708,96 @@ async fn priced<R: Reader, S: Signer, C: Clock>(
     let earliest = countdown.slot;
     let mut priced_at: Option<u64> = None;
     let mut since_priced = 0u32;
-    let mut finished = false;
+    let mut tried = false;
+    let mut misses = 0u32;
     for _ in 0..ctx.pace.give_up_after {
-        let request = read::request(ctx.reader, ctx.vault, countdown.request).await?;
-        let last = read::last_priced(ctx.reader, ctx.vault).await?;
-        if let Some(last) = last.filter(|last| last.time >= earliest)
-            && priced_at.is_none()
-        {
-            let at = pricing_time(ctx, &last, earliest).await?;
+        let look = async {
+            let request = read::request(ctx.reader, ctx.vault, countdown.request).await?;
+            let last = read::last_priced(ctx.reader, ctx.vault).await?;
+            let newly = match last.filter(|last| last.time >= earliest) {
+                Some(last) if priced_at.is_none() => {
+                    Some(pricing_time(ctx, &last, earliest).await?)
+                }
+                _ => None,
+            };
+            let now = match (priced_at, newly) {
+                (None, None) => Some(ctx.reader.chain_time().await?),
+                _ => None,
+            };
+            Ok::<_, TxError>((request, newly, now))
+        }
+        .await;
+        let (request, newly, now) = match look {
+            Ok(look) => {
+                misses = 0;
+                look
+            }
+            Err(error) => {
+                misses += 1;
+                if misses > ctx.pace.dropped_after {
+                    return Err(error);
+                }
+                ctx.clock.sleep(ctx.pace.poll_millis).await;
+                continue;
+            }
+        };
+        if let Some(at) = newly {
             priced_at = Some(at);
             countdown.slot = at;
-            ctx.step(Step::Priced { countdown, at });
+            ctx.step(Step::Priced {
+                countdown,
+                at,
+                unsent: None,
+            });
         }
         if request.done {
             return Ok(priced_at.unwrap_or(countdown.slot));
         }
         match priced_at {
-            Some(_) => {
+            Some(at) => {
                 since_priced += 1;
                 // Settling is open to anyone; the keeper does it with the
-                // valuation. If nobody has, the app sends it.
-                if since_priced >= ctx.pace.finish_after && !finished {
-                    finished = true;
-                    ctx.transact(
-                        Prompt::Finish,
-                        ctx.vault,
-                        IVault::settleCall {
-                            max: U256::from(256u32),
-                        }
-                        .abi_encode(),
-                    )
-                    .await?;
+                // valuation. If nobody has, the app sends it, once, and again
+                // whenever the person asks.
+                let asked = ctx.settle_now.take();
+                if asked || (!tried && since_priced >= ctx.pace.finish_after) {
+                    tried = true;
+                    let unsent = ctx
+                        .transact(
+                            Prompt::Finish,
+                            ctx.vault,
+                            IVault::settleCall {
+                                max: U256::from(256u32),
+                            }
+                            .abi_encode(),
+                        )
+                        .await
+                        .err();
+                    ctx.step(Step::Priced {
+                        countdown,
+                        at,
+                        unsent,
+                    });
                 }
             }
             None => {
-                let now = ctx.reader.chain_time().await?;
-                let slot = read::live_slot(earliest, now, timers);
-                if slot != countdown.slot {
-                    countdown.moved_from = Some(countdown.slot);
-                    countdown.slot = slot;
-                    ctx.step(Step::Requested(countdown));
+                if let Some(now) = now {
+                    let slot = read::live_slot(earliest, now, timers);
+                    if slot != countdown.slot {
+                        countdown.moved_from = Some(countdown.slot);
+                        countdown.slot = slot;
+                        ctx.step(Step::Requested(countdown));
+                    }
                 }
             }
         }
         ctx.clock.sleep(ctx.pace.poll_millis).await;
     }
-    Err(TxError::Network(
-        "the request is still waiting for its price; it stands, and your portfolio shows it when it's priced"
-            .to_string(),
-    ))
+    Err(TxError::Landed {
+        hash: countdown.hash,
+        request: Some(countdown.request),
+        then: None,
+    })
 }
 
 /// The time of the valuation that priced a request with this `earliest`:
@@ -674,57 +878,7 @@ pub async fn withdraw<R: Reader, S: Signer, C: Clock>(
             .abi_encode(),
         )
         .await?;
-    let countdown = requested(ctx, &receipt).await?;
-    let at = priced(ctx, countdown, &figures.timers).await?;
-
-    let id = B256::from(countdown.request);
-    let withdrawn = ctx
-        .reader
-        .logs(
-            ctx.vault,
-            IVault::Withdrawn::SIGNATURE_HASH,
-            Some(id),
-            receipt.block,
-        )
-        .await?;
-    if let Some(event) = decode::<IVault::Withdrawn>(ctx.vault, &withdrawn)
-        .into_iter()
-        .next()
-    {
-        return Ok(Outcome::Paid {
-            shares: event.shares,
-            assets: event.assets,
-            at: Some(at),
-            hash: countdown.hash,
-        });
-    }
-    // Not paid: booked as a claim, for exactly these shares, in the
-    // account's name, after the request.
-    let booked = ctx
-        .reader
-        .logs(
-            ctx.vault,
-            IVault::ClaimBooked::SIGNATURE_HASH,
-            None,
-            receipt.block,
-        )
-        .await?;
-    let claim = decode::<IVault::ClaimBooked>(ctx.vault, &booked)
-        .into_iter()
-        .filter(|event| event.owner == ctx.account && event.shares == shares)
-        .map(|event| event.claimId)
-        .max()
-        .ok_or_else(|| {
-            TxError::Network(
-                "the withdrawal settled, but its record couldn't be read; your portfolio shows it"
-                    .to_string(),
-            )
-        })?;
-    Ok(Outcome::Booked {
-        claim,
-        shares,
-        hash: countdown.hash,
-    })
+    follow(ctx, &receipt, RequestKind::Redeem, shares, &figures.timers).await
 }
 
 /// A closed vault's payout: the shares' fraction of its cash, at once.
@@ -747,7 +901,8 @@ async fn redeem_closed<R: Reader, S: Signer, C: Clock>(
         .events::<IVault::Withdrawn>(&receipt)
         .into_iter()
         .find(|event| event.owner == ctx.account)
-        .ok_or_else(|| TxError::Network("the payout's record wasn't in its receipt".to_string()))?;
+        .ok_or_else(|| TxError::Network("the payout's record wasn't in its receipt".to_string()))
+        .map_err(landed(receipt.hash, None))?;
     Ok(Outcome::Paid {
         shares: paid.shares,
         assets: paid.assets,
@@ -756,10 +911,71 @@ async fn redeem_closed<R: Reader, S: Signer, C: Clock>(
     })
 }
 
+// Settling a request now ---------------------------------------------------
+
+/// The second step on its own ("Settle now"), for a request already priced
+/// and not yet settled: anyone may send it. It ends as the request settled.
+pub async fn settle_request<R: Reader, S: Signer, C: Clock>(
+    ctx: &Ctx<'_, R, S, C>,
+    id: U256,
+) -> Result<Outcome, TxError> {
+    ctx.step(Step::Checking);
+    check_endpoint(ctx).await?;
+    let request = read::request(ctx.reader, ctx.vault, id).await?;
+    if request.done || !matches!(request.kind, RequestKind::Deposit | RequestKind::Redeem) {
+        return Err(TxError::WrongState);
+    }
+    let last = read::last_priced(ctx.reader, ctx.vault)
+        .await?
+        .filter(|last| last.time >= request.earliest)
+        .ok_or(TxError::WouldRevert {
+            reason: Revert::Vault("NotYet"),
+        })?;
+    let at = pricing_time(ctx, &last, request.earliest).await?;
+    let receipt = ctx
+        .transact(
+            Prompt::Finish,
+            ctx.vault,
+            IVault::settleCall {
+                max: U256::from(256u32),
+            }
+            .abi_encode(),
+        )
+        .await?;
+    let landed = landed(receipt.hash, Some(id));
+    let after = read::request(ctx.reader, ctx.vault, id)
+        .await
+        .map_err(&landed)?;
+    if !after.done {
+        // Mined, and this request not among those it settled: it still
+        // stands, and the keeper settles it.
+        return Err(TxError::Landed {
+            hash: receipt.hash,
+            request: Some(id),
+            then: None,
+        });
+    }
+    settled(
+        ctx,
+        id,
+        request.kind,
+        request.owner,
+        request.amount,
+        receipt.block,
+        at,
+        receipt.hash,
+    )
+    .await
+    .map_err(&landed)
+}
+
 // Claims, the fallback, collecting ------------------------------------------
 
-/// Push a claim through (`settleClaim`): anyone may. It ends paid, waiting
-/// (a market outside the band), queued for the next valuation, or closing.
+/// Push a claim through: anyone may. On an open vault (`settleClaim`, for a
+/// claim pending or waiting) it ends paid, waiting (a market outside the
+/// band), queued for the next valuation, or closing. On a closed vault
+/// (`claimClosed`, for a claim pending, waiting or queued) it is paid its
+/// share of the cash. A vault ready to close takes neither until it closes.
 pub async fn settle_claim<R: Reader, S: Signer, C: Clock>(
     ctx: &Ctx<'_, R, S, C>,
     claim: U256,
@@ -767,12 +983,12 @@ pub async fn settle_claim<R: Reader, S: Signer, C: Clock>(
     ctx.step(Step::Checking);
     check_endpoint(ctx).await?;
     let before = read::claim(ctx.reader, ctx.vault, claim).await?;
-    if !matches!(before.state, ClaimState::Pending | ClaimState::Waiting) {
+    let figures = read::figures(ctx.reader, ctx.vault).await?;
+    let closed = figures.state == State::Closed;
+    if !claim_door_open(before.state, figures.state, figures.ready_to_close) {
         return Err(TxError::WrongState);
     }
-    let state = read::state(ctx.reader, ctx.vault).await?;
-    let receipt = if state == State::Closed {
-        // A closed vault pays its claims from its cash.
+    let receipt = if closed {
         ctx.transact(
             Prompt::Closed,
             ctx.vault,
@@ -787,42 +1003,126 @@ pub async fn settle_claim<R: Reader, S: Signer, C: Clock>(
         )
         .await?
     };
-    let after = read::claim(ctx.reader, ctx.vault, claim).await?;
+    let after = read::claim(ctx.reader, ctx.vault, claim)
+        .await
+        .map_err(landed(receipt.hash, None))?;
     Ok(Outcome::Claim {
         claim,
+        owner: before.owner,
         state: after.state,
         paid: after.paid,
         hash: receipt.hash,
     })
 }
 
-/// What the fallback is taken for: a withdrawal request, or a claim.
+/// Whether a claim in `claim` can be pushed through on a vault in `vault`,
+/// as the contract takes it: `settleClaim` for a claim pending or waiting on
+/// a vault neither closed, cancelled nor ready to close; `claimClosed` for a
+/// claim pending, waiting or queued on a closed vault.
+pub fn claim_door_open(claim: ClaimState, vault: State, ready_to_close: bool) -> bool {
+    match vault {
+        State::Closed => matches!(
+            claim,
+            ClaimState::Pending | ClaimState::Waiting | ClaimState::Queued
+        ),
+        State::Cancelled | State::None => false,
+        _ => !ready_to_close && matches!(claim, ClaimState::Pending | ClaimState::Waiting),
+    }
+}
+
+/// Whether the claim fallback (`takeProRataClaim`) is open to its owner:
+/// a claim pending, waiting or queued, on a vault neither closed, cancelled
+/// nor ready to close, a day after it was booked (a queued claim also a day
+/// after it was queued). Whether the cash would cover it is left to the
+/// chain's own estimate.
+pub fn claim_fallback_open(
+    claim: &read::Claim,
+    vault: State,
+    ready_to_close: bool,
+    fallback_after: u64,
+    now: u64,
+) -> bool {
+    let from = match claim.state {
+        ClaimState::Pending | ClaimState::Waiting => claim.booked_at,
+        ClaimState::Queued => claim.booked_at.max(claim.last_attempt_at),
+        _ => return false,
+    };
+    !matches!(vault, State::Closed | State::Cancelled | State::None)
+        && !ready_to_close
+        && now >= from.saturating_add(fallback_after)
+}
+
+/// What the fallback is taken for: a waiting request, or a claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fallback {
     Request(U256),
     Claim(U256),
 }
 
-/// The fallback, when nothing has priced for a day: the exact share of the
-/// cash now, and units for the rest of what the stations hold.
+/// The fallback, when nothing has priced for a day, and only by the owner.
+/// On a withdrawal or a claim: the exact share of the cash now, and units
+/// for the rest of what the stations hold. On a deposit: the money back to
+/// the wallet that paid it in, nothing bought (the vault records a refund).
 pub async fn take_cash<R: Reader, S: Signer, C: Clock>(
     ctx: &Ctx<'_, R, S, C>,
     of: Fallback,
 ) -> Result<Outcome, TxError> {
     ctx.step(Step::Checking);
     check_endpoint(ctx).await?;
-    let data = match of {
-        Fallback::Request(id) => IVault::takeProRataCall { requestId: id }.abi_encode(),
-        Fallback::Claim(id) => IVault::takeProRataClaimCall { claimId: id }.abi_encode(),
+    let (prompt, data, deposit) = match of {
+        Fallback::Request(id) => {
+            let request = read::request(ctx.reader, ctx.vault, id).await?;
+            if request.done || request.owner != ctx.account {
+                return Err(TxError::WouldRevert {
+                    reason: Revert::Vault("NotAllowed"),
+                });
+            }
+            let data = IVault::takeProRataCall { requestId: id }.abi_encode();
+            match request.kind {
+                RequestKind::Deposit => (
+                    Prompt::TakeBack {
+                        amount: request.amount,
+                    },
+                    data,
+                    Some(id),
+                ),
+                RequestKind::Redeem => (Prompt::TakeCash, data, None),
+                RequestKind::Claim | RequestKind::TankFill => {
+                    return Err(TxError::WouldRevert {
+                        reason: Revert::Vault("NotAllowed"),
+                    });
+                }
+            }
+        }
+        Fallback::Claim(id) => (
+            Prompt::TakeCash,
+            IVault::takeProRataClaimCall { claimId: id }.abi_encode(),
+            None,
+        ),
     };
-    let receipt = ctx.transact(Prompt::TakeCash, ctx.vault, data).await?;
+    let receipt = ctx.transact(prompt, ctx.vault, data).await?;
+    let landed = landed(receipt.hash, None);
+    if let Some(id) = deposit {
+        let refund = ctx
+            .events::<IVault::Refunded>(&receipt)
+            .into_iter()
+            .find(|event| event.requestId == id)
+            .ok_or_else(|| {
+                TxError::Network("the refund's record wasn't in its receipt".to_string())
+            })
+            .map_err(&landed)?;
+        return Ok(Outcome::Refunded {
+            assets: refund.assets,
+            to: refund.to,
+            hash: receipt.hash,
+        });
+    }
     let taken = ctx
         .events::<IVault::ProRataTaken>(&receipt)
         .into_iter()
         .find(|event| event.owner == ctx.account)
-        .ok_or_else(|| {
-            TxError::Network("the fallback's record wasn't in its receipt".to_string())
-        })?;
+        .ok_or_else(|| TxError::Network("the fallback's record wasn't in its receipt".to_string()))
+        .map_err(&landed)?;
     Ok(Outcome::TookCash {
         assets: taken.assets,
         units: taken.units,
@@ -848,7 +1148,8 @@ pub async fn claim_instead<R: Reader, S: Signer, C: Clock>(
         .events::<IVault::ClaimBooked>(&receipt)
         .into_iter()
         .find(|event| event.owner == ctx.account)
-        .ok_or_else(|| TxError::Network("the claim's record wasn't in its receipt".to_string()))?;
+        .ok_or_else(|| TxError::Network("the claim's record wasn't in its receipt".to_string()))
+        .map_err(landed(receipt.hash, None))?;
     Ok(Outcome::ClaimMade {
         claim: booked.claimId,
         hash: receipt.hash,
@@ -885,9 +1186,8 @@ pub async fn collect_units<R: Reader, S: Signer, C: Clock>(
         .events::<IVault::UnitsPaid>(&receipt)
         .into_iter()
         .find(|event| event.owner == ctx.account)
-        .ok_or_else(|| {
-            TxError::Network("the payment's record wasn't in its receipt".to_string())
-        })?;
+        .ok_or_else(|| TxError::Network("the payment's record wasn't in its receipt".to_string()))
+        .map_err(landed(receipt.hash, None))?;
     Ok(Outcome::Collected {
         assets: paid.assets,
         hash: receipt.hash,
@@ -930,8 +1230,9 @@ pub async fn collect_held<R: Reader, S: Signer, C: Clock>(
     })
 }
 
-/// A request a closed vault never priced: a withdrawal paid from its cash,
-/// a deposit sent back.
+/// A deposit or withdrawal a closed vault never priced: a withdrawal paid
+/// its fraction of the cash, a deposit sent back. A claim's own request is
+/// collected through its claim, and a tank fill isn't a depositor's.
 pub async fn settle_closed<R: Reader, S: Signer, C: Clock>(
     ctx: &Ctx<'_, R, S, C>,
     request: U256,
@@ -939,6 +1240,10 @@ pub async fn settle_closed<R: Reader, S: Signer, C: Clock>(
     ctx.step(Step::Checking);
     check_endpoint(ctx).await?;
     if read::state(ctx.reader, ctx.vault).await? != State::Closed {
+        return Err(TxError::WrongState);
+    }
+    let waiting = read::request(ctx.reader, ctx.vault, request).await?;
+    if waiting.done || !matches!(waiting.kind, RequestKind::Deposit | RequestKind::Redeem) {
         return Err(TxError::WrongState);
     }
     let receipt = ctx
@@ -959,10 +1264,11 @@ pub async fn settle_closed<R: Reader, S: Signer, C: Clock>(
     if let Some(refund) = ctx.events::<IVault::Refunded>(&receipt).into_iter().next() {
         return Ok(Outcome::Refunded {
             assets: refund.assets,
+            to: refund.to,
             hash: receipt.hash,
         });
     }
-    Err(TxError::Network(
+    Err(landed(receipt.hash, Some(request))(TxError::Network(
         "the payout's record wasn't in its receipt".to_string(),
-    ))
+    )))
 }

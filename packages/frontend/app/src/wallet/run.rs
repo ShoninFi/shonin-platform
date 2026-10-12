@@ -10,7 +10,7 @@ use alloy_primitives::{Address, U256};
 use futures_signals::signal::Mutable;
 use shared::{Chain, Request, VaultState};
 
-use crate::tx::flow::{Cancel, Fallback, Step};
+use crate::tx::flow::{Cancel, Fallback, Nudge, Step};
 #[cfg(target_arch = "wasm32")]
 use crate::tx::port::Clock;
 
@@ -25,6 +25,8 @@ pub enum Action {
     CollectUnits,
     CollectHeld,
     SettleClosed(U256),
+    /// The second step for a priced request, now.
+    Settle(U256),
 }
 
 /// A vault as a page needs it to act on it: from the snapshot, for its
@@ -41,11 +43,12 @@ pub struct VaultRef {
     pub requests: Vec<Request>,
 }
 
-/// A flow in progress: its latest step, and its cancel.
+/// A flow in progress: its latest step, its cancel, and "Settle now".
 #[derive(Clone)]
 pub struct Running {
     pub step: Mutable<Option<Step>>,
     pub cancel: Cancel,
+    pub settle_now: Nudge,
 }
 
 impl Running {
@@ -53,6 +56,7 @@ impl Running {
         Self {
             step: Mutable::new(None),
             cancel: Cancel::new(),
+            settle_now: Nudge::new(),
         }
     }
 }
@@ -109,6 +113,7 @@ pub fn start(vault: &VaultRef, action: Action, running: &Running) {
             asset: network.asset,
             account,
             cancel: running.cancel.clone(),
+            settle_now: running.settle_now.clone(),
             pace: Pace::LIVE,
             on_step: &on_step,
         };
@@ -121,8 +126,13 @@ pub fn start(vault: &VaultRef, action: Action, running: &Running) {
             Action::CollectUnits => flow::report(&on_step, flow::collect_units(&ctx)).await,
             Action::CollectHeld => flow::report(&on_step, flow::collect_held(&ctx)).await,
             Action::SettleClosed(id) => flow::report(&on_step, flow::settle_closed(&ctx, id)).await,
+            Action::Settle(id) => flow::report(&on_step, flow::settle_request(&ctx, id)).await,
         };
-        if outcome.is_some() {
+        let moved = matches!(
+            running.step.get_cloned(),
+            Some(Step::Failed(error)) if error.may_have_moved()
+        );
+        if outcome.is_some() || moved {
             // What changed is on the chain now; pages read it again.
             session.changed.replace_with(|n| *n + 1);
         }

@@ -40,7 +40,7 @@ fn main() {
             document.set_title(&route.page().title);
         }
         if dialog::is_open() {
-            dialog::close();
+            dialog::close_for_navigation();
         }
         // Following a link starts at the top of the new page, with focus on
         // its content; the first page leaves focus where the browser puts it.
