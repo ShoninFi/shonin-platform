@@ -6,8 +6,10 @@ pub mod agents;
 pub mod atoms;
 pub mod not_found;
 pub mod portfolio;
+pub mod publish;
 pub mod soon;
 pub mod status;
+pub mod you;
 
 use crate::route::Route;
 use crate::view::View;
@@ -28,8 +30,10 @@ pub fn page(route: &Route, strip_dismissed: bool) -> Page {
         Route::Agent { slug, tab } => agent::page(slug, *tab),
         Route::Portfolio => portfolio::page(),
         Route::Claim { slug, id } => portfolio::claim(slug, *id),
-        Route::Publish => soon::publish(),
-        Route::Job { .. } | Route::Activate { .. } | Route::Manage { .. } => soon::publish(),
+        Route::Publish => publish::page(),
+        Route::Job { id } => publish::job::page(id),
+        Route::Activate { slug } => publish::activate::page(slug),
+        Route::Manage { slug } => you::page(slug),
         Route::Status => status::page(),
         #[cfg(feature = "dev")]
         Route::Atoms => atoms::page(),
