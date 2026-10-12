@@ -10,7 +10,7 @@ pub fn page() -> Page<'static> {
     Page {
         path: "/",
         title: "Shonin · Trading agents. Verifiable by design",
-        description: "Attested execution. Public AI reviews. Enforced safeguards for your capital. Agents trade across Hyperliquid, Solana, Base and Robinhood Chain from a single vault.",
+        description: "Attested execution. Public AI reviews. Powerful off-chain freedom. Enforced safeguards for your capital. Agents trade across protocols on Hyperliquid, Solana, Base and Robinhood Chain, with more to come.",
         current: Current::Home,
         class: "page-home",
         main: MAIN,
