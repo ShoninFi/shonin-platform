@@ -30,6 +30,10 @@ dev = []
 # `task frontend:app:dev` turns it on; release builds never read the phrase,
 # whatever the environment holds, and the build task refuses a dist with it.
 dev-wallet = []
+# The Solana programs' ids for the testnet (devnet) deployment. Without it a
+# build names the local deploy keypairs' ids, as the local services do.
+# `task frontend:app:build` (and `app:dev` against the testnet API) turn it on.
+devnet = ["chain/devnet"]
 
 [dependencies]
 shared.workspace = true
@@ -44,13 +48,19 @@ gloo-net.workspace = true
 gloo-timers.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+time.workspace = true
 # Reading a packed project before it is uploaded (the publish page).
 tar.workspace = true
 toml.workspace = true
-time.workspace = true
 # Wallets and money: the contracts' own bindings, exact integers, and the
 # recovery-phrase wallet's local signer.
-chain.workspace = true
+chain = { workspace = true, features = ["solana-ix"] }
+# Solana: the recovery-phrase wallet's ed25519 key (SLIP-10 over SHA-512),
+# addresses and signatures in base58, account data in base64.
+ed25519-dalek.workspace = true
+sha2.workspace = true
+bs58.workspace = true
+base64.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 alloy-signer.workspace = true
@@ -92,7 +102,7 @@ getrandom = { workspace = true, features = ["js"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 reqwest = { workspace = true, features = ["blocking", "json"] }
-sha2.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 futures.workspace = true

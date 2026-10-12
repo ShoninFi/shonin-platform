@@ -18,6 +18,7 @@ pub mod phrase;
 pub mod rpc;
 pub mod run;
 pub mod session;
+pub mod solana;
 
 pub use machine::{Connection, WalletId};
 pub use network::Network;

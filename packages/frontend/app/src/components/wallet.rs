@@ -50,6 +50,8 @@ pub fn header_control() -> View {
                 })
             }),
         )
+        // The Solana wallet's button, while one is connected.
+        .child(super::solana::wallet::header_button())
         .into()
 }
 
@@ -149,6 +151,7 @@ pub fn open_connect() {
     // Wallets that load after the page announce themselves now.
     #[cfg(target_arch = "wasm32")]
     session.start_discovery();
+    super::solana::wallet::discover();
     let phrase_mode = Mutable::new(false);
     let body = el("div")
         .class("sh-connect")
@@ -299,6 +302,7 @@ fn choosing(phrase_mode: &Mutable<bool>) -> View {
     let session = crate::wallet::get();
     let options = session.wallets.get_cloned();
     let mut rows: Vec<View> = options.into_iter().map(wallet_row).collect();
+    rows.extend(super::solana::wallet::rows());
     if session.dev_available() {
         rows.push(
             option_row(
@@ -310,6 +314,7 @@ fn choosing(phrase_mode: &Mutable<bool>) -> View {
             .hook(|dom| {
                 dom.event(|_: dominator::events::Click| {
                     crate::wallet::get().connect_dev();
+                    super::solana::wallet::also_connect_dev();
                 })
             })
             .into(),
@@ -440,7 +445,10 @@ fn phrase_entry(phrase_mode: &Mutable<bool>) -> View {
         move || {
             let words = std::mem::take(&mut *phrase.borrow_mut());
             match crate::wallet::get().connect_phrase(&words) {
-                Ok(()) => error.set(None),
+                Ok(()) => {
+                    super::solana::wallet::also_connect_phrase(&words);
+                    error.set(None)
+                }
                 Err(bad) => error.set(Some(bad.words().to_string())),
             }
         }

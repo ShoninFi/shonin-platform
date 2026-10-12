@@ -95,11 +95,18 @@ impl Panel {
 
 /// The Exit panel for an agent, for the agent page's right column.
 pub fn panel(slug: &str) -> View {
+    // A Solana vault's panel is signed by a Solana wallet.
+    if crate::tx::solana::run::is_solana(slug) {
+        return super::solana::exit::panel(slug);
+    }
     build(slug, Tab::Deposit, false)
 }
 
 /// The phone's Exit sheet, opened by the action bar's Deposit or Withdraw.
 pub fn open_sheet(slug: &str, tab: Tab) {
+    if crate::tx::solana::run::is_solana(slug) {
+        return super::solana::exit::open_sheet(slug, tab);
+    }
     let title = crate::store::get()
         .agent(slug)
         .map(|agent| agent.title.get_cloned())
@@ -250,7 +257,7 @@ async fn follow(panel: Rc<Panel>) {
     let _ = panel;
 }
 
-fn placeholder() -> View {
+pub(crate) fn placeholder() -> View {
     el("div")
         .class("sh-exit__body")
         .attr("aria-busy", "true")
@@ -358,7 +365,7 @@ fn render(panel: &Rc<Panel>, mode: Mode) -> View {
 
 /// A field's verdict on what's typed.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Check {
+pub(crate) enum Check {
     Empty,
     Invalid(String),
     /// Under the minimum, over the balance, more shares than held.
@@ -499,7 +506,7 @@ fn withdraw_check(panel: &Panel, text: &str, unit: Unit, connected: bool) -> (Ch
 }
 
 /// A row of the summary: a label (with its small print) and a figure.
-fn row(
+pub(crate) fn row(
     label: &'static str,
     detail: Option<&'static str>,
     figure: impl Signal<Item = String> + 'static,
@@ -525,7 +532,7 @@ fn form(panel: &Rc<Panel>, tab: Tab, connected: bool) -> View {
 
 /// The amount input: inputmode decimal, 16px, labelled, its hint or error
 /// linked with aria-describedby.
-fn amount_input(
+pub(crate) fn amount_input(
     id: &'static str,
     value: &Mutable<String>,
     unit: View,
@@ -737,7 +744,7 @@ fn fee_label(panel: &Rc<Panel>, what: &'static str) -> impl Signal<Item = String
     })
 }
 
-fn row_dyn(
+pub(crate) fn row_dyn(
     label: impl Signal<Item = String> + 'static,
     figure: impl Signal<Item = String> + 'static,
 ) -> El {
@@ -748,7 +755,7 @@ fn row_dyn(
 }
 
 /// The line under a field: the hint, or the error with its one-tap fix.
-fn hint(
+pub(crate) fn hint(
     id: &'static str,
     check: impl Signal<Item = Check> + 'static,
     value: &Mutable<String>,
@@ -788,7 +795,7 @@ fn hint(
         )
 }
 
-fn held_sentence(
+pub(crate) fn held_sentence(
     holdings: Option<&Holdings>,
     figures: Option<&VaultFigures>,
     decimals: u8,
@@ -1049,7 +1056,7 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool) -> View {
 }
 
 /// Shares as a button names them: 2,000 or 2,000.5.
-fn whole_shares(shares: U256) -> String {
+pub(crate) fn whole_shares(shares: U256) -> String {
     let shown = money::shares(shares, Rounding::Down);
     shown
         .strip_suffix(".0")
@@ -1289,7 +1296,7 @@ fn tx_link(chain_id: u64, hash: alloy_primitives::B256, label: &'static str) -> 
     }
 }
 
-fn utc(seconds: u64) -> String {
+pub(crate) fn utc(seconds: u64) -> String {
     time::OffsetDateTime::from_unix_timestamp(i64::try_from(seconds).unwrap_or(0))
         .map(|at| crate::format::time(time::PrimitiveDateTime::new(at.date(), at.time())))
         .unwrap_or_default()
@@ -1992,7 +1999,7 @@ fn done_view(
 }
 
 /// The seal moment (M7): the check drawn in.
-fn seal() -> El {
+pub(crate) fn seal() -> El {
     el("span")
         .class("sh-seal sh-seal-in")
         .attr("aria-hidden", "true")

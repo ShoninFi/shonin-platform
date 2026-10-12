@@ -122,6 +122,8 @@ pub fn page() -> Page {
                 })
             }),
         )
+        // What the connected Solana wallet holds, beside the EVM one's.
+        .child(crate::components::solana::portfolio::section())
         .hook(move |dom| dom.future(follow(loaded)));
     Page {
         top: None,
@@ -1101,6 +1103,9 @@ struct ClaimView {
 /// One claim: where it is, what it's estimated at, and how to push it
 /// through.
 pub fn claim(slug: &str, id: u64) -> Page {
+    if crate::tx::solana::run::is_solana(slug) {
+        return crate::components::solana::portfolio::claim(slug, id);
+    }
     let loaded: Mutable<Option<Result<ClaimView, String>>> = Mutable::new(None);
     let body = el("div")
         .class("sh-portfolio sh-claim")

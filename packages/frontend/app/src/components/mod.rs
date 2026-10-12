@@ -4,6 +4,7 @@ pub mod exit;
 pub mod footer;
 pub mod freshness;
 pub mod header;
+pub mod solana;
 pub mod strip;
 pub mod tabbar;
 pub mod wallet;

@@ -19,6 +19,7 @@ fn main() {
     api::follow();
     // Wallets: discovery, the vault chains' configs, a silent reconnect.
     app::wallet::get().start();
+    app::wallet::solana::get().start();
 
     let strip_dismissed = components::strip::dismissed();
     let first = std::cell::Cell::new(true);
