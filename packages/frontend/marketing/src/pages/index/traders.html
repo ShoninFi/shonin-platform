@@ -1,0 +1,63 @@
+
+<section class="sec sec--raised" id="traders" aria-labelledby="traders-title">
+  <div class="wrap traders">
+    <div class="traders__text" data-play>
+      <div class="sec-head sh-reveal">
+        <p class="sh-label">For Traders</p>
+        <h2 class="h2" id="traders-title">Know what an agent will do before you back it.</h2>
+        <p class="reading">Most automated strategies ask you to trust a pitch. Here you read a review of the actual code, and the chain makes sure that code is what's trading.</p>
+      </div>
+      <ol class="points">
+        <li class="sh-reveal dl-60"><span class="points__icon" aria-hidden="true">{{i:review:22}}</span><div><h3>Read what it will do</h3><p>Every agent comes with a public review of its code: a plain summary, and ratings in six areas from financial risk to outside influence.</p></div></li>
+        <li class="sh-reveal dl-120"><span class="points__icon" aria-hidden="true">{{i:check:22}}</span><div><h3>Know it does what it says</h3><p>The Reviewer checks the Author's description, and every limit they claim, against the code itself. A promise the code doesn't keep counts against the agent.</p></div></li>
+        <li class="sh-reveal dl-180"><span class="points__icon" aria-hidden="true">{{i:seal:22}}</span><div><h3>It can never be swapped out</h3><p>Only the exact build that was reviewed can trade the vault. A changed agent is a new agent, with a new vault, and nobody is moved into it.</p></div></li>
+        <li class="sh-reveal dl-240"><span class="points__icon" aria-hidden="true">{{i:code:22}}</span><div><h3>Read the source yourself</h3><p>If the Author made it public, read every line, then rebuild it and get the same fingerprint the chain holds.</p></div></li>
+      </ol>
+      <div class="actions actions--stack-phone sh-reveal dl-300">
+        <a class="sh-btn sh-btn-primary" href="{{app}}/agents">Browse agents</a>
+        <a class="link-strong" href="{{docs}}/basics/ai-review/">How the review works</a>
+      </div>
+    </div>
+
+    <figure class="traders__fig" data-play data-loop>
+      <div class="sh-card review sh-reveal dl-120">
+        <div class="review__head">
+          <div>
+            <p class="review__name">Basis Harvester</p>
+            <p class="review__by">by <span class="sh-mono">0x7f3a…9c21</span></p>
+          </div>
+          <span class="sh-chip sh-chip-neutral">{{i:review:14}}AI Review</span>
+        </div>
+        <p class="quote">“Rebalances two perpetuals so the vault earns funding without holding a view. It keeps its own leverage limit and checks it before every order.”</p>
+        <div class="claims">
+          <p class="sh-label">What the Author claims, checked against the code</p>
+          <ul>
+            <li><span>Never more than 2× leverage.</span><span class="sh-chip sh-chip-gain sh-seal-in dl-700">{{i:check:14}}Kept by the code</span></li>
+            <li><span>Holds no net directional position for more than an hour.</span><span class="sh-chip sh-chip-gain sh-seal-in dl-850">{{i:check:14}}Kept by the code</span></li>
+            <li><span>Keeps at least 10% of its trading account unused as margin.</span><span class="sh-chip sh-chip-gain sh-seal-in dl-1000">{{i:check:14}}Kept by the code</span></li>
+          </ul>
+        </div>
+        <div class="review__tiles">
+          <div class="mini mini--brand">{{i:seal:20}}<span><span class="mini__title">Attested build</span><span class="mini__hash sh-mono">0x4e1d…a90b</span><span class="mini__text">The only code that can trade this vault</span></span></div>
+          <div class="mini">{{i:code:20}}<span><span class="mini__title">Source public</span><span class="mini__text">38 files of Rust. Read it and rebuild it.</span></span></div>
+        </div>
+      </div>
+      <div class="sh-card unkept sh-float dl-1200">
+        <div class="unkept__head">
+          <p class="sh-label">When a claim isn't kept</p>
+          <span class="sh-chip sh-chip-loss sh-seal-in dl-1500">{{i:serious:14}}Serious concerns</span>
+        </div>
+        <div class="unkept__claim">
+          <p class="unkept__who">Momentum Ladder's Author claims:</p>
+          <p class="unkept__what">“Never adds to a losing position.”</p>
+        </div>
+        <div class="unkept__found">
+          <p class="unkept__label">The review found</p>
+          <p class="unkept__quote">“The code doubles its order size after each loss, so this claim isn't kept.”</p>
+        </div>
+        <p class="unkept__note">It's on the agent's page, in public, before anyone deposits.</p>
+      </div>
+      <figcaption class="traders__caption sh-reveal dl-400">A review isn't a prediction. It never rates how much an agent might make.</figcaption>
+    </figure>
+  </div>
+</section>

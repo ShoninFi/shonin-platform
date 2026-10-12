@@ -1,0 +1,35 @@
+
+<section class="sec sec--paper" aria-labelledby="write-title">
+  <div class="wrap">
+    <div class="sec-head sec-head--split">
+      <div class="sec-head__main sh-reveal" data-play>
+        <p class="sh-label">What you write</p>
+        <h2 class="h2" id="write-title">An ordinary Rust project that compiles to one WebAssembly component.</h2>
+      </div>
+      <p class="sec-head__intro reading sh-reveal dl-120" data-play>It runs as one long-lived program. It watches the markets, decides, and hands its orders to the attested machine that signs and sends them.</p>
+    </div>
+    <div class="write">
+      <figure class="sh-card who sh-reveal" data-play>
+        <figcaption class="sh-label who__cap">Who does what</figcaption>
+        <div class="who__row"><span class="who__icon who__icon--brand">{{i:code:24}}</span><span class="who__text"><span class="who__name">Your agent</span><span class="who__does">Watches the markets and decides what to trade.</span></span></div>
+        <div class="who__link" aria-hidden="true"><span class="who__line"></span><span class="who__what">orders</span></div>
+        <div class="who__row"><span class="who__icon">{{i:machine:24}}</span><span class="who__text"><span class="who__name">The attested machine</span><span class="who__does">Signs and sends them with a trade-only key. The key is made inside it and never leaves.</span></span></div>
+        <div class="who__link" aria-hidden="true"><span class="who__line"></span><span class="who__what">signed orders</span></div>
+        <div class="who__row"><span class="who__icon">{{i:vault:24}}</span><span class="who__text"><span class="who__name">Your vault's own accounts</span><span class="who__does">The only place your code can ever trade.</span></span></div>
+        <p class="who__note">{{i:lock:20}}<span>You never hold a key, and your code can only ever trade your vault's own accounts.</span></p>
+      </figure>
+      <div class="sh-card can sh-reveal dl-120" data-play>
+        <p class="can__title">What your agent can do</p>
+        <ul class="can__list">
+          <li><span class="can__icon">{{i:swap:20}}</span><span><span class="can__what">Place and cancel orders</span><span class="can__how">On the venues its drivers connect to, for its own vault only.</span></span></li>
+          <li><span class="can__icon">{{i:vault:20}}</span><span><span class="can__what">Follow its own trades, positions and balance</span><span class="can__how">So it always knows what it holds.</span></span></li>
+          <li><span class="can__icon">{{i:up:20}}</span><span><span class="can__what">Read market data</span><span class="can__how">Prices, funding rates and the rest of what the venue publishes.</span></span></li>
+          <li><span class="can__icon">{{i:external:20}}</span><span><span class="can__what">Stay connected to other services</span><span class="can__how">Within the allowances you set. The Reviewer rates what they could steer.</span></span></li>
+          <li><span class="can__icon">{{i:machine:20}}</span><span><span class="can__what">Run an AI model you ship with it</span><span class="can__how">Inside the same attested machine, paid for as model time.</span></span></li>
+          <li><span class="can__icon">{{i:lock:20}}</span><span><span class="can__what">Use secrets you seal into it</span><span class="can__how">Such as a data service's API key, readable only inside the attested machine.</span></span></li>
+          <li><span class="can__icon">{{i:exit:20}}</span><span><span class="can__what">Unwind neatly when a Depositor withdraws</span><span class="can__how">Close that Depositor's share of each position in its own way.</span></span></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>

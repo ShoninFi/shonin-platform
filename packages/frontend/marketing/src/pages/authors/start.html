@@ -1,0 +1,38 @@
+
+<section class="sec sec--raised" aria-labelledby="start-title">
+  <div class="wrap start">
+    <div class="start__main">
+      <div class="sh-reveal" data-play>
+        <p class="sh-label">The template</p>
+        <h2 class="h2" id="start-title">Get started in four commands.</h2>
+        <p class="reading">The template is a working agent with tests. Change the strategy, keep the shape.</p>
+      </div>
+      <figure class="codefig terminal sh-reveal dl-120" data-play>
+        <figcaption class="codefig__bar terminal__bar">
+          <span class="terminal__name">{{i:code:16}}Terminal</span>
+          <button class="sh-iconbtn terminal__copy" type="button" aria-label="Copy the four commands" data-copy="terminal-commands" hidden><span class="terminal__icon">{{i:copy:18}}</span><span class="terminal__icon terminal__icon--done">{{i:check:18}}</span></button>
+        </figcaption>
+        <pre class="sh-mono codefig__code terminal__code" id="terminal-commands" tabindex="0" aria-label="Four commands, scrolls sideways"><span class="terminal__prompt" aria-hidden="true">$ </span>git clone https://github.com/ShoninFi/shonin-agent-template my-agent
+<span class="terminal__prompt" aria-hidden="true">$ </span>cd my-agent
+<span class="terminal__prompt" aria-hidden="true">$ </span>cargo test
+<span class="terminal__prompt" aria-hidden="true">$ </span>cargo build --release --target wasm32-wasip2</pre>
+        <p class="terminal__status" aria-live="polite"></p>
+      </figure>
+      <p class="start__then sh-reveal dl-180" data-play>When it does what you want, submit it on the <a href="{{app}}/publish">Publish page</a> and pay $1.</p>
+    </div>
+    <div class="sh-card files-table sh-reveal dl-160" data-play>
+      <table class="sh-table">
+        <caption>What's in the template</caption>
+        <thead><tr><th scope="col">File</th><th scope="col">What it's for</th></tr></thead>
+        <tbody>
+          <tr><th scope="row" class="sh-mono">shonin.toml</th><td>Name, description, claims, vault chain and drivers. Fixed once published.</td></tr>
+          <tr><th scope="row" class="sh-mono">src/config.rs</th><td>Your settings and limits, in one place.</td></tr>
+          <tr><th scope="row" class="sh-mono">src/lib.rs</th><td>The long-lived program: watches the markets and hands orders on.</td></tr>
+          <tr><th scope="row" class="sh-mono">src/decide.rs</th><td>Your strategy, as a pure function that's easy to test.</td></tr>
+          <tr><th scope="row" class="sh-mono">tests/</th><td>Tests for the strategy. <span class="sh-mono">cargo test</span> runs them.</td></tr>
+          <tr><th scope="row" class="sh-mono">Cargo.toml<br>Cargo.lock<br>rust-toolchain.toml</th><td>Pinned dependencies and toolchain, so anyone can rebuild it and get the same program.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>

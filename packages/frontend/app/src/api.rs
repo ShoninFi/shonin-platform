@@ -1,15 +1,20 @@
 //! Talking to the platform's API.
 //!
 //! The app asks for a snapshot, renders it, and asks again. It never holds a
-//! second copy of anything: whatever the chain says is what the screen shows,
-//! a couple of seconds later at worst.
+//! second copy of anything. Chain figures carry their observation dates and
+//! follow the indexer's configured active or idle cadence; authenticated executor
+//! reports update independently.
 
 #[cfg(target_arch = "wasm32")]
 use crate::data;
 
-/// Where the API answers. The dev server proxies this path to it, and a
-/// deployed app is served beside it, so the same relative path works in both.
-pub const BASE: &str = "/api";
+/// Where the API answers. A release build names the API's own address (the
+/// build task sets `SHONIN_APP_API` from the public config); the dev server
+/// proxies the relative path to the local API.
+pub const BASE: &str = match option_env!("SHONIN_APP_API") {
+    Some(base) => base,
+    None => "/api",
+};
 
 /// How often to ask whether anything has changed.
 #[cfg(target_arch = "wasm32")]
