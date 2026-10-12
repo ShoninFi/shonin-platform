@@ -340,6 +340,7 @@ impl Chain {
                 address: vault(),
                 topics: data.topics().to_vec(),
                 data: data.data.clone(),
+                transaction: None,
             },
         ));
     }
@@ -453,6 +454,8 @@ impl Chain {
                 ok(self.claims[usize::try_from(call.claimId).unwrap() - 1].clone())
             }
             IVault::unitsOfCall::SELECTOR => ok((U256::from(5u8), self.units_claimable)),
+            IVault::requestCountCall::SELECTOR => ok(U256::from(self.requests.len())),
+            IVault::openedBlockCall::SELECTOR => ok(0u64),
             IVault::heldForCall::SELECTOR => ok(self.held),
             _ => panic!("unexpected vault read {selector:?}"),
         }
@@ -610,6 +613,7 @@ impl Chain {
                         address: asset(),
                         topics: data.topics().to_vec(),
                         data: data.data.clone(),
+                        transaction: None,
                     },
                 ));
             }
@@ -1618,7 +1622,8 @@ fn a_claim_is_offered_only_the_doors_the_contract_opens_for_its_state() {
 }
 
 #[test]
-fn the_claim_fallback_opens_a_day_after_booking_and_a_queued_claim_a_day_after_it_was_queued() {
+fn the_claim_fallback_opens_a_day_after_booking_and_a_queued_claim_a_day_after_the_slot_it_was_queued_for()
+ {
     let claim = |state, booked_at, last_attempt_at| super::read::Claim {
         owner: Address::ZERO,
         shares: U256::from(WAD),
@@ -1628,27 +1633,37 @@ fn the_claim_fallback_opens_a_day_after_booking_and_a_queued_claim_a_day_after_i
         paid: U256::ZERO,
     };
     let day = 86_400;
-    let open =
-        |c: &super::read::Claim, now| flow::claim_fallback_open(c, State::Open, false, day, now);
+    let timers = super::read::Timers {
+        slot_interval: 10,
+        slot_lead: 5,
+        slot_window: 3,
+        fallback_after: day,
+    };
+    let open = |c: &super::read::Claim, now| {
+        flow::claim_fallback_open(c, State::Open, false, &timers, now)
+    };
     let waiting = claim(ClaimState::Waiting, 100, 0);
     assert!(!open(&waiting, 100 + day - 1));
     assert!(open(&waiting, 100 + day));
+    // Queued at 5,000: its own request is for the slot at 5,010, and the
+    // vault counts the day from there.
     let queued = claim(ClaimState::Queued, 100, 5_000);
     assert!(!open(&queued, 100 + day));
-    assert!(open(&queued, 5_000 + day));
+    assert!(!open(&queued, 5_000 + day));
+    assert!(open(&queued, 5_010 + day));
     assert!(!open(&claim(ClaimState::Paid, 100, 0), 10 * day));
     assert!(!flow::claim_fallback_open(
         &waiting,
         State::Closed,
         false,
-        day,
+        &timers,
         10 * day
     ));
     assert!(!flow::claim_fallback_open(
         &waiting,
         State::Open,
         true,
-        day,
+        &timers,
         10 * day
     ));
 }

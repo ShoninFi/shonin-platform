@@ -150,6 +150,7 @@ pub fn parse_log(value: &Value) -> Result<Log, TxError> {
         address: address(&value["address"])?,
         topics,
         data: Bytes::from(hex_bytes(value["data"].as_str().unwrap_or("0x"))?),
+        transaction: word(&value["transactionHash"]).ok(),
     })
 }
 

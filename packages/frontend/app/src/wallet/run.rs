@@ -3,6 +3,7 @@
 //! changes. In the browser it reads through the vault chain's public endpoint
 //! and signs with the connected wallet.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -43,28 +44,75 @@ pub struct VaultRef {
     pub requests: Vec<Request>,
 }
 
-/// A flow in progress: its latest step, its cancel, and "Settle now".
-#[derive(Clone)]
-pub struct Running {
-    pub step: Mutable<Option<Step>>,
-    pub cancel: Cancel,
-    pub settle_now: Nudge,
-}
-
-impl Running {
-    pub fn new() -> Self {
-        Self {
-            step: Mutable::new(None),
-            cancel: Cancel::new(),
-            settle_now: Nudge::new(),
+impl Action {
+    /// Where a page shows this flow: the Exit panel's deposit and withdrawal
+    /// share one place (one at a time per vault and account); every other
+    /// action is its own, by kind and id.
+    pub fn slot(&self) -> String {
+        match self {
+            Self::Deposit(_) | Self::Withdraw(_) => EXIT.to_string(),
+            other => format!("{other:?}"),
         }
     }
 }
 
-impl Default for Running {
-    fn default() -> Self {
-        Self::new()
+/// The Exit panel's slot.
+pub const EXIT: &str = "exit";
+
+/// A flow in progress (or ended and not yet dismissed): what it does, its
+/// latest step, its cancel, and "Settle now". The session keeps it per
+/// vault and account ([`super::Session::flow`]), so a panel or card built
+/// while it runs shows where it is.
+#[derive(Clone)]
+pub struct Running {
+    /// This flow, among every flow this page has started.
+    pub id: u64,
+    pub action: Action,
+    pub step: Mutable<Option<Step>>,
+    pub cancel: Cancel,
+    pub settle_now: Nudge,
+    /// When its countdown started on the reader's clock, for the seconds
+    /// left; set once per request.
+    pub requested_local: Rc<Cell<Option<(f64, u64)>>>,
+}
+
+impl std::fmt::Debug for Running {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Running")
+            .field("id", &self.id)
+            .field("action", &self.action)
+            .finish_non_exhaustive()
     }
+}
+
+impl PartialEq for Running {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Running {
+    pub fn new(action: Action) -> Self {
+        thread_local! {
+            static NEXT: Cell<u64> = const { Cell::new(1) };
+        }
+        Self {
+            id: NEXT.with(|next| next.replace(next.get() + 1)),
+            action,
+            step: Mutable::new(None),
+            cancel: Cancel::new(),
+            settle_now: Nudge::new(),
+            requested_local: Rc::new(Cell::new(None)),
+        }
+    }
+}
+
+/// Which flow a page shows: a vault, an account, a slot ([`Action::slot`]).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FlowKey {
+    pub slug: String,
+    pub account: Address,
+    pub slot: String,
 }
 
 /// The browser's clock.

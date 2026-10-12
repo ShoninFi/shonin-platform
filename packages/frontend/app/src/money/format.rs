@@ -67,6 +67,17 @@ pub fn shares(value: U256, rounding: Rounding) -> String {
     format_units(value, 18, 1, rounding)
 }
 
+/// The fallback's units, a fraction of what the stations hold scaled by
+/// 1e18, as a percentage to four decimals rounded down: `1.2345%`; a
+/// fraction too small to show says so rather than read as none.
+pub fn units_share(value: U256) -> String {
+    let shown = format_units(value, 16, 4, Rounding::Down);
+    if !value.is_zero() && shown == "0.0000" {
+        return "less than 0.0001%".to_string();
+    }
+    format!("{shown}%")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +116,15 @@ mod tests {
         let held = U256::from(8_771_449_999_999_999_999_999u128);
         assert_eq!(shares(held, Rounding::Down), "8,771.4");
         assert_eq!(shares(held, Rounding::Up), "8,771.5");
+    }
+
+    #[test]
+    fn the_fallbacks_units_read_as_a_share_of_the_stations_never_as_raw_units() {
+        // 1.23% of what the stations hold, scaled by 1e18.
+        let units = U256::from(12_300_000_000_000_000u64);
+        assert_eq!(units_share(units), "1.2300%");
+        assert_eq!(units_share(U256::from(7u8)), "less than 0.0001%");
+        assert_eq!(units_share(U256::ZERO), "0.0000%");
+        assert!(!units_share(units).contains("12300000"));
     }
 }

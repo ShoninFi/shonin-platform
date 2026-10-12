@@ -293,6 +293,7 @@ impl Chain {
             address,
             topics: data.topics().to_vec(),
             data: data.data.clone(),
+            transaction: None,
         });
     }
 

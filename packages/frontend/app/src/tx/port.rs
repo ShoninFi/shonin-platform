@@ -27,6 +27,8 @@ pub struct Log {
     pub address: Address,
     pub topics: Vec<B256>,
     pub data: Bytes,
+    /// The transaction that wrote it, when the endpoint says.
+    pub transaction: Option<B256>,
 }
 
 /// A mined transaction.
