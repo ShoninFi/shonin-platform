@@ -1,0 +1,59 @@
+/* The Exit panel (Deposit-*, Withdraw-*): a card filling its slot in the
+   agent page's right column (the column is sticky, not the panel), full
+   width on tablet, the same content in the phone's Exit sheet. Tabs, the amount field (48px, $ and
+   the unit either side), quick amounts, a summary list of label and
+   figure, the primary action full width, the risk line. The countdown ring
+   (M8) empties over the seconds left; done draws the seal (M7). */
+.sh-exit {
+  display: flex; flex-direction: column; gap: 20px; width: 100%; padding: var(--space-6);
+  background: var(--paper-raised); border: var(--border-hairline) solid var(--line); border-radius: var(--radius-l);
+}
+.sh-exit--sheet { padding: 0; border: 0; background: transparent; }
+.sh-exit__tabs { display: flex; gap: var(--space-6); border-bottom: var(--border-hairline) solid var(--line); }
+.sh-exit__tabs .sh-tab { margin-bottom: -1px; background: none; border-left: 0; border-right: 0; border-top: 0; cursor: pointer; }
+.sh-exit__body, .sh-exit__form { display: flex; flex-direction: column; gap: var(--space-4); }
+.sh-exit__held { font: var(--type-body-s); color: var(--ink-muted); }
+.sh-exit__held:empty { display: none; }
+.sh-exit__fieldhead { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
+.sh-exit__balance { font: var(--type-body-s); color: var(--ink-muted); }
+.sh-exit__dollar { color: var(--ink-muted); }
+.sh-exit__picks { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.sh-exit__rows { display: flex; flex-direction: column; gap: 10px; margin: 0; }
+.sh-exit__row { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-4); }
+.sh-exit__row dt { font: var(--type-body-s); color: var(--ink-muted); }
+.sh-exit__row dd { margin: 0; font: 600 15px/22px var(--font-sans); text-align: right; }
+.sh-exit__row--total dt { color: var(--ink); font-weight: 600; }
+.sh-exit__row--total dd { font: var(--type-figure); letter-spacing: var(--track-figure); }
+.sh-exit__detail { display: block; font: 400 13px/18px var(--font-sans); color: var(--ink-muted); }
+.sh-exit__small { font: var(--type-body-s); }
+.sh-exit__risk { font: 400 13px/20px var(--font-sans); color: var(--ink-muted); }
+.sh-exit__title { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font: var(--type-heading); letter-spacing: var(--track-heading); }
+.sh-exit__reviewhead { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-3); }
+.sh-exit__edit, .sh-exit__fill {
+  padding: 10px 0; border: 0; background: none; color: var(--link); font: 600 14px/20px var(--font-sans); cursor: pointer;
+}
+.sh-exit__wait, .sh-exit__countdown, .sh-exit__done, .sh-exit__error { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-3); }
+.sh-exit__wait .sh-btn, .sh-exit__done .sh-btn, .sh-exit__error .sh-btn { align-self: stretch; }
+.sh-exit__error { padding: var(--space-4); border-radius: var(--radius-m); background: var(--loss-soft); }
+.sh-exit__error[role="status"] { background: var(--neutral-soft); }
+.sh-exit__txlink { display: inline-flex; align-items: center; gap: var(--space-2); min-height: 44px; }
+.sh-countdown { flex: none; }
+.sh-countdown__track { fill: none; stroke: var(--line); stroke-width: 4; }
+.sh-countdown__fill {
+  fill: none; stroke: var(--brand); stroke-width: 4; stroke-linecap: round;
+  transform: rotate(-90deg); transform-origin: 24px 24px;
+  transition: stroke-dashoffset 1s linear;
+}
+.sh-countdown__text { fill: var(--ink); font: 600 12px/1 var(--font-sans); }
+.sh-seal {
+  display: inline-flex; align-items: center; justify-content: center; width: 48px; height: 48px;
+  border-radius: var(--radius-full); background: var(--gain-soft); color: var(--gain);
+}
+@media (prefers-reduced-motion: reduce) { .sh-countdown__fill { transition: none; } }
+@media (min-width: 600px) and (max-width: 899px) {
+  .sh-exit:not(.sh-exit--sheet) .sh-exit__form { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: var(--space-6); }
+  .sh-exit:not(.sh-exit--sheet) .sh-exit__form > * { grid-column: 1; }
+  .sh-exit:not(.sh-exit--sheet) .sh-exit__form > .sh-exit__rows,
+  .sh-exit:not(.sh-exit--sheet) .sh-exit__form > .sh-exit__small,
+  .sh-exit:not(.sh-exit--sheet) .sh-exit__form > .sh-btn { grid-column: 2; }
+}

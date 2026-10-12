@@ -44,7 +44,7 @@ tasks:
         cd "{{.PATH_PACKAGE_APP}}" && NO_COLOR=true trunk serve
         --port {{.PORT_APP_DEV}}
         --dist "{{.PATH_DIST_APP_DEV}}"
-        --features dev
+        --features dev,dev-wallet
         --proxy-backend "{{.API | default .URL_API_DEV}}/api/"
         --watch "{{.PATH_ROOT_CARGO_TOML}}"
         --watch "{{.PATH_PACKAGE_SHARED}}"
@@ -78,10 +78,10 @@ tasks:
         --app-api "{{.URL_API_TESTNET}}/api"
         --chains "{{.PATH_CHAINS}}"
         {{.SEO_API_ARG}}
-      # The development wallet's phrase must never reach a release build:
-      # refuse a dist that carries it whole, or any two of its words in a row.
-      # Binary-safe, so the wasm is read too. Prints only pass or fail, never
-      # a word.
+      # The development wallet's phrase is compiled in only by the
+      # `dev-wallet` feature, which this build never turns on: refuse a dist
+      # that carries it whole, or any two of its words in a row. Binary-safe,
+      # so the wasm is read too. Prints only pass or fail, never a word.
       - cmd: |
           phrase="${SHONIN_DEV_WALLET_MNEMONIC:-}"
           if [ -z "$phrase" ] && [ -f "{{.PATH_ROOT}}/.env" ]; then

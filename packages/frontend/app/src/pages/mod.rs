@@ -5,6 +5,7 @@ pub mod agents;
 #[cfg(feature = "dev")]
 pub mod atoms;
 pub mod not_found;
+pub mod portfolio;
 pub mod soon;
 pub mod status;
 
@@ -25,8 +26,10 @@ pub fn page(route: &Route, strip_dismissed: bool) -> Page {
         Route::Home => agents::page(None, strip_dismissed),
         Route::Agents { author } => agents::page(author.clone(), strip_dismissed),
         Route::Agent { slug, tab } => agent::page(slug, *tab),
-        Route::Portfolio => soon::portfolio(),
+        Route::Portfolio => portfolio::page(),
+        Route::Claim { slug, id } => portfolio::claim(slug, *id),
         Route::Publish => soon::publish(),
+        Route::Job { .. } | Route::Activate { .. } | Route::Manage { .. } => soon::publish(),
         Route::Status => status::page(),
         #[cfg(feature = "dev")]
         Route::Atoms => atoms::page(),

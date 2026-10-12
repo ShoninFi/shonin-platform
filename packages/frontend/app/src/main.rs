@@ -17,6 +17,8 @@ fn main() {
 
     clock::start();
     api::follow();
+    // Wallets: discovery, the vault chains' configs, a silent reconnect.
+    app::wallet::get().start();
 
     let strip_dismissed = components::strip::dismissed();
     let first = std::cell::Cell::new(true);

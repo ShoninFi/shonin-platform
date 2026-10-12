@@ -113,6 +113,15 @@ alloy = { version = "2.4.2", features = ["full", "signer-mnemonic"] }
 alloy-primitives = "1.7.3"
 alloy-sol-types = "1.7.3"
 k256 = "0.14.0"
+# The web app's recovery-phrase wallet: a key derived from the phrase in the
+# browser's memory signs locally (EIP-1559 transactions and the deposit
+# statement). These build for wasm32-unknown-unknown; `getrandom` needs its
+# `js` backend there.
+alloy-signer = "2.4.2"
+alloy-signer-local = { version = "2.4.2", default-features = false, features = ["mnemonic"] }
+alloy-consensus = { version = "2.4.2", default-features = false, features = ["k256"] }
+alloy-eips = { version = "2.4.2", default-features = false }
+getrandom = "0.2.17"
 # Lighter's transaction signing (Poseidon2 over Goldilocks, Schnorr on
 # ECgFp5), offline only: no client, no network.
 lighters = { version = "0.1.1", default-features = false }

@@ -29,6 +29,14 @@ type Slot = Rc<RefCell<Option<Dialog>>>;
 thread_local! {
     static OPEN: Mutable<Option<Slot>> = Mutable::new(None);
     static RETURN_TO: RefCell<Option<web_sys::HtmlElement>> = const { RefCell::new(None) };
+    static LOCKED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Keep the open dialog or sheet from closing (a wallet is being asked to
+/// sign): Esc, the close button, the scrim and a swipe do nothing until it
+/// is unlocked.
+pub fn lock(locked: bool) {
+    LOCKED.with(|cell| cell.set(locked));
 }
 
 /// Open a dialog over the page, remembering what had focus.
@@ -40,6 +48,9 @@ pub fn open(dialog: Dialog) {
 
 /// Close the open dialog and give focus back.
 pub fn close() {
+    if LOCKED.with(Cell::get) {
+        return;
+    }
     let was_open = OPEN.with(|open| open.replace(None).is_some());
     if !was_open {
         return;
