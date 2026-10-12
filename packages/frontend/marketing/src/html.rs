@@ -209,7 +209,7 @@ fn header(current: Current) -> String {
     <div class="site-header__end">
       <a class="sh-nav sh-nav--ext site-header__docs" href="{{{{docs}}}}/">Docs{{{{i:external:16}}}}</a>
       <a class="sh-btn sh-btn-hero site-header__app" href="{{{{app}}}}/agents">Open the app{{{{i:arrow:16}}}}</a>
-      <button class="sh-iconbtn site-header__menu" type="button" aria-label="Open menu" aria-expanded="false" aria-controls="menu" aria-haspopup="dialog" hidden>{{{{i:menu:24}}}}</button>
+      <button class="sh-iconbtn site-header__menu" type="button" aria-label="Open menu" aria-expanded="false" aria-controls="menu" hidden>{{{{i:menu:24}}}}</button>
     </div>
   </div>
 </header>"#,

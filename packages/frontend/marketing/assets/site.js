@@ -205,6 +205,10 @@
       var scrolly = desktop.matches && motion && !reduce.matches && observe;
       section.classList.toggle('is-stepped', carousel || scrolly);
       controls.hidden = !carousel;
+      // The row scrolls only on a phone; only there is it a tab stop, so
+      // the keyboard can scroll it too.
+      if (carousel) list.setAttribute('tabindex', '0');
+      else list.removeAttribute('tabindex');
       if (carousel && !observe) {
         show(1);
       } else if (carousel) {
