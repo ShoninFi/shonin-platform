@@ -120,3 +120,120 @@ pub fn risk_line() -> El {
         .child(icon(Icon::Concern, 16))
         .text("The agent can lose money. Nothing here stops that.")
 }
+
+/// A link to a place on this page (`#id`). Without scripts the browser
+/// follows it; in the app it scrolls there and moves focus without asking
+/// the router, which would otherwise draw the page again for a new hash.
+pub fn in_page_link(id: impl Into<String>) -> El {
+    let id = id.into();
+    let target = id.clone();
+    el("a").attr("href", format!("#{id}")).hook(move |dom| {
+        dom.event_with_options(
+            &dominator::EventOptions::preventable(),
+            move |event: dominator::events::Click| {
+                if event.ctrl_key() || event.shift_key() || event.alt_key() {
+                    return;
+                }
+                event.prevent_default();
+                go_to(&target);
+            },
+        )
+    })
+}
+
+/// Scroll to the element `id` on this page, focus it and put it in the
+/// address (replacing the entry, so Back still leaves the page).
+pub fn go_to(id: &str) {
+    use wasm_bindgen::JsCast;
+    let Some(document) = crate::web::document() else {
+        return;
+    };
+    replace_hash(id);
+    if let Some(element) = document
+        .get_element_by_id(id)
+        .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
+    {
+        if !element.has_attribute("tabindex") {
+            let _ = element.set_attribute("tabindex", "-1");
+        }
+        element.scroll_into_view();
+        let _ = element.focus();
+    }
+}
+
+/// Put `#id` in the address without a navigation.
+pub fn replace_hash(id: &str) {
+    if let Some(window) = crate::web::window()
+        && let Ok(history) = window.history()
+    {
+        let _ = history.replace_state_with_url(
+            &wasm_bindgen::JsValue::NULL,
+            "",
+            Some(&format!("#{id}")),
+        );
+    }
+}
+
+/// A button that copies `value` and says so for a moment.
+pub fn copy_button(value: String, what: &'static str) -> El {
+    use futures_signals::signal::Mutable;
+    let copied = Mutable::new(false);
+    el("button")
+        .attr("type", "button")
+        .class("sh-btn")
+        .class("sh-btn-secondary")
+        .class("sh-btn-sm")
+        .class("ag-copy")
+        .attr("aria-label", format!("Copy {what}"))
+        .child_from(&copied, |copied| {
+            Some(icon(if *copied { Icon::Check } else { Icon::Copy }, 16).into())
+        })
+        .child(
+            el("span")
+                .attr("aria-hidden", "true")
+                .text_from(&copied, |copied| {
+                    if *copied { "Copied" } else { "Copy" }.to_string()
+                }),
+        )
+        .child(
+            el("span")
+                .class("sh-vh")
+                .attr("role", "status")
+                .text_from(&copied, |copied| {
+                    if *copied {
+                        "Copied".into()
+                    } else {
+                        String::new()
+                    }
+                }),
+        )
+        .hook({
+            let copied = copied.clone();
+            move |dom| {
+                dom.event(move |_: dominator::events::Click| {
+                    crate::web::copy(&value);
+                    copied.set(true);
+                    let copied = copied.clone();
+                    gloo_timers::callback::Timeout::new(1_500, move || copied.set(false)).forget();
+                })
+            }
+        })
+}
+
+/// Where the API's store serves a file, as an address a reader can use
+/// anywhere: the API's own origin when the build names it, else this page's
+/// (a development build, whose server passes `/api` on).
+pub fn store_url(hash: &str, name: &str) -> String {
+    let base = crate::api::BASE.trim_end_matches('/');
+    let base = if crate::api::origin(base).is_some() || !cfg!(target_arch = "wasm32") {
+        base.to_string()
+    } else {
+        let here = crate::web::window()
+            .and_then(|window| js_sys::Reflect::get(&window, &"location".into()).ok())
+            .and_then(|location| js_sys::Reflect::get(&location, &"origin".into()).ok())
+            .and_then(|origin| origin.as_string())
+            .unwrap_or_default();
+        format!("{here}{base}")
+    };
+    format!("{base}/store/{hash}/{name}")
+}

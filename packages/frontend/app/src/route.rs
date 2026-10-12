@@ -25,14 +25,16 @@ pub const GITHUB: &str = "https://github.com/ShoninFi";
 pub enum AgentTab {
     Overview,
     Review,
+    Source,
     Verify,
     Activity,
 }
 
 impl AgentTab {
-    pub const ALL: [AgentTab; 4] = [
+    pub const ALL: [AgentTab; 5] = [
         AgentTab::Overview,
         AgentTab::Review,
+        AgentTab::Source,
         AgentTab::Verify,
         AgentTab::Activity,
     ];
@@ -41,6 +43,7 @@ impl AgentTab {
         match self {
             Self::Overview => None,
             Self::Review => Some("review"),
+            Self::Source => Some("source"),
             Self::Verify => Some("verify"),
             Self::Activity => Some("activity"),
         }
@@ -50,6 +53,7 @@ impl AgentTab {
         match self {
             Self::Overview => "Overview",
             Self::Review => "Review",
+            Self::Source => "Source",
             Self::Verify => "Verify",
             Self::Activity => "Activity",
         }
@@ -488,6 +492,10 @@ mod tests {
             Route::Agent {
                 slug: "solana-3".to_string(),
                 tab: AgentTab::Activity,
+            },
+            Route::Agent {
+                slug: "base-1".to_string(),
+                tab: AgentTab::Source,
             },
             Route::Portfolio,
             Route::Publish,
