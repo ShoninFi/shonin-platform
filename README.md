@@ -162,9 +162,8 @@ task docs:deploy   # build and deploy it to Cloudflare
 
 | Worker | Where | Task |
 | --- | --- | --- |
-| `shonin-app` | app.shonin.fi | `task frontend:app:deploy` |
-| `shonin-landing` | shonin.fi: the app, until the marketing site takes it | `task frontend:landing:deploy` |
-| `shonin-marketing` | its workers.dev address only, for now | `task frontend:marketing:deploy` |
+| `shonin-app` | app.shonin.fi: the app | `task frontend:app:deploy` |
+| `shonin-landing` | shonin.fi: the marketing site, static pages with no data, API or wallet code | `task frontend:landing:deploy` |
 | `shonin-docs` | docs.shonin.fi | `task docs:deploy` |
 
 `task deploy` runs the first two. The deployed app reads a chain and an API, so it shows live data only once both are deployed somewhere public.

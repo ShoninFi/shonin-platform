@@ -1,0 +1,71 @@
+<section class="legal-hero sh-hero is-in" aria-labelledby="legal-title" data-play>
+  <svg class="hexgrid" aria-hidden="true" focusable="false"><defs><pattern id="hexgrid-legal" width="56" height="97" patternUnits="userSpaceOnUse"><path d="M28 0 L56 16.2 L56 48.5 L28 64.7 L0 48.5 L0 16.2 Z M28 64.7 L28 97"/></pattern></defs><rect width="100%" height="100%" fill="url(#hexgrid-legal)"/></svg>
+  <div class="wrap legal-hero__inner">
+    <p class="sh-label hero__eyebrow sh-reveal">Privacy Policy</p>
+    <h1 class="legal-hero__title sh-reveal dl-120" id="legal-title">No accounts. No analytics. No cookies.</h1>
+    <p class="legal-hero__lede sh-reveal dl-240">What Shonin knows about you, which is very little, and what anyone can see on-chain, which is a lot. Last updated Oct 12, 2026.</p>
+  </div>
+</section>
+
+<div class="sec sec--paper legal">
+  <div class="wrap legal__grid">
+    <nav class="legal__toc" aria-label="On this page">
+      <p class="sh-label">On this page</p>
+      <ol>
+        <li><a href="#short">The short version</a></li>
+        <li><a href="#public">Your wallet is public</a></li>
+        <li><a href="#browser">What stays in your browser</a></li>
+        <li><a href="#api">What our API sees and logs</a></li>
+        <li><a href="#code">Code and secrets you publish</a></li>
+        <li><a href="#hosts">The services we use</a></li>
+        <li><a href="#changes">Changes to this policy</a></li>
+      </ol>
+    </nav>
+
+    <article class="prose">
+      <section aria-labelledby="short">
+        <h2 id="short">The short version</h2>
+        <ul>
+          <li>There are no accounts. We never ask for your name, your email or anything else about you. Your wallet is your identity.</li>
+          <li>There are no analytics and no tracking. We don't measure who visits.</li>
+          <li>There are no cookies, on shonin.fi or on the app.</li>
+          <li>Your wallet address and your transactions are public on-chain, for anyone to see, for good.</li>
+        </ul>
+      </section>
+
+      <section aria-labelledby="public">
+        <h2 id="public">Your wallet is public</h2>
+        <p>Everything you do with Shonin's contracts is a transaction on a public blockchain: deposits, withdrawals, claims, the statement you sign before a deposit, publishing an agent and looking after it. Anyone can read them, along with your wallet address, and they can't be removed, by us or anyone else.</p>
+        <p>If you don't want a wallet linked to you, don't use one that is.</p>
+      </section>
+
+      <section aria-labelledby="browser">
+        <h2 id="browser">What stays in your browser</h2>
+        <p>The app keeps a few preferences in your browser's own storage: which wallet you connected last, so it can reconnect without asking, and whether you've dismissed a notice. They never leave your device, and clearing your browser's data removes them.</p>
+        <p>If you use a recovery phrase in the app on a test network, it stays in the page's memory only. It is never stored or sent anywhere, and reloading the page forgets it.</p>
+      </section>
+
+      <section aria-labelledby="api">
+        <h2 id="api">What our API sees and logs</h2>
+        <p>The app reads public data from our API: agents, their reviews, their vaults' records and the publishing queue. When you open your portfolio, the app asks the API for the positions of your wallet address, which are public on-chain anyway.</p>
+        <p>The API doesn't keep a log of the requests it answers, the addresses it's asked about or the IP addresses that ask. Its logs record what went wrong when something does, naming the chain or the job involved.</p>
+      </section>
+
+      <section aria-labelledby="code">
+        <h2 id="code">Code and secrets you publish</h2>
+        <p>When you publish an agent, its code is stored with the wallet that uploaded it, and its review is public. Public source can be read by anyone. Sealed source is read only by attested machines and the Reviewer's model. Secrets you seal into an agent are encrypted in your browser before they leave it, and only the attested machine can read them.</p>
+      </section>
+
+      <section aria-labelledby="hosts">
+        <h2 id="hosts">The services we use</h2>
+        <p>Cloudflare serves shonin.fi and the app. Google Cloud runs the API and the attested machines. Like any host, they see your IP address when you connect, and may keep their own standard records of requests under their own privacy policies.</p>
+        <p>When you connect a wallet, the app reads from and sends to each chain through public endpoints, and your wallet does the same. Those endpoints, and your wallet's maker, see your requests under their own policies.</p>
+      </section>
+
+      <section aria-labelledby="changes">
+        <h2 id="changes">Changes to this policy</h2>
+        <p>We may change this policy. When we do, the date at the top of this page changes with it.</p>
+      </section>
+    </article>
+  </div>
+</div>

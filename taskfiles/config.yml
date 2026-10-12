@@ -73,7 +73,6 @@ vars:
   PATH_CLOUDFLARE: '{{joinPath .PATH_ROOT "cloudflare"}}'
   PATH_WRANGLER_APP: '{{joinPath .PATH_CLOUDFLARE "app" "wrangler.jsonc"}}'
   PATH_WRANGLER_LANDING: '{{joinPath .PATH_CLOUDFLARE "landing" "wrangler.jsonc"}}'
-  PATH_WRANGLER_MARKETING: '{{joinPath .PATH_CLOUDFLARE "marketing" "wrangler.jsonc"}}'
   PATH_WRANGLER_DOCS: '{{joinPath .PATH_CLOUDFLARE "docs" "wrangler.jsonc"}}'
   # The public documentation site. Zensical insists its output sits inside its
   # own project, so this one does not live under .trunk-dist with the rest.
@@ -83,10 +82,10 @@ vars:
   # in docs/zensical.toml.
   PATH_DIST_DOCS: '{{joinPath .PATH_DOCS "site"}}'
   PATH_TRUNK_DIST: '{{joinPath .PATH_ROOT ".trunk-dist"}}'
-  # Must match assets.directory in cloudflare/app and cloudflare/landing.
+  # Must match assets.directory in cloudflare/app/wrangler.jsonc.
   PATH_DIST_APP: '{{joinPath .PATH_TRUNK_DIST "app"}}'
   PATH_DIST_APP_DEV: '{{joinPath .PATH_TRUNK_DIST "app-dev"}}'
-  # Must match assets.directory in cloudflare/marketing/wrangler.jsonc.
+  # Must match assets.directory in cloudflare/landing/wrangler.jsonc.
   PATH_DIST_MARKETING: '{{joinPath .PATH_TRUNK_DIST "marketing"}}'
   PATH_DIST_MARKETING_DEV: '{{joinPath .PATH_TRUNK_DIST "marketing-dev"}}'
 
@@ -191,9 +190,8 @@ vars:
   URL_APP_DEV: "http://localhost:{{.PORT_APP_DEV}}"
   URL_MARKETING_DEV: "http://localhost:{{.PORT_MARKETING_DEV}}"
   URL_APP_PROD: "https://app.shonin.fi"
-  # shonin.fi serves the app (shonin-landing) until the marketing site takes
-  # it; the app's pre-rendered pages name it as their canonical address until
-  # then.
+  # shonin.fi: the marketing site (shonin-landing). The app's pages name
+  # URL_APP_PROD as their canonical address.
   URL_SITE_PROD: "https://shonin.fi"
   URL_DOCS_PROD: "https://docs.shonin.fi"
   URL_API_DEV: "http://localhost:{{.PORT_API}}"

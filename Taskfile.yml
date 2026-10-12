@@ -86,7 +86,7 @@ tasks:
       - task: frontend:build
 
   deploy:
-    desc: "Build and deploy the app to Cloudflare: app.shonin.fi and shonin.fi"
+    desc: "Build and deploy both sites to Cloudflare: the app at app.shonin.fi and the marketing site at shonin.fi"
     cmds:
       - task: frontend:deploy
 

@@ -1,0 +1,48 @@
+
+<section class="sec sec--raised" aria-labelledby="steps-title">
+  <div class="wrap jobsteps">
+    <div class="jobsteps__head">
+      <div class="sh-reveal" data-play>
+        <p class="sh-label">How publishing works</p>
+        <h2 class="h2" id="steps-title">Publishing, step by step.</h2>
+      </div>
+      <p class="aside aside--reading sh-reveal dl-120" data-play>{{i:seal:20}}<span>Every step leaves a public record, including builds that fail.</span></p>
+    </div>
+
+    <div class="stepper">
+      <span class="stepper__rail" aria-hidden="true"><span class="stepper__fill"></span></span>
+      <ol class="stepper__list">
+        <li class="stepper__step is-done"><span class="stepper__dot" aria-hidden="true">{{i:check:14:2.5}}</span><span class="sh-label">Step 1 · Done</span><h3>Submit your code and pay $1</h3><p>Only a payment from the wallet that uploaded the code starts the job.</p></li>
+        <li class="stepper__step is-now" aria-current="step"><span class="stepper__dot" aria-hidden="true"></span><span class="sh-label">Step 2 · Now</span><h3>The Reviewer reads your code and writes its report</h3><p>Six areas rated. Malicious code stops here, and is never built.</p></li>
+        <li class="stepper__step"><span class="stepper__dot" aria-hidden="true"></span><span class="sh-label">Step 3</span><h3>An attested builder compiles it once</h3><p>It signs what came out. That signed build is the only one that can ever trade your vault.</p></li>
+        <li class="stepper__step"><span class="stepper__dot" aria-hidden="true"></span><span class="sh-label">Step 4</span><h3>You activate it</h3><p>Choose its allowances and idle floor, and put a starting amount in the tank: at least $10.</p></li>
+      </ol>
+    </div>
+
+    <div class="sh-card job sh-reveal" data-play>
+      <div class="job__about">
+        <p class="sh-label">Example job · sample data</p>
+        <div class="job__name"><p>Spread Keeper</p><span class="sh-chip sh-chip-brand">{{i:review:14}}In the review queue</span></div>
+        <dl class="job__facts">
+          <dt>Agent id</dt><dd class="sh-num">142</dd>
+          <dt>Submitted</dt><dd>Sep 29, 10:05 UTC</dd>
+          <dt>By</dt><dd class="sh-mono">0x7f3a…9c21</dd>
+          <dt>Place in queue</dt><dd>3rd</dd>
+          <dt>Source</dt><dd>Public</dd>
+          <dt>Vault chain</dt><dd>Hyperliquid</dd>
+        </dl>
+        <a class="sh-btn sh-btn-secondary sh-btn-sm job__open" href="{{app}}/publish">Publish an agent{{i:arrow:16}}</a>
+      </div>
+      <div class="job__next">
+        <p class="sh-label">What happens next</p>
+        <ol class="job__timeline">
+          <li class="is-done"><span class="job__icon">{{i:check:20}}</span><span class="job__what">Paid $1 from the uploading wallet</span><span class="job__when">Sep 29, 10:05 UTC</span></li>
+          <li class="is-now"><span class="job__icon">{{i:review:20}}</span><span class="job__what">Reviewing</span><span class="job__when">Up next after 2 jobs</span></li>
+          <li><span class="job__icon">{{i:seal:20}}</span><span class="job__what">Building</span></li>
+          <li><span class="job__icon">{{i:vault:20}}</span><span class="job__what">Ready: review posted, waiting for you to activate</span></li>
+        </ol>
+        <p class="job__ends"><span>It can also end as</span><span class="sh-chip sh-chip-loss">{{i:serious:14}}Refused as malicious</span><span>or</span><span class="sh-chip sh-chip-loss">{{i:serious:14}}Build failed</span><span>Both are public too.</span></p>
+      </div>
+    </div>
+  </div>
+</section>
