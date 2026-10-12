@@ -1145,18 +1145,27 @@ pub async fn settling<R: SolReader>(
 }
 
 /// What taking back deposit `request` (at `at`) sends, from its owner: their
-/// dollar account opened if missing, then the fallback, which asks every
-/// driver group of the station whether the vault could be valued now.
+/// dollar account opened if missing, then the fallback. Within the freeze
+/// period on an open vault the program asks every driver group of the
+/// station whether the vault could be valued now, so the groups are named;
+/// past it, or on a vault no longer open, it gives the deposit back without
+/// asking, and naming none keeps the transaction small enough to send.
 pub async fn taking_back<R: SolReader>(
     reader: &R,
     mint: &Pubkey,
     keys: &VaultKeys,
+    vault: &Vault,
+    now: u64,
     at: &Pubkey,
     request: &Request,
 ) -> Result<Vec<Instruction>, SolError> {
     let mut ixs = Vec::new();
     open_if_missing(reader, &request.owner, &request.owner, mint, &mut ixs).await?;
-    let groups = groups(reader, keys).await?;
+    let groups = if asks_the_station(vault, request, now) {
+        groups(reader, keys).await?
+    } else {
+        Groups::none()
+    };
     ixs.push(ix::take_pro_rata(
         keys,
         &request.owner,
@@ -1165,6 +1174,14 @@ pub async fn taking_back<R: SolReader>(
         &groups,
     ));
     Ok(ixs)
+}
+
+/// Whether the program asks the station before giving deposit `request`
+/// back: only on an open vault, within the freeze period from the
+/// request's valuation time.
+pub fn asks_the_station(vault: &Vault, request: &Request, now: u64) -> bool {
+    vault.state == accounts::VaultState::Open
+        && now < request.earliest.saturating_add(vault.timers.freeze_after)
 }
 
 /// A stand-in for whoever sends, for measuring: no key the transaction
@@ -1188,7 +1205,7 @@ pub async fn take_cash<R: SolReader, S: SolSigner, C: Clock>(
 ) -> Result<Outcome, SolError> {
     ctx.step(Step::Checking);
     ctx.check_endpoint().await?;
-    let Loaded { keys, .. } = ctx.load().await?;
+    let Loaded { vault, keys } = ctx.load().await?;
     let mut ixs = Vec::new();
     ctx.open_if_missing(&ctx.account, &mut ixs).await?;
     match of {
@@ -1203,7 +1220,17 @@ pub async fn take_cash<R: SolReader, S: SolSigner, C: Clock>(
                 // A deposit's asks the station whether it could be valued
                 // now.
                 RequestKind::Deposit => {
-                    ixs = taking_back(ctx.reader, &ctx.cluster.mint, &keys, &at, &request).await?;
+                    let now = ctx.reader.chain_time().await?;
+                    ixs = taking_back(
+                        ctx.reader,
+                        &ctx.cluster.mint,
+                        &keys,
+                        &vault,
+                        now,
+                        &at,
+                        &request,
+                    )
+                    .await?;
                 }
                 _ => ixs.push(ix::take_pro_rata(
                     &keys,

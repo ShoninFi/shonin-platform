@@ -968,13 +968,13 @@ enum Meanwhile {
 }
 
 /// While the wallet is asked for the second step: read the request at
-/// every look, and end when it is settled or the step is skipped. After the
-/// long wait, only the wallet's answer ends it.
+/// every look, and end when it is settled or the step is skipped, for as
+/// long as the prompt is shown. The wallet's answer ends it too.
 async fn while_asked<R: Reader, S: Signer, C: Clock>(
     ctx: &Ctx<'_, R, S, C>,
     id: U256,
 ) -> Meanwhile {
-    for _ in 0..ctx.pace.give_up_after {
+    loop {
         if ctx.skip_second.take() {
             return Meanwhile::Skipped;
         }
@@ -983,7 +983,6 @@ async fn while_asked<R: Reader, S: Signer, C: Clock>(
         }
         ctx.clock.sleep(ctx.pace.poll_millis).await;
     }
-    std::future::pending().await
 }
 
 /// The settling call the second step sends: open to anyone.

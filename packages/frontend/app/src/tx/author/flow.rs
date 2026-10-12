@@ -352,6 +352,15 @@ pub async fn pay<R: Reader, S: Signer, C: Clock>(
         AuthorError::Tx(TxError::Cancelled) if ctx.signer.account() != Some(uploader) => {
             wrong_payer
         }
+        // The fee's approval was mined and the payment stopped before it
+        // was sent: the approval stands, and paying again uses it.
+        AuthorError::Tx(then) if !then.may_have_moved() && approved.get().is_some() => {
+            AuthorError::ApprovalStands {
+                spender: Spender::Publishing,
+                amount: approved.get().unwrap_or_default(),
+                then: Box::new(AuthorError::Tx(then)),
+            }
+        }
         other => other,
     })
 }
@@ -536,6 +545,7 @@ pub async fn activate<R: Reader, S: Signer, C: Clock>(
             let landing = matches!(&then, AuthorError::Tx(error) if error.may_have_moved());
             if approved && !landing {
                 AuthorError::ApprovalStands {
+                    spender: Spender::Factory,
                     amount: activation.tank,
                     then: Box::new(then),
                 }
@@ -574,7 +584,10 @@ pub async fn fund_tank<R: Reader, S: Signer, C: Clock>(
     if matches!(read.state, State::Closed | State::Cancelled | State::None) {
         return Err(AuthorError::NotOpen);
     }
-    ctx.pay_from_wallet(asset, vault, Spender::Vault, amount, false)
+    // Exactly the amount, whatever stands: nothing larger than the top-up
+    // stays approved to the vault.
+    let approved = ctx
+        .pay_from_wallet(asset, vault, Spender::Vault, amount, true)
         .await?;
     let receipt = ctx
         .transact(
@@ -582,7 +595,21 @@ pub async fn fund_tank<R: Reader, S: Signer, C: Clock>(
             vault,
             IVault::fundTankCall { assets: amount }.abi_encode(),
         )
-        .await?;
+        .await
+        .map_err(|then| {
+            // The approval was mined and the top-up wasn't sent: it stands
+            // until used. Not said when the top-up itself may still land.
+            let landing = matches!(&then, AuthorError::Tx(error) if error.may_have_moved());
+            if approved && !landing {
+                AuthorError::ApprovalStands {
+                    spender: Spender::Vault,
+                    amount,
+                    then: Box::new(then),
+                }
+            } else {
+                then
+            }
+        })?;
     let funded = decode::<IVault::TankFunded>(vault, &receipt.logs)
         .into_iter()
         .find(|event| event.from == ctx.account)

@@ -684,6 +684,7 @@ fn an_activation_stopped_after_its_approval_says_the_approval_stands_and_retries
     assert_eq!(
         error,
         AuthorError::ApprovalStands {
+            spender: flow::Spender::Factory,
             amount: dollars(210),
             then: Box::new(AuthorError::Tx(revert("NotAllowed"))),
         }
@@ -747,6 +748,7 @@ fn an_activation_declined_after_its_approval_is_not_titled_nothing_was_sent() {
     assert_eq!(
         error,
         AuthorError::ApprovalStands {
+            spender: flow::Spender::Factory,
             amount: dollars(210),
             then: Box::new(AuthorError::Tx(TxError::Rejected)),
         }
