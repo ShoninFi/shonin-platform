@@ -105,10 +105,16 @@ async fn a_chain_whose_node_cannot_simulate_is_not_kept_and_is_said() {
     let rpc = serve_node(node.clone()).await;
     let keeper = start_keeper("cannot-simulate", &rpc, "http://127.0.0.1:1");
 
-    let health = keeper
-        .health_until(Duration::from_secs(20), |status| status != 200)
-        .await;
+    assert!(
+        wait_until(Duration::from_secs(20), || keeper
+            .logged()
+            .contains("this chain's node can't simulate"))
+        .await,
+        "the simulation refusal was never reached: {}",
+        keeper.logged()
+    );
     tokio::time::sleep(Duration::from_secs(8)).await;
+    let health = keeper.health().await;
     let (rounds, sent) = {
         let locked = node.lock().unwrap();
         (locked.vars["rounds"], locked.sent.len())

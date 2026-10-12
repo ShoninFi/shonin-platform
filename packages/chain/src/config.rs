@@ -447,6 +447,7 @@ impl ChainConfigs {
             );
         }
 
+        file.rpc.service.validate()?;
         file.rpc.defaults.validate("defaults")?;
         for key in file.rpc.chains.keys() {
             if !chains.contains_key(key) {
@@ -466,6 +467,11 @@ impl ChainConfigs {
     /// Reader defaults with only this chain's explicit overrides applied.
     pub fn rpc_policy(&self, key: &ChainKey) -> crate::rpc_policy::RpcPolicy {
         self.rpc.for_chain(key)
+    }
+
+    /// Global service polls from this file, not a selected chain's policy.
+    pub fn service_rpc_policy(&self) -> &crate::rpc_policy::ServiceRpcPolicy {
+        &self.rpc.service
     }
 
     /// Read the file at `path`, with overrides from the process environment.

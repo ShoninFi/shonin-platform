@@ -62,9 +62,6 @@ use vp::state::{Claim, ClaimState, Holder, Request, Vault, VaultState};
 
 use crate::{DAY, MINUTE, Said, chain_kept, waited};
 
-/// The most rounds a vault's requests go unread for their rent: they are
-/// read again sooner whenever settlement has moved.
-const RENT_EVERY: u64 = 30;
 /// The most records closed in one transaction.
 const CLOSES_AT_ONCE: usize = 8;
 /// The least an unwind must bring home to be paid for: a cent.
@@ -1093,7 +1090,9 @@ impl Keeping {
         let vault = self.platform.vault(&self.client, address).await?;
         let read_at = (vault.request_cursor, memory.rounds);
         if memory.rent_read.is_some_and(|(cursor, round)| {
-            cursor == vault.request_cursor && memory.rounds < round + RENT_EVERY
+            cursor == vault.request_cursor
+                && memory.rounds
+                    < round.saturating_add(self.client.rpc_policy().solana_rent_poll_rounds)
         }) {
             return Ok(());
         }
@@ -2808,3 +2807,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "solana_rent_tests.rs"]
+mod rent_tests;

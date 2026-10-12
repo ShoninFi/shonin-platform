@@ -273,7 +273,7 @@ fn answer(node: &Shared, asked: &Value) -> Value {
 /// Whether a call is the keeper's check that the node simulates: its probe,
 /// as creation code or as an overridden contract's code, names
 /// [`NOTHING_AT`].
-fn simulation_check(params: &Value) -> bool {
+pub fn simulation_check(params: &Value) -> bool {
     let names = |code: &[u8]| code.windows(20).any(|at| at == NOTHING_AT.as_slice());
     let created = params[0].get("to").is_none_or(Value::is_null) && names(&tx_fields(&params[0]).1);
     let overridden = params
@@ -474,7 +474,27 @@ pub fn start_keeper_on(test: &str, chains: &[(&str, u64, &str)], executor: &str)
     start(test, chains, executor, &[])
 }
 
+/// Start one chain with explicit overrides in the same policy file the process loads.
+pub fn start_keeper_with_rpc_policy(
+    test: &str,
+    rpc: &str,
+    executor: &str,
+    settings: &[(&str, u64)],
+) -> Keeper {
+    start_configured(test, &[("base", 31337, rpc)], executor, &[], settings)
+}
+
 fn start(test: &str, chains: &[(&str, u64, &str)], executor: &str, shortened: &[&str]) -> Keeper {
+    start_configured(test, chains, executor, shortened, &[])
+}
+
+fn start_configured(
+    test: &str,
+    chains: &[(&str, u64, &str)],
+    executor: &str,
+    shortened: &[&str],
+    settings: &[(&str, u64)],
+) -> Keeper {
     let dir = std::env::temp_dir().join(format!("keeper-{test}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut network = Vec::new();
@@ -507,6 +527,24 @@ fn start(test: &str, chains: &[(&str, u64, &str)], executor: &str, shortened: &[
     toml.push_str("[networks.local]\n");
     for (vault_chain, key, _) in &network {
         toml.push_str(&format!("{vault_chain} = \"{key}\"\n"));
+    }
+    if !settings.is_empty() {
+        let defaults = include_str!("../../../../config/chains.toml")
+            .split_once("[rpc.defaults]")
+            .unwrap()
+            .1
+            .split("\n[chains.")
+            .next()
+            .unwrap();
+        toml.push_str(&format!("\n[rpc.defaults]{defaults}\n"));
+    }
+    for (_, key, _) in &network {
+        if !settings.is_empty() {
+            toml.push_str(&format!("\n[rpc.chains.\"{key}\"]\n"));
+            for (name, value) in settings {
+                toml.push_str(&format!("{name} = {value}\n"));
+            }
+        }
     }
     let config = dir.join("chains.toml");
     std::fs::write(&config, toml).unwrap();

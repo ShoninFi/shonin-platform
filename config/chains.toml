@@ -37,6 +37,13 @@
 # Reader cadences and resource bounds, in milliseconds unless otherwise named.
 # The keeper must separately check vault timer compatibility before work;
 # these limits alone do not prove that a valuation window can be met.
+# One queue and connection-discovery loop serve the whole process. These
+# polls have no chain override. Defaults retain the established two seconds;
+# shorter accepted waits show jobs/connections sooner without unbounded spins.
+[rpc.service]
+indexer_queue_poll_ms = 2000
+indexer_discovery_poll_ms = 2000
+
 [rpc.defaults]
 # Head and event checks retain the existing two-second round cadence.
 head_poll_ms = 2000
@@ -50,6 +57,15 @@ read_budget_ms = 1000
 # ordinary active reads in place; this retry affects savings, not money wakes.
 quiet_probe_budget_ms = 10000
 quiet_probe_retry_ms = 60000
+# A node unable to simulate is checked before vault rounds start. Shorter
+# waits recover sooner; larger waits than the established maxima are refused.
+keeper_simulation_initial_ms = 5000
+keeper_simulation_max_ms = 300000
+keeper_simulation_backoff_factor = 2
+# Completed Solana request/claim records are scanned for reclaimable rent
+# after this many rounds, or earlier when settlement moves. Shorter waits
+# return rent sooner; more than the established thirty rounds is refused.
+solana_rent_poll_rounds = 30
 # Solana rate-limit retries retain their established 5s-to-2min backoff.
 # Shorter waits may recover sooner; limits refuse a longer inherited wait.
 keeper_rate_limit_initial_ms = 5000

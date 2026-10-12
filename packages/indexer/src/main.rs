@@ -56,7 +56,8 @@ async fn main() -> Result<()> {
     // Each chain is read from the moment it connects: one out of reach
     // holds up none of the others.
     let connections = indexer::connections(&args.chain_args)?;
-    let mut indexer = Indexer::new(connections.expected.clone(), args.store, args.builder_url);
+    let mut indexer = Indexer::new(connections.expected.clone(), args.store, args.builder_url)
+        .with_service_rpc_policy(connections.service_rpc_policy.clone())?;
     if let Some(url) = args.store_url.as_deref().filter(|url| !url.is_empty()) {
         indexer = indexer.with_store_url(url);
     }

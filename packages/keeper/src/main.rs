@@ -4333,16 +4333,12 @@ async fn can_simulate(client: &Client) -> Result<()> {
     mark_after_unwind(client, NOTHING_AT).await.map(|_| ())
 }
 
-/// How long a chain whose node can't simulate waits before it is checked
-/// again, at first and at most: the wait doubles in between.
-const SIMULATION_CHECK_FIRST: Duration = Duration::from_secs(5);
-const SIMULATION_CHECK_MOST: Duration = Duration::from_secs(5 * 60);
-
 /// Check that the chain's node can simulate, until it can: while it can't,
 /// the chain is not kept, and that is said at warn and in the keeper's
 /// health.
 async fn until_it_can_simulate(chain: Chain, client: &Client, key: &impl std::fmt::Display) {
-    let mut wait = SIMULATION_CHECK_FIRST;
+    let policy = client.rpc_policy();
+    let mut wait = Duration::from_millis(policy.keeper_simulation_initial_ms);
     let mut said = Said::default();
     while let Err(error) = can_simulate(client).await {
         chain_kept(chain, |kept| kept.cannot_simulate = true);
@@ -4350,7 +4346,9 @@ async fn until_it_can_simulate(chain: Chain, client: &Client, key: &impl std::fm
             tracing::warn!(chain = %key, times, error = format!("{error:#}"), "this chain's node can't simulate what an unwind leaves; the chain is not kept until it can");
         }
         tokio::time::sleep(wait).await;
-        wait = (wait * 2).min(SIMULATION_CHECK_MOST);
+        wait = wait
+            .saturating_mul(policy.keeper_simulation_backoff_factor as u32)
+            .min(Duration::from_millis(policy.keeper_simulation_max_ms));
     }
     if said.over() {
         tracing::info!(chain = %key, "this chain's node simulates; it is kept");

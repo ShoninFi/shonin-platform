@@ -34,6 +34,10 @@ settings!(
     read_budget_ms,
     quiet_probe_budget_ms,
     quiet_probe_retry_ms,
+    keeper_simulation_initial_ms,
+    keeper_simulation_max_ms,
+    keeper_simulation_backoff_factor,
+    solana_rent_poll_rounds,
     keeper_rate_limit_initial_ms,
     keeper_rate_limit_max_ms,
     keeper_rate_limit_backoff_factor,
@@ -65,6 +69,8 @@ settings!(
 #[serde(deny_unknown_fields)]
 pub struct RpcPolicies {
     pub defaults: RpcPolicy,
+    #[serde(default)]
+    pub service: ServiceRpcPolicy,
     #[serde(default)]
     pub chains: BTreeMap<ChainKey, RpcOverrides>,
 }
@@ -162,6 +168,36 @@ impl RpcPolicy {
                 self.keeper_rate_limit_max_ms, self.keeper_rate_limit_initial_ms
             )));
         }
+        bounded(
+            "keeper_simulation_initial_ms",
+            self.keeper_simulation_initial_ms,
+            1_000,
+            5_000,
+        )?;
+        bounded(
+            "keeper_simulation_max_ms",
+            self.keeper_simulation_max_ms,
+            1_000,
+            300_000,
+        )?;
+        bounded(
+            "keeper_simulation_backoff_factor",
+            self.keeper_simulation_backoff_factor,
+            1,
+            2,
+        )?;
+        if self.keeper_simulation_max_ms < self.keeper_simulation_initial_ms {
+            return Err(ConfigError::new(format!(
+                "RPC settings for {name}: keeper_simulation_max_ms={} is below keeper_simulation_initial_ms={}",
+                self.keeper_simulation_max_ms, self.keeper_simulation_initial_ms
+            )));
+        }
+        bounded(
+            "solana_rent_poll_rounds",
+            self.solana_rent_poll_rounds,
+            1,
+            30,
+        )?;
         bounded("solana_rescan_ms", self.solana_rescan_ms, 0, 86_400_000)?;
         bounded("indexer_backoff_factor", self.indexer_backoff_factor, 1, 16)?;
         bounded("history_page_reads", self.history_page_reads, 1, 4_096)?;
@@ -236,6 +272,69 @@ impl RpcPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_simulation_and_rent_checks_retain_their_default_waits() {
+        let policy = RpcPolicy::default();
+        assert_eq!(policy.keeper_simulation_initial_ms, 5_000);
+        assert_eq!(policy.keeper_simulation_max_ms, 300_000);
+        assert_eq!(policy.keeper_simulation_backoff_factor, 2);
+        assert_eq!(policy.solana_rent_poll_rounds, 30);
+        for initial in [1_000, 5_000] {
+            for maximum in [initial, 300_000] {
+                for factor in [1, 2] {
+                    for rounds in [1, 30] {
+                        let candidate = RpcPolicy {
+                            keeper_simulation_initial_ms: initial,
+                            keeper_simulation_max_ms: maximum,
+                            keeper_simulation_backoff_factor: factor,
+                            solana_rent_poll_rounds: rounds,
+                            ..policy.clone()
+                        };
+                        candidate.validate("observation").unwrap();
+                    }
+                }
+            }
+        }
+        for (field, minimum, maximum) in [
+            ("keeper_simulation_initial_ms", 1_000, 5_000),
+            ("keeper_simulation_max_ms", 1_000, 300_000),
+            ("keeper_simulation_backoff_factor", 1, 2),
+            ("solana_rent_poll_rounds", 1, 30),
+        ] {
+            for value in [0, minimum - 1, maximum + 1, u64::MAX] {
+                let mut candidate = policy.clone();
+                match field {
+                    "keeper_simulation_initial_ms" => {
+                        candidate.keeper_simulation_initial_ms = value
+                    }
+                    "keeper_simulation_max_ms" => candidate.keeper_simulation_max_ms = value,
+                    "keeper_simulation_backoff_factor" => {
+                        candidate.keeper_simulation_backoff_factor = value
+                    }
+                    _ => candidate.solana_rent_poll_rounds = value,
+                }
+                let error = candidate.validate("observation").unwrap_err().to_string();
+                assert!(
+                    error.contains(&format!("{field}={value}")) && error.contains("observation"),
+                    "{error}"
+                );
+            }
+        }
+        let inconsistent = RpcPolicy {
+            keeper_simulation_initial_ms: 5_000,
+            keeper_simulation_max_ms: 4_999,
+            ..policy
+        };
+        let error = inconsistent
+            .validate("observation")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("keeper_simulation_max_ms=4999")
+                && error.contains("keeper_simulation_initial_ms=5000")
+        );
+    }
 
     #[test]
     fn configured_defaults_and_partial_overrides_preserve_other_values() {
@@ -355,5 +454,81 @@ mod tests {
                 .contains("view_batch_reads=65")
         );
         assert!(toml::from_str::<RpcOverrides>("unknown_cadence_ms = 1").is_err());
+    }
+}
+
+/// Process-wide observations, independent of any one chain's overrides.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceRpcPolicy {
+    pub indexer_queue_poll_ms: u64,
+    pub indexer_discovery_poll_ms: u64,
+}
+
+impl Default for ServiceRpcPolicy {
+    fn default() -> Self {
+        #[derive(Deserialize)]
+        struct File {
+            rpc: Root,
+        }
+        #[derive(Deserialize)]
+        struct Root {
+            service: ServiceRpcPolicy,
+        }
+        toml::from_str::<File>(include_str!("../../../config/chains.toml"))
+            .expect("the checked-in service settings are valid")
+            .rpc
+            .service
+    }
+}
+
+impl ServiceRpcPolicy {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (name, value) in [
+            ("indexer_queue_poll_ms", self.indexer_queue_poll_ms),
+            ("indexer_discovery_poll_ms", self.indexer_discovery_poll_ms),
+        ] {
+            if !(1_000..=2_000).contains(&value) {
+                return Err(ConfigError::new(format!(
+                    "RPC service settings: {name}={value}, expected 1000..=2000"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+    #[test]
+    fn service_polls_have_global_named_boundaries_and_one_default_source() {
+        let defaults = ServiceRpcPolicy::default();
+        assert_eq!(defaults.indexer_queue_poll_ms, 2_000);
+        assert_eq!(defaults.indexer_discovery_poll_ms, 2_000);
+        for queue in [1_000, 1_001, 1_999, 2_000] {
+            for discovery in [1_000, 1_001, 1_999, 2_000] {
+                ServiceRpcPolicy {
+                    indexer_queue_poll_ms: queue,
+                    indexer_discovery_poll_ms: discovery,
+                }
+                .validate()
+                .unwrap();
+            }
+        }
+        for value in [0, 999, 2_001, u64::MAX] {
+            for queue in [true, false] {
+                let mut policy = defaults.clone();
+                let name = if queue {
+                    policy.indexer_queue_poll_ms = value;
+                    "indexer_queue_poll_ms"
+                } else {
+                    policy.indexer_discovery_poll_ms = value;
+                    "indexer_discovery_poll_ms"
+                };
+                let error = policy.validate().unwrap_err().to_string();
+                assert!(error.contains(name) && error.contains(&value.to_string()));
+            }
+        }
     }
 }

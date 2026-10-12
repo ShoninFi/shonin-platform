@@ -314,6 +314,7 @@ pub enum Lookup {
 /// one as it connects: one out of reach holds up none of the others.
 pub struct Connections {
     pub expected: Vec<Chain>,
+    pub service_rpc_policy: chain::rpc_policy::ServiceRpcPolicy,
     pub evm: tokio::sync::mpsc::UnboundedReceiver<Served>,
     pub solana: tokio::sync::mpsc::UnboundedReceiver<SolanaServed>,
 }
@@ -337,6 +338,9 @@ pub fn connections(args: &chain::ChainArgs) -> Result<Connections> {
     let mut expected = evm_chains;
     expected.extend(solana.iter().map(|target| target.vault_chain));
     Ok(Connections {
+        service_rpc_policy: chain::config::ChainConfigs::load(&args.chains)?
+            .service_rpc_policy()
+            .clone(),
         expected,
         evm,
         solana: args.connect_each_solana()?,
@@ -346,6 +350,7 @@ pub fn connections(args: &chain::ChainArgs) -> Result<Connections> {
 /// The record, as read from every vault chain, and what it needs to keep
 /// reading.
 pub struct Indexer {
+    service_rpc_policy: chain::rpc_policy::ServiceRpcPolicy,
     /// The vault chains to be read, connected or not yet: a chain is read
     /// from the moment it connects, and one that hasn't holds up no other.
     expected: Vec<Chain>,
@@ -394,6 +399,7 @@ impl Indexer {
     /// handed over by [`Indexer::add`].
     pub fn new(expected: Vec<Chain>, store: PathBuf, builder: Option<String>) -> Self {
         Self {
+            service_rpc_policy: chain::rpc_policy::ServiceRpcPolicy::default(),
             snapshot: RwLock::new(empty_snapshot()),
             expected,
             readers: std::sync::RwLock::new(Vec::new()),
@@ -410,6 +416,16 @@ impl Indexer {
             completions: std::sync::Mutex::new(HashMap::new()),
             names: std::sync::RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Use validated process-wide queue and connection-discovery polls.
+    pub fn with_service_rpc_policy(
+        mut self,
+        policy: chain::rpc_policy::ServiceRpcPolicy,
+    ) -> Result<Self> {
+        policy.validate()?;
+        self.service_rpc_policy = policy;
+        Ok(self)
     }
 
     /// The same indexer, its store reading through to the public copy at
@@ -782,7 +798,10 @@ impl Indexer {
         running.push(Box::pin(async {
             loop {
                 self.refresh_queue().await;
-                tokio::time::sleep(PAUSE).await;
+                tokio::time::sleep(Duration::from_millis(
+                    self.service_rpc_policy.indexer_queue_poll_ms,
+                ))
+                .await;
             }
         }));
         let mut started = std::collections::HashSet::new();
@@ -802,7 +821,7 @@ impl Indexer {
             }
             tokio::select! {
                 _ = running.next() => {}
-                _ = tokio::time::sleep(PAUSE) => {}
+                _ = tokio::time::sleep(Duration::from_millis(self.service_rpc_policy.indexer_discovery_poll_ms)) => {}
             }
         }
     }
@@ -1604,9 +1623,6 @@ const JOB_READS: Duration = Duration::from_secs(5);
 
 /// How many of one chain's jobs are completed at once.
 const JOBS_AT_ONCE: usize = 8;
-
-/// How long between reads of each chain, and of the queue.
-const PAUSE: Duration = Duration::from_secs(2);
 
 /// How long a chain may go unread before its health says so: well past a
 /// slow read, and far short of a record anyone would trust.

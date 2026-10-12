@@ -611,7 +611,9 @@ mod tests {
                                         };
                                         let mut value = vault(id);
                                         if node.invalid_wake && id == 1 {
-                                            value["owner"] = json!(anchor_lang::solana_program::system_program::ID.to_string());
+                                            let mut other_owner = shonin_vault::ID.to_bytes();
+                                            other_owner[0] ^= 1;
+                                            value["owner"] = json!(Pubkey::new_from_array(other_owner).to_string());
                                         }
                                         value
                                     }
