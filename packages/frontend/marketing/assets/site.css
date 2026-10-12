@@ -523,6 +523,9 @@ html.menu-open { overflow: hidden; }
 .hero__title .word { display: inline-block; }
 .hero--authors .hero__title { font: 800 40px/44px var(--font-display); letter-spacing: -0.03em; }
 .hero__statement { font: 650 19px/27px var(--font-sans); letter-spacing: -0.005em; color: var(--hero-ink); max-width: 560px; }
+.hero__points { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-2); }
+.hero__points li { display: flex; align-items: center; gap: var(--space-3); font: 650 19px/27px var(--font-sans); letter-spacing: -0.005em; color: var(--hero-ink); }
+.hero__points .ic { flex: none; color: var(--mark-sky); }
 .hero__lede { font: 400 16px/25px var(--font-sans); color: var(--hero-ink-muted); max-width: 540px; }
 .hero__lede--authors { font: 400 17px/26px var(--font-sans); max-width: 550px; }
 .hero__actions { display: flex; flex-direction: column; gap: var(--space-3); margin-top: 6px; }
@@ -569,6 +572,7 @@ html.menu-open { overflow: hidden; }
   .hero__eyebrow { letter-spacing: .24em; }
   .hero__title { max-width: 640px; }
   .hero__statement { font-size: 22px; line-height: 32px; max-width: 600px; }
+  .hero__points li { font-size: 21px; line-height: 30px; }
   .hero__lede { font-size: 18px; line-height: 28px; max-width: 580px; }
   .hero__actions { flex-direction: row; margin-top: var(--space-1); }
   .hero__actions .sh-btn { width: auto; }
