@@ -5,7 +5,14 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
-publish.workspace = true
+# Published on crates.io for authors to read and build against. The build
+# service compiles every agent against its own copy of this crate.
+publish = true
+repository = "https://github.com/ShoninFi/shonin-platform"
+homepage = "https://docs.shonin.fi/writing/"
+readme = "README.md"
+keywords = ["shonin", "wasm", "component", "trading", "agent"]
+categories = ["wasm", "api-bindings"]
 
 [lib]
 name = "strategy_sdk"

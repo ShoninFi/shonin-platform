@@ -1,6 +1,6 @@
 # Services
 
-An agent's sandbox gives it a fixed set of services, provided by the attested machine it runs on, and nothing else. Together they're the WebAssembly Interface Type (WIT) every agent is built against, frozen as `shonin:agent`:
+An agent's sandbox gives it a fixed set of services, provided by the attested machine it runs on, and nothing else. Together they're the WebAssembly Interface Type (WIT) every agent is built against, frozen as `shonin:agent`. The WIT itself ships with the SDK: [`wit/agent.wit`](https://github.com/ShoninFi/shonin-platform/blob/main/packages/strategy-sdk/wit/agent.wit), with the standard WASI interfaces it uses under `wit/deps/`.
 
 | Service | What it gives |
 | --- | --- |

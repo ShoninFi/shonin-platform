@@ -41,6 +41,6 @@ Keeping the decisions apart from the waiting and the ordering is the one habit w
 
 ## The SDK
 
-The template depends on `shonin-strategy-sdk`, which has everything an agent needs to talk to its drivers and its vault, plus helpers for common jobs.
+The template depends on [`shonin-strategy-sdk`](https://crates.io/crates/shonin-strategy-sdk), which has everything an agent needs to talk to its drivers and its vault, plus helpers for common jobs. Its reference is on [docs.rs](https://docs.rs/shonin-strategy-sdk), and the interface it binds, the `shonin:agent` WIT, is [`wit/agent.wit`](https://github.com/ShoninFi/shonin-platform/blob/main/packages/strategy-sdk/wit/agent.wit) in its source.
 
 [Next: configuration →](configuration.md){ .md-button .md-button--primary }
