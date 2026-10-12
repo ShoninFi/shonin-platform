@@ -243,6 +243,9 @@ struct Memory {
     quiet_since: Option<u64>,
     /// Each waiting claim's next try: the slot, and the wait in slots.
     claims_tried: HashMap<u64, (u64, u64)>,
+    /// The unchanged share count and next bounded partial-payment probe.
+    /// Retained across rounds so a probe budget cannot starve small parts.
+    claim_parts_next: HashMap<u64, (u128, u128)>,
     /// Each unit holder's next serve, by owner (see [`next_units_try`]).
     units_tried: HashMap<Pubkey, UnitsTry>,
     /// The slot the station was last unwound in, and when an unwind found
@@ -436,6 +439,79 @@ fn next_check(before: Option<(u64, u64)>, now: u64, interval: u64) -> (u64, u64)
 
 /// Whether an unwind that brings home `brought` is worth paying for: a cent,
 /// or the vault's dust, whichever is larger.
+/// The drivers, of `count`, a stopped unwind names: grown from none a
+/// driver at a time in the station's order, each kept only if `goes` says
+/// the set with it goes through.
+async fn grown<F, Fut>(count: u8, mut goes: F) -> Vec<u8>
+where
+    F: FnMut(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut named = Vec::new();
+    for index in 0..count {
+        let mut with = named.clone();
+        with.push(index);
+        if goes(with.clone()).await {
+            named = with;
+        }
+    }
+    named
+}
+
+/// The most parts of one claim paid in a round, and the most parts of it
+/// simulated.
+const CLAIM_PARTS_A_ROUND: u32 = 4;
+const CLAIM_PART_TRIES_A_ROUND: u32 = 16;
+
+/// The parts of a claim of `shares` tried, in order: half of it, then half
+/// of that, down to a single share; never all of it (a whole try is
+/// `settle_claim`'s), never none.
+fn halvings(shares: u128, next: Option<u128>) -> impl Iterator<Item = u128> {
+    let first = next
+        .filter(|part| *part > 0 && *part < shares)
+        .unwrap_or(shares / 2);
+    std::iter::successors(Some(first), |part| Some(part / 2)).take_while(|part| *part > 0)
+}
+
+/// Whether a decoded claim proves payment progress. A settlement keeps the
+/// account until the separate rent duty closes it; a missing account is no
+/// evidence of a successful simulation.
+fn served(before: u128, before_paid: u64, after: Option<(ClaimState, u128, u64)>) -> bool {
+    match after {
+        Some((ClaimState::Paid, 0, paid)) => before > 0 && paid > before_paid,
+        Some((ClaimState::Pending, shares, paid)) => {
+            shares > 0 && shares < before && paid > before_paid
+        }
+        _ => false,
+    }
+}
+
+/// A whole settlement can queue the claim against available cash or
+/// complete a dust claim; those ordinary paths must not become part closes.
+fn settlement_progress(
+    before: u128,
+    before_paid: u64,
+    after: (ClaimState, u128, u64),
+    whole: bool,
+) -> bool {
+    (whole
+        && before > 0
+        && after.2 >= before_paid
+        && (matches!(after, (ClaimState::Queued, shares, _) if shares == before)
+            || matches!(after, (ClaimState::Paid, shares, _) if shares <= before)))
+        || served(before, before_paid, Some(after))
+}
+
+/// The most stopped unwinds of one vault the keeper sends in one slot.
+const UNWINDS_A_SLOT: u32 = 4;
+
+/// Whether, `done` unwinds of a stopped station sent in this slot, another
+/// that would bring `brought` home is sent: while it is worth an unwind and
+/// fewer than [`UNWINDS_A_SLOT`] went.
+fn unwind_again(done: u32, brought: u128, dust: u128) -> bool {
+    done < UNWINDS_A_SLOT && worth_an_unwind(brought, dust)
+}
+
 fn worth_an_unwind(brought: u128, dust: u128) -> bool {
     brought >= UNWIND_WORTH_AT_LEAST.max(dust)
 }
@@ -499,6 +575,27 @@ fn next_units_try(
 fn freeze_for_units_due(holder: &Holder, vault: &Vault, now: u64) -> bool {
     holder.units != 0
         && now >= holder.units_since.saturating_add(vault.timers.freeze_after)
+        && vault.live()
+        && !vault.halted()
+        && !vault.owed()
+}
+
+/// Whether the keeper tries a claim in `state` this round: one pending or
+/// waiting is tried; one the cash covered (queued) waits for the next
+/// valuation to pay it, and is only looked at for its freeze.
+fn claim_tried(state: ClaimState) -> bool {
+    matches!(state, ClaimState::Pending | ClaimState::Waiting)
+}
+
+/// Whether a vault may be frozen for a claim in `state` booked at
+/// `booked_at`: it is still unpaid (pending, waiting or queued) a freeze
+/// period after its booking, the vault is live and hasn't halted, and no
+/// valuation's settlement is owed, which may pay it.
+fn freeze_for_claim_due(state: ClaimState, booked_at: u64, vault: &Vault, now: u64) -> bool {
+    matches!(
+        state,
+        ClaimState::Pending | ClaimState::Waiting | ClaimState::Queued
+    ) && now >= booked_at.saturating_add(vault.timers.freeze_after)
         && vault.live()
         && !vault.halted()
         && !vault.owed()
@@ -751,7 +848,7 @@ impl Keeping {
         carry_on(
             address,
             "claims",
-            self.claims(&v, address, claims, memory).await,
+            self.claims(&v, address, claims, memory, (vault, now)).await,
         );
         carry_on(
             address,
@@ -874,12 +971,43 @@ impl Keeping {
         address: &Pubkey,
         claims: &[Claim],
         memory: &mut Memory,
+        round: (&Vault, u64),
     ) -> Result<()> {
         memory
             .claims_tried
             .retain(|id, _| claims.iter().any(|claim| claim.id == *id));
+        memory.claim_parts_next.retain(|id, _| {
+            claims
+                .iter()
+                .any(|claim| claim.id == *id && claim_tried(claim.state))
+        });
         for claim in claims {
-            if !matches!(claim.state, ClaimState::Pending | ClaimState::Waiting) {
+            let tried = claim_tried(claim.state);
+            if !tried && claim.state != ClaimState::Queued {
+                continue;
+            }
+            if !tried {
+                // The cash covered it: the next valuation pays it, so it is
+                // not tried again. Still unpaid past the freeze period, it
+                // freezes the vault as any other unpaid claim does: checked
+                // first against this round's reads, then read afresh, since
+                // the round's own settle may have paid it since.
+                if !freeze_for_claim_due(claim.state, claim.booked_at, round.0, round.1) {
+                    continue;
+                }
+                let now = self.client.now().await?;
+                let vault = self.platform.vault(&self.client, address).await?;
+                if let Some(fresh) = self.platform.claim(&self.client, address, claim.id).await? {
+                    self.freeze_if_overdue(
+                        address,
+                        claim.id,
+                        fresh.state,
+                        fresh.booked_at,
+                        &vault,
+                        now,
+                    )
+                    .await;
+                }
                 continue;
             }
             let now = self.client.now().await?;
@@ -889,11 +1017,24 @@ impl Keeping {
             if before.is_some_and(|(next, _)| slot < next) {
                 continue;
             }
-            let ix = self
-                .platform
-                .ix_settle_claim(&self.client, v, &self.keeper(), claim.id)
-                .await?;
-            let outcome = self.send(address, vec![ix], "settle a claim").await;
+            // Whole when a whole try would pay; otherwise in parts while a
+            // part would (a venue may close only so much in one
+            // transaction); and a whole try sent all the same when none
+            // would, so the claim is tried as before.
+            let paid_parts = if self.claim_serves(v, address, claim, None).await {
+                0
+            } else {
+                self.claim_in_parts(v, address, claim.id, memory).await
+            };
+            let outcome = if paid_parts > 0 {
+                Outcome::Done
+            } else {
+                let ix = self
+                    .platform
+                    .ix_settle_claim(&self.client, v, &self.keeper(), claim.id)
+                    .await?;
+                self.send(address, vec![ix], "settle a claim").await
+            };
             let after = self.platform.claim(&self.client, address, claim.id).await?;
             let state = after.as_ref().map_or(ClaimState::Paid, |claim| claim.state);
             match outcome {
@@ -912,23 +1053,189 @@ impl Keeping {
             }
             // Tried and still unpaid past the freeze period: the vault is
             // frozen, never while a valuation's settlement is owed.
-            if matches!(
-                state,
-                ClaimState::Pending | ClaimState::Waiting | ClaimState::Queued
-            ) && now >= claim.booked_at.saturating_add(vault.timers.freeze_after)
-                && vault.live()
-                && !vault.halted()
-                && !vault.owed()
-            {
-                self.send(
-                    address,
-                    vec![self.platform.ix_freeze(address, claim.id)],
-                    "freeze",
-                )
+            let booked_at = after
+                .as_ref()
+                .map_or(claim.booked_at, |claim| claim.booked_at);
+            self.freeze_if_overdue(address, claim.id, state, booked_at, &vault, now)
                 .await;
-            }
         }
         Ok(())
+    }
+
+    /// Freeze the vault for claim `id` (see [`freeze_for_claim_due`]).
+    async fn freeze_if_overdue(
+        &self,
+        address: &Pubkey,
+        id: u64,
+        state: ClaimState,
+        booked_at: u64,
+        vault: &Vault,
+        now: u64,
+    ) {
+        if freeze_for_claim_due(state, booked_at, vault, now) {
+            self.send(
+                address,
+                vec![self.platform.ix_freeze(address, id)],
+                "freeze",
+            )
+            .await;
+        }
+    }
+
+    /// Whether a try of claim `claim` (whole, or `part` of its shares) would
+    /// pay something, from a simulation of it: the claim paid, or fewer of
+    /// its shares left.
+    async fn claim_serves(
+        &self,
+        v: &VaultAccounts,
+        address: &Pubkey,
+        claim: &Claim,
+        part: Option<u128>,
+    ) -> bool {
+        let ix = match part {
+            None => {
+                self.platform
+                    .ix_settle_claim(&self.client, v, &self.keeper(), claim.id)
+                    .await
+            }
+            Some(shares) => {
+                self.platform
+                    .ix_settle_claim_part(&self.client, v, &self.keeper(), claim.id, shares)
+                    .await
+            }
+        };
+        let Ok(ix) = ix else {
+            return false;
+        };
+        let at = vp::state::claim_address(address, claim.id).0;
+        let Ok(simulated) = self
+            .client
+            .simulate_reading(vec![ix], &self.keeper(), &[at])
+            .await
+        else {
+            return false;
+        };
+        let [Some(account)] = simulated.accounts.as_slice() else {
+            return false;
+        };
+        if account.owner != vp::ID {
+            return false;
+        }
+        let Ok(after) = Claim::try_deserialize(&mut &account.data[..]) else {
+            return false;
+        };
+        if after.id != claim.id || after.owner != claim.owner || after.paid < claim.paid {
+            return false;
+        }
+        settlement_progress(
+            claim.shares,
+            claim.paid,
+            (after.state, after.shares, after.paid),
+            part.is_none(),
+        )
+    }
+
+    /// Claim `id` served in parts: halving its shares from half until a part
+    /// would pay, that part sent, and again on what is left while each part
+    /// is paid, at most [`CLAIM_PARTS_A_ROUND`] parts a round. Answers how
+    /// many parts were paid.
+    async fn claim_in_parts(
+        &self,
+        v: &VaultAccounts,
+        address: &Pubkey,
+        id: u64,
+        memory: &mut Memory,
+    ) -> u32 {
+        let mut paid = 0;
+        let mut tried = 0;
+        while paid < CLAIM_PARTS_A_ROUND && tried < CLAIM_PART_TRIES_A_ROUND {
+            let Ok(Some(claim)) = self.platform.claim(&self.client, address, id).await else {
+                break;
+            };
+            if !matches!(claim.state, ClaimState::Pending | ClaimState::Waiting) {
+                break;
+            }
+            // What remains after a paid part may now fit a whole settlement.
+            if paid > 0 && self.claim_serves(v, address, &claim, None).await {
+                let Ok(ix) = self
+                    .platform
+                    .ix_settle_claim(&self.client, v, &self.keeper(), id)
+                    .await
+                else {
+                    break;
+                };
+                if self
+                    .send(address, vec![ix], "settle the rest of a claim")
+                    .await
+                    == Outcome::Done
+                {
+                    if let Ok(Some(after)) = self.platform.claim(&self.client, address, id).await
+                        && after.id == claim.id
+                        && after.owner == claim.owner
+                        && after.paid >= claim.paid
+                        && served(
+                            claim.shares,
+                            claim.paid,
+                            Some((after.state, after.shares, after.paid)),
+                        )
+                    {
+                        paid += 1;
+                    }
+                    memory.claim_parts_next.remove(&id);
+                }
+                break;
+            }
+            let next = memory
+                .claim_parts_next
+                .get(&id)
+                .filter(|(basis, _)| *basis == claim.shares)
+                .map(|(_, next)| *next);
+            let mut sent = false;
+            for part in halvings(claim.shares, next) {
+                if tried >= CLAIM_PART_TRIES_A_ROUND {
+                    break;
+                }
+                tried += 1;
+                memory.claim_parts_next.insert(id, (claim.shares, part));
+                if !self.claim_serves(v, address, &claim, Some(part)).await {
+                    memory.claim_parts_next.insert(id, (claim.shares, part / 2));
+                    continue;
+                }
+                let Ok(ix) = self
+                    .platform
+                    .ix_settle_claim_part(&self.client, v, &self.keeper(), id, part)
+                    .await
+                else {
+                    break;
+                };
+                if self.send(address, vec![ix], "settle part of a claim").await == Outcome::Done {
+                    let Ok(Some(after)) = self.platform.claim(&self.client, address, id).await
+                    else {
+                        break;
+                    };
+                    if after.id != claim.id
+                        || after.owner != claim.owner
+                        || after.paid < claim.paid
+                        || !served(
+                            claim.shares,
+                            claim.paid,
+                            Some((after.state, after.shares, after.paid)),
+                        )
+                    {
+                        break;
+                    }
+                    memory.claim_parts_next.remove(&id);
+                    paid += 1;
+                    sent = true;
+                    tracing::info!(vault = %address, claim = id, shares = part, "part of the claim is paid");
+                }
+                break;
+            }
+            if !sent {
+                break;
+            }
+        }
+        paid
     }
 
     /// Finished requests and claims closed, their rent going back to whoever
@@ -1270,33 +1577,14 @@ impl Keeping {
         if !station.stopped {
             return Ok(());
         }
-        let ix = self
-            .platform
-            .ix_unwind(
-                &self.client,
-                v,
-                &self.keeper(),
-                chain::solana::programs::driver::WAD,
-            )
-            .await?;
-        let simulated = self
-            .client
-            .simulate_reading(vec![ix.clone()], &self.keeper(), &[v.station])
-            .await;
-        let brought = match simulated {
-            Ok(simulated) => simulated
-                .accounts
-                .first()
-                .cloned()
-                .flatten()
-                .and_then(|account| {
-                    station::state::Station::try_deserialize(&mut &account.data[..]).ok()
-                })
-                .map_or(0, |after| after.sent_home.saturating_sub(station.sent_home)),
-            Err(error) => {
-                tracing::debug!(vault = %address, error = format!("{error:#}"), "the unwind would not go through");
-                0
-            }
+        let Some((ix, brought)) = self.next_unwind(v, address, &station).await else {
+            memory.unwind_checks = Some(next_check(
+                memory.unwind_checks,
+                now,
+                vault.timers.slot_interval,
+            ));
+            memory.unwind_idle = true;
+            return Ok(());
         };
         if !worth_an_unwind(brought, vault.dust()) {
             memory.unwind_checks = Some(next_check(
@@ -1309,11 +1597,127 @@ impl Keeping {
         }
         memory.unwind_checks = None;
         memory.unwind_idle = false;
-        if self.send(address, vec![ix], "unwind the station").await == Outcome::Done {
-            memory.unwound_in = Some(slot);
-            tracing::info!(vault = %address, brought, "the stopped station was unwound");
+        if self.send(address, vec![ix], "unwind the station").await != Outcome::Done {
+            return Ok(());
+        }
+        memory.unwound_in = Some(slot);
+        tracing::info!(vault = %address, brought, "the stopped station was unwound");
+        // A venue may close only part of a crowded holding in one unwind
+        // (Orca's sale stops at the ticks one transaction can cross): the
+        // rest is unwound again in the same slot while each one still brings
+        // something worth it home.
+        let mut done = 1;
+        loop {
+            let station = self.platform.station(&self.client, &v.station).await?;
+            let Some((ix, brought)) = self.next_unwind(v, address, &station).await else {
+                break;
+            };
+            if !unwind_again(done, brought, vault.dust()) {
+                break;
+            }
+            if self
+                .send(address, vec![ix], "unwind the station again")
+                .await
+                != Outcome::Done
+            {
+                break;
+            }
+            done += 1;
+            tracing::info!(vault = %address, brought, done, "the stopped station was unwound again");
         }
         Ok(())
+    }
+
+    /// The stopped station's full unwind as it stands now and what it would
+    /// send home, without the drivers that would fail it; `None` if nothing
+    /// would go through.
+    async fn next_unwind(
+        &self,
+        v: &VaultAccounts,
+        address: &Pubkey,
+        station: &station::state::Station,
+    ) -> Option<(chain::solana::Instruction, u128)> {
+        let full = self
+            .platform
+            .ix_unwind(
+                &self.client,
+                v,
+                &self.keeper(),
+                chain::solana::programs::driver::WAD,
+            )
+            .await;
+        let tried = match full {
+            Ok(ix) => self
+                .brings(v, station, &ix)
+                .await
+                .map(|brought| (ix, brought)),
+            Err(error) => Err(error),
+        };
+        match tried {
+            Ok(tried) => Some(tried),
+            Err(error) => {
+                tracing::debug!(vault = %address, error = format!("{error:#}"), "the unwind would not go through; trying it without the drivers that fail");
+                self.unwind_without_failing(v, station).await
+            }
+        }
+    }
+
+    /// What `ix`, an unwind of the stopped station, would send home, from a
+    /// simulation of it.
+    async fn brings(
+        &self,
+        v: &VaultAccounts,
+        station: &station::state::Station,
+        ix: &chain::solana::Instruction,
+    ) -> Result<u128> {
+        let simulated = self
+            .client
+            .simulate_reading(vec![ix.clone()], &self.keeper(), &[v.station])
+            .await?;
+        Ok(simulated
+            .accounts
+            .first()
+            .cloned()
+            .flatten()
+            .and_then(|account| {
+                station::state::Station::try_deserialize(&mut &account.data[..]).ok()
+            })
+            .map_or(0, |after| after.sent_home.saturating_sub(station.sent_home)))
+    }
+
+    /// The stopped station's unwind through as many of its drivers as go
+    /// through together, leaving out those that would fail it, and what it
+    /// would send home; `None` if even sending the counted dollars home
+    /// would not go through. The set is grown a driver at a time, each kept
+    /// only if the set with it still goes through, so a driver that fails
+    /// only beside another (the two too large for one transaction, say)
+    /// still leaves the rest to come home.
+    async fn unwind_without_failing(
+        &self,
+        v: &VaultAccounts,
+        station: &station::state::Station,
+    ) -> Option<(chain::solana::Instruction, u128)> {
+        let named = grown(station.drivers.len() as u8, |with| async move {
+            match self
+                .platform
+                .ix_unwind_stopped(&self.client, v, &self.keeper(), &with)
+                .await
+            {
+                Ok(ix) => self.brings(v, station, &ix).await.is_ok(),
+                Err(_) => false,
+            }
+        })
+        .await;
+        let ix = self
+            .platform
+            .ix_unwind_stopped(&self.client, v, &self.keeper(), &named)
+            .await
+            .ok()?;
+        let brought = self.brings(v, station, &ix).await.ok()?;
+        if named.len() < station.drivers.len() {
+            tracing::warn!(vault = %v.vault, named = ?named, "a driver's close fails: the stopped station is unwound without it");
+        }
+        Some((ix, brought))
     }
 
     // The bill --------------------------------------------------------------------------------
@@ -2033,6 +2437,136 @@ pub fn troubles(now: Instant) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_claim_that_can_t_be_served_whole_is_tried_in_halves_down_to_a_share() {
+        assert_eq!(
+            halvings(100, None).collect::<Vec<_>>(),
+            vec![50, 25, 12, 6, 3, 1]
+        );
+        assert_eq!(halvings(2, None).collect::<Vec<_>>(), vec![1]);
+        // A claim of one share can only be served whole.
+        assert_eq!(halvings(1, None).count(), 0);
+        assert_eq!(halvings(0, None).count(), 0);
+        // Never all of it, never none.
+        assert!(halvings(u128::MAX, None).all(|part| part > 0 && part < u128::MAX));
+        assert!(halvings(u128::MAX, None).count() <= 128);
+    }
+
+    #[test]
+    fn bounded_partial_claim_probes_eventually_reach_one_share() {
+        let shares = u128::MAX;
+        let mut next = None;
+        let mut all = Vec::new();
+        for _ in 0..8 {
+            let round: Vec<_> = halvings(shares, next)
+                .take(CLAIM_PART_TRIES_A_ROUND as usize)
+                .collect();
+            assert!(round.len() <= CLAIM_PART_TRIES_A_ROUND as usize);
+            next = round.last().map(|part| part / 2);
+            all.extend(round);
+            if next == Some(0) {
+                break;
+            }
+        }
+        assert_eq!(all, halvings(shares, None).collect::<Vec<_>>());
+        assert_eq!(all.last(), Some(&1));
+        assert_eq!(halvings(100, Some(25)).next(), Some(25));
+        assert_eq!(halvings(10, Some(25)).next(), Some(5));
+    }
+
+    #[test]
+    fn a_paid_part_requires_a_positive_cash_delta_and_fewer_shares() {
+        assert!(!served(10, 20, None));
+        assert!(served(10, 20, Some((ClaimState::Paid, 0, 21))));
+        assert!(served(10, 20, Some((ClaimState::Pending, 5, 21))));
+        for after in [
+            (ClaimState::Pending, 5, 20),
+            (ClaimState::Paid, 0, 20),
+            (ClaimState::Pending, 5, 19),
+            (ClaimState::Waiting, 10, 21),
+            (ClaimState::Pending, 10, 21),
+            (ClaimState::Paid, 10, 21),
+            (ClaimState::Fallback, 0, 21),
+        ] {
+            assert!(!served(10, 20, Some(after)));
+        }
+        assert!(!served(0, 20, Some((ClaimState::Paid, 0, 21))));
+    }
+
+    #[test]
+    fn a_whole_claim_keeps_ordinary_cash_queue_and_dust_completion() {
+        assert!(settlement_progress(
+            10,
+            20,
+            (ClaimState::Queued, 10, 20),
+            true
+        ));
+        assert!(!settlement_progress(
+            10,
+            20,
+            (ClaimState::Queued, 10, 20),
+            false
+        ));
+        assert!(!settlement_progress(
+            10,
+            20,
+            (ClaimState::Queued, 11, 20),
+            true
+        ));
+        assert!(!settlement_progress(
+            10,
+            20,
+            (ClaimState::Waiting, 10, 20),
+            true
+        ));
+        assert!(settlement_progress(
+            10,
+            20,
+            (ClaimState::Pending, 5, 21),
+            false
+        ));
+        assert!(settlement_progress(10, 20, (ClaimState::Paid, 0, 20), true));
+        assert!(settlement_progress(
+            10,
+            20,
+            (ClaimState::Paid, 10, 20),
+            true
+        ));
+        assert!(!settlement_progress(
+            10,
+            20,
+            (ClaimState::Paid, 0, 19),
+            true
+        ));
+    }
+
+    #[test]
+    fn a_stopped_station_is_unwound_again_in_its_slot_while_each_brings_something_home() {
+        let dust = 10_000;
+        // A cent home after the first: again.
+        assert!(unwind_again(1, 10_000, dust));
+        // Nothing worth it home: no more.
+        assert!(!unwind_again(1, 0, dust));
+        assert!(!unwind_again(1, UNWIND_WORTH_AT_LEAST - 1, 0));
+        // At most a few in one slot, however much each brings.
+        assert!(unwind_again(UNWINDS_A_SLOT - 1, u128::MAX, dust));
+        assert!(!unwind_again(UNWINDS_A_SLOT, u128::MAX, dust));
+    }
+
+    #[tokio::test]
+    async fn a_stopped_unwind_names_every_driver_that_goes_through_beside_the_others() {
+        // Each goes alone; 0 and 1 together don't (too large for one
+        // transaction, say); 3 never goes.
+        let goes = |with: Vec<u8>| async move {
+            !with.contains(&3) && !(with.contains(&0) && with.contains(&1))
+        };
+        assert_eq!(grown(4, goes).await, vec![0, 2]);
+        assert_eq!(grown(0, goes).await, Vec::<u8>::new());
+        assert_eq!(grown(3, |_| async { false }).await, Vec::<u8>::new());
+        assert_eq!(grown(3, |_| async { true }).await, vec![0, 1, 2]);
+    }
+
     use super::*;
 
     fn a_tank(
@@ -2395,6 +2929,52 @@ mod tests {
         assert_eq!(
             next_units_try(Some(waited), Some(Outcome::Reverted), 7, 2 * 60 * MINUTE, 2).wait,
             1
+        );
+    }
+
+    #[test]
+    fn a_queued_claim_is_not_tried_again_but_still_freezes_the_vault_a_freeze_period_after_booking()
+    {
+        assert!(claim_tried(ClaimState::Pending));
+        assert!(claim_tried(ClaimState::Waiting));
+        assert!(
+            !claim_tried(ClaimState::Queued),
+            "the next valuation pays it"
+        );
+        let vault = a_vault();
+        // Booked at 100 with a freeze period of 1,000.
+        for state in [ClaimState::Pending, ClaimState::Waiting, ClaimState::Queued] {
+            assert!(
+                !freeze_for_claim_due(state, 100, &vault, 1_099),
+                "{state:?} too early"
+            );
+            assert!(freeze_for_claim_due(state, 100, &vault, 1_100), "{state:?}");
+        }
+        for state in [ClaimState::Paid, ClaimState::Fallback] {
+            assert!(
+                !freeze_for_claim_due(state, 100, &vault, 5_000),
+                "{state:?}"
+            );
+        }
+        let mut halted = a_vault();
+        halted.halted_at = 50;
+        assert!(
+            !freeze_for_claim_due(ClaimState::Queued, 100, &halted, 5_000),
+            "halted"
+        );
+        let mut closed = a_vault();
+        closed.state = VaultState::Closed;
+        assert!(
+            !freeze_for_claim_due(ClaimState::Queued, 100, &closed, 5_000),
+            "closed"
+        );
+        let mut owed = a_vault();
+        owed.priced = true;
+        owed.priced_through = 3;
+        owed.request_cursor = 1;
+        assert!(
+            !freeze_for_claim_due(ClaimState::Queued, 100, &owed, 5_000),
+            "a valuation's settlement is owed"
         );
     }
 

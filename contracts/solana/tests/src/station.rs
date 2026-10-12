@@ -74,7 +74,9 @@ pub const VENUES: [Pubkey; 3] = [
 
 /// The venue a driver program trades at.
 pub fn venue_of(driver: &Pubkey) -> Pubkey {
-    if *driver == shonin_local_driver_2::ID {
+    if *driver == shonin_orca_driver::ID {
+        shonin_orca_driver::network::WHIRLPOOL_PROGRAM
+    } else if *driver == shonin_local_driver_2::ID {
         shonin_local_venue_2::ID
     } else if *driver == shonin_local_driver_3::ID {
         shonin_local_venue_3::ID
@@ -196,8 +198,13 @@ impl Env {
     /// Another vault, `label`, with [`FUNDS`], whose station pins `drivers`,
     /// with the executor blessed for it.
     pub fn new_home(&mut self, label: &str, drivers: &[Declared]) -> Home {
+        self.new_home_with_band(label, drivers, EXIT_BAND)
+    }
+
+    /// [`Env::new_home`], its station's exit band `band`.
+    pub fn new_home_with_band(&mut self, label: &str, drivers: &[Declared], band: u16) -> Home {
         let home = self.open_vault(label);
-        expect_ok(self.create_station(&home, EXIT_BAND, drivers));
+        expect_ok(self.create_station(&home, band, drivers));
         let programs: Vec<Pubkey> = drivers.iter().map(|driver| driver.program).collect();
         let home = self.home_of(label, &programs);
         let executor = self.executor.pubkey();
@@ -1115,6 +1122,9 @@ impl Env {
     /// the stand-in driver's layout at that venue, behind the mode account for
     /// the test driver.
     pub fn driver_group(&self, station: &Pubkey, program: &Pubkey) -> Vec<AccountMeta> {
+        if *program == shonin_orca_driver::ID {
+            return self.orca_group(station);
+        }
         let venue = venue_of(program);
         let authority = authority_of(station, program);
         let mut group = vec![

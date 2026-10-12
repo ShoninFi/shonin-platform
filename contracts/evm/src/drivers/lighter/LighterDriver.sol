@@ -124,6 +124,10 @@ contract LighterDriver is IDriver, IDelayedDriver {
     /// What the freed margin is counted at when judging whether a claim's
     /// close could come home: nine tenths.
     uint256 private constant SAFETY_BPS = 1000;
+    /// What a taker fill pays the exchange at most, in basis points,
+    /// counted against a close's least: nothing on a standard account, and
+    /// under three on a premium one at its base tier.
+    uint256 private constant FEE_BOUND_BPS = 10;
     /// The name stations know the driver by.
     bytes32 private constant NAME = "lighter";
     /// What a withdrawn key is replaced with: five field elements nobody
@@ -514,6 +518,21 @@ contract LighterDriver is IDriver, IDelayedDriver {
         return _exposure(report);
     }
 
+    /// The exposure, then each market's index at the stage's post, which
+    /// the close's orders are limited by.
+    function snapshot(address station) external view returns (int256[] memory held) {
+        (LighterReport memory report,) = board.reportOf(station);
+        int256[] memory exposed = _exposure(report);
+        uint256 n = _markets.length;
+        held = new int256[](exposed.length + n);
+        for (uint256 i = 0; i < exposed.length; i++) {
+            held[i] = exposed[i];
+        }
+        for (uint256 m = 0; m < n; m++) {
+            held[exposed.length + m] = int256(uint256(_priceOf(report, _markets[m].index).index));
+        }
+    }
+
     function _exposure(LighterReport memory report) private view returns (int256[] memory held) {
         uint256 n = _markets.length;
         held = new int256[](2 * n + 1 + 2 * report.positions.length);
@@ -547,8 +566,10 @@ contract LighterDriver is IDriver, IDelayedDriver {
     /// `closedPart` asks): the exchange's side now, less the rest
     /// (1 - `fraction` x `part`, rounded up) of `dollars` and `before`'s
     /// positions repriced at the marks now, never below `bandBps` of what
-    /// the close ordered at those marks. A market the newest post has no
-    /// price for keeps the mark it had.
+    /// the close ordered at those marks, nor below her part of the accounts
+    /// as they were with every order filled at its limit from the stage's
+    /// index, less what a fill pays the exchange. A market the newest post
+    /// has no price for keeps the mark it had.
     function measure(
         address station,
         int256 dollars,
@@ -556,9 +577,11 @@ contract LighterDriver is IDriver, IDelayedDriver {
         uint256 fraction,
         uint256 part,
         uint16 bandBps
-    ) external view returns (int256) {
+    ) external view returns (int256 measured, int256 least) {
         (LighterReport memory report,) = board.reportOf(station);
         uint256 n = _markets.length;
+        // The positions, before the stage's indexes at the end.
+        uint256 end = before.length - n;
         int256 then = dollars;
         int256[] memory marks = new int256[](n);
         for (uint256 m = 0; m < n; m++) {
@@ -570,24 +593,53 @@ contract LighterDriver is IDriver, IDelayedDriver {
         uint256 kept = size.mulDiv(
             WAD - fraction.mulDiv(part, WAD), WAD, then < 0 ? Math.Rounding.Floor : Math.Rounding.Ceil
         );
-        int256 measured = _worth(station, report) - (then < 0 ? -int256(kept) : int256(kept));
+        measured = _worth(station, report) - (then < 0 ? -int256(kept) : int256(kept));
         // What the orders could have lost at their limits: `bandBps` of what
-        // they ordered, position by position.
-        int256 least;
-        for (uint256 k = 2 * n + 1; k + 1 < before.length; k += 2) {
+        // they ordered, position by position; and the accounts as they were,
+        // every position closed at its limit from the stage's index.
+        uint256 band = Math.min(bandBps, BPS);
+        int256 worst = dollars;
+        uint256 orderedThen;
+        for (uint256 k = 2 * n + 1; k + 1 < end; k += 2) {
             uint16 market = uint16(uint256(before[k]));
             for (uint256 m = 0; m < n; m++) {
                 if (_markets[m].index != market) continue;
                 int256 was = before[k + 1];
                 uint256 ordered = uint256(was < 0 ? -was : was).mulDiv(fraction, WAD, Math.Rounding.Ceil);
                 least -= int256(
-                    uint256(_notional(m, int256(ordered), marks[m])).mulDiv(
-                        Math.min(bandBps, BPS), BPS, Math.Rounding.Ceil
-                    )
+                    uint256(_notional(m, int256(ordered), marks[m])).mulDiv(band, BPS, Math.Rounding.Ceil)
                 );
+                uint256 index = uint256(before[end + m]);
+                if (index == 0) index = uint256(before[n + 1 + m]);
+                orderedThen += uint256(_notional(m, int256(ordered), int256(index)));
+                // At the limit her order was placed at, from the stage's index
+                // alone, less what a fill pays the exchange: her own orders
+                // can't have filled worse than their limits.
+                worst += was > 0
+                    ? _notional(m, was, int256(index.mulDiv(BPS - band - FEE_BOUND_BPS, BPS)))
+                    : _notional(m, was, int256(index.mulDiv(BPS + band + FEE_BOUND_BPS, BPS, Math.Rounding.Ceil)));
             }
         }
-        return measured < least ? least : measured;
+        // Her part of the accounts as they were, every order filled at its
+        // limit: the least her close fetched. A measure below it is a loss
+        // her orders could not have made (a reduction the exchange forced,
+        // funding, an order resting before the stage that filled before the
+        // executor cancelled it), which the whole pool shares: the station
+        // lapses the stage rather than pay or charge it. A price that moved
+        // after her orders filled changes neither figure: her part was
+        // sold, and the rest is repriced on both sides.
+        uint256 worstSize = uint256(worst < 0 ? -worst : worst);
+        uint256 share = worstSize.mulDiv(
+            fraction.mulDiv(part, WAD), WAD, worst < 0 ? Math.Rounding.Ceil : Math.Rounding.Floor
+        );
+        // What wasn't closed of what was ordered may have filled and been
+        // traded back since: no more than the band on it at the stage's
+        // index is the leaver's to lose.
+        int256 floor = (worst < 0 ? -int256(share) : int256(share))
+            - int256(
+                orderedThen.mulDiv(band, BPS, Math.Rounding.Ceil).mulDiv(WAD - part, WAD, Math.Rounding.Ceil)
+            );
+        if (floor > least) least = floor;
     }
 
     /// `size` base units of market `m` at `price` ticks, in dollar units.
@@ -604,6 +656,13 @@ contract LighterDriver is IDriver, IDelayedDriver {
     /// ordered (a piece under the exchange's smallest order, at the stage's
     /// mark, was not), the share of what was ordered that it is smaller by,
     /// on the same side or flat, rounded down; the smallest of them.
+    ///
+    /// A post names positions, not whose trades made them: a reduction the
+    /// exchange forces (a liquidation, a deleveraging) reads as a fill. So a
+    /// position smaller by more than what was ordered of it, on the other
+    /// side, or, where it was ordered, larger, holds something that isn't
+    /// hers, and nothing is known: the stage can't be measured, and lapses
+    /// with nothing paid.
     function closedPart(
         address station,
         int256[] calldata before,
@@ -615,7 +674,9 @@ contract LighterDriver is IDriver, IDelayedDriver {
         part = WAD;
         known = true;
         uint256 n = _markets.length;
-        for (uint256 k = 2 * n + 1; k + 1 < before.length; k += 2) {
+        // The positions, before the stage's indexes at the end.
+        uint256 end = before.length - n;
+        for (uint256 k = 2 * n + 1; k + 1 < end; k += 2) {
             int256 was = before[k + 1];
             if (was == 0) continue;
             uint256 key = uint256(before[k]);
@@ -627,11 +688,15 @@ contract LighterDriver is IDriver, IDelayedDriver {
             uint256 open = uint256(was > 0 ? was : -was);
             uint256 ordered = open.mulDiv(fraction, WAD, Math.Rounding.Ceil);
             if (ordered > open) ordered = open;
+            // Crossed, or smaller by more than her order could fill: not
+            // hers, whether or not this piece was ordered.
+            int256 done = was > 0 ? was - is_ : is_ - was;
+            if ((is_ != 0 && (was > 0) != (is_ > 0)) || done > int256(ordered)) return (0, false);
             if (ordered == 0 || !_orderable(uint16(key), ordered, _markAt(before, uint16(key)))) continue;
-            // Crossed to the other side: more than closed, by its own trade.
-            int256 done =
-                (was > 0) == (is_ > 0) || is_ == 0 ? (was > 0 ? was - is_ : is_ - was) : was > 0 ? was : -was;
-            if (done <= 0) return (0, true);
+            // Larger than before: not hers either.
+            if (done < 0) return (0, false);
+            // Her order missed: nothing of it closed, and the rest is still
+            // read for anything that isn't hers.
             uint256 share = uint256(done) >= ordered ? WAD : uint256(done).mulDiv(WAD, ordered);
             if (share < part) part = share;
         }

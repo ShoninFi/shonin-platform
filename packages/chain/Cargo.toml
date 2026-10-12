@@ -35,6 +35,7 @@ solana = [
     "dep:shonin-vault",
     "dep:shonin-local-venue",
     "dep:shonin-local-driver",
+    "dep:shonin-orca-driver",
     "dep:solana-transaction",
     "dep:solana-keypair",
     "dep:solana-signer",
@@ -75,6 +76,7 @@ mainnet = [
     "shonin-profiles?/mainnet",
     "shonin-station?/mainnet",
     "shonin-vault?/mainnet",
+    "shonin-orca-driver?/mainnet",
 ]
 devnet = [
     "shonin-registry?/devnet",
@@ -87,6 +89,7 @@ devnet = [
     "shonin-vault?/devnet",
     "shonin-local-venue?/devnet",
     "shonin-local-driver?/devnet",
+    "shonin-orca-driver?/devnet",
 ]
 
 [dependencies]
@@ -123,6 +126,7 @@ shonin-station = { path = "../../contracts/solana/programs/shonin-station", opti
 shonin-vault = { path = "../../contracts/solana/programs/shonin-vault", optional = true, features = ["no-entrypoint"] }
 shonin-local-venue = { path = "../../contracts/solana/programs/shonin-local-venue", optional = true, features = ["no-entrypoint"] }
 shonin-local-driver = { path = "../../contracts/solana/programs/shonin-local-driver", optional = true, features = ["no-entrypoint"] }
+shonin-orca-driver = { path = "../../contracts/solana/programs/shonin-orca-driver", optional = true, features = ["no-entrypoint"] }
 solana-transaction = { version = "2.2", optional = true, features = ["bincode", "verify"] }
 solana-keypair = { version = "2.2", optional = true }
 solana-signer = { version = "2.2", optional = true }

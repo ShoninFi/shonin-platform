@@ -49,9 +49,10 @@ import {Math} from "openzeppelin/utils/math/Math.sol";
 /// valuation always fits between two of them.
 ///
 /// A claim's close is refused before anything is sold when the account
-/// couldn't release the fraction's worth after it: what the account is
-/// worth less the venue's transfer requirement on what stays open, with a
-/// margin, and less what the close's orders could lose at their limits.
+/// couldn't release the fraction's worth after it: what stays, the rest of
+/// the account's worth, must cover the venue's transfer requirement on what
+/// stays open, with a margin. The close's slippage is the leaver's, taken
+/// off what is asked of the venue, so it never has to fit in what stays.
 contract HyperliquidDriver is IDriver, IDelayedDriver {
     using Math for uint256;
 
@@ -106,6 +107,10 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
     /// cost 0.00002 HYPE on testnet.
     uint256 private constant GAS_RESERVE_HUNDREDTHS = 100;
     uint256 private constant GAS_FLOOR_HUNDREDTHS = 1;
+    /// What a taker fill pays the venue at most, in basis points (its base
+    /// tier: 0.045% on a perp, 0.07% on spot), counted against a close's
+    /// least.
+    uint256 private constant FEE_BOUND_BPS = 10;
 
     IERC20 public immutable usdc;
     ICoreDepositWallet public immutable depositWallet;
@@ -347,7 +352,7 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         if (fraction < WAD) {
             HyperCore.SpotBalance memory gas = HyperCore.spotBalance(station, _spots[_gas].token);
             if (uint256(gas.total) - uint256(gas.hold) < gasFloor) return (new Call[](0), true);
-            if (!priced(station) || !_releasable(station, fraction, bandBps)) return (new Call[](0), true);
+            if (!priced(station) || !_releasable(station, fraction)) return (new Call[](0), true);
         }
         calls = new Call[](_perps.length + _spots.length);
         uint256 count;
@@ -366,11 +371,13 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
     /// Whether the perp side could release `fraction` of its worth after a
     /// close of `fraction`: with `v` its worth, `n` its open notional and
     /// `r` the venue's transfer requirement, the larger of the initial
-    /// margin used and `TRANSFER_BPS` of `n`, what stays after the close,
-    /// `v - band x f x n` (the most the orders can lose at their limits)
-    /// less `(1 - f) r` grossed up by `SAFETY_BPS`, must cover `f v`. Spot
-    /// dollars and tokens sold for them are always free.
-    function _releasable(address station, uint256 fraction, uint16 bandBps) private view returns (bool) {
+    /// margin used and `TRANSFER_BPS` of `n`, what stays after the leaver's
+    /// part is taken, `v - f v`, must cover `(1 - f) r` grossed up by
+    /// `SAFETY_BPS`. What the close's orders lose to slippage is the
+    /// leaver's: the measure takes it off what is asked of the venue, so it
+    /// never comes out of what stays. Spot dollars and tokens sold for them
+    /// are always free.
+    function _releasable(address station, uint256 fraction) private view returns (bool) {
         HyperCore.MarginSummary memory summary = HyperCore.marginSummary(station);
         uint256 ntl = summary.ntlPos;
         if (ntl == 0) return true;
@@ -380,10 +387,7 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         uint256 kept = required.mulDiv(WAD - fraction, WAD, Math.Rounding.Ceil).mulDiv(
             BPS + SAFETY_BPS, BPS, Math.Rounding.Ceil
         );
-        uint256 loss = ntl.mulDiv(fraction, WAD, Math.Rounding.Ceil).mulDiv(
-            Math.min(bandBps, BPS), BPS, Math.Rounding.Ceil
-        );
-        return worth >= kept + loss + worth.mulDiv(fraction, WAD, Math.Rounding.Ceil);
+        return worth >= kept + worth.mulDiv(fraction, WAD, Math.Rounding.Ceil);
     }
 
     /// The order closing `fraction` of one perp position, if any.
@@ -528,10 +532,35 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         }
     }
 
+    /// The exposure, then each market's own price as the close's orders are
+    /// limited by it (a perp's oracle, a pair's spot price), in hundredths of
+    /// a millionth of a dollar per lot, as `measure` counts.
+    function snapshot(address station) external view returns (int256[] memory held) {
+        int256[] memory sizes = exposure(station);
+        uint256 n = sizes.length;
+        held = new int256[](2 * n);
+        for (uint256 i = 0; i < n; i++) {
+            held[i] = sizes[i];
+            held[n + i] = int256(
+                i < _perps.length
+                    ? uint256(HyperCore.oraclePx(_perps[i].index)) * 100
+                    : HyperCore.spotPx(_spots[i - _perps.length].pair)
+            );
+        }
+    }
+
     /// Not before `since`, when the close's own orders have run: then, for
     /// each market it ordered (a piece too small to have been ordered for
     /// sure asks nothing), the share of what it ordered that the position is
     /// smaller by, on the same side, rounded down; the smallest of them.
+    ///
+    /// The venue's reads can't tell her fills from a reduction the venue
+    /// forces (a liquidation, a deleveraging): only the position's size is
+    /// read. So a position smaller by more than her order there (the size
+    /// the close ordered, in the venue's own lots), on the other side, or,
+    /// where she ordered, larger, holds something that isn't hers, and
+    /// nothing is known: the stage can't be measured, and lapses with
+    /// nothing paid.
     function closedPart(
         address station,
         int256[] calldata before,
@@ -539,10 +568,11 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         uint64 since
     ) external view returns (uint256 part, bool known) {
         if (block.timestamp < since) return (0, false);
-        if (before.length != _perps.length + _spots.length) return (0, true);
+        uint256 n = _perps.length + _spots.length;
+        if (before.length != 2 * n) return (0, true);
         int256[] memory now_ = exposure(station);
         part = WAD;
-        for (uint256 i = 0; i < before.length; i++) {
+        for (uint256 i = 0; i < n; i++) {
             int256 was = before[i];
             int256 is_ = now_[i];
             // HYPE up to the reserve was never a holding, never ordered.
@@ -551,13 +581,19 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
             bool isLong = was > 0;
             uint256 open = uint256(isLong ? was : -was);
             uint256 size = _part(open, fraction);
+            // Crossed, or smaller by more than her order could fill: not
+            // hers, whether or not this piece was ordered.
+            int256 done = isLong ? was - is_ : is_ - was;
+            if ((isLong ? is_ < 0 : is_ > 0) || done > int256(size)) return (0, false);
             // Millionths of a dollar, times a hundred.
             uint256 price = i < _perps.length
                 ? uint256(HyperCore.markPx(_perps[i].index)) * 100
                 : HyperCore.spotPx(_spots[i - _perps.length].pair);
             if (size * price < 2 * MIN_ORDER * 100) continue;
-            int256 done = isLong ? was - is_ : is_ - was;
-            if (done <= 0) return (0, true);
+            // Larger than before: not hers either.
+            if (done < 0) return (0, false);
+            // Her order missed: nothing of it closed, and the rest is still
+            // read for anything that isn't hers.
             uint256 share = uint256(done) >= size ? WAD : uint256(done).mulDiv(WAD, size);
             if (share < part) part = share;
         }
@@ -581,11 +617,12 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
     /// Each perp at its mark, each spot token at its spot price (HYPE up to
     /// the reserve, and a holding worth less than the smallest order, at
     /// nothing then, and as much of it at nothing now): the account's worth
-    /// now, less the rest of
-    /// its worth then (1 - `fraction` x `part`, rounded up) repriced at the
-    /// same prices, never below `bandBps` of what the close ordered. Figures
-    /// are kept in hundredths of a millionth until the end, which rounds
-    /// down.
+    /// now, less the rest of its worth then (1 - `fraction` x `part`,
+    /// rounded up) repriced at the same prices; and the least the close
+    /// fetched, her part of the account then with every order filled at its
+    /// limit from the stage's own prices, less what a fill pays the venue,
+    /// never below `bandBps` of what the close ordered. Figures are kept in hundredths of a millionth until the
+    /// end, which rounds down.
     function measure(
         address station,
         int256 dollars,
@@ -593,12 +630,17 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
         uint256 fraction,
         uint256 part,
         uint16 bandBps
-    ) external view returns (int256) {
+    ) external view returns (int256 measured, int256 least) {
         int256[] memory current = exposure(station);
+        uint256 n = current.length;
         int256 then = dollars * 100;
         int256 now_ = ledger(station) * 100;
+        // The account as it was, every order filled at its limit.
+        int256 worst = dollars * 100;
         uint256 ordered;
-        for (uint256 i = 0; i < current.length; i++) {
+        uint256 orderedThen;
+        uint256 band = Math.min(bandBps, BPS);
+        for (uint256 i = 0; i < n; i++) {
             int256 was = before[i];
             int256 is_ = current[i];
             uint256 px;
@@ -622,18 +664,53 @@ contract HyperliquidDriver is IDriver, IDelayedDriver {
             then += was * int256(px);
             now_ += is_ * int256(px);
             ordered += _part(uint256(was < 0 ? -was : was), fraction) * px;
+            // A long sold no lower than the stage's own price less the band,
+            // a short bought back no higher than it plus the band: the
+            // limits her orders were placed at, less what a fill pays the
+            // venue. Only the stage's prices: her own orders can't have
+            // filled worse than their limits.
+            uint256 stagePx = uint256(before[n + i]);
+            orderedThen += _part(uint256(was < 0 ? -was : was), fraction) * stagePx;
+            worst += was > 0
+                ? was * int256(stagePx.mulDiv(BPS - band - FEE_BOUND_BPS, BPS))
+                : was * int256(stagePx.mulDiv(BPS + band + FEE_BOUND_BPS, BPS, Math.Rounding.Ceil));
         }
-        int256 measured = now_ - _keptPart(then, fraction.mulDiv(part, WAD));
-        int256 least = -int256(ordered.mulDiv(Math.min(bandBps, BPS), BPS, Math.Rounding.Ceil));
-        if (measured < least) measured = least;
+        uint256 share = fraction.mulDiv(part, WAD);
+        measured = now_ - _keptPart(then, share);
+        least = -int256(ordered.mulDiv(band, BPS, Math.Rounding.Ceil));
+        // Her part of the account as it was with every order of the part
+        // closed filled at its limit: the least her close fetched. A
+        // measure below it is a loss her orders could not have made (a
+        // reduction the venue forced, funding, an order resting before the
+        // stage that filled before the executor cancelled it), which the
+        // whole pool shares: the station lapses the stage rather than pay
+        // or charge it. A price that moved after her orders filled changes
+        // neither figure: her part was sold, and the rest is repriced on
+        // both sides.
+        // What wasn't closed of what was ordered may have filled and been
+        // traded back since: no more than the band on it at the stage's
+        // prices is the leaver's to lose.
+        int256 floor = _share(worst, share)
+            - int256(
+                orderedThen.mulDiv(band, BPS, Math.Rounding.Ceil).mulDiv(WAD - part, WAD, Math.Rounding.Ceil)
+            );
+        if (floor > least) least = floor;
         // Down, toward minus infinity.
-        return measured >= 0 ? measured / 100 : -((-measured + 99) / 100);
+        measured = measured >= 0 ? measured / 100 : -((-measured + 99) / 100);
+        least = least >= 0 ? least / 100 : -((-least + 99) / 100);
     }
 
     /// Spot lots worth less than the smallest order at `px` (a hundredth of
     /// a millionth per lot): nothing can sell them.
     function _sellable(int256 lots, uint256 px) private pure returns (int256) {
         return lots > 0 && uint256(lots) * px < MIN_ORDER * 100 ? int256(0) : lots;
+    }
+
+    /// `fraction` of `worth`, rounded down (toward minus infinity).
+    function _share(int256 worth, uint256 fraction) private pure returns (int256) {
+        uint256 size = uint256(worth < 0 ? -worth : worth);
+        uint256 part = size.mulDiv(fraction, WAD, worth < 0 ? Math.Rounding.Ceil : Math.Rounding.Floor);
+        return worth < 0 ? -int256(part) : int256(part);
     }
 
     /// (1 - `fraction`) of `worth`, rounded up.

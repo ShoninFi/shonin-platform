@@ -524,4 +524,34 @@ mod tests {
         tight.add(1.0, 0.0, &small, lamports * LAMPORT_AS_WEI);
         assert!(tight.total() < U256::from(150_000_000u64));
     }
+    // Rent the key gets back (an Orca position closed) is credited against
+    // what was billed, so an agent that re-centres its band pays one
+    // position's rent, not one each time.
+    #[test]
+    fn rent_paid_refunded_and_paid_again_is_billed_once() {
+        // A position's rent (position, Token-2022 mint, its token account),
+        // about 0.007 SOL; SOL at $150; a generous allowance.
+        let rent: i64 = 7_000_000;
+        let allowed = gas_only(1_000.0);
+        let mut meter = Meter::new(Some(150.0), 0);
+        // The key's running total of lamports spent, `spent` in `Trading`,
+        // read as `meter` reads it each tick.
+        let gas_now = |spent: i64| spent.max(0) as u128 * LAMPORT_AS_WEI;
+        let mut spent = 0i64;
+        // A day served first, so the allowance holds back none of it.
+        meter.add(86_400.0, 0.0, &allowed, gas_now(spent));
+        // Tick 1: an open (rent paid). Tick 2: the close (rent back).
+        // Tick 3: the open of the new band (rent paid). Fees left out.
+        for change in [rent, -rent, rent] {
+            spent += change;
+            meter.add(5.0, 0.0, &allowed, gas_now(spent));
+        }
+        // Net the key is out one position's rent: $1.05.
+        let billed = meter.total();
+        assert_eq!(
+            billed,
+            U256::from(1_050_000u64),
+            "billed {billed} millionths of a dollar for one position's rent ($1.05) held"
+        );
+    }
 }

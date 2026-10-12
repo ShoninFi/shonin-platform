@@ -99,8 +99,10 @@ pub struct Funding {
 pub enum HyperliquidFeed {
     /// Every market's mid price, whenever any changes.
     Mids,
-    /// One market's book (a coin, such as `BTC`, or a spot pair such as
-    /// `@107`).
+    /// One market's book: a perp by its coin (`BTC`), or a spot pair by the
+    /// name orders use (`HYPE/USDC`), which the executor turns into the
+    /// venue's own name for it on the network it serves (or by that name,
+    /// `@107`, which differs between networks).
     Book { coin: String },
     /// One perpetual's funding, mark and oracle prices.
     Funding { coin: String },

@@ -24,8 +24,24 @@ import {Math} from "openzeppelin/utils/math/Math.sol";
 /// the venue, and delivered once it has landed, or, a delivery window after
 /// the ask, the part of it that has landed is delivered. A measure below
 /// nothing is a loss the stage's own sale made, owed by whom it was for.
-/// Only a stage nothing at all could be measured for by the end of its
-/// window (no reading of the venue after it) lapses with nothing paid.
+///
+/// The account can't tell the stage's fills from anyone else's trades, so
+/// the proof has a fixed span: from the stage until it is proved, or until
+/// `PROOF_WINDOWS` windows after it was placed, the attested executor
+/// trades nothing at its venues (it cancels the account's resting orders
+/// and refuses the agent's orders and moves there). The venue can still
+/// act on the account meanwhile (a liquidation, a deleveraging, funding),
+/// and nothing read there says whose a reduction was, so a stage is paid
+/// only on evidence that can all be hers: where a position is smaller than
+/// her orders could have made it, on the other side, or larger, the driver
+/// can't tell, and where the account is worth less than her orders could
+/// have fetched at their limits, the loss is the whole pool's. Either way
+/// the stage lapses: nothing is paid from it or charged to her, what it
+/// sold stays the pool's, and her claim is staged again later, measured
+/// from the account as it is then. A stage not proved by its deadline can
+/// no longer be, and lapses the same way, as does one nothing at all could
+/// be measured for by the end of its window (no reading of the venue after
+/// it).
 library StationCloses {
     using StationStorage for StationLayout;
     using SafeERC20 for IERC20;
@@ -33,6 +49,13 @@ library StationCloses {
 
     uint256 private constant WAD = 1e18;
     uint256 private constant BPS = 10_000;
+    /// How many delivery windows after it was placed a stage may still be
+    /// proved. A partial close is first proved once one window is over; a
+    /// second gives the keeper, or anyone, the leaver included, as long
+    /// again to land the proof, while it bounds how long the agent is kept
+    /// from trading its venues (ten minutes on Hyperliquid, an hour on
+    /// Lighter).
+    uint64 private constant PROOF_WINDOWS = 2;
 
     error NotAllowed();
     error NotYet();
@@ -263,7 +286,7 @@ library StationCloses {
             IDelayedDriver driver = IDelayedDriver(address(drivers[i]));
             window = uint64(Math.max(window, driver.deliveryWindow()));
             delay = uint64(Math.max(delay, driver.settleDelay()));
-            s.stagedExposure[name] = driver.exposure(address(this));
+            s.stagedExposure[name] = driver.snapshot(address(this));
             s.stagedLedger[name] = driver.ledger(address(this));
             s.stagedFreed[name] = freed[i];
             estimate += freed[i];
@@ -291,6 +314,7 @@ library StationCloses {
             sweptBlock: 0,
             window: window,
             delay: delay,
+            provedBy: uint64(block.timestamp) + PROOF_WINDOWS * window,
             forVault: s.isHome()
         });
         emit IStation.CloseStaged(fraction, owed, estimate);
@@ -311,22 +335,33 @@ library StationCloses {
             ) {
                 revert NotYet();
             }
+            // Past its deadline the agent may have traded the account again:
+            // nothing read there now is the stage's alone, and it lapses.
+            if (block.timestamp >= current.provedBy) {
+                _lapse(s);
+                return;
+            }
             bool over = block.timestamp >= uint256(current.stagedAt) + current.window;
             (uint256 part, bool known) = _closedPart(s, current);
             // Wholly closed proves it at once; anything less waits for the
             // window, and is then measured for the part that closed.
             if ((!known || part < WAD) && !over) revert NotYet();
             if (!known) {
-                // Nothing the venue did after the stage can be read: nothing
-                // can be measured, and the stage ends with nothing paid.
+                // Nothing the venue did after the stage can be read, or what
+                // it did isn't all hers: nothing can be measured, and the
+                // stage ends with nothing paid.
                 _lapse(s);
                 return;
             }
+            // What came home since the stage and each venue's measure, which
+            // counts it out where the venue's figures do; against what the
+            // close fetched at the least, venue by venue.
             int256 measured = int256(arrived);
+            int256 least;
             for (uint256 i = 0; i < s.spec.drivers.length; i++) {
                 bytes32 name = s.spec.drivers[i];
                 if (s.stagedExposure[name].length == 0) continue;
-                int256 one = IDelayedDriver(s.pinned(name)).measure(
+                (int256 one, int256 floor) = IDelayedDriver(s.pinned(name)).measure(
                     address(this),
                     s.stagedLedger[name],
                     s.stagedExposure[name],
@@ -335,8 +370,20 @@ library StationCloses {
                     s.spec.exitBandBps
                 );
                 measured += one;
-                // What to ask this venue for: its own part, as measured.
-                s.stagedFreed[name] = one > 0 ? uint256(one) : 0;
+                least += floor;
+                // What to ask this venue for: its own part, as measured, or
+                // as it fetched at the least.
+                int256 ask = one > floor ? one : floor;
+                s.stagedFreed[name] = ask > 0 ? uint256(ask) : 0;
+            }
+            // Less than her orders could have fetched at their limits: the
+            // account lost what her orders could not have (a reduction the
+            // venue forced, funding), which is the whole pool's. Neither
+            // paying her the least nor charging her the loss would be hers:
+            // the stage lapses.
+            if (measured < least) {
+                _lapse(s);
+                return;
             }
             current.part = part;
             if (measured < 0) {

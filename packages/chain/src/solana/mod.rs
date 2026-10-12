@@ -20,6 +20,8 @@
 //!   wire by address.
 //! - [`events`]: a landed transaction, and the events in it.
 //! - [`keys`]: the role keys, and keypair files.
+//! - [`orca`]: Orca Whirlpools through a station's Orca driver: the
+//!   driver's group, Orca's instructions, and a position's maths.
 //! - [`platform`]: every instruction the platform sends, built from the
 //!   deployment's accounts.
 //! - [`upkeep`]: what keeps a vault going (the bill, rent back, held
@@ -31,6 +33,7 @@ pub mod client;
 pub mod events;
 pub mod executor;
 pub mod keys;
+pub mod orca;
 pub mod platform;
 pub mod pro_rata;
 pub mod rpc;
@@ -58,6 +61,7 @@ pub mod programs {
     pub use shonin_driver as driver;
     pub use shonin_local_driver as local_driver;
     pub use shonin_local_venue as local_venue;
+    pub use shonin_orca_driver as orca_driver;
     pub use shonin_prices as prices;
     pub use shonin_profiles as profiles;
     pub use shonin_publishing as publishing;
@@ -81,6 +85,7 @@ pub mod programs {
             ("shonin_vault", shonin_vault::ID),
             ("shonin_local_venue", shonin_local_venue::ID),
             ("shonin_local_driver", shonin_local_driver::ID),
+            ("shonin_orca_driver", shonin_orca_driver::ID),
         ]
     }
 }

@@ -30,6 +30,7 @@ mod root;
 mod runner;
 mod scale;
 mod solana;
+mod staged;
 mod state;
 mod store;
 mod streams_rh;
@@ -145,6 +146,33 @@ async fn main() -> Result<()> {
         }
         .to_string()
     }));
+    // Agents name a spot pair's book as their orders name the pair; the
+    // venue numbers pairs per network, so their feed names are read from it,
+    // and read again now and then for pairs listed since.
+    let pairs_network = if args.chain_args.network == chain::NetworkName::Mainnet {
+        ::hyperliquid::Network::Mainnet
+    } else {
+        ::hyperliquid::Network::Testnet
+    };
+    tokio::spawn(async move {
+        let api = ::hyperliquid::Api::new(pairs_network);
+        let mut warned = Throttle::default();
+        loop {
+            let wait = match ::hyperliquid::Markets::read(&api).await {
+                Ok(markets) => {
+                    data::name_spot_pairs(&markets);
+                    SPOT_PAIRS_READ_EVERY
+                }
+                Err(error) => {
+                    if warned.due(std::time::Instant::now()) {
+                        tracing::warn!(error = %format!("{error:#}"), "Hyperliquid's spot pairs weren't read; agents can't yet ask for a pair's book by its name");
+                    }
+                    Duration::from_secs(5)
+                }
+            };
+            tokio::time::sleep(wait).await;
+        }
+    });
     // The EVM chains and the Solana clusters to serve. A Solana vault chain
     // named alone is served alone.
     let solana_targets = args.chain_args.solana_targets()?;
@@ -874,10 +902,13 @@ async fn sweep_one(
     if !servable {
         return Ok(());
     }
-    if finished(client, vault).await? {
+    if finished(client, vault).await? && !posts_for_lighter(client, book, vault).await? {
         // Past its grace the vault's station is stopped and its key has
         // nothing left to send. The meter runs on, so the final bill can
-        // still be collected.
+        // still be collected. A station with Lighter accounts still needs
+        // their posts, read after each of its unwinds, until the vault
+        // closes: such a vault is still taken on (after a restart, or a
+        // serve that failed) to post them, with no agent run.
         return Ok(());
     }
     let bundle = client.read(vault, IVault::bundleHashCall {}).await?;
@@ -1366,6 +1397,37 @@ async fn serve(
     )
     .await?;
 
+    // A halted vault past its agent's grace whose station trades on Lighter
+    // is served only to post its Lighter accounts: its station is stopped,
+    // or about to be, so nothing is approved and no agent runs.
+    if matches!(finished(&chain, vault).await, Ok(true))
+        && matches!(
+            station_trades_on(&chain, station, robinhood::LIGHTER).await,
+            Ok(true)
+        )
+    {
+        // The key's blessing is still asked for again when due: only a
+        // blessed key may post.
+        let _tracking = AbortOnDrop(tokio::spawn(track_blessing(
+            chain.clone(),
+            deployments.clone(),
+            attestation.clone(),
+            key.address,
+            vault,
+            bundle,
+            || {},
+        )));
+        let half = robinhood::LighterHalf::connect_to_post(
+            &chain,
+            key.clone(),
+            station,
+            robinhood::LIGHTER,
+        )
+        .await?;
+        let _posts = AbortOnDrop(half.report_loop());
+        return posted_until_closed(&chain, vault, &AtomicBool::new(false), true).await;
+    }
+
     // The station is the venue account's master and approves the key there.
     // Anyone may ask; it obeys only what the registry says. The venue holds
     // the key approved only until the blessing the station last copied to
@@ -1500,24 +1562,48 @@ async fn serve(
     // buying some on the pinned HYPE/USDC pair when it runs low, and keeps
     // looking for which markets the driver lists the venue doesn't list for
     // trading.
-    let (hyperliquid, _hyperliquid_events, _hyperliquid_hype, _hyperliquid_missing) =
-        if names(hyperliquid::DRIVER) {
-            let half = hyperliquid::Half::connect(
-                &chain,
-                vault,
-                station,
-                deployments.usd,
-                vault_key.signer(),
-                hyperliquid::DRIVER,
-            )
-            .await?;
-            let events = AbortOnDrop(half.forward_events(account_events.sender()));
-            let hype = AbortOnDrop(half.hype_loop());
-            let missing = AbortOnDrop(half.missing_loop());
-            (Some(half), Some(events), Some(hype), Some(missing))
-        } else {
-            (None, None, None, None)
-        };
+    //
+    // While a close staged at the station is being measured, the account's
+    // resting orders at its delayed venues are cancelled (see `staged`).
+    let (
+        hyperliquid,
+        _hyperliquid_events,
+        _hyperliquid_hype,
+        _hyperliquid_missing,
+        _hyperliquid_paused,
+    ) = if names(hyperliquid::DRIVER) {
+        let half = hyperliquid::Half::connect(
+            &chain,
+            vault,
+            station,
+            deployments.usd,
+            vault_key.signer(),
+            hyperliquid::DRIVER,
+        )
+        .await?;
+        let events = AbortOnDrop(half.forward_events(account_events.sender()));
+        let hype = AbortOnDrop(half.hype_loop());
+        let missing = AbortOnDrop(half.missing_loop());
+        let cancelling = half.clone();
+        let paused = AbortOnDrop(staged::cancel_loop(
+            chain.clone(),
+            station,
+            hyperliquid::DRIVER,
+            move || {
+                let half = cancelling.clone();
+                async move { half.cancel_resting().await }
+            },
+        ));
+        (
+            Some(half),
+            Some(events),
+            Some(hype),
+            Some(missing),
+            Some(paused),
+        )
+    } else {
+        (None, None, None, None, None)
+    };
     // A Robinhood Chain vault's Safe is traded by this vault's key through
     // the Safe's role; its Lighter account by a Lighter key made now, which
     // the station registers, and whose accounts this executor posts on the
@@ -1535,10 +1621,25 @@ async fn serve(
             robinhood::LighterHalf::connect(&chain, key.clone(), station, robinhood::LIGHTER)
                 .await?;
         let posts = AbortOnDrop(half.report_loop());
-        (Some(half), Some(posts))
+        let cancelling = half.clone();
+        let paused = AbortOnDrop(staged::cancel_loop(
+            chain.clone(),
+            station,
+            robinhood::LIGHTER,
+            move || {
+                let half = cancelling.clone();
+                async move { half.cancel_resting().await }
+            },
+        ));
+        (Some(half), Some((posts, paused)))
     } else {
         (None, None)
     };
+
+    // Taken on past its grace only to post its Lighter accounts: no agent.
+    if _lighter_posts.is_some() && matches!(finished(&chain, vault).await, Ok(true)) {
+        return posted_until_closed(&chain, vault, &replaced, _lighter_posts.is_some()).await;
+    }
 
     // Until the vault's halt is known (see [`Shared::halt_known`]), a halted
     // vault starts a faulting agent again at once, however long ago it
@@ -1561,13 +1662,14 @@ async fn serve(
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
             tracing::info!(%vault, "the vault has stopped; letting it go");
-            return Ok(Stop::Finished);
+            return posted_until_closed(&chain, vault, &replaced, _lighter_posts.is_some()).await;
         }
         // A dry tank, or one not yet read, holds the agent back: a tank
         // already dry when the vault was taken on is never traded on.
         if dry.load(Ordering::SeqCst) || !metered.load(Ordering::SeqCst) {
             if finished(&chain, vault).await? {
-                return Ok(Stop::Finished);
+                return posted_until_closed(&chain, vault, &replaced, _lighter_posts.is_some())
+                    .await;
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
@@ -1712,7 +1814,7 @@ async fn serve(
         let done = done_its_part(ended_cleanly, halting_heard.load(Ordering::SeqCst));
         if after_the_agent(&chain, vault, &wound_down, done).await? {
             tracing::info!(%vault, "the vault has stopped; letting it go");
-            return Ok(Stop::Finished);
+            return posted_until_closed(&chain, vault, &replaced, _lighter_posts.is_some()).await;
         }
         if stopped_dry {
             continue;
@@ -1759,10 +1861,80 @@ async fn serve(
             }
             Some(Woken::Finished) => {
                 tracing::info!(%vault, "the vault has stopped; letting it go");
-                return Ok(Stop::Finished);
+                return posted_until_closed(&chain, vault, &replaced, _lighter_posts.is_some())
+                    .await;
             }
             Some(Woken::Replaced) => return Ok(Stop::Replaced),
         }
+    }
+}
+
+/// Whether `vault`'s station trades on Lighter, whose accounts only posts
+/// value.
+async fn posts_for_lighter(client: &Client, book: &mut Book, vault: Address) -> Result<bool> {
+    let station = match book.stations.get(&vault) {
+        Some(station) => *station,
+        None => {
+            let station = client.read(vault, IVault::homeStationCall {}).await?;
+            book.stations.insert(vault, station);
+            station
+        }
+    };
+    station_trades_on(client, station, robinhood::LIGHTER).await
+}
+
+/// Whether `station` declares the driver called `driver`.
+async fn station_trades_on(client: &Client, station: Address, driver: &str) -> Result<bool> {
+    let spec = client
+        .read(station, chain::bindings::station::IStation::specCall {})
+        .await?;
+    Ok(spec
+        .drivers
+        .iter()
+        .any(|declared| *declared == robinhood::name(driver)))
+}
+
+/// How often Hyperliquid's spot pairs are read again for their feed names.
+const SPOT_PAIRS_READ_EVERY: Duration = Duration::from_secs(600);
+
+/// How often a halted vault whose Lighter accounts are still posted for is
+/// looked at to see whether it has closed.
+const POSTED_UNTIL_CLOSED_LOOK: Duration = Duration::from_secs(10);
+
+/// The serve's end once its agent has nothing left to run. A Lighter
+/// account is valued and its closes proved only by posts read after them,
+/// and a halted vault's full unwind runs after the agent's grace: so while
+/// this executor posts for the vault's Lighter accounts it goes on posting,
+/// its post loop kept alive here, until the vault has closed (everything
+/// its stations held has come home or been given up) or another executor's
+/// key holds the station's approval.
+async fn posted_until_closed(
+    chain: &Client,
+    vault: Address,
+    replaced: &AtomicBool,
+    posting: bool,
+) -> Result<Stop> {
+    if !posting {
+        return Ok(Stop::Finished);
+    }
+    tracing::info!(%vault, "the agent's grace is over; posting the Lighter accounts until the vault closes");
+    // Nothing is traded any more, so nothing here waits on holding the
+    // station's approval: a driver of the station's revoked, or another
+    // executor's key approved, leaves these posts as useful as before (the
+    // board takes any blessed key's newer reading).
+    let _ = replaced;
+    loop {
+        match chain.read(vault, IVault::stateCall {}).await {
+            Ok(VaultState::None | VaultState::Closed | VaultState::Cancelled) => {
+                tracing::info!(%vault, "the vault has closed; letting it go");
+                return Ok(Stop::Finished);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!(%vault, error = %format!("{error:#}"), "the vault's state wasn't read");
+            }
+        }
+        tokio::time::sleep(POSTED_UNTIL_CLOSED_LOOK).await;
     }
 }
 
@@ -2742,18 +2914,19 @@ fn recorded_in(
         .manifest
         .check(&catalogue, network)
         .map_err(|why| anyhow::anyhow!("this image won't run it: {why}"))?;
-    // This image carries four drivers' executor halves: the stand-in
-    // venue's, Hyperliquid's, and Robinhood Chain's two (its stock tokens
-    // and Lighter), which an agent may use together.
+    // This image carries five drivers' executor halves: the stand-in
+    // venue's, Hyperliquid's, Orca's, and Robinhood Chain's two (its stock
+    // tokens and Lighter), which an agent may use together.
     let drivers: Vec<String> = canonical.manifest.drivers.keys().cloned().collect();
     let robinhood_chain = |name: &str| name == robinhood::ROBINHOOD || name == robinhood::LIGHTER;
+    let alone = [host::LOCAL, hyperliquid::DRIVER, solana::ORCA];
     let carried = match drivers.as_slice() {
-        [only] if only.as_str() == host::LOCAL || only.as_str() == hyperliquid::DRIVER => true,
+        [only] if alone.contains(&only.as_str()) => true,
         some => !some.is_empty() && some.iter().all(|name| robinhood_chain(name)),
     };
     anyhow::ensure!(
         carried,
-        "this image carries the local or hyperliquid driver alone, or robinhood and lighter together, and the manifest names {drivers:?}"
+        "this image carries the local, hyperliquid or orca driver alone, or robinhood and lighter together, and the manifest names {drivers:?}"
     );
     Ok(Recorded {
         drivers,

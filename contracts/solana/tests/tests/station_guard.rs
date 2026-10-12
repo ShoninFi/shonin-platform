@@ -271,6 +271,10 @@ fn a_foreign_account_where_the_authoritys_own_must_stand_is_refused() {
                     vec![other.authority_dollars(0), home.vault_dollars, stranger]
                 }
                 Own::Fixed(_) => vec![other_account, stranger, home.authority_dollars(0)],
+                // The stand-in venue keeps no positions as tokens.
+                Own::StationMint(_) | Own::StationPositionToken(_) | Own::StationPositionHeld => {
+                    unreachable!("the stand-in venue's allowlist names no position mint")
+                }
             };
             for substitute in substitutes {
                 let mut changed = ix.clone();
@@ -650,6 +654,8 @@ fn pinned_with(owns: Vec<Own>, fixed: Vec<Vec<Pubkey>>) -> Pinned {
         }],
         addresses: vec![],
         fixed,
+        position_mints: vec![],
+        token_accounts: vec![],
     }
 }
 
@@ -1210,4 +1216,87 @@ fn a_drivers_close_naming_the_stations_own_dollar_account_is_refused() {
     );
     assert_eq!(env.usd_balance(&home.vault), vault);
     assert_eq!(env.position(&home.authority(0), spot()), UNIT as i128);
+}
+
+/// An allowlist over one instruction, `[7]`, whose positions are `owns` in
+/// order, at the stand-in venue.
+fn allowlist_of(owns: Vec<Own>) -> shonin_driver::Allowlist {
+    shonin_driver::Allowlist {
+        venue: shonin_local_venue::ID,
+        rules: vec![Rule {
+            discriminator: vec![7],
+            class: Class::Trade,
+            positions: owns
+                .into_iter()
+                .enumerate()
+                .map(|(index, own)| Position {
+                    index: index as u8,
+                    own,
+                })
+                .collect(),
+        }],
+        fixed: vec![],
+    }
+}
+
+/// A position's token account names a position mint standing in its own
+/// instruction, and position mints come in a bounded number of slots.
+#[test]
+fn a_position_token_must_name_a_position_mint_of_its_own_rule() {
+    let valid =
+        |owns: Vec<Own>| guard::validate(&allowlist_of(owns), &shonin_test_vault::ID).is_ok();
+    assert!(valid(vec![
+        Own::Station,
+        Own::StationMint(2),
+        Own::StationPositionToken(1)
+    ]));
+    // Naming a position that is no position mint, or itself.
+    assert!(!valid(vec![Own::Station, Own::StationPositionToken(0)]));
+    assert!(!valid(vec![Own::StationPositionToken(0)]));
+    assert!(!valid(vec![
+        Own::StationMint(2),
+        Own::StationPositionToken(5)
+    ]));
+    // No slots, or more than a station keeps.
+    assert!(!valid(vec![Own::StationMint(0)]));
+    let most = shonin_driver::MAX_POSITION_MINTS as u8;
+    assert!(valid(vec![Own::StationMint(most)]));
+    assert!(!valid(vec![Own::StationMint(most + 1)]));
+    // A held position needs some rule giving the authority position mints.
+    assert!(!valid(vec![Own::StationPositionHeld]));
+    assert!(valid(vec![Own::StationPositionHeld, Own::StationMint(1)]));
+}
+
+/// A position mint is one of the authority's first slots the rule names,
+/// and the station signs for that one; any other address is foreign.
+#[test]
+fn a_position_mint_is_one_of_the_authority_s_slots_and_nothing_else() {
+    let station = Pubkey::new_unique();
+    let mut pinned = pinned_with(vec![Own::StationMint(2)], vec![]);
+    let allowlist = allowlist_of(vec![Own::StationMint(3)]);
+    pinned.position_mints = guard::position_mints(&allowlist, &AUTHORITY);
+    assert_eq!(pinned.position_mints.len(), 3);
+    for (slot, mint) in pinned.position_mints.iter().enumerate() {
+        assert_eq!(
+            mint.address,
+            shonin_driver::position_mint(&shonin_station::ID, &AUTHORITY, slot as u8).0
+        );
+    }
+    let check = |key: Pubkey| {
+        guard::check(
+            &call(&[key]),
+            &pinned,
+            std::slice::from_ref(&pinned),
+            &station,
+            &Pubkey::new_unique(),
+            &shonin_test_vault::ID,
+            &[],
+        )
+    };
+    let second = check(pinned.position_mints[1].address).expect("the second slot is taken");
+    assert_eq!(second.mints, vec![1]);
+    // The third slot is beyond the two this rule names.
+    assert!(check(pinned.position_mints[2].address).is_err());
+    assert!(check(Pubkey::new_unique()).is_err());
+    assert!(check(AUTHORITY).is_err());
 }

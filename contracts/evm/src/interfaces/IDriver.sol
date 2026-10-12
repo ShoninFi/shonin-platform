@@ -112,6 +112,11 @@ interface IDelayedDriver {
     /// and `measure` reprices. A driver may add to it what it needs to read
     /// it again (when it was read, the prices it was read at).
     function exposure(address station) external view returns (int256[] memory);
+    /// What the station keeps of the account when it stages a close: its
+    /// `exposure`, and after it whatever else the driver needs to measure
+    /// the close later (the venue's own prices the close's orders were
+    /// limited by). `closedPart` and `measure` are given this.
+    function snapshot(address station) external view returns (int256[] memory);
     /// The station's dollars through the driver, signed (a perp ledger can
     /// be negative): with `exposure`, everything the account is worth.
     function ledger(address station) external view returns (int256);
@@ -121,7 +126,11 @@ interface IDelayedDriver {
     /// now, on the same side; the smallest of those, and 1e18 where nothing
     /// needed ordering. `known` is false while the driver can't yet tell
     /// from what the venue did after `since` (the stage plus its settle
-    /// delay): a reading made before then says nothing about the close.
+    /// delay): a reading made before then says nothing about the close. It
+    /// is false too where a position is smaller than the close's own order
+    /// could have made it, has crossed to the other side, or, where it was
+    /// ordered, is larger: the venue changed it some other way (a forced
+    /// reduction), and nothing read there says which part was hers.
     function closedPart(
         address station,
         int256[] calldata before,
@@ -129,17 +138,27 @@ interface IDelayedDriver {
         uint64 since
     ) external view returns (uint256 part, bool known);
     /// What a close of `fraction` placed when the account held `dollars`
-    /// (its `ledger`) and `before` (its `exposure`) fetched for `part` of
+    /// (its `ledger`) and `before` (its `snapshot`) fetched for `part` of
     /// it (1e18 is all), by the venue's prices now: what the account is
     /// worth now, less what the rest of the account as it was
     /// (1 - `fraction` x `part`) would be worth now, rounded against the
     /// leaver. A market move since cancels out, and so does a trade made
     /// since at the price now; every dollar of slippage of what the close
-    /// sold falls on it. Never below what the close's own orders could have
-    /// lost at their limits (`bandBps` of what they ordered, at the prices
-    /// now), so a loss nobody's close could have made isn't the leaver's.
-    /// It may be negative; the station adds what reached it from the venue
-    /// meanwhile.
+    /// sold falls on it. It may be negative.
+    ///
+    /// And `least`, what the close fetched at the least: her part of the
+    /// account as it was, every order filled at its limit (the venue's own
+    /// price at the stage, less or plus the band) and paying the venue's
+    /// taker fee at most, never below what the orders could lose at their
+    /// limits at the prices now. It reads the stage's prices only: her own
+    /// orders never fill worse than their limits, so a measure below the
+    /// least is a loss her orders could not have made (a reduction the
+    /// venue forced, funding, an order resting before the stage that filled
+    /// before it was cancelled), which is the whole pool's. A price that
+    /// moved after her orders filled changes neither figure. The station
+    /// adds what reached it from the venue meanwhile to the measures; where
+    /// that is below the sum of the leasts, it lapses the stage, paying and
+    /// charging nothing.
     function measure(
         address station,
         int256 dollars,
@@ -147,7 +166,7 @@ interface IDelayedDriver {
         uint256 fraction,
         uint256 part,
         uint16 bandBps
-    ) external view returns (int256);
+    ) external view returns (int256 measured, int256 least);
     /// How long a close through the driver may take to be proved, and its
     /// dollars to reach the station once asked for.
     function deliveryWindow() external view returns (uint64);

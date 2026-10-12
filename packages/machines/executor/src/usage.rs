@@ -327,10 +327,18 @@ impl Meter {
         self.capacity += cost(running.min(seconds), allowances);
         let day = allowances.gas_per_day * unit;
         self.gas_allowed += day * (seconds / 86_400.0);
-        let paid = gas_now.saturating_sub(self.gas_seen);
+        // A rise is what the key paid; a fall is what it got back (rent an
+        // account closed returned to it), credited against what was billed,
+        // never below nothing: the same lamports paid, refunded and paid
+        // again are billed once, and nothing never billed is credited.
+        let (paid, back) = (
+            gas_now.saturating_sub(self.gas_seen),
+            self.gas_seen.saturating_sub(gas_now),
+        );
         self.gas_seen = gas_now;
         if let Some(price) = self.native_usd {
             self.gas_spent += paid as f64 / 1e18 * price * unit;
+            self.gas_spent = (self.gas_spent - back as f64 / 1e18 * price * unit).max(0.0);
         }
         // Unspent allowance is carried, but no more than a day's: the vault
         // carries its own unused cap the same way, and never charges more.

@@ -88,11 +88,19 @@ contract Station is IStation, ReentrancyGuardTransient {
         s.spec = spec_;
         // Pin what the registry approves now, for good.
         IAttestationRegistry registry = s.registry();
+        uint256 delayed;
         for (uint256 i = 0; i < spec_.drivers.length; i++) {
             address implementation = registry.tradingDriver(spec_.drivers[i]);
             if (implementation == address(0)) revert NotApproved();
             s.pinnedDriver[spec_.drivers[i]] = implementation;
+            if (IDriver(implementation).exitPath() == ExitPath.Delayed) delayed++;
         }
+        // A station closes through drivers that all settle in the
+        // transaction, or all after it: a stage beside a venue that closes at
+        // once would sell there for a leaver whatever part of the delayed
+        // close then happens, and a try that closes nothing would leave that
+        // sale's spread with the holders who stay.
+        if (delayed != 0 && delayed != spec_.drivers.length) revert MixedExits();
         for (uint256 i = 0; i < spec_.bridges.length; i++) {
             address implementation = registry.bridgeOf(spec_.bridges[i]);
             if (implementation == address(0)) revert NotApproved();

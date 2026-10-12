@@ -116,6 +116,7 @@ async fn a_claim_held_off_by_a_close_staged_in_the_same_round_does_not_freeze_th
                     sweptBlock: 0,
                     window: 1_800,
                     delay: 120,
+                    provedBy: u64::MAX,
                     forVault: true,
                 })));
             }

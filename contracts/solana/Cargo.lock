@@ -4301,6 +4301,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "shonin-orca-driver"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang",
+ "shonin-driver",
+ "shonin-program-id",
+ "shonin-station",
+ "uint",
+]
+
+[[package]]
 name = "shonin-prices"
 version = "0.1.0"
 dependencies = [
@@ -4380,6 +4391,7 @@ dependencies = [
  "shonin-local-venue",
  "shonin-local-venue-2",
  "shonin-local-venue-3",
+ "shonin-orca-driver",
  "shonin-prices",
  "shonin-profiles",
  "shonin-publishing",
@@ -4398,6 +4410,7 @@ dependencies = [
  "solana-keypair",
  "solana-message",
  "solana-sdk-ids",
+ "solana-sha256-hasher",
  "solana-signer",
  "solana-transaction",
  "solana-transaction-error",

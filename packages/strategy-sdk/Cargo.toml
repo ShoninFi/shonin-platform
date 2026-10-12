@@ -21,9 +21,10 @@ name = "strategy_sdk"
 # Each driver's typed payloads. They need nothing beyond what the SDK already
 # uses, so they stay on by default; a driver's executor half turns off the
 # rest.
-default = ["hyperliquid", "lighter", "robinhood"]
+default = ["hyperliquid", "lighter", "orca", "robinhood"]
 hyperliquid = []
 lighter = []
+orca = []
 robinhood = []
 
 [dependencies]

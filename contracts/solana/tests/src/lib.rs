@@ -33,6 +33,7 @@ pub use shonin_prices::{Allowances, PricePeriod, UnitPrices};
 pub use shonin_publishing::state::{ChainNeed, Lists, Review, ReviewInput, Strategy, Submission};
 pub use shonin_registry::state::{ApprovalKind, ImageKind, Journal, KeyInfo};
 
+pub mod orca;
 pub mod real_token;
 pub mod station;
 pub mod vault;
@@ -211,7 +212,13 @@ impl Env {
     /// proposed, the timelock passed, and the builder and reviewer keys
     /// blessed.
     pub fn new() -> Self {
-        let mut env = Self::bare();
+        Self::new_with_mint(None)
+    }
+
+    /// The same, the dollar's mint at `mint` when one is given (as a driver
+    /// that lists the dollar by its address needs), else at a fresh address.
+    pub fn new_with_mint(mint: Option<Pubkey>) -> Self {
+        let mut env = Self::bare_with_mint(mint);
         env.initialize_registry(TIMELOCK, 0);
         env.initialize_publishing();
         env.initialize_prices();
@@ -240,6 +247,10 @@ impl Env {
     /// The programs deployed and the first checker created, and nothing set
     /// up: for tests of setting up.
     pub fn bare() -> Self {
+        Self::bare_with_mint(None)
+    }
+
+    fn bare_with_mint(mint: Option<Pubkey>) -> Self {
         let mut svm = LiteSVM::new();
         let mut clock = svm.get_sysvar::<Clock>();
         clock.unix_timestamp = START as i64;
@@ -319,7 +330,10 @@ impl Env {
         }
         let attestor = env.attestor.pubkey();
         env.checker = env.create_checker(attestor);
-        env.create_mint();
+        match mint {
+            Some(address) => env.place_mint(address),
+            None => env.create_mint(),
+        }
         env
     }
 
@@ -1435,6 +1449,38 @@ impl Env {
         .unwrap();
         expect_ok(self.send(vec![create, init], &[&payer, &mint]));
         self.mint = mint.pubkey();
+        let platform = self.platform.pubkey();
+        self.token_account(&platform);
+    }
+
+    /// The dollar's mint, placed at `address` with the fixture's mint
+    /// authority: a mint nobody holds the key of, which only a test can put
+    /// there.
+    fn place_mint(&mut self, address: Pubkey) {
+        use anchor_lang::solana_program::program_pack::Pack;
+        let mint = spl_token::state::Mint {
+            mint_authority: Some(self.mint_authority.pubkey()).into(),
+            supply: 0,
+            decimals: 6,
+            is_initialized: true,
+            freeze_authority: None.into(),
+        };
+        let mut data = vec![0; spl_token::state::Mint::LEN];
+        mint.pack_into_slice(&mut data);
+        let lamports = self.svm.minimum_balance_for_rent_exemption(data.len());
+        self.svm
+            .set_account(
+                address,
+                Account {
+                    lamports,
+                    data,
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        self.mint = address;
         let platform = self.platform.pubkey();
         self.token_account(&platform);
     }

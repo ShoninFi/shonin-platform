@@ -81,7 +81,7 @@ const EXPLORER_LOOK_EVERY: Duration = Duration::from_secs(1);
 const WITHDRAWAL_PAGES: u64 = 5;
 
 /// A driver's name as a station keys it: the name, zero-padded.
-fn name(driver: &str) -> B256 {
+pub fn name(driver: &str) -> B256 {
     let mut bytes = [0u8; 32];
     bytes[..driver.len()].copy_from_slice(driver.as_bytes());
     B256::from(bytes)
@@ -317,6 +317,28 @@ impl LighterHalf {
         station: Address,
         driver: &str,
     ) -> Result<Arc<Self>> {
+        Self::connect_as(chain, key, station, driver, true).await
+    }
+
+    /// The half for posting alone, for a halted vault whose agent's grace is
+    /// over: it names no Lighter key on the board and registers none at the
+    /// exchange, since nothing will be traded.
+    pub async fn connect_to_post(
+        chain: &Client,
+        key: KeyClient,
+        station: Address,
+        driver: &str,
+    ) -> Result<Arc<Self>> {
+        Self::connect_as(chain, key, station, driver, false).await
+    }
+
+    async fn connect_as(
+        chain: &Client,
+        key: KeyClient,
+        station: Address,
+        driver: &str,
+        trading: bool,
+    ) -> Result<Arc<Self>> {
         let (api, explorer, chain_id) = match chain.chain_id {
             robinhood::listings::MAINNET => (
                 lighter::Api::new(lighter::api::MAINNET),
@@ -348,14 +370,16 @@ impl LighterHalf {
             }
         };
         let lighter_key = lighter::Key::generate();
-        key.send(
-            board,
-            lighter::report::ILighterBoard::setPubKeyCall {
-                pubKey: lighter_key.public().to_vec().into(),
-            },
-        )
-        .await
-        .context("naming this start's Lighter key on the board")?;
+        if trading {
+            key.send(
+                board,
+                lighter::report::ILighterBoard::setPubKeyCall {
+                    pubKey: lighter_key.public().to_vec().into(),
+                },
+            )
+            .await
+            .context("naming this start's Lighter key on the board")?;
+        }
         let half = Arc::new(Self {
             chain: chain.clone(),
             key,
@@ -375,7 +399,7 @@ impl LighterHalf {
             trader: Mutex::new(None),
         });
         // Best effort now; tried again before the first order.
-        if let Err(error) = half.trader().await {
+        if trading && let Err(error) = half.trader().await {
             tracing::info!(%station, error = %format!("{error:#}"), "no Lighter account to trade yet");
         }
         Ok(half)
@@ -447,6 +471,36 @@ impl LighterHalf {
                 return Outcome::Refused(format!("that is not a Lighter action: {error}"));
             }
         };
+        self.send(&action).await
+    }
+
+    /// Cancel every order resting on the account: one, once it is sent, or
+    /// none when the station has no account yet (nothing can rest).
+    pub async fn cancel_resting(&self) -> Result<usize> {
+        if self.trader.lock().await.is_none() {
+            let account = self
+                .chain
+                .read(
+                    self.exchange,
+                    IExchange::addressToAccountIndexCall {
+                        owner: self.station,
+                    },
+                )
+                .await?;
+            if account.is_zero() {
+                return Ok(0);
+            }
+        }
+        match self.send(&lighter::payload::Action::CancelAll).await {
+            Outcome::Accepted(_) => Ok(1),
+            Outcome::Refused(why) | Outcome::Unknown(why) => {
+                Err(anyhow!("cancelling the account's orders: {why}"))
+            }
+        }
+    }
+
+    /// Sign one action with this start's key and send it.
+    async fn send(&self, action: &lighter::payload::Action) -> Outcome<Vec<u8>> {
         let held = match self.trader().await {
             Ok(held) => held,
             Err(error) => return Outcome::Refused(format!("{error:#}")),
@@ -460,7 +514,7 @@ impl LighterHalf {
             Ok(nonce) => nonce,
             Err(error) => return Outcome::Refused(format!("{error:#}")),
         };
-        let signed = match trader.sign(&action, nonce, now_ms()) {
+        let signed = match trader.sign(action, nonce, now_ms()) {
             Ok(signed) => signed,
             Err(error) => return Outcome::Refused(format!("{error:#}")),
         };

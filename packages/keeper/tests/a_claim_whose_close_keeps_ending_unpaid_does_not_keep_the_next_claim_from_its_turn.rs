@@ -131,6 +131,7 @@ async fn a_claim_whose_close_keeps_ending_unpaid_does_not_keep_the_next_claim_fr
                     sweptBlock: 0,
                     window: 300,
                     delay: 0,
+                    provedBy: u64::MAX,
                     forVault: true,
                 })));
             }

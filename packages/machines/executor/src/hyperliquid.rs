@@ -55,7 +55,7 @@ const USDC_TOKEN: u64 = 0;
 const GAS_TOKEN_NAME: &str = "HYPE";
 /// How often the venue's markets are read again to find which of the
 /// pinned driver's markets it doesn't list for trading.
-const MISSING_LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+pub const MISSING_LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// One vault's Hyperliquid account, and the key that trades it.
 pub struct Half {
@@ -154,48 +154,14 @@ impl Half {
     pub fn missing_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let half = self.clone();
         tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(MISSING_LOOK_EVERY).await;
-                let markets = match Markets::read(&half.api).await {
-                    Ok(markets) => markets,
-                    Err(error) => {
-                        tracing::warn!(
-                            station = %half.station,
-                            error = %format!("{error:#}"),
-                            "the venue's markets couldn't be read to look for the missing ones"
-                        );
-                        continue;
-                    }
-                };
-                let Ok(allowlist) =
-                    Allowlist::from_driver(half.station, markets, &half.perps, &half.spots)
-                else {
-                    continue;
-                };
-                let was = half.trader.allowlist();
-                if allowlist.missing != was.missing {
-                    for market in was.missing.keys() {
-                        if !allowlist.missing.contains_key(market) {
-                            tracing::info!(
-                                station = %half.station,
-                                market,
-                                "a market the station's driver lists is listed for trading again, and traded"
-                            );
-                        }
-                    }
-                    for (market, why) in &allowlist.missing {
-                        if !was.missing.contains_key(market) {
-                            tracing::warn!(
-                                station = %half.station,
-                                market,
-                                why,
-                                "a market the station's driver lists is no longer listed for trading, and is not traded"
-                            );
-                        }
-                    }
-                    half.trader.hold_to(allowlist);
-                }
-            }
+            look_for_missing(
+                &half.trader,
+                &half.api,
+                half.station,
+                (&half.perps, &half.spots),
+                MISSING_LOOK_EVERY,
+            )
+            .await
         })
     }
 
@@ -712,6 +678,44 @@ impl Half {
 }
 
 impl Half {
+    /// Cancel every order resting on the account, trigger orders among
+    /// them, as the venue lists them now: how many were cancelled. Each
+    /// is tried; any that fails makes the whole an error, to be tried
+    /// again.
+    pub async fn cancel_resting(&self) -> Result<usize> {
+        use hyperliquid::payload::{Action, OrderRef};
+        let answer = self
+            .api
+            .info(serde_json::json!({"type": "frontendOpenOrders", "user": self.station}))
+            .await
+            .context("reading the account's open orders")?;
+        let allowlist = self.trader.allowlist();
+        let mut cancelled = 0;
+        let mut failed = Vec::new();
+        for (coin, oid) in resting(&answer)? {
+            let market = allowlist
+                .markets
+                .by_coin(&coin)
+                .map(|market| market.name.clone())
+                .unwrap_or(coin);
+            match self
+                .trader
+                .submit(&Action::Cancel {
+                    market: market.clone(),
+                    order: OrderRef::Venue(oid),
+                })
+                .await
+            {
+                Ok(_) => cancelled += 1,
+                Err(error) => failed.push(format!("{market} {oid}: {error:#}")),
+            }
+        }
+        if !failed.is_empty() {
+            anyhow::bail!("not cancelled: {}", failed.join("; "));
+        }
+        Ok(cancelled)
+    }
+
     /// Whether a close is staged at the station now.
     async fn close_staged(&self) -> Result<bool> {
         let stage = self
@@ -724,6 +728,24 @@ impl Half {
             .context("reading whether a close is staged at the station")?;
         Ok(stage.stagedAt != 0)
     }
+}
+
+/// The orders resting on an account, as the venue's `frontendOpenOrders`
+/// lists them (trigger orders among them): each one's coin and the venue's
+/// id. An answer that isn't that list, or an entry without either, is an
+/// error: never fewer orders than the venue holds.
+pub fn resting(answer: &serde_json::Value) -> Result<Vec<(String, u64)>> {
+    let list = answer
+        .as_array()
+        .ok_or_else(|| anyhow!("the venue's open orders can't be read: {answer}"))?;
+    list.iter()
+        .map(
+            |order| match (order["coin"].as_str(), order["oid"].as_u64()) {
+                (Some(coin), Some(oid)) => Ok((coin.to_string(), oid)),
+                _ => Err(anyhow!("an open order can't be read: {order}")),
+            },
+        )
+        .collect()
 }
 
 /// Whether the account has less free HYPE than the driver needs to start a
@@ -940,9 +962,80 @@ fn dollars(millionths: alloy::primitives::U256) -> hyperliquid::payload::Decimal
     hyperliquid::payload::Decimal::from(units) / hyperliquid::payload::Decimal::from(1_000_000u32)
 }
 
+/// Read the venue's markets every `every`, for as long as it runs, and hold
+/// `trader` to the markets of the driver `station` pinned (its `perps` and
+/// `spots`), as the venue lists them then, whenever the set of those missing
+/// from the venue's listing has changed, either way: a market the venue
+/// stops listing is refused from then on while the others carry on, and one
+/// it lists again is traded again.
+pub async fn look_for_missing(
+    trader: &Trader,
+    api: &Api,
+    station: Address,
+    (perps, spots): (&[u32], &[u32]),
+    every: std::time::Duration,
+) {
+    loop {
+        tokio::time::sleep(every).await;
+        let markets = match Markets::read(api).await {
+            Ok(markets) => markets,
+            Err(error) => {
+                tracing::warn!(
+                    station = %station,
+                    error = %format!("{error:#}"),
+                    "the venue's markets couldn't be read to look for the missing ones"
+                );
+                continue;
+            }
+        };
+        let Ok(allowlist) = Allowlist::from_driver(station, markets, perps, spots) else {
+            continue;
+        };
+        let was = trader.allowlist();
+        if allowlist.missing != was.missing {
+            for market in was.missing.keys() {
+                if !allowlist.missing.contains_key(market) {
+                    tracing::info!(
+                        station = %station,
+                        market,
+                        "a market the station's driver lists is listed for trading again, and traded"
+                    );
+                }
+            }
+            for (market, why) in &allowlist.missing {
+                if !was.missing.contains_key(market) {
+                    tracing::warn!(
+                        station = %station,
+                        market,
+                        why,
+                        "a market the station's driver lists is no longer listed for trading, and is not traded"
+                    );
+                }
+            }
+            trader.hold_to(allowlist);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_resting_order_the_venue_lists_is_read_trigger_orders_among_them() {
+        let answer = serde_json::json!([
+            {"coin": "ETH", "oid": 7, "isTrigger": false},
+            {"coin": "@107", "oid": 8, "isTrigger": true, "triggerPx": "20.0"},
+        ]);
+        assert_eq!(
+            resting(&answer).unwrap(),
+            vec![("ETH".to_string(), 7), ("@107".to_string(), 8)]
+        );
+        assert!(resting(&serde_json::json!([])).unwrap().is_empty());
+        // An answer that can't be read is never taken for no orders.
+        assert!(resting(&serde_json::json!({"error": "busy"})).is_err());
+        assert!(resting(&serde_json::json!([{"coin": "ETH"}])).is_err());
+    }
 
     #[test]
     fn the_driver_is_named_as_the_station_keys_it() {

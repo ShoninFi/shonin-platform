@@ -7282,6 +7282,7 @@ dependencies = [
  "shonin-driver",
  "shonin-local-driver",
  "shonin-local-venue",
+ "shonin-orca-driver",
  "shonin-prices",
  "shonin-profiles",
  "shonin-program-id",
@@ -7562,6 +7563,17 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
+]
+
+[[package]]
+name = "shonin-orca-driver"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang",
+ "shonin-driver",
+ "shonin-program-id",
+ "shonin-station",
+ "uint",
 ]
 
 [[package]]

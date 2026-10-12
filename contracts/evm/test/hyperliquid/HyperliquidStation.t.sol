@@ -75,7 +75,7 @@ contract HyperliquidStationTest is HyperliquidVault {
         (int256 accountValue,) = core.accountValue(address(station));
         assertEq(mark, uint256(accountValue), "nothing ever sells it, so it is worth nothing to anyone");
         // Nor is it asked of a proof: the perp shrinking is enough.
-        int256[] memory before = hl.exposure(address(station));
+        int256[] memory before = hl.snapshot(address(station));
         core.trade(address(station), ETH, -333_334, ETH_PX);
         (uint256 part, bool known) = hl.closedPart(address(station), before, 0.5e18, uint64(block.timestamp));
         assertTrue(known);

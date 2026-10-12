@@ -44,6 +44,12 @@ struct Stage {
     /// How long after it was placed it may first be proved: the longest
     /// settle delay of its drivers.
     uint64 delay;
+    /// The moment it may no longer be proved: from then on the agent may
+    /// trade the venue accounts again, so nothing read there tells the
+    /// close from the agent's trading, and the stage can only lapse. Until
+    /// it is proved or this has passed, the attested executor neither
+    /// places nor changes an order nor moves dollars at its venues.
+    uint64 provedBy;
     /// Placed by the vault for one of its claims or one holder's units, and
     /// delivered through the vault's own door for them.
     bool forVault;
@@ -97,9 +103,12 @@ interface IStation {
     /// the venue; or, a delivery window on, asked for again.
     event CloseSwept(uint256 fraction, uint256 fetched, uint256 asked);
     /// A staged close nothing could be measured for by the end of its
-    /// window (no reading of the venue after it), or one a stopped
-    /// station's full unwind took the place of: whatever it sold stays at
-    /// the station, everyone's.
+    /// window (no reading of the venue after it, or a position the venue
+    /// changed by more than her orders could have), one measured below what
+    /// her orders could have fetched at their limits, one not proved by its
+    /// deadline, or one a stopped station's full unwind took the place of:
+    /// nothing is paid from it, and whatever it sold stays at the station,
+    /// everyone's.
     event CloseLapsed(uint256 fraction);
     event CloseDelivered(uint256 fraction, uint256 amount);
     /// How a staged close ended: `part` of it delivered (1e18 is all), and
@@ -113,6 +122,8 @@ interface IStation {
     /// position was bought on still holds the proceeds at the venue. The
     /// whole unwind is undone.
     error ShortSweep();
+    /// A station's drivers all close in the transaction, or all after it.
+    error MixedExits();
 
     /// Let `key` trade through `driver`, replacing the key approved for it
     /// now. Anyone may call it; it obeys only the registry.

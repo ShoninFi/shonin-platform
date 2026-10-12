@@ -34,10 +34,17 @@ pub fn hold_on_claim(vault: &mut Vault, claim: &mut Claim, assets: u64) -> Resul
 /// station refuses (one that can't bring its worth home, or would pay the
 /// leaver nothing) fails the whole transaction: it sold nothing, so it was
 /// never a try, and the claim waits as it was.
+///
+/// A try may serve only `part` of the claim's shares, where a venue can't
+/// bring the whole of it home in one transaction: that part is closed and
+/// paid exactly as a whole claim of it would be, its shares burned, and the
+/// rest stays booked with its original turn and deadline. Partial payment
+/// cannot postpone the protections for the unpaid remainder.
 pub fn settle_claim<'info>(
     ctx: Context<'_, '_, 'info, 'info, SettleClaim<'info>>,
     claim_id: u64,
     groups: Vec<u8>,
+    part: Option<u128>,
 ) -> Result<()> {
     let a = ctx.accounts;
     let vault_key = a.pool.vault.key();
@@ -58,14 +65,20 @@ pub fn settle_claim<'info>(
         vault.state != VaultState::Closed && !vault.ready_to_close(),
         VaultError::WrongState
     );
-    let shares = claim.shares;
+    let shares = match part {
+        Some(part) => {
+            require!(part > 0 && part < claim.shares, VaultError::NotAllowed);
+            part
+        }
+        None => claim.shares,
+    };
     let now = now()?;
 
     // Cash at home that already covers it: an ordinary request, priced at the
     // next valuation, with nothing to close. The claim makes it, at its own
     // address for the last request it was queued by, so nobody can take the
-    // address it is queued at.
-    if vault.priced {
+    // address it is queued at. Only a whole claim is queued.
+    if vault.priced && part.is_none() {
         let latest = vault.latest;
         let (_, _, covered) = exit_of(vault, &latest, shares)?;
         if covered <= vault.cash {
@@ -183,7 +196,13 @@ pub fn settle_claim<'info>(
         to_units: 0,
     });
     let owned = cash_share.checked_add(home).ok_or(VaultError::Overflow)?;
-    pay_claim(a, &mut claim, claim_id, owned, &seeds, &mut said)?;
+    pay_claim(a, &mut claim, claim_id, shares, owned, &seeds, &mut said)?;
+    if claim.shares != 0 {
+        // Keep the original booking: even many tiny payments cannot
+        // postpone the unpaid remainder's freeze or fallback.
+        claim.state = ClaimState::Pending;
+        claim.last_attempt_at = now;
+    }
     said.say(ClaimTried {
         claim_id,
         blocked: false,
@@ -200,6 +219,7 @@ fn pay_claim<'info>(
     a: &mut SettleClaim<'info>,
     claim: &mut Claim,
     claim_id: u64,
+    shares: u128,
     owned: u64,
     seeds: &[&[u8]],
     said: &mut Said,
@@ -215,7 +235,6 @@ fn pay_claim<'info>(
     };
     let vault = &mut a.pool.vault;
     let owned = owned.min(vault.cash);
-    let shares = claim.shares;
     let fee = dollars(fee_of(vault.mark, &vault.fees, owned as u128, shares)?)?;
     let gross = owned - fee;
     let kept = dollars(mul_div_up(
@@ -228,7 +247,10 @@ fn pay_claim<'info>(
     vault.pending_shares -= shares;
     vault.burn_held(shares, &vault_key, said)?;
     vault.cash -= owned - kept;
-    claim.state = ClaimState::Paid;
+    claim.shares -= shares;
+    if claim.shares == 0 {
+        claim.state = ClaimState::Paid;
+    }
     if fee != 0 {
         let total = vault.fees.author_bps as u128 + vault.fees.platform_bps as u128;
         let to_author = dollars(mul_div(fee as u128, vault.fees.author_bps as u128, total)?)?;
@@ -242,7 +264,7 @@ fn pay_claim<'info>(
             vault.held_total += fee - to_author;
         }
     }
-    claim.paid = payout;
+    claim.paid += payout;
     if !purse.pay(&a.owner_dollars, &claim.owner, payout, said)? {
         hold_on_claim(vault, claim, payout)?;
     }

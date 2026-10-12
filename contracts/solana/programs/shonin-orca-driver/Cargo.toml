@@ -1,0 +1,41 @@
+[package]
+name = "shonin-orca-driver"
+version = "0.1.0"
+description = "Orca Whirlpools' driver: values a station's positions there at Pyth's price and prepares their closes"
+edition = "2021"
+license = "BUSL-1.1"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "shonin_orca_driver"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "shonin-driver/idl-build", "shonin-station/idl-build"]
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+# What the driver lists (the pools, the dollar, the price account, how old a
+# price may be) is fixed at build time for one network, like its address:
+# see `network`.
+mainnet = ["shonin-station/mainnet"]
+devnet = ["shonin-station/devnet"]
+
+[dependencies]
+anchor-lang = { workspace = true }
+shonin-driver = { path = "../../crates/shonin-driver" }
+# The station program, only for its address: the authority's position mints
+# are its addresses.
+shonin-station = { path = "../shonin-station", default-features = false, features = ["no-entrypoint"] }
+uint = { workspace = true }
+
+[build-dependencies]
+shonin-program-id = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

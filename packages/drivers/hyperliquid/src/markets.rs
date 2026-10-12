@@ -244,6 +244,11 @@ impl Markets {
     }
 
     /// The market a feed or a fill names by the venue's coin.
+    /// Every spot pair the venue lists against the dollar.
+    pub fn spot(&self) -> impl Iterator<Item = &Market> {
+        self.by_name.values().filter(|market| market.is_spot())
+    }
+
     pub fn by_coin(&self, coin: &str) -> Option<&Market> {
         self.by_coin
             .get(coin)

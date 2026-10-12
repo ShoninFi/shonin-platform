@@ -700,7 +700,8 @@ impl<'a> Seed<'a> {
 /// [`crate::market::operate`]): every `every`, both markets' prices from a
 /// tape like bitcoin's, and the funding the rate quoted last accrued since,
 /// by the cluster's clock. The venue's reserves are kept at what the set-up
-/// gave them, the admin minting what they have paid out beyond.
+/// gave them, the admin minting what they have paid out beyond; and Orca's
+/// pool is brought back to Pyth's price whenever it has strayed.
 pub async fn operate(served: &SolanaServed, every: Duration) -> Result<()> {
     use crate::market::{Tape, TapeParams};
     let client = &served.client;
@@ -793,6 +794,15 @@ pub async fn operate(served: &SolanaServed, every: Duration) -> Result<()> {
             Err(error) => {
                 tracing::warn!(cluster = %served.key, error = %format!("{error:#}"), "the post did not land; the next one accrues for this stretch too")
             }
+        }
+        // Orca's pool, brought back to Pyth's price if it has strayed: on a
+        // testnet nobody else arbitrages it.
+        let kept = async {
+            let admin = client.role(Role::Admin)?;
+            crate::solana_orca::keep_with_pyth(client, platform, admin, operator).await
+        };
+        if let Err(error) = kept.await {
+            tracing::warn!(cluster = %served.key, error = %format!("{error:#}"), "Orca's pool could not be brought to Pyth's price; tried again next time");
         }
     }
 }

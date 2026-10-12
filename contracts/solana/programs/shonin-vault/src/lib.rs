@@ -154,7 +154,18 @@ pub mod shonin_vault {
         claim_id: u64,
         groups: Vec<u8>,
     ) -> Result<()> {
-        claims::settle_claim(ctx, claim_id, groups)
+        claims::settle_claim(ctx, claim_id, groups, None)
+    }
+
+    /// Serves `shares` of a claim's shares, as many as its close can bring
+    /// home in one transaction; the rest stays booked for the next try.
+    pub fn settle_claim_part<'info>(
+        ctx: Context<'_, '_, 'info, 'info, SettleClaim<'info>>,
+        claim_id: u64,
+        groups: Vec<u8>,
+        shares: u128,
+    ) -> Result<()> {
+        claims::settle_claim(ctx, claim_id, groups, Some(shares))
     }
 
     pub fn claim_instead<'info>(

@@ -205,6 +205,8 @@ pub mod shonin_station {
                 dollars,
                 key: Pubkey::default(),
                 addresses: guard::station_addresses(&allowlist, &authority),
+                position_mints: guard::position_mints(&allowlist, &authority),
+                token_accounts: guard::token_accounts(&allowlist, &authority),
                 rules: allowlist.rules,
                 fixed: allowlist.fixed,
             });
@@ -496,7 +498,7 @@ pub mod shonin_station {
             .remaining_accounts
             .split_first()
             .ok_or(StationError::WrongProgram)?;
-        let ix = Instruction {
+        let mut ix = Instruction {
             program_id: *program.key,
             accounts: accounts
                 .iter()
@@ -508,7 +510,7 @@ pub mod shonin_station {
                 .collect(),
             data,
         };
-        let class = guard::check(
+        let checked = guard::check(
             &ix,
             pinned,
             &station.drivers,
@@ -517,6 +519,9 @@ pub mod shonin_station {
             &station.vault_program,
             accounts,
         )?;
+        checked.mark_signers(&mut ix, pinned);
+        let mint_seeds = checked.mint_seeds(pinned);
+        let class = checked.class();
         let approved = pinned.key != Pubkey::default() && pinned.key == key;
         let revoked = read::revoked(
             ApprovalKind::Driver,
@@ -556,13 +561,21 @@ pub mod shonin_station {
         let authority_dollars = a.authority_dollars.to_account_info();
         let mut infos = accounts.to_vec();
         infos.push(program.clone());
-        let held = guard::TokenAccounts::before(&ix, accounts, &[&venue.authority, &station_key]);
+        let held = guard::TokenAccounts::before(
+            &ix,
+            accounts,
+            &[&venue.authority, &station_key],
+            &checked.position_tokens,
+        );
         let unasked = guard::balance(&authority_dollars)?;
         if fund != 0 {
             main.send(fund, &authority_dollars)?;
         }
-        invoke_signed(&ix, &infos, &[&venue.seeds()])?;
+        let seeds = guard::signer_seeds(venue.seeds(), &venue.authority, &mint_seeds);
+        let seeds: Vec<&[&[u8]]> = seeds.iter().map(Vec::as_slice).collect();
+        invoke_signed(&ix, &infos, &seeds)?;
         held.still_held()?;
+        guard::positions_held(&ix, &checked.position_tokens, accounts, &venue.authority)?;
         guard::authority_untouched(&a.authority)?;
         let returned = venue.take_back(
             unasked,
@@ -1000,6 +1013,12 @@ fn unwind_fraction<'info>(
             &leg.accounts,
             shonin_driver::data(discriminator::VALUE, &band),
         )?;
+        // A part nobody can value is no part kept: an account the close
+        // left outside the band (its sale ending on the band's very edge)
+        // undoes the close rather than read the stayers' part as nothing.
+        if remains.outside {
+            return err!(StationError::ShortSweep);
+        }
         // A shortfall past the rounding is the leaver's own fill, never the
         // stayers' gain: proceeds that went to repay the account's margin
         // debt, so the account is left worth more than the stayers' share,
@@ -1053,10 +1072,8 @@ fn unwind_named<'info>(
         let accounts = driver_accounts(&station.drivers[*index], group)?;
         // The close comes with the account's valuation at the same band,
         // read from the same accounts: what its sale should bring home.
-        let Close { value, plan } = guard::ask(
-            &accounts,
-            shonin_driver::data(discriminator::CLOSE, &(WAD, band)),
-        )?;
+        let Close { value, plan } =
+            guard::ask(&accounts, shonin_driver::data(discriminator::UNWIND, &band))?;
         if plan.outside {
             blocked = true;
             continue;
@@ -1107,8 +1124,8 @@ fn run<'info>(
     let (authority, dollars) = (&given[0], &given[1]);
     let unasked = guard::balance(dollars)?;
     for prepared in &plan.instructions {
-        let ix = guard::rebuild(prepared, given, &venue.authority)?;
-        guard::check(
+        let mut ix = guard::rebuild(prepared, given, &venue.authority)?;
+        let checked = guard::check(
             &ix,
             pinned,
             &station.drivers,
@@ -1117,13 +1134,23 @@ fn run<'info>(
             &station.vault_program,
             given,
         )?;
+        checked.mark_signers(&mut ix, pinned);
+        let mint_seeds = checked.mint_seeds(pinned);
         // A close only ever brings money to the station: no instruction a
         // driver prepares may take dollars out of the authority's account,
         // even to bring more back in a later one.
-        let held = guard::TokenAccounts::before(&ix, given, &[&venue.authority, main.station.key]);
+        let held = guard::TokenAccounts::before(
+            &ix,
+            given,
+            &[&venue.authority, main.station.key],
+            &checked.position_tokens,
+        );
         let before = guard::balance(dollars)?;
-        invoke_signed(&ix, accounts, &[&venue.seeds()])?;
+        let seeds = guard::signer_seeds(venue.seeds(), &venue.authority, &mint_seeds);
+        let seeds: Vec<&[&[u8]]> = seeds.iter().map(Vec::as_slice).collect();
+        invoke_signed(&ix, accounts, &seeds)?;
         held.still_held()?;
+        guard::positions_held(&ix, &checked.position_tokens, given, &venue.authority)?;
         guard::authority_untouched(authority)?;
         require!(
             guard::balance(dollars)? >= before,

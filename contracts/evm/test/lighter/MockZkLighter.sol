@@ -154,6 +154,30 @@ contract MockZkLighter {
         entry[account][market] = markOf[market];
     }
 
+    /// The exchange changing a position by itself (a liquidation, a
+    /// deleveraging), whoever's order it was not: `delta` of it at `price`.
+    /// What it closes realises its profit or loss in cash; what it opens
+    /// (past flat, or more on the same side) is held from `price`.
+    function force(uint48 account, uint16 market, int64 delta, uint32 price) external {
+        int64 held = size[account][market];
+        int256 entered = int256(uint256(entry[account][market]));
+        int256 px = int256(uint256(price));
+        bool closing = held != 0 && (held > 0) != (delta > 0);
+        if (closing) {
+            int64 open = held > 0 ? held : -held;
+            int64 change = delta > 0 ? delta : -delta;
+            int64 closed = change < open ? change : open;
+            int256 pnl = (px - entered) * int256(closed) * 1e6 / int256(unit[market]);
+            cash[account] += held > 0 ? pnl : -pnl;
+            if (change > open) entry[account][market] = price;
+        } else {
+            int256 before = held > 0 ? int256(held) : -int256(held);
+            int256 added = delta > 0 ? int256(delta) : -int256(delta);
+            entry[account][market] = uint32(uint256((entered * before + px * added) / (before + added)));
+        }
+        size[account][market] = held + delta;
+    }
+
     /// Carry out the queued requests: reduce-only IOC orders fill at the mark
     /// when the limit allows; withdrawals become pending balances.
     function process() external {

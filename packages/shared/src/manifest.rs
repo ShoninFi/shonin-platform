@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::catalogue::{Catalogue, DriverChain};
+use crate::catalogue::{Catalogue, DriverChain, Exit};
 use crate::model::common::Chain;
 
 /// The version of the canonical format. It is hashed along with the manifest,
@@ -147,6 +147,23 @@ impl Manifest {
             }
         }
         let needs = self.chains(catalogue)?;
+        // A station closes through drivers that all close in the
+        // transaction, or all after it; one mixing the two is never created.
+        for need in &needs {
+            let delayed = need
+                .drivers
+                .iter()
+                .filter(|name| catalogue.drivers[name.as_str()].exit == Exit::Delayed)
+                .count();
+            if delayed != 0 && delayed != need.drivers.len() {
+                return Err(format!(
+                    "on {} the drivers {} mix venues that close in the transaction with venues \
+                     whose closes settle after it; a vault's station closes through one kind only",
+                    need.chain.name(),
+                    need.drivers.join(", ")
+                ));
+            }
+        }
         if needs.iter().any(|need| need.chain != vault_chain) && self.bridges.is_empty() {
             return Err(
                 "a driver on another chain than the vault's needs a bridge, as a [bridges.<name>] table"
@@ -438,6 +455,33 @@ exclude = ["GB"]
 
     fn catalogue() -> Catalogue {
         Catalogue::published()
+    }
+
+    #[test]
+    fn a_manifest_mixing_venues_that_close_at_once_with_delayed_ones_on_one_chain_is_refused() {
+        let mut catalogue = catalogue();
+        for driver in catalogue.drivers.values_mut() {
+            driver.networks = vec!["testnet".into()];
+        }
+        let manifest = |drivers: &str| -> Manifest {
+            toml::from_str(&format!(
+                "[vault]\nchain = \"robinhood\"\n[description]\ntitle = \"t\"\ntext = \"t\"\n{drivers}"
+            ))
+            .unwrap()
+        };
+        let mixed = manifest("[drivers.robinhood]\n[drivers.lighter]\n");
+        let refused = mixed.check(&catalogue, "testnet").unwrap_err();
+        assert!(refused.contains("one kind only"), "{refused}");
+        assert!(
+            manifest("[drivers.lighter]\n")
+                .check(&catalogue, "testnet")
+                .is_ok()
+        );
+        assert!(
+            manifest("[drivers.robinhood]\n")
+                .check(&catalogue, "testnet")
+                .is_ok()
+        );
     }
 
     #[test]

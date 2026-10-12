@@ -22,12 +22,12 @@ contract TheMeasureNeverChargesTheLeaverForWhatItDoesNotCountTest is Hyperliquid
         // $100 of spot dollars and 0.05 HYPE, under the reserve.
         core.creditSpot(address(station), 0, 100e8);
         core.creditSpot(address(station), HYPE_TOKEN, 0.05e8);
-        int256[] memory before = hl.exposure(address(station));
+        int256[] memory before = hl.snapshot(address(station));
         int256 dollars = hl.ledger(address(station));
         // The executor tops the reserve up with 0.6 HYPE at $20: $12 of the
         // dollars.
         core.buySpot(address(station), HYPE_PAIR, 60, 20_000_000);
-        int256 measured = hl.measure(address(station), dollars, before, HALF, 1e18, _band());
+        (int256 measured,) = hl.measure(address(station), dollars, before, HALF, 1e18, _band());
         assertEq(measured, 50e6, "half of the $100 the account was worth, the top-up charged to nobody");
     }
 
@@ -35,7 +35,7 @@ contract TheMeasureNeverChargesTheLeaverForWhatItDoesNotCountTest is Hyperliquid
         // Two HYPE: one above the reserve, $24.
         core.creditSpot(address(station), HYPE_TOKEN, 2e8);
         core.setSpot(HYPE_PAIR, 24_000_000, 24_000_000, 24_000_000);
-        int256[] memory before = hl.exposure(address(station));
+        int256[] memory before = hl.snapshot(address(station));
         int256 dollars = hl.ledger(address(station));
         // Half of it sold, as the close orders it.
         (Call[] memory calls, bool blocked) = hl.close(address(station), HALF, _band());
@@ -50,7 +50,7 @@ contract TheMeasureNeverChargesTheLeaverForWhatItDoesNotCountTest is Hyperliquid
         // The price falls: the half left is worth $9.50, under the smallest
         // order.
         core.setSpot(HYPE_PAIR, 19_000_000, 19_000_000, 19_000_000);
-        int256 measured = hl.measure(address(station), dollars, before, HALF, 1e18, _band());
+        (int256 measured,) = hl.measure(address(station), dollars, before, HALF, 1e18, _band());
         assertEq(measured, proceeds, "the leaver is paid what the sale fetched, nothing taken for the rest");
     }
 }

@@ -419,3 +419,164 @@ fn a_withdrawal_asked_while_a_market_is_outside_the_band_becomes_a_claim_after_a
     expect_ok(env.settle_claim(&v, id));
     assert_eq!(env.claim(&v, id).unwrap().state, ClaimState::Paid);
 }
+
+/// A claim a venue can't bring home whole in one transaction is served in
+/// parts: each part is closed and paid as a claim of it alone would be, its
+/// shares burned, and the rest stays booked, still the claim's own. Served
+/// in two halves without fees it differs from a whole payment only by rounding.
+#[test]
+fn fee_free_parts_and_a_whole_claim_differ_only_by_rounding() {
+    let paid = |halves: bool| {
+        let mut env = Env::new();
+        env.set_up_stations_for(shonin_vault::ID);
+        let mut t = terms();
+        t.fees.holding_bps = 0;
+        t.fees.author_bps = 0;
+        t.fees.platform_bps = 0;
+        t.fees.transaction_bps = 0;
+        expect_ok(env.initialize_vaults(t, anchor_lang::prelude::Pubkey::default()));
+        let v = env.open(&[Declared::local()]);
+        let (alice, bob) = (env.alice.insecure_clone(), env.bob.insecure_clone());
+        let a = env.deposit_as(&v, &alice, 100_000_000_000);
+        env.deposit_as(&v, &bob, 100_000_000_000);
+        hedge(&mut env, &v, 190_000_000_000, UNIT);
+        let id = claim_for(&mut env, &v, &alice, a);
+        let before = env.usd_balance(&alice.pubkey());
+        let booked_at = env.claim(&v, id).unwrap().booked_at;
+        if halves {
+            expect_ok(env.settle_claim_part(&v, id, a / 2));
+            let claim = env.claim(&v, id).unwrap();
+            assert_eq!(claim.state, ClaimState::Pending);
+            assert_eq!(claim.shares, a - a / 2);
+            assert_eq!(claim.booked_at, booked_at);
+            assert!(claim.paid > 0);
+            assert_eq!(env.vault(&v).pending_shares, a - a / 2);
+        }
+        expect_ok(env.settle_claim(&v, id));
+        let claim = env.claim(&v, id).unwrap();
+        assert_eq!(claim.state, ClaimState::Paid);
+        assert_eq!(claim.shares, 0);
+        let got = env.usd_balance(&alice.pubkey()) - before;
+        assert_eq!(got, claim.paid);
+        got
+    };
+    let (whole, halves) = (paid(false), paid(true));
+    println!("whole {whole}, in halves {halves}");
+    assert!(
+        halves.abs_diff(whole) <= 2,
+        "whole {whole}, halves {halves}"
+    );
+}
+
+/// A part is some of the claim's shares, never none of them nor all: a
+/// whole claim is tried as a whole.
+#[test]
+fn a_part_of_a_claim_is_neither_none_of_its_shares_nor_all() {
+    let (mut env, v) = Env::with_vault();
+    let (alice, bob) = (env.alice.insecure_clone(), env.bob.insecure_clone());
+    let a = env.deposit_as(&v, &alice, 100_000_000_000);
+    env.deposit_as(&v, &bob, 100_000_000_000);
+    hedge(&mut env, &v, 190_000_000_000, UNIT);
+    let id = claim_for(&mut env, &v, &alice, a);
+    for part in [0, a, a + 1] {
+        expect_code(
+            env.settle_claim_part(&v, id, part),
+            vault_error(VaultError::NotAllowed),
+        );
+    }
+}
+
+/// Payment in parts leaves the unpaid remainder's original protections.
+#[test]
+fn partial_payment_preserves_the_original_freeze_deadline() {
+    let (mut env, v) = Env::with_vault();
+    let (alice, bob) = (env.alice.insecure_clone(), env.bob.insecure_clone());
+    let a = env.deposit_as(&v, &alice, 100_000_000_000);
+    env.deposit_as(&v, &bob, 100_000_000_000);
+    hedge(&mut env, &v, 190_000_000_000, UNIT);
+    let id = claim_for(&mut env, &v, &alice, a);
+    let booked_at = env.claim(&v, id).unwrap().booked_at;
+    env.skip(6 * DAY);
+    expect_ok(env.settle_claim_part(&v, id, a / 2));
+    assert_eq!(env.claim(&v, id).unwrap().booked_at, booked_at);
+    expect_code(env.freeze(&v, id), vault_error(VaultError::NotYet));
+    env.skip(2 * DAY);
+    expect_ok(env.freeze(&v, id));
+}
+
+#[test]
+fn tiny_payments_cannot_postpone_the_unpaid_remainders_freeze() {
+    let (mut env, v) = Env::with_vault();
+    let (alice, bob) = (env.alice.insecure_clone(), env.bob.insecure_clone());
+    let a = env.deposit_as(&v, &alice, 100_000_000_000);
+    env.deposit_as(&v, &bob, 100_000_000_000);
+    hedge(&mut env, &v, 190_000_000_000, UNIT);
+    let id = claim_for(&mut env, &v, &alice, a);
+    let booked_at = env.claim(&v, id).unwrap().booked_at;
+    for _ in 0..3 {
+        env.skip(6 * DAY);
+        let before = env.claim(&v, id).unwrap().paid;
+        expect_ok(env.settle_claim_part(&v, id, a / 100_000));
+        let after = env.claim(&v, id).unwrap();
+        assert!(after.paid > before);
+        assert_eq!(after.booked_at, booked_at);
+    }
+    assert!(env.claim(&v, id).unwrap().shares > a * 99 / 100);
+    expect_ok(env.freeze(&v, id));
+}
+
+#[test]
+fn removing_dust_shares_keeps_the_unpaid_claims_booking() {
+    let (mut env, v) = Env::with_vault();
+    let (alice, bob) = (env.alice.insecure_clone(), env.bob.insecure_clone());
+    let a = env.deposit_as(&v, &alice, 100_000_000_000);
+    env.deposit_as(&v, &bob, 100_000_000_000);
+    hedge(&mut env, &v, 190_000_000_000, UNIT);
+    let id = claim_for(&mut env, &v, &alice, a);
+    let before = env.claim(&v, id).unwrap();
+    env.skip(6 * DAY);
+    expect_ok(env.settle_claim_part(&v, id, 1));
+    let after = env.claim(&v, id).unwrap();
+    assert_eq!(after.paid, before.paid);
+    assert_eq!(after.shares, before.shares - 1);
+    assert_eq!(after.booked_at, before.booked_at);
+}
+
+#[test]
+fn partial_remainder_fallback_opens_on_original_deadline_and_only_for_owner() {
+    let (mut env, v) = Env::with_vault();
+    let (alice, bob) = (env.alice.insecure_clone(), env.bob.insecure_clone());
+    let a = env.deposit_as(&v, &alice, 100_000_000_000);
+    env.deposit_as(&v, &bob, 100_000_000_000);
+    hedge(&mut env, &v, 190_000_000_000, UNIT);
+    let id = claim_for(&mut env, &v, &alice, a);
+    let original = env.claim(&v, id).unwrap();
+    env.warp(original.booked_at + DAY - 1);
+    expect_ok(env.settle_claim_part(&v, id, a / 2));
+    let part = env.claim(&v, id).unwrap();
+    assert_eq!(part.owner, original.owner);
+    assert_eq!(part.id, original.id);
+    assert_eq!(part.booked_at, original.booked_at);
+    assert!(part.paid > original.paid);
+    assert_eq!(part.shares, a - a / 2);
+    let ix = env.ix_take_pro_rata_claim(&v, &alice.pubkey(), id);
+    expect_code(
+        env.send(vec![ix], &[&alice]),
+        vault_error(VaultError::NotYet),
+    );
+    env.warp(original.booked_at + DAY);
+    let wrong = env.ix_take_pro_rata_claim(&v, &bob.pubkey(), id);
+    expect_code(
+        env.send(vec![wrong], &[&bob]),
+        vault_error(VaultError::NotAllowed),
+    );
+    let ix = env.ix_take_pro_rata_claim(&v, &alice.pubkey(), id);
+    expect_ok(env.send(vec![ix], &[&alice]));
+    let after = env.claim(&v, id).unwrap();
+    assert_eq!(after.state, ClaimState::Fallback);
+    assert_eq!(after.booked_at, original.booked_at);
+    assert_eq!(after.owner, original.owner);
+    assert_eq!(after.paid, part.paid);
+    assert_eq!(env.vault(&v).pending_shares, 0);
+    assert!(env.holder(&v, &alice.pubkey()).unwrap().units > 0);
+}

@@ -98,6 +98,26 @@ pub struct Pinned {
     /// created, since an address derived from the authority's never changes,
     /// so no call has to search for it again.
     pub addresses: Vec<StationAddress>,
+    /// The authority's position mints at this venue, slot by slot, as many as
+    /// the rules' largest [`shonin_driver::Own::StationMint`] names (none for
+    /// a venue that holds no positions as tokens): worked out once, when the
+    /// station was created, like `addresses`.
+    pub position_mints: Vec<PositionMint>,
+    /// The authority's associated token accounts, under the classic token
+    /// program, for every mint of a set the rules' `StationToken` positions
+    /// name: worked out once, when the station was created, like
+    /// `addresses`, so that a call naming one is checked without working it
+    /// out again.
+    pub token_accounts: Vec<Pubkey>,
+}
+
+/// One of the authority's position mints: the station program's address
+/// with seeds `[POSITION_MINT_SEED, authority, [slot]]`, its slot being its
+/// place in [`Pinned::position_mints`].
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PositionMint {
+    pub address: Pubkey,
+    pub bump: u8,
 }
 
 /// The venue's program-derived address for the station's authority there,
@@ -116,6 +136,11 @@ impl Pinned {
             .iter()
             .find(|derived| derived.prefix == prefix)
             .map(|derived| &derived.address)
+    }
+
+    /// Whether `key` is one of the authority's position mints at this venue.
+    pub fn is_position_mint(&self, key: &Pubkey) -> bool {
+        self.position_mints.iter().any(|mint| &mint.address == key)
     }
 }
 
@@ -279,6 +304,15 @@ mod tests {
                     address: Pubkey::default(),
                 })
                 .collect(),
+            position_mints: vec![
+                PositionMint {
+                    address: Pubkey::default(),
+                    bump: 0,
+                };
+                MAX_POSITION_MINTS
+            ],
+            // Every pinned account a mint, each with its token account.
+            token_accounts: vec![Pubkey::default(); MAX_FIXED],
         };
         let mut s = station(0, 0);
         s.drivers = vec![pinned; MAX_DRIVERS];

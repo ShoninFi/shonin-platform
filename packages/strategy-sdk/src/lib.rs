@@ -47,6 +47,8 @@ pub mod hyperliquid;
 #[cfg(feature = "lighter")]
 pub mod lighter;
 pub mod local;
+#[cfg(feature = "orca")]
+pub mod orca;
 pub mod payload;
 #[cfg(feature = "robinhood")]
 pub mod robinhood;
