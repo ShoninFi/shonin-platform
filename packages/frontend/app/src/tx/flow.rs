@@ -360,6 +360,7 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
         let mut unseen = false;
         for _ in 0..self.pace.give_up_after {
             if let Ok(Some(receipt)) = self.reader.receipt(hash).await {
+                self.reached(receipt.block).await;
                 return Ok(receipt);
             }
             match self.reader.pending(hash).await {
@@ -403,6 +404,22 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
             Err(TxError::Stuck { hash })
         } else {
             Err(TxError::Dropped { hash })
+        }
+    }
+
+    /// Wait, briefly, until the endpoint's latest block is at least `block`,
+    /// so the next read or simulation sees what was just mined (a pool of
+    /// nodes can answer a receipt from one node and a call from another a
+    /// block behind). Gives up after a few looks: the receipt stands either
+    /// way, and a read that still misses it is one more look later.
+    async fn reached(&self, block: u64) {
+        for _ in 0..self.pace.dropped_after.clamp(1, 30) {
+            match self.reader.block_number().await {
+                Ok(Some(latest)) if latest < block => {
+                    self.clock.sleep(self.pace.poll_millis).await;
+                }
+                _ => return,
+            }
         }
     }
 

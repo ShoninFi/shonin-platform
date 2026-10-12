@@ -92,6 +92,12 @@ pub trait Reader {
     async fn mined_nonce(&self, who: Address) -> Result<u64, TxError>;
     /// The latest block's time, in seconds: the chain's own clock.
     async fn chain_time(&self) -> Result<u64, TxError>;
+    /// The latest block's number, where the endpoint can say: a read after
+    /// a receipt waits until the endpoint has reached the receipt's block.
+    /// `None` when it can't say, and then nothing waits.
+    async fn block_number(&self) -> Result<Option<u64>, TxError> {
+        Ok(None)
+    }
     /// A block's time.
     async fn block_time(&self, block: u64) -> Result<u64, TxError>;
     /// Logs from one contract with this first topic (and optionally a second),
