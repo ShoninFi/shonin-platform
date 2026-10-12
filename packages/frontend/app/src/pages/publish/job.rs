@@ -11,6 +11,7 @@ use futures_signals::signal::{Mutable, SignalExt};
 use shared::{Area, Failure, Job, JobState};
 use ui::icons::Icon;
 
+use super::FEE;
 use super::parts::{self, ordinal};
 use crate::atoms::badge::{Tone, badge};
 use crate::atoms::button::{Button, Kind, Size};
@@ -19,6 +20,7 @@ use crate::atoms::icon;
 use crate::atoms::notice::{NoticeTone, notice};
 use crate::atoms::rating::rating;
 use crate::pages::Page;
+use crate::tx::author::read::PaymentRecord;
 use crate::view::{El, View, el, text};
 use crate::web::app_link;
 
@@ -36,29 +38,42 @@ enum Load {
 
 pub fn page(id: &str) -> Page {
     let load = Mutable::new(Load::Loading);
+    // What the publishing contract records of the payment this session
+    // made for the job, while the queue still waits for it.
+    let paid: Mutable<Option<PaymentRecord>> = Mutable::new(None);
     let id = id.to_string();
     let follow = load.clone();
+    let follow_paid = paid.clone();
     let follow_id = id.clone();
+    let seen = futures_signals::map_ref! {
+        let load = load.signal_cloned(),
+        let paid = paid.signal() => (load.clone(), *paid)
+    }
+    .broadcast();
     let body = el("div")
         .class("sh-author sh-job")
         .child(
             el("p")
                 .class("sh-vh")
                 .attr("aria-live", "polite")
-                .text_signal("", load.signal_cloned().map(|load| announce(&load))),
+                .text_signal(
+                    "",
+                    seen.signal_cloned()
+                        .map(|(load, paid)| announce(&load, paid)),
+                ),
         )
         .child_signal(
             Some(skeleton()),
-            load.signal_cloned().map(move |load| {
+            seen.signal_cloned().map(move |(load, paid)| {
                 Some(match load {
                     Load::Loading => skeleton(),
                     Load::Missing => missing(&id),
                     Load::Unanswered(None) => unanswered(&id),
-                    Load::Unanswered(Some(job)) | Load::Found(job) => job_view(&job),
+                    Load::Unanswered(Some(job)) | Load::Found(job) => job_view(&job, paid),
                 })
             }),
         )
-        .hook(move |dom| dom.future(watch(follow_id, follow)));
+        .hook(move |dom| dom.future(watch(follow_id, follow, follow_paid)));
     Page {
         top: None,
         body: body.into(),
@@ -67,12 +82,16 @@ pub fn page(id: &str) -> Page {
 
 /// Ask the queue every 5 s while the job runs, every 15 s once it has ended
 /// (a ready job can still be activated).
-async fn watch(id: String, load: Mutable<Load>) {
+async fn watch(id: String, load: Mutable<Load>, paid: Mutable<Option<PaymentRecord>>) {
     #[cfg(target_arch = "wasm32")]
     loop {
         let finished = match crate::tx::author::run::job(&id).await {
             Ok(Some(job)) => {
                 let done = job.state.is_finished();
+                paid.set_neq(match job.state {
+                    JobState::AwaitingPayment => payment_on_chain(&id, &job).await,
+                    _ => None,
+                });
                 // Redrawn only when the job changed.
                 let same = match &*load.lock_ref() {
                     Load::Found(seen) => {
@@ -101,17 +120,69 @@ async fn watch(id: String, load: Mutable<Load>) {
         gloo_timers::future::TimeoutFuture::new(if finished { 15_000 } else { 5_000 }).await;
     }
     #[cfg(not(target_arch = "wasm32"))]
-    let _ = (id, load);
+    let _ = (id, load, paid);
+}
+
+/// The payment this session made for the job, as the publishing contract
+/// records it under the id its receipt gave: tied to the job's upload and
+/// to the wallet the job names, or nothing.
+#[cfg(target_arch = "wasm32")]
+async fn payment_on_chain(id: &str, job: &Job) -> Option<PaymentRecord> {
+    use crate::tx::author::run::{self, Lookup};
+    let made = run::payment_for_job(id)?;
+    let named = job.author.parse::<alloy_primitives::Address>().ok()?;
+    if made.chain != job.chain || made.uploader != named {
+        return None;
+    }
+    run::payment(
+        made.chain,
+        made.upload,
+        made.uploader,
+        Lookup::At(made.strategy_id),
+    )
+    .await
+    .ok()
 }
 
 /// The words the live region says for the job's state: one per change.
-fn announce(load: &Load) -> String {
+fn announce(load: &Load, paid: Option<PaymentRecord>) -> String {
     match load {
         Load::Found(job) | Load::Unanswered(Some(job)) => {
-            let (headline, detail) = status_words(job);
+            let (headline, detail) = job_words(job, paid);
             format!("{headline}. {detail}")
         }
         _ => String::new(),
+    }
+}
+
+/// The status words, with what the chain records of this session's payment
+/// while the queue still waits for one.
+pub fn job_words(job: &Job, paid: Option<PaymentRecord>) -> (String, String) {
+    match (&job.state, paid) {
+        (JobState::AwaitingPayment, Some(found)) => {
+            paid_words(found).unwrap_or_else(|| status_words(job))
+        }
+        _ => status_words(job),
+    }
+}
+
+/// What a payment the chain records for the job's upload means for it.
+pub fn paid_words(found: PaymentRecord) -> Option<(String, String)> {
+    match found {
+        PaymentRecord::ByUploader { strategy_id } => Some((
+            "Paid. Waiting for the payment's confirmations".to_string(),
+            format!(
+                "The chain records your payment for this upload from the wallet that made it, as agent {strategy_id}. The job starts once the build service has seen it confirmed; this page moves on by itself."
+            ),
+        )),
+        PaymentRecord::ByAnother { payer, .. } => Some((
+            "Paid from another wallet".to_string(),
+            format!(
+                "The chain records a payment for this upload from {}, which didn't make the upload, so it doesn't start the job. Only a payment from the wallet that uploaded it does.",
+                crate::format::short_hash(&format!("{payer:?}"))
+            ),
+        )),
+        PaymentRecord::None => None,
     }
 }
 
@@ -163,9 +234,10 @@ fn step_of(state: &JobState) -> usize {
 pub fn status_words(job: &Job) -> (String, String) {
     match &job.state {
         JobState::AwaitingPayment => (
-            "Waiting for the $1".to_string(),
-            "The job starts once the wallet that uploaded it pays. Nothing has been charged yet."
-                .to_string(),
+            "Waiting for the payment".to_string(),
+            format!(
+                "The job starts once the wallet that uploaded it has paid {FEE} and the build service has seen the payment confirmed on the chain. If you've just paid, this page moves on by itself."
+            ),
         ),
         JobState::Queued { position } => (
             "In the queue".to_string(),
@@ -200,8 +272,7 @@ pub fn status_words(job: &Job) -> (String, String) {
         ),
         JobState::Failed { .. } => (
             "The build didn't finish".to_string(),
-            "Whichever way it ends, the $1 is spent. To try again, publish a new agent."
-                .to_string(),
+            format!("Whichever way it ends, the {FEE} is spent. To try again, publish a new agent."),
         ),
     }
 }
@@ -219,7 +290,7 @@ fn chip(state: &JobState) -> El {
     }
 }
 
-fn job_view(job: &Job) -> View {
+fn job_view(job: &Job, paid: Option<PaymentRecord>) -> View {
     let title = if job.title.trim().is_empty() {
         format!("Job {}", job.id)
     } else {
@@ -257,7 +328,7 @@ fn job_view(job: &Job) -> View {
     let main = if job.state.is_finished() {
         outcome_card(job)
     } else {
-        status_card(job)
+        status_card(job, paid)
     };
     el("div")
         .class("sh-job__body")
@@ -276,8 +347,8 @@ fn job_view(job: &Job) -> View {
         .into()
 }
 
-fn status_card(job: &Job) -> View {
-    let (headline, detail) = status_words(job);
+fn status_card(job: &Job, paid: Option<PaymentRecord>) -> View {
+    let (headline, detail) = job_words(job, paid);
     let now = step_of(&job.state);
     let steps = [
         ("Queued", "In order, one at a time"),
@@ -355,12 +426,12 @@ fn report_link(job: &Job) -> View {
     }
 }
 
-const SPENT: &str = "Whichever way it ends, the $1 is spent. To try again, publish a new agent.";
-
 fn outcome_card(job: &Job) -> View {
     let spent = el("p")
         .class("sh-muted sh-author__small")
-        .text(SPENT)
+        .text(format!(
+            "Whichever way it ends, the {FEE} is spent. To try again, publish a new agent."
+        ))
         .child(text(" "))
         .child(
             app_link("/publish")
@@ -427,7 +498,7 @@ fn outcome_card(job: &Job) -> View {
                         .child(action),
                 )
                 .child(el("p").class("sh-muted sh-author__small").text(
-                    "The $1 is spent: it paid for this review and this build.",
+                    format!("The {FEE} is spent: it paid for this review and this build."),
                 ))
                 .into()
         }
@@ -612,7 +683,7 @@ mod tests {
             JobState::Ready,
         ] {
             let html = outcome_card(&job(state.clone())).html();
-            assert!(html.contains("$1 is spent"), "{state:?}: {html}");
+            assert!(html.contains("1 USDC is spent"), "{state:?}: {html}");
         }
     }
 

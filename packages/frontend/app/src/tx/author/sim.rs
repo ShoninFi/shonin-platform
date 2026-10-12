@@ -16,7 +16,7 @@ use alloy_sol_types::{SolCall, SolEvent, SolValue};
 use chain::bindings::erc20::IERC20;
 use chain::bindings::factory::{ChainName, IVaultFactory, VaultConfig};
 use chain::bindings::prices::IPrices;
-use chain::bindings::publishing::IPublishing;
+use chain::bindings::publishing::{IPublishing, Submission};
 use chain::bindings::reviews::IReviewRegistry;
 use chain::bindings::strategies::{ChainNeed, IStrategyRegistry, Strategy};
 use chain::bindings::vault::{self as b, IVault};
@@ -25,7 +25,7 @@ use futures::executor::block_on;
 use super::error::AuthorError;
 use super::flow::{self, Activation, Ctx, Outcome, Prompt, Spender, Step, Usage};
 use super::form::{self, Allowances};
-use super::read::Registries;
+use super::read::{self, PaymentRecord, Registries};
 use crate::tx::flow::{Cancel, Pace};
 use crate::tx::port::{Clock, Log, Pending, Reader, Receipt, Signer, StatementRequest, TxRequest};
 use crate::tx::read::State;
@@ -109,6 +109,13 @@ struct Chain {
     reverts: bool,
     /// Pay events record another upload than the one paid for.
     pay_logs_other: bool,
+    /// The wallet moves to this account once its first transaction is sent.
+    switch_after_first_send: Option<Address>,
+    /// The wallet hands payments on, and the network never mines them while
+    /// the app watches.
+    payments_unseen: bool,
+    /// Payments handed on and not mined yet: they may still land.
+    unmined: Vec<TxRequest>,
 }
 
 type Sim = Rc<RefCell<Chain>>;
@@ -160,6 +167,9 @@ impl World {
             wallet_signs_wrong: false,
             reverts: false,
             pay_logs_other: false,
+            switch_after_first_send: None,
+            payments_unseen: false,
+            unmined: Vec::new(),
         };
         Self {
             sim: Rc::new(RefCell::new(chain)),
@@ -329,6 +339,20 @@ impl Chain {
             return match selector {
                 IPublishing::feeCall::SELECTOR => ok(self.fee),
                 IPublishing::assetCall::SELECTOR => ok(usd()),
+                IPublishing::countCall::SELECTOR => ok(U256::from(self.submissions.len())),
+                IPublishing::submissionOfCall::SELECTOR => {
+                    let call = IPublishing::submissionOfCall::abi_decode(data).unwrap();
+                    let at = usize::try_from(call.strategyId).unwrap_or(usize::MAX);
+                    let (author, upload) = at
+                        .checked_sub(1)
+                        .and_then(|at| self.submissions.get(at).copied())
+                        .unwrap_or((Address::ZERO, B256::ZERO));
+                    ok(Submission {
+                        author,
+                        upload,
+                        paidAt: 0,
+                    })
+                }
                 _ => panic!("unexpected publishing read"),
             };
         }
@@ -753,6 +777,13 @@ impl Signer for SimWallet {
         );
         sim.sent.push(request.clone());
         let hash = keccak256(sim.sent.len().to_be_bytes());
+        if let Some(next) = sim.switch_after_first_send.take() {
+            sim.wallet_account = Some(next);
+        }
+        if sim.payments_unseen && request.to == publishing() {
+            sim.unmined.push(request.clone());
+            return Ok(hash);
+        }
         sim.block += 1;
         let first = sim.logs.len();
         let success = sim.execute(request);
@@ -794,7 +825,30 @@ fn dollars(amount: u64) -> U256 {
 // Publishing -------------------------------------------------------------------
 
 fn pay(world: &World) -> (Result<Outcome, AuthorError>, Vec<Step>) {
-    world.run(|ctx| Box::pin(flow::pay(ctx, publishing(), upload())))
+    let uploader = world.account();
+    world.run(move |ctx| Box::pin(flow::pay(ctx, publishing(), upload(), uploader)))
+}
+
+impl World {
+    /// Mine what the wallet handed on and the network hadn't mined.
+    fn mine_late(&self) {
+        let mut sim = self.sim.borrow_mut();
+        for request in std::mem::take(&mut sim.unmined) {
+            sim.execute(&request);
+        }
+    }
+
+    fn payment_after(&self, since: Option<U256>) -> PaymentRecord {
+        let reader = SimReader(self.sim.clone());
+        block_on(read::payment_after(
+            &reader,
+            publishing(),
+            upload(),
+            self.account(),
+            since,
+        ))
+        .unwrap()
+    }
 }
 
 #[test]
@@ -905,12 +959,161 @@ fn a_payment_recorded_for_another_upload_is_never_reported_as_this_ones() {
 }
 
 #[test]
-fn an_account_that_changed_stops_the_payment_before_anything_is_sent() {
+fn a_wallet_switched_away_from_the_uploading_account_is_never_asked_to_pay() {
     let world = World::new();
+    let uploader = world.account();
     world.with(|chain| chain.wallet_account = Some(Address::repeat_byte(0x99)));
-    let (result, _) = pay(&world);
-    assert_eq!(result, Err(AuthorError::Tx(TxError::AccountChanged)));
+    let (result, steps) = pay(&world);
+    assert_eq!(result, Err(AuthorError::WrongPayer { uploader }));
+    assert!(prompts(&steps).is_empty());
     assert!(world.calls().is_empty());
+}
+
+#[test]
+fn switching_accounts_between_upload_and_payment_sends_nothing() {
+    // Uploaded from one account; by the time the payment is due, the wallet
+    // is on another, and a flow built for the account connected now would
+    // pay from it. The payment is bound to the uploading account instead.
+    let world = World::new();
+    let uploader = world.account();
+    let now = Address::repeat_byte(0x99);
+    world.with(|chain| {
+        chain.wallet_account = Some(now);
+        chain.usd.insert(now, dollars(50));
+        chain
+            .native
+            .insert(now, U256::from(10u64).pow(U256::from(18u8)));
+    });
+    let steps = RefCell::new(Vec::new());
+    let on_step = |step: Step| steps.borrow_mut().push(step);
+    let reader = SimReader(world.sim.clone());
+    let wallet = SimWallet {
+        sim: world.sim.clone(),
+        key: world.key.clone(),
+    };
+    // Even a context built for the account connected now pays nothing.
+    let ctx = Ctx {
+        reader: &reader,
+        signer: &wallet,
+        clock: &NoWait,
+        chain_id: CHAIN,
+        account: now,
+        cancel: Cancel::new(),
+        pace: Pace::FAST,
+        on_step: &on_step,
+    };
+    let result = block_on(flow::pay(&ctx, publishing(), upload(), uploader));
+    assert_eq!(result, Err(AuthorError::WrongPayer { uploader }));
+    assert!(prompts(&steps.borrow()).is_empty());
+    assert!(world.calls().is_empty());
+    assert!(world.sim.borrow().sent.is_empty());
+    assert_eq!(world.usd_of(now), dollars(50));
+    assert!(world.sim.borrow().submissions.is_empty());
+
+    // Switched back, the same upload is paid from the account it named.
+    world.with(|chain| chain.wallet_account = Some(uploader));
+    let (result, _) = pay(&world);
+    assert!(matches!(result, Ok(Outcome::Paid { .. })), "{result:?}");
+    assert_eq!(world.sim.borrow().submissions, vec![(uploader, upload())]);
+}
+
+#[test]
+fn an_account_switched_after_the_approval_stops_the_payment_before_it_is_sent() {
+    let world = World::new();
+    let uploader = world.account();
+    world.with(|chain| chain.switch_after_first_send = Some(Address::repeat_byte(0x99)));
+    let before = world.usd_of(uploader);
+    let (result, _) = pay(&world);
+    let error = result.unwrap_err();
+    assert_eq!(error, AuthorError::WrongPayer { uploader });
+    // Only the approval went: no payment, from anyone.
+    assert_eq!(world.calls(), vec![IERC20::approveCall::SELECTOR]);
+    assert_eq!(world.usd_of(uploader), before);
+    assert!(world.sim.borrow().submissions.is_empty());
+    let words = error.words(&crate::tx::error::Context {
+        wallet: "MetaMask",
+        chain: "Base",
+        wallet_chain: None,
+        symbol: "USDC",
+        decimals: 6,
+        native: "ETH",
+    });
+    let short = crate::format::short_hash(&format!("{uploader:?}"));
+    assert!(
+        words
+            .text
+            .starts_with(&format!("Switch back to {short}, which made this upload")),
+        "{}",
+        words.text
+    );
+    assert!(words.text.contains("Nothing was sent."));
+}
+
+#[test]
+fn a_payment_not_seen_mined_is_never_offered_again_until_the_chain_shows_none() {
+    let world = World::new();
+    world.with(|chain| chain.payments_unseen = true);
+    let (result, _) = pay(&world);
+    let error = result.unwrap_err();
+    let AuthorError::PaymentUnsure {
+        upload: paid_for,
+        since,
+        then,
+    } = &error
+    else {
+        panic!("{error:?}");
+    };
+    assert_eq!(*paid_for, upload());
+    assert_eq!(*since, U256::ZERO);
+    assert!(then.may_have_moved());
+    assert!(error.may_have_paid());
+    assert!(error.after_send());
+    // While it hasn't landed, the chain shows no payment for the upload.
+    assert_eq!(world.payment_after(Some(*since)), PaymentRecord::None);
+    // Once it lands, it is found, as the uploader's.
+    world.mine_late();
+    assert_eq!(
+        world.payment_after(Some(*since)),
+        PaymentRecord::ByUploader {
+            strategy_id: U256::from(1u8)
+        }
+    );
+    assert_eq!(
+        world.payment_after(None),
+        PaymentRecord::ByUploader {
+            strategy_id: U256::from(1u8)
+        }
+    );
+}
+
+#[test]
+fn a_payment_for_the_upload_from_another_wallet_is_recorded_as_starting_nothing() {
+    let world = World::new();
+    let payer = Address::repeat_byte(0x99);
+    world.with(|chain| {
+        chain.submissions = vec![(payer, upload()), (payer, B256::repeat_byte(0x33))]
+    });
+    assert_eq!(
+        world.payment_after(Some(U256::ZERO)),
+        PaymentRecord::ByAnother {
+            strategy_id: U256::from(1u8),
+            payer
+        }
+    );
+    let reader = SimReader(world.sim.clone());
+    let at = |id: u8| {
+        block_on(read::payment_at(
+            &reader,
+            publishing(),
+            U256::from(id),
+            upload(),
+            world.account(),
+        ))
+        .unwrap()
+    };
+    // Another upload's record, and an id never assigned, are no payment.
+    assert_eq!(at(2), PaymentRecord::None);
+    assert_eq!(at(9), PaymentRecord::None);
 }
 
 // Activation -------------------------------------------------------------------
@@ -1221,7 +1424,10 @@ fn a_signed_withdrawal_needs_a_recent_total() {
     );
     assert_eq!(
         prompts(&steps),
-        vec![Prompt::WithdrawTank { amount: dollars(1) }]
+        vec![Prompt::WithdrawTank {
+            amount: dollars(1),
+            tab: U256::from(100u8)
+        }]
     );
 }
 

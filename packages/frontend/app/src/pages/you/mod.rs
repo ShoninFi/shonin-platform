@@ -624,7 +624,7 @@ fn tank_card(read: &Rc<Read>, controls: &Rc<Controls>, names: &Rc<Names>) -> El 
                         Some("$"),
                         Some(read.network.asset_symbol.clone()),
                         &controls.take,
-                        "The tab is paid first, the rest goes to your wallet.".to_string(),
+                        "The bill so far is paid from the tank first. You're asked for no more than what it leaves, and the wallet names what you'll get.".to_string(),
                         futures_signals::signal::always(None),
                     ),
                     on_click(

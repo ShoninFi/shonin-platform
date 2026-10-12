@@ -1,9 +1,9 @@
 //! `/publish` (Publish-Desktop, Publish-Mobile): package a project, upload
-//! it, choose public or sealed source, and pay $1 from the wallet that
-//! uploaded it. The `shonin.toml` summary is read from the archive itself,
-//! read-only, before anything is uploaded; a project the build service
-//! would refuse for its size is refused here, in an alert, with nothing
-//! uploaded or charged.
+//! it, choose public or sealed source, and pay the fee (1 USDC) from the
+//! wallet that uploaded it, and only from that wallet. The `shonin.toml`
+//! summary is read from the archive itself, read-only, before anything is
+//! uploaded; a project the build service would refuse for its size is
+//! refused here, in an alert, with nothing uploaded or charged.
 
 pub mod activate;
 pub mod job;
@@ -11,7 +11,7 @@ pub mod parts;
 
 use std::rc::Rc;
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use shared::Chain;
 use ui::icons::Icon;
@@ -22,6 +22,8 @@ use crate::atoms::check::{checkbox, radio};
 use crate::atoms::icon;
 use crate::atoms::notice::{NoticeTone, notice};
 use crate::route::DOCS;
+use crate::tx::author::AuthorError;
+use crate::tx::author::Step;
 use crate::tx::author::archive::{self, Refusal, Summary};
 use crate::tx::author::run::Running;
 use crate::view::{El, View, el, text};
@@ -38,6 +40,10 @@ const CHECKS: [&str; 8] = [
     "The build takes 20 minutes or less.",
     "I re-read shonin.toml. Its description and claims are what the Reviewer checks and what Depositors read.",
 ];
+
+/// The publishing fee as the page writes it before the chain's own figure
+/// is read: in the token, never in dollars.
+pub const FEE: &str = "1 USDC";
 
 /// How to package a project the way the build service takes it.
 const PACKAGE: &str = "git archive --format=tar -o agent.tar HEAD";
@@ -60,11 +66,12 @@ enum Sending {
     Uploading {
         note: String,
     },
-    /// Taken: pay against it from the same account.
+    /// Taken: pay against it from the account the upload named, and no
+    /// other.
     Uploaded {
         job: String,
         upload: B256,
-        account: String,
+        account: Address,
         chain: Chain,
         /// What was offered: the archive's hash, sealed or not, and the
         /// package. Anything else chosen since is uploaded again.
@@ -89,20 +96,38 @@ struct Draft {
     checks_open: Mutable<bool>,
     sending: Mutable<Sending>,
     running: Mutable<Option<Running>>,
+    /// Uploading or starting the payment: one at a time, however often the
+    /// payment section is redrawn.
+    busy: Mutable<bool>,
+    /// What looking on the chain for a payment that may have landed found.
+    checked: Mutable<Option<String>>,
     dragging: Mutable<bool>,
 }
 
 pub fn page() -> Page {
-    let draft = Rc::new(Draft {
-        picked: Mutable::new(None),
-        agent: Mutable::new(0),
-        source: Mutable::new(Source::Public),
-        checks: CHECKS.iter().map(|_| Mutable::new(false)).collect(),
-        checks_open: Mutable::new(false),
-        sending: Mutable::new(Sending::Idle),
-        running: Mutable::new(None),
-        dragging: Mutable::new(false),
-    });
+    let draft = Draft::new();
+    page_of(&draft)
+}
+
+impl Draft {
+    fn new() -> Rc<Self> {
+        Rc::new(Draft {
+            picked: Mutable::new(None),
+            agent: Mutable::new(0),
+            source: Mutable::new(Source::Public),
+            checks: CHECKS.iter().map(|_| Mutable::new(false)).collect(),
+            checks_open: Mutable::new(false),
+            sending: Mutable::new(Sending::Idle),
+            running: Mutable::new(None),
+            busy: Mutable::new(false),
+            checked: Mutable::new(None),
+            dragging: Mutable::new(false),
+        })
+    }
+}
+
+fn page_of(draft: &Rc<Draft>) -> Page {
+    let draft = draft.clone();
     let body = el("div")
         .class("sh-author sh-publish")
         .child(
@@ -113,7 +138,7 @@ pub fn page() -> Page {
                         .class("sh-author__headtext")
                         .child(el("h1").class("sh-author__title").text("Publish an agent"))
                         .child(el("p").class("sh-author__lede").text(
-                            "Submit your code for $1. We review it, build it once and seal it. You activate it when you’re happy.",
+                            format!("Submit your code for {FEE}. We review it, build it once and seal it. You activate it when you’re happy."),
                         )),
                 )
                 .child(
@@ -194,7 +219,7 @@ fn steps_list(state: &(bool, Source, bool, Option<String>)) -> View {
                 Source::Sealed => "Sealed source".to_string(),
             },
         ),
-        ("Pay $1", "One transaction, or two".to_string()),
+        ("Pay 1 USDC", "One transaction, or two".to_string()),
     ];
     el("ol")
         .class("sh-publish__steplist")
@@ -531,6 +556,7 @@ fn read_back(draft: &Rc<Draft>, picked: &Picked, summary: &Summary, index: usize
                 replace.picked.set(None);
                 replace.sending.set(Sending::Idle);
                 replace.running.set(None);
+                replace.checked.set(None);
             },
         ));
     let several = if summary.agents.len() > 1 {
@@ -688,7 +714,7 @@ fn seal_section(draft: &Rc<Draft>) -> El {
         )
 }
 
-// 4 · Pay $1 ---------------------------------------------------------------------------
+// 4 · Pay the fee ---------------------------------------------------------------------------
 
 /// The chain the chosen agent's vault is on, and that chain's network,
 /// once the project can be published.
@@ -720,7 +746,7 @@ fn pay_section(draft: &Rc<Draft>) -> El {
                         el("h2")
                             .attr("id", "st-pay")
                             .class("sh-publish__h2")
-                            .text("Pay $1"),
+                            .text(format!("Pay {FEE}")),
                     ),
                 ),
         )
@@ -749,18 +775,35 @@ fn pay_body(
         .as_ref()
         .map(|(chain, _)| chain.label().to_string())
         .unwrap_or_else(|| "the chain your vault will live on".to_string());
-    let from = el("span").class("sh-mono").text_signal(
-        "your wallet",
-        session.connection.signal_cloned().map(|connection| {
-            connection
-                .account()
+    // Once uploaded, the payment comes from the account the upload named;
+    // before that, from the one connected.
+    let payer = futures_signals::map_ref! {
+        let connection = session.connection.signal_cloned(),
+        let sending = draft.sending.signal_cloned() => {
+            let account = match sending {
+                Sending::Uploaded { account, .. } => Some(*account),
+                _ => connection.account(),
+            };
+            account
                 .map(|account| crate::format::short_hash(&format!("{account:?}")))
                 .unwrap_or_else(|| "your wallet".to_string())
-        }),
-    );
+        }
+    };
+    let from = el("span")
+        .class("sh-mono")
+        .text_signal("your wallet", payer);
+    // The fee as the publishing contract on this chain has it, once read.
+    let fee: Mutable<Option<String>> = Mutable::new(None);
+    let fee_text = fee
+        .signal_cloned()
+        .map(|fee| fee.unwrap_or_else(|| FEE.to_string()));
     let list = el("dl")
         .class("sh-publish__dl")
-        .child(parts::row("Publishing fee", parts::words("$1.00")))
+        .child(parts::row_signal(
+            "Publishing fee",
+            FEE.to_string(),
+            fee_text,
+        ))
         .child(parts::row(
             "Covers",
             parts::words("The review and the build"),
@@ -770,43 +813,47 @@ fn pay_body(
             View::Many(vec![text(format!("{chain_label} from ")), from.into()]),
         ));
     let action: View = match target {
-        None => Button::new(Kind::Primary, "Submit for $1")
-            .size(Size::Large)
-            .block()
-            .disabled(true)
-            .build()
-            .into(),
+        None => submit_button(FEE).disabled(true).build().into(),
         Some((_, None)) => notice(
             NoticeTone::Caution,
             text("This chain isn't reachable from the app right now. Try again shortly."),
         )
         .into(),
         Some((chain, Some(network))) => {
-            let draft = draft.clone();
             let names = Rc::new(Names::of(&network));
-            let busy = Mutable::new(false);
-            let sending = draft.sending.clone();
-            let running = draft.running.clone();
-            let button_draft = draft.clone();
+            let read_fee = fee.clone();
+            let fee_names = names.clone();
+            let gate_draft = draft.clone();
             let chain_id = network.chain_id;
             el("div")
                 .class("sh-publish__payaction")
                 .child(wallet_gate(chain_id, move || {
-                    let draft = button_draft.clone();
-                    let busy = busy.clone();
-                    on_click(
-                        Button::new(Kind::Primary, "Submit for $1")
-                            .size(Size::Large)
-                            .block()
-                            .busy(&busy)
-                            .build(),
-                        move || submit(&draft, chain, &busy),
-                    )
-                    .into()
+                    let draft = gate_draft.clone();
+                    let state = futures_signals::map_ref! {
+                        let fee = fee.signal_cloned(),
+                        let unsure = may_have_paid(&draft) => (fee.clone(), unsure.clone())
+                    };
+                    el("div")
+                        .child_signal(
+                            None,
+                            state.map(move |(fee, unsure)| {
+                                Some(pay_action(&draft, chain, fee, unsure.is_some()))
+                            }),
+                        )
+                        .into()
                 }))
+                .child_from(&draft.checked, |checked| {
+                    checked.as_ref().map(|note| {
+                        el("p")
+                            .class("sh-publish__note")
+                            .attr("role", "status")
+                            .text(note.clone())
+                            .into()
+                    })
+                })
                 .child_signal(
                     None,
-                    sending.signal_cloned().map(|sending| match sending {
+                    draft.sending.signal_cloned().map(|sending| match sending {
                         Sending::Uploading { note } => Some(
                             el("p")
                                 .class("sh-publish__note")
@@ -832,10 +879,17 @@ fn pay_body(
                 )
                 .child_signal(
                     None,
-                    running.signal_cloned().map(move |running| {
+                    draft.running.signal_cloned().map(move |running| {
                         running.map(|running| parts::status(&running, names.clone()).into())
                     }),
                 )
+                .hook(move |dom| {
+                    dom.future(async move {
+                        if let Some(amount) = crate::tx::author::run::fee(chain).await {
+                            read_fee.set(Some(fee_names.tokens(amount)));
+                        }
+                    })
+                })
                 .into()
         }
     };
@@ -844,14 +898,67 @@ fn pay_body(
         .child(list)
         .child(action)
         .child(el("p").class("sh-muted sh-publish__small").text(
-            "One transaction on the chain your vault will live on, or two if your wallet hasn't allowed the $1 yet. Only a payment from the wallet that uploaded the project starts the job. You never compute a hash.",
+            "One transaction on the chain your vault will live on, or two if your wallet hasn't allowed the fee yet. Only a payment from the wallet that uploaded the project starts the job, so the payment is only ever sent from that wallet. You never compute a hash.",
         ))
         .into()
 }
 
-/// Upload (unless this account already did, for this chain) and pay.
-fn submit(draft: &Rc<Draft>, chain: Chain, busy: &Mutable<bool>) {
-    if busy.get()
+fn submit_button(fee: &str) -> Button {
+    Button::new(Kind::Primary, format!("Submit for {fee}"))
+        .size(Size::Large)
+        .block()
+}
+
+/// The error of a payment that may have been made, or may still land,
+/// while it is the latest word: until the chain is checked, nothing offers
+/// to pay again.
+fn may_have_paid(draft: &Draft) -> impl Signal<Item = Option<AuthorError>> + 'static {
+    draft
+        .running
+        .signal_cloned()
+        .map(|running| match running {
+            Some(running) => running
+                .step
+                .signal_cloned()
+                .map(|step| match step {
+                    Some(Step::Failed(error)) if error.may_have_paid() => Some(error),
+                    _ => None,
+                })
+                .boxed_local(),
+            None => futures_signals::signal::always(None).boxed_local(),
+        })
+        .flatten()
+}
+
+/// "Submit for 1 USDC", or, after a payment that may have gone through,
+/// only a way to look for it on the chain.
+fn pay_action(draft: &Rc<Draft>, chain: Chain, fee: Option<String>, unsure: bool) -> View {
+    let busy = draft.busy.clone();
+    let draft = draft.clone();
+    if unsure {
+        return on_click(
+            Button::new(Kind::Secondary, "Check the chain for the payment")
+                .size(Size::Large)
+                .block()
+                .busy(&busy)
+                .build(),
+            move || check_payment(&draft, chain),
+        )
+        .into();
+    }
+    on_click(
+        submit_button(fee.as_deref().unwrap_or(FEE))
+            .busy(&busy)
+            .build(),
+        move || submit(&draft, chain),
+    )
+    .into()
+}
+
+/// Upload (unless this project was already uploaded for this chain) and
+/// pay, from the account the upload named.
+fn submit(draft: &Rc<Draft>, chain: Chain) {
+    if draft.busy.get()
         || draft
             .running
             .lock_ref()
@@ -860,10 +967,38 @@ fn submit(draft: &Rc<Draft>, chain: Chain, busy: &Mutable<bool>) {
     {
         return;
     }
+    draft.checked.set(None);
     #[cfg(target_arch = "wasm32")]
-    browser::submit(draft.clone(), chain, busy.clone());
+    browser::submit(draft.clone(), chain);
     #[cfg(not(target_arch = "wasm32"))]
     let _ = chain;
+}
+
+/// Look on the chain for a payment for this upload that may have landed:
+/// found, the job page; not found, the payment is offered again.
+fn check_payment(draft: &Rc<Draft>, chain: Chain) {
+    if draft.busy.get() {
+        return;
+    }
+    #[cfg(target_arch = "wasm32")]
+    browser::check_payment(draft.clone(), chain);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = chain;
+}
+
+/// What looking for a payment that may have landed says, when it didn't
+/// find the uploader's.
+pub fn check_words(found: &crate::tx::author::read::PaymentRecord, wallet: &str) -> String {
+    use crate::tx::author::read::PaymentRecord;
+    match found {
+        PaymentRecord::ByAnother { payer, .. } => format!(
+            "The chain shows a payment for this upload from {}, which didn't make the upload, so it doesn't start the job. Nothing from the wallet that made the upload yet.",
+            crate::format::short_hash(&format!("{payer:?}"))
+        ),
+        _ => format!(
+            "The chain shows no payment for this upload yet. If {wallet} still shows the payment waiting, wait for it or cancel it there before paying again."
+        ),
+    }
 }
 
 fn aside() -> El {
@@ -903,7 +1038,7 @@ fn aside() -> El {
                 .child(
                     notice(
                         NoticeTone::Info,
-                        text("The $1 is spent whichever way it ends. To try again, you publish a new agent."),
+                        text(format!("The {FEE} is spent whichever way it ends. To try again, you publish a new agent.")),
                     )
                     .class("sh-notice--compact"),
                 ),
@@ -924,16 +1059,16 @@ fn aside() -> El {
 mod browser {
     use std::rc::Rc;
 
-    use futures_signals::signal::Mutable;
     use js_sys::{Function, Promise, Reflect, Uint8Array};
     use shared::{Chain, Upload};
     use wasm_bindgen::{JsCast, JsValue};
     use wasm_bindgen_futures::JsFuture;
 
     use super::{Draft, Picked, Sending, Source};
-    use crate::tx::author::Outcome;
     use crate::tx::author::archive;
-    use crate::tx::author::run::{self, Action, Running, UploadError};
+    use crate::tx::author::read::PaymentRecord;
+    use crate::tx::author::run::{self, Action, Lookup, Running, UploadError};
+    use crate::tx::author::{AuthorError, Outcome, Step};
 
     /// The first file of an `<input type=file>`.
     pub fn take_input(draft: &Rc<Draft>, input: &web_sys::Element) {
@@ -975,6 +1110,7 @@ mod browser {
             draft.agent.set(0);
             draft.sending.set(Sending::Idle);
             draft.running.set(None);
+            draft.checked.set(None);
             draft.picked.set(Some(Picked {
                 name,
                 bytes: Rc::new(bytes),
@@ -993,7 +1129,7 @@ mod browser {
         Some(Uint8Array::new(&buffer).to_vec())
     }
 
-    pub fn submit(draft: Rc<Draft>, chain: Chain, busy: Mutable<bool>) {
+    pub fn submit(draft: Rc<Draft>, chain: Chain) {
         let session = crate::wallet::get();
         let Some(account) = session.account() else {
             return;
@@ -1009,17 +1145,20 @@ mod browser {
             .as_ref()
             .map(|summary| summary.agents.len() > 1)
             .unwrap_or(false);
-        let author = format!("{account:#x}");
         let sealed = draft.source.get() == Source::Sealed;
         let package = if several { agent.package.clone() } else { None };
         let offered = format!(
             "{}|{sealed}|{package:?}",
             alloy_primitives::keccak256(picked.bytes.as_slice())
         );
+        let busy = draft.busy.clone();
         busy.set(true);
         wasm_bindgen_futures::spawn_local(async move {
-            // An upload this account already made for this chain is paid
-            // for as it is; anything else is uploaded first.
+            // This project, already uploaded for this chain, is paid for as
+            // it is, from the account its upload named: the flow refuses
+            // any other and says which to switch back to. Anything else is
+            // uploaded first, in the connected account's name, and bound to
+            // that account from then on.
             let ready = match draft.sending.get_cloned() {
                 Sending::Uploaded {
                     job,
@@ -1027,20 +1166,20 @@ mod browser {
                     account: by,
                     chain: on,
                     offered: what,
-                } if by == author && on == chain && what == offered => Some((job, upload)),
+                } if on == chain && what == offered => Some((job, upload, by)),
                 _ => None,
             };
-            let (job, upload) = match ready {
+            let (job, upload, uploader) = match ready {
                 Some(ready) => ready,
                 None => {
                     let offer = Upload {
-                        author: author.clone(),
+                        author: format!("{account:#x}"),
                         archive_base64: shared::base64::encode(&picked.bytes),
                         sealed,
                         package,
                     };
                     match offer_until_taken(&draft, chain, &offer).await {
-                        Some(taken) => taken,
+                        Some((job, upload)) => (job, upload, account),
                         None => {
                             busy.set(false);
                             return;
@@ -1051,21 +1190,101 @@ mod browser {
             draft.sending.set(Sending::Uploaded {
                 job: job.clone(),
                 upload,
-                account: author,
+                account: uploader,
                 chain,
                 offered,
             });
             let running = Running::new();
             draft.running.set(Some(running.clone()));
             busy.set(false);
-            run::start(chain, Action::Pay { upload }, &running, move |outcome| {
-                if matches!(outcome, Outcome::Paid { .. }) {
-                    dominator::routing::go_to_url(&format!(
-                        "/publish/jobs/{}",
-                        crate::route::encode(&job)
-                    ));
+            run::start(
+                chain,
+                Action::Pay { upload, uploader },
+                &running,
+                move |outcome| {
+                    if let Outcome::Paid { strategy_id, .. } = outcome {
+                        run::remember_payment(
+                            &job,
+                            run::Paid {
+                                chain,
+                                upload,
+                                uploader,
+                                strategy_id: *strategy_id,
+                            },
+                        );
+                        go_to_job(&job);
+                    }
+                },
+            );
+        });
+    }
+
+    fn go_to_job(job: &str) {
+        dominator::routing::go_to_url(&format!("/publish/jobs/{}", crate::route::encode(job)));
+    }
+
+    /// Look for a payment for the upload that may have landed, after the
+    /// payments the contract had recorded before it was sent.
+    pub fn check_payment(draft: Rc<Draft>, chain: Chain) {
+        let Sending::Uploaded {
+            job,
+            upload,
+            account: uploader,
+            chain: on,
+            ..
+        } = draft.sending.get_cloned()
+        else {
+            return;
+        };
+        if on != chain {
+            return;
+        }
+        let since = match draft
+            .running
+            .lock_ref()
+            .as_ref()
+            .and_then(|running| running.step.get_cloned())
+        {
+            Some(Step::Failed(AuthorError::PaymentUnsure { since, .. })) => Some(since),
+            _ => None,
+        };
+        let wallet = crate::wallet::get().wallet_name.get_cloned();
+        let wallet = if wallet.is_empty() {
+            "your wallet".to_string()
+        } else {
+            wallet
+        };
+        let busy = draft.busy.clone();
+        busy.set(true);
+        draft.checked.set(None);
+        wasm_bindgen_futures::spawn_local(async move {
+            let found = run::payment(chain, upload, uploader, Lookup::After(since)).await;
+            busy.set(false);
+            match found {
+                Ok(PaymentRecord::ByUploader { strategy_id }) => {
+                    run::remember_payment(
+                        &job,
+                        run::Paid {
+                            chain,
+                            upload,
+                            uploader,
+                            strategy_id,
+                        },
+                    );
+                    go_to_job(&job);
                 }
-            });
+                Ok(found) => {
+                    // Nothing from the uploader on the chain: the payment is
+                    // offered again, with what was found said.
+                    draft.running.set(None);
+                    draft.checked.set(Some(super::check_words(&found, &wallet)));
+                }
+                Err(why) => {
+                    draft
+                        .checked
+                        .set(Some(format!("Couldn't look: {why}. Try again shortly.")));
+                }
+            }
         });
     }
 
@@ -1127,5 +1346,92 @@ mod browser {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tx::TxError;
+    use crate::tx::author::read::PaymentRecord;
+
+    /// A dollar sign and a one, written as the fee would be.
+    const DOLLAR_ONE: &str = concat!("$", "1");
+
+    /// Where the fee is written in dollars: a dollar sign and a one not
+    /// followed by a digit or a thousands comma (ten dollars and a thousand
+    /// dollars are other amounts).
+    fn dollar_fee(text: &str) -> Option<String> {
+        text.match_indices(DOLLAR_ONE).find_map(|(at, _)| {
+            let next = text[at + 2..].chars().next();
+            (!matches!(next, Some(c) if c.is_ascii_digit() || c == ','))
+                .then(|| text[at.saturating_sub(40)..(at + 12).min(text.len())].to_string())
+        })
+    }
+
+    #[test]
+    fn no_page_under_publish_writes_the_fee_in_dollars() {
+        let html = page().body.html();
+        assert!(html.contains("Submit for 1 USDC"), "{html}");
+        assert_eq!(dollar_fee(&html), None);
+        for (name, source) in [
+            ("mod.rs", include_str!("mod.rs")),
+            ("job.rs", include_str!("job.rs")),
+            ("activate.rs", include_str!("activate.rs")),
+            ("parts.rs", include_str!("parts.rs")),
+        ] {
+            // What the page says, its tests aside.
+            let source = source.split("#[cfg(test)]").next().unwrap_or_default();
+            assert_eq!(dollar_fee(source), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn after_a_payment_that_may_have_landed_the_page_offers_only_to_look_for_it() {
+        let draft = Draft::new();
+        let html = pay_action(&draft, Chain::Base, Some("1 USDC".to_string()), false).html();
+        assert!(html.contains("Submit for 1 USDC"), "{html}");
+        let html = pay_action(&draft, Chain::Base, Some("1 USDC".to_string()), true).html();
+        assert!(!html.contains("Submit"), "{html}");
+        assert!(html.contains("Check the chain for the payment"), "{html}");
+        // Which errors hold the payment back until the chain is checked.
+        let unsure = AuthorError::PaymentUnsure {
+            upload: B256::ZERO,
+            since: alloy_primitives::U256::ZERO,
+            then: Box::new(TxError::Dropped { hash: B256::ZERO }),
+        };
+        assert!(unsure.may_have_paid());
+        assert!(AuthorError::PaymentMismatch.may_have_paid());
+        assert!(AuthorError::Tx(TxError::Stuck { hash: B256::ZERO }).may_have_paid());
+        assert!(AuthorError::Tx(TxError::Replaced { hash: B256::ZERO }).may_have_paid());
+        assert!(!AuthorError::Tx(TxError::Rejected).may_have_paid());
+        assert!(
+            !AuthorError::WrongPayer {
+                uploader: Address::ZERO
+            }
+            .may_have_paid()
+        );
+        assert!(
+            !AuthorError::Tx(TxError::Reverted {
+                hash: B256::ZERO,
+                reason: None
+            })
+            .may_have_paid()
+        );
+    }
+
+    #[test]
+    fn looking_for_a_payment_says_what_the_chain_shows() {
+        let none = check_words(&PaymentRecord::None, "MetaMask");
+        assert!(none.starts_with("The chain shows no payment for this upload yet."));
+        assert!(none.contains("MetaMask"));
+        let other = check_words(
+            &PaymentRecord::ByAnother {
+                strategy_id: alloy_primitives::U256::from(3u8),
+                payer: Address::repeat_byte(0x97),
+            },
+            "MetaMask",
+        );
+        assert!(other.contains("doesn't start the job"), "{other}");
     }
 }
