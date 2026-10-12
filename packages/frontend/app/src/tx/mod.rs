@@ -2,6 +2,7 @@
 //! two ports: a reader of the vault's chain and the connected wallet. See
 //! [`flow`] for the rules every flow keeps.
 
+pub mod author;
 pub mod error;
 pub mod flow;
 pub mod port;

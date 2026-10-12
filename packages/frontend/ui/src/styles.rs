@@ -40,6 +40,7 @@ pub const ALL: &[(&str, &str)] = &[
     ("wallet", include_str!("../styles/wallet.css")),
     ("exit", include_str!("../styles/exit.css")),
     ("portfolio", include_str!("../styles/portfolio.css")),
+    ("author", include_str!("../styles/author.css")),
 ];
 
 /// Every stylesheet in [`ALL`], joined in order, each under a comment naming
