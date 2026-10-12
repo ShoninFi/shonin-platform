@@ -120,8 +120,34 @@ pub fn verified_build(agent: &Rc<Agent>) -> El {
                         "Check it yourself",
                     ))
                     .into(),
+                source_line(strategy).into(),
             ])
         }))
+}
+
+/// Where the code is: a link to read it, or plainly that nobody but the
+/// Reviewer can.
+pub fn source_line(strategy: &Strategy) -> El {
+    if strategy.bundle.source.is_published() {
+        let files = strategy.bundle.source_files.len();
+        el("p")
+            .class("ag-source-line")
+            .child(icon(Icon::Code, 16))
+            .child(
+                crate::web::app_link(format!("/agents/{}/source", strategy.slug))
+                    .text("Read its source"),
+            )
+            .text(if files > 0 {
+                format!(" · {} files, public", format::number(files as f64, 0))
+            } else {
+                " · public".to_string()
+            })
+    } else {
+        el("p")
+            .class("ag-source-line")
+            .child(icon(Icon::Lock, 16))
+            .text("Source sealed: only the Reviewer read it")
+    }
 }
 
 /// The exit in one sentence: direct or served.

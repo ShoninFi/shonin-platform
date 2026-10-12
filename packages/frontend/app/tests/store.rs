@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use app::model::Group;
-use app::pages::agents::{Filters, ListTab, Sort, SortKey, select};
+use app::pages::agents::{Filters, List, Sort, SortKey, select};
 use app::store::Store;
 use futures::Stream;
 use futures::task::noop_waker_ref;
@@ -138,7 +138,7 @@ fn a_vault_not_read_yet_is_counted_not_shown_as_an_agent() {
 fn sorting_by_money_in_vault_puts_the_largest_first_and_can_be_reversed() {
     let store = Store::new();
     let mut snapshot = snapshot();
-    // Make every agent ranked, so the open list has them all.
+    // Make every agent ranked, so the live list compares them all alike.
     for strategy in &mut snapshot.strategies {
         strategy.standing = shared::Standing::Listed;
     }
@@ -148,10 +148,10 @@ fn sorting_by_money_in_vault_puts_the_largest_first_and_can_be_reversed() {
         key: SortKey::InVault,
         descending: true,
     };
-    let rows = select(&agents, ListTab::Open, None, &Filters::default(), "", sort);
+    let rows = select(&agents, List::Live, None, &Filters::default(), "", sort);
     let open = agents
         .iter()
-        .filter(|agent| agent.group.get() == Group::Open)
+        .filter(|agent| matches!(agent.group.get(), Group::Open | Group::New))
         .count();
     assert!(open > 1, "the captured snapshot has open vaults to sort");
     assert_eq!(rows.len(), open);
@@ -160,7 +160,7 @@ fn sorting_by_money_in_vault_puts_the_largest_first_and_can_be_reversed() {
     }
     let rows = select(
         &agents,
-        ListTab::Open,
+        List::Live,
         None,
         &Filters::default(),
         "",
@@ -186,7 +186,7 @@ fn an_agent_with_no_30_day_figure_sorts_last_whichever_way() {
     for descending in [true, false] {
         let rows = select(
             &agents,
-            ListTab::Open,
+            List::Live,
             None,
             &Filters::default(),
             "",
@@ -209,21 +209,90 @@ fn an_agent_with_no_30_day_figure_sorts_last_whichever_way() {
 }
 
 #[test]
-fn the_new_list_holds_only_new_agents_and_search_finds_by_name_or_author() {
+fn the_live_list_holds_ranked_and_new_agents_and_never_a_closing_one() {
     let store = Store::new();
     let snapshot = snapshot();
     store.apply(&snapshot);
     let agents = store.all();
-    let new = select(
+    let live = select(
         &agents,
-        ListTab::New,
+        List::Live,
         None,
         &Filters::default(),
         "",
         Sort::default(),
     );
-    assert!(new.iter().all(|agent| agent.group.get() == Group::New));
+    assert!(
+        live.iter()
+            .all(|agent| matches!(agent.group.get(), Group::Open | Group::New))
+    );
+    let expected = agents
+        .iter()
+        .filter(|agent| matches!(agent.group.get(), Group::Open | Group::New))
+        .count();
+    assert_eq!(live.len(), expected);
+    let closing = select(
+        &agents,
+        List::Closing,
+        None,
+        &Filters::default(),
+        "",
+        Sort::default(),
+    );
+    assert!(
+        closing
+            .iter()
+            .all(|agent| agent.group.get() == Group::Closing)
+    );
+}
 
+#[test]
+fn by_30_days_new_agents_follow_every_ranked_one_longest_running_first() {
+    let store = Store::new();
+    let mut snapshot = snapshot();
+    // Half of them ranked, half new, whatever the capture holds.
+    for (index, strategy) in snapshot.strategies.iter_mut().enumerate() {
+        strategy.standing = if index % 2 == 0 {
+            shared::Standing::Listed
+        } else {
+            shared::Standing::New
+        };
+    }
+    store.apply(&snapshot);
+    let agents = store.all();
+    for descending in [true, false] {
+        let rows = select(
+            &agents,
+            List::Live,
+            None,
+            &Filters::default(),
+            "",
+            Sort {
+                key: SortKey::Return30,
+                descending,
+            },
+        );
+        let first_new = rows
+            .iter()
+            .position(|agent| agent.group.get() == Group::New)
+            .unwrap_or(rows.len());
+        let new = &rows[first_new..];
+        assert!(
+            new.iter().all(|agent| agent.group.get() == Group::New),
+            "once one is new, the rest are too"
+        );
+        for pair in new.windows(2) {
+            assert!(pair[0].figures.get().days >= pair[1].figures.get().days);
+        }
+    }
+}
+
+#[test]
+fn search_finds_an_agent_by_name_whatever_the_case() {
+    let store = Store::new();
+    let snapshot = snapshot();
+    store.apply(&snapshot);
+    let agents = store.all();
     let name = agents[0].title.get_cloned();
     let found = select(
         &agents,
@@ -236,7 +305,7 @@ fn the_new_list_holds_only_new_agents_and_search_finds_by_name_or_author() {
     assert!(found.iter().any(|agent| Rc::ptr_eq(agent, &agents[0])));
     let none = select(
         &agents,
-        ListTab::New,
+        List::Live,
         None,
         &Filters::default(),
         "no agent is called this",
@@ -281,16 +350,15 @@ fn an_author_link_narrows_the_lists_to_that_author_on_that_chain() {
 }
 
 /// The list a group's agents are shown in.
-trait List {
-    fn list(self) -> ListTab;
+trait InList {
+    fn list(self) -> List;
 }
 
-impl List for Group {
-    fn list(self) -> ListTab {
+impl InList for Group {
+    fn list(self) -> List {
         match self {
-            Group::Open => ListTab::Open,
-            Group::New => ListTab::New,
-            Group::Closing | Group::Hidden => ListTab::Closing,
+            Group::Open | Group::New => List::Live,
+            Group::Closing | Group::Hidden => List::Closing,
         }
     }
 }

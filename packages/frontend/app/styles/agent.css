@@ -417,9 +417,10 @@
 .ag-term { border-radius: var(--radius-m); border: var(--border-hairline) solid var(--line); overflow: hidden; }
 .ag-term__bar { display: flex; align-items: center; justify-content: space-between; padding: 10px var(--space-4); background: var(--paper); border-bottom: var(--border-hairline) solid var(--line); }
 .ag-term__name { display: inline-flex; align-items: center; gap: var(--space-2); font: 600 13px/20px var(--font-sans); }
+.ag-term__bar .ag-copy { height: 32px; }
+.ag-nowrap { white-space: nowrap; }
 .ag-term__body { margin: 0; padding: var(--space-4); overflow-x: auto; background: var(--paper-sunk); font: var(--type-mono); white-space: pre; }
 .ag-term__comment { color: var(--ink-muted); }
-.ag-term__confirm { padding: 1px 4px; border-radius: 4px; background: var(--caution-soft); color: var(--caution); }
 .ag-match { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: var(--space-4); }
 .ag-match__box { display: flex; flex-direction: column; gap: var(--space-1); padding: var(--space-3) var(--space-4); border-radius: var(--radius-m); border: var(--border-hairline) solid var(--line); }
 .ag-match__box--yours { border: var(--border-control) dashed var(--line-control); }
@@ -536,9 +537,6 @@
   .sh-app:has(.ag-actionbar) { padding-bottom: calc(118px + env(safe-area-inset-bottom)); }
 }
 
-/* The overview gives the reviewer's summary six lines; the review tab has
-   it whole. */
-.ag-o-review .ag-quote__text { display: -webkit-box; -webkit-line-clamp: 6; line-clamp: 6; -webkit-box-orient: vertical; overflow: hidden; }
 .ag-record .sh-hash { height: auto; min-height: 28px; padding-top: 4px; padding-bottom: 4px; }
 .ag-record .sh-hash__value { overflow-wrap: anywhere; min-width: 0; }
 
@@ -559,3 +557,99 @@
 .ag-chart__controls { flex-wrap: wrap; }
 .ag-layout .sh-card, .ag-layout section, .ag-scroll { min-width: 0; max-width: 100%; }
 .ag-scroll .sh-mono, .ag-scroll .ag-tx, .ag-scroll thead th { white-space: nowrap; }
+
+/* ---- Links to the source -------------------------------------------------- */
+/* The header's "Source public" chip is the way in to the code. */
+.ag-chip-link { gap: 4px; color: var(--ink); text-decoration: none; cursor: pointer; }
+.ag-chip-link .sh-icon:last-child { margin-right: -2px; color: var(--ink-muted); transition: transform var(--dur-fast) var(--ease-out); }
+@media (hover: hover) {
+  .ag-chip-link:hover { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; box-shadow: inset 0 0 0 1px var(--line-control); }
+  .ag-chip-link:hover .sh-icon:last-child { transform: translateX(2px); }
+}
+@media (prefers-reduced-motion: reduce) { .ag-chip-link .sh-icon:last-child { transition: none; } }
+.ag-record__read { display: inline-flex; white-space: nowrap; align-items: center; gap: 4px; align-self: flex-start; min-height: 32px; font: 600 13px/20px var(--font-sans); }
+.ag-record__read .sh-icon { width: 14px; height: 14px; }
+.ag-source-line { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; font: var(--type-body-s); color: var(--ink-muted); }
+.ag-source-line .sh-icon { flex: none; color: var(--ink-muted); }
+.ag-source-line a { font-weight: 600; min-height: 32px; display: inline-flex; align-items: center; }
+.ag-built .ag-source-line { padding-top: var(--space-3); border-top: var(--border-hairline) solid var(--brand-edge); }
+.ag-card__links { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: var(--space-2) var(--space-5); }
+
+/* ---- The review in brief (overview) ---------------------------------------- */
+.ag-headline { display: flex; flex-direction: column; gap: var(--space-2); }
+
+/* ---- The review tab: report card first, then the summary ------------------ */
+.ag-report-card__head { display: flex; flex-direction: column; gap: var(--space-3); padding: 20px var(--space-5); }
+.ag-report-card__head .ag-card__head { align-items: baseline; }
+.ag-summary { display: flex; flex-direction: column; gap: var(--space-3); }
+.ag-summary p { margin: 0; }
+/* About three lines where scripts run (the button to open it needs them),
+   fading out; the whole text without. */
+@media (scripting: enabled) {
+  .ag-summary--clamp {
+    max-height: calc(3 * 30px); overflow: hidden;
+    -webkit-mask-image: linear-gradient(to bottom, #000 55%, transparent);
+    mask-image: linear-gradient(to bottom, #000 55%, transparent);
+  }
+}
+.ag-summary__more { align-self: flex-start; margin-top: 0; }
+.ag-quote__by { flex-wrap: wrap; }
+.ag-quote__source { font-weight: 600; }
+
+/* ---- The source tab --------------------------------------------------------- */
+.ag-srcpage { display: flex; flex-direction: column; gap: var(--space-5); min-width: 0; margin-top: var(--space-2); }
+.ag-src-head { gap: var(--space-3); }
+.ag-src-head__row { display: flex; align-items: flex-end; justify-content: space-between; flex-wrap: wrap; gap: var(--space-4); padding-top: var(--space-2); }
+.ag-src-hash { display: flex; flex-direction: column; gap: var(--space-1); min-width: 0; }
+.ag-src-hash .sh-hash { align-self: flex-start; max-width: 100%; }
+.ag-src-head__actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-3) var(--space-5); }
+.ag-src-head__actions .sh-link { min-height: 44px; }
+
+/* The file list beside the file from 900px; above it below that. */
+.ag-src { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-4); align-items: start; min-width: 0; }
+@media (min-width: 900px) {
+  .ag-src { grid-template-columns: 300px minmax(0, 1fr); gap: var(--space-5); }
+  .ag-src__nav { position: sticky; top: 88px; max-height: calc(100vh - 112px); overflow-y: auto; }
+}
+.ag-src__nav { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-3) 0; border-radius: var(--radius-l); background: var(--paper-raised); border: var(--border-hairline) solid var(--line); min-width: 0; }
+.ag-src__count { padding: 0 var(--space-4); font: var(--type-label); letter-spacing: var(--track-label); text-transform: uppercase; color: var(--ink-muted); }
+.ag-src__list { display: flex; flex-direction: column; }
+.ag-src__link {
+  display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-3); min-height: 36px; padding: 7px var(--space-4);
+  border-left: 2px solid transparent; color: var(--ink); text-decoration: none; font: var(--type-mono-s);
+}
+.ag-src__path { min-width: 0; overflow-wrap: anywhere; }
+.ag-src__link--nested { padding-left: 28px; }
+.ag-src__folder { padding: var(--space-3) var(--space-4) 2px; font: var(--type-mono-s); font-size: 11px; color: var(--ink-muted); overflow-wrap: anywhere; }
+.ag-src__name { font-weight: 600; }
+.ag-src__size { flex: none; font: 400 12px/16px var(--font-sans); color: var(--ink-muted); white-space: nowrap; }
+@media (hover: hover) { .ag-src__link:hover { background: var(--paper-sunk); } .ag-src__link:hover .ag-src__name { text-decoration: underline; text-underline-offset: 3px; } }
+.ag-src__link:focus-visible { outline-offset: -2px; }
+.ag-src__link[aria-current="true"] { background: var(--brand-soft); border-left-color: var(--brand); }
+.ag-src__link[aria-current="true"] .ag-src__name { color: var(--brand); }
+
+.ag-src__files { min-width: 0; scroll-margin-top: 88px; }
+/* One file at a time: the one the address names, or the first, without
+   scripts; the one picked in the list, in the app. */
+.ag-src__file { display: none; min-width: 0; border-radius: var(--radius-l); background: var(--paper-raised); border: var(--border-hairline) solid var(--line); overflow: hidden; scroll-margin-top: 88px; }
+.ag-src:not(.ag-src--live) .ag-src__file:target,
+.ag-src:not(.ag-src--live) .ag-src__files:not(:has(.ag-src__file:target)) .ag-src__file--first,
+.ag-src--live .ag-src__file--current { display: block; }
+.ag-src__bar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: var(--space-1) var(--space-3); padding: var(--space-3) var(--space-4); background: var(--paper); border-bottom: var(--border-hairline) solid var(--line); }
+.ag-src__title { min-width: 0; font: var(--type-mono); font-weight: 600; overflow-wrap: anywhere; }
+.ag-src__meta { font: 400 13px/18px var(--font-sans); color: var(--ink-muted); white-space: nowrap; }
+/* Line numbers in their own column; long lines scroll inside the code's box. */
+.ag-src__body { display: grid; grid-template-columns: auto minmax(0, 1fr); background: var(--paper-raised); }
+.ag-src__gutter, .ag-src__code { margin: 0; padding: var(--space-3) 0; font: var(--type-mono-s); line-height: 20px; white-space: pre; tab-size: 4; }
+.ag-src__gutter { padding-left: var(--space-3); padding-right: var(--space-3); text-align: right; color: var(--ink-muted); background: var(--paper); border-right: var(--border-hairline) solid var(--line); user-select: none; }
+.ag-src__code { padding-left: var(--space-4); padding-right: var(--space-4); overflow-x: auto; color: var(--ink); }
+.ag-src__code:focus-visible { outline-offset: -2px; }
+@media (max-width: 599px) {
+  .ag-src-head__row { align-items: stretch; flex-direction: column; }
+  .ag-src__nav { max-height: 320px; overflow-y: auto; }
+  .ag-src__link { min-height: 44px; align-items: center; }
+  .ag-src__gutter { padding-left: var(--space-2); padding-right: var(--space-2); }
+  .ag-src__code { padding-left: var(--space-3); padding-right: var(--space-3); }
+}
+.ag-finding__file { text-decoration: none; }
+.ag-finding__file .ag-code { color: var(--link); text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1px; }

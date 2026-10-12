@@ -1,21 +1,24 @@
-//! `/agents/:id/review`: the whole AI review. What the reviewer found in a
-//! sentence and in six ratings, area by area with every finding, the
-//! author's claims, what the review couldn't see, and what a review is and
-//! isn't; beside it, where the report came from.
+//! `/agents/:id/review`: the whole AI review. The report card first (six
+//! areas, one rating each), then the Reviewer's summary (a few lines, with
+//! the rest a button away), area by area with every finding, the author's
+//! claims, what the review couldn't see, and what a review is and isn't;
+//! beside it, where the report came from.
 
 use std::rc::Rc;
 
+use futures_signals::map_ref;
+use futures_signals::signal::{Mutable, SignalExt};
 use shared::{Area, Rating, Review, Severity, Source, Strategy};
 use ui::icons::Icon;
 
 use super::parts::{self, card, more_in_app};
 use super::{facts, live, side};
 use crate::atoms::badge::{Tone, badge};
+use crate::atoms::button::on_click;
 use crate::atoms::icon;
 use crate::atoms::notice::{NoticeTone, notice};
 use crate::atoms::rating::{rating, rating_icon};
 use crate::format;
-use crate::model::rating_word;
 use crate::route::DOCS;
 use crate::store::Agent;
 use crate::view::{El, View, el, text};
@@ -43,8 +46,8 @@ fn main(strategy: &Strategy) -> View {
             .into();
     };
     View::Many(vec![
+        report_card(strategy, review).into(),
         found(strategy, review).into(),
-        report_card(review).into(),
         areas(strategy, review).into(),
         claims(strategy, review),
         limits(review),
@@ -54,6 +57,96 @@ fn main(strategy: &Strategy) -> View {
 
 fn sealed(strategy: &Strategy, review: &Review) -> bool {
     review.sealed || matches!(strategy.bundle.source, Source::Sealed)
+}
+
+/// The paragraphs of the Reviewer's summary, as it wrote them.
+pub fn paragraphs(summary: &str) -> Vec<String> {
+    summary
+        .split("\n\n")
+        .map(|part| part.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+/// The id of the summary's text, which its button controls.
+pub const SUMMARY_ID: &str = "ag-summary";
+
+/// The Reviewer's summary, held to about three lines with a button that
+/// opens the rest. The whole text is always in the page: the clamp is drawn
+/// only where scripts run (CSS `scripting`), and the button shows only when
+/// the app has measured that the text is longer than its lines.
+fn summary(summary: &str) -> View {
+    let expanded = Mutable::new(false);
+    let overflows = Mutable::new(false);
+    let mut parts = paragraphs(summary);
+    if let Some(first) = parts.first_mut() {
+        *first = format!("“{first}");
+    }
+    if let Some(last) = parts.last_mut() {
+        last.push('”');
+    }
+    let text = el("blockquote")
+        .class("ag-quote__text")
+        .class("ag-summary")
+        .attr("id", SUMMARY_ID)
+        .class_signal(
+            "ag-summary--clamp",
+            true,
+            expanded.signal().map(|expanded| !expanded),
+        )
+        .children(parts.into_iter().map(|part| el("p").text(part)))
+        .hook({
+            let expanded = expanded.clone();
+            let overflows = overflows.clone();
+            move |dom| {
+                dominator::with_node!(dom, element => {
+                    .future(super::measure_clamp(
+                        element,
+                        futures_signals::signal::always(String::new()),
+                        expanded,
+                        overflows,
+                    ))
+                })
+            }
+        });
+    let label = |expanded: bool| {
+        if expanded {
+            "Show less of the summary"
+        } else {
+            "Read the Reviewer's full summary"
+        }
+    };
+    let toggle = el("button")
+        .attr("type", "button")
+        .class("ag-more")
+        .class("ag-summary__more")
+        .attr("aria-controls", SUMMARY_ID)
+        .attr_signal(
+            "hidden",
+            Some(String::new()),
+            map_ref! {
+                let overflows = overflows.signal(),
+                let expanded = expanded.signal() => (!*overflows && !*expanded).then(String::new)
+            },
+        )
+        .attr_signal(
+            "aria-expanded",
+            Some("false".to_string()),
+            expanded.signal().map(|expanded| Some(expanded.to_string())),
+        )
+        .child(
+            el("span").text_signal(
+                label(false),
+                expanded
+                    .signal()
+                    .map(move |expanded| label(expanded).to_string()),
+            ),
+        )
+        .child(icon(Icon::ChevronDown, 16));
+    let toggle = on_click(toggle, move || {
+        expanded.replace_with(|expanded| !*expanded);
+    });
+    View::Many(vec![text.into(), toggle.into()])
 }
 
 fn found(strategy: &Strategy, review: &Review) -> El {
@@ -67,47 +160,6 @@ fn found(strategy: &Strategy, review: &Review) -> El {
         ),
         (false, None) => "Written by the Reviewer, after reading its source".to_string(),
     };
-    let counts = facts::rating_counts(review);
-    let tiles = el("ul")
-        .class("ag-counts")
-        .attr("aria-label", "How the six areas are rated")
-        .children(counts.iter().map(|(rated, areas)| {
-            let detail = if *rated == Rating::LooksFine {
-                "of 6 areas".to_string()
-            } else {
-                areas
-                    .iter()
-                    .map(|area| area.label())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            el("li")
-                .class("ag-counts__tile")
-                .class_if(
-                    !areas.is_empty() && *rated != Rating::LooksFine,
-                    match rated {
-                        Rating::SeriousConcerns => "ag-counts__tile--serious",
-                        Rating::SomeConcerns => "ag-counts__tile--some",
-                        _ => "ag-counts__tile--unknown",
-                    },
-                )
-                .child(
-                    el("span")
-                        .class("ag-counts__word")
-                        .child(icon(rating_icon(*rated), 16))
-                        .text(rating_word(*rated)),
-                )
-                .child(
-                    el("span")
-                        .class("ag-counts__n")
-                        .child(el("strong").text(areas.len().to_string()))
-                        .text(if areas.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" {detail}")
-                        }),
-                )
-        }));
     let accurate = review.rating(Area::AccurateDescription);
     let verdict = match accurate {
         Rating::LooksFine => {
@@ -123,64 +175,44 @@ fn found(strategy: &Strategy, review: &Review) -> El {
             "The Reviewer judged what the code does first, then checked it against this. It couldn't tell whether they match."
         }
     };
+    let byline = el("figcaption")
+        .class("ag-quote__by")
+        .child(icon(Icon::Review, 16))
+        .text(read);
+    let byline = if sealed {
+        byline
+    } else {
+        byline.child(
+            crate::web::app_link(format!("/agents/{}/source", strategy.slug))
+                .class("ag-quote__source")
+                .text("Read the source yourself"),
+        )
+    };
     el("section")
         .class("sh-card")
         .class("ag-card")
         .class("ag-found")
         .attr("aria-labelledby", "ag-found-title")
         .child(
-            el("div")
-                .class("ag-found__top")
-                .child(el("p").class("sh-label").text(if sealed {
-                    "AI review · sealed report"
-                } else {
-                    "AI review · public report"
-                }))
-                .child(
-                    el("p")
-                        .class("ag-found__when")
-                        .child(icon(Icon::Clock, 16))
-                        .text(format!(
-                            "Reviewed {}, before the build",
-                            facts::full_day(review.reviewed)
-                        )),
-                ),
-        )
-        .child(
             el("h2")
-                .class("ag-found__title")
+                .class("ag-card__title")
                 .attr("id", "ag-found-title")
                 .text("What the Reviewer found"),
         )
-        .child(View::from(review.refused.then(|| {
-            notice(
-                NoticeTone::Danger,
-                View::Many(vec![
-                    el("strong").text("Refused.").into(),
-                    text(
-                        " The Reviewer judged this code written to do harm, so it was never built.",
-                    ),
-                ]),
-            )
-            .into()
-        })))
         .child(
             el("figure")
                 .class("ag-quote")
                 .class("ag-quote--well")
-                .child(
-                    el("blockquote")
-                        .class("ag-quote__text")
-                        .text(format!("“{}”", review.summary.trim())),
-                )
-                .child(
-                    el("figcaption")
-                        .class("ag-quote__by")
-                        .child(icon(Icon::Review, 16))
-                        .text(read),
-                ),
+                .child(summary(&review.summary))
+                .child(byline),
         )
-        .child(tiles)
+        .child(View::from(sealed.then(|| {
+            el("p")
+                .class("ag-sealed-note")
+                .child(icon(Icon::Lock, 16))
+                .text("A sealed report gives ratings, a summary and findings by area and severity. It never names files, gives line numbers or quotes the code.")
+                .into()
+        })))
         .child(
             el("div")
                 .class("ag-says")
@@ -213,23 +245,59 @@ fn one_line(review: &Review, area: Area) -> String {
     }
 }
 
-fn report_card(review: &Review) -> El {
+/// The six areas and their ratings: the first thing the tab says.
+fn report_card(strategy: &Strategy, review: &Review) -> El {
+    let sealed = sealed(strategy, review);
     el("section")
         .class("sh-card")
         .class("ag-card")
         .class("ag-card--flush")
+        .class("ag-report-card")
         .attr("aria-labelledby", "ag-card-title")
         .child(
             el("div")
-                .class("ag-card__head")
-                .class("ag-card__head--pad")
+                .class("ag-report-card__head")
                 .child(
-                    el("h2")
-                        .class("ag-card__title")
-                        .attr("id", "ag-card-title")
-                        .text("Report card"),
+                    el("div")
+                        .class("ag-found__top")
+                        .child(el("p").class("sh-label").text(if sealed {
+                            "AI review · sealed report"
+                        } else {
+                            "AI review · public report"
+                        }))
+                        .child(
+                            el("p")
+                                .class("ag-found__when")
+                                .child(icon(Icon::Clock, 16))
+                                .text(format!(
+                                    "Reviewed {}, before the build",
+                                    facts::full_day(review.reviewed)
+                                )),
+                        ),
                 )
-                .child(el("p").class("ag-muted").text("Six areas, one rating each")),
+                .child(
+                    el("div")
+                        .class("ag-card__head")
+                        .child(
+                            el("h2")
+                                .class("ag-found__title")
+                                .attr("id", "ag-card-title")
+                                .text("Report card"),
+                        )
+                        .child(el("p").class("ag-muted").text("Six areas, one rating each")),
+                )
+                .child(View::from(review.refused.then(|| {
+                    notice(
+                        NoticeTone::Danger,
+                        View::Many(vec![
+                            el("strong").text("Refused.").into(),
+                            text(
+                                " The Reviewer judged this code written to do harm, so it was never built.",
+                            ),
+                        ]),
+                    )
+                    .into()
+                }))),
         )
         .child(
             el("div").class("ag-scroll").child(
@@ -274,9 +342,8 @@ fn report_card(review: &Review) -> El {
                             )
                             .child(
                                 el("td").class("sh-r").child(
-                                    el("a")
+                                    parts::in_page_link(area_anchor(area))
                                         .class("ag-report__go")
-                                        .attr("href", format!("#{}", area_anchor(area)))
                                         .attr("aria-label", format!("Go to {}", area.label()))
                                         .child(icon(Icon::ChevronRight, 18)),
                                 ),
@@ -404,9 +471,33 @@ fn areas(strategy: &Strategy, review: &Review) -> El {
                                                     (Some(file), None) => file.clone(),
                                                     _ => String::new(),
                                                 };
+                                                let code = el("code").class("ag-code").text(place);
+                                                // A file the source holds opens on the Source tab.
+                                                let held = finding.file.as_ref().filter(|file| {
+                                                    strategy
+                                                        .bundle
+                                                        .source_files
+                                                        .iter()
+                                                        .any(|held| held.path == **file)
+                                                });
                                                 el("p")
                                                     .class("ag-finding__where")
-                                                    .child(el("code").class("ag-code").text(place))
+                                                    .child(match held {
+                                                        Some(file) => crate::web::app_link(
+                                                            format!(
+                                                                "/agents/{}/source#{}",
+                                                                strategy.slug,
+                                                                super::source::file_id(file)
+                                                            ),
+                                                        )
+                                                        .class("ag-finding__file")
+                                                        .attr(
+                                                            "aria-label",
+                                                            format!("Open {file} in the source"),
+                                                        )
+                                                        .child(code),
+                                                        None => code,
+                                                    })
                                                     .into()
                                             }),
                                         )),
@@ -441,8 +532,7 @@ fn claims(strategy: &Strategy, review: &Review) -> View {
                 .text("Accurate description: ")
                 .child(rating(accurate))
                 .child(
-                    el("a")
-                        .attr("href", format!("#{}", area_anchor(Area::AccurateDescription)))
+                    parts::in_page_link(area_anchor(Area::AccurateDescription))
                         .text("See what it found"),
                 ),
         )

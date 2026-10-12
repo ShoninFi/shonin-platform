@@ -1,7 +1,7 @@
 //! `/agents/:id/verify`: which code is trading this vault. The five records
-//! on the chain from the source to the vault, how to rebuild the source and
-//! compare, the keys allowed to trade and the machine images behind them,
-//! and what checking can't tell you.
+//! on the chain from the source to the vault, how to check the source and
+//! the build against them, the keys allowed to trade and the machine images
+//! behind them, and what checking can't tell you.
 
 use std::rc::Rc;
 
@@ -51,11 +51,13 @@ struct Node {
     what: &'static str,
     glyph: Icon,
     link: Option<&'static str>,
+    /// Where to read what the record names, inside the app.
+    read: Option<(String, &'static str)>,
 }
 
 fn nodes(strategy: &Strategy) -> Vec<Node> {
     let source_sub = match (&strategy.bundle.source, facts::source_size(strategy)) {
-        (Source::Sealed, _) => "Sealed".to_string(),
+        (Source::Sealed, _) => "Sealed: only the Reviewer read it".to_string(),
         (_, Some((files, _))) => format!("Public · {} files", format::number(files as f64, 0)),
         _ => "Public".to_string(),
     };
@@ -79,6 +81,12 @@ fn nodes(strategy: &Strategy) -> Vec<Node> {
             what: "source hash",
             glyph: Icon::Code,
             link: Some("The report on the chain names the source it read."),
+            read: strategy.bundle.source.is_published().then(|| {
+                (
+                    format!("/agents/{}/source", strategy.slug),
+                    "Read the source",
+                )
+            }),
         },
         Node {
             title: "Review".into(),
@@ -89,6 +97,12 @@ fn nodes(strategy: &Strategy) -> Vec<Node> {
             what: "report hash",
             glyph: Icon::Review,
             link: Some("The build came from that same source, on an approved builder."),
+            read: review.is_some().then(|| {
+                (
+                    format!("/agents/{}/review", strategy.slug),
+                    "Read the review",
+                )
+            }),
         },
         Node {
             title: "Build".into(),
@@ -97,6 +111,7 @@ fn nodes(strategy: &Strategy) -> Vec<Node> {
             what: "build hash",
             glyph: Icon::Machine,
             link: Some("Each key was made inside an attested machine running this exact build."),
+            read: None,
         },
         Node {
             title: if attestation.is_some() {
@@ -113,6 +128,7 @@ fn nodes(strategy: &Strategy) -> Vec<Node> {
             what: "executor image",
             glyph: Icon::Seal,
             link: Some("The contract checked each key's attestation before letting it trade."),
+            read: None,
         },
         Node {
             title: "Vault".into(),
@@ -121,6 +137,7 @@ fn nodes(strategy: &Strategy) -> Vec<Node> {
             what: "vault contract address",
             glyph: Icon::Vault,
             link: None,
+            read: None,
         },
     ]
 }
@@ -162,6 +179,14 @@ fn chain_of_records(strategy: &Strategy) -> View {
                     Some(value) => parts::chip(value, node.what),
                     None => el("span").class("ag-record__none").text("Missing"),
                 })
+                .child(View::from(node.read.clone().map(|(href, words)| {
+                    crate::web::app_link(href)
+                        .class("ag-record__read")
+                        .attr("aria-label", words)
+                        .text("Read it")
+                        .child(icon(Icon::ArrowRight, 16))
+                        .into()
+                })))
                 .child(View::from(node.link.map(|_| {
                     el("span")
                         .class("ag-record__link")
@@ -299,10 +324,6 @@ fn rebuild(strategy: &Strategy) -> View {
             )
             .into();
     }
-    let (rust, _) = toolchain
-        .split_once(' ')
-        .map(|(_, version)| (version.to_string(), ()))
-        .unwrap_or((toolchain.clone(), ()));
     let size = facts::source_size(strategy)
         .map(|(files, lines)| {
             format!(
@@ -312,35 +333,10 @@ fn rebuild(strategy: &Strategy) -> View {
             )
         })
         .unwrap_or_else(|| "Public".to_string());
-    let where_from = match &strategy.bundle.source {
-        Source::Published { repo, .. } => repo.clone(),
-        Source::Sealed => String::new(),
-    };
-    let line = |kind: &'static str, words: String| el("span").class(kind).text(words);
-    let terminal = el("div")
-        .class("ag-term")
-        .child(
-            el("div")
-                .class("ag-term__bar")
-                .child(el("span").class("ag-term__name").child(icon(Icon::Code, 16)).text("Terminal")),
-        )
-        .child(
-            el("pre").class("ag-term__body").child(
-                el("code")
-                    .child(line("ag-term__comment", "# 1  Get the source at the recorded commit\n".into()))
-                    .child(line("ag-term__confirm", format!("[CONFIRM: source repository URL — the chain records {where_from}]")))
-                    .text("\n\n")
-                    .child(line("ag-term__comment", "# 2  Build with the pinned toolchain\n".into()))
-                    .text(format!("rustup toolchain install {rust} --target {target}\ncargo build --release --locked --target {target}\n\n"))
-                    .child(line("ag-term__comment", "# 3  Compare the fingerprint\n".into()))
-                    .child(line("ag-term__confirm", "[CONFIRM: fingerprint command]".into()))
-                    .text("\n")
-                    .child(line("ag-term__comment", format!("# expect {}", format::short_hash(build)))),
-            ),
-        );
-    card("ag-rebuild-title", "Rebuild it yourself", None)
+    let terminal = check_commands(strategy);
+    card("ag-rebuild-title", "Check it yourself", None)
         .child(el("p").class("ag-body").text(
-            "Builds are exactly repeatable. Build the source with the published recipe and you get the same fingerprint the chain holds. You don't have to trust us, or the page you're reading.",
+            "The store keeps the exact files the chain's hashes name, so you can download them and hash them yourself. Builds are exactly repeatable too: build the source with the published recipe and you get the same fingerprint the chain holds. You don't have to trust us, or the page you're reading.",
         ))
         .child(
             el("dl")
@@ -353,12 +349,21 @@ fn rebuild(strategy: &Strategy) -> View {
         .child(
             el("ol")
                 .class("ag-rsteps")
-                .child(el("li").child(el("strong").text("Get the source")).text(format!(
-                    " at the commit the chain records for {}.",
-                    format::short_hash(&strategy.bundle.source_hash)
-                )))
-                .child(el("li").child(el("strong").text("Build it")).text(" with the pinned toolchain and locked dependencies."))
-                .child(el("li").child(el("strong").text("Compare")).text(" your fingerprint with the build the chain holds.")),
+                .child(
+                    el("li")
+                        .child(el("strong").text("Read the source"))
+                        .text(" ")
+                        .child(crate::web::app_link(format!("/agents/{}/source", strategy.slug)).text("on its Source tab"))
+                        .text(", or download it with the commands below."),
+                )
+                .child(el("li").child(el("strong").text("Hash what you got.")).text(" The archive's SHA-256 is the source hash the Reviewer's report names; the component's is the build hash."))
+                .child(
+                    el("li")
+                        .child(el("strong").text("Rebuild it"))
+                        .text(format!(" with {toolchain} for {target}, "))
+                        .child(el("code").class("ag-code").class("ag-nowrap").text("--release --locked"))
+                        .text(". Your component's hash should be the build the chain holds."),
+                ),
         )
         .child(terminal)
         .child(
@@ -388,6 +393,66 @@ fn rebuild(strategy: &Strategy) -> View {
                 .child(el("a").attr("href", format!("{DOCS}verify/")).text("The full rebuild guide")),
         )
         .into()
+}
+
+/// The commands that fetch the source and the build from the store and hash
+/// them, with what each should print: real addresses, real hashes.
+fn check_commands(strategy: &Strategy) -> El {
+    let bundle = &strategy.bundle;
+    let digits = |hash: &str| hash.strip_prefix("sha256:").unwrap_or(hash).to_string();
+    let source = parts::store_url(&bundle.source_hash, "source.tar");
+    let build = parts::store_url(&bundle.bundle_hash, "component.wasm");
+    let steps = [
+        (
+            "# 1  The source the Reviewer read",
+            format!("curl -fLo source.tar '{source}'\nshasum -a 256 source.tar"),
+            format!("# expect {}", digits(&bundle.source_hash)),
+        ),
+        (
+            "# 2  The build that trades this vault",
+            format!("curl -fLo component.wasm '{build}'\nshasum -a 256 component.wasm"),
+            format!("# expect {}", digits(&bundle.component_hash)),
+        ),
+    ];
+    let all = steps
+        .iter()
+        .map(|(title, commands, expect)| format!("{title}\n{commands}\n{expect}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let line = |kind: &'static str, words: String| el("span").class(kind).text(words);
+    let mut code = el("code");
+    for (index, (title, commands, expect)) in steps.into_iter().enumerate() {
+        if index > 0 {
+            code = code.text("\n\n");
+        }
+        code = code
+            .child(line("ag-term__comment", format!("{title}\n")))
+            .text(format!("{commands}\n"))
+            .child(line("ag-term__comment", expect));
+    }
+    el("div")
+        .class("ag-term")
+        .child(
+            el("div")
+                .class("ag-term__bar")
+                .child(
+                    el("span")
+                        .class("ag-term__name")
+                        .child(icon(Icon::Code, 16))
+                        .text("Terminal"),
+                )
+                .child(parts::copy_button(all, "the commands")),
+        )
+        .child(
+            el("pre")
+                .class("ag-term__body")
+                .attr("tabindex", "0")
+                .attr(
+                    "aria-label",
+                    "Commands to download and hash the source and the build",
+                )
+                .child(code),
+        )
 }
 
 fn keys(strategy: &Strategy) -> View {

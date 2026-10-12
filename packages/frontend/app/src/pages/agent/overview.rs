@@ -5,11 +5,11 @@
 
 use std::rc::Rc;
 
-use shared::{Area, Custody, ExitClass, Leg, Rating, Source, Strategy, VenueStatus};
+use shared::{Area, Custody, ExitClass, Leg, Rating, Strategy, VenueStatus};
 use ui::icons::Icon;
 
 use super::chart::{ChartState, chart};
-use super::parts::{self, card, card_with_aside, more, more_in_app};
+use super::parts::{card, card_with_aside, more, more_in_app};
 use super::{facts, join_and, live, side};
 use crate::atoms::badge::{Tone, badge};
 use crate::atoms::delta::{missing_figure, tone_class};
@@ -129,6 +129,8 @@ fn stats(agent: &Rc<Agent>) -> El {
 
 // ---- The review in brief --------------------------------------------------
 
+/// The review in brief: the report card's six ratings and its headline
+/// finding. The summary, every finding and the claims live on the Review tab.
 fn review_card(strategy: &Strategy) -> View {
     let Some(review) = &strategy.review else {
         return card("ag-review-title", "The review", Some(Icon::Review))
@@ -139,15 +141,6 @@ fn review_card(strategy: &Strategy) -> View {
                     .text("No review is on the chain for this agent yet."),
             )
             .into();
-    };
-    let sealed = review.sealed || matches!(strategy.bundle.source, Source::Sealed);
-    let caption = match (sealed, facts::source_size(strategy)) {
-        (true, _) => "Written by the Reviewer, which read the sealed source".to_string(),
-        (false, Some((_, lines))) => format!(
-            "The AI Reviewer's summary, after reading all {} lines of its source",
-            format::number(lines as f64, 0)
-        ),
-        (false, None) => "The AI Reviewer's summary, after reading its source".to_string(),
     };
     let ratings = el("ul")
         .class("ag-ratings")
@@ -161,66 +154,6 @@ fn review_card(strategy: &Strategy) -> View {
                 .child(el("span").class("ag-ratings__area").text(area.label()))
                 .child(rating(review.rating(area)))
         }));
-    // Each concern with a finding gets its own notice; areas rated with no
-    // finding to quote are named together, one notice per rating.
-    let mut concerns: Vec<(Rating, View)> = Vec::new();
-    let mut unexplained: Vec<(Rating, Vec<&str>)> = Vec::new();
-    for (area, rated) in facts::concerns(review) {
-        let (tone, glyph) = match rated {
-            Rating::SeriousConcerns => (NoticeTone::Danger, Icon::Serious),
-            _ => (NoticeTone::Caution, Icon::Concern),
-        };
-        match facts::lead_finding(review, area) {
-            Some(finding) => concerns.push((
-                rated,
-                crate::atoms::notice::notice_with(
-                    tone,
-                    glyph,
-                    View::Many(vec![
-                        el("strong")
-                            .text(format!(
-                                "{}: {}.",
-                                area.label(),
-                                rating_word(rated).to_lowercase()
-                            ))
-                            .into(),
-                        text(format!(" {}.", finding.summary.trim_end_matches('.'))),
-                    ]),
-                )
-                .into(),
-            )),
-            None => match unexplained.iter_mut().find(|(r, _)| *r == rated) {
-                Some((_, areas)) => areas.push(area.label()),
-                None => unexplained.push((rated, vec![area.label()])),
-            },
-        }
-    }
-    for (rated, areas) in unexplained {
-        let (tone, glyph) = match rated {
-            Rating::SeriousConcerns => (NoticeTone::Danger, Icon::Serious),
-            _ => (NoticeTone::Caution, Icon::Concern),
-        };
-        concerns.push((
-            rated,
-            crate::atoms::notice::notice_with(
-                tone,
-                glyph,
-                View::Many(vec![
-                    el("strong")
-                        .text(format!(
-                            "{}: {}.",
-                            join_and(&areas),
-                            rating_word(rated).to_lowercase()
-                        ))
-                        .into(),
-                    text(" Read the full review for what the Reviewer found."),
-                ]),
-            )
-            .into(),
-        ));
-    }
-    concerns.sort_by_key(|(rated, _)| *rated != Rating::SeriousConcerns);
-    let concerns: Vec<View> = concerns.into_iter().map(|(_, view)| view).collect();
     let refused = review.refused.then(|| {
         notice(
             NoticeTone::Danger,
@@ -231,56 +164,30 @@ fn review_card(strategy: &Strategy) -> View {
         )
         .into()
     });
-    let claims = (!strategy.claims.is_empty()).then(|| {
-        el("div")
-            .class("ag-claims")
-            .child(el("h3").class("sh-label").text("What its Author promises"))
-            .child(
-                el("ul")
-                    .class("ag-bullets")
-                    .children(strategy.claims.iter().map(|claim| el("li").text(claim.clone()))),
-            )
-            .child(el("p").class("ag-note").text(
-                "The Reviewer checked the code against each promise. Its contracts don't enforce them.",
-            ))
-            .into()
-    });
-    let sealed_note = sealed.then(|| {
-        el("p")
-            .class("ag-sealed-note")
-            .child(icon(Icon::Lock, 16))
-            .text("A sealed report gives ratings, a summary and findings by area and severity. It never names files, gives line numbers or quotes the code.")
-            .into()
-    });
     card_with_aside(
         "ag-review-title",
         "The review",
         Some(Icon::Review),
-        parts::chip(&review.report_hash, "review hash"),
+        el("p")
+            .class("ag-muted")
+            .text(format!("Reviewed {}", facts::full_day(review.reviewed))),
     )
     .class("ag-o-review")
     .child(View::from(refused))
-    .child(
-        el("figure")
-            .class("ag-quote")
-            .child(
-                el("blockquote")
-                    .class("ag-quote__text")
-                    .text(format!("“{}”", review.summary.trim())),
-            )
-            .child(el("figcaption").class("ag-quote__by").text(caption)),
-    )
     .child(ratings)
-    .child(View::Many(concerns))
-    .child(View::from(sealed_note))
-    .child(View::from(claims))
+    .child(headline(review))
     .child(
         el("div")
             .class("ag-card__foot")
-            .child(more_in_app(
-                format!("/agents/{}/review", strategy.slug),
-                "Read the full review",
-            ))
+            .child(
+                el("div")
+                    .class("ag-card__links")
+                    .child(more_in_app(
+                        format!("/agents/{}/review", strategy.slug),
+                        "Read the full review",
+                    ))
+                    .child(side::source_line(strategy)),
+            )
             .child(
                 el("p").class("ag-note").text(
                     "A review isn't a prediction. It never rates how much an agent might make.",
@@ -288,6 +195,124 @@ fn review_card(strategy: &Strategy) -> View {
             ),
     )
     .into()
+}
+
+/// How much an area's rating says, for picking what leads.
+fn rating_weight(rated: Rating) -> u8 {
+    match rated {
+        Rating::SeriousConcerns => 3,
+        Rating::SomeConcerns => 2,
+        Rating::CouldntTell => 1,
+        Rating::LooksFine => 0,
+    }
+}
+
+/// The finding that leads the review: the most severe one, from the worst
+/// rated area on a tie, the first of those.
+pub fn headline_finding(review: &shared::Review) -> Option<(Area, &shared::Finding)> {
+    let mut best: Option<(Area, &shared::Finding)> = None;
+    for area in Area::ALL {
+        for finding in review.findings_in(area) {
+            let better = match best {
+                None => true,
+                Some((held, lead)) => {
+                    (finding.severity, rating_weight(review.rating(area)))
+                        > (lead.severity, rating_weight(review.rating(held)))
+                }
+            };
+            if better {
+                best = Some((area, finding));
+            }
+        }
+    }
+    best
+}
+
+/// The headline finding as one notice, or the areas rated with concerns
+/// when there is no finding to quote, or nothing when all six look fine.
+fn headline(review: &shared::Review) -> View {
+    let block = |body: View, tone: NoticeTone, glyph: Icon| -> View {
+        el("div")
+            .class("ag-headline")
+            .child(el("h3").class("sh-label").text("Headline finding"))
+            .child(crate::atoms::notice::notice_with(tone, glyph, body))
+            .into()
+    };
+    if let Some((area, finding)) = headline_finding(review) {
+        let (tone, glyph) = tone_of(finding.severity);
+        // A worse-rated area with no finding to quote still gets named.
+        let worse: Vec<(Area, Rating)> = facts::concerns(review)
+            .into_iter()
+            .filter(|(_, rated)| rating_weight(*rated) > rating_weight(review.rating(area)))
+            .collect();
+        let also = worse.first().map(|(_, worst)| {
+            let names: Vec<&str> = worse
+                .iter()
+                .filter(|(_, rated)| rated == worst)
+                .map(|(area, _)| area.label())
+                .collect();
+            el("p")
+                .class("ag-note")
+                .text(format!(
+                    "Also rated {}: {}.",
+                    rating_word(*worst).to_lowercase(),
+                    join_and(&names)
+                ))
+                .into()
+        });
+        return View::Many(vec![
+            block(
+                View::Many(vec![
+                    el("strong")
+                        .text(format!(
+                            "{}: {}.",
+                            area.label(),
+                            rating_word(review.rating(area)).to_lowercase()
+                        ))
+                        .into(),
+                    text(format!(" {}.", finding.summary.trim_end_matches('.'))),
+                ]),
+                tone,
+                glyph,
+            ),
+            View::from(also),
+        ]);
+    }
+    let concerns = facts::concerns(review);
+    let Some((_, worst)) = concerns.first().copied() else {
+        return View::Empty;
+    };
+    let areas: Vec<&str> = concerns
+        .iter()
+        .filter(|(_, rated)| *rated == worst)
+        .map(|(area, _)| area.label())
+        .collect();
+    let (tone, glyph) = match worst {
+        Rating::SeriousConcerns => (NoticeTone::Danger, Icon::Serious),
+        _ => (NoticeTone::Caution, Icon::Concern),
+    };
+    block(
+        View::Many(vec![
+            el("strong")
+                .text(format!(
+                    "{}: {}.",
+                    join_and(&areas),
+                    rating_word(worst).to_lowercase()
+                ))
+                .into(),
+            text(" Read the full review for what the Reviewer found."),
+        ]),
+        tone,
+        glyph,
+    )
+}
+
+fn tone_of(severity: shared::Severity) -> (NoticeTone, Icon) {
+    match severity {
+        shared::Severity::Serious => (NoticeTone::Danger, Icon::Serious),
+        shared::Severity::Concern => (NoticeTone::Caution, Icon::Concern),
+        shared::Severity::Note => (NoticeTone::Info, Icon::Info),
+    }
 }
 
 // ---- What can still go wrong ---------------------------------------------

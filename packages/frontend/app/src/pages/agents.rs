@@ -1,13 +1,16 @@
 //! `/agents`: the leaderboard (Leaderboard-Desktop, -Tablet, -Mobile).
 //!
-//! Three lists behind tabs: open for deposits (ranked by 30 days), new (under
-//! 30 days, not ranked) and winding down or closed. A real `<table>` from
-//! 600px up, sortable by 30 days or money in vault with `aria-sort` on the
-//! sorted column only; a list of cards on a phone, where sort and filters open
-//! as sheets. Rows never reorder because a figure moved: only when someone
-//! sorts, filters, or an agent joins or leaves a list.
+//! One list of every live agent: those with 30 days of history ranked by
+//! their 30-day return, new ones (under 30 days) marked New and showing the
+//! period they have instead. Winding-down and closed agents sit in a quieter
+//! section under it. Shown as a real `<table>` from 600px up, sortable by 30
+//! days or money in vault with `aria-sort` on the sorted column only, or as
+//! a grid of cards (the reader's choice, remembered in this browser); a list
+//! of cards on a phone, where sort and filters open as sheets. Rows never
+//! reorder because a figure moved: only when someone sorts, filters, or an
+//! agent joins or leaves a list.
 //!
-//! `?author=<chain>:<address>` narrows every list to one Author.
+//! `?author=<chain>:<address>` narrows both lists to one Author.
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -24,7 +27,7 @@ use crate::atoms::delta::{delta_from, missing_figure};
 use crate::atoms::dialog::{self, Dialog};
 use crate::atoms::gauge::gauge;
 use crate::atoms::hash::hash_plain;
-use crate::atoms::notice::{NoticeTone, lead, notice, notice_with};
+use crate::atoms::notice::{NoticeTone, notice};
 use crate::atoms::skeleton::skeleton;
 use crate::atoms::sparkline::sparkline;
 use crate::atoms::{Tone, badge, icon, review_chip};
@@ -32,44 +35,66 @@ use crate::format;
 use crate::model::{AuthorKey, Group, days_until};
 use crate::route::DOCS_DEPOSITORS;
 use crate::store::{self, Agent};
-use crate::view::{El, View, el, text};
+use crate::view::{El, View, el, svg, text};
 use crate::web::app_link;
 
 use super::Page;
 
-/// The three lists.
+/// The two lists: live agents, and those winding down or closed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ListTab {
-    Open,
-    New,
+pub enum List {
+    Live,
     Closing,
 }
 
-impl ListTab {
-    pub const ALL: [ListTab; 3] = [ListTab::Open, ListTab::New, ListTab::Closing];
-
-    fn label(self) -> &'static str {
+impl List {
+    fn holds(self, group: Group) -> bool {
         match self {
-            ListTab::Open => "Open for deposits",
-            ListTab::New => "New",
-            ListTab::Closing => "Winding down and closed",
+            List::Live => matches!(group, Group::Open | Group::New),
+            List::Closing => group == Group::Closing,
+        }
+    }
+}
+
+/// How the live list is drawn from 600px up: a table or a grid of cards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    List,
+    Grid,
+}
+
+impl Layout {
+    const KEY: &'static str = "agents.layout";
+
+    fn word(self) -> &'static str {
+        match self {
+            Layout::List => "list",
+            Layout::Grid => "grid",
         }
     }
 
-    fn group(self) -> Group {
-        match self {
-            ListTab::Open => Group::Open,
-            ListTab::New => Group::New,
-            ListTab::Closing => Group::Closing,
+    fn from_word(word: &str) -> Option<Self> {
+        match word {
+            "list" => Some(Layout::List),
+            "grid" => Some(Layout::Grid),
+            _ => None,
         }
     }
 
-    fn id(self) -> &'static str {
-        match self {
-            ListTab::Open => "lb-tab-open",
-            ListTab::New => "lb-tab-new",
-            ListTab::Closing => "lb-tab-closing",
+    /// The reader's last choice in this browser, or the table. Storage can
+    /// fail or be empty anywhere (a private window, cleared data), and the
+    /// pre-render has none: the table then.
+    fn remembered() -> Self {
+        if !cfg!(target_arch = "wasm32") {
+            return Layout::List;
         }
+        crate::web::storage_get(Self::KEY)
+            .and_then(|word| Self::from_word(&word))
+            .unwrap_or(Layout::List)
+    }
+
+    fn remember(self) {
+        crate::web::storage_set(Self::KEY, self.word());
     }
 }
 
@@ -130,7 +155,7 @@ pub enum ReviewFilter {
     AllFine,
 }
 
-/// What narrows a list, besides the tab.
+/// What narrows the lists.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Filters {
     pub chains: BTreeSet<Chain>,
@@ -180,12 +205,17 @@ fn matches_search(agent: &Agent, search: &str) -> bool {
             .is_some_and(|key| key.to_lowercase().contains(&search))
 }
 
-/// The rows of one list, in order: the agents in `tab` that pass the author,
-/// filters and search, sorted. Open agents follow `sort`; new ones go by how
-/// long they have run, longest first; winding-down ones by how soon they stop.
+/// The rows of one list, in order: the agents in `list` that pass the
+/// author, filters and search, sorted.
+///
+/// Live agents follow `sort`. By 30 days, an agent with 30 days of history
+/// goes ahead of every new one (a shorter period isn't comparable), and the
+/// new ones follow by how long they have run, longest first. By money in
+/// vault, every live agent is compared alike. Winding-down agents go by how
+/// soon they stop.
 pub fn select(
     agents: &[Rc<Agent>],
-    tab: ListTab,
+    list: List,
     author: Option<&str>,
     filters: &Filters,
     search: &str,
@@ -193,7 +223,7 @@ pub fn select(
 ) -> Vec<Rc<Agent>> {
     let mut rows: Vec<Rc<Agent>> = agents
         .iter()
-        .filter(|agent| agent.group.get() == tab.group())
+        .filter(|agent| list.holds(agent.group.get()))
         .filter(|agent| {
             author.is_none_or(|key| agent.author_key.lock_ref().as_deref() == Some(key))
         })
@@ -201,36 +231,31 @@ pub fn select(
         .cloned()
         .collect();
     let by_name = |a: &Rc<Agent>, b: &Rc<Agent>| a.title.lock_ref().cmp(&b.title.lock_ref());
-    match tab {
-        ListTab::Open => rows.sort_by(|a, b| {
-            let order = match sort.key {
+    let directed = |order: std::cmp::Ordering| {
+        if sort.descending {
+            order.reverse()
+        } else {
+            order
+        }
+    };
+    match list {
+        List::Live => rows.sort_by(|a, b| {
+            match sort.key {
                 SortKey::Return30 => {
                     let (x, y) = (a.figures.get().return_30d, b.figures.get().return_30d);
                     match (x, y) {
                         // Agents with no 30-day figure go last, whichever way.
-                        (Some(_), None) => return std::cmp::Ordering::Less,
-                        (None, Some(_)) => return std::cmp::Ordering::Greater,
-                        (Some(x), Some(y)) => x.total_cmp(&y),
-                        (None, None) => std::cmp::Ordering::Equal,
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (Some(x), Some(y)) => directed(x.total_cmp(&y)),
+                        (None, None) => b.figures.get().days.cmp(&a.figures.get().days),
                     }
                 }
-                SortKey::InVault => a.in_vault.get().total_cmp(&b.in_vault.get()),
-            };
-            let order = if sort.descending {
-                order.reverse()
-            } else {
-                order
-            };
-            order.then_with(|| by_name(a, b))
+                SortKey::InVault => directed(a.in_vault.get().total_cmp(&b.in_vault.get())),
+            }
+            .then_with(|| by_name(a, b))
         }),
-        ListTab::New => rows.sort_by(|a, b| {
-            b.figures
-                .get()
-                .days
-                .cmp(&a.figures.get().days)
-                .then_with(|| by_name(a, b))
-        }),
-        ListTab::Closing => rows.sort_by(|a, b| {
+        List::Closing => rows.sort_by(|a, b| {
             let (x, y) = (a.wind_down_ends.get(), b.wind_down_ends.get());
             match (x, y) {
                 (Some(x), Some(y)) => x.cmp(&y),
@@ -247,18 +272,17 @@ pub fn select(
 /// The page's own state. Lives as long as the page.
 struct Board {
     author: Option<String>,
-    tab: Mutable<ListTab>,
-    /// Whether the reader picked a tab: until then, an empty ranked list
-    /// gives way to the new agents.
-    tab_chosen: Mutable<bool>,
+    layout: Mutable<Layout>,
     sort: Mutable<Sort>,
     filters: Mutable<Filters>,
     search: Mutable<String>,
     rows: MutableVec<Rc<Agent>>,
-    new_rows: MutableVec<Rc<Agent>>,
-    counts: Mutable<[usize; 3]>,
-    /// How many of the tab's agents pass the filters and search.
-    shown: Mutable<usize>,
+    closing_rows: MutableVec<Rc<Agent>>,
+    /// How many agents each list holds for this author, before filters.
+    counts: Mutable<[usize; 2]>,
+    /// How many live agents pass the filters and search, and how many of
+    /// those are new.
+    shown: Mutable<(usize, usize)>,
     popover: Mutable<Option<Popover>>,
 }
 
@@ -273,15 +297,14 @@ impl Board {
     fn new(author: Option<String>) -> Rc<Self> {
         let board = Rc::new(Self {
             author,
-            tab: Mutable::new(ListTab::Open),
-            tab_chosen: Mutable::new(false),
+            layout: Mutable::new(Layout::remembered()),
             sort: Mutable::new(Sort::default()),
             filters: Mutable::new(Filters::default()),
             search: Mutable::new(String::new()),
             rows: MutableVec::new(),
-            new_rows: MutableVec::new(),
-            counts: Mutable::new([0; 3]),
-            shown: Mutable::new(0),
+            closing_rows: MutableVec::new(),
+            counts: Mutable::new([0; 2]),
+            shown: Mutable::new((0, 0)),
             popover: Mutable::new(None),
         });
         board.recompute();
@@ -294,34 +317,32 @@ impl Board {
         let filters = self.filters.get_cloned();
         let search = self.search.get_cloned();
         let none = Filters::default();
-        let counts =
-            ListTab::ALL.map(|tab| select(&agents, tab, author, &none, "", Sort::default()).len());
+        let counts = [List::Live, List::Closing]
+            .map(|list| select(&agents, list, author, &none, "", Sort::default()).len());
         self.counts.set_neq(counts);
-        if !self.tab_chosen.get() {
-            let tab = if counts[0] == 0 && counts[1] > 0 {
-                ListTab::New
-            } else {
-                ListTab::Open
-            };
-            self.tab.set_neq(tab);
-        }
-        let tab = self.tab.get();
-        let rows = select(&agents, tab, author, &filters, &search, self.sort.get());
-        self.shown.set_neq(rows.len());
+        let rows = select(
+            &agents,
+            List::Live,
+            author,
+            &filters,
+            &search,
+            self.sort.get(),
+        );
+        let new = rows
+            .iter()
+            .filter(|agent| agent.group.get() == Group::New)
+            .count();
+        self.shown.set_neq((rows.len(), new));
         replace(&self.rows, rows);
-        let new_rows = if tab == ListTab::New {
-            Vec::new()
-        } else {
-            select(
-                &agents,
-                ListTab::New,
-                author,
-                &filters,
-                &search,
-                Sort::default(),
-            )
-        };
-        replace(&self.new_rows, new_rows);
+        let closing = select(
+            &agents,
+            List::Closing,
+            author,
+            &filters,
+            &search,
+            Sort::default(),
+        );
+        replace(&self.closing_rows, closing);
     }
 
     fn filtered(&self) -> bool {
@@ -351,12 +372,11 @@ pub fn page(author: Option<String>, strip_dismissed: bool) -> Page {
     let board = Board::new(author_key.as_ref().map(AuthorKey::key));
     let store = store::get();
 
-    // Recompute the rows when the reader asks (tab, sort, filters, search)
-    // or the set of agents changes; never because a figure moved.
+    // Recompute the rows when the reader asks (sort, filters, search) or the
+    // set of agents changes; never because a figure moved.
     let watch = {
         let board = board.clone();
         map_ref! {
-            let _tab = board.tab.signal(),
             let _sort = board.sort.signal(),
             let _filters = board.filters.signal_cloned(),
             let _search = board.search.signal_cloned(),
@@ -383,11 +403,12 @@ pub fn page(author: Option<String>, strip_dismissed: bool) -> Page {
 
     let body = el("div")
         .class("lb")
+        .class_from("lb--grid", &board.layout, |layout| *layout == Layout::Grid)
         .child(head)
         .child(author_line(author.as_deref(), author_key.as_ref()))
         .child(controls(&board))
         .child(panel(&board))
-        .child(new_section(&board))
+        .child(closing_section(&board))
         .child(how_to_read().class("lb-howto--bottom"))
         .hook(move |dom| dom.future(watch));
 
@@ -435,8 +456,6 @@ fn author_line(raw: Option<&str>, key: Option<&AuthorKey>) -> View {
 fn controls(board: &Rc<Board>) -> El {
     el("div")
         .class("lb-controls")
-        .child(tabs(board))
-        .child(chips(board))
         .child(
             el("div")
                 .class("lb-tools")
@@ -444,103 +463,61 @@ fn controls(board: &Rc<Board>) -> El {
                 .child(filter_menus(board))
                 .child(filters_button(board).class("lb-tools__filters"))
                 .child(sort_button(board))
-                .child(summary(board)),
+                .child(summary(board))
+                .child(layout_picker(board)),
         )
         .child(active_filters(board))
 }
 
-/// The tabs, from 600px up.
-fn tabs(board: &Rc<Board>) -> El {
-    el("div")
-        .class("sh-tabs")
-        .class("lb-tabs")
-        .attr("role", "tablist")
-        .attr("aria-label", "Agent lists")
-        .children(ListTab::ALL.iter().enumerate().map(|(index, tab)| {
-            let tab = *tab;
-            let pick = board.clone();
-            el("button")
-                .attr("type", "button")
-                .class("sh-tab")
-                .attr("role", "tab")
-                .attr("id", tab.id())
-                .attr("aria-controls", "lb-panel")
-                .attr_from("aria-selected", &board.tab, move |current| {
-                    Some((*current == tab).to_string())
-                })
-                .attr_from("tabindex", &board.tab, move |current| {
-                    Some(if *current == tab { "0" } else { "-1" }.to_string())
-                })
-                .text(tab.label())
-                .child(
-                    el("span")
-                        .class("sh-chip")
-                        .class("sh-chip-neutral")
-                        .text_from(&board.counts, move |counts| counts[index].to_string()),
-                )
-                .hook(move |dom| {
-                    let keys = pick.clone();
-                    dom.event(move |_: dominator::events::Click| {
-                        pick.tab_chosen.set(true);
-                        pick.tab.set_neq(tab);
-                    })
-                    .event(move |event: dominator::events::KeyDown| tab_keys(&keys, &event))
-                })
-        }))
-}
-
-/// The ARIA tabs pattern: arrows move between tabs, Home and End jump.
-fn tab_keys(board: &Board, event: &dominator::events::KeyDown) {
-    let index = ListTab::ALL
-        .iter()
-        .position(|tab| *tab == board.tab.get())
-        .unwrap_or(0);
-    let next = match event.key().as_str() {
-        "ArrowRight" => (index + 1) % 3,
-        "ArrowLeft" => (index + 2) % 3,
-        "Home" => 0,
-        "End" => 2,
-        _ => return,
+/// A 16px glyph for the layout picker: rows, or a two-by-two grid.
+fn layout_glyph(layout: Layout) -> El {
+    let path = match layout {
+        Layout::List => "M4 6h16M4 12h16M4 18h16",
+        Layout::Grid => "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z",
     };
-    event.prevent_default();
-    board.tab_chosen.set(true);
-    board.tab.set_neq(ListTab::ALL[next]);
-    if let Some(tab) = crate::web::document()
-        .and_then(|document| document.get_element_by_id(ListTab::ALL[next].id()))
-        .and_then(|tab| wasm_bindgen::JsCast::dyn_into::<web_sys::HtmlElement>(tab).ok())
-    {
-        crate::web::focus(&tab);
-    }
+    svg("svg")
+        .class("sh-icon")
+        .attr("viewBox", "0 0 24 24")
+        .attr("width", "16")
+        .attr("height", "16")
+        .attr("aria-hidden", "true")
+        .attr("fill", "none")
+        .attr("stroke", "currentColor")
+        .attr("stroke-width", "2")
+        .attr("stroke-linejoin", "round")
+        .attr("stroke-linecap", "round")
+        .child(svg("path").attr("d", path))
 }
 
-/// The same lists as scrolling chips, on a phone.
-fn chips(board: &Rc<Board>) -> El {
+/// List or grid, from 600px up (a phone always shows cards): a segmented
+/// control, buttons with `aria-pressed` in a labelled group.
+fn layout_picker(board: &Rc<Board>) -> El {
     el("div")
-        .class("lb-chips")
+        .class("sh-seg")
+        .class("lb-layout")
         .attr("role", "group")
-        .attr("aria-label", "Agent lists")
-        .children(ListTab::ALL.iter().enumerate().map(|(index, tab)| {
-            let tab = *tab;
-            let pick = board.clone();
-            el("button")
-                .attr("type", "button")
-                .class("lb-chip")
-                .attr_from("aria-pressed", &board.tab, move |current| {
-                    Some((*current == tab).to_string())
-                })
-                .text(tab.label())
-                .child(
-                    el("span")
-                        .class("lb-chip__n")
-                        .text_from(&board.counts, move |counts| counts[index].to_string()),
-                )
-                .hook(move |dom| {
-                    dom.event(move |_: dominator::events::Click| {
-                        pick.tab_chosen.set(true);
-                        pick.tab.set_neq(tab);
-                    })
-                })
-        }))
+        .attr("aria-label", "Show agents as")
+        .children(
+            [(Layout::List, "List"), (Layout::Grid, "Grid")]
+                .into_iter()
+                .map(|(value, words)| {
+                    let selected = board.layout.clone();
+                    el("button")
+                        .attr("type", "button")
+                        .attr_from("aria-pressed", &board.layout, move |current| {
+                            Some((*current == value).to_string())
+                        })
+                        .child(layout_glyph(value))
+                        .text(words)
+                        .hook(move |dom| {
+                            dom.event(move |_: dominator::events::Click| {
+                                selected.set_neq(value);
+                                // Kept for the reader's next visit.
+                                value.remember();
+                            })
+                        })
+                }),
+        )
 }
 
 fn search_field(board: &Rc<Board>, id: &'static str) -> El {
@@ -821,9 +798,6 @@ fn sort_button(board: &Rc<Board>) -> El {
     .icon_before(Icon::Sort)
     .build()
     .class("lb-tools__sort")
-    .class_from("lb-tools__sort--off", &board.tab, |tab| {
-        *tab != ListTab::Open
-    })
     .attr("aria-haspopup", "dialog")
     .hook(move |dom| {
         dom.event(move |_: dominator::events::Click| {
@@ -878,20 +852,19 @@ fn sort_button(board: &Rc<Board>) -> El {
     })
 }
 
-/// "5 agents, ranked by 30 days", announced politely as it changes.
+/// "5 agents, sorted by 30 days, highest first", announced politely as it
+/// changes.
 fn summary(board: &Rc<Board>) -> El {
     let words = map_ref! {
-        let tab = board.tab.signal(),
         let counts = board.counts.signal(),
         let shown = board.shown.signal(),
         let sort = board.sort.signal(),
         let filters = board.filters.signal_cloned(),
         let search = board.search.signal_cloned() =>
-        summary_words(*tab, *counts, *shown, *sort, filters.count() > 0 || !search.trim().is_empty())
+        summary_words(counts[0], *shown, *sort, filters.count() > 0 || !search.trim().is_empty())
     };
     let now = summary_words(
-        board.tab.get(),
-        board.counts.get(),
+        board.counts.get()[0],
         board.shown.get(),
         board.sort.get(),
         board.filtered(),
@@ -910,25 +883,23 @@ fn agents(count: usize) -> String {
     }
 }
 
-fn summary_words(
-    tab: ListTab,
-    counts: [usize; 3],
-    shown: usize,
-    sort: Sort,
-    filtered: bool,
-) -> String {
-    let total = match tab {
-        ListTab::Open => counts[0],
-        ListTab::New => counts[1],
-        ListTab::Closing => counts[2],
-    };
+/// `shown` is how many live agents pass the filters, and how many of those
+/// are new.
+fn summary_words(total: usize, shown: (usize, usize), sort: Sort, filtered: bool) -> String {
+    let (count, new) = shown;
     if filtered {
-        return format!("Showing {shown} of {}", agents(total));
+        return format!("Showing {count} of {}", agents(total));
     }
-    match tab {
-        ListTab::Open => format!("{}, sorted by {}", agents(total), sort.words()),
-        ListTab::New => format!("{}, not ranked yet", agents(total)),
-        ListTab::Closing => format!("{} winding down or closed", agents(total)),
+    match sort.key {
+        SortKey::Return30 if count > 0 && new == count => {
+            format!("{}, all under 30 days, so not ranked yet", agents(count))
+        }
+        SortKey::Return30 if new > 0 => format!(
+            "{}, sorted by {}; new agents after",
+            agents(count),
+            sort.words()
+        ),
+        _ => format!("{}, sorted by {}", agents(count), sort.words()),
     }
 }
 
@@ -1009,44 +980,42 @@ fn pills(board: &Rc<Board>, filters: &Filters) -> Option<View> {
     )
 }
 
-/// The list itself: a notice for the tab, the table (600px up) or the cards
-/// (phone), and what to do when it's empty.
+/// The live list: the table (600px up, in the list layout) or the cards
+/// (the grid layout, and a phone), and what to do when it's empty.
 fn panel(board: &Rc<Board>) -> El {
     let store = store::get();
     let loaded = store.loaded.clone();
-    let tab_board = board.clone();
-    el("div")
+    let empty_board = board.clone();
+    let empty_now = board.rows.lock_ref().is_empty() && store.loaded.get();
+    el("section")
         .class("lb-list")
+        .attr("aria-label", "Live agents")
         .child(
             el("div")
                 .class("sh-card")
                 .class("lb-panel")
                 .attr("id", "lb-panel")
-                .attr("role", "tabpanel")
-                .attr_from("aria-labelledby", &board.tab, |tab| Some(tab.id().to_string()))
                 .attr_from("aria-busy", &loaded, |loaded| (!loaded).then(|| "true".to_string()))
-                .child_from(&board.tab, |tab| tab_notice(*tab))
-                .child(table(board))
-                .child(cards(board))
+                .child(table(board, List::Live))
+                .child(cards(board, List::Live))
                 .child_signal(
-                    empty(&tab_board, board.rows.lock_ref().is_empty() && store.loaded.get()),
+                    empty(&empty_board, empty_now),
                     {
                         let board = board.clone();
                         map_ref! {
                             let empty = board.rows.signal_vec_cloned().len().map(|len| len == 0),
                             let loaded = loaded.signal(),
-                            let _tab = board.tab.signal(),
                             let _filters = board.filters.signal_cloned(),
                             let _search = board.search.signal_cloned() => *empty && *loaded
                         }
-                        .map(move |empty_now| empty(&tab_board, empty_now))
+                        .map(move |empty_now| empty(&empty_board, empty_now))
                     },
                 ),
         )
         .child(
             el("p")
                 .class("lb-note")
-                .text("Returns are after fees and read straight from each vault’s contract. A review isn’t a prediction, and a track record isn’t a promise.")
+                .text("Returns are after fees and read straight from each vault’s contract. An agent with under 30 days shows its return over the days it has, marked New, and isn’t ranked against 30-day figures. A review isn’t a prediction, and a track record isn’t a promise.")
                 .child_from(&store.unread, |unread| {
                     (*unread > 0).then(|| {
                         text(format!(
@@ -1058,34 +1027,6 @@ fn panel(board: &Rc<Board>) -> El {
                     })
                 }),
         )
-}
-
-fn tab_notice(tab: ListTab) -> Option<View> {
-    match tab {
-        ListTab::Open => None,
-        ListTab::New => Some(
-            notice(
-                NoticeTone::Info,
-                "Agents with under 30 days of history aren’t ranked yet, because there’s less to go on. Their 30-day figure appears once they’ve run for 30 days.",
-            )
-            .class("sh-notice--compact")
-            .class("lb-panel__notice")
-            .into(),
-        ),
-        ListTab::Closing => Some(
-            notice_with(
-                NoticeTone::Caution,
-                Icon::Clock,
-                lead(
-                    "Retiring agents take no new deposits.",
-                    "If you’re in one, you can leave any time before its last day. After that, its positions close at market, which can lock in a loss.",
-                ),
-            )
-            .class("sh-notice--compact")
-            .class("lb-panel__notice")
-            .into(),
-        ),
-    }
 }
 
 fn empty(board: &Rc<Board>, is_empty: bool) -> Option<View> {
@@ -1116,15 +1057,10 @@ fn empty(board: &Rc<Board>, is_empty: bool) -> Option<View> {
                 .into(),
         );
     }
-    let words = match board.tab.get() {
-        ListTab::Open if board.author.is_some() => {
-            "This Author has no agent with 30 days of history yet."
-        }
-        ListTab::Open => {
-            "No agent has 30 days of history yet, so none is ranked. New agents are listed below."
-        }
-        ListTab::New => "No new agents right now.",
-        ListTab::Closing => "No agent is winding down or closed.",
+    let words = if board.author.is_some() {
+        "This Author has no live agent right now."
+    } else {
+        "No agent is live right now."
     };
     Some(
         el("div")
@@ -1134,19 +1070,18 @@ fn empty(board: &Rc<Board>, is_empty: bool) -> Option<View> {
     )
 }
 
-fn caption(tab: ListTab, sort: Sort) -> String {
-    match tab {
-        ListTab::Open => format!(
-            "Agents open for deposits, sorted by {}",
+fn caption(list: List, sort: Sort) -> String {
+    match list {
+        List::Live => format!(
+            "Live agents, sorted by {}",
             match (sort.key, sort.descending) {
-                (SortKey::Return30, true) => "return over 30 days, highest first",
-                (SortKey::Return30, false) => "return over 30 days, lowest first",
+                (SortKey::Return30, true) => "return over 30 days, highest first, new agents after",
+                (SortKey::Return30, false) => "return over 30 days, lowest first, new agents after",
                 (SortKey::InVault, true) => "money in vault, largest first",
                 (SortKey::InVault, false) => "money in vault, smallest first",
             }
         ),
-        ListTab::New => "New agents, not ranked yet".to_string(),
-        ListTab::Closing => "Agents winding down and closed".to_string(),
+        List::Closing => "Agents winding down and closed".to_string(),
     }
 }
 
@@ -1161,69 +1096,59 @@ fn header_cell(
     let Some(key) = key else {
         return th.text(label);
     };
-    let sort = board.sort.clone();
-    let tab = board.tab.clone();
-    let sorted = map_ref! {
-        let sort = sort.signal(),
-        let tab = tab.signal() => (*tab == ListTab::Open && sort.key == key).then(|| {
-            if sort.descending { "descending" } else { "ascending" }.to_string()
+    let sorted = move |sort: &Sort| {
+        (sort.key == key).then(|| {
+            if sort.descending {
+                "descending"
+            } else {
+                "ascending"
+            }
+            .to_string()
         })
     };
-    let now = (board.tab.get() == ListTab::Open && board.sort.get().key == key).then(|| {
-        if board.sort.get().descending {
-            "descending"
-        } else {
-            "ascending"
-        }
-        .to_string()
-    });
     let click = board.sort.clone();
-    th.attr_signal("aria-sort", now, sorted)
-        .child_from(&board.tab, move |current| {
-            Some(if *current == ListTab::Open {
-                let click = click.clone();
-                el("button")
-                    .attr("type", "button")
-                    .class("sh-sort")
-                    .text(label)
-                    .child_from(&click, move |sort| {
-                        Some(
-                            icon(
-                                if sort.key == key {
-                                    Icon::ChevronDown
-                                } else {
-                                    Icon::Sort
-                                },
-                                16,
-                            )
-                            .into(),
-                        )
-                    })
-                    .hook(move |dom| {
-                        dom.event(move |_: dominator::events::Click| {
-                            click.replace_with(|sort| Sort {
-                                key,
-                                descending: if sort.key == key {
-                                    !sort.descending
-                                } else {
-                                    true
-                                },
-                            });
-                        })
-                    })
-                    .into()
-            } else {
-                text(label)
+    th.attr_from("aria-sort", &board.sort, sorted).child(
+        el("button")
+            .attr("type", "button")
+            .class("sh-sort")
+            .text(label)
+            .child_from(&board.sort, move |sort| {
+                Some(
+                    icon(
+                        if sort.key == key {
+                            Icon::ChevronDown
+                        } else {
+                            Icon::Sort
+                        },
+                        16,
+                    )
+                    .class_if(sort.key == key && !sort.descending, "lb-sort--up")
+                    .into(),
+                )
             })
-        })
+            .hook(move |dom| {
+                dom.event(move |_: dominator::events::Click| {
+                    click.replace_with(|sort| Sort {
+                        key,
+                        descending: if sort.key == key {
+                            !sort.descending
+                        } else {
+                            true
+                        },
+                    });
+                })
+            }),
+    )
 }
 
-fn table(board: &Rc<Board>) -> El {
+fn table(board: &Rc<Board>, list: List) -> El {
     let store = store::get();
-    let caption_now = caption(board.tab.get(), board.sort.get());
-    let words = map_ref! {
-        let tab = board.tab.signal(),
-        let sort = board.sort.signal() => caption(*tab, *sort)
+    let sortable = |key: SortKey| (list == List::Live).then_some(key);
+    let caption_now = caption(list, board.sort.get());
+    let words = board.sort.signal().map(move |sort| caption(list, sort));
+    let rows = match list {
+        List::Live => &board.rows,
+        List::Closing => &board.closing_rows,
     };
     el("div").class("lb-table-wrap").child(
         el("table")
@@ -1238,7 +1163,7 @@ fn table(board: &Rc<Board>) -> El {
                         .child(header_cell(
                             board,
                             "30 days",
-                            Some(SortKey::Return30),
+                            sortable(SortKey::Return30),
                             "lb-c-r30 sh-r",
                         ))
                         .child(header_cell(
@@ -1256,7 +1181,7 @@ fn table(board: &Rc<Board>) -> El {
                         .child(header_cell(
                             board,
                             "In vault",
-                            Some(SortKey::InVault),
+                            sortable(SortKey::InVault),
                             "lb-c-vault sh-r",
                         ))
                         .child(header_cell(board, "Tank", None, "lb-c-tank lb-wide"))
@@ -1270,9 +1195,10 @@ fn table(board: &Rc<Board>) -> El {
             )
             .child(
                 el("tbody")
-                    .children_from(&board.rows, row)
-                    .child_from(&store.loaded, |loaded| {
-                        (!loaded).then(|| View::Many((0..4).map(|_| skeleton_row()).collect()))
+                    .children_from(rows, row)
+                    .child_from(&store.loaded, move |loaded| {
+                        (!loaded && list == List::Live)
+                            .then(|| View::Many((0..4).map(|_| skeleton_row()).collect()))
                     }),
             ),
     )
@@ -1452,6 +1378,7 @@ fn name_link(agent: &Rc<Agent>, group_closing: bool) -> El {
             .child(
                 el("span")
                     .class("lb-meta")
+                    .child(new_chip(agent))
                     .text_from(&agent.meta, Clone::clone)
                     .child(
                         el("span")
@@ -1473,13 +1400,51 @@ fn name_link(agent: &Rc<Agent>, group_closing: bool) -> El {
     )
 }
 
+/// "New", beside a live agent with under 30 days of history.
+fn new_chip(agent: &Agent) -> El {
+    el("span")
+        .class("lb-newchip")
+        .child_from(&agent.group, |group| {
+            (*group == Group::New).then(|| badge(Tone::Brand, None, "New").into())
+        })
+}
+
+/// The 30-day cell: the 30-day return. A new agent has no 30-day figure, so
+/// it says plainly how far it has got ("5 of 30 days"); where the table has
+/// no Since opening column (under 1024px), it also gives the return over
+/// the days it has, with the period named.
+fn period_figure(agent: &Agent) -> El {
+    if agent.group.get() == Group::New {
+        el("span")
+            .class("lb-stack")
+            .child(
+                el("span")
+                    .class("lb-wide")
+                    .class("lb-period")
+                    .text_from(&agent.figures, |figures| {
+                        format!("{} of 30 days", figures.days)
+                    }),
+            )
+            .child(
+                el("span")
+                    .class("lb-narrow")
+                    .class("lb-stack")
+                    .child(since_opening(agent).class("lb-fig"))
+                    .child(
+                        el("span")
+                            .class("lb-sub")
+                            .text_from(&agent.figures, |figures| {
+                                format!("over {}", format::days(figures.days))
+                            }),
+                    ),
+            )
+    } else {
+        return_30(agent, "Needs 30 days").class("lb-fig")
+    }
+}
+
 fn row(agent: &Rc<Agent>) -> View {
     let closing = agent.group.get() == Group::Closing;
-    let missing = if agent.group.get() == Group::New {
-        "Not ranked yet"
-    } else {
-        "Needs 30 days"
-    };
     let name = name_link(agent, closing);
     let name = if closing {
         name.child(closing_line(agent))
@@ -1496,12 +1461,7 @@ fn row(agent: &Rc<Agent>) -> View {
                 .child(name),
         )
         .child(el("td").child_from(&agent.review, |review| Some(review_chip(review).into())))
-        .child(
-            el("td")
-                .class("sh-r")
-                .class("lb-fig")
-                .child(return_30(agent, missing)),
-        )
+        .child(el("td").class("sh-r").child(period_figure(agent)))
         .child(
             el("td").class("sh-r").class("lb-wide").child(
                 el("span")
@@ -1543,17 +1503,19 @@ fn row(agent: &Rc<Agent>) -> View {
         .into()
 }
 
-/// The phone's list of cards.
-fn cards(board: &Rc<Board>) -> El {
+/// The cards: every list on a phone, and the grid layout from 600px up.
+fn cards(board: &Rc<Board>, list: List) -> El {
     let store = store::get();
+    let rows = match list {
+        List::Live => &board.rows,
+        List::Closing => &board.closing_rows,
+    };
     el("ul")
         .class("lb-cards")
-        .attr_from("aria-label", &board.tab, |tab| {
-            Some(caption(*tab, Sort::default()))
-        })
-        .children_from(&board.rows, |agent| card(agent, false))
-        .child_from(&store.loaded, |loaded| {
-            (!loaded).then(|| {
+        .attr("aria-label", caption(list, Sort::default()))
+        .children_from(rows, card)
+        .child_from(&store.loaded, move |loaded| {
+            (!loaded && list == List::Live).then(|| {
                 View::Many(
                     (0..4)
                         .map(|_| {
@@ -1585,9 +1547,9 @@ fn card_stat(label: &'static str, figure: El, period: Option<El>) -> El {
     }
 }
 
-/// One agent as a card: on a phone in every list, and in the New section.
-/// `new_section` cards show the New chip and lead with since opening.
-fn card(agent: &Rc<Agent>, new_section: bool) -> View {
+/// One agent as a card. A new agent's card carries its New chip and leads
+/// with its return since opening, over the days it has.
+fn card(agent: &Rc<Agent>) -> View {
     let group = agent.group.get();
     let is_new = group == Group::New;
     let top_right: El = if is_new {
@@ -1605,23 +1567,20 @@ fn card(agent: &Rc<Agent>, new_section: bool) -> View {
     let head = el("span")
         .class("lb-card__head")
         .child(
-            el("span")
-                .class("lb-card__name")
-                .child_if_spark(new_section, agent)
-                .child(
-                    el("span")
-                        .class("lb-name__text")
-                        .child(
-                            el("span")
-                                .class("lb-name__title")
-                                .text_from(&agent.title, Clone::clone),
-                        )
-                        .child(
-                            el("span")
-                                .class("lb-meta")
-                                .text_from(&agent.meta, Clone::clone),
-                        ),
-                ),
+            el("span").class("lb-card__name").child(
+                el("span")
+                    .class("lb-name__text")
+                    .child(
+                        el("span")
+                            .class("lb-name__title")
+                            .text_from(&agent.title, Clone::clone),
+                    )
+                    .child(
+                        el("span")
+                            .class("lb-meta")
+                            .text_from(&agent.meta, Clone::clone),
+                    ),
+            ),
         )
         .child(top_right);
     let stats = if is_new {
@@ -1680,9 +1639,8 @@ fn card(agent: &Rc<Agent>, new_section: bool) -> View {
         });
     let link = app_link(agent.href())
         .class("sh-card")
+        .class("sh-card-link")
         .class("lb-card")
-        .class_if(new_section, "sh-card-link")
-        .class_if(new_section, "lb-card--new")
         .child(head)
         .child(
             el("span")
@@ -1699,50 +1657,53 @@ fn card(agent: &Rc<Agent>, new_section: bool) -> View {
     el("li").child(link.child(stats)).into()
 }
 
-trait SparkFirst {
-    fn child_if_spark(self, show: bool, agent: &Rc<Agent>) -> Self;
-}
-
-impl SparkFirst for El {
-    /// The New section's cards (desktop) put the sparkline before the name.
-    fn child_if_spark(self, show: bool, agent: &Rc<Agent>) -> Self {
-        if show {
-            self.child(
-                sparkline(&agent.spark)
-                    .class("lb-spark")
-                    .class("lb-spark--lead"),
-            )
-        } else {
-            self
-        }
-    }
-}
-
-/// "New agents": under the ranked list, while the New tab isn't the one shown.
-fn new_section(board: &Rc<Board>) -> El {
-    let shown = map_ref! {
-        let tab = board.tab.signal(),
-        let count = board.new_rows.signal_vec_cloned().len() => *tab != ListTab::New && *count > 0
-    };
-    let now = board.tab.get() != ListTab::New && !board.new_rows.lock_ref().is_empty();
+/// Winding down and closed: under the live list, quieter, with what
+/// leaving one means. Shown only when there is one to show.
+fn closing_section(board: &Rc<Board>) -> El {
+    let shown = board
+        .closing_rows
+        .signal_vec_cloned()
+        .len()
+        .map(|count| count > 0);
+    let count_now = board.closing_rows.lock_ref().len();
+    let now = count_now > 0;
     el("section")
-        .class("lb-new")
-        .attr("aria-labelledby", "lb-new-title")
-        .class_signal("lb-new--shown", now, shown)
+        .class("lb-closed")
+        .attr("aria-labelledby", "lb-closed-title")
+        .class_signal("lb-closed--shown", now, shown)
         .child(
             el("div")
-                .class("lb-new__head")
-                .child(el("h2").attr("id", "lb-new-title").class("lb-new__title").text("New agents"))
+                .class("lb-closed__head")
                 .child(
-                    el("p")
-                        .class("lb-new__lede")
-                        .text("Agents with under 30 days of history aren’t ranked yet, because there’s less to go on."),
-                ),
+                    el("h2")
+                        .attr("id", "lb-closed-title")
+                        .class("lb-closed__title")
+                        .text("Winding down and closed")
+                        .child(
+                            el("span")
+                                .class("sh-chip")
+                                .class("sh-chip-neutral")
+                                .text_signal(
+                                    count_now.to_string(),
+                                    board
+                                        .closing_rows
+                                        .signal_vec_cloned()
+                                        .len()
+                                        .map(|count| count.to_string()),
+                                ),
+                        ),
+                )
+                .child(el("p").class("lb-closed__lede").text(
+                    "They take no new deposits. If you’re in a retiring one, you can leave any time before its last day; after that its positions close at market, which can lock in a loss. A closed one pays out from its cash, with no deadline.",
+                )),
         )
         .child(
-            el("ul")
-                .class("lb-new__grid")
-                .children_from(&board.new_rows, |agent| card(agent, true)),
+            el("div")
+                .class("sh-card")
+                .class("lb-panel")
+                .class("lb-panel--quiet")
+                .child(table(board, List::Closing))
+                .child(cards(board, List::Closing)),
         )
 }
 
@@ -1750,23 +1711,72 @@ fn new_section(board: &Rc<Board>) -> El {
 mod tests {
     use super::*;
 
+    fn agents_html() -> String {
+        let snapshot: shared::Snapshot =
+            serde_json::from_str(include_str!("../../tests/snapshot.json"))
+                .expect("the captured snapshot decodes");
+        store::get().apply(&snapshot);
+        page(None, false).body.html()
+    }
+
     #[test]
-    fn the_summary_names_the_sort_and_how_many_are_shown() {
+    fn the_leaderboard_is_one_list_with_closing_agents_in_their_own_section() {
+        let html = agents_html();
+        assert!(!html.contains("role=\"tablist\""), "no tabs");
+        assert!(!html.contains("Open for deposits"));
+        let live = html
+            .find("aria-label=\"Live agents\"")
+            .expect("the live list");
+        let closed = html
+            .find("Winding down and closed")
+            .expect("the closing section");
+        assert!(live < closed);
+        assert!(
+            html.contains("lb-closed--shown"),
+            "the capture has closed agents"
+        );
+        // Sorting still works: the sorted column says so.
+        assert_eq!(html.matches("aria-sort=").count(), 1);
+    }
+
+    #[test]
+    fn the_layout_picker_is_a_labelled_group_of_pressed_buttons() {
+        let html = agents_html();
+        let at = html
+            .find("aria-label=\"Show agents as\"")
+            .expect("the picker");
+        let picker = &html[at..at + html[at..].find("</div>").unwrap()];
+        assert_eq!(picker.matches("aria-pressed=\"true\"").count(), 1);
+        assert_eq!(picker.matches("aria-pressed=\"false\"").count(), 1);
+        assert!(picker.contains(">List<") || picker.contains("List"));
+        assert!(picker.contains("Grid"));
+    }
+
+    #[test]
+    fn the_summary_names_the_sort_and_says_when_new_agents_follow() {
         assert_eq!(
-            summary_words(ListTab::Open, [5, 2, 1], 5, Sort::default(), false),
+            summary_words(5, (5, 0), Sort::default(), false),
             "5 agents, sorted by 30 days, highest first"
         );
         assert_eq!(
-            summary_words(ListTab::New, [5, 2, 1], 2, Sort::default(), false),
-            "2 agents, not ranked yet"
+            summary_words(5, (5, 2), Sort::default(), false),
+            "5 agents, sorted by 30 days, highest first; new agents after"
         );
         assert_eq!(
-            summary_words(ListTab::Open, [5, 2, 1], 4, Sort::default(), true),
+            summary_words(3, (3, 3), Sort::default(), false),
+            "3 agents, all under 30 days, so not ranked yet"
+        );
+        let by_vault = Sort {
+            key: SortKey::InVault,
+            descending: true,
+        };
+        assert_eq!(
+            summary_words(5, (5, 2), by_vault, false),
+            "5 agents, sorted by In vault, largest first"
+        );
+        assert_eq!(
+            summary_words(5, (4, 1), Sort::default(), true),
             "Showing 4 of 5 agents"
-        );
-        assert_eq!(
-            summary_words(ListTab::Closing, [5, 2, 1], 1, Sort::default(), false),
-            "1 agent winding down or closed"
         );
     }
 

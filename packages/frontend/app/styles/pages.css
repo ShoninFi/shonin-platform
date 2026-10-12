@@ -24,9 +24,8 @@
 .lb-author__all { margin-left: var(--space-2); font-weight: 600; }
 
 .lb-controls { display: flex; flex-direction: column; gap: 20px; }
-.lb-chips { display: none; }
 .lb-tools { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
-.lb-search { width: 360px; }
+.lb-search { flex: 0 1 360px; min-width: 200px; }
 .lb-search .sh-input { height: 40px; }
 .lb-menus { display: flex; gap: var(--space-2); }
 .lb-menus .sh-btn { height: 40px; }
@@ -37,7 +36,12 @@
   background: var(--paper-raised); border-radius: var(--radius-m); box-shadow: var(--shadow-float);
 }
 .lb-tools__filters, .lb-tools__sort { display: none; }
-.lb-summary { margin-left: auto; font: 500 14px/20px var(--font-sans); color: var(--ink-muted); }
+.lb-summary { flex: 1 1 160px; margin-left: auto; font: 500 14px/20px var(--font-sans); color: var(--ink-muted); text-align: right; }
+.lb-layout { flex: none; }
+.lb-layout button { display: inline-flex; align-items: center; gap: 6px; }
+.lb-layout .sh-icon { flex: none; }
+/* In the grid, the sort is a button (the table's headers aren't there). */
+.lb--grid .lb-tools__sort { display: inline-flex; }
 .lb-count {
   min-width: 20px; height: 20px; padding: 0 6px; border-radius: var(--radius-full);
   background: var(--brand); color: var(--on-brand); font: 700 12px/20px var(--font-sans); text-align: center;
@@ -73,9 +77,14 @@
 .lb-name { display: flex; align-items: center; gap: var(--space-3); min-width: 0; color: var(--ink); text-decoration: none; }
 .lb-name__text { display: flex; flex-direction: column; min-width: 0; }
 .lb-name__title { font: var(--type-agent-name); letter-spacing: var(--track-agent-name); }
+.lb-newchip:empty { display: none; }
+.lb-newchip { margin-right: 6px; }
+.lb-newchip .sh-chip { height: 18px; padding: 0 6px; font-size: 11px; line-height: 18px; vertical-align: 1px; }
+.lb-period { font: 500 13px/18px var(--font-sans); color: var(--ink-muted); white-space: nowrap; }
+.lb-sort--up { transform: rotate(180deg); }
 @media (hover: hover) { .lb-name:hover { color: var(--ink); } .lb-name:hover .lb-name__title, .sh-card-link:hover .lb-name__title { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; } }
 .lb-meta { font: 400 13px/18px var(--font-sans); color: var(--ink-muted); }
-.lb-narrow { display: none; }
+.lb-narrow, span.lb-narrow.lb-stack { display: none; }
 .lb-closing { font: 500 13px/18px var(--font-sans); color: var(--caution); }
 .lb-stale { display: inline-flex; align-items: center; gap: 4px; font: 500 13px/18px var(--font-sans); color: var(--caution); }
 .lb-closing:empty, .lb-stale:empty, .lb-card__tank:empty { display: none; }
@@ -97,15 +106,24 @@
 .lb-note { font: 400 14px/22px var(--font-sans); color: var(--ink-muted); }
 .lb-cards { display: none; }
 
-/* New agents */
-.lb-new { display: none; }
-.lb-new--shown { display: flex; flex-direction: column; gap: 20px; padding-top: var(--space-4); }
-.lb-new__head { display: flex; flex-direction: column; gap: 6px; }
-.lb-new__title { font: var(--type-heading); letter-spacing: var(--track-heading); }
-.lb-new__lede { color: var(--ink-muted); }
-.lb-new__grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-5); }
+/* The grid layout (600px up): the phone's cards, three or two across. */
+.lb--grid .lb-panel { overflow: visible; background: none; border: 0; border-radius: 0; box-shadow: none; }
+.lb--grid .lb-table-wrap { display: none; }
+.lb--grid .lb-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-4); }
+@media (max-width: 1023px) { .lb--grid .lb-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.lb--grid .lb-empty { border-radius: var(--radius-l); background: var(--paper-raised); border: var(--border-hairline) solid var(--line); }
 
-/* A card: in the New section on every width, and every list on a phone. */
+/* Winding down and closed: under the live list, quieter. */
+.lb-closed { display: none; }
+.lb-closed--shown { display: flex; flex-direction: column; gap: var(--space-4); padding-top: var(--space-4); border-top: var(--border-hairline) solid var(--line); }
+.lb-closed__head { display: flex; flex-direction: column; gap: 6px; max-width: 760px; }
+.lb-closed__title { display: flex; align-items: center; gap: var(--space-2); font: var(--type-subheading); color: var(--ink); }
+.lb-closed__title .sh-chip { height: 20px; padding: 0 6px; }
+.lb-closed__lede { font: var(--type-body-s); color: var(--ink-muted); }
+.lb-panel--quiet { background: var(--paper); box-shadow: none; }
+.lb-panel--quiet .lb-name__title { font-size: 15px; line-height: 22px; }
+
+/* A card: the grid layout, and every list on a phone. */
 .lb-card { display: flex; flex-direction: column; gap: var(--space-3); height: 100%; padding: var(--space-4); color: var(--ink); text-decoration: none; }
 .lb-card__head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-3); }
 .lb-card__name { display: flex; align-items: center; gap: var(--space-3); min-width: 0; }
@@ -117,19 +135,14 @@
 .lb-cstat__value { font: 600 15px/22px var(--font-sans); font-variant-numeric: tabular-nums; }
 .lb-cstat__value .sh-delta { font-weight: 600; }
 .lb-cstat__period { font: 400 12px/16px var(--font-sans); color: var(--ink-muted); }
-.lb-spark--lead, .lb-wide-only { display: none; }
+.lb-wide-only { display: none; }
 @media (min-width: 1024px) {
-  .lb-card--new { gap: var(--space-4); padding: var(--space-5); }
-  .lb-card--new .lb-name__title { font-size: 18px; line-height: 24px; }
-  .lb-card--new .lb-card__head > .lb-spark { display: none; }
-  .lb-card--new .lb-spark--lead { display: block; }
-  .lb-card--new .lb-card__stats { gap: var(--space-4); padding-top: var(--space-4); }
-  .lb-card--new .lb-cstat .sh-label { font-size: 12px; letter-spacing: var(--track-label); }
-  .lb-card--new .lb-cstat__value { font: 600 20px/28px var(--font-sans); }
-  .lb-card--new .lb-cstat__period { font-size: 13px; line-height: 18px; }
-  .lb-wide-only { display: block; }
+  .lb--grid .lb-card { gap: var(--space-4); padding: 20px; }
+  .lb--grid .lb-card .lb-name__title { font-size: 18px; line-height: 24px; }
+  .lb--grid .lb-card__stats { gap: var(--space-3); padding-top: var(--space-4); }
+  .lb--grid .lb-cstat__value { font: 600 18px/26px var(--font-sans); }
+  .lb--grid .lb-wide-only { display: block; }
 }
-.lb-card--new .lb-card__head > .sh-chip-brand { order: 2; }
 
 /* Sparklines in the table only from 900px. */
 @media (max-width: 899px) { .lb-table .lb-spark { display: none; } }
@@ -141,13 +154,14 @@
   .lb-title { font-size: 40px; line-height: 46px; }
   .lb-lede { font-size: 16px; line-height: 24px; }
   .lb-controls { gap: var(--space-4); }
-  .lb-search { width: 100%; flex-basis: 100%; }
+  .lb-search { width: 100%; flex: 1 1 100%; }
   .lb-search .sh-input { height: 48px; }
   .lb-menus { display: none; }
   .lb-tools__filters { display: inline-flex; }
   .lb-wide { display: none; }
   .lb-narrow { display: inline; }
   span.lb-narrow.lb-meta { display: block; }
+  span.lb-narrow.lb-stack { display: flex; }
   .lb-table { table-layout: auto; }
   .lb-table th:first-child, .lb-table td:first-child { padding-left: 20px; }
   .lb-table th:last-child, .lb-table td:last-child { padding-right: var(--space-3); }
@@ -158,12 +172,10 @@
   .lb-c-open { width: 44px; }
   .lb-view { opacity: 1; transform: none; color: var(--ink-muted); font-size: 0; }
   .lb-view .sh-icon { width: 20px; height: 20px; }
-  .lb-new--shown { gap: var(--space-4); padding-top: var(--space-2); }
-  .lb-new__grid { gap: var(--space-4); }
-  .lb-card--new { padding: 20px; gap: 14px; }
+  .lb-summary { flex: 1 1 auto; }
 }
 
-/* Phone: lists of cards; tabs as chips; sort and filters in sheets. */
+/* Phone: lists of cards; sort and filters in sheets. */
 @media (max-width: 599px) {
   .lb { gap: var(--space-4); }
   .lb-head__text { gap: 6px; }
@@ -171,23 +183,12 @@
   .lb-lede { font: var(--type-body); }
   .lb-howto--top { display: none; }
   .lb-howto--bottom { display: inline-flex; min-height: 44px; align-items: center; }
-  .lb-tabs { display: none; }
-  .lb-chips { display: flex; gap: var(--space-2); overflow-x: auto; scrollbar-width: none; margin: 0 calc(-1 * var(--gutter)); padding: 0 var(--gutter); }
-  .lb-chips::-webkit-scrollbar { display: none; }
-  .lb-chip {
-    flex: none; display: inline-flex; align-items: center; gap: var(--space-2); height: 44px; padding: 0 14px;
-    border: var(--border-hairline) solid var(--line); border-radius: var(--radius-m); background: var(--paper-raised);
-    color: var(--ink); font: 600 14px/20px var(--font-sans); white-space: nowrap; cursor: pointer;
-  }
-  .lb-chip[aria-pressed="true"] { background: var(--brand-soft); border-color: var(--brand-edge); color: var(--brand); }
-  .lb-chip__n { min-width: 20px; height: 20px; padding: 0 6px; border-radius: var(--radius-s); background: var(--neutral-soft); color: var(--ink-muted); font: 600 12px/20px var(--font-sans); text-align: center; }
-  .lb-chip[aria-pressed="true"] .lb-chip__n { background: var(--paper-raised); color: var(--brand); }
-  .lb-tools { flex-wrap: nowrap; gap: var(--space-2); }
+  .lb-layout { display: none; }
+  .lb-tools { flex-wrap: wrap; gap: var(--space-2); }
   .lb-tools > .lb-search { display: none; }
   .lb-tools__sort { display: inline-flex; order: -1; }
-  .lb-tools__sort--off { display: none; }
   .lb-tools .sh-btn-sm { height: 44px; padding: 0 14px; }
-  .lb-summary { font-size: 13px; }
+  .lb-summary { flex-basis: 100%; margin-left: 0; font-size: 13px; text-align: left; }
   .lb-active { display: none; }
   .lb-sheet-search { display: flex; }
   .lb-panel { overflow: visible; background: none; border: 0; border-radius: 0; }
@@ -196,12 +197,8 @@
   .lb-cards { display: flex; flex-direction: column; gap: var(--space-3); }
   .lb-empty { padding: var(--space-5) 0; }
   .lb-note { font-size: 13px; line-height: 20px; }
-  .lb-new--shown { gap: var(--space-3); padding-top: var(--space-4); }
-  .lb-new__head { gap: 4px; }
-  .lb-new__lede { font-size: 14px; line-height: 22px; }
-  .lb-new__grid { grid-template-columns: minmax(0, 1fr); gap: var(--space-3); }
-  .lb-card--new { padding: var(--space-4); gap: var(--space-3); }
-  .lb-card--new .lb-card__head > .lb-spark { display: none; }
+  .lb--grid .lb-cards { grid-template-columns: minmax(0, 1fr); gap: var(--space-3); }
+  .lb-panel--quiet { background: none; }
 }
 .lb-card:active { background: var(--paper-sunk); }
 
@@ -412,3 +409,6 @@
 
 /* Figures inside the tablet's second line read at the line's size. */
 .lb-narrow .lb-drop, .lb-narrow .sh-delta { font: inherit; font-weight: 600; }
+
+/* The layout picker needs scripts; without them the table is the page. */
+@media (scripting: none) { .lb-layout { display: none; } }

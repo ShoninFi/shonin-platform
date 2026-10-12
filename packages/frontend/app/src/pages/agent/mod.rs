@@ -1,5 +1,5 @@
 //! `/agents/:id` and its tabs, each its own URL: the overview, `/review`,
-//! `/verify` and `/activity`.
+//! `/source`, `/verify` and `/activity`.
 //!
 //! The page is drawn once per visit. Each section follows the agent's record
 //! in the store and is redrawn only when what it shows has changed, so a
@@ -12,6 +12,7 @@ mod overview;
 mod parts;
 mod review;
 mod side;
+mod source;
 mod verify;
 
 use std::rc::Rc;
@@ -211,7 +212,16 @@ fn facts_row(strategy: &Strategy, now: Option<time::PrimitiveDateTime>) -> View 
     );
     chips.push(
         if strategy.bundle.source.is_published() {
-            badge(Tone::Neutral, Some(Icon::Code), "Source public")
+            // The badge is the way in to the code: a link that looks like
+            // the fact it states.
+            app_link(format!("/agents/{}/source", strategy.slug))
+                .class("sh-chip")
+                .class(Tone::Neutral.class())
+                .class("ag-chip-link")
+                .child(icon(Icon::Code, 14))
+                .text("Source public")
+                .child(el("span").class("sh-vh").text(": read the code"))
+                .child(icon(Icon::ChevronRight, 14))
         } else {
             badge(Tone::Neutral, Some(Icon::Lock), "Source sealed")
         }
@@ -853,6 +863,7 @@ fn agent_page(agent: &Rc<Agent>, tab: AgentTab) -> El {
     let body = match tab {
         AgentTab::Overview => overview::body(agent),
         AgentTab::Review => review::body(agent),
+        AgentTab::Source => source::body(agent),
         AgentTab::Verify => verify::body(agent),
         AgentTab::Activity => activity::body(agent),
     };
@@ -861,6 +872,7 @@ fn agent_page(agent: &Rc<Agent>, tab: AgentTab) -> El {
         .class(match tab {
             AgentTab::Overview => "ag--overview",
             AgentTab::Review => "ag--review",
+            AgentTab::Source => "ag--source",
             AgentTab::Verify => "ag--verify",
             AgentTab::Activity => "ag--activity",
         })
@@ -1019,5 +1031,176 @@ mod tests {
         let html = header_html("base-1", AgentTab::Review);
         assert!(html.contains("In vault"));
         assert!(!html.contains("ag-description"));
+    }
+
+    fn tab_html(slug: &str, tab: AgentTab) -> String {
+        View::from(agent_page(&agent(slug), tab)).html()
+    }
+
+    #[test]
+    fn no_page_the_app_renders_carries_a_placeholder() {
+        agent("base-1");
+        for route in crate::route::Route::all_pages() {
+            let html = View::from(crate::shell::shell(&route, false)).html();
+            assert!(
+                !html.contains("[CONFIRM"),
+                "{route:?} carries a placeholder"
+            );
+            assert!(
+                !html.contains("CONFIRM:"),
+                "{route:?} carries a placeholder"
+            );
+        }
+    }
+
+    #[test]
+    fn the_source_page_lists_every_file_and_holds_each_one_whole() {
+        let agent = agent("base-1");
+        let strategy = agent.strategy.lock_ref().clone();
+        assert!(!strategy.bundle.source_files.is_empty());
+        let html = tab_html("base-1", AgentTab::Source);
+        let nav = &html[html.find("ag-src__nav").expect("the file list is drawn")..];
+        for file in &strategy.bundle.source_files {
+            let id = source::file_id(&file.path);
+            assert!(
+                nav.contains(&format!("href=\"#{id}\"")),
+                "{} is listed",
+                file.path
+            );
+            assert!(
+                html.contains(&format!("id=\"{id}\"")),
+                "{} is in the page",
+                file.path
+            );
+            let last = file.body.lines().rev().find(|line| !line.trim().is_empty());
+            if let Some(last) = last {
+                assert!(
+                    html.contains(&crate::view::escape(last)),
+                    "{} is whole",
+                    file.path
+                );
+            }
+        }
+        assert!(html.contains(&strategy.bundle.source_hash));
+        assert!(html.contains(&format!(
+            "/store/{}/source.tar",
+            strategy.bundle.source_hash
+        )));
+        assert!(html.contains("download=\"source.tar\""));
+        // Exactly one file is shown first without scripts.
+        assert_eq!(html.matches("ag-src__file--first").count(), 1);
+        // Without scripts the address picks the file, so the list marks none.
+        assert!(!nav.contains("aria-current=\"true\""));
+    }
+
+    #[test]
+    fn a_sealed_agents_source_page_says_so_and_offers_nothing_to_open() {
+        let html = tab_html("base-6", AgentTab::Source);
+        assert!(html.contains("Source sealed: only the Reviewer read it"));
+        assert!(!html.contains("source.tar"));
+        assert!(!html.contains("ag-src__file"));
+        let header = header_html("base-6", AgentTab::Source);
+        assert!(header.contains("Source sealed"));
+        assert!(
+            !header.contains("/agents/base-6/source"),
+            "the badge links nowhere"
+        );
+    }
+
+    #[test]
+    fn the_source_public_badge_links_to_the_code() {
+        let html = header_html("base-1", AgentTab::Overview);
+        let badge = &html[..html.find("Source public").expect("the badge is drawn")];
+        let open = badge.rfind("<a ").expect("the badge is a link");
+        assert!(badge[open..].contains("href=\"/agents/base-1/source\""));
+    }
+
+    #[test]
+    fn the_review_tab_leads_with_the_report_card() {
+        let html = tab_html("base-1", AgentTab::Review);
+        let body = &html[html.find("ag-layout").expect("the tab is drawn")..];
+        let card = body.find("Report card").expect("the report card is drawn");
+        let found = body
+            .find("What the Reviewer found")
+            .expect("the summary is drawn");
+        let areas = body.find("Area by area").expect("the areas are drawn");
+        assert!(card < found && found < areas);
+        let first = body.find("<section").expect("a section");
+        assert!(
+            body[first..]
+                .starts_with("<section class=\"sh-card ag-card ag-card--flush ag-report-card\"")
+        );
+    }
+
+    #[test]
+    fn the_reviewers_summary_is_whole_in_the_page_behind_a_real_toggle() {
+        let agent = agent("base-1");
+        let summary = agent.strategy.lock_ref().review.clone().unwrap().summary;
+        let html = tab_html("base-1", AgentTab::Review);
+        for paragraph in review::paragraphs(&summary) {
+            let words: String = paragraph.chars().take(60).collect();
+            assert!(html.contains(&crate::view::escape(&words)), "{words}");
+        }
+        let at = html.find("ag-summary__more").expect("the toggle is drawn");
+        let open = html[..at].rfind('<').unwrap();
+        let tag = &html[open..open + html[open..].find('>').unwrap()];
+        assert!(tag.starts_with("<button"), "a real button: {tag}");
+        assert!(tag.contains("aria-controls=\"ag-summary\""));
+        assert!(tag.contains("aria-expanded=\"false\""));
+        assert!(
+            tag.contains("hidden=\"\""),
+            "hidden until the app has measured"
+        );
+        assert!(
+            html.contains("Read the Reviewer&#39;s full summary")
+                || html.contains("Read the Reviewer's full summary")
+        );
+        assert!(html.contains("id=\"ag-summary\""));
+    }
+
+    #[test]
+    fn the_overview_shows_the_review_in_brief_and_leaves_the_detail_to_its_tab() {
+        let agent = agent("base-1");
+        let summary = agent.strategy.lock_ref().review.clone().unwrap().summary;
+        let html = tab_html("base-1", AgentTab::Overview);
+        let card = &html[html.find("ag-o-review").expect("the review card is drawn")..];
+        let card = &card[..card.find("</section>").unwrap()];
+        for area in shared::Area::ALL {
+            assert!(card.contains(area.label()), "{}", area.label());
+        }
+        assert!(card.contains("Headline finding"));
+        assert!(card.contains("Read the full review"));
+        let opening: String = review::paragraphs(&summary)[0].chars().take(60).collect();
+        assert!(
+            !html.contains(&crate::view::escape(&opening)),
+            "the summary lives on Review"
+        );
+        assert!(!card.contains("What its Author promises"));
+    }
+
+    #[test]
+    fn the_headline_finding_is_the_most_severe_one() {
+        let agent = agent("base-5");
+        let review = agent.strategy.lock_ref().review.clone().unwrap();
+        let (area, finding) = overview::headline_finding(&review).expect("findings");
+        assert_eq!(finding.severity, shared::Severity::Serious);
+        assert_eq!(area, shared::Area::Reliability);
+    }
+
+    #[test]
+    fn the_verify_tab_checks_the_source_and_build_with_real_commands() {
+        let agent = agent("base-1");
+        let bundle = agent.strategy.lock_ref().bundle.clone();
+        let html = tab_html("base-1", AgentTab::Verify);
+        let digits = |hash: &str| hash.trim_start_matches("sha256:").to_string();
+        assert!(html.contains("shasum -a 256 source.tar"));
+        assert!(html.contains(&format!("# expect {}", digits(&bundle.source_hash))));
+        assert!(html.contains(&format!("# expect {}", digits(&bundle.component_hash))));
+        assert!(html.contains(&format!("/store/{}/component.wasm", bundle.bundle_hash)));
+        assert!(html.contains("ag-copy"), "a copy button");
+        assert!(
+            html.contains("href=\"/agents/base-1/source\""),
+            "the source record links to it"
+        );
     }
 }
