@@ -41,6 +41,7 @@ pub struct Rpc {
     url: Arc<str>,
     label: Arc<str>,
     next: Arc<AtomicU64>,
+    counted_cluster: &'static str,
     /// When the node last asked to be asked less often: every call made
     /// through this connection (its clones too) waits until then.
     pace: Arc<Mutex<Pace>>,
@@ -242,6 +243,10 @@ pub struct Simulated {
 impl Rpc {
     pub fn new(url: &str, label: &str) -> Result<Self> {
         let http = reqwest::Client::builder()
+            // Every attempt is made explicitly through try_call, where it
+            // is counted. The configured endpoint never forwards the call.
+            .retry(reqwest::retry::never())
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(CALL_TIMEOUT)
             .build()
             .context("building the HTTP client")?;
@@ -250,8 +255,20 @@ impl Rpc {
             url: url.into(),
             label: label.into(),
             next: Arc::new(AtomicU64::new(1)),
+            counted_cluster: "connecting",
             pace: Arc::new(Mutex::new(Pace::default())),
         })
+    }
+
+    pub(crate) fn counted_on(mut self, cluster: &str) -> Self {
+        self.counted_cluster = match cluster {
+            "localnet" => "localnet",
+            "devnet" => "devnet",
+            "testnet" => "testnet",
+            "mainnet-beta" => "mainnet-beta",
+            _ => "other",
+        };
+        self
     }
 
     pub fn label(&self) -> &str {
@@ -311,21 +328,34 @@ impl Rpc {
     }
 
     async fn try_call(&self, method: &str, params: &Value) -> Result<Tried> {
+        tokio::time::timeout(CALL_TIMEOUT, self.try_call_with_retries(method, params))
+            .await
+            .with_context(|| format!("{} did not answer {method} before the timeout", self.label))?
+    }
+
+    async fn try_call_with_retries(&self, method: &str, params: &Value) -> Result<Tried> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let reply = self
-            .http
-            .post(&*self.url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| {
-                anyhow!(
-                    "{} did not answer {method}: {}",
-                    self.label,
-                    error.without_url()
-                )
-            })?;
+        let mut attempt = 0;
+        let reply = loop {
+            crate::rpc_counts::solana(self.counted_cluster, method);
+            let reply = self.http.post(&*self.url).json(&body).send().await;
+            if let Err(error) = &reply
+                && attempt < crate::http_retry::EXTRA_TRIES
+                && crate::http_retry::unprocessed(error)
+            {
+                attempt += 1;
+                continue;
+            }
+            break reply;
+        }
+        .map_err(|error| {
+            anyhow!(
+                "{} did not answer {method}: {}",
+                self.label,
+                error.without_url()
+            )
+        })?;
         let asked = reply
             .headers()
             .get(reqwest::header::RETRY_AFTER)
@@ -747,6 +777,47 @@ pub fn parse_pubkey(text: &str) -> Result<Pubkey> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn protocol_refusals_retry_identical_signed_bytes_and_count_each_attempt() {
+        for (cluster, refusals, reason, expected, succeeds) in [
+            ("counter-test-one", 1, h2::Reason::REFUSED_STREAM, 2, true),
+            (
+                "counter-test-two",
+                100,
+                h2::Reason::REFUSED_STREAM,
+                3,
+                false,
+            ),
+            ("counter-test-three", 1, h2::Reason::CANCEL, 1, false),
+        ] {
+            let (url, bodies, server) = crate::http_retry::refusing_server(refusals, reason).await;
+            let mut rpc = Rpc::new(&url, "test").unwrap();
+            rpc.counted_cluster = cluster;
+            rpc.http = reqwest::Client::builder()
+                .http2_prior_knowledge()
+                .retry(reqwest::retry::never())
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(CALL_TIMEOUT)
+                .build()
+                .unwrap();
+            let answer: Result<String> = rpc.call("sendTransaction", json!(["signed-wire"])).await;
+            assert_eq!(answer.is_ok(), succeeds, "{cluster}: {answer:?}");
+            let bodies = bodies.lock().unwrap();
+            assert_eq!(bodies.len(), expected);
+            assert!(bodies.iter().all(|body| body == &bodies[0]));
+            let snapshot = crate::rpc_counts::snapshot();
+            let row = snapshot
+                .counters
+                .iter()
+                .find(|row| {
+                    row.chain == format!("solana:{cluster}") && row.method == "sendTransaction"
+                })
+                .unwrap();
+            assert_eq!(row.requests, expected as u64);
+            server.abort();
+        }
+    }
 
     #[test]
     fn a_node_behind_a_pinned_read_s_slot_is_known_by_its_code_or_its_words() {

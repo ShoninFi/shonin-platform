@@ -13,7 +13,7 @@ name = "chain"
 [features]
 # Talking to a node. Native only: the web app encodes calls with this crate
 # and sends them through the browser's own wallet.
-rpc = ["dep:alloy", "dep:anyhow", "dep:tokio", "dep:tower", "dep:tracing"]
+rpc = ["dep:alloy", "dep:anyhow", "dep:tokio", "dep:tower", "dep:tracing", "dep:h2"]
 # The arguments every service takes to choose its network and chain.
 args = ["rpc", "solana", "dep:clap", "dep:tracing-subscriber"]
 # Speaking to Solana: the programs' own crates for every account, instruction
@@ -89,6 +89,7 @@ anyhow = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
+h2 = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 
@@ -124,6 +125,8 @@ sha2 = { workspace = true, optional = true }
 bincode = { version = "1.3", optional = true }
 
 [dev-dependencies]
+http.workspace = true
+bytes.workspace = true
 # A paused clock, so a test can wait out a receipt timeout without waiting.
 tokio = { workspace = true, features = ["test-util"] }
 

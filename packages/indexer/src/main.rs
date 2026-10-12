@@ -39,6 +39,14 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    chain::rpc_counts::start(
+        chain::rpc_counts::Component::Indexer,
+        format!(
+            "{}-{}",
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos(),
+            std::process::id()
+        ),
+    );
     tracing_subscriber::fmt()
         .with_env_filter(chain::log_filter())
         .with_target(false)
@@ -58,6 +66,10 @@ async fn main() -> Result<()> {
     if args.port != 0 {
         let app = axum::Router::new()
             .route("/health", get(health))
+            .route(
+                "/debug/rpc",
+                get(|| async { Json(chain::rpc_counts::snapshot()) }),
+            )
             .route("/api/{chain}/health", post(post_health))
             .with_state(indexer.clone());
         let address = SocketAddr::from((args.listen, args.port));

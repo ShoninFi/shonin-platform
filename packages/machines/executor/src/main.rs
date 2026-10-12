@@ -119,6 +119,14 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    chain::rpc_counts::start(
+        chain::rpc_counts::Component::Executor,
+        format!(
+            "{}-{}",
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos(),
+            std::process::id()
+        ),
+    );
     tracing_subscriber::fmt()
         .with_env_filter(chain::log_filter())
         .with_target(false)
@@ -2830,6 +2838,10 @@ async fn serve_status(
         app = app.merge(shonin_rootkey::routes(service));
     }
     let app = app
+        .route(
+            "/debug/rpc",
+            axum::routing::get(|| async { axum::Json(chain::rpc_counts::snapshot()) }),
+        )
         .route(
             "/health",
             axum::routing::get(move || {

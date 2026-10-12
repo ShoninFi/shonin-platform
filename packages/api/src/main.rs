@@ -99,6 +99,16 @@ struct Service {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    chain::rpc_counts::start(
+        chain::rpc_counts::Component::Api,
+        format!(
+            "{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos(),
+            std::process::id()
+        ),
+    );
     tracing_subscriber::fmt()
         .with_env_filter(chain::log_filter())
         .with_target(false)
@@ -183,6 +193,10 @@ async fn main() -> Result<()> {
 
     let app = axum::Router::new()
         .route("/health", get(health))
+        .route(
+            "/debug/rpc",
+            get(|| async { axum::Json(chain::rpc_counts::snapshot()) }),
+        )
         .route("/api/snapshot", get(snapshot))
         // Across every vault chain: the record, and the one build queue.
         .route("/api/jobs", get(jobs))
