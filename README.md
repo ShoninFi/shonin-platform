@@ -139,7 +139,7 @@ packages/
   indexer/        the reference indexer: reads the chain into the record
   keeper/         the vaults' clockwork: valuations, settling, claims and the daily bill
   devnet/         deploys and drives the local chains, and serves the ops dashboard
-  strategy-sdk/   Rust bindings for the shonin:agent WIT world
+  strategy-sdk/   Rust bindings for the shonin:agent WIT world (wit/agent.wit), on crates.io as shonin-strategy-sdk
 deploy/gcp/       a Dockerfile per machine and service, and how they launch
 cloudflare/       one wrangler.jsonc per Worker: app, landing, marketing, docs
 docs/             the public documentation site (docs.shonin.fi)
