@@ -153,3 +153,160 @@ base = "evm:8453"
 hyperliquid = "evm:999"
 robinhood = "evm:4663"
 solana = "solana:mainnet-beta"
+
+# --- RPC settings: how often the services read a chain, and how much at once -
+# Whole milliseconds unless a name says otherwise. [rpc.defaults] holds every
+# setting for every chain; [rpc.chains."kind:id"] changes only the settings it
+# lists, for a chain configured above. A value outside its range, or an
+# unknown name, stops the service at startup with the setting named. The
+# keeper also checks each vault's timers against these at startup.
+
+# One queue and one connection-discovery loop serve the whole process.
+[rpc.service]
+# How soon a queued job is picked up, against one read per poll. 1000..=2000.
+indexer_queue_poll_ms = 2000
+# How soon a new connection is found, against one read per poll. 1000..=2000.
+indexer_discovery_poll_ms = 2000
+
+[rpc.defaults]
+# --- Keeper (EVM)
+# Pace when no bounded schedule applies: unbounded, landing, or after a failed
+# observation. Faster reacts sooner, at more reads. 250..=2000.
+keeper_active_round_ms = 2000
+# Longest gap between observations, so how soon an outsider's transaction is
+# seen, against a read per observation. keeper_active_round_ms..=60000.
+keeper_notice_ms = 5000
+# Backstop scan for facts only logs carry, against a log read per scan.
+# keeper_notice_ms..=3600000.
+keeper_log_scan_ms = 300000
+# How soon a landed transaction is known, against receipt reads. 100..=7000.
+receipt_poll_ms = 2000
+# Wait after a node fails to simulate: first wait, longest wait and growth
+# per failure. Shorter recovers sooner, at more reads. 1000..=5000,
+# keeper_simulation_initial_ms..=300000 (and at least 1000), 1..=2.
+keeper_simulation_initial_ms = 5000
+keeper_simulation_max_ms = 300000
+keeper_simulation_backoff_factor = 2
+# Wait after an endpoint rate-limits a request: first wait, longest wait and
+# growth per refusal. Shorter recovers sooner, at the risk of further refusals.
+# 1..=5000, keeper_rate_limit_initial_ms..=120000, 1..=2.
+keeper_rate_limit_initial_ms = 5000
+keeper_rate_limit_max_ms = 120000
+keeper_rate_limit_backoff_factor = 2
+# How soon a key request is relayed, against one read per poll. 250..=2000.
+key_poll_ms = 2000
+# How often keys are looked over for renewal and stocking, against reads per
+# look. 250..=15000.
+key_look_ms = 15000
+
+# --- Chain clock and observation
+# How old a head may be and still be scheduled from; an older one sends the
+# keeper to the active pace. 500..=30000.
+head_lag_max_ms = 3000
+# How far a head's time may run ahead of the local clock before it is taken
+# as skew. 0..=10000.
+head_ahead_max_ms = 2000
+# Agreeing observations needed before leaving the active pace: steadier
+# against a jittery clock, slower to settle. 1..=20.
+clock_settle_observations = 3
+# The time one observation may take; the startup checks count on it.
+# 100..=10000.
+read_budget_ms = 1000
+# Reads in one batched call: fewer means more calls. 1..=512.
+view_batch_reads = 256
+# Gas for one batched call, and for each read inside it; split to fit an
+# endpoint's cap. 1000000..=100000000, 21000..=1000000.
+view_outer_gas = 30000000
+view_inner_gas = 1000000
+# Bytes of input one batched call may send. 1024..=1048576.
+view_batch_input_bytes = 262144
+# Bytes one read inside a batch may return; a longer answer is read alone.
+# 32..=16384.
+view_result_bytes = 1024
+# Bytes one batched call may return in all. 65536..=1048576.
+view_output_bytes = 400000
+# Deepest reorganisation rolled back block by block; a deeper one is a full
+# re-read. 1..=256.
+max_reorg_blocks = 256
+
+# --- Record
+# How fresh the public record is, against reads per refresh per chain.
+# 2000..=300000.
+record_refresh_ms = 30000
+# Time without a whole refresh before the record reports itself unhealthy.
+# At least 2 * the slower refresh + read_budget_ms, at most 86400000.
+record_stale_ms = 180000
+# Blocks in one log page, and pages read per refresh: catch-up speed against
+# the size of each read. 1..=10000, 1..=100.
+record_page_blocks = 2000
+record_pages_per_refresh = 25
+# Newest blocks read again on each refresh, to catch a shallow
+# reorganisation. 0..=max_reorg_blocks.
+record_overlap_blocks = 32
+# Checkpoints kept: memory, against how deep a reorganisation can be undone
+# without a full re-read. 2..=256.
+record_checkpoints = 16
+# Most addresses in one log filter: fewer means more log reads. 1..=1024.
+log_batch_addresses = 256
+# Entries and bytes of settled facts kept in memory instead of read again;
+# zero keeps none. 0..=65536, 0..=67108864.
+immutable_cache_entries = 1024
+immutable_cache_bytes = 1048576
+
+# --- Solana
+# Pace and longest gap between observations, as their EVM counterparts.
+# 250..=2000, solana_active_round_ms..=60000.
+solana_active_round_ms = 2000
+solana_notice_ms = 5000
+# How fresh the public record is for a Solana cluster. 2000..=300000.
+solana_record_refresh_ms = 30000
+# Longest gap between full scans for new accounts; zero scans on every look.
+# 0..=86400000.
+solana_rescan_ms = 300000
+# Rounds between checks for rent to reclaim: sooner returns rent, at more
+# reads. 1..=30.
+solana_rent_poll_rounds = 30
+# Transactions read per history page. 1..=4096.
+solana_history_transactions = 64
+
+# Per chain: receipts are polled at the block interval, and a head's allowed
+# age and lead follow how the chain produces and reports blocks.
+
+[rpc.chains."evm:31337"]
+head_lag_max_ms = 4000
+
+[rpc.chains."evm:31338"]
+receipt_poll_ms = 1000
+
+[rpc.chains."evm:31339"]
+receipt_poll_ms = 500
+
+[rpc.chains."solana:localnet"]
+head_lag_max_ms = 10000
+head_ahead_max_ms = 5000
+
+[rpc.chains."evm:84532"]
+head_lag_max_ms = 4000
+
+[rpc.chains."evm:998"]
+receipt_poll_ms = 1000
+
+[rpc.chains."evm:46630"]
+receipt_poll_ms = 500
+
+[rpc.chains."solana:devnet"]
+head_lag_max_ms = 10000
+head_ahead_max_ms = 5000
+
+[rpc.chains."evm:8453"]
+head_lag_max_ms = 4000
+
+[rpc.chains."evm:999"]
+receipt_poll_ms = 1000
+
+[rpc.chains."evm:4663"]
+receipt_poll_ms = 500
+
+[rpc.chains."solana:mainnet-beta"]
+head_lag_max_ms = 10000
+head_ahead_max_ms = 5000

@@ -162,6 +162,9 @@ pub struct Client {
     log_endpoints: Endpoints,
     /// The most blocks one log query may span, both ends included.
     log_range: Option<u64>,
+    /// Whether log queries go to the `rpc` endpoints (no `logs_rpc`), so an
+    /// `rpc` endpoint's place in its list is its place in `log_endpoints`.
+    logs_share_rpc: bool,
     /// The `rpc` endpoints, each on its own: for sends, and for reads pinned
     /// to a past block, which only an endpoint that honours the block
     /// answers.
@@ -1646,6 +1649,10 @@ impl Client {
             ),
             Signing::ReadOnly => (Vec::new(), None),
         };
+        let logs_share_rpc = config
+            .logs_rpc
+            .as_deref()
+            .is_none_or(|list| list.trim().is_empty());
         let (logs, log_endpoints) = match config
             .logs_rpc
             .as_deref()
@@ -1672,6 +1679,7 @@ impl Client {
             logs,
             log_endpoints,
             log_range: config.log_range,
+            logs_share_rpc,
             endpoints,
             signing: signing_provider,
             label: config.label.clone(),
@@ -2306,6 +2314,30 @@ impl Client {
     /// and its logs may come from different ones: the check is exact per
     /// endpoint, not per node behind it.
     pub async fn logs(&self, filter: &Filter) -> Result<Vec<Log>> {
+        self.logs_with(filter, Heads::new(self.log_endpoints.each.len()))
+            .await
+    }
+
+    /// The logs `filter` matches, read as [`Client::logs`] reads them, when
+    /// the caller has just seen `rpc` endpoint `seen.0` (its place in the
+    /// list, from [`Client::each_endpoint`]) at block `seen.1`: that
+    /// endpoint is asked first, and is not asked for its head again for a
+    /// window ending at or below that block. Every other endpoint is still
+    /// asked for its head before it reads a window. When log queries go to
+    /// `logs_rpc`, `seen` names another list and is not used.
+    pub async fn logs_seen(&self, filter: &Filter, seen: Option<(usize, u64)>) -> Result<Vec<Log>> {
+        let heads = Heads::new(self.log_endpoints.each.len());
+        if self.logs_share_rpc
+            && let Some((at, head)) = seen
+            && at < self.log_endpoints.each.len()
+        {
+            heads.saw(at, head);
+            self.log_endpoints.answered(at);
+        }
+        self.logs_with(filter, heads).await
+    }
+
+    async fn logs_with(&self, filter: &Filter, heads: Heads) -> Result<Vec<Log>> {
         use alloy::eips::BlockNumberOrTag;
         use alloy::rpc::types::FilterBlockOption;
         let from = filter.get_from_block();
@@ -2317,7 +2349,6 @@ impl Client {
                 ..
             }
         );
-        let heads = Heads::new(self.log_endpoints.each.len());
         if self.log_range.is_some() && from.is_some() && to_the_head {
             to = Some(
                 logs_head(&self.log_endpoints, &heads)
