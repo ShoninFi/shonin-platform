@@ -45,6 +45,8 @@ settings!(
     key_poll_ms,
     key_look_ms,
     history_page_reads,
+    ancestry_reads,
+    ancestry_cache_headers,
     log_batch_addresses,
     log_batch_blocks,
     log_batch_logs,
@@ -161,8 +163,22 @@ impl RpcPolicy {
         bounded("solana_rescan_ms", self.solana_rescan_ms, 0, 86_400_000)?;
         bounded("indexer_backoff_factor", self.indexer_backoff_factor, 1, 16)?;
         bounded("history_page_reads", self.history_page_reads, 1, 4_096)?;
+        bounded("ancestry_reads", self.ancestry_reads, 1, 4_096)?;
+        bounded(
+            "ancestry_cache_headers",
+            self.ancestry_cache_headers,
+            1,
+            65_536,
+        )?;
         bounded("log_batch_addresses", self.log_batch_addresses, 1, 1_024)?;
         bounded("log_batch_blocks", self.log_batch_blocks, 1, 10_000)?;
+        let needed = self.log_batch_blocks + self.ancestry_reads * 2 + 2;
+        if self.ancestry_cache_headers < needed {
+            return Err(ConfigError::new(format!(
+                "RPC settings for {name}: ancestry_cache_headers={} needs at least {needed} for log_batch_blocks={} and ancestry_reads={}",
+                self.ancestry_cache_headers, self.log_batch_blocks, self.ancestry_reads
+            )));
+        }
         bounded("log_batch_logs", self.log_batch_logs, 1, 100_000)?;
         bounded(
             "solana_history_transactions",

@@ -15,6 +15,8 @@ pub mod args;
 #[cfg(feature = "rpc")]
 pub mod attest;
 #[cfg(feature = "rpc")]
+pub mod branch;
+#[cfg(feature = "rpc")]
 pub mod client;
 pub mod config;
 pub mod deployments;

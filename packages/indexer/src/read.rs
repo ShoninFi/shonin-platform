@@ -45,6 +45,7 @@ use crate::store::Store;
 /// been read.
 #[derive(Default)]
 pub struct History {
+    pub(crate) branch: std::sync::Arc<tokio::sync::Mutex<chain::branch::BranchProofs>>,
     pub(crate) anchor: Option<(u64, B256)>,
     pub(crate) discard_previous: bool,
     proofs: chain::sealed_views::Proofs,

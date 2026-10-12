@@ -71,6 +71,12 @@ key_poll_ms = 2000
 key_look_ms = 15000
 # Catch-up work is bounded per pass; unfinished cursors continue next pass.
 history_page_reads = 48
+# Each selected-head comparison and historical ancestry pass gets this many
+# bounded reads. Exhaustion keeps the record dated; sparse progress is retained.
+ancestry_reads = 64
+# Sparse checkpoints and recently walked headers; eviction affects catch-up
+# cost only. Keep at least a complete configured log page plus its anchors.
+ancestry_cache_headers = 8192
 # One refresh may share these bounded, numbered log observations. Wider or
 # uncovered requests use their ordinary incremental reads instead.
 log_batch_addresses = 256

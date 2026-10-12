@@ -199,6 +199,12 @@ pub struct Client {
 
 struct LogVerification {
     head: u64,
+    branch: Option<Arc<tokio::sync::Mutex<crate::branch::BranchProofs>>>,
+    identity: B256,
+    watched: Vec<Address>,
+    block_logs: tokio::sync::Mutex<HashMap<B256, Vec<Log>>>,
+    cached_logs: std::sync::atomic::AtomicU64,
+    refused: std::sync::atomic::AtomicBool,
     identities: tokio::sync::Mutex<HashMap<u64, (B256, Option<u64>)>>,
 }
 
@@ -1870,6 +1876,17 @@ impl Client {
 
     /// Read a contract, without sending anything.
     pub async fn read<C: SolCall>(&self, to: Address, call: C) -> Result<C::Return> {
+        if let Some(scope) = &self.log_verification
+            && scope.branch.is_some()
+        {
+            return self
+                .read_at(
+                    to,
+                    call,
+                    alloy::eips::BlockId::hash_canonical(scope.identity),
+                )
+                .await;
+        }
         let request = TransactionRequest::default()
             .with_to(to)
             .with_input(call.abi_encode());
@@ -1903,6 +1920,21 @@ impl Client {
         block: alloy::eips::BlockId,
     ) -> Result<C::Return> {
         use alloy::eips::{BlockId, BlockNumberOrTag};
+        let block = if let Some(scope) = &self.log_verification
+            && scope.branch.is_some()
+        {
+            match block {
+                BlockId::Number(BlockNumberOrTag::Number(number)) => {
+                    BlockId::hash_canonical(self.branch_header(number).await?.hash)
+                }
+                BlockId::Number(BlockNumberOrTag::Latest | BlockNumberOrTag::Pending) => {
+                    BlockId::hash_canonical(scope.identity)
+                }
+                other => other,
+            }
+        } else {
+            block
+        };
         let request = TransactionRequest::default()
             .with_to(to)
             .with_input(call.abi_encode());
@@ -2050,6 +2082,90 @@ impl Client {
         })
     }
 
+    /// A header identified by its hash, never by another node's canonical height.
+    pub async fn header_by_hash(&self, hash: B256) -> Result<HeadObservation> {
+        let mut last = None;
+        for endpoint in self.each_endpoint() {
+            match endpoint.get_block_by_hash(hash).await {
+                Ok(Some(block)) if block.header.hash == hash => {
+                    return Ok(HeadObservation {
+                        number: block.header.number,
+                        timestamp: block.header.timestamp,
+                        hash,
+                        parent_hash: block.header.parent_hash,
+                        logs_bloom: block.header.logs_bloom,
+                    });
+                }
+                Ok(_) => {
+                    last = Some(anyhow!(
+                        "the requested ancestor hash is unavailable at this endpoint"
+                    ))
+                }
+                Err(error) => last = Some(error.into()),
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow!("no ancestor endpoint")))
+    }
+
+    async fn branch_header(&self, number: u64) -> Result<HeadObservation> {
+        let scope = self
+            .log_verification
+            .as_ref()
+            .context("no selected record branch")?;
+        let branch = scope
+            .branch
+            .as_ref()
+            .context("no selected record ancestry")?;
+        let mut proofs = branch.lock().await;
+        let result = async {
+            if proofs
+                .head()
+                .is_none_or(|head| head.hash != scope.identity || head.number != scope.head)
+            {
+                bail!("the record's ancestry belongs to a different observation");
+            }
+            proofs.at(self, number).await
+        }
+        .await;
+        if result.is_err() {
+            scope
+                .refused
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// A stream may catch an individual read error to resume later. Such a
+    /// partial read must not publish as a fresh whole record after ancestry fails.
+    pub fn ensure_record_branch(&self) -> Result<()> {
+        if self
+            .log_verification
+            .as_ref()
+            .is_some_and(|scope| scope.refused.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            bail!("the record contains an unfinished or refused branch observation");
+        }
+        Ok(())
+    }
+
+    pub fn verifying_branch(
+        &self,
+        head: &HeadObservation,
+        branch: Arc<tokio::sync::Mutex<crate::branch::BranchProofs>>,
+        mut watched: Vec<Address>,
+    ) -> Self {
+        let mut client = self.verifying_logs(head.number, head.hash);
+        watched.sort_unstable();
+        watched.dedup();
+        if watched.len() > self.policy.log_batch_addresses as usize {
+            watched.clear();
+        }
+        let scope = Arc::get_mut(client.log_verification.as_mut().unwrap()).unwrap();
+        scope.branch = Some(branch);
+        scope.watched = watched;
+        client
+    }
+
     /// A clone sharing only this bounded, numbered observation of logs.
     /// Uncovered ranges, addresses and dynamic block tags use ordinary reads.
     /// The caller must recheck the end block before publishing derived state:
@@ -2117,6 +2233,9 @@ impl Client {
         let Some(scope) = &self.log_verification else {
             return Ok(self.numbered_header(number).await?.1);
         };
+        if scope.branch.is_some() {
+            return Ok(self.branch_header(number).await?.timestamp);
+        }
         if number > scope.head {
             bail!("a block time is newer than the observed head");
         }
@@ -2489,6 +2608,17 @@ impl Client {
     /// and its logs may come from different ones: the check is exact per
     /// endpoint, not per node behind it.
     pub async fn logs(&self, filter: &Filter) -> Result<Vec<Log>> {
+        if let Some(scope) = &self.log_verification
+            && scope.branch.is_some()
+        {
+            let result = self.branch_logs(filter, scope).await;
+            if result.is_err() {
+                scope
+                    .refused
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            return result;
+        }
         let logs = match self
             .log_snapshot
             .as_ref()
@@ -2526,6 +2656,107 @@ impl Client {
         Ok(logs)
     }
 
+    async fn branch_logs(&self, filter: &Filter, scope: &LogVerification) -> Result<Vec<Log>> {
+        let (from, to) = if let Some(hash) = filter.get_block_hash() {
+            let header = self.header_by_hash(hash).await?;
+            if self.branch_header(header.number).await?.hash != hash {
+                bail!("the requested log block is outside the selected branch");
+            }
+            (header.number, header.number)
+        } else {
+            filter
+                .get_from_block()
+                .zip(filter.get_to_block())
+                .context("selected record logs require a numbered range or a block hash")?
+        };
+        if from > to {
+            return Ok(Vec::new());
+        }
+        if to > scope.head {
+            bail!("log range is newer than the selected branch");
+        }
+        let addresses: Vec<_> = filter.address.iter().copied().collect();
+        let covered = !addresses.is_empty()
+            && !scope.watched.is_empty()
+            && addresses
+                .iter()
+                .all(|address| scope.watched.contains(address));
+        let watched = if covered { &scope.watched } else { &addresses };
+        let mut out = Vec::new();
+        for number in from..=to {
+            let header = self.branch_header(number).await?;
+            if !watched.is_empty() && !header.may_have_logs(watched) {
+                continue;
+            }
+            let kept = if covered {
+                scope.block_logs.lock().await.get(&header.hash).cloned()
+            } else {
+                None
+            };
+            let logs = match kept {
+                Some(logs) => logs,
+                None => {
+                    let query = if covered {
+                        Filter::new()
+                            .address(scope.watched.clone())
+                            .at_block_hash(header.hash)
+                    } else {
+                        filter.clone().at_block_hash(header.hash)
+                    };
+                    let mut answer = None;
+                    let mut last = None;
+                    for endpoint in self.log_endpoints.each.iter() {
+                        match endpoint.provider.get_logs(&query).await {
+                            Ok(logs) => {
+                                answer = Some(logs);
+                                break;
+                            }
+                            Err(error) => last = Some(error),
+                        }
+                    }
+                    let logs = match answer {
+                        Some(logs) => logs,
+                        None => {
+                            return Err(last
+                                .context("no endpoint answered the hash-bound log query")?
+                                .into());
+                        }
+                    };
+                    if logs.len() > self.policy.log_batch_logs as usize {
+                        bail!("a log block exceeds the configured log bound");
+                    }
+                    for log in &logs {
+                        if log.removed
+                            || log.block_number != Some(number)
+                            || log.block_hash != Some(header.hash)
+                            || !query.rpc_matches(log)
+                        {
+                            bail!("a log does not match its exact selected block");
+                        }
+                    }
+                    if covered {
+                        let mut blocks = scope.block_logs.lock().await;
+                        let count = scope.cached_logs.load(std::sync::atomic::Ordering::Relaxed);
+                        if blocks.len() < self.policy.log_batch_blocks as usize
+                            && count.saturating_add(logs.len() as u64) <= self.policy.log_batch_logs
+                        {
+                            scope
+                                .cached_logs
+                                .fetch_add(logs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                            blocks.insert(header.hash, logs.clone());
+                        }
+                    }
+                    logs
+                }
+            };
+            out.extend(logs.into_iter().filter(|log| filter.rpc_matches(log)));
+            if out.len() > self.policy.log_batch_logs as usize {
+                bail!("a log range exceeds the configured log bound");
+            }
+        }
+        Ok(out)
+    }
+
     /// A refresh-local log verifier. Every direct, fallback and shared log
     /// read checks its returned blocks against this canonical branch. The
     /// caller must check this head again before publishing, then discard the
@@ -2535,6 +2766,12 @@ impl Client {
         client.log_snapshot = None;
         client.log_verification = Some(Arc::new(LogVerification {
             head,
+            branch: None,
+            identity,
+            watched: Vec::new(),
+            block_logs: tokio::sync::Mutex::new(HashMap::new()),
+            cached_logs: std::sync::atomic::AtomicU64::new(0),
+            refused: std::sync::atomic::AtomicBool::new(false),
             identities: tokio::sync::Mutex::new(HashMap::from([(head, (identity, None))])),
         }));
         client

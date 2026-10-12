@@ -237,6 +237,8 @@ impl Reader {
 /// What one chain read came to: that chain's part of the snapshot.
 #[derive(Clone)]
 struct Read {
+    /// Whether this observation reached the latest head seen at its start.
+    current: bool,
     info: ChainInfo,
     now: u64,
     strategies: Vec<shared::Strategy>,
@@ -826,7 +828,13 @@ impl Indexer {
     async fn refresh_chain(&self, reader: &Reader) -> bool {
         let health = self.health.read().await.clone();
         match self.read_one(reader, &health).await {
-            Ok(read) => {
+            Ok(mut read) => {
+                if !read.current {
+                    for strategy in &mut read.strategies {
+                        strategy.stale_as_of.get_or_insert(read::moment(read.now));
+                    }
+                }
+                let current = read.current;
                 let any_vault_stale = read
                     .strategies
                     .iter()
@@ -845,12 +853,12 @@ impl Indexer {
                     .is_none_or(|previous| !same_record(previous, &read));
                 parts.insert(reader.vault_chain, read);
                 drop(parts);
-                if !every_vault_stale {
+                if current && !every_vault_stale {
                     *reader.read_at.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some(Instant::now());
                 }
                 self.compose().await;
-                changed || any_vault_stale
+                changed || any_vault_stale || !current
             }
             Err(error) => {
                 tracing::warn!(chain = %reader.key, error = format!("{error:#}"), "could not read this chain");
@@ -1097,15 +1105,27 @@ impl Indexer {
         };
         let chain = &served.client;
         let mut history = history.write().await;
-        let (head, now, identity) = chain.head_observation().await?;
-        if let Some((number, hash)) = history.anchor
-            && (head < number || chain.block_identity(number).await? != hash)
-        {
-            // Every cursor and derived immutable record may belong to the
-            // replaced branch. Rebuild rather than keep any as current.
+        let latest = chain.head_details().await?;
+        let branch = history.branch.clone();
+        let (replaced, selected) = {
+            let mut proofs = branch.lock().await;
+            let replaced = proofs.select(chain, latest.clone()).await?;
+            (
+                replaced,
+                proofs.head().expect("a selected candidate exists").clone(),
+            )
+        };
+        let current = selected.hash == latest.hash;
+        let (head, now, identity) = (selected.number, selected.timestamp, selected.hash);
+        if replaced {
             history.reset_branch();
+            history.branch = branch.clone();
         }
-        let verified = chain.verifying_logs(head, identity);
+        let verified = chain.verifying_branch(
+            &selected,
+            branch,
+            history.log_addresses(&served.deployments),
+        );
         let chain = &verified;
         let observed = if let Some((number, _)) = history.anchor
             && number < head
@@ -1186,6 +1206,7 @@ impl Indexer {
             .iter()
             .map(|strategy| read::trade_count(&history, strategy))
             .sum();
+        chain.ensure_record_branch()?;
         match chain.block_identity(head).await {
             Ok(current) if current == identity => {
                 history.anchor = Some((head, identity));
@@ -1200,6 +1221,7 @@ impl Indexer {
         }
         drop(history);
         Ok(Read {
+            current,
             info: ChainInfo {
                 chain: served.vault_chain,
                 key: reader.key.to_string(),
@@ -1242,6 +1264,7 @@ impl Indexer {
         drop(history);
         let feed = solana::feed(served.vault_chain, &read.strategies);
         Ok(Read {
+            current: true,
             info: ChainInfo {
                 chain: served.vault_chain,
                 key: reader.key.to_string(),
@@ -1661,6 +1684,7 @@ mod tests {
     #[test]
     fn a_later_observation_is_idle_only_when_its_displayed_record_is_unchanged() {
         let a = Read {
+            current: true,
             info: ChainInfo {
                 chain: Chain::Base,
                 key: "evm:1".into(),
@@ -1984,3 +2008,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod branch_tests;
