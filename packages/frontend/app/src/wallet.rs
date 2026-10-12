@@ -402,9 +402,9 @@ mod send {
         let amount = units(assets);
         let usd = asset_address(chain)?;
 
+        let restricted = read(chain, vault, IVault::restrictedTextCall {}).await?;
         working("Signing the statement");
-        let statement =
-            sign_statement(chain, &from, vault, &strategy.vault.restricted.join(",")).await?;
+        let statement = sign_statement(chain, &from, vault, &restricted).await?;
 
         working("Approving");
         send(
@@ -445,7 +445,8 @@ mod send {
         let chain = strategy.vault.chain;
         let vault = address_of(&strategy.vault.address)?;
 
-        if strategy.vault.state == shared::model::vault::VaultState::Closed {
+        let state = read(chain, vault, IVault::stateCall {}).await?;
+        if matches!(state, chain::bindings::vault::VaultState::Closed) {
             working("Withdrawing from the closed vault");
             let hash = send(
                 chain,

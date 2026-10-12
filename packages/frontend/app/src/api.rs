@@ -1,8 +1,9 @@
 //! Talking to the platform's API.
 //!
 //! The app asks for a snapshot, renders it, and asks again. It never holds a
-//! second copy of anything: whatever the chain says is what the screen shows,
-//! a couple of seconds later at worst.
+//! second copy of anything. Chain figures carry their observation dates and
+//! follow the indexer's configured active or idle cadence; authenticated executor
+//! reports update independently.
 
 #[cfg(target_arch = "wasm32")]
 use crate::data;
