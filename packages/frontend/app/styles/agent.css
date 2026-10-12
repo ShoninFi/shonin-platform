@@ -13,8 +13,22 @@
 .ag-crumb a { color: var(--ink-muted); text-decoration: none; }
 @media (hover: hover) { .ag-crumb a:hover { color: var(--ink); text-decoration: underline; } }
 
-.ag-head { display: flex; align-items: flex-end; justify-content: space-between; gap: var(--space-6); }
-.ag-head__main { display: flex; flex-direction: column; gap: var(--space-4); max-width: 792px; min-width: 0; }
+/* Stacked under 900px: the name and its facts, the share price, then the
+   Author's description. From 900px two columns on the page's own grid: the
+   share price takes the 376px column the Exit panel takes below, starting
+   on the same vertical, and the description fills the left one. */
+.ag-head { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-5); }
+.ag-head__main { display: flex; flex-direction: column; gap: var(--space-4); min-width: 0; }
+@media (min-width: 900px) {
+  .ag-head { grid-template-columns: minmax(0, 1fr) 376px; column-gap: var(--space-6); row-gap: var(--space-4); }
+  .ag-head__main, .ag-about { grid-column: 1; }
+  .ag-price { grid-column: 2; grid-row: 1; align-self: start; padding-left: var(--space-5); border-left: var(--border-hairline) solid var(--line); }
+  /* The overview's description runs beside the price; extra height from a
+     tall price block goes under the description, never between rows. */
+  .ag--overview .ag-head { grid-template-rows: auto 1fr; }
+  .ag--overview .ag-price { grid-row: 1 / span 2; }
+  .ag-about { align-self: start; }
+}
 .ag-name { font: var(--type-display-l); letter-spacing: var(--track-display-l); overflow-wrap: anywhere; }
 .ag-facts { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2) var(--space-3); }
 .ag-by { font: var(--type-body); color: var(--ink-muted); }
@@ -27,18 +41,44 @@
   background: var(--neutral-soft); color: var(--ink-muted); font: 700 11px/20px var(--font-sans); text-align: center;
 }
 .ag-tile--m { width: 24px; height: 24px; font-size: 12px; line-height: 24px; }
-.ag-tagline { font: var(--type-body-l); max-width: 70ch; overflow-wrap: anywhere; }
+.ag-about { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-2); min-width: 0; }
+.ag-tagline { font: var(--type-body-l); overflow-wrap: anywhere; }
+/* Three lines where scripts run (the button to open it needs them); the
+   whole text without. */
+@media (scripting: enabled) {
+  .ag-tagline--clamp { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden; }
+}
+.ag-more {
+  display: inline-flex; align-items: center; gap: var(--space-1); min-height: 32px; margin: calc(-1 * var(--space-1)) 0 0 calc(-1 * var(--space-1)); padding: 0 var(--space-1);
+  border: 0; border-radius: var(--radius-s); background: none; color: var(--link); font: 600 14px/20px var(--font-sans); cursor: pointer;
+}
+.ag-more[hidden] { display: none; }
+.ag-more .sh-icon { flex: none; transition: transform var(--dur-fast) var(--ease-out); }
+.ag-more[aria-expanded="true"] .sh-icon { transform: rotate(180deg); }
+@media (hover: hover) { .ag-more:hover { color: var(--brand-hover); text-decoration: underline; } }
+@media (prefers-reduced-motion: reduce) { .ag-more .sh-icon { transition: none; } }
 .ag-accuracy { display: flex; align-items: flex-start; gap: var(--space-2); font: var(--type-body-s); color: var(--ink-muted); }
 .ag-accuracy .sh-icon { flex: none; margin-top: 2px; }
 .ag-accuracy--fine .sh-icon { color: var(--gain); }
 .ag-accuracy--some .sh-icon { color: var(--caution); }
 .ag-accuracy--serious .sh-icon { color: var(--loss); }
-.ag-read__line { display: flex; align-items: center; gap: 6px; font: var(--type-body-s); color: var(--ink-muted); white-space: nowrap; }
-.ag-read__line--stale { color: var(--caution); font-weight: 600; white-space: normal; }
-.ag-head__figures { display: flex; gap: var(--space-6); text-align: right; flex: none; }
-.ag-head__figures > div { display: flex; flex-direction: column; gap: 2px; }
-.ag-head__figure { font: var(--type-figure-l); letter-spacing: var(--track-figure-l); font-variant-numeric: tabular-nums; }
-.ag-head__period { font: var(--type-body-s); color: var(--ink-muted); }
+.ag-read__line { display: flex; align-items: flex-start; gap: 6px; font: var(--type-body-s); color: var(--ink-muted); }
+.ag-read__line .sh-icon { flex: none; margin-top: 2px; }
+.ag-read__line--stale { color: var(--caution); font-weight: 600; }
+
+/* The share price: the page's headline number (figure-xl), its change
+   since opening, the high-water mark, and when it was read. */
+.ag-price { display: flex; flex-direction: column; gap: var(--space-3); min-width: 0; }
+.ag-price__figures { display: flex; flex-direction: column; gap: var(--space-2); }
+.ag-price__main { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-3); }
+.ag-price__main dt { flex-basis: 100%; }
+.ag-price__value { font: var(--type-figure-xl); letter-spacing: var(--track-figure-xl); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ag-price__none { font: var(--type-body-s); color: var(--ink-muted); }
+.ag-price__facts { display: flex; flex-wrap: wrap; gap: var(--space-1) var(--space-5); font: var(--type-body-s); }
+.ag-price__facts:empty, .ag-price > .sh-contents:empty { display: none; }
+.ag-price__row { display: flex; gap: 6px; }
+.ag-price__row dt { color: var(--ink-muted); }
+.ag-price__row dd { font-weight: 600; font-variant-numeric: tabular-nums; }
 
 .ag-banners { display: flex; flex-direction: column; gap: var(--space-3); }
 .ag-banners:empty, .ag-banners > .sh-contents:empty { display: none; }
@@ -100,6 +140,13 @@
 .ag-chart__headline { display: flex; flex-direction: column; gap: var(--space-1); }
 .ag-chart__figure { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2) var(--space-3); }
 .ag-chart__value { font: var(--type-figure-xl); letter-spacing: var(--track-figure-xl); font-variant-numeric: tabular-nums; }
+/* From 600px the header carries the share price and the crosshair's
+   tooltip reads a day, so the card's head is its title; on phones the
+   head keeps the figure, which follows a finger on the chart. */
+@media (min-width: 600px) {
+  .ag-chart__figure { display: none; }
+  .ag-chart__headline .sh-label { font: var(--type-heading); letter-spacing: var(--track-heading); text-transform: none; color: var(--ink); }
+}
 .ag-chart__controls { display: flex; flex-direction: column; align-items: flex-end; gap: var(--space-2); }
 .ag-chart__legend { display: flex; flex-wrap: wrap; gap: var(--space-2) 20px; font: 500 13px/18px var(--font-sans); color: var(--ink-muted); }
 .ag-chart__key { display: inline-flex; align-items: center; gap: var(--space-2); }
@@ -415,10 +462,6 @@
   .ag-verify__links { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .ag-plot { grid-template-rows: 220px 16px; }
 }
-@media (max-width: 899px) {
-  .ag-head { flex-direction: column; align-items: flex-start; gap: var(--space-3); }
-  .ag-head__figures { text-align: left; }
-}
 
 /* ---- Phone ------------------------------------------------------------------------------ */
 @media (max-width: 599px) {
@@ -426,7 +469,12 @@
   .ag-name { font: var(--type-display-m); letter-spacing: var(--track-display-m); }
   .ag-tagline { font: var(--type-body); }
   .ag-accuracy, .ag-opened { display: none; }
-  .ag-read__line { white-space: normal; }
+  .ag-head { gap: var(--space-4); }
+  /* The phone's overview reads the share price at the top of the chart,
+     where touching the chart reads a day (Agent-Mobile); the header keeps
+     only when it was read, under the description. */
+  .ag--overview .ag-price__figures, .ag--overview .ag-price > .sh-contents { display: none; }
+  .ag--overview .ag-price { order: 1; }
   .ag-tabs { gap: 20px; margin: 0 calc(-1 * var(--gutter)); padding: 0 var(--gutter); }
   .ag-layout { display: flex; flex-direction: column; gap: var(--space-4); }
   .ag-layout--overview .ag-main, .ag-layout--overview .ag-side { display: contents; }
