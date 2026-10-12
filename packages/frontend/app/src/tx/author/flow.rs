@@ -30,7 +30,7 @@ use super::error::AuthorError;
 use super::form::Allowances;
 use super::read::{self, AuthorVault, Escape, Registries};
 use crate::tx::TxError;
-use crate::tx::flow::{Cancel, Pace, decode, recovers_to};
+use crate::tx::flow::{Cancel, Pace, as_the_vault_takes_it, decode, recovers_to};
 use crate::tx::port::{Clock, Reader, Receipt, Signer, StatementRequest};
 use crate::tx::read::{State, allowance, asset_balance, read as call};
 
@@ -78,8 +78,11 @@ pub enum Prompt {
     },
     Retire,
     RequestEscape,
+    /// Pay `amount` out of the tank to the author, after at most `tab` of
+    /// the bill so far is settled from it.
     WithdrawTank {
         amount: U256,
+        tab: U256,
     },
 }
 
@@ -239,14 +242,14 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
 
     /// Approve `spender` for exactly `amount` of `asset`, unless the
     /// allowance already covers it; refuse first if the wallet doesn't hold
-    /// it.
+    /// it. Whether an approval was sent and mined.
     async fn pay_from_wallet(
         &self,
         asset: Address,
         spender: Address,
         who: Spender,
         amount: U256,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let have = asset_balance(self.reader, asset, self.account).await?;
         if have < amount {
             return Err(TxError::InsufficientBalance { have }.into());
@@ -266,8 +269,9 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
                 .abi_encode(),
             )
             .await?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// The vault as its author's controls act on it, read now; refused
@@ -302,26 +306,66 @@ pub async fn report(
 // Publishing -----------------------------------------------------------------
 
 /// Pay the publishing fee against an upload, from the wallet that uploaded
-/// it: approve exactly the fee if the allowance doesn't cover it, then pay.
-/// The contract takes no permit, so it is approve and pay, at most two
-/// prompts.
+/// it and no other: approve exactly the fee if the allowance doesn't cover
+/// it, then pay. The contract takes no permit, so it is approve and pay, at
+/// most two prompts.
+///
+/// The flow is bound to `uploader`, the account the upload named: the
+/// context must be built for it, and the wallet must be on it when the flow
+/// starts and immediately before every send (the shared guard compares the
+/// wallet's account with the context's). A payment from any other account
+/// would start nothing, so if the wallet is on another account nothing is
+/// sent, and the words name the wallet to switch back to.
 pub async fn pay<R: Reader, S: Signer, C: Clock>(
     ctx: &Ctx<'_, R, S, C>,
     publishing: Address,
     upload: B256,
+    uploader: Address,
 ) -> Result<Outcome> {
     ctx.step(Step::Checking);
+    let wrong_payer = AuthorError::WrongPayer { uploader };
+    if ctx.account != uploader || ctx.signer.account() != Some(uploader) {
+        return Err(wrong_payer);
+    }
+    let paid = pay_as_uploader(ctx, publishing, upload).await;
+    paid.map_err(|error| match error {
+        // The wallet left the uploading account: the guard stopped it, or
+        // the session cancelled the flow when the account changed.
+        AuthorError::Tx(TxError::AccountChanged | TxError::NotConnected) => wrong_payer,
+        AuthorError::Tx(TxError::Cancelled) if ctx.signer.account() != Some(uploader) => {
+            wrong_payer
+        }
+        other => other,
+    })
+}
+
+async fn pay_as_uploader<R: Reader, S: Signer, C: Clock>(
+    ctx: &Ctx<'_, R, S, C>,
+    publishing: Address,
+    upload: B256,
+) -> Result<Outcome> {
     ctx.check_endpoint().await?;
     let terms = read::publishing(ctx.reader, publishing).await?;
     ctx.pay_from_wallet(terms.asset, publishing, Spender::Publishing, terms.fee)
         .await?;
+    // How many payments the contract has recorded before this one: a payment
+    // that isn't seen mined is looked for after these.
+    let since = call(ctx.reader, publishing, IPublishing::countCall {}).await?;
     let receipt = ctx
         .transact(
             Prompt::Pay { fee: terms.fee },
             publishing,
             IPublishing::submitCall { upload }.abi_encode(),
         )
-        .await?;
+        .await
+        .map_err(|error| match error {
+            AuthorError::Tx(then) if then.may_have_moved() => AuthorError::PaymentUnsure {
+                upload,
+                since,
+                then: Box::new(then),
+            },
+            other => other,
+        })?;
     // The job starts only for a payment from the uploading wallet against
     // this upload: say so if the record isn't that.
     let submitted = decode::<IPublishing::Submitted>(publishing, &receipt.logs)
@@ -422,8 +466,12 @@ pub async fn activate<R: Reader, S: Signer, C: Clock>(
     if !recovers_to(&signature, statement.digest(), ctx.account) {
         return Err(TxError::BadSignature.into());
     }
+    // In the form the vault's check takes (`v` as 27 or 28), as every
+    // statement is sent, and before the tank is approved.
+    let signature = as_the_vault_takes_it(&signature).ok_or(TxError::BadSignature)?;
 
-    ctx.pay_from_wallet(asset, at.factory, Spender::Factory, activation.tank)
+    let approved = ctx
+        .pay_from_wallet(asset, at.factory, Spender::Factory, activation.tank)
         .await?;
     let receipt = ctx
         .transact(
@@ -442,7 +490,21 @@ pub async fn activate<R: Reader, S: Signer, C: Clock>(
             }
             .abi_encode(),
         )
-        .await?;
+        .await
+        .map_err(|then| {
+            // The approval was mined and the activation wasn't: it stands
+            // until used, and trying again uses it. Not said when the
+            // activation itself may still land and spend it.
+            let landing = matches!(&then, AuthorError::Tx(error) if error.may_have_moved());
+            if approved && !landing {
+                AuthorError::ApprovalStands {
+                    amount: activation.tank,
+                    then: Box::new(then),
+                }
+            } else {
+                then
+            }
+        })?;
     let activated = decode::<IVaultFactory::Activated>(at.factory, &receipt.logs)
         .into_iter()
         .find(|event| event.strategyId == activation.strategy_id && event.author == ctx.account)
@@ -610,11 +672,12 @@ pub async fn withdraw_unsigned<R: Reader, S: Signer, C: Clock>(
         }
         Escape::Lapsed => return Err(AuthorError::EscapeLapsed),
     }
+    within_tank(&read, amount)?;
     tank_out(
         ctx,
         vault,
-        &read,
         amount,
+        U256::ZERO,
         IVault::withdrawTankUnsignedCall { assets: amount }.abi_encode(),
     )
     .await
@@ -631,6 +694,12 @@ pub struct Usage {
 /// Withdraw from the tank, the bill so far settled first with the
 /// executor's latest signed total: the tab is paid first, the rest goes to
 /// the wallet.
+///
+/// The vault collects the bill first, as much of `total − settled` as its
+/// cap and the tank allow, then pays what is asked out of what is left. So
+/// the wallet is asked for no more than the tank less the whole unsettled
+/// bill: what it names is then exactly what is paid, whatever the cap lets
+/// the vault collect.
 pub async fn withdraw_tank<R: Reader, S: Signer, C: Clock>(
     ctx: &Ctx<'_, R, S, C>,
     vault: Address,
@@ -642,13 +711,13 @@ pub async fn withdraw_tank<R: Reader, S: Signer, C: Clock>(
         return Err(TxError::NothingToSend.into());
     }
     let read = ctx.authors_vault(vault).await?;
-    // The vault takes only a recent total, and never one older than what it
-    // has already settled.
-    if usage.as_of.saturating_add(read.usage_freshness) < read.now
-        || usage.total < read.tank.usage_settled
-    {
-        return Err(AuthorError::NoUsageTotal);
+    let tab = tab_before_withdrawal(&read, usage)?;
+    within_tank(&read, amount)?;
+    let left = read.tank.balance - tab;
+    if left.is_zero() {
+        return Err(AuthorError::TabTakesTank { tab });
     }
+    let amount = amount.min(left);
     let data = IVault::withdrawTankCall {
         assets: amount,
         total: usage.total,
@@ -656,26 +725,50 @@ pub async fn withdraw_tank<R: Reader, S: Signer, C: Clock>(
         signature: usage.signature.clone(),
     }
     .abi_encode();
-    tank_out(ctx, vault, &read, amount, data).await
+    tank_out(ctx, vault, amount, tab, data).await
 }
 
-async fn tank_out<R: Reader, S: Signer, C: Clock>(
-    ctx: &Ctx<'_, R, S, C>,
-    vault: Address,
-    read: &AuthorVault,
-    amount: U256,
-    data: Vec<u8>,
-) -> Result<Outcome> {
-    // The vault pays at most what the tank holds; asking for more than that
-    // would say one figure and pay another.
+/// The most of the unsettled bill a signed withdrawal settles from the tank
+/// first, as the vault takes the total: refused unless the vault would take
+/// it (recent enough, never below what is settled, and, when it collects,
+/// later than the last total it settled and not ahead of the chain).
+pub fn tab_before_withdrawal(read: &AuthorVault, usage: &Usage) -> Result<U256> {
+    let settled = read.tank.usage_settled;
+    if usage.as_of.saturating_add(read.usage_freshness) < read.now || usage.total < settled {
+        return Err(AuthorError::NoUsageTotal);
+    }
+    // A total the vault has already settled isn't collected again.
+    let collects = usage.total != settled || usage.as_of != read.tank.usage_as_of;
+    if !collects {
+        return Ok(U256::ZERO);
+    }
+    if usage.as_of <= read.tank.usage_as_of || usage.as_of > read.now {
+        return Err(AuthorError::NoUsageTotal);
+    }
+    Ok((usage.total - settled).min(read.tank.balance))
+}
+
+/// The vault pays at most what the tank holds; asking for more than that
+/// would say one figure and pay another.
+fn within_tank(read: &AuthorVault, amount: U256) -> Result<()> {
     if amount > read.tank.balance {
         return Err(TxError::InsufficientBalance {
             have: read.tank.balance,
         }
         .into());
     }
+    Ok(())
+}
+
+async fn tank_out<R: Reader, S: Signer, C: Clock>(
+    ctx: &Ctx<'_, R, S, C>,
+    vault: Address,
+    amount: U256,
+    tab: U256,
+    data: Vec<u8>,
+) -> Result<Outcome> {
     let receipt = ctx
-        .transact(Prompt::WithdrawTank { amount }, vault, data)
+        .transact(Prompt::WithdrawTank { amount, tab }, vault, data)
         .await?;
     let paid = decode::<IVault::TankWithdrawn>(vault, &receipt.logs)
         .into_iter()

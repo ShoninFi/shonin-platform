@@ -30,6 +30,89 @@ pub async fn publishing<R: Reader>(reader: &R, at: Address) -> Result<Publishing
     })
 }
 
+/// What the publishing contract's own record says of a payment for one
+/// upload, judged against the wallet the upload named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaymentRecord {
+    /// Paid by the wallet the upload named, under this id: the job starts
+    /// once the build service has read it confirmed.
+    ByUploader { strategy_id: U256 },
+    /// Paid by another wallet: it starts nothing.
+    ByAnother { strategy_id: U256, payer: Address },
+    /// No payment for the upload is recorded where it was looked for.
+    None,
+}
+
+/// The most payments looked through after a known count.
+const MOST_SEARCHED: u64 = 256;
+
+/// The payment recorded under `strategy_id`, if it is for `upload`.
+pub async fn payment_at<R: Reader>(
+    reader: &R,
+    publishing: Address,
+    strategy_id: U256,
+    upload: B256,
+    uploader: Address,
+) -> Result<PaymentRecord, TxError> {
+    let record = read(
+        reader,
+        publishing,
+        IPublishing::submissionOfCall {
+            strategyId: strategy_id,
+        },
+    )
+    .await?;
+    Ok(judge(
+        strategy_id,
+        record.author,
+        record.upload,
+        upload,
+        uploader,
+    ))
+}
+
+/// A payment for `upload` among those recorded after the first `since`
+/// (or among the latest, when that count isn't known): the uploader's if
+/// there is one.
+pub async fn payment_after<R: Reader>(
+    reader: &R,
+    publishing: Address,
+    upload: B256,
+    uploader: Address,
+    since: Option<U256>,
+) -> Result<PaymentRecord, TxError> {
+    let count = read(reader, publishing, IPublishing::countCall {}).await?;
+    let since = since.unwrap_or_else(|| count.saturating_sub(U256::from(MOST_SEARCHED)));
+    let last = count.min(since.saturating_add(U256::from(MOST_SEARCHED)));
+    let mut found = PaymentRecord::None;
+    let mut id = since.saturating_add(U256::from(1u8));
+    while id <= last {
+        match payment_at(reader, publishing, id, upload, uploader).await? {
+            PaymentRecord::None => {}
+            mine @ PaymentRecord::ByUploader { .. } => return Ok(mine),
+            other => found = other,
+        }
+        id += U256::from(1u8);
+    }
+    Ok(found)
+}
+
+fn judge(
+    strategy_id: U256,
+    payer: Address,
+    paid_for: B256,
+    upload: B256,
+    uploader: Address,
+) -> PaymentRecord {
+    if payer == Address::ZERO || paid_for != upload {
+        PaymentRecord::None
+    } else if payer == uploader {
+        PaymentRecord::ByUploader { strategy_id }
+    } else {
+        PaymentRecord::ByAnother { strategy_id, payer }
+    }
+}
+
 /// The factory's terms that an activation names and is checked against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Terms {

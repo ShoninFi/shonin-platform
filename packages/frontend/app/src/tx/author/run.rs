@@ -17,8 +17,11 @@ use crate::tx::flow::Cancel;
 /// What a flow does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
+    /// Pay for `upload`, from `uploader`, the account the upload named, and
+    /// no other: the flow is built for that account, whatever is connected.
     Pay {
         upload: B256,
+        uploader: Address,
     },
     Activate(Activation),
     FundTank {
@@ -93,6 +96,41 @@ impl Default for Running {
     }
 }
 
+/// A payment this page session made for an upload, so the job page can
+/// check it against the publishing contract's own record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Paid {
+    pub chain: Chain,
+    pub upload: B256,
+    pub uploader: Address,
+    pub strategy_id: U256,
+}
+
+/// Where to look for a payment for an upload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lookup {
+    /// Under this id, as its receipt said.
+    At(U256),
+    /// After the first this many payments, or among the latest when that
+    /// isn't known.
+    After(Option<U256>),
+}
+
+thread_local! {
+    static PAID: std::cell::RefCell<std::collections::BTreeMap<String, Paid>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// Remember the payment for a job.
+pub fn remember_payment(job: &str, paid: Paid) {
+    PAID.with(|map| map.borrow_mut().insert(job.to_string(), paid));
+}
+
+/// The payment this page session made for a job, if any.
+pub fn payment_for_job(job: &str) -> Option<Paid> {
+    PAID.with(|map| map.borrow().get(job).copied())
+}
+
 /// Where the platform's contracts are on one EVM chain, from its config.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Platform {
@@ -143,14 +181,15 @@ mod browser {
     use std::collections::BTreeMap;
     use std::rc::Rc;
 
-    use alloy_primitives::{Address, Bytes, U256};
+    use alloy_primitives::{Address, B256, Bytes, U256};
     use shared::{Chain, Job, Upload, UploadAccepted};
 
-    use super::{Action, Platform, Running, UploadError};
+    use super::{Action, Lookup, Platform, Running, UploadError};
     use crate::api::BASE;
     use crate::tx::TxError;
     use crate::tx::author::error::AuthorError;
     use crate::tx::author::flow::{self, Ctx, Outcome, Step, Usage};
+    use crate::tx::author::read::{self, PaymentRecord};
     use crate::tx::flow::Pace;
     use crate::wallet::run::Timer;
     use crate::wallet::session::Session;
@@ -272,6 +311,41 @@ mod browser {
         })
     }
 
+    /// The publishing fee on `chain`, read from the publishing contract.
+    pub async fn fee(chain: Chain) -> Option<U256> {
+        let session = crate::wallet::get();
+        let (network, platform) = (session.network(chain).await?, platform(chain).await?);
+        let reader = Session::reader(&network);
+        read::publishing(&reader, platform.publishing)
+            .await
+            .ok()
+            .map(|terms| terms.fee)
+    }
+
+    /// What the publishing contract records of a payment for `upload`.
+    pub async fn payment(
+        chain: Chain,
+        upload: B256,
+        uploader: Address,
+        lookup: Lookup,
+    ) -> Result<PaymentRecord, String> {
+        let session = crate::wallet::get();
+        let (Some(network), Some(platform)) = (session.network(chain).await, platform(chain).await)
+        else {
+            return Err("this chain isn't reachable from this app".to_string());
+        };
+        let reader = Session::reader(&network);
+        let found = match lookup {
+            Lookup::At(id) => {
+                read::payment_at(&reader, platform.publishing, id, upload, uploader).await
+            }
+            Lookup::After(since) => {
+                read::payment_after(&reader, platform.publishing, upload, uploader, since).await
+            }
+        };
+        found.map_err(|_| "the chain didn't answer".to_string())
+    }
+
     /// Start `action` on `chain`, reporting into `running`; `done` runs with
     /// the outcome once the chain has confirmed it.
     pub fn start(
@@ -288,9 +362,15 @@ mod browser {
             let step = running.step.clone();
             let on_step = move |next: Step| step.set(Some(next));
             let fail = |error: AuthorError| on_step(Step::Failed(error));
-            let Some(account) = session.account() else {
+            let Some(connected) = session.account() else {
                 fail(TxError::NotConnected.into());
                 return;
+            };
+            // A payment is bound to the account its upload named; every
+            // other flow to the account connected now.
+            let account = match &action {
+                Action::Pay { uploader, .. } => *uploader,
+                _ => connected,
             };
             let (Some(network), Some(platform)) =
                 (session.network(chain).await, platform(chain).await)
@@ -314,8 +394,12 @@ mod browser {
             };
             let asset = network.asset;
             let outcome = match action {
-                Action::Pay { upload } => {
-                    flow::report(&on_step, flow::pay(&ctx, platform.publishing, upload)).await
+                Action::Pay { upload, uploader } => {
+                    flow::report(
+                        &on_step,
+                        flow::pay(&ctx, platform.publishing, upload, uploader),
+                    )
+                    .await
                 }
                 Action::Activate(chosen) => {
                     flow::report(
@@ -372,9 +456,12 @@ mod native {
 
     use shared::Chain;
 
-    use super::{Action, Platform, Running};
+    use alloy_primitives::{Address, B256, U256};
+
+    use super::{Action, Lookup, Platform, Running};
     use crate::tx::TxError;
     use crate::tx::author::flow::{Outcome, Step};
+    use crate::tx::author::read::PaymentRecord;
 
     /// Without a browser nothing runs.
     pub fn start(
@@ -390,6 +477,19 @@ mod native {
 
     pub async fn platform(_chain: Chain) -> Option<Rc<Platform>> {
         None
+    }
+
+    pub async fn fee(_chain: Chain) -> Option<U256> {
+        None
+    }
+
+    pub async fn payment(
+        _chain: Chain,
+        _upload: B256,
+        _uploader: Address,
+        _lookup: Lookup,
+    ) -> Result<PaymentRecord, String> {
+        Err("no chain without a browser".to_string())
     }
 }
 

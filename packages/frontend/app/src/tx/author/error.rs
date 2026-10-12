@@ -1,7 +1,7 @@
 //! What can stop an author's flow, beyond what stops any flow
 //! ([`TxError`]), and how each is said: what happened, then what to do.
 
-use alloy_primitives::U256;
+use alloy_primitives::{Address, B256, U256};
 
 use crate::money::format;
 use crate::tx::TxError;
@@ -28,6 +28,24 @@ pub enum AuthorError {
     TermsChanged,
     /// The payment's record on the chain isn't for this upload and account.
     PaymentMismatch,
+    /// The connected account isn't the one the upload named: only that
+    /// wallet's payment starts the job, so nothing is sent from another.
+    WrongPayer { uploader: Address },
+    /// The payment was sent and wasn't seen mined (dropped, stuck or
+    /// replaced): it may still land. `since` is how many payments the
+    /// publishing contract had recorded before it was sent, so the chain
+    /// can be searched for it.
+    PaymentUnsure {
+        upload: B256,
+        since: U256,
+        then: Box<TxError>,
+    },
+    /// The activation stopped after its approval of the tank (`amount`) was
+    /// mined: the approval stands, and trying again uses it.
+    ApprovalStands {
+        amount: U256,
+        then: Box<AuthorError>,
+    },
     /// The idle floor is a share of the vault: at most 100%.
     FloorTooHigh,
     /// No lowering of the idle floor is waiting.
@@ -41,6 +59,9 @@ pub enum AuthorError {
     /// The executor serves no signed total for the vault, or not a recent
     /// enough one.
     NoUsageTotal,
+    /// The bill so far, settled from the tank first, would leave nothing to
+    /// withdraw.
+    TabTakesTank { tab: U256 },
 }
 
 impl From<TxError> for AuthorError {
@@ -53,7 +74,31 @@ impl AuthorError {
     /// Whether a transaction may have been sent, so nothing may say
     /// "Nothing was sent".
     pub fn after_send(&self) -> bool {
-        matches!(self, Self::Tx(error) if error.after_send())
+        match self {
+            Self::Tx(error) => error.after_send(),
+            Self::PaymentMismatch | Self::PaymentUnsure { .. } | Self::ApprovalStands { .. } => {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a payment for the upload may have been made (or may still
+    /// land): the page must not offer to pay again until the chain shows
+    /// no payment for it.
+    pub fn may_have_paid(&self) -> bool {
+        matches!(self, Self::PaymentMismatch | Self::PaymentUnsure { .. })
+            || matches!(self, Self::Tx(error) if error.may_have_moved())
+    }
+
+    /// The transaction the error is about, for its link.
+    pub fn hash(&self) -> Option<B256> {
+        match self {
+            Self::Tx(error) => error.hash(),
+            Self::PaymentUnsure { then, .. } => then.hash(),
+            Self::ApprovalStands { then, .. } => then.hash(),
+            _ => None,
+        }
     }
 
     pub fn words(&self, context: &Context<'_>) -> Words {
@@ -99,6 +144,49 @@ impl AuthorError {
                 "The chain recorded a payment, but not for this upload from this wallet. Check your wallet's activity before paying again."
                     .to_string(),
             ),
+            Self::WrongPayer { uploader } => alert(
+                "Switch back to the wallet that made this upload",
+                format!(
+                    "Switch back to {}, which made this upload: only its payment starts the job. Nothing was sent. To pay from this wallet instead, replace the file and upload it again.",
+                    crate::format::short_hash(&format!("{uploader:?}"))
+                ),
+            ),
+            Self::PaymentUnsure { then, .. } => {
+                let wallet = context.wallet;
+                let seen = match then.as_ref() {
+                    TxError::Dropped { .. } => {
+                        "The network this app reads hasn't seen your payment.".to_string()
+                    }
+                    TxError::Stuck { .. } => {
+                        "Your payment was sent and still isn't mined after a long wait.".to_string()
+                    }
+                    TxError::Replaced { .. } => format!(
+                        "Another transaction took your payment's place in {wallet}: it may have been sped up or cancelled."
+                    ),
+                    _ => "Your payment was sent and hasn't been seen mined.".to_string(),
+                };
+                alert(
+                    "Your payment may still go through",
+                    format!(
+                        "{seen} It may still land. Check {wallet}'s activity, then check the chain for it here before paying again."
+                    ),
+                )
+            }
+            Self::ApprovalStands { amount, then } => {
+                let words = then.words(context);
+                let reason = words
+                    .text
+                    .strip_suffix("Nothing was sent.")
+                    .map(|text| format!("{text}The activation wasn't sent."))
+                    .unwrap_or(words.text);
+                alert(
+                    &words.title,
+                    format!(
+                        "{reason} Your approval of {} to the vault factory went through and stands: activating again uses it, without asking for it again.",
+                        format::dollars_exact(*amount, context.decimals)
+                    ),
+                )
+            }
             Self::FloorTooHigh => alert(
                 "That's more than 100%",
                 "The idle floor is a share of the vault. Nothing was sent.".to_string(),
@@ -132,6 +220,13 @@ impl AuthorError {
                 "No recent bill to settle first",
                 "The agent's executor isn't serving a signed bill for this vault right now. You can ask to withdraw without one. Nothing was sent."
                     .to_string(),
+            ),
+            Self::TabTakesTank { tab } => alert(
+                "The tab takes what's in the tank",
+                format!(
+                    "The bill so far, up to {}, is paid from the tank first and leaves nothing to withdraw. Nothing was sent.",
+                    format::dollars_exact(*tab, context.decimals)
+                ),
             ),
         }
     }

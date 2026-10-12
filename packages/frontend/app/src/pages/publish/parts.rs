@@ -167,9 +167,20 @@ pub fn prompt_words(prompt: &Prompt, names: &Names) -> (String, String) {
             format!("Ask to withdraw in {wallet}"),
             "The wait before you can withdraw without a signed bill starts now.".to_string(),
         ),
-        Prompt::WithdrawTank { amount } => (
+        Prompt::WithdrawTank { amount, tab } if tab.is_zero() => (
             format!("Withdraw {} in {wallet}", names.dollars(*amount)),
-            "From the tank to your wallet.".to_string(),
+            format!(
+                "{} goes from the tank to your wallet.",
+                names.dollars(*amount)
+            ),
+        ),
+        Prompt::WithdrawTank { amount, tab } => (
+            format!("Withdraw {} in {wallet}", names.dollars(*amount)),
+            format!(
+                "The bill so far, up to {}, is paid from the tank first; then {} goes to your wallet.",
+                names.dollars(*tab),
+                names.dollars(*amount)
+            ),
         ),
     }
 }
@@ -178,8 +189,10 @@ pub fn prompt_words(prompt: &Prompt, names: &Names) -> (String, String) {
 pub fn outcome_words(outcome: &Outcome, names: &Names) -> (String, String) {
     match outcome {
         Outcome::Paid { strategy_id, .. } => (
-            "Paid. Your job has started.".to_string(),
-            format!("Your agent's id is {strategy_id}."),
+            "Paid from the wallet that uploaded it".to_string(),
+            format!(
+                "Your agent's id is {strategy_id}. The job starts once the build service has seen the payment confirmed on the chain."
+            ),
         ),
         Outcome::Activated { .. } => (
             "Your vault is open".to_string(),
@@ -386,10 +399,7 @@ fn step_view(step: &Step, names: &Names, cancel: &crate::tx::flow::Cancel) -> Vi
         }
         Step::Failed(error) => {
             let words = names.words(error);
-            let hash = match error {
-                AuthorError::Tx(error) => error.hash(),
-                _ => None,
-            };
+            let hash = error.hash();
             el("div")
                 .class("sh-author__error")
                 .class_if(words.alert, "sh-author__error--alert")
