@@ -862,6 +862,63 @@ fn events_are_read_from_the_vaults_own_log_lines_and_its_calls_of_itself_only() 
     );
 }
 
+/// A venue program the vault calls can log whatever text it likes, but its
+/// lines always read `Program log: ...`: shaped like the runtime's own
+/// (`Program <vault> invoke [2]`, `Program <it> success`), they never make
+/// its `Program data:` the vault's, and a line out of step with the
+/// invocations ends what is trusted.
+#[test]
+fn a_called_program_s_own_log_lines_never_make_its_data_the_vault_s() {
+    use shonin_vault::events as e;
+    let vault = super::ids::VAULT.to_string();
+    let venue = "Venue111111111111111111111111111111111111111";
+    let forged = said(e::Refunded {
+        request_id: 7,
+        to: key(2),
+        assets: 999,
+    });
+    let real = said(e::Refunded {
+        request_id: 7,
+        to: key(2),
+        assets: 3,
+    });
+    let logs = vec![
+        format!("Program {vault} invoke [1]"),
+        format!("Program {venue} invoke [2]"),
+        // The venue's own lines, shaped like the runtime's.
+        format!("Program log: Program {venue} success"),
+        format!("Program log: Program {vault} invoke [2]"),
+        format!("Program data: {}", encode(&forged)),
+        format!("Program {venue} consumed 1000 of 200000 compute units"),
+        format!("Program {venue} success"),
+        format!("Program data: {}", encode(&real)),
+        format!("Program {vault} success"),
+    ];
+    assert_eq!(
+        events_in(&logs, &[], base64),
+        vec![Event::Refunded {
+            request_id: 7,
+            to: key(2),
+            assets: 3
+        }]
+    );
+    // An invocation the runtime couldn't have logged (a depth out of step)
+    // ends what is trusted: nothing after it is the vault's.
+    let logs = vec![
+        format!("Program {vault} invoke [1]"),
+        format!("Program {vault} invoke [3]"),
+        format!("Program data: {}", encode(&forged)),
+    ];
+    assert_eq!(events_in(&logs, &[], base64), vec![]);
+    // An end naming another program than the one running, likewise.
+    let logs = vec![
+        format!("Program {venue} invoke [1]"),
+        format!("Program {vault} success"),
+        format!("Program data: {}", encode(&forged)),
+    ];
+    assert_eq!(events_in(&logs, &[], base64), vec![]);
+}
+
 #[test]
 fn every_vault_error_number_names_the_programs_own_error() {
     use shonin_vault::error::VaultError as E;

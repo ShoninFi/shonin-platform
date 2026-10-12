@@ -357,11 +357,18 @@ impl Platform {
         }
     }
 
-    /// A closed vault pays a claim still waiting when it closed.
-    pub fn ix_claim_closed(&self, v: &VaultAccounts, claim: &Claim) -> Instruction {
+    /// A closed vault pays a claim still waiting when it closed. A queued
+    /// claim names the request it is queued by, `queued_by`: found among the
+    /// vault's requests by [`queued_request`], as the program finds it by
+    /// its id.
+    pub fn ix_claim_closed(
+        &self,
+        v: &VaultAccounts,
+        claim: &Claim,
+        queued_by: Option<&Pubkey>,
+    ) -> Instruction {
         let address = vs::claim_address(&v.vault, claim.id).0;
-        let other = (claim.state == shonin_vault::state::ClaimState::Queued)
-            .then(|| vs::request_address(&v.vault, &address, claim.request).0);
+        let other = queued_by.copied();
         Instruction {
             program_id: shonin_vault::ID,
             accounts: shonin_vault::accounts::ClosedDoor {
@@ -403,6 +410,32 @@ impl Platform {
         ixs.push(self.ix_close_vault(v, vault));
         Ok(ixs)
     }
+}
+
+/// Where the request a queued claim is queued by lives, among `requests`
+/// (the vault's, with their addresses). The claim's `request` field holds
+/// that request's queue id, and the program finds it by that id: it made
+/// it at the claim's request address for the nonce the claim held *before*
+/// (0 the first time), so it is not at the address the id would give. None
+/// for a claim not queued, or whose request isn't among them.
+pub fn queued_request(
+    vault: &Pubkey,
+    claim: &Claim,
+    requests: &[(Pubkey, Request)],
+) -> Option<Pubkey> {
+    if claim.state != shonin_vault::state::ClaimState::Queued {
+        return None;
+    }
+    requests
+        .iter()
+        .find(|(_, r)| {
+            r.vault == *vault
+                && r.id == claim.request
+                && r.kind == RequestKind::Claim
+                && r.reference == claim.id
+                && r.owner == claim.owner
+        })
+        .map(|(address, _)| *address)
 }
 
 /// Whether a request or claim account may be closed for its rent: finished,

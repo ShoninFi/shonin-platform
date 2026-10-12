@@ -387,6 +387,15 @@ struct Cluster0 {
     keeper_delay: u64,
     settlements: u64,
     cancel: Cancel,
+    /// The node takes each send, but its answer never reaches the app.
+    lose_send_answers: bool,
+    /// Each landed transaction is first seen at `processed` with an error
+    /// (on a fork the cluster then drops), and confirmed fine a tick later.
+    fork_first: bool,
+    /// Statuses that become the confirmed ones at the next tick.
+    later: Vec<(Sig, Status)>,
+    /// Status looks the node doesn't answer before it answers again.
+    unanswered_looks: u32,
 }
 
 #[derive(Clone)]
@@ -398,6 +407,14 @@ fn owned(data: Vec<u8>) -> AccountData {
         lamports: 1_000_000,
         data,
     }
+}
+
+/// A vault as its account reads: open, priced, its cash all at home; for
+/// the pages' tests to change as they need.
+pub(crate) fn a_vault() -> chain::solana_ix::accounts::Vault {
+    let sim = Sim::new();
+    let state = sim.0.borrow().vault.clone();
+    chain::solana_ix::accounts::Vault::read(&vault_bytes(&state)).unwrap()
 }
 
 impl Sim {
@@ -456,6 +473,10 @@ impl Sim {
             keeper_delay: 2,
             settlements: 0,
             cancel: Cancel::new(),
+            lose_send_answers: false,
+            fork_first: false,
+            later: Vec::new(),
+            unanswered_looks: 0,
         })))
     }
 
@@ -552,14 +573,24 @@ impl Sim {
         logs.push(format!("Program {} success", ids::VAULT));
         let mut c = self.0.borrow_mut();
         let slot = c.tick;
-        c.statuses.insert(
-            signature,
-            Status {
-                slot,
-                err: None,
-                confirmed: true,
-            },
-        );
+        let landed = Status {
+            slot,
+            err: None,
+            confirmed: true,
+        };
+        if c.fork_first {
+            c.statuses.insert(
+                signature,
+                Status {
+                    slot,
+                    err: Some(r#"{"InstructionError":[2,{"Custom":6000}]}"#.to_string()),
+                    confirmed: false,
+                },
+            );
+            c.later.push((signature, landed));
+        } else {
+            c.statuses.insert(signature, landed);
+        }
         c.records.insert(
             signature,
             Record {
@@ -579,6 +610,9 @@ impl Sim {
         c.tick += 1;
         c.time += 1;
         c.height += 10;
+        for (signature, status) in std::mem::take(&mut c.later) {
+            c.statuses.insert(signature, status);
+        }
         let due: Vec<Pubkey> = c
             .requests
             .iter()
@@ -708,11 +742,21 @@ impl SolReader for Sim {
         if !self.0.borrow().drop_sends {
             self.land(wire, signature);
         }
+        if self.0.borrow().lose_send_answers {
+            return Err(SolError::Network(
+                "the connection dropped before the node answered".to_string(),
+            ));
+        }
         Ok(signature)
     }
 
     async fn status(&self, signature: &Sig, _history: bool) -> Result<Option<Status>, SolError> {
-        Ok(self.0.borrow().statuses.get(signature).cloned())
+        let mut c = self.0.borrow_mut();
+        if c.unanswered_looks > 0 {
+            c.unanswered_looks -= 1;
+            return Err(SolError::Network("the node didn't answer".to_string()));
+        }
+        Ok(c.statuses.get(signature).cloned())
     }
 
     async fn signatures_for(&self, key: &Pubkey, _limit: usize) -> Result<Vec<Sig>, SolError> {
@@ -1051,6 +1095,129 @@ fn an_endpoint_answering_for_another_cluster_is_refused() {
     };
     let (end, _) = run!(&sim, remote, |ctx| flow::deposit(&ctx, 100 * USD, shown()));
     assert_eq!(end, Err(SolError::WrongEndpoint));
+}
+
+#[test]
+fn a_send_whose_answer_was_lost_and_that_landed_is_followed_to_its_outcome() {
+    let sim = Sim::new();
+    sim.0.borrow_mut().lose_send_answers = true;
+    let (end, steps) = run!(&sim, local(), |ctx| flow::deposit(&ctx, 100 * USD, shown()));
+    assert!(matches!(end, Ok(Outcome::Deposited { .. })), "{end:?}");
+    assert_eq!(sim.sends(), 1);
+    assert_eq!(sim.0.borrow().prompts.len(), 1, "the wallet was asked once");
+    assert!(steps.iter().any(|step| matches!(step, Step::Sent { .. })));
+}
+
+#[test]
+fn a_send_whose_answer_was_lost_is_watched_until_it_can_no_longer_land_then_said_plainly() {
+    let sim = Sim::new();
+    {
+        let mut c = sim.0.borrow_mut();
+        c.lose_send_answers = true;
+        c.drop_sends = true;
+    }
+    let (end, steps) = run!(&sim, local(), |ctx| flow::deposit(&ctx, 100 * USD, shown()));
+    // Followed as sent (never "the network didn't answer, try again") until
+    // its blockhash passed: then it can't land, and that is what is said.
+    assert!(steps.iter().any(|step| matches!(step, Step::Sent { .. })));
+    let Err(error) = end else { panic!("{end:?}") };
+    assert!(matches!(error, SolError::Expired { .. }), "{error:?}");
+    assert!(!error.may_have_moved());
+    assert_eq!(sim.sends(), 1, "sent again");
+}
+
+#[test]
+fn a_status_look_the_node_doesnt_answer_is_looked_again_never_said_as_a_failure_to_retry() {
+    let sim = Sim::new();
+    {
+        let mut c = sim.0.borrow_mut();
+        c.lose_send_answers = true;
+        c.unanswered_looks = 3;
+    }
+    let (end, _) = run!(&sim, local(), |ctx| flow::deposit(&ctx, 100 * USD, shown()));
+    assert!(matches!(end, Ok(Outcome::Deposited { .. })), "{end:?}");
+    assert_eq!(sim.sends(), 1);
+}
+
+#[test]
+fn an_error_seen_before_confirmation_is_not_judged_until_the_cluster_confirms() {
+    let sim = Sim::new();
+    sim.0.borrow_mut().fork_first = true;
+    let (end, _) = run!(&sim, local(), |ctx| flow::deposit(&ctx, 100 * USD, shown()));
+    assert!(matches!(end, Ok(Outcome::Deposited { .. })), "{end:?}");
+}
+
+#[test]
+fn a_cluster_is_checked_by_its_genesis_under_either_name_and_a_local_one_is_never_a_public_one() {
+    const MAINNET: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+    const DEVNET: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
+    let sim = Sim::new();
+    // `mainnet` is the cluster `mainnet-beta`: its endpoint is checked, not
+    // refused for the name. (The wallet here offers only the local cluster.)
+    sim.0.borrow_mut().genesis = MAINNET.to_string();
+    let mainnet = Cluster {
+        name: "mainnet".to_string(),
+        chain: "solana:mainnet".to_string(),
+        mint: mint(),
+        local_endpoint: false,
+    };
+    let (end, _) = run!(&sim, mainnet.clone(), |ctx| flow::deposit(
+        &ctx,
+        100 * USD,
+        shown()
+    ));
+    assert_eq!(end, Err(SolError::WrongCluster));
+    sim.0.borrow_mut().genesis = DEVNET.to_string();
+    let (end, _) = run!(&sim, mainnet, |ctx| flow::deposit(&ctx, 100 * USD, shown()));
+    assert_eq!(end, Err(SolError::WrongEndpoint));
+    // A local endpoint answering for a public cluster isn't a local cluster.
+    let (end, _) = run!(&sim, local(), |ctx| flow::deposit(&ctx, 100 * USD, shown()));
+    assert_eq!(end, Err(SolError::WrongEndpoint));
+    assert_eq!(sim.sends(), 0);
+}
+
+/// A claim's close through a venue where the station holds eight markets
+/// names more accounts than a legacy transaction carries: measured, it
+/// doesn't fit, so it is never offered from the app. One market fits.
+#[test]
+fn a_transaction_larger_than_the_app_can_send_is_measured_as_not_fitting() {
+    use chain::solana_ix::accounts::{Claim, ClaimState};
+    use chain::solana_ix::vault::{Groups, Pinned, stand_in_group};
+    let k = keys();
+    let owner = depositor().pubkey();
+    let claim = Claim {
+        id: 3,
+        owner,
+        shares: WAD,
+        booked_at: 1,
+        last_attempt_at: 0,
+        state: ClaimState::Pending,
+        paid: 0,
+        request: 0,
+        payer: owner,
+        held: 0,
+    };
+    let venue = Pubkey::new_from_array([0x31; 32]);
+    let authority = address::venue_authority(&k.station, &venue);
+    let pinned = Pinned {
+        program: Pubkey::new_from_array([0x32; 32]),
+        venue,
+        authority,
+        dollars: address::dollars(&authority, &k.mint),
+    };
+    let close = |markets: u8| {
+        let held: Vec<Pubkey> = (0..markets)
+            .map(|i| Pubkey::new_from_array([0x40 + i; 32]))
+            .collect();
+        let mut groups = Groups::none();
+        groups.push(stand_in_group(&pinned, &k.mint, &held));
+        vec![
+            chain::solana_ix::budget::open_dollars(&flow::someone(), &owner, &k.mint),
+            ix::settle_claim(&k, &flow::someone(), &claim.keys(), &groups),
+        ]
+    };
+    assert!(flow::fits(&flow::someone(), close(1)));
+    assert!(!flow::fits(&flow::someone(), close(8)));
 }
 
 // Withdrawals ---------------------------------------------------------------------------------

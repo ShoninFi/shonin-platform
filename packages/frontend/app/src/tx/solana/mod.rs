@@ -14,7 +14,7 @@ pub mod run;
 #[cfg(test)]
 mod live;
 #[cfg(test)]
-mod sim;
+pub(crate) mod sim;
 
 pub use error::SolError;
 pub use flow::{Outcome, Prompt, Step};

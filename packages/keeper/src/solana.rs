@@ -53,7 +53,7 @@ use chain::solana::programs::anchor_lang::AccountDeserialize;
 use chain::solana::programs::{station, vault as vp};
 use chain::solana::rate_limited;
 use chain::solana::scan::VaultScan;
-use chain::solana::upkeep::SignedUsage;
+use chain::solana::upkeep::{SignedUsage, queued_request};
 use chain::solana::{
     Instruction, Keypair, Platform, Pubkey, Signer, SolanaClient, TransactionFailed,
 };
@@ -1512,24 +1512,32 @@ impl Keeping {
             station_left = !memory.unwind_idle;
         }
 
-        // What was waiting when it closed, paid out.
+        // What was waiting when it closed, paid out. A queued claim names
+        // the request it is queued by, found among the vault's by its id.
         let mut waiting = false;
+        let requests: Result<Vec<(Pubkey, Request)>> =
+            self.platform.requests_of(&self.client, &address).await;
         for claim in claims {
             if matches!(
                 claim.state,
                 ClaimState::Pending | ClaimState::Waiting | ClaimState::Queued
             ) {
                 waiting = true;
+                let queued_by = queued_request(&address, claim, requests.as_deref().unwrap_or(&[]));
+                if claim.state == ClaimState::Queued && queued_by.is_none() {
+                    // Not read yet: the next round reads the requests again.
+                    tracing::debug!(vault = %address, claim = claim.id, "the request a queued claim is queued by wasn't found");
+                    continue;
+                }
                 self.send(
                     &address,
-                    vec![self.platform.ix_claim_closed(v, claim)],
+                    vec![self.platform.ix_claim_closed(v, claim, queued_by.as_ref())],
                     "pay a claim of the closed vault",
                 )
                 .await;
             }
         }
-        let requests: Vec<(Pubkey, Request)> =
-            self.platform.requests_of(&self.client, &address).await?;
+        let requests = requests?;
         for (record, request) in &requests {
             if !request.done && request.kind != vp::state::RequestKind::Claim {
                 waiting = true;

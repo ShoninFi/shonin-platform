@@ -271,8 +271,15 @@ impl SolSigner for SessionSigner {
             }
             #[cfg(target_arch = "wasm32")]
             Active::Legacy(legacy) => {
+                // Phantom's older provider takes no chain: it sends to
+                // whichever network Phantom is set to, where the blockhash
+                // (read from this cluster) is unknown and nothing lands.
+                // That is said as the wrong network, plainly.
                 let _ = chain;
-                legacy.sign_and_send(&unsigned.wire()).await
+                legacy
+                    .sign_and_send(&unsigned.wire())
+                    .await
+                    .map_err(super::legacy_error)
             }
             Active::Key(key) => {
                 let _ = chain;

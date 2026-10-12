@@ -340,8 +340,17 @@ pub fn claim_instead(
     )
 }
 
-/// A claim as its account holds it: its id, its owner, and the nonce of the
-/// request it was last queued by (its `request` field).
+/// A claim as its account holds it: its id, its owner, and its `request`
+/// field: the queue id of the request it was last queued by (0 if never).
+///
+/// That id is also the nonce the claim's *next* request is made at, which is
+/// all [`settle_claim`] needs. It is not where the request it is queued by
+/// now lives: the program made that one at the nonce the claim held before
+/// (0 the first time), and only then stored its id. So a queued claim's
+/// request is found by its id ([`accounts::Claim::is_queued_by`]), and its
+/// address handed to [`take_pro_rata_claim`] and [`claim_closed`].
+///
+/// [`accounts::Claim::is_queued_by`]: super::accounts::Claim::is_queued_by
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClaimKeys {
     pub id: u64,
@@ -354,9 +363,9 @@ impl ClaimKeys {
         address::claim(&v.vault, self.id)
     }
 
-    /// The request a queued claim is priced by: the claim's own, at its
-    /// last nonce.
-    fn queued(&self, v: &VaultKeys) -> Pubkey {
+    /// Where the request is made if the claim is queued now: the claim's own
+    /// request address, at the nonce it holds.
+    fn next_request(&self, v: &VaultKeys) -> Pubkey {
         address::request(&v.vault, &self.address(v), self.request)
     }
 }
@@ -376,7 +385,7 @@ pub fn settle_claim(
         r(ids::STATION),
         w(v.station_dollars),
         w(claim.address(v)),
-        w(claim.queued(v)),
+        w(claim.next_request(v)),
         w(v.dollars(&claim.owner)),
         w(v.dollars(&v.author)),
         w(v.dollars(&v.platform)),
@@ -418,14 +427,19 @@ pub fn take_pro_rata(
     )
 }
 
-/// `claim`'s owner takes the pro-rata fallback for a claim nothing served;
-/// `queued` says whether the claim is queued, when its request is named.
-pub fn take_pro_rata_claim(v: &VaultKeys, claim: &ClaimKeys, queued: bool) -> Instruction {
+/// `claim`'s owner takes the pro-rata fallback for a claim nothing served.
+/// `queued` is, for a queued claim, the address of the request it is queued
+/// by, found by its id (see [`ClaimKeys`]); `None` for a claim not queued.
+pub fn take_pro_rata_claim(
+    v: &VaultKeys,
+    claim: &ClaimKeys,
+    queued: Option<&Pubkey>,
+) -> Instruction {
     let mut accounts = vec![ws(claim.owner)];
     accounts.extend(v.pool());
     accounts.extend([
         w(claim.address(v)),
-        if queued { w(claim.queued(v)) } else { none() },
+        queued.map_or_else(none, |request| w(*request)),
         w(v.holder(&claim.owner)),
         w(v.dollars(&claim.owner)),
         r(ids::SYSTEM),
@@ -490,12 +504,12 @@ pub fn redeem_closed(
 
 /// A closed vault pays `claim`, still waiting when it closed, to its owner;
 /// `queued` as for [`take_pro_rata_claim`]. Anyone may send it.
-pub fn claim_closed(v: &VaultKeys, claim: &ClaimKeys, queued: bool) -> Instruction {
+pub fn claim_closed(v: &VaultKeys, claim: &ClaimKeys, queued: Option<&Pubkey>) -> Instruction {
     let mut accounts = vec![
         w(v.vault),
         r(v.station),
         w(claim.address(v)),
-        if queued { w(claim.queued(v)) } else { none() },
+        queued.map_or_else(none, |request| w(*request)),
         w(v.dollars(&claim.owner)),
     ];
     accounts.extend(v.purse());

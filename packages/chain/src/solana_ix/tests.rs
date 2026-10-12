@@ -441,14 +441,16 @@ fn a_claim_s_fallback_is_the_program_s_take_pro_rata_claim_queued_or_not() {
         request: 6,
     };
     let claim_address = vs::claim_address(&v.vault, 40).0;
-    for queued in [true, false] {
+    // The request it is queued by, wherever it was found.
+    let request = key();
+    for queued in [Some(&request), None] {
         let expected = anchor(
             shonin_vault::ID,
             shonin_vault::accounts::TakeProRataClaim {
                 owner: claim.owner,
                 pool: pool(&v),
                 claim: claim_address,
-                request: queued.then(|| vs::request_address(&v.vault, &claim_address, 6).0),
+                request: queued.copied(),
                 holder: vs::holder_address(&v.vault, &claim.owner).0,
                 to_dollars: dollars(&claim.owner, &v),
                 system_program: SYSTEM,
@@ -555,14 +557,15 @@ fn a_closed_vault_s_claim_payout_is_the_program_s_claim_closed_queued_or_not() {
         request: 1,
     };
     let address = vs::claim_address(&v.vault, 8).0;
-    for queued in [true, false] {
+    let request = key();
+    for queued in [Some(&request), None] {
         let expected = anchor(
             shonin_vault::ID,
             shonin_vault::accounts::ClosedDoor {
                 vault: v.vault,
                 station: v.station,
                 record: address,
-                other: queued.then(|| vs::request_address(&v.vault, &address, 1).0),
+                other: queued.copied(),
                 to: dollars(&claim.owner, &v),
                 vault_dollars: dollars(&v.vault, &v),
                 mint: v.mint,
@@ -1388,6 +1391,101 @@ mod services {
                 None,
                 &dollars(&payer, &v)
             )
+        );
+    }
+
+    fn a_request(
+        vault: Pubkey,
+        id: u64,
+        kind: vs::RequestKind,
+        reference: u64,
+        owner: Pubkey,
+    ) -> vs::Request {
+        vs::Request {
+            vault,
+            id,
+            owner,
+            kind,
+            earliest: 100,
+            done: false,
+            amount: 5,
+            reference,
+            payer: owner,
+            held: 0,
+            held_for: Pubkey::default(),
+            bump: 255,
+            reserved: [0; 16],
+        }
+    }
+
+    /// The keeper pays a closed vault's queued claim through the request it
+    /// is queued by, found by the id the claim holds: the one the program
+    /// made at the nonce the claim held before, never the address the id
+    /// gives, and never another vault's or another claim's request with the
+    /// same id. Its instruction is the web app's.
+    #[test]
+    fn the_keeper_names_a_queued_claim_s_request_found_by_its_id_as_the_app_does() {
+        use crate::solana::upkeep::queued_request;
+        let v = a_vault();
+        let p = platform(&v);
+        let owner = key();
+        let claim_address = vs::claim_address(&v.vault, 9).0;
+        let mut claim = vs::Claim {
+            id: 9,
+            owner,
+            shares: 5,
+            booked_at: 1,
+            last_attempt_at: 2,
+            state: vs::ClaimState::Queued,
+            paid: 0,
+            request: 13,
+            payer: owner,
+            held: 0,
+            bump: 255,
+        };
+        // Made at nonce 0, holding id 13; and decoys.
+        let made = vs::request_address(&v.vault, &claim_address, 0).0;
+        let requests = vec![
+            (
+                vs::request_address(&v.vault, &claim_address, 13).0,
+                a_request(v.vault, 14, vs::RequestKind::Claim, 9, owner),
+            ),
+            (
+                key(),
+                a_request(key(), 13, vs::RequestKind::Claim, 9, owner),
+            ),
+            (
+                key(),
+                a_request(v.vault, 13, vs::RequestKind::Redeem, 9, owner),
+            ),
+            (
+                key(),
+                a_request(v.vault, 13, vs::RequestKind::Claim, 8, owner),
+            ),
+            (
+                made,
+                a_request(v.vault, 13, vs::RequestKind::Claim, 9, owner),
+            ),
+        ];
+        let found = queued_request(&v.vault, &claim, &requests);
+        assert_eq!(found, Some(made));
+        let keys = ClaimKeys {
+            id: 9,
+            owner,
+            request: 13,
+        };
+        assert_eq!(
+            p.ix_claim_closed(&accounts(&p, &v), &claim, found.as_ref()),
+            super::super::vault::claim_closed(&v, &keys, found.as_ref())
+        );
+        // Without the request it is queued by among them, none is named.
+        assert_eq!(queued_request(&v.vault, &claim, &requests[..4]), None);
+        // A claim not queued names none.
+        claim.state = vs::ClaimState::Pending;
+        assert_eq!(queued_request(&v.vault, &claim, &requests), None);
+        assert_eq!(
+            p.ix_claim_closed(&accounts(&p, &v), &claim, None),
+            super::super::vault::claim_closed(&v, &keys, None)
         );
     }
 

@@ -35,8 +35,12 @@ struct Row {
     account: Rc<Vault>,
     holder: Option<Holder>,
     value_cents: u128,
-    /// This wallet's requests still waiting, with their addresses.
+    /// This wallet's deposits and withdrawals still waiting, with their
+    /// addresses.
     waiting: Vec<(Pubkey, Request)>,
+    /// The ids of waiting deposits whose take-back is too large to send
+    /// from the app.
+    too_large: Vec<u64>,
     /// Payouts held for this wallet on requests.
     held: Vec<(Pubkey, Request)>,
     now: u64,
@@ -211,11 +215,39 @@ async fn read(owner: Pubkey) -> Option<Loaded> {
             .share_price()
             .and_then(|price| crate::money::quote::value_of(shares, price))
             .unwrap_or(U256::ZERO);
+        // A queued claim's request and the author's tank fills are this
+        // wallet's too, but not its to act on: a claim is shown with the
+        // claims, a fill on the author's page.
         let waiting: Vec<(Pubkey, Request)> = mine
             .iter()
             .filter_map(|(at, a)| Request::read(&a.data).map(|r| (*at, r)))
             .filter(|(_, r)| r.vault == vault.address && !r.done && r.owner == owner)
+            .filter(|(_, r)| matches!(r.kind, RequestKind::Deposit | RequestKind::Redeem))
             .collect();
+        let keys = chain::solana_ix::vault::VaultKeys::new(
+            account.strategy_id,
+            account.mint,
+            account.author,
+            account.platform,
+        );
+        let mut too_large = Vec::new();
+        for (at, request) in &waiting {
+            if request.kind == RequestKind::Deposit && account.request_falls_back(request, now) {
+                let fits = crate::tx::solana::flow::taking_back(
+                    &reader,
+                    &network.mint,
+                    &keys,
+                    at,
+                    request,
+                )
+                .await
+                .map(|ixs| crate::tx::solana::flow::fits(&owner, ixs))
+                .unwrap_or(true);
+                if !fits {
+                    too_large.push(request.id);
+                }
+            }
+        }
         let held: Vec<(Pubkey, Request)> = held_for
             .iter()
             .filter_map(|(at, a)| Request::read(&a.data).map(|r| (*at, r)))
@@ -244,6 +276,7 @@ async fn read(owner: Pubkey) -> Option<Loaded> {
             holder,
             value_cents: cents(value, network.asset_decimals),
             waiting,
+            too_large,
             held,
             now,
         });
@@ -474,9 +507,7 @@ fn extra_card(row: &Row, network: Option<Rc<SolNetwork>>, decimals: u8) -> El {
                 .class("sh-portfolio__claimtitle")
                 .text(row.vault.title.clone()),
         );
-    let closed = row.account.state == VaultState::Closed;
     for (_, request) in &row.waiting {
-        let due = request.earliest + row.account.timers.fallback_after;
         let what = match request.kind {
             RequestKind::Deposit => format!(
                 "Deposit of {} waiting for a price",
@@ -488,8 +519,10 @@ fn extra_card(row: &Row, network: Option<Rc<SolNetwork>>, decimals: u8) -> El {
             ),
         };
         card = card.child(el("p").text(what));
-        if closed {
-            card = card.child(act(
+        let fits = !row.too_large.contains(&request.id);
+        card = match request_offer(&row.account, request, row.now, fits) {
+            RequestOffer::None => card,
+            RequestOffer::SettleClosed => card.child(act(
                 &row.vault,
                 network.clone(),
                 SolAction::SettleClosed(request.id),
@@ -499,40 +532,39 @@ fn extra_card(row: &Row, network: Option<Rc<SolNetwork>>, decimals: u8) -> El {
                     "Settle at the closed vault’s price"
                 },
                 Kind::Primary,
-            ));
-        } else if row.now >= due {
-            if request.kind == RequestKind::Deposit {
-                // The fallback on a deposit sends it back.
-                card = card
-                    .child(el("p").class("sh-muted").text(
-                        "Nothing has priced it for a day. You can take your deposit back now.",
-                    ))
-                    .child(act(
-                        &row.vault,
-                        network.clone(),
-                        SolAction::TakeCash(Fallback::Request(request.id)),
-                        "Take your deposit back",
-                        Kind::Primary,
-                    ));
-            } else {
-                card = card
-                    .child(el("p").class("sh-muted").text("Nothing has priced it for a day. You can take your exact share of the vault’s cash now; the rest becomes units, paid as the money comes home."))
-                    .child(act(
-                        &row.vault,
-                        network.clone(),
-                        SolAction::TakeCash(Fallback::Request(request.id)),
-                        "Take cash share now",
-                        Kind::Primary,
-                    ))
-                    .child(act(
-                        &row.vault,
-                        network.clone(),
-                        SolAction::ClaimInstead(request.id),
-                        "Make it a claim instead",
-                        Kind::Secondary,
-                    ));
-            }
-        }
+            )),
+            // The fallback on a deposit sends it back.
+            RequestOffer::TakeBack => card
+                .child(el("p").class("sh-muted").text(
+                    "Nothing has priced it for a day. You can take your deposit back now.",
+                ))
+                .child(act(
+                    &row.vault,
+                    network.clone(),
+                    SolAction::TakeCash(Fallback::Request(request.id)),
+                    "Take your deposit back",
+                    Kind::Primary,
+                )),
+            RequestOffer::TakeBackTooLarge => card.child(el("p").class("sh-muted").text(
+                "Nothing has priced it for a day, but taking it back names more accounts than one transaction from the app can carry: the vault’s station holds positions in many markets. It stays a request: it is priced at the next valuation, or sent back if the vault closes.",
+            )),
+            RequestOffer::Fallback => card
+                .child(el("p").class("sh-muted").text("Nothing has priced it for a day. You can take your exact share of the vault’s cash now; the rest becomes units, paid as the money comes home."))
+                .child(act(
+                    &row.vault,
+                    network.clone(),
+                    SolAction::TakeCash(Fallback::Request(request.id)),
+                    "Take cash share now",
+                    Kind::Primary,
+                ))
+                .child(act(
+                    &row.vault,
+                    network.clone(),
+                    SolAction::ClaimInstead(request.id),
+                    "Make it a claim instead",
+                    Kind::Secondary,
+                )),
+        };
     }
     if let Some(holder) = &row.holder {
         let claimable = holder.units_claimable(row.account.per_unit).unwrap_or(0);
@@ -570,6 +602,39 @@ fn extra_card(row: &Row, network: Option<Rc<SolNetwork>>, decimals: u8) -> El {
             ));
     }
     card
+}
+
+/// What a waiting deposit or withdrawal is offered: only a door the program
+/// takes for it now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestOffer {
+    None,
+    /// A closed vault's own door: a deposit back, a withdrawal paid.
+    SettleClosed,
+    /// A deposit nothing priced for a day, sent back.
+    TakeBack,
+    /// The same, too large to send from the app: said, not offered.
+    TakeBackTooLarge,
+    /// A withdrawal nothing priced for a day: its cash share, or a claim.
+    Fallback,
+}
+
+fn request_offer(vault: &Vault, request: &Request, now: u64, fits: bool) -> RequestOffer {
+    let ours = matches!(request.kind, RequestKind::Deposit | RequestKind::Redeem) && !request.done;
+    if !ours {
+        return RequestOffer::None;
+    }
+    if vault.state == VaultState::Closed {
+        return RequestOffer::SettleClosed;
+    }
+    if !vault.request_falls_back(request, now) {
+        return RequestOffer::None;
+    }
+    match (request.kind, fits) {
+        (RequestKind::Deposit, true) => RequestOffer::TakeBack,
+        (RequestKind::Deposit, false) => RequestOffer::TakeBackTooLarge,
+        _ => RequestOffer::Fallback,
+    }
 }
 
 /// A button that runs one Solana flow, with its status line in place.
@@ -707,10 +772,17 @@ pub(super) fn status(
                                 }
                                 None => View::Empty,
                             })
-                            .child(on_click(
-                                Button::new(Kind::Secondary, "OK").size(Size::Small).build(),
-                                move || running.set(None),
-                            ))
+                            // What may have moved (or may still) isn't
+                            // offered again: the page shows it once it lands.
+                            .child(if error.may_have_moved() {
+                                View::Empty
+                            } else {
+                                on_click(
+                                    Button::new(Kind::Secondary, "OK").size(Size::Small).build(),
+                                    move || running.set(None),
+                                )
+                                .into()
+                            })
                             .into()
                     }
                 })
@@ -728,6 +800,51 @@ struct ClaimView {
     account: Rc<Vault>,
     claim: Claim,
     now: u64,
+    /// For a queued claim, its request's valuation time.
+    queued_earliest: Option<u64>,
+    /// Settling it fits one transaction from the app.
+    settle_fits: bool,
+}
+
+/// What a claim is offered: only the doors the program takes for it now.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClaimOffers {
+    /// The closed vault's payout.
+    collect_closed: bool,
+    /// "Settle now".
+    settle: bool,
+    /// Settling is open, but too large to send from the app: said instead.
+    settle_too_large: bool,
+    /// The fallback, for its owner.
+    take_cash: bool,
+}
+
+fn claim_offers(
+    vault: &Vault,
+    claim: &Claim,
+    queued_earliest: Option<u64>,
+    now: u64,
+    mine: bool,
+    settle_fits: bool,
+) -> ClaimOffers {
+    let waiting = matches!(
+        claim.state,
+        ClaimState::Pending | ClaimState::Waiting | ClaimState::Queued
+    );
+    if vault.state == VaultState::Closed {
+        return ClaimOffers {
+            collect_closed: waiting,
+            ..ClaimOffers::default()
+        };
+    }
+    let settles =
+        matches!(claim.state, ClaimState::Pending | ClaimState::Waiting) && !vault.ready_to_close();
+    ClaimOffers {
+        collect_closed: false,
+        settle: settles && settle_fits,
+        settle_too_large: settles && !settle_fits,
+        take_cash: mine && vault.claim_falls_back(claim, queued_earliest, now),
+    }
 }
 
 /// `/portfolio/claims/<slug>-<id>` for a Solana vault.
@@ -781,13 +898,47 @@ async fn follow_claim(slug: String, id: u64, loaded: Mutable<Option<Result<Claim
                     match (account, claim) {
                         (Some(account), Ok(Some(claim))) if account.owner == ids::VAULT => {
                             match Vault::read(&account.data) {
-                                Some(account) => Ok(ClaimView {
-                                    vault,
-                                    network,
-                                    account: Rc::new(account),
-                                    claim,
-                                    now,
-                                }),
+                                Some(account) => {
+                                    // A queued claim's request, found by its
+                                    // id: when its fallback opens.
+                                    let mut queued_earliest = None;
+                                    if let Ok(Some(at)) =
+                                        flow::queued_request(&reader, &vault.address, &claim).await
+                                        && let Ok(Some(request)) =
+                                            flow::request_at(&reader, &vault.address, &at).await
+                                    {
+                                        queued_earliest = Some(request.earliest);
+                                    }
+                                    // Measured before "Settle now" is offered.
+                                    let keys = chain::solana_ix::vault::VaultKeys::new(
+                                        account.strategy_id,
+                                        account.mint,
+                                        account.author,
+                                        account.platform,
+                                    );
+                                    let settle_fits = !matches!(
+                                        claim.state,
+                                        ClaimState::Pending | ClaimState::Waiting
+                                    ) || flow::settling(
+                                        &reader,
+                                        &network.mint,
+                                        &keys,
+                                        &flow::someone(),
+                                        &claim,
+                                    )
+                                    .await
+                                    .map(|ixs| flow::fits(&flow::someone(), ixs))
+                                    .unwrap_or(true);
+                                    Ok(ClaimView {
+                                        vault,
+                                        network,
+                                        account: Rc::new(account),
+                                        claim,
+                                        now,
+                                        queued_earliest,
+                                        settle_fits,
+                                    })
+                                }
                                 None => Err("This vault can’t be read right now.".to_string()),
                             }
                         }
@@ -823,7 +974,6 @@ fn claim_view(view: &ClaimView) -> View {
     let decimals = view.network.asset_decimals;
     let claim = &view.claim;
     let state = claim.state;
-    let closed = view.account.state == VaultState::Closed;
     let figures = crate::tx::solana::read::figures(&view.account);
     let estimate = figures
         .exit_quote(U256::from(claim.shares))
@@ -857,14 +1007,16 @@ fn claim_view(view: &ClaimView) -> View {
         ClaimState::None => "",
     };
     let mine = crate::wallet::solana::get().account() == Some(claim.owner);
-    let fallback_due = claim.booked_at + view.account.timers.fallback_after;
+    let offers = claim_offers(
+        &view.account,
+        claim,
+        view.queued_earliest,
+        view.now,
+        mine,
+        view.settle_fits,
+    );
     let mut actions = el("div").class("sh-claim__actions");
-    if closed
-        && matches!(
-            state,
-            ClaimState::Pending | ClaimState::Waiting | ClaimState::Queued
-        )
-    {
+    if offers.collect_closed {
         // A closed vault pays every claim still waiting from its cash, a
         // queued one included.
         actions = actions
@@ -878,7 +1030,8 @@ fn claim_view(view: &ClaimView) -> View {
                 "Collect from the closed vault",
                 Kind::Primary,
             ));
-    } else if open {
+    }
+    if offers.settle {
         actions = actions
             .child(el("h2").class("sh-portfolio__h2").text("Push it through yourself"))
             .child(el("p").text("Settling is public. It doesn’t depend on us: anyone can send it, including you. You pay its network fee. If the market is still outside the exit band, nothing closes and the claim keeps waiting."))
@@ -890,14 +1043,12 @@ fn claim_view(view: &ClaimView) -> View {
                 Kind::Secondary,
             ));
     }
-    if mine
-        && !closed
-        && view.now >= fallback_due
-        && matches!(
-            state,
-            ClaimState::Pending | ClaimState::Waiting | ClaimState::Queued
-        )
-    {
+    if offers.settle_too_large {
+        actions = actions
+            .child(el("h2").class("sh-portfolio__h2").text("Settled by the keeper"))
+            .child(el("p").text("Settling this claim names more accounts than one transaction from the app can carry: the vault’s station holds positions in many markets. The platform’s keeper settles it through its own lookup tables, and anyone else can the same way. You don’t need to do anything."));
+    }
+    if offers.take_cash {
         actions = actions
             .child(el("h2").class("sh-portfolio__h2").text("No price for 24 hours"))
             .child(el("p").text("You can take your exact share of the vault’s cash at once. The rest becomes units on the station’s holdings, paid as the money comes home."))
@@ -989,6 +1140,158 @@ fn claim_view(view: &ClaimView) -> View {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tx::solana::sim::a_vault;
+
+    const DAY: u64 = 86_400;
+    const WAD: u128 = 1_000_000_000_000_000_000;
+
+    fn a_request(kind: RequestKind, earliest: u64) -> Request {
+        let owner = Pubkey::new_from_array([3; 32]);
+        Request {
+            vault: Pubkey::new_from_array([1; 32]),
+            id: 5,
+            owner,
+            kind,
+            earliest,
+            done: false,
+            amount: 100 * WAD,
+            reference: 0,
+            payer: owner,
+            held: 0,
+            held_for: Pubkey::default(),
+        }
+    }
+
+    fn a_claim(state: ClaimState, booked_at: u64) -> Claim {
+        let owner = Pubkey::new_from_array([3; 32]);
+        Claim {
+            id: 9,
+            owner,
+            shares: 100 * WAD,
+            booked_at,
+            last_attempt_at: 0,
+            state,
+            paid: 0,
+            request: 13,
+            payer: owner,
+            held: 0,
+        }
+    }
+
+    #[test]
+    fn a_waiting_request_is_offered_only_a_door_the_program_takes_for_its_kind() {
+        let mut vault = a_vault();
+        // Priced last at 1,000; the request's time came after, a day ago.
+        let earliest = 1_010;
+        let now = earliest + DAY;
+        let offer =
+            |vault: &Vault, kind, fits| request_offer(vault, &a_request(kind, earliest), now, fits);
+        assert_eq!(
+            offer(&vault, RequestKind::Redeem, true),
+            RequestOffer::Fallback
+        );
+        assert_eq!(
+            offer(&vault, RequestKind::Deposit, true),
+            RequestOffer::TakeBack
+        );
+        assert_eq!(
+            offer(&vault, RequestKind::Deposit, false),
+            RequestOffer::TakeBackTooLarge
+        );
+        // A queued claim's request and a tank fill are not the owner's to
+        // take back, nor make a claim of.
+        assert_eq!(offer(&vault, RequestKind::Claim, true), RequestOffer::None);
+        assert_eq!(
+            offer(&vault, RequestKind::TankFill, true),
+            RequestOffer::None
+        );
+        // Not yet a day past its time.
+        assert_eq!(
+            request_offer(
+                &vault,
+                &a_request(RequestKind::Redeem, earliest),
+                now - 1,
+                true
+            ),
+            RequestOffer::None
+        );
+        // A valuation able to price it, or one waiting to settle: none.
+        vault.latest.time = earliest;
+        assert_eq!(offer(&vault, RequestKind::Redeem, true), RequestOffer::None);
+        vault.latest.time = 1_000;
+        vault.priced_through = vault.request_cursor + 1;
+        assert_eq!(offer(&vault, RequestKind::Redeem, true), RequestOffer::None);
+        vault.priced_through = vault.request_cursor;
+        // A closed vault's own door, for a deposit or a withdrawal only.
+        vault.state = VaultState::Closed;
+        assert_eq!(
+            offer(&vault, RequestKind::Redeem, true),
+            RequestOffer::SettleClosed
+        );
+        assert_eq!(
+            offer(&vault, RequestKind::Deposit, true),
+            RequestOffer::SettleClosed
+        );
+        assert_eq!(offer(&vault, RequestKind::Claim, true), RequestOffer::None);
+    }
+
+    #[test]
+    fn a_claim_is_offered_only_the_doors_the_program_takes_for_it_now() {
+        let mut vault = a_vault();
+        let booked = 900;
+        let now = booked + DAY;
+        // The cash at the last price covers it: no fallback, it can be
+        // settled at a price instead.
+        let pending = a_claim(ClaimState::Pending, booked);
+        let offers = claim_offers(&vault, &pending, None, now, true, true);
+        assert!(offers.settle && !offers.take_cash && !offers.collect_closed);
+        // The cash doesn't cover it: the fallback, for its owner only.
+        vault.cash = 1;
+        assert!(claim_offers(&vault, &pending, None, now, true, true).take_cash);
+        assert!(!claim_offers(&vault, &pending, None, now, false, true).take_cash);
+        assert!(!claim_offers(&vault, &pending, None, now - 1, true, true).take_cash);
+        // Settling too large to send from the app is said, not offered.
+        let offers = claim_offers(&vault, &pending, None, now, true, false);
+        assert!(!offers.settle && offers.settle_too_large);
+        // A queued claim falls back as its request does: a day past the
+        // request's time, no valuation able to price it.
+        let queued = a_claim(ClaimState::Queued, booked);
+        assert!(!claim_offers(&vault, &queued, None, now + DAY, true, true).take_cash);
+        let earliest = 1_010;
+        assert!(
+            !claim_offers(
+                &vault,
+                &queued,
+                Some(earliest),
+                earliest + DAY - 1,
+                true,
+                true
+            )
+            .take_cash
+        );
+        assert!(
+            claim_offers(&vault, &queued, Some(earliest), earliest + DAY, true, true).take_cash
+        );
+        vault.latest.time = earliest;
+        assert!(
+            !claim_offers(&vault, &queued, Some(earliest), earliest + DAY, true, true).take_cash
+        );
+        // Not settled again once queued.
+        assert!(!claim_offers(&vault, &queued, Some(earliest), now, true, true).settle);
+        // A closed vault pays it through its own door, queued or not, and
+        // nothing else.
+        vault.state = VaultState::Closed;
+        for claim in [&pending, &queued] {
+            let offers = claim_offers(&vault, claim, Some(earliest), now + DAY, true, true);
+            assert_eq!(
+                offers,
+                ClaimOffers {
+                    collect_closed: true,
+                    ..ClaimOffers::default()
+                }
+            );
+        }
+    }
 
     #[test]
     fn a_rows_value_is_rounded_down_to_the_cent_once_and_the_total_is_their_sum() {

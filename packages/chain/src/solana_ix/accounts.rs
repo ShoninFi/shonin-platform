@@ -396,6 +396,78 @@ impl Vault {
     pub fn ready_to_close(&self) -> bool {
         self.halted() && self.priced && self.latest.time > self.halted_at && self.empty()
     }
+
+    /// The program's `owed()`: a priced valuation still waits to settle.
+    pub fn owed(&self) -> bool {
+        self.priced && self.state != VaultState::Closed && self.request_cursor < self.priced_through
+    }
+
+    /// The program's `exit_of` payout: what `shares` would be paid at the
+    /// last priced valuation, before any check against the cash. `None` if
+    /// nothing was ever priced or the figures don't divide.
+    pub fn exit_payout(&self, shares: u128) -> Option<u64> {
+        let v = &self.latest;
+        if v.gross_exit == 0 || v.supply == 0 {
+            return None;
+        }
+        let wide = |x: u128| U256::from(x);
+        let slice = if v.fee_exit == 0 {
+            U256::ZERO
+        } else {
+            let product = wide(shares) * wide(v.fee_exit);
+            product.div_ceil(wide(v.gross_exit))
+        };
+        let burned = wide(shares) - slice.min(wide(shares));
+        let gross = burned * wide(v.gross_exit) / wide(v.supply);
+        let kept = (gross * U256::from(self.fees.transaction_bps)).div_ceil(U256::from(10_000u32));
+        Some(u64::try_from(gross - kept).unwrap_or(u64::MAX))
+    }
+
+    /// Whether the program takes the fallback (`take_pro_rata`), or a claim
+    /// instead of a withdrawal (`claim_instead`, a redemption only), for
+    /// `request` at `now`: a deposit or a redemption, not done, a day past
+    /// its valuation time, nothing owed, and no valuation able to price it.
+    /// A redemption's isn't taken by a vault waiting to close; a closed
+    /// vault's requests go through its own door (`settle_closed`).
+    pub fn request_falls_back(&self, request: &Request, now: u64) -> bool {
+        matches!(request.kind, RequestKind::Deposit | RequestKind::Redeem)
+            && !request.done
+            && self.state != VaultState::Closed
+            && now >= request.earliest.saturating_add(self.timers.fallback_after)
+            && !self.owed()
+            && (request.kind == RequestKind::Deposit || !self.ready_to_close())
+            && !(self.priced && self.latest.time >= request.earliest)
+    }
+
+    /// Whether the program takes a claim's fallback (`take_pro_rata_claim`)
+    /// at `now`: open, a day past its booking, nothing owed; one not queued
+    /// only when the cash at the last price doesn't cover it; a queued one
+    /// (`queued_earliest`, its request's valuation time) only as its request
+    /// would fall back.
+    pub fn claim_falls_back(&self, claim: &Claim, queued_earliest: Option<u64>, now: u64) -> bool {
+        let open = matches!(
+            claim.state,
+            ClaimState::Pending | ClaimState::Waiting | ClaimState::Queued
+        );
+        if !open
+            || self.state == VaultState::Closed
+            || self.ready_to_close()
+            || now < claim.booked_at.saturating_add(self.timers.fallback_after)
+            || self.owed()
+        {
+            return false;
+        }
+        if claim.state == ClaimState::Queued {
+            return queued_earliest.is_some_and(|earliest| {
+                !(self.priced && self.latest.time >= earliest)
+                    && now >= earliest.saturating_add(self.timers.fallback_after)
+            });
+        }
+        !self.priced
+            || self
+                .exit_payout(claim.shares)
+                .is_some_and(|payout| payout > self.cash)
+    }
 }
 
 // A holder, a request, a claim ---------------------------------------------------------
@@ -611,7 +683,9 @@ pub struct Claim {
     pub last_attempt_at: u64,
     pub state: ClaimState,
     pub paid: u64,
-    /// The nonce of the request a queued claim is priced by.
+    /// The queue id of the request it was last queued by (0 if never), and
+    /// the nonce its next one is made at. Not the nonce of the request it is
+    /// queued by now: see [`Claim::is_queued_by`].
     pub request: u64,
     pub payer: Pubkey,
     pub held: u64,
@@ -636,6 +710,21 @@ impl Claim {
             payer: key(c.payer),
             held: c.held,
         })
+    }
+
+    /// Whether `request`, of `vault`, is the one this claim is queued by:
+    /// the request holding the queue id in the claim's `request` field, made
+    /// for this claim. The program finds it by that id wherever it is, and
+    /// it is not at the address that id would give as a nonce (see
+    /// [`super::vault::ClaimKeys`]), so it is found among the vault's
+    /// requests by this.
+    pub fn is_queued_by(&self, vault: &Pubkey, request: &Request) -> bool {
+        self.state == ClaimState::Queued
+            && request.vault == *vault
+            && request.id == self.request
+            && request.kind == RequestKind::Claim
+            && request.reference == self.id
+            && request.owner == self.owner
     }
 
     /// The instruction builders' keys for this claim.
@@ -1071,39 +1160,57 @@ impl Event {
 /// Every event the vault program said in a transaction, from its log lines
 /// and from the calls it made of itself, in that order. `logs` are the
 /// node's log lines; a `Program data:` line counts only while the vault
-/// program is the one running (the line before it in the invocation stack),
-/// so another program can't put words in the vault's mouth. `calls` are the
-/// transaction's inner calls as (program, data). `decode` turns a log
-/// line's base64 into bytes.
+/// program is the one running, so another program can't put words in the
+/// vault's mouth. Which program is running is followed from the runtime's
+/// own lines alone: a program's ordinary log lines (`Program log: ...`) are
+/// never read as an invocation starting or ending, each invocation must be
+/// one level deeper than the one running, and each end must name the
+/// program running. Past a line that doesn't fit, nothing more is trusted.
+/// `calls` are the transaction's inner calls as (program, data). `decode`
+/// turns a log line's base64 into bytes.
 pub fn events_in(
     logs: &[String],
     calls: &[(Pubkey, Vec<u8>)],
     decode: impl Fn(&str) -> Option<Vec<u8>>,
 ) -> Vec<Event> {
     let vault = super::ids::VAULT.to_string();
-    let mut stack: Vec<String> = Vec::new();
+    let mut stack: Vec<&str> = Vec::new();
     let mut found = Vec::new();
     for line in logs {
-        if let Some(rest) = line.strip_prefix("Program ") {
-            if let Some(program) = rest
-                .split(" invoke [")
-                .next()
-                .filter(|_| rest.contains(" invoke ["))
-            {
-                stack.push(program.to_string());
-                continue;
-            }
-            if rest.ends_with(" success") || rest.contains(" failed: ") {
-                stack.pop();
-                continue;
-            }
-            if let Some(data) = rest.strip_prefix("data: ")
-                && stack.last() == Some(&vault)
+        let Some(rest) = line.strip_prefix("Program ") else {
+            continue;
+        };
+        // A program's own words, or the runtime's notes on one: neither
+        // starts nor ends an invocation.
+        if rest.starts_with("log: ") || rest.starts_with("return: ") || rest.contains(" consumed ")
+        {
+            continue;
+        }
+        if let Some(data) = rest.strip_prefix("data: ") {
+            if stack.last() == Some(&vault.as_str())
                 && let Some(bytes) = decode(data.trim())
                 && let Some(event) = Event::read(&bytes)
             {
                 found.push(event);
             }
+            continue;
+        }
+        if let Some((program, depth)) = rest.split_once(" invoke [") {
+            let depth: Option<usize> = depth.strip_suffix(']').and_then(|d| d.parse().ok());
+            if depth != Some(stack.len() + 1) {
+                break;
+            }
+            stack.push(program);
+            continue;
+        }
+        let ended = rest
+            .strip_suffix(" success")
+            .or_else(|| rest.split_once(" failed: ").map(|(program, _)| program));
+        if let Some(program) = ended {
+            if stack.last() != Some(&program) {
+                break;
+            }
+            stack.pop();
         }
     }
     found.extend(

@@ -48,8 +48,12 @@ pub enum SolError {
     },
     /// Its blockhash expired before it landed: it can never land now.
     Expired { signature: Sig },
-    /// Sent, and not seen landed after a long wait.
+    /// Sent, and not seen landed after a long wait, its blockhash not known
+    /// to have passed: it may still land.
     Stuck { signature: Sig },
+    /// Landed, confirmed without an error, but what it did couldn't be read
+    /// back: never "nothing was sent".
+    Landed { signature: Sig, why: String },
     /// The request landed and stands, but what became of it after couldn't
     /// be followed: never "nothing was sent".
     Pending { signature: Sig, why: String },
@@ -161,9 +165,17 @@ impl SolError {
     /// Whether a transaction may have been sent, so the page must not say
     /// "Nothing was sent".
     pub fn after_send(&self) -> bool {
+        self.may_have_moved() || matches!(self, Self::Failed { .. })
+    }
+
+    /// Whether money may have moved (or may still move): the page must not
+    /// offer to send the same thing again, only to look at where it stands.
+    /// A transaction that failed moved nothing but its fee, and one whose
+    /// blockhash passed can never land: those may be tried again.
+    pub fn may_have_moved(&self) -> bool {
         matches!(
             self,
-            Self::Failed { .. } | Self::Stuck { .. } | Self::Pending { .. }
+            Self::Stuck { .. } | Self::Pending { .. } | Self::Landed { .. }
         )
     }
 
@@ -173,7 +185,8 @@ impl SolError {
             Self::Failed { signature, .. }
             | Self::Expired { signature }
             | Self::Stuck { signature }
-            | Self::Pending { signature, .. } => Some(*signature),
+            | Self::Pending { signature, .. }
+            | Self::Landed { signature, .. } => Some(*signature),
             _ => None,
         }
     }
@@ -279,9 +292,14 @@ impl SolError {
                     .to_string(),
             ),
             Self::Stuck { .. } => alert(
-                "Still waiting for the network",
+                "Sent, and still waiting for the network",
+                "The network hasn't confirmed your transaction yet, and it may still go through. Don't send it again: your portfolio shows it once it lands."
+                    .to_string(),
+            ),
+            Self::Landed { why, .. } => alert(
+                "Your transaction went through",
                 format!(
-                    "The network hasn't confirmed your transaction yet. It may still go through: check {wallet} before trying again."
+                    "The network confirmed it, but the app couldn't read what it did: {why}. Don't send it again: your portfolio shows the result."
                 ),
             ),
             Self::Pending { why, .. } => alert(
@@ -299,8 +317,9 @@ impl SolError {
                 format!("{wallet} signed with another account or other content. Nothing was sent."),
             ),
             Self::TooLarge => alert(
-                "Too large to send",
-                "This transaction is larger than the network takes. Nothing was sent.".to_string(),
+                "Too large to send from the app",
+                "It names more accounts than one transaction from the app can carry, so you weren't asked to sign. Nothing was sent."
+                    .to_string(),
             ),
             Self::Network(why) => alert(
                 "The network didn't answer",
@@ -377,5 +396,58 @@ mod tests {
         }
         .words(&context);
         assert!(words.text.contains("Nothing moved"));
+    }
+    #[test]
+    fn what_may_have_landed_or_may_still_is_never_said_as_nothing_sent_nor_offered_again() {
+        let context = Context {
+            wallet: "Phantom",
+            chain: "Solana devnet",
+            wallet_chain: None,
+            symbol: "USDC",
+            decimals: 6,
+            native: "SOL",
+        };
+        let signature = Sig([4; 64]);
+        for error in [
+            SolError::Stuck { signature },
+            SolError::Pending {
+                signature,
+                why: "the vault couldn't be read".to_string(),
+            },
+            SolError::Landed {
+                signature,
+                why: "the payout's record wasn't in its transaction".to_string(),
+            },
+        ] {
+            assert!(error.after_send() && error.may_have_moved(), "{error:?}");
+            assert_eq!(error.signature(), Some(signature));
+            let words = error.words(&context);
+            let said = format!("{} {}", words.title, words.text);
+            for never in [
+                "Nothing was sent",
+                "nothing moved",
+                "Nothing moved",
+                "try again",
+                "Try again",
+            ] {
+                assert!(!said.contains(never), "{said}");
+            }
+            assert!(said.contains("Don't send it again"), "{said}");
+        }
+        // A failure moved nothing but its fee, and an expired one can never
+        // land: those may be tried again, and say so.
+        let failed = SolError::Failed {
+            signature,
+            reason: None,
+        };
+        assert!(failed.after_send() && !failed.may_have_moved());
+        let expired = SolError::Expired { signature };
+        assert!(!expired.may_have_moved());
+        assert!(
+            expired
+                .words(&context)
+                .text
+                .contains("can't go through now")
+        );
     }
 }

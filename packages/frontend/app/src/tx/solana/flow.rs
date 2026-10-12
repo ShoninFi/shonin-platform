@@ -30,6 +30,13 @@
 //!   transaction, and the outcome is read from the accounts and the vault's
 //!   own events, never assumed. A transaction whose blockhash expired is
 //!   reported as such (nothing moved); it is never sent again by itself.
+//! - Once a transaction may have gone out (the node's answer to the app's
+//!   own send was lost, or a look at its status went unanswered), it is
+//!   followed by its signature until it lands or its blockhash can no
+//!   longer land it, and an error after it landed says it went through:
+//!   nothing offers to send it again while it may still land.
+//! - A transaction too large for one legacy transaction is never offered:
+//!   the pages measure it first ([`fits`]).
 
 use chain::solana_ix::accounts::{
     self, Claim, ClaimState, Event, Holder, Request, RequestKind, Vault,
@@ -37,7 +44,7 @@ use chain::solana_ix::accounts::{
 use chain::solana_ix::budget::{open_dollars, with_budget};
 use chain::solana_ix::transaction::Unsigned;
 use chain::solana_ix::vault::{self as ix, Groups, Held, VaultKeys};
-use chain::solana_ix::{Instruction, Pubkey, address, ids, read};
+use chain::solana_ix::{Hash, Instruction, Pubkey, address, ids, read};
 
 use super::error::{Reason, SolError};
 use super::port::{Record, Sig, Signed, Simulated, SolReader, SolSigner};
@@ -210,23 +217,30 @@ impl<R: SolReader, S: SolSigner, C: Clock> Ctx<'_, R, S, C> {
         (self.on_step)(step);
     }
 
-    /// The endpoint answers for the vault's cluster.
+    /// The endpoint answers for the vault's cluster: a public cluster's by
+    /// its genesis hash (`mainnet` and `mainnet-beta` are one cluster); a
+    /// local cluster only through this machine's endpoint, and never one
+    /// whose genesis is a public cluster's.
     pub(crate) async fn check_endpoint(&self) -> Result<(), SolError> {
+        let name = match self.cluster.name.as_str() {
+            "mainnet" => "mainnet-beta",
+            other => other,
+        };
         let known = GENESIS
             .iter()
-            .find(|(name, _)| *name == self.cluster.name.as_str())
+            .find(|(cluster, _)| *cluster == name)
             .map(|(_, hash)| *hash);
+        let genesis = self.reader.genesis().await?;
         match known {
-            Some(expected) => {
-                if self.reader.genesis().await? != expected {
-                    return Err(SolError::WrongEndpoint);
-                }
+            Some(expected) if genesis == expected => Ok(()),
+            None if self.cluster.local_endpoint
+                && name == "localnet"
+                && !GENESIS.iter().any(|(_, hash)| *hash == genesis) =>
+            {
+                Ok(())
             }
-            // A local cluster: only through this machine's endpoint.
-            None if self.cluster.local_endpoint && self.cluster.name == "localnet" => {}
-            None => return Err(SolError::WrongEndpoint),
+            _ => Err(SolError::WrongEndpoint),
         }
-        Ok(())
     }
 
     /// The vault, read and checked: owned by the vault program, its keys the
@@ -280,8 +294,7 @@ impl<R: SolReader, S: SolSigner, C: Clock> Ctx<'_, R, S, C> {
         ixs: Vec<Instruction>,
     ) -> Result<Landed, SolError> {
         let blockhash = self.reader.blockhash().await?;
-        let unsigned = Unsigned::legacy(&self.account, &with_budget(ixs), blockhash.hash)
-            .map_err(|_| SolError::TooLarge)?;
+        let unsigned = as_sent(&self.account, ixs, blockhash.hash).ok_or(SolError::TooLarge)?;
         if let Simulated::Failed(failure) = self.reader.simulate(&unsigned.wire()).await? {
             return Err(SolError::WouldFail {
                 reason: Reason::from_failure(&failure),
@@ -302,11 +315,17 @@ impl<R: SolReader, S: SolSigner, C: Clock> Ctx<'_, R, S, C> {
             Signed::Sent(signature) => (signature, blockhash.last_valid + WALLET_SENT_MARGIN),
             Signed::Wire(wire) => {
                 let signature = check_signed(&wire, &unsigned, &self.account)?;
-                let sent = self.reader.send(&wire).await?;
-                if sent != signature {
-                    return Err(SolError::Network(
-                        "the cluster named another signature for the transaction".to_string(),
-                    ));
+                match self.reader.send(&wire).await {
+                    // Whatever the node names, the transaction sent is the
+                    // one signed, and is known by its signature.
+                    Ok(_) => {}
+                    // The node ran it first and refused it: nothing was sent.
+                    Err(refused @ SolError::WouldFail { .. }) => return Err(refused),
+                    // The node's answer was lost (a timeout, a dropped
+                    // connection) or made no sense: it may have taken the
+                    // transaction all the same, so it is followed by its
+                    // signature until its blockhash can no longer land it.
+                    Err(_) => {}
                 }
                 (signature, blockhash.last_valid)
             }
@@ -316,44 +335,59 @@ impl<R: SolReader, S: SolSigner, C: Clock> Ctx<'_, R, S, C> {
     }
 
     /// Wait for the cluster to confirm a sent transaction, or say what
-    /// became of it: failed, expired (its blockhash passed without it), or
-    /// still unseen after a long wait.
+    /// became of it: failed (confirmed with an error), expired (its
+    /// blockhash passed without it), or still unseen after a long wait. A
+    /// look the node doesn't answer is looked again: once sent, a
+    /// transaction is never left as "the network didn't answer", which
+    /// would offer to send it again while it may still land.
     pub(crate) async fn confirmed(&self, signature: Sig, expiry: u64) -> Result<Landed, SolError> {
         for _ in 0..self.pace.give_up_after {
-            let mut status = self.reader.status(&signature, false).await?;
-            if status.is_none() && self.reader.block_height().await? > expiry {
-                // One last look through the whole history before calling it
-                // gone: past its last valid height it can never land.
-                status = self.reader.status(&signature, true).await?;
-                if status.is_none() {
-                    return Err(SolError::Expired { signature });
-                }
-            }
-            if let Some(status) = status {
-                if let Some(err) = status.err {
-                    let logs = self
-                        .reader
-                        .transaction(&signature)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|record| record.logs)
-                        .unwrap_or_default();
-                    return Err(SolError::Failed {
-                        signature,
-                        reason: Some(Reason::from_failure(&super::port::Failure { err, logs })),
-                    });
-                }
-                if status.confirmed {
-                    return Ok(Landed {
-                        signature,
-                        slot: status.slot,
-                    });
-                }
+            if let Ok(Some(end)) = self.look(signature, expiry).await {
+                return end;
             }
             self.clock.sleep(self.pace.poll_millis).await;
         }
         Err(SolError::Stuck { signature })
+    }
+
+    /// One look at a sent transaction: how it ended, if it has.
+    async fn look(
+        &self,
+        signature: Sig,
+        expiry: u64,
+    ) -> Result<Option<Result<Landed, SolError>>, SolError> {
+        let mut status = self.reader.status(&signature, false).await?;
+        if status.is_none() && self.reader.block_height().await? > expiry {
+            // One last look through the whole history before calling it
+            // gone: past its last valid height it can never land.
+            status = self.reader.status(&signature, true).await?;
+            if status.is_none() {
+                return Ok(Some(Err(SolError::Expired { signature })));
+            }
+        }
+        // Only a confirmed status is judged: one seen at `processed` may be
+        // on a fork the cluster drops, and land (or fail) differently.
+        let Some(status) = status.filter(|status| status.confirmed) else {
+            return Ok(None);
+        };
+        if let Some(err) = status.err {
+            let logs = self
+                .reader
+                .transaction(&signature)
+                .await
+                .ok()
+                .flatten()
+                .map(|record| record.logs)
+                .unwrap_or_default();
+            return Ok(Some(Err(SolError::Failed {
+                signature,
+                reason: Some(Reason::from_failure(&super::port::Failure { err, logs })),
+            })));
+        }
+        Ok(Some(Ok(Landed {
+            signature,
+            slot: status.slot,
+        })))
     }
 
     /// The vault's events in a landed transaction.
@@ -387,11 +421,7 @@ impl<R: SolReader, S: SolSigner, C: Clock> Ctx<'_, R, S, C> {
         owner: &Pubkey,
         ixs: &mut Vec<Instruction>,
     ) -> Result<(), SolError> {
-        let dollars = address::dollars(owner, &self.cluster.mint);
-        if self.reader.account(&dollars).await?.is_none() {
-            ixs.push(open_dollars(&self.account, owner, &self.cluster.mint));
-        }
-        Ok(())
+        open_if_missing(self.reader, &self.account, owner, &self.cluster.mint, ixs).await
     }
 
     /// The dollars `owner` holds.
@@ -420,6 +450,39 @@ impl<R: SolReader, S: SolSigner, C: Clock> Ctx<'_, R, S, C> {
             "no free request address was found".to_string(),
         ))
     }
+}
+
+/// `owner`'s dollar account opened first, `payer` paying its rent, if it
+/// doesn't exist.
+async fn open_if_missing<R: SolReader>(
+    reader: &R,
+    payer: &Pubkey,
+    owner: &Pubkey,
+    mint: &Pubkey,
+    ixs: &mut Vec<Instruction>,
+) -> Result<(), SolError> {
+    if reader
+        .account(&address::dollars(owner, mint))
+        .await?
+        .is_none()
+    {
+        ixs.push(open_dollars(payer, owner, mint));
+    }
+    Ok(())
+}
+
+/// `ixs` as the app sends them, from `payer`: one legacy transaction with
+/// the compute budget in front, or `None` when that is larger than the wire
+/// takes. The app keeps no lookup table of its own, so a transaction too
+/// large is never offered: the keeper, which sends through its own tables,
+/// does what it would have done.
+fn as_sent(payer: &Pubkey, ixs: Vec<Instruction>, blockhash: Hash) -> Option<Unsigned> {
+    Unsigned::legacy(payer, &with_budget(ixs), blockhash).ok()
+}
+
+/// Whether `ixs`, sent by `payer`, fit one transaction from the app.
+pub fn fits(payer: &Pubkey, ixs: Vec<Instruction>) -> bool {
+    as_sent(payer, ixs, Hash::default()).is_some()
 }
 
 /// The signature of a transaction a wallet signed and handed back, once it
@@ -567,6 +630,27 @@ pub async fn find_request<R: SolReader>(
             .filter(|request| request.vault == *vault && request.id == id)
             .map(|request| (address, request))
     }))
+}
+
+/// For a queued claim, the address of the request it is queued by: found by
+/// the id the claim holds, as the program finds it, since the program made
+/// it at the nonce the claim held before (see `ClaimKeys`). `None` for a
+/// claim not queued; for a queued claim whose request can't be found,
+/// nothing can be built.
+pub async fn queued_request<R: SolReader>(
+    reader: &R,
+    vault: &Pubkey,
+    claim: &Claim,
+) -> Result<Option<Pubkey>, SolError> {
+    if claim.state != ClaimState::Queued {
+        return Ok(None);
+    }
+    match find_request(reader, vault, claim.request).await? {
+        Some((address, request)) if claim.is_queued_by(vault, &request) => Ok(Some(address)),
+        _ => Err(SolError::Network(
+            "the request this claim is queued by couldn't be found".to_string(),
+        )),
+    }
 }
 
 /// Requests of this vault holding a payout for `owner`.
@@ -736,6 +820,19 @@ pub async fn deposit<R: SolReader, S: SolSigner, C: Clock>(
     })
 }
 
+/// An error once a transaction has landed (not a request, which
+/// [`pending`] covers): whatever it was, what it did stands.
+fn went_through(signature: Sig, error: SolError) -> SolError {
+    match error {
+        SolError::Landed { .. } | SolError::Pending { .. } => error,
+        SolError::Network(why) => SolError::Landed { signature, why },
+        _ => SolError::Landed {
+            signature,
+            why: "the vault couldn't be read afterwards".to_string(),
+        },
+    }
+}
+
 /// An error once a request has landed: whatever it was, the request stands.
 fn pending(signature: Sig, error: SolError) -> SolError {
     match error {
@@ -885,7 +982,9 @@ pub async fn withdraw<R: SolReader, S: SolSigner, C: Clock>(
         accounts::VaultState::Closed => {
             ixs.push(ix::redeem_closed(&keys, &ctx.account, shares, &ctx.account));
             let landed = ctx.transact(Prompt::Closed, ixs).await?;
-            return paid_at_once(ctx, landed).await;
+            return paid_at_once(ctx, landed)
+                .await
+                .map_err(|error| went_through(landed.signature, error));
         }
         accounts::VaultState::None => return Err(SolError::WrongState),
         _ if vault.ready_to_close() => return Err(SolError::WrongState),
@@ -998,41 +1097,80 @@ pub async fn settle_claim<R: SolReader, S: SolSigner, C: Clock>(
     let before = claim(ctx.reader, &ctx.vault, id)
         .await?
         .ok_or(SolError::WrongState)?;
-    let mut ixs = Vec::new();
-    ctx.open_if_missing(&before.owner, &mut ixs).await?;
     let landed = if vault.state == accounts::VaultState::Closed {
+        let mut ixs = Vec::new();
+        ctx.open_if_missing(&before.owner, &mut ixs).await?;
         if !matches!(
             before.state,
             ClaimState::Pending | ClaimState::Waiting | ClaimState::Queued
         ) {
             return Err(SolError::WrongState);
         }
-        ixs.push(ix::claim_closed(
-            &keys,
-            &before.keys(),
-            before.state == ClaimState::Queued,
-        ));
+        let queued_by = queued_request(ctx.reader, &ctx.vault, &before).await?;
+        ixs.push(ix::claim_closed(&keys, &before.keys(), queued_by.as_ref()));
         ctx.transact(Prompt::Closed, ixs).await?
     } else {
         if !matches!(before.state, ClaimState::Pending | ClaimState::Waiting) {
             return Err(SolError::WrongState);
         }
-        let groups = groups(ctx.reader, &keys).await?;
-        ixs.push(ix::settle_claim(
-            &keys,
-            &ctx.account,
-            &before.keys(),
-            &groups,
-        ));
+        let ixs = settling(ctx.reader, &ctx.cluster.mint, &keys, &ctx.account, &before).await?;
         ctx.transact(Prompt::SettleClaim { claim: id }, ixs).await?
     };
-    let after = claim(ctx.reader, &ctx.vault, id).await?;
+    let after = claim(ctx.reader, &ctx.vault, id)
+        .await
+        .map_err(|error| went_through(landed.signature, error))?;
     Ok(Outcome::Claim {
         claim: id,
         state: after.as_ref().map_or(ClaimState::Paid, |claim| claim.state),
         paid: after.as_ref().map_or(0, |claim| claim.paid),
         signature: landed.signature,
     })
+}
+
+/// What settling `claim` on an open vault sends, from `caller`: its owner's
+/// dollar account opened if missing, then the claim's close through every
+/// driver group of the vault's station.
+pub async fn settling<R: SolReader>(
+    reader: &R,
+    mint: &Pubkey,
+    keys: &VaultKeys,
+    caller: &Pubkey,
+    claim: &Claim,
+) -> Result<Vec<Instruction>, SolError> {
+    let mut ixs = Vec::new();
+    open_if_missing(reader, caller, &claim.owner, mint, &mut ixs).await?;
+    let groups = groups(reader, keys).await?;
+    ixs.push(ix::settle_claim(keys, caller, &claim.keys(), &groups));
+    Ok(ixs)
+}
+
+/// What taking back deposit `request` (at `at`) sends, from its owner: their
+/// dollar account opened if missing, then the fallback, which asks every
+/// driver group of the station whether the vault could be valued now.
+pub async fn taking_back<R: SolReader>(
+    reader: &R,
+    mint: &Pubkey,
+    keys: &VaultKeys,
+    at: &Pubkey,
+    request: &Request,
+) -> Result<Vec<Instruction>, SolError> {
+    let mut ixs = Vec::new();
+    open_if_missing(reader, &request.owner, &request.owner, mint, &mut ixs).await?;
+    let groups = groups(reader, keys).await?;
+    ixs.push(ix::take_pro_rata(
+        keys,
+        &request.owner,
+        at,
+        request.id,
+        &groups,
+    ));
+    Ok(ixs)
+}
+
+/// A stand-in for whoever sends, for measuring: no key the transaction
+/// names otherwise, so the measure is the largest the transaction can be.
+pub fn someone() -> Pubkey {
+    Pubkey::new_from_array([0x5e; 32])
 }
 
 /// What the fallback is taken for: a request, or a claim.
@@ -1061,12 +1199,20 @@ pub async fn take_cash<R: SolReader, S: SolSigner, C: Clock>(
             if request.owner != ctx.account || request.done {
                 return Err(SolError::WrongState);
             }
-            // A deposit's asks the station whether it could be valued now.
-            let groups = match request.kind {
-                RequestKind::Deposit => groups(ctx.reader, &keys).await?,
-                _ => Groups::none(),
-            };
-            ixs.push(ix::take_pro_rata(&keys, &ctx.account, &at, id, &groups));
+            match request.kind {
+                // A deposit's asks the station whether it could be valued
+                // now.
+                RequestKind::Deposit => {
+                    ixs = taking_back(ctx.reader, &ctx.cluster.mint, &keys, &at, &request).await?;
+                }
+                _ => ixs.push(ix::take_pro_rata(
+                    &keys,
+                    &ctx.account,
+                    &at,
+                    id,
+                    &Groups::none(),
+                )),
+            }
         }
         Fallback::Claim(id) => {
             let claim = claim(ctx.reader, &ctx.vault, id)
@@ -1075,14 +1221,24 @@ pub async fn take_cash<R: SolReader, S: SolSigner, C: Clock>(
             if claim.owner != ctx.account {
                 return Err(SolError::WrongState);
             }
+            let queued_by = queued_request(ctx.reader, &ctx.vault, &claim).await?;
             ixs.push(ix::take_pro_rata_claim(
                 &keys,
                 &claim.keys(),
-                claim.state == ClaimState::Queued,
+                queued_by.as_ref(),
             ));
         }
     }
     let landed = ctx.transact(Prompt::TakeCash, ixs).await?;
+    took_cash(ctx, landed)
+        .await
+        .map_err(|error| went_through(landed.signature, error))
+}
+
+async fn took_cash<R: SolReader, S: SolSigner, C: Clock>(
+    ctx: &Ctx<'_, R, S, C>,
+    landed: Landed,
+) -> Result<Outcome, SolError> {
     for event in ctx.events(&landed.signature).await? {
         match event {
             Event::ProRataTaken {
@@ -1131,6 +1287,15 @@ pub async fn claim_instead<R: SolReader, S: SolSigner, C: Clock>(
             vec![ix::claim_instead(&keys, &ctx.account, &at, request_id)],
         )
         .await?;
+    claim_made(ctx, landed)
+        .await
+        .map_err(|error| went_through(landed.signature, error))
+}
+
+async fn claim_made<R: SolReader, S: SolSigner, C: Clock>(
+    ctx: &Ctx<'_, R, S, C>,
+    landed: Landed,
+) -> Result<Outcome, SolError> {
     for event in ctx.events(&landed.signature).await? {
         if let Event::ClaimBooked {
             claim_id, owner, ..
@@ -1168,7 +1333,9 @@ pub async fn collect_units<R: SolReader, S: SolSigner, C: Clock>(
     ctx.open_if_missing(&ctx.account, &mut ixs).await?;
     ixs.push(ix::collect_units(&keys, &ctx.account));
     let landed = ctx.transact(Prompt::CollectUnits, ixs).await?;
-    collected(ctx, landed).await
+    collected(ctx, landed)
+        .await
+        .map_err(|error| went_through(landed.signature, error))
 }
 
 /// Where a payout is held for the account.
@@ -1213,7 +1380,9 @@ pub async fn collect_held<R: SolReader, S: SolSigner, C: Clock>(
     ctx.open_if_missing(&ctx.account, &mut ixs).await?;
     ixs.push(ix::collect_held(&keys, &ctx.account, held, record));
     let landed = ctx.transact(Prompt::CollectHeld, ixs).await?;
-    collected(ctx, landed).await
+    collected(ctx, landed)
+        .await
+        .map_err(|error| went_through(landed.signature, error))
 }
 
 async fn collected<R: SolReader, S: SolSigner, C: Clock>(
@@ -1272,5 +1441,7 @@ pub async fn settle_closed<R: SolReader, S: SolSigner, C: Clock>(
         &request.payer,
     ));
     let landed = ctx.transact(Prompt::Closed, ixs).await?;
-    paid_at_once(ctx, landed).await
+    paid_at_once(ctx, landed)
+        .await
+        .map_err(|error| went_through(landed.signature, error))
 }

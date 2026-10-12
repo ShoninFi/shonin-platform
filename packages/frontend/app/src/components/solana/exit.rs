@@ -1477,8 +1477,9 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
             if let Some(signature) = error.signature() {
                 card = card.child(sig_link(network.as_deref(), &signature, "Transaction"));
             }
-            if matches!(error, SolError::Pending { .. }) {
-                // The request stands: sending it again would make a second.
+            if error.may_have_moved() {
+                // It stands, or may still land: sending it again would make
+                // a second.
                 return card
                     .child(
                         crate::web::app_link("/portfolio")
