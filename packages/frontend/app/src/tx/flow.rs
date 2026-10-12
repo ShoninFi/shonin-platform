@@ -378,12 +378,17 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
                 }
                 Ok(Pending::Unknown) => {
                     unknown_polls += 1;
-                    // Known once, gone now, and its nonce used by another:
-                    // never while the endpoint has any receipt for it, even
-                    // one whose block isn't sealed yet (a chain confirming
-                    // ahead of its blocks counts it in the nonce already).
+                    // Known once, gone now on two looks running, and its
+                    // nonce used by another: never while the endpoint has
+                    // any receipt for it, even one whose block isn't sealed
+                    // yet (a chain confirming ahead of its blocks counts it
+                    // in the nonce already), asked twice, since a pool of
+                    // nodes can answer one read from a node that hasn't had
+                    // it yet.
                     if let Some(nonce) = known
+                        && unknown_polls >= 2
                         && matches!(self.reader.mined_nonce(self.account).await, Ok(mined) if mined > nonce)
+                        && matches!(self.reader.receipt_seen(hash).await, Ok(false))
                         && matches!(self.reader.receipt_seen(hash).await, Ok(false))
                     {
                         return Err(TxError::Replaced { hash });

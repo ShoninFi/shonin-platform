@@ -193,11 +193,11 @@ fn run(script: Vec<(&'static str, Value)>) -> (Result<Outcome, TxError>, Vec<Ste
 }
 
 /// Poll 1: no receipt yet; the node asked has the transaction (nonce 5).
-/// Poll 2: the receipt is preconfirmed (zero block hash); the node asked
-/// about the transaction hasn't had the flashblock (null); the nonce at
-/// `latest` is already 6; the receipt re-read is still preconfirmed. Poll
-/// 3 onward: sealed everywhere. The transaction was mined, and the flow
-/// must say so.
+/// Polls 2 and 3: the receipt is preconfirmed (zero block hash) and the
+/// node asked about the transaction hasn't had it (null), two looks running;
+/// on the second the nonce at `latest` is already 6 and the receipt re-read
+/// is still preconfirmed. Poll 4 onward: sealed everywhere. The transaction
+/// was mined, and the flow must say so.
 #[test]
 fn a_mined_transaction_whose_receipt_is_still_preconfirmed_is_never_said_replaced() {
     let script = vec![
@@ -206,6 +206,8 @@ fn a_mined_transaction_whose_receipt_is_still_preconfirmed_is_never_said_replace
             "eth_getTransactionByHash",
             json!({"hash": format!("{:?}", hash()), "nonce": "0x5"}),
         ),
+        ("eth_getTransactionReceipt", preconfirmed()),
+        ("eth_getTransactionByHash", Value::Null),
         ("eth_getTransactionReceipt", preconfirmed()),
         ("eth_getTransactionByHash", Value::Null),
         ("eth_getTransactionCount", json!("0x6")),

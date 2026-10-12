@@ -155,12 +155,13 @@ pub fn parse_log(value: &Value) -> Result<Log, TxError> {
 }
 
 /// Whether a receipt's block is sealed: only a block hash of all zeros (a
-/// receipt handed out ahead of its block) says it isn't; a node that leaves
-/// the field out is taken at its block number.
+/// receipt handed out ahead of its block) or a null one says it isn't; a
+/// node that leaves the field out is taken at its block number.
 fn sealed(receipt: &Value) -> bool {
-    match receipt.get("blockHash").and_then(Value::as_str) {
-        Some(hash) => !hash.trim_start_matches("0x").chars().all(|c| c == '0'),
-        None => true,
+    match receipt.get("blockHash") {
+        Some(Value::String(hash)) => !hash.trim_start_matches("0x").chars().all(|c| c == '0'),
+        Some(Value::Null) => false,
+        _ => true,
     }
 }
 
@@ -547,6 +548,9 @@ mod tests {
         });
         assert_eq!(parse_receipt(&preconfirmed).unwrap(), None);
         assert!(receipt_exists(&preconfirmed));
+        let mut null_hash = preconfirmed.clone();
+        null_hash["blockHash"] = Value::Null;
+        assert_eq!(parse_receipt(&null_hash).unwrap(), None);
         // A node that leaves the hash out is taken at its block number.
         let no_hash = json!({
             "transactionHash": format!("0x{}", "11".repeat(32)),
