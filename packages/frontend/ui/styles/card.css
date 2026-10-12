@@ -1,0 +1,12 @@
+/* Card: one topic on a page. paper-raised · hairline · radius 16 · padding
+   24 desktop and tablet, 16 phone · never a shadow. A link card lifts 2px. */
+.sh-card { background: var(--paper-raised); border: var(--border-hairline) solid var(--line); border-radius: var(--radius-l); }
+.sh-card--pad { padding: var(--space-5); }
+@media (max-width: 599px) { .sh-card--pad { padding: var(--space-4); } }
+.sh-card-link {
+  display: block; color: var(--ink); text-decoration: none;
+  transition: border-color var(--dur-fast) var(--ease-out), transform var(--dur-base) var(--ease-out);
+}
+@media (hover: hover) { .sh-card-link:hover { border-color: var(--line-strong); transform: translateY(-2px); color: var(--ink); } }
+.sh-card-link:active { background: var(--paper-sunk); }
+.sh-well { background: var(--paper-sunk); border-radius: var(--radius-m); }

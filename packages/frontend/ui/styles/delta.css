@@ -1,0 +1,7 @@
+/* A change in a figure: always signed with + or a true minus, or an arrow.
+   Colour goes on the figure only, never the row or card. Zero is ink. */
+.sh-delta { display: inline-flex; align-items: center; gap: 2px; font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.sh-delta--up { color: var(--gain); }
+.sh-delta--down { color: var(--loss); }
+.sh-delta--flat { color: var(--ink); }
+.sh-delta .sh-icon { width: 16px; height: 16px; }

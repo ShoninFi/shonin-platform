@@ -1,0 +1,6 @@
+/* Stat tile: label over figure-l over its period. The period is never optional. */
+.sh-stat { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.sh-stat--tile { padding: var(--space-4) 20px; background: var(--paper-raised); border: var(--border-hairline) solid var(--line); border-radius: var(--radius-l); }
+.sh-stat__value { font: var(--type-figure-l); letter-spacing: var(--track-figure-l); font-variant-numeric: tabular-nums; }
+.sh-stat__period { font: var(--type-body-s); color: var(--ink-muted); }
+.sh-stat--xl .sh-stat__value { font: var(--type-figure-xl); letter-spacing: var(--track-figure-xl); }

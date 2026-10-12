@@ -1,0 +1,15 @@
+/* Containers and gutters (Handoff overview, section 4). Phone < 600, tablet
+   600–1023, desktop >= 1024; content never wider than 1200px. */
+:root { --gutter: 16px; }
+@media (min-width: 600px) { :root { --gutter: 40px; } }
+@media (min-width: 1024px) { :root { --gutter: 32px; } }
+
+.sh-container { width: min(1200px, 100% - 2 * var(--gutter)); margin-inline: auto; }
+
+.sh-grid-12 { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: var(--space-5); }
+@media (max-width: 1023px) { .sh-grid-12 { grid-template-columns: repeat(8, minmax(0, 1fr)); } }
+@media (max-width: 599px) { .sh-grid-12 { grid-template-columns: repeat(4, minmax(0, 1fr)); column-gap: var(--space-4); } }
+
+/* Utility stacks. */
+.sh-stack { display: flex; flex-direction: column; }
+.sh-row-flex { display: flex; align-items: center; }

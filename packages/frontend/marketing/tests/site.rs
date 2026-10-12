@@ -160,11 +160,21 @@ fn no_page_ships_a_bracketed_placeholder_or_an_unfilled_template() {
 
 #[test]
 fn the_dist_carries_no_wallet_or_api_code() {
-    for (path, bytes) in files() {
-        let text = String::from_utf8_lossy(&bytes);
+    let files = files();
+    // The one place the lowercase name may appear is the address of Solana's
+    // mark. Anything else (`window.solana`, `@solana/`, a `solana:` URI) is
+    // wallet code.
+    let mark = files
+        .keys()
+        .find(|path| path.starts_with("assets/chains/solana."))
+        .map(|path| format!("/{path}"))
+        .expect("Solana's mark");
+    for (path, bytes) in files {
+        let text = String::from_utf8_lossy(&bytes).replace(&mark, "");
         for word in [
             "ethereum",
             "solana",
+            "phantom",
             "wallet_",
             "testnet-api",
             "fetch(",
@@ -183,6 +193,7 @@ fn pages_run_only_the_hashed_boot_script_and_carry_no_inline_styles() {
     let files = files();
     let headers = String::from_utf8(files["_headers"].clone()).unwrap();
     assert!(headers.contains(&marketing::boot_hash()));
+    assert!(headers.contains("img-src 'self';"));
     assert!(headers.contains("frame-ancestors 'none'"));
     assert!(!headers.contains("unsafe-inline"));
     for (page, html) in pages(&files) {
@@ -239,4 +250,250 @@ fn the_terms_quote_the_statement_the_vault_contract_checks() {
     );
     let terms = String::from_utf8(files()["terms.html"].clone()).unwrap();
     assert!(terms.contains(marketing::pages::legal::STATEMENT));
+}
+
+/// The four chains, their marks' file stems, and the name each file carries.
+const CHAINS: [(&str, &str); 4] = [
+    ("hyperliquid", "Hyperliquid"),
+    ("solana", "Solana"),
+    ("base", "Base"),
+    ("robinhood-chain", "Robinhood Chain"),
+];
+
+#[test]
+fn every_chain_mark_is_written_named_and_shown() {
+    let files = files();
+    let home = String::from_utf8(files["index.html"].clone()).unwrap();
+    let sources = include_str!("../assets/chains/SOURCES.md");
+    let on_disk: BTreeSet<String> =
+        std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/chains"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.ends_with(".svg"))
+            .collect();
+    assert_eq!(
+        on_disk.len(),
+        CHAINS.len(),
+        "one mark per chain: {on_disk:?}"
+    );
+    for (stem, name) in CHAINS {
+        assert!(on_disk.contains(&format!("{stem}.svg")), "{stem}.svg");
+        let (path, bytes) = files
+            .iter()
+            .find(|(path, _)| {
+                path.starts_with(&format!("assets/chains/{stem}.")) && path.ends_with(".svg")
+            })
+            .unwrap_or_else(|| panic!("the {name} mark is not written"));
+        let svg = String::from_utf8(bytes.clone()).unwrap();
+        assert!(svg.starts_with("<svg "), "{path}: no prolog or comments");
+        assert!(
+            svg.contains(&format!(
+                "role=\"img\" aria-label=\"{name}\"><title>{name}</title>"
+            )),
+            "{path} is named {name}"
+        );
+        for junk in [
+            "<?xml",
+            "<!--",
+            "<style",
+            "data-name",
+            "Layer_1",
+            "<script",
+            "href=",
+        ] {
+            assert!(!svg.contains(junk), "{path} carries {junk}");
+        }
+        assert!(
+            home.contains(&format!("/{path}\"")),
+            "the home page shows the {name} mark"
+        );
+
+        assert!(
+            sources.contains(&format!("`{stem}.svg`")),
+            "SOURCES.md records where {stem}.svg came from"
+        );
+    }
+    assert!(
+        !home.contains("art-initial"),
+        "no initial tiles left in the hero"
+    );
+}
+
+#[test]
+fn the_privacy_page_names_cloudflare_web_analytics() {
+    let files = files();
+    let privacy = String::from_utf8(files["privacy.html"].clone()).unwrap();
+    assert!(privacy.contains("Cloudflare Web Analytics"));
+    assert!(privacy.contains("cookieless"));
+    for (page, html) in pages(&files) {
+        let lower = html.to_lowercase();
+        for claim in ["no analytics", "no tracking"] {
+            assert!(!lower.contains(claim), "{page} still says {claim:?}");
+        }
+    }
+}
+
+#[test]
+fn the_policy_allows_only_this_origin_and_cloudflare_web_analytics() {
+    let headers = String::from_utf8(files()["_headers"].clone()).unwrap();
+    let csp = headers
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Content-Security-Policy: "))
+        .expect("a Content-Security-Policy");
+    let mut hosts = BTreeSet::new();
+    for directive in csp.split("; ") {
+        let mut parts = directive.split(' ');
+        let name = parts.next().unwrap();
+        let values: Vec<&str> = parts.collect();
+        match name {
+            "script-src" => assert_eq!(
+                values,
+                [
+                    "'self'",
+                    marketing::boot_hash().as_str(),
+                    marketing::ANALYTICS_SCRIPT
+                ]
+            ),
+            "connect-src" => assert_eq!(values, [marketing::ANALYTICS_REPORT]),
+            _ => {}
+        }
+        for value in values {
+            if !value.starts_with('\'') {
+                hosts.insert(value);
+            }
+        }
+    }
+    assert_eq!(
+        hosts,
+        BTreeSet::from([marketing::ANALYTICS_SCRIPT, marketing::ANALYTICS_REPORT]),
+        "nothing outside 'self' but the analytics script's host and its endpoint"
+    );
+    assert_eq!(
+        marketing::ANALYTICS_SCRIPT,
+        "https://static.cloudflareinsights.com"
+    );
+    assert_eq!(
+        marketing::ANALYTICS_REPORT,
+        "https://cloudflareinsights.com/cdn-cgi/rum"
+    );
+}
+
+/// Where `_redirects` sends `path`, read as Workers read it: the first rule
+/// that matches, `*` as a greedy splat, `:name` as one non-empty segment.
+fn redirect(rules: &str, path: &str) -> Option<(String, u16)> {
+    for line in rules.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [from, to, status] = fields[..] else {
+            panic!("a rule with three fields: {line:?}");
+        };
+        let from: Vec<&str> = from.split('/').collect();
+        let path: Vec<&str> = path.split('/').collect();
+        let mut bound: Vec<(String, String)> = Vec::new();
+        let mut matched = true;
+        for (index, part) in from.iter().enumerate() {
+            if *part == "*" {
+                bound.push((":splat".into(), path.get(index..).unwrap_or(&[]).join("/")));
+                break;
+            }
+            match path.get(index) {
+                Some(segment) if part.starts_with(':') && !segment.is_empty() => {
+                    bound.push(((*part).to_string(), (*segment).to_string()));
+                }
+                Some(segment) if segment == part => {}
+                _ => {
+                    matched = false;
+                    break;
+                }
+            }
+            if index + 1 == from.len() && path.len() != from.len() {
+                matched = false;
+            }
+        }
+        if matched {
+            let mut to = to.to_string();
+            for (name, value) in bound {
+                to = to.replace(&name, &value);
+            }
+            return Some((to, status.parse().unwrap()));
+        }
+    }
+    None
+}
+
+#[test]
+fn the_old_app_addresses_go_to_the_app_and_nothing_else_moves() {
+    let files = files();
+    let rules = String::from_utf8(files["_redirects"].clone()).unwrap();
+    let app = "https://app.shonin.fi";
+    for (from, to) in [
+        ("/agents", format!("{app}/agents")),
+        (
+            "/agents/basis-harvester",
+            format!("{app}/agents/basis-harvester"),
+        ),
+        (
+            "/agents/basis-harvester/review",
+            format!("{app}/agents/basis-harvester/review"),
+        ),
+        (
+            "/agents/basis-harvester/code",
+            format!("{app}/agents/basis-harvester/verify"),
+        ),
+        (
+            "/agents/basis-harvester/record",
+            format!("{app}/agents/basis-harvester"),
+        ),
+        (
+            "/agents/basis-harvester/health",
+            format!("{app}/agents/basis-harvester"),
+        ),
+        ("/strategies", format!("{app}/agents")),
+        (
+            "/strategies/basis-harvester",
+            format!("{app}/agents/basis-harvester"),
+        ),
+        (
+            "/strategies/basis-harvester/code",
+            format!("{app}/agents/basis-harvester"),
+        ),
+        ("/portfolio", format!("{app}/portfolio")),
+        ("/portfolio/claims/7", format!("{app}/portfolio/claims/7")),
+        ("/publish", format!("{app}/publish")),
+        ("/publish/jobs/12", format!("{app}/publish/jobs/12")),
+        ("/you/agents/3", format!("{app}/you/agents/3")),
+        ("/status", format!("{app}/status")),
+        ("/queue", format!("{app}/publish")),
+        ("/queue/12", format!("{app}/publish/jobs/12")),
+        ("/verify", format!("{app}/status")),
+        ("/about", "/".to_string()),
+        ("/authors/someone", format!("{app}/agents")),
+        ("/authors/someone/agents", format!("{app}/agents")),
+    ] {
+        assert_eq!(redirect(&rules, from), Some((to, 301)), "{from}");
+    }
+    // This site's own pages and files, and anything unknown (the 404).
+    for path in [
+        "/",
+        "/authors",
+        "/terms",
+        "/privacy",
+        "/robots.txt",
+        "/nope",
+        "/agentsx",
+    ] {
+        assert_eq!(redirect(&rules, path), None, "{path} is not redirected");
+    }
+    for path in files.keys().filter(|path| !path.starts_with('_')) {
+        assert_eq!(redirect(&rules, &format!("/{path}")), None, "/{path}");
+    }
+    // Workers want the single addresses before the patterns.
+    let sources: Vec<bool> = rules
+        .lines()
+        .map(|line| line.split_whitespace().next().unwrap().contains([':', '*']))
+        .collect();
+    let first_pattern = sources.iter().position(|pattern| *pattern).unwrap();
+    assert!(
+        sources[first_pattern..].iter().all(|pattern| *pattern),
+        "single addresses come before patterns"
+    );
 }

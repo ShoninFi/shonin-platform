@@ -2,48 +2,43 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <!-- Per-route title, description, canonical and Open Graph tags replace
          everything between these markers at build time (src/bin/seo.rs). -->
     <!-- seo:head -->
     <title>Shonin</title>
     <!-- /seo:head -->
-    <meta name="theme-color" content="#07090c" />
-    <link rel="icon" type="image/svg+xml" href="/public/logo.svg" />
+    <!-- Light only: the browser chrome takes the page's paper. -->
+    <meta name="theme-color" content="#f6f7fb" />
+    <meta name="color-scheme" content="light" />
+    <link rel="icon" type="image/svg+xml" href="/logos/shonin-mark.svg" />
 
-    <!-- The design system. Trunk hashes it and injects the <link> here, so
-         every pre-rendered page gets it too. tokens.css is the shared design
-         tokens (written by `task frontend:tokens`); app.css comes after it and
-         still decides how the app looks. -->
+    <!-- The two faces above the fold; Newsreader and JetBrains Mono load on
+         first use. -->
+    <link rel="preload" href="/fonts/HankenGrotesk-Variable.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="/fonts/PlusJakartaSans-Variable.woff2" as="font" type="font/woff2" crossorigin />
+
+    <!-- The design system (packages/frontend/ui, written by
+         `task frontend:tokens`): tokens, fonts, then every atom and component,
+         then the app's page layouts. Trunk hashes each and links it here, so
+         every pre-rendered page gets them too. No inline styles or scripts:
+         the Content-Security-Policy allows only files from this origin. -->
     <link data-trunk rel="css" href="../ui/dist/tokens.css" />
-    <link data-trunk rel="css" href="styles/app.css" />
-    <link data-trunk rel="rust" data-bin="app" data-wasm-opt="z" />
-    <link data-trunk rel="copy-dir" href="public" />
-    <!-- Workers static assets read _headers from the output root. -->
+    <link data-trunk rel="css" href="../ui/dist/fonts.css" />
+    <link data-trunk rel="css" href="../ui/dist/sh.css" />
+    <link data-trunk rel="css" href="styles/pages.css" />
+    <link data-trunk rel="copy-dir" href="../ui/dist/fonts" />
+    <link data-trunk rel="copy-dir" href="../ui/dist/logos" />
+    <link data-trunk rel="rust" data-bin="app" data-wasm-opt="z" data-integrity="none" />
+    <!-- Workers static assets read these from the output root. -->
     <link data-trunk rel="copy-file" href="_headers" />
-
-    <!-- Enough to paint the right background before app.css lands, so the
-         page never flashes white, and to apply a remembered light theme
-         before the first paint rather than after the app boots. -->
-    <style>
-      html { background: #07090c; }
-      html[data-theme="light"] { background: #f6f7f8; }
-    </style>
-    <script>
-      try {
-        var t = localStorage.getItem("shonin.theme");
-        if (t === "light" || t === "dark")
-          document.documentElement.setAttribute("data-theme", t);
-      } catch (e) {
-        /* private mode, blocked storage: the default theme is fine */
-      }
-    </script>
+    <link data-trunk rel="copy-file" href="_redirects" />
   </head>
   <body>
-    <!-- Each route's content is written here at build time (src/bin/seo.rs),
-         so crawlers, link previews and readers without JavaScript see the real
-         page. The app removes this and renders the interactive version of the
-         same data when it boots (src/main.rs). -->
+    <!-- Each route's page is written here at build time (src/bin/seo.rs), so
+         crawlers, link previews and readers without JavaScript see the real
+         page. The app removes it and draws the same page, live, when it
+         boots (src/main.rs). -->
     <div id="prerender"><!-- seo:body --></div>
   </body>
 </html>

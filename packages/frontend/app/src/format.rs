@@ -1,14 +1,25 @@
-//! How numbers, hashes and dates are written throughout the app.
+//! Every figure on the site goes through these (Foundations, "Numbers and
+//! formats"). No web dependencies, so the pre-render and the tests use exactly
+//! what the app shows.
 //!
-//! One place, so a figure reads the same on a leaderboard row, on a record
-//! page and in the pre-rendered HTML. No web dependencies: the build-time
-//! pre-render uses exactly these functions.
+//! - Money: dollars with separators; cents on what a person owns or moves,
+//!   whole dollars for vault totals. Never abbreviated.
+//! - Share price: four decimals.
+//! - Returns: one decimal, always signed, a true minus (U+2212); zero is
+//!   0.0% with no sign.
+//! - Times: 24-hour with the UTC suffix; dates as a short month and day, the
+//!   year only when it isn't this year.
+//! - Hashes and addresses: `0x` and the first 4 … last 4.
 
-use time::{Date, Duration, Month, PrimitiveDateTime};
+use time::{Date, Month, PrimitiveDateTime, Weekday};
 
-/// Group the integer part in threes: 1204331 becomes 1,204,331.
-fn grouped(whole: i64) -> String {
-    let digits = whole.abs().to_string();
+/// The true minus sign, which lines up with digits in tabular figures.
+pub const MINUS: char = '\u{2212}';
+/// What a missing figure shows, with the reason beside it.
+pub const MISSING: &str = "—";
+
+/// Group the integer part in threes: 2418330 becomes 2,418,330.
+fn grouped(digits: &str) -> String {
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
         if index > 0 && (digits.len() - index).is_multiple_of(3) {
@@ -16,121 +27,136 @@ fn grouped(whole: i64) -> String {
         }
         out.push(digit);
     }
-    if whole < 0 { format!("-{out}") } else { out }
+    out
 }
 
-/// A number with thousands separators and a fixed number of decimals.
-pub fn number(value: f64, decimals: usize) -> String {
+/// A non-negative number with separators and a fixed number of decimals.
+fn unsigned(value: f64, decimals: usize) -> String {
     let rounded = format!("{:.*}", decimals, value.abs());
-    let (whole, fraction) = rounded.split_once('.').unwrap_or((rounded.as_str(), ""));
-    let whole: i64 = whole.parse().unwrap_or(0);
-    let sign = if value < 0.0 { "-" } else { "" };
-    if fraction.is_empty() {
-        format!("{sign}{}", grouped(whole))
-    } else {
-        format!("{sign}{}.{fraction}", grouped(whole))
+    match rounded.split_once('.') {
+        Some((whole, fraction)) => format!("{}.{fraction}", grouped(whole)),
+        None => grouped(&rounded),
     }
 }
 
-/// Money, to the dollar: $1,204,331. A negative amount carries its sign
-/// before the currency, never inside it.
+/// Whether a value rounds to zero at this many decimals, so it can't be shown
+/// with a sign ("−0.0%" would be a lie).
+fn rounds_to_zero(value: f64, decimals: usize) -> bool {
+    format!("{:.*}", decimals, value.abs())
+        .chars()
+        .all(|c| c == '0' || c == '.')
+}
+
+/// A number with separators and a fixed number of decimals, a true minus when
+/// negative: 8,771.4.
+pub fn number(value: f64, decimals: usize) -> String {
+    if value < 0.0 && !rounds_to_zero(value, decimals) {
+        format!("{MINUS}{}", unsigned(value, decimals))
+    } else {
+        unsigned(value, decimals)
+    }
+}
+
+fn money_with(value: f64, decimals: usize) -> String {
+    if !value.is_finite() {
+        return MISSING.to_string();
+    }
+    if value < 0.0 && !rounds_to_zero(value, decimals) {
+        format!("{MINUS}${}", unsigned(value, decimals))
+    } else {
+        format!("${}", unsigned(value, decimals))
+    }
+}
+
+/// A vault total, to the dollar: $2,418,330.
+pub fn money_whole(value: f64) -> String {
+    money_with(value, 0)
+}
+
+/// Money a person owns or moves, to the cent: $10,001.25.
 pub fn money(value: f64) -> String {
-    signed_money(value, 0)
+    money_with(value, 2)
 }
 
-/// Money, to the cent, for amounts a person is about to move.
-pub fn money_exact(value: f64) -> String {
-    signed_money(value, 2)
+/// A share price, to four decimals: $1.1402. Also the high-water mark.
+pub fn price(value: f64) -> String {
+    money_with(value, 4)
 }
 
-fn signed_money(value: f64, decimals: usize) -> String {
-    if value < 0.0 {
-        format!("−${}", number(-value, decimals))
+/// A return, from a fraction: one decimal, always signed, a true minus. Zero
+/// (after rounding) is 0.0% with no sign.
+pub fn ret(fraction: f64) -> String {
+    if !fraction.is_finite() {
+        return MISSING.to_string();
+    }
+    let percent = fraction * 100.0;
+    if rounds_to_zero(percent, 1) {
+        "0.0%".to_string()
+    } else if percent > 0.0 {
+        format!("+{}%", unsigned(percent, 1))
     } else {
-        format!("${}", number(value, decimals))
+        format!("{MINUS}{}%", unsigned(percent, 1))
     }
 }
 
-/// Money at a glance: $3.24M, $412k, $86.40.
-pub fn money_compact(value: f64) -> String {
-    let size = value.abs();
-    let sign = if value < 0.0 { "-" } else { "" };
-    if size >= 1_000_000_000.0 {
-        format!("{sign}${:.2}B", size / 1_000_000_000.0)
-    } else if size >= 1_000_000.0 {
-        format!("{sign}${:.2}M", size / 1_000_000.0)
-    } else if size >= 1_000.0 {
-        format!("{sign}${:.0}k", size / 1_000.0)
-    } else if size >= 1.0 {
-        format!("{sign}${size:.0}")
+/// Which way a figure went, for its colour: gain, loss or neither.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Up,
+    Down,
+    Flat,
+}
+
+/// The direction of a return as it will be shown: a value that rounds to
+/// 0.0% is flat, whatever its sign.
+pub fn direction(fraction: f64) -> Direction {
+    let percent = fraction * 100.0;
+    if !percent.is_finite() || rounds_to_zero(percent, 1) {
+        Direction::Flat
+    } else if percent > 0.0 {
+        Direction::Up
     } else {
-        format!("{sign}${size:.2}")
+        Direction::Down
     }
 }
 
-/// A fraction as a percentage, with a sign: +18.4%, −4.1%.
-pub fn percent_signed(fraction: f64, decimals: usize) -> String {
-    let value = fraction * 100.0;
-    if value > 0.0 {
-        format!("+{:.*}%", decimals, value)
-    } else if value < 0.0 {
-        // A proper minus sign: it aligns with digits in tabular figures.
-        format!("−{:.*}%", decimals, value.abs())
+/// A count of shares: 8,771.4 shares.
+pub fn shares(value: f64) -> String {
+    format!("{} shares", number(value, 1))
+}
+
+/// A rate in basis points, as the docs write it: 10 is 0.1%, 100 is 1%.
+pub fn bps(value: u32) -> String {
+    if value.is_multiple_of(100) {
+        format!("{}%", value / 100)
     } else {
-        format!("{:.*}%", decimals, 0.0)
+        let percent = f64::from(value) / 100.0;
+        let text = format!("{percent:.2}");
+        format!("{}%", text.trim_end_matches('0'))
     }
 }
 
-/// A fraction as a percentage, unsigned: 18.4%.
-pub fn percent(fraction: f64, decimals: usize) -> String {
-    format!("{:.*}%", decimals, fraction * 100.0)
-}
-
-/// An annualised return, as the leaderboard writes it.
-pub fn annualised(fraction: f64) -> String {
-    format!("{} ann.", percent_signed(fraction, 1))
-}
-
-/// Basis points as a percentage: 50 becomes 0.5%.
-pub fn from_bps(bps: u32) -> String {
-    let value = f64::from(bps) / 100.0;
-    if (value - value.round()).abs() < 0.001 {
-        format!("{value:.0}%")
-    } else {
-        format!("{value:.1}%")
+/// A hash or an address, shortened to `0x` and the first 4 … last 4, with an
+/// ellipsis (U+2026). Anything that isn't long enough to shorten is shown
+/// whole. A `sha256:` prefix is kept.
+pub fn short_hash(value: &str) -> String {
+    if let Some(digest) = value.strip_prefix("sha256:") {
+        return format!("sha256:{}", elide(digest, 4, 4));
+    }
+    match value.strip_prefix("0x") {
+        Some(hex) => format!("0x{}", elide(hex, 4, 4)),
+        None => elide(value, 4, 4),
     }
 }
 
-/// A vault's value per share, which is always read to four decimals.
-pub fn share_price(value: f64) -> String {
-    format!("{value:.4}")
-}
-
-/// A whole number of things: 3,902 trades.
-pub fn count(value: u32) -> String {
-    grouped(i64::from(value))
-}
-
-/// The middle of a hash or an address, elided: sha256:9c41a8…b2e1.
-pub fn short_hash(hash: &str) -> String {
-    match hash.split_once(':') {
-        Some((prefix, digest)) => format!("{prefix}:{}", elide(digest)),
-        None => elide(hash),
-    }
-}
-
-/// An address, elided the same way: 0x7e3a91…4c8d.
-pub fn short_address(address: &str) -> String {
-    elide(address)
-}
-
-fn elide(value: &str) -> String {
-    let body = value.strip_prefix("0x").unwrap_or(value);
-    let prefix = if value.starts_with("0x") { "0x" } else { "" };
-    if body.len() <= 12 {
+fn elide(value: &str, head: usize, tail: usize) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= head + tail + 1 {
         return value.to_string();
     }
-    format!("{prefix}{}…{}", &body[..6], &body[body.len() - 4..])
+    let start: String = chars[..head].iter().collect();
+    let end: String = chars[chars.len() - tail..].iter().collect();
+    format!("{start}\u{2026}{end}")
 }
 
 fn month(month: Month) -> &'static str {
@@ -150,202 +176,212 @@ fn month(month: Month) -> &'static str {
     }
 }
 
-/// 20 Sep 2026.
-pub fn date(date: Date) -> String {
-    format!("{} {} {}", date.day(), month(date.month()), date.year())
-}
-
-/// Sep 2026, for a chart axis or a monthly table.
-pub fn month_year(date: Date) -> String {
-    format!("{} {}", month(date.month()), date.year())
-}
-
-/// 20 Sep, for a dense axis.
-pub fn day_month(date: Date) -> String {
-    format!("{} {}", date.day(), month(date.month()))
-}
-
-/// 20 Sep 2026, 14:20 UTC.
-pub fn timestamp(at: PrimitiveDateTime) -> String {
-    format!(
-        "{} {} {}, {:02}:{:02} UTC",
-        at.day(),
-        month(at.month()),
-        at.year(),
-        at.hour(),
-        at.minute()
-    )
-}
-
-/// How long ago something happened, read from a fixed "now". Past two days
-/// it reads in days, because that is how people talk about the past.
-pub fn ago(at: PrimitiveDateTime, now: PrimitiveDateTime) -> String {
-    let span = now - at;
-    if span.is_negative() {
-        return "just now".to_string();
-    }
-    match span_words(span, 48) {
-        None => "just now".to_string(),
-        Some(words) => format!("{words} ago"),
+/// The full name of a month: August.
+pub fn month_name(month: Month) -> &'static str {
+    match month {
+        Month::January => "January",
+        Month::February => "February",
+        Month::March => "March",
+        Month::April => "April",
+        Month::May => "May",
+        Month::June => "June",
+        Month::July => "July",
+        Month::August => "August",
+        Month::September => "September",
+        Month::October => "October",
+        Month::November => "November",
+        Month::December => "December",
     }
 }
 
-/// How long until something happens. It stays in hours for three days,
-/// because the things the app counts down to — a blessing expiring, a
-/// timelock running out, a vault freezing — are quoted in hours.
-pub fn until(at: PrimitiveDateTime, now: PrimitiveDateTime) -> String {
-    let span = at - now;
-    if span.is_negative() {
-        return "expired".to_string();
-    }
-    match span_words(span, 72) {
-        None => "any moment".to_string(),
-        Some(words) => format!("in {words}"),
+/// The weekday, in full: Saturday.
+pub fn weekday(date: Date) -> &'static str {
+    match date.weekday() {
+        Weekday::Monday => "Monday",
+        Weekday::Tuesday => "Tuesday",
+        Weekday::Wednesday => "Wednesday",
+        Weekday::Thursday => "Thursday",
+        Weekday::Friday => "Friday",
+        Weekday::Saturday => "Saturday",
+        Weekday::Sunday => "Sunday",
     }
 }
 
-/// A span in the largest unit that still says something, or `None` when it
-/// is too short to be worth a number.
-fn span_words(span: Duration, hour_limit: i64) -> Option<String> {
-    let minutes = span.whole_minutes();
-    if minutes < 1 {
-        None
-    } else if minutes < 60 {
-        Some(format!("{minutes}m"))
-    } else if span.whole_hours() < hour_limit {
-        Some(format!("{}h", span.whole_hours()))
-    } else if span.whole_days() < 90 {
-        Some(format!("{}d", span.whole_days()))
+/// A date: Sep 29, and Sep 29, 2025 when it isn't in `this_year`.
+pub fn day(date: Date, this_year: i32) -> String {
+    if date.year() == this_year {
+        format!("{} {}", month(date.month()), date.day())
     } else {
-        Some(format!("{}mo", span.whole_days() / 30))
+        format!("{} {}, {}", month(date.month()), date.day(), date.year())
     }
 }
 
-/// A run of days, as a record's age is written: 214d.
-pub fn days(days: u32) -> String {
-    if days >= 730 {
-        format!("{}y", days / 365)
+/// A time of day in UTC, to the second: 14:32:40 UTC.
+pub fn time(at: PrimitiveDateTime) -> String {
+    format!("{:02}:{:02}:{:02} UTC", at.hour(), at.minute(), at.second())
+}
+
+/// A time of day in UTC, to the minute: 09:14 UTC.
+pub fn time_short(at: PrimitiveDateTime) -> String {
+    format!("{:02}:{:02} UTC", at.hour(), at.minute())
+}
+
+/// A date with its time: Sep 29, 09:14 UTC.
+pub fn day_time(at: PrimitiveDateTime, this_year: i32) -> String {
+    format!("{}, {}", day(at.date(), this_year), time_short(at))
+}
+
+/// A whole number of days: 1 day, 91 days.
+pub fn days(count: u32) -> String {
+    if count == 1 {
+        "1 day".to_string()
     } else {
-        format!("{days}d")
+        format!("{} days", number(f64::from(count), 0))
     }
 }
 
-/// A span in prose: "two days", "one day", "18 hours". Used where a sentence
-/// states a period the chain enforces, so the sentence takes the chain's
-/// figure rather than repeating one.
-pub fn day_count(days: f64) -> String {
-    if days < 1.0 {
-        let hours = (days * 24.0).round() as u32;
-        return if hours == 1 {
-            "one hour".to_string()
-        } else {
-            format!("{hours} hours")
-        };
+/// A runway in days, rounded down, as an estimate: About 41 days, About a
+/// day, Under a day.
+pub fn runway(days_left: f64) -> String {
+    if !days_left.is_finite() {
+        return "No charges yet".to_string();
     }
-    let whole = days.round() as u32;
-    let spelled = match whole {
-        1 => return "one day".to_string(),
-        2 => "two",
-        3 => "three",
-        4 => "four",
-        5 => "five",
-        6 => "six",
-        7 => "seven",
-        8 => "eight",
-        9 => "nine",
-        10 => "ten",
-        _ => return format!("{whole} days"),
+    let whole = days_left.floor();
+    if whole < 1.0 {
+        "Under a day".to_string()
+    } else if whole < 2.0 {
+        "About a day".to_string()
+    } else {
+        format!("About {} days", number(whole, 0))
+    }
+}
+
+/// How long ago, said plainly and rounded down: 40 seconds, 3 minutes,
+/// 2 hours, 4 days.
+pub fn ago(seconds: f64) -> String {
+    let seconds = seconds.max(0.0).floor() as u64;
+    let (count, unit) = if seconds < 60 {
+        (seconds, "second")
+    } else if seconds < 3_600 {
+        (seconds / 60, "minute")
+    } else if seconds < 86_400 {
+        (seconds / 3_600, "hour")
+    } else {
+        (seconds / 86_400, "day")
     };
-    format!("{spelled} days")
-}
-
-/// A build's duration: 2m 22s.
-pub fn duration(seconds: u32) -> String {
-    if seconds < 60 {
-        format!("{seconds}s")
+    if count == 1 {
+        format!("1 {unit}")
     } else {
-        format!("{}m {}s", seconds / 60, seconds % 60)
+        format!("{count} {unit}s")
     }
-}
-
-/// A file size: 184 MiB, 4.1 KiB.
-pub fn bytes(value: u32) -> String {
-    let size = f64::from(value);
-    if size >= 1_048_576.0 {
-        format!("{:.1} MiB", size / 1_048_576.0)
-    } else if size >= 1024.0 {
-        format!("{:.1} KiB", size / 1024.0)
-    } else {
-        format!("{value} B")
-    }
-}
-
-/// A rate the tank is charged at: $4.80 a day.
-pub fn per_day(value: f64) -> String {
-    format!("{} a day", money_exact(value))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use time::macros::datetime;
 
     #[test]
-    fn money_is_grouped_and_rounded() {
-        assert_eq!(money(1_204_331.42), "$1,204,331");
-        assert_eq!(money_exact(86.4), "$86.40");
-        assert_eq!(money(0.0), "$0");
-        assert_eq!(money(-2_400.0), "−$2,400");
-        assert_eq!(money_exact(-20.0), "−$20.00");
+    fn money_has_separators_cents_on_what_people_move_and_whole_dollars_for_totals() {
+        assert_eq!(money(10_001.25), "$10,001.25");
+        assert_eq!(money(0.5), "$0.50");
+        assert_eq!(money_whole(2_418_330.4), "$2,418,330");
+        assert_eq!(money_whole(999.5), "$1,000");
+        assert_eq!(money_whole(0.0), "$0");
+        assert_eq!(money(-12.5), "\u{2212}$12.50");
     }
 
     #[test]
-    fn compact_money_picks_its_unit() {
-        assert_eq!(money_compact(3_240_000.0), "$3.24M");
-        assert_eq!(money_compact(412_000.0), "$412k");
-        assert_eq!(money_compact(86.4), "$86");
-        assert_eq!(money_compact(0.42), "$0.42");
-        assert_eq!(money_compact(1_500_000_000.0), "$1.50B");
+    fn money_is_never_abbreviated() {
+        assert_eq!(money_whole(2_400_000.0), "$2,400,000");
+        assert!(!money_whole(1e9).contains('B'));
     }
 
     #[test]
-    fn a_signed_percentage_always_carries_its_sign() {
-        assert_eq!(percent_signed(0.184, 1), "+18.4%");
-        assert_eq!(percent_signed(-0.041, 1), "−4.1%");
-        assert_eq!(percent_signed(0.0, 1), "0.0%");
+    fn a_share_price_has_four_decimals() {
+        assert_eq!(price(1.1402), "$1.1402");
+        assert_eq!(price(1.0), "$1.0000");
+        assert_eq!(price(1745.785789), "$1,745.7858");
     }
 
     #[test]
-    fn hashes_keep_their_prefix_when_elided() {
+    fn a_return_is_signed_with_a_true_minus_and_one_decimal() {
+        assert_eq!(ret(0.032), "+3.2%");
+        assert_eq!(ret(-0.069), "\u{2212}6.9%");
+        assert_eq!(ret(0.14), "+14.0%");
+        assert_eq!(ret(1.5), "+150.0%");
+        assert!(!ret(-0.05).contains('-'), "a hyphen is not a minus");
+    }
+
+    #[test]
+    fn a_return_that_rounds_to_zero_has_no_sign_and_no_colour() {
+        assert_eq!(ret(0.0), "0.0%");
+        assert_eq!(ret(0.0004), "0.0%");
+        assert_eq!(ret(-0.0004), "0.0%");
+        assert_eq!(direction(-0.0004), Direction::Flat);
+        assert_eq!(direction(0.0006), Direction::Up);
+        assert_eq!(direction(-0.0006), Direction::Down);
+    }
+
+    #[test]
+    fn shares_have_one_decimal_and_the_word() {
+        assert_eq!(shares(8_771.44), "8,771.4 shares");
+    }
+
+    #[test]
+    fn fees_read_as_the_docs_write_them() {
+        assert_eq!(bps(10), "0.1%");
+        assert_eq!(bps(100), "1%");
+        assert_eq!(bps(1_500), "15%");
+        assert_eq!(bps(25), "0.25%");
+    }
+
+    #[test]
+    fn a_hash_shows_its_first_and_last_four() {
         assert_eq!(
-            short_hash("sha256:9c41a8b7d6e5f40312ab"),
-            "sha256:9c41a8…12ab"
+            short_hash("0x4e1d30877432d1026706d7e805da846a32c3bb81e3c29b62179273c8eb5ba90b"),
+            "0x4e1d\u{2026}a90b"
         );
-        assert_eq!(short_address("0x7e3a91cd5b2f84d0"), "0x7e3a91…84d0");
-        assert_eq!(short_address("0x7e3a"), "0x7e3a");
+        assert_eq!(
+            short_hash("0x2d19b682575ec87a171ac826a6fce48478dcb4e8"),
+            "0x2d19\u{2026}b4e8"
+        );
+        assert_eq!(
+            short_hash("sha256:2961d4010c01acc1"),
+            "sha256:2961\u{2026}acc1"
+        );
+        assert_eq!(short_hash("0xabc"), "0xabc");
+        assert_eq!(
+            short_hash("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"),
+            "5Q54\u{2026}e4j1"
+        );
     }
 
     #[test]
-    fn dates_and_spans_read_as_words() {
-        let day = Date::from_calendar_date(2026, Month::September, 20).unwrap();
-        assert_eq!(date(day), "20 Sep 2026");
-        assert_eq!(month_year(day), "Sep 2026");
-
-        let now = day.with_hms(14, 20, 0).unwrap();
-        assert_eq!(ago(now - Duration::hours(3), now), "3h ago");
-        assert_eq!(ago(now - Duration::days(5), now), "5d ago");
-        assert_eq!(ago(now - Duration::seconds(20), now), "just now");
-        assert_eq!(until(now + Duration::hours(51), now), "in 51h");
-        assert_eq!(until(now - Duration::hours(1), now), "expired");
+    fn times_are_utc_and_twenty_four_hour() {
+        let at = datetime!(2026-09-29 14:32:40);
+        assert_eq!(time(at), "14:32:40 UTC");
+        assert_eq!(time_short(datetime!(2026-09-29 09:04:00)), "09:04 UTC");
+        assert_eq!(day_time(at, 2026), "Sep 29, 14:32 UTC");
     }
 
     #[test]
-    fn small_units_read_plainly() {
-        assert_eq!(days(214), "214d");
-        assert_eq!(duration(142), "2m 22s");
-        assert_eq!(duration(38), "38s");
-        assert_eq!(from_bps(50), "0.5%");
-        assert_eq!(from_bps(1000), "10%");
-        assert_eq!(count(3902), "3,902");
-        assert_eq!(share_price(1.08423), "1.0842");
+    fn a_date_names_its_year_only_when_it_is_not_this_year() {
+        let date = datetime!(2026-09-29 0:00).date();
+        assert_eq!(day(date, 2026), "Sep 29");
+        assert_eq!(day(date, 2027), "Sep 29, 2026");
+        assert_eq!(weekday(date), "Tuesday");
+    }
+
+    #[test]
+    fn durations_are_plain_words_rounded_down() {
+        assert_eq!(days(1), "1 day");
+        assert_eq!(days(91), "91 days");
+        assert_eq!(runway(41.9), "About 41 days");
+        assert_eq!(runway(1.2), "About a day");
+        assert_eq!(runway(0.4), "Under a day");
+        assert_eq!(ago(59.9), "59 seconds");
+        assert_eq!(ago(180.0), "3 minutes");
+        assert_eq!(ago(3_600.0), "1 hour");
     }
 }

@@ -1,0 +1,14 @@
+/* Segmented control: one of a few views of the same data. Buttons with
+   aria-pressed inside role="group" with an aria-label. track paper-sunk,
+   padding 3, gap 2, radius 10 · buttons 30 high, radius 8, 600 13 ·
+   pressed: paper-raised with a line ring · 44px tall on touch. */
+.sh-seg { display: inline-flex; padding: 3px; gap: 2px; background: var(--paper-sunk); border-radius: var(--radius-m); }
+.sh-seg button {
+  height: 30px; padding: 0 var(--space-3); border: 0; border-radius: 8px; background: transparent; cursor: pointer;
+  color: var(--ink-muted); font: 600 13px/30px var(--font-sans); white-space: nowrap;
+  transition: background-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+}
+@media (hover: hover) { .sh-seg button:hover { color: var(--ink); } }
+.sh-seg button[aria-pressed="true"] { background: var(--paper-raised); color: var(--ink); box-shadow: 0 0 0 1px var(--line); }
+.sh-seg button:focus-visible { outline-offset: 1px; }
+@media (max-width: 1023px) { .sh-seg button { height: 38px; line-height: 38px; } }

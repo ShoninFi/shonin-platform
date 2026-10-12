@@ -1,0 +1,17 @@
+/* The chip family: a short status, rating or fact beside what it describes.
+   Never a button. height 24 · padding 0 8 · radius 6 · 600 12/16 · icon 14 ·
+   gap 4 · soft ground with strong text of the same hue. Status colour never
+   comes without a word, a sign or an icon. */
+.sh-chip {
+  display: inline-flex; align-items: center; gap: var(--space-1); flex: none;
+  height: 24px; padding: 0 var(--space-2); border-radius: var(--radius-s);
+  font: var(--type-chip); white-space: nowrap;
+}
+.sh-chip .sh-icon { width: 14px; height: 14px; }
+.sh-chip-gain { background: var(--gain-soft); color: var(--gain); }
+.sh-chip-caution { background: var(--caution-soft); color: var(--caution); }
+.sh-chip-loss { background: var(--loss-soft); color: var(--loss); }
+.sh-chip-neutral { background: var(--neutral-soft); color: var(--ink-muted); }
+.sh-chip-brand { background: var(--brand-soft); color: var(--brand); }
+.sh-chips { display: flex; flex-wrap: wrap; gap: var(--space-1) 6px; }
+.sh-chips--stack { flex-direction: column; align-items: flex-start; }

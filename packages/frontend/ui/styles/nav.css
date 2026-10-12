@@ -1,0 +1,12 @@
+/* Header navigation items. Current: brand on brand-soft, aria-current="page". */
+.sh-nav {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 10px 12px; border-radius: var(--radius-m);
+  color: var(--ink); text-decoration: none; font: var(--type-nav);
+  transition: background-color var(--dur-fast) var(--ease-out);
+}
+@media (hover: hover) { .sh-nav:hover { background: var(--paper-sunk); color: var(--ink); } }
+.sh-nav[aria-current="page"] { color: var(--brand); background: var(--brand-soft); }
+.sh-nav--offsite { color: var(--ink-muted); }
+.sh-hero .sh-nav { color: var(--hero-ink); }
+@media (hover: hover) { .sh-hero .sh-nav:hover { background: var(--hero-tint); color: var(--hero-ink); } }

@@ -1,0 +1,24 @@
+/* The first-visit strip on /agents: slim, dismissible, never returns once
+   dismissed. And the freshness bar: 36px under the header once figures fall
+   more than a minute behind. */
+.sh-strip { background: var(--paper-sunk); border-bottom: var(--border-hairline) solid var(--line); }
+.sh-strip__inner { display: flex; align-items: center; gap: var(--space-3); padding: 4px 0; }
+.sh-strip__inner > .sh-icon { color: var(--brand); }
+.sh-strip p { flex: 1; min-width: 0; font: 400 14px/22px var(--font-sans); color: var(--ink); }
+.sh-strip p a { font-weight: 600; margin-left: 4px; white-space: nowrap; }
+.sh-strip .sh-iconbtn { width: 40px; height: 40px; margin-right: -12px; }
+@media (max-width: 599px) {
+  .sh-strip__inner { align-items: flex-start; gap: 10px; padding: var(--space-3) 0; width: auto; margin: 0 4px 0 var(--space-4); }
+  .sh-strip__inner > .sh-icon { margin-top: 2px; }
+  .sh-strip .sh-iconbtn { width: 44px; height: 44px; margin: -10px 0 -10px 0; }
+}
+
+.sh-stalebar {
+  display: flex; align-items: center; justify-content: center; gap: var(--space-2);
+  min-height: 36px; padding: var(--space-2) var(--space-4);
+  background: var(--paper-sunk); border-bottom: var(--border-hairline) solid var(--line);
+  font: 500 13px/20px var(--font-sans); color: var(--ink); text-align: center;
+}
+.sh-stalebar .sh-icon { color: var(--caution); }
+.sh-appheader + .sh-stalebar { position: sticky; top: 64px; z-index: 99; }
+@media (max-width: 599px) { .sh-appheader + .sh-stalebar { top: 56px; } }

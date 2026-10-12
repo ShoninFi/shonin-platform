@@ -140,6 +140,13 @@
   // with the visual for the snapped card below; on a desktop the visual is
   // pinned and swaps as each step crosses the middle of the screen. A tablet,
   // and reduced motion on a desktop, keep the drawn state.
+  //
+  // On a desktop the active step is the last one whose top is above the
+  // middle of the screen, read from the layout once a frame while scrolling.
+  // That is a pure function of the scroll position, so each crossing changes
+  // the step exactly once, however fast the reader scrolls (a zero-height
+  // observer band misses a step that jumps past it, and fires again for any
+  // step that moves).
   function publishing() {
     var section = document.querySelector('[data-steps]');
     if (!section) return;
@@ -151,6 +158,29 @@
     var phone = window.matchMedia('(max-width: 599px)');
     var desktop = window.matchMedia('(min-width: 1024px)');
     var observer = null;
+    var frame = 0;
+
+    function pick() {
+      frame = 0;
+      var line = window.innerHeight / 2;
+      var n = 1;
+      steps.forEach(function (step, index) {
+        if (step.getBoundingClientRect().top <= line) n = index + 1;
+      });
+      if (section.getAttribute('data-active') !== String(n)) show(n);
+    }
+    function schedule() {
+      if (!frame) frame = window.requestAnimationFrame(pick);
+    }
+    function follow(on) {
+      var method = on ? 'addEventListener' : 'removeEventListener';
+      window[method]('scroll', schedule, { passive: true });
+      window[method]('resize', schedule, { passive: true });
+      if (!on && frame) {
+        window.cancelAnimationFrame(frame);
+        frame = 0;
+      }
+    }
 
     function show(n) {
       section.setAttribute('data-active', String(n));
@@ -169,6 +199,7 @@
     function mode() {
       if (observer) observer.disconnect();
       observer = null;
+      follow(false);
       var observe = 'IntersectionObserver' in window;
       var carousel = phone.matches;
       var scrolly = desktop.matches && motion && !reduce.matches && observe;
@@ -185,13 +216,8 @@
         steps.forEach(function (step) { observer.observe(step); });
         show(1);
       } else if (scrolly) {
-        observer = new IntersectionObserver(function (entries) {
-          entries.forEach(function (entry) {
-            if (entry.isIntersecting) show(steps.indexOf(entry.target) + 1);
-          });
-        }, { rootMargin: '-50% 0px -50% 0px' });
-        steps.forEach(function (step) { observer.observe(step); });
-        show(1);
+        follow(true);
+        pick();
       } else {
         show(2);
       }
@@ -218,6 +244,7 @@
     section.querySelector('[data-step-next]').addEventListener('click', function () { go(1); });
     phone.addEventListener('change', mode);
     desktop.addEventListener('change', mode);
+    reduce.addEventListener('change', mode);
     mode();
   }
 

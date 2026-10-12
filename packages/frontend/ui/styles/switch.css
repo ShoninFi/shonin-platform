@@ -1,0 +1,23 @@
+/* Toggle: a setting that takes effect when flipped. role="switch" +
+   aria-checked. track 44 x 24, radius 999 · off line-control, on brand ·
+   knob 18, 3 inset, moves 160ms · the On/Off word is always visible ·
+   row min 44 high. */
+.sh-switch { display: flex; align-items: center; gap: var(--space-3); min-height: 44px; padding: 0; border: 0; background: none; cursor: pointer; text-align: left; color: var(--ink); }
+.sh-switch__text { flex: 1; display: flex; flex-direction: column; }
+.sh-switch__title { font: 600 15px/22px var(--font-sans); }
+.sh-switch__detail { font: var(--type-body-s); color: var(--ink-muted); }
+.sh-switch__state { font: 600 13px/20px var(--font-sans); color: var(--ink-muted); min-width: 24px; text-align: right; }
+.sh-switch__track {
+  position: relative; flex: none; width: 44px; height: 24px; border-radius: var(--radius-full);
+  background: var(--line-control); transition: background-color var(--dur-base) var(--ease-out);
+}
+.sh-switch__knob {
+  position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: var(--radius-full);
+  background: var(--paper-raised); transition: transform var(--dur-base) var(--ease-out);
+}
+.sh-switch[aria-checked="true"] .sh-switch__track { background: var(--brand); }
+.sh-switch[aria-checked="true"] .sh-switch__knob { transform: translateX(20px); }
+.sh-switch:disabled { cursor: not-allowed; }
+.sh-switch:disabled .sh-switch__track { background: var(--paper-sunk); box-shadow: inset 0 0 0 1px var(--line); }
+.sh-switch:focus-visible { outline: none; }
+.sh-switch:focus-visible .sh-switch__track { outline: var(--border-focus) solid var(--focus); outline-offset: 2px; }

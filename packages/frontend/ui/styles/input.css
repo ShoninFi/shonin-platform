@@ -1,0 +1,44 @@
+/* Fields. Every control has a visible label, a 44px target on touch and a
+   focus ring. Input: height 48 · padding 0 14 · radius 10 · 1.5 line-control ·
+   500 16/24 (no iOS zoom) · focus: brand border + 3px brand-soft ring ·
+   error: loss border and a message. */
+.sh-field { display: flex; flex-direction: column; gap: 6px; }
+.sh-field__label { font: 600 14px/20px var(--font-sans); }
+.sh-field__hint { font: var(--type-body-s); color: var(--ink-muted); }
+.sh-field--error .sh-field__hint { color: var(--loss); }
+.sh-input {
+  display: flex; align-items: center; gap: var(--space-2);
+  height: 48px; padding: 0 14px;
+  border: var(--border-control) solid var(--line-control); border-radius: var(--radius-m);
+  background: var(--paper-raised); color: var(--ink); font: 500 16px/24px var(--font-sans);
+  transition: border-color var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out);
+}
+.sh-input:focus-within { border-color: var(--brand); box-shadow: 0 0 0 3px var(--brand-soft); }
+.sh-input input {
+  flex: 1; min-width: 0; height: 100%; padding: 0; border: 0; outline: 0; background: transparent;
+  font: inherit; color: inherit;
+}
+.sh-input input::placeholder { color: var(--ink-muted); opacity: 1; }
+.sh-input input::-webkit-search-cancel-button { -webkit-appearance: none; }
+.sh-input .sh-icon { color: var(--ink-muted); }
+.sh-input--s { height: 40px; }
+.sh-input--s input { font-size: 15px; }
+.sh-input[aria-invalid="true"], .sh-field--error .sh-input { border-color: var(--loss); }
+.sh-input__unit { font: 600 15px/24px var(--font-sans); color: var(--ink-muted); }
+
+/* Checkbox: a real input under the drawn box; the whole row is the target. */
+.sh-check { position: relative; display: flex; align-items: flex-start; gap: var(--space-3); min-height: 44px; padding: 10px 0; cursor: pointer; font: var(--type-body); }
+.sh-check input { position: absolute; opacity: 0; width: 20px; height: 20px; margin: 2px 0 0; }
+.sh-check__box {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; margin-top: 2px; border-radius: var(--radius-s);
+  border: var(--border-control) solid var(--line-control); background: var(--paper-raised); color: transparent;
+}
+.sh-check__box .sh-icon { width: 14px; height: 14px; }
+.sh-check input:checked + .sh-check__box { background: var(--brand); border-color: var(--brand); color: var(--on-brand); }
+.sh-check input:focus-visible + .sh-check__box { outline: var(--border-focus) solid var(--focus); outline-offset: 2px; }
+.sh-check input:disabled + .sh-check__box { background: var(--paper-sunk); border-color: var(--line); }
+.sh-check--radio .sh-check__box { border-radius: var(--radius-full); }
+.sh-check--radio input:checked + .sh-check__box { background: var(--brand); border-color: var(--brand); box-shadow: inset 0 0 0 4px var(--paper-raised); }
+.sh-fieldset { margin: 0; padding: 0; border: 0; min-width: 0; }
+.sh-fieldset legend { padding: 0; margin-bottom: var(--space-1); font: 600 14px/20px var(--font-sans); }

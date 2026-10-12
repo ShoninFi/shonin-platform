@@ -1,0 +1,17 @@
+# Old routes, sent to their new homes (permanent). The root is the
+# leaderboard. An Author's page is now the leaderboard filtered by Author
+# (/agents?author=<chain>:<address>); the old pages were keyed by a display
+# name that can't be turned into an address here, so they go to the full list.
+/                       /agents                   302
+/strategies             /agents                   301
+/strategies/:slug       /agents/:slug             301
+/strategies/:slug/*     /agents/:slug             301
+/agents/:slug/record    /agents/:slug             301
+/agents/:slug/health    /agents/:slug             301
+/agents/:slug/code      /agents/:slug/verify      301
+/queue                  /publish                  301
+/queue/:id              /publish/jobs/:id         301
+/verify                 /status                   301
+/about                  https://shonin.fi/        301
+/authors                /agents                   301
+/authors/*              /agents                   301

@@ -1,0 +1,32 @@
+/* App header (tablet and desktop): 64px, paper-raised, hairline bottom,
+   sticky. Lockup 28 links to shonin.fi; nav Agents, Portfolio, Publish,
+   Docs; the wallet control on the right.
+   Phone header (< 600): 56px, padding 0 16. Lockup 24 on /agents, else the
+   mark 28 and the page title; "Connect" or the wallet chip. Docs lives in
+   the footer on phone. */
+.sh-appheader {
+  position: sticky; top: 0; z-index: 100;
+  background: var(--paper-raised); border-bottom: var(--border-hairline) solid var(--line);
+}
+.sh-appheader__inner { display: flex; align-items: center; gap: var(--space-6); height: 64px; }
+.sh-appheader__nav { display: flex; gap: 4px; flex: 1; min-width: 0; }
+.sh-appheader__nav .sh-icon { width: 16px; height: 16px; }
+.sh-appheader__tools { display: flex; align-items: center; gap: var(--space-2); margin-left: auto; }
+.sh-appheader__title { display: none; }
+.sh-appheader .sh-logo--mark { display: none; }
+.sh-appheader__short { display: none; }
+
+@media (max-width: 599px) {
+  .sh-appheader__inner { height: 56px; gap: var(--space-3); width: auto; padding: 0 var(--space-4); }
+  .sh-appheader__nav { display: none; }
+  .sh-appheader .sh-logo { min-height: 44px; }
+  .sh-appheader .sh-logo--lockup img { height: 24px; }
+  .sh-appheader--titled .sh-logo--lockup { display: none; }
+  .sh-appheader--titled .sh-logo--mark { display: flex; }
+  .sh-appheader--titled .sh-appheader__title {
+    display: block; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font: var(--type-heading); letter-spacing: var(--track-heading);
+  }
+  .sh-appheader__long { display: none; }
+  .sh-appheader__short { display: inline; }
+}

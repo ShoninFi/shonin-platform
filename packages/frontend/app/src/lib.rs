@@ -1,19 +1,25 @@
 //! The Shonin web app.
 //!
-//! Everything but the views themselves is plain Rust with no web
-//! dependencies, so two binaries share it: the app (`src/main.rs`, wasm) and
-//! the build-time pre-render (`src/bin/seo.rs`, native). Adding a route in
-//! `route.rs` gives it a page in the app, a pre-rendered HTML file and a
-//! sitemap entry.
+//! Everything is written once, as [`view::View`]s built from the store's
+//! signals, so two binaries share it: the app (`src/main.rs`, wasm), which
+//! draws live Dominator trees, and the build-time pre-render
+//! (`src/bin/seo.rs`, native), which writes the same views as static HTML so
+//! every page reads with JavaScript off.
+//!
+//! Layers: [`atoms`] (one file each) → [`components`] (the page chrome) →
+//! [`pages`] (one module per route). The store ([`store`]) holds the latest
+//! snapshot as keyed `Mutable`s; [`api`] keeps it fresh.
 
 pub mod api;
-pub mod copy;
-pub mod data;
-pub mod fixture;
+pub mod atoms;
+pub mod clock;
+pub mod components;
 pub mod format;
+pub mod freshness;
+pub mod model;
 pub mod pages;
-pub mod prerender;
 pub mod route;
-pub mod state;
-pub mod ui;
-pub mod wallet;
+pub mod shell;
+pub mod store;
+pub mod view;
+pub mod web;

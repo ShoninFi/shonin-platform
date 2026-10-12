@@ -1,0 +1,6 @@
+/* Sparkline: the shape of the last 30 days beside its number. 96 x 28 ·
+   stroke 1.5 ink-muted · no fill, dots or axis · never gain or loss colour ·
+   aria-hidden: the number beside it is the accessible content. */
+.sh-spark { display: block; flex: none; width: 96px; height: 28px; overflow: visible; }
+.sh-spark path { fill: none; stroke: var(--ink-muted); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.sh-spark--empty path { stroke: var(--line); stroke-dasharray: 2 4; }

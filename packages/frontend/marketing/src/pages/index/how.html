@@ -104,7 +104,7 @@
           </ul>
         </figure>
         <div class="tech-card__body">
-          <h3 class="tech-card__title">Trade-only keys</h3>
+          <h3 class="tech-card__title">Blockchain</h3>
           <p class="reading-s">The agent never holds a key. The machine signs its orders with a key the venue lets place and cancel orders, and nothing else. So nobody can withdraw your money: not the agent, not its Author, not us.</p>
           <ul class="ticks">
             <li>{{i:check:20}}Enforced by blockchain tech and open-source contracts</li>
@@ -116,6 +116,25 @@
       </article>
     </div>
 
+    <article class="sh-card wasm sh-reveal" data-play aria-labelledby="wasm-title">
+      <figure class="wasm__fig">
+        <svg class="diagram diagram--wide" viewBox="0 0 560 300" role="img" aria-label="An agent, a WebAssembly component, docked inside the attested machine, which hands it its services: orders, transfers, venue data, the network, sealed secrets and AI models."><rect class="wa-frame" x="8" y="8" width="544" height="284" rx="16"/><text class="wa-host" x="28" y="38">Attested machine</text><text class="wa-host-note" x="532" y="38">signs, connects, runs models</text><path class="wa-wire sh-draw dl-600" d="M168 98 C204 98 204 133 240 133" pathLength="1"/><g class="sh-reveal dl-400"><rect class="wa-port" x="32" y="78" width="136" height="40" rx="10"/><circle class="wa-pin" cx="168" cy="98" r="4"/><text class="wa-port-name" x="100" y="103">Orders</text></g><path class="wa-wire sh-draw dl-660" d="M392 98 C356 98 356 133 320 133" pathLength="1"/><g class="sh-reveal dl-460"><rect class="wa-port" x="392" y="78" width="136" height="40" rx="10"/><circle class="wa-pin" cx="392" cy="98" r="4"/><text class="wa-port-name" x="460" y="103">Network</text></g><path class="wa-wire sh-draw dl-720" d="M168 158 C204 158 204 158 240 158" pathLength="1"/><g class="sh-reveal dl-520"><rect class="wa-port" x="32" y="138" width="136" height="40" rx="10"/><circle class="wa-pin" cx="168" cy="158" r="4"/><text class="wa-port-name" x="100" y="163">Transfers</text></g><path class="wa-wire sh-draw dl-780" d="M392 158 C356 158 356 158 320 158" pathLength="1"/><g class="sh-reveal dl-580"><rect class="wa-port" x="392" y="138" width="136" height="40" rx="10"/><circle class="wa-pin" cx="392" cy="158" r="4"/><text class="wa-port-name" x="460" y="163">Secrets</text></g><path class="wa-wire sh-draw dl-840" d="M168 218 C204 218 204 183 240 183" pathLength="1"/><g class="sh-reveal dl-640"><rect class="wa-port" x="32" y="198" width="136" height="40" rx="10"/><circle class="wa-pin" cx="168" cy="218" r="4"/><text class="wa-port-name" x="100" y="223">Venue data</text></g><path class="wa-wire sh-draw dl-900" d="M392 218 C356 218 356 183 320 183" pathLength="1"/><g class="sh-reveal dl-700"><rect class="wa-port" x="392" y="198" width="136" height="40" rx="10"/><circle class="wa-pin" cx="392" cy="218" r="4"/><text class="wa-port-name" x="460" y="223">AI models</text></g><g transform="translate(280 158)"><g class="sh-seal-in dl-300"><path class="wa-agent" d="M0.0 -46.0 L39.8 -23.0 L39.8 23.0 L0.0 46.0 L-39.8 23.0 L-39.8 -23.0 Z"/><path class="wa-agent-core" d="M0.0 -30.0 L26.0 -15.0 L26.0 15.0 L0.0 30.0 L-26.0 15.0 L-26.0 -15.0 Z"/><text class="wa-agent-ext" y="4">.wasm</text></g></g><text class="dg-strong" x="280" y="234">Your agent</text><text class="dg-hash" x="280" y="250">decides; never holds a key</text></svg>
+        <svg class="diagram diagram--tall" viewBox="0 0 326 330" role="img" aria-label="An agent, a WebAssembly component, docked inside the attested machine, which hands it its services: orders, transfers, venue data, the network, sealed secrets and AI models."><rect class="wa-frame" x="4" y="4" width="318" height="322" rx="16"/><text class="wa-host wa-host--mid" x="163" y="32">Attested machine</text><path class="wa-wire sh-draw dl-600" d="M106 90 C118 90 118 132 131 132" pathLength="1"/><g class="sh-reveal dl-400"><rect class="wa-port" x="12" y="72" width="94" height="36" rx="10"/><circle class="wa-pin" cx="106" cy="90" r="4"/><text class="wa-port-name" x="59" y="95">Orders</text></g><path class="wa-wire sh-draw dl-660" d="M220 90 C208 90 208 132 195 132" pathLength="1"/><g class="sh-reveal dl-460"><rect class="wa-port" x="220" y="72" width="94" height="36" rx="10"/><circle class="wa-pin" cx="220" cy="90" r="4"/><text class="wa-port-name" x="267" y="95">Network</text></g><path class="wa-wire sh-draw dl-720" d="M106 150 C118 150 118 150 131 150" pathLength="1"/><g class="sh-reveal dl-520"><rect class="wa-port" x="12" y="132" width="94" height="36" rx="10"/><circle class="wa-pin" cx="106" cy="150" r="4"/><text class="wa-port-name" x="59" y="155">Transfers</text></g><path class="wa-wire sh-draw dl-780" d="M220 150 C208 150 208 150 195 150" pathLength="1"/><g class="sh-reveal dl-580"><rect class="wa-port" x="220" y="132" width="94" height="36" rx="10"/><circle class="wa-pin" cx="220" cy="150" r="4"/><text class="wa-port-name" x="267" y="155">Secrets</text></g><path class="wa-wire sh-draw dl-840" d="M106 210 C118 210 118 168 131 168" pathLength="1"/><g class="sh-reveal dl-640"><rect class="wa-port" x="12" y="192" width="94" height="36" rx="10"/><circle class="wa-pin" cx="106" cy="210" r="4"/><text class="wa-port-name" x="59" y="215">Venue data</text></g><path class="wa-wire sh-draw dl-900" d="M220 210 C208 210 208 168 195 168" pathLength="1"/><g class="sh-reveal dl-700"><rect class="wa-port" x="220" y="192" width="94" height="36" rx="10"/><circle class="wa-pin" cx="220" cy="210" r="4"/><text class="wa-port-name" x="267" y="215">AI models</text></g><g transform="translate(163.0 150)"><g class="sh-seal-in dl-300"><path class="wa-agent" d="M0.0 -36.8 L31.9 -18.4 L31.9 18.4 L0.0 36.8 L-31.9 18.4 L-31.9 -18.4 Z"/><path class="wa-agent-core" d="M0.0 -24.0 L20.8 -12.0 L20.8 12.0 L0.0 24.0 L-20.8 12.0 L-20.8 -12.0 Z"/><text class="wa-agent-ext" y="3">.wasm</text></g></g><text class="dg-strong" x="163" y="268">Your agent</text><text class="dg-hash" x="163" y="286">decides; never holds a key</text></svg>
+      </figure>
+      <div class="wasm__text">
+        <p class="sh-label">For Authors · WebAssembly</p>
+        <h3 class="wasm__title" id="wasm-title">Write the strategy. The machine brings the rest.</h3>
+        <p class="reading-s">An agent is a small WebAssembly component, written in Rust against a fixed interface. The attested machine it runs on hands it everything it needs to trade, so the code you write is the decision itself: no keys, no servers, no chain plumbing.</p>
+        <a class="more" href="{{docs}}/writing/services/">What the machine gives an agent{{i:arrow:18}}</a>
+      </div>
+      <ul class="wasm__points">
+        <li><h4>Services out of the box</h4><p>Orders the machine signs, transfers between the vault and its stations, shared venue prices, sealed secrets, AI models and, if it declares it, the network.</p></li>
+        <li><h4>Sandboxed</h4><p>No filesystem, no environment and no sockets of its own. It reaches only what the machine hands it.</p></li>
+        <li><h4>Held to what it declares</h4><p>Its allowances cap the computing, memory and traffic it may use, and that is the most its tank can be charged.</p></li>
+        <li><h4>Tested before it's published</h4><p>Start from the template, a working agent, and test its decisions with plain <span class="sh-mono">cargo test</span> on your own machine.</p></li>
+      </ul>
+    </article>
+
     <div class="sh-card chains sh-reveal" data-play data-loop>
       <div class="chains__text">
         <h3 class="chains__title">One vault, many chains</h3>
@@ -124,7 +143,7 @@
       </div>
       <div class="chains__map">
         <div class="chains__vault">
-          <span class="tile tile--brand" aria-hidden="true">S</span>
+          <span class="tile tile--brand tile--chain" aria-hidden="true"><img src="{{asset:chain-solana}}" alt="" width="30" height="26"></span>
           <span class="chains__name">Your vault</span>
           <span class="chains__where">on Solana</span>
         </div>
@@ -145,8 +164,8 @@
           <g transform="translate(204 55)"><circle class="wire-node" r="13"/><g class="wire-icon" transform="translate(-8 -8) scale(0.67)">{{i:bridge:24:2.2}}</g></g>
         </svg>
         <ul class="chains__stations">
-          <li><span class="tile" aria-hidden="true">H</span><span><span class="chains__name">Station on Hyperliquid</span><span class="chains__where">Trades perpetuals</span></span></li>
-          <li><span class="tile" aria-hidden="true">R</span><span><span class="chains__name">Station on Robinhood Chain</span><span class="chains__where">Trades stock tokens</span></span></li>
+          <li><span class="tile tile--chain" aria-hidden="true"><img src="{{asset:chain-hyperliquid}}" alt="" width="24" height="18"></span><span><span class="chains__name">Station on Hyperliquid</span><span class="chains__where">Trades perpetuals</span></span></li>
+          <li><span class="tile tile--chain" aria-hidden="true"><img src="{{asset:chain-robinhood-chain}}" alt="" width="17" height="22"></span><span><span class="chains__name">Station on Robinhood Chain</span><span class="chains__where">Trades stock tokens</span></span></li>
         </ul>
       </div>
     </div>

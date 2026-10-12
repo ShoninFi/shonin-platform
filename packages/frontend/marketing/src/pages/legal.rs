@@ -28,7 +28,7 @@ pub fn privacy() -> Page<'static> {
     Page {
         path: "/privacy",
         title: "Privacy Policy · Shonin",
-        description: "No accounts, no analytics, no cookies. Your wallet address and your transactions are public on-chain.",
+        description: "No accounts and no cookies. Cookieless, aggregate analytics from Cloudflare. Your wallet address and your transactions are public on-chain.",
         current: Current::Other,
         class: "page-legal",
         main: PRIVACY,

@@ -1,0 +1,20 @@
+/* Hash chip: 0x + 4 … 4, mono, a copy button with a 44px hit area. The full
+   value is in title and aria-label. height 28 · padding 0 4 0 10 · radius 6. */
+.sh-hash {
+  position: relative; display: inline-flex; align-items: center; gap: 6px; flex: none;
+  height: 28px; padding: 0 4px 0 10px; border-radius: var(--radius-s);
+  background: var(--paper-sunk); color: var(--ink);
+}
+.sh-hash--plain { padding-right: 10px; }
+.sh-hash__label { font: 450 12px/16px var(--font-sans); color: var(--ink-muted); }
+.sh-hash__value { font: var(--type-mono-s); }
+.sh-hash__copy {
+  position: relative; display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 24px; padding: 0; border: 0; border-radius: 4px;
+  background: transparent; color: var(--ink-muted); cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+}
+.sh-hash__copy::before { content: ""; position: absolute; inset: -10px; }
+@media (hover: hover) { .sh-hash__copy:hover { background: var(--line); color: var(--ink); } }
+.sh-hash__copy[data-copied] { color: var(--gain); }
+.sh-hash .sh-tip { left: 50%; bottom: 36px; transform: translateX(-50%); }

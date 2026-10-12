@@ -15,16 +15,20 @@ name = "app"
 name = "app"
 path = "src/main.rs"
 
-# Build-time SEO: per-route HTML, sitemap.xml, robots.txt (native).
+# Build-time pre-render: per-route HTML, sitemap.xml, robots.txt and the
+# Content-Security-Policy in _headers (native).
 [[bin]]
 name = "seo"
 path = "src/bin/seo.rs"
 
+[features]
+# Dev-only pages (/_atoms). Only `task frontend:app:dev` turns it on; release
+# builds never include them.
+dev = []
+
 [dependencies]
 shared.workspace = true
-chain.workspace = true
-alloy-primitives.workspace = true
-alloy-sol-types.workspace = true
+ui.workspace = true
 dominator.workspace = true
 futures-signals.workspace = true
 wasm-bindgen.workspace = true
@@ -40,29 +44,38 @@ web-sys = { workspace = true, features = [
     "Window",
     "Document",
     "DomRect",
+    "DomRectList",
     "DomTokenList",
     "Element",
     "EventTarget",
+    "History",
     "HtmlElement",
     "HtmlInputElement",
-    "HtmlSelectElement",
-    "HtmlTextAreaElement",
-    "FileList",
-    "File",
-    "DragEvent",
-    "DataTransfer",
     "Navigator",
     "Clipboard",
     "KeyboardEvent",
     "MouseEvent",
+    "PointerEvent",
+    "FocusEvent",
+    "Node",
+    "NodeList",
     "Storage",
     "Url",
+    "VisibilityState",
+    "CssStyleDeclaration",
 ] }
 
-# The pre-render runs natively at build time and reads a snapshot over HTTP,
-# which the browser does through its own fetch instead.
+# The pre-render runs natively at build time: it reads a snapshot over HTTP,
+# hashes the loader it moves out of index.html and reads the chains' public
+# endpoints for the policy.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 reqwest = { workspace = true, features = ["blocking", "json"] }
+sha2.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+time = { workspace = true, features = ["macros"] }
 
 [lints]
 workspace = true

@@ -2,7 +2,7 @@
   <svg class="hexgrid" aria-hidden="true" focusable="false"><defs><pattern id="hexgrid-legal" width="56" height="97" patternUnits="userSpaceOnUse"><path d="M28 0 L56 16.2 L56 48.5 L28 64.7 L0 48.5 L0 16.2 Z M28 64.7 L28 97"/></pattern></defs><rect width="100%" height="100%" fill="url(#hexgrid-legal)"/></svg>
   <div class="wrap legal-hero__inner">
     <p class="sh-label hero__eyebrow sh-reveal">Privacy Policy</p>
-    <h1 class="legal-hero__title sh-reveal dl-120" id="legal-title">No accounts. No analytics. No cookies.</h1>
+    <h1 class="legal-hero__title sh-reveal dl-120" id="legal-title">No accounts. No cookies.</h1>
     <p class="legal-hero__lede sh-reveal dl-240">What Shonin knows about you, which is very little, and what anyone can see on-chain, which is a lot. Last updated Oct 12, 2026.</p>
   </div>
 </section>
@@ -17,6 +17,7 @@
         <li><a href="#browser">What stays in your browser</a></li>
         <li><a href="#api">What our API sees and logs</a></li>
         <li><a href="#code">Code and secrets you publish</a></li>
+        <li><a href="#analytics">Analytics</a></li>
         <li><a href="#hosts">The services we use</a></li>
         <li><a href="#changes">Changes to this policy</a></li>
       </ol>
@@ -27,7 +28,7 @@
         <h2 id="short">The short version</h2>
         <ul>
           <li>There are no accounts. We never ask for your name, your email or anything else about you. Your wallet is your identity.</li>
-          <li>There are no analytics and no tracking. We don't measure who visits.</li>
+          <li>We use Cloudflare Web Analytics, which is cookieless and collects aggregate page-view and performance data without identifying visitors.</li>
           <li>There are no cookies, on shonin.fi or on the app.</li>
           <li>Your wallet address and your transactions are public on-chain, for anyone to see, for good.</li>
         </ul>
@@ -54,6 +55,12 @@
       <section aria-labelledby="code">
         <h2 id="code">Code and secrets you publish</h2>
         <p>When you publish an agent, its code is stored with the wallet that uploaded it, and its review is public. Public source can be read by anyone. Sealed source is read only by attested machines and the Reviewer's model. Secrets you seal into an agent are encrypted in your browser before they leave it, and only the attested machine can read them.</p>
+      </section>
+
+      <section aria-labelledby="analytics">
+        <h2 id="analytics">Analytics</h2>
+        <p>We use Cloudflare Web Analytics on our sites. Cloudflare adds a small script to each page that reports, in aggregate, which pages are viewed and how quickly they load. It is cookieless: it stores nothing in your browser, and it doesn't identify visitors.</p>
+        <p>We see only the totals. Cloudflare handles that data under <a href="https://www.cloudflare.com/privacypolicy/">its own privacy policy</a>.</p>
       </section>
 
       <section aria-labelledby="hosts">
