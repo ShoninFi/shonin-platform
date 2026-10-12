@@ -9,13 +9,16 @@
 //! Here: a node refusing a log request spanning more than 10,000 blocks,
 //! the platform deployed 20,000 blocks ago, one vault.
 
+mod stand_in;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
 use axum::routing::post;
-use chain::{ChainConfig, ChainKey, Client, Deployments, Served, Signing};
+use chain::{ChainConfig, ChainKey, Deployments, Served};
 use indexer::Indexer;
 use serde_json::{Value, json};
 
@@ -31,63 +34,79 @@ fn block_of(tag: &Value, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-async fn a_node() -> SocketAddr {
+async fn a_node(refusals: Arc<AtomicU64>) -> SocketAddr {
     let app = Router::new().route(
         "/",
-        post(move |axum::Json(request): axum::Json<Value>| async move {
-            let id = request["id"].clone();
-            let method = request["method"].as_str().unwrap_or_default().to_string();
-            let answer = |result: Value| json!({"jsonrpc": "2.0", "id": id, "result": result});
-            let reply = match method.as_str() {
-                "eth_chainId" => answer(json!("0x7a69")),
-                "eth_blockNumber" => answer(json!(format!("{HEAD:#x}"))),
-                "eth_getBlockByNumber" => {
-                    let mut block =
-                        alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
-                    block.header.inner.number = HEAD;
-                    block.header.inner.timestamp = 1_700_000_000;
-                    answer(serde_json::to_value(block).unwrap())
+        post(move |axum::Json(request): axum::Json<Value>| {
+            let refusals = refusals.clone();
+            async move {
+                let id = request["id"].clone();
+                if let Some(result) = stand_in::ancestry_answer(&request, |_| 1_700_000_000) {
+                    return axum::Json(json!({"jsonrpc":"2.0","id":id,"result":result}));
                 }
-                "eth_getLogs" => {
-                    let filter = &request["params"][0];
-                    let from = block_of(&filter["fromBlock"], 0);
-                    let to = block_of(&filter["toBlock"], HEAD);
-                    if to.saturating_sub(from) > RANGE_CAP {
-                        json!({"jsonrpc": "2.0", "id": id, "error": {
-                            "code": -32005,
-                            "message": "query exceeds max block range 10000"
-                        }})
-                    } else {
-                        answer(json!([]))
+                let request = stand_in::numbered_data_request(&request);
+                let method = request["method"].as_str().unwrap_or_default().to_string();
+                let answer = |result: Value| json!({"jsonrpc": "2.0", "id": id, "result": result});
+                let reply = match method.as_str() {
+                    "eth_chainId" => answer(json!("0x7a69")),
+                    "eth_blockNumber" => answer(json!(format!("{HEAD:#x}"))),
+                    "eth_getBlockByNumber" => {
+                        let mut block =
+                            alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
+                        let number = stand_in::requested_block(&request, HEAD);
+                        block.header.inner.number = number;
+                        block.header.inner.parent_hash = if number == 0 {
+                            alloy::primitives::B256::ZERO
+                        } else {
+                            stand_in::block_hash(number - 1)
+                        };
+                        block.header.inner.logs_bloom = alloy::primitives::Bloom::from([255; 256]);
+                        block.header.hash = stand_in::block_hash(number);
+                        block.header.inner.timestamp = 1_700_000_000;
+                        answer(serde_json::to_value(block).unwrap())
                     }
-                }
-                "eth_call" => {
-                    let data = request["params"][0]["input"]
-                        .as_str()
-                        .or_else(|| request["params"][0]["data"].as_str())
-                        .unwrap_or("0x")
-                        .to_ascii_lowercase();
-                    let vaults = format!(
+                    "eth_getLogs" => {
+                        let filter = &request["params"][0];
+                        let from = block_of(&filter["fromBlock"], 0);
+                        let to = block_of(&filter["toBlock"], HEAD);
+                        if to.saturating_sub(from).saturating_add(1) > RANGE_CAP {
+                            refusals.fetch_add(1, Ordering::SeqCst);
+                            json!({"jsonrpc": "2.0", "id": id, "error": {
+                                "code": -32005,
+                                "message": "query exceeds max block range 10000"
+                            }})
+                        } else {
+                            answer(json!([]))
+                        }
+                    }
+                    "eth_call" => {
+                        let data = request["params"][0]["input"]
+                            .as_str()
+                            .or_else(|| request["params"][0]["data"].as_str())
+                            .unwrap_or("0x")
+                            .to_ascii_lowercase();
+                        let vaults = format!(
                         "0x{}",
                         alloy::hex::encode(
                             <chain::bindings::factory::IVaultFactory::vaultsCall
                                 as alloy::sol_types::SolCall>::SELECTOR
                         )
                     );
-                    if data == vaults {
-                        answer(json!(format!(
-                            "0x{}{}{}",
-                            "0".repeat(62) + "20",
-                            "0".repeat(63) + "1",
-                            "0".repeat(24) + VAULT
-                        )))
-                    } else {
-                        answer(json!(format!("0x{}", "0".repeat(64 * 128))))
+                        if data == vaults {
+                            answer(json!(format!(
+                                "0x{}{}{}",
+                                "0".repeat(62) + "20",
+                                "0".repeat(63) + "1",
+                                "0".repeat(24) + VAULT
+                            )))
+                        } else {
+                            answer(json!(format!("0x{}", "0".repeat(64 * 128))))
+                        }
                     }
-                }
-                _ => answer(json!([])),
-            };
-            axum::Json(reply)
+                    _ => answer(json!([])),
+                };
+                axum::Json(reply)
+            }
         }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -134,7 +153,8 @@ fn deployments() -> Deployments {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_capping_log_ranges_still_has_its_chain_read() {
-    let node = format!("http://{}", a_node().await);
+    let refusals = Arc::new(AtomicU64::new(0));
+    let node = format!("http://{}", a_node(refusals.clone()).await);
     let config = ChainConfig {
         label: "stand-in".to_string(),
         rpc: node.clone(),
@@ -146,7 +166,26 @@ async fn a_node_capping_log_ranges_still_has_its_chain_read() {
         log_range: None,
         confirmations: None,
     };
-    let client = Client::connect(&config, Signing::ReadOnly).await.unwrap();
+    let client = stand_in::client_with_limits(
+        &config,
+        &[("ancestry_reads", 4096), ("ancestry_cache_headers", 65536)],
+    )
+    .await;
+    // Ordinary numbered queries still split the provider's capped range.
+    // The record additionally requires hash-connected bounded catch-up.
+    let logs = client
+        .logs(
+            &alloy::rpc::types::Filter::new()
+                .from_block(DEPLOYED)
+                .to_block(HEAD),
+        )
+        .await
+        .unwrap();
+    assert!(logs.is_empty());
+    assert!(
+        refusals.load(Ordering::SeqCst) > 0,
+        "the range cap must actually be exercised before hash-bound indexing"
+    );
     let store = std::env::temp_dir().join(format!("shonin-indexer-log-cap-{}", std::process::id()));
     let indexer = Arc::new(Indexer::new(vec![shared::Chain::Base], store, None));
     indexer
@@ -160,10 +199,22 @@ async fn a_node_capping_log_ranges_still_has_its_chain_read() {
         })
         .await;
 
-    tokio::time::timeout(Duration::from_secs(30), indexer.refresh())
-        .await
-        .expect("a refresh ends")
-        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for _ in 0..32 {
+            indexer.refresh().await.unwrap();
+            let snapshot = indexer.snapshot.read().await;
+            if snapshot
+                .chain(shared::Chain::Base)
+                .is_some_and(|info| info.block == HEAD)
+                && snapshot.strategies.len() == 1
+                && indexer.health_at("indexer", std::time::Instant::now()).0
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("bounded catch-up ends");
     let snapshot = indexer.snapshot.read().await.clone();
     let block = snapshot
         .chain(shared::Chain::Base)

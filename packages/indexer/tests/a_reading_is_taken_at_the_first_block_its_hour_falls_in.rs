@@ -9,13 +9,15 @@
 //! to the head puts the hour after block 1 near block 378, nearly four days
 //! on.
 
+mod stand_in;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::Router;
 use axum::routing::post;
-use chain::{ChainConfig, ChainKey, Client, Deployments, Served, Signing};
+use chain::{ChainConfig, ChainKey, Deployments, Served};
 use indexer::Indexer;
 use serde_json::{Value, json};
 
@@ -47,6 +49,10 @@ async fn a_node(head: Arc<AtomicU64>, samples: Arc<std::sync::Mutex<Vec<u64>>>) 
             let samples = samples.clone();
             async move {
                 let id = request["id"].clone();
+                if let Some(result) = stand_in::ancestry_answer(&request, time_of) {
+                    return axum::Json(json!({"jsonrpc":"2.0","id":id,"result":result}));
+                }
+                let request = stand_in::numbered_data_request(&request);
                 let method = request["method"].as_str().unwrap_or_default().to_string();
                 let now = head.load(Ordering::SeqCst);
                 let result = match method.as_str() {
@@ -61,6 +67,13 @@ async fn a_node(head: Arc<AtomicU64>, samples: Arc<std::sync::Mutex<Vec<u64>>>) 
                         let mut block =
                             alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
                         block.header.inner.number = number;
+                        block.header.inner.parent_hash = if number == 0 {
+                            alloy::primitives::B256::ZERO
+                        } else {
+                            stand_in::block_hash(number - 1)
+                        };
+                        block.header.inner.logs_bloom = alloy::primitives::Bloom::from([255; 256]);
+                        block.header.hash = stand_in::block_hash(number);
                         block.header.inner.timestamp = time_of(number);
                         serde_json::to_value(block).unwrap()
                     }
@@ -75,6 +88,7 @@ async fn a_node(head: Arc<AtomicU64>, samples: Arc<std::sync::Mutex<Vec<u64>>>) 
                             .unwrap_or("0x")
                             .to_ascii_lowercase();
                         if let Some(at) = at
+                            && at < now
                             && data.starts_with(&selector::<
                                 chain::bindings::vault::IVault::sharePriceCall,
                             >())
@@ -157,7 +171,11 @@ async fn each_reading_is_the_first_block_its_hour_falls_in() {
         log_range: None,
         confirmations: None,
     };
-    let client = Client::connect(&config, Signing::ReadOnly).await.unwrap();
+    let client = stand_in::client_with_limits(
+        &config,
+        &[("ancestry_reads", 4096), ("ancestry_cache_headers", 65536)],
+    )
+    .await;
     let store = std::env::temp_dir().join(format!(
         "shonin-indexer-first-block-of-the-hour-{}",
         std::process::id()
@@ -173,20 +191,27 @@ async fn each_reading_is_the_first_block_its_hour_falls_in() {
             public_rpc: String::new(),
         })
         .await;
-    for _ in 0..3 {
+    // Hash-connected history catches up in bounded passes before the
+    // sampler can establish the vault's creation and historical readings.
+    for _ in 0..64 {
         indexer.refresh().await.unwrap();
+        if samples.lock().unwrap().len() >= 2 {
+            break;
+        }
     }
     let mut blocks = samples.lock().unwrap().clone();
     blocks.dedup();
     assert!(blocks.len() >= 2, "readings at {blocks:?}");
+    assert_eq!(blocks[0], DEPLOYED, "the record starts at vault creation");
     for pair in blocks.windows(2) {
-        let gap = time_of(pair[1]) - time_of(pair[0]);
+        let due = time_of(pair[0]) + 3_600;
+        assert!(pair[1] > pair[0], "samples must advance: {blocks:?}");
         assert!(
-            gap <= 3_600 + QUIET_GAP,
-            "readings at blocks {} and {} are {:.1} days apart; an hourly record has a reading in every hour's first block",
-            pair[0],
+            time_of(pair[1] - 1) < due && due <= time_of(pair[1]),
+            "block {} must be the first at or after due time {due}; predecessor time {}, selected time {}",
             pair[1],
-            gap as f64 / 86_400.0
+            time_of(pair[1] - 1),
+            time_of(pair[1]),
         );
     }
 }

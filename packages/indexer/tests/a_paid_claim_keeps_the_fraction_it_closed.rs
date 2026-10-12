@@ -50,7 +50,7 @@ fn the_payment() -> Value {
             address: vault,
             data: event.encode_log_data(),
         },
-        block_hash: Some(B256::repeat_byte(PAID_IN as u8)),
+        block_hash: Some(stand_in::block_hash(PAID_IN)),
         block_number: Some(PAID_IN),
         block_timestamp: Some(1_790_000_000),
         transaction_hash: Some(B256::repeat_byte(2)),
@@ -72,6 +72,10 @@ async fn a_node(paid: Arc<AtomicBool>, logged: bool) -> SocketAddr {
             let paid = paid.load(Ordering::SeqCst);
             async move {
                 let id = request["id"].clone();
+                if let Some(result) = stand_in::ancestry_answer(&request, |_| 1_790_000_000) {
+                    return axum::Json(json!({"jsonrpc":"2.0","id":id,"result":result}));
+                }
+                let request = stand_in::numbered_data_request(&request);
                 let method = request["method"].as_str().unwrap_or_default().to_string();
                 let answer = |result: Value| json!({"jsonrpc": "2.0", "id": id, "result": result});
                 let reply = match method.as_str() {
@@ -91,7 +95,13 @@ async fn a_node(paid: Arc<AtomicBool>, logged: bool) -> SocketAddr {
                         let number =
                             stand_in::requested_block(&request, if logged { 0x10 } else { 1 });
                         block.header.inner.number = number;
-                        block.header.hash = B256::repeat_byte(number as u8);
+                        block.header.inner.parent_hash = if number == 0 {
+                            alloy::primitives::B256::ZERO
+                        } else {
+                            stand_in::block_hash(number - 1)
+                        };
+                        block.header.inner.logs_bloom = alloy::primitives::Bloom::from([255; 256]);
+                        block.header.hash = stand_in::block_hash(number);
                         block.header.inner.timestamp = 1_790_000_000;
                         answer(serde_json::to_value(block).unwrap())
                     }

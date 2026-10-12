@@ -12,6 +12,8 @@
 //! chain, and the one vault was created there; the node answers no logs. A
 //! refresh is given 20 s.
 
+mod stand_in;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,7 +21,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::routing::post;
-use chain::{ChainConfig, ChainKey, Client, Deployments, Served, Signing};
+use chain::{ChainConfig, ChainKey, Deployments, Served};
 use indexer::Indexer;
 use serde_json::{Value, json};
 
@@ -37,6 +39,10 @@ async fn a_node(before_deployment: Arc<AtomicU64>) -> SocketAddr {
             let before_deployment = before_deployment.clone();
             async move {
                 let id = request["id"].clone();
+                if let Some(result) = stand_in::ancestry_answer(&request, |_| 1_700_000_000) {
+                    return axum::Json(json!({"jsonrpc":"2.0","id":id,"result":result}));
+                }
+                let request = stand_in::numbered_data_request(&request);
                 let method = request["method"].as_str().unwrap_or_default().to_string();
                 let result = match method.as_str() {
                     "eth_chainId" => json!("0x7a69"),
@@ -44,7 +50,15 @@ async fn a_node(before_deployment: Arc<AtomicU64>) -> SocketAddr {
                     "eth_getBlockByNumber" => {
                         let mut block =
                             alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
-                        block.header.inner.number = HEAD;
+                        let number = stand_in::requested_block(&request, HEAD);
+                        block.header.inner.number = number;
+                        block.header.inner.parent_hash = if number == 0 {
+                            alloy::primitives::B256::ZERO
+                        } else {
+                            stand_in::block_hash(number - 1)
+                        };
+                        block.header.inner.logs_bloom = alloy::primitives::Bloom::from([255; 256]);
+                        block.header.hash = stand_in::block_hash(number);
                         block.header.inner.timestamp = 1_700_000_000;
                         serde_json::to_value(block).unwrap()
                     }
@@ -142,7 +156,11 @@ async fn a_vault_s_record_is_read_from_the_deployment_not_from_block_one() {
         log_range: None,
         confirmations: None,
     };
-    let client = Client::connect(&config, Signing::ReadOnly).await.unwrap();
+    let client = stand_in::client_with_limits(
+        &config,
+        &[("ancestry_reads", 4096), ("ancestry_cache_headers", 65536)],
+    )
+    .await;
     let store = std::env::temp_dir().join(format!(
         "shonin-sample-from-deployment-{}",
         std::process::id()

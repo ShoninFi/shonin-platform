@@ -6,13 +6,15 @@
 //! of chain time; the node fails the first two value reads asked of a past
 //! block.
 
+mod stand_in;
+
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::routing::post;
-use chain::{ChainConfig, ChainKey, Client, Deployments, Served, Signing};
+use chain::{ChainConfig, ChainKey, Deployments, Served};
 use indexer::Indexer;
 use serde_json::{Value, json};
 
@@ -40,6 +42,11 @@ async fn a_node(reads: Arc<Mutex<Reads>>) -> SocketAddr {
             let reads = reads.clone();
             async move {
                 let id = request["id"].clone();
+                if let Some(result) = stand_in::ancestry_answer(&request, |n| GENESIS_TIME + 2 * n)
+                {
+                    return axum::Json(json!({"jsonrpc":"2.0","id":id,"result":result}));
+                }
+                let request = stand_in::numbered_data_request(&request);
                 let method = request["method"].as_str().unwrap_or_default().to_string();
                 let answer = |result: Value| json!({"jsonrpc": "2.0", "id": id, "result": result});
                 let reply = match method.as_str() {
@@ -54,6 +61,13 @@ async fn a_node(reads: Arc<Mutex<Reads>>) -> SocketAddr {
                         let mut block =
                             alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
                         block.header.inner.number = number;
+                        block.header.inner.parent_hash = if number == 0 {
+                            alloy::primitives::B256::ZERO
+                        } else {
+                            stand_in::block_hash(number - 1)
+                        };
+                        block.header.inner.logs_bloom = alloy::primitives::Bloom::from([255; 256]);
+                        block.header.hash = stand_in::block_hash(number);
                         block.header.inner.timestamp = GENESIS_TIME + 2 * number;
                         answer(serde_json::to_value(block).unwrap())
                     }
@@ -157,7 +171,11 @@ async fn a_reading_the_vault_does_not_answer_is_asked_again() {
         log_range: None,
         confirmations: None,
     };
-    let client = Client::connect(&config, Signing::ReadOnly).await.unwrap();
+    let client = stand_in::client_with_limits(
+        &config,
+        &[("ancestry_reads", 4096), ("ancestry_cache_headers", 65536)],
+    )
+    .await;
     let store = std::env::temp_dir().join(format!(
         "shonin-indexer-unanswered-reading-{}",
         std::process::id()

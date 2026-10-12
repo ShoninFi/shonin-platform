@@ -2681,7 +2681,10 @@ impl Client {
             && addresses
                 .iter()
                 .all(|address| scope.watched.contains(address));
-        let watched = if covered { &scope.watched } else { &addresses };
+        // Only an explicit shared capture may enlarge a query's coverage.
+        // Historical streams retain their own addresses/topics and birth bounds.
+        let shared = covered && addresses.len() == scope.watched.len() && !filter.has_topics();
+        let watched = if shared { &scope.watched } else { &addresses };
         let mut out = Vec::new();
         for number in from..=to {
             let header = self.branch_header(number).await?;
@@ -2696,7 +2699,7 @@ impl Client {
             let logs = match kept {
                 Some(logs) => logs,
                 None => {
-                    let query = if covered {
+                    let query = if shared {
                         Filter::new()
                             .address(scope.watched.clone())
                             .at_block_hash(header.hash)
@@ -2734,7 +2737,7 @@ impl Client {
                             bail!("a log does not match its exact selected block");
                         }
                     }
-                    if covered {
+                    if shared {
                         let mut blocks = scope.block_logs.lock().await;
                         let count = scope.cached_logs.load(std::sync::atomic::Ordering::Relaxed);
                         if blocks.len() < self.policy.log_batch_blocks as usize

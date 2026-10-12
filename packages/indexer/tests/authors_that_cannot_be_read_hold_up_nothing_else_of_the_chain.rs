@@ -27,7 +27,7 @@ async fn authors_that_cannot_be_read_hold_up_nothing_else_of_the_chain() {
                     let number = requested_block(request, head);
                     block.header.inner.number = number;
                     block.header.hash = alloy::primitives::B256::repeat_byte(number as u8);
-                    block.header.inner.timestamp = 1_790_000_000 + head;
+                    block.header.inner.timestamp = 1_790_000_000 + number;
                     Some(Ok(serde_json::to_value(block).unwrap()))
                 }
                 "eth_call"

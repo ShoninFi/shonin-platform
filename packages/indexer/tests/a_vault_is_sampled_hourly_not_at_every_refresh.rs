@@ -8,13 +8,15 @@
 //! one block further each time (four minutes of chain time). Hourly sampling
 //! takes one or two readings.
 
+mod stand_in;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::Router;
 use axum::routing::post;
-use chain::{ChainConfig, ChainKey, Client, Deployments, Served, Signing};
+use chain::{ChainConfig, ChainKey, Deployments, Served};
 use indexer::Indexer;
 use serde_json::{Value, json};
 
@@ -26,8 +28,8 @@ fn selector<C: alloy::sol_types::SolCall>() -> String {
     format!("0x{}", alloy::hex::encode(C::SELECTOR))
 }
 
-/// A node whose head is `head`, with 2 s blocks. Counts `sharePrice` reads
-/// asked of a past block: one per sample.
+/// A node whose head is `head`, with 2 s blocks. Counts all hash-bound
+/// `sharePrice` reads, including the one ordinary snapshot read per refresh.
 async fn a_node(head: Arc<AtomicU64>, samples: Arc<AtomicU64>) -> SocketAddr {
     let app = Router::new().route(
         "/",
@@ -36,6 +38,11 @@ async fn a_node(head: Arc<AtomicU64>, samples: Arc<AtomicU64>) -> SocketAddr {
             let samples = samples.clone();
             async move {
                 let id = request["id"].clone();
+                if let Some(result) = stand_in::ancestry_answer(&request, |n| GENESIS_TIME + 2 * n)
+                {
+                    return axum::Json(json!({"jsonrpc":"2.0","id":id,"result":result}));
+                }
+                let request = stand_in::numbered_data_request(&request);
                 let method = request["method"].as_str().unwrap_or_default().to_string();
                 let now = head.load(Ordering::SeqCst);
                 let result = match method.as_str() {
@@ -50,6 +57,13 @@ async fn a_node(head: Arc<AtomicU64>, samples: Arc<AtomicU64>) -> SocketAddr {
                         let mut block =
                             alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
                         block.header.inner.number = number;
+                        block.header.inner.parent_hash = if number == 0 {
+                            alloy::primitives::B256::ZERO
+                        } else {
+                            stand_in::block_hash(number - 1)
+                        };
+                        block.header.inner.logs_bloom = alloy::primitives::Bloom::from([255; 256]);
+                        block.header.hash = stand_in::block_hash(number);
                         block.header.inner.timestamp = GENESIS_TIME + 2 * number;
                         serde_json::to_value(block).unwrap()
                     }
@@ -145,7 +159,11 @@ async fn a_vault_is_sampled_hourly_not_at_every_refresh() {
         log_range: None,
         confirmations: None,
     };
-    let client = Client::connect(&config, Signing::ReadOnly).await.unwrap();
+    let client = stand_in::client_with_limits(
+        &config,
+        &[("ancestry_reads", 4096), ("ancestry_cache_headers", 65536)],
+    )
+    .await;
     let store =
         std::env::temp_dir().join(format!("shonin-indexer-sampling-{}", std::process::id()));
     let indexer = Arc::new(Indexer::new(vec![shared::Chain::Base], store, None));
@@ -165,11 +183,17 @@ async fn a_vault_is_sampled_hourly_not_at_every_refresh() {
         indexer.refresh().await.unwrap();
         head.fetch_add(1, Ordering::SeqCst);
     }
-    let taken = samples.load(Ordering::SeqCst);
-    // Four minutes of chain time: hourly sampling takes the first reading
-    // and perhaps one more.
+    let reads = samples.load(Ordering::SeqCst);
+    // Current snapshot reads are now hash-bound too. Each refresh reads its
+    // share price once; additional reads are historical samples. Counting
+    // every hash-bound read as a sample would mistake live views for history.
     assert!(
-        taken <= 2,
+        reads >= REFRESHES,
+        "every refresh must read its current price"
+    );
+    let taken = reads - REFRESHES;
+    assert!(
+        (1..=2).contains(&taken),
         "{taken} samples taken (and kept) over {REFRESHES} refreshes spanning {} s of chain time",
         2 * REFRESHES
     );

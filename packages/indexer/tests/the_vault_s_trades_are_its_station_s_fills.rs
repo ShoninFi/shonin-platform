@@ -47,7 +47,7 @@ fn the_fill() -> Value {
             address: VENUE,
             data: event.encode_log_data(),
         },
-        block_hash: Some(B256::repeat_byte(1)),
+        block_hash: Some(stand_in::block_hash(1)),
         block_number: Some(1),
         block_timestamp: Some(1_790_000_000),
         transaction_hash: Some(B256::repeat_byte(2)),
@@ -87,6 +87,7 @@ async fn a_node() -> SocketAddr {
         "/",
         post(move |axum::Json(request): axum::Json<Value>| async move {
             let id = request["id"].clone();
+            let request = stand_in::numbered_data_request(&request);
             let method = request["method"].as_str().unwrap_or_default().to_string();
             let answer = |result: Value| json!({"jsonrpc": "2.0", "id": id, "result": result});
             let reply = match method.as_str() {
@@ -97,7 +98,13 @@ async fn a_node() -> SocketAddr {
                         alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
                     let number = stand_in::requested_block(&request, 1);
                     block.header.inner.number = number;
-                    block.header.hash = B256::repeat_byte(number as u8);
+                    block.header.hash = stand_in::block_hash(number);
+                    block.header.inner.parent_hash = if number == 0 {
+                        B256::ZERO
+                    } else {
+                        stand_in::block_hash(number - 1)
+                    };
+                    block.header.inner.logs_bloom = alloy::primitives::Bloom::from([255; 256]);
                     block.header.inner.timestamp = 1_790_000_000;
                     answer(serde_json::to_value(block).unwrap())
                 }

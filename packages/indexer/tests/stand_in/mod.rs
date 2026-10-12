@@ -24,6 +24,103 @@ pub fn selector<C: SolCall>() -> String {
     format!("0x{}", alloy::hex::encode(C::SELECTOR))
 }
 
+/// Stable fixture identities include the complete height without byte wrapping.
+pub fn block_hash(number: u64) -> B256 {
+    branch_hash(number, 0)
+}
+fn branch_hash(number: u64, marker: u8) -> B256 {
+    let mut bytes = [0; 32];
+    bytes[0] = marker;
+    bytes[24..].copy_from_slice(&number.checked_add(1).unwrap().to_be_bytes());
+    B256::from(bytes)
+}
+pub fn hash_number(hash: B256) -> u64 {
+    u64::from_be_bytes(hash.as_slice()[24..].try_into().unwrap())
+        .checked_sub(1)
+        .unwrap()
+}
+/// Hash-bound reads reach the same numbered fixture oracle, including empty logs.
+pub fn numbered_data_request(request: &Value) -> Value {
+    let mut request = request.clone();
+    let method = request["method"].as_str().unwrap_or_default().to_string();
+    let hash = match method.as_str() {
+        "eth_getBlockByHash" => request["params"][0].as_str(),
+        "eth_call" => request["params"][1]["blockHash"].as_str(),
+        "eth_getLogs" => request["params"][0]["blockHash"].as_str(),
+        _ => None,
+    };
+    if let Some(hash) = hash {
+        let number = hash_number(hash.parse().unwrap());
+        let tag = json!(format!("0x{number:x}"));
+        match method.as_str() {
+            "eth_getBlockByHash" => {
+                request["method"] = json!("eth_getBlockByNumber");
+                request["params"][0] = tag;
+            }
+            "eth_call" => request["params"][1] = tag,
+            "eth_getLogs" => {
+                let f = request["params"][0].as_object_mut().unwrap();
+                f.remove("blockHash");
+                f.insert("fromBlock".into(), tag.clone());
+                f.insert("toBlock".into(), tag);
+            }
+            _ => unreachable!(),
+        }
+    }
+    request
+}
+/// A reference EVM BLOCKHASH answer for the fixture's honest linear headers.
+pub fn ancestry_answer(request: &Value, time: impl Fn(u64) -> u64) -> Option<Value> {
+    use alloy::primitives::U256;
+    use chain::header_read::HeaderRead;
+    if request["method"] != "eth_call"
+        || !input(request).starts_with(&selector::<HeaderRead::readCall>())
+        || request["params"].as_array()?.len() != 3
+    {
+        return None;
+    }
+    let hash: B256 = request["params"][1]["blockHash"].as_str()?.parse().ok()?;
+    let number = hash_number(hash);
+    let call = HeaderRead::readCall::abi_decode(
+        &alloy::hex::decode(input(request).strip_prefix("0x")?).ok()?,
+    )
+    .ok()?;
+    let ancestor: u64 = call.ancestorNumber.try_into().ok()?;
+    if ancestor >= number || number - ancestor > 256 {
+        return None;
+    }
+    let answer = HeaderRead::readReturn {
+        number: U256::from(number),
+        timestamp: U256::from(time(number)),
+        parentHash: branch_hash(number - 1, hash[0]),
+        ancestorHash: branch_hash(ancestor, hash[0]),
+    };
+    Some(json!(format!(
+        "0x{}",
+        alloy::hex::encode(HeaderRead::readCall::abi_encode_returns(&answer))
+    )))
+}
+/// A read-only client with explicit fixture catch-up limits via normal config.
+pub async fn client_with_limits(config: &ChainConfig, limits: &[(&str, u64)]) -> Client {
+    let mut text = include_str!("../../../../config/chains.toml").to_string();
+    text.push_str("\n[rpc.chains.\"evm:31337\"]\n");
+    for (field, value) in limits {
+        text.push_str(&format!("{field} = {value}\n"));
+    }
+    let configs = chain::ChainConfigs::from_toml(&text, |_| None).unwrap();
+    chain::Target {
+        network: chain::NetworkName::Mainnet,
+        vault_chain: shared::Chain::Base,
+        key: "evm:31337".parse().unwrap(),
+        config: config.clone(),
+        configs,
+        deployments_dir: std::path::PathBuf::new(),
+    }
+    .connect()
+    .await
+    .unwrap()
+}
+
 /// The requested numbered header, or the current head for a dynamic tag.
 pub fn requested_block(request: &Value, head: u64) -> u64 {
     request["params"][0]
@@ -64,7 +161,7 @@ pub fn logged<E: SolEvent>(event: E, block: u64, index: u64) -> Value {
             address: vault(),
             data: event.encode_log_data(),
         },
-        block_hash: Some(B256::repeat_byte(block as u8)),
+        block_hash: Some(block_hash(block)),
         block_number: Some(block),
         block_timestamp: Some(1_790_000_000 + block),
         transaction_hash: Some(B256::repeat_byte(0x40 + index as u8)),
@@ -79,6 +176,60 @@ pub fn logged<E: SolEvent>(event: E, block: u64, index: u64) -> Value {
 /// for a JSON-RPC error, or `None` for the default.
 pub type Answer = Arc<dyn Fn(&Value) -> Option<Result<Value, String>> + Send + Sync>;
 
+/// Translate hash-bound requests to the fixture's numbered state oracle.
+/// The fixture has short branches with repeated-byte identities; a backend
+/// refuses hashes outside its current branch rather than answering at latest.
+fn numbered_request(request: &Value, answer: &Answer) -> Result<Value, String> {
+    let mut numbered = request.clone();
+    let method = request["method"].as_str().unwrap_or_default();
+    let hash = match method {
+        "eth_getBlockByHash" => request["params"][0].as_str(),
+        "eth_call" => request["params"][1]["blockHash"].as_str(),
+        "eth_getLogs" => request["params"][0]["blockHash"].as_str(),
+        _ => None,
+    };
+    if let Some(hash) = hash {
+        let hash: B256 = hash.parse().map_err(|_| "unknown block hash")?;
+        let latest = json!({"method":"eth_getBlockByNumber","params":["latest",false]});
+        let head = match answer(&latest) {
+            Some(result) => result?,
+            None => {
+                let mut block =
+                    alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
+                block.header.inner.number = 16;
+                serde_json::to_value(block).unwrap()
+            }
+        };
+        let head: alloy::rpc::types::Block<alloy::rpc::types::Transaction> =
+            serde_json::from_value(head).map_err(|_| "unavailable latest header")?;
+        let marker = if head.header.hash == B256::ZERO {
+            0
+        } else {
+            head.header.hash[0] ^ head.header.inner.number as u8
+        };
+        let number = hash_number(hash);
+        if hash != branch_hash(number, marker) || number > head.header.inner.number {
+            return Err("unknown block hash".into());
+        }
+        let tag = json!(format!("0x{number:x}"));
+        match method {
+            "eth_getBlockByHash" => {
+                numbered["method"] = json!("eth_getBlockByNumber");
+                numbered["params"][0] = tag;
+            }
+            "eth_call" => numbered["params"][1] = tag,
+            "eth_getLogs" => {
+                let filter = numbered["params"][0].as_object_mut().unwrap();
+                filter.remove("blockHash");
+                filter.insert("fromBlock".into(), tag.clone());
+                filter.insert("toBlock".into(), tag);
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(numbered)
+}
+
 pub async fn a_node(answer: Answer) -> String {
     let app =
         Router::new().route(
@@ -87,6 +238,10 @@ pub async fn a_node(answer: Answer) -> String {
                 let answer = answer.clone();
                 async move {
                     let id = request["id"].clone();
+                    let request = match numbered_request(&request, &answer) {
+                        Ok(request) => request,
+                        Err(message) => return axum::Json(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":message}})),
+                    };
                     let ok = |result: Value| json!({"jsonrpc": "2.0", "id": id, "result": result});
                     let reply = match answer(&request) {
                         Some(Ok(result)) => ok(result),
@@ -133,6 +288,17 @@ pub async fn a_node(answer: Answer) -> String {
                         }
                     };
                     let mut reply = reply;
+                    if request["method"] == "eth_getBlockByNumber"
+                        && let Ok(mut block) = serde_json::from_value::<alloy::rpc::types::Block<alloy::rpc::types::Transaction>>(reply["result"].clone())
+                    {
+                        let number = block.header.inner.number;
+                        let marker = if block.header.hash == B256::ZERO {0} else {block.header.hash[0] ^ number as u8};
+                        block.header.hash = branch_hash(number, marker);
+                        block.header.inner.parent_hash = if number == 0 {B256::ZERO} else {branch_hash(number-1,marker)};
+                        // False positives force the event paths to run in these fixtures.
+                        block.header.inner.logs_bloom = alloy::primitives::Bloom::from([255;256]);
+                        reply["result"] = serde_json::to_value(block).unwrap();
+                    }
                     if request["method"] == "eth_getLogs"
                         && let Some(logs) = reply["result"].as_array_mut()
                     {

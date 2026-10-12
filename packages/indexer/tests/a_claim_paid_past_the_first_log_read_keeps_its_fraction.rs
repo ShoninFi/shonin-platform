@@ -1,11 +1,11 @@
 //! A claim first read paid keeps the share of the vault it closed even when
-//! its `ClaimPaid` lies past what one refresh reads of the vault's log (25
-//! pages of 2,000 blocks): until the payment is read, the claim's fraction is
+//! its `ClaimPaid` lies past what one refresh reads of the vault's log (one
+//! configured page of four blocks): until the payment is read, the claim's fraction is
 //! not kept for good, and once it is, it is measured against the supply
 //! before the payment.
 //!
 //! Here: the indexer starts with a vault whose claim (50 of 100 shares) was
-//! paid at block 60,000, and deposits since have brought the supply to 150.
+//! paid at block12, and deposits since have brought the supply to 150.
 //! Measured against today's supply with its shares put back, it would read
 //! 0.25, and if kept as that, would stay 0.25 once the log is read through.
 
@@ -20,7 +20,7 @@ use alloy::sol_types::{SolCall, SolEvent};
 use axum::Router;
 use axum::routing::post;
 use chain::bindings::vault::{Claim, ClaimState, IVault};
-use chain::{ChainConfig, ChainKey, Client, Deployments, Served, Signing};
+use chain::{ChainConfig, ChainKey, Deployments, Served};
 use indexer::Indexer;
 use serde_json::{Value, json};
 
@@ -36,7 +36,7 @@ fn shares(count: u64) -> U256 {
 }
 
 /// The block the claim was paid in, when the vault's log shows it.
-const PAID_IN: u64 = 60_000;
+const PAID_IN: u64 = 12;
 
 /// The vault's `ClaimPaid` for claim 1, in block [`PAID_IN`].
 fn the_payment() -> Value {
@@ -50,7 +50,7 @@ fn the_payment() -> Value {
             address: vault,
             data: event.encode_log_data(),
         },
-        block_hash: Some(B256::repeat_byte(PAID_IN as u8)),
+        block_hash: Some(stand_in::block_hash(PAID_IN)),
         block_number: Some(PAID_IN),
         block_timestamp: Some(1_790_000_000),
         transaction_hash: Some(B256::repeat_byte(2)),
@@ -72,6 +72,10 @@ async fn a_node(paid: Arc<AtomicBool>, logged: bool) -> SocketAddr {
             let paid = paid.load(Ordering::SeqCst);
             async move {
                 let id = request["id"].clone();
+                if let Some(result) = stand_in::ancestry_answer(&request, |_| 1_790_000_000) {
+                    return axum::Json(json!({"jsonrpc":"2.0","id":id,"result":result}));
+                }
+                let request = stand_in::numbered_data_request(&request);
                 let method = request["method"].as_str().unwrap_or_default().to_string();
                 let answer = |result: Value| json!({"jsonrpc": "2.0", "id": id, "result": result});
                 let reply = match method.as_str() {
@@ -108,7 +112,13 @@ async fn a_node(paid: Arc<AtomicBool>, logged: bool) -> SocketAddr {
                             if logged { PAID_IN + 10 } else { 1 },
                         );
                         block.header.inner.number = number;
-                        block.header.hash = B256::repeat_byte(number as u8);
+                        block.header.inner.parent_hash = if number == 0 {
+                            alloy::primitives::B256::ZERO
+                        } else {
+                            stand_in::block_hash(number - 1)
+                        };
+                        block.header.inner.logs_bloom = alloy::primitives::Bloom::from([255; 256]);
+                        block.header.hash = stand_in::block_hash(number);
                         block.header.inner.timestamp = 1_790_000_000;
                         answer(serde_json::to_value(block).unwrap())
                     }
@@ -239,7 +249,11 @@ async fn an_indexer(paid: Arc<AtomicBool>, logged: bool, name: &str) -> Arc<Inde
         log_range: None,
         confirmations: None,
     };
-    let client = Client::connect(&config, Signing::ReadOnly).await.unwrap();
+    let client = stand_in::client_with_limits(
+        &config,
+        &[("history_page_reads", 1), ("log_batch_blocks", 4)],
+    )
+    .await;
     let store = std::env::temp_dir().join(format!("shonin-indexer-{name}-{}", std::process::id()));
     let indexer = Arc::new(Indexer::new(vec![shared::Chain::Base], store, None));
     indexer
@@ -264,7 +278,14 @@ async fn a_claim_paid_past_the_first_refresh_s_log_read_keeps_the_fraction_it_cl
     let indexer = an_indexer(Arc::new(AtomicBool::new(true)), true, "paid-late").await;
     // The first refreshes read the factory's and the vault's logs only part
     // of the way; later ones read them through to the payment.
-    for _ in 0..4 {
+    for _ in 0..3 {
+        indexer.refresh().await.unwrap();
+    }
+    assert!(
+        (fraction(&indexer).await - 0.25).abs() < 1e-9,
+        "the payment must lie beyond the first partial reads"
+    );
+    for _ in 0..8 {
         indexer.refresh().await.unwrap();
     }
     let closed = fraction(&indexer).await;

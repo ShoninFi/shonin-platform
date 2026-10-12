@@ -39,10 +39,27 @@ async fn a_node(chain_id: u64, slow: Arc<std::sync::atomic::AtomicBool>) -> Sock
                 format!("\"0x{chain_id:x}\"")
             } else if body.contains("\"eth_blockNumber\"") {
                 "\"0x10\"".to_string()
-            } else if body.contains("\"eth_getBlockByNumber\"") {
+            } else if body.contains("\"eth_getBlockByNumber\"")
+                || body.contains("\"eth_getBlockByHash\"")
+            {
                 let mut block =
                     alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
-                block.header.inner.number = 16;
+                let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+                let tag = request["params"][0].as_str().unwrap();
+                let number = if request["method"] == "eth_getBlockByHash" {
+                    tag.parse::<alloy::primitives::B256>().unwrap()[0] as u64
+                } else {
+                    tag.strip_prefix("0x")
+                        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                        .unwrap_or(16)
+                };
+                block.header.inner.number = number;
+                block.header.hash = alloy::primitives::B256::repeat_byte(number as u8);
+                block.header.inner.parent_hash = if number == 0 {
+                    alloy::primitives::B256::ZERO
+                } else {
+                    alloy::primitives::B256::repeat_byte((number - 1) as u8)
+                };
                 block.header.inner.timestamp = 1_700_000_000;
                 serde_json::to_string(&block).unwrap()
             } else if body.contains("\"eth_call\"") {

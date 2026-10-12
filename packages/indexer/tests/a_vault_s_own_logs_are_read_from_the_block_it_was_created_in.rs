@@ -20,7 +20,7 @@ use axum::Router;
 use axum::routing::post;
 use chain::bindings::factory::IVaultFactory;
 use chain::bindings::vault::{Claim, ClaimState, IVault};
-use chain::{ChainConfig, ChainKey, Client, Deployments, Served, Signing};
+use chain::{ChainConfig, ChainKey, Deployments, Served};
 use indexer::Indexer;
 use serde_json::{Value, json};
 
@@ -46,7 +46,7 @@ fn shares(count: u64) -> U256 {
 fn a_log(address: Address, data: LogData, block: u64, log_index: u64) -> Value {
     let log = alloy::rpc::types::Log {
         inner: Primitive { address, data },
-        block_hash: Some(B256::repeat_byte(block as u8)),
+        block_hash: Some(stand_in::block_hash(block)),
         block_number: Some(block),
         block_timestamp: Some(1_790_000_000 + block),
         transaction_hash: Some(B256::repeat_byte(2)),
@@ -108,6 +108,11 @@ async fn a_node(asked_from: Arc<Mutex<Vec<u64>>>) -> SocketAddr {
             let asked_from = asked_from.clone();
             async move {
                 let id = request["id"].clone();
+                if let Some(result) = stand_in::ancestry_answer(&request, |_| 1_790_000_000 + HEAD)
+                {
+                    return axum::Json(json!({"jsonrpc":"2.0","id":id,"result":result}));
+                }
+                let request = stand_in::numbered_data_request(&request);
                 let method = request["method"].as_str().unwrap_or_default().to_string();
                 let answer = |result: Value| json!({"jsonrpc": "2.0", "id": id, "result": result});
                 let reply = match method.as_str() {
@@ -126,15 +131,12 @@ async fn a_node(asked_from: Arc<Mutex<Vec<u64>>>) -> SocketAddr {
                             .unwrap_or(0)
                         };
                         let (from, to) = (bound("fromBlock"), bound("toBlock"));
-                        let asks_the_vault = filter["address"]
-                            .as_str()
-                            .is_some_and(|address| address.to_lowercase().ends_with(VAULT));
-                        let asks_for_activations = filter["topics"][0].as_str()
-                            == Some(&format!("{:#x}", IVaultFactory::Activated::SIGNATURE_HASH));
-                        let logs: Vec<Value> = if asks_the_vault {
-                            asked_from.lock().unwrap().push(from);
-                            the_vault_s_logs()
-                        } else if asks_for_activations {
+                        let asks_the_vault = stand_in::asks_the_vault(&request);
+                        let asks_for_activations = filter["topics"].get(0).is_none_or(|topic| {
+                            topic.as_str()
+                                == Some(&format!("{:#x}", IVaultFactory::Activated::SIGNATURE_HASH))
+                        });
+                        let mut logs: Vec<Value> = if asks_for_activations {
                             vec![a_log(
                                 Address::with_last_byte(1),
                                 IVaultFactory::Activated {
@@ -151,6 +153,10 @@ async fn a_node(asked_from: Arc<Mutex<Vec<u64>>>) -> SocketAddr {
                         } else {
                             Vec::new()
                         };
+                        if asks_the_vault {
+                            asked_from.lock().unwrap().push(from);
+                            logs.extend(the_vault_s_logs());
+                        }
                         let logs: Vec<Value> = logs
                             .into_iter()
                             .filter(|log| {
@@ -172,7 +178,13 @@ async fn a_node(asked_from: Arc<Mutex<Vec<u64>>>) -> SocketAddr {
                             alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
                         let number = stand_in::requested_block(&request, HEAD);
                         block.header.inner.number = number;
-                        block.header.hash = B256::repeat_byte(number as u8);
+                        block.header.inner.parent_hash = if number == 0 {
+                            alloy::primitives::B256::ZERO
+                        } else {
+                            stand_in::block_hash(number - 1)
+                        };
+                        block.header.inner.logs_bloom = alloy::primitives::Bloom::from([255; 256]);
+                        block.header.hash = stand_in::block_hash(number);
                         block.header.inner.timestamp = 1_790_000_000 + HEAD;
                         answer(serde_json::to_value(block).unwrap())
                     }
@@ -291,7 +303,11 @@ async fn read_through(name: &str) -> (Arc<Indexer>, Vec<u64>) {
         log_range: None,
         confirmations: None,
     };
-    let client = Client::connect(&config, Signing::ReadOnly).await.unwrap();
+    let client = stand_in::client_with_limits(
+        &config,
+        &[("ancestry_reads", 4096), ("ancestry_cache_headers", 65536)],
+    )
+    .await;
     let store = std::env::temp_dir().join(format!("shonin-indexer-{name}-{}", std::process::id()));
     let indexer = Arc::new(Indexer::new(vec![shared::Chain::Base], store, None));
     indexer
@@ -304,7 +320,9 @@ async fn read_through(name: &str) -> (Arc<Indexer>, Vec<u64>) {
             public_rpc: String::new(),
         })
         .await;
-    for _ in 0..3 {
+    // Cold history may need several bounded ancestry passes; keep the large
+    // deployment-to-creation gap while allowing that configured catch-up.
+    for _ in 0..64 {
         indexer.refresh().await.unwrap();
     }
     let asked = asked_from.lock().unwrap().clone();
