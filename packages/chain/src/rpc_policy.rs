@@ -47,6 +47,8 @@ settings!(
     history_page_reads,
     ancestry_reads,
     ancestry_cache_headers,
+    immutable_cache_entries,
+    immutable_cache_bytes,
     log_batch_addresses,
     log_batch_blocks,
     log_batch_logs,
@@ -169,6 +171,18 @@ impl RpcPolicy {
             self.ancestry_cache_headers,
             1,
             65_536,
+        )?;
+        bounded(
+            "immutable_cache_entries",
+            self.immutable_cache_entries,
+            0,
+            65_536,
+        )?;
+        bounded(
+            "immutable_cache_bytes",
+            self.immutable_cache_bytes,
+            0,
+            67_108_864,
         )?;
         bounded("log_batch_addresses", self.log_batch_addresses, 1, 1_024)?;
         bounded("log_batch_blocks", self.log_batch_blocks, 1, 10_000)?;

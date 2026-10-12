@@ -77,6 +77,10 @@ ancestry_reads = 64
 # Sparse checkpoints and recently walked headers; eviction affects catch-up
 # cost only. Keep at least a complete configured log page plus its anchors.
 ancestry_cache_headers = 8192
+# Completed immutable registrations stay only on a proven record branch.
+# Entries and encoded bytes bound retained data; either zero disables caching.
+immutable_cache_entries = 1024
+immutable_cache_bytes = 1048576
 # One refresh may share these bounded, numbered log observations. Wider or
 # uncovered requests use their ordinary incremental reads instead.
 log_batch_addresses = 256

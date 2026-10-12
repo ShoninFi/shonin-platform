@@ -10,7 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use alloy::eips::BlockId;
 use alloy::primitives::{Address, B256, U256};
 use alloy::rpc::types::{Filter, Log};
-use alloy::sol_types::SolEvent;
+use alloy::sol_types::{SolEvent, SolValue};
 use anyhow::Result;
 use chain::bindings::attestation::IAttestationRegistry;
 use chain::bindings::factory::IVaultFactory;
@@ -49,6 +49,10 @@ pub struct History {
     pub(crate) anchor: Option<(u64, B256)>,
     pub(crate) discard_previous: bool,
     proofs: chain::sealed_views::Proofs,
+    /// Completed registrations never change on the same branch. A branch
+    /// replacement clears these with every other derived record.
+    strategy_records: HashMap<(Address, U256), StrategyRecord>,
+    strategy_record_bytes: u64,
     /// Each vault's readings, oldest first: hourly for the last
     /// [`HOURLY_FOR`], daily before that.
     samples: HashMap<Address, Vec<Sample>>,
@@ -89,6 +93,11 @@ pub struct History {
     /// Each station's fills: the vault never trades itself, its home station
     /// does.
     fills: HashMap<Address, Stream<Fills>>,
+}
+
+struct StrategyRecord {
+    value: chain::bindings::strategies::Strategy,
+    bytes: u64,
 }
 
 impl History {
@@ -538,14 +547,15 @@ async fn one(
     let bundle_hash = views
         .read(chain, address, IVault::bundleHashCall {})
         .await?;
-    let registered = chain
-        .read(
-            deployments.strategies,
-            IStrategyRegistry::strategyOfCall {
-                strategyId: strategy_id,
-            },
-        )
-        .await?;
+    let registered = registered_strategy(
+        chain,
+        history,
+        deployments.strategies,
+        strategy_id,
+        author,
+        bundle_hash,
+    )
+    .await?;
 
     let slug = Strategy::slug_for(vault_chain, id);
     let days_live = (now.saturating_sub(created as u64)) / 86_400;
@@ -635,6 +645,69 @@ async fn one(
             .map(|bridge| name_of(*bridge))
             .collect(),
     })
+}
+
+async fn registered_strategy(
+    chain: &Client,
+    history: &mut History,
+    registry: Address,
+    id: U256,
+    author: Address,
+    bundle: B256,
+) -> Result<chain::bindings::strategies::Strategy> {
+    let policy = chain.rpc_policy();
+    if policy.immutable_cache_entries == 0
+        || policy.immutable_cache_bytes == 0
+        || history.strategy_records.len() > policy.immutable_cache_entries as usize
+        || history.strategy_record_bytes > policy.immutable_cache_bytes
+    {
+        history.strategy_records.clear();
+        history.strategy_record_bytes = 0;
+    }
+    let bound = history.anchor.is_some() && chain.record_observation() == history.anchor;
+    let key = (registry, id);
+    if bound {
+        if let Some(record) = history.strategy_records.get(&key)
+            && record.value.author == author
+            && record.value.bundleHash == bundle
+        {
+            return Ok(record.value.clone());
+        }
+        if let Some(record) = history.strategy_records.remove(&key) {
+            history.strategy_record_bytes =
+                history.strategy_record_bytes.saturating_sub(record.bytes);
+        }
+    }
+    let registered = chain
+        .read(
+            registry,
+            IStrategyRegistry::strategyOfCall { strategyId: id },
+        )
+        .await?;
+    // Zero is an absence, not immutable proof: it can become registered later.
+    // Only an internally consistent completed record may be retained.
+    if bound
+        && registered.registeredAt != 0
+        && registered.author == author
+        && registered.bundleHash == bundle
+        && registered.sourceHash != B256::ZERO
+    {
+        let bytes = registered.abi_encoded_size() as u64;
+        if history.strategy_records.len() < policy.immutable_cache_entries as usize
+            && let Some(total) = history.strategy_record_bytes.checked_add(bytes)
+            && total <= policy.immutable_cache_bytes
+        {
+            history.strategy_records.insert(
+                key,
+                StrategyRecord {
+                    value: registered.clone(),
+                    bytes,
+                },
+            );
+            history.strategy_record_bytes = total;
+        }
+    }
+    Ok(registered)
 }
 
 fn standing(state: &ChainVaultState, days_live: u64) -> Standing {

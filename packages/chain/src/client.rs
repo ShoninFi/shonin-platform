@@ -2135,6 +2135,16 @@ impl Client {
         result
     }
 
+    /// The branch snapshot whose ordinary record reads are hash-pinned.
+    /// Live readers and scopes without ancestry return no observation.
+    pub fn record_observation(&self) -> Option<(u64, B256)> {
+        let scope = self.log_verification.as_ref()?;
+        if scope.branch.is_none() || scope.refused.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        Some((scope.head, scope.identity))
+    }
+
     /// A stream may catch an individual read error to resume later. Such a
     /// partial read must not publish as a fresh whole record after ancestry fails.
     pub fn ensure_record_branch(&self) -> Result<()> {
