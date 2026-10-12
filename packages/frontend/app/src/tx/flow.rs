@@ -257,6 +257,9 @@ pub struct Ctx<'a, R, S, C> {
     pub cancel: Cancel,
     /// "Settle now", pressed on the page.
     pub settle_now: Nudge,
+    /// "Skip", pressed on the page while the wallet is asked for the
+    /// optional second step: only that step is let go.
+    pub skip_second: Nudge,
     pub pace: Pace,
     pub on_step: &'a dyn Fn(Step),
 }
@@ -918,6 +921,9 @@ async fn priced<R: Reader, S: Signer, C: Clock>(
                     match second_step(ctx, countdown.request, &report).await {
                         Second::Settled => return Ok(at),
                         Second::Open(unsent) => report(unsent, None),
+                        // Sent and mined: said as sent, so the page never
+                        // says the app will still send it.
+                        Second::Mined(hash) => report(None, Some(hash)),
                     }
                 }
             }
@@ -948,6 +954,35 @@ enum Second {
     /// Not settled yet; why the app's own step wasn't sent or seen mined,
     /// if it wasn't.
     Open(Option<TxError>),
+    /// The app's own step was mined without settling it: the keeper does.
+    Mined(B256),
+}
+
+/// What ended the wait on the wallet for the second step, before it
+/// answered.
+enum Meanwhile {
+    /// The vault reports the request settled, by anyone.
+    Settled,
+    /// The person let the step go ("Skip").
+    Skipped,
+}
+
+/// While the wallet is asked for the second step: read the request at
+/// every look, and end when it is settled or the step is skipped, for as
+/// long as the prompt is shown. The wallet's answer ends it too.
+async fn while_asked<R: Reader, S: Signer, C: Clock>(
+    ctx: &Ctx<'_, R, S, C>,
+    id: U256,
+) -> Meanwhile {
+    loop {
+        if ctx.skip_second.take() {
+            return Meanwhile::Skipped;
+        }
+        if matches!(read::request(ctx.reader, ctx.vault, id).await, Ok(request) if request.done) {
+            return Meanwhile::Settled;
+        }
+        ctx.clock.sleep(ctx.pace.poll_millis).await;
+    }
 }
 
 /// The settling call the second step sends: open to anyone.
@@ -970,16 +1005,34 @@ async fn second_step<R: Reader, S: Signer, C: Clock>(
     if matches!(read::request(ctx.reader, ctx.vault, id).await, Ok(request) if request.done) {
         return Second::Settled;
     }
-    let hash = match ctx.send(Prompt::Finish, ctx.vault, settle_call()).await {
-        Ok(hash) => hash,
-        Err(why) => return Second::Open(Some(why)),
+    // A "Skip" pressed before this step was asked for is not for it.
+    ctx.skip_second.take();
+    // The request is read while the wallet is asked: a wallet that never
+    // answers doesn't hold a request the vault has settled, and "Skip" lets
+    // only this step go.
+    let hash = {
+        let mut send = std::pin::pin!(ctx.send(Prompt::Finish, ctx.vault, settle_call()));
+        let mut meanwhile = std::pin::pin!(while_asked(ctx, id));
+        let first = std::future::poll_fn(|cx| {
+            if let std::task::Poll::Ready(sent) = send.as_mut().poll(cx) {
+                return std::task::Poll::Ready(Ok(sent));
+            }
+            meanwhile.as_mut().poll(cx).map(Err)
+        })
+        .await;
+        match first {
+            Ok(Ok(hash)) => hash,
+            Ok(Err(why)) => return Second::Open(Some(why)),
+            Err(Meanwhile::Settled) => return Second::Settled,
+            Err(Meanwhile::Skipped) => return Second::Open(Some(TxError::Cancelled)),
+        }
     };
     report(None, Some(hash));
     match watch_second(ctx, id, hash).await {
         Watched::Settled => Second::Settled,
         // Mined, and the request not among those it settled: the keeper
         // settles it.
-        Watched::Mined => Second::Open(None),
+        Watched::Mined => Second::Mined(hash),
         Watched::Reverted => Second::Open(Some(TxError::Reverted { hash, reason: None })),
         Watched::NotSeen(why) => Second::Open(Some(why)),
     }

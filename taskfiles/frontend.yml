@@ -38,13 +38,15 @@ tasks:
 
   app:dev:
     desc: "The app: Trunk dev server with live reload and the dev-only pages (/_atoms), proxying /api to the local API (API=<url> to proxy another, e.g. the testnet API)"
+    # Solana program ids: the local deploy keypairs' against the local API;
+    # with API=<url> (the testnet API) the devnet ids (the `devnet` feature).
     deps: [tokens]
     cmds:
       - >-
         cd "{{.PATH_PACKAGE_APP}}" && NO_COLOR=true trunk serve
         --port {{.PORT_APP_DEV}}
         --dist "{{.PATH_DIST_APP_DEV}}"
-        --features dev,dev-wallet
+        --features dev,dev-wallet{{if .API}},devnet{{end}}
         --proxy-backend "{{.API | default .URL_API_DEV}}/api/"
         --watch "{{.PATH_ROOT_CARGO_TOML}}"
         --watch "{{.PATH_PACKAGE_SHARED}}"
@@ -68,7 +70,8 @@ tasks:
       SHONIN_APP_NETWORK: testnet
     cmds:
       - cd "{{.PATH_PACKAGE_APP}}" && NO_COLOR=true trunk clean --dist "{{.PATH_DIST_APP}}"
-      - cd "{{.PATH_PACKAGE_APP}}" && NO_COLOR=true trunk build --release --dist "{{.PATH_DIST_APP}}"
+      # The testnet build: the Solana programs' devnet ids.
+      - cd "{{.PATH_PACKAGE_APP}}" && NO_COLOR=true trunk build --release --dist "{{.PATH_DIST_APP}}" --features devnet
       # Per-route HTML (with 404.html), sitemap.xml and robots.txt, from src/route.rs.
       # Pass API=<url> to pre-render the pages that need data from another API.
       # It also moves Trunk's inline loader into a file and writes _headers'

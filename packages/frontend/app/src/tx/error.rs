@@ -247,7 +247,7 @@ impl TxError {
                 context.native, context.chain
             ),
             Self::WouldRevert { .. } => "the chain wouldn’t take it just now".to_string(),
-            Self::Reverted { .. } => "it didn’t go through".to_string(),
+            Self::Reverted { .. } => "the chain refused it when it was mined".to_string(),
             Self::Replaced { .. } | Self::Dropped { .. } | Self::Stuck { .. } => {
                 "it hasn’t been seen mined".to_string()
             }
@@ -562,6 +562,16 @@ mod tests {
             .unsent_words(&context()),
             "your wallet needs a little HYPE on Hyperliquid for its network fee"
         );
+    }
+
+    #[test]
+    fn a_reverted_second_step_is_said_once_not_as_didnt_go_through_twice() {
+        let words = TxError::Reverted {
+            hash: B256::repeat_byte(7),
+            reason: None,
+        }
+        .unsent_words(&context());
+        assert!(!words.contains("didn’t go through"), "{words}");
     }
 
     #[test]

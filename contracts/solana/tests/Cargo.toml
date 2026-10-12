@@ -46,6 +46,11 @@ solana-transaction-error = "2.2"
 bincode = "1.3"
 base64 = "0.22"
 
+# The instruction builders the web app and the services share, run here
+# against the programs themselves.
+[dev-dependencies]
+shonin-chain = { path = "../../../packages/chain", features = ["solana-ix"] }
+
 # A failed transaction carries its logs, which is the point of returning it.
 [lints.clippy]
 result_large_err = "allow"

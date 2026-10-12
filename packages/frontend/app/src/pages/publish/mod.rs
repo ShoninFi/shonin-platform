@@ -101,6 +101,9 @@ struct Draft {
     busy: Mutable<bool>,
     /// What looking on the chain for a payment that may have landed found.
     checked: Mutable<Option<String>>,
+    /// A look on the chain found no payment: looking again stays offered
+    /// beside the payment, since one the wallet still holds may land.
+    look_again: Mutable<bool>,
     dragging: Mutable<bool>,
 }
 
@@ -121,6 +124,7 @@ impl Draft {
             running: Mutable::new(None),
             busy: Mutable::new(false),
             checked: Mutable::new(None),
+            look_again: Mutable::new(false),
             dragging: Mutable::new(false),
         })
     }
@@ -223,6 +227,8 @@ fn steps_list(state: &(bool, Source, bool, Option<String>)) -> View {
     ];
     el("ol")
         .class("sh-publish__steplist")
+        .attr("aria-label", "Steps")
+        .attr("tabindex", "0")
         .children(
             steps
                 .into_iter()
@@ -309,7 +315,10 @@ fn checklist(draft: &Rc<Draft>) -> El {
                     checkbox(format!("check-{index}"), *words, &draft.checks[index])
                 }))
                 .child(el("p").class("sh-muted").text("Then package it:"))
-                .child(el("code").class("sh-publish__code").text(PACKAGE)),
+                .child(el("code")
+                    .class("sh-publish__code")
+                    .attr("tabindex", "0")
+                    .text(PACKAGE)),
         )
 }
 
@@ -516,7 +525,10 @@ fn dropzone(draft: &Rc<Draft>, refused: Option<(&str, &Refusal)>) -> View {
                 }),
         )
         .child(el("p").class("sh-muted").text("Package it from the root of your repository:"))
-        .child(el("code").class("sh-publish__code").text(PACKAGE))
+        .child(el("code")
+                    .class("sh-publish__code")
+                    .attr("tabindex", "0")
+                    .text(PACKAGE))
         .into()
 }
 
@@ -557,6 +569,7 @@ fn read_back(draft: &Rc<Draft>, picked: &Picked, summary: &Summary, index: usize
                 replace.sending.set(Sending::Idle);
                 replace.running.set(None);
                 replace.checked.set(None);
+                replace.look_again.set(false);
             },
         ));
     let several = if summary.agents.len() > 1 {
@@ -831,13 +844,14 @@ fn pay_body(
                     let draft = gate_draft.clone();
                     let state = futures_signals::map_ref! {
                         let fee = fee.signal_cloned(),
-                        let unsure = may_have_paid(&draft) => (fee.clone(), unsure.clone())
+                        let unsure = may_have_paid(&draft),
+                        let again = draft.look_again.signal() => (fee.clone(), unsure.clone(), *again)
                     };
                     el("div")
                         .child_signal(
                             None,
-                            state.map(move |(fee, unsure)| {
-                                Some(pay_action(&draft, chain, fee, unsure.is_some()))
+                            state.map(move |(fee, unsure, again)| {
+                                Some(pay_action(&draft, chain, fee, unsure.is_some(), again))
                             }),
                         )
                         .into()
@@ -931,8 +945,14 @@ fn may_have_paid(draft: &Draft) -> impl Signal<Item = Option<AuthorError>> + 'st
 }
 
 /// "Submit for 1 USDC", or, after a payment that may have gone through,
-/// only a way to look for it on the chain.
-fn pay_action(draft: &Rc<Draft>, chain: Chain, fee: Option<String>, unsure: bool) -> View {
+/// only a way to look for it on the chain; once a look found nothing, both.
+fn pay_action(
+    draft: &Rc<Draft>,
+    chain: Chain,
+    fee: Option<String>,
+    unsure: bool,
+    look_again: bool,
+) -> View {
     let busy = draft.busy.clone();
     let draft = draft.clone();
     if unsure {
@@ -946,13 +966,28 @@ fn pay_action(draft: &Rc<Draft>, chain: Chain, fee: Option<String>, unsure: bool
         )
         .into();
     }
-    on_click(
+    let submit_draft = draft.clone();
+    let pay = on_click(
         submit_button(fee.as_deref().unwrap_or(FEE))
             .busy(&busy)
             .build(),
-        move || submit(&draft, chain),
-    )
-    .into()
+        move || submit(&submit_draft, chain),
+    );
+    if !look_again {
+        return pay.into();
+    }
+    el("div")
+        .class("sh-publish__payactions")
+        .child(pay)
+        .child(on_click(
+            Button::new(Kind::Secondary, "Check the chain again")
+                .size(Size::Large)
+                .block()
+                .busy(&busy)
+                .build(),
+            move || check_payment(&draft, chain),
+        ))
+        .into()
 }
 
 /// Upload (unless this project was already uploaded for this chain) and
@@ -1202,7 +1237,9 @@ mod browser {
                 Action::Pay { upload, uploader },
                 &running,
                 move |outcome| {
-                    if let Outcome::Paid { strategy_id, .. } = outcome {
+                    if let Outcome::Paid { strategy_id, .. }
+                    | Outcome::AlreadyPaid { strategy_id } = outcome
+                    {
                         run::remember_payment(
                             &job,
                             run::Paid {
@@ -1277,6 +1314,7 @@ mod browser {
                     // Nothing from the uploader on the chain: the payment is
                     // offered again, with what was found said.
                     draft.running.set(None);
+                    draft.look_again.set(true);
                     draft.checked.set(Some(super::check_words(&found, &wallet)));
                 }
                 Err(why) => {
@@ -1387,11 +1425,27 @@ mod tests {
     }
 
     #[test]
+    fn after_a_look_on_the_chain_found_no_payment_looking_again_stays_offered_beside_paying() {
+        let draft = Draft::new();
+        let html = pay_action(&draft, Chain::Base, Some("1 USDC".to_string()), false, true).html();
+        assert!(html.contains("Submit for 1 USDC"), "{html}");
+        assert!(html.contains("Check the chain again"), "{html}");
+    }
+
+    #[test]
     fn after_a_payment_that_may_have_landed_the_page_offers_only_to_look_for_it() {
         let draft = Draft::new();
-        let html = pay_action(&draft, Chain::Base, Some("1 USDC".to_string()), false).html();
+        let html = pay_action(
+            &draft,
+            Chain::Base,
+            Some("1 USDC".to_string()),
+            false,
+            false,
+        )
+        .html();
         assert!(html.contains("Submit for 1 USDC"), "{html}");
-        let html = pay_action(&draft, Chain::Base, Some("1 USDC".to_string()), true).html();
+        assert!(!html.contains("Check the chain"), "{html}");
+        let html = pay_action(&draft, Chain::Base, Some("1 USDC".to_string()), true, false).html();
         assert!(!html.contains("Submit"), "{html}");
         assert!(html.contains("Check the chain for the payment"), "{html}");
         // Which errors hold the payment back until the chain is checked.
@@ -1407,7 +1461,8 @@ mod tests {
         assert!(!AuthorError::Tx(TxError::Rejected).may_have_paid());
         assert!(
             !AuthorError::WrongPayer {
-                uploader: Address::ZERO
+                uploader: Address::ZERO,
+                approved: None,
             }
             .may_have_paid()
         );

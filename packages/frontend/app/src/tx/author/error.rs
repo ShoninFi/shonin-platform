@@ -30,7 +30,12 @@ pub enum AuthorError {
     PaymentMismatch,
     /// The connected account isn't the one the upload named: only that
     /// wallet's payment starts the job, so nothing is sent from another.
-    WrongPayer { uploader: Address },
+    /// `approved` is the fee's approval when it was mined before the payment
+    /// was stopped: it stands, and the uploader's payment uses it.
+    WrongPayer {
+        uploader: Address,
+        approved: Option<U256>,
+    },
     /// The payment was sent and wasn't seen mined (dropped, stuck or
     /// replaced): it may still land. `since` is how many payments the
     /// publishing contract had recorded before it was sent, so the chain
@@ -41,8 +46,10 @@ pub enum AuthorError {
         then: Box<TxError>,
     },
     /// The activation stopped after its approval of the tank (`amount`) was
-    /// mined: the approval stands, and trying again uses it.
+    /// mined: the approval stands; trying again with the same tank uses it,
+    /// and with another replaces it with exactly that tank.
     ApprovalStands {
+        spender: super::flow::Spender,
         amount: U256,
         then: Box<AuthorError>,
     },
@@ -79,6 +86,7 @@ impl AuthorError {
             Self::PaymentMismatch | Self::PaymentUnsure { .. } | Self::ApprovalStands { .. } => {
                 true
             }
+            Self::WrongPayer { approved, .. } => approved.is_some(),
             _ => false,
         }
     }
@@ -144,13 +152,23 @@ impl AuthorError {
                 "The chain recorded a payment, but not for this upload from this wallet. Check your wallet's activity before paying again."
                     .to_string(),
             ),
-            Self::WrongPayer { uploader } => alert(
-                "Switch back to the wallet that made this upload",
-                format!(
-                    "Switch back to {}, which made this upload: only its payment starts the job. Nothing was sent. To pay from this wallet instead, replace the file and upload it again.",
-                    crate::format::short_hash(&format!("{uploader:?}"))
-                ),
-            ),
+            Self::WrongPayer { uploader, approved } => {
+                let uploader = crate::format::short_hash(&format!("{uploader:?}"));
+                let sent = match approved {
+                    None => "Nothing was sent.".to_string(),
+                    Some(fee) => format!(
+                        "The payment wasn't sent. Its approval of {} {} went through and stands: {uploader}'s payment uses it, without asking for it again.",
+                        crate::money::format_exact(*fee, context.decimals, 0),
+                        context.symbol
+                    ),
+                };
+                alert(
+                    "Switch back to the wallet that made this upload",
+                    format!(
+                        "Switch back to {uploader}, which made this upload: only its payment starts the job. {sent} To pay from this wallet instead, replace the file and upload it again."
+                    ),
+                )
+            }
             Self::PaymentUnsure { then, .. } => {
                 let wallet = context.wallet;
                 let seen = match then.as_ref() {
@@ -172,18 +190,56 @@ impl AuthorError {
                     ),
                 )
             }
-            Self::ApprovalStands { amount, then } => {
+            Self::ApprovalStands {
+                spender,
+                amount,
+                then,
+            } => {
+                use super::flow::Spender;
+                let (step, title, to, again) = match spender {
+                    Spender::Factory => (
+                        "The activation wasn't sent.",
+                        "Not activated: your approval stands",
+                        "the vault factory",
+                        "activating again with a {amount} tank uses it, without asking for it again; another tank replaces it with an approval of exactly that tank.",
+                    ),
+                    Spender::Vault => (
+                        "The top-up wasn't sent.",
+                        "Not topped up: your approval stands",
+                        "the vault",
+                        "topping up {amount} again uses it, without asking for it again; another amount replaces it with an approval of exactly that amount.",
+                    ),
+                    Spender::Publishing => (
+                        "The payment wasn't sent.",
+                        "Not paid: your approval stands",
+                        "the publishing contract",
+                        "paying again uses it, without asking for it again.",
+                    ),
+                };
                 let words = then.words(context);
-                let reason = words
-                    .text
-                    .strip_suffix("Nothing was sent.")
-                    .map(|text| format!("{text}The activation wasn't sent."))
+                // The inner words say nothing moved; the approval did.
+                let reason = ["Nothing was sent.", "No money moved and no request was made."]
+                    .iter()
+                    .find_map(|said| words.text.strip_suffix(said))
+                    .map(|text| format!("{text}{step}"))
                     .unwrap_or(words.text);
+                // The fee is said in the dollar's own name, as the publish
+                // page says it.
+                let amount = match spender {
+                    Spender::Publishing => format!(
+                        "{} {}",
+                        crate::money::format_exact(*amount, context.decimals, 0),
+                        context.symbol
+                    ),
+                    _ => format::dollars_exact(*amount, context.decimals),
+                };
+                let again = again.replace("{amount}", &amount);
+                // Its own title: the approval went, so no title of a step
+                // that sent nothing stands above it.
                 alert(
-                    &words.title,
+                    title,
                     format!(
-                        "{reason} Your approval of {} to the vault factory went through and stands: activating again uses it, without asking for it again.",
-                        format::dollars_exact(*amount, context.decimals)
+                        "{reason} Your approval of {amount} to {to} went through and stands: {again}"
                     ),
                 )
             }

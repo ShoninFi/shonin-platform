@@ -71,6 +71,8 @@ pub struct Running {
     pub step: Mutable<Option<Step>>,
     pub cancel: Cancel,
     pub settle_now: Nudge,
+    /// "Skip" on the optional second step's wallet prompt.
+    pub skip_second: Nudge,
     /// When its countdown started on the reader's clock, for the seconds
     /// left; set once per request.
     pub requested_local: Rc<Cell<Option<(f64, u64)>>>,
@@ -102,6 +104,7 @@ impl Running {
             step: Mutable::new(None),
             cancel: Cancel::new(),
             settle_now: Nudge::new(),
+            skip_second: Nudge::new(),
             requested_local: Rc::new(Cell::new(None)),
         }
     }
@@ -162,6 +165,7 @@ pub fn start(vault: &VaultRef, action: Action, running: &Running) {
             account,
             cancel: running.cancel.clone(),
             settle_now: running.settle_now.clone(),
+            skip_second: running.skip_second.clone(),
             pace: Pace::LIVE,
             on_step: &on_step,
         };

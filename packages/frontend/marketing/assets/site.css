@@ -1011,7 +1011,7 @@ html.menu-open { overflow: hidden; }
   .pvis { gap: 28px; min-height: 596px; padding: 22px 24px; }
   .pipe { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--space-3); }
   .pipe__tile { display: flex; flex-direction: column; align-items: center; gap: var(--space-2); padding: 14px var(--space-2); border-radius: var(--radius-m); background: var(--paper-raised); border: var(--border-hairline) solid var(--line); color: var(--ink-muted); font: 600 13px/18px var(--font-sans); text-align: center; }
-  .pipe__tile.is-todo { border-style: dashed; border-color: var(--line-control); }
+  .pipe__tile.is-later { border-style: dashed; border-color: var(--line-control); }
   .pipe__tile.is-now { background: var(--brand-soft); border: var(--border-control) solid var(--brand); color: var(--brand); font-weight: 650; }
   .pvis__card { gap: var(--space-4); padding: var(--space-5); }
   .pvis__cardhead { flex-wrap: nowrap; }

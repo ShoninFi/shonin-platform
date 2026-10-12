@@ -194,6 +194,12 @@ pub fn outcome_words(outcome: &Outcome, names: &Names) -> (String, String) {
                 "Your agent's id is {strategy_id}. The job starts once the build service has seen the payment confirmed on the chain."
             ),
         ),
+        Outcome::AlreadyPaid { strategy_id } => (
+            "Already paid from the wallet that uploaded it".to_string(),
+            format!(
+                "The chain already records this upload's payment from this wallet, as agent {strategy_id}, so nothing was sent. The job starts once the build service has seen it confirmed on the chain."
+            ),
+        ),
         Outcome::Activated { .. } => (
             "Your vault is open".to_string(),
             "It's listed under New agents until it has 30 days of history.".to_string(),
@@ -252,8 +258,9 @@ pub fn outcome_words(outcome: &Outcome, names: &Names) -> (String, String) {
     }
 }
 
-fn outcome_hash(outcome: &Outcome) -> B256 {
-    match outcome {
+fn outcome_hash(outcome: &Outcome) -> Option<B256> {
+    let hash = match outcome {
+        Outcome::AlreadyPaid { .. } => return None,
         Outcome::Paid { hash, .. }
         | Outcome::Activated { hash, .. }
         | Outcome::TankFunded { hash, .. }
@@ -265,7 +272,8 @@ fn outcome_hash(outcome: &Outcome) -> B256 {
         | Outcome::Retired { hash }
         | Outcome::EscapeRequested { hash, .. }
         | Outcome::TankWithdrawn { hash, .. } => *hash,
-    }
+    };
+    Some(hash)
 }
 
 /// A transaction, linked to the chain's explorer where there is one.
@@ -390,11 +398,11 @@ fn step_view(step: &Step, names: &Names, cancel: &crate::tx::flow::Cancel) -> Vi
                         .text(title),
                 )
                 .child(el("p").text(line))
-                .child(tx_link(
-                    names.chain_id,
-                    outcome_hash(outcome),
-                    "Transaction",
-                ))
+                .child(
+                    outcome_hash(outcome)
+                        .map(|hash| tx_link(names.chain_id, hash, "Transaction"))
+                        .unwrap_or(View::Empty),
+                )
                 .into()
         }
         Step::Failed(error) => {

@@ -280,7 +280,6 @@ const FOOTER: &str = r#"<footer class="site-footer sh-hero">
         <p class="sh-label">Shonin</p>
         <ul>
           <li><a href="{{docs}}/">Docs</a></li>
-          <li><a href="{{docs}}/checklist/">Build checklist</a></li>
           <li><a href="https://github.com/ShoninFi">Source code</a></li>
         </ul>
       </nav>
@@ -296,7 +295,7 @@ const FOOTER: &str = r#"<footer class="site-footer sh-hero">
           <li><a href="https://github.com/ShoninFi" aria-label="Shonin on GitHub" data-logo="github">GH</a></li>
         </ul>
       </div>
-      <p class="site-footer__risk">Agents can lose money. A review isn't a prediction, and a track record isn't a promise. These pages describe the platform as designed; the <a href="{{docs}}/checklist/">build checklist</a> records what is built.</p>
+      <p class="site-footer__risk">Agents can lose money. A review isn't a prediction, and a track record isn't a promise. These pages describe the platform as designed.</p>
     </div>
   </div>
 </footer>"#;
@@ -316,7 +315,7 @@ const FOOTER_COMPACT: &str = r#"<footer class="site-footer site-footer--compact 
           <li><a href="https://github.com/ShoninFi" aria-label="Shonin on GitHub" data-logo="github">GH</a></li>
         </ul>
       </div>
-      <p class="site-footer__risk">Agents can lose money. A review isn't a prediction, and a track record isn't a promise. These pages describe the platform as designed; the <a href="{{docs}}/checklist/">build checklist</a> records what is built.</p>
+      <p class="site-footer__risk">Agents can lose money. A review isn't a prediction, and a track record isn't a promise. These pages describe the platform as designed.</p>
     </div>
   </div>
 </footer>"#;

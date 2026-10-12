@@ -46,8 +46,21 @@ solana = [
     "dep:sha2",
     "dep:bincode",
     "dep:solana-message",
+    "solana-message/bincode",
     "dep:solana-hash",
     "dep:solana-address-lookup-table-interface",
+]
+# Building the Solana programs' instructions and transactions on every
+# target, the browser's included, without the programs' crates: their ids,
+# addresses, instruction data and accounts, a transaction to sign. Each is
+# checked against the programs' own crates by the tests. Program ids are
+# compiled in as the programs compile theirs (`mainnet`, `devnet` or neither).
+solana-ix = [
+    "dep:solana-pubkey",
+    "dep:solana-instruction",
+    "dep:solana-message",
+    "dep:solana-hash",
+    "dep:borsh",
 ]
 # Which network's program ids the programs' crates compile in (see
 # contracts/solana/crates/shonin-program-id): with neither, the local deploy
@@ -123,12 +136,38 @@ bs58 = { workspace = true, optional = true }
 base64 = { version = "0.22", optional = true }
 sha2 = { workspace = true, optional = true }
 bincode = { version = "1.3", optional = true }
+solana-pubkey = { workspace = true, optional = true }
+solana-instruction = { workspace = true, optional = true }
+borsh = { workspace = true, optional = true }
+
+[build-dependencies]
+shonin-program-id.workspace = true
 
 [dev-dependencies]
 http.workspace = true
 bytes.workspace = true
 # A paused clock, so a test can wait out a receipt timeout without waiting.
 tokio = { workspace = true, features = ["test-util"] }
+# What the `solana-ix` builders are checked against, byte for byte: the
+# programs' own crates and the Solana SDK's own builders.
+anchor-lang.workspace = true
+anchor-spl.workspace = true
+shonin-registry.workspace = true
+shonin-publishing.workspace = true
+shonin-prices.workspace = true
+shonin-station.workspace = true
+shonin-vault.workspace = true
+shonin-local-venue.workspace = true
+shonin-local-driver.workspace = true
+solana-transaction.workspace = true
+solana-compute-budget-interface.workspace = true
+solana-ed25519-program.workspace = true
+shonin-common.workspace = true
+bincode.workspace = true
+# The rules a station pins, which its account's layout carries.
+shonin-driver = { path = "../../contracts/solana/crates/shonin-driver" }
+# Log lines carry events in base64.
+base64 = "0.22"
 
 [lints]
 workspace = true

@@ -192,7 +192,7 @@ pub fn mini_exit(agent: &Rc<Agent>) -> El {
         .class("sh-card")
         .class("ag-card")
         .class("ag-mini-exit")
-        .attr("aria-label", "Deposit or withdraw")
+        .attr("aria-label", "Share price and the way out")
         .child(live(agent, |strategy| {
             let since = crate::model::figures(strategy).since_opening;
             el("div")

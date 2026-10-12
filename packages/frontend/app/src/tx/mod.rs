@@ -7,6 +7,7 @@ pub mod error;
 pub mod flow;
 pub mod port;
 pub mod read;
+pub mod solana;
 
 #[cfg(test)]
 mod sim;

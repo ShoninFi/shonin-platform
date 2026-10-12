@@ -123,6 +123,8 @@
 .ag-bullets li { position: relative; padding-left: 16px; font: var(--type-body); overflow-wrap: anywhere; }
 .ag-bullets li::before { content: ""; position: absolute; left: 0; top: 9px; width: 6px; height: 6px; border-radius: var(--radius-full); background: var(--ink-muted); }
 .ag-scroll { position: relative; overflow-x: auto; }
+/* A scrolling region's ring sits inside it, so a card's rounded clip never cuts it. */
+.ag-scroll:focus-visible, .ag-term__body:focus-visible { outline-offset: -2px; }
 .ag-scroll .sh-table { min-width: 560px; }
 .ag-risk { display: flex; align-items: flex-start; gap: var(--space-2); font: 500 13px/20px var(--font-sans); color: var(--ink); }
 .ag-risk .sh-icon { flex: none; margin-top: 2px; color: var(--caution); }

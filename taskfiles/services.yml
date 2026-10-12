@@ -54,7 +54,7 @@ tasks:
         --gcp-region "{{.GCP_REGION}}"
 
   seed:
-    desc: "Publish the reference work through the real flows (AGENT=name for just one; LIVE=1 then deposits and books and pays a claim on its vault; PUBLISH_ONLY=1 publishes AGENT and stops; STRATEGY=<id> runs the live part on a registered strategy; TAKE_ON_SECONDS=<s>, 180 by default; API_URL=<url> for a remote API). VAULT_CHAIN=solana publishes on Solana: through the API and the services everywhere but the local cluster's full seed, an agent's own solana/ copy if it has one"
+    desc: "Publish the reference work through the real flows (AGENT=name for just one; LIVE=1 then deposits and books and pays a claim on its vault; PUBLISH_ONLY=1 publishes AGENT and stops; STRATEGY=<id> runs the live part on a registered strategy; TAKE_ON_SECONDS=<s>, 180 by default; API_URL=<url> for a remote API). VAULT_CHAIN=solana publishes on Solana: through the API and the services, an agent's own solana/ copy if it has one (the local cluster's full seed plays the services itself with stand-in hashes, then publishes funding-basis through them and uses its vault live)"
     vars:
       SEED_API: '{{.API_URL | default .URL_API_DEV}}'
       AGENT_ARG: >-

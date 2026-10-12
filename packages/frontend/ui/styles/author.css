@@ -90,7 +90,7 @@
 .sh-publish__choiceline { padding-left: 32px; font: var(--type-body-s); }
 .sh-publish__agents { display: flex; flex-direction: column; }
 .sh-publish__pay { display: flex; flex-direction: column; gap: var(--space-4); }
-.sh-publish__payaction { display: flex; flex-direction: column; gap: var(--space-3); }
+.sh-publish__payaction, .sh-publish__payactions { display: flex; flex-direction: column; gap: var(--space-3); }
 .sh-publish__note { font: var(--type-body-s); color: var(--ink-muted); }
 .sh-publish__aside { display: flex; flex-direction: column; gap: var(--space-4); }
 .sh-publish__asidecard { display: flex; flex-direction: column; gap: var(--space-3); }

@@ -583,7 +583,7 @@ fn link_out(href: String, words: &'static str) -> El {
         .child(icon(Icon::ArrowRight, 16))
 }
 
-fn banner(banner: &Banner, strategy: &Strategy, this_year: i32) -> El {
+pub(crate) fn banner(banner: &Banner, strategy: &Strategy, this_year: i32) -> El {
     let when = |at: Option<time::PrimitiveDateTime>| {
         at.map(|at| format::day(at.date(), this_year))
             .unwrap_or_else(|| "a recent day".to_string())
@@ -601,7 +601,7 @@ fn banner(banner: &Banner, strategy: &Strategy, this_year: i32) -> El {
                 .unwrap_or_else(|| "recently".to_string());
             let mut rest = String::new();
             if !reason.is_empty() {
-                rest.push_str(&format!(" Reason: “{}”.", facts::sentence(reason)));
+                rest.push_str(&format!(" Reason: “{}”.", facts::sentence(reason.trim_end_matches(['.', ' ']))));
             }
             if let Some(outcome) = outcome {
                 rest.push_str(&format!(" {}.", facts::sentence(outcome.trim_end_matches('.'))));
@@ -896,7 +896,7 @@ fn stat_skeleton(label: &'static str) -> El {
 
 /// The skeleton the States board draws while the first snapshot is on its
 /// way: the page's shape, nothing pretending to be a figure.
-fn loading(slug: &str, tab: AgentTab) -> El {
+pub(crate) fn loading(slug: &str, tab: AgentTab) -> El {
     el("div")
         .class("ag")
         .attr("aria-busy", "true")

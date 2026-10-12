@@ -74,33 +74,44 @@ pub fn committed_id(network: &str, path: &Path, text: Option<&str>) -> Result<St
 /// named `lib_name` (as in `[lib] name`), for `include!` in its `lib.rs`.
 pub fn emit(lib_name: &str) {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets it"));
-    let source = source(
+    let id = program_id(
+        lib_name,
+        &manifest,
         std::env::var_os("CARGO_FEATURE_MAINNET").is_some(),
         std::env::var_os("CARGO_FEATURE_DEVNET").is_some(),
-    )
-    .unwrap_or_else(|why| panic!("{why}"));
-    let id = match source {
-        Source::Committed { network, file } => {
-            let path = manifest.join(file);
-            println!("cargo:rerun-if-changed={}", path.display());
-            let text = std::fs::read_to_string(&path).ok();
-            committed_id(network, &path, text.as_deref()).unwrap_or_else(|why| panic!("{why}"))
-        }
-        Source::LocalKeypair => {
-            let keypair = manifest.join(format!("../../target/deploy/{lib_name}-keypair.json"));
-            println!("cargo:rerun-if-changed={}", keypair.display());
-            match std::fs::read_to_string(&keypair) {
-                Ok(text) => address_of(&text),
-                Err(_) => PLACEHOLDER.to_string(),
-            }
-        }
-    };
+    );
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets it"));
     std::fs::write(
         out.join("program_id.rs"),
         format!("anchor_lang::declare_id!(\"{id}\");\n"),
     )
     .expect("writing the program id");
+}
+
+/// The address, in base58, of the program whose library is named `lib_name`
+/// and whose `Cargo.toml` is in `program_dir`, for a build for mainnet, devnet
+/// or neither: what [`emit`] compiles into the program, for a build script
+/// that compiles the same id into a crate that calls the program. Tells cargo
+/// to run the build script again when the file it is read from changes, and
+/// panics, failing the build, where [`emit`] would.
+pub fn program_id(lib_name: &str, program_dir: &Path, mainnet: bool, devnet: bool) -> String {
+    let source = source(mainnet, devnet).unwrap_or_else(|why| panic!("{why}"));
+    match source {
+        Source::Committed { network, file } => {
+            let path = program_dir.join(file);
+            println!("cargo:rerun-if-changed={}", path.display());
+            let text = std::fs::read_to_string(&path).ok();
+            committed_id(network, &path, text.as_deref()).unwrap_or_else(|why| panic!("{why}"))
+        }
+        Source::LocalKeypair => {
+            let keypair = program_dir.join(format!("../../target/deploy/{lib_name}-keypair.json"));
+            println!("cargo:rerun-if-changed={}", keypair.display());
+            match std::fs::read_to_string(&keypair) {
+                Ok(text) => address_of(&text),
+                Err(_) => PLACEHOLDER.to_string(),
+            }
+        }
+    }
 }
 
 /// A keypair file is the secret then the public key, as 64 numbers.

@@ -55,7 +55,7 @@ pub fn bar() -> View {
         .into()
 }
 
-fn behind_bar(freshness: Freshness, failing: bool) -> Option<View> {
+pub(crate) fn behind_bar(freshness: Freshness, failing: bool) -> Option<View> {
     let Freshness::Behind { seconds } = freshness else {
         return None;
     };
@@ -81,7 +81,7 @@ pub fn card() -> View {
         .into()
 }
 
-fn unreachable_card(freshness: Freshness) -> Option<View> {
+pub(crate) fn unreachable_card(freshness: Freshness) -> Option<View> {
     let Freshness::Unreachable { since } = freshness else {
         return None;
     };

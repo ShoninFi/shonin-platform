@@ -964,7 +964,13 @@ fn a_wallet_switched_away_from_the_uploading_account_is_never_asked_to_pay() {
     let uploader = world.account();
     world.with(|chain| chain.wallet_account = Some(Address::repeat_byte(0x99)));
     let (result, steps) = pay(&world);
-    assert_eq!(result, Err(AuthorError::WrongPayer { uploader }));
+    assert_eq!(
+        result,
+        Err(AuthorError::WrongPayer {
+            uploader,
+            approved: None
+        })
+    );
     assert!(prompts(&steps).is_empty());
     assert!(world.calls().is_empty());
 }
@@ -1003,7 +1009,13 @@ fn switching_accounts_between_upload_and_payment_sends_nothing() {
         on_step: &on_step,
     };
     let result = block_on(flow::pay(&ctx, publishing(), upload(), uploader));
-    assert_eq!(result, Err(AuthorError::WrongPayer { uploader }));
+    assert_eq!(
+        result,
+        Err(AuthorError::WrongPayer {
+            uploader,
+            approved: None
+        })
+    );
     assert!(prompts(&steps.borrow()).is_empty());
     assert!(world.calls().is_empty());
     assert!(world.sim.borrow().sent.is_empty());
@@ -1025,7 +1037,13 @@ fn an_account_switched_after_the_approval_stops_the_payment_before_it_is_sent() 
     let before = world.usd_of(uploader);
     let (result, _) = pay(&world);
     let error = result.unwrap_err();
-    assert_eq!(error, AuthorError::WrongPayer { uploader });
+    assert_eq!(
+        error,
+        AuthorError::WrongPayer {
+            uploader,
+            approved: Some(dollars(1))
+        }
+    );
     // Only the approval went: no payment, from anyone.
     assert_eq!(world.calls(), vec![IERC20::approveCall::SELECTOR]);
     assert_eq!(world.usd_of(uploader), before);
@@ -1046,7 +1064,48 @@ fn an_account_switched_after_the_approval_stops_the_payment_before_it_is_sent() 
         "{}",
         words.text
     );
-    assert!(words.text.contains("Nothing was sent."));
+    // The approval went and stands: never "Nothing was sent", and the page
+    // is told something was.
+    assert!(!words.text.contains("Nothing was sent"), "{}", words.text);
+    assert!(words.text.contains("approval of 1 USDC"), "{}", words.text);
+    assert!(words.text.contains("stands"), "{}", words.text);
+    assert!(error.after_send());
+}
+
+#[test]
+fn paying_for_an_upload_the_chain_already_records_as_paid_sends_no_second_payment() {
+    // A payment the app had given up on landed after all: the chain records
+    // this upload paid from this wallet. Nothing is sent; the job is shown.
+    let world = World::new();
+    let uploader = world.account();
+    world.with(|chain| chain.submissions = vec![(uploader, upload())]);
+    let before = world.usd_of(uploader);
+    let (result, steps) = pay(&world);
+    assert_eq!(
+        result,
+        Ok(Outcome::AlreadyPaid {
+            strategy_id: U256::from(1u8)
+        })
+    );
+    assert!(world.calls().is_empty(), "{:?}", world.calls());
+    assert!(prompts(&steps).is_empty());
+    assert_eq!(world.sim.borrow().submissions.len(), 1);
+    assert_eq!(world.usd_of(uploader), before);
+}
+
+#[test]
+fn an_upload_paid_only_by_another_wallet_is_still_paid_from_the_uploader() {
+    // Another wallet's payment for the same upload starts nothing: the
+    // uploader's own is still asked for.
+    let world = World::new();
+    let uploader = world.account();
+    world.with(|chain| chain.submissions = vec![(Address::repeat_byte(0x77), upload())]);
+    let (result, _) = pay(&world);
+    assert!(
+        matches!(result, Ok(Outcome::Paid { strategy_id, .. }) if strategy_id == U256::from(2u8)),
+        "{result:?}"
+    );
+    assert_eq!(world.sim.borrow().submissions[1], (uploader, upload()));
 }
 
 #[test]

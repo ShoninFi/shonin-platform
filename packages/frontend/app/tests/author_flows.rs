@@ -93,6 +93,8 @@ struct Chain {
     /// The factory refuses the activation for this reason, after the tank's
     /// approval.
     refuse_activation: Option<&'static str>,
+    /// The wallet declines every transaction after this many were sent.
+    reject_after: Option<usize>,
 }
 
 type Sim = Rc<RefCell<Chain>>;
@@ -134,6 +136,7 @@ impl World {
             wallet_account: Some(account),
             wallet_parity_byte: false,
             refuse_activation: None,
+            reject_after: None,
         };
         Self {
             sim: Rc::new(RefCell::new(chain)),
@@ -561,6 +564,12 @@ impl Signer for SimWallet {
     }
     async fn send(&self, request: &TxRequest) -> Result<B256, TxError> {
         let mut sim = self.sim.borrow_mut();
+        if sim
+            .reject_after
+            .is_some_and(|after| sim.sent.len() >= after)
+        {
+            return Err(TxError::Rejected);
+        }
         assert_eq!(
             request.chain_id, sim.wallet_chain,
             "sent on the wrong chain"
@@ -675,6 +684,7 @@ fn an_activation_stopped_after_its_approval_says_the_approval_stands_and_retries
     assert_eq!(
         error,
         AuthorError::ApprovalStands {
+            spender: flow::Spender::Factory,
             amount: dollars(210),
             then: Box::new(AuthorError::Tx(revert("NotAllowed"))),
         }
@@ -717,6 +727,94 @@ fn an_activation_stopped_after_its_approval_says_the_approval_stands_and_retries
     assert_eq!(
         prompts(&steps),
         vec![Prompt::Statement, Prompt::Activate { tank: dollars(210) }]
+    );
+}
+
+/// The tank is approved and mined, then the author declines the activation
+/// itself in the wallet: the approval stands, and no title says nothing was
+/// sent above the words that say so.
+#[test]
+fn an_activation_declined_after_its_approval_is_not_titled_nothing_was_sent() {
+    let world = World::new();
+    let account = world.account();
+    // The wallet declines the second transaction: the activation.
+    world.with(|chain| chain.reject_after = Some(1));
+    let (result, _) = world.run(|ctx| {
+        Box::pin(async move {
+            flow::activate(ctx, &registries(), usd(), &activation(dollars(210))).await
+        })
+    });
+    let error = result.unwrap_err();
+    assert_eq!(
+        error,
+        AuthorError::ApprovalStands {
+            spender: flow::Spender::Factory,
+            amount: dollars(210),
+            then: Box::new(AuthorError::Tx(TxError::Rejected)),
+        }
+    );
+    assert_eq!(
+        world.sim.borrow().allowance.get(&(account, factory())),
+        Some(&dollars(210))
+    );
+    let words = error.words(&context());
+    assert!(words.text.contains("stands"), "{}", words.text);
+    assert!(
+        !words.title.contains("Nothing was sent"),
+        "{:?} / {:?}",
+        words.title,
+        words.text
+    );
+}
+
+/// An approval of the tank stands after a stopped activation; activating
+/// again with a smaller tank approves exactly that tank first, so nothing
+/// larger than the action stays approved to the factory.
+#[test]
+fn activating_again_with_a_smaller_tank_leaves_no_approval_larger_than_the_tank() {
+    let world = World::new();
+    let account = world.account();
+    world.with(|chain| chain.refuse_activation = Some("NotAllowed"));
+    let (result, _) = world.run(|ctx| {
+        Box::pin(async move {
+            flow::activate(ctx, &registries(), usd(), &activation(dollars(210))).await
+        })
+    });
+    assert!(
+        matches!(result, Err(AuthorError::ApprovalStands { .. })),
+        "{result:?}"
+    );
+    world.with(|chain| chain.refuse_activation = None);
+    let (result, steps) = world.run(|ctx| {
+        Box::pin(async move {
+            flow::activate(ctx, &registries(), usd(), &activation(dollars(100))).await
+        })
+    });
+    assert!(
+        matches!(result, Ok(Outcome::Activated { .. })),
+        "{result:?}"
+    );
+    assert_eq!(
+        prompts(&steps),
+        vec![
+            Prompt::Statement,
+            Prompt::Approve {
+                amount: dollars(100),
+                spender: Spender::Factory
+            },
+            Prompt::Activate { tank: dollars(100) }
+        ]
+    );
+    assert_eq!(world.sim.borrow().tank.balance, dollars(100));
+    assert_eq!(
+        world
+            .sim
+            .borrow()
+            .allowance
+            .get(&(account, factory()))
+            .copied()
+            .unwrap_or_default(),
+        U256::ZERO
     );
 }
 

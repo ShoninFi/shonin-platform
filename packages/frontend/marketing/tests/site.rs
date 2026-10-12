@@ -143,6 +143,32 @@ fn app_links_go_to_the_app_origin_in_full() {
 }
 
 #[test]
+fn every_docs_link_names_a_page_the_docs_publish() {
+    let content = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../docs/content");
+    let pages = pages(&files());
+    let mut seen = 0;
+    for (page, html) in &pages {
+        for href in attributes(html, "href") {
+            let Some(path) = href.strip_prefix("https://docs.shonin.fi/") else {
+                continue;
+            };
+            seen += 1;
+            let path = path.split('#').next().unwrap().trim_end_matches('/');
+            let source = if path.is_empty() {
+                content.join("index.md")
+            } else {
+                content.join(format!("{path}.md"))
+            };
+            assert!(
+                source.is_file() || content.join(path).join("index.md").is_file(),
+                "{page} links to {href}, which the docs don't publish"
+            );
+        }
+    }
+    assert!(seen > 0, "no page links the docs");
+}
+
+#[test]
 fn no_page_ships_a_bracketed_placeholder_or_an_unfilled_template() {
     for (page, html) in pages(&files()) {
         assert!(!html.contains("{{"), "{page} has an unfilled placeholder");

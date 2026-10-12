@@ -94,6 +94,11 @@ pub enum Outcome {
         strategy_id: U256,
         hash: B256,
     },
+    /// The chain already records a payment for this upload from this
+    /// wallet, under this id: nothing was sent.
+    AlreadyPaid {
+        strategy_id: U256,
+    },
     /// The vault exists.
     Activated {
         vault: Address,
@@ -206,6 +211,7 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
             cancel: self.cancel.clone(),
             // The author's flows have no second step to settle.
             settle_now: crate::tx::flow::Nudge::new(),
+            skip_second: crate::tx::flow::Nudge::new(),
             pace: self.pace,
             on_step,
         }
@@ -241,21 +247,24 @@ impl<R: Reader, S: Signer, C: Clock> Ctx<'_, R, S, C> {
     }
 
     /// Approve `spender` for exactly `amount` of `asset`, unless the
-    /// allowance already covers it; refuse first if the wallet doesn't hold
-    /// it. Whether an approval was sent and mined.
+    /// allowance already covers it (with `exact`, unless it already is
+    /// exactly `amount`, so nothing more than the action stays approved
+    /// after it); refuse first if the wallet doesn't hold it. Whether an
+    /// approval was sent and mined.
     async fn pay_from_wallet(
         &self,
         asset: Address,
         spender: Address,
         who: Spender,
         amount: U256,
+        exact: bool,
     ) -> Result<bool> {
         let have = asset_balance(self.reader, asset, self.account).await?;
         if have < amount {
             return Err(TxError::InsufficientBalance { have }.into());
         }
         let allowed = allowance(self.reader, asset, self.account, spender).await?;
-        if allowed < amount {
+        if allowed < amount || (exact && allowed != amount) {
             self.transact(
                 Prompt::Approve {
                     amount,
@@ -323,17 +332,34 @@ pub async fn pay<R: Reader, S: Signer, C: Clock>(
     uploader: Address,
 ) -> Result<Outcome> {
     ctx.step(Step::Checking);
-    let wrong_payer = AuthorError::WrongPayer { uploader };
     if ctx.account != uploader || ctx.signer.account() != Some(uploader) {
-        return Err(wrong_payer);
+        return Err(AuthorError::WrongPayer {
+            uploader,
+            approved: None,
+        });
     }
-    let paid = pay_as_uploader(ctx, publishing, upload).await;
+    // The fee's approval, once mined: it stands if the payment is stopped.
+    let approved = std::cell::Cell::new(None);
+    let paid = pay_as_uploader(ctx, publishing, upload, &approved).await;
+    let wrong_payer = AuthorError::WrongPayer {
+        uploader,
+        approved: approved.get(),
+    };
     paid.map_err(|error| match error {
         // The wallet left the uploading account: the guard stopped it, or
         // the session cancelled the flow when the account changed.
         AuthorError::Tx(TxError::AccountChanged | TxError::NotConnected) => wrong_payer,
         AuthorError::Tx(TxError::Cancelled) if ctx.signer.account() != Some(uploader) => {
             wrong_payer
+        }
+        // The fee's approval was mined and the payment stopped before it
+        // was sent: the approval stands, and paying again uses it.
+        AuthorError::Tx(then) if !then.may_have_moved() && approved.get().is_some() => {
+            AuthorError::ApprovalStands {
+                spender: Spender::Publishing,
+                amount: approved.get().unwrap_or_default(),
+                then: Box::new(AuthorError::Tx(then)),
+            }
         }
         other => other,
     })
@@ -343,11 +369,30 @@ async fn pay_as_uploader<R: Reader, S: Signer, C: Clock>(
     ctx: &Ctx<'_, R, S, C>,
     publishing: Address,
     upload: B256,
+    approved: &std::cell::Cell<Option<U256>>,
 ) -> Result<Outcome> {
     ctx.check_endpoint().await?;
+    // A payment for this upload from this wallet already on the chain (one
+    // the app gave up on that landed after all): paying again would buy
+    // nothing, so nothing is sent and the job is shown instead.
+    if let read::PaymentRecord::ByUploader { strategy_id } =
+        read::payment_after(ctx.reader, publishing, upload, ctx.account, None).await?
+    {
+        return Ok(Outcome::AlreadyPaid { strategy_id });
+    }
     let terms = read::publishing(ctx.reader, publishing).await?;
-    ctx.pay_from_wallet(terms.asset, publishing, Spender::Publishing, terms.fee)
-        .await?;
+    if ctx
+        .pay_from_wallet(
+            terms.asset,
+            publishing,
+            Spender::Publishing,
+            terms.fee,
+            false,
+        )
+        .await?
+    {
+        approved.set(Some(terms.fee));
+    }
     // How many payments the contract has recorded before this one: a payment
     // that isn't seen mined is looked for after these.
     let since = call(ctx.reader, publishing, IPublishing::countCall {}).await?;
@@ -470,8 +515,10 @@ pub async fn activate<R: Reader, S: Signer, C: Clock>(
     // statement is sent, and before the tank is approved.
     let signature = as_the_vault_takes_it(&signature).ok_or(TxError::BadSignature)?;
 
+    // Exactly the tank: an approval left standing from an earlier try for
+    // another tank is replaced, never left larger than the action.
     let approved = ctx
-        .pay_from_wallet(asset, at.factory, Spender::Factory, activation.tank)
+        .pay_from_wallet(asset, at.factory, Spender::Factory, activation.tank, true)
         .await?;
     let receipt = ctx
         .transact(
@@ -498,6 +545,7 @@ pub async fn activate<R: Reader, S: Signer, C: Clock>(
             let landing = matches!(&then, AuthorError::Tx(error) if error.may_have_moved());
             if approved && !landing {
                 AuthorError::ApprovalStands {
+                    spender: Spender::Factory,
                     amount: activation.tank,
                     then: Box::new(then),
                 }
@@ -536,7 +584,10 @@ pub async fn fund_tank<R: Reader, S: Signer, C: Clock>(
     if matches!(read.state, State::Closed | State::Cancelled | State::None) {
         return Err(AuthorError::NotOpen);
     }
-    ctx.pay_from_wallet(asset, vault, Spender::Vault, amount)
+    // Exactly the amount, whatever stands: nothing larger than the top-up
+    // stays approved to the vault.
+    let approved = ctx
+        .pay_from_wallet(asset, vault, Spender::Vault, amount, true)
         .await?;
     let receipt = ctx
         .transact(
@@ -544,7 +595,21 @@ pub async fn fund_tank<R: Reader, S: Signer, C: Clock>(
             vault,
             IVault::fundTankCall { assets: amount }.abi_encode(),
         )
-        .await?;
+        .await
+        .map_err(|then| {
+            // The approval was mined and the top-up wasn't sent: it stands
+            // until used. Not said when the top-up itself may still land.
+            let landing = matches!(&then, AuthorError::Tx(error) if error.may_have_moved());
+            if approved && !landing {
+                AuthorError::ApprovalStands {
+                    spender: Spender::Vault,
+                    amount,
+                    then: Box::new(then),
+                }
+            } else {
+                then
+            }
+        })?;
     let funded = decode::<IVault::TankFunded>(vault, &receipt.logs)
         .into_iter()
         .find(|event| event.from == ctx.account)

@@ -27,6 +27,8 @@ pub mod logs;
 pub mod rpc_counts;
 #[cfg(feature = "solana")]
 pub mod solana;
+#[cfg(feature = "solana-ix")]
+pub mod solana_ix;
 
 #[cfg(feature = "args")]
 pub use args::{

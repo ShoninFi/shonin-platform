@@ -52,7 +52,7 @@ fn events(strategy: &Strategy) -> View {
     }
     section
         .child(
-            el("div").class("ag-scroll").child(
+            super::parts::scroll("Events table").child(
                 el("table")
                     .class("sh-table")
                     .class("ag-log")
@@ -135,7 +135,7 @@ fn trades(strategy: &Strategy) -> View {
     }
     section
         .child(
-            el("div").class("ag-scroll").child(
+            super::parts::scroll("Trades table").child(
                 el("table")
                     .class("sh-table")
                     .class("ag-log")

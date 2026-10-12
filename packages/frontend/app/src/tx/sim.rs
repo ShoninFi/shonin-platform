@@ -224,6 +224,7 @@ impl World {
             account: self.account(),
             cancel: Cancel::new(),
             settle_now: settle_now.clone(),
+            skip_second: Nudge::new(),
             pace: Pace::FAST,
             on_step: &on_step,
         };
@@ -1347,6 +1348,7 @@ fn a_cancelled_flow_sends_nothing() {
         account: world.account(),
         cancel,
         settle_now: Nudge::new(),
+        skip_second: Nudge::new(),
         pace: Pace::FAST,
         on_step: &on_step,
     };

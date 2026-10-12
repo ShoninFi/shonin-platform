@@ -71,11 +71,12 @@ fn ret_figure(value: Option<f64>, missing: &'static str) -> View {
 
 fn stats(agent: &Rc<Agent>) -> El {
     let as_of = store::get().as_of.clone();
-    el("dl")
+    // The list is drawn inside the live binding, so its groups are its own
+    // children (a binding's wrappers inside a `dl` aren't allowed there).
+    el("div")
         .class("sh-card")
         .class("ag-stats")
         .class("ag-o-stats")
-        .attr("aria-label", "Record")
         .child(live(agent, move |strategy| {
             let figures = crate::model::figures(strategy);
             let this_year = as_of.get().map(|at| at.year()).unwrap_or(2026);
@@ -83,47 +84,51 @@ fn stats(agent: &Rc<Agent>) -> El {
                 .stale_as_of
                 .map(|at| format!(" · as of {}", format::day(at.date(), this_year)))
                 .unwrap_or_default();
-            View::Many(vec![
-                stat(
-                    "30 days",
-                    ret_figure(figures.return_30d, "Needs 30 days"),
-                    match (figures.return_30d, facts::period_30d(strategy, this_year)) {
-                        (Some(_), Some(period)) => format!("{period}{stale}"),
-                        _ => "Needs 30 days".to_string(),
-                    },
-                )
-                .into(),
-                stat(
-                    "Since opening",
-                    ret_figure(figures.since_opening, "No record yet"),
-                    if figures.since_opening.is_some() {
-                        format!("Return over {}{stale}", format::days(figures.days))
-                    } else {
-                        "No record yet".to_string()
-                    },
-                )
-                .into(),
-                stat(
-                    "Deepest drop",
-                    ret_figure(figures.deepest_drop, "No record yet"),
-                    if figures.deepest_drop.is_some() {
-                        "From a high, since opening".to_string()
-                    } else {
-                        "No record yet".to_string()
-                    },
-                )
-                .into(),
-                stat(
-                    "In vault",
-                    text(format::money_whole(strategy.vault.value)),
-                    format!(
-                        "{} on {}{stale}",
-                        strategy.vault.asset,
-                        strategy.vault.chain.label()
-                    ),
-                )
-                .into(),
-            ])
+            el("dl")
+                .class("sh-contents")
+                .attr("aria-label", "Record")
+                .child(View::Many(vec![
+                    stat(
+                        "30 days",
+                        ret_figure(figures.return_30d, "Needs 30 days"),
+                        match (figures.return_30d, facts::period_30d(strategy, this_year)) {
+                            (Some(_), Some(period)) => format!("{period}{stale}"),
+                            _ => "Needs 30 days".to_string(),
+                        },
+                    )
+                    .into(),
+                    stat(
+                        "Since opening",
+                        ret_figure(figures.since_opening, "No record yet"),
+                        if figures.since_opening.is_some() {
+                            format!("Return over {}{stale}", format::days(figures.days))
+                        } else {
+                            "No record yet".to_string()
+                        },
+                    )
+                    .into(),
+                    stat(
+                        "Deepest drop",
+                        ret_figure(figures.deepest_drop, "No record yet"),
+                        if figures.deepest_drop.is_some() {
+                            "From a high, since opening".to_string()
+                        } else {
+                            "No record yet".to_string()
+                        },
+                    )
+                    .into(),
+                    stat(
+                        "In vault",
+                        text(format::money_whole(strategy.vault.value)),
+                        format!(
+                            "{} on {}{stale}",
+                            strategy.vault.asset,
+                            strategy.vault.chain.label()
+                        ),
+                    )
+                    .into(),
+                ]))
+                .into()
         }))
 }
 

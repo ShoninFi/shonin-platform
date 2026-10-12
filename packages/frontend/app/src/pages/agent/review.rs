@@ -300,7 +300,7 @@ fn report_card(strategy: &Strategy, review: &Review) -> El {
                 }))),
         )
         .child(
-            el("div").class("ag-scroll").child(
+            super::parts::scroll("The six areas and their ratings").child(
                 el("table")
                     .class("sh-table")
                     .class("ag-report")

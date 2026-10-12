@@ -146,6 +146,36 @@ impl Controls {
 }
 
 pub fn page(slug: &str) -> Page {
+    // A Solana vault is managed with a Solana wallet, from its own account.
+    if crate::tx::solana::run::is_solana(slug) {
+        // The title once the store has the agent: a direct load arrives
+        // before the first snapshot.
+        let title_of = |slug: &str| {
+            crate::store::get()
+                .agent(slug)
+                .map(|agent| agent.strategy.lock_ref().title.clone())
+                .unwrap_or_else(|| "Manage your agent".to_string())
+        };
+        let store = crate::store::get();
+        let asked = slug.to_string();
+        let title = futures_signals::map_ref! {
+            let _membership = store.membership.signal(),
+            let _loaded = store.loaded.signal() => title_of(&asked)
+        }
+        .dedupe_cloned();
+        let body = el("div")
+            .class("sh-author sh-manage")
+            .child(
+                el("h1")
+                    .class("sh-author__title")
+                    .text_signal(title_of(slug), title),
+            )
+            .child(crate::components::solana::manage::panel(slug));
+        return Page {
+            top: None,
+            body: body.into(),
+        };
+    }
     let load = Mutable::new(Load::Loading);
     let controls = Rc::new(Controls::new());
     let follow = load.clone();

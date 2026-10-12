@@ -479,7 +479,7 @@ fn keys(strategy: &Strategy) -> View {
             "Only keys made inside an attested machine running this exact build can trade. They can place and cancel orders, and nothing else.",
         ))
         .child(
-            el("div").class("ag-scroll").child(
+            super::parts::scroll("Blessed keys").child(
                 el("table")
                     .class("sh-table")
                     .class("ag-keys")
@@ -599,7 +599,7 @@ fn images(strategy: &Strategy) -> View {
             "Only machines running an image on this public list can review, build, run or unwind agents.{wait}"
         )))
         .child(
-            el("div").class("ag-scroll").child(
+            super::parts::scroll("Machine images behind this agent").child(
                 el("table")
                     .class("sh-table")
                     .child(el("caption").class("sh-vh").text("Machine images behind this agent"))
