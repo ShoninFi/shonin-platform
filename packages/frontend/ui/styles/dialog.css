@@ -1,0 +1,48 @@
+/* Dialogs on desktop, sheets on phone, same content. Labelled by the title,
+   aria-modal, focus moves in, is trapped and returns to the trigger. Esc, the
+   close button and the scrim close it.
+   Dialog: width 480 (max 100vw - 32) · padding 24 · radius 16 · gap 16.
+   Sheet: radius 16 16 0 0 · padding 8 16 16 + safe area · grabber 36 x 4. */
+.sh-scrim {
+  position: fixed; inset: 0; z-index: 1000; background: var(--scrim);
+  display: flex; align-items: center; justify-content: center; padding: var(--space-4);
+  animation: sh-fade 200ms var(--ease-out) both;
+}
+.sh-dialog {
+  position: relative; width: min(480px, 100vw - 32px); max-height: calc(100dvh - 32px); overflow: auto;
+  display: flex; flex-direction: column; gap: var(--space-4); padding: var(--space-5);
+  border-radius: var(--radius-l); background: var(--paper-raised); box-shadow: var(--shadow-float);
+  animation: sh-dialog var(--dur-panel) var(--ease-emph) both;
+}
+.sh-dialog--wide { width: min(560px, 100vw - 32px); }
+.sh-dialog__head { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--space-4); }
+.sh-dialog__title { font: var(--type-heading); letter-spacing: var(--track-heading); }
+.sh-dialog__title:focus { outline: none; }
+.sh-dialog__close { margin: -10px -10px 0 0; }
+.sh-dialog__body { display: flex; flex-direction: column; gap: var(--space-4); }
+.sh-dialog__foot { display: flex; justify-content: flex-end; gap: var(--space-3); padding-top: 4px; flex-wrap: wrap; }
+
+.sh-dialog__grab { display: none; }
+
+/* Below 600px the same dialog is a bottom sheet. */
+@media (max-width: 599px) {
+  .sh-scrim { align-items: flex-end; padding: 0; }
+  .sh-dialog {
+    width: 100%; max-height: calc(100dvh - 48px); gap: var(--space-4);
+    padding: var(--space-5) var(--space-4) calc(var(--space-4) + env(safe-area-inset-bottom));
+    border-radius: var(--radius-l) var(--radius-l) 0 0;
+    animation: sh-sheet var(--dur-panel) var(--ease-emph) both;
+  }
+  .sh-dialog__grab {
+    display: block; position: absolute; top: var(--space-2); left: 50%; width: 36px; height: 4px; margin-left: -18px;
+    border-radius: var(--radius-full); background: var(--line-control);
+  }
+  .sh-dialog__head { align-items: center; touch-action: none; }
+  .sh-dialog__close { margin: 0 -10px 0 0; }
+  .sh-dialog__foot { flex-direction: column-reverse; }
+  .sh-dialog__foot .sh-btn { width: 100%; }
+  .sh-dialog[data-dragging] { animation: none; transition: none; }
+  .sh-dialog[data-settling] { transition: transform var(--dur-panel) var(--ease-emph); }
+}
+/* Background content is inert while a dialog is open. */
+.sh-inert { overflow: hidden; }

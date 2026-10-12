@@ -1,0 +1,9 @@
+/* Tank gauge: how long an agent can keep running. track paper-sunk, radius
+   999 · fill gain (7 days or more) or caution-fill (under 7) · the runway is
+   always in words. Drawn as SVG so its width needs no inline style. */
+.sh-gauge { display: block; width: 100%; height: 8px; border-radius: var(--radius-full); overflow: hidden; }
+.sh-gauge__track { fill: var(--paper-sunk); }
+.sh-gauge__fill { fill: var(--gain); transform-box: fill-box; transform-origin: left; animation: sh-grow 800ms var(--ease-emph) both; }
+.sh-gauge--low .sh-gauge__fill { fill: var(--caution-fill); }
+.sh-gauge--empty .sh-gauge__fill { display: none; }
+.sh-gauge--mini { width: 48px; height: 6px; }

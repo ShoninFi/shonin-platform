@@ -1,0 +1,55 @@
+/* Base: the page, links, focus, and the small helpers every atom leans on. */
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; background: var(--paper); }
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--paper);
+  color: var(--ink);
+  font: var(--type-body);
+  font-feature-settings: "tnum" 1;
+  font-optical-sizing: auto;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+h1, h2, h3, h4, h5, h6, p, ul, ol, dl, dd, figure, blockquote { margin: 0; }
+ul, ol { padding: 0; list-style: none; }
+img, svg { display: block; }
+button, input, select, textarea { font: inherit; color: inherit; }
+table { border-collapse: collapse; }
+
+a { color: var(--link); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+@media (hover: hover) { a:hover { color: var(--brand-hover); } }
+
+/* Every interactive element: a 2px ring, 2px off, only for keyboard focus. */
+:focus-visible { outline: var(--border-focus) solid var(--focus); outline-offset: 2px; }
+:focus:not(:focus-visible) { outline: none; }
+
+/* Visually hidden, still read. */
+.sh-vh {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+
+.sh-label { font: var(--type-label); letter-spacing: var(--track-label); text-transform: uppercase; color: var(--ink-muted); }
+.sh-mono { font: var(--type-mono); letter-spacing: 0; }
+.sh-mono-s { font: var(--type-mono-s); }
+.sh-num { font-variant-numeric: tabular-nums; }
+.sh-muted { color: var(--ink-muted); }
+.sh-gain { color: var(--gain); }
+.sh-loss { color: var(--loss); }
+.sh-caution { color: var(--caution); }
+
+/* The skip link: the first thing a keyboard reaches, shown when focused. */
+.sh-skip {
+  position: absolute; left: var(--space-4); top: -100px; z-index: 1200;
+  padding: var(--space-3) var(--space-4); border-radius: var(--radius-m);
+  background: var(--paper-raised); color: var(--brand); box-shadow: var(--shadow-float);
+  font: var(--type-button); text-decoration: none;
+}
+.sh-skip:focus, .sh-skip:focus-visible { top: var(--space-3); }
+
+/* A standalone link: 600 15/24 with an arrow. */
+.sh-link { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; font-size: 15px; line-height: 24px; }
+.sh-link .sh-icon { flex: none; }
+.sh-contents { display: contents; }

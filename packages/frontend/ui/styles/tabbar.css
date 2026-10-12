@@ -1,0 +1,23 @@
+/* Bottom tab bar, phone only, on /agents, /portfolio and /publish: 64px plus
+   the safe area, three equal tabs, icon 24 over a 600 12/16 label; the
+   current tab is brand with a 24 x 3 bar. Links with aria-current. */
+.sh-tabbar { display: none; }
+@media (max-width: 599px) {
+  .sh-tabbar {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 100;
+    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+    height: calc(64px + env(safe-area-inset-bottom)); padding-bottom: env(safe-area-inset-bottom);
+    background: var(--paper-raised); border-top: var(--border-hairline) solid var(--line);
+  }
+  .sh-tabbar a {
+    position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
+    min-height: 44px; color: var(--ink-muted); text-decoration: none; font: 600 12px/16px var(--font-sans);
+  }
+  .sh-tabbar a:focus-visible { outline-offset: -4px; border-radius: var(--radius-m); }
+  .sh-tabbar a[aria-current="page"] { color: var(--brand); }
+  .sh-tabbar a[aria-current="page"]::before {
+    content: ""; position: absolute; top: 0; left: 50%; width: 24px; height: 3px; margin-left: -12px;
+    border-radius: 0 0 3px 3px; background: var(--brand);
+  }
+  .sh-app--tabbar { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
+}

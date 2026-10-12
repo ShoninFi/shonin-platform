@@ -1,0 +1,15 @@
+/* Tabs: route tabs are links with aria-current; panel tabs follow the ARIA
+   tabs pattern. height 44 · 600 15/20 · selected: ink + 2px brand underline. */
+.sh-tabs { display: flex; gap: 28px; border-bottom: var(--border-hairline) solid var(--line); overflow-x: auto; scrollbar-width: none; }
+.sh-tabs::-webkit-scrollbar { display: none; }
+.sh-tab {
+  display: inline-flex; align-items: center; gap: var(--space-2); flex: none;
+  height: 44px; padding: 0 4px; margin-bottom: -1px;
+  border: 0; border-bottom: 2px solid transparent; background: none; cursor: pointer;
+  color: var(--ink-muted); font: var(--type-tab); text-decoration: none; white-space: nowrap;
+  transition: color var(--dur-fast) var(--ease-out), border-color var(--dur-base) var(--ease-out);
+}
+@media (hover: hover) { .sh-tab:hover { color: var(--ink); } }
+.sh-tab[aria-current="page"], .sh-tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--brand); }
+.sh-tab:focus-visible { outline-offset: -2px; border-radius: var(--radius-s); }
+.sh-tab .sh-chip { height: 20px; padding: 0 6px; }

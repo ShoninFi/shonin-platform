@@ -1,0 +1,18 @@
+/* Notice: info (what happens next), caution (may affect you), danger (has
+   happened and limits you). padding 12 16 · radius 10 · icon 20, 2px down ·
+   gap 12 · ink 15/24 · danger leads with a 650 sentence · never a coloured
+   left border. Static notices have no role; one that appears after an action
+   is role="status" (info, caution) or role="alert" (danger). */
+.sh-notice { display: flex; gap: var(--space-3); padding: var(--space-3) var(--space-4); border-radius: var(--radius-m); color: var(--ink); }
+.sh-notice > .sh-icon { margin-top: 2px; }
+.sh-notice__body { flex: 1; min-width: 0; font: var(--type-body); }
+.sh-notice__body strong, .sh-notice__lead { font-weight: 650; }
+.sh-notice__actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) 20px; margin-top: 6px; }
+.sh-notice__actions a { font-weight: 600; font-size: 14px; line-height: 20px; display: inline-flex; align-items: center; gap: 6px; }
+.sh-notice--info { background: var(--brand-soft); }
+.sh-notice--info > .sh-icon { color: var(--brand); }
+.sh-notice--caution { background: var(--caution-soft); }
+.sh-notice--caution > .sh-icon { color: var(--caution); }
+.sh-notice--danger { background: var(--loss-soft); }
+.sh-notice--danger > .sh-icon { color: var(--loss); }
+.sh-notice--compact .sh-notice__body { font: var(--type-body-s); font-size: 14px; line-height: 22px; }

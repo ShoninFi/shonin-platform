@@ -1,0 +1,14 @@
+/* Skeletons match the final layout exactly. No spinners. The shimmer stops
+   under reduced motion; the shape stays. */
+.sh-skel {
+  display: block; border-radius: var(--radius-s);
+  background: linear-gradient(90deg, var(--paper-sunk) 0%, var(--skeleton-shine) 50%, var(--paper-sunk) 100%);
+  background-size: 200% 100%;
+  animation: sh-shimmer 1.4s linear infinite;
+}
+.sh-skel--text { height: 14px; }
+.sh-skel--title { height: 34px; border-radius: 8px; }
+.sh-skel--figure { height: 28px; }
+.sh-skel--block { border-radius: var(--radius-m); }
+.sh-skel--spark { width: 96px; height: 28px; }
+@media (prefers-reduced-motion: reduce) { .sh-skel { animation: none; background: var(--paper-sunk); } }

@@ -1,0 +1,11 @@
+/* Tooltip: ink ground, white text, radius 6, padding 8 10, 13/18, floats. */
+.sh-tip-anchor { position: relative; display: inline-flex; }
+.sh-tip {
+  position: absolute; z-index: 1200; pointer-events: none;
+  padding: var(--space-2) 10px; border-radius: var(--radius-s);
+  background: var(--ink); color: var(--paper-raised); box-shadow: var(--shadow-float);
+  font: 500 13px/18px var(--font-sans); white-space: nowrap;
+  animation: sh-fade var(--dur-fast) var(--ease-out) both;
+}
+.sh-tip--above { left: 50%; bottom: calc(100% + 8px); transform: translateX(-50%); }
+.sh-tip--below { left: 50%; top: calc(100% + 8px); transform: translateX(-50%); }

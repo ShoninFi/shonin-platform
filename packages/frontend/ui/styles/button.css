@@ -1,0 +1,67 @@
+/* Buttons do things; links go places. A link styled as a button is
+   <a class="sh-btn ...">, never a button inside a link.
+   height 36 / 44 / 52 · padding 0 14 / 20 / 24 · radius 10 · border 1.5 ·
+   600 14 / 15 / 16 · gap 8 · icon 18 · press .98 · colour 120ms. */
+.sh-btn {
+  position: relative;
+  display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2);
+  height: 44px; padding: 0 20px;
+  border-radius: var(--radius-m); border: var(--border-control) solid transparent;
+  font: var(--type-button); text-decoration: none; white-space: nowrap; cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out), transform 80ms var(--ease-out);
+}
+.sh-btn:active:not(:disabled):not([aria-disabled="true"]) { transform: scale(.98); }
+.sh-btn-sm { height: 36px; padding: 0 14px; font-size: 14px; }
+.sh-btn-lg { height: 52px; padding: 0 24px; font-size: 16px; }
+.sh-btn-block { display: flex; width: 100%; }
+
+.sh-btn-primary { background: var(--brand); color: var(--on-brand); }
+.sh-btn-secondary { background: var(--paper-raised); color: var(--ink); border-color: var(--line-control); }
+.sh-btn-ghost { background: transparent; color: var(--ink); }
+.sh-btn-danger { background: var(--danger); color: var(--on-brand); }
+.sh-btn-hero { background: var(--hero-ink); color: var(--hero-ground); }
+.sh-btn-hero-2 { background: transparent; color: var(--hero-ink); border-color: var(--hero-ink-muted); }
+.sh-btn-caution { background: var(--caution-soft); color: var(--caution); }
+
+@media (hover: hover) {
+  .sh-btn-primary:hover { background: var(--brand-hover); color: var(--on-brand); }
+  .sh-btn-secondary:hover { background: var(--paper-sunk); color: var(--ink); }
+  .sh-btn-ghost:hover { background: var(--paper-sunk); color: var(--ink); }
+  .sh-btn-danger:hover { background: var(--danger-hover); color: var(--on-brand); }
+  .sh-btn-hero:hover { background: var(--hero-hover); color: var(--hero-ground); }
+  .sh-btn-hero-2:hover { background: var(--hero-tint); color: var(--hero-ink); }
+}
+.sh-btn-primary:active { background: var(--brand-hover); }
+.sh-btn-secondary:active, .sh-btn-ghost:active { background: var(--paper-sunk); }
+.sh-btn-danger:active { background: var(--danger-hover); }
+
+/* Disabled says why somewhere near; the button itself only greys. */
+.sh-btn:disabled, .sh-btn[aria-disabled="true"] {
+  background: var(--paper-sunk); color: var(--ink-disabled); border-color: transparent; cursor: not-allowed;
+}
+
+/* Loading keeps the label and the width, adds a tracing hex, ignores clicks. */
+.sh-btn[aria-busy="true"] { cursor: progress; pointer-events: none; }
+.sh-btn__hex { flex: none; }
+.sh-btn__hex-trace { stroke-dasharray: .25 .75; animation: sh-trace 1.2s linear infinite; }
+
+/* Small buttons stay 36px to look at but take a 44px touch target. */
+@media (max-width: 1023px) {
+  .sh-btn-sm::after { content: ""; position: absolute; inset: -4px -2px; }
+}
+
+/* Icon buttons: only for universally understood icons; aria-label required. */
+.sh-iconbtn {
+  position: relative;
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 44px; height: 44px; padding: 0;
+  border: 0; border-radius: var(--radius-m); background: transparent; color: var(--ink); cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+}
+.sh-iconbtn-dense { width: 36px; height: 36px; }
+.sh-iconbtn-s { width: 32px; height: 32px; }
+@media (hover: hover) { .sh-iconbtn:hover { background: var(--paper-sunk); } }
+.sh-iconbtn:disabled { color: var(--ink-disabled); cursor: not-allowed; background: transparent; }
+.sh-hero .sh-iconbtn { color: var(--hero-ink); }
+@media (hover: hover) { .sh-hero .sh-iconbtn:hover { background: var(--hero-tint); } }

@@ -1,0 +1,36 @@
+/* Named motions and their keyframes (Motion board). Every one stops under
+   prefers-reduced-motion. Money never animates. */
+.sh-reveal { animation: sh-rise var(--dur-reveal) var(--ease-emph) both; }
+.sh-fade-in { animation: sh-fade var(--dur-reveal) var(--ease-out) both; }
+.sh-draw { stroke-dasharray: 1; stroke-dashoffset: 1; animation: sh-draw var(--dur-draw) var(--ease-emph) forwards; }
+.sh-float { animation: sh-float 7s var(--ease-in-out) infinite alternate; }
+.sh-spin-slow { transform-box: fill-box; transform-origin: center; animation: sh-spin 90s linear infinite; }
+.sh-glow-drift { animation: sh-glow 18s var(--ease-in-out) infinite alternate; }
+.sh-trace { stroke-dasharray: .08 .92; animation: sh-trace 6s linear infinite; }
+.sh-seal-in { transform-box: fill-box; transform-origin: center; animation: sh-seal 700ms var(--ease-emph) both; }
+.sh-ring-out { transform-box: fill-box; transform-origin: center; animation: sh-ring 900ms var(--ease-out) both; }
+.sh-sheet-up { animation: sh-sheet var(--dur-panel) var(--ease-emph) both; }
+.sh-dialog-in { animation: sh-dialog var(--dur-panel) var(--ease-emph) both; }
+
+@keyframes sh-rise { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: none; } }
+@keyframes sh-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes sh-draw { to { stroke-dashoffset: 0; } }
+@keyframes sh-grow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+@keyframes sh-float { from { transform: translateY(-6px); } to { transform: translateY(6px); } }
+@keyframes sh-spin { to { transform: rotate(360deg); } }
+@keyframes sh-glow {
+  0% { transform: translate(0, 0) scale(1); opacity: .95; }
+  50% { transform: translate(-3%, 2%) scale(1.06); opacity: 1; }
+  100% { transform: translate(2%, -2%) scale(.98); opacity: .9; }
+}
+@keyframes sh-trace { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+@keyframes sh-seal { 0% { opacity: 0; transform: scale(.6) rotate(-30deg); } 100% { opacity: 1; transform: none; } }
+@keyframes sh-ring { 0% { opacity: .6; transform: scale(.8); } 100% { opacity: 0; transform: scale(1.6); } }
+@keyframes sh-sheet { from { transform: translateY(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+@keyframes sh-dialog { from { transform: scale(.98); opacity: 0; } to { transform: none; opacity: 1; } }
+@keyframes sh-shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+  .sh-draw { stroke-dashoffset: 0; }
+}

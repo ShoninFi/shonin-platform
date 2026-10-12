@@ -1,0 +1,35 @@
+/* Toasts: confirm what just happened; never the only copy. Bottom-right on
+   desktop (24 from the edges, newest last, at most 3), top on phone under the
+   header. width 400 · padding 16 · radius 16 · shadow-float · 3px timer bar
+   that pauses on hover or focus. */
+.sh-toasts {
+  position: fixed; z-index: 1100; right: var(--space-5); bottom: var(--space-5);
+  display: flex; flex-direction: column; gap: var(--space-3); width: min(400px, 100vw - 32px);
+  pointer-events: none;
+}
+@media (max-width: 599px) {
+  .sh-toasts { right: var(--space-4); left: var(--space-4); top: 64px; bottom: auto; width: auto; flex-direction: column-reverse; }
+}
+.sh-toast {
+  position: relative; overflow: hidden; pointer-events: auto;
+  display: flex; gap: var(--space-3); align-items: flex-start; padding: var(--space-4) var(--space-2) var(--space-4) var(--space-4);
+  border: var(--border-hairline) solid var(--line); border-radius: var(--radius-l);
+  background: var(--paper-raised); box-shadow: var(--shadow-float);
+  animation: sh-sheet var(--dur-panel) var(--ease-emph) both;
+}
+.sh-toast > .sh-icon { margin-top: 2px; }
+.sh-toast--success > .sh-icon { color: var(--gain); }
+.sh-toast--info > .sh-icon { color: var(--brand); }
+.sh-toast--neutral > .sh-icon { color: var(--ink-muted); }
+.sh-toast--error > .sh-icon { color: var(--loss); }
+.sh-toast__body { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.sh-toast__title { font: 600 15px/24px var(--font-sans); }
+.sh-toast__text { font: var(--type-body-s); color: var(--ink-muted); }
+.sh-toast__timer { position: absolute; left: 0; bottom: 0; width: 100%; height: 3px; background: var(--paper-sunk); }
+.sh-toast__timer-fill {
+  display: block; width: 100%; height: 100%; background: var(--line-control); transform-origin: left;
+  animation: sh-toast-timer 6s linear forwards;
+}
+.sh-toast[data-paused] .sh-toast__timer-fill { animation-play-state: paused; }
+@keyframes sh-toast-timer { from { transform: scaleX(1); } to { transform: scaleX(0); } }
+@media (prefers-reduced-motion: reduce) { .sh-toast__timer-fill { animation: none; } }

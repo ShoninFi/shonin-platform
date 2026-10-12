@@ -1,0 +1,7 @@
+/* The logo files, always as drawn. The link around them goes to shonin.fi. */
+.sh-logo { display: flex; align-items: center; flex: none; }
+.sh-logo img { display: block; width: auto; }
+.sh-logo--lockup img { height: 28px; aspect-ratio: 1305 / 422; }
+.sh-logo--lockup-s img { height: 24px; aspect-ratio: 1305 / 422; }
+.sh-logo--mark img { height: 28px; aspect-ratio: 388.5 / 422; }
+.sh-logo--tagline img { height: 40px; aspect-ratio: 1305 / 422; }

@@ -1,0 +1,5 @@
+/* The navy ground: the marketing hero, the footer band and the 404. The focus
+   ring turns white on it. */
+.sh-hero { background: var(--hero-ground); color: var(--hero-ink); }
+.sh-hero :focus-visible { outline-color: var(--hero-ink); }
+.sh-hero a:not(.sh-btn) { color: var(--hero-ink); }

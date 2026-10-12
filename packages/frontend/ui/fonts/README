@@ -1,0 +1,16 @@
+The design system's variable fonts, self-hosted by both sites.
+
+Every family here is licensed under the SIL Open Font License, Version 1.1
+(https://openfontlicense.org):
+
+- Hanken Grotesk (HankenGrotesk-Variable.woff2, HankenGrotesk-Variable-Italic.woff2):
+  SIL Open Font License 1.1.
+- Plus Jakarta Sans (PlusJakartaSans-Variable.woff2):
+  SIL Open Font License 1.1.
+- Newsreader (Newsreader-Variable.woff2, Newsreader-Variable-Italic.woff2):
+  SIL Open Font License 1.1.
+- JetBrains Mono (JetBrainsMono-Variable.woff2):
+  SIL Open Font License 1.1.
+
+The licence lets the fonts be used, embedded and redistributed with the sites,
+as long as they are not sold on their own and keep their names and notices.
