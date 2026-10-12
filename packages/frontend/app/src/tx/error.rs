@@ -45,7 +45,8 @@ pub enum TxError {
     /// Another transaction took its place (sped up or cancelled in the
     /// wallet).
     Replaced { hash: B256 },
-    /// The network dropped it.
+    /// Sent, and the network we read through never saw it while the app
+    /// watched. Another node may have it, so it may still land.
     Dropped { hash: B256 },
     /// Sent, known to the network, and still not mined after a long wait.
     Stuck { hash: B256 },
@@ -62,6 +63,16 @@ pub enum TxError {
     Network(String),
     /// Anything else the wallet said.
     Wallet(String),
+    /// The transaction that moves the money was mined (`hash`), and the app
+    /// couldn't follow it to the end: the money moved whatever comes next. A
+    /// request (`request`) stands and is settled at its price by the keeper,
+    /// or by anyone. `then` is what stopped the app: something it couldn't
+    /// read, or, when `None`, the long wait running out.
+    Landed {
+        hash: B256,
+        request: Option<U256>,
+        then: Option<Box<TxError>>,
+    },
 }
 
 /// A contract's reason for refusing, as far as it can be read.
@@ -190,12 +201,17 @@ impl TxError {
     /// Whether a transaction may have been sent, so the page must not say
     /// "Nothing was sent".
     pub fn after_send(&self) -> bool {
+        self.may_have_moved() || matches!(self, Self::Reverted { .. })
+    }
+
+    /// Whether money may have moved (or may still move): the page must not
+    /// offer to send the same thing again, only to look at where it stands.
+    /// A reverted transaction moved nothing but its fee, so it may be tried
+    /// again.
+    pub fn may_have_moved(&self) -> bool {
         matches!(
             self,
-            Self::Reverted { .. }
-                | Self::Replaced { .. }
-                | Self::Dropped { .. }
-                | Self::Stuck { .. }
+            Self::Landed { .. } | Self::Replaced { .. } | Self::Dropped { .. } | Self::Stuck { .. }
         )
     }
 
@@ -205,8 +221,37 @@ impl TxError {
             Self::Reverted { hash, .. }
             | Self::Replaced { hash }
             | Self::Dropped { hash }
-            | Self::Stuck { hash } => Some(*hash),
+            | Self::Stuck { hash }
+            | Self::Landed { hash, .. } => Some(*hash),
             _ => None,
+        }
+    }
+
+    /// Why the app's own second step (settling a priced request) wasn't
+    /// sent, as the end of a sentence: the request stands either way.
+    pub fn unsent_words(&self, context: &Context<'_>) -> String {
+        let wallet = context.wallet;
+        match self {
+            Self::Rejected => format!("you declined it in {wallet}"),
+            Self::Cancelled => "it was stopped before it was sent".to_string(),
+            Self::WrongNetwork { .. } => match context.wallet_chain {
+                Some(on) => format!("your wallet is on {on}, not {}", context.chain),
+                None => format!("your wallet isn’t on {}", context.chain),
+            },
+            Self::AccountChanged => "your wallet’s account changed".to_string(),
+            Self::NotConnected => "no wallet is connected".to_string(),
+            Self::Locked => "your wallet is locked".to_string(),
+            Self::AlreadyAsking => format!("{wallet} was already asking something else"),
+            Self::InsufficientGas { .. } => format!(
+                "your wallet needs a little {} on {} for its network fee",
+                context.native, context.chain
+            ),
+            Self::WouldRevert { .. } => "the chain wouldn’t take it just now".to_string(),
+            Self::Reverted { .. } => "it didn’t go through".to_string(),
+            Self::Replaced { .. } | Self::Dropped { .. } | Self::Stuck { .. } => {
+                "it hasn’t been seen mined".to_string()
+            }
+            _ => "the network didn’t answer".to_string(),
         }
     }
 
@@ -315,12 +360,14 @@ impl TxError {
             Self::Stuck { .. } => alert(
                 "Still waiting to be mined",
                 format!(
-                    "The network has your transaction but hasn't mined it yet. It may still go through: check {wallet} before trying again."
+                    "The network has your transaction but hasn't mined it yet. It may still go through: check {wallet}'s activity before sending anything again."
                 ),
             ),
             Self::Dropped { .. } => alert(
-                "The network dropped this transaction",
-                "It was never mined, so nothing moved. You can try again.".to_string(),
+                "Not seen by the network yet",
+                format!(
+                    "The network this app reads hasn't seen your transaction. It may still go through: check {wallet}'s activity before sending anything again."
+                ),
             ),
             Self::StatementMismatch => alert(
                 "The statement didn't match the vault's",
@@ -339,6 +386,26 @@ impl TxError {
                 format!("{why}. Check your connection and try again."),
             ),
             Self::Wallet(why) => alert("Your wallet refused it", format!("{wallet} said: {why}")),
+            Self::Landed { request, then, .. } => {
+                let then = match then.as_deref() {
+                    None => "It isn't settled yet, and this page has stopped watching it.",
+                    Some(_) => "This page couldn't read what happened next from the network.",
+                };
+                match request {
+                    Some(_) => polite(
+                        "Your request stands",
+                        format!(
+                            "It's on the chain, and it's settled at its price by the keeper, or by anyone. {then} Your portfolio shows it; there's no need to send it again."
+                        ),
+                    ),
+                    None => polite(
+                        "It went through",
+                        format!(
+                            "The transaction was mined. {then} Your portfolio shows the result; there's no need to send it again."
+                        ),
+                    ),
+                }
+            }
         }
     }
 }
@@ -411,6 +478,89 @@ mod tests {
         assert_eq!(
             Revert::from_message("execution reverted: custom error WrongState()"),
             Revert::Vault("WrongState")
+        );
+    }
+
+    /// Every error a flow can end with once its money-moving transaction is
+    /// mined, in words: none may say nothing was sent or invite a re-send.
+    #[test]
+    fn once_the_money_moved_no_words_say_nothing_was_sent_or_invite_the_same_send_again() {
+        let hash = B256::repeat_byte(7);
+        let causes = [
+            None,
+            Some(TxError::Network(
+                "the chain answered a read with nothing".to_string(),
+            )),
+            Some(TxError::Rejected),
+            Some(TxError::WrongNetwork {
+                wallet: 1,
+                vault: 2,
+            }),
+        ];
+        for request in [Some(U256::from(9u8)), None] {
+            for then in causes.clone() {
+                let error = TxError::Landed {
+                    hash,
+                    request,
+                    then: then.map(Box::new),
+                };
+                let words = error.words(&context());
+                let said = format!("{} {}", words.title, words.text);
+                assert!(error.after_send() && error.may_have_moved());
+                assert_eq!(error.hash(), Some(hash));
+                for never in [
+                    "Nothing was sent",
+                    "No money moved",
+                    "no request was made",
+                    "try again",
+                    "Try again",
+                ] {
+                    assert!(!said.contains(never), "{said}");
+                }
+                assert!(said.contains("no need to send it again"), "{said}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_transaction_not_seen_yet_is_never_called_one_that_moved_nothing() {
+        let hash = B256::repeat_byte(7);
+        for error in [
+            TxError::Dropped { hash },
+            TxError::Stuck { hash },
+            TxError::Replaced { hash },
+        ] {
+            let words = error.words(&context());
+            let said = format!("{} {}", words.title, words.text);
+            assert!(error.may_have_moved());
+            assert!(!said.contains("nothing moved"), "{said}");
+            assert!(!said.contains("You can try again"), "{said}");
+        }
+        // A revert moved nothing but its fee: that one may be tried again.
+        assert!(!TxError::Reverted { hash, reason: None }.may_have_moved());
+    }
+
+    #[test]
+    fn the_second_step_not_sent_is_said_as_why_with_the_wallets_and_chains_names() {
+        assert_eq!(
+            TxError::Rejected.unsent_words(&context()),
+            "you declined it in MetaMask"
+        );
+        assert_eq!(
+            TxError::WrongNetwork {
+                wallet: 8453,
+                vault: 998
+            }
+            .unsent_words(&context()),
+            "your wallet is on Base, not Hyperliquid"
+        );
+        assert_eq!(
+            TxError::InsufficientGas {
+                need: U256::from(2u8),
+                have: U256::from(1u8)
+            }
+            .unsent_words(&context()),
+            "your wallet needs a little HYPE on Hyperliquid for its network fee"
         );
     }
 

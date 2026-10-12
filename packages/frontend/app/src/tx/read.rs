@@ -138,8 +138,12 @@ impl VaultFigures {
         Some((exit, path))
     }
 
-    /// The fewest shares that pay at least `assets` on the way out.
+    /// The fewest shares that pay at least `assets` on the way out: at a
+    /// closed vault, their fraction of its cash with no fee.
     pub fn shares_for(&self, assets: U256) -> Option<U256> {
+        if self.state == State::Closed {
+            return quote::closed_shares_for(assets, self.cash, self.total_supply);
+        }
         quote::shares_for(assets, self.fees.transaction_bps, &self.basis())
     }
 
@@ -271,10 +275,24 @@ pub fn restricted_hash(list: &[B256]) -> B256 {
     keccak256(list.to_vec().abi_encode())
 }
 
+/// What a request asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestKind {
+    /// Dollars in escrow, for shares at a later valuation.
+    Deposit,
+    /// Shares held by the vault, for dollars at a later valuation.
+    Redeem,
+    /// A claim's own request, after the cash covered it.
+    Claim,
+    /// The author's shares, into the tank.
+    TankFill,
+}
+
 /// One request, as the vault holds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Request {
     pub owner: Address,
+    pub kind: RequestKind,
     pub earliest: u64,
     pub done: bool,
     pub amount: U256,
@@ -282,8 +300,16 @@ pub struct Request {
 
 pub async fn request<R: Reader>(reader: &R, vault: Address, id: U256) -> Result<Request, TxError> {
     let request = read(reader, vault, IVault::requestAtCall { requestId: id }).await?;
+    use bindings::RequestKind as K;
+    let kind = match request.kind {
+        K::Deposit => RequestKind::Deposit,
+        K::Redeem => RequestKind::Redeem,
+        K::Claim => RequestKind::Claim,
+        _ => RequestKind::TankFill,
+    };
     Ok(Request {
         owner: request.owner,
+        kind,
         earliest: request.earliest,
         done: request.done,
         amount: request.amount,

@@ -63,6 +63,9 @@ tasks:
     env:
       # The API's address, compiled into the app (public config, not a secret).
       SHONIN_APP_API: "{{.URL_API_TESTNET}}/api"
+      # The network the build is for: a test network offers the
+      # recovery-phrase wallet; a build that names none leaves it out.
+      SHONIN_APP_NETWORK: testnet
     cmds:
       - cd "{{.PATH_PACKAGE_APP}}" && NO_COLOR=true trunk clean --dist "{{.PATH_DIST_APP}}"
       - cd "{{.PATH_PACKAGE_APP}}" && NO_COLOR=true trunk build --release --dist "{{.PATH_DIST_APP}}"

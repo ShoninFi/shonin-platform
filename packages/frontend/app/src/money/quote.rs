@@ -210,6 +210,17 @@ pub fn closed(shares: U256, cash: U256, total_supply: U256) -> Option<U256> {
     mul_div(cash, shares, total_supply)
 }
 
+/// The fewest shares a closed vault pays at least `assets` for: the inverse
+/// of [`closed`], rounded so the payout never falls short. `None` when the
+/// vault has no cash or the amount is more than it holds.
+pub fn closed_shares_for(assets: U256, cash: U256, total_supply: U256) -> Option<U256> {
+    if cash.is_zero() || assets > cash {
+        return None;
+    }
+    let shares = mul_div_up(assets, total_supply, cash)?;
+    (closed(shares, cash, total_supply)? >= assets).then_some(shares)
+}
+
 /// The share price the vault reports (`sharePrice()`): the value net of the
 /// profit fee per whole share, in the dollar's base units. A dollar before
 /// any valuation.
@@ -238,6 +249,24 @@ pub fn value_of(shares: U256, price: U256) -> Option<U256> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dollars_at_a_closed_vault_ask_for_the_fewest_shares_whose_cash_fraction_pays_them() {
+        // $131,870 of cash over 100,000 shares: no fee, and no exit price.
+        let cash = U256::from(131_870u64 * 1_000_000);
+        let supply = U256::from(100_000u128 * 1_000_000_000_000_000_000);
+        for dollars in [1u64, 250, 1_000, 131_870] {
+            let assets = U256::from(dollars * 1_000_000);
+            let shares = closed_shares_for(assets, cash, supply).unwrap();
+            assert!(closed(shares, cash, supply).unwrap() >= assets);
+            assert!(closed(shares - U256::from(1u8), cash, supply).unwrap() < assets);
+        }
+        assert_eq!(
+            closed_shares_for(cash + U256::from(1u8), cash, supply),
+            None
+        );
+        assert_eq!(closed_shares_for(U256::from(1u8), U256::ZERO, supply), None);
+    }
 
     fn usd(dollars: u64) -> U256 {
         U256::from(dollars) * U256::from(1_000_000u64)
