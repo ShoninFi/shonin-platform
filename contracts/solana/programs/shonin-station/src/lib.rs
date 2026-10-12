@@ -879,6 +879,66 @@ pub mod shonin_station {
         }
         answer(&total)
     }
+
+    // Upgrading ----------------------------------------------------------------
+
+    /// Rewrites a station the first programs wrote, whose drivers end at
+    /// their `addresses`, in the current layout: every value as it was, every
+    /// driver's `position_mints` and `token_accounts` empty, the account
+    /// grown to exactly the new size. Anyone may send it; `payer` pays only
+    /// what the larger account needs for rent beyond what it holds, and the
+    /// station's lamports never go down. A station already in the current
+    /// layout is left as it is, so it can be sent again and again with the
+    /// same result. Refused for an account this program doesn't own, one
+    /// without the station's discriminator, one that decodes whole in
+    /// neither layout, and one not at its own station address. It neither
+    /// reads nor changes whether the station has stopped: a stopped station
+    /// is rewritten the same way, and no station keeps anything between
+    /// transactions that a rewrite could cut short.
+    pub fn migrate_station(ctx: Context<MigrateStation>) -> Result<()> {
+        let info = ctx.accounts.station.to_account_info();
+        let (station, layout) = {
+            let data = info.try_borrow_data()?;
+            Station::read_any(&data).ok_or(StationError::NotAStation)?
+        };
+        if layout == Layout::Current {
+            return Ok(());
+        }
+        let derived = Pubkey::create_program_address(
+            &[STATION_SEED, station.vault.as_ref(), &[station.bump]],
+            &crate::ID,
+        )
+        .map_err(|_| error!(StationError::NotAStation))?;
+        require_keys_eq!(derived, info.key(), StationError::NotAStation);
+
+        let mut bytes = Vec::new();
+        station.try_serialize(&mut bytes)?;
+        let before = info.data_len();
+        let rent = Rent::get()?.minimum_balance(bytes.len());
+        let held = info.lamports();
+        if rent > held {
+            invoke(
+                &anchor_lang::solana_program::system_instruction::transfer(
+                    ctx.accounts.payer.key,
+                    info.key,
+                    rent - held,
+                ),
+                &[
+                    ctx.accounts.payer.to_account_info(),
+                    info.clone(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+            )?;
+        }
+        info.resize(bytes.len())?;
+        info.try_borrow_mut_data()?.copy_from_slice(&bytes);
+        emit!(StationMigrated {
+            station: info.key(),
+            size_before: before as u32,
+            size_after: bytes.len() as u32,
+        });
+        Ok(())
+    }
 }
 
 // Unwinding ------------------------------------------------------------------
@@ -1739,6 +1799,18 @@ pub struct UnwindStopped<'info> {
 pub struct Value<'info> {
     #[account(seeds = [STATION_SEED, station.vault.as_ref()], bump = station.bump)]
     pub station: Box<Account<'info, Station>>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateStation<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    /// CHECK: owned by this program; `Station::read_any` accepts only a
+    /// station's record, whole, in either layout, and the instruction checks
+    /// it stands at its own station address.
+    #[account(mut, owner = crate::ID)]
+    pub station: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
 }
 
 /// Where a vault's station is, or will be.

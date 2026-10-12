@@ -747,6 +747,9 @@ enum OwnBytes {
     StationToken(Option<u8>),
     StationAddress(Vec<u8>),
     Fixed(u8),
+    StationMint(u8),
+    StationPositionToken(u8),
+    StationPositionHeld,
 }
 
 #[derive(BorshDeserialize)]
@@ -760,8 +763,17 @@ struct PositionRule {
 #[allow(dead_code)]
 struct RuleBytes {
     discriminator: Vec<u8>,
-    class: u8,
+    class: ClassBytes,
     positions: Vec<PositionRule>,
+}
+
+/// A rule's class, as the program encodes it: two variants and no others,
+/// so a byte the program would refuse is refused here too.
+#[derive(BorshDeserialize)]
+#[allow(dead_code)]
+enum ClassBytes {
+    Trade,
+    Exit,
 }
 
 #[derive(BorshDeserialize)]
@@ -773,7 +785,15 @@ struct StationAddressBytes {
 
 #[derive(BorshDeserialize)]
 #[allow(dead_code)]
-struct PinnedBytes {
+struct PositionMintBytes {
+    address: [u8; 32],
+    bump: u8,
+}
+
+/// A driver as the station pins it, in the first layout's fields...
+#[derive(BorshDeserialize)]
+#[allow(dead_code)]
+struct FirstPinnedBytes {
     name: [u8; 32],
     program: [u8; 32],
     venue: [u8; 32],
@@ -786,9 +806,19 @@ struct PinnedBytes {
     addresses: Vec<StationAddressBytes>,
 }
 
+/// ...and in the current layout's, which end with its position mints and
+/// token accounts.
 #[derive(BorshDeserialize)]
 #[allow(dead_code)]
-struct StationBytes {
+struct PinnedBytes {
+    first: FirstPinnedBytes,
+    position_mints: Vec<PositionMintBytes>,
+    token_accounts: Vec<[u8; 32]>,
+}
+
+#[derive(BorshDeserialize)]
+#[allow(dead_code)]
+struct StationBytes<P> {
     vault: [u8; 32],
     vault_program: [u8; 32],
     vault_dollars: [u8; 32],
@@ -803,7 +833,7 @@ struct StationBytes {
     stopped_at: u64,
     payer: [u8; 32],
     bump: u8,
-    drivers: Vec<PinnedBytes>,
+    drivers: Vec<P>,
 }
 
 /// A driver as a station pins it: what its group is built from.
@@ -821,14 +851,48 @@ pub struct Station {
     pub drivers: Vec<PinnedDriver>,
 }
 
+/// Which layout a station's account is written in, as the station program's
+/// `Layout`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StationLayout {
+    /// Every driver ends with its position mints and token accounts.
+    Current,
+    /// The first programs': every driver ends at its `addresses`.
+    First,
+}
+
 impl Station {
+    /// A station's account in either layout, by the station program's own
+    /// rule (`Station::read_any` there): the station's discriminator, then a
+    /// body that decodes whole, no byte left over, as the current layout, or
+    /// failing that as the first. A station is made at exactly its size, so
+    /// bytes past its record, zero or not, are never a station's.
     pub fn read(data: &[u8]) -> Option<Self> {
-        let s: StationBytes = body(data, discriminator::STATION)?;
-        Some(Self {
-            vault: key(s.vault),
-            stopped: s.stopped,
-            drivers: s
-                .drivers
+        Self::read_with_layout(data).map(|(station, _)| station)
+    }
+
+    /// The station in `data` and the layout it is written in.
+    pub fn read_with_layout(data: &[u8]) -> Option<(Self, StationLayout)> {
+        let body = data.strip_prefix(&discriminator::STATION)?;
+        if let Some(s) = whole::<StationBytes<PinnedBytes>>(body) {
+            let drivers = s.drivers.into_iter().map(|d| d.first).collect();
+            return Some((
+                Self::of(s.vault, s.stopped, drivers),
+                StationLayout::Current,
+            ));
+        }
+        let s = whole::<StationBytes<FirstPinnedBytes>>(body)?;
+        Some((
+            Self::of(s.vault, s.stopped, s.drivers),
+            StationLayout::First,
+        ))
+    }
+
+    fn of(vault: [u8; 32], stopped: bool, drivers: Vec<FirstPinnedBytes>) -> Self {
+        Self {
+            vault: key(vault),
+            stopped,
+            drivers: drivers
                 .into_iter()
                 .map(|d| PinnedDriver {
                     name: d.name,
@@ -840,8 +904,15 @@ impl Station {
                     },
                 })
                 .collect(),
-        })
+        }
     }
+}
+
+/// `T` decoded from all of `body`, or nothing if it doesn't decode or leaves
+/// bytes over.
+fn whole<T: BorshDeserialize>(mut body: &[u8]) -> Option<T> {
+    let value = T::deserialize(&mut body).ok()?;
+    body.is_empty().then_some(value)
 }
 
 #[derive(BorshDeserialize)]

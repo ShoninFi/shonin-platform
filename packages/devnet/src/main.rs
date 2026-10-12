@@ -26,6 +26,7 @@ mod publish;
 mod seed;
 mod smoke;
 mod solana;
+mod solana_migrate;
 mod solana_orca;
 mod solana_seed;
 mod solana_testnet;
@@ -125,6 +126,16 @@ enum Command {
         /// vault's closes need. Zero sets no seed up.
         #[arg(long, default_value_t = 40.0)]
         orca_seed_sol: f64,
+    },
+    /// After the station program is upgraded in place, rewrite every
+    /// station the first station program wrote (each driver ending at its
+    /// `addresses`) in the current layout: one `migrate_station` each, paid
+    /// by the deployer, each read back with every value unchanged. Sends
+    /// nothing when no station needs it. Safe to run again.
+    MigrateStations {
+        /// List what would be rewritten, and send nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// The smoke check a deploy ends with, read-only: each EVM chain's
     /// deployment read back from the chain (or only `--vault-chain`'s), and
@@ -405,6 +416,7 @@ async fn main() -> Result<()> {
                 | Command::HyperliquidVaults { .. }
                 | Command::Market { .. }
                 | Command::Demo { .. }
+                | Command::MigrateStations { dry_run: false }
         )
     );
     if target.network == NetworkName::Mainnet && changes_chains {
@@ -456,6 +468,12 @@ async fn main() -> Result<()> {
                 );
             }
             Ok(())
+        }
+        Some(Command::MigrateStations { dry_run }) => {
+            on_each_cluster(&target, one, |client, _| async move {
+                solana_migrate::run(&client, dry_run).await
+            })
+            .await
         }
         Some(Command::Deploy) => {
             let names = chain_names(&target);

@@ -1680,7 +1680,7 @@ impl Keeping {
             .cloned()
             .flatten()
             .and_then(|account| {
-                station::state::Station::try_deserialize(&mut &account.data[..]).ok()
+                station::state::Station::read_any(&account.data).map(|(after, _)| after)
             })
             .map_or(0, |after| after.sent_home.saturating_sub(station.sent_home)))
     }

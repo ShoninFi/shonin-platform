@@ -76,4 +76,6 @@ pub enum StationError {
     AuthorityWritable,
     #[msg("A venue call left the station's authority at the venue other than a system account with no data")]
     AuthorityChanged,
+    #[msg("Not a station of this program's, whole in a layout it can read, at its own address")]
+    NotAStation,
 }
