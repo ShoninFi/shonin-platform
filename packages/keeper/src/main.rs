@@ -313,7 +313,7 @@ async fn main() -> Result<()> {
             chain_kept(chain, |kept| kept.startup_incomplete = true);
             let mut startup_said = Said::default();
             loop {
-                match validate_known_timers(&served.client, served.deployments.factory).await {
+                match validate_known_timers(&served.client, served.deployments.factory, served.client.rpc_policy()).await {
                     Ok(()) => break,
                     Err(error) => {
                         if let Some(times) = startup_said.due(std::time::Instant::now()) {
@@ -772,6 +772,28 @@ struct Memory {
     /// The station's drivers whose venue acts after the transaction, and
     /// the pace of what is done for them (see [`delayed`]).
     delayed: delayed::Memory,
+    /// The vault's timers were found shorter than this keeper's observation
+    /// cadence can guarantee, and that warning.
+    timers_said: Said,
+}
+
+impl Memory {
+    /// Forget what was read from the chain and may belong to a branch that
+    /// was replaced: the finished prefixes, the logs read so far, and what
+    /// a closed vault was last found to need. They are read again. What the
+    /// keeper sent and when stays, so a branch change sends nothing twice.
+    fn forget_branch(&mut self) {
+        self.claims_from = 0;
+        self.requests_from = 0;
+        self.holders.clear();
+        self.holders_read_to = 0;
+        self.retired_at = None;
+        self.retired_read_to = 0;
+        self.skipped.clear();
+        self.skipped_read_to = 0;
+        self.quiet_since = None;
+        self.closer_closed_nothing = None;
+    }
 }
 
 /// The slots in a row in which the vault refused a call of one kind before
@@ -975,16 +997,50 @@ fn validate_timers(
     validate_timer_policy(client.rpc_policy(), vault, timers)
 }
 
-async fn validate_known_timers(client: &Client, factory: Address) -> Result<()> {
-    let (vaults, unread) = every_vault(client, factory, &mut Factories::default()).await?;
+/// Check the vaults found at startup. A vault whose own timers are shorter
+/// than even the established observation cadence can guarantee was kept
+/// before these settings existed and is kept still, with a warning. A vault
+/// the established cadence meets but the configured settings do not is the
+/// configuration's doing: the chain's vault rounds are refused, naming the
+/// vault, the timer and the values. Nothing read here holds a chain up: a
+/// list or a vault that can't be read now is checked in its own rounds.
+async fn validate_known_timers(
+    client: &Client,
+    factory: Address,
+    configured: &chain::rpc_policy::RpcPolicy,
+) -> Result<()> {
+    let (vaults, unread) = match every_vault(client, factory, &mut Factories::default()).await {
+        Ok(found) => found,
+        Err(error) => {
+            tracing::warn!(
+                chain_id = client.chain_id,
+                error = format!("{error:#}"),
+                "the vaults could not be listed at startup; each is checked in its own rounds"
+            );
+            return Ok(());
+        }
+    };
     if !unread.is_empty() {
-        anyhow::bail!(
-            "cannot validate keeper startup timers while factory discovery is incomplete"
-        );
+        tracing::warn!(chain_id = client.chain_id, factories = ?unread, "an earlier factory's vaults could not be listed at startup; each is checked in its own rounds");
     }
+    let established = chain::rpc_policy::RpcPolicy::default();
     for vault in vaults {
-        let timers = client.read(vault, IVault::timersCall {}).await?;
-        validate_timers(client, vault, &timers)?;
+        let timers = match client.read(vault, IVault::timersCall {}).await {
+            Ok(timers) => timers,
+            Err(error) => {
+                tracing::warn!(chain_id = client.chain_id, %vault, error = format!("{error:#}"), "a vault's timers could not be read at startup; it is checked in its own rounds");
+                continue;
+            }
+        };
+        let Err(shortfall) = validate_timer_policy(configured, vault, &timers) else {
+            continue;
+        };
+        if let Err(error) = validate_timer_policy(&established, vault, &timers) {
+            tracing::warn!(chain_id = client.chain_id, %vault, error = format!("{error:#}"), "this vault's timers are shorter than the established observation cadence can guarantee; it is kept as before");
+            continue;
+        }
+        return Err(shortfall
+            .context("the configured RPC settings cannot meet a timer the established ones meet"));
     }
     Ok(())
 }
@@ -1008,7 +1064,7 @@ fn validate_timer_policy(
     ] {
         if u128::from(seconds) * 1000 < u128::from(needed) {
             anyhow::bail!(
-                "vault {vault}: RPC head_poll_ms={}, event_scan_ms={}, read_budget_ms={} require {needed}ms, but {name}={seconds}s; this vault's keeper policy is refused",
+                "vault {vault}: RPC head_poll_ms={}, event_scan_ms={}, read_budget_ms={} require {needed}ms, but {name}={seconds}s; its windows are not guaranteed",
                 policy.head_poll_ms,
                 policy.event_scan_ms,
                 policy.read_budget_ms
@@ -1031,9 +1087,12 @@ async fn tick(
 ) -> Result<()> {
     match schedule.poll(client) {
         Ok(true) => {
-            // Terminal prefixes, log cursors and prior deadlines can all
-            // belong to the replaced branch. Rebuild every derived memory.
-            memory.clear();
+            // Terminal prefixes and log cursors can belong to the replaced
+            // branch: read them again. Paces, holds and backoffs keep what
+            // was sent, so nothing goes twice for a branch change.
+            for remembered in memory.values_mut() {
+                remembered.forget_branch();
+            }
             *factories = Factories::default();
         }
         Ok(false) => {}
@@ -1341,8 +1400,13 @@ async fn keep_one(
         return Ok(());
     }
     let timers = client.read(vault, IVault::timersCall {}).await?;
-    if !matches!(state, VaultState::None) {
-        validate_timers(client, vault, &timers)?;
+    // A timer the observation cadence can't guarantee is said; the vault is
+    // still owed every action, as it was before these settings existed.
+    if !matches!(state, VaultState::None)
+        && let Err(error) = validate_timers(client, vault, &timers)
+        && let Some(times) = memory.timers_said.due(std::time::Instant::now())
+    {
+        tracing::warn!(chain_id = client.chain_id, %vault, times, error = format!("{error:#}"), "this vault's timers are shorter than the keeper's observation cadence can guarantee; it is still kept");
     }
     let from_block = deployments.deployed_block;
 
@@ -5637,6 +5701,8 @@ mod stand_in;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[path = "round_memory.rs"]
+    mod round_memory;
 
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12451,16 +12517,23 @@ mod tests {
         assert!(quiet_input(client.chain_id, first, &memory[&first]).is_some());
     }
 
+    /// At startup a vault whose own timers are shorter than even the
+    /// established cadence can guarantee is kept, as it was before the
+    /// settings existed; settings slower than the established ones that
+    /// can't meet a vault's timers are refused, naming the vault and the
+    /// timer, before anything is sent. A list or a vault that can't be read
+    /// holds nothing up.
     #[tokio::test]
-    async fn startup_checks_every_discovered_vault_before_any_send() {
+    async fn startup_refuses_only_settings_slower_than_the_established_cadence() {
         let node = node(BETWEEN_SLOTS);
         let factory = deployments().factory;
         let other = Address::repeat_byte(0x79);
+        let unreadable = Address::repeat_byte(0x7a);
         answers(
             &node,
             factory,
             IVaultFactory::vaultsCall {},
-            vec![VAULT, other],
+            vec![VAULT, other, unreadable],
         );
         answers(
             &node,
@@ -12469,18 +12542,40 @@ mod tests {
             Address::ZERO,
         );
         answers(&node, VAULT, IVault::timersCall {}, stand_in::timers());
-        let mut unsafe_timers = stand_in::timers();
-        unsafe_timers.slotWindow = 2;
-        answers(&node, other, IVault::timersCall {}, unsafe_timers);
+        let mut short = stand_in::timers();
+        short.slotWindow = 2;
+        answers(&node, other, IVault::timersCall {}, short);
         let client = stand_in::connect(&node).await;
-        let error = validate_known_timers(&client, factory)
+        let established = chain::rpc_policy::RpcPolicy::default();
+        validate_known_timers(&client, factory, &established)
             .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains(&other.to_string()) && error.contains("slotWindow=2s"));
+            .unwrap();
+        let slower = chain::rpc_policy::RpcPolicy {
+            read_budget_ms: established.read_budget_ms + 3_000,
+            ..established.clone()
+        };
+        let error = format!(
+            "{:#}",
+            validate_known_timers(&client, factory, &slower)
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            error.contains(&VAULT.to_string())
+                && error.contains("slotLead=5s")
+                && error.contains(&format!("read_budget_ms={}", slower.read_budget_ms)),
+            "{error}"
+        );
         assert!(everything_sent(&node).is_empty());
-        answers(&node, other, IVault::timersCall {}, stand_in::timers());
-        validate_known_timers(&client, factory).await.unwrap();
+        answers(
+            &node,
+            factory,
+            IReplacesFactory::previousCall {},
+            Address::repeat_byte(0x66),
+        );
+        validate_known_timers(&client, factory, &established)
+            .await
+            .unwrap();
         assert!(everything_sent(&node).is_empty());
     }
 

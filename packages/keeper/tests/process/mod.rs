@@ -484,6 +484,18 @@ pub fn start_keeper_with_rpc_policy(
     start_configured(test, &[("base", 31337, rpc)], executor, &[], settings)
 }
 
+/// Start each of `chains` with `args` on the command line and `settings`
+/// overriding every chain's RPC settings in the file the process loads.
+pub fn start_keeper_configured(
+    test: &str,
+    chains: &[(&str, u64, &str)],
+    executor: &str,
+    args: &[&str],
+    settings: &[(&str, u64)],
+) -> Keeper {
+    start_configured(test, chains, executor, args, settings)
+}
+
 fn start(test: &str, chains: &[(&str, u64, &str)], executor: &str, shortened: &[&str]) -> Keeper {
     start_configured(test, chains, executor, shortened, &[])
 }

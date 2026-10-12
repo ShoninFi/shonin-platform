@@ -50,16 +50,12 @@ async fn a_vault_the_keeper_cannot_read_at_all_is_heard_of() {
         answers(&node, vault, IVault::claimCountCall {}, U256::ZERO);
     }
     answers(&node, good, IVault::timersCall {}, timers());
-    // Both pass the initial policy check. The second becomes unreadable
-    // after the first ordinary vault round begins.
-    answers(&node, unreadable, IVault::timersCall {}, timers());
+    // `timers()` of the second vault: unscripted, so the read reverts.
     answers(&node, STATION, IStation::specCall {}, a_spec(vec![]));
     answers(&node, STATION, IStation::outsideBandCall {}, false);
     node.lock().unwrap().on_call = Some(Arc::new(move |node, to, data| {
         if to == good && data[..4] == IVault::stateCall::SELECTOR {
             node.timestamp += 10;
-            node.by_selector
-                .remove(&(unreadable, IVault::timersCall::SELECTOR));
         }
         None
     }));

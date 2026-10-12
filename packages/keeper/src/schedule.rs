@@ -484,7 +484,11 @@ impl Schedule {
                     bail!("the same header hash has contradictory details");
                 }
             } else if next.number <= previous.number {
-                replaced = true;
+                // Endpoints behind one list routinely answer a block apart, so
+                // a lower or competing head proves nothing about the remembered
+                // one. Adopt nothing; only a later head that does not link to
+                // the remembered head shows that its branch was replaced.
+                bail!("a head at or below the observed head; waiting for a later one");
             } else if next.number - previous.number > client.rpc_policy().log_batch_blocks {
                 // No ancestry proof ties this head to the remembered branch.
                 // A numbered anchor from another endpoint cannot establish it.
@@ -1161,8 +1165,11 @@ mod tests {
         assert!(!schedule.sleeping(&client, watched, None));
     }
 
+    /// A competing header at the observed height is not adopted and proves
+    /// nothing about the remembered branch, but it does discard certificates
+    /// and factory discovery; a later head must link to the remembered one.
     #[tokio::test]
-    async fn a_same_height_replacement_discards_certificates_and_factory_discovery() {
+    async fn a_same_height_competitor_discards_certificates_and_factory_discovery() {
         let watched = Address::repeat_byte(7);
         let first = header(10, B256::repeat_byte(9), None);
         let headers = Arc::new(Mutex::new(vec![first.clone()]));
@@ -1174,7 +1181,8 @@ mod tests {
         schedule.listed(vec![watched], vec![Address::repeat_byte(3)], true);
         assert!(schedule.vaults(&client).is_none());
         headers.lock().unwrap()[0].hash = B256::repeat_byte(99);
-        assert!(schedule.observe(&client).await.unwrap());
+        assert!(schedule.observe(&client).await.is_err());
+        assert_eq!(schedule.head.as_ref().unwrap().hash, first.hash);
         assert!(schedule.listed.is_none());
         assert!(schedule.hints.is_empty());
         assert!(schedule.vaults(&client).is_none());

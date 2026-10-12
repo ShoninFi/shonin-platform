@@ -220,7 +220,7 @@ fn validate_timers(
     ] {
         if u128::from(seconds) * 1000 < u128::from(needed) {
             anyhow::bail!(
-                "vault {address}: RPC head_poll_ms={}, event_scan_ms={}, read_budget_ms={} require {needed}ms, but {name}={seconds}s; this vault's keeper policy is refused",
+                "vault {address}: RPC head_poll_ms={}, event_scan_ms={}, read_budget_ms={} require {needed}ms, but {name}={seconds}s; its windows are not guaranteed",
                 policy.head_poll_ms,
                 policy.event_scan_ms,
                 policy.read_budget_ms
@@ -252,6 +252,9 @@ struct Keeping {
 struct Memory {
     /// The keeper's rounds this vault has been in.
     rounds: u64,
+    /// The vault's timers were found shorter than this keeper's observation
+    /// cadence can guarantee, and that warning.
+    timers_said: Said,
     /// The chain time of the last daily round.
     daily_at: Option<u64>,
     /// The `as_of` of the last total a `keep` went through with, or that was
@@ -670,8 +673,24 @@ impl Keeping {
         let found = scan.look_near_due(&self.client, &quiet).await?;
         let vaults = found.vaults;
         if !*started_vaults {
+            // A vault whose own timers are shorter than even the established
+            // cadence can guarantee is kept as before, with a warning; one the
+            // configured settings alone can't meet refuses this cluster's
+            // vault rounds, naming the vault, the timer and the values.
+            let established = chain::rpc_policy::RpcPolicy::default();
             for (address, vault) in &vaults {
-                validate_timers(self.client.rpc_policy(), address, &vault.timers)?;
+                let Err(configured) =
+                    validate_timers(self.client.rpc_policy(), address, &vault.timers)
+                else {
+                    continue;
+                };
+                if let Err(error) = validate_timers(&established, address, &vault.timers) {
+                    tracing::warn!(vault = %address, error = format!("{error:#}"), "this vault's timers are shorter than the established observation cadence can guarantee; it is kept as before");
+                    continue;
+                }
+                return Err(configured.context(
+                    "the configured RPC settings cannot meet a timer the established ones meet",
+                ));
             }
             *started_vaults = true;
         }
@@ -820,7 +839,13 @@ impl Keeping {
         memory: &mut Memory,
     ) -> Result<()> {
         memory.rounds += 1;
-        validate_timers(self.client.rpc_policy(), address, &vault.timers)?;
+        // A timer the observation cadence can't guarantee is said; the vault
+        // is still owed every action, as it was before these settings existed.
+        if let Err(error) = validate_timers(self.client.rpc_policy(), address, &vault.timers)
+            && let Some(times) = memory.timers_said.due(Instant::now())
+        {
+            tracing::warn!(vault = %address, times, error = format!("{error:#}"), "this vault's timers are shorter than the keeper's observation cadence can guarantee; it is still kept");
+        }
         let now = self.client.now().await?;
         let v = self.platform.vault_accounts(vault.strategy_id);
         if vault.state == VaultState::Closed {

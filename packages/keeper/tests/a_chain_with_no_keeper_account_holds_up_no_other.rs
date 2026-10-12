@@ -7,19 +7,14 @@ mod process;
 use std::time::Duration;
 
 use chain::bindings::factory::IVaultFactory;
-use chain::bindings::vault::IVault;
-use process::{
-    FACTORY, VAULT, answers, called, node, one_vault, serve_node, start_keeper_on, timers,
-    wait_until,
-};
+use process::{FACTORY, called, node, one_vault, serve_node, start_keeper_on, wait_until};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_chain_with_no_keeper_account_holds_up_no_other() {
     let kept = node(1_700_000_005);
     one_vault(&kept);
-    answers(&kept, VAULT, IVault::timersCall {}, timers());
-    // Timers permit startup; the remaining vault reads are unscripted.
-    // Its round fails, and the chain's rounds still finish.
+    // The vault itself is unscripted: its round fails, and the chain's
+    // rounds still finish.
     let keyless = node(1_700_000_005);
     {
         let mut keyless = keyless.lock().unwrap();
