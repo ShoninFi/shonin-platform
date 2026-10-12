@@ -578,6 +578,13 @@ impl Session {
         self.vaults.get_cloned()
     }
 
+    /// The page's snapshot reader hands each snapshot it reads here, so the
+    /// vault directory is never fetched twice.
+    pub fn take_snapshot(&self, snapshot: &shared::Snapshot) {
+        self.vaults.set(super::run::directory(snapshot));
+        self.vaults_at.set(js_sys::Date::now());
+    }
+
     /// A vault chain's network, reading its config if it hasn't been.
     pub async fn network(&self, chain: Chain) -> Option<Rc<Network>> {
         if let Some(network) = self.networks.lock_ref().get(&chain) {

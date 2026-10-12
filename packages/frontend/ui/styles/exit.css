@@ -17,6 +17,11 @@
 .sh-exit__fieldhead { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
 .sh-exit__balance { font: var(--type-body-s); color: var(--ink-muted); }
 .sh-exit__dollar { color: var(--ink-muted); }
+/* The amount is the panel's figure: 24px, 56px tall, its unit small. */
+.sh-exit__input { height: 56px; font: 600 24px/32px var(--font-sans); }
+.sh-exit__input .sh-exit__dollar { font: 600 24px/32px var(--font-sans); }
+.sh-exit__input .sh-input__unit:last-child { font: 600 14px/20px var(--font-sans); }
+.sh-exit .sh-field { gap: var(--space-2); }
 .sh-exit__picks { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
 .sh-exit__rows { display: flex; flex-direction: column; gap: 10px; margin: 0; }
 .sh-exit__row { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-4); }
@@ -24,6 +29,14 @@
 .sh-exit__row dd { margin: 0; font: 600 15px/22px var(--font-sans); text-align: right; }
 .sh-exit__row--total dt { color: var(--ink); font-weight: 600; }
 .sh-exit__row--total dd { font: var(--type-figure); letter-spacing: var(--track-figure); }
+/* The preview under the amount: a sunken box, the total under a rule. */
+.sh-exit__preview { padding: var(--space-4); border-radius: var(--radius-m); background: var(--paper-sunk); }
+.sh-exit__preview .sh-exit__row--total { padding-top: 12px; border-top: var(--border-hairline) solid var(--line); }
+.sh-exit__preview .sh-exit__row--total dd { font: 650 20px/28px var(--font-sans); letter-spacing: 0; }
+/* A note led by its icon: the clock on timing, the triangle on risk. */
+.sh-exit__note { display: flex; gap: var(--space-2); align-items: flex-start; }
+.sh-exit__note > .sh-icon { flex: none; margin-top: 2px; }
+.sh-exit__warn { color: var(--caution); }
 .sh-exit__detail { display: block; font: 400 13px/18px var(--font-sans); color: var(--ink-muted); }
 .sh-exit__small { font: var(--type-body-s); }
 .sh-exit__risk { font: 400 13px/20px var(--font-sans); color: var(--ink-muted); }
@@ -51,10 +64,30 @@
 }
 /* Reduced motion: no ring at all; the "in 7 s" beside the time still counts. */
 @media (prefers-reduced-motion: reduce) { .sh-countdown { display: none; } }
+/* The heading shows only on a tablet, where the panel is one wide card. */
+.sh-exit__heading { display: none; }
+.sh-exit__lead, .sh-exit__trail { display: flex; flex-direction: column; gap: var(--space-4); min-width: 0; }
+/* Tablet (Agent-Tablet): one "Deposit or withdraw" card. The heading and a
+   segmented Deposit/Withdraw on top; what's typed on the left; what it comes
+   to, the action and the risk line on the right. */
 @media (min-width: 600px) and (max-width: 899px) {
-  .sh-exit:not(.sh-exit--sheet) .sh-exit__form { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: var(--space-6); }
-  .sh-exit:not(.sh-exit--sheet) .sh-exit__form > * { grid-column: 1; }
-  .sh-exit:not(.sh-exit--sheet) .sh-exit__form > .sh-exit__rows,
-  .sh-exit:not(.sh-exit--sheet) .sh-exit__form > .sh-exit__small,
-  .sh-exit:not(.sh-exit--sheet) .sh-exit__form > .sh-btn { grid-column: 2; }
+  .sh-exit:not(.sh-exit--sheet) { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: var(--space-6); row-gap: 20px; }
+  .sh-exit:not(.sh-exit--sheet) > * { grid-column: 1 / -1; }
+  .sh-exit:not(.sh-exit--sheet) > .sh-exit__risk { grid-column: 2; }
+  .sh-exit:not(.sh-exit--sheet) .sh-exit__head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); }
+  .sh-exit:not(.sh-exit--sheet) .sh-exit__heading { display: block; font: 650 20px/28px var(--font-sans); }
+  .sh-exit:not(.sh-exit--sheet) .sh-exit__tabs { flex: none; width: 240px; gap: 2px; padding: 3px; border: 0; border-radius: var(--radius-m); background: var(--paper-sunk); }
+  .sh-exit:not(.sh-exit--sheet) .sh-exit__tabs .sh-tab {
+    flex: 1; justify-content: center; height: 38px; margin: 0; padding: 0 var(--space-3);
+    border: 0; border-radius: 8px; font: 600 13px/38px var(--font-sans);
+  }
+  .sh-exit:not(.sh-exit--sheet) .sh-exit__tabs .sh-tab[aria-selected="true"] { background: var(--paper-raised); color: var(--ink); box-shadow: 0 0 0 1px var(--line); }
+  .sh-exit:not(.sh-exit--sheet) .sh-exit__form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: var(--space-6); align-items: start; }
 }
+/* The quick amounts: equal chips in one row, as drawn. */
+.sh-exit__picks[role="group"] { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: var(--space-2); }
+.sh-exit__picks[role="group"] .sh-btn { height: 40px; padding: 0; }
+/* Nothing to say, no gap: an empty hint, max line or path notice. */
+.sh-exit .sh-field__hint:empty,
+.sh-exit__lead > div:empty,
+.sh-exit__picks:has(> span:only-child:empty) { display: none; }

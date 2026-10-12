@@ -82,6 +82,8 @@ struct Panel {
     /// The list shown on the review, which the deposit states.
     shown: Mutable<Option<[u8; 32]>>,
     requested_local: Rc<Cell<Option<(f64, u64)>>>,
+    /// Bumped by "Try again" on the unreachable state: read again now.
+    retry: Mutable<u32>,
     in_sheet: bool,
 }
 
@@ -127,6 +129,7 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
         running: Mutable::new(None),
         shown: Mutable::new(None),
         requested_local: Rc::new(Cell::new(None)),
+        retry: Mutable::new(0),
         in_sheet,
     });
     let solana = crate::wallet::solana::get();
@@ -155,11 +158,21 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
         .class("sh-exit")
         .class_if(in_sheet, "sh-exit--sheet")
         .attr("aria-label", "Deposit or withdraw")
-        .child(tabs(&panel))
+        .child(
+            el("div")
+                .class("sh-exit__head")
+                .child(
+                    el("h2")
+                        .class("sh-exit__heading")
+                        .text("Deposit or withdraw"),
+                )
+                .child(tabs(&panel)),
+        )
         .child_signal(Some(placeholder()), body)
         .child(
             el("p")
-                .class("sh-exit__risk")
+                .class("sh-exit__risk sh-exit__note")
+                .child(icon(Icon::Concern, 16).class("sh-exit__warn"))
                 .text("The agent can lose money. Nothing here stops that."),
         )
         .hook(move |dom| dom.future(follow(loader)))
@@ -211,23 +224,27 @@ async fn follow(panel: Rc<Panel>) {
         use crate::wallet::solana::SolSession;
 
         let session = crate::wallet::solana::get();
-        let mut vault = None;
-        for _ in 0..40 {
-            vault = crate::tx::solana::run::vault_of(&panel.slug);
-            if vault.is_some() {
-                break;
+        let (vault, network) = loop {
+            let mut vault = None;
+            for _ in 0..40 {
+                vault = crate::tx::solana::run::vault_of(&panel.slug);
+                if vault.is_some() {
+                    break;
+                }
+                gloo_timers::future::TimeoutFuture::new(250).await;
             }
-            gloo_timers::future::TimeoutFuture::new(250).await;
-        }
-        let Some(vault) = vault else {
-            panel.missing.set(true);
-            return;
+            let network = match &vault {
+                Some(_) => session.load_network().await,
+                None => None,
+            };
+            if let (Some(vault), Some(network)) = (vault, network) {
+                panel.missing.set_neq(false);
+                break (vault, network);
+            }
+            panel.missing.set_neq(true);
+            wait_or_retry(&panel, 15).await;
         };
         panel.vault.set(Some(vault.clone()));
-        let Some(network) = session.load_network().await else {
-            panel.missing.set(true);
-            return;
-        };
         panel.network.set(Some(network.clone()));
         let reader = SolSession::reader(&network);
         loop {
@@ -238,6 +255,7 @@ async fn follow(panel: Rc<Panel>) {
                 panel
                     .figures
                     .set(Some(crate::tx::solana::read::figures(&read)));
+                panel.missing.set_neq(false);
                 let read = Rc::new(read);
                 panel.account.set(Some(read.clone()));
                 if let Ok(codes) = flow::restricted(&reader, &vault.address).await {
@@ -272,17 +290,25 @@ async fn follow(panel: Rc<Panel>) {
             } else if panel.figures.lock_ref().is_none() {
                 panel.missing.set(true);
             }
-            let seen = (session.changed.get(), session.account());
-            for _ in 0..10 {
-                gloo_timers::future::TimeoutFuture::new(1_000).await;
-                if (session.changed.get(), session.account()) != seen {
-                    break;
-                }
-            }
+            wait_or_retry(&panel, 10).await;
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
     let _ = panel;
+}
+
+/// Wait `seconds`, or less if the account changes, a flow lands or the
+/// reader presses "Try again".
+#[cfg(target_arch = "wasm32")]
+async fn wait_or_retry(panel: &Panel, seconds: u32) {
+    let session = crate::wallet::solana::get();
+    let seen = (session.changed.get(), session.account(), panel.retry.get());
+    for _ in 0..seconds {
+        gloo_timers::future::TimeoutFuture::new(1_000).await;
+        if (session.changed.get(), session.account(), panel.retry.get()) != seen {
+            break;
+        }
+    }
 }
 
 fn tabs(panel: &Rc<Panel>) -> El {
@@ -316,58 +342,66 @@ fn render(panel: &Rc<Panel>, mode: Mode) -> View {
     let body = el("div").class("sh-exit__body");
     match mode {
         Mode::Loading => placeholder(),
-        Mode::Unavailable => body
-            .child(notice(
-                NoticeTone::Info,
-                text("This vault can’t be reached from here right now."),
-            ))
-            .into(),
+        Mode::Unavailable => crate::components::exit::unreachable(&panel.retry),
         Mode::SignedOut(tab) => body
-            .child(form(panel, tab, false))
-            .child(el("p").class("sh-muted").text(match tab {
-                Tab::Deposit => {
-                    "This vault is on Solana. Connect a Solana wallet, such as Phantom, to deposit. The smallest deposit is $10."
-                }
-                Tab::Withdraw => "Connect the Solana wallet that holds your shares to withdraw.",
-            }))
-            .child(
-                on_click(
-                    Button::new(Kind::Primary, "Connect a Solana wallet")
-                        .block()
-                        .build(),
-                    open_connect,
-                )
-                .attr("aria-haspopup", "dialog"),
-            )
-            .child(
-                el("p")
-                    .class("sh-muted sh-exit__small")
-                    .text("Connecting doesn’t move money or sign anything."),
-            )
+            .child(form(
+                panel,
+                tab,
+                false,
+                View::Many(vec![
+                    el("p")
+                        .class("sh-muted")
+                        .text(match tab {
+                            Tab::Deposit => {
+                                "This vault is on Solana. Connect a Solana wallet, such as Phantom, to deposit."
+                            }
+                            Tab::Withdraw => {
+                                "Connect the Solana wallet that holds your shares to withdraw."
+                            }
+                        })
+                        .into(),
+                    on_click(
+                        Button::new(Kind::Primary, "Connect a Solana wallet")
+                            .block()
+                            .build(),
+                        open_connect,
+                    )
+                    .attr("aria-haspopup", "dialog")
+                    .into(),
+                    el("p")
+                        .class("sh-muted sh-exit__small")
+                        .text("Connecting doesn’t move money or sign anything.")
+                        .into(),
+                ]),
+            ))
             .into(),
         Mode::OtherKind(tab) => body
             .attr("role", "status")
-            .child(form(panel, tab, false))
-            .child(
-                el("p")
-                    .class("sh-exit__title")
-                    .child(icon(Icon::Concern, 18))
-                    .text(" This vault needs a Solana wallet"),
-            )
-            .child(el("p").text(
-                "It’s on Solana, and the wallet you connected is for the EVM chains. Connect a Solana wallet, such as Phantom, as well: both can stay connected.",
+            .child(form(
+                panel,
+                tab,
+                false,
+                View::Many(vec![
+                    el("p")
+                        .class("sh-exit__title")
+                        .child(icon(Icon::Concern, 18))
+                        .text(" This vault needs a Solana wallet")
+                        .into(),
+                    el("p")
+                        .text("It’s on Solana, and the wallet you connected is for the EVM chains. Connect a Solana wallet, such as Phantom, as well: both can stay connected.")
+                        .into(),
+                    on_click(
+                        Button::new(Kind::Primary, "Connect a Solana wallet")
+                            .block()
+                            .build(),
+                        open_connect,
+                    )
+                    .attr("aria-haspopup", "dialog")
+                    .into(),
+                ]),
             ))
-            .child(
-                on_click(
-                    Button::new(Kind::Primary, "Connect a Solana wallet")
-                        .block()
-                        .build(),
-                    open_connect,
-                )
-                .attr("aria-haspopup", "dialog"),
-            )
             .into(),
-        Mode::Form(tab) => body.child(form(panel, tab, true)).into(),
+        Mode::Form(tab) => body.child(form(panel, tab, true, View::Empty)).into(),
         Mode::Review => review(panel),
         Mode::Flow => flow_view(panel),
     }
@@ -510,10 +544,13 @@ fn withdraw_check(panel: &Panel, text: &str, unit: Unit, connected: bool) -> (Ch
     (Check::Ready, Some(shares))
 }
 
-fn form(panel: &Rc<Panel>, tab: Tab, connected: bool) -> View {
+/// The form for `tab`: what's typed on the left (the lead), what it comes to
+/// and what to do on the right (the trail) on a tablet, one column
+/// elsewhere. `tail` ends the trail: the signed-out lines, say.
+fn form(panel: &Rc<Panel>, tab: Tab, connected: bool, tail: View) -> View {
     match tab {
-        Tab::Deposit => deposit_form(panel, connected),
-        Tab::Withdraw => withdraw_form(panel, connected),
+        Tab::Deposit => deposit_form(panel, connected, tail),
+        Tab::Withdraw => withdraw_form(panel, connected, tail),
     }
 }
 
@@ -523,7 +560,7 @@ fn deposit_quote(panel: &Panel, amount: U256) -> Option<crate::money::quote::Dep
     crate::tx::solana::read::deposit_quote(&account, amount)
 }
 
-fn deposit_form(panel: &Rc<Panel>, connected: bool) -> View {
+fn deposit_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
     let figures = panel.figures.get_cloned();
     if let Some(figures) = figures.filter(|f| f.state != State::Open || f.ready_to_close) {
         let line = match figures.state {
@@ -647,6 +684,9 @@ fn deposit_form(panel: &Rc<Panel>, connected: bool) -> View {
     };
     el("div")
         .class("sh-exit__form")
+        .child(
+            el("div")
+                .class("sh-exit__lead")
         .child(el("p").class("sh-exit__held").text_signal("", held_line))
         .child(
             el("div")
@@ -667,8 +707,11 @@ fn deposit_form(panel: &Rc<Panel>, connected: bool) -> View {
                     crate::components::exit::field_id("sh-deposit-amount", panel.in_sheet),
                     &panel.deposit_text,
                     text(symbol(panel)),
+                    (true, futures_signals::signal::always(true)),
                     check.signal_ref(invalid),
                 ))
+                // The chips sit between the field and its hint, as drawn.
+                .child(quick)
                 .child(hint(
                     crate::components::exit::field_id("sh-deposit-amount-hint", panel.in_sheet),
                     check.signal_cloned().map(|(check, _)| check),
@@ -676,22 +719,30 @@ fn deposit_form(panel: &Rc<Panel>, connected: bool) -> View {
                     "The smallest deposit is $10.",
                 )),
         )
-        .child(quick)
+        )
+        .child(
+            el("div")
+                .class("sh-exit__trail")
         .child(
             el("dl")
-                .class("sh-exit__rows")
+                .class("sh-exit__rows sh-exit__preview")
                 .child(row_dyn(fee_label(panel, "Deposit fee"), fee_figure))
                 .child(row("Share price now", None, price_figure))
                 .child(row("You get about", None, shares_figure).class("sh-exit__row--total")),
         )
-        .child(el("p").class("sh-muted sh-exit__small").text(
-            "Priced a few seconds after you ask, at the next valuation time. The share price can move a little before then.",
-        ))
+        .child(
+            el("p")
+                .class("sh-muted sh-exit__small sh-exit__note")
+                .child(icon(Icon::Clock, 16))
+                .text("Priced a few seconds after you ask, at the next valuation time. The share price can move a little before then."),
+        )
         .child(if connected {
             continue_button.into()
         } else {
             View::Empty
         })
+        .child(tail),
+        )
         .into()
 }
 
@@ -708,7 +759,7 @@ fn fee_label(panel: &Rc<Panel>, what: &'static str) -> impl Signal<Item = String
     })
 }
 
-fn withdraw_form(panel: &Rc<Panel>, connected: bool) -> View {
+fn withdraw_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
     let closed = panel
         .figures
         .lock_ref()
@@ -845,86 +896,108 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool) -> View {
                 })
             })
     };
-    let unit_label = panel.unit.signal().map(|unit| match unit {
-        Unit::Shares => "shares".to_string(),
-        Unit::Dollars => "USDC".to_string(),
-    });
     let invalid =
         |check: &(Check, Option<U256>)| matches!(check.0, Check::Invalid(_) | Check::Over { .. });
     el("div")
         .class("sh-exit__form")
-        .child(el("p").class("sh-exit__held").text_signal("", held_line))
         .child(
             el("div")
-                .class("sh-field")
-                .class_signal("sh-field--error", false, check.signal_ref(invalid))
+                .class("sh-exit__lead")
+                .child(el("p").class("sh-exit__held").text_signal("", held_line))
                 .child(
                     el("div")
-                        .class("sh-exit__fieldhead")
+                        .class("sh-field")
+                        .class_signal("sh-field--error", false, check.signal_ref(invalid))
                         .child(
-                            el("label")
-                                .class("sh-field__label")
-                                .attr(
-                                    "for",
-                                    crate::components::exit::field_id(
-                                        "sh-withdraw-amount",
-                                        panel.in_sheet,
-                                    ),
+                            el("div")
+                                .class("sh-exit__fieldhead")
+                                .child(
+                                    el("label")
+                                        .class("sh-field__label")
+                                        .attr(
+                                            "for",
+                                            crate::components::exit::field_id(
+                                                "sh-withdraw-amount",
+                                                panel.in_sheet,
+                                            ),
+                                        )
+                                        .text("Amount"),
                                 )
-                                .text("Amount"),
+                                .child(segmented(
+                                    "Amount in",
+                                    &[(Unit::Shares, "Shares"), (Unit::Dollars, "USDC")],
+                                    &panel.unit,
+                                )),
                         )
-                        .child(segmented(
-                            "Amount in",
-                            &[(Unit::Shares, "Shares"), (Unit::Dollars, "USDC")],
-                            &panel.unit,
+                        .child(amount_input(
+                            crate::components::exit::field_id("sh-withdraw-amount", panel.in_sheet),
+                            &panel.withdraw_text,
+                            el("span")
+                                .text_from(&panel.unit, |unit| match unit {
+                                    Unit::Shares => "shares".to_string(),
+                                    Unit::Dollars => "USDC".to_string(),
+                                })
+                                .into(),
+                            (
+                                panel.unit.get() == Unit::Dollars,
+                                panel.unit.signal().map(|unit| unit == Unit::Dollars),
+                            ),
+                            check.signal_ref(invalid),
+                        ))
+                        .child(hint(
+                            crate::components::exit::field_id(
+                                "sh-withdraw-amount-hint",
+                                panel.in_sheet,
+                            ),
+                            check.signal_cloned().map(|(check, _)| check),
+                            &panel.withdraw_text,
+                            "",
                         )),
                 )
-                .child(amount_input(
-                    crate::components::exit::field_id("sh-withdraw-amount", panel.in_sheet),
-                    &panel.withdraw_text,
-                    el("span").text_signal("shares", unit_label).into(),
-                    check.signal_ref(invalid),
-                ))
-                .child(hint(
-                    crate::components::exit::field_id("sh-withdraw-amount-hint", panel.in_sheet),
-                    check.signal_cloned().map(|(check, _)| check),
-                    &panel.withdraw_text,
-                    "",
-                )),
+                .child(
+                    el("div")
+                        .class("sh-exit__picks")
+                        .child(el("span").class("sh-muted").text_signal("", max_line))
+                        .child(if connected { max.into() } else { View::Empty }),
+                )
+                .child(el("div").child_signal(None, path_notice)),
         )
         .child(
             el("div")
-                .class("sh-exit__picks")
-                .child(el("span").class("sh-muted").text_signal("", max_line))
-                .child(if connected { max.into() } else { View::Empty }),
+                .class("sh-exit__trail")
+                .child(if closed {
+                    el("dl")
+                        .class("sh-exit__rows sh-exit__preview")
+                        .child(row("Your share of the cash", None, gross))
+                        .child(row("You get", None, payout).class("sh-exit__row--total"))
+                } else {
+                    el("dl")
+                        .class("sh-exit__rows sh-exit__preview")
+                        .child(row(
+                            "Valued at exit-side marks",
+                            Some("what the positions would actually sell for"),
+                            gross,
+                        ))
+                        .child(row_dyn(fee_label(panel, "Withdrawal fee"), fee))
+                        .child(row("You get", None, payout).class("sh-exit__row--total"))
+                })
+                .child(
+                    el("p")
+                        .class("sh-muted sh-exit__small sh-exit__note")
+                        .child(icon(Icon::Clock, 16))
+                        .text(if closed {
+                            "Paid at once from the vault’s cash, in one transaction."
+                        } else {
+                            "Priced a few seconds after you ask. A request can’t be cancelled."
+                        }),
+                )
+                .child(if connected {
+                    submit.into()
+                } else {
+                    View::Empty
+                })
+                .child(tail),
         )
-        .child(el("div").child_signal(None, path_notice))
-        .child(if closed {
-            el("dl")
-                .class("sh-exit__rows")
-                .child(row("Your share of the cash", None, gross))
-                .child(row("You get", None, payout).class("sh-exit__row--total"))
-        } else {
-            el("dl")
-                .class("sh-exit__rows")
-                .child(row(
-                    "Valued at exit-side marks",
-                    Some("what the positions would actually sell for"),
-                    gross,
-                ))
-                .child(row_dyn(fee_label(panel, "Withdrawal fee"), fee))
-                .child(row("You get", None, payout).class("sh-exit__row--total"))
-        })
-        .child(el("p").class("sh-muted sh-exit__small").text(if closed {
-            "Paid at once from the vault’s cash, in one transaction."
-        } else {
-            "Priced a few seconds after you ask. A request can’t be cancelled."
-        }))
-        .child(if connected {
-            submit.into()
-        } else {
-            View::Empty
-        })
         .into()
 }
 
@@ -1489,14 +1562,12 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
                 return card
                     .child(
                         crate::web::app_link("/portfolio")
-                            .class("sh-btn sh-btn-secondary sh-btn-block")
+                            .class("sh-btn sh-btn-primary sh-btn-block")
                             .text("View in portfolio"),
                     )
-                    .child(on_click(
-                        el("button")
-                            .attr("type", "button")
-                            .class("sh-exit__edit")
-                            .text("Done"),
+                    .child(crate::components::exit::back_to(
+                        &panel_title(panel),
+                        panel.in_sheet,
                         back,
                     ))
                     .into();
@@ -1508,6 +1579,21 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
             .into()
         }
     }
+}
+
+/// The agent's name, as the vault or the store has it.
+fn panel_title(panel: &Panel) -> String {
+    panel
+        .vault
+        .lock_ref()
+        .as_ref()
+        .map(|vault| vault.title.clone())
+        .or_else(|| {
+            crate::store::get()
+                .agent(&panel.slug)
+                .map(|agent| agent.title.get_cloned())
+        })
+        .unwrap_or_default()
 }
 
 fn done_view(
@@ -1527,15 +1613,9 @@ fn done_view(
         }
     };
     let portfolio = crate::web::app_link("/portfolio")
-        .class("sh-btn sh-btn-secondary sh-btn-block")
+        .class("sh-btn sh-btn-primary sh-btn-block")
         .text("View in portfolio");
-    let again = on_click(
-        el("button")
-            .attr("type", "button")
-            .class("sh-exit__edit")
-            .text("Done"),
-        reset,
-    );
+    let again = crate::components::exit::back_to(&panel_title(panel), panel.in_sheet, reset);
     let card = |title: String, rows: Vec<(String, String)>, signature: Sig, extra: View| -> View {
         el("div")
             .class("sh-exit__done")

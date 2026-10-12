@@ -173,6 +173,9 @@ pub struct Sync {
     pub failing: Mutable<bool>,
     /// What the latest failure was, in words.
     pub error: Mutable<Option<String>>,
+    /// Bumped by a "Try again": the reader asks again now instead of
+    /// waiting out its backoff.
+    pub retry: Mutable<u32>,
 }
 
 /// The store.

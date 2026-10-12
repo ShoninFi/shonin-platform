@@ -40,30 +40,40 @@ pub fn radio<T: Copy + PartialEq + 'static>(
     value: T,
     selected: &Mutable<T>,
 ) -> El {
-    let choose = selected.clone();
-    let checked = selected.clone();
     el("label")
         .class("sh-check")
         .class("sh-check--radio")
         .attr("for", id.clone())
-        .child(
-            el("input")
-                .attr("type", "radio")
-                .attr("name", name)
-                .attr("id", id)
-                .attr_from("checked", selected, move |current| {
-                    (*current == value).then(String::new)
-                })
-                .hook(move |dom| {
-                    dom.prop_signal(
-                        "checked",
-                        futures_signals::signal::SignalExt::map(checked.signal(), move |current| {
-                            current == value
-                        }),
-                    )
-                    .event(move |_: dominator::events::Change| choose.set_neq(value))
-                }),
-        )
+        .child(radio_input(name, id, value, selected))
         .child(el("span").class("sh-check__box"))
         .child(el("span").text(label.into()))
+}
+
+/// The input of a radio alone, for a larger label to hold (an option card):
+/// put it in an element with `sh-check sh-check--radio`, followed by an
+/// `sh-check__box`.
+pub fn radio_input<T: Copy + PartialEq + 'static>(
+    name: &'static str,
+    id: String,
+    value: T,
+    selected: &Mutable<T>,
+) -> El {
+    let choose = selected.clone();
+    let checked = selected.clone();
+    el("input")
+        .attr("type", "radio")
+        .attr("name", name)
+        .attr("id", id)
+        .attr_from("checked", selected, move |current| {
+            (*current == value).then(String::new)
+        })
+        .hook(move |dom| {
+            dom.prop_signal(
+                "checked",
+                futures_signals::signal::SignalExt::map(checked.signal(), move |current| {
+                    current == value
+                }),
+            )
+            .event(move |_: dominator::events::Change| choose.set_neq(value))
+        })
 }

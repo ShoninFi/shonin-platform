@@ -159,9 +159,20 @@ pub fn parse_receipt(value: &Value) -> Result<Option<Receipt>, TxError> {
     if value.is_null() {
         return Ok(None);
     }
-    // A receipt without a block isn't mined yet (some nodes answer so).
+    // A receipt without a block isn't mined yet (some nodes answer so), and
+    // nor is one whose block has no hash yet: a chain that confirms ahead of
+    // its blocks (Base's flashblocks) hands out a receipt with a zero block
+    // hash before the block is sealed, while a call against the latest block
+    // can't see the transaction yet.
     if value.get("blockNumber").is_none_or(Value::is_null) {
         return Ok(None);
+    }
+    match value.get("blockHash").and_then(Value::as_str) {
+        None => return Ok(None),
+        Some(hash) if hash.trim_start_matches("0x").chars().all(|c| c == '0') => {
+            return Ok(None);
+        }
+        Some(_) => {}
     }
     let logs = value
         .get("logs")
@@ -323,6 +334,12 @@ impl<T: Transport> Reader for RpcReader<T> {
         quantity_u64(&block["timestamp"])
     }
 
+    async fn block_number(&self) -> Result<Option<u64>, TxError> {
+        Ok(Some(quantity_u64(
+            &self.ask("eth_blockNumber", json!([])).await?,
+        )?))
+    }
+
     async fn block_time(&self, number: u64) -> Result<u64, TxError> {
         let block = self
             .ask(
@@ -479,6 +496,7 @@ mod tests {
             "transactionHash": format!("0x{}", "11".repeat(32)),
             "status": "0x1",
             "blockNumber": "0x2a",
+            "blockHash": format!("0x{}", "33".repeat(32)),
             "logs": [{
                 "address": format!("0x{}", "aa".repeat(20)),
                 "topics": [format!("0x{}", "22".repeat(32))],
@@ -490,10 +508,32 @@ mod tests {
         assert_eq!(receipt.block, 42);
         assert_eq!(receipt.logs[0].address, Address::repeat_byte(0xaa));
         assert_eq!(receipt.logs[0].data.as_ref(), &[1, 2]);
-        let failed = json!({"transactionHash": format!("0x{}", "11".repeat(32)), "status": "0x0", "blockNumber": "0x1", "logs": []});
+        let failed = json!({"transactionHash": format!("0x{}", "11".repeat(32)), "status": "0x0", "blockNumber": "0x1", "blockHash": format!("0x{}", "33".repeat(32)), "logs": []});
         assert!(!parse_receipt(&failed).unwrap().unwrap().success);
         assert_eq!(parse_receipt(&Value::Null).unwrap(), None);
         assert_eq!(parse_receipt(&json!({"blockNumber": null})).unwrap(), None);
+    }
+
+    /// A chain that confirms ahead of its blocks hands out a receipt whose
+    /// block has no hash yet; until the block is sealed a call against the
+    /// latest block can't see the transaction, so it isn't mined yet.
+    #[test]
+    fn a_receipt_whose_block_is_not_sealed_is_not_mined_yet() {
+        let preconfirmed = json!({
+            "transactionHash": format!("0x{}", "11".repeat(32)),
+            "status": "0x1",
+            "blockNumber": "0x2a",
+            "blockHash": format!("0x{}", "00".repeat(32)),
+            "logs": [],
+        });
+        assert_eq!(parse_receipt(&preconfirmed).unwrap(), None);
+        let no_hash = json!({
+            "transactionHash": format!("0x{}", "11".repeat(32)),
+            "status": "0x1",
+            "blockNumber": "0x2a",
+            "logs": [],
+        });
+        assert_eq!(parse_receipt(&no_hash).unwrap(), None);
     }
 
     #[test]

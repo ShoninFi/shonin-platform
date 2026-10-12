@@ -132,14 +132,17 @@ fn freshness() -> View {
         ),
         labelled(
             "Can't reach the indexer, with figures from earlier",
-            unreachable_card(Freshness::Unreachable {
-                since: Some(at(285, 14)),
-            })
+            unreachable_card(
+                Freshness::Unreachable {
+                    since: Some(at(285, 14)),
+                },
+                true,
+            )
             .unwrap_or(View::Empty),
         ),
         labelled(
             "Can't reach the indexer, nothing arrived yet (offline)",
-            unreachable_card(Freshness::Unreachable { since: None }).unwrap_or(View::Empty),
+            unreachable_card(Freshness::Unreachable { since: None }, true).unwrap_or(View::Empty),
         ),
     ])
 }

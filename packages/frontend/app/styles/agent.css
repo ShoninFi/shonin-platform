@@ -99,6 +99,10 @@
 /* 600–899: the right column moves under the header, in normal flow. */
 @media (min-width: 600px) and (max-width: 899px) {
   .ag-layout--overview .ag-side { order: -1; }
+  /* The Exit panel across, the tank and the verified build side by side. */
+  .ag-layout--overview .ag-side { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: stretch; }
+  .ag-layout--overview .ag-side > .ag-exit-slot > * { grid-column: 1 / -1; }
+  .ag-layout--overview .ag-side > :last-child:nth-child(2) { grid-column: 1 / -1; }
 }
 
 /* ---- Cards ------------------------------------------------------------- */

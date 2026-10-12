@@ -32,7 +32,8 @@ use crate::wallet::Network;
 struct Info {
     chain: Chain,
     id: u64,
-    title: String,
+    /// Its name as its publishing job gave it, when the jobs list answered.
+    title: Option<String>,
     network: Rc<Network>,
     readiness: Readiness,
     terms: Terms,
@@ -234,8 +235,7 @@ async fn read_page(chain: Chain, id: u64, load: Mutable<Load>) {
                     .find(|job| job.chain == chain && job.strategy_id == Some(id))
                     .map(|job| job.title)
             })
-            .filter(|title| !title.trim().is_empty())
-            .unwrap_or_else(|| format!("agent {id}"));
+            .filter(|title| !title.trim().is_empty());
         load.set(Load::Ready(Rc::new(Info {
             chain,
             id,
@@ -252,23 +252,7 @@ async fn read_page(chain: Chain, id: u64, load: Mutable<Load>) {
 
 /// Why the strategy can't be activated by this page, if it can't.
 fn blocker(info: &Info) -> Option<View> {
-    let slug = shared::Strategy::slug_for(info.chain, info.id);
     let ready = &info.readiness;
-    if ready.vault.is_some() {
-        return Some(
-            notice(
-                NoticeTone::Info,
-                View::Many(vec![
-                    text("It's already active. "),
-                    crate::web::app_link(format!("/you/agents/{slug}"))
-                        .class("sh-link")
-                        .text("Manage it")
-                        .into(),
-                ]),
-            )
-            .into(),
-        );
-    }
     if !ready.registered || !ready.reviewed {
         return Some(
             notice(
@@ -290,21 +274,142 @@ fn blocker(info: &Info) -> Option<View> {
     None
 }
 
+/// The agent's name: its publishing job's, else the snapshot's, else its
+/// number.
+fn title_now(info: &Info) -> String {
+    let slug = shared::Strategy::slug_for(info.chain, info.id);
+    info.title
+        .clone()
+        .or_else(|| {
+            crate::store::get()
+                .agent(&slug)
+                .map(|agent| agent.title.get_cloned())
+                .filter(|title| !title.trim().is_empty())
+        })
+        .unwrap_or_else(|| format!("agent {}", info.id))
+}
+
+/// The name as the snapshot arrives.
+fn title_signal(info: &Rc<Info>) -> impl Signal<Item = String> + 'static {
+    let info = info.clone();
+    crate::store::get()
+        .loaded
+        .signal()
+        .map(move |_| title_now(&info))
+}
+
+/// The agent's page, once the snapshot has it.
+fn agent_href(info: &Info) -> Option<String> {
+    let slug = shared::Strategy::slug_for(info.chain, info.id);
+    crate::store::get().agent(&slug).map(|agent| agent.href())
+}
+
+/// "Publish / {agent} / Activate".
+fn crumb(info: &Rc<Info>) -> El {
+    el("nav")
+        .class("ag-crumb")
+        .attr("aria-label", "Breadcrumb")
+        .child(
+            el("ol")
+                .child(
+                    el("li")
+                        .child(crate::web::app_link("/publish").text("Publish"))
+                        .child(el("span").attr("aria-hidden", "true").text("/")),
+                )
+                .child(
+                    el("li")
+                        .text_signal(title_now(info), title_signal(info))
+                        .child(el("span").attr("aria-hidden", "true").text("/")),
+                )
+                .child(el("li").attr("aria-current", "page").text("Activate")),
+        )
+}
+
+fn head(info: &Rc<Info>, lede: &'static str) -> El {
+    let title = title_signal(info).map(|title| format!("Activate {title}"));
+    el("div").class("sh-author__head").child(
+        el("div")
+            .class("sh-author__headtext")
+            .child(
+                el("h1")
+                    .class("sh-author__title")
+                    .text_signal(format!("Activate {}", title_now(info)), title),
+            )
+            .child(el("p").class("sh-author__lede").text(lede)),
+    )
+}
+
+/// An agent whose vault is open: nothing to activate, a way to manage it.
+fn already_active(info: &Rc<Info>) -> View {
+    let slug = shared::Strategy::slug_for(info.chain, info.id);
+    let page_link = {
+        let info = info.clone();
+        crate::store::get().loaded.signal().map(move |_| {
+            agent_href(&info).map(|href| {
+                crate::web::app_link(href)
+                    .class("sh-btn sh-btn-secondary")
+                    .text("View its page")
+                    .into()
+            })
+        })
+    };
+    el("div")
+        .class("sh-activate__body")
+        .child(crumb(info))
+        .child(head(info, "Its vault is open and taking deposits. There's nothing left to activate."))
+        .child(
+            el("div")
+                .class("sh-card sh-card--pad sh-activate__card")
+                .child(
+                    el("div")
+                        .class("sh-activate__ready")
+                        .child(crate::atoms::badge::badge(
+                            crate::atoms::badge::Tone::Gain,
+                            Some(Icon::Check),
+                            "Active",
+                        ))
+                        .child(el("span").class("sh-muted").text("It's already active")),
+                )
+                .child(el("p").text(
+                    "Change its allowances and idle floor, top up its tank or retire it from its manage page.",
+                ))
+                .child(
+                    el("div")
+                        .class("sh-activate__quick")
+                        .child(
+                            crate::web::app_link(format!("/you/agents/{slug}"))
+                                .class("sh-btn sh-btn-primary")
+                                .text("Manage it"),
+                        )
+                        .child_signal(None, page_link),
+                ),
+        )
+        .into()
+}
+
 fn view(info: &Rc<Info>) -> View {
+    if info.readiness.vault.is_some() {
+        return already_active(info);
+    }
     let names = Rc::new(Names::of(&info.network));
     let decimals = info.network.asset_decimals;
     let form = Rc::new(Form::new(decimals));
     let can_activate = blocker(info).is_none();
-    let head = el("div")
-        .class("sh-author__head")
-        .child(
-            el("div")
-                .class("sh-author__headtext")
-                .child(el("h1").class("sh-author__title").text(format!("Activate {}", info.title)))
-                .child(el("p").class("sh-author__lede").text(
-                    "Set its limits, fill its tank, and open its vault in one transaction. You can change the limits and the idle floor later; the vault's page shows every change.",
-                )),
-        );
+    let head = head(
+        info,
+        "Set its limits, fill its tank, and open its vault in one transaction. You can change the limits and the idle floor later; the vault's page shows every change.",
+    );
+    let report = {
+        let info = info.clone();
+        crate::store::get().loaded.signal().map(move |_| {
+            agent_href(&info).map(|href| {
+                crate::web::app_link(format!("{href}/review"))
+                    .class("sh-link")
+                    .text("Read the report")
+                    .into()
+            })
+        })
+    };
     let status: View = match blocker(info) {
         Some(blocker) => blocker,
         None => el("div")
@@ -319,11 +424,13 @@ fn view(info: &Rc<Info>) -> View {
                     .class("sh-muted")
                     .text("Review posted, build registered"),
             )
+            .child_signal(None, report)
             .into(),
     };
     let author_note = author_notice(info);
     el("div")
         .class("sh-activate__body")
+        .child(crumb(info))
         .child(head)
         .child(status)
         .child(author_note)
@@ -813,7 +920,14 @@ fn summary(info: &Rc<Info>, form: &Rc<Form>, names: &Rc<Names>, can_activate: bo
         .child(
             el("dl")
                 .class("sh-publish__dl")
-                .child(parts::row("Agent", parts::words(format!("{} · {}", info.title, info.id))))
+                .child(parts::row_signal(
+                    "Agent",
+                    format!("{} · {}", title_now(info), info.id),
+                    {
+                        let id = info.id;
+                        title_signal(info).map(move |title| format!("{title} · {id}"))
+                    },
+                ))
                 .child(parts::row("Vault chain", parts::words(chain)))
                 .child(parts::row_signal("Running costs", "—".to_string(), daily))
                 .child(parts::row_signal("Idle floor", "5%".to_string(), floor))

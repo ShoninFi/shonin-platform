@@ -73,15 +73,19 @@ pub(crate) fn behind_bar(freshness: Freshness, failing: bool) -> Option<View> {
     )
 }
 
-/// The card at the top of the main column.
-pub fn card() -> View {
+/// The card at the top of the main column. `link_status` is false on the
+/// status page itself, which never links to itself.
+pub fn card(link_status: bool) -> View {
     el("div")
         .class("sh-contents")
-        .child_signal(unreachable_card(now()), signal().map(unreachable_card))
+        .child_signal(
+            unreachable_card(now(), link_status),
+            signal().map(move |freshness| unreachable_card(freshness, link_status)),
+        )
         .into()
 }
 
-pub(crate) fn unreachable_card(freshness: Freshness) -> Option<View> {
+pub(crate) fn unreachable_card(freshness: Freshness, link_status: bool) -> Option<View> {
     let Freshness::Unreachable { since } = freshness else {
         return None;
     };
@@ -108,11 +112,14 @@ pub(crate) fn unreachable_card(freshness: Freshness) -> Option<View> {
                             .text("Check on-chain")
                             .child(icon(Icon::External, 14)),
                     )
-                    .child(
+                    .child(if link_status {
                         app_link("/status")
                             .text("Status page")
-                            .child(icon(Icon::ArrowRight, 16)),
-                    )
+                            .child(icon(Icon::ArrowRight, 16))
+                            .into()
+                    } else {
+                        View::Empty
+                    })
                     .into(),
             ]),
         )

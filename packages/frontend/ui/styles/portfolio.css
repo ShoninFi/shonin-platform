@@ -48,3 +48,5 @@
   .sh-portfolio .sh-table td:empty { display: none; }
   .sh-portfolio .sh-table td .sh-btn { width: 100%; }
 }
+.sh-portfolio__title .sh-mono { font-family: var(--font-mono); font-size: 0.8em; font-weight: 500; }
+.sh-claim__back { align-self: flex-start; }

@@ -220,6 +220,10 @@
 .st-system__seal--warn { background: var(--caution-soft); color: var(--caution); }
 .st-system__seal--wait { background: var(--neutral-soft); color: var(--ink-muted); }
 .st-loading { display: flex; flex-direction: column; gap: var(--space-4); }
+.st-offline { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-3); padding: var(--space-5); border: var(--border-hairline) solid var(--line); border-radius: var(--radius-m); background: var(--paper-sunk); }
+.st-offline > .sh-icon { flex: none; color: var(--caution); }
+.st-offline p { flex: 1 1 240px; font: 400 14px/22px var(--font-sans); }
+.st-offline strong { font-weight: 650; }
 .st-system__tilehead { display: flex; justify-content: space-between; align-items: center; gap: var(--space-2); }
 .st-system__name { font: 650 15px/22px var(--font-sans); }
 .st-system__words { font: var(--type-body-s); color: var(--ink-muted); }
