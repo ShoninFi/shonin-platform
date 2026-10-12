@@ -1,5 +1,5 @@
 //! The author's controls for a vault on Solana (Manage-*): the tank (fund
-//! it, top it up from fee shares, the level auto-fill keeps, withdrawing
+//! it, top it up from the author's shares, the level auto-fill keeps, withdrawing
 //! with the executor's signed total or through the unsigned escape), the
 //! allowances, the idle floor, and retiring. Every figure is read from the
 //! vault's account; every change is one transaction through the Solana
@@ -252,7 +252,7 @@ fn controls(read: &Rc<Read>) -> View {
             let fund = fund.clone();
             move || Ok(SolAction::Author(AuthorAction::FundTank(dollars(&fund.get_cloned(), decimals)?)))
         }))
-        .child(field("sol-topup", "Top up from your fee shares", &shares, "shares"))
+        .child(field("sol-topup", "Top up from your shares", &shares, "shares"))
         .child(act(read, "Redeem into the tank", Kind::Secondary, {
             let shares = shares.clone();
             move || {

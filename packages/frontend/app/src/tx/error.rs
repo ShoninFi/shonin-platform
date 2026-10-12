@@ -73,6 +73,10 @@ pub enum TxError {
         request: Option<U256>,
         then: Option<Box<TxError>>,
     },
+    /// The deposit stopped before it was sent, or was refused when mined
+    /// (`then`), after its approval of `amount` to the vault was mined: the
+    /// approval stands, and depositing the same amount again uses it.
+    ApprovalStands { amount: U256, then: Box<TxError> },
 }
 
 /// A contract's reason for refusing, as far as it can be read.
@@ -201,7 +205,7 @@ impl TxError {
     /// Whether a transaction may have been sent, so the page must not say
     /// "Nothing was sent".
     pub fn after_send(&self) -> bool {
-        self.may_have_moved() || matches!(self, Self::Reverted { .. })
+        self.may_have_moved() || matches!(self, Self::Reverted { .. } | Self::ApprovalStands { .. })
     }
 
     /// Whether money may have moved (or may still move): the page must not
@@ -223,6 +227,7 @@ impl TxError {
             | Self::Dropped { hash }
             | Self::Stuck { hash }
             | Self::Landed { hash, .. } => Some(*hash),
+            Self::ApprovalStands { then, .. } => then.hash(),
             _ => None,
         }
     }
@@ -386,6 +391,28 @@ impl TxError {
                 format!("{why}. Check your connection and try again."),
             ),
             Self::Wallet(why) => alert("Your wallet refused it", format!("{wallet} said: {why}")),
+            Self::ApprovalStands { amount, then } => {
+                let words = then.words(context);
+                // The inner words say nothing moved; the approval did.
+                let reason = [
+                    "Nothing was sent.",
+                    "No money moved and no request was made.",
+                    "No money moved.",
+                ]
+                .iter()
+                .find_map(|said| words.text.strip_suffix(said))
+                .map(|text| format!("{text}The deposit wasn't sent."))
+                .unwrap_or(words.text);
+                let amount = format::dollars_exact(*amount, context.decimals);
+                // Its own title: the approval went, so no title of a step
+                // that sent nothing stands above it.
+                alert(
+                    "Not deposited: your approval stands",
+                    format!(
+                        "{reason} Your approval of {amount} to the vault went through and stands: depositing {amount} again uses it, without asking for it again."
+                    ),
+                )
+            }
             Self::Landed { request, then, .. } => {
                 let then = match then.as_deref() {
                     None => "It isn't settled yet, and this page has stopped watching it.",

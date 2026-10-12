@@ -107,7 +107,7 @@ fn nodes(strategy: &Strategy) -> Vec<Node> {
         Node {
             title: "Build".into(),
             sub: format!("Built in {}s", strategy.bundle.built_in_seconds),
-            value: Some(strategy.bundle.component_hash.clone()),
+            value: Some(strategy.bundle.bundle_hash.clone()),
             what: "build hash",
             glyph: Icon::Machine,
             link: Some("Each key was made inside an attested machine running this exact build."),
@@ -296,7 +296,10 @@ fn spelled(value: &str) -> El {
 }
 
 fn rebuild(strategy: &Strategy) -> View {
-    let build = &strategy.bundle.component_hash;
+    // The chain holds the build's hash; a rebuild makes the component inside
+    // it, which is what the commands below check.
+    let build = &strategy.bundle.bundle_hash;
+    let component = &strategy.bundle.component_hash;
     let (toolchain, target) = match strategy.bundle.toolchain.split_once(" · ") {
         Some((toolchain, target)) => (toolchain.to_string(), target.to_string()),
         None => (
@@ -336,7 +339,7 @@ fn rebuild(strategy: &Strategy) -> View {
     let terminal = check_commands(strategy);
     card("ag-rebuild-title", "Check it yourself", None)
         .child(el("p").class("ag-body").text(
-            "The store keeps the exact files the chain's hashes name, so you can download them and hash them yourself. Builds are exactly repeatable too: build the source with the published recipe and you get the same fingerprint the chain holds. You don't have to trust us, or the page you're reading.",
+            "The store keeps the exact files the chain's hashes name, so you can download them and hash them yourself. Builds are exactly repeatable too: build the source with the published recipe and you get the same component, hash for hash. You don't have to trust us, or the page you're reading.",
         ))
         .child(
             el("dl")
@@ -356,13 +359,13 @@ fn rebuild(strategy: &Strategy) -> View {
                         .child(crate::web::app_link(format!("/agents/{}/source", strategy.slug)).text("on its Source tab"))
                         .text(", or download it with the commands below."),
                 )
-                .child(el("li").child(el("strong").text("Hash what you got.")).text(" The archive's SHA-256 is the source hash the Reviewer's report names; the component's is the build hash."))
+                .child(el("li").child(el("strong").text("Hash what you got.")).text(" The archive's SHA-256 is the source hash the Reviewer's report names; the component's is the component hash, the code inside the build the chain holds."))
                 .child(
                     el("li")
                         .child(el("strong").text("Rebuild it"))
                         .text(format!(" with {toolchain} for {target}, "))
                         .child(el("code").class("ag-code").class("ag-nowrap").text("--release --locked"))
-                        .text(". Your component's hash should be the build the chain holds."),
+                        .text(". Your component's hash should be the component hash below."),
                 ),
         )
         .child(terminal)
@@ -372,8 +375,8 @@ fn rebuild(strategy: &Strategy) -> View {
                 .child(
                     el("div")
                         .class("ag-match__box")
-                        .child(el("p").class("sh-label").text("The chain holds"))
-                        .child(spelled(build)),
+                        .child(el("p").class("sh-label").text("The build's component"))
+                        .child(spelled(component)),
                 )
                 .child(el("span").class("ag-match__eq").attr("aria-hidden", "true").text("="))
                 .child(
@@ -381,13 +384,13 @@ fn rebuild(strategy: &Strategy) -> View {
                         .class("ag-match__box")
                         .class("ag-match__box--yours")
                         .child(el("p").class("sh-label").text("You should get"))
-                        .child(spelled(build)),
+                        .child(spelled(component)),
                 ),
         )
         .child(
             el("p")
                 .class("ag-muted")
-                .text("If yours is different, the build on the chain isn't the one you made. Don't rely on it, and tell us on the ")
+                .text("If yours is different, the component in the build on the chain isn't the one you made. Don't rely on it, and tell us on the ")
                 .child(crate::web::app_link("/status").text("status page"))
                 .text(". ")
                 .child(el("a").attr("href", format!("{DOCS}verify/")).text("The full rebuild guide")),
@@ -409,7 +412,7 @@ fn check_commands(strategy: &Strategy) -> El {
             format!("# expect {}", digits(&bundle.source_hash)),
         ),
         (
-            "# 2  The build that trades this vault",
+            "# 2  The component of the build that trades this vault",
             format!("curl -fLo component.wasm '{build}'\nshasum -a 256 component.wasm"),
             format!("# expect {}", digits(&bundle.component_hash)),
         ),
@@ -449,7 +452,7 @@ fn check_commands(strategy: &Strategy) -> El {
                 .attr("tabindex", "0")
                 .attr(
                     "aria-label",
-                    "Commands to download and hash the source and the build",
+                    "Commands to download and hash the source and the build's component",
                 )
                 .child(code),
         )

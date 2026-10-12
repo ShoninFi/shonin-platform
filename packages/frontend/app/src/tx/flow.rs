@@ -516,7 +516,8 @@ pub async fn deposit<R: Reader, S: Signer, C: Clock>(
 
     // Exactly the amount, and only if needed.
     let allowed = read::allowance(ctx.reader, ctx.asset, ctx.account, ctx.vault).await?;
-    if allowed < amount {
+    let approving = allowed < amount;
+    if approving {
         ctx.transact(
             Prompt::Approve { amount },
             ctx.asset,
@@ -540,7 +541,19 @@ pub async fn deposit<R: Reader, S: Signer, C: Clock>(
             }
             .abi_encode(),
         )
-        .await?;
+        .await
+        .map_err(|then| {
+            // The approval was mined and the deposit stopped before it was
+            // sent: the approval stands, and depositing again uses it.
+            if approving && !then.may_have_moved() {
+                TxError::ApprovalStands {
+                    amount,
+                    then: Box::new(then),
+                }
+            } else {
+                then
+            }
+        })?;
     follow(ctx, &receipt, RequestKind::Deposit, amount, &figures.timers).await
 }
 
