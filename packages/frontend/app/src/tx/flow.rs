@@ -544,8 +544,12 @@ pub async fn deposit<R: Reader, S: Signer, C: Clock>(
         .await
         .map_err(|then| {
             // The approval was mined and the deposit stopped before it was
-            // sent: the approval stands, and depositing again uses it.
-            if approving && !then.may_have_moved() {
+            // sent: the approval stands, and depositing again uses it. Not
+            // said when the wallet left the account that approved: the
+            // approval is that account's, and the one now connected would
+            // be asked for its own.
+            let left = matches!(then, TxError::AccountChanged | TxError::NotConnected);
+            if approving && !then.may_have_moved() && !left {
                 TxError::ApprovalStands {
                     amount,
                     then: Box::new(then),
