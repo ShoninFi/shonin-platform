@@ -9,9 +9,12 @@
 //!
 //! Logs are checked, never trusted: each log's block hash must be the
 //! followed branch's hash at its number (from the observation's window, the
-//! anchors, or one header beyond them), and each page's last block is
-//! checked the same way. That is one comparison per page and per
-//! log-bearing block, never one per block.
+//! anchors, or one header beyond them), and so must the last block of each
+//! window of logs, as the endpoint that answered the window gives it just
+//! after (one header there, unless that endpoint is the one the observation
+//! came from). A window from an endpoint on another branch, which may leave
+//! out a log the followed branch has, is refused that way. That is one
+//! comparison per window and per log-bearing block, never one per block.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -64,8 +67,10 @@ pub struct Pages {
     pub start: u64,
     /// The last block read.
     pub to: u64,
-    /// The last block of each page.
-    pub ends: Vec<u64>,
+    /// The last block of each window of logs, with its hash as the
+    /// endpoint that answered the window gave it (`None` for the endpoint
+    /// the observation came from, checked against what it saw there).
+    pub ends: Vec<(u64, Option<B256>)>,
     pub logs: Vec<Log>,
 }
 
@@ -156,9 +161,11 @@ impl RangeReader {
                 if !self.watch.topics.is_empty() {
                     filter = filter.event_signature(self.watch.topics.clone());
                 }
-                logs.extend(follower.client().logs_seen(&filter, seen).await?);
+                for window in follower.client().logs_by_window(&filter, seen).await? {
+                    ends.push((window.to, window.end_hash));
+                    logs.extend(window.logs);
+                }
             }
-            ends.push(page_to);
             page_from = page_to + 1;
         }
         Ok(Some(Pages {
@@ -229,11 +236,22 @@ impl RangeReader {
                 logs.push(log);
             }
         }
-        // The hashes to compare: each log-bearing block's and each page end's.
-        let mut wanted: BTreeMap<u64, Option<B256>> =
-            by_block.iter().map(|(n, (h, _))| (*n, Some(*h))).collect();
-        for end in &pages.ends {
-            wanted.entry(*end).or_insert(None);
+        // The hashes to compare: each log-bearing block's, and each window
+        // end's as the endpoint that answered the window gave it (none for
+        // the observation's own endpoint: the end is then held as the
+        // followed branch has it).
+        let mut wanted: BTreeMap<u64, BTreeSet<B256>> = by_block
+            .iter()
+            .map(|(n, (h, _))| (*n, BTreeSet::from([*h])))
+            .collect();
+        for (end, hash) in &pages.ends {
+            if *end < pages.from || *end > pages.to {
+                return RangeRead::Unverified(format!(
+                    "a window of logs ends at block {end}, outside the read"
+                ));
+            }
+            let found = wanted.entry(*end).or_default();
+            found.extend(*hash);
         }
         let mut proven = Vec::new();
         for (number, found) in wanted {
@@ -264,11 +282,9 @@ impl RangeReader {
                     ));
                 }
             };
-            if let Some(found) = found
-                && found != expected
-            {
+            if let Some(found) = found.iter().find(|found| **found != expected) {
                 return RangeRead::Unverified(format!(
-                    "the logs of block {number} carry hash {found}, the followed branch has {expected}"
+                    "the logs up to block {number} came from a branch with hash {found} there, the followed branch has {expected}"
                 ));
             }
             proven.push((number, expected));
