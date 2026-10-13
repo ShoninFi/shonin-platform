@@ -25,6 +25,7 @@ use serde::Deserialize;
 pub mod icons;
 pub mod images;
 pub mod logos;
+pub mod social;
 pub mod styles;
 
 /// The design's tokens, exactly as exported (plus what this build adds and

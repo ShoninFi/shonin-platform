@@ -8,6 +8,7 @@
 //! - `{{app}}` and `{{docs}}`: the app's and the docs' origins.
 //! - `{{i:name:size}}` (or `{{i:name:size:stroke}}`): an icon.
 //! - `{{asset:name}}`: the fingerprinted address of a logo or font.
+//! - `{{social}}`: the footer's social links, each with its brand mark.
 //!
 //! Nothing a page shows comes from outside the build, so there is no
 //! untrusted text to escape; the few values that are passed in (the origins)
@@ -109,6 +110,9 @@ fn placeholder(name: &str, cx: &Cx) -> Result<String> {
     }
     if name == "docs" {
         return Ok(esc(&cx.links.docs));
+    }
+    if name == "social" {
+        return Ok(ui::social::Social::row_html(20));
     }
     if let Some(icon) = name.strip_prefix("i:") {
         let mut parts = icon.split(':');
@@ -273,7 +277,7 @@ pub(crate) const MENU: &str = r#"<div class="menu sh-hero sh-sheet-up" id="menu"
 </div>"#;
 
 /// The footer band: brand, three link columns, the legal and social row, and
-/// the risk line. Discord and X are left out until their addresses exist.
+/// the risk line.
 const FOOTER: &str = r#"<footer class="site-footer sh-hero">
   <div class="wrap">
     <div class="site-footer__cols">
@@ -316,7 +320,7 @@ const FOOTER: &str = r#"<footer class="site-footer sh-hero">
           <a href="/privacy">Privacy Policy</a>
         </nav>
         <ul class="site-footer__social" aria-label="Shonin elsewhere">
-          <li><a href="https://github.com/ShoninFi" aria-label="Shonin on GitHub" data-logo="github">GH</a></li>
+          {{social}}
         </ul>
       </div>
       <p class="site-footer__risk">Agents can lose money. A review isn't a prediction, and a track record isn't a promise. These pages describe the platform as designed.</p>
@@ -336,7 +340,7 @@ const FOOTER_COMPACT: &str = r#"<footer class="site-footer site-footer--compact 
           <a href="/privacy">Privacy Policy</a>
         </nav>
         <ul class="site-footer__social" aria-label="Shonin elsewhere">
-          <li><a href="https://github.com/ShoninFi" aria-label="Shonin on GitHub" data-logo="github">GH</a></li>
+          {{social}}
         </ul>
       </div>
       <p class="site-footer__risk">Agents can lose money. A review isn't a prediction, and a track record isn't a promise. These pages describe the platform as designed.</p>
