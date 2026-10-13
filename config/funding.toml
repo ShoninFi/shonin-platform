@@ -32,15 +32,18 @@ executor = 0
 keeper = 0.2
 author = 0.06
 
-# The funder here is thin (a few thousandths of an ETH), so only what one
-# live vault needs: two vault-key stakes (one for a handover), the blessings
-# and the keeper's own sends.
+# The funder here is thin (a few hundredths of an ETH at most), so only
+# what the live vaults need for about two weeks unattended: the keeper's
+# vault-key stakes (one more for a handover), the blessings and its own
+# sends; and the market operator's posts, every ten minutes, at about
+# 0.00014 ETH a day.
 [testnet."evm:46630"] # Robinhood Chain testnet, ETH
 reserve = 0.0015
 default = 0.0003
 admin = 0.004
 executor = 0
-keeper = 0.002
+keeper = 0.006
+operator = 0.002
 author = 0.001
 
 # Solana devnet, SOL. The funder is the deployer (m/44'/501'/0'/0' of the
