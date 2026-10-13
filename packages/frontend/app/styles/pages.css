@@ -428,7 +428,7 @@
   .sh-claim__crumbs a, .ag-by a, .ag-chip-link, .ag-more, .ag-chart__table-toggle,
   .ag-report__go, .ag-record__read, .sh-seg button, .st-filter, .sh-nav, .lb-howto,
   .sh-appheader .sh-logo, .sh-walletbtn, .ag-crumb a, .ag-tank__about a, .ag-source-line a,
-  .sh-footer__brand .sh-logo, .sh-strip .sh-iconbtn, .sh-table th a {
+  .sh-footer__brand .sh-logo, .sh-strip .sh-iconbtn, .sh-table th a, .sh-you__name {
     position: relative;
   }
   .sh-link::after, .sh-notice__actions a::after, .sh-notice__body > a::after, .st-event__link::after,
@@ -437,7 +437,7 @@
   .sh-seg button::after, .st-filter::after, .sh-nav::after, .lb-howto::after,
   .sh-appheader .sh-logo::after, .sh-walletbtn::after, .ag-crumb a::after,
   .ag-tank__about a::after, .ag-source-line a::after, .sh-footer__brand .sh-logo::after,
-  .sh-strip .sh-iconbtn::after, .sh-table th a::after {
+  .sh-strip .sh-iconbtn::after, .sh-table th a::after, .sh-you__name::after {
     content: ""; position: absolute; left: 50%; top: 50%;
     width: max(100%, 44px); height: max(100%, 44px); transform: translate(-50%, -50%);
   }

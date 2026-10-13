@@ -35,6 +35,7 @@ pub fn page(route: &Route, strip_dismissed: bool) -> Page {
         Route::Publish => publish::page(),
         Route::Job { id } => publish::job::page(id),
         Route::Activate { slug } => publish::activate::page(slug),
+        Route::You => you::list::page(),
         Route::Manage { slug } => you::page(slug),
         Route::Status => status::page(),
         #[cfg(feature = "dev")]

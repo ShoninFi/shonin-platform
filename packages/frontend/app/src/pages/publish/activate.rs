@@ -304,7 +304,7 @@ fn agent_href(info: &Info) -> Option<String> {
     crate::store::get().agent(&slug).map(|agent| agent.href())
 }
 
-/// "Publish / {agent} / Activate".
+/// "Your agents / {agent} / Activate".
 fn crumb(info: &Rc<Info>) -> El {
     el("nav")
         .class("ag-crumb")
@@ -313,7 +313,7 @@ fn crumb(info: &Rc<Info>) -> El {
             el("ol")
                 .child(
                     el("li")
-                        .child(crate::web::app_link("/publish").text("Publish"))
+                        .child(crate::web::app_link("/you").text("Your agents"))
                         .child(el("span").attr("aria-hidden", "true").text("/")),
                 )
                 .child(

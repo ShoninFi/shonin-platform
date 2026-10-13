@@ -19,8 +19,9 @@
 //!   listed still get a file, marked `noindex`.
 //! - one shared page per kind of address with an id (`_shells/claim.html`,
 //!   `_shells/job.html`, `_shells/activate.html`, `_shells/manage.html`),
-//!   marked `noindex`, which `_redirects` serves with status 200 at every
-//!   such address.
+//!   and one for `/you`, which is only ever the connected account's own
+//!   (`_shells/you.html`): each marked `noindex`, never in the sitemap, and
+//!   served by `_redirects` with status 200 at every such address.
 //! - `sitemap.xml` and `robots.txt`.
 //! - `_headers` with its Content-Security-Policy filled in: `'self'`, the
 //!   API origin the app was built with, and the public RPC origins in
@@ -123,9 +124,10 @@ mod native {
         }
 
         // One shared page per kind of address with an id (a claim, a job,
-        // an activation, an Author's controls): `_redirects` serves it with
-        // status 200 at every such address, and the app draws the page from
-        // the address when it boots.
+        // an activation, an Author's controls), and one for the connected
+        // account's own agents and jobs: `_redirects` serves it with status
+        // 200 at every such address, and the app draws the page from the
+        // address (and the wallet) when it boots.
         for route in Route::shell_kinds() {
             let file = route.shell_file().expect("every shell kind has a file");
             let target = args.dist.join(file);
@@ -429,6 +431,24 @@ mod native {
                 assert!(!html.contains("rel=\"canonical\""));
                 assert!(!html.contains(BODY));
             }
+        }
+
+        #[test]
+        fn your_agents_page_is_a_noindex_shell_and_never_in_the_sitemap() {
+            let shell_html = format!("<head>{HEAD_START}{HEAD_END}</head><body>{BODY}</body>");
+            let base = "https://app.shonin.fi";
+            assert!(Route::shell_kinds().contains(&Route::You));
+            let html = render_shell(&shell_html, base, &Route::You);
+            assert_eq!(meta(&html, "robots"), Some("noindex"));
+            assert!(!html.contains("rel=\"canonical\""));
+            assert!(
+                html.contains("<title>Your agents · Shonin</title>"),
+                "{html}"
+            );
+            // Only its shell: no agent or job of anyone's is written into it.
+            assert!(html.contains("aria-busy=\"true\""));
+            let written: Vec<Route> = Route::all_pages().into_iter().chain([Route::You]).collect();
+            assert!(!sitemap(base, &written).contains("/you"));
         }
 
         /// The `content` of the first `<meta>` whose `property` or `name` is

@@ -5,6 +5,7 @@
 //! the allowances, the idle floor and any lowering waiting, the Author's
 //! shares) and read again after every change and every 15 seconds.
 
+pub mod list;
 pub mod retire;
 
 use std::rc::Rc;
