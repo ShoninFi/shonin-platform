@@ -744,17 +744,13 @@ pub fn queue(jobs: Vec<Value>) -> (&'static str, String) {
 }
 
 /// The SDK the builder carries, in `dir`, as the builder checks it when it
-/// starts: a copy of the SDK it is built with, at that version. Where it is.
+/// starts: the manifest of the SDK it is built with. Where it is.
 pub fn sdk(dir: &std::path::Path) -> PathBuf {
     let sdk = dir.join("sdk");
     std::fs::create_dir_all(&sdk).unwrap();
-    std::fs::write(
+    std::fs::copy(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../strategy-sdk/Cargo.toml"),
         sdk.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"{}\"\nversion = \"{}\"\n",
-            shared::dependencies::SDK,
-            strategy_sdk::VERSION
-        ),
     )
     .unwrap();
     sdk

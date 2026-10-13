@@ -10,14 +10,15 @@
 //! copy of exactly that list, so nothing else could be compiled anyway.
 //!
 //! A lock names the SDK from crates.io, as Cargo writes it for an author who
-//! depends on it as on any crate, at the version the build service carries
-//! or an earlier one compatible with it. The lock only names it: the build
-//! service decides what the SDK is, and builds against its own copy, the
-//! lock's entry made the path package that copy is (see
-//! [`with_carried_sdk`]), whatever checksum the entry held. A lock naming the
-//! SDK as a path package, patched to a copy of it, is refused.
+//! depends on it as on any crate, at exactly the version the build service
+//! carries, and every manifest's requirement on it is one that version
+//! satisfies (see [`sdk_refused`]). The lock only names it: the build service
+//! decides what the SDK is, and builds against its own copy, the lock's entry
+//! made the path package that copy is (see [`with_carried_sdk`]), whatever
+//! checksum the entry held. A lock naming the SDK as a path package, patched
+//! to a copy of it, is refused.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 use std::path::{Component, Path, PathBuf};
 
@@ -53,9 +54,17 @@ impl Crate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Allowlist {
     crates: Vec<Crate>,
-    /// The version of the SDK the build service carries, where the SDK may
-    /// be named from crates.io (see [`Allowlist::carrying`]).
-    sdk: Option<semver::Version>,
+    /// The SDK the build service carries, where the SDK may be named from
+    /// crates.io (see [`Allowlist::carrying`]).
+    sdk: Option<Carried>,
+}
+
+/// The SDK the build service carries: its version, and the packages its
+/// entry in a lock depends on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Carried {
+    version: semver::Version,
+    dependencies: BTreeSet<String>,
 }
 
 impl Allowlist {
@@ -64,15 +73,23 @@ impl Allowlist {
         Self::from_toml(ALLOWLIST).expect("the committed dependency allowlist reads")
     }
 
-    /// This list, taking the SDK from crates.io too: at `carried`, the
-    /// version of the SDK the build service carries and builds every agent
-    /// against, or at an earlier version compatible with it. A list not told
-    /// what the build service carries takes no SDK at all.
-    pub fn carrying(self, carried: &str) -> Result<Self, String> {
-        let sdk = semver::Version::parse(carried)
+    /// This list, taking the SDK from crates.io too, at exactly `carried`,
+    /// the version of the SDK the build service carries and builds every
+    /// agent against, whose entry in a lock depends on exactly
+    /// `dependencies` (the packages its manifest names). A list not told what
+    /// the build service carries takes no SDK at all.
+    pub fn carrying(
+        self,
+        carried: &str,
+        dependencies: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, String> {
+        let version = semver::Version::parse(carried)
             .map_err(|error| format!("the SDK's version {carried}: {error}"))?;
         Ok(Self {
-            sdk: Some(sdk),
+            sdk: Some(Carried {
+                version,
+                dependencies: dependencies.into_iter().map(Into::into).collect(),
+            }),
             ..self
         })
     }
@@ -80,7 +97,7 @@ impl Allowlist {
     /// The version of the SDK the build service carries, if this list was
     /// told it.
     pub fn carried(&self) -> Option<&semver::Version> {
-        self.sdk.as_ref()
+        self.sdk.as_ref().map(|carried| &carried.version)
     }
 
     pub fn from_toml(text: &str) -> Result<Self, String> {
@@ -91,7 +108,7 @@ impl Allowlist {
         }
         let listed: Listed =
             toml::from_str(text).map_err(|error| format!("the allowlist: {error}"))?;
-        let mut seen = std::collections::BTreeSet::new();
+        let mut seen = BTreeSet::new();
         for listed in &listed.crates {
             if !seen.insert((&listed.name, &listed.version)) {
                 return Err(format!(
@@ -184,11 +201,9 @@ fn within(from: &Path, relative: &str) -> Option<PathBuf> {
 ///
 /// Refused: a project with no `Cargo.lock` beside its package or above it;
 /// a lock file naming a git dependency, another registry, or a crates.io
-/// crate not on the list or under another checksum; a lock naming the SDK
-/// as a path package, or from crates.io at a version the build service does
-/// not take (see
-/// [`sdk_taken`]), or in a way it cannot rewrite (see [`with_carried_sdk`]);
-/// a path package no `Cargo.toml` in the archive declares; and a
+/// crate not on the list or under another checksum; a project naming the
+/// SDK otherwise than the build service builds it (see [`sdk_refused`]); a
+/// path package no `Cargo.toml` in the archive declares; and a
 /// `Cargo.toml` naming a git or registry source for a dependency or a patch,
 /// or naming any path outside the archive: a dependency's, a patch's, its
 /// workspace's, a target's (`[lib]`, `[[bin]]` and the rest) or its build
@@ -236,31 +251,14 @@ pub fn checked(
         .iter()
         .filter(|(path, _)| path.ends_with("Cargo.lock"))
     {
-        #[derive(serde::Deserialize)]
-        struct Lock {
-            #[serde(rename = "package", default)]
-            packages: Vec<Locked>,
-        }
-        #[derive(serde::Deserialize)]
-        struct Locked {
-            name: String,
-            version: String,
-            source: Option<String>,
-            checksum: Option<String>,
-        }
         let lock: Lock = toml::from_str(text)
             .map_err(|_| format!("{} is not a lock file Cargo reads", path.display()))?;
         for locked in lock.packages {
             let named = format!("{} {}", locked.name, locked.version);
             match locked.source.as_deref() {
-                None if locked.name == SDK => {
-                    return Err(format!(
-                        "{} locks {named} as a path package: take {SDK} from crates.io, as \
-                         any crate, and drop any [patch] for it; the build service builds \
-                         against its own copy",
-                        path.display()
-                    ));
-                }
+                // The SDK is checked once every other crate is (see
+                // [`sdk_refused`]).
+                None | Some(CRATES_IO) if locked.name == SDK => {}
                 None if packages.contains(&locked.name) => {}
                 None => {
                     return Err(format!(
@@ -269,11 +267,6 @@ pub fn checked(
                          reviewed crates.io list",
                         path.display()
                     ));
-                }
-                Some(CRATES_IO) if locked.name == SDK => {
-                    sdk_taken(&locked.version, allowed.carried()).map_err(|why| {
-                        format!("{} locks {named} from crates.io: {why}", path.display())
-                    })?;
                 }
                 Some(CRATES_IO) => {
                     let listed = allowed.get(&locked.name, &locked.version);
@@ -314,51 +307,245 @@ pub fn checked(
                 }
             }
         }
-        // What is checked here is what the build service builds: the lock
-        // with the SDK from crates.io made the copy it carries.
-        if let Some(carried) = allowed.carried() {
-            with_carried_sdk(text, &carried.to_string())
-                .map_err(|why| format!("{} {why}", path.display()))?;
-        }
+    }
+    if let Some(why) = sdk_refused_in(&files, allowed) {
+        return Err(why);
     }
     Ok(depended.into_values().collect())
 }
 
-/// Whether a lock may name the SDK from crates.io at `version`, the build
-/// service carrying the SDK at `carried`: at `carried` itself, or at an
-/// earlier version it is compatible with, as Cargo reads compatible (`^`).
-/// The build service builds against its own copy, so a lock naming a newer
-/// version, or one its copy is not compatible with, names an SDK the agent
-/// would not be built against.
-pub fn sdk_taken(version: &str, carried: Option<&semver::Version>) -> Result<(), String> {
-    let Some(carried) = carried else {
-        return Err(format!(
-            "this check is not told which {SDK} the build service carries, so it takes no SDK"
-        ));
-    };
-    let Ok(named) = semver::Version::parse(version) else {
-        return Err(format!("{version} is not a version Cargo reads"));
-    };
-    let compatible = semver::Comparator {
-        op: semver::Op::Caret,
-        major: named.major,
-        minor: Some(named.minor),
-        patch: Some(named.patch),
-        pre: named.pre.clone(),
-    };
-    if compatible.matches(carried) {
-        return Ok(());
+/// A lock file, as far as the checks read it.
+#[derive(serde::Deserialize)]
+struct Lock {
+    #[serde(rename = "package", default)]
+    packages: Vec<Locked>,
+}
+
+#[derive(serde::Deserialize)]
+struct Locked {
+    name: String,
+    version: String,
+    source: Option<String>,
+    checksum: Option<String>,
+    #[serde(default)]
+    dependencies: Vec<String>,
+}
+
+/// Why a packed project names the SDK otherwise than the build service
+/// builds it, if it does; `None` if every manifest and lock in it names the
+/// SDK as the build service builds it, or names no SDK.
+///
+/// The build service builds every agent against its own copy of the SDK, at
+/// the version it carries, so each of these would be paid for and then fail
+/// to build, and is refused: a manifest requiring the SDK at a version the
+/// carried one does not satisfy (or at no version); a lock naming the SDK as
+/// a path package, or from crates.io at another version than the carried
+/// one, or depending on other packages than the carried SDK does, or on one
+/// it does not lock; and a lock whose SDK entry the build service cannot
+/// rewrite (see [`with_carried_sdk`]). A list not told what the build
+/// service carries refuses any SDK.
+///
+/// Only the SDK the build service carries changes what this says of a
+/// project, so a project it once passed and no longer does was refused by a
+/// change to the build service, not to the project.
+pub fn sdk_refused(archive: &[u8], allowed: &Allowlist) -> Option<String> {
+    sdk_refused_in(&manifests(archive).ok()?, allowed)
+}
+
+fn sdk_refused_in(files: &BTreeMap<PathBuf, String>, allowed: &Allowlist) -> Option<String> {
+    let carried = allowed.sdk.as_ref();
+    if let Some(carried) = carried {
+        for (path, text) in files
+            .iter()
+            .filter(|(path, _)| path.ends_with("Cargo.toml"))
+        {
+            let Ok(cargo) = text.parse::<toml::Table>() else {
+                continue;
+            };
+            if let Some(why) = requirement_refused(&cargo, &carried.version) {
+                return Some(format!("{} {why}", path.display()));
+            }
+        }
     }
-    let what = if named > *carried {
-        "newer than"
-    } else {
-        "not compatible with"
-    };
-    Err(format!(
-        "{version} is {what} the {SDK} the build service carries and builds every agent \
-         against, {carried}: lock {carried} or an earlier version compatible with it \
-         (cargo update -p {SDK} --precise {carried})"
-    ))
+    for (path, text) in files
+        .iter()
+        .filter(|(path, _)| path.ends_with("Cargo.lock"))
+    {
+        let Ok(lock) = toml::from_str::<Lock>(text) else {
+            continue;
+        };
+        let locked: BTreeSet<&str> = lock
+            .packages
+            .iter()
+            .map(|package| package.name.as_str())
+            .collect();
+        for sdk in lock.packages.iter().filter(|package| package.name == SDK) {
+            let why = match (sdk.source.as_deref(), carried) {
+                (None, _) => Some(format!(
+                    "locks {SDK} {} as a path package: take {SDK} from crates.io, as any crate, \
+                     and drop any [patch] for it; the build service builds against its own copy",
+                    sdk.version
+                )),
+                (Some(CRATES_IO), None) => Some(format!(
+                    "locks {SDK} {} from crates.io, and this check is not told which {SDK} the \
+                     build service carries, so it takes no SDK",
+                    sdk.version
+                )),
+                (Some(CRATES_IO), Some(carried)) => entry_refused(sdk, &locked, carried),
+                // From anywhere else, refused as any crate from there is.
+                _ => None,
+            };
+            if let Some(why) = why {
+                return Some(format!("{} {why}", path.display()));
+            }
+        }
+        // What is checked here is what the build service builds: the lock
+        // with the SDK from crates.io made the copy it carries.
+        if let Some(carried) = carried
+            && let Err(why) = with_carried_sdk(text, &carried.version.to_string())
+        {
+            return Some(format!("{} {why}", path.display()));
+        }
+    }
+    None
+}
+
+/// Why a manifest's requirement on the SDK is not one the carried
+/// `version` satisfies, if it is not: in any dependency table, under its own
+/// name or renamed (`package = ...`). A dependency inherited from the
+/// workspace is read in the workspace's table; one taken from a path, git or
+/// another registry is refused as such.
+fn requirement_refused(cargo: &toml::Table, version: &semver::Version) -> Option<String> {
+    for (table, what) in dependency_tables(cargo) {
+        for (name, dependency) in table {
+            let requirement = match dependency {
+                toml::Value::String(requirement) if name == SDK => requirement.as_str(),
+                toml::Value::Table(dependency) => {
+                    let package = dependency
+                        .get("package")
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or(name);
+                    let inherited =
+                        dependency.get("workspace").and_then(toml::Value::as_bool) == Some(true);
+                    let elsewhere = ["path", "git", "registry", "registry-index"]
+                        .iter()
+                        .any(|key| dependency.contains_key(*key));
+                    if package != SDK || inherited {
+                        continue;
+                    }
+                    match dependency.get("version").and_then(toml::Value::as_str) {
+                        Some(requirement) => requirement,
+                        None if elsewhere => continue,
+                        None => {
+                            return Some(format!(
+                                "requires {SDK} in [{what}] at no version: depend on \
+                                 {SDK} = \"{version}\""
+                            ));
+                        }
+                    }
+                }
+                _ => continue,
+            };
+            let satisfied = semver::VersionReq::parse(requirement)
+                .is_ok_and(|requirement| requirement.matches(version));
+            if !satisfied {
+                return Some(format!(
+                    "requires {SDK} = \"{requirement}\" in [{what}], which the {SDK} the build \
+                     service carries and builds every agent against, {version}, does not \
+                     satisfy: depend on {SDK} = \"{version}\" and run `cargo update -p {SDK}`"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Why a lock's entry for the SDK from crates.io is not the carried SDK's,
+/// if it is not: another version, or other dependencies than the carried
+/// SDK's, or one the lock does not hold. `locked` is every package the lock
+/// names.
+fn entry_refused(sdk: &Locked, locked: &BTreeSet<&str>, carried: &Carried) -> Option<String> {
+    let version = &carried.version;
+    let update = format!("run `cargo update -p {SDK}`");
+    if sdk.version != version.to_string() {
+        return Some(format!(
+            "locks {SDK} {} from crates.io, and the build service carries {SDK} {version} and \
+             builds every agent against it: take {SDK} = \"{version}\" from crates.io and \
+             {update}",
+            sdk.version
+        ));
+    }
+    // Cargo names a dependency by its name, and its version too where two
+    // packages share the name.
+    let named: BTreeSet<&str> = sdk
+        .dependencies
+        .iter()
+        .filter_map(|dependency| dependency.split(' ').next())
+        .collect();
+    let carried_names: BTreeSet<&str> = carried.dependencies.iter().map(String::as_str).collect();
+    if named != carried_names {
+        let list = |names: &BTreeSet<&str>| names.iter().copied().collect::<Vec<_>>().join(", ");
+        return Some(format!(
+            "locks {SDK} {version} depending on [{}], and the {SDK} the build service carries \
+             depends on [{}]: {update}",
+            list(&named),
+            list(&carried_names)
+        ));
+    }
+    named
+        .iter()
+        .find(|name| !locked.contains(*name))
+        .map(|name| {
+            format!("locks {SDK} {version} depending on {name}, which it does not lock: {update}")
+        })
+}
+
+/// Every table of dependencies in a `Cargo.toml`, each with where it is:
+/// each kind at the top and under each `[target.*]`, in Cargo's spellings
+/// and the underscore ones it still reads before edition 2024, and the
+/// workspace's.
+fn dependency_tables(cargo: &toml::Table) -> Vec<(&toml::Table, String)> {
+    const KINDS: [&str; 5] = [
+        "dependencies",
+        "dev-dependencies",
+        "build-dependencies",
+        "dev_dependencies",
+        "build_dependencies",
+    ];
+    let mut tables = Vec::new();
+    for kind in KINDS {
+        add(&mut tables, cargo.get(kind), kind.to_string());
+    }
+    if let Some(targets) = cargo.get("target").and_then(toml::Value::as_table) {
+        for (target, table) in targets {
+            for kind in KINDS {
+                add(
+                    &mut tables,
+                    table.get(kind),
+                    format!("target.{target}.{kind}"),
+                );
+            }
+        }
+    }
+    add(
+        &mut tables,
+        cargo
+            .get("workspace")
+            .and_then(|workspace| workspace.get("dependencies")),
+        "workspace.dependencies".into(),
+    );
+    tables
+}
+
+/// `table`, if it is a table, added to `tables` as `what`.
+fn add<'a>(
+    tables: &mut Vec<(&'a toml::Table, String)>,
+    table: Option<&'a toml::Value>,
+    what: String,
+) {
+    if let Some(table) = table.and_then(toml::Value::as_table) {
+        tables.push((table, what));
+    }
 }
 
 /// `lock`, the text of a `Cargo.lock`, with its entry for the SDK from
@@ -400,7 +587,7 @@ pub fn with_carried_sdk(lock: &str, carried: &str) -> Result<Option<String>, Str
     if packages.iter().filter(|package| is_sdk(package)).count() > 1 {
         return Err(format!(
             "locks {SDK} more than once: the build service builds every agent against its one \
-             copy"
+             copy, so lock it once (run `cargo update -p {SDK}`)"
         ));
     }
     // Where one package has a name, Cargo refers to it by the name alone; a
@@ -469,47 +656,7 @@ pub fn with_carried_sdk(lock: &str, carried: &str) -> Result<Option<String>, Str
 /// from anywhere but crates.io or a path inside the archive, or that names
 /// any other path outside the archive (see [`paths_outside`]).
 fn sources(cargo: &toml::Table, directory: &Path, path: &Path) -> Result<(), String> {
-    // Cargo still reads the underscore spellings, with a warning, on the
-    // editions before 2024.
-    const KINDS: [&str; 5] = [
-        "dependencies",
-        "dev-dependencies",
-        "build-dependencies",
-        "dev_dependencies",
-        "build_dependencies",
-    ];
-
-    let mut tables: Vec<(&toml::Table, String)> = Vec::new();
-    fn add<'a>(
-        tables: &mut Vec<(&'a toml::Table, String)>,
-        table: Option<&'a toml::Value>,
-        what: String,
-    ) {
-        if let Some(table) = table.and_then(toml::Value::as_table) {
-            tables.push((table, what));
-        }
-    }
-    for kind in KINDS {
-        add(&mut tables, cargo.get(kind), kind.to_string());
-    }
-    if let Some(targets) = cargo.get("target").and_then(toml::Value::as_table) {
-        for (target, table) in targets {
-            for kind in KINDS {
-                add(
-                    &mut tables,
-                    table.get(kind),
-                    format!("target.{target}.{kind}"),
-                );
-            }
-        }
-    }
-    add(
-        &mut tables,
-        cargo
-            .get("workspace")
-            .and_then(|workspace| workspace.get("dependencies")),
-        "workspace.dependencies".into(),
-    );
+    let mut tables = dependency_tables(cargo);
     if let Some(patches) = cargo.get("patch").and_then(toml::Value::as_table) {
         for (source, table) in patches {
             add(&mut tables, Some(table), format!("patch.{source}"));
@@ -647,18 +794,7 @@ fn paths_outside(cargo: &toml::Table, directory: &Path) -> Vec<(String, String)>
 /// platform having reviewed it. Unreadable lock files name none (a project
 /// with one is refused before it is paid for).
 pub fn listed(archive: &[u8]) -> Vec<(String, String)> {
-    #[derive(serde::Deserialize)]
-    struct Lock {
-        #[serde(rename = "package", default)]
-        packages: Vec<Locked>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Locked {
-        name: String,
-        version: String,
-        source: Option<String>,
-    }
-    let mut named = std::collections::BTreeSet::new();
+    let mut named = BTreeSet::new();
     for (path, text) in manifests(archive).unwrap_or_default() {
         if !path.ends_with("Cargo.lock") {
             continue;
@@ -692,6 +828,9 @@ mod tests {
         }
     }
 
+    /// What the SDK depends on, as its entry in a lock lists it.
+    const SDK_DEPENDENCIES: [&str; 5] = ["ciborium", "fastnum", "futures", "serde", "wit-bindgen"];
+
     /// A project in memory: an agent depending on the SDK, locked by `lock`.
     fn agent_locking(lock: &str) -> Vec<u8> {
         let files = [
@@ -718,80 +857,116 @@ mod tests {
         archive.into_inner().unwrap()
     }
 
-    /// A lock holding the agent and the SDK's entry `sdk`.
+    /// A lock holding the agent, the SDK's dependencies as the allowlist
+    /// holds them, and the SDK's entry `sdk`.
     fn lock_with(sdk: &str) -> String {
-        format!(
+        let allowed = Allowlist::platform();
+        let mut lock = format!(
             "# This file is automatically @generated by Cargo.\nversion = 4\n\n\
              [[package]]\nname = \"agent\"\nversion = \"0.1.0\"\n\
-             dependencies = [\n \"{SDK}\",\n]\n\n{sdk}"
-        )
+             dependencies = [\n \"{SDK}\",\n]\n"
+        );
+        for name in SDK_DEPENDENCIES {
+            let listed = allowed
+                .crates()
+                .iter()
+                .find(|listed| listed.name == name)
+                .unwrap();
+            lock.push_str(&format!(
+                "\n[[package]]\nname = \"{name}\"\nversion = \"{}\"\nsource = \"{CRATES_IO}\"\n\
+                 checksum = \"{}\"\n",
+                listed.version, listed.checksum
+            ));
+        }
+        format!("{lock}\n{sdk}")
+    }
+
+    fn dependencies() -> String {
+        let listed: String = SDK_DEPENDENCIES
+            .iter()
+            .map(|name| format!(" \"{name}\",\n"))
+            .collect();
+        format!("dependencies = [\n{listed}]\n")
     }
 
     fn from_crates_io(version: &str) -> String {
         format!(
             "[[package]]\nname = \"{SDK}\"\nversion = \"{version}\"\nsource = \"{CRATES_IO}\"\n\
-             checksum = \"{}\"\n",
-            "ab".repeat(32)
+             checksum = \"{}\"\n{}",
+            "ab".repeat(32),
+            dependencies()
         )
     }
 
     /// The SDK's entry as the build service rewrites it: the path package
     /// of its copy at `version`.
     fn as_carried(version: &str) -> String {
-        format!("[[package]]\nname = \"{SDK}\"\nversion = \"{version}\"\n")
+        format!(
+            "[[package]]\nname = \"{SDK}\"\nversion = \"{version}\"\n{}",
+            dependencies()
+        )
     }
 
     fn carrying(version: &str) -> Allowlist {
-        Allowlist::platform().carrying(version).unwrap()
+        Allowlist::platform()
+            .carrying(version, SDK_DEPENDENCIES)
+            .unwrap()
     }
 
     #[test]
-    fn the_sdk_is_taken_at_the_carried_version_or_an_earlier_compatible_one() {
-        let carried = semver::Version::parse("0.1.1").unwrap();
-        for taken in ["0.1.0", "0.1.1"] {
-            assert_eq!(sdk_taken(taken, Some(&carried)), Ok(()), "{taken}");
-        }
-        for (refused, why) in [
-            ("0.1.2", "newer than"),
-            ("0.2.0", "newer than"),
-            ("1.0.0", "newer than"),
-            ("0.0.9", "not compatible with"),
+    fn only_the_carried_version_of_the_sdk_is_taken() {
+        let allowed = carrying("0.1.1");
+        let archive = agent_locking(&lock_with(&from_crates_io("0.1.1")));
+        let taken = checked(&archive, "shonin.toml", &allowed);
+        assert!(taken.is_ok(), "{taken:?}");
+        for version in [
+            "0.1.0",
+            "0.1.2",
+            "0.2.0",
+            "1.0.0",
+            "0.1.1-alpha.1",
+            "0.1.1+build",
         ] {
-            let said = sdk_taken(refused, Some(&carried)).unwrap_err();
+            let archive = agent_locking(&lock_with(&from_crates_io(version)));
+            let said = checked(&archive, "shonin.toml", &allowed).unwrap_err();
             assert!(
-                said.contains(why)
-                    && said.contains("carries and builds every agent against, 0.1.1"),
-                "{refused}: {said}"
+                said.starts_with(&format!("Cargo.lock locks {SDK} {version} from crates.io"))
+                    && said.contains(&format!(
+                        "take {SDK} = \"0.1.1\" from crates.io and run `cargo update -p {SDK}`"
+                    )),
+                "{version}: {said}"
             );
         }
-
-        let carried = semver::Version::parse("1.2.3").unwrap();
-        assert_eq!(sdk_taken("1.0.0", Some(&carried)), Ok(()));
-        assert!(sdk_taken("1.2.4", Some(&carried)).is_err());
-        assert!(sdk_taken("2.0.0", Some(&carried)).is_err());
-        assert!(sdk_taken("0.9.0", Some(&carried)).is_err());
-
-        // Before 0.1, every version is compatible only with itself.
-        let carried = semver::Version::parse("0.0.3").unwrap();
-        assert_eq!(sdk_taken("0.0.3", Some(&carried)), Ok(()));
-        assert!(sdk_taken("0.0.2", Some(&carried)).is_err());
-
-        assert!(sdk_taken("one", Some(&carried)).is_err());
-        assert!(sdk_taken("0.0.3", None).is_err());
     }
 
     #[test]
     fn a_lock_naming_the_sdk_from_crates_io_passes_under_any_checksum() {
         let allowed = carrying("0.1.1");
-        for version in ["0.1.0", "0.1.1"] {
-            let archive = agent_locking(&lock_with(&from_crates_io(version)));
-            assert_eq!(checked(&archive, "shonin.toml", &allowed), Ok(vec![]));
-            let other =
-                lock_with(&from_crates_io(version)).replace(&"ab".repeat(32), &"0".repeat(64));
-            assert_eq!(
-                checked(&agent_locking(&other), "shonin.toml", &allowed),
-                Ok(vec![])
+        let lock = lock_with(&from_crates_io("0.1.1")).replace(&"ab".repeat(32), &"0".repeat(64));
+        let taken = checked(&agent_locking(&lock), "shonin.toml", &allowed);
+        assert!(taken.is_ok(), "{taken:?}");
+    }
+
+    #[test]
+    fn the_sdk_s_name_is_taken_from_nowhere_else() {
+        let allowed = carrying("0.1.1");
+        for (source, why) in [
+            ("git+https://example.invalid/sdk.git#0123", "from git"),
+            (
+                "registry+https://example.invalid/index",
+                "from a registry other than crates.io",
+            ),
+            (
+                "sparse+https://example.invalid/index/",
+                "from a registry other than crates.io",
+            ),
+        ] {
+            let lock = lock_with(&from_crates_io("0.1.1")).replace(
+                &format!("{SDK}\"\nversion = \"0.1.1\"\nsource = \"{CRATES_IO}\""),
+                &format!("{SDK}\"\nversion = \"0.1.1\"\nsource = \"{source}\""),
             );
+            let said = checked(&agent_locking(&lock), "shonin.toml", &allowed).unwrap_err();
+            assert!(said.contains(why), "{source}: {said}");
         }
     }
 
@@ -813,40 +988,6 @@ mod tests {
     }
 
     #[test]
-    fn a_lock_naming_a_newer_sdk_is_refused_naming_the_carried_version() {
-        let allowed = carrying("0.1.1");
-        for version in ["0.1.2", "0.2.0"] {
-            let archive = agent_locking(&lock_with(&from_crates_io(version)));
-            let said = checked(&archive, "shonin.toml", &allowed).unwrap_err();
-            assert!(
-                said.starts_with(&format!("Cargo.lock locks {SDK} {version} from crates.io"))
-                    && said.contains("0.1.1"),
-                "{said}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_sdk_s_name_is_taken_from_nowhere_else() {
-        let allowed = carrying("0.1.1");
-        for (source, why) in [
-            ("git+https://example.invalid/sdk.git#0123", "from git"),
-            (
-                "registry+https://example.invalid/index",
-                "from a registry other than crates.io",
-            ),
-            (
-                "sparse+https://example.invalid/index/",
-                "from a registry other than crates.io",
-            ),
-        ] {
-            let lock = lock_with(&from_crates_io("0.1.1")).replace(CRATES_IO, source);
-            let said = checked(&agent_locking(&lock), "shonin.toml", &allowed).unwrap_err();
-            assert!(said.contains(why), "{source}: {said}");
-        }
-    }
-
-    #[test]
     fn a_list_not_told_the_carried_sdk_takes_none() {
         let archive = agent_locking(&lock_with(&from_crates_io("0.1.1")));
         let said = checked(&archive, "shonin.toml", &Allowlist::platform()).unwrap_err();
@@ -855,7 +996,7 @@ mod tests {
 
     #[test]
     fn the_sdk_from_crates_io_is_rewritten_as_the_path_package_and_nothing_else() {
-        let lock = lock_with(&from_crates_io("0.1.0"));
+        let lock = lock_with(&from_crates_io("0.1.1"));
         let rewritten = with_carried_sdk(&lock, "0.1.1").unwrap().unwrap();
         assert_eq!(rewritten, lock_with(&as_carried("0.1.1")));
 
@@ -876,47 +1017,45 @@ mod tests {
     }
 
     #[test]
-    fn a_lock_the_rewrite_would_not_build_as_checked_is_refused() {
+    fn a_lock_naming_the_sdk_twice_is_refused_with_what_to_do() {
         let allowed = carrying("0.1.1");
-        let refused = [
-            // The SDK twice.
-            lock_with(&format!(
-                "{}\n{}",
-                from_crates_io("0.1.0"),
-                from_crates_io("0.1.1")
-            )),
-            // Its entry written otherwise than Cargo writes it.
-            lock_with(&from_crates_io("0.1.0").replace(&format!("\"{SDK}\""), &format!("'{SDK}'"))),
-            // A reference to it naming its version.
-            lock_with(&from_crates_io("0.1.0"))
-                .replace(&format!(" \"{SDK}\",\n"), &format!(" \"{SDK} 0.1.0\",\n")),
-        ];
-        for lock in refused {
-            assert!(with_carried_sdk(&lock, "0.1.1").is_err(), "{lock}");
-            let said = checked(&agent_locking(&lock), "shonin.toml", &allowed).unwrap_err();
-            assert!(said.starts_with("Cargo.lock "), "{said}");
-        }
+        let lock = lock_with(&format!(
+            "{}\n{}",
+            from_crates_io("0.1.1"),
+            from_crates_io("0.1.1")
+        ));
+        let said = checked(&agent_locking(&lock), "shonin.toml", &allowed).unwrap_err();
+        assert!(
+            said.starts_with(&format!("Cargo.lock locks {SDK} more than once"))
+                && said.contains(&format!("cargo update -p {SDK}")),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn the_paid_re_check_tells_a_change_to_the_sdk_from_the_author_s() {
+        // The SDK named as the build service builds it: nothing of the SDK's
+        // to refuse, whatever else the project names.
+        let lock = lock_with(&from_crates_io("0.1.1"));
+        assert_eq!(sdk_refused(&agent_locking(&lock), &carrying("0.1.1")), None);
+        let unlisted = format!(
+            "{lock}\n[[package]]\nname = \"helper\"\nversion = \"1.0.0\"\nsource = \"{CRATES_IO}\"\n\
+             checksum = \"{}\"\n",
+            "9".repeat(64)
+        );
+        let archive = agent_locking(&unlisted);
+        assert!(checked(&archive, "shonin.toml", &carrying("0.1.1")).is_err());
+        assert_eq!(sdk_refused(&archive, &carrying("0.1.1")), None);
+        // The build service carrying another SDK since: the SDK's doing.
+        assert!(sdk_refused(&agent_locking(&lock), &carrying("0.1.2")).is_some());
     }
 
     #[test]
     fn the_reviewer_is_not_told_the_sdk_is_a_reviewed_crate() {
-        let futures = Allowlist::platform()
-            .crates()
-            .iter()
-            .find(|listed| listed.name == "futures")
-            .unwrap()
-            .clone();
-        let lock = format!(
-            "{}\n[[package]]\nname = \"futures\"\nversion = \"{}\"\nsource = \"{CRATES_IO}\"\n\
-             checksum = \"{}\"\n",
-            lock_with(&from_crates_io("0.1.1")),
-            futures.version,
-            futures.checksum
-        );
-        assert_eq!(
-            listed(&agent_locking(&lock)),
-            vec![("futures".to_string(), futures.version)]
-        );
+        let lock = lock_with(&from_crates_io("0.1.1"));
+        let named = listed(&agent_locking(&lock));
+        assert!(named.iter().all(|(name, _)| name != SDK), "{named:?}");
+        assert_eq!(named.len(), SDK_DEPENDENCIES.len());
     }
 
     #[test]

@@ -160,16 +160,12 @@ async fn a_dependency_the_platform_has_not_reviewed_is_refused_before_it_is_paid
         ("helper/src/lib.rs", "pub fn help() {}\n".to_string()),
         (
             "Cargo.lock",
-            black_box::lock(
-                &["agent", "helper"],
-                &[
-                    ("futures", &futures.version, &futures.checksum),
-                    (
-                        shared::dependencies::SDK,
-                        strategy_sdk::VERSION,
-                        &"5".repeat(64),
-                    ),
-                ],
+            format!(
+                "{}\n[[package]]\nname = \"helper\"\nversion = \"0.1.0\"\n",
+                black_box::lock_with_sdk(&black_box::sdk_from_crates_io(
+                    strategy_sdk::VERSION,
+                    &"5".repeat(64)
+                ))
             ),
         ),
     ]);

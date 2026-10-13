@@ -1,12 +1,10 @@
 //! Before it builds, the build service makes a lock's entry for the SDK from
-//! crates.io, at the carried version or an earlier one, the path package it
-//! patches in. That entry is the only thing it touches: every other entry,
+//! crates.io the path package it patches in. That entry is the only thing it touches: every other entry,
 //! and every other byte of the lock (its line endings, comments and spacing
 //! included), is what the author committed and the reviewer was told of.
 //!
 //! Sequence: author A uploads an agent whose lock takes the SDK from
-//! crates.io at the carried version, then one at an earlier compatible
-//! version, each lock written with CRLF line endings, comments,
+//! crates.io, then one locking it under another checksum, each lock written with CRLF line endings, comments,
 //! and other entries spaced as Cargo would not write them; pays for each;
 //! the reviewer clears them. Expected: for each, the stand-in `cargo` is run
 //! on a lock that differs from the upload's only in the SDK's entry, made the
@@ -37,12 +35,6 @@ async fn rewriting_the_sdk_s_entry_leaves_every_other_lock_entry_byte_identical(
     black_box::CLEARS.store(true, Ordering::SeqCst);
 
     let carried = strategy_sdk::VERSION;
-    let parts: Vec<&str> = carried.split('.').collect();
-    let earlier = format!("{}.{}.0", parts[0], parts[1]);
-    assert_ne!(
-        earlier, carried,
-        "the carried SDK has no earlier version compatible with it to lock"
-    );
     let crlf = |text: &str| text.replace('\n', "\r\n");
     let by_path = crlf(&black_box::sdk_as_carried(carried));
     let entries = [
@@ -51,8 +43,8 @@ async fn rewriting_the_sdk_s_entry_leaves_every_other_lock_entry_byte_identical(
             crlf(&black_box::sdk_from_crates_io(carried, &"9".repeat(64))),
         ),
         (
-            "at an earlier version",
-            crlf(&black_box::sdk_from_crates_io(&earlier, &"9".repeat(64))),
+            "under another checksum",
+            crlf(&black_box::sdk_from_crates_io(carried, &"0".repeat(64))),
         ),
     ];
 

@@ -18,7 +18,7 @@ Depend on it from crates.io, as on any crate:
 shonin-strategy-sdk = "0.1.1"
 ```
 
-The build service compiles every agent against its own copy of this crate, so the version an agent declares is the interface it is written against. It takes a `Cargo.lock` naming the SDK from crates.io at 0.1.1 or an earlier version compatible with it, and refuses one naming a newer version, or naming the SDK as a path package (patched to a copy of it), when the project is uploaded.
+The build service compiles every agent against its own copy of this crate, so the version an agent declares is the interface it is written against. It takes a project whose `Cargo.lock` names the SDK from crates.io at exactly 0.1.1, and whose requirements on it allow 0.1.1; it refuses one naming another version, or naming the SDK as a path package (patched to a copy of it), when the project is uploaded.
 
 ## License
 

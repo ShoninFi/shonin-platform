@@ -332,35 +332,73 @@ fn pin(source: &Path, sdk: &Path, vendor: &Path) -> std::io::Result<()> {
     std::fs::write(directory.join("config.toml"), config(sdk, vendor))
 }
 
-/// Whether `sdk` is a copy of the SDK this program is built with, at its
-/// version ([`strategy_sdk::VERSION`]): the version a lock naming the SDK
-/// from crates.io is rewritten to, which the copy patched in must be for the
-/// build to be `--locked` to it.
-pub fn carries(sdk: &Path) -> Result<(), String> {
+/// The packages the SDK at `sdk` depends on, as its entry in a lock lists
+/// them, if `sdk` is a copy of the SDK this program is built with, at its
+/// version ([`strategy_sdk::VERSION`]): the version a lock must name the SDK
+/// at, and the copy patched in for the build to be `--locked` to it. Only the
+/// name and version are checked here; what the copy holds is pinned by the
+/// image that carries it.
+///
+/// A dependency is named as its table names the package (`package = ...`,
+/// or its key). An optional dependency, which a lock lists only as features
+/// turn it on, makes the entry a lock must hold depend on features, so a
+/// copy with one is refused rather than checked loosely.
+pub fn carries(sdk: &Path) -> Result<Vec<String>, String> {
     let manifest = sdk.join("Cargo.toml");
-    let package = std::fs::read_to_string(&manifest)
+    let cargo = std::fs::read_to_string(&manifest)
         .ok()
         .and_then(|text| text.parse::<toml::Table>().ok())
-        .and_then(|cargo| cargo.get("package").cloned());
+        .unwrap_or_default();
     let field = |key: &str| {
-        package
-            .as_ref()
+        cargo
+            .get("package")
             .and_then(|package| package.get(key))
             .and_then(toml::Value::as_str)
-            .map(str::to_string)
     };
-    let (name, version) = (field("name"), field("version"));
-    if name.as_deref() == Some(shared::dependencies::SDK)
-        && version.as_deref() == Some(strategy_sdk::VERSION)
+    if field("name") != Some(shared::dependencies::SDK)
+        || field("version") != Some(strategy_sdk::VERSION)
     {
-        return Ok(());
+        return Err(format!(
+            "{} is not {} {}, the SDK this build service is built with: give --sdk a copy of \
+             it",
+            manifest.display(),
+            shared::dependencies::SDK,
+            strategy_sdk::VERSION,
+        ));
     }
-    Err(format!(
-        "{} is not {} {}, the SDK this build service is built with: give --sdk a copy of it",
-        manifest.display(),
-        shared::dependencies::SDK,
-        strategy_sdk::VERSION,
-    ))
+    // A lock lists a package's dependencies and build dependencies, on
+    // every target; a dependency's own dev-dependencies never.
+    let mut tables: Vec<&toml::Value> = ["dependencies", "build-dependencies"]
+        .iter()
+        .filter_map(|kind| cargo.get(*kind))
+        .collect();
+    if let Some(targets) = cargo.get("target").and_then(toml::Value::as_table) {
+        for target in targets.values() {
+            for kind in ["dependencies", "build-dependencies"] {
+                tables.extend(target.get(kind));
+            }
+        }
+    }
+    let mut named = Vec::new();
+    for (key, dependency) in tables
+        .into_iter()
+        .filter_map(toml::Value::as_table)
+        .flatten()
+    {
+        if dependency.get("optional").and_then(toml::Value::as_bool) == Some(true) {
+            return Err(format!(
+                "{} has an optional dependency, {key}: a lock lists it only as features turn \
+                 it on, so the SDK's entry in a lock can't be checked exactly",
+                manifest.display()
+            ));
+        }
+        let package = dependency
+            .get("package")
+            .and_then(toml::Value::as_str)
+            .unwrap_or(key);
+        named.push(package.to_string());
+    }
+    Ok(named)
 }
 
 /// The Cargo config every build is made with.

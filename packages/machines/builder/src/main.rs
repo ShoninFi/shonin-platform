@@ -677,9 +677,9 @@ async fn main() -> Result<()> {
     // A lock may name the SDK from crates.io at the version this build
     // service carries, which is this program's own SDK: the copy it builds
     // against must be that version too.
-    build::carries(&args.sdk).map_err(|error| anyhow!(error))?;
+    let sdk_dependencies = build::carries(&args.sdk).map_err(|error| anyhow!(error))?;
     let allowed = shared::dependencies::Allowlist::platform()
-        .carrying(strategy_sdk::VERSION)
+        .carrying(strategy_sdk::VERSION, sdk_dependencies)
         .map_err(|error| anyhow!(error))?;
     vendor::check(&allowed, &args.vendor)?;
     let jobs = prepare_jobs(args.jobs.clone())?;
@@ -2538,22 +2538,34 @@ async fn run(service: &Arc<Service>, entry: &Entry) -> Result<(JobState, Option<
     shared::archive::unpack(&archive, &source)?;
     // What was checked before payment is checked again before anything is
     // compiled, as cheap as it is: the project's dependencies against the
-    // allowlist as it stands now, and that it carries no Cargo config.
-    let refused = build::overrides(&source).or_else(|| {
-        shared::dependencies::checked(&archive, &entry.manifest_path, &service.allowed).err()
-    });
-    if let Some(refused) = refused {
+    // allowlist as it stands now, and that it carries no Cargo config. A
+    // project refused only for how it names the SDK passed when it was paid
+    // for, so the SDK this build service carries has changed since: the
+    // failure is ours, not the author's.
+    let refused = build::overrides(&source)
+        .map(|refused| (refused, Failure::Build))
+        .or_else(|| {
+            let refused =
+                shared::dependencies::checked(&archive, &entry.manifest_path, &service.allowed)
+                    .err()?;
+            let ours = shared::dependencies::sdk_refused(&archive, &service.allowed).is_some();
+            Some((
+                refused,
+                if ours {
+                    Failure::Service
+                } else {
+                    Failure::Build
+                },
+            ))
+        });
+    if let Some((refused, outcome)) = refused {
         tracing::warn!(
             id = entry.job.id,
             refused,
+            outcome = outcome.label(),
             "a paid project no longer passes the checks made before it was paid for"
         );
-        return Ok((
-            JobState::Failed {
-                outcome: Failure::Build,
-            },
-            None,
-        ));
+        return Ok((JobState::Failed { outcome }, None));
     }
     // And nothing lies above it that cargo would take for its own: should
     // something, the job goes back in the queue and the queue is held.
@@ -3114,7 +3126,13 @@ mod tests {
             sdk: dir.join("sdk"),
             vendor: dir.join("vendor"),
             allowed: shared::dependencies::Allowlist::platform()
-                .carrying(strategy_sdk::VERSION)
+                .carrying(
+                    strategy_sdk::VERSION,
+                    build::carries(
+                        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../strategy-sdk"),
+                    )
+                    .unwrap(),
+                )
                 .unwrap(),
             reviewer: String::new(),
             http: reqwest::Client::new(),
