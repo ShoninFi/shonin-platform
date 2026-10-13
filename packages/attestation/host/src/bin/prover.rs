@@ -6,10 +6,14 @@
 //! zkVM with the pinned guest, wraps the proof in Groth16 (RISC Zero runs
 //! that step in Docker), checks the receipt as a chain's checker would, and
 //! posts the seal back to the machine it came from (`POST
-//! /attestation/seal`). It proves one token at a time, each once. A machine
-//! that is off is passed over quietly: the builder and the reviewer run only
-//! on demand. It holds no secret: the token, the binding and the seal are
-//! all public, and only a seal that verifies is of any use.
+//! /attestation/seal`). It proves one token at a time, each once. A seal the
+//! machine gave no answer about (the post timed out or failed, or a server
+//! error) is held and posted again, waiting longer each time, while the
+//! machine still wants it, for up to half an hour from its proof, so a slow
+//! answer doesn't cost a proof. A machine that is off is passed over
+//! quietly: the builder and the reviewer run only on demand. It holds no
+//! secret: the token, the binding and the seal are all public, and only a
+//! seal that verifies is of any use.
 //!
 //! It exits once it has had nothing to do for the idle time, so the machine
 //! it runs on can power off.
@@ -43,6 +47,21 @@ const USAGE: &str = "usage: attestation-prover [--executor-url <url>] [--status-
 
 /// How often a machine that doesn't answer is said to.
 const UNREACHABLE_SAID_EVERY: Duration = Duration::from_secs(10 * 60);
+
+/// How long a seal's post may take: before it answers, the machine checks
+/// the seal on every chain it holds keys on, one after another, and takes
+/// longer the more vaults it holds.
+const POST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// How long a seal not yet delivered is held, from its proof, while its
+/// machine still wants it: the prover stays up for it that long, and for
+/// the last post's answer.
+const HOLD_FOR: Duration = Duration::from_secs(30 * 60);
+
+/// The wait before a held seal's first post again, doubled after each one
+/// not delivered, up to `RETRY_MOST`.
+const RETRY_FIRST: Duration = Duration::from_secs(60);
+const RETRY_MOST: Duration = Duration::from_secs(5 * 60);
 
 struct Args {
     /// Every status port asked, in order, each once.
@@ -199,9 +218,44 @@ fn fetch(agent: &ureq::Agent, url: &str) -> Result<Status> {
     serde_json::from_str(&text).with_context(|| format!("{url}'s answer"))
 }
 
-/// What has been proved already, by where it came from, its nonce and its
-/// token's issue time: each is proved once.
-type Tried = HashSet<(String, String, u64)>;
+/// A token by where it came from, its nonce and its issue time.
+type Token = (String, String, u64);
+
+/// What has been proved already: each token is proved once.
+type Tried = HashSet<Token>;
+
+/// A proved seal and its journal, as posted.
+type Sealed = (Vec<u8>, Vec<u8>);
+
+/// A seal proved but not yet delivered, and when to post it again.
+#[derive(Debug)]
+struct Hold {
+    sealed: Sealed,
+    proved: Instant,
+    next_try: Instant,
+    wait: Duration,
+}
+
+impl Hold {
+    /// A seal proved at `proved` whose first post ended at `posted`.
+    fn new(sealed: Sealed, proved: Instant, posted: Instant) -> Self {
+        Hold {
+            sealed,
+            proved,
+            next_try: posted + RETRY_FIRST,
+            wait: RETRY_FIRST,
+        }
+    }
+
+    /// Not delivered again: wait twice as long before the next post.
+    fn later(&mut self, now: Instant) {
+        self.wait = (self.wait * 2).min(RETRY_MOST);
+        self.next_try = now + self.wait;
+    }
+}
+
+/// Seals proved but not yet delivered, by the token each proves.
+type Held = HashMap<Token, Hold>;
 
 /// The next token to prove, and the status URL it came from: the first, in
 /// the order given, of the machines that answer and want a seal for a token
@@ -229,24 +283,126 @@ fn next_work(
     None
 }
 
-fn post(agent: &ureq::Agent, url: &str, nonce: &str, seal: &[u8], journal: &[u8]) -> Result<()> {
+/// What became of a posted seal.
+#[derive(Debug)]
+enum Posted {
+    Taken,
+    /// The machine looked at the seal and turned it away (a newer binding,
+    /// or a seal its chains would refuse): posting it again changes nothing.
+    Refused(String),
+    /// No answer about the seal itself: the post timed out or failed, the
+    /// machine could not check it yet (a server error), or asked to be
+    /// asked later. The seal is still good for its token, and is kept to
+    /// post again.
+    Undelivered(anyhow::Error),
+}
+
+/// What a machine's answer to a posted seal says became of it.
+fn answered(url: &str, status: ureq::http::StatusCode, why: String) -> Posted {
+    if status.is_success() {
+        Posted::Taken
+    } else if status.is_server_error()
+        || status == ureq::http::StatusCode::REQUEST_TIMEOUT
+        || status == ureq::http::StatusCode::TOO_MANY_REQUESTS
+    {
+        Posted::Undelivered(anyhow::anyhow!(
+            "{url} could not take the seal yet ({status}): {why}"
+        ))
+    } else {
+        Posted::Refused(format!("{url} refused the seal ({status}): {why}"))
+    }
+}
+
+fn post(agent: &ureq::Agent, url: &str, nonce: &str, sealed: &Sealed) -> Posted {
+    let (seal, journal) = sealed;
     let body = serde_json::json!({
         "nonce": nonce,
         "seal": format!("0x{}", hex::encode(seal)),
         "journal": format!("0x{}", hex::encode(journal)),
     })
     .to_string();
-    let mut answer = agent
+    let answer = agent
         .post(format!("{url}/attestation/seal"))
+        .config()
+        .timeout_global(Some(POST_TIMEOUT))
+        .build()
         .header("content-type", "application/json")
-        .send(body)
-        .context("posting the seal")?;
-    let status = answer.status();
-    if status.is_success() {
-        return Ok(());
+        .send(body);
+    match answer {
+        Ok(mut answer) => {
+            let status = answer.status();
+            let why = answer.body_mut().read_to_string().unwrap_or_default();
+            answered(url, status, why)
+        }
+        Err(error) => Posted::Undelivered(anyhow::Error::new(error).context("posting the seal")),
     }
-    let why = answer.body_mut().read_to_string().unwrap_or_default();
-    bail!("{url} refused the seal ({status}): {why}")
+}
+
+/// Whether a status still wants a seal for this token.
+fn still_wanted(status: &Status, (_, nonce, issued_at): &Token) -> bool {
+    status.seal_wanted && &status.nonce == nonce && status.token_issued_at == Some(*issued_at)
+}
+
+/// Post again the held seal most overdue, if one is due, and drop the
+/// held seals that are taken, refused, no longer wanted (the machine moved
+/// on to a newer binding or token) or held for `HOLD_FOR` already. A
+/// machine that doesn't answer keeps its seal until then. One post at a
+/// time, so a new token waits on at most one slow answer.
+fn deliver_held(
+    held: &mut Held,
+    now: Instant,
+    fetch: impl Fn(&str) -> Result<Status>,
+    post: impl FnOnce(&str, &str, &Sealed) -> Posted,
+) {
+    held.retain(|(url, nonce, _), hold| {
+        let keep = now.duration_since(hold.proved) < HOLD_FOR;
+        if !keep {
+            println!(
+                "{url} has not taken the seal for nonce {nonce} in {} s; dropped",
+                HOLD_FOR.as_secs()
+            );
+        }
+        keep
+    });
+    let Some(token) = held
+        .iter()
+        .filter(|(_, hold)| hold.next_try <= now)
+        .min_by_key(|(_, hold)| hold.next_try)
+        .map(|(token, _)| token.clone())
+    else {
+        return;
+    };
+    let (url, nonce, _) = &token;
+    let keep = match fetch(url) {
+        Err(_) => true,
+        Ok(status) if !still_wanted(&status, &token) => {
+            println!("{url} no longer wants the held seal for nonce {nonce}; dropped");
+            false
+        }
+        Ok(_) => match post(url, nonce, &held[&token].sealed) {
+            Posted::Taken => {
+                println!("{url} took the held seal");
+                false
+            }
+            Posted::Refused(why) => {
+                println!("{why}");
+                false
+            }
+            Posted::Undelivered(error) => {
+                println!("{error:#}; the seal is kept to post again");
+                true
+            }
+        },
+    };
+    if keep {
+        // The wait runs from the post's end: a post that ran to its timeout
+        // is not followed by another at once.
+        if let Some(hold) = held.get_mut(&token) {
+            hold.later(now.max(Instant::now()));
+        }
+    } else {
+        held.remove(&token);
+    }
 }
 
 /// Prove one token, check the receipt as a chain would, and say the EVM
@@ -292,6 +448,7 @@ fn main() -> Result<()> {
 
     let agent = agent();
     let mut tried: Tried = HashSet::new();
+    let mut held: Held = HashMap::new();
     let mut last_work = Instant::now();
     let mut unreachable_said: HashMap<String, Instant> = HashMap::new();
     loop {
@@ -319,11 +476,19 @@ fn main() -> Result<()> {
             );
             let started = Instant::now();
             match prove(&guest, &trusted, &work) {
-                Ok((seal, journal)) => {
+                Ok(sealed) => {
+                    let proved = Instant::now();
                     println!("proved in {} s", started.elapsed().as_secs());
-                    match post(&agent, &url, &work.nonce, &seal, &journal) {
-                        Ok(()) => println!("{url} took the seal"),
-                        Err(error) => println!("{error:#}"),
+                    match post(&agent, &url, &work.nonce, &sealed) {
+                        Posted::Taken => println!("{url} took the seal"),
+                        Posted::Refused(why) => println!("{why}"),
+                        Posted::Undelivered(error) => {
+                            println!("{error:#}; the seal is kept to post again");
+                            held.insert(
+                                (url.clone(), work.nonce.clone(), work.issued_at),
+                                Hold::new(sealed, proved, Instant::now()),
+                            );
+                        }
                     }
                 }
                 Err(error) => println!("could not prove the token: {error:#}"),
@@ -332,7 +497,17 @@ fn main() -> Result<()> {
             // Look again at once: another machine may be waiting.
             continue;
         }
-        if last_work.elapsed() >= args.idle_exit {
+        // Nothing new to prove: deliver what was proved and not taken. A
+        // held seal keeps the prover up, for `HOLD_FOR` at most.
+        if !held.is_empty() {
+            deliver_held(
+                &mut held,
+                Instant::now(),
+                |url| fetch(&agent, url),
+                |url, nonce, sealed| post(&agent, url, nonce, sealed),
+            );
+        }
+        if held.is_empty() && last_work.elapsed() >= args.idle_exit {
             println!(
                 "nothing to prove for {} s; exiting",
                 args.idle_exit.as_secs()
@@ -501,5 +676,156 @@ mod tests {
         });
         let status: Status = serde_json::from_value(json).unwrap();
         assert!(status.seal_wanted);
+    }
+
+    fn token(url: &str) -> Token {
+        (url.to_string(), binding().nonce(), 1_000)
+    }
+
+    fn held(url: &str, now: Instant) -> Held {
+        HashMap::from([(token(url), Hold::new((vec![1], vec![2]), now, now))])
+    }
+
+    #[test]
+    fn a_seal_is_kept_only_when_the_machine_gave_no_answer_about_it() {
+        use ureq::http::StatusCode;
+        let url = "http://executor";
+        assert!(matches!(
+            answered(url, StatusCode::NO_CONTENT, String::new()),
+            Posted::Taken
+        ));
+        for refused in [
+            StatusCode::CONFLICT,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::BAD_REQUEST,
+        ] {
+            assert!(matches!(
+                answered(url, refused, "no".into()),
+                Posted::Refused(_)
+            ));
+        }
+        for unanswered in [
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            assert!(matches!(
+                answered(url, unanswered, "later".into()),
+                Posted::Undelivered(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_held_token_is_not_proved_again_while_its_seal_is_posted_until_taken() {
+        let start = Instant::now();
+        let urls = vec!["http://executor".to_string()];
+        let fetch = |_: &str| -> Result<Status> { Ok(status(&binding(), true)) };
+        // Proved once: the token is tried, and its seal held.
+        let tried: Tried = HashSet::from([token("http://executor")]);
+        let mut held = held("http://executor", start);
+        assert!(next_work(&urls, fetch, &[], 2_000, &tried, |_, _| {}).is_none());
+
+        // Not due before the first wait.
+        deliver_held(&mut held, start, fetch, |_, _, _| {
+            panic!("posted again at once")
+        });
+        let mut posts = 0;
+        let mut at = start + RETRY_FIRST;
+        deliver_held(&mut held, at, fetch, |_, _, sealed| {
+            posts += 1;
+            assert_eq!(sealed, &(vec![1], vec![2]));
+            Posted::Undelivered(anyhow::anyhow!("timed out"))
+        });
+        assert_eq!((posts, held.len()), (1, 1));
+        assert!(next_work(&urls, fetch, &[], 2_000, &tried, |_, _| {}).is_none());
+
+        // The wait doubles after each post not delivered, up to its most.
+        let waits: Vec<Duration> = (0..4)
+            .map(|_| {
+                let wait = held[&token("http://executor")].next_try - at;
+                at += wait;
+                deliver_held(&mut held, at, fetch, |_, _, _| {
+                    Posted::Undelivered(anyhow::anyhow!("timed out"))
+                });
+                wait
+            })
+            .collect();
+        assert_eq!(
+            waits,
+            [RETRY_FIRST * 2, RETRY_FIRST * 4, RETRY_MOST, RETRY_MOST]
+        );
+        at = held[&token("http://executor")].next_try;
+        deliver_held(&mut held, at, fetch, |_, _, _| Posted::Taken);
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn a_held_seal_is_dropped_once_refused_or_no_longer_wanted() {
+        let start = Instant::now();
+        let due = start + RETRY_FIRST;
+        let fetch = |_: &str| -> Result<Status> { Ok(status(&binding(), true)) };
+        let mut kept = held("http://executor", start);
+        deliver_held(&mut kept, due, fetch, |_, _, _| {
+            Posted::Refused("409".into())
+        });
+        assert!(kept.is_empty());
+
+        // The machine has a seal already, a newer token, or a newer binding.
+        for moved_on in [
+            |status: &mut Status| status.seal_wanted = false,
+            |status: &mut Status| status.token_issued_at = Some(1_500),
+            |status: &mut Status| status.nonce = "00".repeat(32),
+        ] {
+            let mut kept = held("http://executor", start);
+            let fetch = |_: &str| -> Result<Status> {
+                let mut status = status(&binding(), true);
+                moved_on(&mut status);
+                Ok(status)
+            };
+            deliver_held(&mut kept, due, fetch, |_, _, _| {
+                panic!("posted a seal no longer wanted")
+            });
+            assert!(kept.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_held_seal_waits_while_its_machine_does_not_answer_and_is_dropped_after_the_hold() {
+        let start = Instant::now();
+        let mut kept = held("http://builder", start);
+        let fetch = |_: &str| -> Result<Status> { bail!("connection refused") };
+        deliver_held(&mut kept, start + RETRY_FIRST, fetch, |_, _, _| {
+            panic!("posted to a machine that is off")
+        });
+        assert_eq!(kept.len(), 1);
+        deliver_held(&mut kept, start + HOLD_FOR, fetch, |_, _, _| {
+            panic!("posted a seal held too long")
+        });
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn one_held_seal_is_posted_at_a_time_the_most_overdue_first() {
+        let start = Instant::now();
+        let mut kept = held("http://executor", start);
+        kept.insert(
+            token("http://builder"),
+            Hold::new(
+                (vec![3], vec![4]),
+                start - Duration::from_secs(10),
+                start - Duration::from_secs(10),
+            ),
+        );
+        let fetch = |_: &str| -> Result<Status> { Ok(status(&binding(), true)) };
+        let mut posted = Vec::new();
+        deliver_held(&mut kept, start + RETRY_FIRST, fetch, |url, _, _| {
+            posted.push(url.to_string());
+            Posted::Taken
+        });
+        assert_eq!(posted, ["http://builder"]);
+        assert_eq!(kept.len(), 1);
     }
 }
