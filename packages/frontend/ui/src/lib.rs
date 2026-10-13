@@ -14,6 +14,7 @@
 //! - [`fonts_css`] and [`FONTS`]: the self-hosted variable fonts.
 //! - [`icons`]: the 24px line icon set, as data.
 //! - [`logos`]: the logo files, exactly as drawn.
+//! - [`images`]: the share images and the PNG icons, drawn from the mark.
 //!
 //! `task frontend:tokens` writes all of it into `dist/` (see `src/bin/tokens.rs`).
 
@@ -22,6 +23,7 @@ use std::fmt::Write;
 use serde::Deserialize;
 
 pub mod icons;
+pub mod images;
 pub mod logos;
 pub mod styles;
 

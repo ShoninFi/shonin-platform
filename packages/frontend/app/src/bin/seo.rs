@@ -11,7 +11,9 @@
 //!
 //! - one HTML file per page (`agents.html`, `agents/base-1/review.html`,
 //!   `status.html`, …, and `404.html`), each with its title, description,
-//!   canonical URL and Open Graph tags, and the page itself drawn from the
+//!   canonical URL, Open Graph and X card tags (every page shows the app's
+//!   share image, `share/shonin-app.png`, which this writes too, from
+//!   `packages/frontend/ui/images`), and the page itself drawn from the
 //!   same views the app draws, so it reads with JavaScript off. The app
 //!   replaces it with the live page when it boots. Pages that shouldn't be
 //!   listed still get a file, marked `noindex`.
@@ -46,6 +48,9 @@ mod native {
     use app::{api, route::Route, shell::shell, store, view::escape};
 
     const SITE_NAME: &str = "Shonin";
+    /// Where the share image is served. Not fingerprinted: link previews are
+    /// cached by address, so it stays put and `_headers` caches it briefly.
+    const SHARE_IMAGE: &str = "/share/shonin-app.png";
 
     // Both markers are literals in index.html. If either goes missing this fails
     // loudly rather than shipping the bare shell on every route.
@@ -131,32 +136,19 @@ mod native {
                 .map_err(|e| format!("writing {}: {e}", target.display()))?;
         }
 
-        let urls: String = written
-            .iter()
-            .filter(|route| route.is_indexable())
-            .filter_map(Route::path)
-            .map(|path| {
-                format!(
-                    "  <url><loc>{}</loc></url>\n",
-                    escape(&format!("{base}{path}"))
-                )
-            })
-            .collect();
-        fs::write(
-            args.dist.join("sitemap.xml"),
-            format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n{urls}</urlset>\n"
-            ),
-        )?;
-        fs::write(
-            args.dist.join("robots.txt"),
-            format!("User-agent: *\nAllow: /\n\nSitemap: {base}/sitemap.xml\n"),
-        )?;
+        let share = args.dist.join(SHARE_IMAGE.trim_start_matches('/'));
+        if let Some(parent) = share.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&share, ui::images::SHARE_APP.png.bytes)
+            .map_err(|e| format!("writing {}: {e}", share.display()))?;
+        fs::write(args.dist.join("sitemap.xml"), sitemap(base, &written))?;
+        fs::write(args.dist.join("robots.txt"), robots(base))?;
 
         write_csp(&args)?;
 
         println!(
-            "pre-rendered {} pages (with 404.html), sitemap.xml, robots.txt and the CSP",
+            "pre-rendered {} pages (with 404.html), the share image, sitemap.xml, robots.txt and the CSP",
             written.len()
         );
         Ok(())
@@ -220,9 +212,35 @@ mod native {
         format!("{before}{}{after}", head(base, route)).replacen(BODY, &body.html(), 1)
     }
 
+    /// Every listed page the pre-render wrote, at its full address.
+    fn sitemap(base: &str, written: &[Route]) -> String {
+        let urls: String = written
+            .iter()
+            .filter(|route| route.is_indexable())
+            .filter_map(Route::path)
+            .map(|path| {
+                format!(
+                    "  <url><loc>{}</loc></url>\n",
+                    escape(&format!("{base}{path}"))
+                )
+            })
+            .collect();
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n{urls}</urlset>\n"
+        )
+    }
+
+    /// Everything may be crawled; the sitemap says what there is.
+    fn robots(base: &str) -> String {
+        format!("User-agent: *\nAllow: /\n\nSitemap: {base}/sitemap.xml\n")
+    }
+
     fn head(base: &str, route: &Route) -> String {
         let page = route.page();
         let (title, description) = (escape(&page.title), escape(&page.description));
+        let share = &ui::images::SHARE_APP;
+        let image = escape(&format!("{base}{SHARE_IMAGE}"));
+        let (width, height, alt) = (share.png.width, share.png.height, escape(share.alt));
         let mut out = format!(
             "<title>{title}</title>\n\
              <meta name=\"description\" content=\"{description}\" />\n\
@@ -230,7 +248,13 @@ mod native {
              <meta property=\"og:site_name\" content=\"{SITE_NAME}\" />\n\
              <meta property=\"og:title\" content=\"{title}\" />\n\
              <meta property=\"og:description\" content=\"{description}\" />\n\
-             <meta name=\"twitter:card\" content=\"summary\" />\n"
+             <meta property=\"og:image\" content=\"{image}\" />\n\
+             <meta property=\"og:image:width\" content=\"{width}\" />\n\
+             <meta property=\"og:image:height\" content=\"{height}\" />\n\
+             <meta property=\"og:image:alt\" content=\"{alt}\" />\n\
+             <meta name=\"twitter:card\" content=\"summary_large_image\" />\n\
+             <meta name=\"twitter:image\" content=\"{image}\" />\n\
+             <meta name=\"twitter:image:alt\" content=\"{alt}\" />\n"
         );
         match route.path() {
             Some(path) if route.is_indexable() => {
@@ -404,6 +428,117 @@ mod native {
                 assert!(html.contains("<meta name=\"robots\" content=\"noindex\" />"));
                 assert!(!html.contains("rel=\"canonical\""));
                 assert!(!html.contains(BODY));
+            }
+        }
+
+        /// The `content` of the first `<meta>` whose `property` or `name` is
+        /// `key`.
+        fn meta<'a>(html: &'a str, key: &str) -> Option<&'a str> {
+            ["property", "name"].iter().find_map(|attr| {
+                let needle = format!("<meta {attr}=\"{key}\" content=\"");
+                let at = html.find(&needle)? + needle.len();
+                Some(&html[at..at + html[at..].find('"')?])
+            })
+        }
+
+        #[test]
+        fn every_pre_rendered_page_previews_with_the_share_image_at_its_full_address() {
+            let shell_html = format!("<head>{HEAD_START}{HEAD_END}</head><body>{BODY}</body>");
+            let base = "https://app.shonin.fi";
+            let mut pages: Vec<String> = Route::all_pages()
+                .iter()
+                .chain([&Route::NotFound])
+                .map(|route| render(&shell_html, base, route))
+                .collect();
+            pages.extend(
+                Route::shell_kinds()
+                    .iter()
+                    .map(|route| render_shell(&shell_html, base, route)),
+            );
+            assert!(pages.len() > 4);
+            for html in &pages {
+                assert_eq!(
+                    meta(html, "og:image"),
+                    Some("https://app.shonin.fi/share/shonin-app.png"),
+                    "{html}"
+                );
+                assert_eq!(meta(html, "og:image:width"), Some("1200"));
+                assert_eq!(meta(html, "og:image:height"), Some("630"));
+                assert!(meta(html, "og:image:alt").is_some_and(|alt| alt.starts_with("Shonin.")));
+                assert_eq!(meta(html, "og:site_name"), Some("Shonin"));
+                assert_eq!(meta(html, "twitter:card"), Some("summary_large_image"));
+                assert_eq!(meta(html, "twitter:image"), meta(html, "og:image"));
+            }
+            assert_eq!(
+                ui::images::dimensions(ui::images::SHARE_APP.png.bytes),
+                Some((1200, 630))
+            );
+            assert!(SHARE_IMAGE.ends_with(ui::images::SHARE_APP.png.name));
+        }
+
+        #[test]
+        fn the_404_is_never_listed() {
+            let shell_html = format!("<head>{HEAD_START}{HEAD_END}</head><body>{BODY}</body>");
+            let html = render(&shell_html, "https://app.shonin.fi", &Route::NotFound);
+            assert_eq!(meta(&html, "robots"), Some("noindex"));
+            assert!(!html.contains("rel=\"canonical\""));
+            assert!(!sitemap("https://app.shonin.fi", &[Route::NotFound]).contains("<loc>"));
+        }
+
+        #[test]
+        fn robots_allows_everything_and_names_the_sitemap() {
+            assert_eq!(
+                robots("https://app.shonin.fi"),
+                "User-agent: *\nAllow: /\n\nSitemap: https://app.shonin.fi/sitemap.xml\n"
+            );
+            let sitemap = sitemap(
+                "https://app.shonin.fi",
+                &[
+                    Route::Agents { author: None },
+                    Route::Status,
+                    Route::Portfolio,
+                ],
+            );
+            assert!(sitemap.contains("<loc>https://app.shonin.fi/agents</loc>"));
+            assert!(sitemap.contains("<loc>https://app.shonin.fi/status</loc>"));
+            assert!(
+                !sitemap.contains("/portfolio"),
+                "a private page is not listed"
+            );
+        }
+
+        #[test]
+        fn the_icons_are_linked_copied_and_cached_and_so_is_the_share_image() {
+            let index = include_str!("../../index.html");
+            assert!(
+                index.contains("<link data-trunk rel=\"copy-dir\" href=\"../ui/images/icons\" />")
+            );
+            for (rel, icon) in [
+                (
+                    "icon\" type=\"image/png\" sizes=\"32x32",
+                    &ui::images::ICON_32,
+                ),
+                (
+                    "icon\" type=\"image/png\" sizes=\"512x512",
+                    &ui::images::ICON_512,
+                ),
+                ("apple-touch-icon", &ui::images::ICON_180),
+            ] {
+                assert!(
+                    index.contains(&format!(
+                        "<link rel=\"{rel}\" href=\"/icons/{}\" />",
+                        icon.name
+                    )),
+                    "{}",
+                    icon.name
+                );
+            }
+            let headers = include_str!("../../_headers");
+            for dir in ["/icons/*", "/share/*"] {
+                assert!(
+                    headers.contains(&format!("{dir}\n  Cache-Control: public, max-age=86400\n")),
+                    "{dir}"
+                );
             }
         }
 

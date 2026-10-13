@@ -7,3 +7,11 @@
 
 /fonts/*
   Cache-Control: public, max-age=31536000, immutable
+
+# The icons and the share image keep their addresses (link previews and home
+# screens hold on to them), so they are cached for a day, not for good.
+/icons/*
+  Cache-Control: public, max-age=86400
+
+/share/*
+  Cache-Control: public, max-age=86400

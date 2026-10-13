@@ -14,6 +14,7 @@ pub fn page() -> Page<'static> {
         class: "page-authors",
         main: MAIN,
         footer: Footer::Full,
+        indexed: true,
     }
 }
 

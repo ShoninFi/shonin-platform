@@ -40,6 +40,8 @@ pub struct Cx<'a> {
     /// The inline script that runs before first paint, and its CSP hash.
     pub boot: &'a str,
     pub theme_color: &'a str,
+    /// The share image's path on this site, such as `/share/shonin.png`.
+    pub share_image: &'a str,
 }
 
 /// Which page is current, for `aria-current` in the header.
@@ -62,6 +64,9 @@ pub struct Page<'a> {
     pub main: &'a str,
     /// The footer: the full band, or the compact one the 404 uses.
     pub footer: Footer,
+    /// Whether search engines may list it (and the sitemap names it). Only
+    /// the 404 is kept out.
+    pub indexed: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -129,7 +134,17 @@ fn placeholder(name: &str, cx: &Cx) -> Result<String> {
 
 /// The whole document.
 pub fn document(page: &Page, cx: &Cx) -> Result<String> {
-    let url = format!("{}{}", cx.links.site, page.path);
+    let share = &ui::images::SHARE_SITE;
+    // A page that is listed names its one address; the 404 is served at any
+    // address, so it names none and asks not to be listed.
+    let address = if page.indexed {
+        let url = esc(&format!("{}{}", cx.links.site, page.path));
+        format!(
+            "<link rel=\"canonical\" href=\"{url}\">\n<meta property=\"og:url\" content=\"{url}\">\n"
+        )
+    } else {
+        "<meta name=\"robots\" content=\"noindex\">\n".to_string()
+    };
     let head = format!(
         r#"<!doctype html>
 <html lang="en">
@@ -138,17 +153,23 @@ pub fn document(page: &Page, cx: &Cx) -> Result<String> {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 <meta name="description" content="{description}">
-<!-- Not for indexing: whether this hostname is indexed is decided per host. -->
-<meta name="robots" content="noindex">
 <meta name="color-scheme" content="light">
 <meta name="theme-color" content="{theme}">
-<link rel="canonical" href="{url}">
-<meta property="og:type" content="website">
+{address}<meta property="og:type" content="website">
 <meta property="og:site_name" content="Shonin">
 <meta property="og:title" content="{title}">
 <meta property="og:description" content="{description}">
-<meta property="og:url" content="{url}">
+<meta property="og:image" content="{image}">
+<meta property="og:image:width" content="{width}">
+<meta property="og:image:height" content="{height}">
+<meta property="og:image:alt" content="{alt}">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="{image}">
+<meta name="twitter:image:alt" content="{alt}">
+<link rel="icon" type="image/png" sizes="32x32" href="{{{{asset:icon-32}}}}">
+<link rel="icon" type="image/png" sizes="512x512" href="{{{{asset:icon-512}}}}">
 <link rel="icon" type="image/svg+xml" href="{{{{asset:mark}}}}">
+<link rel="apple-touch-icon" href="{{{{asset:icon-180}}}}">
 <link rel="preload" href="{{{{asset:font-sans}}}}" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="{{{{asset:font-display}}}}" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="{stylesheet}">
@@ -159,7 +180,10 @@ pub fn document(page: &Page, cx: &Cx) -> Result<String> {
         title = esc(page.title),
         description = esc(page.description),
         theme = esc(cx.theme_color),
-        url = esc(&url),
+        image = esc(&format!("{}{}", cx.links.site, cx.share_image)),
+        width = share.png.width,
+        height = share.png.height,
+        alt = esc(share.alt),
         stylesheet = esc(cx.stylesheet),
         boot = cx.boot,
         script = esc(cx.script),

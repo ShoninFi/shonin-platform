@@ -12,6 +12,7 @@ pub fn page() -> Page<'static> {
         class: "page-404",
         main: MAIN,
         footer: Footer::Compact,
+        indexed: false,
     }
 }
 

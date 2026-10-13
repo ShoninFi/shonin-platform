@@ -175,6 +175,8 @@ fn kind(file: &Path) -> &'static str {
         Some("css") => "text/css; charset=utf-8",
         Some("js") => "text/javascript; charset=utf-8",
         Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("xml") => "application/xml; charset=utf-8",
         Some("woff2") => "font/woff2",
         Some("txt") => "text/plain; charset=utf-8",
         _ => "application/octet-stream",

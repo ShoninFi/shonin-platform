@@ -15,6 +15,7 @@ pub fn page() -> Page<'static> {
         class: "page-home",
         main: MAIN,
         footer: Footer::Full,
+        indexed: true,
     }
 }
 

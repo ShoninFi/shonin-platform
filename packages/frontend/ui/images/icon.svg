@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" viewBox="0 0 512 512">
+  <!-- The home-screen and app icons (180 and 512 pixels): the mark on the
+       paper token (#f6f7fb), whole, with room for the platforms' rounding
+       and masks. Rasterised by render.sh. -->
+  <rect width="512" height="512" fill="#f6f7fb"/>
+  <image href="../logos/shonin-mark.svg" x="108.7" y="96" width="294.6" height="320"/>
+</svg>

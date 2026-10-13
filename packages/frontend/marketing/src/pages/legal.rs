@@ -21,6 +21,7 @@ pub fn terms() -> Page<'static> {
         class: "page-legal",
         main: TERMS,
         footer: Footer::Full,
+        indexed: true,
     }
 }
 
@@ -33,6 +34,7 @@ pub fn privacy() -> Page<'static> {
         class: "page-legal",
         main: PRIVACY,
         footer: Footer::Full,
+        indexed: true,
     }
 }
 
