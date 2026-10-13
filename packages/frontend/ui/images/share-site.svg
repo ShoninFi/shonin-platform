@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <!-- shonin.fi's share image (Open Graph and X cards): the home hero on its
+       navy ground. Colours are the design tokens' values (tokens.json):
+       hero-ground #041030, mark-deep #021a5e, mark-mid #0152de,
+       mark-bright #0070fd, mark-sky #2bbcfe, hero-ink #ffffff,
+       hero-ink-muted #b8c4ea. Rasterised by render.sh. -->
+  <style>
+    @font-face { font-family: "Plus Jakarta Sans"; font-weight: 200 800; src: url("../fonts/PlusJakartaSans-Variable.woff2") format("woff2"); }
+    @font-face { font-family: "Hanken Grotesk"; font-weight: 100 900; src: url("../fonts/HankenGrotesk-Variable.woff2") format("woff2"); }
+    @font-face { font-family: "JetBrains Mono"; font-weight: 100 800; src: url("../fonts/JetBrainsMono-Variable.woff2") format("woff2"); }
+    .eyebrow { font: 650 17px "Hanken Grotesk"; letter-spacing: 0.24em; fill: #b8c4ea; }
+    .title { font: 800 74px "Plus Jakarta Sans"; letter-spacing: -0.035em; fill: #ffffff; }
+    .host { font: 450 20px "JetBrains Mono"; fill: #b8c4ea; }
+  </style>
+  <defs>
+    <radialGradient id="ground" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" gradientTransform="translate(900 300) scale(760 560)">
+      <stop offset="0" stop-color="#0152de"/>
+      <stop offset="0.46" stop-color="#021a5e"/>
+      <stop offset="0.82" stop-color="#041030"/>
+    </radialGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#0070fd" stop-opacity="0.5"/>
+      <stop offset="0.38" stop-color="#0152de" stop-opacity="0.22"/>
+      <stop offset="0.7" stop-color="#0152de" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="hexgrid" width="56" height="97" patternUnits="userSpaceOnUse">
+      <path d="M28 0 L56 16.2 L56 48.5 L28 64.7 L0 48.5 L0 16.2 Z M28 64.7 L28 97" fill="none" stroke="#b8c4ea" stroke-opacity="0.07" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <rect width="1200" height="630" fill="#041030"/>
+  <rect width="1200" height="630" fill="url(#ground)"/>
+  <rect width="1200" height="630" fill="url(#hexgrid)"/>
+
+  <!-- The mark, on the hero art's glow and orbit. -->
+  <circle cx="935" cy="315" r="330" fill="url(#glow)"/>
+  <circle cx="935" cy="315" r="214" fill="none" stroke="#b8c4ea" stroke-opacity="0.18" stroke-width="1.5" stroke-dasharray="3 10"/>
+  <circle cx="1149" cy="315" r="5" fill="#2bbcfe"/>
+  <circle cx="783.7" cy="466.3" r="3.5" fill="#b8c4ea"/>
+  <image href="../logos/shonin-mark.svg" x="830.5" y="201.5" width="209" height="227"/>
+
+  <!-- The words. -->
+  <image href="../logos/shonin-lockup-reversed.svg" x="80" y="68" width="136" height="44"/>
+  <text class="eyebrow" x="80" y="268">THE OPEN PLATFORM FOR AUTONOMOUS FINANCE</text>
+  <text class="title" x="76" y="362">Trading agents</text>
+  <text class="title" x="76" y="442">Verifiable by design</text>
+  <text class="host" x="80" y="558">shonin.fi</text>
+</svg>

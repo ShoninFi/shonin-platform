@@ -67,6 +67,8 @@ fn every_page_and_file_the_worker_serves_is_written() {
         "_headers",
         "_redirects",
         "robots.txt",
+        "sitemap.xml",
+        "share/shonin.png",
     ] {
         assert!(files.contains_key(path), "{path} is not written");
     }
@@ -238,8 +240,127 @@ fn pages_run_only_the_hashed_boot_script_and_carry_no_inline_styles() {
             html.contains("<main id=\"content\""),
             "{page} has the skip link's target"
         );
-        assert!(html.contains("noindex"), "{page} keeps noindex");
     }
+}
+
+/// The `content` of the first `<meta>` whose `property` or `name` is `key`.
+fn meta<'a>(html: &'a str, key: &str) -> Option<&'a str> {
+    ["property", "name"].iter().find_map(|attr| {
+        let needle = format!("<meta {attr}=\"{key}\" content=\"");
+        let at = html.find(&needle)? + needle.len();
+        Some(&html[at..at + html[at..].find('"')?])
+    })
+}
+
+#[test]
+fn every_page_previews_with_the_share_image_at_its_full_address() {
+    let files = files();
+    let image = files["share/shonin.png"].as_slice();
+    assert_eq!(ui::images::dimensions(image), Some((1200, 630)));
+    for (page, html) in pages(&files) {
+        assert_eq!(
+            meta(&html, "og:image"),
+            Some("https://shonin.fi/share/shonin.png"),
+            "{page}"
+        );
+        assert_eq!(meta(&html, "og:image:width"), Some("1200"), "{page}");
+        assert_eq!(meta(&html, "og:image:height"), Some("630"), "{page}");
+        assert!(
+            meta(&html, "og:image:alt").is_some_and(|alt| alt.starts_with("Shonin.")),
+            "{page}"
+        );
+        assert_eq!(meta(&html, "og:site_name"), Some("Shonin"), "{page}");
+        assert_eq!(
+            meta(&html, "twitter:card"),
+            Some("summary_large_image"),
+            "{page}"
+        );
+        assert_eq!(
+            meta(&html, "twitter:image"),
+            meta(&html, "og:image"),
+            "{page}"
+        );
+    }
+    let headers = String::from_utf8(files["_headers"].clone()).unwrap();
+    assert!(
+        headers.contains("/share/*\n  Cache-Control: public, max-age=86400\n"),
+        "the share image is cached, briefly, at an address that never changes"
+    );
+}
+
+#[test]
+fn every_page_links_the_png_icons_and_they_are_the_sizes_they_say() {
+    let files = files();
+    for (page, html) in pages(&files) {
+        for (rel, stem, size) in [
+            ("icon\" type=\"image/png\" sizes=\"32x32", "shonin-32", 32),
+            (
+                "icon\" type=\"image/png\" sizes=\"512x512",
+                "shonin-512",
+                512,
+            ),
+            ("apple-touch-icon", "shonin-180", 180),
+        ] {
+            let needle = format!("<link rel=\"{rel}\" href=\"/");
+            let at = html
+                .find(&needle)
+                .unwrap_or_else(|| panic!("{page} doesn't link {stem}"))
+                + needle.len();
+            let path = &html[at..at + html[at..].find('"').unwrap()];
+            assert!(
+                path.starts_with(&format!("assets/icons/{stem}.")),
+                "{page}: {path}"
+            );
+            assert_eq!(
+                ui::images::dimensions(&files[path]),
+                Some((size, size)),
+                "{page}: {path}"
+            );
+        }
+        assert!(
+            html.contains("<link rel=\"icon\" type=\"image/svg+xml\""),
+            "{page}"
+        );
+    }
+}
+
+#[test]
+fn only_the_404_asks_not_to_be_listed() {
+    for (page, html) in pages(&files()) {
+        let noindex = meta(&html, "robots") == Some("noindex");
+        assert_eq!(noindex, page == "404.html", "{page}");
+        // A listed page names its one address; the 404 is at every address.
+        assert_eq!(html.contains("rel=\"canonical\""), !noindex, "{page}");
+    }
+}
+
+#[test]
+fn the_sitemap_lists_every_listed_page_at_its_full_address() {
+    let sitemap = String::from_utf8(files()["sitemap.xml"].clone()).unwrap();
+    assert!(sitemap.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
+    let locs: Vec<&str> = sitemap
+        .match_indices("<loc>")
+        .map(|(at, _)| &sitemap[at + 5..at + sitemap[at..].find("</loc>").unwrap()])
+        .collect();
+    assert_eq!(
+        locs,
+        [
+            "https://shonin.fi/",
+            "https://shonin.fi/authors",
+            "https://shonin.fi/terms",
+            "https://shonin.fi/privacy",
+        ]
+    );
+}
+
+#[test]
+fn robots_allows_everything_and_names_the_sitemap() {
+    let robots = String::from_utf8(files()["robots.txt"].clone()).unwrap();
+    assert_eq!(
+        robots,
+        "User-agent: *\nAllow: /\n\nSitemap: https://shonin.fi/sitemap.xml\n"
+    );
+    assert!(!robots.contains("Disallow"));
 }
 
 #[test]

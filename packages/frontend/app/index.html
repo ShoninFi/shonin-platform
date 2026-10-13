@@ -11,7 +11,12 @@
     <!-- Light only: the browser chrome takes the page's paper. -->
     <meta name="theme-color" content="#f6f7fb" />
     <meta name="color-scheme" content="light" />
+    <!-- The mark: PNGs for what can't take the SVG (home screens, older
+         browsers, search results), drawn from it (packages/frontend/ui/images). -->
+    <link rel="icon" type="image/png" sizes="32x32" href="/icons/shonin-32.png" />
+    <link rel="icon" type="image/png" sizes="512x512" href="/icons/shonin-512.png" />
     <link rel="icon" type="image/svg+xml" href="/logos/shonin-mark.svg" />
+    <link rel="apple-touch-icon" href="/icons/shonin-180.png" />
 
     <!-- The two faces above the fold; Newsreader and JetBrains Mono load on
          first use. -->
@@ -30,6 +35,7 @@
     <link data-trunk rel="css" href="styles/agent.css" />
     <link data-trunk rel="copy-dir" href="../ui/dist/fonts" />
     <link data-trunk rel="copy-dir" href="../ui/dist/logos" />
+    <link data-trunk rel="copy-dir" href="../ui/images/icons" />
     <link data-trunk rel="rust" data-bin="app" data-wasm-opt="z" data-integrity="none" />
     <!-- Workers static assets read these from the output root. -->
     <link data-trunk rel="copy-file" href="_headers" />

@@ -97,6 +97,28 @@ const ASSETS: &[Asset] = &[
         ext: "svg",
         bytes: include_bytes!("../../ui/logos/shonin-mark.svg"),
     },
+    // The PNG icons drawn from the mark (packages/frontend/ui/images).
+    Asset {
+        key: "icon-32",
+        dir: "icons",
+        stem: "shonin-32",
+        ext: "png",
+        bytes: ui::images::ICON_32.bytes,
+    },
+    Asset {
+        key: "icon-180",
+        dir: "icons",
+        stem: "shonin-180",
+        ext: "png",
+        bytes: ui::images::ICON_180.bytes,
+    },
+    Asset {
+        key: "icon-512",
+        dir: "icons",
+        stem: "shonin-512",
+        ext: "png",
+        bytes: ui::images::ICON_512.bytes,
+    },
     Asset {
         key: "lockup-reversed",
         dir: "logos",
@@ -143,6 +165,11 @@ const ASSETS: &[Asset] = &[
     },
 ];
 
+/// Where the share image is served. Not fingerprinted: link previews are
+/// cached by address, sometimes for long after a page changes, so the
+/// address stays put and `_headers` gives it a short cache life instead.
+pub const SHARE_IMAGE: &str = "/share/shonin.png";
+
 /// Every file the site serves.
 pub fn site(links: &Links) -> Result<Vec<File>> {
     let mut files = Vec::new();
@@ -175,6 +202,7 @@ pub fn site(links: &Links) -> Result<Vec<File>> {
         script: &format!("/{js_path}"),
         boot: BOOT,
         theme_color: &theme,
+        share_image: SHARE_IMAGE,
     };
     for (file, page) in &pages {
         files.push(File {
@@ -201,8 +229,16 @@ pub fn site(links: &Links) -> Result<Vec<File>> {
         bytes: redirects(links).into_bytes(),
     });
     files.push(File {
+        path: SHARE_IMAGE.trim_start_matches('/').into(),
+        bytes: ui::images::SHARE_SITE.png.bytes.to_vec(),
+    });
+    files.push(File {
+        path: "sitemap.xml".into(),
+        bytes: sitemap(links, &pages).into_bytes(),
+    });
+    files.push(File {
         path: "robots.txt".into(),
-        bytes: ROBOTS.as_bytes().to_vec(),
+        bytes: robots(links).into_bytes(),
     });
     Ok(files)
 }
@@ -359,6 +395,8 @@ fn headers() -> String {
   Cross-Origin-Opener-Policy: same-origin
 /assets/*
   Cache-Control: public, max-age=31536000, immutable
+/share/*
+  Cache-Control: public, max-age=86400
 "
     )
 }
@@ -407,8 +445,29 @@ fn redirects(links: &Links) -> String {
     out
 }
 
-/// Not for indexing: whether this hostname is indexed is decided per host.
-const ROBOTS: &str = "User-agent: *\nDisallow: /\n";
+/// Every page search engines may list, at its full address.
+fn sitemap(links: &Links, pages: &[(&str, html::Page)]) -> String {
+    let mut out = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
+    );
+    for (_, page) in pages.iter().filter(|(_, page)| page.indexed) {
+        let _ = writeln!(
+            out,
+            "  <url><loc>{}</loc></url>",
+            html::esc(&format!("{}{}", links.site, page.path))
+        );
+    }
+    out.push_str("</urlset>\n");
+    out
+}
+
+/// Everything may be crawled; the sitemap says what there is.
+fn robots(links: &Links) -> String {
+    format!(
+        "User-agent: *\nAllow: /\n\nSitemap: {}/sitemap.xml\n",
+        links.site
+    )
+}
 
 #[cfg(test)]
 mod tests {
