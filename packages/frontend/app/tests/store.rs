@@ -54,7 +54,7 @@ fn a_new_snapshot_touches_only_the_fields_that_changed() {
     assert_eq!(in_vault.pending(), 1);
 
     bump(&mut snapshot);
-    snapshot.strategies[0].vault.value += 1_000.0;
+    snapshot.strategies[0].vault.shares += 1_000.0;
     assert!(store.apply(&snapshot));
 
     assert_eq!(in_vault.pending(), 1, "the money in the vault changed");

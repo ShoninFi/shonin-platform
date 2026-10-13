@@ -537,7 +537,7 @@ fn price(agent: &Rc<Agent>, tab: AgentTab) -> El {
         if tab != AgentTab::Overview {
             rows.push(row(
                 "In vault",
-                text(format::money_whole(strategy.vault.value)),
+                text(format::money_whole(crate::model::in_vault(strategy))),
             ));
         }
         if rows.is_empty() {

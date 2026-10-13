@@ -128,7 +128,7 @@ fn headline(agent: &Agent, state: &ChartState) -> El {
         }
         match model.mode {
             Mode::Price => format::price(strategy.vault.share_price),
-            Mode::Money => format::money_whole(strategy.vault.value),
+            Mode::Money => format::money_whole(crate::model::in_vault(strategy)),
         }
     };
     let now = now_text(
