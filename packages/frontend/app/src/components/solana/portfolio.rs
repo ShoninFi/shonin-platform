@@ -24,7 +24,7 @@ use crate::money::{Rounding, units::pow10};
 use crate::pages::Page;
 use crate::pages::portfolio::{Balance, Summary, balances_view, section_loading, wallet_section};
 use crate::tx::solana::flow::{Fallback, HeldAt, Outcome, Step};
-use crate::tx::solana::run::{SolAction, SolRunning, SolVault};
+use crate::tx::solana::run::{self, CardShows, SolAction, SolRunning, SolVault};
 use crate::view::{El, View, el, text};
 use crate::wallet::recent::Family;
 use crate::wallet::solana::SolNetwork;
@@ -706,7 +706,11 @@ fn request_offer(vault: &Vault, request: &Request, now: u64, fits: bool) -> Requ
     }
 }
 
-/// A button that runs one Solana flow, with its status line in place.
+/// A button that runs one Solana flow, with its status line in place. The
+/// flow is kept per account, vault and action across the page's reads: one
+/// under way (or whose money may still move) is shown, never offered again;
+/// one that ended shows its outcome until dismissed, with the action
+/// offered again beside it.
 fn act(
     vault: &SolVault,
     network: Option<Rc<SolNetwork>>,
@@ -714,22 +718,11 @@ fn act(
     label: &'static str,
     kind: Kind,
 ) -> El {
-    let session = crate::wallet::solana::get();
-    // Kept across reads: a flow under way stays shown, never offered again.
-    let running = crate::tx::solana::run::card_slot(
-        session.account(),
-        &vault.address,
-        &format!("{action:?}"),
-    );
-    let vault = vault.clone();
+    let address = vault.address;
     el("div").class("sh-act").child_signal(
         None,
-        futures_signals::map_ref! {
-            let account = session.connection.signal_ref(|c| c.account()),
-            let current = running.signal_cloned() => (*account, current.clone())
-        }
-        .map(move |(account, current)| {
-            if account.is_none() {
+        run::card_signal(address, format!("{action:?}")).map(move |card| {
+            if card.account.is_none() {
                 return Some(
                     on_click(
                         Button::new(kind, "Connect a Solana wallet")
@@ -740,29 +733,31 @@ fn act(
                     .into(),
                 );
             }
-            if let Some(current) = current {
-                return Some(status(&current, network.clone(), &running));
-            }
-            let running = running.clone();
-            let address = vault.address;
-            let action = action.clone();
-            let reviewed = network.clone();
-            Some(
+            let shown = card
+                .slot
+                .get_cloned()
+                .map(|current| status(&current, network.clone(), &card.slot));
+            let button = {
+                let action = action.clone();
+                let reviewed = network.clone();
+                let card = card.clone();
                 on_click(
                     Button::new(kind, label).size(Size::Small).build(),
                     move || {
-                        // Built with the cluster this card was read with:
-                        // the flow signs with it or not at all.
-                        let Some(reviewed) = reviewed.clone() else {
-                            return;
-                        };
-                        let flow = SolRunning::new(reviewed);
-                        crate::tx::solana::run::start(address, action.clone(), &flow);
-                        running.set(Some(flow));
+                        // Built with the cluster this card was read with: the
+                        // flow signs with it or not at all.
+                        if let Some(reviewed) = reviewed.clone() {
+                            run::start_from(&card, address, action.clone(), reviewed);
+                        }
                     },
                 )
-                .into(),
-            )
+                .into()
+            };
+            Some(match (card.shows, shown) {
+                (CardShows::Status, Some(shown)) => shown,
+                (CardShows::StatusAndAction, Some(shown)) => View::Many(vec![shown, button]),
+                _ => button,
+            })
         }),
     )
 }
@@ -833,10 +828,12 @@ pub(super) fn status(
                             Outcome::Deposited { signature, .. }
                             | Outcome::Changed { signature } => ("Done.".to_string(), *signature),
                         };
+                        let running = running.clone();
                         el("div")
                             .attr("role", "status")
                             .child(el("p").text(line))
                             .child(sig_link(network.as_deref(), &signature, "Transaction"))
+                            .child(dismiss("Done", move || running.set(None)))
                             .into()
                     }
                     Step::Failed(error) => {
@@ -853,9 +850,11 @@ pub(super) fn status(
                                 None => View::Empty,
                             })
                             // What may have moved (or may still) isn't
-                            // offered again: the page shows it once it lands.
+                            // offered again until the person has read it
+                            // and dismissed it: the page shows it once it
+                            // lands.
                             .child(if error.may_have_moved() {
-                                View::Empty
+                                dismiss("Dismiss", move || running.set(None))
                             } else {
                                 on_click(
                                     Button::new(Kind::Secondary, "OK").size(Size::Small).build(),
@@ -869,6 +868,18 @@ pub(super) fn status(
             }),
         )
         .into()
+}
+
+/// A link that leaves a flow's status, as the EVM cards' "Done".
+fn dismiss(label: &'static str, leave: impl Fn() + 'static) -> View {
+    on_click(
+        el("button")
+            .attr("type", "button")
+            .class("sh-link")
+            .text(label),
+        leave,
+    )
+    .into()
 }
 
 // The claim page ----------------------------------------------------------------------------

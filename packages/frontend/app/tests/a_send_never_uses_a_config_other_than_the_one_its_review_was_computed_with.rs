@@ -496,3 +496,51 @@ fn a_card_drawn_again_shows_its_flow_under_way_rather_than_offering_it_again() {
     shown.set(None);
     assert!(card_slot(account, &vault, "Collect").lock_ref().is_none());
 }
+
+#[test]
+fn a_card_drawn_again_after_its_flow_landed_offers_the_action_again() {
+    use app::tx::solana::port::Sig;
+    use app::tx::solana::run::{CardShows, card_shows_slot, card_slot};
+    use app::tx::solana::{Outcome as SolOutcome, Step as SolStep};
+    use chain::solana_ix::Pubkey;
+    let account = Some(Pubkey::new_from_array([3; 32]));
+    let vault = Pubkey::new_from_array([4; 32]);
+    let session = app::wallet::solana::get();
+    session.remember(&devnet(6, 7));
+    let cluster = session.network.get_cloned().unwrap();
+    // The author funds the tank: while it runs, the card shows only its
+    // status, however often it is drawn.
+    let flow = app::tx::solana::SolRunning::new(cluster.clone());
+    flow.step.set(Some(SolStep::Checking));
+    card_slot(account, &vault, "Add from your wallet").set(Some(flow.clone()));
+    assert_eq!(
+        card_shows_slot(&card_slot(account, &vault, "Add from your wallet")),
+        CardShows::Status
+    );
+    // It lands. The page reads again: the card drawn anew shows the
+    // outcome and offers "Add from your wallet" again beside it.
+    flow.step.set(Some(SolStep::Done(SolOutcome::Changed {
+        signature: Sig([1; 64]),
+    })));
+    let found = card_slot(account, &vault, "Add from your wallet");
+    assert_eq!(card_shows_slot(&found), CardShows::StatusAndAction);
+    // Dismissed ("Done"): the action alone, for every drawing.
+    found.set(None);
+    assert_eq!(
+        card_shows_slot(&card_slot(account, &vault, "Add from your wallet")),
+        CardShows::Action
+    );
+    // A send that may still land is not offered again until it has been
+    // read and dismissed.
+    let flow = app::tx::solana::SolRunning::new(cluster);
+    flow.step
+        .set(Some(SolStep::Failed(app::tx::solana::SolError::Pending {
+            signature: Sig([2; 64]),
+            why: "the cluster stopped answering".to_string(),
+        })));
+    card_slot(account, &vault, "Collect").set(Some(flow));
+    assert_eq!(
+        card_shows_slot(&card_slot(account, &vault, "Collect")),
+        CardShows::Status
+    );
+}

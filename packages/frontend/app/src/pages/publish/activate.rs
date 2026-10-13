@@ -198,6 +198,19 @@ fn live(form: &Kept) -> bool {
         .is_some_and(|running| running.is_live())
 }
 
+/// A read that failed (`why`): said in place of the page on the first read.
+/// Once the page has been drawn, what it shows (the form, and a flow's
+/// status and links, finished or not) stays, and the read is tried again
+/// shortly. Whether to stop reading.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn read_failed(load: &Mutable<Load>, why: String) -> bool {
+    if matches!(&*load.lock_ref(), Load::Ready(_)) {
+        return false;
+    }
+    load.set(Load::Failed(why));
+    true
+}
+
 async fn read_page(chain: Chain, id: u64, load: Mutable<Load>, form: Kept) {
     #[cfg(target_arch = "wasm32")]
     {
@@ -207,13 +220,17 @@ async fn read_page(chain: Chain, id: u64, load: Mutable<Load>, form: Kept) {
         use chain::bindings::factory::IVaultFactory;
 
         let session = crate::wallet::get();
+        let failed = |why: String| read_failed(&load, why);
         loop {
             let (Some(network), Some(platform)) = run::platform(chain).await.unzip() else {
-                load.set(Load::Failed(format!(
+                if failed(format!(
                     "{} isn't reachable from the app right now. Reload to try again.",
                     chain.label()
-                )));
-                return;
+                )) {
+                    return;
+                }
+                gloo_timers::future::TimeoutFuture::new(5_000).await;
+                continue;
             };
             let reader = Session::reader(&network);
             let strategy_id = U256::from(id);
@@ -236,10 +253,11 @@ async fn read_page(chain: Chain, id: u64, load: Mutable<Load>, form: Kept) {
             let (readiness, terms, restricted) = match read_all.await {
                 Ok(read) => read,
                 Err(_) => {
-                    load.set(Load::Failed(
-                        "The chain didn't answer. Reload to try again.".to_string(),
-                    ));
-                    return;
+                    if failed("The chain didn't answer. Reload to try again.".to_string()) {
+                        return;
+                    }
+                    gloo_timers::future::TimeoutFuture::new(5_000).await;
+                    continue;
                 }
             };
             let title = run::jobs()
@@ -1119,6 +1137,21 @@ mod tests {
             },
             restricted: String::new(),
         })
+    }
+
+    #[test]
+    fn a_read_that_fails_after_the_page_was_drawn_keeps_a_finished_activations_status() {
+        // The first read fails: said in place of the page, and reading stops.
+        let load = Mutable::new(Load::Loading);
+        assert!(read_failed(&load, "The chain didn't answer.".to_string()));
+        assert!(matches!(load.get_cloned(), Load::Failed(_)));
+        // Drawn, with an activation that has ended: a later read that fails
+        // keeps the page (its form, the flow's status and its links), and
+        // the read is tried again.
+        let shown = info(1, 6, false);
+        let load = Mutable::new(Load::Ready(shown.clone()));
+        assert!(!read_failed(&load, "The chain didn't answer.".to_string()));
+        assert!(matches!(load.get_cloned(), Load::Ready(info) if Rc::ptr_eq(&info, &shown)));
     }
 
     #[test]

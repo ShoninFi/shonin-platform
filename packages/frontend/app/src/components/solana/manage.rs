@@ -19,7 +19,7 @@ use crate::components::wallet::open_connect;
 use crate::money::format as money;
 use crate::money::{Rounding, parse_units};
 use crate::tx::solana::author::AuthorAction;
-use crate::tx::solana::run::{SolAction, SolRunning, SolVault};
+use crate::tx::solana::run::{self, CardShows, SolAction, SolVault};
 use crate::view::{El, View, el, text};
 use crate::wallet::solana::SolNetwork;
 
@@ -173,49 +173,47 @@ fn act(
     make: impl Fn() -> Result<SolAction, String> + 'static,
 ) -> El {
     let address = read.vault.address;
-    // Kept across reads: a flow under way stays shown, never offered again.
-    let running =
-        crate::tx::solana::run::card_slot(crate::wallet::solana::get().account(), &address, label);
     let refused: Mutable<Option<String>> = Mutable::new(None);
     let reviewed = read.network.clone();
     let network = Some(read.network.clone());
     let make = Rc::new(make);
     el("div")
         .class("sh-act")
+        // Kept per account across reads: a flow under way stays shown and
+        // is never offered again; one that ended shows its outcome until
+        // dismissed, with the action offered again beside it.
         .child_signal(
             None,
-            running.signal_cloned().map({
-                let running = running.clone();
+            run::card_signal(address, label.to_string()).map({
                 let refused = refused.clone();
-                move |current| {
-                    if let Some(current) = current {
-                        return Some(super::portfolio::status(
-                            &current,
-                            network.clone(),
-                            &running,
-                        ));
-                    }
-                    let running = running.clone();
+                move |card| {
+                    let shown = card.slot.get_cloned().map(|current| {
+                        super::portfolio::status(&current, network.clone(), &card.slot)
+                    });
                     let refused = refused.clone();
                     let make = make.clone();
                     let reviewed = reviewed.clone();
-                    Some(
-                        on_click(
-                            Button::new(kind, label).size(Size::Small).build(),
-                            move || match make() {
-                                Ok(action) => {
-                                    refused.set(None);
-                                    // Built with this read's cluster: the
-                                    // flow signs with it or not at all.
-                                    let flow = SolRunning::new(reviewed.clone());
-                                    crate::tx::solana::run::start(address, action, &flow);
-                                    running.set(Some(flow));
-                                }
-                                Err(why) => refused.set(Some(why)),
-                            },
-                        )
-                        .into(),
+                    let card_now = card.clone();
+                    let button: View = on_click(
+                        Button::new(kind, label).size(Size::Small).build(),
+                        move || match make() {
+                            Ok(action) => {
+                                refused.set(None);
+                                // Built with this read's cluster: the flow
+                                // signs with it or not at all.
+                                run::start_from(&card_now, address, action, reviewed.clone());
+                            }
+                            Err(why) => refused.set(Some(why)),
+                        },
                     )
+                    .into();
+                    Some(match (card.shows, shown) {
+                        (CardShows::Status, Some(shown)) => shown,
+                        (CardShows::StatusAndAction, Some(shown)) => {
+                            View::Many(vec![shown, button])
+                        }
+                        _ => button,
+                    })
                 }
             }),
         )
