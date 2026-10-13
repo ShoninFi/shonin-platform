@@ -152,21 +152,25 @@ pub fn page(slug: &str) -> Page {
     };
     let load = Mutable::new(Load::Loading);
     let follow = load.clone();
+    // One form for the page's life: what was typed, and the flow it
+    // started, outlive a read again (the chain's settings changing).
+    let form = Kept::default();
+    let watched = form.clone();
     let body = el("div")
         .class("sh-author sh-activate")
         .child_signal(
             Some(loading()),
-            load.signal_cloned().map(|load| {
+            load.signal_cloned().map(move |load| {
                 Some(match load {
                     Load::Loading => loading(),
                     Load::Failed(why) => notice(NoticeTone::Danger, text(why))
                         .attr("role", "alert")
                         .into(),
-                    Load::Ready(info) => view(&info),
+                    Load::Ready(info) => view(&info, &form),
                 })
             }),
         )
-        .hook(move |dom| dom.future(read_page(chain, id, follow)));
+        .hook(move |dom| dom.future(read_page(chain, id, follow, watched)));
     Page {
         top: None,
         body: body.into(),
@@ -182,7 +186,19 @@ fn loading() -> View {
         .into()
 }
 
-async fn read_page(chain: Chain, id: u64, load: Mutable<Load>) {
+/// The page's form, made on its first read and kept from then on.
+type Kept = Rc<std::cell::OnceCell<Rc<Form>>>;
+
+/// Whether the page's form has a flow under way: the wallet asked, or a
+/// transaction on its way.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn live(form: &Kept) -> bool {
+    form.get()
+        .and_then(|form| form.running.get_cloned())
+        .is_some_and(|running| running.is_live())
+}
+
+async fn read_page(chain: Chain, id: u64, load: Mutable<Load>, form: Kept) {
     #[cfg(target_arch = "wasm32")]
     {
         use crate::tx::author::read;
@@ -192,9 +208,7 @@ async fn read_page(chain: Chain, id: u64, load: Mutable<Load>) {
 
         let session = crate::wallet::get();
         loop {
-            let (Some(network), Some(platform)) =
-                (session.network(chain).await, run::platform(chain).await)
-            else {
+            let (Some(network), Some(platform)) = run::platform(chain).await.unzip() else {
                 load.set(Load::Failed(format!(
                     "{} isn't reachable from the app right now. Reload to try again.",
                     chain.label()
@@ -247,22 +261,25 @@ async fn read_page(chain: Chain, id: u64, load: Mutable<Load>) {
                 terms,
                 restricted,
             })));
-            // Read again once the chain's settings change: the form is then
-            // drawn, and the activation computed, with the network it would
-            // sign with.
-            while session
-                .networks
-                .lock_ref()
-                .get(&chain)
-                .map(|network| network.config)
-                == Some(config)
+            // Read again once the chain's settings change: the form (kept,
+            // with what was typed) is then drawn, and the activation
+            // computed, with the network it would sign with. Never while a
+            // flow is under way: its status stays, and it can't be started
+            // twice.
+            while live(&form)
+                || session
+                    .networks
+                    .lock_ref()
+                    .get(&chain)
+                    .map(|network| network.config)
+                    == Some(config)
             {
                 gloo_timers::future::TimeoutFuture::new(1_000).await;
             }
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
-    let _ = (chain, id, load);
+    let _ = (chain, id, load, form);
 }
 
 /// Why the strategy can't be activated by this page, if it can't.
@@ -402,13 +419,15 @@ fn already_active(info: &Rc<Info>) -> View {
         .into()
 }
 
-fn view(info: &Rc<Info>) -> View {
-    if info.readiness.vault.is_some() {
+fn view(info: &Rc<Info>, kept: &Kept) -> View {
+    let decimals = info.network.asset_decimals;
+    let form = kept.get_or_init(|| Rc::new(Form::new(decimals))).clone();
+    // A flow under way (or ended, and not left) stays in view, whatever
+    // the chain now says about the vault.
+    if info.readiness.vault.is_some() && form.running.lock_ref().is_none() {
         return already_active(info);
     }
     let names = Rc::new(Names::of(&info.network));
-    let decimals = info.network.asset_decimals;
-    let form = Rc::new(Form::new(decimals));
     let can_activate = blocker(info).is_none();
     let head = head(
         info,
@@ -503,7 +522,8 @@ async fn follow_costs(info: Rc<Info>, form: Rc<Form>) {
         use crate::wallet::session::Session;
         let session = crate::wallet::get();
         let reader = Session::reader(&info.network);
-        let Some(platform) = run::platform(info.chain).await else {
+        // The contracts of the config this page was read with.
+        let Some(platform) = run::platform_of(&info.network) else {
             return;
         };
         let decimals = info.network.asset_decimals;
@@ -1053,4 +1073,94 @@ fn start(info: &Rc<Info>, form: &Rc<Form>) {
         &running,
         |_| {},
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::{Address, B256};
+
+    use super::*;
+    use crate::tx::author::read::{Readiness, Terms};
+    use crate::wallet::config_cache::ConfigId;
+
+    /// The page as read with the network of config `config`, `decimals`
+    /// decimals; `active` once its vault exists.
+    fn info(config: u8, decimals: u8, active: bool) -> Rc<Info> {
+        Rc::new(Info {
+            chain: Chain::Base,
+            id: 7,
+            title: Some("Funding basis".to_string()),
+            network: Rc::new(Network {
+                chain: Chain::Base,
+                chain_id: 84_532,
+                label: "Base Sepolia".to_string(),
+                rpc: String::new(),
+                asset: Address::repeat_byte(config),
+                asset_symbol: "USDC".to_string(),
+                asset_decimals: decimals,
+                dev_account: None,
+                config: ConfigId(B256::repeat_byte(config)),
+            }),
+            readiness: Readiness {
+                author: Address::repeat_byte(0x42),
+                registered: true,
+                reviewed: true,
+                vault: active.then(|| Address::repeat_byte(0x5f)),
+                other_chains: Vec::new(),
+            },
+            terms: Terms {
+                hash: B256::repeat_byte(config),
+                minimum_tank: U256::from(10u8),
+                minimum_deposit: U256::from(10u8),
+                author_bps: 1000,
+                activation_window: 0,
+                floor_delay: 0,
+                wind_down: 0,
+            },
+            restricted: String::new(),
+        })
+    }
+
+    #[test]
+    fn a_config_change_never_hides_or_restarts_an_activation_under_way() {
+        let kept = Kept::default();
+        let _ = view(&info(1, 6, false), &kept).html();
+        let form = kept
+            .get()
+            .expect("the form, made on the first read")
+            .clone();
+        form.tank.set("250".to_string());
+        // The author starts it: the flow is under way.
+        let running = Running::new();
+        running.step.set(Some(Step::Checking));
+        form.running.set(Some(running.clone()));
+        assert!(live(&kept), "the page reads nothing again while it runs");
+        // The chain's settings change and the page is drawn again: the same
+        // form, what was typed, and the flow under way, shown.
+        let again = info(2, 18, false);
+        let html = view(&again, &kept).html();
+        assert!(Rc::ptr_eq(kept.get().unwrap(), &form));
+        assert_eq!(form.tank.get_cloned(), "250");
+        assert!(html.contains("sh-activate__total"), "{html}");
+        // "Activate agent" starts nothing while it runs.
+        start(&again, &form);
+        assert!(matches!(
+            form.running
+                .get_cloned()
+                .and_then(|now| now.step.get_cloned()),
+            Some(Step::Checking)
+        ));
+        // Drawn with a vault that now exists, the form and its flow stay
+        // rather than the page for an agent already active.
+        let html = view(&info(2, 18, true), &kept).html();
+        assert!(!html.contains("nothing left to activate"), "{html}");
+        assert!(html.contains("sh-activate__total"), "{html}");
+        let fresh = view(&info(2, 18, true), &Kept::default()).html();
+        assert!(fresh.contains("nothing left to activate"), "{fresh}");
+        // Once it has ended, the page may read again.
+        running.step.set(Some(Step::Failed(
+            crate::tx::TxError::SettingsChanged.into(),
+        )));
+        assert!(!live(&kept));
+    }
 }

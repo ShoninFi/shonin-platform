@@ -85,6 +85,14 @@ async fn follow(slug: String, loaded: Mutable<Option<Result<Read, String>>>) {
 
         let session = crate::wallet::solana::get();
         loop {
+            // Read again when a flow lands, the account changes or the
+            // cluster's settings change, counting from before this read: the
+            // controls are then drawn with the cluster a send would sign with.
+            let seen = (
+                session.changed.get(),
+                session.account(),
+                session.config_id(),
+            );
             let result = match (
                 crate::tx::solana::run::vault_of(&slug),
                 session.load_network().await,
@@ -110,14 +118,6 @@ async fn follow(slug: String, loaded: Mutable<Option<Result<Read, String>>>) {
                 _ => Err("The Solana cluster can’t be reached right now.".to_string()),
             };
             loaded.set(Some(result));
-            // Read again when a flow lands, the account changes or the
-            // cluster's settings change: the controls are then drawn with
-            // the cluster a send would sign with.
-            let seen = (
-                session.changed.get(),
-                session.account(),
-                session.config_id(),
-            );
             for _ in 0..10 {
                 gloo_timers::future::TimeoutFuture::new(1_000).await;
                 if (
@@ -172,9 +172,11 @@ fn act(
     kind: Kind,
     make: impl Fn() -> Result<SolAction, String> + 'static,
 ) -> El {
-    let running: Mutable<Option<SolRunning>> = Mutable::new(None);
-    let refused: Mutable<Option<String>> = Mutable::new(None);
     let address = read.vault.address;
+    // Kept across reads: a flow under way stays shown, never offered again.
+    let running =
+        crate::tx::solana::run::card_slot(crate::wallet::solana::get().account(), &address, label);
+    let refused: Mutable<Option<String>> = Mutable::new(None);
     let reviewed = read.network.clone();
     let network = Some(read.network.clone());
     let make = Rc::new(make);

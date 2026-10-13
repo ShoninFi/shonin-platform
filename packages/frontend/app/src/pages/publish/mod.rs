@@ -1069,6 +1069,7 @@ fn pay_body(
         Some((chain, Some(network))) => {
             let names = Rc::new(Names::of(&network));
             let read_fee = fee.clone();
+            let fee_network = network.clone();
             let fee_names = names.clone();
             let gate_draft = draft.clone();
             let gate_names = names.clone();
@@ -1174,7 +1175,9 @@ fn pay_body(
                     )
                     .hook(move |dom| {
                         dom.future(async move {
-                            if let Some(amount) = crate::tx::author::run::fee(chain).await {
+                            // From the contracts of the config this payment
+                            // is shown and paid with.
+                            if let Some(amount) = crate::tx::author::run::fee(&fee_network).await {
                                 read_fee.set(Some(fee_names.tokens(amount)));
                             }
                         })

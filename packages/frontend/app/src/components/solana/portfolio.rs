@@ -131,7 +131,15 @@ async fn follow(
         // that keeps not answering is said to.
         let mut failures = 0u32;
         loop {
-            let account = session.account();
+            // Read again when a flow lands, the account changes or the
+            // cluster's settings change, counting from before this read: every
+            // card is then drawn with the cluster a send would sign with.
+            let seen = (
+                session.changed.get(),
+                session.account(),
+                session.config_id(),
+            );
+            let account = seen.1;
             match account {
                 Some(account) => match read(account).await {
                     Some(read) if session.account() == Some(account) => {
@@ -153,14 +161,6 @@ async fn follow(
                     failing.set_neq(false);
                 }
             }
-            // Read again when a flow lands, the account changes or the
-            // cluster's settings change: every card is then drawn with the
-            // cluster a send would sign with.
-            let seen = (
-                session.changed.get(),
-                session.account(),
-                session.config_id(),
-            );
             let wait = if failures > 0 { 5 } else { 15 };
             for _ in 0..wait {
                 gloo_timers::future::TimeoutFuture::new(1_000).await;
@@ -714,8 +714,13 @@ fn act(
     label: &'static str,
     kind: Kind,
 ) -> El {
-    let running: Mutable<Option<SolRunning>> = Mutable::new(None);
     let session = crate::wallet::solana::get();
+    // Kept across reads: a flow under way stays shown, never offered again.
+    let running = crate::tx::solana::run::card_slot(
+        session.account(),
+        &vault.address,
+        &format!("{action:?}"),
+    );
     let vault = vault.clone();
     el("div").class("sh-act").child_signal(
         None,
@@ -971,6 +976,9 @@ async fn follow_claim(slug: String, id: u64, loaded: Mutable<Option<Result<Claim
 
         let session = crate::wallet::solana::get();
         loop {
+            // Counting from before this read: a change while it runs reads
+            // again at once.
+            let seen = (session.changed.get(), session.config_id());
             let vault = crate::tx::solana::run::vault_of(&slug);
             let result = match (vault, session.load_network().await) {
                 (Some(vault), Some(network)) => {
@@ -1036,7 +1044,6 @@ async fn follow_claim(slug: String, id: u64, loaded: Mutable<Option<Result<Claim
                 (_, None) => Err("The Solana cluster can’t be reached right now.".to_string()),
             };
             loaded.set(Some(result));
-            let seen = (session.changed.get(), session.config_id());
             for _ in 0..10 {
                 gloo_timers::future::TimeoutFuture::new(1_000).await;
                 if (session.changed.get(), session.config_id()) != seen {

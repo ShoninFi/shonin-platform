@@ -91,6 +91,10 @@ pub struct Session {
     /// Each chain's config as the API wrote it, and where the page's copy
     /// came from: only a fetched copy is ever used to sign.
     configs: RefCell<BTreeMap<Chain, Rc<ConfigSlot>>>,
+    /// Every config text the page has read a network from, by its id: what
+    /// the page reads beside a network (the platform's contracts) comes from
+    /// the very config that network came from.
+    texts: RefCell<BTreeMap<ConfigId, Rc<str>>>,
     /// Whether the API has been asked for every chain's config once.
     pub networks_tried: Mutable<bool>,
     /// Every vault by slug, from the latest snapshot this session read.
@@ -115,6 +119,7 @@ thread_local! {
         wallet_name: Mutable::new(String::new()),
         networks: Mutable::new(BTreeMap::new()),
         configs: RefCell::new(BTreeMap::new()),
+        texts: RefCell::new(BTreeMap::new()),
         networks_tried: Mutable::new(false),
         vaults: Mutable::new(BTreeMap::new()),
         changed: Mutable::new(0),
@@ -270,6 +275,12 @@ impl Session {
             .map(|held| held.raw)
     }
 
+    /// The config text `network` was read from, remembered or fetched:
+    /// good for reading beside it. A send takes [`Session::config_text`].
+    pub fn text_of(&self, network: &Network) -> Option<Rc<str>> {
+        self.texts.borrow().get(&network.config).cloned()
+    }
+
     fn slot(&self, chain: Chain) -> Rc<ConfigSlot> {
         self.configs.borrow_mut().entry(chain).or_default().clone()
     }
@@ -278,6 +289,10 @@ impl Session {
     /// one this build can use. Redraws only when it changed.
     fn adopt(&self, chain: Chain, raw: &str) -> Option<Rc<Network>> {
         let network = Rc::new(parse_network(raw)?);
+        self.texts
+            .borrow_mut()
+            .entry(network.config)
+            .or_insert_with(|| raw.into());
         if self.networks.lock_ref().get(&chain).map(|held| &**held) != Some(&*network) {
             self.networks.lock_mut().insert(chain, network.clone());
         }

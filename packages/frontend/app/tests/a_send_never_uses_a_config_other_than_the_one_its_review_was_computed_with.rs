@@ -25,16 +25,28 @@ async fn down() -> Result<String, String> {
 /// A Base Sepolia config as the API writes it, with its dollar at
 /// `0x{usd}…` and `decimals` decimals, in the form the page holds it.
 fn base(decimals: u8, usd: u8) -> String {
+    base_at(decimals, usd, 1, [2026, 286, 8, 18, 18, 0])
+}
+
+/// The same, read at the chain's head `block`/`as_of`.
+fn base_at(decimals: u8, usd: u8, block: u64, as_of: [u32; 6]) -> String {
+    deployed(decimals, usd, 1, block, as_of)
+}
+
+/// The same, its platform's contracts at `0x{platform}…`, `0x{platform}+1…`
+/// and so on.
+fn deployed(decimals: u8, usd: u8, platform: u8, block: u64, as_of: [u32; 6]) -> String {
     let address = |byte: u8| format!("{:?}", alloy_primitives::Address::repeat_byte(byte));
+    let at = |n: u8| address(platform.wrapping_add(n));
     canonical(
         &serde_json::json!({
-            "chain": {"chain": "base", "key": "evm:84532", "chain_id": 84532, "block": 1, "as_of": [2026, 286, 8, 18, 18, 0]},
+            "chain": {"chain": "base", "key": "evm:84532", "chain_id": 84532, "block": block, "as_of": as_of},
             "rpc_url": "https://sepolia.base.org",
             "addresses": {
-                "usd": address(usd), "publishing": address(1), "prices": address(2),
-                "venue": address(3), "attestation": address(4), "strategies": address(5),
-                "reviews": address(6), "profiles": address(7), "factory": address(8),
-                "station_factory": address(9),
+                "usd": address(usd), "publishing": at(0), "prices": at(1),
+                "venue": at(2), "attestation": at(3), "strategies": at(4),
+                "reviews": at(5), "profiles": at(6), "factory": at(7),
+                "station_factory": at(8),
             },
             "asset_symbol": "USDC",
             "asset_decimals": decimals,
@@ -54,10 +66,15 @@ fn base(decimals: u8, usd: u8) -> String {
 /// A devnet config naming this build's programs, its dollar `mint` with
 /// `decimals` decimals, in the form the page holds it.
 fn devnet(decimals: u8, mint: u8) -> String {
+    devnet_at(decimals, mint, 510_561_479, [2026, 286, 8, 14, 18, 0])
+}
+
+/// The same, read at the cluster's head `block`/`as_of`.
+fn devnet_at(decimals: u8, mint: u8, block: u64, as_of: [u32; 6]) -> String {
     use chain::solana_ix::{Pubkey, ids};
     canonical(
         &serde_json::json!({
-            "chain": {"chain": "solana", "key": "solana:devnet", "block": 510561479, "as_of": [2026, 286, 8, 14, 18, 0]},
+            "chain": {"chain": "solana", "key": "solana:devnet", "block": block, "as_of": as_of},
             "rpc_url": "https://api.devnet.solana.com",
             "addresses": {
                 "cluster": "devnet",
@@ -289,4 +306,193 @@ fn a_solana_send_stops_before_the_wallet_unless_the_cluster_is_the_one_its_revie
     // And once more with nothing changed: the same cluster.
     let signed = block_on(session.network_to_sign_with(again.config, down)).unwrap();
     assert_eq!(*signed, *again);
+}
+
+/// What the exit panels do on "Try again" after the settings changed: the
+/// amount the flow carried, written out in the reviewed network's units,
+/// read again by the review with the new network's decimals.
+fn rescaled(
+    amount: alloy_primitives::U256,
+    from: u8,
+    to: u8,
+) -> Result<alloy_primitives::U256, app::money::AmountError> {
+    app::money::parse_units(&app::money::format::plain_exact(amount, from), to)
+}
+
+#[test]
+fn trying_again_rescales_the_typed_amount_exactly_or_refuses_it_never_truncates() {
+    use alloy_primitives::U256;
+    use app::money::AmountError;
+    use app::money::units::pow10;
+    let amounts = [
+        U256::from(1u8),
+        U256::from(11_000_000u64),
+        U256::from(10_000_001u64),
+        U256::from(812_409_999u64),
+        U256::from(u64::MAX),
+        U256::from(123_456_789_012_345_678_901_234_567_890u128),
+    ];
+    for amount in amounts {
+        for from in [0u8, 2, 6, 9, 18] {
+            for to in [0u8, 2, 6, 9, 18] {
+                let got = rescaled(amount, from, to);
+                if to >= from {
+                    // More decimals: the same dollars, scaled up exactly.
+                    assert_eq!(got, Ok(amount * pow10(to - from)), "{amount} {from}->{to}");
+                } else {
+                    // Fewer: exact when no digit falls past them, else
+                    // refused as the form says; never truncated or rounded.
+                    let step = pow10(from - to);
+                    if (amount % step).is_zero() {
+                        assert_eq!(got, Ok(amount / step), "{amount} {from}->{to}");
+                    } else {
+                        assert_eq!(
+                            got,
+                            Err(AmountError::TooManyDecimals { allowed: to }),
+                            "{amount} {from}->{to}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // Past 256 bits: refused, never wrapped.
+    assert_eq!(rescaled(U256::MAX, 0, 1), Err(AmountError::TooLarge));
+    // A Solana deposit past a u64 after the rescale is refused by the
+    // panel's check, never sent as its low bits.
+    let scaled = rescaled(U256::from(u64::MAX), 6, 9).unwrap();
+    assert!(u64::try_from(scaled).is_err());
+}
+
+#[test]
+fn a_settings_change_is_a_stop_before_anything_was_sent() {
+    assert!(!TxError::SettingsChanged.may_have_moved());
+    assert!(!SolError::SettingsChanged.may_have_moved());
+    assert_eq!(TxError::SettingsChanged.hash(), None);
+    assert_eq!(SolError::SettingsChanged.signature(), None);
+}
+
+#[test]
+fn a_config_that_differs_only_in_the_chains_head_is_the_same_config_and_stops_nothing() {
+    use app::wallet::config_cache::ConfigId;
+    let at_one = base_at(6, 0xe2, 1, [2026, 286, 8, 18, 18, 0]);
+    let at_later = base_at(6, 0xe2, 48_055_999, [2026, 287, 1, 2, 3, 4]);
+    assert_eq!(ConfigId::of(&at_one), ConfigId::of(&at_later));
+    // Key order and whitespace, as the page canonicalises them: the same.
+    let value: serde_json::Value = serde_json::from_str(&at_one).unwrap();
+    let pretty = serde_json::to_string_pretty(&value).unwrap();
+    assert_ne!(pretty, at_one);
+    assert_eq!(
+        ConfigId::of(&canonical(&pretty).unwrap()),
+        ConfigId::of(&at_one)
+    );
+    // Any other byte: another config.
+    assert_ne!(ConfigId::of(&at_one), ConfigId::of(&base(6, 0xe3)));
+    assert_ne!(ConfigId::of(&at_one), ConfigId::of(&base(18, 0xe2)));
+    // EVM, the later head answered at send time or landed first.
+    for landed_first in [false, true] {
+        on_a_fresh_page(move || {
+            let session = app::wallet::get();
+            session.remember(Chain::Base, &base_at(6, 0xe2, 1, [2026, 286, 8, 18, 18, 0]));
+            let reviewed = session.networks.lock_ref()[&Chain::Base].clone();
+            let later = base_at(6, 0xe2, 48_055_999, [2026, 287, 1, 2, 3, 4]);
+            let signed = if landed_first {
+                assert!(
+                    block_on(session.refresh_with(Chain::Base, || async move { Ok(later) }))
+                        .is_some()
+                );
+                block_on(session.network_to_sign_with(Chain::Base, reviewed.config, down))
+            } else {
+                block_on(session.network_to_sign_with(
+                    Chain::Base,
+                    reviewed.config,
+                    || async move { Ok(later) },
+                ))
+            };
+            assert_eq!(*signed.unwrap(), *reviewed);
+        });
+    }
+    // Solana, both orders.
+    for landed_first in [false, true] {
+        on_a_fresh_page(move || {
+            let session = app::wallet::solana::get();
+            session.remember(&devnet_at(6, 7, 510_561_479, [2026, 286, 8, 14, 18, 0]));
+            let reviewed = session.network.get_cloned().unwrap();
+            let later = devnet_at(6, 7, 510_999_999, [2026, 287, 0, 0, 0, 1]);
+            let signed = if landed_first {
+                assert!(block_on(session.refresh_with(|| async move { Ok(later) })).is_some());
+                block_on(session.network_to_sign_with(reviewed.config, down))
+            } else {
+                block_on(session.network_to_sign_with(reviewed.config, || async move { Ok(later) }))
+            };
+            assert_eq!(*signed.unwrap(), *reviewed);
+        });
+    }
+}
+
+#[test]
+fn the_platform_a_page_reads_is_the_one_named_by_the_config_its_network_came_from() {
+    use alloy_primitives::Address;
+    use app::tx::author::run::platform_of;
+    let session = app::wallet::get();
+    // Deployment A, remembered: the page reads A's network and A's
+    // contracts with it.
+    session.remember(
+        Chain::Base,
+        &deployed(6, 0xe2, 0x10, 1, [2026, 286, 8, 18, 18, 0]),
+    );
+    let a = session.networks.lock_ref()[&Chain::Base].clone();
+    let platform = platform_of(&a).expect("the contracts of the config read");
+    assert_eq!(platform.publishing, Address::repeat_byte(0x10));
+    assert_eq!(platform.registries.factory, Address::repeat_byte(0x17));
+    assert_eq!(platform.usd, a.asset);
+    // A redeploy lands: the page now reads B's network, and B's contracts
+    // with it, at once and without a reload.
+    let b = deployed(6, 0xe2, 0x40, 1, [2026, 286, 8, 18, 18, 0]);
+    assert!(block_on(session.refresh_with(Chain::Base, || async move { Ok(b) })).is_some());
+    let b = session.networks.lock_ref()[&Chain::Base].clone();
+    assert_ne!(b.config, a.config);
+    let platform = platform_of(&b).unwrap();
+    assert_eq!(platform.publishing, Address::repeat_byte(0x40));
+    assert_eq!(platform.registries.factory, Address::repeat_byte(0x47));
+    // What was drawn with A still reads A's: a review and its figures
+    // never mix two deployments.
+    assert_eq!(
+        platform_of(&a).unwrap().publishing,
+        Address::repeat_byte(0x10)
+    );
+    // And a flow started from B signs with B's very text.
+    let signed = block_on(session.network_to_sign_with(Chain::Base, b.config, down)).unwrap();
+    assert_eq!(
+        session.config_text(Chain::Base, &signed).as_deref(),
+        session.text_of(&b).as_deref()
+    );
+}
+
+#[test]
+fn a_card_drawn_again_shows_its_flow_under_way_rather_than_offering_it_again() {
+    use app::tx::solana::run::card_slot;
+    use chain::solana_ix::Pubkey;
+    let account = Some(Pubkey::new_from_array([3; 32]));
+    let vault = Pubkey::new_from_array([4; 32]);
+    let session = app::wallet::solana::get();
+    session.remember(&devnet(6, 7));
+    let cluster = session.network.get_cloned().unwrap();
+    // The card starts a flow.
+    let shown = card_slot(account, &vault, "Collect");
+    shown.set(Some(app::tx::solana::SolRunning::new(cluster)));
+    // The page reads again (the cluster's settings changed): the card drawn
+    // anew finds the same flow.
+    assert!(card_slot(account, &vault, "Collect").lock_ref().is_some());
+    // Another account, vault or action has its own.
+    assert!(card_slot(None, &vault, "Collect").lock_ref().is_none());
+    assert!(
+        card_slot(account, &Pubkey::new_from_array([5; 32]), "Collect")
+            .lock_ref()
+            .is_none()
+    );
+    assert!(card_slot(account, &vault, "Settle").lock_ref().is_none());
+    // Dismissed, it is gone for every drawing.
+    shown.set(None);
+    assert!(card_slot(account, &vault, "Collect").lock_ref().is_none());
 }

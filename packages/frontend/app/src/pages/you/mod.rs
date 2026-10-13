@@ -311,11 +311,8 @@ async fn read(slug: &str, account: Address) -> Result<Option<Read>, String> {
         .address
         .parse()
         .map_err(|_| "This agent's vault isn't an address this app can act on.".to_string())?;
-    let session = crate::wallet::get();
-    let (Some(network), Some(platform)) = (
-        session.network(chain).await,
-        crate::tx::author::run::platform(chain).await,
-    ) else {
+    let (Some(network), Some(platform)) = crate::tx::author::run::platform(chain).await.unzip()
+    else {
         return Err(format!(
             "{} isn't reachable from the app right now.",
             chain.label()

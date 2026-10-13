@@ -262,7 +262,7 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
 
 /// Read and review with `network` from now on. One read from another
 /// config than the panel's drops the figures and holdings read through the
-/// old one, so nothing is shown or reviewed with a mix of the two: the panel
+/// old one, and the review's acknowledgement, so nothing is shown or reviewed with a mix of the two: the panel
 /// waits for them to be read again, then draws its form or review anew.
 fn take_network(panel: &Panel, network: Rc<Network>) {
     let before = panel.network.get_cloned();
@@ -272,6 +272,12 @@ fn take_network(panel: &Panel, network: Rc<Network>) {
     if before.is_some_and(|before| before.config != network.config) {
         panel.figures.set(None);
         panel.holdings.set(None);
+        // An acknowledgement was of the review the person saw; the one
+        // drawn for the new config is acknowledged anew. The vault's list
+        // stays: it is the vault's own, read again through the new network
+        // before the figures that reopen the review, and a deposit stops if
+        // the list it carries isn't the vault's when it is signed.
+        panel.ack.set(false);
     }
     panel.network.set(Some(network));
 }
@@ -3053,6 +3059,7 @@ mod tests {
     fn a_config_read_after_the_panel_opened_drops_the_figures_read_through_the_old_one() {
         let panel = Rc::new(Panel::new("base-4", Tab::Deposit, false));
         take_network(&panel, Rc::new(network()));
+        panel.ack.set(true);
         panel.figures.set(Some(VaultFigures {
             state: State::Open,
             fees: Default::default(),
@@ -3068,12 +3075,14 @@ mod tests {
         take_network(&panel, Rc::new(network()));
         assert!(panel.figures.lock_ref().is_some());
         assert!(panel.holdings.lock_ref().is_some());
+        assert!(panel.ack.get());
         // Another config: the panel reads and reviews with it, and waits
         // for figures read through it.
         take_network(&panel, Rc::new(updated()));
         assert_eq!(panel.network.get_cloned().as_deref(), Some(&updated()));
         assert!(panel.figures.lock_ref().is_none());
         assert!(panel.holdings.lock_ref().is_none());
+        assert!(!panel.ack.get(), "the new review is acknowledged anew");
         assert!(reads_with(&panel, updated().config));
         assert!(!reads_with(&panel, network().config));
         // The review is drawn anew for the new config.

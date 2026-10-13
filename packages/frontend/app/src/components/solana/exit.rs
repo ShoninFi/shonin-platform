@@ -214,7 +214,7 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
 
 /// Read and review with `network` from now on. One read from another
 /// config than the panel's drops the figures and holdings read through the
-/// old one, so nothing is shown or reviewed with a mix of the two: the panel
+/// old one, and the review's acknowledgement, so nothing is shown or reviewed with a mix of the two: the panel
 /// waits for them to be read again, then draws its form or review anew.
 fn take_network(panel: &Panel, network: Rc<SolNetwork>) {
     let before = panel.network.get_cloned();
@@ -224,6 +224,12 @@ fn take_network(panel: &Panel, network: Rc<SolNetwork>) {
     if before.is_some_and(|before| before.config != network.config) {
         panel.figures.set(None);
         panel.holdings.set(None);
+        // An acknowledgement was of the review the person saw; the one
+        // drawn for the new config is acknowledged anew. The vault's list
+        // stays: it is the vault's own, read again through the new network
+        // before the figures that reopen the review, and a deposit stops if
+        // the list it carries isn't the vault's when it is signed.
+        panel.ack.set(false);
     }
     panel.network.set(Some(network));
 }

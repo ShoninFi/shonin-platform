@@ -181,6 +181,29 @@ impl SolRunning {
     }
 }
 
+/// Where a card shows the flow it started, kept for the page's life by the
+/// connected account, the vault and what the card does: a card drawn again
+/// (its page reading again, the cluster's settings changing) shows the flow
+/// under way rather than offering to start it a second time.
+pub fn card_slot(
+    account: Option<Pubkey>,
+    vault: &Pubkey,
+    what: &str,
+) -> Mutable<Option<SolRunning>> {
+    thread_local! {
+        static CARDS: std::cell::RefCell<std::collections::BTreeMap<String, Mutable<Option<SolRunning>>>> =
+            const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+    }
+    let key = format!("{account:?}|{vault}|{what}");
+    CARDS.with(|cards| {
+        cards
+            .borrow_mut()
+            .entry(key)
+            .or_insert_with(|| Mutable::new(None))
+            .clone()
+    })
+}
+
 /// Start `action` on the vault at `vault`, reporting into `running`.
 #[cfg(target_arch = "wasm32")]
 pub fn start(vault: Pubkey, action: SolAction, running: &SolRunning) {
