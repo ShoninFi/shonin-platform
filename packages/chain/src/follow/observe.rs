@@ -3,17 +3,17 @@
 
 use std::collections::BTreeMap;
 use std::ops::Range;
-use std::time::Duration;
 
 use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::network::TransactionBuilder;
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::{DynProvider, Provider};
 use alloy::rpc::types::TransactionRequest;
 use anyhow::{Result, anyhow, bail};
+use tokio::time::Instant;
 
-use super::capabilities::{self, BlockSource, CallError, header};
-use super::multicall::{Batch, IArbSys};
+use super::capabilities::{self, BlockSource, CallError, Capabilities, header};
+use super::multicall::Batch;
 use super::view_reads::{self, Answer, Call, Outcome};
 use super::{At, Follower, Header, Item, Observed, Path, Plan, Read, wall_ms};
 
@@ -37,6 +37,10 @@ pub(super) enum Failure {
     Unsupported(anyhow::Error),
     /// The answer was refused as too big: asked again, smaller.
     TooBig,
+    /// The call as a whole ran out of gas.
+    OutOfGas,
+    /// Fewer reads a call were learned: asked again.
+    Fewer,
 }
 
 impl From<CallError> for Failure {
@@ -220,32 +224,45 @@ impl Follower {
         bail!("no endpoint gave an observation ({})", failures.join("; "))
     }
 
-    /// Observe `plan` at `at` on `endpoint` alone.
+    /// Observe `plan` at `at` on `endpoint` alone, within `read_budget_ms`
+    /// whatever the endpoint does: the wait for a check of what it can do
+    /// (`ready`), the paths, and a second try when reads of
+    /// their own were found to need a hash pin, all share that one budget.
     pub async fn observe_on(&mut self, endpoint: usize, plan: &Plan, at: At) -> Result<Observed> {
         plan.check()?;
         if endpoint >= self.endpoints.len() {
             bail!("there is no endpoint {}", endpoint + 1);
         }
-        self.prepare(endpoint).await;
-        let mut result = self.timed(endpoint, plan, at).await;
+        let deadline = Instant::now() + self.budget();
+        self.ready(endpoint, deadline).await;
+        let mut result = self.timed(endpoint, plan, at, deadline).await;
         // Reads that need a read of their own wait for the endpoint to be
-        // shown to honour hash pins, which is asked once, outside the
-        // budget, and the observation made again.
-        let capabilities = &self.capabilities[endpoint];
-        if result.is_err() && capabilities.wants_hash_pin && capabilities.hash_pin.is_none() {
-            self.hash_pin(endpoint).await;
-            result = self.timed(endpoint, plan, at).await;
+        // shown to honour hash pins: asked now, and the observation made
+        // again if that is known within the budget.
+        if result.is_err() {
+            let known = self.known(endpoint);
+            if known.wants_hash_pin && known.hash_pin.is_none() {
+                self.ready(endpoint, deadline).await;
+                if self.known(endpoint).hash_pin == Some(true) {
+                    result = self.timed(endpoint, plan, at, deadline).await;
+                }
+            }
         }
         if result.is_err() {
-            self.capabilities[endpoint].failed_at = Some(tokio::time::Instant::now());
+            self.learn(endpoint, |known| known.failed_at = Some(Instant::now()));
         }
         result
     }
 
-    /// The paths, within the read budget.
-    async fn timed(&mut self, endpoint: usize, plan: &Plan, at: At) -> Result<Observed> {
-        let budget = Duration::from_millis(self.policy.read_budget_ms);
-        tokio::time::timeout(budget, self.paths(endpoint, plan, at))
+    /// The paths, until `deadline`.
+    async fn timed(
+        &mut self,
+        endpoint: usize,
+        plan: &Plan,
+        at: At,
+        deadline: Instant,
+    ) -> Result<Observed> {
+        tokio::time::timeout_at(deadline, self.paths(endpoint, plan, at))
             .await
             .unwrap_or_else(|_| {
                 Err(anyhow!(
@@ -255,130 +272,63 @@ impl Follower {
             })
     }
 
-    /// Ask the endpoint's capabilities when they are due, and the ones the
-    /// paths it will need depend on; outside the read budget, so a slow
-    /// check is never cut off half way and asked again forever.
-    async fn prepare(&mut self, endpoint: usize) {
-        self.probe(endpoint).await;
-        let capabilities = &self.capabilities[endpoint];
-        let helper = capabilities.overrides == Some(true) && capabilities.source.is_some();
-        if !helper || capabilities.wants_hash_pin {
-            self.source(endpoint).await;
-            if !helper && self.multicall3(endpoint).await {
+    /// Start a check of what `endpoint` can do (`capabilities::check`)
+    /// when one is due, or when the paths need something not known yet and
+    /// no check of it failed lately; never two at once. Wait for a running
+    /// check, until `deadline`, only while the paths need what it is finding
+    /// out: a recheck of what is known runs on while observations use it.
+    /// A check the deadline cuts short goes on, and what it finds is there
+    /// for the next observation.
+    pub(super) async fn ready(&mut self, endpoint: usize, deadline: Instant) {
+        // Twice at most: a check that ended may have found that the paths
+        // need one more thing (Multicall3 where overrides are refused).
+        for _ in 0..2 {
+            if self.checks[endpoint]
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                self.checks[endpoint] = None;
+            }
+            let known = self.known(endpoint);
+            if self.checks[endpoint].is_none() {
+                if !known.due() && !(known.missing() && !known.check_failed_lately()) {
+                    return;
+                }
+                self.checks[endpoint] = Some(tokio::spawn(capabilities::check(
+                    self.endpoints[endpoint].clone(),
+                    self.capabilities[endpoint].clone(),
+                    self.policy.view_outer_gas,
+                    self.options.multicall3,
+                    self.options.multicall3_code_hash,
+                )));
+            }
+            if !known.missing() {
                 return;
             }
-            self.hash_pin(endpoint).await;
+            let Some(check) = self.checks[endpoint].as_mut() else {
+                return;
+            };
+            if tokio::time::timeout_at(deadline, check).await.is_err() {
+                return;
+            }
+            self.checks[endpoint] = None;
         }
     }
 
-    /// Whether the helper runs here, and with which block source, asked
-    /// when due ([`Capabilities::due`]).
-    pub(super) async fn probe(&mut self, endpoint: usize) {
-        if !self.capabilities[endpoint].due() {
-            return;
-        }
-        let provider = self.endpoints[endpoint].clone();
-        let capabilities = &mut self.capabilities[endpoint];
-        capabilities.reset();
-        capabilities.checked_at = Some(tokio::time::Instant::now());
-        match tokio::time::timeout(
-            capabilities::CHECK_TIMEOUT,
-            capabilities::probe_overrides(&provider, self.policy.view_outer_gas),
-        )
-        .await
-        {
-            Ok(Ok(source)) => {
-                capabilities.overrides = Some(source.is_some());
-                capabilities.source = source;
-            }
-            _ => capabilities.failed_at = Some(tokio::time::Instant::now()),
-        }
+    /// What `endpoint` is known to do, now.
+    fn known(&self, endpoint: usize) -> Capabilities {
+        capabilities::lock(&self.capabilities[endpoint]).clone()
     }
 
-    /// The block source, asked when the helper did not say: ArbSys where it
-    /// answers with a block number, the plain one otherwise.
-    async fn source(&mut self, endpoint: usize) -> Option<BlockSource> {
-        if let Some(source) = self.capabilities[endpoint].source {
-            return Some(source);
-        }
-        let provider = self.endpoints[endpoint].clone();
-        let request = TransactionRequest::default()
-            .with_to(capabilities::ARB_SYS)
-            .with_input(alloy_sol_types::SolCall::abi_encode(
-                &IArbSys::arbBlockNumberCall {},
-            ));
-        let answer =
-            tokio::time::timeout(capabilities::CHECK_TIMEOUT, provider.call(request)).await;
-        let source = match answer {
-            Ok(Ok(bytes)) if bytes.len() == 32 => BlockSource::ArbSys,
-            Ok(Ok(_)) | Ok(Err(alloy::rpc::json_rpc::RpcError::ErrorResp(_))) => BlockSource::Plain,
-            _ => {
-                self.capabilities[endpoint].failed_at = Some(tokio::time::Instant::now());
-                return None;
-            }
-        };
-        self.capabilities[endpoint].source = Some(source);
-        Some(source)
-    }
-
-    /// Whether Multicall3 is here with its known code, asked once.
-    async fn multicall3(&mut self, endpoint: usize) -> bool {
-        if let Some(present) = self.capabilities[endpoint].multicall3 {
-            return present;
-        }
-        let provider = self.endpoints[endpoint].clone();
-        match tokio::time::timeout(
-            capabilities::CHECK_TIMEOUT,
-            capabilities::probe_code(
-                &provider,
-                self.options.multicall3,
-                self.options.multicall3_code_hash,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(present)) => {
-                self.capabilities[endpoint].multicall3 = Some(present);
-                present
-            }
-            _ => {
-                self.capabilities[endpoint].failed_at = Some(tokio::time::Instant::now());
-                false
-            }
-        }
-    }
-
-    /// Whether a read pinned to a block hash is answered as of that block,
-    /// asked once ([`capabilities::probe_hash_pin`]).
-    async fn hash_pin(&mut self, endpoint: usize) -> bool {
-        if let Some(honours) = self.capabilities[endpoint].hash_pin {
-            return honours;
-        }
-        let Some(source) = self.source(endpoint).await else {
-            return false;
-        };
-        let provider = self.endpoints[endpoint].clone();
-        match tokio::time::timeout(
-            capabilities::CHECK_TIMEOUT * 2,
-            capabilities::probe_hash_pin(&provider, source),
-        )
-        .await
-        {
-            Ok(Ok(honours)) => {
-                self.capabilities[endpoint].hash_pin = Some(honours);
-                honours
-            }
-            _ => {
-                self.capabilities[endpoint].failed_at = Some(tokio::time::Instant::now());
-                false
-            }
-        }
+    /// Note something learned of `endpoint`.
+    fn learn(&self, endpoint: usize, learned: impl FnOnce(&mut Capabilities)) {
+        learned(&mut capabilities::lock(&self.capabilities[endpoint]));
     }
 
     /// The paths in order, each used only where it was shown to work here.
     async fn paths(&mut self, endpoint: usize, plan: &Plan, at: At) -> Result<Observed> {
         let mut unsupported = Vec::new();
-        let capabilities = self.capabilities[endpoint].clone();
+        let capabilities = self.known(endpoint);
         if capabilities.overrides == Some(true)
             && let Some(source) = capabilities.source
         {
@@ -391,10 +341,11 @@ impl Follower {
                         break;
                     }
                     Err(Failure::TooBig) => self.shrink(endpoint),
+                    Err(Failure::OutOfGas | Failure::Fewer) => {}
                 }
             }
         }
-        let capabilities = self.capabilities[endpoint].clone();
+        let capabilities = self.known(endpoint);
         if let Some(source) = capabilities.source {
             if capabilities.multicall3 == Some(true) {
                 for _ in 0..=SHRINKS {
@@ -406,9 +357,11 @@ impl Follower {
                             break;
                         }
                         Err(Failure::TooBig) => self.shrink(endpoint),
+                        Err(Failure::OutOfGas | Failure::Fewer) => {}
                     }
                 }
             }
+            let capabilities = self.known(endpoint);
             if capabilities.hash_pin == Some(true) {
                 match self.by_individual(endpoint, plan, at).await {
                     Ok(observed) => return Ok(observed),
@@ -418,6 +371,9 @@ impl Follower {
                     }
                     Err(Failure::TooBig) => {
                         unsupported.push("single reads: an answer was too big".into())
+                    }
+                    Err(Failure::OutOfGas | Failure::Fewer) => {
+                        unsupported.push("single reads: a read ran out of gas".into())
                     }
                 }
             }
@@ -430,15 +386,15 @@ impl Follower {
 
     /// Ask for answers half as large from now on.
     fn shrink(&mut self, endpoint: usize) {
-        let capabilities = &mut self.capabilities[endpoint];
-        let now = capabilities
-            .output_bytes
-            .unwrap_or(self.policy.view_output_bytes);
-        capabilities.output_bytes = Some((now / 2).max(32_768));
+        let largest = self.policy.view_output_bytes;
+        self.learn(endpoint, |known| {
+            let now = known.output_bytes.unwrap_or(largest);
+            known.output_bytes = Some((now / 2).max(32_768));
+        });
     }
 
     fn limits(&self, endpoint: usize) -> Limits {
-        let capabilities = &self.capabilities[endpoint];
+        let capabilities = self.known(endpoint);
         let max_reads = usize::try_from(self.policy.view_batch_reads)
             .unwrap_or(usize::MAX)
             .min(view_reads::MAX_READS)
@@ -608,7 +564,7 @@ impl Follower {
                     });
                 }
             }
-            self.take(endpoint, range.start, &answer, &mut gathered);
+            self.take(endpoint, range.start, &answer, &mut gathered, true);
         }
         let mut context = context.expect("the first call sets the block");
         if !gathered.open.is_empty() {
@@ -649,9 +605,18 @@ impl Follower {
         )
     }
 
-    /// Record a helper answer's items, from `start` in the plan, and learn
-    /// how many reads one call gets through before its gas runs low.
-    fn take(&mut self, endpoint: usize, start: usize, answer: &Answer, gathered: &mut Gathered) {
+    /// Record a helper answer's items, from `start` in the plan, and, with
+    /// `learn` (a call at the usual result cap: a larger cap reserves more
+    /// gas a read and runs fewer), learn how many reads one call gets
+    /// through before its gas runs low.
+    fn take(
+        &self,
+        endpoint: usize,
+        start: usize,
+        answer: &Answer,
+        gathered: &mut Gathered,
+        learn: bool,
+    ) {
         let mut ran = 0;
         let mut ran_low = false;
         for (offset, result) in answer.results.iter().enumerate() {
@@ -686,12 +651,12 @@ impl Follower {
                 ran += 1;
             }
         }
-        let capabilities = &mut self.capabilities[endpoint];
-        capabilities.gas_at_entry = Some(answer.gas_at_entry);
-        if ran_low {
-            let learned = capabilities.max_reads.unwrap_or(usize::MAX).min(ran.max(1));
-            capabilities.max_reads = Some(learned);
-        }
+        self.learn(endpoint, |known| {
+            known.gas_at_entry = Some(answer.gas_at_entry);
+            if ran_low && learn {
+                known.max_reads = Some(known.max_reads.unwrap_or(usize::MAX).min(ran.max(1)));
+            }
+        });
     }
 
     /// Read the open items again at `block`: those whose gas ran low as
@@ -757,7 +722,13 @@ impl Follower {
                     let before = gathered.open.len();
                     // Map the call's items back to their places in the plan.
                     let mut placed = Gathered::new(range.len());
-                    self.take(endpoint, 0, &answer, &mut placed);
+                    self.take(
+                        endpoint,
+                        0,
+                        &answer,
+                        &mut placed,
+                        result_bytes == self.limits(endpoint).result_bytes,
+                    );
                     for (offset, done) in placed.items.into_iter().enumerate() {
                         if let Some(done) = done {
                             gathered.items[indices[range.start + offset]] = Some(done);
@@ -781,8 +752,8 @@ impl Follower {
         if rest.is_empty() {
             return Ok(());
         }
-        if self.capabilities[endpoint].hash_pin != Some(true) {
-            self.capabilities[endpoint].wants_hash_pin = true;
+        if self.known(endpoint).hash_pin != Some(true) {
+            self.learn(endpoint, |known| known.wants_hash_pin = true);
             return Err(Failure::Unsupported(anyhow!(
                 "{} reads need a read of their own, and this endpoint has not been shown to honour a hash pin",
                 rest.len()
@@ -797,6 +768,17 @@ impl Follower {
 
     /// The Multicall3 path: the endpoint's header first, then every call
     /// pinned to it and accepted only if Multicall3 reports that block.
+    ///
+    /// Multicall3 gives each read all the gas left and reports a read that
+    /// ran out of it as it reports a revert with no data: an endpoint that
+    /// caps a call's gas without saying so makes a costly read fail so, while
+    /// the cheap ones after it still return. A read that failed with no data
+    /// is therefore no answer: it is read alone, pinned to the block's hash,
+    /// on an endpoint shown to honour hash pins, where running out of gas is
+    /// an error and not a revert; elsewhere the observation fails. A read
+    /// that then answers had been starved by the reads before it, so calls
+    /// here take fewer reads from then on; a call that runs out of gas as a
+    /// whole is asked again with half its reads.
     async fn by_multicall(
         &mut self,
         endpoint: usize,
@@ -818,6 +800,9 @@ impl Follower {
         )
         .map_err(Failure::Unsupported)?;
         let mut wall = 0;
+        // Reads that failed with no data: (place in the plan, place among
+        // its call's reads).
+        let mut unclear = Vec::new();
         for (index, range) in chunks.iter().enumerate() {
             let first = index == 0;
             let mut numbers = if first { window.clone() } else { Vec::new() };
@@ -834,9 +819,26 @@ impl Follower {
                 if first { &plan.balances } else { &[] },
                 &plan.reads[range.clone()],
             );
-            let parts = self
+            let parts = match self
                 .multicall_at(&provider, &batch, &block, &mut gathered)
-                .await?;
+                .await
+            {
+                Ok(parts) => parts,
+                Err(Failure::OutOfGas) if range.len() > 1 => {
+                    let fewer = range.len() / 2;
+                    self.learn(endpoint, |known| {
+                        known.max_reads = Some(known.max_reads.unwrap_or(usize::MAX).min(fewer));
+                    });
+                    return Err(Failure::Fewer);
+                }
+                Err(Failure::OutOfGas) => {
+                    return Err(Failure::Unsupported(anyhow!(
+                        "a Multicall3 call with {} reads ran out of gas",
+                        range.len()
+                    )));
+                }
+                Err(failure) => return Err(failure),
+            };
             if first {
                 wall = wall_ms();
                 for (number, hash) in &parts.hashes {
@@ -845,14 +847,37 @@ impl Follower {
                 gathered.balances = parts.balances.clone();
             }
             for (offset, result) in parts.reads.iter().enumerate() {
-                gathered.items[range.start + offset] = Some(if result.success {
-                    Item::Returned(result.returnData.clone())
+                let index = range.start + offset;
+                if result.success {
+                    gathered.items[index] = Some(Item::Returned(result.returnData.clone()));
+                } else if result.returnData.is_empty() {
+                    unclear.push((index, offset));
                 } else {
-                    Item::Reverted(result.returnData.clone())
-                });
+                    gathered.items[index] = Some(Item::Reverted(result.returnData.clone()));
+                }
             }
         }
-        gathered.observed(endpoint, Path::Multicall3, block, true, wall, None)
+        if !unclear.is_empty() {
+            if self.known(endpoint).hash_pin != Some(true) {
+                self.learn(endpoint, |known| known.wants_hash_pin = true);
+                return Err(Failure::Unsupported(anyhow!(
+                    "{} reads failed with no data in Multicall3, which reports running out of gas so too, and this endpoint has not been shown to honour a hash pin to read them alone",
+                    unclear.len()
+                )));
+            }
+            for (index, place) in unclear {
+                let alone =
+                    single_read(&provider, &plan.reads[index], &block, &mut gathered).await?;
+                if place > 0 && alone != Item::Reverted(Bytes::new()) {
+                    self.learn(endpoint, |known| {
+                        known.max_reads = Some(known.max_reads.unwrap_or(usize::MAX).min(place));
+                    });
+                }
+                gathered.items[index] = Some(alone);
+            }
+        }
+        let gas = self.known(endpoint).gas_at_entry;
+        gathered.observed(endpoint, Path::Multicall3, block, true, wall, gas)
     }
 
     /// One `aggregate3` pinned to `block`: by hash, then by number, accepted
@@ -896,6 +921,7 @@ impl Follower {
                     elsewhere = Some(parts.number);
                 }
                 Err(error) if error.too_big() => return Err(Failure::TooBig),
+                Err(error) if error.out_of_gas() => return Err(Failure::OutOfGas),
                 Err(CallError::Refused { .. }) => {}
                 Err(error) => return Err(error.into()),
             }
@@ -982,7 +1008,6 @@ async fn single_read(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::Bytes;
 
     fn reads(count: usize, size: usize) -> Vec<Read> {
         (0..count)

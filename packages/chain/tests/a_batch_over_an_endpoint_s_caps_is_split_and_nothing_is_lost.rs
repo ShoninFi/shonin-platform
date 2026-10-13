@@ -1,13 +1,14 @@
 //! A plan larger than one call allows is split, and nothing is lost when an
 //! endpoint caps a call's gas without saying so or refuses an answer as too
 //! big: reads the helper could not reach are read again at the same block,
-//! the endpoint's limit is learned, and the next observation asks for less
-//! at once.
+//! a Multicall3 call that runs out of gas as a whole is asked again in
+//! smaller calls, the endpoint's limit is learned, and the next observation
+//! asks for less at once.
 
 mod stand_in_node;
 
 use alloy::primitives::U256;
-use chain::follow::{At, Item, Plan};
+use chain::follow::{At, Item, Path, Plan};
 use stand_in_node::{Anvil, FollowProbe, PROBE, Proxy, policy};
 
 fn burning(count: usize) -> Plan {
@@ -112,4 +113,52 @@ async fn an_answer_refused_as_too_big_is_asked_for_again_smaller() {
         assert_eq!(data.len(), 32 + 32 + 928);
     }
     assert!(follower.capabilities(0).unwrap().output_bytes.unwrap() < policy().view_output_bytes);
+}
+
+#[tokio::test]
+async fn a_multicall3_call_out_of_gas_as_a_whole_is_split_and_the_split_is_learned() {
+    let anvil = chain(31_440_004).await;
+    anvil
+        .set_code(
+            stand_in_node::MULTICALL,
+            &stand_in_node::code("StandInMulticall3"),
+        )
+        .await;
+    anvil.mine(2, 1).await;
+    let proxy = Proxy::start(&anvil.url).await;
+    // Overrides refused, so Multicall3 is the path; three reads of about
+    // 5.5M gas each under a 10M cap leave the call too little to return.
+    proxy.script(|script| {
+        script.refuse_overrides = true;
+        script.gas_cap = Some(10_000_000);
+    });
+    let mut follower = stand_in_node::follower(&[&proxy.url], policy()).await;
+    let mut plan = Plan::default();
+    for i in 0..3u64 {
+        plan.read(
+            PROBE,
+            &FollowProbe::burnCall {
+                rounds: U256::from(50_000 + i),
+            },
+        );
+    }
+    let first = follower.observe(&plan, At::Latest).await.unwrap();
+    assert_eq!(first.path, Path::Multicall3);
+    for (i, item) in first.items.iter().enumerate() {
+        assert_eq!(
+            item,
+            &Item::Returned(
+                U256::from(5 + 50_000 + i as u64)
+                    .to_be_bytes::<32>()
+                    .to_vec()
+                    .into()
+            ),
+            "read {i}"
+        );
+    }
+    assert_eq!(follower.capabilities(0).unwrap().max_reads, Some(1));
+    // The next observation is split up front: the header and three calls.
+    let next = follower.observe(&plan, At::Latest).await.unwrap();
+    assert_eq!(next.items, first.items);
+    assert_eq!(next.requests, 4);
 }

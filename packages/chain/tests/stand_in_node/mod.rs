@@ -250,6 +250,9 @@ pub struct Script {
     pub lag: Option<Duration>,
     /// Behave as a node this many blocks behind the upstream's head.
     pub behind: u64,
+    /// Run a call at the head this many blocks below the head the endpoint
+    /// gives everywhere else, as a node behind a load balancer may.
+    pub calls_behind: u64,
     /// Fail this many of the next requests (`eth_chainId` excepted), with an
     /// internal error.
     pub fail_next: u32,
@@ -547,6 +550,7 @@ async fn answer(
         }
         let target = match pin_of(params.get(at)) {
             _ if now.ignore_pins => hex(visible),
+            Pin::Head if method == "eth_call" => hex(visible.saturating_sub(now.calls_behind)),
             Pin::Head => hex(visible),
             Pin::Number(number) if number > visible => {
                 return error(&id, -32000, "header not found");
