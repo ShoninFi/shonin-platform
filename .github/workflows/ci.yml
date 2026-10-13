@@ -209,6 +209,19 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The third-party programs the tests load at their real addresses
+      # (Orca's, Pyth's receiver), dumped from mainnet and checked against
+      # the hashes in programs.txt; kept between runs while those hashes
+      # stand, so a run asks mainnet only when they change.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .shonin/fixtures
+          key: solana-fixtures-${{ hashFiles('contracts/solana/tests/fixtures/programs.txt') }}
+
+      - name: Fixtures
+        working-directory: .
+        run: contracts/solana/tests/fixtures/fetch.sh .shonin/fixtures
+
       # The programs' tests run in-process (LiteSVM) against the programs
       # just built, as `task contracts:solana:test` runs them.
       - name: Test
