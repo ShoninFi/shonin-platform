@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use chain::solana::platform::{Declared, VaultAccounts};
+use chain::solana::platform::VaultAccounts;
 use chain::solana::programs::{local_venue, prices, vault};
 use chain::solana::{Keypair, Pubkey, Signer, SolanaClient, name};
 use chain::{Role, SolanaServed};
@@ -380,7 +380,7 @@ impl<'a> Seed<'a> {
     }
 
     /// Once its review is posted, the author activates the strategy's vault
-    /// on the stand-in driver, at the modest allowances, with the least tank
+    /// on the drivers its record names, at the modest allowances, with the least tank
     /// the terms allow.
     async fn activate(&self, id: u64, author: &Keypair) -> Result<VaultAccounts> {
         let until = deadline(WAIT_SECONDS);
@@ -398,7 +398,7 @@ impl<'a> Seed<'a> {
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        let drivers = [Declared::local()];
+        let drivers = self.platform.declared_drivers(self.client, id).await?;
         let (_, statement) = self
             .platform
             .restricted_for(self.client, &author.pubkey(), id, &drivers)

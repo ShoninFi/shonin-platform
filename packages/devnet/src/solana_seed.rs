@@ -13,7 +13,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use chain::solana::platform::{Declared, Registration, VaultAccounts};
+use chain::solana::platform::{Registration, VaultAccounts};
 use chain::solana::programs::{local_venue, prices, publishing, registry, vault};
 use chain::solana::{Keypair, Pubkey, Signer, SolanaClient, TransactionFailed, name};
 use chain::{Role, SolanaServed};
@@ -280,12 +280,15 @@ impl Seed<'_> {
         })
     }
 
-    /// The author activates the strategy's vault on the stand-in driver,
+    /// The author activates the strategy's vault on the drivers its record names,
     /// with the least tank the terms allow, and the executor's key is
     /// blessed for it.
     async fn activate(&self, published: &Published) -> Result<VaultAccounts> {
         let author = self.client.role(Role::Author)?;
-        let drivers = [Declared::local()];
+        let drivers = self
+            .platform
+            .declared_drivers(self.client, published.id)
+            .await?;
         let (_, statement) = self
             .platform
             .restricted_for(self.client, &author.pubkey(), published.id, &drivers)

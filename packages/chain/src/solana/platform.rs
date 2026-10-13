@@ -1492,6 +1492,40 @@ impl Platform {
 
     // Vaults: the author -----------------------------------------------------------------
 
+    /// The drivers strategy `id`'s vault is created with: those its record
+    /// names for its chain, in the record's order, each at the
+    /// implementation the registry approves now. The vault takes the names
+    /// from the record, so activation must declare exactly these.
+    pub async fn declared_drivers(&self, client: &SolanaClient, id: u64) -> Result<Vec<Declared>> {
+        let record = self
+            .strategy(client, id)
+            .await?
+            .ok_or_else(|| anyhow!("strategy {id} is not registered"))?;
+        let now = client.now().await?;
+        let mut drivers = Vec::new();
+        for need in &record.lists.chains {
+            for name in &need.drivers {
+                let slot = registry::approval_address(ApprovalKind::Driver, name);
+                let program = client
+                    .load::<ApprovalSlot>(&slot)
+                    .await?
+                    .map(|slot| slot.effective(now))
+                    .unwrap_or_default();
+                if program == Pubkey::default() {
+                    bail!(
+                        "the registry approves no implementation of {} now",
+                        String::from_utf8_lossy(name).trim_end_matches('\0')
+                    );
+                }
+                drivers.push(Declared {
+                    name: *name,
+                    program,
+                });
+            }
+        }
+        Ok(drivers)
+    }
+
     /// The author's `activate` of strategy `id`, its station pinning
     /// `drivers`, stating for the list `statement` hashes and the factory's
     /// terms `terms` hashes.
