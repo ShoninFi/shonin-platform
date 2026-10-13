@@ -1,0 +1,47 @@
+# Every six hours, and on demand: the key ids Google serves for its
+# Confidential Space token signer, against the key sets the proof checker and
+# the prover trust (packages/attestation/core/testdata/google-jwks-*.json).
+#
+# Google signs with each of these keys for at most two weeks and publishes a
+# new one at least six hours before it first signs with it. A served key id
+# that no pinned set holds means tokens signed with it will soon arrive, and
+# neither the prover nor the chains' checkers will take them: a checker
+# trusting the new key is due beside the old one, and the prover is to be
+# given the new set. This run fails then, so GitHub notifies whoever watches
+# the repository's scheduled runs. A pinned key Google no longer serves is
+# only said.
+name: Google signing keys
+
+on:
+  schedule:
+    - cron: "41 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  keys:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Every served key is pinned
+        run: |
+          set -eu
+          url=https://www.googleapis.com/service_accounts/v1/metadata/jwk/signer@confidentialspace-sign.iam.gserviceaccount.com
+          pinned=$(jq -r '.keys[].kid' packages/attestation/core/testdata/google-jwks-*.json | sort -u)
+          served=$(curl -fsS --retry 3 --retry-delay 10 "$url" | jq -r '.keys[].kid' | sort -u)
+          [ -n "$served" ] || { echo "::error::Google's key set came back empty"; exit 1; }
+          echo "served: $(echo $served)"
+          echo "pinned: $(echo $pinned)"
+          gone=$(comm -23 <(echo "$pinned") <(echo "$served"))
+          [ -z "$gone" ] || echo "::notice::pinned keys Google no longer serves: $(echo $gone)"
+          new=$(comm -13 <(echo "$pinned") <(echo "$served"))
+          if [ -n "$new" ]; then
+            echo "::error::Google serves signing keys nothing pins: $(echo $new). Deploy a checker trusting them beside the current one, and give the prover the new key set, before tokens signed with them arrive."
+            exit 1
+          fi
