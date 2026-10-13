@@ -21,8 +21,8 @@ use crate::atoms::icon;
 use crate::atoms::notice::{NoticeTone, notice};
 use crate::atoms::segmented::segmented;
 use crate::components::exit::{
-    Check, Shown, Statement, Tab, TabClick, amount_input, held_sentence, hint, placeholder, row,
-    row_dyn, seal, statement_notice, tab_bar, tab_click, utc, whole_shares,
+    Check, Shown, Statement, Tab, TabClick, amount_input, held_sentence, hint, placeholder,
+    review_ready, row, row_dyn, seal, statement_notice, tab_bar, tab_click, utc, whole_shares,
 };
 use crate::components::wallet::{hex_ring, open_connect};
 use crate::money::format as money;
@@ -661,11 +661,21 @@ fn deposit_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
     }
     let continue_button = {
         let panel = panel.clone();
+        // The review opens only once the vault's list is read: it shows the
+        // list the deposit states.
+        let ready = {
+            let panel = panel.clone();
+            map_ref! {
+                let (check, _) = check.signal_cloned(),
+                let read = panel.codes.signal_ref(Option::is_some) =>
+                review_ready(check, *read)
+            }
+        };
         on_click(
             Button::new(Kind::Primary, "Continue").block().build(),
             move || {
                 let (check, _) = deposit_check(&panel, &panel.deposit_text.get_cloned(), true);
-                if check == Check::Ready && panel.codes.lock_ref().is_some() {
+                if review_ready(&check, panel.codes.lock_ref().is_some()) {
                     panel.stage.set(Stage::Review);
                 }
             },
@@ -673,9 +683,7 @@ fn deposit_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
         .attr_signal(
             "disabled",
             Some(String::new()),
-            check
-                .signal_cloned()
-                .map(|(check, _)| (check != Check::Ready).then(String::new)),
+            ready.map(|ready| (!ready).then(String::new)),
         )
     };
     let fee_figure = quote.signal_cloned().map(move |quote| match quote {

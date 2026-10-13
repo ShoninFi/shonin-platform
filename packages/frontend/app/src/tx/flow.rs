@@ -18,7 +18,9 @@
 //! - An approval is for exactly the amount being deposited, and only when
 //!   the allowance doesn't already cover it.
 //! - The statement is signed over the vault's own list read from the chain,
-//!   and the digest the app would ask for is checked against the vault's own
+//!   and only when that list is the one the review showed (otherwise the
+//!   person is asked to review it again, and nothing is signed); the digest
+//!   the app would ask for is checked against the vault's own
 //!   `statementDigest` before anything is shown; the signature is checked to
 //!   recover to the account before it is sent.
 //! - Success is reported only from a mined receipt and the vault's own
@@ -490,10 +492,12 @@ pub async fn report(
 /// Deposit `amount` of the dollar: the statement if the vault's list needs
 /// one, an approval for exactly the amount if the allowance doesn't cover
 /// it, the request, its price, and the second step if nobody else has sent
-/// it.
+/// it. `shown` is the vault's list as the review showed it: the statement
+/// is signed only if the vault's list is still that one.
 pub async fn deposit<R: Reader, S: Signer, C: Clock>(
     ctx: &Ctx<'_, R, S, C>,
     amount: U256,
+    shown: &str,
 ) -> Result<Outcome, TxError> {
     ctx.step(Step::Checking);
     check_endpoint(ctx).await?;
@@ -519,7 +523,7 @@ pub async fn deposit<R: Reader, S: Signer, C: Clock>(
     let statement = if read::has_statement(ctx.reader, ctx.vault, ctx.account).await? {
         Bytes::new()
     } else {
-        sign_statement(ctx).await?
+        sign_statement(ctx, shown).await?
     };
 
     // Exactly the amount, and only if needed.
@@ -813,12 +817,20 @@ async fn check_endpoint<R: Reader, S: Signer, C: Clock>(
     Ok(())
 }
 
-/// Ask for the statement, after checking the digest it will produce is the
-/// one the vault checks, and check the signature recovers to the account.
+/// Ask for the statement, after checking the list read from the vault now
+/// is the one the review showed (`shown`) and the digest it will produce is
+/// the one the vault checks, and check the signature recovers to the
+/// account. What is signed is always the vault's list as read now.
 async fn sign_statement<R: Reader, S: Signer, C: Clock>(
     ctx: &Ctx<'_, R, S, C>,
+    shown: &str,
 ) -> Result<Bytes, TxError> {
     let restricted = read::restricted_text(ctx.reader, ctx.vault).await?;
+    // The list changed since the review: the person reviews it again before
+    // the wallet is asked anything.
+    if restricted != shown {
+        return Err(TxError::ListChanged { now: restricted });
+    }
     let statement = StatementRequest {
         chain_id: ctx.chain_id,
         vault: ctx.vault,

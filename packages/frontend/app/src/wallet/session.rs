@@ -1014,13 +1014,19 @@ mod tests {
             })
         };
         connect(one);
-        let deposit = Running::new(Action::Deposit(U256::from(15u8)));
+        let deposit = Running::new(Action::Deposit {
+            amount: U256::from(15u8),
+            shown: String::new(),
+        });
         assert!(session.begin("base-1", &deposit));
         // A panel or sheet built while it runs finds it, rather than a
         // fresh form.
         assert_eq!(session.flow("base-1", EXIT), Some(deposit.clone()));
         // Another panel for the same vault can't start a second one.
-        let again = Running::new(Action::Deposit(U256::from(15u8)));
+        let again = Running::new(Action::Deposit {
+            amount: U256::from(15u8),
+            shown: String::new(),
+        });
         assert!(!session.begin("base-1", &again));
         // Another vault, and the portfolio's own buttons, are their own.
         assert_eq!(session.flow("base-2", EXIT), None);

@@ -850,6 +850,13 @@ pub(crate) fn amount_input(
         .child(el("span").class("sh-input__unit").child(unit))
 }
 
+/// Whether the deposit's review may open: the amount is ready, and the
+/// vault's list has been read (`list_read`), so the review always shows the
+/// list the statement is checked against before it is signed.
+pub(crate) fn review_ready(check: &Check, list_read: bool) -> bool {
+    *check == Check::Ready && list_read
+}
+
 fn deposit_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
     let state = panel
         .figures
@@ -944,11 +951,19 @@ fn deposit_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
     }
     let continue_button = {
         let panel = panel.clone();
+        let ready = {
+            let panel = panel.clone();
+            map_ref! {
+                let (check, _) = check.signal_cloned(),
+                let read = panel.restricted.signal_ref(Option::is_some) =>
+                review_ready(check, *read)
+            }
+        };
         on_click(
             Button::new(Kind::Primary, "Continue").block().build(),
             move || {
                 let (check, _) = deposit_check(&panel, &panel.deposit_text.get_cloned(), true);
-                if check == Check::Ready {
+                if review_ready(&check, panel.restricted.lock_ref().is_some()) {
                     panel.stage.set(Stage::Review);
                 }
             },
@@ -956,11 +971,14 @@ fn deposit_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
         .attr_signal(
             "disabled",
             Some(String::new()),
-            check
-                .signal_cloned()
-                .map(|(check, _)| (check != Check::Ready).then(String::new)),
+            ready.map(|ready| (!ready).then(String::new)),
         )
     };
+    // Why Continue waits, while the vault's list hasn't been read.
+    let list_wait = panel.restricted.signal_ref(|restricted| match restricted {
+        None => "Reading who this vault is open to. You can review once it’s read.".to_string(),
+        Some(_) => String::new(),
+    });
     let fee_figure = quote.signal_cloned().map(move |quote| match quote {
         Some((quote, _)) => money::dollars(quote.fee, decimals, Rounding::Up),
         None => "—".to_string(),
@@ -1023,6 +1041,15 @@ fn deposit_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
                 .text("Priced a few seconds after you ask, at the next valuation time. The share price can move a little before then."),
         )
         .child(if connected { continue_button.into() } else { View::Empty })
+        .child(if connected {
+            el("p")
+                .class("sh-muted sh-exit__small")
+                .attr("aria-live", "polite")
+                .text_signal("", list_wait)
+                .into()
+        } else {
+            View::Empty
+        })
         .child(tail),
         )
         .into()
@@ -1397,10 +1424,14 @@ fn review(panel: &Rc<Panel>) -> View {
     let decimals = decimals(panel);
     let symbol = symbol(panel);
     let (_, amount) = deposit_check(panel, &panel.deposit_text.get_cloned(), true);
-    let Some(amount) = amount else {
+    // Never without the vault's list: the review shows what is signed.
+    let (Some(amount), true) = (amount, panel.restricted.lock_ref().is_some()) else {
         panel.stage.set(Stage::Form);
         return placeholder();
     };
+    // The list as this review last drew it: the deposit carries it, and is
+    // stopped before signing if the vault's list is another by then.
+    let shown: Rc<std::cell::RefCell<Option<String>>> = Rc::default();
     let figures = panel.figures.get_cloned();
     let quote = figures
         .as_ref()
@@ -1419,13 +1450,17 @@ fn review(panel: &Rc<Panel>) -> View {
     let go = {
         let panel = panel.clone();
         let ticked = ack.clone();
+        let shown = shown.clone();
         on_click(
             Button::new(Kind::Primary, label).block().build(),
             move || {
                 if first && !ticked.get() {
                     return;
                 }
-                start(&panel, Action::Deposit(amount));
+                let Some(shown) = shown.borrow().clone() else {
+                    return;
+                };
+                start(&panel, Action::Deposit { amount, shown });
             },
         )
         .attr_signal(
@@ -1489,7 +1524,10 @@ fn review(panel: &Rc<Panel>) -> View {
                 ))
                 .child(static_row("Network fee", "Paid in your wallet".to_string(), None)),
         )
-        .child_from(&panel.restricted, |restricted| {
+        .child_from(&panel.restricted, move |restricted| {
+            if restricted.is_some() {
+                shown.replace(restricted.clone());
+            }
             Some(statement_notice(Statement::Evm(restricted.as_deref())))
         })
         .child(notice(
@@ -1546,6 +1584,16 @@ pub(crate) fn not_open_to(codes: &[&str]) -> Option<String> {
         parts.push("sanctioned persons".to_string());
     }
     (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// A list as the wallet's prompt names it, to compare with that prompt:
+/// "Restricted: SANCTIONED,US", or "Restricted: (none)" for an empty one.
+pub(crate) fn restricted_line(restricted: &str) -> String {
+    if restricted.is_empty() {
+        "Restricted: (none)".to_string()
+    } else {
+        format!("Restricted: {restricted}")
+    }
 }
 
 /// The codes of a list as the vault writes it: `SANCTIONED,US`.
@@ -1623,12 +1671,15 @@ pub(crate) fn statement_notice(statement: Statement<'_>) -> View {
         },
     };
     let how = match &statement {
-        Statement::Evm(Some(restricted)) if list_codes(restricted).is_empty() => {
-            "Your wallet asks you to sign this, for an empty list, the first time you deposit. It’s a signature, not a transaction.".to_string()
-        }
+        Statement::Evm(Some(restricted)) if restricted.is_empty() => format!(
+            "Your wallet asks you to sign this, with the list as “{}” (an empty list, so the field is blank in your wallet), \
+             the first time you deposit and again if the list changes. It’s a signature, not a transaction.",
+            restricted_line(restricted)
+        ),
         Statement::Evm(Some(restricted)) => format!(
-            "Your wallet asks you to sign this, with the list as “Restricted: {restricted}”, \
-             the first time you deposit and again if the list changes. It’s a signature, not a transaction."
+            "Your wallet asks you to sign this, with the list as “{}”, \
+             the first time you deposit and again if the list changes. It’s a signature, not a transaction.",
+            restricted_line(restricted)
         ),
         Statement::Evm(None) => {
             "Your wallet asks you to sign this the first time you deposit. It’s a signature, not a transaction.".to_string()
@@ -2042,7 +2093,7 @@ fn step_view(panel: &Rc<Panel>, running: &Running, step: &Step) -> View {
                             }),
                         ),
                 );
-            let is_deposit = matches!(running.action, Action::Deposit(_));
+            let is_deposit = matches!(running.action, Action::Deposit { .. });
             let when = if priced {
                 el("p")
                     .class("sh-exit__title")
@@ -2158,7 +2209,14 @@ fn step_view(panel: &Rc<Panel>, running: &Running, step: &Step) -> View {
             let back = {
                 let panel = panel.clone();
                 let running = running.clone();
+                let error = error.clone();
                 move || {
+                    if let TxError::ListChanged { now } = &error {
+                        // Back to the review, with the vault's list as it
+                        // is now; the person confirms again, nothing more.
+                        review_again(&panel, &running, now);
+                        return;
+                    }
                     crate::wallet::get().dismiss(&running);
                     if moved {
                         // What was typed was sent, or may still land: the
@@ -2197,6 +2255,22 @@ fn step_view(panel: &Rc<Panel>, running: &Running, step: &Step) -> View {
     }
 }
 
+/// After the vault's list changed between the review and signing: leave the
+/// failed flow for the review of the same deposit, showing the list as it is
+/// now (`now`). Nothing is started: the person reads it and confirms again.
+fn review_again(panel: &Panel, running: &Running, now: &str) {
+    crate::wallet::get().dismiss(running);
+    panel.restricted.set(Some(now.to_string()));
+    if let Action::Deposit { amount, .. } = &running.action {
+        panel
+            .deposit_text
+            .set(money::plain_exact(*amount, decimals(panel)));
+        panel.tab.set(Tab::Deposit);
+        panel.ack.set(false);
+        panel.stage.set(Stage::Review);
+    }
+}
+
 /// The second step, after the app's own try didn't go through: the request
 /// stands either way, and the keeper settles it at this price. Offered again
 /// unless the one sent may still land.
@@ -2223,7 +2297,9 @@ fn settle_now(running: &Running, why: &str, may_land: bool) -> View {
 /// What the request is for, exactly as it was sent.
 fn request_amount_row(action: &Action, decimals: u8, symbol: &str) -> El {
     let (label, figure) = match action {
-        Action::Deposit(amount) => ("You paid in", money::token_exact(*amount, decimals, symbol)),
+        Action::Deposit { amount, .. } => {
+            ("You paid in", money::token_exact(*amount, decimals, symbol))
+        }
         Action::Withdraw(shares) => (
             "Shares",
             format!("{} marked pending", money::shares(*shares, Rounding::Down)),
@@ -2623,6 +2699,78 @@ mod tests {
     }
 
     #[test]
+    fn the_review_cant_start_with_no_list_read() {
+        let panel = Rc::new(Panel::new("base-1", Tab::Deposit, false));
+        panel.deposit_text.set("100".to_string());
+        let (check, _) = deposit_check(&panel, "100", true);
+        assert_eq!(check, Check::Ready, "the amount itself is fine");
+        // The vault's list hasn't been read: Continue stays shut.
+        assert!(!review_ready(&check, panel.restricted.lock_ref().is_some()));
+        // And a review asked for anyway goes back to the form, showing no
+        // deposit button.
+        panel.stage.set(Stage::Review);
+        let html = review(&panel).html();
+        assert_eq!(panel.stage.get(), Stage::Form);
+        assert!(!html.contains("Deposit $100"), "{html}");
+        // Once the list is read, the review opens and shows it.
+        panel.restricted.set(Some("SANCTIONED,US".to_string()));
+        assert!(review_ready(&check, panel.restricted.lock_ref().is_some()));
+        panel.stage.set(Stage::Review);
+        let html = review(&panel).html();
+        assert_eq!(panel.stage.get(), Stage::Review);
+        assert!(html.contains("Restricted: SANCTIONED,US"), "{html}");
+        assert!(html.contains("Deposit $100"), "{html}");
+    }
+
+    #[test]
+    fn an_empty_list_is_shown_as_restricted_none_to_compare_with_the_wallet() {
+        let html = statement_notice(Statement::Evm(Some(""))).html();
+        assert!(html.contains("Restricted: (none)"), "{html}");
+        assert!(html.contains("Open to everyone"), "{html}");
+    }
+
+    #[test]
+    fn trying_again_after_the_list_changed_reopens_the_review_with_the_new_list_and_signs_nothing()
+    {
+        let panel = Rc::new(Panel::new("base-4", Tab::Deposit, false));
+        panel.network.set(Some(Rc::new(network())));
+        panel.restricted.set(Some("SANCTIONED".to_string()));
+        let account = Address::repeat_byte(0x5c);
+        let running = deposit_shown(
+            &panel,
+            account,
+            Step::Failed(TxError::ListChanged {
+                now: "SANCTIONED,US".to_string(),
+            }),
+        );
+        review_again(&panel, &running, "SANCTIONED,US");
+        // The failed flow is left and nothing new is started.
+        assert!(panel.running().is_none());
+        let mode = mode_of(
+            &connected(account),
+            Some(&network()),
+            true,
+            panel.tab.get(),
+            panel.stage.get(),
+            None,
+        );
+        assert_eq!(mode, Mode::Review);
+        assert_eq!(panel.deposit_text.get_cloned(), "11");
+        assert!(!panel.ack.get(), "acknowledged again on the new review");
+        // The review shows the new list.
+        let html = review(&panel).html();
+        assert!(html.contains("Restricted: SANCTIONED,US"), "{html}");
+        assert!(
+            html.contains("Not open to: people in the US, sanctioned persons."),
+            "{html}"
+        );
+        assert!(
+            panel.running().is_none(),
+            "drawing the review starts nothing"
+        );
+    }
+
+    #[test]
     fn a_solana_review_names_the_list_read_from_the_vaults_account_in_plain_words() {
         let codes = ["SANCTIONED".to_string(), "US".to_string()];
         let html = statement_notice(Statement::Solana(&codes)).html();
@@ -2640,7 +2788,10 @@ mod tests {
     fn deposit_shown(panel: &Panel, account: Address, step: Step) -> Running {
         let session = crate::wallet::get();
         session.connection.set(connected(account));
-        let running = Running::new(Action::Deposit(U256::from(11_000_000u64)));
+        let running = Running::new(Action::Deposit {
+            amount: U256::from(11_000_000u64),
+            shown: "SANCTIONED,US".to_string(),
+        });
         running.step.set(Some(step));
         assert!(session.begin(&panel.slug, &running));
         running

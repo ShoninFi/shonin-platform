@@ -18,7 +18,12 @@ use crate::tx::port::Clock;
 /// What a flow does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
-    Deposit(U256),
+    /// Deposit `amount`, stating for the vault's restricted list as the
+    /// review showed it (`shown`, as the vault writes it).
+    Deposit {
+        amount: U256,
+        shown: String,
+    },
     Withdraw(U256),
     SettleClaim(U256),
     TakeCash(Fallback),
@@ -50,7 +55,7 @@ impl Action {
     /// action is its own, by kind and id.
     pub fn slot(&self) -> String {
         match self {
-            Self::Deposit(_) | Self::Withdraw(_) => EXIT.to_string(),
+            Self::Deposit { .. } | Self::Withdraw(_) => EXIT.to_string(),
             other => format!("{other:?}"),
         }
     }
@@ -170,7 +175,9 @@ pub fn start(vault: &VaultRef, action: Action, running: &Running) {
             on_step: &on_step,
         };
         let outcome = match action {
-            Action::Deposit(amount) => flow::report(&on_step, flow::deposit(&ctx, amount)).await,
+            Action::Deposit { amount, shown } => {
+                flow::report(&on_step, flow::deposit(&ctx, amount, &shown)).await
+            }
             Action::Withdraw(shares) => flow::report(&on_step, flow::withdraw(&ctx, shares)).await,
             Action::SettleClaim(id) => flow::report(&on_step, flow::settle_claim(&ctx, id)).await,
             Action::TakeCash(of) => flow::report(&on_step, flow::take_cash(&ctx, of)).await,
