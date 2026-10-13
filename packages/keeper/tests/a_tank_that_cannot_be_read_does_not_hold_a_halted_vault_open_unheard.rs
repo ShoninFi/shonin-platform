@@ -129,7 +129,7 @@ async fn a_tank_that_cannot_be_read_does_not_hold_a_halted_vault_open_unheard() 
     let keeper = start_keeper_holding("tank-unread-hold", &rpc, &executor, 0);
 
     let health = keeper
-        .health_until(Duration::from_secs(60), |status| status != 200)
+        .health_saying(Duration::from_secs(60), "tanks unreadable")
         .await;
     assert!(
         health
