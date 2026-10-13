@@ -41,6 +41,10 @@ pub enum SolError {
     /// and the person reviews the deposit again with the list read now
     /// (`now`, its codes).
     ListChanged { now: Vec<[u8; 32]> },
+    /// The cluster's settings the page read (its config: endpoint, dollar,
+    /// decimals) were updated since the review was computed: nothing is
+    /// signed, and the person reviews again with the new settings.
+    SettingsChanged,
     /// The cluster would refuse it: nothing was sent.
     WouldFail { reason: Reason },
     /// Landed, and failed: nothing moved but the network fee.
@@ -288,6 +292,13 @@ impl SolError {
                     ),
                 )
             }
+            Self::SettingsChanged => alert(
+                "This chain's settings were just updated",
+                format!(
+                    "The app's settings for {} were updated since you reviewed this, so the figures you saw may not hold. Review it again with the new settings. Nothing was signed or sent.",
+                    context.chain
+                ),
+            ),
             Self::WouldFail { reason } => alert(
                 "The network wouldn't accept it. Nothing moved.",
                 format!("{} Nothing was sent.", reason.words()),

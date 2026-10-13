@@ -61,6 +61,7 @@ impl Read {
             && self.at.floor.waiting(self.at.now).is_some()
                 == other.at.floor.waiting(other.at.now).is_some()
             && self.at.escape() == other.at.escape()
+            && self.network == other.network
     }
 }
 
@@ -246,7 +247,10 @@ async fn watch(slug: String, load: Mutable<Load>) {
     {
         let session = crate::wallet::get();
         loop {
-            let seen = (session.changed.get(), session.account());
+            // Read again when a flow lands, the account changes or the
+            // chain's settings change: the controls are then drawn with the
+            // network a send would sign with.
+            let seen = (session.changed.get(), session.account(), session.configs());
             match seen.1 {
                 None => load.set(Load::SignedOut),
                 Some(account) => match read(&slug, account).await {
@@ -282,7 +286,7 @@ async fn watch(slug: String, load: Mutable<Load>) {
             }
             for _ in 0..15 {
                 gloo_timers::future::TimeoutFuture::new(1_000).await;
-                if (session.changed.get(), session.account()) != seen {
+                if (session.changed.get(), session.account(), session.configs()) != seen {
                     break;
                 }
             }
@@ -436,7 +440,9 @@ fn start(read: &Read, slot: &Mutable<Option<Running>>, action: Action) {
     }
     let running = Running::new();
     slot.set(Some(running.clone()));
-    crate::tx::author::run::start(read.chain, action, &running, |_| {});
+    // Computed with this read's network: the flow signs with it or not at
+    // all.
+    crate::tx::author::run::start(read.chain, action, read.network.config, &running, |_| {});
 }
 
 /// A refusal before anything is asked, said where the flow's status goes.
@@ -1152,6 +1158,7 @@ mod tests {
             asset_symbol: "USDC".to_string(),
             asset_decimals: 6,
             dev_account: None,
+            config: crate::wallet::config_cache::ConfigId::default(),
         });
         let read = Rc::new(Read {
             vault: Address::repeat_byte(0x11),

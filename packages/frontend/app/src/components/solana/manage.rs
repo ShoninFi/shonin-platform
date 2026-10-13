@@ -110,10 +110,22 @@ async fn follow(slug: String, loaded: Mutable<Option<Result<Read, String>>>) {
                 _ => Err("The Solana cluster can’t be reached right now.".to_string()),
             };
             loaded.set(Some(result));
-            let seen = (session.changed.get(), session.account());
+            // Read again when a flow lands, the account changes or the
+            // cluster's settings change: the controls are then drawn with
+            // the cluster a send would sign with.
+            let seen = (
+                session.changed.get(),
+                session.account(),
+                session.config_id(),
+            );
             for _ in 0..10 {
                 gloo_timers::future::TimeoutFuture::new(1_000).await;
-                if (session.changed.get(), session.account()) != seen {
+                if (
+                    session.changed.get(),
+                    session.account(),
+                    session.config_id(),
+                ) != seen
+                {
                     break;
                 }
             }
@@ -163,6 +175,7 @@ fn act(
     let running: Mutable<Option<SolRunning>> = Mutable::new(None);
     let refused: Mutable<Option<String>> = Mutable::new(None);
     let address = read.vault.address;
+    let reviewed = read.network.clone();
     let network = Some(read.network.clone());
     let make = Rc::new(make);
     el("div")
@@ -183,13 +196,16 @@ fn act(
                     let running = running.clone();
                     let refused = refused.clone();
                     let make = make.clone();
+                    let reviewed = reviewed.clone();
                     Some(
                         on_click(
                             Button::new(kind, label).size(Size::Small).build(),
                             move || match make() {
                                 Ok(action) => {
                                     refused.set(None);
-                                    let flow = SolRunning::new();
+                                    // Built with this read's cluster: the
+                                    // flow signs with it or not at all.
+                                    let flow = SolRunning::new(reviewed.clone());
                                     crate::tx::solana::run::start(address, action, &flow);
                                     running.set(Some(flow));
                                 }

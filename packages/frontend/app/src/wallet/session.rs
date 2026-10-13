@@ -23,7 +23,7 @@ use futures_signals::signal::Mutable;
 use serde_json::{Value, json};
 use shared::Chain;
 
-use super::config_cache::{ConfigSlot, ForSigning};
+use super::config_cache::{ConfigId, ConfigSlot, ForSigning};
 use super::dev;
 use super::machine::{self, Connection, Event, Refusal, WalletId};
 use super::network::Network;
@@ -248,6 +248,28 @@ impl Session {
             .collect()
     }
 
+    /// The configs the page reads every chain with now: a page that drew
+    /// figures with them reads again when this changes.
+    pub fn configs(&self) -> Vec<ConfigId> {
+        self.networks
+            .lock_ref()
+            .values()
+            .map(|network| network.config)
+            .collect()
+    }
+
+    /// `chain`'s config as the API wrote it, if the page holds one fetched
+    /// in its own life and `network` was read from it.
+    pub fn config_text(&self, chain: Chain, network: &Network) -> Option<Rc<str>> {
+        self.slot(chain)
+            .held()
+            .filter(|held| {
+                held.source == super::config_cache::Source::Fetched
+                    && ConfigId::of(&held.raw) == network.config
+            })
+            .map(|held| held.raw)
+    }
+
     fn slot(&self, chain: Chain) -> Rc<ConfigSlot> {
         self.configs.borrow_mut().entry(chain).or_default().clone()
     }
@@ -286,31 +308,37 @@ impl Session {
 
     /// The network a flow sends on: from a config fetched in this page's
     /// life, never from a remembered copy alone (see
-    /// [`super::config_cache`]).
+    /// [`super::config_cache`]), and only the one its review was computed
+    /// with (`reviewed`). Any other stops the flow before a wallet is asked:
+    /// the page reads the fresh one from now on, and the person reviews
+    /// again.
     pub async fn network_to_sign_with<F, Fut>(
         &self,
         chain: Chain,
+        reviewed: ConfigId,
         fetch: F,
     ) -> Result<Rc<Network>, TxError>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<String, String>>,
     {
-        match self.slot(chain).for_signing(fetch).await {
-            ForSigning::Use(raw) => self.adopt(chain, &raw).ok_or_else(|| {
-                TxError::Network("this vault's chain can't be used by this app".to_string())
-            }),
-            ForSigning::Changed(raw) => {
-                self.adopt(chain, &raw);
-                Err(TxError::Network(
-                    "this page's settings for the vault's chain were just updated, so nothing was sent"
-                        .to_string(),
-                ))
+        let raw = match self.slot(chain).for_signing(fetch).await {
+            // A fetch that replaced the remembered copy is no reason to stop
+            // when the review was computed with the fetched one.
+            ForSigning::Use(raw) | ForSigning::Changed(raw) => raw,
+            ForSigning::Unavailable(_) => {
+                return Err(TxError::Network(
+                    "this vault's chain isn't reachable from this app".to_string(),
+                ));
             }
-            ForSigning::Unavailable(_) => Err(TxError::Network(
-                "this vault's chain isn't reachable from this app".to_string(),
-            )),
+        };
+        let network = self.adopt(chain, &raw).ok_or_else(|| {
+            TxError::Network("this vault's chain can't be used by this app".to_string())
+        })?;
+        if network.config != reviewed {
+            return Err(TxError::SettingsChanged);
         }
+        Ok(network)
     }
 
     /// The flow shown for `slug` and `slot`, for the connected account.
@@ -556,8 +584,7 @@ impl SessionSigner {
 
 /// The EVM network a config names, if this build can use it.
 fn parse_network(raw: &str) -> Option<Network> {
-    let config: shared::Config = serde_json::from_str(raw).ok()?;
-    Network::from_config(&config).ok()
+    Network::from_raw(raw)
 }
 
 fn hash_of(value: &Value) -> Result<B256, TxError> {
@@ -765,15 +792,26 @@ impl Session {
         self.refresh(chain).await
     }
 
-    /// A vault chain's network to send on: never a remembered copy alone.
-    pub async fn network_to_sign(&self, chain: Chain) -> Result<Rc<Network>, TxError> {
+    /// A vault chain's network to send on: never a remembered copy alone,
+    /// and only the one the review was computed with (`reviewed`).
+    pub async fn network_to_sign(
+        &self,
+        chain: Chain,
+        reviewed: ConfigId,
+    ) -> Result<Rc<Network>, TxError> {
         let network = self
-            .network_to_sign_with(chain, || super::config_cache::fetch_raw(chain))
-            .await?;
-        if let Some(held) = self.slot(chain).held() {
+            .network_to_sign_with(chain, reviewed, || super::config_cache::fetch_raw(chain))
+            .await;
+        // A fetched config is kept for the next visit, whether or not this
+        // send goes on with it.
+        if let Some(held) = self
+            .slot(chain)
+            .held()
+            .filter(|_| self.slot(chain).is_fresh())
+        {
             super::config_cache::keep(chain, &held.raw);
         }
-        Ok(network)
+        network
     }
 
     fn browser_wallets() -> Vec<Announced> {
@@ -1155,7 +1193,7 @@ mod tests {
         // A send while the API is down: nothing is signed.
         let down = || async { Err::<String, String>("the API answered 503".to_string()) };
         assert!(matches!(
-            block_on(session.network_to_sign_with(Chain::Base, down)),
+            block_on(session.network_to_sign_with(Chain::Base, read.config, down)),
             Err(TxError::Network(_))
         ));
         // The API answers again, its head moved on: the same config, used.
@@ -1163,8 +1201,10 @@ mod tests {
             super::super::config_cache::canonical(&base_config().replace("48055605", "48055999"))
                 .unwrap();
         let signed =
-            block_on(session.network_to_sign_with(Chain::Base, || async move { Ok(later) }))
-                .unwrap();
+            block_on(
+                session.network_to_sign_with(Chain::Base, read.config, || async move { Ok(later) }),
+            )
+            .unwrap();
         assert_eq!(*signed, *read);
     }
 
@@ -1234,23 +1274,30 @@ mod tests {
             })
         };
         connect(one);
-        let deposit = Running::new(Action::Deposit {
-            amount: U256::from(15u8),
-            shown: String::new(),
-        });
+        let network = Rc::new(parse_network(&base_config()).expect("a usable config"));
+        let deposit = Running::new(
+            Action::Deposit {
+                amount: U256::from(15u8),
+                shown: String::new(),
+            },
+            network.clone(),
+        );
         assert!(session.begin("base-1", &deposit));
         // A panel or sheet built while it runs finds it, rather than a
         // fresh form.
         assert_eq!(session.flow("base-1", EXIT), Some(deposit.clone()));
         // Another panel for the same vault can't start a second one.
-        let again = Running::new(Action::Deposit {
-            amount: U256::from(15u8),
-            shown: String::new(),
-        });
+        let again = Running::new(
+            Action::Deposit {
+                amount: U256::from(15u8),
+                shown: String::new(),
+            },
+            network.clone(),
+        );
         assert!(!session.begin("base-1", &again));
         // Another vault, and the portfolio's own buttons, are their own.
         assert_eq!(session.flow("base-2", EXIT), None);
-        let settle = Running::new(Action::Settle(U256::from(3u8)));
+        let settle = Running::new(Action::Settle(U256::from(3u8)), network.clone());
         assert!(session.begin("base-1", &settle));
         assert_eq!(
             session.flow("base-1", &Action::Settle(U256::from(3u8)).slot()),

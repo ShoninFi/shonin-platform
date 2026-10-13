@@ -226,6 +226,7 @@ pub(crate) fn open(read: &Rc<Read>, slot: &Mutable<Option<Running>>, names: &Rc<
                     Action::Retire {
                         vault: retire_read.vault,
                     },
+                    retire_read.network.config,
                     &running,
                     |_| {},
                 );

@@ -191,60 +191,75 @@ async fn read_page(chain: Chain, id: u64, load: Mutable<Load>) {
         use chain::bindings::factory::IVaultFactory;
 
         let session = crate::wallet::get();
-        let (Some(network), Some(platform)) =
-            (session.network(chain).await, run::platform(chain).await)
-        else {
-            load.set(Load::Failed(format!(
-                "{} isn't reachable from the app right now. Reload to try again.",
-                chain.label()
-            )));
-            return;
-        };
-        let reader = Session::reader(&network);
-        let strategy_id = U256::from(id);
-        let read_all = async {
-            let readiness =
-                read::readiness(&reader, &platform.registries, network.chain_id, strategy_id)
-                    .await?;
-            let terms = read::terms(&reader, platform.registries.factory).await?;
-            let restricted = call(
-                &reader,
-                platform.registries.factory,
-                IVaultFactory::restrictedForCall {
-                    strategyId: strategy_id,
-                },
-            )
-            .await?
-            .text;
-            Ok::<_, crate::tx::TxError>((readiness, terms, restricted))
-        };
-        let (readiness, terms, restricted) = match read_all.await {
-            Ok(read) => read,
-            Err(_) => {
-                load.set(Load::Failed(
-                    "The chain didn't answer. Reload to try again.".to_string(),
-                ));
+        loop {
+            let (Some(network), Some(platform)) =
+                (session.network(chain).await, run::platform(chain).await)
+            else {
+                load.set(Load::Failed(format!(
+                    "{} isn't reachable from the app right now. Reload to try again.",
+                    chain.label()
+                )));
                 return;
+            };
+            let reader = Session::reader(&network);
+            let strategy_id = U256::from(id);
+            let read_all = async {
+                let readiness =
+                    read::readiness(&reader, &platform.registries, network.chain_id, strategy_id)
+                        .await?;
+                let terms = read::terms(&reader, platform.registries.factory).await?;
+                let restricted = call(
+                    &reader,
+                    platform.registries.factory,
+                    IVaultFactory::restrictedForCall {
+                        strategyId: strategy_id,
+                    },
+                )
+                .await?
+                .text;
+                Ok::<_, crate::tx::TxError>((readiness, terms, restricted))
+            };
+            let (readiness, terms, restricted) = match read_all.await {
+                Ok(read) => read,
+                Err(_) => {
+                    load.set(Load::Failed(
+                        "The chain didn't answer. Reload to try again.".to_string(),
+                    ));
+                    return;
+                }
+            };
+            let title = run::jobs()
+                .await
+                .ok()
+                .and_then(|jobs| {
+                    jobs.into_iter()
+                        .find(|job| job.chain == chain && job.strategy_id == Some(id))
+                        .map(|job| job.title)
+                })
+                .filter(|title| !title.trim().is_empty());
+            let config = network.config;
+            load.set(Load::Ready(Rc::new(Info {
+                chain,
+                id,
+                title,
+                network,
+                readiness,
+                terms,
+                restricted,
+            })));
+            // Read again once the chain's settings change: the form is then
+            // drawn, and the activation computed, with the network it would
+            // sign with.
+            while session
+                .networks
+                .lock_ref()
+                .get(&chain)
+                .map(|network| network.config)
+                == Some(config)
+            {
+                gloo_timers::future::TimeoutFuture::new(1_000).await;
             }
-        };
-        let title = run::jobs()
-            .await
-            .ok()
-            .and_then(|jobs| {
-                jobs.into_iter()
-                    .find(|job| job.chain == chain && job.strategy_id == Some(id))
-                    .map(|job| job.title)
-            })
-            .filter(|title| !title.trim().is_empty());
-        load.set(Load::Ready(Rc::new(Info {
-            chain,
-            id,
-            title,
-            network,
-            readiness,
-            terms,
-            restricted,
-        })));
+        }
     }
     #[cfg(not(target_arch = "wasm32"))]
     let _ = (chain, id, load);
@@ -1030,5 +1045,12 @@ fn start(info: &Rc<Info>, form: &Rc<Form>) {
     };
     let running = Running::new();
     form.running.set(Some(running.clone()));
-    run::start(info.chain, Action::Activate(activation), &running, |_| {});
+    // Computed with this page's network: the flow signs with it or not at all.
+    run::start(
+        info.chain,
+        Action::Activate(activation),
+        info.network.config,
+        &running,
+        |_| {},
+    );
 }

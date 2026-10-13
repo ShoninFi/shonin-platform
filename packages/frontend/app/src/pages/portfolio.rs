@@ -486,7 +486,10 @@ async fn follow(loaded: Mutable<Option<Loaded>>) {
     {
         let session = crate::wallet::get();
         loop {
-            let seen = (session.changed.get(), session.account());
+            // Read again when a flow lands, the account changes or a
+            // chain's settings change: every card is then drawn with the
+            // network a send would sign with.
+            let seen = (session.changed.get(), session.account(), session.configs());
             if let Some(account) = seen.1 {
                 // A reading that reached no chain at all keeps what was
                 // shown (or the skeleton), and is tried again.
@@ -500,7 +503,7 @@ async fn follow(loaded: Mutable<Option<Loaded>>) {
             }
             for _ in 0..15 {
                 gloo_timers::future::TimeoutFuture::new(1_000).await;
-                if (session.changed.get(), session.account()) != seen {
+                if (session.changed.get(), session.account(), session.configs()) != seen {
                     if session.account() != seen.1 {
                         loaded.set(None);
                     }
@@ -1448,11 +1451,13 @@ fn act(
             }
             let vault = vault.clone();
             let action = action.clone();
+            let reviewed = network.clone();
             Some(
                 on_click(Button::new(kind, label).size(Size::Small).build(), move || {
                     // One flow at a time per action: a second click starts
-                    // nothing.
-                    let flow = Running::new(action.clone());
+                    // nothing. It signs with the network this card was
+                    // read and drawn with, or not at all.
+                    let flow = Running::new(action.clone(), reviewed.clone());
                     if crate::wallet::get().begin(&vault.slug, &flow) {
                         crate::wallet::run::start(&vault, action.clone(), &flow);
                     }
@@ -1667,7 +1672,7 @@ async fn follow_claim(slug: String, id: u64, loaded: Mutable<Option<Result<Claim
         use crate::wallet::session::Session;
         let session = crate::wallet::get();
         loop {
-            let seen = session.changed.get();
+            let seen = (session.changed.get(), session.configs());
             let vaults = session.read_vaults().await;
             let result = async {
                 let vault = vaults
@@ -1719,7 +1724,7 @@ async fn follow_claim(slug: String, id: u64, loaded: Mutable<Option<Result<Claim
             loaded.set(Some(result));
             for _ in 0..10 {
                 gloo_timers::future::TimeoutFuture::new(1_000).await;
-                if session.changed.get() != seen {
+                if (session.changed.get(), session.configs()) != seen {
                     break;
                 }
             }
@@ -2087,6 +2092,7 @@ mod tests {
             asset_symbol: "USDC".to_string(),
             asset_decimals: 6,
             dev_account: None,
+            config: crate::wallet::config_cache::ConfigId::default(),
         };
         let claim = |state| Outcome::Claim {
             claim: U256::from(1u8),

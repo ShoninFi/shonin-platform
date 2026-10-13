@@ -28,6 +28,7 @@ use crate::tx::error::{Context, TxError};
 use crate::tx::flow::{Outcome, Prompt, Step};
 use crate::tx::read::{ClaimState, Holdings, State, VaultFigures};
 use crate::view::{El, View, el, text};
+use crate::wallet::config_cache::ConfigId;
 use crate::wallet::machine::Connection;
 use crate::wallet::run::EXIT;
 use crate::wallet::{Action, Network, Running, VaultRef, networks};
@@ -59,8 +60,11 @@ enum Mode {
     Unavailable,
     SignedOut(Tab),
     WrongNetwork(u64),
-    Form(Tab),
-    Review,
+    /// The form, drawn with the network read from this config.
+    Form(Tab, ConfigId),
+    /// The review, computed with the network read from this config: drawn
+    /// again when the chain's settings change.
+    Review(ConfigId),
     /// A flow for this vault and account, by its id: another account's or
     /// another flow redraws.
     Flow(u64),
@@ -189,6 +193,23 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
     let (tabs, why) = tabs(&panel);
     let loader = panel.clone();
     let acting = panel.network.clone();
+    // The vault chain's network as the session reads it, as it changes: a
+    // config fetched after the panel opened is what it reads and reviews
+    // with from then on.
+    let network_change = {
+        let panel = panel.clone();
+        map_ref! {
+            let vault = panel.vault.signal_cloned(),
+            let networks = session.networks.signal_cloned() =>
+            vault.as_ref().and_then(|vault| networks.get(&vault.chain).cloned())
+        }
+        .for_each(move |network| {
+            if let Some(network) = network {
+                take_network(&panel, network);
+            }
+            async {}
+        })
+    };
     // Another account (or none) gets the empty form.
     let account_change = {
         let panel = panel.clone();
@@ -229,6 +250,7 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
         .hook(move |dom| {
             dom.future(follow(loader))
                 .future(account_change)
+                .future(network_change)
                 // While open, the header's chip compares the wallet's chain
                 // with this vault's.
                 .future(super::wallet::acting_on(acting.signal_ref(|network| {
@@ -236,6 +258,32 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
                 })))
         })
         .into()
+}
+
+/// Read and review with `network` from now on. One read from another
+/// config than the panel's drops the figures and holdings read through the
+/// old one, so nothing is shown or reviewed with a mix of the two: the panel
+/// waits for them to be read again, then draws its form or review anew.
+fn take_network(panel: &Panel, network: Rc<Network>) {
+    let before = panel.network.get_cloned();
+    if before.as_deref() == Some(&*network) {
+        return;
+    }
+    if before.is_some_and(|before| before.config != network.config) {
+        panel.figures.set(None);
+        panel.holdings.set(None);
+    }
+    panel.network.set(Some(network));
+}
+
+/// Whether the panel still reads with the network of `config`.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn reads_with(panel: &Panel, config: ConfigId) -> bool {
+    panel
+        .network
+        .lock_ref()
+        .as_ref()
+        .is_some_and(|network| network.config == config)
 }
 
 /// Whether the connected account (or none) is another than the one the
@@ -274,8 +322,8 @@ fn mode_of(
         return Mode::WrongNetwork(network.chain_id);
     }
     match (tab, stage) {
-        (Tab::Deposit, Stage::Review) => Mode::Review,
-        _ => Mode::Form(tab),
+        (Tab::Deposit, Stage::Review) => Mode::Review(network.config),
+        _ => Mode::Form(tab, network.config),
     }
 }
 
@@ -318,15 +366,25 @@ async fn follow(panel: Rc<Panel>) {
             panel.missing.set_neq(true);
             wait_or_retry(&panel, 15).await;
         };
+        take_network(&panel, network);
         panel.vault.set(Some(vault.clone()));
-        panel.network.set(Some(network.clone()));
-        let reader = Session::reader(&network);
         loop {
+            // Through the network the panel reads with now: the session's
+            // copy, followed as it changes. What a read through an older
+            // one answers is dropped.
+            let Some(network) = panel.network.get_cloned() else {
+                wait_or_retry(&panel, 1).await;
+                continue;
+            };
+            let reader = Session::reader(&network);
             // Before the figures, so the review never opens without it.
-            if let Ok(restricted) = read::restricted_text(&reader, vault.address).await {
+            if let Ok(restricted) = read::restricted_text(&reader, vault.address).await
+                && reads_with(&panel, network.config)
+            {
                 panel.restricted.set_neq(Some(restricted));
             }
             match read::figures(&reader, vault.address).await {
+                Ok(_) if !reads_with(&panel, network.config) => continue,
                 Ok(figures) => {
                     panel.figures.set(Some(figures));
                     panel.missing.set_neq(false);
@@ -341,6 +399,7 @@ async fn follow(panel: Rc<Panel>) {
                 Some(account) => {
                     if let Ok(held) =
                         read::holdings(&reader, vault.address, network.asset, account).await
+                        && reads_with(&panel, network.config)
                     {
                         panel.holdings.set(Some(held));
                         panel.holdings_at.set(at);
@@ -356,8 +415,8 @@ async fn follow(panel: Rc<Panel>) {
     let _ = panel;
 }
 
-/// Wait `seconds`, or less if the account changes, a flow lands or the
-/// reader presses "Try again".
+/// Wait `seconds`, or less if the account changes, a flow lands, the
+/// chain's settings change or the reader presses "Try again".
 #[cfg(target_arch = "wasm32")]
 async fn wait_or_retry(panel: &Panel, seconds: u32) {
     wait_or_retry_since(panel, seconds, crate::wallet::get().changed.get()).await;
@@ -368,10 +427,23 @@ async fn wait_or_retry(panel: &Panel, seconds: u32) {
 #[cfg(target_arch = "wasm32")]
 async fn wait_or_retry_since(panel: &Panel, seconds: u32, changed: u64) {
     let session = crate::wallet::get();
-    let seen = (changed, session.account(), panel.retry.get());
+    let config = || {
+        panel
+            .network
+            .lock_ref()
+            .as_ref()
+            .map(|network| network.config)
+    };
+    let seen = (changed, session.account(), panel.retry.get(), config());
     for _ in 0..seconds {
         gloo_timers::future::TimeoutFuture::new(1_000).await;
-        if (session.changed.get(), session.account(), panel.retry.get()) != seen {
+        if (
+            session.changed.get(),
+            session.account(),
+            panel.retry.get(),
+            config(),
+        ) != seen
+        {
             break;
         }
     }
@@ -638,8 +710,8 @@ fn render(panel: &Rc<Panel>, mode: Mode) -> View {
                 .child(switch_button(chain_id, Size::Medium).class("sh-btn-block"))
                 .into()
         }
-        Mode::Form(tab) => body.child(form(panel, tab, true, View::Empty)).into(),
-        Mode::Review => review(panel),
+        Mode::Form(tab, _) => body.child(form(panel, tab, true, View::Empty)).into(),
+        Mode::Review(_) => review(panel),
         Mode::Flow(_) => flow_view(panel),
     }
 }
@@ -1327,8 +1399,12 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
                         panel.unit.get(),
                         true,
                     );
-                    if let (Check::Ready, Some(shares)) = (verdict, shares) {
-                        start(&panel, Action::Withdraw(shares));
+                    // Figured with the network the panel reads with now;
+                    // the flow signs with that one or not at all.
+                    if let (Check::Ready, Some(shares), Some(reviewed)) =
+                        (verdict, shares, panel.network.get_cloned())
+                    {
+                        start(&panel, Action::Withdraw(shares), reviewed);
                     }
                 })
             })
@@ -1445,10 +1521,21 @@ pub(crate) fn whole_shares(shares: U256) -> String {
 
 // Review ------------------------------------------------------------------------
 
-fn review(panel: &Rc<Panel>) -> View {
-    let decimals = decimals(panel);
-    let symbol = symbol(panel);
+/// The network a deposit's review is computed with, and the amount typed,
+/// scaled with that network's decimals: the deposit signs with this network
+/// or not at all.
+fn reviewed_deposit(panel: &Panel) -> Option<(Rc<Network>, Option<U256>)> {
+    let reviewed = panel.network.get_cloned()?;
     let (_, amount) = deposit_check(panel, &panel.deposit_text.get_cloned(), true);
+    Some((reviewed, amount))
+}
+
+fn review(panel: &Rc<Panel>) -> View {
+    let Some((reviewed, amount)) = reviewed_deposit(panel) else {
+        return placeholder();
+    };
+    let decimals = reviewed.asset_decimals;
+    let symbol = reviewed.asset_symbol.clone();
     // Never without the vault's list: the review shows what is signed.
     let (Some(amount), true) = (amount, panel.restricted.lock_ref().is_some()) else {
         panel.stage.set(Stage::Form);
@@ -1485,7 +1572,7 @@ fn review(panel: &Rc<Panel>) -> View {
                 let Some(shown) = shown.borrow().clone() else {
                     return;
                 };
-                start(&panel, Action::Deposit { amount, shown });
+                start(&panel, Action::Deposit { amount, shown }, reviewed.clone());
             },
         )
         .attr_signal(
@@ -1737,13 +1824,14 @@ pub(crate) fn statement_notice(statement: Statement<'_>) -> View {
 
 // Running a flow ------------------------------------------------------------------
 
-fn start(panel: &Rc<Panel>, action: Action) {
+/// Start `action`, figured with the network `reviewed`.
+fn start(panel: &Rc<Panel>, action: Action, reviewed: Rc<Network>) {
     let Some(vault) = panel.vault.get_cloned() else {
         return;
     };
     // One flow at a time per vault and account: a second click, or another
     // panel for the same vault, starts nothing while one is shown.
-    let running = Running::new(action.clone());
+    let running = Running::new(action.clone(), reviewed);
     if !crate::wallet::get().begin(&panel.slug, &running) {
         return;
     }
@@ -1950,19 +2038,15 @@ fn prompt_lines(
 
 fn step_view(panel: &Rc<Panel>, running: &Running, step: &Step) -> View {
     let (wallet, chain_name, wallet_chain, symbol, native) = context_names(panel);
-    let decimals = decimals(panel);
+    // The flow's amounts are in the reviewed network's units.
+    let decimals = running.reviewed.asset_decimals;
     let vault_title = panel
         .vault
         .lock_ref()
         .as_ref()
         .map(|vault| vault.title.clone())
         .unwrap_or_default();
-    let chain_id = panel
-        .network
-        .lock_ref()
-        .as_ref()
-        .map(|network| network.chain_id)
-        .unwrap_or_default();
+    let chain_id = running.reviewed.chain_id;
     let live = |line: String| {
         el("p")
             .class("sh-vh")
@@ -2259,6 +2343,12 @@ fn step_view(panel: &Rc<Panel>, running: &Running, step: &Step) -> View {
                         review_again(&panel, &running, now);
                         return;
                     }
+                    if error == TxError::SettingsChanged {
+                        // Back to the review, computed with the chain's
+                        // settings as they are now.
+                        review_with_new_settings(&panel, &running);
+                        return;
+                    }
                     crate::wallet::get().dismiss(&running);
                     if moved {
                         // What was typed was sent, or may still land: the
@@ -2301,15 +2391,39 @@ fn step_view(panel: &Rc<Panel>, running: &Running, step: &Step) -> View {
 /// failed flow for the review of the same deposit, showing the list as it is
 /// now (`now`). Nothing is started: the person reads it and confirms again.
 fn review_again(panel: &Panel, running: &Running, now: &str) {
-    crate::wallet::get().dismiss(running);
     panel.restricted.set(Some(now.to_string()));
-    if let Action::Deposit { amount, .. } = &running.action {
-        panel
-            .deposit_text
-            .set(money::plain_exact(*amount, decimals(panel)));
-        panel.tab.set(Tab::Deposit);
-        panel.ack.set(false);
-        panel.stage.set(Stage::Review);
+    restore(panel, running);
+}
+
+/// After the chain's settings changed between the review and signing:
+/// leave the failed flow for the review of the same deposit (or the form of
+/// the same withdrawal), computed with the network the panel reads now.
+/// Nothing is started: the person reads it and confirms again.
+fn review_with_new_settings(panel: &Panel, running: &Running) {
+    restore(panel, running);
+}
+
+/// Leave a flow stopped before signing for what started it, as typed: the
+/// amount in the units of the network it was reviewed with, read again by
+/// the form or review with the network the panel reads now.
+fn restore(panel: &Panel, running: &Running) {
+    crate::wallet::get().dismiss(running);
+    panel.ack.set(false);
+    match &running.action {
+        Action::Deposit { amount, .. } => {
+            panel
+                .deposit_text
+                .set(money::plain_exact(*amount, running.reviewed.asset_decimals));
+            panel.tab.set(Tab::Deposit);
+            panel.stage.set(Stage::Review);
+        }
+        Action::Withdraw(shares) => {
+            panel.withdraw_text.set(money::plain_exact(*shares, 18));
+            panel.unit.set(Unit::Shares);
+            panel.tab.set(Tab::Withdraw);
+            panel.stage.set(Stage::Form);
+        }
+        _ => {}
     }
 }
 
@@ -2456,13 +2570,28 @@ pub fn done_states() -> Vec<(String, View)> {
         panel
             .holdings_at
             .set(if read { landed } else { landed - 1 });
-        let running = Running::new(Action::Withdraw(U256::ZERO));
+        let running = Running::new(Action::Withdraw(U256::ZERO), Rc::new(sample_network()));
         (
             label.to_string(),
             done_view(&panel, &running, &outcome, 84_532, 6),
         )
     })
     .collect()
+}
+
+/// A Base Sepolia network, for the state gallery.
+fn sample_network() -> Network {
+    Network {
+        chain: shared::Chain::Base,
+        chain_id: 84_532,
+        label: "Base Sepolia".to_string(),
+        rpc: String::new(),
+        asset: alloy_primitives::Address::repeat_byte(0xdd),
+        asset_symbol: "USDC".to_string(),
+        asset_decimals: 6,
+        dev_account: None,
+        config: ConfigId::default(),
+    }
 }
 
 fn done_view(
@@ -2741,6 +2870,7 @@ mod tests {
             asset_symbol: "USDC".to_string(),
             asset_decimals: 6,
             dev_account: None,
+            config: ConfigId::default(),
         }
     }
 
@@ -2806,7 +2936,7 @@ mod tests {
             panel.stage.get(),
             None,
         );
-        assert_eq!(mode, Mode::Form(Tab::Deposit));
+        assert_eq!(mode, Mode::Form(Tab::Deposit, network().config));
         assert!(panel.deposit_text.get_cloned().is_empty());
         assert!(panel.withdraw_text.get_cloned().is_empty());
         assert!(!panel.ack.get());
@@ -2817,6 +2947,7 @@ mod tests {
     #[test]
     fn the_review_names_who_the_vault_is_not_open_to_before_the_acknowledgement() {
         let panel = Rc::new(Panel::new("base-1", Tab::Deposit, false));
+        panel.network.set(Some(Rc::new(network())));
         panel.deposit_text.set("100".to_string());
         panel.restricted.set(Some("SANCTIONED,US".to_string()));
         panel.stage.set(Stage::Review);
@@ -2837,6 +2968,7 @@ mod tests {
     #[test]
     fn the_review_cant_start_with_no_list_read() {
         let panel = Rc::new(Panel::new("base-1", Tab::Deposit, false));
+        panel.network.set(Some(Rc::new(network())));
         panel.deposit_text.set("100".to_string());
         let (check, _) = deposit_check(&panel, "100", true);
         assert_eq!(check, Check::Ready, "the amount itself is fine");
@@ -2890,7 +3022,7 @@ mod tests {
             panel.stage.get(),
             None,
         );
-        assert_eq!(mode, Mode::Review);
+        assert_eq!(mode, Mode::Review(network().config));
         assert_eq!(panel.deposit_text.get_cloned(), "11");
         assert!(!panel.ack.get(), "acknowledged again on the new review");
         // The review shows the new list.
@@ -2904,6 +3036,124 @@ mod tests {
             panel.running().is_none(),
             "drawing the review starts nothing"
         );
+    }
+
+    /// The same chain read from another config: another dollar, at 18
+    /// decimals.
+    fn updated() -> Network {
+        Network {
+            asset: Address::repeat_byte(0xee),
+            asset_decimals: 18,
+            config: ConfigId(alloy_primitives::B256::repeat_byte(2)),
+            ..network()
+        }
+    }
+
+    #[test]
+    fn a_config_read_after_the_panel_opened_drops_the_figures_read_through_the_old_one() {
+        let panel = Rc::new(Panel::new("base-4", Tab::Deposit, false));
+        take_network(&panel, Rc::new(network()));
+        panel.figures.set(Some(VaultFigures {
+            state: State::Open,
+            fees: Default::default(),
+            timers: Default::default(),
+            cash: U256::ZERO,
+            total_supply: U256::ZERO,
+            minimum_deposit: U256::ZERO,
+            last: None,
+            ready_to_close: false,
+        }));
+        panel.holdings.set(Some(Holdings::default()));
+        // The same config again: nothing is read again.
+        take_network(&panel, Rc::new(network()));
+        assert!(panel.figures.lock_ref().is_some());
+        assert!(panel.holdings.lock_ref().is_some());
+        // Another config: the panel reads and reviews with it, and waits
+        // for figures read through it.
+        take_network(&panel, Rc::new(updated()));
+        assert_eq!(panel.network.get_cloned().as_deref(), Some(&updated()));
+        assert!(panel.figures.lock_ref().is_none());
+        assert!(panel.holdings.lock_ref().is_none());
+        assert!(reads_with(&panel, updated().config));
+        assert!(!reads_with(&panel, network().config));
+        // The review is drawn anew for the new config.
+        let review = |config| {
+            mode_of(
+                &connected(Address::repeat_byte(0x5c)),
+                Some(&Network {
+                    config,
+                    ..network()
+                }),
+                true,
+                Tab::Deposit,
+                Stage::Review,
+                None,
+            )
+        };
+        assert_ne!(review(network().config), review(updated().config));
+    }
+
+    #[test]
+    fn trying_again_after_the_settings_changed_reopens_the_review_computed_with_the_new_network() {
+        let panel = Rc::new(Panel::new("base-4", Tab::Deposit, false));
+        panel.network.set(Some(Rc::new(network())));
+        panel.restricted.set(Some("SANCTIONED".to_string()));
+        let account = Address::repeat_byte(0x5c);
+        // A deposit of 11, reviewed with 6 decimals, stopped before the
+        // wallet: the chain's settings were updated meanwhile.
+        let running = deposit_shown(&panel, account, Step::Failed(TxError::SettingsChanged));
+        assert_eq!(running.reviewed.config, network().config);
+        take_network(&panel, Rc::new(updated()));
+        review_with_new_settings(&panel, &running);
+        // The failed flow is left and nothing new is started.
+        assert!(panel.running().is_none());
+        assert_eq!(panel.deposit_text.get_cloned(), "11");
+        assert!(!panel.ack.get(), "acknowledged again on the new review");
+        let mode = mode_of(
+            &connected(account),
+            Some(&updated()),
+            true,
+            panel.tab.get(),
+            panel.stage.get(),
+            None,
+        );
+        assert_eq!(mode, Mode::Review(updated().config));
+        // The review is computed with the new network: the same 11 dollars,
+        // scaled with its 18 decimals, and the deposit would carry it.
+        let (reviewed, amount) = reviewed_deposit(&panel).unwrap();
+        assert_eq!(*reviewed, updated());
+        assert_eq!(amount, Some(U256::from(11_000_000_000_000_000_000u128)));
+        let html = review(&panel).html();
+        assert!(html.contains("Deposit $11"), "{html}");
+        assert!(
+            panel.running().is_none(),
+            "drawing the review starts nothing"
+        );
+    }
+
+    #[test]
+    fn trying_again_after_the_settings_changed_on_a_withdrawal_offers_the_same_shares() {
+        let panel = Rc::new(Panel::new("base-4", Tab::Withdraw, false));
+        panel.network.set(Some(Rc::new(network())));
+        let session = crate::wallet::get();
+        session
+            .connection
+            .set(connected(Address::repeat_byte(0x5d)));
+        let running = Running::new(
+            Action::Withdraw(U256::from(2_500_000_000_000_000_000u128)),
+            Rc::new(network()),
+        );
+        running
+            .step
+            .set(Some(Step::Failed(TxError::SettingsChanged)));
+        assert!(session.begin(&panel.slug, &running));
+        take_network(&panel, Rc::new(updated()));
+        review_with_new_settings(&panel, &running);
+        assert!(panel.running().is_none());
+        assert_eq!(panel.tab.get(), Tab::Withdraw);
+        assert_eq!(panel.stage.get(), Stage::Form);
+        assert_eq!(panel.unit.get(), Unit::Shares);
+        assert_eq!(panel.withdraw_text.get_cloned(), "2.5");
     }
 
     #[test]
@@ -2924,10 +3174,13 @@ mod tests {
     fn deposit_shown(panel: &Panel, account: Address, step: Step) -> Running {
         let session = crate::wallet::get();
         session.connection.set(connected(account));
-        let running = Running::new(Action::Deposit {
-            amount: U256::from(11_000_000u64),
-            shown: "SANCTIONED,US".to_string(),
-        });
+        let running = Running::new(
+            Action::Deposit {
+                amount: U256::from(11_000_000u64),
+                shown: "SANCTIONED,US".to_string(),
+            },
+            Rc::new(network()),
+        );
         running.step.set(Some(step));
         assert!(session.begin(&panel.slug, &running));
         running
@@ -2966,7 +3219,7 @@ mod tests {
                 panel.stage.get(),
                 None,
             );
-            assert_eq!(mode, Mode::Form(Tab::Withdraw), "{slug}");
+            assert_eq!(mode, Mode::Form(Tab::Withdraw, network().config), "{slug}");
         }
     }
 
@@ -3026,10 +3279,13 @@ mod tests {
             ..held
         }));
         panel.holdings_at.set(landed - 1);
-        let running = Running::new(Action::Deposit {
-            amount: U256::from(50_000_000u64),
-            shown: String::new(),
-        });
+        let running = Running::new(
+            Action::Deposit {
+                amount: U256::from(50_000_000u64),
+                shown: String::new(),
+            },
+            Rc::new(network()),
+        );
         let outcome = Outcome::Deposited {
             assets: U256::from(50_000_000u64),
             shares: held.shares,

@@ -191,6 +191,7 @@ mod browser {
     use crate::tx::author::flow::{self, Ctx, Outcome, Step, Usage};
     use crate::tx::author::read::{self, PaymentRecord};
     use crate::tx::flow::Pace;
+    use crate::wallet::config_cache::ConfigId;
     use crate::wallet::run::Timer;
     use crate::wallet::session::Session;
 
@@ -347,10 +348,13 @@ mod browser {
     }
 
     /// Start `action` on `chain`, reporting into `running`; `done` runs with
-    /// the outcome once the chain has confirmed it.
+    /// the outcome once the chain has confirmed it. `reviewed` is the config
+    /// of the network the page computed the action with: the flow signs
+    /// with that config or not at all.
     pub fn start(
         chain: Chain,
         action: Action,
+        reviewed: ConfigId,
         running: &Running,
         done: impl FnOnce(&Outcome) + 'static,
     ) {
@@ -373,20 +377,29 @@ mod browser {
                 _ => connected,
             };
             // Never a config remembered from an earlier visit alone: one the
-            // API answered in this page's life.
-            let network = match session.network_to_sign(chain).await {
+            // API answered in this page's life, and the one the page computed
+            // this with; any other stops here, before a wallet is asked.
+            let network = match session.network_to_sign(chain, reviewed).await {
                 Ok(network) => network,
                 Err(error) => {
                     fail(error.into());
                     return;
                 }
             };
-            let Some(platform) = platform(chain).await else {
+            // The platform's contracts from the very config the flow signs
+            // with, never from another answer.
+            let Some(platform) = session
+                .config_text(chain, &network)
+                .and_then(|raw| serde_json::from_str::<shared::Config>(&raw).ok())
+                .and_then(|config| Platform::from_config(&config))
+                .map(Rc::new)
+            else {
                 fail(
                     TxError::Network("this chain isn't reachable from this app".to_string()).into(),
                 );
                 return;
             };
+            PLATFORMS.with(|map| map.borrow_mut().insert(chain, platform.clone()));
             let reader = Session::reader(&network);
             let signer = session.signer(network.clone());
             let ctx = Ctx {
@@ -474,6 +487,7 @@ mod native {
     pub fn start(
         _chain: Chain,
         _action: Action,
+        _reviewed: crate::wallet::config_cache::ConfigId,
         running: &Running,
         _done: impl FnOnce(&Outcome) + 'static,
     ) {

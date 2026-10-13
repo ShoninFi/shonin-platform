@@ -6,7 +6,7 @@
 //! list as read from its account: approving the deposit is the statement.
 //! A wallet of the other kind says plainly which kind this vault needs.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use alloy_primitives::U256;
@@ -35,6 +35,7 @@ use crate::tx::solana::port::Sig;
 use crate::tx::solana::run::{SolAction, SolRunning, SolVault};
 use crate::tx::solana::{SolError, author::AuthorPrompt};
 use crate::view::{El, View, el, text};
+use crate::wallet::config_cache::ConfigId;
 use crate::wallet::solana::{SolConnection, SolNetwork};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,8 +57,11 @@ enum Mode {
     SignedOut(Tab),
     /// Only an EVM wallet is connected: this vault needs a Solana one.
     OtherKind(Tab),
-    Form(Tab),
-    Review,
+    /// The form, drawn with the cluster read from this config.
+    Form(Tab, ConfigId),
+    /// The review, computed with the cluster read from this config: drawn
+    /// again when the cluster's settings change.
+    Review(ConfigId),
     Flow,
 }
 
@@ -85,9 +89,10 @@ struct Panel {
     running: Mutable<Option<SolRunning>>,
     /// The list shown on the review, which the deposit states.
     shown: Mutable<Option<[u8; 32]>>,
-    /// The amount of the deposit last started, in base units: reviewed
-    /// again, with no typing, if the vault's list changed before signing.
-    asked: Cell<Option<u64>>,
+    /// The deposit or withdrawal last started: reviewed again, with no
+    /// typing, if the vault's list or the cluster's settings changed before
+    /// signing.
+    asked: RefCell<Option<SolAction>>,
     requested_local: Rc<Cell<Option<(f64, u64)>>>,
     /// Bumped by "Try again" on the unreachable state: read again now.
     retry: Mutable<u32>,
@@ -137,7 +142,7 @@ impl Panel {
             ack: Mutable::new(false),
             running: Mutable::new(None),
             shown: Mutable::new(None),
-            asked: Cell::new(None),
+            asked: RefCell::new(None),
             requested_local: Rc::new(Cell::new(None)),
             retry: Mutable::new(0),
             in_sheet,
@@ -154,7 +159,7 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
         map_ref! {
             let connection = solana.connection.signal_cloned(),
             let evm = evm.connection.signal_ref(|c| c.account().is_some()),
-            let network = panel.network.signal_ref(Option::is_some),
+            let network = panel.network.signal_ref(|network| network.as_ref().map(|network| network.config)),
             let figures = panel.figures.signal_ref(Option::is_some),
             let tab = panel.tab.signal(),
             let stage = panel.stage.signal(),
@@ -170,6 +175,17 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
     };
     let loader = panel.clone();
     let (tabs, why) = tabs(&panel);
+    // The cluster as the session reads it, as it changes: a config fetched
+    // after the panel opened is what it reads and reviews with from then on.
+    let network_change = {
+        let panel = panel.clone();
+        solana.network.signal_cloned().for_each(move |network| {
+            if let Some(network) = network {
+                take_network(&panel, network);
+            }
+            async {}
+        })
+    };
     el("section")
         .class("sh-exit")
         .class_if(in_sheet, "sh-exit--sheet")
@@ -192,15 +208,41 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
                 .child(icon(Icon::Concern, 16).class("sh-exit__warn"))
                 .text("The agent can lose money. Nothing here stops that."),
         )
-        .hook(move |dom| dom.future(follow(loader)))
+        .hook(move |dom| dom.future(follow(loader)).future(network_change))
         .into()
+}
+
+/// Read and review with `network` from now on. One read from another
+/// config than the panel's drops the figures and holdings read through the
+/// old one, so nothing is shown or reviewed with a mix of the two: the panel
+/// waits for them to be read again, then draws its form or review anew.
+fn take_network(panel: &Panel, network: Rc<SolNetwork>) {
+    let before = panel.network.get_cloned();
+    if before.as_deref() == Some(&*network) {
+        return;
+    }
+    if before.is_some_and(|before| before.config != network.config) {
+        panel.figures.set(None);
+        panel.holdings.set(None);
+    }
+    panel.network.set(Some(network));
+}
+
+/// Whether the panel still reads with the cluster of `config`.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn reads_with(panel: &Panel, config: ConfigId) -> bool {
+    panel
+        .network
+        .lock_ref()
+        .as_ref()
+        .is_some_and(|network| network.config == config)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn mode_of(
     connection: &SolConnection,
     evm: bool,
-    network: bool,
+    network: Option<ConfigId>,
     figures: bool,
     tab: Tab,
     stage: Stage,
@@ -213,9 +255,9 @@ fn mode_of(
     if running {
         return Mode::Flow;
     }
-    if !network || !figures {
+    let (Some(network), true) = (network, figures) else {
         return Mode::Loading;
-    }
+    };
     if connection.account().is_none() {
         return if evm {
             Mode::OtherKind(tab)
@@ -224,8 +266,8 @@ fn mode_of(
         };
     }
     match (tab, stage) {
-        (Tab::Deposit, Stage::Review) => Mode::Review,
-        _ => Mode::Form(tab),
+        (Tab::Deposit, Stage::Review) => Mode::Review(network),
+        _ => Mode::Form(tab, network),
     }
 }
 
@@ -261,13 +303,24 @@ async fn follow(panel: Rc<Panel>) {
             panel.missing.set_neq(true);
             wait_or_retry(&panel, 15).await;
         };
+        take_network(&panel, network);
         panel.vault.set(Some(vault.clone()));
-        panel.network.set(Some(network.clone()));
-        let reader = SolSession::reader(&network);
         loop {
+            // Through the cluster the panel reads with now: the session's
+            // copy, followed as it changes. What a read through an older
+            // one answers is dropped.
+            let Some(network) = panel.network.get_cloned() else {
+                wait_or_retry(&panel, 1).await;
+                continue;
+            };
+            let reader = SolSession::reader(&network);
             // What had landed before this read: the read shows it.
             let at = session.changed.get();
-            if let Ok(Some(account)) = reader.account(&vault.address).await
+            let read = reader.account(&vault.address).await;
+            if !reads_with(&panel, network.config) {
+                continue;
+            }
+            if let Ok(Some(account)) = read
                 && account.owner == ids::VAULT
                 && let Some(read) = Vault::read(&account.data)
             {
@@ -296,7 +349,9 @@ async fn follow(panel: Rc<Panel>) {
                             Ok(None) => Some(0),
                             Err(_) => None,
                         };
-                        if let Some(balance) = balance {
+                        if let Some(balance) = balance
+                            && reads_with(&panel, network.config)
+                        {
                             panel.holdings.set(Some(crate::tx::solana::read::holdings(
                                 &read,
                                 holder.as_ref(),
@@ -330,10 +385,23 @@ async fn wait_or_retry(panel: &Panel, seconds: u32) {
 #[cfg(target_arch = "wasm32")]
 async fn wait_or_retry_since(panel: &Panel, seconds: u32, changed: u64) {
     let session = crate::wallet::solana::get();
-    let seen = (changed, session.account(), panel.retry.get());
+    let config = || {
+        panel
+            .network
+            .lock_ref()
+            .as_ref()
+            .map(|network| network.config)
+    };
+    let seen = (changed, session.account(), panel.retry.get(), config());
     for _ in 0..seconds {
         gloo_timers::future::TimeoutFuture::new(1_000).await;
-        if (session.changed.get(), session.account(), panel.retry.get()) != seen {
+        if (
+            session.changed.get(),
+            session.account(),
+            panel.retry.get(),
+            config(),
+        ) != seen
+        {
             break;
         }
     }
@@ -441,8 +509,8 @@ fn render(panel: &Rc<Panel>, mode: Mode) -> View {
                 ]),
             ))
             .into(),
-        Mode::Form(tab) => body.child(form(panel, tab, true, View::Empty)).into(),
-        Mode::Review => review(panel),
+        Mode::Form(tab, _) => body.child(form(panel, tab, true, View::Empty)).into(),
+        Mode::Review(_) => review(panel),
         Mode::Flow => flow_view(panel),
     }
 }
@@ -936,10 +1004,13 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
                         panel.unit.get(),
                         true,
                     );
-                    if let (Check::Ready, Some(shares)) = (verdict, shares)
+                    // Figured with the cluster the panel reads with now; the
+                    // flow signs with that one or not at all.
+                    if let (Check::Ready, Some(shares), Some(reviewed)) =
+                        (verdict, shares, panel.network.get_cloned())
                         && let Ok(shares) = u128::try_from(shares)
                     {
-                        start(&panel, SolAction::Withdraw(shares));
+                        start(&panel, SolAction::Withdraw(shares), reviewed);
                     }
                 })
             })
@@ -1052,8 +1123,13 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
 // Review: the deposit and its statement ---------------------------------------------------------
 
 fn review(panel: &Rc<Panel>) -> View {
-    let decimals = decimals(panel);
-    let symbol = symbol(panel);
+    // The cluster this review is computed with: its amount is scaled with
+    // this cluster's decimals, and the deposit signs with it or not at all.
+    let Some(reviewed) = panel.network.get_cloned() else {
+        return placeholder();
+    };
+    let decimals = reviewed.asset_decimals;
+    let symbol = reviewed.asset_symbol.clone();
     let (_, amount) = deposit_check(panel, &panel.deposit_text.get_cloned(), true);
     let (Some(amount), Some(codes)) = (amount, panel.codes.get_cloned()) else {
         panel.stage.set(Stage::Form);
@@ -1090,7 +1166,11 @@ fn review(panel: &Rc<Panel>) -> View {
                 let Ok(amount) = u64::try_from(amount) else {
                     return;
                 };
-                start(&panel, SolAction::Deposit { amount, shown });
+                start(
+                    &panel,
+                    SolAction::Deposit { amount, shown },
+                    reviewed.clone(),
+                );
             },
         )
         .attr_signal(
@@ -1186,15 +1266,14 @@ fn review(panel: &Rc<Panel>) -> View {
 
 // Running a flow ---------------------------------------------------------------------------
 
-fn start(panel: &Rc<Panel>, action: SolAction) {
+/// Start `action`, figured with the cluster `reviewed`.
+fn start(panel: &Rc<Panel>, action: SolAction, reviewed: Rc<SolNetwork>) {
     let Some(vault) = panel.vault.get_cloned() else {
         return;
     };
-    let running = SolRunning::new();
+    let running = SolRunning::new(reviewed);
     panel.requested_local.set(None);
-    if let SolAction::Deposit { amount, .. } = &action {
-        panel.asked.set(Some(*amount));
-    }
+    panel.asked.replace(Some(action.clone()));
     if panel.in_sheet {
         crate::atoms::dialog::lock(true);
     }
@@ -1389,9 +1468,19 @@ fn live(line: String) -> El {
 fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
     let session = crate::wallet::solana::get();
     let wallet = session.wallet_name.get_cloned();
-    let network = panel.network.get_cloned();
-    let decimals = decimals(panel);
-    let symbol = symbol(panel);
+    // The flow's amounts are in the reviewed cluster's units.
+    let network = panel
+        .running
+        .lock_ref()
+        .as_ref()
+        .map(|running| running.reviewed.clone())
+        .or_else(|| panel.network.get_cloned());
+    let decimals = network
+        .as_ref()
+        .map_or_else(|| decimals(panel), |n| n.asset_decimals);
+    let symbol = network
+        .as_ref()
+        .map_or_else(|| symbol(panel), |n| n.asset_symbol.clone());
     let vault_title = panel
         .vault
         .lock_ref()
@@ -1600,6 +1689,12 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
                         review_again(&panel, now);
                         return;
                     }
+                    if error == SolError::SettingsChanged {
+                        // Back to the review, computed with the cluster's
+                        // settings as they are now.
+                        restore(&panel);
+                        return;
+                    }
                     panel.running.set(None);
                 }
             };
@@ -1641,14 +1736,40 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
 /// now (`now`). Nothing is started: the person reads it and confirms again.
 fn review_again(panel: &Panel, now: &[[u8; 32]]) {
     panel.codes.set(Some(now.to_vec()));
-    if let Some(amount) = panel.asked.get() {
-        panel
-            .deposit_text
-            .set(money::plain_exact(U256::from(amount), decimals(panel)));
-    }
-    panel.tab.set(Tab::Deposit);
+    restore(panel);
+}
+
+/// Leave a flow stopped before signing for what started it, as typed: the
+/// deposit's review (or the withdrawal's form), its amount in the units of
+/// the cluster it was reviewed with, read again with the cluster the panel
+/// reads now. Nothing is started: the person reads it and confirms again.
+fn restore(panel: &Panel) {
+    let reviewed = panel
+        .running
+        .lock_ref()
+        .as_ref()
+        .map(|running| running.reviewed.asset_decimals)
+        .unwrap_or_else(|| decimals(panel));
     panel.ack.set(false);
-    panel.stage.set(Stage::Review);
+    match panel.asked.borrow().clone() {
+        Some(SolAction::Withdraw(shares)) => {
+            panel
+                .withdraw_text
+                .set(money::plain_exact(U256::from(shares), 18));
+            panel.unit.set(Unit::Shares);
+            panel.tab.set(Tab::Withdraw);
+            panel.stage.set(Stage::Form);
+        }
+        asked => {
+            if let Some(SolAction::Deposit { amount, .. }) = asked {
+                panel
+                    .deposit_text
+                    .set(money::plain_exact(U256::from(amount), reviewed));
+            }
+            panel.tab.set(Tab::Deposit);
+            panel.stage.set(Stage::Review);
+        }
+    }
     panel.running.set(None);
 }
 
@@ -1805,10 +1926,66 @@ fn done_view(
 mod tests {
     use super::*;
 
+    /// A devnet cluster as the panel reads it, from the config `config`.
+    fn cluster(config: u8) -> Rc<SolNetwork> {
+        Rc::new(SolNetwork {
+            cluster: "devnet".to_string(),
+            label: "Solana devnet".to_string(),
+            rpc: "https://api.devnet.solana.com".to_string(),
+            mint: chain::solana_ix::Pubkey::new_from_array([7; 32]),
+            asset_symbol: "USDC".to_string(),
+            asset_decimals: 6,
+            dev_account: None,
+            config: ConfigId(alloy_primitives::B256::repeat_byte(config)),
+        })
+    }
+
     fn code(text: &str) -> [u8; 32] {
         let mut code = [0u8; 32];
         code[..text.len()].copy_from_slice(text.as_bytes());
         code
+    }
+
+    #[test]
+    fn trying_again_after_the_settings_changed_reopens_the_review_computed_with_the_new_cluster() {
+        let panel = Rc::new(Panel::new("solana-4", Tab::Deposit, false));
+        panel.codes.set(Some(vec![code("SANCTIONED")]));
+        panel.network.set(Some(cluster(1)));
+        // A deposit of 11, reviewed with 6 decimals, stopped before the
+        // wallet: the cluster's settings were updated meanwhile.
+        panel.asked.replace(Some(SolAction::Deposit {
+            amount: 11_000_000,
+            shown: [0; 32],
+        }));
+        let running = SolRunning::new(cluster(1));
+        running
+            .step
+            .set(Some(Step::Failed(SolError::SettingsChanged)));
+        panel.running.set(Some(running));
+        let words = sol_error_words(&SolError::SettingsChanged, None);
+        assert!(words.text.contains("Review it again"), "{}", words.text);
+        assert!(
+            words.text.contains("Nothing was signed or sent."),
+            "{}",
+            words.text
+        );
+        // The panel reads the updated cluster: another dollar, 9 decimals.
+        let updated = Rc::new(SolNetwork {
+            asset_decimals: 9,
+            mint: chain::solana_ix::Pubkey::new_from_array([8; 32]),
+            ..(*cluster(2)).clone()
+        });
+        take_network(&panel, updated.clone());
+        // "Try again": back to the review of the same deposit, nothing
+        // started, computed with the cluster the panel reads now.
+        restore(&panel);
+        assert!(panel.running.lock_ref().is_none());
+        assert_eq!(panel.stage.get(), Stage::Review);
+        assert_eq!(panel.deposit_text.get_cloned(), "11");
+        assert!(!panel.ack.get());
+        assert_eq!(decimals(&panel), 9);
+        let html = review(&panel).html();
+        assert!(html.contains("Deposit $11"), "{html}");
     }
 
     #[test]
@@ -1818,12 +1995,16 @@ mod tests {
         panel.codes.set(Some(vec![code("SANCTIONED")]));
         // A deposit of 11 was started, and stopped before signing: the
         // vault's list became SANCTIONED, US.
-        panel.asked.set(Some(11_000_000));
+        panel.asked.replace(Some(SolAction::Deposit {
+            amount: 11_000_000,
+            shown: [0; 32],
+        }));
         panel.stage.set(Stage::Review);
         panel.deposit_text.set(String::new());
         let now = vec![code("SANCTIONED"), code("US")];
         let error = SolError::ListChanged { now: now.clone() };
-        let running = SolRunning::new();
+        panel.network.set(Some(cluster(1)));
+        let running = SolRunning::new(cluster(1));
         running.step.set(Some(Step::Failed(error.clone())));
         panel.running.set(Some(running));
         // The error names the new list.

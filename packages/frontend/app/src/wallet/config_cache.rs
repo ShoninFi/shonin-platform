@@ -9,17 +9,32 @@
 //! A remembered config is never used to sign. Before a flow sends anything
 //! it takes [`ConfigSlot::for_signing`]: the config fetched from the API in
 //! this page's life, fetching it now if the page holds only a remembered
-//! copy. A fresh answer that differs from the remembered copy the page was
-//! showing stops that send, so the person sees the new figures first. The
-//! flows' own checks (the cluster's genesis, the programs' ids, the chain id
-//! the endpoint answers for) run on whatever is used, as before.
+//! copy. And a send never uses a config other than the one its review was
+//! computed with: every network the page reads carries its config's
+//! [`ConfigId`], a flow carries the id of the network its review used, and
+//! the flow stops before any wallet prompt when the network it would sign
+//! with has another id, so the person reviews again with the new figures.
+//! The flows' own checks (the cluster's genesis, the programs' ids, the
+//! chain id the endpoint answers for) run on whatever is used, as before.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::rc::Rc;
 
 use futures_signals::signal::{Mutable, SignalExt};
 use shared::Chain;
+
+/// Which config a network was read from: the digest of its [`canonical`]
+/// text. Two networks with the same id were read from the same bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConfigId(pub alloy_primitives::B256);
+
+impl ConfigId {
+    /// The id of a config as the page holds it.
+    pub fn of(raw: &str) -> Self {
+        Self(alloy_primitives::keccak256(raw.as_bytes()))
+    }
+}
 
 /// Where the page's copy of a config came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,9 +57,10 @@ pub struct Held {
 pub enum ForSigning {
     /// A config fetched from the API in this page's life.
     Use(Rc<str>),
-    /// The API's fresh answer differs from the remembered copy the page was
-    /// showing: the page takes the fresh one, and this send stops so the
-    /// person sees what changed.
+    /// A config fetched in this page's life that differs from the
+    /// remembered copy the page was reading from before it, said once,
+    /// whenever the fetch landed: the page may have shown the remembered
+    /// one. The send goes on only if its review was computed with this one.
     Changed(Rc<str>),
     /// No fresh config could be read: nothing is sent.
     Unavailable(String),
@@ -57,6 +73,9 @@ pub struct ConfigSlot {
     held: RefCell<Option<Held>>,
     in_flight: Mutable<bool>,
     last_error: RefCell<Option<String>>,
+    /// A fetch replaced a remembered copy with other bytes, and no send has
+    /// been told yet.
+    unseen_change: Cell<bool>,
 }
 
 impl ConfigSlot {
@@ -114,10 +133,18 @@ impl ConfigSlot {
         let result = match answer {
             Ok(raw) => {
                 let raw: Rc<str> = raw.into();
-                *self.held.borrow_mut() = Some(Held {
+                let replaced = self.held.borrow_mut().replace(Held {
                     raw: raw.clone(),
                     source: Source::Fetched,
                 });
+                if let Some(Held {
+                    raw: before,
+                    source: Source::Remembered,
+                }) = replaced
+                    && *before != *raw
+                {
+                    self.unseen_change.set(true);
+                }
                 Ok(raw)
             }
             Err(why) => {
@@ -131,26 +158,28 @@ impl ConfigSlot {
 
     /// The config a send may use: one fetched in this page's life, else a
     /// fresh fetch now. A remembered copy is used only as the fresh fetch
-    /// itself: identical byte for byte, or the send stops.
+    /// itself: identical byte for byte. A fetch that replaced a remembered
+    /// copy with other bytes, whether it landed now or earlier in the
+    /// background, is said once as [`ForSigning::Changed`].
     pub async fn for_signing<F, Fut>(&self, fetch: F) -> ForSigning
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<String, String>>,
     {
-        let before = self.held();
-        if let Some(Held {
-            raw,
-            source: Source::Fetched,
-        }) = &before
-        {
-            return ForSigning::Use(raw.clone());
-        }
-        match self.refresh(fetch).await {
-            Ok(fresh) => match before {
-                Some(remembered) if *remembered.raw != *fresh => ForSigning::Changed(fresh),
-                _ => ForSigning::Use(fresh),
+        let fresh = match self.held() {
+            Some(Held {
+                raw,
+                source: Source::Fetched,
+            }) => raw,
+            _ => match self.refresh(fetch).await {
+                Ok(fresh) => fresh,
+                Err(why) => return ForSigning::Unavailable(why),
             },
-            Err(why) => ForSigning::Unavailable(why),
+        };
+        if self.unseen_change.replace(false) {
+            ForSigning::Changed(fresh)
+        } else {
+            ForSigning::Use(fresh)
         }
     }
 }

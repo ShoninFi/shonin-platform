@@ -73,6 +73,10 @@ pub struct Running {
     /// This flow, among every flow this page has started.
     pub id: u64,
     pub action: Action,
+    /// The network its review was computed with (its amounts are scaled
+    /// with this network's decimals): the flow signs with this config or
+    /// not at all.
+    pub reviewed: Rc<super::Network>,
     pub step: Mutable<Option<Step>>,
     pub cancel: Cancel,
     pub settle_now: Nudge,
@@ -99,13 +103,14 @@ impl PartialEq for Running {
 }
 
 impl Running {
-    pub fn new(action: Action) -> Self {
+    pub fn new(action: Action, reviewed: Rc<super::Network>) -> Self {
         thread_local! {
             static NEXT: Cell<u64> = const { Cell::new(1) };
         }
         Self {
             id: NEXT.with(|next| next.replace(next.get() + 1)),
             action,
+            reviewed,
             step: Mutable::new(None),
             cancel: Cancel::new(),
             settle_now: Nudge::new(),
@@ -264,8 +269,12 @@ pub fn start(vault: &VaultRef, action: Action, running: &Running) {
             }
         };
         // Never a config remembered from an earlier visit alone: one the
-        // API answered in this page's life.
-        let network = match session.network_to_sign(vault.chain).await {
+        // API answered in this page's life, and the one the review was
+        // computed with; any other stops here, before a wallet is asked.
+        let network = match session
+            .network_to_sign(vault.chain, running.reviewed.config)
+            .await
+        {
             Ok(network) => network,
             Err(error) => {
                 on_step(Step::Failed(error));

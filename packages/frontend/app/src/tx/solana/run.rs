@@ -159,16 +159,25 @@ pub fn cluster(network: &SolNetwork) -> Cluster {
     }
 }
 
-/// A flow in progress: its latest step, and its cancel.
-#[derive(Clone, Default)]
+/// A flow in progress: its latest step, its cancel, and the cluster its
+/// review was computed with.
+#[derive(Clone)]
 pub struct SolRunning {
     pub step: Mutable<Option<Step>>,
     pub cancel: Cancel,
+    /// The cluster the review was computed with (its amounts are scaled
+    /// with this cluster's decimals): the flow signs with this config or
+    /// not at all.
+    pub reviewed: std::rc::Rc<SolNetwork>,
 }
 
 impl SolRunning {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(reviewed: std::rc::Rc<SolNetwork>) -> Self {
+        Self {
+            step: Mutable::new(None),
+            cancel: Cancel::default(),
+            reviewed,
+        }
     }
 }
 
@@ -192,8 +201,9 @@ pub fn start(vault: Pubkey, action: SolAction, running: &SolRunning) {
             return;
         };
         // Never a config remembered from an earlier visit alone: one the
-        // API answered in this page's life.
-        let network = match session.network_to_sign().await {
+        // API answered in this page's life, and the one the review was
+        // computed with; any other stops here, before a wallet is asked.
+        let network = match session.network_to_sign(running.reviewed.config).await {
             Ok(network) => network,
             Err(error) => {
                 step.set(Some(Step::Failed(error)));

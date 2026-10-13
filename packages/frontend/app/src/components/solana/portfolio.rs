@@ -153,11 +153,23 @@ async fn follow(
                     failing.set_neq(false);
                 }
             }
-            let seen = (session.changed.get(), session.account());
+            // Read again when a flow lands, the account changes or the
+            // cluster's settings change: every card is then drawn with the
+            // cluster a send would sign with.
+            let seen = (
+                session.changed.get(),
+                session.account(),
+                session.config_id(),
+            );
             let wait = if failures > 0 { 5 } else { 15 };
             for _ in 0..wait {
                 gloo_timers::future::TimeoutFuture::new(1_000).await;
-                if (session.changed.get(), session.account()) != seen {
+                if (
+                    session.changed.get(),
+                    session.account(),
+                    session.config_id(),
+                ) != seen
+                {
                     if session.account() != seen.1 {
                         loaded.set(None);
                         summary.set(None);
@@ -729,11 +741,17 @@ fn act(
             let running = running.clone();
             let address = vault.address;
             let action = action.clone();
+            let reviewed = network.clone();
             Some(
                 on_click(
                     Button::new(kind, label).size(Size::Small).build(),
                     move || {
-                        let flow = SolRunning::new();
+                        // Built with the cluster this card was read with:
+                        // the flow signs with it or not at all.
+                        let Some(reviewed) = reviewed.clone() else {
+                            return;
+                        };
+                        let flow = SolRunning::new(reviewed);
                         crate::tx::solana::run::start(address, action.clone(), &flow);
                         running.set(Some(flow));
                     },
@@ -1018,10 +1036,10 @@ async fn follow_claim(slug: String, id: u64, loaded: Mutable<Option<Result<Claim
                 (_, None) => Err("The Solana cluster can’t be reached right now.".to_string()),
             };
             loaded.set(Some(result));
-            let seen = session.changed.get();
+            let seen = (session.changed.get(), session.config_id());
             for _ in 0..10 {
                 gloo_timers::future::TimeoutFuture::new(1_000).await;
-                if session.changed.get() != seen {
+                if (session.changed.get(), session.config_id()) != seen {
                     break;
                 }
             }
