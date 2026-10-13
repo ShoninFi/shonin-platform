@@ -74,6 +74,11 @@ pub use local::{
 pub use payload::{Decimal, decimal, from_payload, millionths, to_payload};
 pub use sizing::{Limits, size_for};
 
+/// This crate's version. The build service compiles every agent against the
+/// SDK it carries, and takes a lock naming the SDK from crates.io at this
+/// version or an earlier one compatible with it.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Declare the agent the host should run.
 ///
 /// ```ignore

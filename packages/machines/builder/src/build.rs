@@ -311,11 +311,56 @@ fn walk(directory: &Path, depth: usize) -> Vec<PathBuf> {
 /// Point the submission's SDK at the one this build service carries, whatever
 /// it asked for, and crates.io at the vendored copy of the reviewed crates.
 /// An author declares a version; the build service decides what that version
-/// is, and that every other crate is one the platform reviewed.
+/// is, and that every other crate is one the platform reviewed. A lock that
+/// names the SDK from crates.io is made to name the path package patched in,
+/// at the carried version, so the build is `--locked` to the lock as checked
+/// (see [`shared::dependencies::with_carried_sdk`]).
 fn pin(source: &Path, sdk: &Path, vendor: &Path) -> std::io::Result<()> {
+    for lock in walk(source, 32)
+        .into_iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == "Cargo.lock"))
+    {
+        let text = std::fs::read_to_string(&lock)?;
+        let rewritten = shared::dependencies::with_carried_sdk(&text, strategy_sdk::VERSION)
+            .map_err(std::io::Error::other)?;
+        if let Some(rewritten) = rewritten {
+            std::fs::write(&lock, rewritten)?;
+        }
+    }
     let directory = source.join(".cargo");
     std::fs::create_dir_all(&directory)?;
     std::fs::write(directory.join("config.toml"), config(sdk, vendor))
+}
+
+/// Whether `sdk` is a copy of the SDK this program is built with, at its
+/// version ([`strategy_sdk::VERSION`]): the version a lock naming the SDK
+/// from crates.io is rewritten to, which the copy patched in must be for the
+/// build to be `--locked` to it.
+pub fn carries(sdk: &Path) -> Result<(), String> {
+    let manifest = sdk.join("Cargo.toml");
+    let package = std::fs::read_to_string(&manifest)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|cargo| cargo.get("package").cloned());
+    let field = |key: &str| {
+        package
+            .as_ref()
+            .and_then(|package| package.get(key))
+            .and_then(toml::Value::as_str)
+            .map(str::to_string)
+    };
+    let (name, version) = (field("name"), field("version"));
+    if name.as_deref() == Some(shared::dependencies::SDK)
+        && version.as_deref() == Some(strategy_sdk::VERSION)
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "{} is not {} {}, the SDK this build service is built with: give --sdk a copy of it",
+        manifest.display(),
+        shared::dependencies::SDK,
+        strategy_sdk::VERSION,
+    ))
 }
 
 /// The Cargo config every build is made with.

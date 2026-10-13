@@ -505,6 +505,29 @@ impl Builder {
         Some(reply.json().await.unwrap())
     }
 
+    /// Upload `archive` as `author`, pay for it, and wait for its job to
+    /// end: the job as it ended, and what the builder said meanwhile.
+    pub async fn publish(&self, author: Address, archive: &[u8]) -> (Job, String) {
+        let (status, body) = self.upload(author, archive).await;
+        assert_eq!(status, 200, "the upload was refused: {body}");
+        let accepted: shared::UploadAccepted = serde_json::from_str(&body).unwrap();
+        let head = self.node.head.load(Ordering::SeqCst);
+        self.node
+            .pay(head + 1, 5, author, accepted.upload.parse().unwrap());
+        self.node.head.store(head + 2, Ordering::SeqCst);
+        let jobs = self
+            .wait_for(Duration::from_secs(30), |jobs| {
+                jobs.iter()
+                    .any(|job| job.id == accepted.job_id && job.state.is_finished())
+            })
+            .await;
+        let job = jobs
+            .into_iter()
+            .find(|job| job.id == accepted.job_id)
+            .unwrap();
+        (job, self.said.lock().unwrap().clone())
+    }
+
     /// Wait up to `within` for `ready` to hold of every job the builder
     /// holds.
     pub async fn wait_for(&self, within: Duration, ready: impl Fn(&[Job]) -> bool) -> Vec<Job> {
@@ -517,6 +540,28 @@ impl Builder {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
+}
+
+/// The builder `command` starts, given none of this shell's overrides of a
+/// chain's endpoints (`SHONIN_RPC_*`, `SHONIN_WS_*`, `SHONIN_LOGS_RPC_*`,
+/// `SHONIN_LOG_RANGE_*`), which would point it away from the stand-in node.
+pub fn without_chain_overrides(command: &mut std::process::Command) -> &mut std::process::Command {
+    for (name, _) in std::env::vars_os() {
+        let overrides = name.to_str().is_some_and(|name| {
+            [
+                "SHONIN_RPC_",
+                "SHONIN_WS_",
+                "SHONIN_LOGS_RPC_",
+                "SHONIN_LOG_RANGE_",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        });
+        if overrides {
+            command.env_remove(name);
+        }
+    }
+    command
 }
 
 /// Start the builder binary, its store already holding each of `files`
@@ -598,32 +643,34 @@ pub async fn spawn_with(node: Node, files: &[(&str, String)], args: &[&str]) -> 
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap().port()
     };
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_builder"))
-        .args(["--network", "local", "--vault-chain", "base", "--chains"])
-        .arg(dir.join("chains.toml"))
-        .arg("--deployments-dir")
-        .arg(&deployments_dir)
-        .arg("--store")
-        .arg(&store)
-        .arg("--builds")
-        .arg(dir.join("builds"))
-        .arg("--sdk")
-        .arg(dir.join("sdk"))
-        .arg("--vendor")
-        .arg(vendor(&dir))
-        .arg("--jobs")
-        .arg(dir.join("jobs"))
-        .arg("--reviewer-url")
-        .arg(format!("http://{reviewer_at}"))
-        .args(["--port", &port.to_string()])
-        .args(args)
-        .env_remove("SHONIN_DEPLOYMENTS_JSON")
-        .env("NO_COLOR", "1")
-        .env("RUST_LOG", "info")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = without_chain_overrides(&mut std::process::Command::new(env!(
+        "CARGO_BIN_EXE_builder"
+    )))
+    .args(["--network", "local", "--vault-chain", "base", "--chains"])
+    .arg(dir.join("chains.toml"))
+    .arg("--deployments-dir")
+    .arg(&deployments_dir)
+    .arg("--store")
+    .arg(&store)
+    .arg("--builds")
+    .arg(dir.join("builds"))
+    .arg("--sdk")
+    .arg(sdk(&dir))
+    .arg("--vendor")
+    .arg(vendor(&dir))
+    .arg("--jobs")
+    .arg(dir.join("jobs"))
+    .arg("--reviewer-url")
+    .arg(format!("http://{reviewer_at}"))
+    .args(["--port", &port.to_string()])
+    .args(args)
+    .env_remove("SHONIN_DEPLOYMENTS_JSON")
+    .env("NO_COLOR", "1")
+    .env("RUST_LOG", "info")
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
     let said = Arc::new(Mutex::new(String::new()));
     for stream in [
         child
@@ -696,6 +743,23 @@ pub fn queue(jobs: Vec<Value>) -> (&'static str, String) {
     )
 }
 
+/// The SDK the builder carries, in `dir`, as the builder checks it when it
+/// starts: a copy of the SDK it is built with, at that version. Where it is.
+pub fn sdk(dir: &std::path::Path) -> PathBuf {
+    let sdk = dir.join("sdk");
+    std::fs::create_dir_all(&sdk).unwrap();
+    std::fs::write(
+        sdk.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"{}\"\n",
+            shared::dependencies::SDK,
+            strategy_sdk::VERSION
+        ),
+    )
+    .unwrap();
+    sdk
+}
+
 /// A vendored copy of the platform's reviewed crates in `dir`, as the
 /// builder checks it when it starts: a directory for each, holding the
 /// checksum Cargo reads. Where it is.
@@ -730,6 +794,114 @@ pub fn lock(packages: &[&str], crates: &[(&str, &str, &str)]) -> String {
         ));
     }
     lock
+}
+
+/// The SDK's entry in a lock taking it from crates.io at `version`, as Cargo
+/// writes it, under `checksum`.
+pub fn sdk_from_crates_io(version: &str, checksum: &str) -> String {
+    format!(
+        "[[package]]\nname = \"{}\"\nversion = \"{version}\"\nsource = \"{}\"\n\
+         checksum = \"{checksum}\"\n{SDK_DEPENDENCIES}",
+        shared::dependencies::SDK,
+        shared::dependencies::CRATES_IO
+    )
+}
+
+/// The SDK's entry in a lock as the build service rewrites it before it
+/// builds: the path package of its own copy, at `version`, as Cargo writes
+/// that package.
+pub fn sdk_as_carried(version: &str) -> String {
+    format!(
+        "[[package]]\nname = \"{}\"\nversion = \"{version}\"\n{SDK_DEPENDENCIES}",
+        shared::dependencies::SDK
+    )
+}
+
+/// The SDK's own dependencies, as its entry in a lock lists them.
+const SDK_DEPENDENCIES: &str = "dependencies = [\n \"ciborium\",\n \"fastnum\",\n \"futures\",\n \"serde\",\n \"wit-bindgen\",\n]\n";
+
+/// A lock file for [`agent_on_the_sdk`]: the agent, the SDK's dependencies
+/// as the allowlist holds them, and the SDK's entry `sdk`, in Cargo's order.
+pub fn lock_with_sdk(sdk: &str) -> String {
+    let allowed = shared::dependencies::Allowlist::platform();
+    let listed = |name: &str| {
+        let listed = allowed
+            .crates()
+            .iter()
+            .find(|listed| listed.name == name)
+            .unwrap();
+        format!(
+            "[[package]]\nname = \"{name}\"\nversion = \"{}\"\nsource = \"{}\"\n\
+             checksum = \"{}\"\n",
+            listed.version,
+            shared::dependencies::CRATES_IO,
+            listed.checksum
+        )
+    };
+    let mut entries = vec![format!(
+        "[[package]]\nname = \"agent\"\nversion = \"0.1.0\"\ndependencies = [\n \"futures\",\n \
+         \"{}\",\n]\n",
+        shared::dependencies::SDK
+    )];
+    for name in ["ciborium", "fastnum", "futures", "serde"] {
+        entries.push(listed(name));
+    }
+    entries.push(sdk.to_string());
+    entries.push(listed("wit-bindgen"));
+    format!(
+        "# This file is automatically @generated by Cargo.\n# It is not intended for manual \
+         editing.\nversion = 4\n\n{}",
+        entries.join("\n")
+    )
+}
+
+/// An agent depending on the SDK at `requirement` and on a listed crate,
+/// locked by `lock`.
+pub fn agent_on_the_sdk(requirement: &str, lock: &str) -> Vec<u8> {
+    let root = scratch().join("project");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"agent\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+             [dependencies]\n{} = \"{requirement}\"\nfutures = \"0.3\"\n",
+            shared::dependencies::SDK
+        ),
+    )
+    .unwrap();
+    std::fs::write(root.join("Cargo.lock"), lock).unwrap();
+    std::fs::write(
+        root.join("shonin.toml"),
+        "[vault]\nchain = \"base\"\n[description]\ntitle = \"An agent\"\ntext = \"x\"\n\
+         [drivers.local]\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn agent() {}\n").unwrap();
+    let packed = shared::archive::pack(&root).unwrap();
+    let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    packed
+}
+
+/// Write into `bin` a stand-in for `cargo build` that keeps a copy of the
+/// `Cargo.lock` it is run on at `kept` and leaves a component where the
+/// builder looks for one. The test puts `bin` first on its path.
+pub fn cargo_keeping_the_lock(bin: &std::path::Path, kept: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(bin).unwrap();
+    let cargo = bin.join("cargo");
+    std::fs::write(
+        &cargo,
+        format!(
+            "#!/bin/sh\ncp Cargo.lock '{}'\n\
+             mkdir -p \"$CARGO_TARGET_DIR/wasm32-wasip2/release\"\n\
+             printf '\\000asm\\015\\000\\001\\000' > \
+             \"$CARGO_TARGET_DIR/wasm32-wasip2/release/agent.wasm\"\n",
+            kept.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// A project the build service takes: one agent, on base, trading through

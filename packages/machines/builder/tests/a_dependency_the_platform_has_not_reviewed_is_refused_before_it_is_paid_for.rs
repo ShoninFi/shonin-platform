@@ -132,8 +132,9 @@ async fn a_dependency_the_platform_has_not_reviewed_is_refused_before_it_is_paid
     }
     assert!(builder.jobs().is_empty(), "a refused upload made a job");
 
-    // Shaped as the template and the reference agents are: the SDK, a listed
-    // crate, and a helper crate of the author's own inside the upload.
+    // Shaped as the template and the reference agents are: the SDK from
+    // crates.io, a listed crate, and a helper crate of the author's own
+    // inside the upload.
     let taken = project(&[
         (
             "Cargo.toml",
@@ -160,8 +161,15 @@ async fn a_dependency_the_platform_has_not_reviewed_is_refused_before_it_is_paid
         (
             "Cargo.lock",
             black_box::lock(
-                &["agent", "helper", shared::dependencies::SDK],
-                &[("futures", &futures.version, &futures.checksum)],
+                &["agent", "helper"],
+                &[
+                    ("futures", &futures.version, &futures.checksum),
+                    (
+                        shared::dependencies::SDK,
+                        strategy_sdk::VERSION,
+                        &"5".repeat(64),
+                    ),
+                ],
             ),
         ),
     ]);

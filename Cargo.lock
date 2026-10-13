@@ -7242,6 +7242,7 @@ dependencies = [
  "shonin-chain",
  "shonin-rootkey",
  "shonin-shared",
+ "shonin-strategy-sdk",
  "tar",
  "time",
  "tokio",
@@ -7696,6 +7697,7 @@ dependencies = [
  "bs58",
  "ciborium",
  "hex",
+ "semver 1.0.28",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -7723,7 +7725,7 @@ dependencies = [
 
 [[package]]
 name = "shonin-strategy-sdk"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ciborium",
  "fastnum",

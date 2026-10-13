@@ -92,7 +92,8 @@ struct Args {
     #[arg(long, env = "SHONIN_BUILDER_JOBS")]
     jobs: Option<PathBuf>,
     /// The SDK this build service carries, which every submission is built
-    /// against whatever it asked for.
+    /// against whatever it asked for: a copy of the SDK this program is
+    /// built with, at its version, or the build service does not start.
     #[arg(long)]
     sdk: PathBuf,
     /// The vendored copy of the platform's reviewed crates (made with
@@ -673,7 +674,13 @@ async fn main() -> Result<()> {
     }
 
     let args = Args::parse();
-    let allowed = shared::dependencies::Allowlist::platform();
+    // A lock may name the SDK from crates.io at the version this build
+    // service carries, which is this program's own SDK: the copy it builds
+    // against must be that version too.
+    build::carries(&args.sdk).map_err(|error| anyhow!(error))?;
+    let allowed = shared::dependencies::Allowlist::platform()
+        .carrying(strategy_sdk::VERSION)
+        .map_err(|error| anyhow!(error))?;
     vendor::check(&allowed, &args.vendor)?;
     let jobs = prepare_jobs(args.jobs.clone())?;
     let launcher = args.attestation == Attestation::Launcher;
@@ -3106,7 +3113,9 @@ mod tests {
             jobs: dir.join("jobs"),
             sdk: dir.join("sdk"),
             vendor: dir.join("vendor"),
-            allowed: shared::dependencies::Allowlist::platform(),
+            allowed: shared::dependencies::Allowlist::platform()
+                .carrying(strategy_sdk::VERSION)
+                .unwrap(),
             reviewer: String::new(),
             http: reqwest::Client::new(),
             queue: Mutex::new(Queue::default()),
