@@ -75,6 +75,9 @@ struct Panel {
     network: Mutable<Option<Rc<Network>>>,
     figures: Mutable<Option<VaultFigures>>,
     holdings: Mutable<Option<Holdings>>,
+    /// The vault's restricted list as it writes it (`SANCTIONED,US`), read
+    /// as the deposit statement reads it: what the review shows.
+    restricted: Mutable<Option<String>>,
     tab: Mutable<Tab>,
     deposit_text: Mutable<String>,
     withdraw_text: Mutable<String>,
@@ -96,6 +99,7 @@ impl Panel {
             network: Mutable::new(None),
             figures: Mutable::new(None),
             holdings: Mutable::new(None),
+            restricted: Mutable::new(None),
             tab: Mutable::new(tab),
             deposit_text: Mutable::new(String::new()),
             withdraw_text: Mutable::new(String::new()),
@@ -177,7 +181,7 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
         let panel = panel.clone();
         mode.map(move |mode| Some(render(&panel, mode)))
     };
-    let tabs = tabs(&panel);
+    let (tabs, why) = tabs(&panel);
     let loader = panel.clone();
     // Another account (or none) gets the empty form.
     let account_change = {
@@ -208,6 +212,7 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
                 )
                 .child(tabs),
         )
+        .child(why)
         .child_signal(Some(placeholder()), body)
         .child(
             el("p")
@@ -303,6 +308,10 @@ async fn follow(panel: Rc<Panel>) {
         panel.network.set(Some(network.clone()));
         let reader = Session::reader(&network);
         loop {
+            // Before the figures, so the review never opens without it.
+            if let Ok(restricted) = read::restricted_text(&reader, vault.address).await {
+                panel.restricted.set_neq(Some(restricted));
+            }
             match read::figures(&reader, vault.address).await {
                 Ok(figures) => {
                     panel.figures.set(Some(figures));
@@ -377,32 +386,172 @@ pub(crate) fn placeholder() -> View {
         .into()
 }
 
-fn tabs(panel: &Rc<Panel>) -> El {
-    let tab = |which: Tab, label: &'static str| {
-        let panel = panel.clone();
+/// Where the flow a panel shows stands, as its tabs see it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Shown {
+    /// No flow: the form.
+    Nothing,
+    /// A flow still under way, on the tab it was started from.
+    Live,
+    /// A flow that has ended, done or failed: its card stays until left.
+    Ended,
+}
+
+impl Shown {
+    pub(crate) fn of(step: Option<Option<bool>>) -> Self {
+        match step {
+            None => Self::Nothing,
+            Some(Some(true)) => Self::Ended,
+            Some(_) => Self::Live,
+        }
+    }
+}
+
+/// What a click on the Deposit or Withdraw tab does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TabClick {
+    /// Open the tab's form (and leave a review for it).
+    Open,
+    /// Leave the ended flow and open the tab's empty form.
+    Leave,
+    /// Nothing: a flow is under way, or its card is already this tab's.
+    Stay,
+}
+
+pub(crate) fn tab_click(shown: Shown, current: Tab, clicked: Tab) -> TabClick {
+    match shown {
+        Shown::Nothing => TabClick::Open,
+        Shown::Ended if clicked != current => TabClick::Leave,
+        Shown::Ended | Shown::Live => TabClick::Stay,
+    }
+}
+
+/// Why `which` can't be opened now, if it can't: a flow is under way on
+/// the `current` tab, and a flow is never abandoned half-way.
+pub(crate) fn tab_blocked(shown: Shown, current: Tab, which: Tab) -> Option<&'static str> {
+    match (shown, current) {
+        (Shown::Live, current) if current == which => None,
+        (Shown::Live, Tab::Deposit) => Some("Withdraw opens once this deposit has finished."),
+        (Shown::Live, Tab::Withdraw) => Some("Deposit opens once this withdrawal has finished."),
+        _ => None,
+    }
+}
+
+/// The Deposit and Withdraw tabs and, while a flow is under way, the line
+/// that says why the other tab is closed. `shown` follows the panel's flow;
+/// `click` is handed the tab clicked.
+pub(crate) fn tab_bar(
+    tab: &Mutable<Tab>,
+    shown: impl Signal<Item = Shown> + 'static,
+    in_sheet: bool,
+    click: impl Fn(Tab) + 'static,
+) -> (El, El) {
+    let why_id = if in_sheet {
+        "sh-exit-tabs-why-sheet"
+    } else {
+        "sh-exit-tabs-why"
+    };
+    let state = Mutable::new(Shown::Nothing);
+    let both = {
+        let tab = tab.clone();
+        let state = state.clone();
+        move || {
+            map_ref! {
+                let shown = state.signal(),
+                let current = tab.signal() => (*shown, *current)
+            }
+        }
+    };
+    let click = Rc::new(click);
+    let button = |which: Tab, label: &'static str| {
+        let click = click.clone();
+        let blocked = both().map(move |(shown, current)| tab_blocked(shown, current, which));
+        let described = both().map(move |(shown, current)| {
+            tab_blocked(shown, current, which).map(|_| why_id.to_string())
+        });
         el("button")
             .attr("type", "button")
             .class("sh-tab")
             .attr("role", "tab")
-            .attr_from("aria-selected", &panel.tab, move |tab| {
+            .attr_from("aria-selected", tab, move |tab| {
                 Some((*tab == which).to_string())
             })
+            .attr_signal(
+                "aria-disabled",
+                None,
+                blocked.map(|why| why.map(|_| "true".to_string())),
+            )
+            .attr_signal("aria-describedby", None, described)
             .text(label)
-            .hook(move |dom| {
-                dom.event(move |_: dominator::events::Click| {
-                    // Not while a flow is under way.
-                    if panel.running().is_none() {
-                        panel.tab.set_neq(which);
-                        panel.stage.set_neq(Stage::Form);
-                    }
-                })
-            })
+            .hook(move |dom| dom.event(move |_: dominator::events::Click| click(which)))
     };
-    el("div")
+    let tabs = el("div")
         .class("sh-tabs sh-exit__tabs")
         .attr("role", "tablist")
-        .child(tab(Tab::Deposit, "Deposit"))
-        .child(tab(Tab::Withdraw, "Withdraw"))
+        .child(button(Tab::Deposit, "Deposit"))
+        .child(button(Tab::Withdraw, "Withdraw"))
+        .hook(move |dom| {
+            dom.future(shown.for_each(move |shown| {
+                state.set_neq(shown);
+                async {}
+            }))
+        });
+    let why = el("p")
+        .class("sh-muted sh-exit__small sh-exit__why")
+        .attr("id", why_id)
+        .child_signal(
+            None,
+            both().map(|(shown, current)| {
+                let other = match current {
+                    Tab::Deposit => Tab::Withdraw,
+                    Tab::Withdraw => Tab::Deposit,
+                };
+                tab_blocked(shown, current, other).map(text)
+            }),
+        );
+    (tabs, why)
+}
+
+fn tabs(panel: &Rc<Panel>) -> (El, El) {
+    let session = crate::wallet::get();
+    let shown = session
+        .flow_signal(&panel.slug, EXIT)
+        .map(|running| running.map(|running| running.step))
+        .switch(|step| match step {
+            Some(step) => step
+                .signal_ref(|step| Shown::of(Some(step.as_ref().map(Step::is_over))))
+                .boxed_local(),
+            None => futures_signals::signal::always(Shown::Nothing).boxed_local(),
+        });
+    let clicked = panel.clone();
+    tab_bar(&panel.tab, shown, panel.in_sheet, move |which| {
+        click_tab(&clicked, which)
+    })
+}
+
+/// A click on a tab: from a flow that has ended, leave it for the tab's
+/// empty form; while one is under way, stay with it.
+fn click_tab(panel: &Panel, which: Tab) {
+    let running = panel.running();
+    let shown = Shown::of(
+        running
+            .as_ref()
+            .map(|running| running.step.lock_ref().as_ref().map(Step::is_over)),
+    );
+    match tab_click(shown, panel.tab.get(), which) {
+        TabClick::Open => {
+            panel.tab.set_neq(which);
+            panel.stage.set_neq(Stage::Form);
+        }
+        TabClick::Leave => {
+            if let Some(running) = &running {
+                crate::wallet::get().dismiss(running);
+            }
+            panel.clear_form();
+            panel.tab.set_neq(which);
+        }
+        TabClick::Stay => {}
+    }
 }
 
 fn render(panel: &Rc<Panel>, mode: Mode) -> View {
@@ -1340,6 +1489,9 @@ fn review(panel: &Rc<Panel>) -> View {
                 ))
                 .child(static_row("Network fee", "Paid in your wallet".to_string(), None)),
         )
+        .child_from(&panel.restricted, |restricted| {
+            Some(statement_notice(Statement::Evm(restricted.as_deref())))
+        })
         .child(notice(
             NoticeTone::Info,
             text("A request can’t be cancelled once you confirm it. Nobody can see its price yet, including you."),
@@ -1364,6 +1516,147 @@ fn review(panel: &Rc<Panel>) -> View {
             View::Empty
         })
         .into()
+}
+
+// The statement ---------------------------------------------------------------------
+
+/// The list a deposit's statement is made for, as its review shows it.
+pub(crate) enum Statement<'a> {
+    /// An EVM vault's list as it writes it (`SANCTIONED,US`), read as the
+    /// statement reads it before it is signed; `None` until it is read.
+    Evm(Option<&'a str>),
+    /// A Solana vault's codes, read from its account: approving the
+    /// deposit is the statement.
+    Solana(&'a [String]),
+}
+
+/// Who a vault's list keeps out, in plain words: "people in the US,
+/// sanctioned persons". `None` for an empty list.
+pub(crate) fn not_open_to(codes: &[&str]) -> Option<String> {
+    let places: Vec<String> = codes
+        .iter()
+        .filter(|code| **code != "SANCTIONED")
+        .map(|code| place_name(code))
+        .collect();
+    let mut parts = Vec::new();
+    if !places.is_empty() {
+        parts.push(format!("people in {}", and_list(&places)));
+    }
+    if codes.contains(&"SANCTIONED") {
+        parts.push("sanctioned persons".to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// The codes of a list as the vault writes it: `SANCTIONED,US`.
+pub(crate) fn list_codes(restricted: &str) -> Vec<&str> {
+    restricted
+        .split(',')
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+        .collect()
+}
+
+fn and_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// A country (ISO 3166) or subdivision (ISO 3166-2) code by its name where
+/// it is a familiar one, else as written.
+fn place_name(code: &str) -> String {
+    const PLACES: [(&str, &str); 30] = [
+        ("US", "the US"),
+        ("GB", "the UK"),
+        ("CA", "Canada"),
+        ("CA-ON", "Ontario (Canada)"),
+        ("CA-QC", "Quebec (Canada)"),
+        ("AU", "Australia"),
+        ("NZ", "New Zealand"),
+        ("FR", "France"),
+        ("DE", "Germany"),
+        ("NL", "the Netherlands"),
+        ("IT", "Italy"),
+        ("ES", "Spain"),
+        ("CH", "Switzerland"),
+        ("JP", "Japan"),
+        ("KR", "South Korea"),
+        ("CN", "China"),
+        ("HK", "Hong Kong"),
+        ("SG", "Singapore"),
+        ("IN", "India"),
+        ("AE", "the UAE"),
+        ("RU", "Russia"),
+        ("BY", "Belarus"),
+        ("UA", "Ukraine"),
+        ("KP", "North Korea"),
+        ("IR", "Iran"),
+        ("CU", "Cuba"),
+        ("SY", "Syria"),
+        ("MM", "Myanmar"),
+        ("VE", "Venezuela"),
+        ("AF", "Afghanistan"),
+    ];
+    PLACES
+        .iter()
+        .find(|(known, _)| *known == code)
+        .map(|(_, name)| (*name).to_string())
+        .unwrap_or_else(|| code.to_string())
+}
+
+/// The review's statement: who the vault is not open to, in plain words,
+/// and the words the depositor states, before the acknowledgement. Drawn
+/// from the list the statement is made for, and nothing else.
+pub(crate) fn statement_notice(statement: Statement<'_>) -> View {
+    let codes: Option<Vec<&str>> = match &statement {
+        Statement::Evm(restricted) => restricted.map(list_codes),
+        Statement::Solana(codes) => Some(codes.iter().map(String::as_str).collect()),
+    };
+    let who = match codes.as_deref() {
+        None => "This vault’s list couldn’t be read just now. Your wallet shows it when it asks you to sign.".to_string(),
+        Some(codes) => match not_open_to(codes) {
+            Some(words) => format!("Not open to: {words}."),
+            None => "Open to everyone: this vault restricts no one.".to_string(),
+        },
+    };
+    let how = match &statement {
+        Statement::Evm(Some(restricted)) if list_codes(restricted).is_empty() => {
+            "Your wallet asks you to sign this, for an empty list, the first time you deposit. It’s a signature, not a transaction.".to_string()
+        }
+        Statement::Evm(Some(restricted)) => format!(
+            "Your wallet asks you to sign this, with the list as “Restricted: {restricted}”, \
+             the first time you deposit and again if the list changes. It’s a signature, not a transaction."
+        ),
+        Statement::Evm(None) => {
+            "Your wallet asks you to sign this the first time you deposit. It’s a signature, not a transaction.".to_string()
+        }
+        Statement::Solana(codes) => format!(
+            "On Solana the deposit itself is the statement: approving it in your wallet states this for the list read from the vault’s account ({}). There’s no separate signature.",
+            if codes.is_empty() { "empty".to_string() } else { codes.join(",") }
+        ),
+    };
+    notice(
+        NoticeTone::Info,
+        View::Many(vec![
+            el("p")
+                .class("sh-notice__lead")
+                .text("Who can deposit")
+                .into(),
+            el("p").text(who).into(),
+            el("p")
+                .text(format!(
+                    "By depositing you state: “{}”",
+                    chain::statement::TEXT
+                ))
+                .into(),
+            el("p").class("sh-exit__small").text(how).into(),
+        ]),
+    )
+    .class("sh-exit__statement")
+    .into()
 }
 
 // Running a flow ------------------------------------------------------------------
@@ -2307,5 +2600,117 @@ mod tests {
         assert!(!panel.ack.get());
         // Disconnecting is a change too.
         assert!(account_moved(&mut seen, None));
+    }
+
+    #[test]
+    fn the_review_names_who_the_vault_is_not_open_to_before_the_acknowledgement() {
+        let panel = Rc::new(Panel::new("base-1", Tab::Deposit, false));
+        panel.deposit_text.set("100".to_string());
+        panel.restricted.set(Some("SANCTIONED,US".to_string()));
+        panel.stage.set(Stage::Review);
+        let html = review(&panel).html();
+        let list = html
+            .find("Not open to: people in the US, sanctioned persons.")
+            .expect("the list in plain words");
+        let words = html
+            .find(chain::statement::TEXT)
+            .expect("the statement's words");
+        let signed = html
+            .find("Restricted: SANCTIONED,US")
+            .expect("the list as the wallet shows it");
+        let ack = html.find("sh-exit-ack").expect("the acknowledgement");
+        assert!(list < ack && words < ack && signed < ack, "{html}");
+    }
+
+    #[test]
+    fn a_solana_review_names_the_list_read_from_the_vaults_account_in_plain_words() {
+        let codes = ["SANCTIONED".to_string(), "US".to_string()];
+        let html = statement_notice(Statement::Solana(&codes)).html();
+        assert!(
+            html.contains("Not open to: people in the US, sanctioned persons."),
+            "{html}"
+        );
+        assert!(html.contains(chain::statement::TEXT), "{html}");
+        assert!(html.contains("(SANCTIONED,US)"), "{html}");
+        let open = statement_notice(Statement::Solana(&[])).html();
+        assert!(open.contains("Open to everyone"), "{open}");
+    }
+
+    /// A deposit flow shown on the panel for `account`, at `step`.
+    fn deposit_shown(panel: &Panel, account: Address, step: Step) -> Running {
+        let session = crate::wallet::get();
+        session.connection.set(connected(account));
+        let running = Running::new(Action::Deposit(U256::from(11_000_000u64)));
+        running.step.set(Some(step));
+        assert!(session.begin(&panel.slug, &running));
+        running
+    }
+
+    fn deposited() -> Step {
+        Step::Done(Outcome::Deposited {
+            assets: U256::from(11_000_000u64),
+            shares: U256::from(10_000_000u64),
+            at: 1_700_000_000,
+            hash: alloy_primitives::B256::repeat_byte(0x11),
+        })
+    }
+
+    #[test]
+    fn the_other_tab_leaves_a_finished_or_failed_flow_for_its_empty_form() {
+        for (slug, step) in [
+            ("base-1", deposited()),
+            ("base-2", Step::Failed(TxError::Rejected)),
+        ] {
+            let panel = Panel::new(slug, Tab::Deposit, false);
+            panel.deposit_text.set("11".to_string());
+            panel.ack.set(true);
+            let account = Address::repeat_byte(0x5a);
+            deposit_shown(&panel, account, step);
+            click_tab(&panel, Tab::Withdraw);
+            assert!(panel.running().is_none(), "{slug}: the ended flow is left");
+            assert_eq!(panel.tab.get(), Tab::Withdraw);
+            assert!(panel.deposit_text.get_cloned().is_empty());
+            assert!(!panel.ack.get());
+            let mode = mode_of(
+                &connected(account),
+                Some(&network()),
+                true,
+                panel.tab.get(),
+                panel.stage.get(),
+                None,
+            );
+            assert_eq!(mode, Mode::Form(Tab::Withdraw), "{slug}");
+        }
+    }
+
+    #[test]
+    fn a_flow_under_way_keeps_its_tab_and_says_why_the_other_is_shut() {
+        let panel = Panel::new("base-3", Tab::Deposit, false);
+        let account = Address::repeat_byte(0x5b);
+        let running = deposit_shown(&panel, account, Step::Signing(Prompt::Statement));
+        click_tab(&panel, Tab::Withdraw);
+        assert_eq!(
+            panel.running(),
+            Some(running),
+            "a live flow is never abandoned"
+        );
+        assert_eq!(panel.tab.get(), Tab::Deposit);
+        assert_eq!(
+            tab_blocked(Shown::Live, Tab::Deposit, Tab::Withdraw),
+            Some("Withdraw opens once this deposit has finished.")
+        );
+        assert_eq!(tab_blocked(Shown::Live, Tab::Deposit, Tab::Deposit), None);
+        assert_eq!(tab_blocked(Shown::Ended, Tab::Deposit, Tab::Withdraw), None);
+        assert_eq!(
+            tab_blocked(Shown::Nothing, Tab::Deposit, Tab::Withdraw),
+            None
+        );
+        // A flow whose first step hasn't come yet is under way too.
+        assert_eq!(Shown::of(Some(None)), Shown::Live);
+        assert_eq!(
+            tab_click(Shown::Ended, Tab::Deposit, Tab::Deposit),
+            TabClick::Stay,
+            "the finished card's own tab keeps it"
+        );
     }
 }

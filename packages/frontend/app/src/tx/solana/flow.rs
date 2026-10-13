@@ -108,6 +108,14 @@ pub enum Step {
     Failed(SolError),
 }
 
+impl Step {
+    /// Whether the flow has ended, well or not: nothing more will happen
+    /// in it, and the panel may leave it.
+    pub fn is_over(&self) -> bool {
+        matches!(self, Self::Done(_) | Self::Failed(_))
+    }
+}
+
 /// How a flow ended well.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {

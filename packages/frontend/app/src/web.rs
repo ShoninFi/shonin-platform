@@ -160,10 +160,23 @@ pub fn navigate(href: &str, link: Option<&web_sys::Element>) {
     let update = Closure::once_into_js(move || {
         js_sys::Promise::new(&mut |resolve, _| {
             dominator::routing::go_to_url(&href);
-            // The new page is drawn in the tasks the route change queued;
-            // the next frame comes after them.
-            if let Some(window) = window() {
-                let _ = window.request_animation_frame(&resolve);
+            // The new page is drawn in the microtasks the route change
+            // queued; a zero-delay timer runs after them. Never a frame:
+            // the browser draws none while it waits on this promise, so a
+            // frame would hold the old page until the transition times out
+            // (4 s in Chrome).
+            match window() {
+                Some(window) => {
+                    if window
+                        .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                        .is_err()
+                    {
+                        let _ = resolve.call0(&wasm_bindgen::JsValue::UNDEFINED);
+                    }
+                }
+                None => {
+                    let _ = resolve.call0(&wasm_bindgen::JsValue::UNDEFINED);
+                }
             }
         })
     });
