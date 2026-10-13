@@ -8,6 +8,8 @@
 use chain::solana_ix::{Pubkey, ids};
 use shared::{Chain, Config};
 
+use crate::wallet::config_cache::ConfigId;
+
 /// The Solana cluster vaults live on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SolNetwork {
@@ -25,6 +27,9 @@ pub struct SolNetwork {
     /// On a development cluster, the account the API names for the
     /// development wallet.
     pub dev_account: Option<Pubkey>,
+    /// The config it was read from: a flow stops if the cluster it would
+    /// sign with isn't the one its review was computed with.
+    pub config: ConfigId,
 }
 
 /// Why the Solana config can't be used for money.
@@ -49,6 +54,19 @@ const PROGRAMS: [(&str, Pubkey); 5] = [
 ];
 
 impl SolNetwork {
+    /// The cluster a config's text names (as the page holds it, see
+    /// [`crate::wallet::config_cache::canonical`]), if this build can use it.
+    pub fn from_raw(raw: &str) -> Option<Self> {
+        let config: Config = serde_json::from_str(raw).ok()?;
+        let network = Self::from_config(&config).ok()?;
+        Some(Self {
+            config: ConfigId::of(raw),
+            ..network
+        })
+    }
+
+    /// The cluster a parsed config names; its [`SolNetwork::config`] is left
+    /// unset (the text it came from isn't known here).
     pub fn from_config(config: &Config) -> Result<Self, Unusable> {
         if config.chain.chain != Chain::Solana {
             return Err(Unusable::NotSolana);
@@ -89,6 +107,7 @@ impl SolNetwork {
             asset_symbol: config.asset_symbol.clone(),
             asset_decimals: config.asset_decimals,
             dev_account,
+            config: ConfigId::default(),
         })
     }
 

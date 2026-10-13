@@ -57,6 +57,10 @@ pub enum TxError {
     /// the one the review showed: nothing is signed, and the person reviews
     /// the deposit again with this list.
     ListChanged { now: String },
+    /// The chain's settings the page read (its config: endpoint, dollar,
+    /// decimals) were updated since the review was computed: nothing is
+    /// signed, and the person reviews again with the new settings.
+    SettingsChanged,
     /// The wallet returned a signature that isn't the connected account's
     /// over the statement shown.
     BadSignature,
@@ -398,6 +402,13 @@ impl TxError {
                     ),
                 )
             }
+            Self::SettingsChanged => alert(
+                "This chain's settings were just updated",
+                format!(
+                    "The app's settings for {} were updated since you reviewed this, so the figures you saw may not hold. Review it again with the new settings. Nothing was signed or sent.",
+                    context.chain
+                ),
+            ),
             Self::BadSignature => alert(
                 "The signature didn't match",
                 format!("{wallet} signed with another account or other content. Nothing was sent."),

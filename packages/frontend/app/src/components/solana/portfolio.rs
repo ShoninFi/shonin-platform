@@ -24,7 +24,7 @@ use crate::money::{Rounding, units::pow10};
 use crate::pages::Page;
 use crate::pages::portfolio::{Balance, Summary, balances_view, section_loading, wallet_section};
 use crate::tx::solana::flow::{Fallback, HeldAt, Outcome, Step};
-use crate::tx::solana::run::{SolAction, SolRunning, SolVault};
+use crate::tx::solana::run::{self, CardShows, SolAction, SolRunning, SolVault};
 use crate::view::{El, View, el, text};
 use crate::wallet::recent::Family;
 use crate::wallet::solana::SolNetwork;
@@ -131,7 +131,15 @@ async fn follow(
         // that keeps not answering is said to.
         let mut failures = 0u32;
         loop {
-            let account = session.account();
+            // Read again when a flow lands, the account changes or the
+            // cluster's settings change, counting from before this read: every
+            // card is then drawn with the cluster a send would sign with.
+            let seen = (
+                session.changed.get(),
+                session.account(),
+                session.config_id(),
+            );
+            let account = seen.1;
             match account {
                 Some(account) => match read(account).await {
                     Some(read) if session.account() == Some(account) => {
@@ -153,11 +161,15 @@ async fn follow(
                     failing.set_neq(false);
                 }
             }
-            let seen = (session.changed.get(), session.account());
             let wait = if failures > 0 { 5 } else { 15 };
             for _ in 0..wait {
                 gloo_timers::future::TimeoutFuture::new(1_000).await;
-                if (session.changed.get(), session.account()) != seen {
+                if (
+                    session.changed.get(),
+                    session.account(),
+                    session.config_id(),
+                ) != seen
+                {
                     if session.account() != seen.1 {
                         loaded.set(None);
                         summary.set(None);
@@ -694,7 +706,11 @@ fn request_offer(vault: &Vault, request: &Request, now: u64, fits: bool) -> Requ
     }
 }
 
-/// A button that runs one Solana flow, with its status line in place.
+/// A button that runs one Solana flow, with its status line in place. The
+/// flow is kept per account, vault and action across the page's reads: one
+/// under way (or whose money may still move) is shown, never offered again;
+/// one that ended shows its outcome until dismissed, with the action
+/// offered again beside it.
 fn act(
     vault: &SolVault,
     network: Option<Rc<SolNetwork>>,
@@ -702,17 +718,11 @@ fn act(
     label: &'static str,
     kind: Kind,
 ) -> El {
-    let running: Mutable<Option<SolRunning>> = Mutable::new(None);
-    let session = crate::wallet::solana::get();
-    let vault = vault.clone();
+    let address = vault.address;
     el("div").class("sh-act").child_signal(
         None,
-        futures_signals::map_ref! {
-            let account = session.connection.signal_ref(|c| c.account()),
-            let current = running.signal_cloned() => (*account, current.clone())
-        }
-        .map(move |(account, current)| {
-            if account.is_none() {
+        run::card_signal(address, format!("{action:?}")).map(move |card| {
+            if card.account.is_none() {
                 return Some(
                     on_click(
                         Button::new(kind, "Connect a Solana wallet")
@@ -723,23 +733,31 @@ fn act(
                     .into(),
                 );
             }
-            if let Some(current) = current {
-                return Some(status(&current, network.clone(), &running));
-            }
-            let running = running.clone();
-            let address = vault.address;
-            let action = action.clone();
-            Some(
+            let shown = card
+                .slot
+                .get_cloned()
+                .map(|current| status(&current, network.clone(), &card.slot));
+            let button = {
+                let action = action.clone();
+                let reviewed = network.clone();
+                let card = card.clone();
                 on_click(
                     Button::new(kind, label).size(Size::Small).build(),
                     move || {
-                        let flow = SolRunning::new();
-                        crate::tx::solana::run::start(address, action.clone(), &flow);
-                        running.set(Some(flow));
+                        // Built with the cluster this card was read with: the
+                        // flow signs with it or not at all.
+                        if let Some(reviewed) = reviewed.clone() {
+                            run::start_from(&card, address, action.clone(), reviewed);
+                        }
                     },
                 )
-                .into(),
-            )
+                .into()
+            };
+            Some(match (card.shows, shown) {
+                (CardShows::Status, Some(shown)) => shown,
+                (CardShows::StatusAndAction, Some(shown)) => View::Many(vec![shown, button]),
+                _ => button,
+            })
         }),
     )
 }
@@ -810,10 +828,12 @@ pub(super) fn status(
                             Outcome::Deposited { signature, .. }
                             | Outcome::Changed { signature } => ("Done.".to_string(), *signature),
                         };
+                        let running = running.clone();
                         el("div")
                             .attr("role", "status")
                             .child(el("p").text(line))
                             .child(sig_link(network.as_deref(), &signature, "Transaction"))
+                            .child(dismiss("Done", move || running.set(None)))
                             .into()
                     }
                     Step::Failed(error) => {
@@ -830,9 +850,11 @@ pub(super) fn status(
                                 None => View::Empty,
                             })
                             // What may have moved (or may still) isn't
-                            // offered again: the page shows it once it lands.
+                            // offered again until the person has read it
+                            // and dismissed it: the page shows it once it
+                            // lands.
                             .child(if error.may_have_moved() {
-                                View::Empty
+                                dismiss("Dismiss", move || running.set(None))
                             } else {
                                 on_click(
                                     Button::new(Kind::Secondary, "OK").size(Size::Small).build(),
@@ -846,6 +868,18 @@ pub(super) fn status(
             }),
         )
         .into()
+}
+
+/// A link that leaves a flow's status, as the EVM cards' "Done".
+fn dismiss(label: &'static str, leave: impl Fn() + 'static) -> View {
+    on_click(
+        el("button")
+            .attr("type", "button")
+            .class("sh-link")
+            .text(label),
+        leave,
+    )
+    .into()
 }
 
 // The claim page ----------------------------------------------------------------------------
@@ -953,6 +987,9 @@ async fn follow_claim(slug: String, id: u64, loaded: Mutable<Option<Result<Claim
 
         let session = crate::wallet::solana::get();
         loop {
+            // Counting from before this read: a change while it runs reads
+            // again at once.
+            let seen = (session.changed.get(), session.config_id());
             let vault = crate::tx::solana::run::vault_of(&slug);
             let result = match (vault, session.load_network().await) {
                 (Some(vault), Some(network)) => {
@@ -1018,10 +1055,9 @@ async fn follow_claim(slug: String, id: u64, loaded: Mutable<Option<Result<Claim
                 (_, None) => Err("The Solana cluster can’t be reached right now.".to_string()),
             };
             loaded.set(Some(result));
-            let seen = session.changed.get();
             for _ in 0..10 {
                 gloo_timers::future::TimeoutFuture::new(1_000).await;
-                if session.changed.get() != seen {
+                if (session.changed.get(), session.config_id()) != seen {
                     break;
                 }
             }

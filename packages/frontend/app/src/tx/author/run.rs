@@ -139,6 +139,17 @@ pub struct Platform {
     pub usd: Address,
 }
 
+/// The platform's contracts as the config `network` was read from names
+/// them. A page reads with these and the network together, so what it shows
+/// (readiness, terms, fees, costs) is read from the contracts a flow started
+/// from it signs with; a config fetched later gives a page that follows the
+/// session's networks the new contracts at once.
+pub fn platform_of(network: &crate::wallet::Network) -> Option<std::rc::Rc<Platform>> {
+    let raw = crate::wallet::get().text_of(network)?;
+    let config: shared::Config = serde_json::from_str(&raw).ok()?;
+    Platform::from_config(&config).map(std::rc::Rc::new)
+}
+
 impl Platform {
     pub fn from_config(config: &shared::Config) -> Option<Self> {
         let evm = config.addresses.evm()?;
@@ -177,8 +188,6 @@ pub use native::*;
 
 #[cfg(target_arch = "wasm32")]
 mod browser {
-    use std::cell::RefCell;
-    use std::collections::BTreeMap;
     use std::rc::Rc;
 
     use alloy_primitives::{Address, B256, Bytes, U256};
@@ -191,12 +200,9 @@ mod browser {
     use crate::tx::author::flow::{self, Ctx, Outcome, Step, Usage};
     use crate::tx::author::read::{self, PaymentRecord};
     use crate::tx::flow::Pace;
+    use crate::wallet::config_cache::ConfigId;
     use crate::wallet::run::Timer;
     use crate::wallet::session::Session;
-
-    thread_local! {
-        static PLATFORMS: RefCell<BTreeMap<Chain, Rc<Platform>>> = const { RefCell::new(BTreeMap::new()) };
-    }
 
     async fn get<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, String> {
         let reply = gloo_net::http::Request::get(&format!("{BASE}/{path}"))
@@ -212,15 +218,12 @@ mod browser {
             .map_err(|_| "the platform said something unexpected".to_string())
     }
 
-    /// The platform's contracts on a chain, read once per page load.
-    pub async fn platform(chain: Chain) -> Option<Rc<Platform>> {
-        if let Some(found) = PLATFORMS.with(|map| map.borrow().get(&chain).cloned()) {
-            return Some(found);
-        }
-        let config: shared::Config = get(&format!("{chain}/config")).await.ok()?;
-        let platform = Rc::new(Platform::from_config(&config)?);
-        PLATFORMS.with(|map| map.borrow_mut().insert(chain, platform.clone()));
-        Some(platform)
+    /// The network a page reads `chain` with now, and the platform's
+    /// contracts as its config names them.
+    pub async fn platform(chain: Chain) -> Option<(Rc<crate::wallet::Network>, Rc<Platform>)> {
+        let network = crate::wallet::get().network(chain).await?;
+        let platform = super::platform_of(&network)?;
+        Some((network, platform))
     }
 
     /// One publishing job, as the queue has it now.
@@ -311,11 +314,11 @@ mod browser {
         })
     }
 
-    /// The publishing fee on `chain`, read from the publishing contract.
-    pub async fn fee(chain: Chain) -> Option<U256> {
-        let session = crate::wallet::get();
-        let (network, platform) = (session.network(chain).await?, platform(chain).await?);
-        let reader = Session::reader(&network);
+    /// The publishing fee, read from the publishing contract that the
+    /// config `network` came from names, through that network.
+    pub async fn fee(network: &crate::wallet::Network) -> Option<U256> {
+        let platform = super::platform_of(network)?;
+        let reader = Session::reader(network);
         read::publishing(&reader, platform.publishing)
             .await
             .ok()
@@ -329,9 +332,7 @@ mod browser {
         uploader: Address,
         lookup: Lookup,
     ) -> Result<PaymentRecord, String> {
-        let session = crate::wallet::get();
-        let (Some(network), Some(platform)) = (session.network(chain).await, platform(chain).await)
-        else {
+        let Some((network, platform)) = platform(chain).await else {
             return Err("this chain isn't reachable from this app".to_string());
         };
         let reader = Session::reader(&network);
@@ -347,10 +348,13 @@ mod browser {
     }
 
     /// Start `action` on `chain`, reporting into `running`; `done` runs with
-    /// the outcome once the chain has confirmed it.
+    /// the outcome once the chain has confirmed it. `reviewed` is the config
+    /// of the network the page computed the action with: the flow signs
+    /// with that config or not at all.
     pub fn start(
         chain: Chain,
         action: Action,
+        reviewed: ConfigId,
         running: &Running,
         done: impl FnOnce(&Outcome) + 'static,
     ) {
@@ -373,15 +377,23 @@ mod browser {
                 _ => connected,
             };
             // Never a config remembered from an earlier visit alone: one the
-            // API answered in this page's life.
-            let network = match session.network_to_sign(chain).await {
+            // API answered in this page's life, and the one the page computed
+            // this with; any other stops here, before a wallet is asked.
+            let network = match session.network_to_sign(chain, reviewed).await {
                 Ok(network) => network,
                 Err(error) => {
                     fail(error.into());
                     return;
                 }
             };
-            let Some(platform) = platform(chain).await else {
+            // The platform's contracts from the very config the flow signs
+            // with, never from another answer.
+            let Some(platform) = session
+                .config_text(chain, &network)
+                .and_then(|raw| serde_json::from_str::<shared::Config>(&raw).ok())
+                .and_then(|config| Platform::from_config(&config))
+                .map(Rc::new)
+            else {
                 fail(
                     TxError::Network("this chain isn't reachable from this app".to_string()).into(),
                 );
@@ -474,6 +486,7 @@ mod native {
     pub fn start(
         _chain: Chain,
         _action: Action,
+        _reviewed: crate::wallet::config_cache::ConfigId,
         running: &Running,
         _done: impl FnOnce(&Outcome) + 'static,
     ) {
@@ -482,11 +495,11 @@ mod native {
             .set(Some(Step::Failed(TxError::NotConnected.into())));
     }
 
-    pub async fn platform(_chain: Chain) -> Option<Rc<Platform>> {
+    pub async fn platform(_chain: Chain) -> Option<(Rc<crate::wallet::Network>, Rc<Platform>)> {
         None
     }
 
-    pub async fn fee(_chain: Chain) -> Option<U256> {
+    pub async fn fee(_network: &crate::wallet::Network) -> Option<U256> {
         None
     }
 

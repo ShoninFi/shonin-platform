@@ -19,7 +19,7 @@ use crate::components::wallet::open_connect;
 use crate::money::format as money;
 use crate::money::{Rounding, parse_units};
 use crate::tx::solana::author::AuthorAction;
-use crate::tx::solana::run::{SolAction, SolRunning, SolVault};
+use crate::tx::solana::run::{self, CardShows, SolAction, SolVault};
 use crate::view::{El, View, el, text};
 use crate::wallet::solana::SolNetwork;
 
@@ -85,6 +85,14 @@ async fn follow(slug: String, loaded: Mutable<Option<Result<Read, String>>>) {
 
         let session = crate::wallet::solana::get();
         loop {
+            // Read again when a flow lands, the account changes or the
+            // cluster's settings change, counting from before this read: the
+            // controls are then drawn with the cluster a send would sign with.
+            let seen = (
+                session.changed.get(),
+                session.account(),
+                session.config_id(),
+            );
             let result = match (
                 crate::tx::solana::run::vault_of(&slug),
                 session.load_network().await,
@@ -110,10 +118,14 @@ async fn follow(slug: String, loaded: Mutable<Option<Result<Read, String>>>) {
                 _ => Err("The Solana cluster can’t be reached right now.".to_string()),
             };
             loaded.set(Some(result));
-            let seen = (session.changed.get(), session.account());
             for _ in 0..10 {
                 gloo_timers::future::TimeoutFuture::new(1_000).await;
-                if (session.changed.get(), session.account()) != seen {
+                if (
+                    session.changed.get(),
+                    session.account(),
+                    session.config_id(),
+                ) != seen
+                {
                     break;
                 }
             }
@@ -160,44 +172,48 @@ fn act(
     kind: Kind,
     make: impl Fn() -> Result<SolAction, String> + 'static,
 ) -> El {
-    let running: Mutable<Option<SolRunning>> = Mutable::new(None);
-    let refused: Mutable<Option<String>> = Mutable::new(None);
     let address = read.vault.address;
+    let refused: Mutable<Option<String>> = Mutable::new(None);
+    let reviewed = read.network.clone();
     let network = Some(read.network.clone());
     let make = Rc::new(make);
     el("div")
         .class("sh-act")
+        // Kept per account across reads: a flow under way stays shown and
+        // is never offered again; one that ended shows its outcome until
+        // dismissed, with the action offered again beside it.
         .child_signal(
             None,
-            running.signal_cloned().map({
-                let running = running.clone();
+            run::card_signal(address, label.to_string()).map({
                 let refused = refused.clone();
-                move |current| {
-                    if let Some(current) = current {
-                        return Some(super::portfolio::status(
-                            &current,
-                            network.clone(),
-                            &running,
-                        ));
-                    }
-                    let running = running.clone();
+                move |card| {
+                    let shown = card.slot.get_cloned().map(|current| {
+                        super::portfolio::status(&current, network.clone(), &card.slot)
+                    });
                     let refused = refused.clone();
                     let make = make.clone();
-                    Some(
-                        on_click(
-                            Button::new(kind, label).size(Size::Small).build(),
-                            move || match make() {
-                                Ok(action) => {
-                                    refused.set(None);
-                                    let flow = SolRunning::new();
-                                    crate::tx::solana::run::start(address, action, &flow);
-                                    running.set(Some(flow));
-                                }
-                                Err(why) => refused.set(Some(why)),
-                            },
-                        )
-                        .into(),
+                    let reviewed = reviewed.clone();
+                    let card_now = card.clone();
+                    let button: View = on_click(
+                        Button::new(kind, label).size(Size::Small).build(),
+                        move || match make() {
+                            Ok(action) => {
+                                refused.set(None);
+                                // Built with this read's cluster: the flow
+                                // signs with it or not at all.
+                                run::start_from(&card_now, address, action, reviewed.clone());
+                            }
+                            Err(why) => refused.set(Some(why)),
+                        },
                     )
+                    .into();
+                    Some(match (card.shows, shown) {
+                        (CardShows::Status, Some(shown)) => shown,
+                        (CardShows::StatusAndAction, Some(shown)) => {
+                            View::Many(vec![shown, button])
+                        }
+                        _ => button,
+                    })
                 }
             }),
         )

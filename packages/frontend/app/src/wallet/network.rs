@@ -5,6 +5,7 @@
 use alloy_primitives::Address;
 use shared::{Chain, Config};
 
+use super::config_cache::ConfigId;
 use super::{dev, networks};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,6 +22,9 @@ pub struct Network {
     pub asset_decimals: u8,
     /// On a development chain, the account it holds the key for.
     pub dev_account: Option<Address>,
+    /// The config it was read from: a flow stops if the network it would
+    /// sign with isn't the one its review was computed with.
+    pub config: ConfigId,
 }
 
 /// Why a chain can't be used for money.
@@ -35,6 +39,19 @@ pub enum Unusable {
 }
 
 impl Network {
+    /// The network a config's text names (as the page holds it, see
+    /// [`super::config_cache::canonical`]), if this build can use it.
+    pub fn from_raw(raw: &str) -> Option<Self> {
+        let config: Config = serde_json::from_str(raw).ok()?;
+        let network = Self::from_config(&config).ok()?;
+        Some(Self {
+            config: ConfigId::of(raw),
+            ..network
+        })
+    }
+
+    /// The network a parsed config names; its [`Network::config`] is left
+    /// unset (the text it came from isn't known here).
     pub fn from_config(config: &Config) -> Result<Self, Unusable> {
         let evm = config.addresses.evm().ok_or(Unusable::NotEvm)?;
         let chain_id = config.chain.chain_id.ok_or(Unusable::NotEvm)?;
@@ -61,6 +78,7 @@ impl Network {
             asset_symbol: config.asset_symbol.clone(),
             asset_decimals: config.asset_decimals,
             dev_account,
+            config: ConfigId::default(),
         })
     }
 

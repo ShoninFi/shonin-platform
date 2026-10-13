@@ -27,6 +27,7 @@ use crate::tx::author::archive::{self, Refusal, Summary};
 use crate::tx::author::run::Running;
 use crate::tx::author::{Prompt, Step};
 use crate::view::{El, View, el, text};
+use crate::wallet::config_cache::ConfigId;
 use parts::{Names, wallet_gate};
 
 /// The checks an author ticks before submitting. Nobody checks the ticks.
@@ -1068,6 +1069,7 @@ fn pay_body(
         Some((chain, Some(network))) => {
             let names = Rc::new(Names::of(&network));
             let read_fee = fee.clone();
+            let fee_network = network.clone();
             let fee_names = names.clone();
             let gate_draft = draft.clone();
             let gate_names = names.clone();
@@ -1075,6 +1077,9 @@ fn pay_body(
             let live_fee = fee.clone();
             let gate_fee = fee.clone();
             let chain_id = network.chain_id;
+            // The network this payment is shown with: it is paid with this
+            // config or not at all.
+            let reviewed = network.config;
             View::Many(vec![
                 // One polite region says each step once; the countdown
                 // itself is never read out.
@@ -1111,7 +1116,7 @@ fn pay_body(
                                 Some(if phase.is_live() {
                                     progress(&draft, &names, fee.as_deref().unwrap_or(FEE), &phase)
                                 } else {
-                                    pay_action(&draft, chain, fee, unsure, again)
+                                    pay_action(&draft, chain, reviewed, fee, unsure, again)
                                 })
                             }),
                         )
@@ -1170,7 +1175,9 @@ fn pay_body(
                     )
                     .hook(move |dom| {
                         dom.future(async move {
-                            if let Some(amount) = crate::tx::author::run::fee(chain).await {
+                            // From the contracts of the config this payment
+                            // is shown and paid with.
+                            if let Some(amount) = crate::tx::author::run::fee(&fee_network).await {
                                 read_fee.set(Some(fee_names.tokens(amount)));
                             }
                         })
@@ -1482,7 +1489,14 @@ pub fn submitting_states() -> Vec<(String, View)> {
         let view = if phase.is_live() {
             progress(&draft, &names, FEE, &phase)
         } else {
-            pay_action(&draft, Chain::Base, Some(FEE.to_string()), false, false)
+            pay_action(
+                &draft,
+                Chain::Base,
+                ConfigId::default(),
+                Some(FEE.to_string()),
+                false,
+                false,
+            )
         };
         (label.to_string(), view)
     })
@@ -1543,6 +1557,7 @@ fn may_have_paid(draft: &Draft) -> impl Signal<Item = Option<AuthorError>> + 'st
 fn pay_action(
     draft: &Rc<Draft>,
     chain: Chain,
+    reviewed: ConfigId,
     fee: Option<String>,
     unsure: bool,
     look_again: bool,
@@ -1565,7 +1580,7 @@ fn pay_action(
         submit_button(fee.as_deref().unwrap_or(FEE))
             .busy(&busy)
             .build(),
-        move || submit(&submit_draft, chain),
+        move || submit(&submit_draft, chain, reviewed),
     );
     if !look_again {
         return pay.into();
@@ -1585,8 +1600,9 @@ fn pay_action(
 }
 
 /// Upload (unless this project was already uploaded for this chain) and
-/// pay, from the account the upload named.
-fn submit(draft: &Rc<Draft>, chain: Chain) {
+/// pay, from the account the upload named, with the config `reviewed` (the
+/// one the payment was shown with) or not at all.
+fn submit(draft: &Rc<Draft>, chain: Chain, reviewed: ConfigId) {
     if draft.busy.get()
         || draft
             .running
@@ -1598,9 +1614,9 @@ fn submit(draft: &Rc<Draft>, chain: Chain) {
     }
     draft.checked.set(None);
     #[cfg(target_arch = "wasm32")]
-    browser::submit(draft.clone(), chain);
+    browser::submit(draft.clone(), chain, reviewed);
     #[cfg(not(target_arch = "wasm32"))]
-    let _ = chain;
+    let _ = (chain, reviewed);
 }
 
 /// Look on the chain for a payment for this upload that may have landed:
@@ -1732,6 +1748,7 @@ mod browser {
     use crate::tx::author::read::PaymentRecord;
     use crate::tx::author::run::{self, Action, Lookup, Running, UploadError};
     use crate::tx::author::{AuthorError, Outcome, Step};
+    use crate::wallet::config_cache::ConfigId;
 
     /// The first file of an `<input type=file>`.
     pub fn take_input(draft: &Rc<Draft>, input: &web_sys::Element) {
@@ -1803,7 +1820,7 @@ mod browser {
         Some(Uint8Array::new(&buffer).to_vec())
     }
 
-    pub fn submit(draft: Rc<Draft>, chain: Chain) {
+    pub fn submit(draft: Rc<Draft>, chain: Chain, reviewed: ConfigId) {
         let session = crate::wallet::get();
         let Some(account) = session.account() else {
             return;
@@ -1881,6 +1898,7 @@ mod browser {
             run::start(
                 chain,
                 Action::Pay { upload, uploader },
+                reviewed,
                 &running,
                 move |outcome| {
                     if let Outcome::Paid { strategy_id, .. }
@@ -2173,7 +2191,15 @@ mod tests {
     #[test]
     fn after_a_look_on_the_chain_found_no_payment_looking_again_stays_offered_beside_paying() {
         let draft = Draft::new();
-        let html = pay_action(&draft, Chain::Base, Some("1 USDC".to_string()), false, true).html();
+        let html = pay_action(
+            &draft,
+            Chain::Base,
+            ConfigId::default(),
+            Some("1 USDC".to_string()),
+            false,
+            true,
+        )
+        .html();
         assert!(html.contains("Submit for 1 USDC"), "{html}");
         assert!(html.contains("Check the chain again"), "{html}");
     }
@@ -2184,6 +2210,7 @@ mod tests {
         let html = pay_action(
             &draft,
             Chain::Base,
+            ConfigId::default(),
             Some("1 USDC".to_string()),
             false,
             false,
@@ -2191,7 +2218,15 @@ mod tests {
         .html();
         assert!(html.contains("Submit for 1 USDC"), "{html}");
         assert!(!html.contains("Check the chain"), "{html}");
-        let html = pay_action(&draft, Chain::Base, Some("1 USDC".to_string()), true, false).html();
+        let html = pay_action(
+            &draft,
+            Chain::Base,
+            ConfigId::default(),
+            Some("1 USDC".to_string()),
+            true,
+            false,
+        )
+        .html();
         assert!(!html.contains("Submit"), "{html}");
         assert!(html.contains("Check the chain for the payment"), "{html}");
         // Which errors hold the payment back until the chain is checked.

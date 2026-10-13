@@ -4,6 +4,8 @@
 //! account changes. In the browser it reads through the cluster's public
 //! endpoint and signs with the connected Solana wallet.
 
+use std::rc::Rc;
+
 use chain::solana_ix::Pubkey;
 use futures_signals::signal::Mutable;
 use shared::Chain;
@@ -159,17 +161,136 @@ pub fn cluster(network: &SolNetwork) -> Cluster {
     }
 }
 
-/// A flow in progress: its latest step, and its cancel.
-#[derive(Clone, Default)]
+/// A flow in progress: its latest step, its cancel, and the cluster its
+/// review was computed with.
+#[derive(Clone)]
 pub struct SolRunning {
     pub step: Mutable<Option<Step>>,
     pub cancel: Cancel,
+    /// The cluster the review was computed with (its amounts are scaled
+    /// with this cluster's decimals): the flow signs with this config or
+    /// not at all.
+    pub reviewed: Rc<SolNetwork>,
 }
 
 impl SolRunning {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(reviewed: Rc<SolNetwork>) -> Self {
+        Self {
+            step: Mutable::new(None),
+            cancel: Cancel::default(),
+            reviewed,
+        }
     }
+}
+
+/// Where a card shows the flow it started, kept for the page's life by the
+/// connected account, the vault and what the card does: a card drawn again
+/// (its page reading again, the cluster's settings changing) shows the flow
+/// under way rather than offering to start it a second time.
+pub fn card_slot(
+    account: Option<Pubkey>,
+    vault: &Pubkey,
+    what: &str,
+) -> Mutable<Option<SolRunning>> {
+    thread_local! {
+        static CARDS: std::cell::RefCell<std::collections::BTreeMap<String, Mutable<Option<SolRunning>>>> =
+            const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+    }
+    let key = format!("{account:?}|{vault}|{what}");
+    CARDS.with(|cards| {
+        cards
+            .borrow_mut()
+            .entry(key)
+            .or_insert_with(|| Mutable::new(None))
+            .clone()
+    })
+}
+
+/// What a card shows for the flow its slot holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardShows {
+    /// No flow: the action.
+    Action,
+    /// A flow under way, or one whose money may still move: its status
+    /// only, never the action again (the latter with a way to dismiss it).
+    Status,
+    /// A flow that ended and moves nothing more: its outcome, with a way to
+    /// dismiss it, and the action offered again beside it.
+    StatusAndAction,
+}
+
+/// What a card shows for a flow at `step`.
+pub fn card_shows(step: Option<&Step>) -> CardShows {
+    match step {
+        Some(Step::Done(_)) => CardShows::StatusAndAction,
+        Some(Step::Failed(error)) if !error.may_have_moved() => CardShows::StatusAndAction,
+        _ => CardShows::Status,
+    }
+}
+
+/// What a card shows for the flow `slot` holds, if any.
+pub fn card_shows_slot(slot: &Mutable<Option<SolRunning>>) -> CardShows {
+    match slot.get_cloned() {
+        None => CardShows::Action,
+        Some(flow) => card_shows(flow.step.lock_ref().as_ref()),
+    }
+}
+
+/// One card as it stands: the account connected, the slot of its flow for
+/// that account, and what it shows.
+#[derive(Clone)]
+pub struct Card {
+    pub account: Option<Pubkey>,
+    pub slot: Mutable<Option<SolRunning>>,
+    pub shows: CardShows,
+}
+
+/// The card for `what` on `vault`, as it changes: with the account
+/// connected (its slot is that account's: a flow is kept under the account
+/// it starts for), and with its flow's steps.
+pub fn card_signal(
+    vault: Pubkey,
+    what: String,
+) -> impl futures_signals::signal::Signal<Item = Card> + use<> {
+    use futures_signals::signal::{SignalExt, always};
+    crate::wallet::solana::get()
+        .connection
+        .signal_ref(|connection| connection.account())
+        .dedupe()
+        .switch(move |account| {
+            let slot = card_slot(account, &vault, &what);
+            let held = slot.clone();
+            slot.signal_cloned()
+                .switch(|current| match current {
+                    None => always(CardShows::Action).boxed_local(),
+                    Some(flow) => flow
+                        .step
+                        .signal_ref(|step| card_shows(step.as_ref()))
+                        .boxed_local(),
+                })
+                .dedupe()
+                .map(move |shows| Card {
+                    account,
+                    slot: held.clone(),
+                    shows,
+                })
+        })
+}
+
+/// Start `action` from a card: only for the account the card was drawn for
+/// (still the one connected), and never while its flow is under way or its
+/// money may still move. Whether it started.
+pub fn start_from(card: &Card, vault: Pubkey, action: SolAction, reviewed: Rc<SolNetwork>) -> bool {
+    if card.account.is_none() || crate::wallet::solana::get().account() != card.account {
+        return false;
+    }
+    if card_shows_slot(&card.slot) == CardShows::Status {
+        return false;
+    }
+    let flow = SolRunning::new(reviewed);
+    start(vault, action, &flow);
+    card.slot.set(Some(flow));
+    true
 }
 
 /// Start `action` on the vault at `vault`, reporting into `running`.
@@ -192,8 +313,9 @@ pub fn start(vault: Pubkey, action: SolAction, running: &SolRunning) {
             return;
         };
         // Never a config remembered from an earlier visit alone: one the
-        // API answered in this page's life.
-        let network = match session.network_to_sign().await {
+        // API answered in this page's life, and the one the review was
+        // computed with; any other stops here, before a wallet is asked.
+        let network = match session.network_to_sign(running.reviewed.config).await {
             Ok(network) => network,
             Err(error) => {
                 step.set(Some(Step::Failed(error)));
@@ -330,4 +452,92 @@ pub fn start(_vault: Pubkey, _action: SolAction, running: &SolRunning) {
     running
         .step
         .set(Some(Step::Failed(super::error::SolError::NotConnected)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tx::solana::SolError;
+    use crate::tx::solana::flow::Outcome;
+    use crate::tx::solana::port::Sig;
+
+    fn cluster() -> Rc<SolNetwork> {
+        Rc::new(SolNetwork {
+            cluster: "devnet".to_string(),
+            label: "Solana devnet".to_string(),
+            rpc: "https://api.devnet.solana.com".to_string(),
+            mint: Pubkey::new_from_array([7; 32]),
+            asset_symbol: "USDC".to_string(),
+            asset_decimals: 6,
+            dev_account: None,
+            config: crate::wallet::config_cache::ConfigId::default(),
+        })
+    }
+
+    #[test]
+    fn a_card_starts_only_for_the_account_it_was_drawn_for_and_never_over_a_flow_under_way() {
+        let session = crate::wallet::solana::get();
+        session
+            .connect_phrase("test test test test test test test test test test test junk")
+            .unwrap();
+        let connected = session.account();
+        let vault = Pubkey::new_from_array([4; 32]);
+        // Drawn for another account (the wallet moved before the card was
+        // drawn again): nothing starts, and no slot is filled.
+        let other = Pubkey::new_from_array([6; 32]);
+        let stale = Card {
+            account: Some(other),
+            slot: card_slot(Some(other), &vault, "Collect"),
+            shows: CardShows::Action,
+        };
+        assert!(!start_from(
+            &stale,
+            vault,
+            SolAction::CollectUnits,
+            cluster()
+        ));
+        assert!(stale.slot.lock_ref().is_none());
+        // Drawn for the account connected: it starts, into that account's
+        // slot.
+        let card = Card {
+            account: connected,
+            slot: card_slot(connected, &vault, "Collect"),
+            shows: CardShows::Action,
+        };
+        assert!(start_from(&card, vault, SolAction::CollectUnits, cluster()));
+        assert!(card_slot(connected, &vault, "Collect").lock_ref().is_some());
+        // Under way: a second start is refused.
+        let flow = card.slot.get_cloned().unwrap();
+        flow.step.set(Some(Step::Checking));
+        assert_eq!(card_shows_slot(&card.slot), CardShows::Status);
+        assert!(!start_from(
+            &card,
+            vault,
+            SolAction::CollectUnits,
+            cluster()
+        ));
+        // Its money may still move: refused until it is dismissed.
+        flow.step.set(Some(Step::Failed(SolError::Pending {
+            signature: Sig([1; 64]),
+            why: "the cluster stopped answering".to_string(),
+        })));
+        assert_eq!(card_shows_slot(&card.slot), CardShows::Status);
+        assert!(!start_from(
+            &card,
+            vault,
+            SolAction::CollectUnits,
+            cluster()
+        ));
+        card.slot.set(None);
+        assert_eq!(card_shows_slot(&card.slot), CardShows::Action);
+        // Ended: offered again beside its outcome.
+        assert!(start_from(&card, vault, SolAction::CollectUnits, cluster()));
+        let flow = card.slot.get_cloned().unwrap();
+        flow.step.set(Some(Step::Done(Outcome::Changed {
+            signature: Sig([2; 64]),
+        })));
+        assert_eq!(card_shows_slot(&card.slot), CardShows::StatusAndAction);
+        assert!(start_from(&card, vault, SolAction::CollectUnits, cluster()));
+        session.disconnect();
+    }
 }

@@ -25,6 +25,7 @@ use super::rpc::SolRpc;
 use crate::tx::flow::Cancel;
 use crate::tx::solana::error::SolError;
 use crate::tx::solana::port::{Signed, SolSigner};
+use crate::wallet::config_cache::ConfigId;
 use crate::wallet::phrase::BadPhrase;
 use crate::wallet::rpc::Endpoint;
 
@@ -212,6 +213,15 @@ impl SolSession {
         }
     }
 
+    /// The config the page reads the cluster with now: a page that drew
+    /// figures with it reads again when this changes.
+    pub fn config_id(&self) -> Option<ConfigId> {
+        self.network
+            .lock_ref()
+            .as_ref()
+            .map(|network| network.config)
+    }
+
     /// Take a copy of the cluster's config into what the page reads, if it
     /// is one this build can use. Redraws only when it changed.
     fn adopt(&self, raw: &str) -> Option<Rc<SolNetwork>> {
@@ -246,30 +256,37 @@ impl SolSession {
 
     /// The cluster a flow sends on: from a config fetched in this page's
     /// life, never from a remembered copy alone (see
-    /// [`crate::wallet::config_cache`]).
-    pub async fn network_to_sign_with<F, Fut>(&self, fetch: F) -> Result<Rc<SolNetwork>, SolError>
+    /// [`crate::wallet::config_cache`]), and only the one its review was
+    /// computed with (`reviewed`). Any other stops the flow before a wallet
+    /// is asked: the page reads the fresh one from now on, and the person
+    /// reviews again.
+    pub async fn network_to_sign_with<F, Fut>(
+        &self,
+        reviewed: ConfigId,
+        fetch: F,
+    ) -> Result<Rc<SolNetwork>, SolError>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<String, String>>,
     {
         use crate::wallet::config_cache::ForSigning;
-        match self.config.for_signing(fetch).await {
-            ForSigning::Use(raw) => self.adopt(&raw).ok_or_else(|| {
-                SolError::Network(
-                    "the Solana cluster's settings can't be used by this app".to_string(),
-                )
-            }),
-            ForSigning::Changed(raw) => {
-                self.adopt(&raw);
-                Err(SolError::Network(
-                    "this page's settings for the Solana cluster were just updated, so nothing was sent"
-                        .to_string(),
-                ))
+        let raw = match self.config.for_signing(fetch).await {
+            // A fetch that replaced the remembered copy is no reason to stop
+            // when the review was computed with the fetched one.
+            ForSigning::Use(raw) | ForSigning::Changed(raw) => raw,
+            ForSigning::Unavailable(_) => {
+                return Err(SolError::Network(
+                    "the Solana cluster isn't reachable from this app".to_string(),
+                ));
             }
-            ForSigning::Unavailable(_) => Err(SolError::Network(
-                "the Solana cluster isn't reachable from this app".to_string(),
-            )),
+        };
+        let network = self.adopt(&raw).ok_or_else(|| {
+            SolError::Network("the Solana cluster's settings can't be used by this app".to_string())
+        })?;
+        if network.config != reviewed {
+            return Err(SolError::SettingsChanged);
         }
+        Ok(network)
     }
 
     /// The connected wallet's app, as a name on its own: "Phantom",
@@ -300,8 +317,7 @@ impl SolSession {
 
 /// The cluster a config names, if this build can use it.
 fn parse_network(raw: &str) -> Option<SolNetwork> {
-    let config: shared::Config = serde_json::from_str(raw).ok()?;
-    SolNetwork::from_config(&config).ok()
+    SolNetwork::from_raw(raw)
 }
 
 /// The session's Solana wallet, signing.
@@ -446,15 +462,20 @@ impl SolSession {
         self.refresh().await
     }
 
-    /// The cluster to send on: never a remembered copy alone.
-    pub async fn network_to_sign(&self) -> Result<Rc<SolNetwork>, SolError> {
+    /// The cluster to send on: never a remembered copy alone, and only the
+    /// one the review was computed with (`reviewed`).
+    pub async fn network_to_sign(&self, reviewed: ConfigId) -> Result<Rc<SolNetwork>, SolError> {
         let network = self
-            .network_to_sign_with(|| crate::wallet::config_cache::fetch_raw(shared::Chain::Solana))
-            .await?;
-        if let Some(held) = self.config.held() {
+            .network_to_sign_with(reviewed, || {
+                crate::wallet::config_cache::fetch_raw(shared::Chain::Solana)
+            })
+            .await;
+        // A fetched config is kept for the next visit, whether or not this
+        // send goes on with it.
+        if let Some(held) = self.config.held().filter(|_| self.config.is_fresh()) {
             crate::wallet::config_cache::keep(shared::Chain::Solana, &held.raw);
         }
-        Ok(network)
+        network
     }
 
     fn standard_named(name: &str) -> Option<StandardWallet> {
@@ -775,12 +796,14 @@ mod tests {
         // A send while the API is down: nothing is signed.
         let down = || async { Err::<String, String>("the API answered 503".to_string()) };
         assert!(matches!(
-            block_on(session.network_to_sign_with(down)),
+            block_on(session.network_to_sign_with(read.config, down)),
             Err(SolError::Network(_))
         ));
         // The API answers the same bytes: the send goes on, with it.
         let same = raw.clone();
-        let signed = block_on(session.network_to_sign_with(|| async move { Ok(same) })).unwrap();
+        let signed =
+            block_on(session.network_to_sign_with(read.config, || async move { Ok(same) }))
+                .unwrap();
         assert_eq!(*signed, *read);
 
         // The API answers something else: this send stops, and the page
@@ -793,8 +816,8 @@ mod tests {
         );
         let fresh = other.clone();
         assert!(matches!(
-            block_on(session.network_to_sign_with(|| async move { Ok(fresh) })),
-            Err(SolError::Network(_))
+            block_on(session.network_to_sign_with(read.config, || async move { Ok(fresh) })),
+            Err(SolError::SettingsChanged)
         ));
         assert_eq!(
             session.network.get_cloned().unwrap().rpc,
