@@ -774,7 +774,7 @@ fn shares_card(slug: &str, read: &Rc<Read>, controls: &Rc<Controls>, names: &Rc<
         )
         .child(el("p").class("sh-muted").text(format!(
             "≈ {} at {} a share",
-            money::dollars(worth, decimals, Rounding::Down),
+            money::dollars(worth, decimals, Rounding::Nearest),
             money::price(read.at.share_price, decimals)
         )))
         .child(el("dl").class("sh-publish__dl").child(parts::row(

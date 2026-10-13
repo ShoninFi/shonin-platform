@@ -33,6 +33,10 @@
 .sh-exit__row { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-4); }
 .sh-exit__row dt { font: var(--type-body-s); color: var(--ink-muted); }
 .sh-exit__row dd { margin: 0; font: 600 15px/22px var(--font-sans); text-align: right; }
+/* A withdrawal's Done line: what was paid for, as one phrase. */
+.sh-exit__valued { font: var(--type-body-s); color: var(--ink-muted); }
+/* A position not read since the flow landed: never the old figure. */
+.sh-exit__row dd.sh-exit__updating { color: var(--ink-muted); font-weight: 500; }
 .sh-exit__row--total dt { color: var(--ink); font-weight: 600; }
 .sh-exit__row--total dd { font: var(--type-figure); letter-spacing: var(--track-figure); }
 /* The preview under the amount: a sunken box, the total under a rule. */

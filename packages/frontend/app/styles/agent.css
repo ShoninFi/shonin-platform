@@ -689,3 +689,13 @@
 }
 .ag-finding__file { text-decoration: none; }
 .ag-finding__file .ag-code { color: var(--link); text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1px; }
+
+/* A returning holder's booked withdrawals, under the Exit panel. */
+.ag-claims { display: flex; flex-direction: column; gap: var(--space-3); }
+.ag-claims__title { font: 650 16px/24px var(--font-sans); }
+.ag-claims__list { display: flex; flex-direction: column; gap: var(--space-3); margin: 0; padding: 0; list-style: none; }
+.ag-claims__item { display: flex; flex-direction: column; gap: var(--space-1); padding-top: var(--space-3); border-top: var(--border-hairline) solid var(--line); }
+.ag-claims__item:first-child { padding-top: 0; border-top: 0; }
+.ag-claims__head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); font: 600 15px/22px var(--font-sans); }
+.ag-claims__booked, .ag-claims__note { font: var(--type-body-s); color: var(--ink-muted); }
+.ag-claims-slot:empty { display: none; }

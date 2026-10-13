@@ -691,11 +691,7 @@ pub fn event_amount(kind: EventKind, amount: Option<f64>) -> Option<String> {
 
 /// A sentence that starts with a capital.
 pub fn sentence(text: &str) -> String {
-    let mut chars = text.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    }
+    format::sentence(text)
 }
 
 // ---- Explorers ------------------------------------------------------------

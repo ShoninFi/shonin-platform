@@ -45,6 +45,7 @@ pub fn body(agent: &Rc<Agent>) -> El {
                 .class("ag-side")
                 .attr("aria-label", "Deposit, withdraw and running costs")
                 .child(side::exit_slot(agent))
+                .child(side::your_claims(agent))
                 .child(side::tank(agent))
                 .child(side::verified_build(agent)),
         )

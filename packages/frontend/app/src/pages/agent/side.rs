@@ -1,8 +1,11 @@
-//! The agent page's right column: the Exit panel's slot, the tank and the
-//! verified build on the overview; a short way in to deposit or withdraw on
+//! The agent page's right column: the Exit panel's slot, a returning
+//! holder's booked withdrawals, the tank and the verified build on the
+//! overview; a short way in to deposit or withdraw on
 //! the other tabs. Sticky from 900px; under the header below that.
 
 use std::rc::Rc;
+
+use futures_signals::signal::SignalExt;
 
 use shared::{ExitClass, Strategy};
 use ui::icons::Icon;
@@ -24,6 +27,151 @@ pub fn exit_slot(agent: &Rc<Agent>) -> El {
     el("div")
         .class("ag-exit-slot")
         .child(exit::panel(&agent.slug))
+}
+
+/// A returning holder's booked withdrawals on this agent (States-Agent,
+/// Agent-Sealed-Mobile): each open claim's state, shares and when it was
+/// booked, with a way to its page. Read from the API's portfolio for the
+/// connected wallet, again whenever a flow lands; nothing while signed out
+/// or with no open claim. EVM vaults only: a Solana vault's claims are on
+/// the portfolio.
+pub fn your_claims(agent: &Rc<Agent>) -> View {
+    let claims: futures_signals::signal::Mutable<Vec<shared::HeldClaim>> =
+        futures_signals::signal::Mutable::new(Vec::new());
+    let slug = agent.slug.clone();
+    let shown = slug.clone();
+    el("div")
+        .class("ag-claims-slot")
+        .child_signal(
+            None,
+            claims.signal_cloned().map(move |claims| {
+                claims_card(
+                    &shown,
+                    &claims,
+                    crate::pages::publish::parts::this_year(2026),
+                )
+            }),
+        )
+        .hook(move |dom| {
+            #[cfg(target_arch = "wasm32")]
+            let dom = dom.future(follow_claims(slug, claims));
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = (&slug, &claims);
+            dom
+        })
+        .into()
+}
+
+/// The card for `slug`'s open claims among `claims`, if there are any.
+pub fn claims_card(slug: &str, claims: &[shared::HeldClaim], this_year: i32) -> Option<View> {
+    use crate::pages::portfolio::{claim_badge, shared_state};
+    let open: Vec<&shared::HeldClaim> = claims
+        .iter()
+        .filter(|claim| claim.slug == slug)
+        .filter(|claim| {
+            !matches!(
+                claim.state,
+                shared::ClaimState::Paid | shared::ClaimState::Fallback
+            )
+        })
+        .collect();
+    if open.is_empty() {
+        return None;
+    }
+    let title = if open.len() == 1 {
+        "Your booked withdrawal"
+    } else {
+        "Your booked withdrawals"
+    };
+    Some(
+        el("section")
+            .class("sh-card")
+            .class("ag-card")
+            .class("ag-claims")
+            .attr("aria-labelledby", "ag-claims-title")
+            .child(
+                el("h2")
+                    .class("ag-claims__title")
+                    .attr("id", "ag-claims-title")
+                    .text(title),
+            )
+            .child(el("ul").class("ag-claims__list").children(open.into_iter().map(|claim| {
+                el("li")
+                    .class("ag-claims__item")
+                    .child(
+                        el("p")
+                            .class("ag-claims__head")
+                            .child(el("span").class("sh-num").text(format!(
+                                "{} shares",
+                                format::number(claim.shares, 1)
+                            )))
+                            .child(claim_badge(shared_state(claim.state))),
+                    )
+                    .child(el("p").class("ag-claims__booked").text(format!(
+                        "Booked {}",
+                        format::day_time(claim.booked, this_year)
+                    )))
+                    .child(
+                        crate::web::app_link(format!("/portfolio/claims/{slug}-{}", claim.id))
+                            .class("sh-link")
+                            .text("See your claim")
+                            .child(icon(Icon::ArrowRight, 16)),
+                    )
+            })))
+            .child(el("p").class("ag-claims__note").text(
+                "Pending shares are paid once the cash is home. Settling is public: anyone can push it through, including you.",
+            ))
+            .into(),
+    )
+}
+
+/// Keep the connected wallet's claims fresh: on load, whenever the account
+/// changes or a flow lands, and every 30 s.
+#[cfg(target_arch = "wasm32")]
+async fn follow_claims(
+    slug: String,
+    claims: futures_signals::signal::Mutable<Vec<shared::HeldClaim>>,
+) {
+    if crate::tx::solana::run::is_solana(&slug) {
+        return;
+    }
+    let Some((chain, _)) = crate::tx::author::run::parse_slug(&slug) else {
+        return;
+    };
+    let session = crate::wallet::get();
+    loop {
+        let seen = (session.changed.get(), session.account());
+        match seen.1 {
+            Some(account) => {
+                let reply = gloo_net::http::Request::get(&format!(
+                    "{}/{chain}/portfolio/{account:?}",
+                    crate::api::BASE
+                ))
+                .send()
+                .await
+                .ok()
+                .filter(|reply| reply.ok());
+                let portfolio: Option<shared::Portfolio> = match reply {
+                    Some(reply) => reply.json().await.ok(),
+                    None => None,
+                };
+                // A failed read keeps what was shown; a later one replaces
+                // it. Another account's answer is never shown.
+                if let Some(portfolio) = portfolio
+                    && session.account() == Some(account)
+                {
+                    claims.set(portfolio.claims);
+                }
+            }
+            None => claims.set(Vec::new()),
+        }
+        for _ in 0..30 {
+            gloo_timers::future::TimeoutFuture::new(1_000).await;
+            if (session.changed.get(), session.account()) != seen {
+                break;
+            }
+        }
+    }
 }
 
 /// How long the agent can keep running: the gauge against 60 days, the
@@ -383,4 +531,52 @@ pub fn facts_hashes(strategy: &Strategy) -> Vec<(&'static str, String)> {
     }
     rows.push(("Vault contract", strategy.vault.address.clone()));
     rows
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+
+    fn claim(slug: &str, id: u64, state: shared::ClaimState) -> shared::HeldClaim {
+        shared::HeldClaim {
+            slug: slug.to_string(),
+            id,
+            shares: 2_400.0,
+            fraction_closed: 0.0,
+            state,
+            booked: time::PrimitiveDateTime::new(
+                time::Date::from_ordinal_date(2026, 280).expect("a day"),
+                time::Time::from_hms(9, 30, 0).expect("a time"),
+            ),
+            settled_for: None,
+        }
+    }
+
+    #[test]
+    fn a_returning_holder_sees_their_open_booked_withdrawals_on_the_agent_and_no_others() {
+        let claims = [
+            claim("base-2", 7, shared::ClaimState::Waiting),
+            claim("base-2", 8, shared::ClaimState::Paid),
+            claim("base-2", 9, shared::ClaimState::Fallback),
+            claim("base-3", 1, shared::ClaimState::Pending),
+        ];
+        let html = claims_card("base-2", &claims, 2026)
+            .expect("an open claim on this agent")
+            .html();
+        assert!(html.contains("Your booked withdrawal"), "{html}");
+        assert!(html.contains("2,400.0 shares"), "{html}");
+        assert!(html.contains("Waiting"), "{html}");
+        assert!(html.contains("Booked "), "{html}");
+        assert!(html.contains("/portfolio/claims/base-2-7"), "{html}");
+        // Paid or taken through the fallback: done, not shown; another
+        // agent's: not this page's.
+        assert!(
+            !html.contains("base-2-8") && !html.contains("base-2-9"),
+            "{html}"
+        );
+        assert!(!html.contains("base-3"), "{html}");
+        // None open: no card.
+        assert!(claims_card("base-2", &claims[1..3], 2026).is_none());
+        assert!(claims_card("base-4", &claims, 2026).is_none());
+    }
 }

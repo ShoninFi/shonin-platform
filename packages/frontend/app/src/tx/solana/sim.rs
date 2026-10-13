@@ -965,7 +965,13 @@ fn a_list_that_changed_since_it_was_shown_is_never_signed() {
     let mut other = shown();
     other[0] ^= 1;
     let (end, _) = run!(&sim, local(), |ctx| flow::deposit(&ctx, 100 * USD, other));
-    assert_eq!(end, Err(SolError::ListChanged));
+    // It says the list the vault holds now, for the review to show.
+    assert_eq!(
+        end,
+        Err(SolError::ListChanged {
+            now: vec![code("SANCTIONED"), code("US")]
+        })
+    );
     assert!(sim.0.borrow().prompts.is_empty());
     assert_eq!(sim.sends(), 0);
 }
@@ -975,7 +981,7 @@ fn a_list_the_vault_no_longer_holds_is_never_signed_even_if_it_was_shown() {
     let sim = Sim::new();
     sim.set_vault(|v| v.restricted_hash = [9; 32]);
     let (end, _) = run!(&sim, local(), |ctx| flow::deposit(&ctx, 100 * USD, shown()));
-    assert_eq!(end, Err(SolError::ListChanged));
+    assert!(matches!(end, Err(SolError::ListChanged { .. })), "{end:?}");
     assert_eq!(sim.sends(), 0);
 }
 

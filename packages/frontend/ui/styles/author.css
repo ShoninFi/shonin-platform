@@ -106,6 +106,35 @@
 .sh-publish__pay { display: flex; flex-direction: column; gap: var(--space-4); }
 .sh-publish__payaction, .sh-publish__payactions { display: flex; flex-direction: column; gap: var(--space-3); }
 .sh-publish__note { font: var(--type-body-s); color: var(--ink-muted); }
+/* The phone's one-line progress (Publish-Mobile): shown under 600px only. */
+.sh-publish__compact { display: none; flex-direction: column; gap: var(--space-2); padding: 12px 16px; border: var(--border-hairline) solid var(--line); border-radius: var(--radius-m); background: var(--paper-raised); }
+.sh-publish__compactline { display: flex; justify-content: space-between; gap: var(--space-3); font: 600 13px/18px var(--font-sans); }
+.sh-publish__compactnext { color: var(--ink-muted); font-weight: 500; }
+.sh-publish__bars { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; }
+.sh-publish__barseg { height: 4px; border-radius: 999px; background: var(--paper-sunk); }
+.sh-publish__barseg--on { background: var(--brand); }
+/* The action, and on a phone the bar that holds it. */
+.sh-publish__bar { display: flex; flex-direction: column; gap: var(--space-3); }
+.sh-publish__barline { display: none; justify-content: space-between; gap: var(--space-3); font: 500 13px/18px var(--font-sans); color: var(--ink-muted); }
+.sh-publish__barfee { color: var(--ink); font-weight: 600; }
+/* A submission under way, where Submit was: upload, approve, pay, queued. */
+.sh-publish__progress { display: flex; flex-direction: column; gap: var(--space-3); }
+.sh-publish__flow { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--space-2); margin: 0; padding: 0; list-style: none; }
+.sh-publish__flowstep { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding-top: 8px; border-top: 3px solid var(--paper-sunk); min-width: 0; }
+.sh-publish__flowstep--done { border-top-color: var(--brand); }
+.sh-publish__flowstep--now { border-top-color: var(--brand); }
+.sh-publish__flowmark {
+  display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 999px;
+  border: 1.5px solid var(--line-control); color: var(--ink-muted); font: 650 12px/1 var(--font-sans);
+}
+.sh-publish__flowstep--now .sh-publish__flowmark { border-color: var(--brand); color: var(--brand); }
+.sh-publish__flowstep--done .sh-publish__flowmark { border-color: var(--brand); background: var(--brand); color: var(--on-brand); }
+.sh-publish__flowtitle { font: 600 13px/18px var(--font-sans); color: var(--ink-muted); overflow-wrap: anywhere; }
+.sh-publish__flowstep--now .sh-publish__flowtitle, .sh-publish__flowstep--done .sh-publish__flowtitle { color: var(--ink); }
+.sh-publish__now { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-2); padding: var(--space-4); border-radius: var(--radius-m); background: var(--paper-sunk); }
+.sh-publish__confirm { display: flex; align-items: center; gap: var(--space-2); font: 600 15px/22px var(--font-sans); }
+.sh-publish__confirm .sh-hexring .sh-btn__hex { width: 20px; height: 20px; }
+.sh-publish__nowactions { display: flex; gap: var(--space-2); flex-wrap: wrap; }
 .sh-publish__aside { display: flex; flex-direction: column; gap: var(--space-4); }
 .sh-publish__asidecard { display: flex; flex-direction: column; gap: var(--space-3); }
 .sh-publish__nextlist { display: flex; flex-direction: column; gap: var(--space-3); margin: 0; padding: 0; list-style: none; }
@@ -179,9 +208,22 @@
 @media (max-width: 599px) {
   .sh-author__title { font: var(--type-display-m); letter-spacing: var(--track-display-m); }
   .sh-publish__section { padding: var(--space-4); }
-  .sh-publish__steplist .sh-publish__stepdetail { display: none; }
+  .sh-publish__steplist { display: none; }
+  .sh-publish__compact { display: flex; }
   .sh-publish__dl { grid-template-columns: minmax(0, 1fr); }
   .sh-publish__dl dt { border-bottom: 0; padding-bottom: 2px; }
+  /* The fee's rows stay label and figure side by side, as drawn. */
+  .sh-publish__paylist { grid-template-columns: auto minmax(0, 1fr); }
+  .sh-publish__paylist dt { border-bottom: var(--border-hairline) solid var(--line); padding-bottom: 10px; background: none; }
+  .sh-publish__paylist dd { text-align: right; }
+  /* The action is held at the foot of the screen, above the tab bar. */
+  .sh-publish__bar {
+    position: fixed; left: 0; right: 0; bottom: calc(64px + env(safe-area-inset-bottom)); z-index: 90;
+    max-height: 60vh; overflow-y: auto; gap: 10px;
+    padding: 12px var(--space-4); background: var(--paper-raised); border-top: var(--border-hairline) solid var(--line);
+  }
+  .sh-publish__barline { display: flex; }
+  .sh-app:has(.sh-publish__bar) { padding-bottom: calc(64px + 140px + env(safe-area-inset-bottom)); }
   .sh-activate__fields, .sh-manage__split { grid-template-columns: minmax(0, 1fr); }
   .sh-retire__table thead { display: none; }
   .sh-retire__table, .sh-retire__table tbody, .sh-retire__table tr, .sh-retire__table th, .sh-retire__table td { display: block; }

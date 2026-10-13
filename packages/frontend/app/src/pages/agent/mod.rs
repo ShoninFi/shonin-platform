@@ -11,7 +11,7 @@ pub mod facts;
 mod overview;
 mod parts;
 mod review;
-mod side;
+pub(crate) mod side;
 mod source;
 mod verify;
 

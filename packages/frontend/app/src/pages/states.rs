@@ -258,6 +258,43 @@ pub fn page() -> Page {
                 )],
             ))
             .child(section("st-jobs", "Publishing job", [jobs()]))
+            .child(section(
+                "st-submit",
+                "Publishing: a submission under way",
+                super::publish::submitting_states()
+                    .into_iter()
+                    .map(|(label, view)| labelled(label, el("div").class("st-submit").child(view))),
+            ))
+            .child(section(
+                "st-done",
+                "Exit panel: done",
+                crate::components::exit::done_states()
+                    .into_iter()
+                    .map(|(label, view)| labelled(label, el("div").class("sh-card sh-card--pad st-done").child(view))),
+            ))
+            .child(section(
+                "st-claims",
+                "Agent page: your booked withdrawal",
+                [labelled(
+                    "A returning holder with an open claim",
+                    el("div").class("st-claims").child(
+                        super::agent::side::claims_card(
+                            "base-2",
+                            &[shared::HeldClaim {
+                                slug: "base-2".to_string(),
+                                id: 7,
+                                shares: 2_400.0,
+                                fraction_closed: 0.0,
+                                state: shared::ClaimState::Waiting,
+                                booked: at(280, 9),
+                                settled_for: None,
+                            }],
+                            2026,
+                        )
+                        .unwrap_or(View::Empty),
+                    ),
+                )],
+            ))
             .into(),
     }
 }

@@ -70,6 +70,10 @@ struct Panel {
     account: Mutable<Option<Rc<Vault>>>,
     figures: Mutable<Option<VaultFigures>>,
     holdings: Mutable<Option<Holdings>>,
+    /// How many flows had landed in this session when the holdings were
+    /// last read: a Done card shows a position only once it was read after
+    /// its flow landed.
+    holdings_at: Mutable<u64>,
     /// The vault's restricted list, read from its own account.
     codes: Mutable<Option<Vec<[u8; 32]>>>,
     tab: Mutable<Tab>,
@@ -81,6 +85,9 @@ struct Panel {
     running: Mutable<Option<SolRunning>>,
     /// The list shown on the review, which the deposit states.
     shown: Mutable<Option<[u8; 32]>>,
+    /// The amount of the deposit last started, in base units: reviewed
+    /// again, with no typing, if the vault's list changed before signing.
+    asked: Cell<Option<u64>>,
     requested_local: Rc<Cell<Option<(f64, u64)>>>,
     /// Bumped by "Try again" on the unreachable state: read again now.
     retry: Mutable<u32>,
@@ -110,28 +117,36 @@ pub fn open_sheet(slug: &str, tab: Tab) {
     });
 }
 
+impl Panel {
+    fn new(slug: &str, tab: Tab, in_sheet: bool) -> Self {
+        Panel {
+            slug: slug.to_string(),
+            vault: Mutable::new(None),
+            missing: Mutable::new(false),
+            network: Mutable::new(None),
+            account: Mutable::new(None),
+            figures: Mutable::new(None),
+            holdings: Mutable::new(None),
+            holdings_at: Mutable::new(0),
+            codes: Mutable::new(None),
+            tab: Mutable::new(tab),
+            deposit_text: Mutable::new(String::new()),
+            withdraw_text: Mutable::new(String::new()),
+            unit: Mutable::new(Unit::Shares),
+            stage: Mutable::new(Stage::Form),
+            ack: Mutable::new(false),
+            running: Mutable::new(None),
+            shown: Mutable::new(None),
+            asked: Cell::new(None),
+            requested_local: Rc::new(Cell::new(None)),
+            retry: Mutable::new(0),
+            in_sheet,
+        }
+    }
+}
+
 fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
-    let panel = Rc::new(Panel {
-        slug: slug.to_string(),
-        vault: Mutable::new(None),
-        missing: Mutable::new(false),
-        network: Mutable::new(None),
-        account: Mutable::new(None),
-        figures: Mutable::new(None),
-        holdings: Mutable::new(None),
-        codes: Mutable::new(None),
-        tab: Mutable::new(tab),
-        deposit_text: Mutable::new(String::new()),
-        withdraw_text: Mutable::new(String::new()),
-        unit: Mutable::new(Unit::Shares),
-        stage: Mutable::new(Stage::Form),
-        ack: Mutable::new(false),
-        running: Mutable::new(None),
-        shown: Mutable::new(None),
-        requested_local: Rc::new(Cell::new(None)),
-        retry: Mutable::new(0),
-        in_sheet,
-    });
+    let panel = Rc::new(Panel::new(slug, tab, in_sheet));
     let solana = crate::wallet::solana::get();
     let evm = crate::wallet::get();
     let mode = {
@@ -250,6 +265,8 @@ async fn follow(panel: Rc<Panel>) {
         panel.network.set(Some(network.clone()));
         let reader = SolSession::reader(&network);
         loop {
+            // What had landed before this read: the read shows it.
+            let at = session.changed.get();
             if let Ok(Some(account)) = reader.account(&vault.address).await
                 && account.owner == ids::VAULT
                 && let Some(read) = Vault::read(&account.data)
@@ -285,6 +302,7 @@ async fn follow(panel: Rc<Panel>) {
                                 holder.as_ref(),
                                 balance,
                             )));
+                            panel.holdings_at.set(at);
                         }
                     }
                     None => panel.holdings.set(None),
@@ -292,7 +310,8 @@ async fn follow(panel: Rc<Panel>) {
             } else if panel.figures.lock_ref().is_none() {
                 panel.missing.set(true);
             }
-            wait_or_retry(&panel, 10).await;
+            // A flow that landed while reading is read again at once.
+            wait_or_retry_since(&panel, 10, at).await;
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -303,8 +322,15 @@ async fn follow(panel: Rc<Panel>) {
 /// reader presses "Try again".
 #[cfg(target_arch = "wasm32")]
 async fn wait_or_retry(panel: &Panel, seconds: u32) {
+    wait_or_retry_since(panel, seconds, crate::wallet::solana::get().changed.get()).await;
+}
+
+/// The same, counting flows landed since `changed` (the session's count
+/// when the last read began).
+#[cfg(target_arch = "wasm32")]
+async fn wait_or_retry_since(panel: &Panel, seconds: u32, changed: u64) {
     let session = crate::wallet::solana::get();
-    let seen = (session.changed.get(), session.account(), panel.retry.get());
+    let seen = (changed, session.account(), panel.retry.get());
     for _ in 0..seconds {
         gloo_timers::future::TimeoutFuture::new(1_000).await;
         if (session.changed.get(), session.account(), panel.retry.get()) != seen {
@@ -695,7 +721,7 @@ fn deposit_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
         None => "—".to_string(),
     });
     let shares_figure = quote.signal_cloned().map(|quote| match quote {
-        Some((quote, _)) => format!("{} shares", money::shares(quote.shares, Rounding::Down)),
+        Some((quote, _)) => format!("{} shares", money::shares(quote.shares, Rounding::Nearest)),
         None => "—".to_string(),
     });
     let invalid = |check: &(Check, Option<U256>)| {
@@ -851,7 +877,7 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
     let gross = quote.signal_cloned().map(move |quote| match quote {
         Some((quote, ..)) => format!(
             "≈ {}",
-            money::dollars(quote.gross, decimals, Rounding::Down)
+            money::dollars(quote.gross, decimals, Rounding::Nearest)
         ),
         None => "—".to_string(),
     });
@@ -862,7 +888,7 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
     let payout = quote.signal_cloned().map(move |quote| match quote {
         Some((quote, ..)) => format!(
             "≈ {}",
-            money::dollars(quote.payout, decimals, Rounding::Down)
+            money::dollars(quote.payout, decimals, Rounding::Nearest)
         ),
         None => "—".to_string(),
     });
@@ -1128,7 +1154,7 @@ fn review(panel: &Rc<Panel>) -> View {
                 .child(static_row(
                     "You get",
                     quote
-                        .map(|q| format!("≈ {} shares", money::shares(q.shares, Rounding::Down)))
+                        .map(|q| format!("≈ {} shares", money::shares(q.shares, Rounding::Nearest)))
                         .unwrap_or_default(),
                     price.map(|price| format!("at about {} a share", money::price(price, decimals))),
                 ))
@@ -1166,6 +1192,9 @@ fn start(panel: &Rc<Panel>, action: SolAction) {
     };
     let running = SolRunning::new();
     panel.requested_local.set(None);
+    if let SolAction::Deposit { amount, .. } = &action {
+        panel.asked.set(Some(*amount));
+    }
     if panel.in_sheet {
         crate::atoms::dialog::lock(true);
     }
@@ -1233,8 +1262,25 @@ pub fn short(full: &str) -> String {
     format!("{head}…{tail}")
 }
 
-/// What the wallet is asked, in the panel's words.
+/// What the wallet is asked, in the panel's words, each line a sentence
+/// (a line may start with the wallet's name: "The development wallet
+/// shows…").
 pub fn prompt_words(
+    prompt: &Prompt,
+    wallet: &str,
+    vault: &str,
+    symbol: &str,
+    decimals: u8,
+) -> (String, String) {
+    let (title, line) = prompt_lines(prompt, wallet, vault, symbol, decimals);
+    (
+        crate::format::sentence(&title),
+        crate::format::sentence(&line),
+    )
+}
+
+/// What the wallet is asked, in the panel's words.
+fn prompt_lines(
     prompt: &Prompt,
     wallet: &str,
     vault: &str,
@@ -1546,7 +1592,14 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
             let words = sol_error_words(error, network.as_deref());
             let back = {
                 let panel = panel.clone();
+                let error = error.clone();
                 move || {
+                    if let SolError::ListChanged { now } = &error {
+                        // Back to the review, with the vault's list as it
+                        // is now; the person confirms again, nothing more.
+                        review_again(&panel, now);
+                        return;
+                    }
                     panel.running.set(None);
                 }
             };
@@ -1581,6 +1634,22 @@ fn step_view(panel: &Rc<Panel>, step: &Step) -> View {
             .into()
         }
     }
+}
+
+/// After the vault's list changed between the review and signing: leave the
+/// failed flow for the review of the same deposit, showing the list as it is
+/// now (`now`). Nothing is started: the person reads it and confirms again.
+fn review_again(panel: &Panel, now: &[[u8; 32]]) {
+    panel.codes.set(Some(now.to_vec()));
+    if let Some(amount) = panel.asked.get() {
+        panel
+            .deposit_text
+            .set(money::plain_exact(U256::from(amount), decimals(panel)));
+    }
+    panel.tab.set(Tab::Deposit);
+    panel.ack.set(false);
+    panel.stage.set(Stage::Review);
+    panel.running.set(None);
 }
 
 /// The agent's name, as the vault or the store has it.
@@ -1638,22 +1707,10 @@ fn done_view(
             .child(extra)
             .into()
     };
+    // Read again once the flow lands: until then, "Updating…".
+    let landed = crate::wallet::solana::get().changed.get();
     let position = |label: &'static str| -> View {
-        el("dl")
-            .class("sh-exit__rows")
-            .child(
-                el("div")
-                    .class("sh-exit__row")
-                    .child(el("dt").text(label))
-                    .child(el("dd").class("sh-num").text_from(&panel.holdings, |held| {
-                        held.as_ref()
-                            .map(|held| {
-                                format!("{} shares", money::shares(held.shares, Rounding::Down))
-                            })
-                            .unwrap_or_default()
-                    })),
-            )
-            .into()
+        crate::components::exit::position_row(label, &panel.holdings, &panel.holdings_at, landed)
     };
     let dollars = |assets: u64| money::dollars(U256::from(assets), decimals, Rounding::Down);
     match outcome {
@@ -1678,19 +1735,20 @@ fn done_view(
                 again.into(),
             ]),
         ),
-        Outcome::Paid { shares, assets, at, signature } => card(
-            format!("{} is in your wallet", dollars(*assets)),
-            vec![(
-                format!(
-                    "{} shares valued at",
-                    money::shares(U256::from(*shares), Rounding::Down)
-                ),
-                at.map(|at| format!("exit-side marks, {}", utc(at)))
-                    .unwrap_or_else(|| "the closed vault’s cash".to_string()),
-            )],
-            *signature,
-            View::Many(vec![position("You still hold"), portfolio.into(), again.into()]),
-        ),
+        Outcome::Paid { shares, assets, at, signature } => el("div")
+            .class("sh-exit__done")
+            .attr("role", "status")
+            .child(seal())
+            .child(el("p").class("sh-exit__title").text(format!("{} is in your wallet", dollars(*assets))))
+            // One phrase, never split across a label and a figure.
+            .child(el("p").class("sh-exit__valued").text(
+                crate::components::exit::valued_words(U256::from(*shares), *at),
+            ))
+            .child(sig_link(network, signature, "Transaction"))
+            .child(position("You still hold"))
+            .child(portfolio)
+            .child(again)
+            .into(),
         Outcome::Booked { claim, shares, signature } => {
             let slug = panel.slug.clone();
             card(
@@ -1740,5 +1798,65 @@ fn done_view(
             again.into(),
         ),
         Outcome::Changed { signature } => card("Done".to_string(), vec![], *signature, again.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn code(text: &str) -> [u8; 32] {
+        let mut code = [0u8; 32];
+        code[..text.len()].copy_from_slice(text.as_bytes());
+        code
+    }
+
+    #[test]
+    fn trying_again_after_the_list_changed_reopens_the_review_with_the_new_list_and_signs_nothing()
+    {
+        let panel = Rc::new(Panel::new("solana-4", Tab::Deposit, false));
+        panel.codes.set(Some(vec![code("SANCTIONED")]));
+        // A deposit of 11 was started, and stopped before signing: the
+        // vault's list became SANCTIONED, US.
+        panel.asked.set(Some(11_000_000));
+        panel.stage.set(Stage::Review);
+        panel.deposit_text.set(String::new());
+        let now = vec![code("SANCTIONED"), code("US")];
+        let error = SolError::ListChanged { now: now.clone() };
+        let running = SolRunning::new();
+        running.step.set(Some(Step::Failed(error.clone())));
+        panel.running.set(Some(running));
+        // The error names the new list.
+        let words = sol_error_words(&error, None);
+        assert!(words.alert);
+        assert!(
+            words
+                .text
+                .contains("It's now not open to: people in the US, sanctioned persons."),
+            "{}",
+            words.text
+        );
+        assert!(
+            words.text.contains("Nothing was signed or sent."),
+            "{}",
+            words.text
+        );
+        // "Try again": back to the review of the same deposit, nothing started.
+        review_again(&panel, &now);
+        assert!(panel.running.lock_ref().is_none());
+        assert_eq!(panel.stage.get(), Stage::Review);
+        assert_eq!(panel.tab.get(), Tab::Deposit);
+        assert_eq!(panel.deposit_text.get_cloned(), "11");
+        assert!(!panel.ack.get(), "acknowledged again on the new review");
+        assert_eq!(panel.codes.get_cloned(), Some(now.clone()));
+        // The review shows the new list, and states it.
+        let html = review(&panel).html();
+        assert_eq!(panel.stage.get(), Stage::Review, "{html}");
+        assert!(html.contains("people in the US"), "{html}");
+        assert!(html.contains("Deposit $11"), "{html}");
+        assert_eq!(
+            panel.shown.get(),
+            Some(chain::solana_ix::read::restricted_hash(&now))
+        );
     }
 }

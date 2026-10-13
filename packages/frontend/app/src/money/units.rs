@@ -80,6 +80,9 @@ pub enum Rounding {
     Down,
     /// Away from zero: what someone pays is never understated.
     Up,
+    /// To the nearest, a half away from zero: an estimate shown with "≈"
+    /// or "about", and never a figure that bounds what is sent.
+    Nearest,
 }
 
 /// Base units as decimal text with exactly `places` digits after the point
@@ -126,7 +129,14 @@ fn split(value: U256, decimals: u8, places: u8, rounding: Rounding) -> (U256, U2
     // The value in units of the last digit shown.
     let step = pow10(decimals - places);
     let mut shown = value / step;
-    if rounding == Rounding::Up && !(value % step).is_zero() {
+    let rest = value % step;
+    let up = match rounding {
+        Rounding::Down => false,
+        Rounding::Up => !rest.is_zero(),
+        // A half or more of the last digit shown.
+        Rounding::Nearest => rest.saturating_mul(U256::from(2u8)) >= step,
+    };
+    if up {
         shown = shown.saturating_add(U256::from(1u8));
     }
     let scale = pow10(places);
@@ -339,5 +349,40 @@ mod tests {
         assert_eq!(mul_div(U256::MAX, two, U256::from(1u8)), None);
         assert_eq!(mul_div(seven, seven, U256::ZERO), None);
         assert_eq!(mul_div_up(seven, seven, U256::ZERO), None);
+    }
+    #[test]
+    fn an_estimate_rounds_to_the_nearest_while_paid_and_received_figures_keep_their_direction() {
+        // A payout of 9.998497 reads as about 10.00, not 9.99.
+        let payout = units("9.998497");
+        assert_eq!(format_units(payout, 6, 2, Rounding::Nearest), "10.00");
+        assert_eq!(format_units(payout, 6, 2, Rounding::Down), "9.99");
+        assert_eq!(format_units(payout, 6, 2, Rounding::Up), "10.00");
+        // A half goes up; under a half goes down.
+        assert_eq!(
+            format_units(units("49.945"), 6, 2, Rounding::Nearest),
+            "49.95"
+        );
+        assert_eq!(
+            format_units(units("49.944999"), 6, 2, Rounding::Nearest),
+            "49.94"
+        );
+        assert_eq!(format_units(units("2.5"), 6, 0, Rounding::Nearest), "3");
+        assert_eq!(
+            format_units(units("1234.5"), 6, 0, Rounding::Nearest),
+            "1,235"
+        );
+        // A cost stays never understated, and what's received never
+        // overstated.
+        assert_eq!(format_units(units("0.001"), 6, 2, Rounding::Up), "0.01");
+        assert_eq!(
+            format_units(units("0.001"), 6, 2, Rounding::Nearest),
+            "0.00"
+        );
+        assert_eq!(format_units(units("0.009"), 6, 2, Rounding::Down), "0.00");
+        // Exact figures are untouched.
+        assert_eq!(
+            format_units(units("12.34"), 6, 2, Rounding::Nearest),
+            "12.34"
+        );
     }
 }
