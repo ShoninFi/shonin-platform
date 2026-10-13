@@ -244,6 +244,8 @@ async fn main() -> Result<()> {
     // The chain whose registry records the root key: the executor's
     // `setRootKey` is relayed there alone.
     let root_chain = args.chain_args.root_chain()?;
+    // Each chain's RPC settings: how often it is looked at, and how.
+    let configs = chain::ChainConfigs::load(&args.chain_args.chains)?;
 
     // Every vault chain turns on its own, from the moment it is connected,
     // so a slow chain, or one out of reach, holds up no other.
@@ -277,76 +279,39 @@ async fn main() -> Result<()> {
         if served.deployments.closer == Address::ZERO {
             tracing::warn!(chain = %served.key, "this chain's deployment has no Closer; halted vaults are closed step by step");
         }
+        let policy = configs.rpc_policy(&served.key);
         chains.spawn(async move {
             // Nothing is sent that hasn't been simulated: a chain whose node
             // can't simulate is not kept until it can.
-            until_it_can_simulate(chain, &served.client, &served.key).await;
+            until_it_can_simulate(chain, &served.client, &served.key, &policy).await;
             chain_kept(chain, |kept| {
                 kept.cannot_simulate = false;
                 kept.connected = Some(std::time::Instant::now());
             });
+            // What the keeper reads on this chain, shared by the vaults'
+            // wakes and the key loops, which read from the wakes' looks.
+            let learned = observed::Shared::default();
+            let keys = Keys {
+                client: served.client.clone(),
+                key: served.key.clone(),
+                deployments: served.deployments.clone(),
+                keeper,
+                http: attestation_http.clone(),
+                learned: learned.clone(),
+                policy: policy.clone(),
+            };
             // The executor's keys: their blessings relayed, and their gas
             // kept, on a cadence of their own, so a round slowed by the
             // vaults never holds up a fresh key's blessing, gas and approval.
-            tokio::spawn(keep_keys(
-                served.client.clone(),
-                served.key.clone(),
-                served.deployments.clone(),
-                keeper,
-                executor.clone(),
-                attestation_http.clone(),
-                canonical,
-            ));
+            tokio::spawn(keep_keys(keys.clone(), executor.clone(), canonical));
             // The builder's and the reviewer's keys, each on its own cadence.
             for service in &services {
-                tokio::spawn(keep_service_keys(
-                    served.client.clone(),
-                    served.key.clone(),
-                    served.deployments.clone(),
-                    keeper,
-                    service.clone(),
-                    attestation_http.clone(),
-                ));
+                tokio::spawn(keep_service_keys(keys.clone(), service.clone()));
             }
-            let mut memory = HashMap::new();
-            let mut factories = Factories::default();
-            let mut said = Said::default();
-            let mut closer = CloserAt::new(served.deployments.closer);
-            let mut deployments = served.deployments.clone();
-            loop {
-                deployments.closer = closer.usable(&served.client, &served.key).await;
-                let started = std::time::Instant::now();
-                let done = tick(
-                    chain,
-                    &served.client,
-                    &deployments,
-                    keeper,
-                    &executor,
-                    &mut memory,
-                    &mut factories,
-                )
-                .await;
-                let now = std::time::Instant::now();
-                match done {
-                    Ok(()) => {
-                        chain_kept(chain, |kept| {
-                            kept.finished = Some(now);
-                            kept.took = now.duration_since(started);
-                            kept.failing = 0;
-                        });
-                        if said.over() {
-                            tracing::info!(chain = %served.key, "the rounds finish again");
-                        }
-                    }
-                    Err(error) => {
-                        chain_kept(chain, |kept| kept.failing += 1);
-                        if let Some(times) = said.due(now) {
-                            tracing::warn!(chain = %served.key, times, error = format!("{error:#}"), "the round did not finish");
-                        }
-                    }
-                }
-                tokio::time::sleep(ROUND_PAUSE).await;
-            }
+            Box::pin(keep_vaults(
+                chain, served, policy, learned, keeper, executor,
+            ))
+            .await;
         });
     }
     if chains.is_empty() && args.port == 0 {
@@ -358,31 +323,70 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Relay the executor's blessings on one chain and keep its blessed keys in
-/// gas, every [`attest::EVERY`], for as long as the keeper runs; on the
-/// canonical chain, relay its root key's record too.
-async fn keep_keys(
+/// One chain's key loops' means: the chain, its deployment, the keeper's
+/// account, the attestations' HTTP client, and what the vaults' wakes read.
+#[derive(Clone)]
+struct Keys {
     client: Client,
     key: chain::ChainKey,
     deployments: Deployments,
     keeper: Address,
-    executor: String,
     http: reqwest::Client,
-    canonical: bool,
-) {
+    learned: observed::Shared,
+    policy: chain::rpc_policy::RpcPolicy,
+}
+
+impl Keys {
+    /// How the key loop reads the chain for one look: from the vaults'
+    /// latest look, when one was taken after the key loop's own last send
+    /// and lately enough, otherwise of the chain itself, as before.
+    fn reads(&self, sent: Option<std::time::Instant>) -> Observed {
+        let fresh =
+            Duration::from_millis(self.policy.keeper_notice_ms.max(self.policy.key_look_ms));
+        let latest = self
+            .learned
+            .lock()
+            .ok()
+            .and_then(|learned| learned.latest_after(sent))
+            .filter(|latest| latest.taken.elapsed() <= fresh);
+        match latest {
+            Some(latest) => {
+                Observed::served(self.client.clone(), self.learned.clone(), latest, None)
+            }
+            None => Observed::live(self.client.clone(), self.learned.clone()),
+        }
+    }
+
+    /// How often the loop checks whether a look is due, and how often the
+    /// chain's keys are looked at.
+    fn pace(&self) -> (Duration, Duration) {
+        (
+            Duration::from_millis(self.policy.key_poll_ms),
+            Duration::from_millis(self.policy.key_look_ms),
+        )
+    }
+}
+
+/// Relay the executor's blessings on one chain and keep its blessed keys in
+/// gas, every `key_look_ms`, for as long as the keeper runs; on the
+/// canonical chain, relay its root key's record too.
+async fn keep_keys(keys: Keys, executor: String, canonical: bool) {
     let mut blessings = attest::Memory::default();
     let mut said = Said::default();
+    let (poll, look) = keys.pace();
+    let mut sent = None;
     loop {
         let at = std::time::Instant::now();
-        if blessings.due(at) {
-            let looked = match attest::published(&http, &executor).await {
+        if blessings.due_every(at, look) {
+            let looked = match attest::published(&keys.http, &executor).await {
                 Ok(published) => {
+                    let client = keys.reads(sent);
                     let registry = attest::OnChain {
                         client: &client,
-                        deployments: &deployments,
-                        keeper,
+                        deployments: &keys.deployments,
+                        keeper: keys.keeper,
                     };
-                    attest::look(
+                    let looked = attest::look(
                         &registry,
                         client.chain_id,
                         canonical,
@@ -390,7 +394,11 @@ async fn keep_keys(
                         &mut blessings,
                         at,
                     )
-                    .await
+                    .await;
+                    if client.sends() > 0 {
+                        sent = Some(std::time::Instant::now());
+                    }
+                    looked
                 }
                 Err(error) => {
                     blessings.looked(at);
@@ -400,43 +408,39 @@ async fn keep_keys(
             match looked {
                 Ok(()) => {
                     if said.over() {
-                        tracing::info!(chain = %key, "the executor's keys are looked after again");
+                        tracing::info!(chain = %keys.key, "the executor's keys are looked after again");
                     }
                 }
                 Err(error) => {
                     if let Some(times) = said.due(std::time::Instant::now()) {
-                        tracing::warn!(chain = %key, times, error = format!("{error:#}"), "could not look after the executor's keys");
+                        tracing::warn!(chain = %keys.key, times, error = format!("{error:#}"), "could not look after the executor's keys");
                     }
                 }
             }
         }
-        tokio::time::sleep(ROUND_PAUSE).await;
+        tokio::time::sleep(poll).await;
     }
 }
 
 /// Relay a builder's or a reviewer's blessings on one chain and keep its
-/// blessed key in gas, every [`attest::EVERY`], for as long as the keeper
-/// runs. The service is often off: that is said at debug only. Nothing it
+/// blessed key in gas, every `key_look_ms`, for as long as the keeper runs.
+/// The service is often off: that is said at debug only. Nothing it
 /// publishes records the root key.
-async fn keep_service_keys(
-    client: Client,
-    key: chain::ChainKey,
-    deployments: Deployments,
-    keeper: Address,
-    service: String,
-    http: reqwest::Client,
-) {
+async fn keep_service_keys(keys: Keys, service: String) {
     let mut blessings = attest::Memory::default();
     let mut said = Said::default();
+    let (poll, look) = keys.pace();
+    let mut sent = None;
     loop {
         let at = std::time::Instant::now();
-        if blessings.due(at) {
-            match attest::published(&http, &service).await {
+        if blessings.due_every(at, look) {
+            match attest::published(&keys.http, &service).await {
                 Ok(published) => {
+                    let client = keys.reads(sent);
                     let registry = attest::OnChain {
                         client: &client,
-                        deployments: &deployments,
-                        keeper,
+                        deployments: &keys.deployments,
+                        keeper: keys.keeper,
                     };
                     let looked = attest::look(
                         &registry,
@@ -447,31 +451,632 @@ async fn keep_service_keys(
                         at,
                     )
                     .await;
+                    if client.sends() > 0 {
+                        sent = Some(std::time::Instant::now());
+                    }
                     match looked {
                         Ok(()) => {
                             if said.over() {
-                                tracing::info!(chain = %key, %service, "the service's key is looked after again");
+                                tracing::info!(chain = %keys.key, %service, "the service's key is looked after again");
                             }
                         }
                         Err(error) => {
                             if let Some(times) = said.due(std::time::Instant::now()) {
-                                tracing::warn!(chain = %key, %service, times, error = format!("{error:#}"), "could not look after the service's key");
+                                tracing::warn!(chain = %keys.key, %service, times, error = format!("{error:#}"), "could not look after the service's key");
                             }
                         }
                     }
                 }
                 Err(error) => {
                     blessings.looked(at);
-                    tracing::debug!(chain = %key, %service, error = format!("{error:#}"), "the service does not answer");
+                    tracing::debug!(chain = %keys.key, %service, error = format!("{error:#}"), "the service does not answer");
                 }
             }
         }
-        tokio::time::sleep(ROUND_PAUSE).await;
+        tokio::time::sleep(poll).await;
     }
 }
 
-/// How long the keeper waits between one round of a chain and the next.
-const ROUND_PAUSE: Duration = Duration::from_secs(2);
+/// The views whose change means a log the keeper's decisions read may have
+/// been written: a vault's units (`ProRataTaken`) and state
+/// (`StateChanged`), and a station's keys and stop (`RevokeSkipped`,
+/// `KeyRevoked`).
+const LOGGED: [[u8; 4]; 5] = [
+    <IVault::unitsCall as alloy::sol_types::SolCall>::SELECTOR,
+    <IVault::stateCall as alloy::sol_types::SolCall>::SELECTOR,
+    <IStation::approvedKeyCall as alloy::sol_types::SolCall>::SELECTOR,
+    <IStation::stoppedCall as alloy::sol_types::SolCall>::SELECTOR,
+    <IStation::reclaimedCall as alloy::sol_types::SolCall>::SELECTOR,
+];
+
+/// One EVM vault chain's vaults, kept for as long as the keeper runs.
+///
+/// Each look reads every vault on the chain in one observation and runs
+/// every vault's whole round on it (see [`observed`]); between looks the
+/// keeper reads nothing, and looks again when a duty can next act (see
+/// [`wake`]), at once when an executor answers, and a moment after a send
+/// of its own. A look that isn't proved to extend the branch the keeper
+/// follows (a lagging or failed observation), or one on a chain whose clock
+/// isn't bounded by the wall clock (a local chain moving an hour a block),
+/// runs the round reading the chain itself, as the keeper always has, and
+/// the next look is at the active pace (`keeper_active_round_ms`). A proved
+/// replacement of the branch forgets what was read of it (see
+/// [`Memory::forget_branch`]) and nothing that was sent.
+async fn keep_vaults(
+    chain: Chain,
+    served: chain::Served,
+    policy: chain::rpc_policy::RpcPolicy,
+    learned: observed::Shared,
+    keeper: Address,
+    executor: String,
+) {
+    use chain::follow::Continuity;
+    let client = served.client.clone();
+    receipts_polled_every(&client, Duration::from_millis(policy.receipt_poll_ms));
+    let endpoints = u64::try_from(client.each_endpoint().len())
+        .unwrap_or(1)
+        .max(1);
+    let established = chain::rpc_policy::RpcPolicies::established().for_chain(&served.key);
+    startup_checks(chain, &served, &policy, &established, endpoints).await;
+    let mut follower = chain::follow::Follower::new(client.clone(), policy.clone());
+    let mut logs = logs::LogReader::new(served.deployments.deployed_block, &policy);
+    let mut memory: HashMap<Address, Memory> = HashMap::new();
+    let mut factories = Factories::default();
+    let mut said = Said::default();
+    let mut closer = CloserAt::new(served.deployments.closer);
+    let mut deployments = served.deployments.clone();
+    let answered = answers_for(client.chain_id);
+    let active = Duration::from_millis(policy.keeper_active_round_ms);
+    let notice = Duration::from_millis(policy.keeper_notice_ms);
+    let mut previous: Option<std::sync::Arc<observed::Snapshot>> = None;
+    let mut logs_said = Said::default();
+    let mut path_on_wakes: Option<bool> = None;
+    let mut stations: HashMap<Address, Address> = HashMap::new();
+    // A read stays in the looks for as long as spans the key loop's looks
+    // and a few notice bounds.
+    if let Ok(mut learned) = learned.lock() {
+        learned.keep_reads_for(Duration::from_millis(
+            policy
+                .key_look_ms
+                .saturating_mul(2)
+                .max(policy.keeper_notice_ms.saturating_mul(3)),
+        ));
+    }
+    loop {
+        deployments.closer = closer.usable(&client, &served.key).await;
+        let started = std::time::Instant::now();
+        let plan = learned
+            .lock()
+            .map(|mut learned| learned.plan(started))
+            .unwrap_or_default();
+        let step = follower.step(&plan, chain::follow::At::Latest).await;
+        let mut active_because: Option<String> = None;
+        match &step.continuity {
+            Continuity::Extends => {}
+            Continuity::Replaced { fork_at, depth } => {
+                tracing::warn!(chain = %served.key, fork_at, depth, "the branch the keeper followed was replaced; what was read of it is read again");
+                forget_branch(
+                    &mut memory,
+                    &mut factories,
+                    &learned,
+                    &mut logs,
+                    Some(*fork_at),
+                );
+            }
+            Continuity::Deep => {
+                tracing::warn!(chain = %served.key, "the branch the keeper followed was replaced deeper than it can trace; everything read of it is read again");
+                forget_branch(&mut memory, &mut factories, &learned, &mut logs, None);
+                active_because = Some("a replacement deeper than the anchors reach".to_string());
+            }
+            Continuity::Lagging { number, head } => {
+                active_because = Some(format!(
+                    "the endpoint answered at block {number}, behind block {head}"
+                ));
+            }
+            Continuity::Unknown(why) => {
+                active_because = Some(format!("no observation: {why}"));
+            }
+        }
+        if active_because.is_none()
+            && let Err(unbounded) = follower.clock.state()
+        {
+            active_because = Some(format!("the chain's clock is not bounded: {unbounded:?}"));
+        }
+        let mut snapshot = match (&active_because, &step.observed) {
+            (None, Some(observed)) => Some(std::sync::Arc::new(observed::Snapshot::new(
+                &plan, observed,
+            ))),
+            _ => None,
+        };
+        // The logs the decisions read, read on before them when due.
+        if let (Some(now), Some(observed)) = (&snapshot, &step.observed) {
+            if previous
+                .as_ref()
+                .is_some_and(|before| !now.changed_since(before, &LOGGED).is_empty())
+            {
+                logs.want();
+            }
+            match logs.scan(&mut follower, observed, started).await {
+                logs::Scanned::Idle => {}
+                logs::Scanned::Replaced { fork_at } => {
+                    tracing::warn!(chain = %served.key, fork_at, "logs show the branch the keeper followed was replaced; what was read of it is read again");
+                    forget_branch(
+                        &mut memory,
+                        &mut factories,
+                        &learned,
+                        &mut logs,
+                        Some(fork_at),
+                    );
+                    snapshot = None;
+                    active_because = Some("logs on a replaced branch".to_string());
+                }
+                logs::Scanned::Deep => {
+                    forget_branch(&mut memory, &mut factories, &learned, &mut logs, None);
+                    snapshot = None;
+                    active_because =
+                        Some("logs replaced deeper than the anchors reach".to_string());
+                }
+                logs::Scanned::Unverified(why) => {
+                    if logs.stuck(started) {
+                        if let Some(times) = logs_said.due(started) {
+                            tracing::warn!(chain = %served.key, times, why, "logs could not be checked against the followed branch for a whole backstop; decisions read them of the chain itself until they can");
+                        }
+                    } else {
+                        tracing::debug!(chain = %served.key, why, "logs not taken; read again at the next look");
+                    }
+                }
+                logs::Scanned::Read if logs_said.over() => {
+                    tracing::info!(chain = %served.key, "logs are checked against the followed branch again");
+                }
+                logs::Scanned::Read => {}
+            }
+        }
+        let reads = match &snapshot {
+            Some(snapshot) => {
+                if let Ok(mut learned) = learned.lock() {
+                    learned.observed(snapshot);
+                }
+                Observed::served(
+                    client.clone(),
+                    learned.clone(),
+                    snapshot.clone(),
+                    logs.view(),
+                )
+            }
+            None => {
+                if let Ok(mut learned) = learned.lock() {
+                    learned.unserved();
+                }
+                Observed::live(client.clone(), learned.clone())
+            }
+        };
+        let done = tick(
+            chain,
+            &reads,
+            &deployments,
+            keeper,
+            &executor,
+            &mut memory,
+            &mut factories,
+        )
+        .await;
+        let now = std::time::Instant::now();
+        let vaults = match done {
+            Ok(vaults) => {
+                chain_kept(chain, |kept| {
+                    kept.finished = Some(now);
+                    kept.took = now.duration_since(started);
+                    kept.failing = 0;
+                });
+                if said.over() {
+                    tracing::info!(chain = %served.key, "the rounds finish again");
+                }
+                Some(vaults)
+            }
+            Err(error) => {
+                chain_kept(chain, |kept| kept.failing += 1);
+                if let Some(times) = said.due(now) {
+                    tracing::warn!(chain = %served.key, times, error = format!("{error:#}"), "the round did not finish");
+                }
+                None
+            }
+        };
+        if let Some(vaults) = &vaults {
+            logs.watch(watched(&reads, vaults, &mut stations));
+            let interval = block_interval_ms(&learned);
+            for vault in vaults {
+                if let Some(remembered) = memory.get_mut(vault) {
+                    timers_said(
+                        &reads,
+                        *vault,
+                        remembered,
+                        &policy,
+                        &established,
+                        interval,
+                        endpoints,
+                    );
+                }
+            }
+        }
+        if reads.sends() > 0 {
+            logs.want();
+        }
+        let next = match (&snapshot, &vaults) {
+            (None, _) => wake::Next {
+                at: now + active,
+                why: "the active path",
+            },
+            (Some(_), None) => wake::Next {
+                at: now + active,
+                why: "a round that did not finish",
+            },
+            // A round that sent anything is followed by a look at once (a
+            // second after the last began, at most): its sends took their
+            // blocks, and what follows them (a settle, a valuation whose
+            // window opened meanwhile) is judged on the chain as it is now.
+            (Some(_), Some(_)) if reads.sends() > 0 => wake::Next {
+                at: now.max(started + active.min(Duration::from_secs(1))),
+                why: "a send of the keeper's own",
+            },
+            (Some(snapshot), Some(vaults)) => {
+                let mut dues = wake::Dues {
+                    head: snapshot.timestamp,
+                    ..wake::Dues::default()
+                };
+                for vault in vaults {
+                    if let Some(remembered) = memory.get(vault) {
+                        wake::dues(&reads, *vault, remembered, &mut dues);
+                    }
+                }
+                let interval = learned
+                    .lock()
+                    .ok()
+                    .and_then(|learned| learned.block_interval)
+                    .unwrap_or(1);
+                wake::next(&dues, interval, active, notice, started, now, |time| {
+                    follower.clock.to_wall_ms(time).map(at_wall_ms)
+                })
+            }
+        };
+        match &active_because {
+            Some(because) => {
+                tracing::debug!(chain = %served.key, because, "read the chain itself this round")
+            }
+            None => tracing::debug!(
+                chain = %served.key,
+                head = snapshot.as_ref().map(|snapshot| snapshot.number),
+                next = ?next.at.saturating_duration_since(now),
+                why = next.why,
+                "looked at the chain"
+            ),
+        }
+        // A change of path is said at info: an operator sees a chain read
+        // every round, and why.
+        let on_wakes = active_because.is_none();
+        if path_on_wakes != Some(on_wakes) {
+            match &active_because {
+                None => tracing::info!(chain = %served.key, "the chain is read at its wakes"),
+                Some(because) => {
+                    tracing::info!(chain = %served.key, because, "the chain is read every round")
+                }
+            }
+            path_on_wakes = Some(on_wakes);
+        }
+        previous = snapshot;
+        tokio::select! {
+            () = tokio::time::sleep_until(next.at.into()) => {}
+            () = answered.notified() => {}
+        }
+    }
+}
+
+/// The moment the wall clock reads `ms` (since the Unix epoch), on the
+/// keeper's own clock.
+fn at_wall_ms(ms: u64) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        });
+    if ms >= wall {
+        now + Duration::from_millis(ms - wall)
+    } else {
+        now.checked_sub(Duration::from_millis(wall - ms))
+            .unwrap_or(now)
+    }
+}
+
+/// Every vault listed and its home station, as far as any round has read
+/// it: the addresses whose logs the keeper's decisions read.
+fn watched(
+    reads: &Observed,
+    vaults: &[Address],
+    stations: &mut HashMap<Address, Address>,
+) -> Vec<Address> {
+    let mut addresses = vaults.to_vec();
+    for vault in vaults {
+        // A vault's home station never changes: once read, it stays
+        // watched, whether or not this round's reads still hold it (a
+        // round that sent reads the chain itself after the send).
+        if let Some(Ok(station)) = reads.peek(*vault, IVault::homeStationCall {}) {
+            stations.insert(*vault, station);
+        }
+        if let Some(station) = stations.get(vault) {
+            addresses.push(*station);
+        }
+    }
+    addresses
+}
+
+/// A proved replacement of the branch the keeper followed: everything read
+/// of the chain above `fork_at` (all of it, with `None`) is read again, and
+/// nothing the keeper sent, nor any pace, hold or back-off, is forgotten.
+fn forget_branch(
+    memory: &mut HashMap<Address, Memory>,
+    factories: &mut Factories,
+    learned: &observed::Shared,
+    logs: &mut logs::LogReader,
+    fork_at: Option<u64>,
+) {
+    for remembered in memory.values_mut() {
+        remembered.forget_branch();
+    }
+    *factories = Factories::default();
+    if let Ok(mut learned) = learned.lock() {
+        match fork_at {
+            Some(fork_at) => learned.forget_above(fork_at),
+            None => learned.forget_all(),
+        }
+    }
+    match fork_at {
+        Some(fork_at) => logs.forget_above(fork_at),
+        None => logs.restart(),
+    }
+}
+
+/// Have the chain's sends' receipts asked for every `every`, where that is
+/// sooner than the connection's own pace: never slower than before.
+fn receipts_polled_every(client: &Client, every: Duration) {
+    use alloy::providers::Provider;
+    for endpoint in std::iter::once(client.provider().clone()).chain(client.each_endpoint()) {
+        if every < endpoint.client().poll_interval() {
+            endpoint.client().set_poll_interval(every);
+        }
+    }
+}
+
+/// The chain's block interval in milliseconds, as last measured, or a second.
+fn block_interval_ms(learned: &observed::Shared) -> u64 {
+    learned
+        .lock()
+        .ok()
+        .and_then(|learned| learned.block_interval)
+        .unwrap_or(1)
+        .saturating_mul(1_000)
+}
+
+/// What a keeper's executor answer wakes, by chain id: the chain's loop
+/// looks at once, so a bill is collected as soon as it is answered.
+static ANSWERED: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<u64, std::sync::Arc<tokio::sync::Notify>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn answers_for(chain_id: u64) -> std::sync::Arc<tokio::sync::Notify> {
+    ANSWERED
+        .lock()
+        .map(|mut answered| answered.entry(chain_id).or_default().clone())
+        .unwrap_or_default()
+}
+
+/// Whether two observations, each an active round and a read on every
+/// endpoint in turn, fit a slot's window of opportunity less a block:
+/// `2 * (keeper_active_round_ms + endpoints * read_budget_ms) <=
+/// slotLead + slotWindow - block interval`. An observation may take a read
+/// budget on each endpoint before one answers.
+fn observations_fit(
+    policy: &chain::rpc_policy::RpcPolicy,
+    timers: &chain::rpc_policy::SlotTimers,
+    block_interval_ms: u64,
+    endpoints: u64,
+) -> Result<(), String> {
+    let needed = policy
+        .keeper_active_round_ms
+        .saturating_add(policy.read_budget_ms.saturating_mul(endpoints))
+        .saturating_mul(2);
+    let room = timers
+        .slot_lead_s
+        .saturating_add(timers.slot_window_s)
+        .saturating_mul(1_000)
+        .saturating_sub(block_interval_ms);
+    if needed <= room {
+        return Ok(());
+    }
+    Err(format!(
+        "two observations need 2 * (keeper_active_round_ms={} + {endpoints} endpoints * read_budget_ms={}) = {needed}ms, \
+         but slotLead={}s + slotWindow={}s - block interval {block_interval_ms}ms leaves {room}ms",
+        policy.keeper_active_round_ms,
+        policy.read_budget_ms,
+        timers.slot_lead_s,
+        timers.slot_window_s,
+    ))
+}
+
+/// Each startup check of one vault's timers against `configured`, judged
+/// against `established` (see [`chain::rpc_policy::judge`]): two
+/// observations in its window of opportunity, a bounded head that sees its
+/// slot's requests, and an outsider's halt noticed and asked about before
+/// its grace and the last orders run out.
+fn judge_timers(
+    configured: &chain::rpc_policy::RpcPolicy,
+    established: &chain::rpc_policy::RpcPolicy,
+    vault: Address,
+    timers: &chain::bindings::vault::Timers,
+    block_interval_ms: u64,
+    endpoints: u64,
+) -> Vec<chain::rpc_policy::Fit> {
+    use chain::rpc_policy::{SlotTimers, judge};
+    let slot = SlotTimers {
+        slot_lead_s: timers.slotLead,
+        slot_window_s: timers.slotWindow,
+    };
+    let subject = format!("vault {vault}");
+    let ask = u64::try_from(ASK_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+    vec![
+        judge(configured, established, &subject, |policy| {
+            observations_fit(policy, &slot, block_interval_ms, endpoints)
+        }),
+        judge(configured, established, &subject, |policy| {
+            policy.bounded_head_sees_requests(&slot, block_interval_ms)
+        }),
+        judge(configured, established, &subject, |policy| {
+            policy.notice_before_deadlines(
+                ask,
+                timers.haltGrace.saturating_mul(1_000),
+                LAST_ORDERS.saturating_mul(1_000),
+            )
+        }),
+    ]
+}
+
+/// In a round, a vault whose timers the configured settings can't meet is
+/// said (at once, then at most every ten minutes) and still sent every
+/// action it is owed.
+fn timers_said(
+    reads: &Observed,
+    vault: Address,
+    memory: &mut Memory,
+    configured: &chain::rpc_policy::RpcPolicy,
+    established: &chain::rpc_policy::RpcPolicy,
+    block_interval_ms: u64,
+    endpoints: u64,
+) {
+    let Some(Ok(timers)) = reads.peek(vault, IVault::timersCall {}) else {
+        return;
+    };
+    let short: Vec<String> = judge_timers(
+        configured,
+        established,
+        vault,
+        &timers,
+        block_interval_ms,
+        endpoints,
+    )
+    .into_iter()
+    .filter_map(|fit| match fit {
+        chain::rpc_policy::Fit::Fits => None,
+        chain::rpc_policy::Fit::BestEffort(why) | chain::rpc_policy::Fit::Refused(why) => Some(why),
+    })
+    .collect();
+    if short.is_empty() {
+        return;
+    }
+    if let Some(times) = memory.timers_said.due(std::time::Instant::now()) {
+        tracing::warn!(chain_id = reads.chain_id, %vault, times, short = short.join("; "), "this vault's timers are shorter than the keeper's RPC settings can guarantee; it is still kept");
+    }
+}
+
+/// Check the vaults found at startup (see [`validate_known_timers`]) until
+/// the configured settings are not refused: until then the chain's vault
+/// rounds don't start, and that is said at warn and in the keeper's health.
+/// Its key loops and the other chains run meanwhile.
+async fn startup_checks(
+    chain: Chain,
+    served: &chain::Served,
+    configured: &chain::rpc_policy::RpcPolicy,
+    established: &chain::rpc_policy::RpcPolicy,
+    endpoints: u64,
+) {
+    chain_kept(chain, |kept| kept.startup_incomplete = true);
+    let mut said = Said::default();
+    loop {
+        match validate_known_timers(
+            &served.client,
+            served.deployments.factory,
+            configured,
+            established,
+            endpoints,
+        )
+        .await
+        {
+            Ok(()) => break,
+            Err(error) => {
+                if let Some(times) = said.due(std::time::Instant::now()) {
+                    tracing::warn!(chain = %served.key, times, error = format!("{error:#}"), "the keeper's RPC settings are refused for this chain; its vault rounds have not started");
+                }
+                tokio::time::sleep(Duration::from_millis(configured.keeper_notice_ms)).await;
+            }
+        }
+    }
+    if said.over() {
+        tracing::info!(chain = %served.key, "the keeper's RPC settings are no longer refused for this chain; its vault rounds start");
+    }
+    chain_kept(chain, |kept| kept.startup_incomplete = false);
+}
+
+/// Check the vaults found at startup. A vault whose own timers are shorter
+/// than even the established settings can guarantee was kept before these
+/// settings existed and is kept still, with a warning. A vault the
+/// established settings meet but the configured ones do not is the
+/// configuration's doing: the chain's vault rounds are refused, naming the
+/// vault, the timer and the values. Nothing read here holds a chain up: a
+/// list or a vault that can't be read now is checked in its own rounds.
+async fn validate_known_timers(
+    client: &Client,
+    factory: Address,
+    configured: &chain::rpc_policy::RpcPolicy,
+    established: &chain::rpc_policy::RpcPolicy,
+    endpoints: u64,
+) -> Result<()> {
+    let reads = Observed::from(client.clone());
+    let (vaults, unread) = match every_vault(&reads, factory, &mut Factories::default()).await {
+        Ok(found) => found,
+        Err(error) => {
+            tracing::warn!(
+                chain_id = client.chain_id,
+                error = format!("{error:#}"),
+                "the vaults could not be listed at startup; each is checked in its own rounds"
+            );
+            return Ok(());
+        }
+    };
+    if !unread.is_empty() {
+        tracing::warn!(chain_id = client.chain_id, factories = ?unread, "an earlier factory's vaults could not be listed at startup; each is checked in its own rounds");
+    }
+    // A transaction lands a block after the head it was decided at.
+    let interval = match block_interval(&reads).await {
+        Ok(seconds) => seconds.saturating_mul(1_000),
+        Err(error) => {
+            tracing::warn!(
+                chain_id = client.chain_id,
+                error = format!("{error:#}"),
+                "the block interval could not be measured at startup; the vaults' timers are checked in their own rounds"
+            );
+            return Ok(());
+        }
+    };
+    for vault in vaults {
+        let timers = match reads.read(vault, IVault::timersCall {}).await {
+            Ok(timers) => timers,
+            Err(error) => {
+                tracing::warn!(chain_id = client.chain_id, %vault, error = format!("{error:#}"), "a vault's timers could not be read at startup; it is checked in its own rounds");
+                continue;
+            }
+        };
+        for fit in judge_timers(configured, established, vault, &timers, interval, endpoints) {
+            match fit {
+                chain::rpc_policy::Fit::Fits => {}
+                chain::rpc_policy::Fit::BestEffort(why) => {
+                    tracing::warn!(chain_id = client.chain_id, %vault, why, "this vault's timers are shorter than even the established RPC settings can guarantee; it is kept as before");
+                }
+                chain::rpc_policy::Fit::Refused(why) => {
+                    anyhow::bail!("{why}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 /// How each vault chain to be kept is doing, for the keeper's health.
 #[derive(Clone, Copy, Debug, Default)]
@@ -492,6 +1097,9 @@ struct Kept {
     /// replaces, couldn't be read in its last round: those vaults are kept as
     /// last listed, and any listed since are not.
     factories_unread: bool,
+    /// Whether its vault rounds wait on the startup checks of its RPC
+    /// settings against its vaults' timers.
+    startup_incomplete: bool,
 }
 
 impl Kept {
@@ -519,6 +1127,9 @@ impl Kept {
         }
         if self.cannot_simulate {
             return Some("can't simulate");
+        }
+        if self.startup_incomplete {
+            return Some("vault startup checks are not complete");
         }
         let Some(connected) = self.connected else {
             return Some("not connected");
@@ -748,6 +1359,32 @@ struct Memory {
     /// The station's drivers whose venue acts after the transaction, and
     /// the pace of what is done for them (see [`delayed`]).
     delayed: delayed::Memory,
+    /// The vault's timers were found shorter than this chain's RPC settings
+    /// can guarantee, and that warning.
+    timers_said: Said,
+}
+
+impl Memory {
+    /// Forget what was read from the chain and may belong to a branch that
+    /// was replaced: the finished prefixes of claims and requests, the logs
+    /// read so far and what was found in them (holders, skipped revokes, the
+    /// retirement), and what a closed or cancelled vault was last found to
+    /// need. They are read again. What the keeper sent and when, and every
+    /// pace, hold and back-off, stays, so a branch change sends nothing
+    /// twice: a send of its own that landed on the replaced branch shows as
+    /// not done, and is made again at its own pace.
+    fn forget_branch(&mut self) {
+        self.claims_from = 0;
+        self.requests_from = 0;
+        self.holders.clear();
+        self.holders_read_to = 0;
+        self.retired_at = None;
+        self.retired_read_to = 0;
+        self.skipped.clear();
+        self.skipped_read_to = 0;
+        self.quiet_since = None;
+        self.closer_closed_nothing = None;
+    }
 }
 
 /// The slots in a row in which the vault refused a call of one kind before
@@ -903,13 +1540,13 @@ fn send_again(before: Option<&SendAgain>, now: u64, interval: u64, round: u64) -
 
 async fn tick(
     chain: Chain,
-    client: &Client,
+    client: &Observed,
     deployments: &Deployments,
     keeper: Address,
     executor: &str,
     memory: &mut HashMap<Address, Memory>,
     factories: &mut Factories,
-) -> Result<()> {
+) -> Result<Vec<Address>> {
     let (vaults, unread_factories) = every_vault(client, deployments.factory, factories).await?;
     let factories_unread = !unread_factories.is_empty();
     chain_kept(chain, |kept| kept.factories_unread = factories_unread);
@@ -920,7 +1557,21 @@ async fn tick(
     } else if factories.unread_said.over() {
         tracing::info!(%chain, "every factory's vaults are read again");
     }
-    for &vault in &vaults {
+    // Read from an observation, what must land inside a slot's window goes
+    // first, for every vault whose window a send made now lands in, before
+    // any vault's other sends take their blocks: each such vault's
+    // valuation step, as its round would make it.
+    let ordered = window_first(client, &vaults);
+    let windowed: Vec<Address> = ordered
+        .iter()
+        .copied()
+        .take_while(|vault| in_window(client, vault))
+        .collect();
+    for vault in windowed {
+        let remembered = memory.entry(vault).or_default();
+        window_step(client, keeper, vault, remembered).await;
+    }
+    for vault in ordered {
         let remembered = memory.entry(vault).or_default();
         let done = keep_one(client, keeper, deployments, executor, vault, remembered).await;
         steps_worked(client.chain_id, vault, done.is_ok());
@@ -965,6 +1616,9 @@ async fn tick(
     if let Ok(mut unread) = TANKS_UNREAD.lock() {
         unread.retain(|(chain_id, vault), _| listed(*chain_id, vault));
     }
+    if let Ok(mut missed) = WINDOWS_MISSED.lock() {
+        missed.retain(|(chain_id, vault), _| listed(*chain_id, vault));
+    }
     if let Ok(mut refused) = BILLS_REFUSED.lock() {
         refused.retain(|(chain_id, vault), _| listed(*chain_id, vault));
     }
@@ -989,7 +1643,79 @@ async fn tick(
     if let Ok(mut not_sent) = NOT_SENT.lock() {
         not_sent.sweep(|(rpc, ..)| *rpc == client.rpc_url, now);
     }
-    Ok(())
+    Ok(vaults)
+}
+
+/// The vaults in the order a round keeps them: read from an observation,
+/// those whose valuation window a send made now lands in first, so what
+/// must land inside a window is never behind another vault's sends; in the
+/// factory's order otherwise, and always on the active path.
+fn window_first(client: &Observed, vaults: &[Address]) -> Vec<Address> {
+    if client.snapshot().is_none() {
+        return vaults.to_vec();
+    }
+    let (first, rest): (Vec<Address>, Vec<Address>) =
+        vaults.iter().partition(|vault| in_window(client, vault));
+    first.into_iter().chain(rest).collect()
+}
+
+/// Whether a valuation the vault sent now, read from an observation, would
+/// land inside its slot's window, by the block interval last measured.
+fn in_window(client: &Observed, vault: &Address) -> bool {
+    let Some(snapshot) = client.snapshot() else {
+        return false;
+    };
+    let block_interval = client.block_interval_seen().unwrap_or(1);
+    client
+        .peek(*vault, IVault::timersCall {})
+        .and_then(Result::ok)
+        .is_some_and(|timers| {
+            landing_slot(
+                snapshot.timestamp,
+                timers.slotInterval,
+                timers.slotWindow,
+                block_interval,
+            )
+            .is_some()
+        })
+}
+
+/// A running vault's valuation step, made ahead of every vault's other
+/// sends in a round read from an observation (see [`tick`]): what [`price`]
+/// does in the vault's round, judged on the same reads. A halted vault is
+/// left to its round, where its station is stopped and emptied before its
+/// valuation. The round's own valuation step follows as before, and finds
+/// the slot valued.
+async fn window_step(client: &Observed, keeper: Address, vault: Address, memory: &mut Memory) {
+    let Ok(state) = client.read(vault, IVault::stateCall {}).await else {
+        return;
+    };
+    if !matches!(
+        state,
+        VaultState::Open | VaultState::WindingDown | VaultState::Frozen | VaultState::Killed
+    ) {
+        return;
+    }
+    let (Ok(timers), Ok(0)) = (
+        client.read(vault, IVault::timersCall {}).await,
+        client.read(vault, IStationVault::haltedAtCall {}).await,
+    ) else {
+        return;
+    };
+    let Ok(block_interval) = block_interval(client).await else {
+        return;
+    };
+    price(
+        client,
+        keeper,
+        vault,
+        &timers,
+        block_interval,
+        true,
+        Halt::Running,
+        memory,
+    )
+    .await;
 }
 
 alloy::sol! {
@@ -1032,7 +1758,7 @@ struct Factories {
 /// deployment block isn't recorded. A vault listed by two factories is kept
 /// once.
 async fn every_vault(
-    client: &Client,
+    client: &Observed,
     factory: Address,
     factories: &mut Factories,
 ) -> Result<(Vec<Address>, Vec<Address>)> {
@@ -1140,7 +1866,7 @@ static STEPS_FAILED: std::sync::LazyLock<std::sync::Mutex<StepsFailed>> =
 /// Everything one vault might need this round. Each step is tried on its own:
 /// one that can't go through yet doesn't hold up the others.
 async fn keep_one(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     deployments: &Deployments,
     executor: &str,
@@ -1426,7 +2152,7 @@ async fn keep_one(
         .await;
     }
     // After the round's settle, so the list is read against what was priced.
-    if refresh {
+    if refresh && restricted_would_grow(client, vault).await {
         send(
             client,
             keeper,
@@ -1510,7 +2236,7 @@ async fn keep_one(
 /// moved on, and money its account put into the venue's own vaults
 /// reclaimed (see [`delayed`]). A station without one needs nothing here.
 async fn delayed_steps(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     station: Address,
     memory: &mut Memory,
@@ -1601,7 +2327,7 @@ fn tank_read_again(chain_id: u64, vault: Address, memory: &mut Memory) {
 /// with nothing left to do is left alone for a day.
 #[allow(clippy::too_many_arguments)]
 async fn closed_round(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     executor: &str,
     vault: Address,
@@ -1709,7 +2435,7 @@ async fn closed_round(
 /// back. So is one whose simulation failed, which is made again next slot
 /// and said once it keeps failing (see [`MOST_PROBES_FAILING`]).
 async fn closed_station(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     vault: Address,
     station: Address,
@@ -1734,7 +2460,7 @@ async fn closed_station(
 /// stopped, and a running station's key can't be taken back while its
 /// blessing stands: the station is stopped once the grace is over.
 async fn stop_after_grace(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     vault: Address,
     station: Address,
@@ -1755,6 +2481,93 @@ async fn stop_after_grace(
         .await;
     }
     Ok(())
+}
+
+/// Whether the vault's daily `refreshRestricted` would add anything to its
+/// restricted list: the list only ever grows, so one that would leave it as
+/// long as it is buys nothing, and is not sent. Judged by a simulation of
+/// the refresh and a read of the list after it (see [`refresh_probe`]); a
+/// simulation that can't be made, or a list that can't be read, has the
+/// refresh sent as before.
+async fn restricted_would_grow(client: &Observed, vault: Address) -> bool {
+    use alloy::network::TransactionBuilder;
+    use alloy::providers::Provider;
+    let Ok(now) = client.read(vault, IVault::restrictedCall {}).await else {
+        return true;
+    };
+    let probe = refresh_probe(vault);
+    let read = |returned: Result<Bytes, alloy::transports::TransportError>| {
+        returned
+            .ok()
+            .filter(|returned| returned.len() == 32)
+            .map(|returned| U256::from_be_slice(&returned))
+    };
+    let created = alloy::rpc::types::TransactionRequest::default().with_deploy_code(probe.clone());
+    let after = match read(client.provider().call(created).await) {
+        Some(after) => Some(after),
+        None => {
+            let request = alloy::rpc::types::TransactionRequest::default().with_to(PROBE_AT);
+            read(
+                client
+                    .provider()
+                    .call(request)
+                    .account_override(
+                        PROBE_AT,
+                        alloy::rpc::types::state::AccountOverride::default().with_code(probe),
+                    )
+                    .await,
+            )
+        }
+    };
+    match after {
+        Some(after) => after > U256::from(now.len()),
+        None => {
+            tracing::debug!(%vault, "the restricted list's refresh could not be simulated; it is sent");
+            true
+        }
+    }
+}
+
+/// Creation code that calls `vault.refreshRestricted()`, then reads
+/// `vault.restricted()`, and returns the list's length; a call that fails
+/// makes it revert with that call's own reason.
+fn refresh_probe(vault: Address) -> Vec<u8> {
+    use alloy::sol_types::SolCall;
+    const PUSH1: u8 = 0x60;
+    fn put_selector(code: &mut Vec<u8>, selector: [u8; 4]) {
+        code.push(0x63);
+        code.extend_from_slice(&selector);
+        code.extend_from_slice(&[PUSH1, 0xe0, 0x1b, PUSH1, 0x00, 0x52]);
+    }
+    let mut code = Vec::new();
+    let mut failed_at = Vec::new();
+    put_selector(&mut code, IVault::refreshRestrictedCall::SELECTOR);
+    // call(gas, vault, 0, 0, 4, 0, 0)
+    code.extend_from_slice(&[
+        PUSH1, 0x00, PUSH1, 0x00, PUSH1, 0x04, PUSH1, 0x00, PUSH1, 0x00, 0x73,
+    ]);
+    code.extend_from_slice(vault.as_slice());
+    code.extend_from_slice(&[0x5a, 0xf1]);
+    code.extend_from_slice(&[0x15, 0x61, 0x00, 0x00, 0x57]);
+    failed_at.push(code.len() - 3);
+    put_selector(&mut code, IVault::restrictedCall::SELECTOR);
+    // staticcall(gas, vault, 0, 4, 0, 0)
+    code.extend_from_slice(&[PUSH1, 0x00, PUSH1, 0x00, PUSH1, 0x04, PUSH1, 0x00, 0x73]);
+    code.extend_from_slice(vault.as_slice());
+    code.extend_from_slice(&[0x5a, 0xfa]);
+    code.extend_from_slice(&[0x15, 0x61, 0x00, 0x00, 0x57]);
+    failed_at.push(code.len() - 3);
+    // returndatacopy(0, 0, returndatasize); return(32, 32): the length.
+    code.extend_from_slice(&[0x3d, PUSH1, 0x00, PUSH1, 0x00, 0x3e]);
+    code.extend_from_slice(&[PUSH1, 0x20, PUSH1, 0x20, 0xf3]);
+    let revert = u16::try_from(code.len()).unwrap_or(u16::MAX).to_be_bytes();
+    code.extend_from_slice(&[
+        0x5b, 0x3d, PUSH1, 0x00, PUSH1, 0x00, 0x3e, 0x3d, PUSH1, 0x00, 0xfd,
+    ]);
+    for at in failed_at {
+        code[at..at + 2].copy_from_slice(&revert);
+    }
+    code
 }
 
 /// What the daily round sends.
@@ -1794,7 +2607,7 @@ fn owes(signed: &Signed, tank: &Tank, sent_as_of: u64) -> bool {
 
 /// Whether a fill could be paid: it redeems the author's shares from the
 /// vault's cash, so the author must hold some and the vault must hold cash.
-async fn can_fill(client: &Client, vault: Address) -> Result<bool> {
+async fn can_fill(client: &Observed, vault: Address) -> Result<bool> {
     let author = client.read(vault, IVault::authorCall {}).await?;
     let shares = client
         .read(vault, IVault::balanceOfCall { owner: author })
@@ -1884,7 +2697,7 @@ fn nothing_to_charge(tank: &Tank, grace_end: Option<u64>) -> Option<Billing> {
 /// [`bill_settled`]), which ends a close's hold for it.
 #[allow(clippy::too_many_arguments)]
 async fn collect_answered(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     executor: &str,
     vault: Address,
@@ -1944,7 +2757,7 @@ async fn collect_answered(
 /// [`collect_answered`], before what became of it is noted.
 #[allow(clippy::too_many_arguments)]
 async fn collect_latest(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     executor: &str,
     vault: Address,
@@ -2029,7 +2842,7 @@ async fn collect_latest(
 /// on the keeper's clock alike (see [`waited`]).
 #[allow(clippy::too_many_arguments)]
 async fn last_bill(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     executor: &str,
     vault: Address,
@@ -2145,7 +2958,7 @@ fn ask_for_escape(
 /// driver the registry revoked. The station refuses while the key still
 /// stands, so a refusal here only means there is nothing to do. Whether any
 /// key may still be approved afterwards.
-async fn revoke_keys(client: &Client, keeper: Address, station: Address) -> bool {
+async fn revoke_keys(client: &Observed, keeper: Address, station: Address) -> bool {
     let Ok(spec) = client.read(station, IStation::specCall {}).await else {
         return true;
     };
@@ -2161,6 +2974,13 @@ async fn revoke_keys(client: &Client, keeper: Address, station: Address) -> bool
         if key == Address::ZERO {
             continue;
         }
+        // Read from an observation, a revoke the station would refuse is not
+        // tried: its estimate would only be refused. On the active path it
+        // is tried, and the station judges it.
+        if client.is_served() && still_blessed(client, station, driver, key).await == Some(true) {
+            left = true;
+            continue;
+        }
         left |= !send(
             client,
             keeper,
@@ -2173,6 +2993,76 @@ async fn revoke_keys(client: &Client, keeper: Address, station: Address) -> bool
     left
 }
 
+/// Whether the station refuses `revokeKey(driver, key)` now, as
+/// `Station.revokeKey` decides it: it refuses while the station runs, the
+/// driver is neither reclaimed at the station nor revoked at the registry,
+/// and the registry counts the key as blessed for the station's vault and
+/// bundle, as an executor's key. The registry is the one the station's
+/// factory names. `None` when any of that can't be read: the revoke is then
+/// tried, and the station judges it.
+async fn still_blessed(
+    client: &Observed,
+    station: Address,
+    driver: B256,
+    key: Address,
+) -> Option<bool> {
+    use chain::bindings::attestation::{IAttestationRegistry, ImageKind};
+    use observed::IMadeBy;
+    if client.read(station, IStation::stoppedCall {}).await.ok()? {
+        return Some(false);
+    }
+    if client
+        .read(station, IStation::reclaimedCall { driver })
+        .await
+        .ok()?
+    {
+        return Some(false);
+    }
+    let made_by = client.read(station, IMadeBy::factoryCall {}).await.ok()?;
+    let registry = client
+        .read(made_by, IMadeBy::attestationCall {})
+        .await
+        .ok()?;
+    let implementation = client
+        .read(station, IStation::pinnedDriverCall { driver })
+        .await
+        .ok()?;
+    if client
+        .read(
+            registry,
+            IAttestationRegistry::isDriverRevokedCall {
+                name: driver,
+                implementation,
+            },
+        )
+        .await
+        .ok()?
+    {
+        return Some(false);
+    }
+    let spec = client.read(station, IStation::specCall {}).await.ok()?;
+    let blessed = client
+        .read(
+            registry,
+            IAttestationRegistry::isBlessedForCall {
+                signer: key,
+                vaultChain: spec.vaultChain,
+                vault: spec.vault,
+                strategyHash: spec.bundleHash,
+            },
+        )
+        .await
+        .ok()?;
+    if !blessed {
+        return Some(false);
+    }
+    let info = client
+        .read(registry, IAttestationRegistry::keyInfoCall { signer: key })
+        .await
+        .ok()?;
+    Some(matches!(info.kind, ImageKind::Executor))
+}
+
 /// Take back the venue approval of a key a station's best-effort revoke
 /// left in place: a handover from a key whose blessing lapsed, or a stop,
 /// says so with `RevokeSkipped`, and anyone may finish it strictly with
@@ -2182,7 +3072,7 @@ async fn revoke_keys(client: &Client, keeper: Address, station: Address) -> bool
 /// on from where the last read stopped. Whether any may be left: one not yet
 /// taken back, or a log not read up to the head.
 async fn revoke_skipped(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     vault: Address,
     station: Address,
@@ -2205,6 +3095,10 @@ async fn revoke_skipped(
     };
     let mut taken_back = Vec::new();
     for &(driver, key) in &memory.skipped {
+        // As for a key that no longer stands (see [`revoke_keys`]).
+        if client.is_served() && still_blessed(client, station, driver, key).await == Some(true) {
+            continue;
+        }
         if send(
             client,
             keeper,
@@ -2226,13 +3120,13 @@ async fn revoke_skipped(
 /// Read on through a station's log for the revokes it skipped, and the
 /// revokes that went through since. Whether it has been read up to the head.
 async fn find_skipped(
-    client: &Client,
+    client: &Observed,
     station: Address,
     from_block: u64,
     memory: &mut Memory,
 ) -> Result<bool> {
     use alloy::sol_types::SolEvent;
-    let head = client.block_number().await?;
+    let head = client.log_head().await?;
     let filter = alloy::rpc::types::Filter::new()
         .address(station)
         .event_signature(vec![
@@ -2273,12 +3167,10 @@ fn slot_of(now: u64, interval: u64) -> u64 {
 /// How far apart the chain's blocks are, from the last two: a transaction
 /// sent now lands in the next block, about this long after the head. At
 /// least a second, since a chain's clock counts whole seconds and the next
-/// block may fall in the next one.
-async fn block_interval(client: &Client) -> Result<u64> {
-    let head = client.block_number().await?;
-    let latest = client.block_timestamp_at(head).await?;
-    let before = client.block_timestamp_at(head.saturating_sub(1)).await?;
-    Ok(latest.saturating_sub(before).max(1))
+/// block may fall in the next one. Measured from one head and its parent,
+/// checked by hash (see [`Observed::block_interval`]).
+async fn block_interval(client: &Observed) -> Result<u64> {
+    client.block_interval().await
 }
 
 /// The slot a transaction sent with the head at `now` is judged in, if it
@@ -2300,7 +3192,7 @@ fn due_for_valuation(now: u64, interval: u64, window: u64, block_interval: u64, 
 
 /// Whether anything priced is waiting to be settled. Settling when nothing
 /// is would be paying for nothing.
-async fn unsettled(client: &Client, vault: Address) -> bool {
+async fn unsettled(client: &Observed, vault: Address) -> bool {
     client
         .read(vault, IStationVault::unsettledCall {})
         .await
@@ -2310,7 +3202,7 @@ async fn unsettled(client: &Client, vault: Address) -> bool {
 /// Whether the vault is known to have nothing priced waiting to be settled.
 /// A freeze waits while something is, or while the read fails: the settle may
 /// pay whoever the freeze is for.
-async fn settled(client: &Client, vault: Address) -> bool {
+async fn settled(client: &Observed, vault: Address) -> bool {
     client
         .read(vault, IStationVault::unsettledCall {})
         .await
@@ -2319,7 +3211,7 @@ async fn settled(client: &Client, vault: Address) -> bool {
 
 /// Settle up to `max` of what is priced, if anything is. Whether a settle
 /// was sent.
-async fn settle(client: &Client, keeper: Address, vault: Address, max: U256, what: &str) -> bool {
+async fn settle(client: &Observed, keeper: Address, vault: Address, max: U256, what: &str) -> bool {
     if !unsettled(client, vault).await {
         return false;
     }
@@ -2385,7 +3277,7 @@ enum Halt {
 /// Whatever can't be read is taken as wanting one: a valuation too many
 /// costs a transaction, one too few keeps somebody waiting.
 async fn valuation_wanted(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     vault: Address,
     slot: u64,
@@ -2440,7 +3332,7 @@ async fn valuation_wanted(
 /// does: a claim booked or waiting to be tried, or a holder's units, read
 /// now. What can't be read is taken as waiting.
 async fn claims_or_units_wait(
-    client: &Client,
+    client: &Observed,
     vault: Address,
     memory: &Memory,
 ) -> Option<&'static str> {
@@ -2486,7 +3378,7 @@ async fn claims_or_units_wait(
 /// with the market, which a valuation wouldn't help. Past the refusal, what
 /// can't be read is taken as wanting one.
 async fn units_wait_for_a_valuation(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     vault: Address,
     index: U256,
@@ -2525,7 +3417,7 @@ async fn units_wait_for_a_valuation(
 /// Whether the vault refuses `holder`'s serve, sent by the keeper now, with
 /// `NotYet`.
 async fn serve_refused_not_yet(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     vault: Address,
     holder: Address,
@@ -2732,7 +3624,7 @@ fn landing_times(now: u64, window: u64, block_interval: u64) -> (u64, u64) {
 /// the simulation fails there, it is left to its gas estimate, as any other
 /// send is. What became of it, if it was judged.
 async fn simulated_valuation(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     vault: Address,
     timers: &chain::bindings::vault::Timers,
@@ -2776,7 +3668,7 @@ async fn simulated_valuation(
 /// valuation (see [`valuation_wanted`]), and settle what has been priced.
 #[allow(clippy::too_many_arguments)]
 async fn price(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     vault: Address,
     timers: &chain::bindings::vault::Timers,
@@ -2875,6 +3767,7 @@ async fn price(
             let outcome =
                 simulated_valuation(client, keeper, vault, timers, now, block_interval).await;
             if let Some(outcome) = outcome {
+                window_send(client.chain_id, vault, outcome);
                 memory.valuations_refused.note(
                     outcome,
                     Refused::Valuations,
@@ -2970,7 +3863,7 @@ fn not_tried(
 /// closing is never tried: it is paid when its close is delivered. A claim
 /// that can't be read this round is left for the next; it holds up no other.
 async fn claims(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     vault: Address,
     timers: &chain::bindings::vault::Timers,
@@ -3178,7 +4071,7 @@ fn claim_tryable(state: ClaimState) -> bool {
 /// Whether a close is staged at the vault's home station: while one is, the
 /// vault tries no claim and serves no units, so nothing is sent for them. A
 /// read that fails is taken as none staged; the vault refuses what it must.
-async fn close_staged(client: &Client, vault: Address) -> bool {
+async fn close_staged(client: &Observed, vault: Address) -> bool {
     let Ok(station) = client.read(vault, IVault::homeStationCall {}).await else {
         return false;
     };
@@ -3192,7 +4085,7 @@ async fn close_staged(client: &Client, vault: Address) -> bool {
 /// fails is taken as inside: it proves nothing about the market, and a claim
 /// that could be paid, or a valuation that could price, mustn't wait on a
 /// read.
-async fn station_outside_band(client: &Client, vault: Address) -> bool {
+async fn station_outside_band(client: &Observed, vault: Address) -> bool {
     let Ok(station) = client.read(vault, IVault::homeStationCall {}).await else {
         return false;
     };
@@ -3219,7 +4112,7 @@ const LEAST_LOG_CHUNK: u64 = 100;
 /// them differ in how wide a range they take. The logs, and the last block
 /// they cover.
 async fn logs_from(
-    client: &Client,
+    client: &Observed,
     filter: &alloy::rpc::types::Filter,
     start: u64,
     end: u64,
@@ -3251,7 +4144,7 @@ async fn logs_from(
 /// costs nothing and is sent again next round.
 #[allow(clippy::too_many_arguments)]
 async fn units(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     vault: Address,
     from_block: u64,
@@ -3374,12 +4267,12 @@ fn units_freeze_due(halted: u64, now: u64, since: u64, freeze_after: u64, held: 
 /// Read on through the vault's log for whoever has taken units, from where
 /// the last read stopped. Whether it has been read up to the head.
 async fn find_holders(
-    client: &Client,
+    client: &Observed,
     vault: Address,
     from_block: u64,
     memory: &mut Memory,
 ) -> Result<bool> {
-    let head = client.block_number().await?;
+    let head = client.log_head().await?;
     let filter = alloy::rpc::types::Filter::new()
         .address(vault)
         .event_signature(<IVault::ProRataTaken as alloy::sol_types::SolEvent>::SIGNATURE_HASH);
@@ -3412,7 +4305,7 @@ async fn find_holders(
 /// deposit sent back) and claims not yet paid. Each pays its own owner, so
 /// anyone may send them. Whether every request and claim is done.
 async fn paid_out(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     vault: Address,
     memory: &mut Memory,
@@ -3506,14 +4399,14 @@ async fn paid_out(
 
 /// Whether the vault has halted and its grace is over, so its station is
 /// to be stopped and emptied and the vault closed.
-async fn grace_is_over(client: &Client, vault: Address, now: u64, halted: u64) -> Result<bool> {
+async fn grace_is_over(client: &Observed, vault: Address, now: u64, halted: u64) -> Result<bool> {
     Ok(grace_end(client, vault, halted)
         .await?
         .is_some_and(|end| now >= end))
 }
 
 /// When the halt's grace ends, if the vault has halted.
-async fn grace_end(client: &Client, vault: Address, halted: u64) -> Result<Option<u64>> {
+async fn grace_end(client: &Observed, vault: Address, halted: u64) -> Result<Option<u64>> {
     if halted == 0 {
         return Ok(None);
     }
@@ -3590,7 +4483,7 @@ fn ask_halted(
 /// holds the close again (newer totals are still collected).
 #[allow(clippy::too_many_arguments)]
 async fn collect_before_close(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     executor: &str,
     vault: Address,
@@ -3794,7 +4687,7 @@ fn worth_an_unwind(amount: U256, dust: U256) -> bool {
 /// station's drivers: a remnant at every venue and the station's rounding at
 /// once. A station whose drivers can't be read has none, so whatever its
 /// unwind would bring home is worth it.
-async fn dust_of(client: &Client, station: Address) -> U256 {
+async fn dust_of(client: &Observed, station: Address) -> U256 {
     match client.read(station, IStation::specCall {}).await {
         Ok(spec) => {
             let parts = U256::from(spec.drivers.len() as u64 + 1);
@@ -3808,7 +4701,7 @@ async fn dust_of(client: &Client, station: Address) -> U256 {
 /// along the way.
 #[allow(clippy::too_many_arguments)]
 async fn stop_and_unwind(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     executor: &str,
     closer: Address,
@@ -3886,15 +4779,16 @@ async fn stop_and_unwind(
             });
         if still_lands {
             // One that doesn't go out is heard of as any other send is.
-            match send_roomy_outcome(
+            let outcome = send_roomy_outcome(
                 client,
                 keeper,
                 closer,
                 ICloser::closeHaltedCall { vault },
                 "close the halted vault in one go",
             )
-            .await
-            {
+            .await;
+            window_send(client.chain_id, vault, outcome);
+            match outcome {
                 // A call that went through closed the vault only if it now
                 // reads closed: one to an address with nothing deployed goes
                 // through and does nothing, and taking it as a close would
@@ -3936,7 +4830,7 @@ async fn stop_and_unwind(
 /// [`next_check`]); one that finds it worth sending is followed by another
 /// next slot, so a station that keeps selling is unwound every slot.
 async fn unwind_stopped(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     vault: Address,
     station: Address,
@@ -4149,16 +5043,20 @@ async fn can_simulate(client: &Client) -> Result<()> {
     mark_after_unwind(client, NOTHING_AT).await.map(|_| ())
 }
 
-/// How long a chain whose node can't simulate waits before it is checked
-/// again, at first and at most: the wait doubles in between.
-const SIMULATION_CHECK_FIRST: Duration = Duration::from_secs(5);
-const SIMULATION_CHECK_MOST: Duration = Duration::from_secs(5 * 60);
-
 /// Check that the chain's node can simulate, until it can: while it can't,
 /// the chain is not kept, and that is said at warn and in the keeper's
-/// health.
-async fn until_it_can_simulate(chain: Chain, client: &Client, key: &impl std::fmt::Display) {
-    let mut wait = SIMULATION_CHECK_FIRST;
+/// health. It is checked again after `keeper_simulation_initial_ms`, the
+/// wait growing by `keeper_simulation_backoff_factor` each time up to
+/// `keeper_simulation_max_ms`.
+async fn until_it_can_simulate(
+    chain: Chain,
+    client: &Client,
+    key: &impl std::fmt::Display,
+    policy: &chain::rpc_policy::RpcPolicy,
+) {
+    let mut wait = Duration::from_millis(policy.keeper_simulation_initial_ms);
+    let most = Duration::from_millis(policy.keeper_simulation_max_ms);
+    let factor = u32::try_from(policy.keeper_simulation_backoff_factor).unwrap_or(u32::MAX);
     let mut said = Said::default();
     while let Err(error) = can_simulate(client).await {
         chain_kept(chain, |kept| kept.cannot_simulate = true);
@@ -4166,7 +5064,7 @@ async fn until_it_can_simulate(chain: Chain, client: &Client, key: &impl std::fm
             tracing::warn!(chain = %key, times, error = format!("{error:#}"), "this chain's node can't simulate what an unwind leaves; the chain is not kept until it can");
         }
         tokio::time::sleep(wait).await;
-        wait = (wait * 2).min(SIMULATION_CHECK_MOST);
+        wait = wait.saturating_mul(factor).min(most);
     }
     if said.over() {
         tracing::info!(chain = %key, "this chain's node simulates; it is kept");
@@ -4266,7 +5164,7 @@ fn unwind_probe(station: Address) -> Vec<u8> {
 /// When the author retired the vault, from its `StateChanged` log, read on
 /// from where the last read stopped and remembered once found.
 async fn retired_at(
-    client: &Client,
+    client: &Observed,
     vault: Address,
     from_block: u64,
     memory: &mut Memory,
@@ -4274,7 +5172,7 @@ async fn retired_at(
     if let Some(at) = memory.retired_at {
         return Ok(Some(at));
     }
-    let head = client.block_number().await?;
+    let head = client.log_head().await?;
     let filter = alloy::rpc::types::Filter::new()
         .address(vault)
         .event_signature(<IVault::StateChanged as alloy::sol_types::SolEvent>::SIGNATURE_HASH);
@@ -4587,6 +5485,8 @@ async fn ask_off_the_round(
                 asks.latest.insert(key, (asked, sent));
             }
             asks.note_serving();
+            // The chain looks at once: the answer may be a bill to collect.
+            answers_for(chain_id).notify_one();
         }
         Err(error) => {
             if asks
@@ -4792,7 +5692,7 @@ type Call = (String, Address, String, B256, [u8; 4]);
 /// send away for that reason, then at most once every ten minutes with how
 /// many sends it has turned away for it since, however many calls fail.
 async fn send_outcome<C: alloy::sol_types::SolCall>(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     to: Address,
     call: C,
@@ -4804,7 +5704,7 @@ async fn send_outcome<C: alloy::sol_types::SolCall>(
 /// [`send_outcome`], with the gas limit [`roomy_gas`] gives: for a call that
 /// tries what it may let fail inside (see [`send_roomy`]).
 async fn send_roomy_outcome<C: alloy::sol_types::SolCall>(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     to: Address,
     call: C,
@@ -4814,7 +5714,7 @@ async fn send_roomy_outcome<C: alloy::sol_types::SolCall>(
 }
 
 async fn send_outcome_with<C: alloy::sol_types::SolCall>(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     to: Address,
     call: C,
@@ -5074,6 +5974,37 @@ static CALLS_REFUSED: std::sync::LazyLock<std::sync::Mutex<CallsRefused>> =
 /// slots in a row.
 type CallsRefused = HashMap<(u64, Address, Refused), u64>;
 
+/// Vaults, by their chain id, whose sends that must land inside a slot's
+/// window (a valuation, the one-transaction close) went out and did not
+/// land there (mined and reverted, or never seen to land), with how many in
+/// a row.
+static WINDOWS_MISSED: std::sync::LazyLock<std::sync::Mutex<HashMap<(u64, Address), u64>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Note what became of a send that must land inside a slot's window. One
+/// that goes through ends the count; one refused before it went out says
+/// nothing of landing.
+fn window_send(chain_id: u64, vault: Address, outcome: Outcome) {
+    let Ok(mut missed) = WINDOWS_MISSED.lock() else {
+        return;
+    };
+    match outcome {
+        Outcome::Done => {
+            missed.remove(&(chain_id, vault));
+        }
+        Outcome::Reverted | Outcome::NotSent => {
+            let count = missed.entry((chain_id, vault)).or_default();
+            *count += 1;
+            if *count == MOST_VAULT_ROUNDS_FAILING {
+                tracing::warn!(chain_id, %vault, times = *count, "sends that must land inside their slot's window keep not landing there");
+            } else {
+                tracing::debug!(chain_id, %vault, times = *count, "a send that must land inside its slot's window did not land there");
+            }
+        }
+        Outcome::Refused | Outcome::Stale => {}
+    }
+}
+
 /// The reasons nodes have turned the keeper's sends away for, by node, as
 /// said.
 static TURNED_AWAY: std::sync::LazyLock<std::sync::Mutex<HashMap<(String, String), Said>>> =
@@ -5102,6 +6033,9 @@ struct Troubles<'a> {
     calls_refused: &'a CallsRefused,
     /// Vaults whose tank couldn't be read, and how many rounds in a row.
     tanks_unread: &'a HashMap<(u64, Address), u64>,
+    /// Vaults whose sends that must land inside a window did not, and how
+    /// many in a row.
+    windows_missed: &'a HashMap<(u64, Address), u64>,
     /// Whether an executor has answered 404 for every vault it was asked
     /// about, and served none, for [`SERVING_NONE_FOR`].
     serving_none: bool,
@@ -5197,6 +6131,20 @@ fn health(troubles: &Troubles, now: std::time::Instant) -> (bool, String) {
         details.push(format!(
             "unwinds not sent, what they leave can't be simulated: {}",
             unprobed.join(", ")
+        ));
+    }
+    let mut missed: Vec<String> = troubles
+        .windows_missed
+        .iter()
+        .filter(|(_, times)| **times >= MOST_VAULT_ROUNDS_FAILING)
+        .map(|((chain_id, vault), times)| format!("{chain_id}/{vault:?} ({times} in a row)"))
+        .collect();
+    if !missed.is_empty() {
+        missed.sort_unstable();
+        first.push(format!("{} windows missed", missed.len()));
+        details.push(format!(
+            "sends that must land inside a slot's window did not: {}",
+            missed.join(", ")
         ));
     }
     let mut refused: Vec<String> = troubles
@@ -5341,7 +6289,7 @@ fn roomy_gas(estimate: u64, block_limit: Option<u64>) -> u64 {
 /// Send a call as the keeper with the gas limit [`roomy_gas`] gives from the
 /// node's estimate, and wait for it to land.
 async fn send_roomy<C: alloy::sol_types::SolCall>(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     to: Address,
     call: C,
@@ -5371,7 +6319,7 @@ async fn send_roomy<C: alloy::sol_types::SolCall>(
 
 /// Send one call as the keeper, and say whether it went through.
 async fn send<C: alloy::sol_types::SolCall>(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     to: Address,
     call: C,
@@ -5390,6 +6338,10 @@ async fn serve_status(address: SocketAddr) {
                 let unanswered = unanswered_asks(now);
                 let serving_none = executors_serving_none(now);
                 let solana = solana::troubles(now);
+                let windows_missed = WINDOWS_MISSED
+                    .lock()
+                    .map(|missed| missed.clone())
+                    .unwrap_or_default();
                 let (
                     Ok(mut not_sent),
                     Ok(chains),
@@ -5423,6 +6375,7 @@ async fn serve_status(address: SocketAddr) {
                     refused: &refused,
                     calls_refused: &calls_refused,
                     tanks_unread: &tanks_unread,
+                    windows_missed: &windows_missed,
                     serving_none,
                     solana: &solana,
                 };
@@ -5445,8 +6398,13 @@ async fn serve_status(address: SocketAddr) {
 
 mod attest;
 mod delayed;
+mod logs;
+mod observed;
 mod solana;
 mod solana_keys;
+mod wake;
+
+use observed::Observed;
 
 #[cfg(test)]
 mod stand_in;
@@ -5454,6 +6412,9 @@ mod stand_in;
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod refresh;
+    mod round_memory;
+    mod served;
 
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -5509,6 +6470,7 @@ mod tests {
     ) -> (bool, String) {
         health(
             &Troubles {
+                windows_missed: &HashMap::new(),
                 not_sent,
                 unanswered,
                 chains,
@@ -5933,6 +6895,7 @@ mod tests {
         let calls_refused = HashMap::from([((31337, VAULT, Refused::Valuations), 10u64)]);
         let (up, said) = health(
             &Troubles {
+                windows_missed: &HashMap::new(),
                 not_sent: &not_sent,
                 unanswered: &[(31337, VAULT)],
                 chains: &chains,
@@ -7023,7 +7986,7 @@ mod tests {
         url
     }
 
-    async fn signing_client(url: String) -> (Client, Address) {
+    async fn signing_client(url: String) -> (Observed, Address) {
         let keys = chain::keys_from_mnemonic(
             "test test test test test test test test test test test junk",
             1,
@@ -7044,7 +8007,8 @@ mod tests {
         (
             Client::connect(&config, chain::Signing::Keys(keys))
                 .await
-                .unwrap(),
+                .unwrap()
+                .into(),
             address,
         )
     }
@@ -12756,7 +13720,7 @@ mod tests {
 
     /// One round's valuation step at the head's time `now`, on a chain of
     /// one-second blocks.
-    async fn price_at(node: &Shared, client: &Client, now: u64, halt: Halt, memory: &mut Memory) {
+    async fn price_at(node: &Shared, client: &Observed, now: u64, halt: Halt, memory: &mut Memory) {
         node.lock().unwrap().timestamp = now;
         price(client, KEEPER, VAULT, &timers(), 1, true, halt, memory).await;
     }

@@ -26,10 +26,10 @@
 
 use std::time::{Duration, Instant};
 
+use crate::observed::Observed;
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy::sol_types::SolValue;
 use anyhow::{Context, Result};
-use chain::Client;
 use chain::bindings::driver::{ExitPath, IDelayedDriver, IDriver};
 use chain::bindings::station::IStation;
 
@@ -93,6 +93,17 @@ pub struct Pace {
     pub unchanged: u32,
 }
 
+impl Memory {
+    /// The chain time the stopped station's next unwind may go, while one
+    /// is paced.
+    pub fn next_unwind(&self) -> Option<u64> {
+        self.unwinds
+            .as_ref()
+            .filter(|pace| !pace.ended())
+            .map(|pace| pace.next)
+    }
+}
+
 impl Pace {
     /// Whether the keeper has stopped unwinding until the venue changes.
     pub fn ended(&self) -> bool {
@@ -103,7 +114,7 @@ impl Pace {
 /// The station's delayed drivers, read once and remembered. A station built
 /// before delayed drivers existed has none.
 pub async fn drivers_of(
-    client: &Client,
+    client: &Observed,
     station: Address,
     memory: &mut Memory,
 ) -> Result<Vec<DelayedDriver>> {
@@ -145,7 +156,7 @@ pub async fn drivers_of(
 /// after the ask, to deliver it, in whole or the part that landed. A call
 /// that can't go yet (`NotYet`) is simply tried next round, and nothing is
 /// sent.
-pub async fn settle_close(client: &Client, keeper: Address, station: Address) -> Result<()> {
+pub async fn settle_close(client: &Observed, keeper: Address, station: Address) -> Result<()> {
     let stage = client.read(station, IStation::stageCall {}).await?;
     let Some(what) = close_step(stage.stagedAt, stage.sweptBlock) else {
         return Ok(());
@@ -223,7 +234,7 @@ alloy::sol! {
 /// minutes after they are asked for, and which anyone may send on to its
 /// owner. Every other venue sends its withdrawals itself.
 pub async fn collect_withdrawals(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     station: Address,
     drivers: &[DelayedDriver],
@@ -335,7 +346,7 @@ pub fn pace(before: Option<&Pace>, seen: B256, now: u64, slot_interval: u64) -> 
 /// Read what a stopped delayed station's unwind would do at chain time
 /// `now`.
 pub async fn work(
-    client: &Client,
+    client: &Observed,
     station: Address,
     drivers: &[DelayedDriver],
     now: u64,
@@ -423,7 +434,7 @@ pub async fn work(
 /// sent home from the station is worth an unwind of its own.
 #[allow(clippy::too_many_arguments)]
 pub async fn unwind_stopped(
-    client: &Client,
+    client: &Observed,
     keeper: Address,
     vault: Address,
     station: Address,
@@ -628,7 +639,7 @@ async fn ask_venue_vaults(
 /// names, and in either case every vault already listed. Looked at once a
 /// minute per station.
 pub async fn reclaim(
-    client: &Client,
+    client: &Observed,
     http: &reqwest::Client,
     keeper: Address,
     station: Address,
