@@ -403,6 +403,20 @@ impl<T: Transport> Reader for RpcReader<T> {
     }
 }
 
+/// How long to wait before asking a rate-limited endpoint again, in
+/// milliseconds: what it asked for (`Retry-After`, in seconds, at most 8),
+/// or half a second doubling each time; `None` once five tries have been
+/// waited out (about 15 seconds in all), and the endpoint's answer stands.
+pub fn backoff(attempt: u32, retry_after_seconds: Option<u32>) -> Option<u32> {
+    if attempt >= 5 {
+        return None;
+    }
+    Some(match retry_after_seconds {
+        Some(seconds) => seconds.min(8) * 1_000,
+        None => 500u32 << attempt,
+    })
+}
+
 /// A chain's public endpoint, over the browser's `fetch`.
 #[derive(Clone, Debug)]
 pub struct Endpoint {
@@ -413,13 +427,31 @@ pub struct Endpoint {
 impl Transport for Endpoint {
     async fn request(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
-        let request = gloo_net::http::Request::post(&self.url)
-            .json(&body)
-            .map_err(|error| RpcError::unreachable(error.to_string()))?;
-        let reply = request
-            .send()
-            .await
-            .map_err(|_| RpcError::unreachable("the chain's endpoint didn't answer"))?;
+        let mut attempt = 0;
+        let reply = loop {
+            let request = gloo_net::http::Request::post(&self.url)
+                .json(&body)
+                .map_err(|error| RpcError::unreachable(error.to_string()))?;
+            let reply = request
+                .send()
+                .await
+                .map_err(|_| RpcError::unreachable("the chain's endpoint didn't answer"))?;
+            // A public endpoint asking us to slow down refused the request
+            // before doing anything with it, so asking again is safe, sends
+            // included: wait as it asks, or back off, a few times.
+            if reply.status() == 429 {
+                let asked = reply
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|value| value.trim().parse::<u32>().ok());
+                if let Some(wait) = backoff(attempt, asked) {
+                    gloo_timers::future::TimeoutFuture::new(wait).await;
+                    attempt += 1;
+                    continue;
+                }
+            }
+            break reply;
+        };
         if !reply.ok() {
             return Err(RpcError::unreachable(format!(
                 "the chain's endpoint answered {}",
@@ -508,6 +540,18 @@ mod tests {
             error.into_tx_error(),
             TxError::InsufficientGas { .. }
         ));
+    }
+
+    #[test]
+    fn a_rate_limited_endpoint_is_asked_again_after_backing_off_then_its_answer_stands() {
+        assert_eq!(backoff(0, None), Some(500));
+        assert_eq!(backoff(1, None), Some(1_000));
+        assert_eq!(backoff(4, None), Some(8_000));
+        assert_eq!(backoff(5, None), None);
+        assert_eq!(backoff(0, Some(2)), Some(2_000));
+        assert_eq!(backoff(0, Some(60)), Some(8_000));
+        let total: u32 = (0..5).map(|n| backoff(n, None).unwrap()).sum();
+        assert!(total <= 16_000, "{total}");
     }
 
     #[test]
