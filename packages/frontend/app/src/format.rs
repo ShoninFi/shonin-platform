@@ -47,6 +47,16 @@ fn rounds_to_zero(value: f64, decimals: usize) -> bool {
         .all(|c| c == '0' || c == '.')
 }
 
+/// Text as a sentence starts: its first letter a capital ("the development
+/// wallet shows…" becomes "The development wallet shows…").
+pub fn sentence(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 /// A number with separators and a fixed number of decimals, a true minus when
 /// negative: 8,771.4.
 pub fn number(value: f64, decimals: usize) -> String {

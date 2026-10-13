@@ -758,7 +758,7 @@ pub async fn deposit<R: SolReader, S: SolSigner, C: Clock>(
     let codes = restricted(ctx.reader, &ctx.vault).await?;
     let statement = read::restricted_hash(&codes);
     if statement != shown || statement != vault.restricted_hash {
-        return Err(SolError::ListChanged);
+        return Err(SolError::ListChanged { now: codes });
     }
     let nonce = ctx.nonce(&vault, &ctx.account).await?;
     let at = address::request(&ctx.vault, &ctx.account, nonce);

@@ -266,14 +266,16 @@ impl TxError {
 
     pub fn words(&self, context: &Context<'_>) -> Words {
         let wallet = context.wallet;
+        // A line may start with the wallet's name ("the development
+        // wallet …"): every one reads as a sentence.
         let polite = |title: &str, text: String| Words {
-            title: title.to_string(),
-            text,
+            title: crate::format::sentence(title),
+            text: crate::format::sentence(&text),
             alert: false,
         };
         let alert = |title: &str, text: String| Words {
-            title: title.to_string(),
-            text,
+            title: crate::format::sentence(title),
+            text: crate::format::sentence(&text),
             alert: true,
         };
         match self {

@@ -37,8 +37,10 @@ pub enum SolError {
     NothingToSend,
     /// The vault isn't in a state that takes this.
     WrongState,
-    /// The vault's restricted list isn't the one shown: nothing is signed.
-    ListChanged,
+    /// The vault's restricted list isn't the one shown: nothing is signed,
+    /// and the person reviews the deposit again with the list read now
+    /// (`now`, its codes).
+    ListChanged { now: Vec<[u8; 32]> },
     /// The cluster would refuse it: nothing was sent.
     WouldFail { reason: Reason },
     /// Landed, and failed: nothing moved but the network fee.
@@ -193,14 +195,16 @@ impl SolError {
 
     pub fn words(&self, context: &Context<'_>) -> Words {
         let wallet = context.wallet;
+        // A line may start with the wallet's name ("the development
+        // wallet …"): every one reads as a sentence.
         let polite = |title: &str, text: String| Words {
-            title: title.to_string(),
-            text,
+            title: crate::format::sentence(title),
+            text: crate::format::sentence(&text),
             alert: false,
         };
         let alert = |title: &str, text: String| Words {
-            title: title.to_string(),
-            text,
+            title: crate::format::sentence(title),
+            text: crate::format::sentence(&text),
             alert: true,
         };
         match self {
@@ -267,11 +271,23 @@ impl SolError {
                 "Not possible right now",
                 "The vault isn't taking this in its current state. Nothing was sent.".to_string(),
             ),
-            Self::ListChanged => alert(
-                "The vault's restricted list changed",
-                "It isn't the list you were shown, so the app stopped before asking you to sign. Read it again and confirm. Nothing was signed or sent."
-                    .to_string(),
-            ),
+            Self::ListChanged { now } => {
+                let codes: Vec<String> = now
+                    .iter()
+                    .map(chain::solana_ix::read::code_text)
+                    .collect();
+                let codes: Vec<&str> = codes.iter().map(String::as_str).collect();
+                let who = match crate::components::exit::not_open_to(&codes) {
+                    Some(words) => format!("It's now not open to: {words}."),
+                    None => "It's now open to everyone.".to_string(),
+                };
+                alert(
+                    "The vault's list changed since your review",
+                    format!(
+                        "The vault's list of who it isn't open to changed since you reviewed your deposit. {who} Review your deposit again with the new list. Nothing was signed or sent."
+                    ),
+                )
+            }
             Self::WouldFail { reason } => alert(
                 "The network wouldn't accept it. Nothing moved.",
                 format!("{} Nothing was sent.", reason.words()),

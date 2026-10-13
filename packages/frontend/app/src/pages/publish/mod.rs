@@ -23,9 +23,9 @@ use crate::atoms::icon;
 use crate::atoms::notice::{NoticeTone, notice};
 use crate::route::DOCS;
 use crate::tx::author::AuthorError;
-use crate::tx::author::Step;
 use crate::tx::author::archive::{self, Refusal, Summary};
 use crate::tx::author::run::Running;
+use crate::tx::author::{Prompt, Step};
 use crate::view::{El, View, el, text};
 use parts::{Names, wallet_gate};
 
@@ -62,10 +62,13 @@ struct Picked {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Sending {
     Idle,
-    /// Offering the project to the build service.
+    /// Offering the project to the build service; while it starts, the
+    /// time of the next try (milliseconds since the epoch).
     Uploading {
-        note: String,
+        next_try: Option<u64>,
     },
+    /// The author stopped the upload before anything was paid.
+    Stopped,
     /// Taken: pay against it from the account the upload named, and no
     /// other.
     Uploaded {
@@ -107,6 +110,98 @@ struct Draft {
     /// beside the payment, since one the wallet still holds may land.
     look_again: Mutable<bool>,
     dragging: Mutable<bool>,
+    /// Which submission is current: "Cancel" moves it on, and an upload
+    /// that answers after that is let go.
+    attempt: Mutable<u32>,
+    /// "Try now", pressed while the build service starts.
+    try_now: Mutable<bool>,
+}
+
+/// Where a submission is, as the page shows it in place of Submit: the
+/// steps the upload and the payment flow already report, and nothing else.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Phase {
+    /// Nothing under way: Submit is offered.
+    Idle,
+    /// Offering the project to the build service.
+    Uploading,
+    /// The build service is starting; the next try at this time (ms).
+    Waking { next_try: u64 },
+    /// Reading the chain before the wallet is asked anything.
+    Checking,
+    /// The wallet is asked to approve the fee.
+    Approving(Prompt),
+    /// The approval is on its way.
+    ApprovalSent(B256),
+    /// The wallet is asked to pay the fee.
+    Paying(Prompt),
+    /// The payment is on its way.
+    PaymentSent(B256),
+    /// Paid: the job is queued and its page opens.
+    Queued,
+}
+
+impl Phase {
+    /// Which of upload, approve, pay and queued it is at (4 once queued).
+    fn at(&self) -> usize {
+        match self {
+            Phase::Idle | Phase::Uploading | Phase::Waking { .. } => 0,
+            Phase::Checking | Phase::Approving(_) | Phase::ApprovalSent(_) => 1,
+            Phase::Paying(_) | Phase::PaymentSent(_) => 2,
+            Phase::Queued => 4,
+        }
+    }
+
+    /// A submission is under way: Submit isn't offered.
+    fn is_live(&self) -> bool {
+        *self != Phase::Idle
+    }
+}
+
+/// The phase a submission is in, from where the upload is and the payment
+/// flow's latest step (`running`: the flow, if one was started, and its
+/// step).
+fn phase_of(sending: &Sending, running: Option<Option<&Step>>) -> Phase {
+    match sending {
+        Sending::Uploading { next_try: None } => Phase::Uploading,
+        Sending::Uploading {
+            next_try: Some(next_try),
+        } => Phase::Waking {
+            next_try: *next_try,
+        },
+        Sending::Uploaded { .. } => match running {
+            None => Phase::Idle,
+            Some(None | Some(Step::Checking)) => Phase::Checking,
+            Some(Some(Step::Signing(prompt @ Prompt::Approve { .. }))) => {
+                Phase::Approving(prompt.clone())
+            }
+            Some(Some(Step::Sent {
+                prompt: Prompt::Approve { .. },
+                hash,
+            })) => Phase::ApprovalSent(*hash),
+            Some(Some(Step::Signing(prompt))) => Phase::Paying(prompt.clone()),
+            Some(Some(Step::Sent { hash, .. })) => Phase::PaymentSent(*hash),
+            Some(Some(Step::Done(_))) => Phase::Queued,
+            Some(Some(Step::Failed(_))) => Phase::Idle,
+        },
+        Sending::Idle | Sending::Stopped | Sending::Refused(_) => Phase::Idle,
+    }
+}
+
+/// The phase, as it changes.
+fn phase_signal(draft: &Draft) -> impl Signal<Item = Phase> + 'static {
+    let running = draft
+        .running
+        .signal_cloned()
+        .map(|running| match running {
+            Some(running) => running.step.signal_cloned().map(Some).boxed_local(),
+            None => futures_signals::signal::always(None).boxed_local(),
+        })
+        .flatten();
+    futures_signals::map_ref! {
+        let sending = draft.sending.signal_cloned(),
+        let running = running => phase_of(sending, running.as_ref().map(Option::as_ref))
+    }
 }
 
 pub fn page() -> Page {
@@ -128,6 +223,8 @@ impl Draft {
             checked: Mutable::new(None),
             look_again: Mutable::new(false),
             dragging: Mutable::new(false),
+            attempt: Mutable::new(0),
+            try_now: Mutable::new(false),
         })
     }
 }
@@ -227,7 +324,38 @@ fn steps_list(state: &(bool, Source, bool, Option<String>)) -> View {
         ),
         ("Pay 1 USDC", "One transaction, or two".to_string()),
     ];
-    el("ol")
+    // The phone's one line (Publish-Mobile): where the author is, what
+    // comes next, and four segments filled up to here.
+    let compact = el("div")
+        .class("sh-publish__compact")
+        .child(
+            el("p")
+                .class("sh-publish__compactline")
+                .child(el("span").text(compact_words(current, steps[current].0)))
+                .child(match steps.get(current + 1) {
+                    Some((next, _)) => el("span")
+                        .class("sh-publish__compactnext")
+                        .text(format!("Next: {next}"))
+                        .into(),
+                    None => View::Empty,
+                }),
+        )
+        .child(
+            el("div")
+                .class("sh-publish__bars")
+                .attr("role", "progressbar")
+                .attr("aria-label", "Publishing progress")
+                .attr("aria-valuemin", "1")
+                .attr("aria-valuemax", "4")
+                .attr("aria-valuenow", (current + 1).to_string())
+                .attr("aria-valuetext", compact_words(current, steps[current].0))
+                .children((0..steps.len()).map(|index| {
+                    el("span")
+                        .class("sh-publish__barseg")
+                        .class_if(index <= current, "sh-publish__barseg--on")
+                })),
+        );
+    let list = el("ol")
         .class("sh-publish__steplist")
         .attr("aria-label", "Steps")
         .attr("tabindex", "0")
@@ -259,8 +387,14 @@ fn steps_list(state: &(bool, Source, bool, Option<String>)) -> View {
                                 .child(el("span").class("sh-publish__stepdetail").text(detail)),
                         )
                 }),
-        )
-        .into()
+        );
+    View::Many(vec![compact.into(), list.into()])
+}
+
+/// "Step 3 of 4 · Seal": the phone's line for the page's step `current`
+/// (counted from 0), titled `title`.
+fn compact_words(current: usize, title: &str) -> String {
+    format!("Step {} of 4 · {title}", current + 1)
 }
 
 // 1 · Before you submit ---------------------------------------------------------
@@ -568,8 +702,25 @@ fn read_back(draft: &Rc<Draft>, picked: &Picked, summary: &Summary, index: Optio
             Button::new(Kind::Secondary, "Replace")
                 .size(Size::Small)
                 .icon_before(Icon::Upload)
-                .build(),
+                .build()
+                // Not while a submission is under way: its file is the one
+                // being uploaded or paid for.
+                .attr_signal(
+                    "disabled",
+                    None,
+                    phase_signal(draft).map(|phase| phase.is_live().then(String::new)),
+                ),
             move || {
+                if replace.busy.get()
+                    || replace
+                        .running
+                        .lock_ref()
+                        .as_ref()
+                        .is_some_and(Running::is_live)
+                {
+                    return;
+                }
+                replace.attempt.replace_with(|n| n.wrapping_add(1));
                 replace.picked.set(None);
                 replace.sending.set(Sending::Idle);
                 replace.running.set(None);
@@ -867,7 +1018,7 @@ fn pay_body(
         .signal_cloned()
         .map(|fee| fee.unwrap_or_else(|| FEE.to_string()));
     let list = el("dl")
-        .class("sh-publish__dl")
+        .class("sh-publish__dl sh-publish__paylist")
         .child(parts::row_signal(
             "Publishing fee",
             FEE.to_string(),
@@ -877,10 +1028,8 @@ fn pay_body(
             "Covers",
             parts::words("The review and the build"),
         ))
-        .child(parts::row(
-            "Paid on",
-            View::Many(vec![text(format!("{chain_label} from ")), from.into()]),
-        ));
+        .child(parts::row("Paid on", parts::words(chain_label)))
+        .child(parts::row("From", from));
     let action: View = match target {
         None if unchosen(draft) => View::Many(vec![
             submit_button(FEE).disabled(true).build().into(),
@@ -900,84 +1049,434 @@ fn pay_body(
             let read_fee = fee.clone();
             let fee_names = names.clone();
             let gate_draft = draft.clone();
+            let gate_names = names.clone();
+            let live_names = names.clone();
+            let live_fee = fee.clone();
+            let gate_fee = fee.clone();
             let chain_id = network.chain_id;
-            el("div")
-                .class("sh-publish__payaction")
-                .child(wallet_gate(chain_id, move || {
+            View::Many(vec![
+                // One polite region says each step once; the countdown
+                // itself is never read out.
+                el("p")
+                    .class("sh-vh")
+                    .attr("aria-live", "polite")
+                    .text_signal(
+                        "",
+                        futures_signals::map_ref! {
+                            let phase = phase_signal(draft),
+                            let fee = live_fee.signal_cloned() =>
+                            announce(phase, &live_names, fee.as_deref().unwrap_or(FEE))
+                        },
+                    )
+                    .into(),
+                wallet_gate(chain_id, move || {
                     let draft = gate_draft.clone();
+                    let names = gate_names.clone();
                     let state = futures_signals::map_ref! {
-                        let fee = fee.signal_cloned(),
+                        let fee = gate_fee.signal_cloned(),
                         let unsure = may_have_paid(&draft),
-                        let again = draft.look_again.signal() => (fee.clone(), unsure.clone(), *again)
+                        let again = draft.look_again.signal(),
+                        let phase = phase_signal(&draft) =>
+                        (fee.clone(), unsure.is_some(), *again, phase.clone())
                     };
                     el("div")
+                        .class("sh-publish__actionslot")
                         .child_signal(
                             None,
-                            state.map(move |(fee, unsure, again)| {
-                                Some(pay_action(&draft, chain, fee, unsure.is_some(), again))
+                            state.map(move |(fee, unsure, again, phase)| {
+                                // While a step is under way its state
+                                // stands where Submit was; Submit only
+                                // comes back once nothing is.
+                                Some(if phase.is_live() {
+                                    progress(&draft, &names, fee.as_deref().unwrap_or(FEE), &phase)
+                                } else {
+                                    pay_action(&draft, chain, fee, unsure, again)
+                                })
                             }),
                         )
                         .into()
-                }))
-                .child_from(&draft.checked, |checked| {
-                    checked.as_ref().map(|note| {
-                        el("p")
-                            .class("sh-publish__note")
-                            .attr("role", "status")
-                            .text(note.clone())
-                            .into()
-                    })
-                })
-                .child_signal(
-                    None,
-                    draft.sending.signal_cloned().map(|sending| match sending {
-                        Sending::Uploading { note } => Some(
+                }),
+                el("div")
+                    .child_from(&draft.checked, |checked| {
+                        checked.as_ref().map(|note| {
                             el("p")
                                 .class("sh-publish__note")
                                 .attr("role", "status")
-                                .text(note)
-                                .into(),
-                        ),
-                        Sending::Refused(why) => Some(
-                            el("div")
-                                .class("sh-author__error sh-author__error--alert")
-                                .attr("role", "alert")
-                                .child(
-                                    el("p")
-                                        .class("sh-author__steptitle")
-                                        .text("The upload wasn't taken"),
-                                )
-                                .child(el("p").text(why))
-                                .child(el("p").text("Nothing was charged."))
-                                .into(),
-                        ),
-                        _ => None,
-                    }),
-                )
-                .child_signal(
-                    None,
-                    draft.running.signal_cloned().map(move |running| {
-                        running.map(|running| parts::status(&running, names.clone()).into())
-                    }),
-                )
-                .hook(move |dom| {
-                    dom.future(async move {
-                        if let Some(amount) = crate::tx::author::run::fee(chain).await {
-                            read_fee.set(Some(fee_names.tokens(amount)));
-                        }
+                                .text(note.clone())
+                                .into()
+                        })
                     })
-                })
-                .into()
+                    .child_signal(
+                        None,
+                        draft.sending.signal_cloned().map(|sending| match sending {
+                            Sending::Stopped => Some(
+                                el("p")
+                                    .class("sh-publish__note")
+                                    .attr("role", "status")
+                                    .text("Stopped before anything was paid. Nothing was charged.")
+                                    .into(),
+                            ),
+                            Sending::Refused(why) => Some(
+                                el("div")
+                                    .class("sh-author__error sh-author__error--alert")
+                                    .attr("role", "alert")
+                                    .child(
+                                        el("p")
+                                            .class("sh-author__steptitle")
+                                            .text("The upload wasn't taken"),
+                                    )
+                                    .child(el("p").text(why))
+                                    .child(el("p").text("Nothing was charged."))
+                                    .into(),
+                            ),
+                            _ => None,
+                        }),
+                    )
+                    .child_signal(
+                        None,
+                        draft
+                            .running
+                            .signal_cloned()
+                            .map(|running| match running {
+                                Some(running) => running.step.signal_cloned().boxed_local(),
+                                None => futures_signals::signal::always(None).boxed_local(),
+                            })
+                            .flatten()
+                            .map(move |step| match step {
+                                Some(Step::Failed(error)) => Some(parts::failed(&error, &names)),
+                                _ => None,
+                            }),
+                    )
+                    .hook(move |dom| {
+                        dom.future(async move {
+                            if let Some(amount) = crate::tx::author::run::fee(chain).await {
+                                read_fee.set(Some(fee_names.tokens(amount)));
+                            }
+                        })
+                    })
+                    .into(),
+            ])
         }
     };
+    // On a phone the action is a bar held at the foot of the screen
+    // (Publish-Mobile), with the choice and the fee in one line above it.
+    let line = futures_signals::map_ref! {
+        let source = draft.source.signal(),
+        let fee = fee.signal_cloned() => (
+            match source {
+                Source::Public => "Public source · one or two transactions",
+                Source::Sealed => "Sealed source · one or two transactions",
+            },
+            fee.clone().unwrap_or_else(|| FEE.to_string()),
+        )
+    }
+    .broadcast();
     el("div")
         .class("sh-publish__pay")
         .child(list)
-        .child(action)
+        .child(
+            el("div")
+                .class("sh-publish__bar")
+                .child(
+                    el("p")
+                        .class("sh-publish__barline")
+                        .attr("aria-hidden", "true")
+                        .child(el("span").text_signal(
+                            "Public source · one or two transactions",
+                            line.signal_ref(|(words, _)| words.to_string()),
+                        ))
+                        .child(
+                            el("span")
+                                .class("sh-publish__barfee")
+                                .text_signal(FEE, line.signal_ref(|(_, fee)| fee.clone())),
+                        ),
+                )
+                .child(el("div").class("sh-publish__payaction").child(action)),
+        )
         .child(el("p").class("sh-muted sh-publish__small").text(
             "One transaction on the chain your vault will live on, or two if your wallet hasn't allowed the fee yet. Only a payment from the wallet that uploaded the project starts the job, so the payment is only ever sent from that wallet. You never compute a hash.",
         ))
         .into()
+}
+
+/// The words the live region says for a phase, once each.
+fn announce(phase: &Phase, names: &Names, fee: &str) -> String {
+    let wallet = &names.wallet;
+    match phase {
+        Phase::Idle => String::new(),
+        Phase::Uploading => "Uploading the project".to_string(),
+        Phase::Waking { .. } => {
+            "The build service is starting. Starting it takes a few minutes; the page keeps trying."
+                .to_string()
+        }
+        Phase::Checking => "Checking the chain".to_string(),
+        Phase::Approving(_) => format!("Step 2 of 4: approve {fee}. Confirm in {wallet}."),
+        Phase::ApprovalSent(_) => {
+            "Approval sent. Waiting for the network to confirm it.".to_string()
+        }
+        Phase::Paying(_) => format!("Step 3 of 4: pay {fee}. Confirm in {wallet}."),
+        Phase::PaymentSent(_) => "Payment sent. Waiting for the network to confirm it.".to_string(),
+        Phase::Queued => "Paid. Your job is queued; its page opens now.".to_string(),
+    }
+}
+
+/// Whole seconds until `next_try`, at `now` (both in milliseconds).
+fn seconds_until(next_try: u64, now: f64) -> u64 {
+    let left = next_try as f64 - now;
+    if left <= 0.0 {
+        0
+    } else {
+        (left / 1_000.0).ceil() as u64
+    }
+}
+
+/// "Next try in 27 seconds", counting down to `next_try`.
+fn countdown_words(next_try: u64, now: f64) -> String {
+    match seconds_until(next_try, now) {
+        0 => "Trying again now…".to_string(),
+        1 => "Next try in 1 second.".to_string(),
+        n => format!("Next try in {n} seconds."),
+    }
+}
+
+/// A submission under way, where Submit was: the four steps (upload,
+/// approve, pay, queued) with where it is, then this step's own state.
+/// "Cancel" only where nothing can have been paid by stopping: before the
+/// wallet is asked, or while it is asked and nothing is sent yet.
+fn progress(draft: &Rc<Draft>, names: &Rc<Names>, fee: &str, phase: &Phase) -> View {
+    let wallet = names.wallet.clone();
+    let titles = [
+        "Upload".to_string(),
+        format!("Approve {fee}"),
+        format!("Pay {fee}"),
+        "Queued".to_string(),
+    ];
+    let at = phase.at();
+    let steps = el("ol")
+        .class("sh-publish__flow")
+        .attr("aria-label", "Submitting")
+        .children(titles.into_iter().enumerate().map(|(index, title)| {
+            let done = index < at;
+            let now = index == at;
+            el("li")
+                .class("sh-publish__flowstep")
+                .class_if(now, "sh-publish__flowstep--now")
+                .class_if(done, "sh-publish__flowstep--done")
+                .attr_if(now, "aria-current", "step")
+                .child(
+                    el("span")
+                        .class("sh-publish__flowmark")
+                        .attr("aria-hidden", "true")
+                        .child(if done {
+                            icon(Icon::Check, 14).into()
+                        } else {
+                            text((index + 1).to_string())
+                        }),
+                )
+                .child(el("span").class("sh-publish__flowtitle").text(title))
+                .child(if done {
+                    el("span").class("sh-vh").text(", done").into()
+                } else {
+                    View::Empty
+                })
+        }));
+    let stop = {
+        let draft = draft.clone();
+        move || stop_upload(&draft)
+    };
+    let cancel_flow = {
+        let draft = draft.clone();
+        move || {
+            if let Some(running) = draft.running.lock_ref().as_ref() {
+                running.cancel.cancel();
+            }
+        }
+    };
+    let cancel = |action: Box<dyn Fn()>| -> View {
+        on_click(
+            Button::new(Kind::Secondary, "Cancel")
+                .size(Size::Small)
+                .build(),
+            action,
+        )
+        .into()
+    };
+    let confirm = el("p")
+        .class("sh-publish__confirm")
+        .child(crate::components::wallet::hex_ring())
+        .text(format!("Confirm in {wallet}…"));
+    let card = |title: String, lines: Vec<View>| -> View {
+        el("div")
+            .class("sh-publish__now")
+            .child(el("p").class("sh-author__steptitle").text(title))
+            .children(lines)
+            .into()
+    };
+    let waiting = |words: &str| -> View {
+        el("p")
+            .class("sh-publish__confirm")
+            .child(crate::components::wallet::hex_ring())
+            .text(words.to_string())
+            .into()
+    };
+    let unseen = format!("Don’t see it? Open {wallet}. Nothing is sent until you approve.");
+    let body = match phase {
+        Phase::Idle => View::Empty,
+        Phase::Uploading => card(
+            "Step 1 of 4 · Uploading the project".to_string(),
+            vec![
+                waiting("Offering it to the build service…"),
+                el("p")
+                    .class("sh-muted sh-publish__small")
+                    .text("Nothing is charged until you pay.")
+                    .into(),
+                cancel(Box::new(stop)),
+            ],
+        ),
+        Phase::Waking { next_try } => {
+            let next_try = *next_try;
+            let try_now = draft.try_now.clone();
+            card(
+                "Step 1 of 4 · Starting the build service".to_string(),
+                vec![
+                    el("p").text("It was asleep. Starting it takes a few minutes; the page keeps trying and uploads your project as soon as it’s up. Nothing is charged until you pay.").into(),
+                    el("p")
+                        .class("sh-publish__confirm sh-num")
+                        .child(crate::components::wallet::hex_ring())
+                        .child(el("span").text_signal(
+                            countdown_words(next_try, crate::clock::now().get()),
+                            crate::clock::signal().map(move |now| countdown_words(next_try, now)),
+                        ))
+                        .into(),
+                    el("div")
+                        .class("sh-publish__nowactions")
+                        .child(on_click(
+                            Button::new(Kind::Primary, "Try now").size(Size::Small).build(),
+                            move || try_now.set(true),
+                        ))
+                        .child(cancel(Box::new(stop)))
+                        .into(),
+                ],
+            )
+        }
+        Phase::Checking => card(
+            "Step 2 of 4 · Checking the chain".to_string(),
+            vec![waiting(&format!(
+                "Reading the fee and what your wallet has allowed on {}…",
+                names.chain
+            ))],
+        ),
+        Phase::Approving(prompt) | Phase::Paying(prompt) => {
+            let (title, line) = parts::prompt_words(prompt, names);
+            let n = if matches!(phase, Phase::Approving(_)) {
+                2
+            } else {
+                3
+            };
+            card(
+                format!("Step {n} of 4 · {title}"),
+                vec![
+                    el("p").text(line).into(),
+                    confirm.into(),
+                    el("p")
+                        .class("sh-muted sh-publish__small")
+                        .text(unseen)
+                        .into(),
+                    cancel(Box::new(cancel_flow)),
+                ],
+            )
+        }
+        Phase::ApprovalSent(hash) => card(
+            "Step 2 of 4 · Approval sent".to_string(),
+            vec![
+                waiting(&format!(
+                    "Waiting for the network to confirm it. Then {wallet} asks for the payment."
+                )),
+                parts::tx_link(names.chain_id, *hash, "Transaction"),
+            ],
+        ),
+        Phase::PaymentSent(hash) => card(
+            "Step 3 of 4 · Payment sent".to_string(),
+            vec![
+                waiting(
+                    "Waiting for the network to confirm it. Your job page opens once it’s confirmed.",
+                ),
+                parts::tx_link(names.chain_id, *hash, "Transaction"),
+            ],
+        ),
+        Phase::Queued => card(
+            "Paid · queued".to_string(),
+            vec![waiting("Opening your job page…")],
+        ),
+    };
+    el("div")
+        .class("sh-publish__progress")
+        .child(steps)
+        .child(body)
+        .into()
+}
+
+/// Each state of a submission under way, drawn by the page's own renderer
+/// from synthetic values, for the dev-only states page.
+pub fn submitting_states() -> Vec<(String, View)> {
+    let draft = Draft::new();
+    let names = Rc::new(Names {
+        wallet: "MetaMask".to_string(),
+        chain: "Base".to_string(),
+        chain_id: 84_532,
+        symbol: "USDC".to_string(),
+        decimals: 6,
+        native: "ETH".to_string(),
+    });
+    let fee = alloy_primitives::U256::from(1_000_000u64);
+    let now = crate::clock::now().get().max(0.0) as u64;
+    let hash = B256::repeat_byte(0x3c);
+    [
+        ("Nothing under way: Submit", Phase::Idle),
+        ("Uploading", Phase::Uploading),
+        (
+            "The build service is starting",
+            Phase::Waking {
+                next_try: now + 27_000,
+            },
+        ),
+        ("Checking the chain", Phase::Checking),
+        (
+            "Approve 1 USDC in the wallet",
+            Phase::Approving(Prompt::Approve {
+                amount: fee,
+                spender: crate::tx::author::Spender::Publishing,
+            }),
+        ),
+        ("Approval sent", Phase::ApprovalSent(hash)),
+        (
+            "Pay 1 USDC in the wallet",
+            Phase::Paying(Prompt::Pay { fee }),
+        ),
+        ("Payment sent", Phase::PaymentSent(hash)),
+        ("Paid and queued", Phase::Queued),
+    ]
+    .into_iter()
+    .map(|(label, phase)| {
+        let view = if phase.is_live() {
+            progress(&draft, &names, FEE, &phase)
+        } else {
+            pay_action(&draft, Chain::Base, Some(FEE.to_string()), false, false)
+        };
+        (label.to_string(), view)
+    })
+    .collect()
+}
+
+/// Stop the upload under way (or the wait for the build service), before
+/// anything is paid: an answer that comes after is let go.
+fn stop_upload(draft: &Draft) {
+    if !matches!(draft.sending.get_cloned(), Sending::Uploading { .. }) {
+        return;
+    }
+    draft.attempt.replace_with(|n| n.wrapping_add(1));
+    draft.busy.set(false);
+    draft.sending.set(Sending::Stopped);
 }
 
 /// A project holding several agents, none of them chosen yet.
@@ -1250,6 +1749,17 @@ mod browser {
                 return;
             };
             let summary = archive::summarise(&bytes);
+            // Not while a submission is under way: its file is the one
+            // being uploaded or paid for.
+            if draft.busy.get()
+                || draft
+                    .running
+                    .lock_ref()
+                    .as_ref()
+                    .is_some_and(Running::is_live)
+            {
+                return;
+            }
             draft.agent.set(None);
             draft.sending.set(Sending::Idle);
             draft.running.set(None);
@@ -1296,6 +1806,9 @@ mod browser {
         );
         let busy = draft.busy.clone();
         busy.set(true);
+        // This submission; "Cancel" moves on to the next.
+        let attempt = draft.attempt.get().wrapping_add(1);
+        draft.attempt.set(attempt);
         wasm_bindgen_futures::spawn_local(async move {
             // This project, already uploaded for this chain, is paid for as
             // it is, from the account its upload named: the flow refuses
@@ -1321,10 +1834,13 @@ mod browser {
                         sealed,
                         package,
                     };
-                    match offer_until_taken(&draft, chain, &offer).await {
+                    match offer_until_taken(&draft, chain, &offer, attempt).await {
                         Some((job, upload)) => (job, upload, account),
                         None => {
-                            busy.set(false);
+                            // A stopped submission's page has moved on.
+                            if draft.attempt.get() == attempt {
+                                busy.set(false);
+                            }
                             return;
                         }
                     }
@@ -1435,19 +1951,25 @@ mod browser {
     }
 
     /// Offer the project until the build service takes it, waiting while it
-    /// starts (as long as it asks, for up to ten minutes). The job id and
-    /// the reference to pay against, or `None` with the reason set.
+    /// starts (as long as it asks, or until "Try now", for up to ten
+    /// minutes). The job id and the reference to pay against, or `None`
+    /// with the reason set, or once the author stopped it (`attempt` is no
+    /// longer the page's), leaving the page as it is.
     async fn offer_until_taken(
         draft: &Rc<Draft>,
         chain: Chain,
         offer: &Upload,
+        attempt: u32,
     ) -> Option<(String, alloy_primitives::B256)> {
+        let current = || draft.attempt.get() == attempt;
         let started = js_sys::Date::now();
-        draft.sending.set(Sending::Uploading {
-            note: "Uploading the project…".to_string(),
-        });
+        draft.sending.set(Sending::Uploading { next_try: None });
         loop {
-            match run::upload(chain, offer).await {
+            let answer = run::upload(chain, offer).await;
+            if !current() {
+                return None;
+            }
+            match answer {
                 Ok(taken) => {
                     let Ok(upload) = taken.upload.parse() else {
                         draft.sending.set(Sending::Refused(
@@ -1465,12 +1987,20 @@ mod browser {
                         ));
                         return None;
                     }
+                    let next_try = js_sys::Date::now() + f64::from(retry_after) * 1_000.0;
+                    draft.try_now.set(false);
                     draft.sending.set(Sending::Uploading {
-                        note: format!(
-                            "The build service is starting. Trying again in {retry_after} seconds…"
-                        ),
+                        next_try: Some(next_try as u64),
                     });
-                    gloo_timers::future::TimeoutFuture::new(retry_after * 1_000).await;
+                    // Counted down on the page; "Try now" ends the wait.
+                    while js_sys::Date::now() < next_try && !draft.try_now.get() {
+                        gloo_timers::future::TimeoutFuture::new(250).await;
+                        if !current() {
+                            return None;
+                        }
+                    }
+                    draft.try_now.set(false);
+                    draft.sending.set(Sending::Uploading { next_try: None });
                 }
                 Err(UploadError::TooLarge) => {
                     draft
@@ -1487,7 +2017,9 @@ mod browser {
                 Err(UploadError::Failed(why)) => {
                     draft
                         .sending
-                        .set(Sending::Refused(format!("{why}. Try again shortly.")));
+                        .set(Sending::Refused(crate::format::sentence(&format!(
+                            "{why}. Try again shortly."
+                        ))));
                     return None;
                 }
             }
@@ -1639,6 +2171,210 @@ mod tests {
             })
             .may_have_paid()
         );
+    }
+
+    fn metamask() -> Rc<Names> {
+        Rc::new(Names {
+            wallet: "MetaMask".to_string(),
+            chain: "Base".to_string(),
+            chain_id: 84_532,
+            symbol: "USDC".to_string(),
+            decimals: 6,
+            native: "ETH".to_string(),
+        })
+    }
+
+    fn uploaded() -> Sending {
+        Sending::Uploaded {
+            job: "8803".to_string(),
+            upload: B256::repeat_byte(1),
+            account: Address::repeat_byte(2),
+            chain: Chain::Base,
+            offered: String::new(),
+        }
+    }
+
+    fn approve() -> Prompt {
+        Prompt::Approve {
+            amount: alloy_primitives::U256::from(1_000_000u64),
+            spender: crate::tx::author::Spender::Publishing,
+        }
+    }
+
+    #[test]
+    fn the_phase_follows_the_upload_and_the_steps_the_payment_flow_reports() {
+        let pay = Prompt::Pay {
+            fee: alloy_primitives::U256::from(1_000_000u64),
+        };
+        let hash = B256::repeat_byte(3);
+        assert_eq!(phase_of(&Sending::Idle, None), Phase::Idle);
+        assert_eq!(phase_of(&Sending::Stopped, None), Phase::Idle);
+        assert_eq!(
+            phase_of(&Sending::Uploading { next_try: None }, None),
+            Phase::Uploading
+        );
+        assert_eq!(
+            phase_of(&Sending::Uploading { next_try: Some(9) }, None),
+            Phase::Waking { next_try: 9 }
+        );
+        let after = |step: Option<Step>| phase_of(&uploaded(), Some(step.as_ref()));
+        assert_eq!(after(None), Phase::Checking);
+        assert_eq!(after(Some(Step::Checking)), Phase::Checking);
+        assert_eq!(
+            after(Some(Step::Signing(approve()))),
+            Phase::Approving(approve())
+        );
+        assert_eq!(
+            after(Some(Step::Sent {
+                prompt: approve(),
+                hash
+            })),
+            Phase::ApprovalSent(hash)
+        );
+        assert_eq!(
+            after(Some(Step::Signing(pay.clone()))),
+            Phase::Paying(pay.clone())
+        );
+        assert_eq!(
+            after(Some(Step::Sent { prompt: pay, hash })),
+            Phase::PaymentSent(hash)
+        );
+        assert_eq!(
+            after(Some(Step::Done(crate::tx::author::Outcome::AlreadyPaid {
+                strategy_id: alloy_primitives::U256::from(2u8)
+            }))),
+            Phase::Queued
+        );
+        // A failed flow offers Submit again (with its error said beside it),
+        // and an upload with no flow started is nothing under way.
+        assert_eq!(
+            after(Some(Step::Failed(AuthorError::Tx(TxError::Rejected)))),
+            Phase::Idle
+        );
+        assert_eq!(phase_of(&uploaded(), None), Phase::Idle);
+    }
+
+    #[test]
+    fn while_a_submission_is_under_way_submit_is_never_shown_in_its_place() {
+        let draft = Draft::new();
+        let names = metamask();
+        let hash = B256::repeat_byte(3);
+        for phase in [
+            Phase::Uploading,
+            Phase::Waking { next_try: 30_000 },
+            Phase::Checking,
+            Phase::Approving(approve()),
+            Phase::ApprovalSent(hash),
+            Phase::Paying(Prompt::Pay {
+                fee: alloy_primitives::U256::from(1_000_000u64),
+            }),
+            Phase::PaymentSent(hash),
+            Phase::Queued,
+        ] {
+            assert!(phase.is_live(), "{phase:?}");
+            let html = progress(&draft, &names, FEE, &phase).html();
+            assert!(!html.contains("Submit for"), "{phase:?}: {html}");
+            // The four steps are always drawn, with where it is.
+            for step in ["Upload", "Approve 1 USDC", "Pay 1 USDC", "Queued"] {
+                assert!(html.contains(step), "{phase:?}: {html}");
+            }
+        }
+        assert!(!Phase::Idle.is_live());
+    }
+
+    #[test]
+    fn each_wallet_prompt_says_its_step_to_confirm_in_the_wallet_and_offers_cancel() {
+        let draft = Draft::new();
+        let names = metamask();
+        let html = progress(&draft, &names, FEE, &Phase::Approving(approve())).html();
+        assert!(
+            html.contains("Step 2 of 4 · Approve 1 USDC in MetaMask"),
+            "{html}"
+        );
+        assert!(html.contains("Confirm in MetaMask…"), "{html}");
+        assert!(html.contains("sh-hexring"), "a spinner: {html}");
+        assert!(html.contains("Cancel"), "{html}");
+        assert!(html.contains(r#"aria-current="step""#), "{html}");
+        let pay = Phase::Paying(Prompt::Pay {
+            fee: alloy_primitives::U256::from(1_000_000u64),
+        });
+        let html = progress(&draft, &names, FEE, &pay).html();
+        assert!(
+            html.contains("Step 3 of 4 · Pay 1 USDC in MetaMask"),
+            "{html}"
+        );
+        assert!(html.contains("Confirm in MetaMask…"), "{html}");
+        assert!(html.contains("Cancel"), "{html}");
+        // Once something is sent, or while the chain is read, stopping
+        // isn't offered: it couldn't take back what was sent.
+        for phase in [
+            Phase::Checking,
+            Phase::ApprovalSent(B256::repeat_byte(3)),
+            Phase::PaymentSent(B256::repeat_byte(3)),
+            Phase::Queued,
+        ] {
+            let html = progress(&draft, &names, FEE, &phase).html();
+            assert!(!html.contains("Cancel"), "{phase:?}: {html}");
+        }
+    }
+
+    #[test]
+    fn a_starting_build_service_counts_down_says_it_takes_minutes_and_offers_try_now() {
+        let draft = Draft::new();
+        let html = progress(
+            &draft,
+            &metamask(),
+            FEE,
+            &Phase::Waking { next_try: 30_000 },
+        )
+        .html();
+        assert!(html.contains("Starting it takes a few minutes"), "{html}");
+        assert!(html.contains("Try now"), "{html}");
+        assert!(html.contains("Cancel"), "{html}");
+        assert_eq!(seconds_until(30_000, 3_500.0), 27);
+        assert_eq!(seconds_until(30_000, 29_001.0), 1);
+        assert_eq!(seconds_until(30_000, 31_000.0), 0);
+        assert_eq!(countdown_words(30_000, 3_500.0), "Next try in 27 seconds.");
+        assert_eq!(countdown_words(30_000, 29_500.0), "Next try in 1 second.");
+        assert_eq!(countdown_words(30_000, 30_000.0), "Trying again now…");
+    }
+
+    #[test]
+    fn cancelling_an_upload_stops_it_before_payment_and_lets_its_late_answer_go() {
+        let draft = Draft::new();
+        draft.busy.set(true);
+        draft.attempt.set(4);
+        draft.sending.set(Sending::Uploading { next_try: Some(1) });
+        stop_upload(&draft);
+        assert_eq!(draft.sending.get_cloned(), Sending::Stopped);
+        assert!(!draft.busy.get());
+        // The upload under way was attempt 4: its answer is no longer the
+        // page's, so it sets nothing.
+        assert_ne!(draft.attempt.get(), 4);
+        assert_eq!(phase_of(&draft.sending.get_cloned(), None), Phase::Idle);
+        // Nothing to stop once the upload was taken.
+        draft.sending.set(uploaded());
+        let attempt = draft.attempt.get();
+        stop_upload(&draft);
+        assert_eq!(draft.attempt.get(), attempt);
+        assert_eq!(draft.sending.get_cloned(), uploaded());
+    }
+
+    #[test]
+    fn on_a_phone_the_page_says_step_n_of_4_and_the_fee_rows_name_the_chain_and_the_payer_apart() {
+        let draft = Draft::new();
+        let html = View::from(stepper(&draft)).html();
+        assert!(html.contains("Step 2 of 4 · Upload"), "{html}");
+        assert!(html.contains("Next: Seal"), "{html}");
+        assert!(html.contains(r#"role="progressbar""#), "{html}");
+        draft.picked.set(Some(project(&["base"])));
+        let html = pay_body(&draft, None).html();
+        assert!(html.contains("<dt>Paid on</dt>"), "{html}");
+        assert!(html.contains("<dt>From</dt>"), "{html}");
+        assert!(!html.contains("live on from"), "one row each: {html}");
+        // The action sits in the bar a phone holds at the foot of the screen.
+        assert!(html.contains("sh-publish__bar"), "{html}");
+        assert_eq!(compact_words(2, "Seal"), "Step 3 of 4 · Seal");
     }
 
     #[test]

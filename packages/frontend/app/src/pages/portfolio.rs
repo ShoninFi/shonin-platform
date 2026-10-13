@@ -750,7 +750,7 @@ fn positions_table(rows: &[&Row], total: u128, paid: Option<u128>) -> View {
         .into()
 }
 
-fn claim_badge(state: ClaimState) -> El {
+pub(crate) fn claim_badge(state: ClaimState) -> El {
     match state {
         ClaimState::Pending => badge(Tone::Neutral, Some(Icon::Clock), "Pending"),
         ClaimState::Waiting => badge(Tone::Caution, Some(Icon::Clock), "Waiting"),
@@ -762,7 +762,7 @@ fn claim_badge(state: ClaimState) -> El {
     }
 }
 
-fn shared_state(state: shared::ClaimState) -> ClaimState {
+pub(crate) fn shared_state(state: shared::ClaimState) -> ClaimState {
     match state {
         shared::ClaimState::Pending => ClaimState::Pending,
         shared::ClaimState::Waiting => ClaimState::Waiting,

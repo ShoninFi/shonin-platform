@@ -75,6 +75,10 @@ struct Panel {
     network: Mutable<Option<Rc<Network>>>,
     figures: Mutable<Option<VaultFigures>>,
     holdings: Mutable<Option<Holdings>>,
+    /// How many flows had landed in this session (its `changed`) when the
+    /// holdings were last read: a Done card shows a position only once it
+    /// was read after its flow landed.
+    holdings_at: Mutable<u64>,
     /// The vault's restricted list as it writes it (`SANCTIONED,US`), read
     /// as the deposit statement reads it: what the review shows.
     restricted: Mutable<Option<String>>,
@@ -99,6 +103,7 @@ impl Panel {
             network: Mutable::new(None),
             figures: Mutable::new(None),
             holdings: Mutable::new(None),
+            holdings_at: Mutable::new(0),
             restricted: Mutable::new(None),
             tab: Mutable::new(tab),
             deposit_text: Mutable::new(String::new()),
@@ -321,17 +326,21 @@ async fn follow(panel: Rc<Panel>) {
                 Err(_) if panel.figures.lock_ref().is_none() => panel.missing.set_neq(true),
                 Err(_) => {}
             }
+            // What had landed before this read: the read shows it.
+            let at = session.changed.get();
             match session.account() {
                 Some(account) => {
                     if let Ok(held) =
                         read::holdings(&reader, vault.address, network.asset, account).await
                     {
                         panel.holdings.set(Some(held));
+                        panel.holdings_at.set(at);
                     }
                 }
                 None => panel.holdings.set(None),
             }
-            wait_or_retry(&panel, 10).await;
+            // A flow that landed while reading is read again at once.
+            wait_or_retry_since(&panel, 10, at).await;
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -342,8 +351,15 @@ async fn follow(panel: Rc<Panel>) {
 /// reader presses "Try again".
 #[cfg(target_arch = "wasm32")]
 async fn wait_or_retry(panel: &Panel, seconds: u32) {
+    wait_or_retry_since(panel, seconds, crate::wallet::get().changed.get()).await;
+}
+
+/// The same, counting flows landed since `changed` (the session's count
+/// when the last read began).
+#[cfg(target_arch = "wasm32")]
+async fn wait_or_retry_since(panel: &Panel, seconds: u32, changed: u64) {
     let session = crate::wallet::get();
-    let seen = (session.changed.get(), session.account(), panel.retry.get());
+    let seen = (changed, session.account(), panel.retry.get());
     for _ in 0..seconds {
         gloo_timers::future::TimeoutFuture::new(1_000).await;
         if (session.changed.get(), session.account(), panel.retry.get()) != seen {
@@ -988,7 +1004,7 @@ fn deposit_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
         None => "—".to_string(),
     });
     let shares_figure = quote.signal_cloned().map(|quote| match quote {
-        Some((quote, _)) => format!("{} shares", money::shares(quote.shares, Rounding::Down)),
+        Some((quote, _)) => format!("{} shares", money::shares(quote.shares, Rounding::Nearest)),
         None => "—".to_string(),
     });
     let fee_label = fee_label(panel, "Deposit fee");
@@ -1147,7 +1163,7 @@ pub(crate) fn held_sentence(
     let value = figures
         .share_price()
         .and_then(|price| crate::money::quote::value_of(held.shares, price))
-        .map(|value| format!(" ≈ {}", money::dollars(value, decimals, Rounding::Down)))
+        .map(|value| format!(" ≈ {}", money::dollars(value, decimals, Rounding::Nearest)))
         .unwrap_or_default();
     format!(
         "You hold {} shares{value}",
@@ -1240,7 +1256,7 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
     let gross = quote.signal_cloned().map(move |quote| match quote {
         Some((quote, ..)) => format!(
             "≈ {}",
-            money::dollars(quote.gross, decimals, Rounding::Down)
+            money::dollars(quote.gross, decimals, Rounding::Nearest)
         ),
         None => "—".to_string(),
     });
@@ -1251,7 +1267,7 @@ fn withdraw_form(panel: &Rc<Panel>, connected: bool, tail: View) -> View {
     let payout = quote.signal_cloned().map(move |quote| match quote {
         Some((quote, ..)) => format!(
             "≈ {}",
-            money::dollars(quote.payout, decimals, Rounding::Down)
+            money::dollars(quote.payout, decimals, Rounding::Nearest)
         ),
         None => "—".to_string(),
     });
@@ -1513,7 +1529,7 @@ fn review(panel: &Rc<Panel>) -> View {
                 .child(static_row(
                     "You get",
                     quote
-                        .map(|q| format!("≈ {} shares", money::shares(q.shares, Rounding::Down)))
+                        .map(|q| format!("≈ {} shares", money::shares(q.shares, Rounding::Nearest)))
                         .unwrap_or_default(),
                     price.map(|price| format!("at about {} a share", money::price(price, decimals))),
                 ))
@@ -1827,8 +1843,25 @@ pub(crate) fn utc(seconds: u64) -> String {
         .unwrap_or_default()
 }
 
-/// What the wallet is asked, in the panel's words.
+/// What the wallet is asked, in the panel's words, each line a sentence
+/// (a line may start with the wallet's name: "The development wallet
+/// shows…").
 fn prompt_words(
+    prompt: &Prompt,
+    wallet: &str,
+    vault: &str,
+    symbol: &str,
+    decimals: u8,
+) -> (String, String) {
+    let (title, line) = prompt_lines(prompt, wallet, vault, symbol, decimals);
+    (
+        crate::format::sentence(&title),
+        crate::format::sentence(&line),
+    )
+}
+
+/// What the wallet is asked, in the panel's words.
+fn prompt_lines(
     prompt: &Prompt,
     wallet: &str,
     vault: &str,
@@ -2312,6 +2345,117 @@ fn request_amount_row(action: &Action, decimals: u8, symbol: &str) -> El {
         .child(el("dd").class("sh-num").text(figure))
 }
 
+/// What a withdrawal paid for, as one phrase: "19.9 shares, valued at the
+/// exit-side marks of 05:47:30 UTC", or at a closed vault's cash.
+pub(crate) fn valued_words(shares: U256, at: Option<u64>) -> String {
+    let shares = money::shares(shares, Rounding::Down);
+    match at {
+        Some(at) => format!(
+            "{shares} shares, valued at the exit-side marks of {}.",
+            utc(at)
+        ),
+        None => format!("{shares} shares, valued at the closed vault’s cash."),
+    }
+}
+
+/// The position a Done card shows: from holdings read once its flow had
+/// landed (`read_at`, the session's count of landed flows when they were
+/// read, against `landed`, its count once this flow landed). Before that,
+/// "Updating…": never the figure from before the flow.
+pub(crate) fn position_words(held: Option<&Holdings>, read_at: u64, landed: u64) -> String {
+    match held {
+        Some(held) if read_at >= landed => {
+            format!("{} shares", money::shares(held.shares, Rounding::Down))
+        }
+        _ => "Updating…".to_string(),
+    }
+}
+
+/// A Done card's position row, following the holdings as they are read.
+pub(crate) fn position_row(
+    label: &'static str,
+    holdings: &Mutable<Option<Holdings>>,
+    holdings_at: &Mutable<u64>,
+    landed: u64,
+) -> View {
+    let now = position_words(holdings.lock_ref().as_ref(), holdings_at.get(), landed);
+    let words = map_ref! {
+        let held = holdings.signal_cloned(),
+        let at = holdings_at.signal() => position_words(held.as_ref(), *at, landed)
+    }
+    .broadcast();
+    el("dl")
+        .class("sh-exit__rows")
+        .child(
+            el("div")
+                .class("sh-exit__row")
+                .child(el("dt").text(label))
+                .child(
+                    el("dd")
+                        .class("sh-num")
+                        .class_signal(
+                            "sh-exit__updating",
+                            now == "Updating…",
+                            words.signal_ref(|words| words == "Updating…"),
+                        )
+                        .text_signal(now, words.signal_cloned()),
+                ),
+        )
+        .into()
+}
+
+/// A withdrawal's and a deposit's Done card, before and after the position
+/// is read again, drawn by the panel's own renderer from synthetic values,
+/// for the dev-only states page.
+pub fn done_states() -> Vec<(String, View)> {
+    // As if a flow had just landed (nothing else here reads holdings).
+    let session = crate::wallet::get();
+    session.changed.replace_with(|n| *n + 1);
+    let landed = session.changed.get();
+    let withdraw = Outcome::Paid {
+        shares: U256::from(19_950_000_000_000_000_000u128),
+        assets: U256::from(19_998_497u64),
+        at: Some(1_791_870_450),
+        hash: alloy_primitives::B256::repeat_byte(0x11),
+    };
+    let deposit = Outcome::Deposited {
+        assets: U256::from(50_000_000u64),
+        shares: U256::from(49_950_000_000_000_000_000u128),
+        at: 1_791_870_450,
+        hash: alloy_primitives::B256::repeat_byte(0x12),
+    };
+    let held = Holdings {
+        balance: U256::ZERO,
+        shares: U256::from(49_950_000_000_000_000_000u128),
+        units: U256::ZERO,
+        units_claimable: U256::ZERO,
+        held: U256::ZERO,
+    };
+    [
+        (
+            "Deposit done, position not read since",
+            deposit.clone(),
+            false,
+        ),
+        ("Deposit done, position read", deposit, true),
+        ("Withdrawal done", withdraw, true),
+    ]
+    .into_iter()
+    .map(|(label, outcome, read)| {
+        let panel = Rc::new(Panel::new("base-0", Tab::Deposit, false));
+        panel.holdings.set(Some(held));
+        panel
+            .holdings_at
+            .set(if read { landed } else { landed - 1 });
+        let running = Running::new(Action::Withdraw(U256::ZERO));
+        (
+            label.to_string(),
+            done_view(&panel, &running, &outcome, 84_532, 6),
+        )
+    })
+    .collect()
+}
+
 fn done_view(
     panel: &Rc<Panel>,
     running: &Running,
@@ -2359,23 +2503,10 @@ fn done_view(
             .into()
     };
     // Read again from the chain once the flow lands, so it follows the
-    // holdings rather than a figure taken before.
+    // holdings rather than a figure taken before: until then, "Updating…".
+    let landed = crate::wallet::get().changed.get();
     let position = |label: &'static str| -> View {
-        el("dl")
-            .class("sh-exit__rows")
-            .child(
-                el("div")
-                    .class("sh-exit__row")
-                    .child(el("dt").text(label))
-                    .child(el("dd").class("sh-num").text_from(&panel.holdings, |held| {
-                        held.as_ref()
-                            .map(|held| {
-                                format!("{} shares", money::shares(held.shares, Rounding::Down))
-                            })
-                            .unwrap_or_default()
-                    })),
-            )
-            .into()
+        position_row(label, &panel.holdings, &panel.holdings_at, landed)
     };
     match outcome {
         Outcome::Deposited {
@@ -2442,29 +2573,25 @@ fn done_view(
             assets,
             at,
             hash,
-        } => {
-            let rows = vec![(
-                format!(
-                    "{} shares valued at",
-                    money::shares(*shares, Rounding::Down)
-                ),
-                at.map(|at| format!("exit-side marks, {}", utc(at)))
-                    .unwrap_or_else(|| "the closed vault’s cash".to_string()),
-            )];
-            card(
-                format!(
-                    "{} is in your wallet",
-                    money::dollars(*assets, decimals, Rounding::Down)
-                ),
-                rows,
-                *hash,
-                View::Many(vec![
-                    position("You still hold"),
-                    portfolio.into(),
-                    again.into(),
-                ]),
+        } => el("div")
+            .class("sh-exit__done")
+            .attr("role", "status")
+            .child(seal())
+            .child(el("p").class("sh-exit__title").text(format!(
+                "{} is in your wallet",
+                money::dollars(*assets, decimals, Rounding::Down)
+            )))
+            // One phrase, never split across a label and a figure.
+            .child(
+                el("p")
+                    .class("sh-exit__valued")
+                    .text(valued_words(*shares, *at)),
             )
-        }
+            .child(tx_link(chain_id, *hash, "Transaction"))
+            .child(position("You still hold"))
+            .child(portfolio)
+            .child(again)
+            .into(),
         Outcome::Booked {
             claim,
             shares,
@@ -2862,6 +2989,125 @@ mod tests {
             tab_click(Shown::Ended, Tab::Deposit, Tab::Deposit),
             TabClick::Stay,
             "the finished card's own tab keeps it"
+        );
+    }
+    #[test]
+    fn the_done_card_never_shows_a_position_read_before_its_flow_landed() {
+        let held = Holdings {
+            balance: U256::ZERO,
+            shares: U256::from(49_950_000_000_000_000_000u128),
+            units: U256::ZERO,
+            units_claimable: U256::ZERO,
+            held: U256::ZERO,
+        };
+        // Read before the flow landed (the figure from before it): never
+        // shown, "Updating…" instead.
+        assert_eq!(position_words(Some(&held), 3, 4), "Updating…");
+        assert_eq!(position_words(None, 4, 4), "Updating…");
+        // Read once it landed: the position.
+        assert_eq!(position_words(Some(&held), 4, 4), "49.9 shares");
+        assert_eq!(position_words(Some(&held), 5, 4), "49.9 shares");
+        // As the card draws it: the old holdings of 0.0 shares, read before.
+        let session = crate::wallet::get();
+        session.changed.replace_with(|n| *n + 1);
+        let landed = session.changed.get();
+        let panel = Rc::new(Panel::new("base-9", Tab::Deposit, false));
+        panel.holdings.set(Some(Holdings {
+            shares: U256::ZERO,
+            ..held
+        }));
+        panel.holdings_at.set(landed - 1);
+        let running = Running::new(Action::Deposit {
+            amount: U256::from(50_000_000u64),
+            shown: String::new(),
+        });
+        let outcome = Outcome::Deposited {
+            assets: U256::from(50_000_000u64),
+            shares: held.shares,
+            at: 1_700_000_000,
+            hash: alloy_primitives::B256::repeat_byte(0x11),
+        };
+        let html = done_view(&panel, &running, &outcome, 8453, 6).html();
+        assert!(html.contains("Updating…"), "{html}");
+        assert!(!html.contains("0.0 shares"), "{html}");
+        // Read again after it landed.
+        panel.holdings.set(Some(held));
+        panel.holdings_at.set(landed);
+        let html = done_view(&panel, &running, &outcome, 8453, 6).html();
+        assert!(html.contains("Your position"), "{html}");
+        assert!(!html.contains("Updating…"), "{html}");
+    }
+
+    #[test]
+    fn a_withdrawals_done_card_says_what_was_paid_for_in_one_phrase() {
+        let shares = U256::from(19_950_000_000_000_000_000u128);
+        let at = 5 * 3600 + 47 * 60 + 30;
+        assert_eq!(
+            valued_words(shares, Some(at)),
+            "19.9 shares, valued at the exit-side marks of 05:47:30 UTC."
+        );
+        assert_eq!(
+            valued_words(shares, None),
+            "19.9 shares, valued at the closed vault’s cash."
+        );
+    }
+
+    #[test]
+    fn a_wallet_prompt_line_starts_with_a_capital_even_when_it_names_the_wallet_first() {
+        for prompt in [
+            Prompt::Statement,
+            Prompt::Approve {
+                amount: U256::from(50_000_000u64),
+            },
+            Prompt::Deposit {
+                amount: U256::from(50_000_000u64),
+            },
+            Prompt::Withdraw {
+                shares: U256::from(10u64),
+            },
+        ] {
+            let (title, line) = prompt_words(
+                &prompt,
+                "the development wallet",
+                "Funding basis",
+                "USDC",
+                6,
+            );
+            for words in [&title, &line] {
+                assert!(
+                    words.chars().next().is_some_and(char::is_uppercase),
+                    "{words}"
+                );
+            }
+        }
+        let (_, line) = prompt_words(
+            &Prompt::Deposit {
+                amount: U256::from(50_000_000u64),
+            },
+            "the development wallet",
+            "Funding basis",
+            "USDC",
+            6,
+        );
+        assert!(
+            line.starts_with(
+                "The development wallet shows 50.00 USDC going to the Funding basis vault."
+            ),
+            "{line}"
+        );
+        // And an error's words.
+        let words = TxError::BadSignature.words(&Context {
+            wallet: "the development wallet",
+            chain: "Base",
+            wallet_chain: None,
+            symbol: "USDC",
+            decimals: 6,
+            native: "ETH",
+        });
+        assert!(
+            words.text.starts_with("The development wallet"),
+            "{}",
+            words.text
         );
     }
 }

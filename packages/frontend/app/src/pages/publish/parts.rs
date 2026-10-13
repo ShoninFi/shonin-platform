@@ -67,14 +67,20 @@ impl Names {
         let on = crate::wallet::get()
             .wallet_chain()
             .map(networks::chain_name);
-        error.words(&Context {
+        let words = error.words(&Context {
             wallet: &self.wallet,
             chain: &self.chain,
             wallet_chain: on.as_deref(),
             symbol: &self.symbol,
             decimals: self.decimals,
             native: &self.native,
-        })
+        });
+        // A line may start with the wallet's name: each reads as a sentence.
+        crate::tx::error::Words {
+            title: crate::format::sentence(&words.title),
+            text: crate::format::sentence(&words.text),
+            alert: words.alert,
+        }
     }
 }
 
@@ -405,22 +411,26 @@ fn step_view(step: &Step, names: &Names, cancel: &crate::tx::flow::Cancel) -> Vi
                 )
                 .into()
         }
-        Step::Failed(error) => {
-            let words = names.words(error);
-            let hash = error.hash();
-            el("div")
-                .class("sh-author__error")
-                .class_if(words.alert, "sh-author__error--alert")
-                .attr("role", if words.alert { "alert" } else { "status" })
-                .child(el("p").class("sh-author__steptitle").text(words.title))
-                .child(el("p").text(words.text))
-                .child(match hash {
-                    Some(hash) => tx_link(names.chain_id, hash, "Transaction"),
-                    None => View::Empty,
-                })
-                .into()
-        }
+        Step::Failed(error) => failed(error, names),
     }
+}
+
+/// How a flow failed, in words, in place: an alert where it needs acting
+/// on, else a status; the transaction, if one was sent.
+pub fn failed(error: &AuthorError, names: &Names) -> View {
+    let words = names.words(error);
+    let hash = error.hash();
+    el("div")
+        .class("sh-author__error")
+        .class_if(words.alert, "sh-author__error--alert")
+        .attr("role", if words.alert { "alert" } else { "status" })
+        .child(el("p").class("sh-author__steptitle").text(words.title))
+        .child(el("p").text(words.text))
+        .child(match hash {
+            Some(hash) => tx_link(names.chain_id, hash, "Transaction"),
+            None => View::Empty,
+        })
+        .into()
 }
 
 /// A labelled text field: `inputmode` decimal, its hint or error under it
