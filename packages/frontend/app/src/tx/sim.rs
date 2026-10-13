@@ -838,8 +838,20 @@ fn amount(dollars: u64) -> U256 {
     U256::from(dollars * USD)
 }
 
+/// A deposit whose review showed the vault's list as it stands.
 fn deposit(world: &World, dollars: u64) -> (Result<Outcome, TxError>, Vec<Step>) {
-    world.run(|ctx| Box::pin(flow::deposit(ctx, amount(dollars))))
+    let shown = world.sim.borrow().restricted_text.clone();
+    deposit_shown(world, dollars, &shown)
+}
+
+/// A deposit whose review showed the list `shown`.
+fn deposit_shown(
+    world: &World,
+    dollars: u64,
+    shown: &str,
+) -> (Result<Outcome, TxError>, Vec<Step>) {
+    let shown = shown.to_string();
+    world.run(move |ctx| Box::pin(async move { flow::deposit(ctx, amount(dollars), &shown).await }))
 }
 
 fn prompts(steps: &[Step]) -> Vec<Prompt> {
@@ -1016,8 +1028,13 @@ fn the_deposit_review_shows_the_list_and_the_words_the_wallet_then_signs() {
         let message = &statement.typed_data()["message"];
         let restricted = message["restricted"].as_str().unwrap();
         assert_eq!(restricted, list);
+        let line = if restricted.is_empty() {
+            "Restricted: (none)".to_string()
+        } else {
+            format!("Restricted: {restricted}")
+        };
         assert!(
-            restricted.is_empty() || review.contains(&format!("Restricted: {restricted}")),
+            review.contains(&line),
             "the review names the list as signed: {review}"
         );
         assert!(
@@ -1035,6 +1052,88 @@ fn the_deposit_review_shows_the_list_and_the_words_the_wallet_then_signs() {
             review.contains(&crate::view::escape(plain)),
             "{list}: {review}"
         );
+    }
+}
+
+#[test]
+fn a_list_changed_between_review_and_signing_asks_for_nothing_and_says_so() {
+    for (shown, now, plain) in [
+        (
+            "SANCTIONED",
+            "SANCTIONED,US",
+            "It's now not open to: people in the US, sanctioned persons (“Restricted: SANCTIONED,US”).",
+        ),
+        (
+            "SANCTIONED,US",
+            "",
+            "It's now open to everyone (“Restricted: (none)”).",
+        ),
+    ] {
+        let world = World::new();
+        // The review showed `shown`; the vault's list is `now` by the time
+        // the statement would be signed.
+        world.with(|chain| chain.restricted_text = now.to_string());
+        let (result, steps) = deposit_shown(&world, 1_000, shown);
+        let Err(error) = result else {
+            panic!("{shown} -> {now}: {result:?}");
+        };
+        assert_eq!(
+            error,
+            TxError::ListChanged {
+                now: now.to_string()
+            }
+        );
+        // The wallet was asked nothing: no signature, no send.
+        assert!(prompts(&steps).is_empty(), "{steps:?}");
+        let sim = world.sim.borrow();
+        assert!(sim.signed.is_empty(), "nothing is signed: {:?}", sim.signed);
+        assert!(sim.sent.is_empty() && sim.calls.is_empty());
+        // Said: the list changed, what it is now, review again, nothing
+        // signed or sent; and the page may offer to try again.
+        let words = said(&error);
+        assert!(
+            words.contains(
+                "The vault's list of who it isn't open to changed since you reviewed your deposit."
+            ),
+            "{words}"
+        );
+        assert!(words.contains(plain), "{words}");
+        assert!(
+            words.contains("Review your deposit again with the new list."),
+            "{words}"
+        );
+        assert!(words.contains("Nothing was signed or sent."), "{words}");
+        assert!(!error.after_send() && !error.may_have_moved());
+    }
+}
+
+#[test]
+fn an_unchanged_list_signs_exactly_as_before() {
+    for list in ["SANCTIONED,US", ""] {
+        let world = World::new();
+        world.with(|chain| chain.restricted_text = list.to_string());
+        let (result, steps) = deposit_shown(&world, 1_000, list);
+        assert!(result.is_ok(), "{list}: {result:?}");
+        assert_eq!(prompts(&steps)[0], Prompt::Statement);
+        let sim = world.sim.borrow();
+        // Exactly the statement signed before: the vault's list as read at
+        // signing, for this account and vault.
+        assert_eq!(
+            sim.signed,
+            vec![StatementRequest {
+                chain_id: CHAIN,
+                vault: vault(),
+                depositor: world.account(),
+                restricted: list.to_string(),
+            }]
+        );
+        let request = IVault::requestDepositCall::abi_decode(&sim.sent[1].data).unwrap();
+        let digest = chain::statement::digest(CHAIN, vault(), world.account(), list);
+        assert!(flow::recovers_to(
+            &request.statement,
+            digest,
+            world.account()
+        ));
     }
 }
 
@@ -1476,7 +1575,7 @@ fn a_cancelled_flow_sends_nothing() {
         pace: Pace::FAST,
         on_step: &on_step,
     };
-    let result = block_on(flow::deposit(&ctx, amount(1_000)));
+    let result = block_on(flow::deposit(&ctx, amount(1_000), "SANCTIONED,US"));
     assert_eq!(result, Err(TxError::Cancelled));
     assert!(world.sim.borrow().sent.is_empty());
 }

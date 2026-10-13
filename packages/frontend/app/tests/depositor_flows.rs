@@ -844,7 +844,8 @@ fn a_deposit_whose_second_step_is_declined_is_never_said_to_have_sent_nothing() 
     // the person declines that prompt (or presses Cancel in the panel).
     let world = World::new(Wallet::DeclinesSettle);
     let before = world.sim.borrow().usd[&world.account()];
-    let (result, steps) = world.run(|ctx| Box::pin(flow::deposit(ctx, U256::from(100 * USD))));
+    let (result, steps) =
+        world.run(|ctx| Box::pin(flow::deposit(ctx, U256::from(100 * USD), "SANCTIONED,US")));
 
     // The deposit request is on the chain and its dollars are in escrow.
     let sim = world.sim.borrow();
@@ -971,7 +972,8 @@ fn a_statement_signed_with_a_parity_byte_of_zero_or_one_is_sent_as_the_vault_tak
         chain.statement_of.clear();
         chain.wallet_account = account;
     });
-    let (result, _) = world.run(|ctx| Box::pin(flow::deposit(ctx, U256::from(100 * USD))));
+    let (result, _) =
+        world.run(|ctx| Box::pin(flow::deposit(ctx, U256::from(100 * USD), "SANCTIONED,US")));
     let sent = world.sim.borrow().sent.clone();
     let deposit = sent
         .iter()
@@ -988,7 +990,13 @@ fn a_statement_signed_with_a_parity_byte_of_zero_or_one_is_sent_as_the_vault_tak
 }
 
 fn deposit(world: &World, dollars: u64) -> (Result<Outcome, TxError>, Vec<Step>) {
-    world.run(|ctx| Box::pin(flow::deposit(ctx, U256::from(dollars * USD))))
+    world.run(|ctx| {
+        Box::pin(flow::deposit(
+            ctx,
+            U256::from(dollars * USD),
+            "SANCTIONED,US",
+        ))
+    })
 }
 
 fn withdraw(world: &World, shares: u128) -> (Result<Outcome, TxError>, Vec<Step>) {

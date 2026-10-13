@@ -849,7 +849,11 @@ mod depositor {
                 pace: Pace::FAST,
                 on_step: &on_step,
             };
-            let result = block_on(flow::deposit(&ctx, U256::from(dollars * USD)));
+            let result = block_on(flow::deposit(
+                &ctx,
+                U256::from(dollars * USD),
+                "SANCTIONED,US",
+            ));
             (result, steps.into_inner())
         }
     }

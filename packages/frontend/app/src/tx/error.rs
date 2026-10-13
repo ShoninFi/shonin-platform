@@ -53,6 +53,10 @@ pub enum TxError {
     /// The digest the app would ask for doesn't match the one the vault
     /// checks: nothing is signed.
     StatementMismatch,
+    /// The vault's restricted list read just before signing (`now`) isn't
+    /// the one the review showed: nothing is signed, and the person reviews
+    /// the deposit again with this list.
+    ListChanged { now: String },
     /// The wallet returned a signature that isn't the connected account's
     /// over the statement shown.
     BadSignature,
@@ -378,6 +382,20 @@ impl TxError {
                 "The statement didn't match the vault's",
                 "The app stopped before asking you to sign. Nothing was signed or sent.".to_string(),
             ),
+            Self::ListChanged { now } => {
+                let codes = crate::components::exit::list_codes(now);
+                let who = match crate::components::exit::not_open_to(&codes) {
+                    Some(words) => format!("It's now not open to: {words}"),
+                    None => "It's now open to everyone".to_string(),
+                };
+                alert(
+                    "The vault's list changed since your review",
+                    format!(
+                        "The vault's list of who it isn't open to changed since you reviewed your deposit. {who} (“{}”). Review your deposit again with the new list. Nothing was signed or sent.",
+                        crate::components::exit::restricted_line(now)
+                    ),
+                )
+            }
             Self::BadSignature => alert(
                 "The signature didn't match",
                 format!("{wallet} signed with another account or other content. Nothing was sent."),
