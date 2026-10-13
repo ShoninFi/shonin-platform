@@ -106,7 +106,7 @@ impl Agent {
         self.review
             .set_neq(ReviewSummary::of(strategy.review.as_ref()));
         self.figures.set_neq(model::figures(strategy));
-        self.in_vault.set_neq(strategy.vault.value);
+        self.in_vault.set_neq(model::in_vault(strategy));
         self.asset.set_neq(strategy.vault.asset.clone());
         self.tank.set_neq(TankState::of(strategy));
         self.spark.set_neq(model::spark(strategy));

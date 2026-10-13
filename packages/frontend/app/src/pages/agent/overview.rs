@@ -120,7 +120,7 @@ fn stats(agent: &Rc<Agent>) -> El {
                     .into(),
                     stat(
                         "In vault",
-                        text(format::money_whole(strategy.vault.value)),
+                        text(format::money_whole(crate::model::in_vault(strategy))),
                         format!(
                             "{} on {}{stale}",
                             strategy.vault.asset,
@@ -668,7 +668,10 @@ fn way_out(strategy: &Strategy) -> View {
                 .attr("x", "100%")
                 .attr("y", "34")
                 .attr("text-anchor", "end")
-                .text(format!("Whole vault {}", format::money_whole(vault.value))),
+                .text(format!(
+                    "Whole vault {}",
+                    format::money_whole(crate::model::in_vault(strategy))
+                )),
         );
     let pending = vault.pending_floor.as_ref().map(|pending| {
         el("p")

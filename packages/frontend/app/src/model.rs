@@ -167,6 +167,22 @@ pub struct Figures {
     pub days: u32,
 }
 
+/// What the vault holds at its last price: its shares outstanding at the
+/// share price it last set. The recorded value is its gross at that
+/// valuation, taken before any deposit or withdrawal settled since, so a
+/// vault that took $25,000 after its last valuation still records what it
+/// held before; its shares, priced at that valuation, already count it.
+/// Without shares or a price, the recorded value is all there is.
+pub fn in_vault(strategy: &Strategy) -> f64 {
+    let vault = &strategy.vault;
+    let priced = vault.shares * vault.share_price;
+    if vault.shares > 0.0 && vault.share_price > 0.0 && priced.is_finite() {
+        priced
+    } else {
+        vault.value
+    }
+}
+
 pub fn figures(strategy: &Strategy) -> Figures {
     match &strategy.record {
         Some(record) if !record.value_per_share.is_empty() => {
@@ -371,6 +387,23 @@ mod tests {
     }
 
     use Rating::{CouldntTell as T, LooksFine as F, SeriousConcerns as S, SomeConcerns as C};
+
+    /// A vault that took deposits after its last valuation records its value
+    /// from before them; what it holds at its last price is its shares at
+    /// that price. Seen on the testnet: $25,000 in, a recorded value of a
+    /// cent, 24,975 shares at $0.999999.
+    #[test]
+    fn what_a_vault_holds_is_its_shares_at_its_last_price() {
+        let snapshot: shared::Snapshot =
+            serde_json::from_str(include_str!("../tests/snapshot.json")).unwrap();
+        let mut strategy = snapshot.strategies[0].clone();
+        strategy.vault.value = 0.01;
+        strategy.vault.shares = 24_975.0;
+        strategy.vault.share_price = 0.999_999;
+        assert!((in_vault(&strategy) - 24_974.975_025).abs() < 0.001);
+        strategy.vault.shares = 0.0;
+        assert_eq!(in_vault(&strategy), 0.01);
+    }
 
     #[test]
     fn the_summary_shows_the_most_severe_rating_present_and_how_many_areas_have_it() {
