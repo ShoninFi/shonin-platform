@@ -12,6 +12,11 @@
   font: 600 14px/20px var(--font-sans); white-space: nowrap;
 }
 .sh-netchip .sh-tile { width: 24px; height: 24px; font-size: 12px; line-height: 24px; border-radius: var(--radius-full); }
+/* On a network no vault is on: caution-soft, the triangle, "Not on Shonin";
+   a button that offers the switch. */
+.sh-netchip--other { padding-left: 10px; border-color: transparent; background: var(--caution-soft); color: var(--caution); cursor: pointer; }
+.sh-netchip--other > .sh-icon { flex: none; }
+.sh-netchip__flag { font: 400 13px/18px var(--font-sans); }
 .sh-walletbtn .sh-mono { font-size: 14px; }
 /* One account button, whatever is connected: a Solana-only wallet leads with
    a small "S" mark, and with both kinds a second mark says the sheet lists two. */
@@ -55,7 +60,7 @@
 .sh-wrongnet__inner p { flex: 1; min-width: 0; }
 
 @media (max-width: 599px) {
-  .sh-netchip__name { display: none; }
+  .sh-netchip__name, .sh-netchip__flag { display: none; }
   .sh-netchip { padding: 0 6px; }
   .sh-wrongnet__inner { flex-wrap: wrap; }
 }

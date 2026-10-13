@@ -257,6 +257,12 @@ pub async fn allowance<R: Reader>(
     read(reader, asset, IERC20::allowanceCall { owner, spender }).await
 }
 
+/// The vault's restricted list as it writes it (`SANCTIONED,US`): what the
+/// deposit statement is signed over, and what the deposit's review shows.
+pub async fn restricted_text<R: Reader>(reader: &R, vault: Address) -> Result<String, TxError> {
+    read(reader, vault, IVault::restrictedTextCall {}).await
+}
+
 /// Whether `depositor` has signed for the vault's list as it stands now: the
 /// vault records the hash of the list each statement was signed for, and
 /// takes a deposit only when that is the list's hash today.

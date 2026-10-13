@@ -93,20 +93,161 @@ fn connect_button() -> El {
 }
 
 /// The chain a browser EVM wallet is on; a local signer has none to show.
+/// A network no vault is on is marked as such, in the caution style, and
+/// offers the switch to one that is.
 fn network_chip(chain_id: Option<u64>) -> View {
     let session = crate::wallet::get();
     match chain_id.filter(|_| session.is_browser()) {
         Some(chain_id) => {
-            let name = networks::chain_name(chain_id);
+            let now = chip(chain_id, ours(&session.app_chains(), chain_id));
             el("span")
-                .class("sh-netchip")
-                .attr("aria-label", format!("Your wallet is on {name}"))
-                .child(tile(&name))
-                .child(el("span").class("sh-netchip__name").text(name))
+                .class("sh-contents")
+                .child_signal(
+                    Some(now),
+                    session
+                        .networks
+                        .signal_ref(move |networks| {
+                            let chains: Vec<u64> =
+                                networks.values().map(|network| network.chain_id).collect();
+                            ours(&chains, chain_id)
+                        })
+                        .dedupe()
+                        .map(move |ours| Some(chip(chain_id, ours))),
+                )
                 .into()
         }
         None => View::Empty,
     }
+}
+
+/// Whether `chain_id` is one of the app's vault chains; `None` until the
+/// app has read which those are.
+fn ours(app_chains: &[u64], chain_id: u64) -> Option<bool> {
+    (!app_chains.is_empty()).then(|| app_chains.contains(&chain_id))
+}
+
+fn chip(chain_id: u64, ours: Option<bool>) -> View {
+    let name = networks::network_name(chain_id);
+    if ours != Some(false) {
+        return el("span")
+            .class("sh-netchip")
+            .attr("aria-label", format!("Your wallet is on {name}"))
+            .child(tile(&name))
+            .child(el("span").class("sh-netchip__name").text(name))
+            .into();
+    }
+    on_click(
+        el("button")
+            .attr("type", "button")
+            .class("sh-netchip sh-netchip--other")
+            .attr("aria-haspopup", "dialog")
+            .attr(
+                "aria-label",
+                format!(
+                    "Your wallet is on {name}, which isn’t one of Shonin’s networks. Switch network"
+                ),
+            )
+            .child(icon(Icon::Concern, 16))
+            .child(el("span").class("sh-netchip__name").text(name))
+            .child(el("span").class("sh-netchip__flag").text("Not on Shonin")),
+        move || open_switch(chain_id),
+    )
+    .into()
+}
+
+/// The networks to offer, in order: the page's vault chain first, then the
+/// app's other chains.
+fn switch_targets(page: Option<u64>, app_chains: &[u64]) -> Vec<u64> {
+    let mut targets: Vec<u64> = page
+        .into_iter()
+        .filter(|id| app_chains.contains(id))
+        .collect();
+    for id in app_chains {
+        if !targets.contains(id) {
+            targets.push(*id);
+        }
+    }
+    targets
+}
+
+/// The vault chain of the agent the page is about, if it is about one.
+fn page_chain() -> Option<u64> {
+    use crate::route::Route;
+    let location = crate::web::window()?.location();
+    let route = Route::from_url(&location.pathname().ok()?, &location.search().ok()?);
+    let slug = match route {
+        Route::Agent { slug, .. }
+        | Route::Claim { slug, .. }
+        | Route::Manage { slug }
+        | Route::Activate { slug } => slug,
+        _ => return None,
+    };
+    let chain = crate::store::get()
+        .agent(&slug)?
+        .strategy
+        .lock_ref()
+        .vault
+        .chain;
+    crate::wallet::get()
+        .networks
+        .lock_ref()
+        .get(&chain)
+        .map(|network| network.chain_id)
+}
+
+/// The wallet is on a network no vault is on: offer the page's vault chain
+/// first, then the app's others, through the usual switch (adding the chain
+/// if the wallet doesn't know it). Closes once the wallet is on one.
+fn open_switch(on: u64) {
+    let session = crate::wallet::get();
+    let app_chains = session.app_chains();
+    let page = page_chain();
+    let targets = switch_targets(page, &app_chains);
+    let name = networks::network_name(on);
+    let lead = match page {
+        Some(page) => format!(
+            "Your wallet is on {name}, which isn’t one of Shonin’s networks. This agent’s vault is on {}.",
+            networks::chain_name(page)
+        ),
+        None => format!(
+            "Your wallet is on {name}, which isn’t one of Shonin’s networks. Switch to one of them to deposit, withdraw or publish."
+        ),
+    };
+    let watch = {
+        let chains = app_chains.clone();
+        session
+            .connection
+            .signal_ref(|connection| match connection {
+                Connection::Connected { chain_id, .. } => *chain_id,
+                _ => None,
+            })
+            .dedupe()
+            .for_each(move |chain_id| {
+                if chain_id.is_some_and(|id| chains.contains(&id)) {
+                    dialog::close();
+                }
+                async {}
+            })
+    };
+    let buttons = targets.into_iter().enumerate().map(|(index, chain_id)| {
+        let kind = if index == 0 {
+            Kind::Primary
+        } else {
+            Kind::Secondary
+        };
+        switch_button_as(chain_id, Size::Medium, kind).class("sh-btn-block")
+    });
+    dialog::open(Dialog {
+        title: "Switch network".to_string(),
+        body: el("div")
+            .class("sh-walletmenu")
+            .child(el("p").text(lead))
+            .children(buttons)
+            .hook(move |dom| dom.future(watch))
+            .into(),
+        foot: None,
+        wide: false,
+    });
 }
 
 /// The one account button: the EVM address when there is one, else the
@@ -759,13 +900,14 @@ pub(crate) fn wrong_network(on: u64, want: u64, what: &str) -> El {
 /// "Switch to Hyperliquid": asks the wallet to switch, adding the chain if it
 /// doesn't know it.
 pub fn switch_button(chain_id: u64, size: Size) -> El {
+    switch_button_as(chain_id, size, Kind::Primary)
+}
+
+fn switch_button_as(chain_id: u64, size: Size, kind: Kind) -> El {
     let busy = Mutable::new(false);
     let label = format!("Switch to {}", networks::chain_name(chain_id));
     on_click(
-        Button::new(Kind::Primary, label)
-            .size(size)
-            .busy(&busy)
-            .build(),
+        Button::new(kind, label).size(size).busy(&busy).build(),
         move || {
             if busy.get() {
                 return;
@@ -865,6 +1007,76 @@ mod tests {
         let none = header_with(false, false);
         assert!(none.contains("Connect wallet"), "{none}");
         assert!(!none.contains("sh-walletbtn"), "{none}");
+    }
+
+    /// The header's chip for a browser wallet on `chain_id`, where the app's
+    /// one vault chain is Base Sepolia.
+    fn chip_on(chain_id: u64) -> String {
+        let session = crate::wallet::get();
+        session.networks.lock_mut().insert(
+            shared::Chain::Base,
+            Rc::new(crate::wallet::Network {
+                chain: shared::Chain::Base,
+                chain_id: 84532,
+                label: "Base Sepolia".to_string(),
+                rpc: "https://sepolia.base.org".to_string(),
+                asset: alloy_primitives::Address::repeat_byte(0xdd),
+                asset_symbol: "USDC".to_string(),
+                asset_decimals: 6,
+                dev_account: None,
+            }),
+        );
+        session.connection.set(Connection::Connected {
+            wallet: WalletId::Injected,
+            account: alloy_primitives::Address::repeat_byte(0x7e),
+            chain_id: Some(chain_id),
+        });
+        crate::wallet::solana::get()
+            .connection
+            .set(crate::wallet::solana::SolConnection::SignedOut);
+        header_control().html()
+    }
+
+    #[test]
+    fn a_network_shonin_doesnt_use_is_named_and_marked_with_a_way_to_switch() {
+        let arbitrum = chip_on(42161);
+        assert!(arbitrum.contains(">Arbitrum One<"), "{arbitrum}");
+        assert!(!arbitrum.contains("chain 42161"), "{arbitrum}");
+        assert!(arbitrum.contains("sh-netchip--other"), "{arbitrum}");
+        assert!(arbitrum.contains("Not on Shonin"), "{arbitrum}");
+        assert!(arbitrum.contains("aria-haspopup=\"dialog\""), "{arbitrum}");
+        assert!(
+            arbitrum.contains("which isn’t one of Shonin’s networks"),
+            "{arbitrum}"
+        );
+        let unknown = chip_on(999_999);
+        assert!(unknown.contains(">Network 999999<"), "{unknown}");
+        assert!(unknown.contains("sh-netchip--other"), "{unknown}");
+        for (id, name) in [
+            (1, "Ethereum"),
+            (10, "Optimism"),
+            (137, "Polygon"),
+            (8453, "Base"),
+        ] {
+            assert_eq!(networks::network_name(id), name);
+        }
+        // Base mainnet is a vault chain, but not this app's: still marked.
+        assert!(chip_on(8453).contains("sh-netchip--other"));
+        let ours = chip_on(84532);
+        assert!(ours.contains(">Base Sepolia<"), "{ours}");
+        assert!(!ours.contains("sh-netchip--other"), "{ours}");
+    }
+
+    #[test]
+    fn the_switch_offers_the_pages_vault_chain_first_then_the_apps_others() {
+        assert_eq!(
+            switch_targets(Some(998), &[84532, 998, 46630]),
+            vec![998, 84532, 46630]
+        );
+        assert_eq!(switch_targets(None, &[84532, 998]), vec![84532, 998]);
+        // A page chain the app doesn't read isn't offered.
+        assert_eq!(switch_targets(Some(1), &[84532]), vec![84532]);
+        assert_eq!(ours(&[], 42161), None, "unknown until the chains are read");
     }
 
     #[test]

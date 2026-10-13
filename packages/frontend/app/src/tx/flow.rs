@@ -122,6 +122,14 @@ pub enum Step {
     Failed(TxError),
 }
 
+impl Step {
+    /// Whether the flow has ended, well or not: nothing more will happen
+    /// in it, and the panel may leave it.
+    pub fn is_over(&self) -> bool {
+        matches!(self, Self::Done(_) | Self::Failed(_))
+    }
+}
+
 /// How a flow ended well.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -810,7 +818,7 @@ async fn check_endpoint<R: Reader, S: Signer, C: Clock>(
 async fn sign_statement<R: Reader, S: Signer, C: Clock>(
     ctx: &Ctx<'_, R, S, C>,
 ) -> Result<Bytes, TxError> {
-    let restricted = read::read(ctx.reader, ctx.vault, IVault::restrictedTextCall {}).await?;
+    let restricted = read::restricted_text(ctx.reader, ctx.vault).await?;
     let statement = StatementRequest {
         chain_id: ctx.chain_id,
         vault: ctx.vault,

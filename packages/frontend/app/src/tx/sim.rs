@@ -73,6 +73,8 @@ struct Chain {
     nonce: HashMap<Address, u64>,
     /// Sends the wallet made, in order.
     sent: Vec<TxRequest>,
+    /// Statements the wallet signed, in order.
+    signed: Vec<StatementRequest>,
     /// Calls of anything that moves money, by selector, in order.
     calls: Vec<[u8; 4]>,
     /// The chain the wallet is on.
@@ -153,6 +155,7 @@ impl World {
             logs: Vec::new(),
             nonce: HashMap::new(),
             sent: Vec::new(),
+            signed: Vec::new(),
             calls: Vec::new(),
             wallet_chain: CHAIN,
             wallet_account: Some(account),
@@ -791,10 +794,11 @@ impl Signer for SimWallet {
         Ok(self.sim.borrow().wallet_chain)
     }
     async fn sign_statement(&self, statement: &StatementRequest) -> Result<Bytes, TxError> {
-        let sim = self.sim.borrow();
+        let mut sim = self.sim.borrow_mut();
         if sim.wallet_rejects {
             return Err(TxError::Rejected);
         }
+        sim.signed.push(statement.clone());
         let key = if sim.wallet_signs_wrong {
             PrivateKeySigner::from_bytes(&B256::repeat_byte(0x43)).unwrap()
         } else {
@@ -986,6 +990,52 @@ fn the_steps_follow_the_canvas_from_checking_to_done() {
             "priced"
         ]
     );
+}
+
+#[test]
+fn the_deposit_review_shows_the_list_and_the_words_the_wallet_then_signs() {
+    for list in ["SANCTIONED,US", "CA-ON,SANCTIONED,US", ""] {
+        let world = World::new();
+        world.with(|chain| chain.restricted_text = list.to_string());
+        // What the panel reads for its review, the way it reads it.
+        let read = block_on(super::read::restricted_text(
+            &SimReader(world.sim.clone()),
+            vault(),
+        ))
+        .unwrap();
+        let review = crate::components::exit::statement_notice(
+            crate::components::exit::Statement::Evm(Some(&read)),
+        )
+        .html();
+        let (result, _) = deposit(&world, 1_000);
+        assert!(result.is_ok(), "{result:?}");
+        let signed = world.sim.borrow().signed.clone();
+        let [statement] = signed.as_slice() else {
+            panic!("one statement signed: {signed:?}");
+        };
+        let message = &statement.typed_data()["message"];
+        let restricted = message["restricted"].as_str().unwrap();
+        assert_eq!(restricted, list);
+        assert!(
+            restricted.is_empty() || review.contains(&format!("Restricted: {restricted}")),
+            "the review names the list as signed: {review}"
+        );
+        assert!(
+            review.contains(&crate::view::escape(message["statement"].as_str().unwrap())),
+            "the review carries the words signed: {review}"
+        );
+        let plain = match list {
+            "SANCTIONED,US" => "Not open to: people in the US, sanctioned persons.",
+            "CA-ON,SANCTIONED,US" => {
+                "Not open to: people in Ontario (Canada) and the US, sanctioned persons."
+            }
+            _ => "Open to everyone: this vault restricts no one.",
+        };
+        assert!(
+            review.contains(&crate::view::escape(plain)),
+            "{list}: {review}"
+        );
+    }
 }
 
 #[test]

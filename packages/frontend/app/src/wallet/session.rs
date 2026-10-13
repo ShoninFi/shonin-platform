@@ -186,6 +186,16 @@ impl Session {
             .map(Active::DevPhrase)
     }
 
+    /// The chain ids of the EVM networks the app's vaults are on, as read
+    /// from the API; empty until read.
+    pub fn app_chains(&self) -> Vec<u64> {
+        self.networks
+            .lock_ref()
+            .values()
+            .map(|network| network.chain_id)
+            .collect()
+    }
+
     /// The flow shown for `slug` and `slot`, for the connected account.
     pub fn flow(&self, slug: &str, slot: &str) -> Option<Running> {
         let account = self.account()?;

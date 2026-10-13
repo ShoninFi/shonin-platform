@@ -104,11 +104,65 @@ pub fn coin(chain_id: u64) -> Coin {
     known(chain_id).map(|known| known.coin).unwrap_or(ETH)
 }
 
-/// A chain's name for people: "Base Sepolia". Unknown chains by number.
+/// Well-known EVM networks no vault is on, by name: a wallet may well be on
+/// one of them when it connects.
+const ELSEWHERE: [(u64, &str); 30] = [
+    (1, "Ethereum"),
+    (10, "Optimism"),
+    (56, "BNB Smart Chain"),
+    (100, "Gnosis"),
+    (130, "Unichain"),
+    (137, "Polygon"),
+    (146, "Sonic"),
+    (250, "Fantom"),
+    (324, "zkSync Era"),
+    (480, "World Chain"),
+    (1101, "Polygon zkEVM"),
+    (1868, "Soneium"),
+    (2741, "Abstract"),
+    (5000, "Mantle"),
+    (34443, "Mode"),
+    (42161, "Arbitrum One"),
+    (42170, "Arbitrum Nova"),
+    (42220, "Celo"),
+    (43114, "Avalanche C-Chain"),
+    (59144, "Linea"),
+    (80094, "Berachain"),
+    (81457, "Blast"),
+    (534352, "Scroll"),
+    (7777777, "Zora"),
+    (17000, "Holesky"),
+    (560048, "Hoodi"),
+    (11155111, "Sepolia"),
+    (11155420, "OP Sepolia"),
+    (421614, "Arbitrum Sepolia"),
+    (80002, "Polygon Amoy"),
+];
+
+/// A network's name when it is a vault chain or a well-known one.
+fn named(chain_id: u64) -> Option<&'static str> {
+    known(chain_id).map(|known| known.name).or_else(|| {
+        ELSEWHERE
+            .iter()
+            .find(|(id, _)| *id == chain_id)
+            .map(|(_, name)| *name)
+    })
+}
+
+/// A chain's name for people, in a sentence: "Base Sepolia". Unknown
+/// chains by number.
 pub fn chain_name(chain_id: u64) -> String {
-    known(chain_id)
-        .map(|known| known.name.to_string())
+    named(chain_id)
+        .map(str::to_string)
         .unwrap_or_else(|| format!("chain {chain_id}"))
+}
+
+/// A network's name on its own, as the header's chip shows it: "Arbitrum
+/// One", or "Network 42161" for one the app doesn't know.
+pub fn network_name(chain_id: u64) -> String {
+    named(chain_id)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Network {chain_id}"))
 }
 
 /// A transaction's page on the chain's explorer.

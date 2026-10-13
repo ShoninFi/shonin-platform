@@ -21,8 +21,8 @@ use crate::atoms::icon;
 use crate::atoms::notice::{NoticeTone, notice};
 use crate::atoms::segmented::segmented;
 use crate::components::exit::{
-    Check, Tab, amount_input, held_sentence, hint, placeholder, row, row_dyn, seal, utc,
-    whole_shares,
+    Check, Shown, Statement, Tab, TabClick, amount_input, held_sentence, hint, placeholder, row,
+    row_dyn, seal, statement_notice, tab_bar, tab_click, utc, whole_shares,
 };
 use crate::components::wallet::{hex_ring, open_connect};
 use crate::money::format as money;
@@ -154,6 +154,7 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
         mode.map(move |mode| Some(render(&panel, mode)))
     };
     let loader = panel.clone();
+    let (tabs, why) = tabs(&panel);
     el("section")
         .class("sh-exit")
         .class_if(in_sheet, "sh-exit--sheet")
@@ -166,8 +167,9 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
                         .class("sh-exit__heading")
                         .text("Deposit or withdraw"),
                 )
-                .child(tabs(&panel)),
+                .child(tabs),
         )
+        .child(why)
         .child_signal(Some(placeholder()), body)
         .child(
             el("p")
@@ -311,31 +313,43 @@ async fn wait_or_retry(panel: &Panel, seconds: u32) {
     }
 }
 
-fn tabs(panel: &Rc<Panel>) -> El {
-    let tab = |which: Tab, label: &'static str| {
-        let panel = panel.clone();
-        el("button")
-            .attr("type", "button")
-            .class("sh-tab")
-            .attr("role", "tab")
-            .attr_from("aria-selected", &panel.tab, move |tab| {
-                Some((*tab == which).to_string())
-            })
-            .text(label)
-            .hook(move |dom| {
-                dom.event(move |_: dominator::events::Click| {
-                    if panel.running.lock_ref().is_none() {
-                        panel.tab.set_neq(which);
-                        panel.stage.set_neq(Stage::Form);
-                    }
-                })
-            })
-    };
-    el("div")
-        .class("sh-tabs sh-exit__tabs")
-        .attr("role", "tablist")
-        .child(tab(Tab::Deposit, "Deposit"))
-        .child(tab(Tab::Withdraw, "Withdraw"))
+fn tabs(panel: &Rc<Panel>) -> (El, El) {
+    let shown = panel
+        .running
+        .signal_cloned()
+        .map(|running| running.map(|running| running.step))
+        .switch(|step| match step {
+            Some(step) => step
+                .signal_ref(|step| Shown::of(Some(step.as_ref().map(Step::is_over))))
+                .boxed_local(),
+            None => futures_signals::signal::always(Shown::Nothing).boxed_local(),
+        });
+    let clicked = panel.clone();
+    tab_bar(&panel.tab, shown, panel.in_sheet, move |which| {
+        let panel = &clicked;
+        let shown = Shown::of(
+            panel
+                .running
+                .lock_ref()
+                .as_ref()
+                .map(|running| running.step.lock_ref().as_ref().map(Step::is_over)),
+        );
+        match tab_click(shown, panel.tab.get(), which) {
+            TabClick::Open => {
+                panel.tab.set_neq(which);
+                panel.stage.set_neq(Stage::Form);
+            }
+            TabClick::Leave => {
+                panel.running.set(None);
+                panel.stage.set(Stage::Form);
+                panel.deposit_text.set(String::new());
+                panel.withdraw_text.set(String::new());
+                panel.ack.set(false);
+                panel.tab.set_neq(which);
+            }
+            TabClick::Stay => {}
+        }
+    })
 }
 
 fn render(panel: &Rc<Panel>, mode: Mode) -> View {
@@ -1081,11 +1095,6 @@ fn review(panel: &Rc<Panel>) -> View {
         .iter()
         .map(chain::solana_ix::read::code_text)
         .collect::<Vec<_>>();
-    let list = if list.is_empty() {
-        "no one".to_string()
-    } else {
-        list.join(", ")
-    };
     el("div")
         .class("sh-exit__body")
         .child(
@@ -1122,22 +1131,7 @@ fn review(panel: &Rc<Panel>) -> View {
                 ))
                 .child(static_row("Network fee", "Paid in SOL by your wallet".to_string(), None)),
         )
-        .child(
-            el("div")
-                .class("sh-notice sh-notice--info")
-                .child(
-                    el("div")
-                        .class("sh-notice__body")
-                        .child(el("p").class("sh-notice__lead").text("Your statement"))
-                        .child(el("p").text(format!("“{}”", chain::statement::TEXT)))
-                        .child(el("p").text(format!(
-                            "This vault’s restricted list, read from its account on Solana: {list}."
-                        )))
-                        .child(el("p").class("sh-muted").text(
-                            "On Solana the deposit itself is the statement: approving it in your wallet states this for the list above. There’s no separate signature.",
-                        )),
-                ),
-        )
+        .child(statement_notice(Statement::Solana(&list)))
         .child(notice(
             NoticeTone::Info,
             text("A request can’t be cancelled once you confirm it. Nobody can see its price yet, including you."),
