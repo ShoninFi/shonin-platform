@@ -516,6 +516,12 @@ pub fn wallet_gate(chain_id: u64, action: impl Fn() -> View + 'static) -> View {
     let session = crate::wallet::get();
     el("div")
         .class("sh-author__gate")
+        // The header's chip compares the wallet's chain with this one.
+        .hook(move |dom| {
+            dom.future(crate::components::wallet::acting_on(
+                futures_signals::signal::always(Some(chain_id)),
+            ))
+        })
         .child_signal(
             None,
             session.connection.signal_cloned().map(move |connection| {

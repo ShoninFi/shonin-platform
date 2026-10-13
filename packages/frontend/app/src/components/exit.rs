@@ -188,6 +188,7 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
     };
     let (tabs, why) = tabs(&panel);
     let loader = panel.clone();
+    let acting = panel.network.clone();
     // Another account (or none) gets the empty form.
     let account_change = {
         let panel = panel.clone();
@@ -225,7 +226,15 @@ fn build(slug: &str, tab: Tab, in_sheet: bool) -> View {
                 .child(icon(Icon::Concern, 16).class("sh-exit__warn"))
                 .text("The agent can lose money. Nothing here stops that."),
         )
-        .hook(move |dom| dom.future(follow(loader)).future(account_change))
+        .hook(move |dom| {
+            dom.future(follow(loader))
+                .future(account_change)
+                // While open, the header's chip compares the wallet's chain
+                // with this vault's.
+                .future(super::wallet::acting_on(acting.signal_ref(|network| {
+                    network.as_ref().map(|network| network.chain_id)
+                })))
+        })
         .into()
 }
 

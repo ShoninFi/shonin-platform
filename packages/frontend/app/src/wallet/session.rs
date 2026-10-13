@@ -23,6 +23,7 @@ use futures_signals::signal::Mutable;
 use serde_json::{Value, json};
 use shared::Chain;
 
+use super::config_cache::{ConfigSlot, ForSigning};
 use super::dev;
 use super::machine::{self, Connection, Event, Refusal, WalletId};
 use super::network::Network;
@@ -84,8 +85,14 @@ pub struct Session {
     pub wallets: Mutable<Vec<WalletOption>>,
     /// The connected wallet's name, for "Approve in MetaMask".
     pub wallet_name: Mutable<String>,
-    /// Vault chains, as their configs are read.
+    /// Vault chains as the page reads them: from copies of their configs
+    /// remembered from an earlier visit at first, then from the API's.
     pub networks: Mutable<BTreeMap<Chain, Rc<Network>>>,
+    /// Each chain's config as the API wrote it, and where the page's copy
+    /// came from: only a fetched copy is ever used to sign.
+    configs: RefCell<BTreeMap<Chain, Rc<ConfigSlot>>>,
+    /// Whether the API has been asked for every chain's config once.
+    pub networks_tried: Mutable<bool>,
     /// Every vault by slug, from the latest snapshot this session read.
     pub vaults: Mutable<BTreeMap<String, Rc<super::run::VaultRef>>>,
     /// Rises when a flow lands, so pages read the chain again.
@@ -107,6 +114,8 @@ thread_local! {
         wallets: Mutable::new(Vec::new()),
         wallet_name: Mutable::new(String::new()),
         networks: Mutable::new(BTreeMap::new()),
+        configs: RefCell::new(BTreeMap::new()),
+        networks_tried: Mutable::new(false),
         vaults: Mutable::new(BTreeMap::new()),
         changed: Mutable::new(0),
         running: Mutable::new(BTreeMap::new()),
@@ -131,12 +140,38 @@ fn reads_config_of(chain: Chain) -> bool {
     chain != Chain::Solana
 }
 
-/// Keep the wallet's id (never anything else) for a silent reconnect.
+/// The browser wallet used before the one remembered now, so the wallet
+/// sheet can offer it back when another app took the EVM slot.
+const PREVIOUS: &str = "wallet.previous";
+
+/// Keep the wallet's id (never anything else) for a silent reconnect, and
+/// the one it replaced.
 fn remember(id: &str) {
     #[cfg(target_arch = "wasm32")]
-    crate::web::storage_set(REMEMBERED, id);
+    {
+        if !id.is_empty()
+            && let Some(old) = crate::web::storage_get(REMEMBERED)
+            && !old.is_empty()
+            && old != id
+        {
+            crate::web::storage_set(PREVIOUS, &old);
+        }
+        crate::web::storage_set(REMEMBERED, id);
+    }
     #[cfg(not(target_arch = "wasm32"))]
-    let _ = (REMEMBERED, id);
+    let _ = (REMEMBERED, PREVIOUS, id);
+}
+
+/// The browser wallet this browser used for EVM before the one connected.
+pub fn previous_wallet() -> Option<WalletId> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        crate::web::storage_get(PREVIOUS)
+            .as_deref()
+            .and_then(WalletId::from_remembered)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    None
 }
 
 impl Session {
@@ -154,6 +189,23 @@ impl Session {
         match &*self.connection.lock_ref() {
             Connection::Connected { chain_id, .. } => *chain_id,
             _ => None,
+        }
+    }
+
+    /// The connected wallet's app, as a name on its own: "MetaMask",
+    /// "Development wallet".
+    pub fn app_name(&self) -> String {
+        match self.connection.lock_ref().wallet() {
+            Some(WalletId::Phrase) => "Recovery phrase".to_string(),
+            Some(WalletId::Dev) => "Development wallet".to_string(),
+            _ => {
+                let name = self.wallet_name.get_cloned();
+                if name.is_empty() {
+                    "Browser wallet".to_string()
+                } else {
+                    name
+                }
+            }
         }
     }
 
@@ -194,6 +246,71 @@ impl Session {
             .values()
             .map(|network| network.chain_id)
             .collect()
+    }
+
+    fn slot(&self, chain: Chain) -> Rc<ConfigSlot> {
+        self.configs.borrow_mut().entry(chain).or_default().clone()
+    }
+
+    /// Take a copy of `chain`'s config into what the page reads, if it is
+    /// one this build can use. Redraws only when it changed.
+    fn adopt(&self, chain: Chain, raw: &str) -> Option<Rc<Network>> {
+        let network = Rc::new(parse_network(raw)?);
+        if self.networks.lock_ref().get(&chain).map(|held| &**held) != Some(&*network) {
+            self.networks.lock_mut().insert(chain, network.clone());
+        }
+        Some(network)
+    }
+
+    /// A copy of `chain`'s config kept from an earlier visit: read from at
+    /// once, never signed with.
+    pub fn remember(&self, chain: Chain, raw: &str) {
+        if parse_network(raw).is_some() {
+            self.slot(chain).remember(raw);
+            if !self.networks.lock_ref().contains_key(&chain) {
+                self.adopt(chain, raw);
+            }
+        }
+    }
+
+    /// Ask the API for `chain`'s config (or wait for the ask in flight),
+    /// and read from its answer.
+    pub async fn refresh_with<F, Fut>(&self, chain: Chain, fetch: F) -> Option<Rc<Network>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<String, String>>,
+    {
+        let raw = self.slot(chain).refresh(fetch).await.ok()?;
+        self.adopt(chain, &raw)
+    }
+
+    /// The network a flow sends on: from a config fetched in this page's
+    /// life, never from a remembered copy alone (see
+    /// [`super::config_cache`]).
+    pub async fn network_to_sign_with<F, Fut>(
+        &self,
+        chain: Chain,
+        fetch: F,
+    ) -> Result<Rc<Network>, TxError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<String, String>>,
+    {
+        match self.slot(chain).for_signing(fetch).await {
+            ForSigning::Use(raw) => self.adopt(chain, &raw).ok_or_else(|| {
+                TxError::Network("this vault's chain can't be used by this app".to_string())
+            }),
+            ForSigning::Changed(raw) => {
+                self.adopt(chain, &raw);
+                Err(TxError::Network(
+                    "this page's settings for the vault's chain were just updated, so nothing was sent"
+                        .to_string(),
+                ))
+            }
+            ForSigning::Unavailable(_) => Err(TxError::Network(
+                "this vault's chain isn't reachable from this app".to_string(),
+            )),
+        }
     }
 
     /// The flow shown for `slug` and `slot`, for the connected account.
@@ -437,6 +554,12 @@ impl SessionSigner {
     }
 }
 
+/// The EVM network a config names, if this build can use it.
+fn parse_network(raw: &str) -> Option<Network> {
+    let config: shared::Config = serde_json::from_str(raw).ok()?;
+    Network::from_config(&config).ok()
+}
+
 fn hash_of(value: &Value) -> Result<B256, TxError> {
     value
         .as_str()
@@ -539,15 +662,26 @@ impl Signer for SessionSigner {
 
 #[cfg(target_arch = "wasm32")]
 impl Session {
-    /// On load: find wallets, read the vault chains' configs, and reconnect
-    /// a remembered wallet if it still allows this site.
+    /// On load: find wallets, read from the vault chains' configs
+    /// remembered from an earlier visit, ask the API for them in the
+    /// background, and reconnect a remembered wallet if it still allows this
+    /// site.
     pub fn start(self: &Rc<Self>) {
         let session = self.clone();
         eip1193::discover(Rc::new(move || session.refresh_wallets()));
         self.refresh_wallets();
+        for chain in Chain::ALL
+            .into_iter()
+            .filter(|chain| reads_config_of(*chain))
+        {
+            if let Some(raw) = super::config_cache::recall(chain) {
+                self.remember(chain, &raw);
+            }
+        }
+        let session = self.clone();
+        wasm_bindgen_futures::spawn_local(async move { session.load_networks().await });
         let session = self.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            session.load_networks().await;
             // Wallets announce within a moment of being asked.
             gloo_timers::future::TimeoutFuture::new(300).await;
             session.refresh_wallets();
@@ -563,30 +697,46 @@ impl Session {
         self.refresh_wallets();
     }
 
-    /// Read every vault chain's config the API serves.
-    pub async fn load_networks(&self) {
-        let Ok(snapshot) = fetch::<shared::Snapshot>("snapshot").await else {
-            return;
-        };
-        self.vaults.set(super::run::directory(&snapshot));
-        self.vaults_at.set(js_sys::Date::now());
-        for info in snapshot.chains {
-            if !reads_config_of(info.chain) || self.networks.lock_ref().contains_key(&info.chain) {
-                continue;
-            }
-            if let Ok(config) = fetch::<shared::Config>(&format!("{}/config", info.chain)).await
-                && let Ok(network) = Network::from_config(&config)
-            {
-                self.networks
-                    .lock_mut()
-                    .insert(info.chain, Rc::new(network));
-            }
+    /// Ask the API for `chain`'s config, keep it for the next visit if it
+    /// reads well, and read from it.
+    async fn refresh(&self, chain: Chain) -> Option<Rc<Network>> {
+        let network = self
+            .refresh_with(chain, || super::config_cache::fetch_raw(chain))
+            .await?;
+        if let Some(held) = self.slot(chain).held() {
+            super::config_cache::keep(chain, &held.raw);
         }
+        Some(network)
+    }
+
+    /// Ask the API for every EVM vault chain's config. A chain this
+    /// deployment doesn't serve answers nothing and is left out.
+    pub async fn load_networks(&self) {
+        for chain in Chain::ALL
+            .into_iter()
+            .filter(|chain| reads_config_of(*chain))
+        {
+            self.refresh(chain).await;
+        }
+        self.networks_tried.set_neq(true);
         self.refresh_wallets();
     }
 
-    /// Every vault, read again if the copy held is more than 15 s old.
+    /// Every vault, read again if the copy held is more than 15 s old. The
+    /// page's own snapshot reader fills it: its first answer is waited for
+    /// rather than the snapshot fetched twice.
     pub async fn read_vaults(&self) -> BTreeMap<String, Rc<super::run::VaultRef>> {
+        use futures_signals::signal::SignalExt;
+        if self.vaults_at.get() == f64::NEG_INFINITY {
+            let store = crate::store::get();
+            futures_signals::map_ref! {
+                let loaded = store.loaded.signal(),
+                let failing = store.sync.failing.signal() =>
+                *loaded || *failing
+            }
+            .wait_for(true)
+            .await;
+        }
         if js_sys::Date::now() - self.vaults_at.get() > 15_000.0
             && let Ok(snapshot) = fetch::<shared::Snapshot>("snapshot").await
         {
@@ -603,17 +753,27 @@ impl Session {
         self.vaults_at.set(js_sys::Date::now());
     }
 
-    /// A vault chain's network, reading its config if it hasn't been.
+    /// A vault chain's network to read from: the copy the page holds
+    /// (remembered or fetched), else the API's answer.
     pub async fn network(&self, chain: Chain) -> Option<Rc<Network>> {
         if let Some(network) = self.networks.lock_ref().get(&chain) {
             return Some(network.clone());
         }
-        let config = fetch::<shared::Config>(&format!("{chain}/config"))
-            .await
-            .ok()?;
-        let network = Rc::new(Network::from_config(&config).ok()?);
-        self.networks.lock_mut().insert(chain, network.clone());
-        Some(network)
+        if !reads_config_of(chain) {
+            return None;
+        }
+        self.refresh(chain).await
+    }
+
+    /// A vault chain's network to send on: never a remembered copy alone.
+    pub async fn network_to_sign(&self, chain: Chain) -> Result<Rc<Network>, TxError> {
+        let network = self
+            .network_to_sign_with(chain, || super::config_cache::fetch_raw(chain))
+            .await?;
+        if let Some(held) = self.slot(chain).held() {
+            super::config_cache::keep(chain, &held.raw);
+        }
+        Ok(network)
     }
 
     fn browser_wallets() -> Vec<Announced> {
@@ -726,6 +886,11 @@ impl Session {
             return;
         };
         if id == WalletId::Dev {
+            if self.dev_account().is_none() {
+                // A development chain's own account comes with its config.
+                use futures_signals::signal::SignalExt;
+                self.networks_tried.signal().wait_for(true).await;
+            }
             if matches!(*self.connection.lock_ref(), Connection::SignedOut) {
                 self.connect_dev();
             }
@@ -946,6 +1111,61 @@ mod tests {
         for chain in [Chain::Base, Chain::Robinhood] {
             assert!(reads_config_of(chain), "{chain:?}");
         }
+    }
+
+    /// A Base Sepolia config as the API writes it.
+    fn base_config() -> String {
+        let address = |byte: u8| format!("{:?}", Address::repeat_byte(byte));
+        json!({
+            "chain": {"chain": "base", "key": "evm:84532", "chain_id": 84532, "block": 48055605, "as_of": [2026, 286, 8, 18, 18, 0]},
+            "rpc_url": "https://sepolia.base.org",
+            "addresses": {
+                "usd": address(0xe2), "publishing": address(1), "prices": address(2),
+                "venue": address(3), "attestation": address(4), "strategies": address(5),
+                "reviews": address(6), "profiles": address(7), "factory": address(8),
+                "station_factory": address(9),
+            },
+            "asset_symbol": "USDC",
+            "asset_decimals": 6,
+            "terms": {
+                "minimum_tank": 10.0, "publish_fee": 1.0,
+                "fees": {"holding_bps": 100, "author_bps": 1000, "platform_bps": 500, "transaction_bps": 10},
+                "exit_band_bps": 100, "freeze_after_days": 7.0, "image_timelock_days": 0.0,
+                "minimum_deposit": 10.0, "terms_hash": format!("0x{}", "00".repeat(32)),
+            },
+            "dev": null,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_remembered_chain_config_is_read_from_at_once_but_never_signed_with_until_the_api_agrees() {
+        use futures::executor::block_on;
+        let session = get();
+        let raw = super::super::config_cache::canonical(&base_config()).unwrap();
+        session.remember(Chain::Base, &raw);
+        let read = session
+            .networks
+            .lock_ref()
+            .get(&Chain::Base)
+            .cloned()
+            .expect("read from the remembered copy");
+        assert_eq!(read.chain_id, 84532);
+        assert_eq!(read.asset, Address::repeat_byte(0xe2));
+        // A send while the API is down: nothing is signed.
+        let down = || async { Err::<String, String>("the API answered 503".to_string()) };
+        assert!(matches!(
+            block_on(session.network_to_sign_with(Chain::Base, down)),
+            Err(TxError::Network(_))
+        ));
+        // The API answers again, its head moved on: the same config, used.
+        let later =
+            super::super::config_cache::canonical(&base_config().replace("48055605", "48055999"))
+                .unwrap();
+        let signed =
+            block_on(session.network_to_sign_with(Chain::Base, || async move { Ok(later) }))
+                .unwrap();
+        assert_eq!(*signed, *read);
     }
 
     #[test]

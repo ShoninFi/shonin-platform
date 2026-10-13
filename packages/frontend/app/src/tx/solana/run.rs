@@ -56,6 +56,89 @@ pub fn vault_of(slug: &str) -> Option<SolVault> {
     })
 }
 
+/// The Solana vault at `address`, from the store.
+pub fn vault_at(address: &Pubkey) -> Option<SolVault> {
+    crate::store::get()
+        .all()
+        .iter()
+        .filter_map(|agent| vault_of(&agent.slug))
+        .find(|vault| vault.address == *address)
+}
+
+/// What this browser keeps of a send, from the step that sent it: only a
+/// deposit, a withdrawal or a claim's own transaction.
+pub fn recent_of(
+    prompt: &super::flow::Prompt,
+    vault: &SolVault,
+    account: &Pubkey,
+    network: &SolNetwork,
+    signature: &super::port::Sig,
+    at_ms: f64,
+) -> Option<crate::wallet::recent::Entry> {
+    use super::flow::Prompt;
+    use crate::money::{Rounding, format as money};
+    use crate::wallet::recent::{Entry, Family, Kind};
+    use alloy_primitives::U256;
+    let (kind, amount) = match prompt {
+        Prompt::Deposit { amount } => (
+            Kind::Deposit,
+            money::dollars(U256::from(*amount), network.asset_decimals, Rounding::Down),
+        ),
+        Prompt::Withdraw { shares } => (
+            Kind::Withdrawal,
+            format!(
+                "{} shares",
+                money::shares(U256::from(*shares), Rounding::Down)
+            ),
+        ),
+        Prompt::SettleClaim { claim } => (Kind::Claim, format!("Settling claim {claim}")),
+        Prompt::TakeCash => (Kind::Claim, "Taking the cash share".to_string()),
+        Prompt::ClaimInstead => (Kind::Claim, "Making a claim instead".to_string()),
+        _ => return None,
+    };
+    let tx = signature.to_string();
+    Some(Entry {
+        tx_url: Some(network.tx_url(&tx)),
+        tx,
+        family: Family::Solana,
+        account: account.to_string(),
+        slug: vault.slug.clone(),
+        title: vault.title.clone(),
+        kind,
+        amount,
+        at_ms,
+        outcome: None,
+    })
+}
+
+/// How a Solana flow ended, in a few words for this browser's record.
+pub fn outcome_words(outcome: &super::flow::Outcome, decimals: u8) -> String {
+    use super::flow::Outcome;
+    use crate::money::{Rounding, format as money};
+    use alloy_primitives::U256;
+    use chain::solana_ix::accounts::ClaimState;
+    let dollars = |value: u64| money::dollars(U256::from(value), decimals, Rounding::Down);
+    match outcome {
+        Outcome::Deposited { shares, .. } => format!(
+            "Bought {} shares",
+            money::shares(U256::from(*shares), Rounding::Down)
+        ),
+        Outcome::Refunded { assets, .. } => format!("Sent back: {}", dollars(*assets)),
+        Outcome::Paid { assets, .. } => format!("Paid {}", dollars(*assets)),
+        Outcome::Booked { claim, .. } => format!("Booked as claim {claim}"),
+        Outcome::Claim {
+            state: ClaimState::Paid,
+            paid,
+            ..
+        } => format!("Paid {}", dollars(*paid)),
+        Outcome::Claim { .. } => "Still booked".to_string(),
+        Outcome::TookCash { assets, .. } => format!("Paid {} in cash", dollars(*assets)),
+        Outcome::ClaimMade { claim, .. } => format!("Made claim {claim}"),
+        Outcome::Collected { assets, .. } => format!("Collected {}", dollars(*assets)),
+        Outcome::Changed { .. } => "Done".to_string(),
+    }
+}
+
 /// Whether `slug`'s vault lives on Solana: as the store knows it, or before
 /// the store has it, as its slug names its chain (`solana-4`).
 pub fn is_solana(slug: &str) -> bool {
@@ -104,16 +187,59 @@ pub fn start(vault: Pubkey, action: SolAction, running: &SolRunning) {
     session.track(running.cancel.clone());
     wasm_bindgen_futures::spawn_local(async move {
         let step = running.step.clone();
-        let on_step = move |next: Step| step.set(Some(next));
         let Some(account) = session.account() else {
-            on_step(Step::Failed(SolError::NotConnected));
+            step.set(Some(Step::Failed(SolError::NotConnected)));
             return;
         };
-        let Some(network) = session.load_network().await else {
-            on_step(Step::Failed(SolError::Network(
-                "the Solana cluster isn't reachable from this app".to_string(),
-            )));
-            return;
+        // Never a config remembered from an earlier visit alone: one the
+        // API answered in this page's life.
+        let network = match session.network_to_sign().await {
+            Ok(network) => network,
+            Err(error) => {
+                step.set(Some(Step::Failed(error)));
+                return;
+            }
+        };
+        // This browser keeps the send once it is on its way, and how it
+        // ended once the flow says.
+        let on_step = {
+            let network = network.clone();
+            let kept: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+            let shown = vault_at(&vault);
+            move |next: Step| {
+                match &next {
+                    Step::Sent { prompt, signature } if kept.borrow().is_none() => {
+                        if let Some(entry) = shown.as_ref().and_then(|shown| {
+                            recent_of(
+                                prompt,
+                                shown,
+                                &account,
+                                &network,
+                                signature,
+                                js_sys::Date::now(),
+                            )
+                        }) {
+                            *kept.borrow_mut() = Some(entry.tx.clone());
+                            crate::wallet::recent::record(entry);
+                        }
+                    }
+                    Step::Done(outcome) => {
+                        if let Some(tx) = kept.borrow().as_deref() {
+                            crate::wallet::recent::settle(
+                                tx,
+                                &outcome_words(outcome, network.asset_decimals),
+                            );
+                        }
+                    }
+                    Step::Failed(error) if !error.may_have_moved() => {
+                        if let Some(tx) = kept.borrow().as_deref() {
+                            crate::wallet::recent::settle(tx, "Didn’t go through");
+                        }
+                    }
+                    _ => {}
+                }
+                step.set(Some(next));
+            }
         };
         let cluster = cluster(&network);
         let reader = SolSession::reader(&network);

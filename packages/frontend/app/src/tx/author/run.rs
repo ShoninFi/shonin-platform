@@ -372,9 +372,16 @@ mod browser {
                 Action::Pay { uploader, .. } => *uploader,
                 _ => connected,
             };
-            let (Some(network), Some(platform)) =
-                (session.network(chain).await, platform(chain).await)
-            else {
+            // Never a config remembered from an earlier visit alone: one the
+            // API answered in this page's life.
+            let network = match session.network_to_sign(chain).await {
+                Ok(network) => network,
+                Err(error) => {
+                    fail(error.into());
+                    return;
+                }
+            };
+            let Some(platform) = platform(chain).await else {
                 fail(
                     TxError::Network("this chain isn't reachable from this app".to_string()).into(),
                 );
